@@ -20,7 +20,7 @@ shopt -s inherit_errexit 2>/dev/null || true
 umask 022
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.1.0"
+readonly SCRIPT_VERSION="1.2.0"
 readonly STATE_DIR="/var/lib/setup.sh"
 readonly BACKUP_DIR="${STATE_DIR}/backup"
 readonly CRON_BEGIN="# BEGIN setup.sh managed cron"
@@ -96,7 +96,9 @@ declare -A OPT=()
 OTHERS=()
 DOMAINS=()
 PURGE=0
+DRY_RUN=0
 PURGE_TARGETS=()
+PURGE_ORDER=()
 SERVICE_ORDER=(basic angie php mariadb valkey elastic others domain)
 declare -A SVC_STATUS=()
 declare -A SVC_SECONDS=()
@@ -144,6 +146,11 @@ Purge (uninstall) mode:
   --purge                               purge everything this script manages
   --purge --php ver=8.5                 purge one PHP version (note --php)
   --purge php mariadb                   bare names are also accepted
+
+Testing:
+  --dry-run                             parse and validate only; show the plan
+                                        without changing the system (works as
+                                        a normal user and with --purge)
 
 Notes:
   * Only one PHP-FPM version can listen on 127.0.0.1:9000 at a time.
@@ -229,6 +236,7 @@ parse_args() {
           PURGE_TARGETS+=("$1"); shift
         done
         ;;
+      --dry-run|--check) DRY_RUN=1; shift ;;
       --version) printf '%s %s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"; exit 0 ;;
       --help|-h) usage; exit 0 ;;
       *) die "Unknown argument: '$1' (use --help)" ;;
@@ -566,18 +574,74 @@ mb_to_config() {
 # ---------------------------------------------------------------------------
 # Cron management
 # ---------------------------------------------------------------------------
+pkg_ok() {
+  dpkg-query -W -f='${Status}' "$1" 2>/dev/null | grep -q 'ok installed'
+}
+
+# Remember whether a package was already present before setup.sh installed it.
+# Purge removes only packages that carry a positive "installed by setup"
+# marker; without proof, a package is left alone.  This makes repeated purges
+# safe even after --purge basic has removed the rest of the state directory.
+pkg_record_origin() {
+  local pkg=$1
+  ensure_state
+  # Never rewrite an existing marker: a package installed by setup.sh on an
+  # earlier run must not become "pre-existing" on a re-run.
+  pkg_installed_by_setup "$pkg" && return 0
+  pkg_preexisting "$pkg" && return 0
+  if pkg_ok "$pkg"; then
+    touch "${STATE_DIR}/preexisting-pkg-${pkg}"
+  else
+    touch "${STATE_DIR}/setup-installed-pkg-${pkg}"
+  fi
+}
+
+pkg_preexisting() {
+  [[ -f "${STATE_DIR}/preexisting-pkg-${1}" ]]
+}
+
+pkg_installed_by_setup() {
+  [[ -f "${STATE_DIR}/setup-installed-pkg-${1}" ]]
+}
+
+# Drop the whole managed block, preserving all unmanaged lines.
 cron_strip_managed() {
   awk -v b="$CRON_BEGIN" -v e="$CRON_END" '
+    $0 == b { inblock = 1; next }
+    $0 == e { inblock = 0; next }
+    !inblock { print }
+  '
+}
+
+# Print only the lines inside the managed block.
+cron_extract_managed() {
+  awk -v b="$CRON_BEGIN" -v e="$CRON_END" '
+    $0 == b { inblock = 1; next }
+    $0 == e { inblock = 0; next }
+    inblock { print }
+  '
+}
+
+# Keep non-empty managed blocks, drop empty begin/end pairs.
+cron_compact_managed() {
+  awk -v b="$CRON_BEGIN" -v e="$CRON_END" '
     $0 == b { inblock = 1; buf = ""; next }
-    $0 == e { inblock = 0; if (buf != "") printf "%s\n%s%s\n", b, buf, e; next }
+    $0 == e {
+      inblock = 0
+      if (buf != "") printf "%s\n%s%s\n", b, buf, e
+      next
+    }
     inblock { buf = buf $0 "\n"; next }
     { print }
+    END {
+      if (inblock && buf != "") printf "%s\n%s%s\n", b, buf, e
+    }
   '
 }
 
 write_cron() {
-  local cur tmp
-  local -a lines=()
+  local cur tmp line group seen=" "
+  local -a lines=() existing=() preserved=()
 
   if [[ ${ENABLED[angie]:-0} -eq 1 ]]; then
     lines+=('0 0 * * * /usr/bin/chown www-data:www-data -R /var/www/ >/dev/null 2>&1')
@@ -590,6 +654,39 @@ write_cron() {
   fi
 
   cur=$(crontab -l 2>/dev/null || true)
+  if [[ -n $cur ]]; then
+    mapfile -t existing < <(printf '%s\n' "$cur" | cron_extract_managed)
+  fi
+
+  # A run that only touches --basic must not silently remove cron entries that
+  # belong to services installed earlier.  Regenerate entries for selected
+  # services, keep entries for other services that are still installed, and
+  # drop stale entries for services that are no longer present.
+  for line in "${existing[@]}"; do
+    [[ -n $line ]] || continue
+    if [[ $line == *mysqlbkup* || $line == *mariadb-check* ]]; then
+      group=mariadb
+    elif [[ $line == *'/etc/angie/'* || $line == *'chown www-data:www-data -R /var/www/'* ]]; then
+      group=angie
+    else
+      group=unknown
+    fi
+    case "$group" in
+      angie)
+        [[ ${ENABLED[angie]:-0} -eq 1 ]] && continue
+        pkg_ok angie || continue
+        ;;
+      mariadb)
+        [[ ${ENABLED[mariadb]:-0} -eq 1 ]] && continue
+        pkg_ok mariadb-server || continue
+        ;;
+    esac
+    [[ $seen == *" ${line} "* ]] && continue
+    seen+="${line} "
+    preserved+=("$line")
+  done
+
+  lines=("${preserved[@]}" "${lines[@]}")
   tmp=$(mktemp)
   {
     if [[ -n $cur ]]; then
@@ -616,7 +713,7 @@ cron_remove_line() {
   cur=$(crontab -l 2>/dev/null || true)
   [[ -n $cur ]] || return 0
   tmp=$(mktemp)
-  printf '%s\n' "$cur" | grep -vF -- "$needle" > "$tmp" || true
+  printf '%s\n' "$cur" | grep -vF -- "$needle" | cron_compact_managed > "$tmp" || true
   if [[ -s $tmp ]]; then crontab "$tmp"; else crontab -r 2>/dev/null || true; fi
   rm -f "$tmp"
 }
@@ -628,7 +725,8 @@ configure_dns() {
   step "DNS"
   record_original /etc/systemd/resolved.conf.d resolved.conf.d
   mkdir -p /etc/systemd/resolved.conf.d
-  rm -f /etc/systemd/resolved.conf.d/*
+  # Only manage our own drop-in; do not delete unrelated resolver configs.
+  rm -f /etc/systemd/resolved.conf.d/dns_servers.conf
   cat > /etc/systemd/resolved.conf.d/dns_servers.conf <<'EOF'
 [Resolve]
 DNS=8.8.8.8 1.1.1.1
@@ -848,6 +946,10 @@ configure_ufw() {
   if [[ ! -f "${STATE_DIR}/ufw-added-before" ]]; then
     ufw show added 2>/dev/null | sort -u > "${STATE_DIR}/ufw-added-before" || true
   fi
+  if [[ ! -f "${STATE_DIR}/ufw-defaults-before" ]]; then
+    ufw status verbose 2>/dev/null | awk '/^Default:/{print}' \
+      > "${STATE_DIR}/ufw-defaults-before" || true
+  fi
 
   ufw --force default deny incoming
   ufw --force default allow outgoing
@@ -934,6 +1036,21 @@ deploy_angie_configs() {
   rm -rf "${src}"/*.md "${src}"/*.txt "${src}"/.git* 2>/dev/null || true
   rsync -a "${src}/" /etc/angie/
   rm -rf "$tmp"
+
+  # Align Angie's body limit with the PHP profile (100 MB).  Angie rejects a
+  # duplicate directive in the same context, so edit the existing value.
+  sed -i -E 's|^([[:space:]]*)client_max_body_size[[:space:]]+.*|\1client_max_body_size 100m;|' \
+    /etc/angie/angie.conf
+
+  # Small managed overrides layered on top of the embedded tree.  open_file_cache
+  # helps static-heavy sites by caching file descriptors and metadata.
+  cat > /etc/angie/http.d/99_setup_overrides.conf <<'EOF'
+# Managed by setup.sh
+open_file_cache max=100000 inactive=30s;
+open_file_cache_min_uses 2;
+open_file_cache_errors on;
+EOF
+  chmod 644 /etc/angie/http.d/99_setup_overrides.conf
 
   # Keep the Cloudflare helper byte-for-byte as published (embedded).
   mkdir -p /etc/angie/scripts
@@ -1088,7 +1205,7 @@ listen.mode = 0660
 
 pm = static
 
-; (PHP_RAM_GB x 1024) / 128
+; 50% of RAM / 256 MB per worker, capped at CPU threads x 8
 pm.max_children = 64
 
 ; CPU_thread x 1024
@@ -1102,9 +1219,11 @@ slowlog = /var/log/php-fpm/www-slow.log
 security.limit_extensions = .php
 EOF
 
-  local ram_mb max_children max_requests
+  local ram_mb max_children max_requests max_by_cpu
   ram_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
-  max_children=$(( ram_mb / 512 ))          # (25% of RAM in GB * 1024) / 128
+  max_children=$(( ram_mb / 256 ))         # ~50% of RAM at 128 MB/worker
+  max_by_cpu=$(( $(nproc) * 8 ))
+  (( max_children > max_by_cpu )) && max_children=$max_by_cpu
   (( max_children < 1 )) && max_children=1
   max_requests=$(( $(nproc) * 1024 ))       # CPU threads * 1024
 
@@ -1219,12 +1338,15 @@ configure_mariadb_apparmor() {
 configure_mariadb() {
   local size_mb=$1 bind=$2
   local cnf=/etc/mysql/mariadb.conf.d/50-server.cnf
-  local buffer logsize threads
+  local buffer logsize threads max_conn
   [[ -f $cnf ]] || die "MariaDB config ${cnf} not found"
 
   buffer=$(mb_to_config "$size_mb")
   logsize=$(mb_to_config "$(( size_mb / 4 ))")
   threads=$(nproc)
+  max_conn=$(( threads * 25 ))
+  (( max_conn > 500 )) && max_conn=500
+  (( max_conn < 100 )) && max_conn=100
 
   # Comment out expire_logs_days if it is active.
   sed -i -E 's|^([[:space:]]*)expire_logs_days([[:space:]]*=)|\1#expire_logs_days\2|' "$cnf"
@@ -1248,20 +1370,21 @@ ${MARIADB_BEGIN}
 collation-server = utf8mb4_general_ci
 character-set-server = utf8mb4
 
-innodb_snapshot_isolation = 0
+innodb_snapshot_isolation = 1
 skip_name_resolve = 1
 query_cache_size = 0
 query_cache_type = 0
 open_files_limit = 524288
 
-max_connections = $(( threads * 50 ))
+max_connections = ${max_conn}
 max_connect_errors = 524288
+thread_cache_size = 64
 
-innodb_log_buffer_size = 2047M
+innodb_log_buffer_size = 64M
 innodb_log_file_size = ${logsize}
 innodb_buffer_pool_size = ${buffer}
 
-innodb_flush_log_at_trx_commit = 0
+innodb_flush_log_at_trx_commit = 2
 innodb_read_only_compressed = OFF
 innodb_lock_wait_timeout = 100
 innodb_flush_neighbors = 0
@@ -1272,14 +1395,16 @@ innodb_io_capacity_max = 6000
 innodb_read_io_threads = ${threads}
 innodb_write_io_threads = ${threads}
 
-join_buffer_size = 4M
-read_buffer_size = 2M
-sort_buffer_size = 4M
+join_buffer_size = 1M
+read_buffer_size = 1M
+sort_buffer_size = 2M
 
-tmp_table_size = 256M
-max_heap_table_size = 256M
+tmp_table_size = 64M
+max_heap_table_size = 64M
 
-table_definition_cache = 1024
+table_open_cache = 4000
+table_definition_cache = 4000
+innodb_open_files = 4000
 key_buffer_size = 32M
 
 aria_pagecache_buffer_size = 256M
@@ -1332,11 +1457,17 @@ EOF
     sleep 1
   done
 
-  local eu ep sql
+  local eu ep sql host
   eu=$(sql_escape "$user")
   ep=$(sql_escape "$pass")
-  sql="CREATE USER IF NOT EXISTS '${eu}'@'localhost' IDENTIFIED BY '${ep}'; ALTER USER '${eu}'@'localhost' IDENTIFIED BY '${ep}'; GRANT ALL ON *.* TO '${eu}'@'localhost' WITH GRANT OPTION; FLUSH PRIVILEGES;"
-  mariadb -e "$sql"
+  # skip_name_resolve=1 means 127.0.0.1 is not translated to localhost, so an
+  # account created only for 'user'@'localhost' cannot be used over TCP.
+  # Create the same account for every loopback spelling.
+  for host in localhost 127.0.0.1 ::1; do
+    sql="CREATE USER IF NOT EXISTS '${eu}'@'${host}' IDENTIFIED BY '${ep}'; ALTER USER '${eu}'@'${host}' IDENTIFIED BY '${ep}'; GRANT ALL ON *.* TO '${eu}'@'${host}' WITH GRANT OPTION;"
+    mariadb -e "$sql"
+  done
+  mariadb -e 'FLUSH PRIVILEGES;'
 
   # MySQL Tuner (embedded)
   blob_mysqltuner > /root/mysqltuner.pl
@@ -1386,16 +1517,24 @@ install_valkey() {
   local conf=/etc/valkey/valkey.conf
   [[ -f $conf ]] || die "Valkey config ${conf} not found"
 
-  local line
-  local -a vlines=('supervised systemd' 'save ""' 'maxmemory 1024mb'
+  local line ram_mb valkey_mb
+  ram_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
+  valkey_mb=$(( ram_mb / 10 ))          # ~10% of RAM for cache
+  (( valkey_mb < 256 )) && valkey_mb=256
+  (( valkey_mb > 8192 )) && valkey_mb=8192
+
+  # Normalise the directives this script owns: remove active copies, then
+  # append the canonical values once.  This also upgrades old profiles that
+  # had "protected-mode no" without leaving contradictory duplicates.
+  sed -i -E '/^[[:space:]]*(bind|protected-mode|save|maxmemory|maxmemory-policy|maxmemory-samples|supervised)[[:space:]]/d' "$conf"
+  local -a vlines=('supervised systemd' 'save ""' "maxmemory ${valkey_mb}mb"
                    'maxmemory-policy allkeys-lru' 'maxmemory-samples 10'
-                   'protected-mode no')
+                   'bind 127.0.0.1 -::1' 'protected-mode yes')
   for line in "${vlines[@]}"; do
-    if ! grep -qxF -- "$line" "$conf"; then
-      printf '%s\n' "$line" >> "$conf"
-    fi
+    printf '%s\n' "$line" >> "$conf"
   done
-  tail -5 "$conf"
+  info "Valkey maxmemory: ${valkey_mb} MB (~10% of RAM)"
+  tail -8 "$conf"
 
   valkey-server -v
   systemctl enable --now valkey-server
@@ -1418,7 +1557,26 @@ install_elastic() {
   local host=${OPT[elastic.host]:-localhost}
   local ram=${OPT[elastic.ram]}
   local ram_lc=${ram,,}
+  local ram_mb ram_total_mb
   step "Elasticsearch"
+
+  if [[ $ram_lc == *g ]]; then
+    ram_mb=$(( ${ram_lc%g} * 1024 ))
+  else
+    ram_mb=${ram_lc%m}
+  fi
+  ram_total_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
+  if (( ram_mb > ram_total_mb / 2 )); then
+    warn "Elasticsearch heap (${ram}) exceeds 50% of RAM; the kernel may OOM-kill it."
+  fi
+
+  case "$host" in
+    localhost|127.0.0.1|::1) ;;
+    *)
+      warn "Elasticsearch is configured with xpack.security disabled on host '${host}'."
+      warn "Do not expose port 9200 to untrusted networks; put it behind a firewall or enable X-Pack security/TLS."
+      ;;
+  esac
 
   apt_install apt-transport-https ca-certificates curl gnupg
 
@@ -1465,12 +1623,20 @@ ${ES_BEGIN}
 cluster.name: essearch
 network.host: ${host}
 http.port: 9200
+bootstrap.memory_lock: true
 indices.query.bool.max_clause_count: 4096
 discovery.type: single-node
 xpack.security.enabled: false
 xpack.security.enrollment.enabled: false
 #cluster.initial_master_nodes: [""]
 ${ES_END}
+EOF
+
+  mkdir -p /etc/systemd/system/elasticsearch.service.d
+  cat > /etc/systemd/system/elasticsearch.service.d/limits.conf <<'EOF'
+[Service]
+LimitMEMLOCK=infinity
+LimitNOFILE=65535
 EOF
 
   mkdir -p /etc/elasticsearch/jvm.options.d
@@ -1523,6 +1689,7 @@ install_others() {
     case "$item" in
       smartmon)
         info "Installing smartmontools"
+        pkg_record_origin smartmontools
         apt_install smartmontools
         systemctl enable --now smartd 2>/dev/null || warn "smartd could not be enabled (no SMART devices?)"
         smartctl --version | head -n 1 || true
@@ -1531,6 +1698,7 @@ install_others() {
         local stype=${OPT[basic.server]:-$(detect_server_type)}
         if [[ $stype == dedi ]] && is_nvme_storage; then
           info "Installing nvme-cli (dedicated server with NVMe storage)"
+          pkg_record_origin nvme-cli
           apt_install nvme-cli
           nvme version || true
         else
@@ -1539,11 +1707,17 @@ install_others() {
         ;;
       gif)
         info "Installing gifsicle"
+        pkg_record_origin gifsicle
         apt_install gifsicle
         gifsicle --version | head -n 1 || true
         ;;
       nodejs)
         info "Configuring NodeSource 26.x and installing Node.js"
+        pkg_record_origin nodejs
+        [[ -e /etc/apt/sources.list.d/nodesource.sources ]] \
+          || touch "${STATE_DIR}/setup-created-nodesource-repo"
+        [[ -e /usr/share/keyrings/nodesource.gpg ]] \
+          || touch "${STATE_DIR}/setup-created-nodesource-key"
         apt_install curl ca-certificates gnupg
         blob_nodesource_key | gpg --dearmor --yes -o /usr/share/keyrings/nodesource.gpg
         chmod 644 /usr/share/keyrings/nodesource.gpg
@@ -1678,6 +1852,14 @@ purge_basic() {
   fi
   if [[ -f "${STATE_DIR}/ufw-active-before" ]] && [[ $(<"${STATE_DIR}/ufw-active-before") == inactive ]]; then
     ufw --force disable || true
+  elif [[ -f "${STATE_DIR}/ufw-defaults-before" ]]; then
+    # Restore the default policies that existed before configure_ufw.
+    local defaults orig_in orig_out
+    defaults=$(<"${STATE_DIR}/ufw-defaults-before")
+    orig_in=$(printf '%s\n' "$defaults" | sed -n 's/.*Default: \([a-z]*\) (incoming).*/\1/p')
+    orig_out=$(printf '%s\n' "$defaults" | sed -n 's/.*, \([a-z]*\) (outgoing).*/\1/p')
+    [[ -n $orig_in ]] && ufw --force default "$orig_in" incoming || true
+    [[ -n $orig_out ]] && ufw --force default "$orig_out" outgoing || true
   fi
 
   restore_original /etc/security/limits.conf limits.conf
@@ -1814,6 +1996,7 @@ purge_elastic() {
   purge_service_stop elasticsearch
   apt_purge_pkgs elasticsearch
   rm -rf /etc/elasticsearch /var/lib/elasticsearch /var/log/elasticsearch /run/elasticsearch
+  rm -rf /etc/systemd/system/elasticsearch.service.d
   rm -f /etc/apt/sources.list.d/elastic-9.x.list /usr/share/keyrings/elasticsearch-keyring.gpg
   rm -f /etc/sysctl.d/99-elasticsearch.conf
   systemctl daemon-reload || true
@@ -1822,18 +2005,36 @@ purge_elastic() {
 
 purge_others() {
   step "Purge other packages"
-  apt_purge_pkgs smartmontools nvme-cli gifsicle
-  if dpkg-query -W -f='${Status}' nodejs 2>/dev/null | grep -q 'ok installed'; then
-    warn "Removing Node.js (including any version that existed before setup.sh)"
-    apt_purge_pkgs nodejs
+  local pkg
+  local -a removable=()
+  for pkg in smartmontools nvme-cli gifsicle; do
+    if pkg_preexisting "$pkg" || ! pkg_installed_by_setup "$pkg"; then
+      info "Keeping package not installed by setup.sh: ${pkg}"
+    else
+      removable+=("$pkg")
+    fi
+  done
+  (( ${#removable[@]} == 0 )) || apt_purge_pkgs "${removable[@]}"
+
+  if pkg_ok nodejs; then
+    if pkg_preexisting nodejs || ! pkg_installed_by_setup nodejs; then
+      info "Keeping Node.js (not installed by setup.sh)"
+    else
+      warn "Removing Node.js (installed by setup.sh)"
+      apt_purge_pkgs nodejs
+    fi
   fi
-  rm -f /etc/apt/sources.list.d/nodesource.sources /etc/apt/sources.list.d/nodesource.list
-  rm -f /usr/share/keyrings/nodesource.gpg
-  rm -f /etc/apt/preferences.d/nodejs /etc/apt/preferences.d/nsolid
+  if [[ -f "${STATE_DIR}/setup-created-nodesource-repo" ]]; then
+    rm -f /etc/apt/sources.list.d/nodesource.sources /etc/apt/sources.list.d/nodesource.list
+    rm -f /etc/apt/preferences.d/nodejs /etc/apt/preferences.d/nsolid
+  fi
+  if [[ -f "${STATE_DIR}/setup-created-nodesource-key" ]]; then
+    rm -f /usr/share/keyrings/nodesource.gpg
+  fi
   ok "Other packages purged"
 }
 
-run_purge() {
+build_purge_order() {
   local -A wanted=()
   local t
 
@@ -1845,22 +2046,31 @@ run_purge() {
     fi
   done
   for t in angie php mariadb valkey elastic others basic; do
-    [[ ${ENABLED[$t]:-0} -eq 1 ]] && wanted[$t]=1
+    if [[ ${ENABLED[$t]:-0} -eq 1 ]]; then
+      wanted[$t]=1
+    fi
   done
   if [[ ${#wanted[@]} -eq 0 ]]; then
     wanted[all]=1
   fi
 
-  local -a ordered=()
+  PURGE_ORDER=()
   if [[ -n ${wanted[all]:-} ]]; then
-    ordered=(angie php mariadb valkey elastic others basic)
+    PURGE_ORDER=(angie php mariadb valkey elastic others basic)
   else
     for t in angie php mariadb valkey elastic others basic; do
-      [[ -n ${wanted[$t]:-} ]] && ordered+=("$t")
+      if [[ -n ${wanted[$t]:-} ]]; then
+        PURGE_ORDER+=("$t")
+      fi
     done
   fi
+  return 0
+}
 
-  for t in "${ordered[@]}"; do
+run_purge() {
+  build_purge_order
+  local t
+  for t in "${PURGE_ORDER[@]}"; do
     case "$t" in
       basic)   purge_basic ;;
       angie)   purge_angie ;;
@@ -1926,6 +2136,51 @@ resolve_basic_defaults() {
   fi
 }
 
+print_plan() {
+  local s
+  printf '\n%sDRY RUN%s - validation only, no changes will be made.\n' "$C_BOLD" "$C_RESET"
+
+  if [[ ${PURGE} -eq 1 ]]; then
+    build_purge_order
+    printf 'Purge order: %s\n' "${PURGE_ORDER[*]}"
+    printf 'Notes: MariaDB/PHP/Angie/Valkey/Elasticsearch data and configuration are removed.\n'
+    printf '       Packages that existed before setup.sh are preserved for --others.\n'
+    return 0
+  fi
+
+  printf 'Install plan:\n'
+  for s in "${SERVICE_ORDER[@]}"; do
+    [[ ${ENABLED[$s]:-0} -eq 1 ]] || continue
+    case "$s" in
+      basic)
+        printf '  %-10s server=%s host=%s time=%s swap=%s\n' "$s" \
+          "${OPT[basic.server]:-auto}" "${OPT[basic.host]:-auto-generated}" \
+          "${OPT[basic.time]:-Asia/Manila}" "${OPT[basic.swap]:-auto (50% of RAM)}"
+        ;;
+      php)
+        printf '  %-10s version=%s\n' "$s" "${OPT[php.ver]:-auto (latest stable in Sury)}"
+        ;;
+      mariadb)
+        printf '  %-10s user=%s size=%s bind=%s\n' "$s" \
+          "${OPT[mariadb.user]:-}" "${OPT[mariadb.size]:-}" "${OPT[mariadb.bind]:-127.0.0.1}"
+        ;;
+      elastic)
+        printf '  %-10s host=%s ram=%s\n' "$s" \
+          "${OPT[elastic.host]:-localhost}" "${OPT[elastic.ram]:-}"
+        ;;
+      others)
+        printf '  %-10s %s\n' "$s" "${OTHERS[*]:-}"
+        ;;
+      domain)
+        printf '  %-10s %s\n' "$s" "${DOMAINS[*]:-}"
+        ;;
+      *)
+        printf '  %-10s install\n' "$s"
+        ;;
+    esac
+  done
+}
+
 main() {
   # --help/--version are safe without root.
   local a
@@ -1935,6 +2190,17 @@ main() {
       --version) printf '%s %s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"; exit 0 ;;
     esac
   done
+
+  # Parse and validate before the root/OS checks so --dry-run works for a
+  # normal user and invalid arguments get an accurate error message.
+  parse_args "$@"
+  validate_all
+
+  if (( DRY_RUN )); then
+    [[ ${ENABLED[basic]:-0} -eq 1 ]] && resolve_basic_defaults
+    print_plan
+    exit 0
+  fi
 
   [[ ${EUID} -eq 0 ]] || die "This script must be run as root (use: sudo bash ${SCRIPT_NAME} ...)"
 
@@ -1946,9 +2212,6 @@ main() {
   if (( ${VERSION_ID%%.*} < 26 )); then
     die "This script requires Ubuntu 26.04 or newer (found ${VERSION_ID})"
   fi
-
-  parse_args "$@"
-  validate_all
 
   if [[ ${PURGE} -eq 1 ]]; then
     run_purge
