@@ -41,6 +41,16 @@ sudo bash setup.sh --basic --angie --php
 sudo bash setup.sh --domain google.com
 ```
 
+### Dry run / validation
+
+`--dry-run` (alias `--check`) parses and validates the command, then prints the resolved install or purge plan without touching the system. It works as a normal user, which makes it safe for CI and for checking combinations:
+
+```bash
+./setup.sh --dry-run --basic server=dedi host=web1 time=Asia/Manila \
+  --angie --php --mariadb user=dan pass=temp size=4gb --valkey --elastic ram=4g
+./setup.sh --dry-run --purge --angie --php ver=8.5
+```
+
 ---
 
 ## Basic setup (`--basic`)
@@ -56,7 +66,7 @@ sudo bash setup.sh --domain google.com
 
 Basic performs:
 
-1. Writes `/etc/systemd/resolved.conf.d/dns_servers.conf` (`8.8.8.8`, `1.1.1.1`) and restarts `systemd-resolved`.
+1. Writes its own `/etc/systemd/resolved.conf.d/dns_servers.conf` (`8.8.8.8`, `1.1.1.1`) and restarts `systemd-resolved`. Other resolver drop-ins are left untouched.
 2. Purges snapd (if present), updates Ubuntu, upgrades packages, autoremoves and cleans.
 3. On a dedicated server: installs `cpufrequtils`, writes `/etc/default/cpufrequtils`, enables the service, and sets the `performance` governor. On a VPS this is skipped.
 4. Installs basic tools: `wget unzip nano zip software-properties-common rsync ca-certificates curl gnupg dmidecode`.
@@ -69,7 +79,7 @@ Basic performs:
 9. Installs/enables cron and writes a managed crontab block containing only the entries for the selected services:
    - Angie: daily `chown` of `/var/www`, daily `chmod +x` and execution of `/etc/angie/scripts/cloudflare.sh`.
    - MariaDB: daily 03:03 mysql backup and monthly `mariadb-check`.
-10. Configures UFW: deny incoming, allow outgoing, limit 22, allow 80 and 443, enable the firewall.
+10. Configures UFW: deny incoming, allow outgoing, limit 22, allow 80 and 443, enable the firewall. The original active state, added rules and default policies are recorded so `--purge basic` can restore them.
 
 Before changing basic settings, the script records the originals under `/var/lib/setup.sh/backup`. `--purge basic` restores them. A swap file is only removed by purge if the script actually created or resized it (`/var/lib/setup.sh/swapfile-managed`).
 
@@ -82,6 +92,7 @@ Before changing basic settings, the script records the originals under `/var/lib
 - Installs the Angie signing key and APT repository.
 - Installs `angie` and deploys the embedded `server-configs-nginx` config tree to `/etc/angie`.
 - Applies the systemd `LimitNOFILE=524288` drop-in and `/etc/default/angie`.
+- Aligns `client_max_body_size` with PHP (100 MB) and adds a managed `open_file_cache` override for static-heavy sites.
 - Generates `/etc/angie/http.d/cloudflare.conf` from the current Cloudflare IPv4/IPv6 ranges and reloads Angie.
 - Runs `angie -t` before reloading.
 
@@ -91,7 +102,7 @@ Before changing basic settings, the script records the originals under `/var/lib
 - If `ver=` is omitted, selects the **latest stable PHP** available to APT from the Sury repository (currently 8.5; pre-release packages such as `8.6.0~rc3` are ignored).
 - Installs `php<ver>-fpm`, `php<ver>-cli` and the `mysql`, `gd`, `curl`, `xml`, `zip`, `gmp`, `mbstring`, `redis` extensions with `--no-install-recommends`.
 - Deploys `www.conf` and `custom_dan.ini`, then computes:
-  - `pm.max_children = (25% of RAM in GB × 1024) / 128`
+  - `pm.max_children = RAM_MB / 256` (~50% of RAM at 128 MB per worker), capped at `CPU threads × 8`
   - `pm.max_requests = CPU threads × 1024`
 - Sets the PHP timezone from `--basic time=`.
 - Enables and restarts `php<ver>-fpm` and prints `php -v`.
@@ -110,14 +121,17 @@ Installing a second version while the first is active is refused **before any pa
 - Installs `mariadb-server` and `mariadb-client`.
 - Adds a systemd `LimitNOFILE=524288` drop-in.
 - Writes a managed `[mariadbd]` block into `/etc/mysql/mariadb.conf.d/50-server.cnf`:
-  - `max_connections = CPU threads × 50`
+  - `max_connections = CPU threads × 25` (clamped to 100–500)
   - `innodb_buffer_pool_size = size`
   - `innodb_log_file_size = size / 4`
+  - `innodb_log_buffer_size = 64M`
+  - `innodb_flush_log_at_trx_commit = 2` (durable across server crash; use `1` if every committed transaction must survive an OS crash)
+  - `innodb_snapshot_isolation = 1` (standard MVCC isolation)
   - `innodb_read_io_threads` / `innodb_write_io_threads = CPU threads`
-  - the documented buffer, cache, flush and charset settings
+  - 1M join/read buffers, 2M sort buffer, 64M temp tables, 4000 table/open-file caches
   - `bind-address` from `bind=` (default `127.0.0.1`)
 - Comments out `expire_logs_days`.
-- Creates the requested admin user with `GRANT ALL ... WITH GRANT OPTION` (idempotent `CREATE USER IF NOT EXISTS` + `ALTER USER`).
+- Creates the requested admin user with `GRANT ALL ... WITH GRANT OPTION` for `localhost`, `127.0.0.1` and `::1` (idempotent `CREATE USER IF NOT EXISTS` + `ALTER USER`). The extra loopback hosts are required because `skip_name_resolve=1` means a TCP connection to `127.0.0.1` does **not** match `'user'@'localhost'`.
 - Creates `/var/log/mariadb`, sets ownership, reloads systemd and restarts MariaDB.
 - Downloads nothing at runtime: `mysqltuner.pl` and the `mysqlbackup` repository are embedded. It installs `mysqltuner.pl` to `/root/mysqltuner.pl`, installs the backup utility under `/root/tools/mysqlbackup-master`, and writes `/etc/mysqlbkup.cnf` with the requested user/password.
 - Verifies `mysqldump` and `mariadb-check` are present.
@@ -129,13 +143,14 @@ The MariaDB backup cron entry is added only when MariaDB is selected.
 ### Valkey (`--valkey`)
 
 - Purges any existing `redis-server`, cleans apt, installs `valkey-server`.
-- Appends (idempotently) to `/etc/valkey/valkey.conf`:
+- Replaces the managed directives in `/etc/valkey/valkey.conf` (no duplicates):
   - `supervised systemd`
-  - `save ""`
-  - `maxmemory 1024mb`
+  - `save ""` (cache-only; enable AOF/RDB if you store sessions or queues)
+  - `maxmemory <10% of RAM>` (minimum 256 MB, maximum 8 GB)
   - `maxmemory-policy allkeys-lru`
   - `maxmemory-samples 10`
-  - `protected-mode no`
+  - `bind 127.0.0.1 -::1`
+  - `protected-mode yes`
 - Enables/restarts `valkey-server` and verifies `valkey-cli ping` returns `PONG`.
 
 ### Elasticsearch (`--elastic [host=localhost] ram=4g`)
@@ -146,17 +161,19 @@ The MariaDB backup cron entry is added only when MariaDB is selected.
   - `cluster.name: essearch`
   - `network.host` from `host=` (default `localhost`)
   - `http.port: 9200`
+  - `bootstrap.memory_lock: true` (the systemd drop-in sets `LimitMEMLOCK=infinity`)
   - `indices.query.bool.max_clause_count: 4096`
   - `discovery.type: single-node`
   - disables `xpack.security.enabled` and `xpack.security.enrollment.enabled`
   - comments out `cluster.initial_master_nodes`
   - comments out the package’s `http.host`/`transport.host` so `network.host` actually controls the bind address
 - Writes `/etc/elasticsearch/jvm.options.d/jvm.options` with `-Xms<ram>`, `-Xmx<ram>` and `-Dlog4j2.formatMsgNoLookups=true`.
+- Writes `/etc/systemd/system/elasticsearch.service.d/limits.conf` with `LimitMEMLOCK=infinity` and `LimitNOFILE=65535`.
 - Writes `/etc/elasticsearch/scripts/xf-date-weighted.groovy`.
 - Sets `vm.max_map_count=1048576` (persisted in `/etc/sysctl.d/99-elasticsearch.conf`).
 - Enables/restarts Elasticsearch and waits for the HTTP endpoint to become ready.
 
-With security disabled, keep `host=localhost` unless you really intend to expose port 9200.
+With security disabled, keep `host=localhost` unless you really intend to expose port 9200. The script warns when a non-loopback `host=` is used; enable X-Pack security/TLS and a firewall before exposing it. The heap is also checked against 50% of RAM and a warning is printed if it is too large.
 
 ### Other packages (`--others ...`)
 
@@ -203,6 +220,8 @@ The script is safe to re-run:
 - `/swapfile` is reused if it already has the requested size.
 - Auto swap is a no-op once total swap is at least 50% of RAM.
 - Managed blocks in `crontab`, `50-server.cnf`, `elasticsearch.yml` and `valkey.conf` are replaced, not duplicated.
+- A `--basic`-only re-run keeps the managed cron entries of services that are still installed; stale entries for removed services are dropped.
+- Package-origin markers prevent `--purge others` from removing packages that existed before setup.sh, even after a previous purge removed the state directory.
 - Package repositories and keys are re-written only when missing.
 - Domain directories and databases use idempotent creation; existing Angie domain configs are preserved.
 - PHP, MariaDB, Angie, Valkey and Elasticsearch services are restarted after configuration changes so changed parameters take effect.
@@ -214,7 +233,7 @@ A second run is normally much faster than the first (typically under a minute fo
 ## Purge / uninstall
 
 ```bash
-# Everything this script manages (including Node.js — see the warning below)
+# Everything this script installed (packages that pre-existed are kept)
 sudo bash setup.sh --purge all
 
 # Selected services only
@@ -236,10 +255,10 @@ sudo bash setup.sh --purge
 
 - `--purge --php ver=8.5` purges one version; `--purge php` purges all installed PHP 8.x versions.
 - Bare targets and service flags are combined, so `--purge basic --php` purges both.
-- `--purge others` removes `smartmontools`, `nvme-cli`, `gifsicle` **and Node.js**. It prints a warning because Node.js may have existed before the script ran. If you want to keep Node.js, purge other services separately.
-- `--purge basic` restores the files recorded in `/var/lib/setup.sh/backup`, removes a `/swapfile` that the script created/resized (and its `/etc/fstab` line), removes the managed cron block, deletes the UFW rules it added, and disables UFW again if it was originally inactive. Pre-existing swap is left untouched if the script did not manage it.
+- `--purge others` removes `smartmontools`, `nvme-cli`, `gifsicle` and Node.js **only when setup.sh installed them**. Packages and the NodeSource repository/key that already existed are preserved, using `/var/lib/setup.sh/setup-installed-pkg-*` and `preexisting-pkg-*` markers. This makes repeated purges safe even after `--purge basic` removed the rest of the state directory.
+- `--purge basic` restores the files recorded in `/var/lib/setup.sh/backup`, removes a `/swapfile` that the script created/resized (and its `/etc/fstab` line), removes the managed cron block while keeping operator-owned cron lines, deletes the UFW rules it added, restores the original UFW default policies, and disables UFW again if it was originally inactive. Pre-existing swap is left untouched if the script did not manage it.
 - Service purge removes packages, service units, configuration directories and runtime data created by the service. **MariaDB purge removes `/var/lib/mariadb` (the database data).** Back up your databases first.
-- Domains are not purged automatically; remove `/var/www/<domain>/`, `/etc/angie/conf.d/<domain>.conf` and the database manually.
+- There is no `--purge domain` target. `--purge angie` removes `/etc/angie/` (including domain vhosts), `--purge mariadb` removes the databases, and `/var/www/<domain>/` is left in place. Remove those manually if needed.
 
 ---
 
@@ -308,12 +327,86 @@ The script was tested on Ubuntu 26.04.1 LTS (16 CPU threads, 32 GB installed RAM
 | Domain idempotency | re-run preserves existing vhost config; database creation is idempotent | PASS |
 | Domain validation | invalid/traversal domains rejected; `--purge --domain` rejected | PASS |
 | Purge modes | `--purge`, `--purge all`, `--purge basic`, per-service, versioned PHP, mixed bare targets + flags | PASS |
+| Cron idempotency | repeated full/basic runs keep exactly one managed block; `--purge basic` removes it but keeps operator-owned lines | PASS |
+| Pre-existing packages | `--purge others` kept a pre-installed `smartmontools`, removed only script-installed packages; safe after state deletion and repeated purges | PASS |
+| MariaDB TCP login | admin user works via socket and TCP `127.0.0.1` with `skip_name_resolve=1` | PASS |
+| Valkey hardening | loopback bind, `protected-mode yes`, no duplicate managed directives | PASS |
+| Elasticsearch hardening | `bootstrap.memory_lock: true`, `LimitMEMLOCK=infinity`, heap ≤ 50% RAM warning | PASS |
 
-Also checked at CLI level:
+Also checked at CLI level (all using `--dry-run`, no system changes):
 
 - All 128 combinations of the seven optional install flags (`angie`, `php`, `mariadb`, `valkey`, `elastic`, `others`, `domain`) parse and validate.
-- All 128 combinations of purge targets parse and validate.
-- 293 parser/validation checks in total, including invalid server type, hostname, timezone, swap size, PHP version, MariaDB size/bind, Elasticsearch RAM/host, unknown `--others`, invalid domains, missing values, non-root execution, `--help` and `--version`.
+- All 127 non-empty bare purge target subsets plus implicit/explicit `all`, and all 127 non-empty `--purge --service` flag subsets parse and validate.
+- 407 parser/validation checks passed in total, including invalid server type, hostname, timezone, swap size, PHP version, MariaDB size/bind, Elasticsearch RAM/host, unknown `--others`, invalid domains, missing values, invalid combinations, `--help` and `--version`.
+- `--dry-run` was verified to make no changes as a normal user.
+
+### Stress test (this machine)
+
+A local site (`stress.test`) exercised Angie → PHP-FPM → MariaDB/Valkey/Elasticsearch. Tests used `wrk`, `sysbench`, `valkey-benchmark`, `ab` and `pidstat`/`vmstat` on 16 CPU threads, 27 GiB RAM, NVMe.
+
+| Target | Concurrency | Result |
+|---|---|---|
+| Static file (Angie) | 200 | ~360–410k req/s, p99 < 2 ms |
+| PHP hello | 200 | ~145–155k req/s |
+| MariaDB primary-key read via PHP | 100 | ~27k req/s, p99 ~6–7 ms |
+| MariaDB `sysbench oltp_read_only` direct | 16 threads | ~11.9k TPS / ~190k QPS, 95th percentile 1.5 ms |
+| Valkey direct `set`/`get` | 100 | ~133k / ~150k ops/s, p50 ~0.65 ms |
+| Elasticsearch direct `_search` | 100 | ~77–79k req/s, p99 < 9 ms |
+| Full stack via PHP | 100 | ~9–11k req/s (warm ~10.5k), p99 15–40 ms |
+| Full stack via PHP | 400 | ~10–10.6k req/s, p99 ~17 ms |
+
+Findings and the adjustments applied:
+
+- The old 54-worker PHP-FPM pool kept throughput but produced ~1 s tail latency at 100 concurrent requests. Increasing the static pool to 108 (the new formula) preserved throughput and reduced p99 to ~15 ms.
+- The full stack is CPU-bound (PHP + Elasticsearch + MariaDB + Valkey), not limited by one service. Elasticsearch thread pools reported zero rejections and MariaDB/Valkey reported no connection or eviction errors.
+- MariaDB's old 2 GB InnoDB log buffer and 4M/2M/4M per-connection buffers were oversized; they were reduced to 64M and 1M/1M/2M. `innodb_flush_log_at_trx_commit` was changed from unsafe `0` to `2`, and snapshot isolation restored to `1`.
+- Valkey now caches ~10% of RAM (2.7 GB here) instead of a fixed 1 GB, stays on loopback with `protected-mode yes`, and no longer accumulates duplicate directives.
+- Elasticsearch heap is now memory-locked (4 GB), and Angie gained `open_file_cache` plus a 100 MB body limit aligned with PHP. Static throughput improved about 10%.
+- Remaining ceiling is application work per request (DB + cache + search). For higher full-stack throughput, add Angie FastCGI microcaching for cacheable pages, avoid doing all three lookups on every request, and scale CPU cores or split Elasticsearch onto another node.
+
+---
+
+## Security and production checklist (large sites)
+
+The script produces a working, internet-facing baseline. For a large or security-sensitive site, review these items:
+
+**TLS / Angie**
+- Replace `h5bp/tls/certificate.pem` and `private.key` with real certificates (ACME/Let's Encrypt or your CA). The default TLS policy is balanced TLS 1.2/1.3; use a stricter policy if your clients allow it.
+- `access_log off` is set globally for performance. Enable a buffered access log per vhost (as the stress-test vhost does) if you need forensics, rate-limit tuning or fail2ban integration. Angie's package logrotate handles rotation.
+- The embedded tree ships optional rate-limit, Naxsi/WAF and FastCGI-cache configs but does not enable them. For large traffic, enable per-route rate limits, a WAF, and FastCGI microcaching for anonymous/cacheable pages.
+- Add HTTP/3 (QUIC) and Brotli if clients support them; the current config enables HTTP/2 and gzip. Keep `client_max_body_size` and PHP upload limits aligned (both 100 MB now).
+- Put Cloudflare or another CDN in front of static traffic and keep the daily Cloudflare real-IP refresh enabled.
+
+**PHP**
+- `disable_functions` currently blocks `show_source,system,passthru,allow_url_fopen`. Add `exec,shell_exec,proc_open,popen,pcntl_exec` unless the application needs them; test per application.
+- Consider `open_basedir` per vhost, `session.cookie_secure=1`, `session.cookie_httponly=1`, and `session.cookie_samesite=Lax`.
+- For production, set `opcache.validate_timestamps=0` and reload PHP-FPM on deploy to avoid per-request stat calls. Keep `expose_php=Off`.
+- `memory_limit=512M` is generous. Lower it per application where possible; the static pool is sized at roughly 128 MB per worker, and worst-case 512 MB per worker must still fit in RAM.
+- Do not run untrusted PHP code as the same `www-data` user across unrelated sites; use separate pools/users per tenant.
+
+**MariaDB**
+- The setup admin user gets `GRANT ALL ... WITH GRANT OPTION`. Create per-application users limited to their own database and remove `GRANT OPTION`; never use the admin account in application config.
+- `innodb_flush_log_at_trx_commit=2` survives a database crash but can lose the last second of commits on an OS/power failure. Use `1` for financial or otherwise critical data.
+- Keep `bind-address=127.0.0.1` unless you really need remote access; if remote, enable TLS and restrict with UFW. `skip_name_resolve=1` is good for latency.
+- Test the embedded `mysqlbkup` job and store encrypted, off-site copies. A local backup on the same NVMe is not disaster recovery.
+- Run `/root/mysqltuner.pl` after the site has real traffic and review slow queries; add indexes rather than raising buffers blindly. Consider a read replica or separate database host at scale.
+
+**Valkey**
+- Loopback bind and `protected-mode yes` are safe for a single host. For remote Valkey, enable ACL users and TLS; do not expose 6379.
+- `save ""` makes it a pure cache. If you store sessions, queues or locks, enable AOF and use a no-eviction policy for that data (or a separate instance).
+- `allkeys-lru` can evict sessions; use `volatile-lru` with TTLs or a dedicated instance for persistent data. Monitor `evicted_keys` and `used_memory`.
+
+**Elasticsearch**
+- X-Pack security is disabled and the default bind is `localhost`. For any non-loopback host, enable `xpack.security.enabled`, TLS, and authentication; never expose 9200/9300 directly to the internet.
+- Keep `vm.max_map_count=1048576`, the 4 GB locked heap here, and monitor JVM GC, thread-pool rejections and disk watermark. For large indexes, add replicas/shards and consider a dedicated search node.
+- Back up with snapshots to an external repository; Elasticsearch data is not covered by the MariaDB backup.
+
+**Host / operations**
+- Use SSH keys only, disable password login, keep UFW limited to 22/80/443, and add fail2ban or equivalent for SSH and web auth endpoints.
+- Enable `unattended-upgrades` for security patches and monitor reboot-required. Keep the kernel/firmware updated.
+- Ship Angie access/error logs, PHP-FPM slow log, MariaDB slow query log, Elasticsearch and Valkey metrics to a central monitor; alert on 5xx rate, p99 latency, disk, memory and queue depth.
+- Load-test after every application or config change. The local `stress.test` site and commands in this README are a starting point; tune `pm.max_children`, MariaDB buffers and Elasticsearch heap from measured RSS/CPU, not guesswork.
+- For very large traffic, scale horizontally: CDN for static, multiple Angie/PHP nodes behind a load balancer, MariaDB read replicas, and a separate Elasticsearch cluster. A single 16-core host tops out around the measured full-stack numbers above.
 
 ---
 
@@ -342,9 +435,9 @@ sudo bash setup.sh --basic ... --mariadb ...
 
 The package is installed, but `smartd` may refuse to start on machines with no SMART-capable disks (common on VMs/desktops). This is a warning, not an installation failure; `smartctl` is still available.
 
-### `--purge others` removes Node.js
+### `--purge others` and pre-existing packages
 
-This is intentional. The script prints a warning. If Node.js existed before setup, reinstall it or avoid purging `others`.
+`--purge others` removes Node.js, `smartmontools`, `nvme-cli` and `gifsicle` only if setup.sh installed them. If they already existed, setup.sh writes a `preexisting-pkg-*` marker and purge leaves them (and the NodeSource repository/key) alone. If the state directory was deleted by an older version, the safe default is also to keep them; remove them manually with APT if desired.
 
 ### `--domain` says Angie or MariaDB is missing
 
@@ -366,9 +459,11 @@ By default `--elastic host=localhost` binds to loopback and security is disabled
 |---|---|
 | `/var/lib/setup.sh/backup/` | Original basic files saved before `--basic` changes |
 | `/var/lib/setup.sh/original-hostname`, `original-timezone` | Values restored by `--purge basic` |
-| `/var/lib/setup.sh/ufw-*` | UFW state used by purge |
+| `/var/lib/setup.sh/ufw-*` | UFW active state, added rules and default policies used by purge |
 | `/var/lib/setup.sh/swapfile-managed` | Marker: the script created/resized `/swapfile` |
+| `/var/lib/setup.sh/setup-installed-pkg-*`, `preexisting-pkg-*` | Package-origin markers used by `--purge others` |
 | `/etc/angie/` | Angie configuration tree |
+| `/etc/angie/http.d/99_setup_overrides.conf` | Managed `open_file_cache` override |
 | `/etc/angie/conf.d/<domain>.conf` | Blank vhost file created by `--domain` |
 | `/var/www/<domain>/public/` | Document root created by `--domain` (owned by `www-data`) |
 | MariaDB `<domain_with_underscores>` | Database created by `--domain` |
@@ -376,6 +471,7 @@ By default `--elastic host=localhost` binds to loopback and security is disabled
 | `/etc/mysql/mariadb.conf.d/50-server.cnf` | MariaDB managed block |
 | `/etc/valkey/valkey.conf` | Valkey settings |
 | `/etc/elasticsearch/` | Elasticsearch configuration, JVM options and scripts |
+| `/etc/systemd/system/elasticsearch.service.d/limits.conf` | Elasticsearch memlock/nofile drop-in |
 | `/root/mysqltuner.pl` | Embedded MySQL Tuner |
 | `/root/tools/mysqlbackup-master/` | Embedded mysqlbackup utility |
 | `/usr/local/bin/mysqlbkup.sh` | Installed backup script |
@@ -391,4 +487,6 @@ By default `--elastic host=localhost` binds to loopback and security is disabled
 - `--domain` only creates the directory, blank Angie vhost and database. It does not install Angie or MariaDB and does not purge them.
 - `--purge basic` restores the recorded originals, but a reboot is the cleanest way to reset all runtime kernel tunables.
 - The script never stores credentials in the repository. MariaDB credentials are written only to `/etc/mysqlbkup.cnf` on the target server (mode 600).
+- `--dry-run` / `--check` is safe as a normal user and makes no changes; use it to validate a command before running it.
+- Package-origin markers in `/var/lib/setup.sh` let purge avoid removing software that existed before setup.sh. Do not delete that directory if you intend to purge later.
 - Package versions follow the upstream repositories at install time; the embedded configuration files are a snapshot, but package repositories are always fetched live.
