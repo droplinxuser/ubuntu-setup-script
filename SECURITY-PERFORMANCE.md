@@ -1,12 +1,50 @@
 # Security, performance and large-site review
 
 This document is the audit and action list for the machine provisioned by
-`setup.sh` 1.6.0. It combines the live configuration review with the stress
+`setup.sh` 1.6.7. It combines the live configuration review with the stress
 results in `tests/stress-site/RESULTS.md`.
 
 The script now produces a solid single-host baseline. The remaining work is
 mostly about identity/secrets, certificates, per-tenant isolation, backups,
 monitoring and scaling beyond one 16-core machine.
+
+---
+
+## 0.1 1.6.7 live validation on a 16 vCPU / 30 GiB VPS
+
+Validated on 2026-11-03 against a clean Ubuntu 26.04.1 VPS (16 vCPU, 30 GiB
+RAM, 281 GiB ext4) with Angie, PHP 8.4 FPM plus a parallel PHP 8.3 pool,
+MariaDB, Valkey, Elasticsearch, Node.js, GifSicle, WordPress, Lychee and
+Pingvin running.
+
+Key results (full table in `tests/stress-site/RESULTS.md`):
+
+- 181k static req/s, 124k PHP-hello req/s, 26k MariaDB reads/s, 20.8k Valkey
+  requests/s, 10.9k Elasticsearch searches/s, 22.2k Node proxy req/s.
+- 169k req/s on the FastCGI-cached full-stack page; a 3-minute soak held
+  165,855 req/s with no socket errors and p99 6.2 ms.
+- Full-stack uncached soak: 6,486 req/s, p99 14.5 ms.
+- WordPress guest page cache: 242 -> 9,972 req/s (p99 8.3 ms), with logged-in
+  cookie and POST bypasses verified.
+- Node cluster 4 -> 8 workers: +16% throughput. Valkey `io-threads 4` gave no
+  gain over 1, so the default stays at 1.
+- MariaDB: 146/400 connections used, zero slow queries or aborted connects.
+  Valkey: zero rejected connections or evictions. Elasticsearch: green.
+
+New issues found and fixed during the live run:
+
+1. apt's `composer` package pulled unrelated PHP builds (php5.6-common and
+   php8.5-cli) through virtual `php-cli`/`php-common` dependencies. Composer is
+   now the official phar, run with the FPM-matched PHP binary.
+2. `/usr/bin/php` could point at a CLI version different from FPM. The script
+   now pins the alternative and restarts the matched FPM pool after
+   Composer/CLI changes.
+3. fail2ban could ban the operator during a long deploy. The SSH client address
+   is now in `ignoreip` (read from the parent process environment or the
+   established `:22` socket).
+4. PHP-FPM sometimes returned `Unable to open primary script ... (Operation not
+   permitted)` for files created after workers started. Restarting the pool
+   clears it; app deploys must reload/restart FPM after syncing files.
 
 ---
 
