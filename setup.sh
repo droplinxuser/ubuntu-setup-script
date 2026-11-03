@@ -1378,8 +1378,38 @@ EOF
     ln -s ../sysctl.conf /etc/sysctl.d/99-sysctl.conf
   fi
 
+  # Load the modules that own the sysctls below before systemd-sysctl runs at
+  # boot; otherwise every boot logs "No such file or directory" for bbr/fq/
+  # conntrack even though the values are applied later.
+  mkdir -p /etc/modules-load.d
+  printf 'tcp_bbr\nsch_fq\nnf_conntrack\n' > /etc/modules-load.d/setup-network.conf
+  chmod 644 /etc/modules-load.d/setup-network.conf
+  rm -f /etc/modules-load.d/setup-conntrack.conf
   modprobe tcp_bbr || warn "Could not load tcp_bbr (kernel may not provide it)"
+  modprobe sch_fq || warn "Could not load sch_fq (kernel may not provide it)"
+  modprobe nf_conntrack || warn "Could not load nf_conntrack; conntrack sysctls may be skipped"
   sysctl -e -p /etc/sysctl.conf || warn "One or more sysctl values could not be applied"
+
+  # BBR/fq are module-owned and systemd-sysctl runs before modules-load on
+  # Ubuntu, which logs "No such file or directory" on every boot. Apply them
+  # from a small oneshot unit after the modules are available instead.
+  cat > /etc/systemd/system/setup-network-tuning.service <<'EOF'
+[Unit]
+Description=Apply BBR/fq network tuning after kernel modules load
+After=systemd-modules-load.service
+[Service]
+Type=oneshot
+ExecStart=/sbin/modprobe tcp_bbr
+ExecStart=/sbin/modprobe sch_fq
+ExecStart=/sbin/sysctl -w net.core.default_qdisc=fq net.ipv4.tcp_congestion_control=bbr
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 644 /etc/systemd/system/setup-network-tuning.service
+  systemctl daemon-reload || true
+  systemctl enable setup-network-tuning.service >/dev/null 2>&1 || true
+  systemctl start setup-network-tuning.service || warn "Could not apply BBR/fq tuning"
 }
 
 configure_limits() {
@@ -2671,6 +2701,10 @@ purge_basic() {
   restore_original /etc/security/limits.d/99-setup.conf limits.d-99-setup.conf
   restore_original /etc/sysctl.conf sysctl.conf
   restore_original /etc/sysctl.d/99-sysctl.conf sysctl.d-99-sysctl.conf
+  rm -f /etc/modules-load.d/setup-network.conf /etc/modules-load.d/setup-conntrack.conf
+  systemctl disable --now setup-network-tuning.service 2>/dev/null || true
+  rm -f /etc/systemd/system/setup-network-tuning.service
+  systemctl daemon-reload || true
   restore_original /etc/systemd/resolved.conf.d resolved.conf.d
   if [[ -f /etc/sysctl.conf ]]; then
     sysctl -e -p /etc/sysctl.conf || true
@@ -3158,57 +3192,57 @@ main() {
 
 blob_sysctl() {
   base64 -d <<'B64' | gzip -dc
-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
+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
+xVQNuBwAAA==
 B64
 }
 
