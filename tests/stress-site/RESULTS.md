@@ -1,5 +1,54 @@
 # Full-stack local stress report
 
+## Live VPS validation - setup.sh 1.6.7, 16 vCPU / 30 GiB
+
+- Host: `web01.stress.test`, 16 vCPU, 30 GiB RAM, 281 GiB ext4, Ubuntu 26.04.1
+- Angie/1.12.4, PHP 8.4.27 FPM (and a parallel PHP 8.3.36 pool), MariaDB 11.8.6,
+  Valkey 9.0.4, Elasticsearch 9.5.6, Node.js v26.13.0, Gifsicle 1.96
+- FastCGI: Unix socket `/run/php/php-fpm.sock`; PHP-FPM `static`, 121 workers,
+  RSS 25.6 MB/worker; MariaDB buffer pool 12.4 GB; ES heap 4 GB
+- Kernel: BBR + fq, `vm.swappiness=10`, `fs.file-max=10485760`
+
+| Scenario | Requests/sec | p50 | p90 | p99 | Client socket errors |
+|---|---:|---:|---:|---:|---|
+| static | 181190.01 | 301.00us | 0.91ms | 3.40ms | none |
+| php-hello | 124444.66 | 513.00us | 1.62ms | 4.48ms | none |
+| mariadb-json | 26120.54 | 3.63ms | 5.72ms | 8.75ms | none |
+| valkey-json | 20808.26 | 4.68ms | 5.30ms | 6.36ms | none |
+| elasticsearch | 10876.38 | 3.58ms | 8.74ms | 48.99ms | none |
+| node-proxy | 22212.86 | 4.31ms | 5.37ms | 7.36ms | none |
+| full-uncached-200 | 7398.29 | 15.39ms | 23.69ms | 64.94ms | timeout 20 |
+| full-cached-200 | 169601.50 | 614.00us | 3.09ms | 5.88ms | none |
+| slow-1s-200 | 108.71 | 1.00s | 1.00s | 1.00s | none |
+
+Sustained soak (no other load):
+
+| Scenario | Duration | Requests/sec | p50 | p90 | p99 | Socket errors |
+|---|---:|---:|---:|---:|---:|---|
+| FastCGI-cached, 200 clients | 180 s | 165,855 | 658us | 3.01ms | 6.20ms | none |
+| Full stack uncached, 50 clients | 120 s | 6,486 | 7.15ms | 10.11ms | 14.50ms | none |
+
+Application and tuning checks:
+
+| Test | Result |
+|---|---|
+| WordPress guest page cache | 242 req/s uncached -> 9,972 req/s cached; p50 4.44 ms, p99 8.31 ms; logged-in cookie and POST bypass confirmed |
+| Node cluster, 4 -> 8 workers | 25,603 -> 29,747 req/s (+16%), p50 7.60 -> 6.05 ms |
+| Valkey Unix socket vs TCP | 132.5k/113.3k vs 70.0k/75.6k SET/GET ops/s |
+| Valkey io-threads 1 -> 4 | no gain (117k/114k ops/s); kept 1 |
+| PHP 8.3 pool | 41,746 req/s, p50 1.13 ms, p99 2.12 ms on a minimal vhost |
+| PHP 8.4 pool | 111,930 req/s, p50 0.32 ms, p99 2.53 ms on a minimal vhost |
+| MariaDB | Max_used_connections 146/400, Slow_queries 0, Aborted_connects 0 |
+| Valkey | rejected_connections 0, evicted_keys 0 |
+| Elasticsearch | cluster green, 3 active shards, 0 unassigned |
+
+Operational note: PHP-FPM can return `Unable to open primary script ...
+(Operation not permitted)` for a script created after the workers started,
+because of the long `realpath_cache_ttl=43200` / OPcache path state. Restarting
+`php<ver>-fpm` after deploying new PHP files clears it (observed twice; no
+errors after restart). Deploy scripts should always reload/restart FPM after
+syncing application files.
+
 ## setup.sh 1.6.0 - 8 vCPU VPS
 
 - Generated: 2026-11-03T02:33:00Z
