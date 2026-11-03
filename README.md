@@ -25,7 +25,7 @@ sudo bash setup.sh \
   --basic server=dedi host=custom.host time=Asia/Manila swap=8G \
   --angie \
   --php ver=8.5 \
-  --mariadb user=dan pass=temp size=4gb bind=127.0.0.1 \
+  --mariadb user=demo pass=temp size=4gb bind=127.0.0.1 \
   --valkey \
   --elastic host=localhost ram=4g \
   --others smartmon nvme gif nodejs
@@ -47,7 +47,7 @@ sudo bash setup.sh --domain google.com
 
 ```bash
 ./setup.sh --dry-run --basic server=dedi host=web1 time=Asia/Manila \
-  --angie --php --mariadb user=dan pass=temp size=4gb --valkey --elastic ram=4g
+  --angie --php --mariadb user=demo pass=temp size=4gb --valkey --elastic ram=4g
 ./setup.sh --dry-run --purge --angie --php ver=8.5
 ```
 
@@ -140,11 +140,11 @@ Installing a second version while the first is active is refused **before any pa
 
 ```bash
 # Listen on loopback and a specific interface
-sudo bash setup.sh --basic ... --mariadb user=dan pass=temp size=4gb \
+sudo bash setup.sh --basic ... --mariadb user=demo pass=temp size=4gb \
   bind=127.0.0.1,10.0.0.5
 
 # Listen on loopback plus the detected public IPv4
-sudo bash setup.sh --basic ... --mariadb user=dan pass=temp size=4gb \
+sudo bash setup.sh --basic ... --mariadb user=demo pass=temp size=4gb \
   bind=127.0.0.1,IPV4
 ```
 
@@ -470,7 +470,7 @@ The package is installed, but `smartd` may refuse to start on machines with no S
 `--domain` only creates the directory, vhost file and database. It does not install the stack. Install Angie and MariaDB first, or combine them:
 
 ```bash
-sudo bash setup.sh --basic ... --angie --mariadb user=dan pass=temp size=4gb --domain google.com
+sudo bash setup.sh --basic ... --angie --mariadb user=demo pass=temp size=4gb --domain google.com
 ```
 
 ### Elasticsearch is reachable only on localhost
