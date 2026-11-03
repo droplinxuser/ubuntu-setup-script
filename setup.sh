@@ -20,7 +20,7 @@ shopt -s inherit_errexit 2>/dev/null || true
 umask 022
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.2.0"
+readonly SCRIPT_VERSION="1.3.0"
 readonly STATE_DIR="/var/lib/setup.sh"
 readonly BACKUP_DIR="${STATE_DIR}/backup"
 readonly CRON_BEGIN="# BEGIN setup.sh managed cron"
@@ -121,7 +121,11 @@ Basic (always required for an install; all values are optional):
 Services (optional; only the ones listed are installed):
   --angie
   --php       [ver=8.5]                            (default: latest stable in Sury)
-  --mariadb   user=dan pass=temp size=4gb [bind=127.0.0.1]
+  --mariadb   user=dan pass=temp size=4gb [bind=127.0.0.1[,ADDR...]|IPV4]
+      bind     comma-separated IPv4 addresses and/or ::1 (default 127.0.0.1)
+               IPV4 auto-detects the server's public IPv4; on NAT it falls
+               back to the local outbound IPv4
+               e.g. bind=127.0.0.1,2.3.4.5  or  bind=127.0.0.1,IPV4
   --valkey
   --elastic   ram=4g [host=localhost]
   --others    smartmon nvme gif nodejs            (or: --others all)
@@ -164,6 +168,9 @@ Examples:
 
   bash setup.sh --basic --angie --php
 
+  bash setup.sh --basic --mariadb user=dan pass=temp size=4gb \
+      bind=127.0.0.1,IPV4
+
   bash setup.sh --domain google.com
   bash setup.sh --domain google.com example.org
 
@@ -202,9 +209,18 @@ parse_args() {
         ;;
       --mariadb)
         ENABLED[mariadb]=1; shift
+        local last_key=""
         while (( $# )) && [[ $1 != --* ]]; do
-          [[ $1 == *=* ]] || die "--mariadb: expected key=value, got '$1'"
-          kv_set mariadb "${1%%=*}" "${1#*=}"; shift
+          if [[ $1 == *=* ]]; then
+            last_key=${1%%=*}
+            kv_set mariadb "$last_key" "${1#*=}"
+          elif [[ $last_key == bind ]]; then
+            # Allow: bind=127.0.0.1, 2.3.4.5  (the shell splits on the space)
+            OPT[mariadb.bind]="${OPT[mariadb.bind]:-},$1"
+          else
+            die "--mariadb: expected key=value, got '$1'"
+          fi
+          shift
         done
         ;;
       --elastic)
@@ -269,6 +285,143 @@ validate_ipv4() {
       return 1
     fi
   done
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# MariaDB bind-address helpers
+# ---------------------------------------------------------------------------
+detect_local_ipv4() {
+  local ip=""
+  if command -v ip >/dev/null 2>&1; then
+    ip=$(ip -4 route get 1.1.1.1 2>/dev/null \
+      | awk '{for (i=1; i<=NF; i++) if ($i == "src") { print $(i+1); exit }}' || true)
+    if [[ -z $ip ]]; then
+      ip=$(ip -4 -o addr show scope global 2>/dev/null \
+        | awk '{split($4, a, "/"); print a[1]; exit}' || true)
+    fi
+  fi
+  if [[ -z $ip ]]; then
+    ip=$(hostname -I 2>/dev/null \
+      | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)
+  fi
+  if [[ -n $ip ]] && validate_ipv4 "$ip"; then
+    printf '%s' "$ip"
+    return 0
+  fi
+  return 1
+}
+
+detect_public_ipv4() {
+  command -v curl >/dev/null 2>&1 || return 1
+  local url ip
+  for url in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
+    ip=$(curl -4 -fsS --connect-timeout 2 --max-time 4 "$url" 2>/dev/null \
+      | tr -d '[:space:]' || true)
+    if validate_ipv4 "$ip"; then
+      printf '%s' "$ip"
+      return 0
+    fi
+  done
+  return 1
+}
+
+is_local_ipv4() {
+  local ip=$1
+  if command -v ip >/dev/null 2>&1; then
+    ip -4 -o addr show 2>/dev/null \
+      | awk -v ip="$ip" '{split($4, a, "/"); if (a[1] == ip) found = 1} END {exit !found}'
+  else
+    hostname -I 2>/dev/null | tr ' ' '\n' | grep -qxF -- "$ip"
+  fi
+}
+
+# Resolve the IPV4 keyword to a usable local address.  Sets REPLY.
+resolve_ipv4_token() {
+  local public localip
+  if [[ -n ${RESOLVED_IPV4_TOKEN:-} ]]; then
+    REPLY=$RESOLVED_IPV4_TOKEN
+    return 0
+  fi
+
+  public=$(detect_public_ipv4 || true)
+  if [[ -n $public ]]; then
+    if is_local_ipv4 "$public"; then
+      REPLY=$public
+      RESOLVED_IPV4_TOKEN=$public
+      return 0
+    fi
+    warn "Public IPv4 ${public} is not assigned to this host (NAT/proxy?)"
+    localip=$(detect_local_ipv4 || true)
+    if [[ -n $localip ]]; then
+      warn "bind=IPV4 will use the local outbound IPv4 ${localip}"
+      REPLY=$localip
+      RESOLVED_IPV4_TOKEN=$localip
+      return 0
+    fi
+    return 1
+  fi
+
+  localip=$(detect_local_ipv4 || true)
+  if [[ -n $localip ]]; then
+    warn "Could not detect the public IPv4; bind=IPV4 will use local IPv4 ${localip}"
+    REPLY=$localip
+    RESOLVED_IPV4_TOKEN=$localip
+    return 0
+  fi
+  return 1
+}
+
+# Validate and normalise a comma-separated bind list.  IPV4 is kept as a token
+# here and resolved later, after --basic has installed curl.  Sets REPLY.
+normalize_mariadb_bind() {
+  local raw token normalized="" seen=" "
+  local -a tokens
+  BIND_BAD_TOKEN=""
+  raw=$(printf '%s' "$1" | tr -d '[:space:]')
+  [[ -n $raw ]] || { BIND_BAD_TOKEN="empty address"; return 1; }
+
+  IFS=',' read -r -a tokens <<< "$raw"
+  for token in "${tokens[@]}"; do
+    [[ -n $token ]] || continue
+    if [[ ${token^^} == IPV4 ]]; then
+      token=IPV4
+    elif [[ $token == "::1" ]]; then
+      :
+    elif ! validate_ipv4 "$token"; then
+      BIND_BAD_TOKEN=$token
+      return 1
+    fi
+    [[ $seen == *" ${token} "* ]] && continue
+    seen+="${token} "
+    normalized+="${normalized:+,}${token}"
+  done
+
+  [[ -n $normalized ]] || { BIND_BAD_TOKEN="empty address"; return 1; }
+  REPLY=$normalized
+  return 0
+}
+
+# Replace every IPV4 token with the detected address.  Sets REPLY.
+resolve_mariadb_bind() {
+  local token normalized="" seen=" "
+  local -a tokens
+  BIND_BAD_TOKEN=""
+  IFS=',' read -r -a tokens <<< "$1"
+  for token in "${tokens[@]}"; do
+    if [[ ${token^^} == IPV4 ]]; then
+      if ! resolve_ipv4_token; then
+        BIND_BAD_TOKEN="could not detect an IPv4 address for IPV4"
+        return 1
+      fi
+      token=$REPLY
+    fi
+    [[ $seen == *" ${token} "* ]] && continue
+    seen+="${token} "
+    normalized+="${normalized:+,}${token}"
+  done
+  [[ -n $normalized ]] || { BIND_BAD_TOKEN="empty address"; return 1; }
+  REPLY=$normalized
   return 0
 }
 
@@ -466,11 +619,10 @@ validate_all() {
     [[ ${OPT[mariadb.size]} =~ ^[1-9][0-9]*([mM][bB]?|[gG][bB]?)$ ]] \
       || die "--mariadb size='${OPT[mariadb.size]}' is invalid (use e.g. 4gb)"
     local bind=${OPT[mariadb.bind]:-127.0.0.1}
-    if [[ $bind != "::1" ]]; then
-      validate_ipv4 "$bind" \
-        || die "--mariadb bind='${bind}' is not a valid IPv4 address"
+    if ! normalize_mariadb_bind "$bind"; then
+      die "--mariadb bind='${bind}' contains an invalid address '${BIND_BAD_TOKEN}'. Use comma-separated IPv4 addresses, ::1, and/or IPV4."
     fi
-    OPT[mariadb.bind]=$bind
+    OPT[mariadb.bind]=$REPLY
   fi
 
   if [[ ${ENABLED[elastic]:-0} -eq 1 ]]; then
@@ -1418,12 +1570,36 @@ install_mariadb() {
   local user=${OPT[mariadb.user]}
   local pass=${OPT[mariadb.pass]}
   local size=${OPT[mariadb.size]}
-  local bind=${OPT[mariadb.bind]:-127.0.0.1}
+  local bind
   local size_mb
   step "MariaDB"
 
   size_mb=$(size_to_mb "$size")
   [[ -n $size_mb ]] || die "Could not parse MariaDB size '${size}'"
+
+  bind=${OPT[mariadb.bind]:-127.0.0.1}
+  if ! resolve_mariadb_bind "$bind"; then
+    die "--mariadb bind='${bind}': ${BIND_BAD_TOKEN}"
+  fi
+  bind=$REPLY
+  OPT[mariadb.bind]=$bind
+  info "MariaDB bind-address: ${bind}"
+
+  local -a bind_addrs
+  local addr
+  IFS=',' read -r -a bind_addrs <<< "$bind"
+  for addr in "${bind_addrs[@]}"; do
+    if [[ $addr != 127.* && $addr != "::1" ]]; then
+      warn "MariaDB will also listen on ${addr}."
+      warn "UFW does not open 3306 automatically; allow only trusted clients, e.g.: ufw allow from <client-ip> to any port 3306"
+      warn "Remote clients also need a matching account, e.g.: CREATE USER 'app'@'<client-ip>' IDENTIFIED BY '...';"
+      [[ $addr == 0.0.0.0 ]] && warn "0.0.0.0 exposes MariaDB on every interface; prefer explicit addresses."
+      if ! is_local_ipv4 "$addr" && [[ $addr != 0.0.0.0 ]]; then
+        warn "${addr} is not assigned to this host; MariaDB may fail to bind unless it is added to an interface first."
+      fi
+      break
+    fi
+  done
 
   configure_mariadb_apparmor
   apt_install mariadb-server mariadb-client
@@ -2137,7 +2313,7 @@ resolve_basic_defaults() {
 }
 
 print_plan() {
-  local s
+  local s bind_display
   printf '\n%sDRY RUN%s - validation only, no changes will be made.\n' "$C_BOLD" "$C_RESET"
 
   if [[ ${PURGE} -eq 1 ]]; then
@@ -2161,8 +2337,10 @@ print_plan() {
         printf '  %-10s version=%s\n' "$s" "${OPT[php.ver]:-auto (latest stable in Sury)}"
         ;;
       mariadb)
+        bind_display=${OPT[mariadb.bind]:-127.0.0.1}
+        [[ $bind_display == *IPV4* ]] && bind_display+=" (IPV4 resolved at install)"
         printf '  %-10s user=%s size=%s bind=%s\n' "$s" \
-          "${OPT[mariadb.user]:-}" "${OPT[mariadb.size]:-}" "${OPT[mariadb.bind]:-127.0.0.1}"
+          "${OPT[mariadb.user]:-}" "${OPT[mariadb.size]:-}" "$bind_display"
         ;;
       elastic)
         printf '  %-10s host=%s ram=%s\n' "$s" \
