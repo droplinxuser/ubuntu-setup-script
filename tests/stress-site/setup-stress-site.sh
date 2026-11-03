@@ -13,8 +13,19 @@ LOG_DIR=/var/www/logs/angie
 NODE_LOG_DIR=/var/www/logs/nodejs
 GIF_LOG_DIR=/var/www/logs/gifsicle
 NODE_DIR=/opt/stress-node
-PHP_BIN=${PHP_BIN:-$(command -v php)}
-PHP_VER=$("$PHP_BIN" -r 'echo PHP_MAJOR_VERSION . "." . PHP_MINOR_VERSION;')
+PHP_BIN=${PHP_BIN:-$(command -v php || true)}
+if [[ -n $PHP_BIN && -x $PHP_BIN ]]; then
+  PHP_VER=$("$PHP_BIN" -r 'echo PHP_MAJOR_VERSION . "." . PHP_MINOR_VERSION;')
+else
+  PHP_VER=$(ls -1 /etc/php 2>/dev/null | grep -E '^[0-9]+\.[0-9]+$' | sort -V | tail -n1)
+fi
+[[ -n ${PHP_VER:-} ]] || { echo "no PHP-FPM installation found" >&2; exit 1; }
+# The stress seeder is a CLI script; install the matching CLI only for this
+# optional test harness, not for the production XenForo profile.
+if [[ -z ${PHP_BIN:-} || ! -x $PHP_BIN ]]; then
+  apt-get install -y --no-install-recommends "php${PHP_VER}-cli" >/dev/null
+  PHP_BIN=$(command -v php)
+fi
 FPM_SVC="php${PHP_VER}-fpm"
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
@@ -133,7 +144,6 @@ server {
     root  ${ROOT};
     index index.php index.html;
     error_log  ${LOG_DIR}/${DOMAIN}.error.log warn;
-    access_log ${LOG_DIR}/${DOMAIN}.access.log perf buffer=64k flush=5s;
     client_max_body_size 100m;
 
     location / {

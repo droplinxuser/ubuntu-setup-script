@@ -46,7 +46,11 @@ ES_BEFORE=$(curl -fsS 'http://127.0.0.1:9200/_nodes/stats/jvm,indices?filter_pat
   echo "- Generated: $(date -Is)"
   echo "- Host: $(hostname), $(nproc) vCPU, $(awk '/^MemTotal:/{printf "%.1f GiB", $2/1024/1024}' /proc/meminfo) RAM"
   echo "- Angie: $(/usr/sbin/angie -v 2>&1 | head -1)"
-  echo "- PHP: $(php -v | head -1)"
+  if command -v php >/dev/null 2>&1; then
+    echo "- PHP: $(php -v | head -1)"
+  else
+    echo "- PHP: $(php-fpm8.5 -v 2>&1 | head -1)"
+  fi
   echo "- MariaDB: $(mariadb -N -B -e 'SELECT VERSION()')"
   echo "- Valkey: $(valkey-server -v)"
   echo "- Elasticsearch: $(curl -fsS http://127.0.0.1:9200 | jq -r .version.number)"
