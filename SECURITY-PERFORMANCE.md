@@ -145,15 +145,13 @@ Recommended changes / additions:
 
 Already good:
 
-- PHP 8.5 with the XenForo-minimal extension set: `fpm`, `mysql`, `gd`,
+- PHP 8.5 with the XenForo profile: `fpm`, `cli`, `opcache`, `mysql`, `gd`,
   `curl`, `xml`, `zip`, `gmp`, `mbstring`, `redis`.
-- OPcache/JIT, `intl`, `imagick`, `bcmath` and `apcu` are **not** installed by
-  default. `custom_dan.ini` contains OPcache/JIT settings, so installing
-  `php8.5-opcache` enables them without further configuration. For a busy
-  XenForo site, OPcache is strongly recommended; without it PHP recompiles
-  every request.
+- OPcache/JIT settings in `custom_dan.ini` are active immediately because
+  `php8.5-opcache` is installed. `intl`, `imagick`, `bcmath` and `apcu` are
+  not installed; add them only if an add-on requires them.
 - `memory_limit` 512 MB, realpath cache 16 MB, file cache under
-  `/var/cache/php/opcache` (used when OPcache is present).
+  `/var/cache/php/opcache`.
 - 108 static workers, `max_requests=16384`, `request_terminate_timeout=100s`,
   slow-request log at 5 s, `catch_workers_output=yes`.
 - `expose_php=Off`, `allow_url_fopen=Off`, `cgi.fix_pathinfo=0`.
