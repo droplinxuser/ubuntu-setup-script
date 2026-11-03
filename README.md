@@ -25,6 +25,20 @@ Non-Angie/non-PHP-FPM configuration lives here.
 `setup.sh` prefers the local files under `configs/` when it is run from this
 checkout, but keeps embedded fallbacks so it still works as a single file.
 
+## What's new in 1.6.1
+
+- Angie no longer writes access logs at all. Only `error_log` is enabled; the
+  per-vhost `access_log` directives and the stress-site access log were
+  removed. This removes the largest source of disk I/O and log volume.
+- The PHP install is now the XenForo-minimal extension set only:
+  `fpm`, `mysql`, `gd`, `curl`, `xml`, `zip`, `gmp`, `mbstring`, `redis`.
+  `php<ver>-cli` is added only when `--others composer` is selected. The
+  optional stress harness installs CLI for its seeder and can be removed
+  afterwards.
+- OPcache/JIT and `intl`/`imagick`/`bcmath`/`apcu` are intentionally not
+  installed. Install `php<ver>-opcache` for production XenForo performance;
+  the ini settings are already in `custom_dan.ini`.
+
 ## What's new in 1.6.0
 
 - **Centralised logs.** Every service now writes below `/var/www/logs/`:
@@ -113,7 +127,7 @@ sudo bash setup.sh \
 
 ### Large-site starting profile
 
-`size=auto` sizes InnoDB to 40% of RAM; PHP, OPcache, JIT and Valkey are sized from RAM automatically. Add `children=` only after measuring worker RSS.
+`size=auto` sizes InnoDB to 40% of RAM; PHP memory/realpath settings and Valkey are sized from RAM automatically. OPcache/JIT settings are pre-wired but only take effect if you install `php<ver>-opcache`. Add `children=` only after measuring worker RSS.
 
 ```bash
 sudo bash setup.sh \
@@ -301,7 +315,8 @@ Before changing basic settings, the script records the originals under `/var/lib
 
 - Adds the Sury APT repository (keyring embedded in the script).
 - If `ver=` is omitted, selects the **latest stable PHP** available to APT from the Sury repository (currently 8.5; pre-release packages such as `8.6.0~rc3` are ignored).
-- Installs `php<ver>-fpm`, `php<ver>-cli` and the extensions needed by XenForo, WordPress, Chevereto, Polr, Lychee and similar apps: `mysql`, `gd`, `curl`, `xml`, `zip`, `gmp`, `mbstring`, `redis`, `intl`, `bcmath`, `imagick`, `soap`, `ldap`, `apcu`, `igbinary`, `msgpack`, `sqlite3`, `bz2`.
+- Installs the XenForo-minimal profile: `php<ver>-fpm`, `php<ver>-mysql`, `php<ver>-gd`, `php<ver>-curl`, `php<ver>-xml`, `php<ver>-zip`, `php<ver>-gmp`, `php<ver>-mbstring`, `php<ver>-redis`. No CLI, OPcache, `intl`, `imagick`, `bcmath`, `apcu`, `igbinary`, `msgpack`, `sqlite3` or `bz2` unless you add them yourself or select `--others composer` (which adds the matching `php<ver>-cli`).
+  - XenForo recommends OPcache for production. If you want it, install `php<ver>-opcache`; the `custom_dan.ini` OPcache settings are already present and take effect automatically. Add `php<ver>-intl` only if an add-on needs it.
 - Deploys `www.conf` from the repo's `scripts/www_<ver>.conf` and `custom_dan.ini` from `scripts/custom_dan.ini`. Add a new `scripts/www_<ver>.conf` to the repo to support a new PHP version; `setup.sh` does not carry pool/ini content.
 - Fills in the dynamic values from `setup.sh`:
   - `pm.max_children = RAM_MB / 256` (~50% of RAM at 128 MB per worker), capped at `CPU threads × 8`
@@ -661,7 +676,7 @@ The script produces a working, internet-facing baseline. For a large or security
 
 **TLS / Angie**
 - Replace the self-signed per-domain certificates under `/etc/angie/ssl/<domain>/` (or the embedded default certificate) with real certificates (Angie ACME/Let's Encrypt or your CA). The default TLS policy is balanced TLS 1.2/1.3; use a stricter policy if your clients allow it.
-- `access_log off` is set globally for performance. Enable a buffered access log per vhost (as the stress-test vhost does) if you need forensics, rate-limit tuning or fail2ban integration. Angie's package logrotate handles rotation.
+- `access_log off` is set globally and no vhost writes access logs by default. If you need forensics, rate-limit tuning or fail2ban web jails, add a buffered per-vhost log (`access_log ... buffer=64k flush=5s;`); use logrotate/shipping so it cannot fill the disk.
 - Rate limiting and FastCGI cache zones are now enabled, with loopback exempt. For a site behind Cloudflare or another proxy, configure `real_ip` (`/etc/angie/scripts/cloudflare.sh`) first, otherwise every visitor shares the proxy IP and the per-IP limiter will throttle them.
 - Add HTTP/3 (QUIC) if clients support it (`listen 443 quic`, `Alt-Svc`, and `ufw allow 443/udp`). The distro Angie build lacks Brotli/zstd modules, so use precompressed gzip (`gzip_static on` is enabled) or install a build with those modules.
 - Keep `client_max_body_size` and PHP upload limits aligned (both 100 MB now). Put Cloudflare or another CDN in front of static traffic and keep the daily Cloudflare real-IP refresh enabled.

@@ -132,8 +132,10 @@ Recommended changes / additions:
 - Add a WAF at the edge (Cloudflare, Coraza/ModSecurity in front of Angie, or a
   separate reverse proxy). The embedded Naxsi/ngx_waf configs cannot be enabled
   on this Angie build.
-- Enable per-vhost buffered access logs for forensics and fail2ban web jails;
-  global `access_log off` is a performance default, not a security default.
+- Angie access logs are disabled by default for performance (only
+  `error_log` is written). If you need forensics or fail2ban web jails, enable
+  a buffered per-vhost log (`access_log ... buffer=64k flush=5s;`) and ship it
+  off-box; do not make it the default on a high-request site.
 - Add `limit_req` to login/registration/password-reset endpoints with tighter
   rates than the general PHP limit.
 - Use `client_max_body_size` per app. 100 MB is fine for XenForo/Lychee large
@@ -143,10 +145,15 @@ Recommended changes / additions:
 
 Already good:
 
-- PHP 8.5 with the extension set needed by XenForo, WordPress, Chevereto, Polr
-  and Lychee.
-- Auto-sized OPcache (512 MB here), JIT (256 MB here), `memory_limit` 512 MB,
-  realpath cache 16 MB, file cache under `/var/cache/php/opcache`.
+- PHP 8.5 with the XenForo-minimal extension set: `fpm`, `mysql`, `gd`,
+  `curl`, `xml`, `zip`, `gmp`, `mbstring`, `redis`.
+- OPcache/JIT, `intl`, `imagick`, `bcmath` and `apcu` are **not** installed by
+  default. `custom_dan.ini` contains OPcache/JIT settings, so installing
+  `php8.5-opcache` enables them without further configuration. For a busy
+  XenForo site, OPcache is strongly recommended; without it PHP recompiles
+  every request.
+- `memory_limit` 512 MB, realpath cache 16 MB, file cache under
+  `/var/cache/php/opcache` (used when OPcache is present).
 - 108 static workers, `max_requests=16384`, `request_terminate_timeout=100s`,
   slow-request log at 5 s, `catch_workers_output=yes`.
 - `expose_php=Off`, `allow_url_fopen=Off`, `cgi.fix_pathinfo=0`.
@@ -319,7 +326,7 @@ Recommended changes (priority order):
    blackbox probes for each vhost, log shipping, and alerts on 5xx, p99, queue
    depth, disk, RAM, GC and replication. `--others sysstat` gives local history
    but not alerting.
-6. **Logging**: per-vhost buffered access logs, PHP slow log, MariaDB slow log,
+6. **Logging**: optional per-vhost buffered access logs, PHP slow log, MariaDB slow log,
    ES/Valkey metrics. Rotate and ship them. Protect logs from web users.
 7. **Per-tenant isolation** for PHP (pools/users/open_basedir) and file
    permissions. This is the main shared-hosting risk.

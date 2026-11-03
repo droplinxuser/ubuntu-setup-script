@@ -25,7 +25,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.6.0"
+readonly SCRIPT_VERSION="1.6.1"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
@@ -1666,15 +1666,11 @@ install_php() {
   chown www-data:www-data /run/php 2>/dev/null || true
   chmod 755 /run/php
 
-  # Extensions required by XenForo, WordPress, Chevereto, Polr, Lychee and
-  # most other PHP applications.  They are small and avoid the usual
-  # "missing intl / bcmath / imagick / exif" support tickets later.
-  apt_install "php${ver}-fpm" "php${ver}-cli" "php${ver}-mysql" "php${ver}-gd" \
+  # XenForo-focused extension set.  Keep this list minimal; the operator can
+  # add intl/imagick/bcmath/apcu or OPcache later if an add-on needs them.
+  apt_install "php${ver}-fpm" "php${ver}-mysql" "php${ver}-gd" \
     "php${ver}-curl" "php${ver}-xml" "php${ver}-zip" "php${ver}-gmp" \
-    "php${ver}-mbstring" "php${ver}-redis" "php${ver}-intl" \
-    "php${ver}-bcmath" "php${ver}-imagick" "php${ver}-soap" \
-    "php${ver}-ldap" "php${ver}-apcu" "php${ver}-igbinary" \
-    "php${ver}-msgpack" "php${ver}-sqlite3" "php${ver}-bz2"
+    "php${ver}-mbstring" "php${ver}-redis"
 
   fetch_server_configs
   local pool_template="${CONFIG_SOURCE_DIR}/scripts/www_${ver//./}.conf"
@@ -1747,7 +1743,11 @@ install_php() {
   systemctl enable --now "php${ver}-fpm"
   systemctl restart "php${ver}-fpm"
   systemctl status "php${ver}-fpm" --no-pager || true
-  "php${ver}" -v
+  if command -v "php-fpm${ver}" >/dev/null 2>&1; then
+    "php-fpm${ver}" -v
+  else
+    "/usr/sbin/php-fpm${ver}" -v
+  fi
   ok "PHP ${ver} installed"
 }
 
@@ -2439,7 +2439,15 @@ EOF
       composer)
         info "Installing Composer"
         pkg_record_origin composer
-        apt_install composer
+        # Composer needs a CLI binary.  The XenForo-minimal PHP profile does
+        # not install php-cli, so add the matching CLI only when requested.
+        local php_ver=""
+        php_ver=$(ls -1 /etc/php 2>/dev/null | grep -E '^[0-9]+\.[0-9]+$' | sort -V | tail -n1)
+        if [[ -n $php_ver ]]; then
+          apt_install "php${php_ver}-cli" composer
+        else
+          apt_install composer
+        fi
         composer --version 2>/dev/null | head -n 1 || true
         ;;
     esac
