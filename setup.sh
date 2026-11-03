@@ -862,6 +862,7 @@ configure_logrotate() {
 # valkey/elasticsearch users do not exist yet.
 /var/www/logs/*/*.log /var/www/logs/elasticsearch/*.json {
     daily
+    maxsize 1G
     rotate 14
     missingok
     notifempty

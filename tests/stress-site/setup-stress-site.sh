@@ -133,7 +133,7 @@ server {
     root  ${ROOT};
     index index.php index.html;
     error_log  ${LOG_DIR}/${DOMAIN}.error.log warn;
-    access_log ${LOG_DIR}/${DOMAIN}.access.log perf;
+    access_log ${LOG_DIR}/${DOMAIN}.access.log perf buffer=64k flush=5s;
     client_max_body_size 100m;
 
     location / {
