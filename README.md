@@ -25,6 +25,48 @@ Non-Angie/non-PHP-FPM configuration lives here.
 `setup.sh` prefers the local files under `configs/` when it is run from this
 checkout, but keeps embedded fallbacks so it still works as a single file.
 
+## What's new in 1.6.7
+
+- Composer is installed from the official `composer.phar` into
+  `/usr/local/bin/composer`, executed with the FPM-matched PHP binary.
+  apt's `composer` package could pull unrelated PHP builds from Sury through
+  virtual `php-cli`/`php-common` dependencies (observed: `php5.6-common` and
+  `php8.5-cli`), which then broke `/usr/bin/php` and survived normal purges.
+- `--purge --others` removes the setup-created Composer phar while still
+  cleaning up an apt-installed Composer from an older release.
+- Installing Composer now restarts the matched PHP-FPM pool. Reconfiguring
+  PHP CLI/intl packages could leave running workers with stale
+  OPcache/realpath state, which surfaced as `Unable to open primary script
+  ... (Operation not permitted)` for existing application files.
+
+## What's new in 1.6.6
+
+- The CLI is now pinned to the same PHP version as FPM with
+  `update-alternatives --set php`. Installing a distro package such as
+  `composer` could previously pull `php8.5-cli` while the web pool ran 8.4,
+  leaving `/usr/bin/php` without the app's `gd`/`xml`/`curl` extensions.
+- `--others composer` installs `php<ver>-cli`/`php<ver>-intl` first and
+  Composer in a separate apt transaction, so apt satisfies the virtual
+  `php-cli` dependency with the FPM version instead of installing another PHP.
+
+## What's new in 1.6.5
+
+- fail2ban's SSH jail now whitelists the deploying operator's SSH client
+  address. Because `sudo` strips `SSH_CONNECTION`, the script reads the parent
+  process environment and falls back to the established `:22` socket. A
+  failed password or automation retry during a long provisioning run can no
+  longer lock the operator out for the full one-hour ban. Loopback is still
+  ignored; all other sources keep the `maxretry=5`, `findtime=10m`,
+  `bantime=1h` policy.
+
+## What's new in 1.6.4
+
+- `--others composer` now installs `php<ver>-intl` alongside the CLI. Composer
+  2.x uses Symfony String's `Normalizer`, so it failed with
+  `Class "Normalizer" not found` on the XenForo-minimal PHP profile.
+- Live VPS validation: full stack install, domain vhosts for every app type,
+  and Composer/Lychee dependency installation.
+
 ## What's new in 1.6.3
 
 - Fixed `--domain` parsing when `app=TYPE` appears before another domain:

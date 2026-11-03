@@ -80,7 +80,7 @@ User=www-data
 Group=www-data
 WorkingDirectory=/opt/stress-node
 Environment=PORT=3100
-Environment=WORKERS=4
+Environment=WORKERS=8
 ExecStart=/usr/bin/node /opt/stress-node/server.js
 Restart=on-failure
 RestartSec=2

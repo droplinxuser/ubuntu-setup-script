@@ -5,7 +5,7 @@ const http = require('node:http');
 const os = require('node:os');
 
 const PORT = Number(process.env.PORT || 3100);
-const WORKERS = Math.max(1, Number(process.env.WORKERS || Math.min(4, os.cpus().length)));
+const WORKERS = Math.max(1, Number(process.env.WORKERS || Math.min(8, os.cpus().length)));
 
 function startWorker() {
   const server = http.createServer((req, res) => {

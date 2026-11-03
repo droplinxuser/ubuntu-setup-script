@@ -25,7 +25,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.6.3"
+readonly SCRIPT_VERSION="1.6.7"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
@@ -422,6 +422,30 @@ is_local_ipv4() {
   else
     hostname -I 2>/dev/null | tr ' ' '\n' | grep -qxF -- "$ip"
   fi
+}
+
+# Best-effort detection of the SSH client address that started this run.
+# sudo normally strips SSH_CONNECTION from the child environment, so also walk
+# the parent process chain and, as a last resort, inspect established :22
+# sockets.  Only used to add an operator whitelist to fail2ban.
+detect_ssh_client_ip() {
+  local ip="${SSH_CONNECTION:-}" pid=$PPID i env
+  ip=${ip%% *}
+  [[ $ip =~ ^[0-9a-fA-F:.]+$ ]] && { printf '%s' "$ip"; return 0; }
+  for ((i = 0; i < 6; i++)); do
+    [[ -r "/proc/${pid}/environ" ]] || break
+    env=$(tr '\0' '\n' < "/proc/${pid}/environ" 2>/dev/null || true)
+    ip=$(printf '%s\n' "$env" \
+      | awk -F= '/^SSH_CONNECTION=/{print $2; exit}' | awk '{print $1}')
+    [[ $ip =~ ^[0-9a-fA-F:.]+$ ]] && { printf '%s' "$ip"; return 0; }
+    pid=$(awk '{print $4}' "/proc/${pid}/stat" 2>/dev/null || true)
+    [[ -n $pid && $pid != 0 ]] || break
+  done
+  ip=$(ss -tnH state established '( sport = :22 )' 2>/dev/null \
+    | awk '{print $4}' | sed -E 's/:[0-9]+$//; s/^\[//; s/\]$//' \
+    | grep -vE '^(127\.|::1$)' | head -n1 || true)
+  [[ $ip =~ ^[0-9a-fA-F:.]+$ ]] && printf '%s' "$ip"
+  return 0
 }
 
 # Resolve the IPV4 keyword to a usable local address.  Sets REPLY.
@@ -1679,6 +1703,17 @@ install_php() {
     "php${ver}-mysql" "php${ver}-gd" "php${ver}-curl" "php${ver}-xml" \
     "php${ver}-zip" "php${ver}-gmp" "php${ver}-mbstring" "php${ver}-redis"
 
+  # Keep the CLI on the same version as FPM.  Without this, installing a
+  # distro package such as composer can add a newer php-cli and make
+  # /usr/bin/php point at a binary whose extension set differs from the web
+  # pool (Composer then fails with "Class Normalizer not found" or missing
+  # ext-gd/ext-xml).
+  if command -v update-alternatives >/dev/null 2>&1 \
+     && [[ -x "/usr/bin/php${ver}" ]]; then
+    update-alternatives --set php "/usr/bin/php${ver}" >/dev/null 2>&1 \
+      || warn "Could not pin /usr/bin/php to PHP ${ver}"
+  fi
+
   fetch_server_configs
   local pool_template="${CONFIG_SOURCE_DIR}/scripts/www_${ver//./}.conf"
   local ini_template="${CONFIG_SOURCE_DIR}/scripts/custom_dan.ini"
@@ -2401,13 +2436,21 @@ EOF
         pkg_record_origin python3-systemd
         apt_install fail2ban python3-systemd
         mkdir -p /etc/fail2ban/jail.d
-        cat > /etc/fail2ban/jail.d/setup-ssh.local <<'EOF'
+        # Never ban the operator who is running this deployment. SSH_CONNECTION
+        # is "<client-ip> <client-port> <server-ip> <server-port>"; keep the
+        # client address so a later typo or automation retry cannot lock the
+        # deploying session out for an hour.
+        local ssh_client_ip=""
+        ssh_client_ip=$(detect_ssh_client_ip || true)
+        [[ $ssh_client_ip =~ ^[0-9a-fA-F:.]+$ ]] || ssh_client_ip=""
+        cat > /etc/fail2ban/jail.d/setup-ssh.local <<EOF
 [DEFAULT]
 backend = systemd
 banaction = ufw
 bantime = 1h
 findtime = 10m
 maxretry = 5
+ignoreip = 127.0.0.1/8 ::1 ${ssh_client_ip}
 
 [sshd]
 enabled = true
@@ -2445,25 +2488,54 @@ EOF
         ;;
       composer)
         info "Installing Composer"
-        pkg_record_origin composer
-        # Composer needs a CLI binary.  The XenForo-minimal PHP profile does
-        # not install php-cli, so add the matching CLI only when requested.
-        local php_ver="" d v
-        for d in /etc/php/*; do
+        # Composer's Symfony String dependency needs ext-intl (Normalizer).
+        # The XenForo-minimal runtime profile deliberately omits intl, so add
+        # it only for the Composer CLI.
+        local php_ver="" d v php_bin
+        for d in /etc/php/*/fpm; do
           [[ -d $d ]] || continue
-          v=${d##*/}
+          v=${d%/fpm}
+          v=${v##*/}
           [[ $v =~ ^[0-9]+\.[0-9]+$ ]] || continue
           if [[ -z $php_ver ]] \
              || [[ $(printf '%s\n%s\n' "$php_ver" "$v" | sort -V | tail -n1) == "$v" ]]; then
             php_ver=$v
           fi
         done
-        if [[ -n $php_ver ]]; then
-          apt_install "php${php_ver}-cli" composer
-        else
-          apt_install composer
+        if [[ -z $php_ver ]]; then
+          die "--others composer requires PHP-FPM; install it with --php first"
         fi
-        composer --version 2>/dev/null | head -n 1 || true
+        php_bin="/usr/bin/php${php_ver}"
+        apt_install "php${php_ver}-cli" "php${php_ver}-intl"
+        update-alternatives --set php "$php_bin" >/dev/null 2>&1 || true
+
+        # Do not use apt's composer package. Its virtual php-cli/php-common
+        # dependencies can pull unrelated PHP builds from Sury (for example
+        # php5.6-common and php8.5-cli), which then break /usr/bin/php and
+        # leave packages behind after purge. Install the official phar and
+        # execute it explicitly with the FPM-matched PHP binary.
+        ensure_state
+        if [[ -x /usr/local/bin/composer ]]; then
+          info "Composer already present at /usr/local/bin/composer; keeping it"
+        else
+          local tmp
+          tmp=$(mktemp)
+          retry 3 5 curl -fsSL --proto '=https' --tlsv1.2 \
+            https://getcomposer.org/download/latest-stable/composer.phar \
+            -o "$tmp" \
+            || die "Could not download Composer from getcomposer.org"
+          "$php_bin" "$tmp" --version >/dev/null 2>&1 \
+            || die "Downloaded Composer phar is not runnable with PHP ${php_ver}"
+          install -m 755 "$tmp" /usr/local/bin/composer
+          rm -f "$tmp"
+          touch "${STATE_DIR}/setup-created-composer-phar"
+        fi
+        "$php_bin" /usr/local/bin/composer --version 2>/dev/null | head -n 1 || true
+        # Installing the CLI/intl packages can leave running FPM workers with
+        # stale OPcache/realpath state (observed as "Unable to open primary
+        # script ... Operation not permitted"). Restart the matched FPM pool.
+        systemctl restart "php${php_ver}-fpm" 2>/dev/null \
+          || warn "Could not restart php${php_ver}-fpm after installing Composer"
         ;;
     esac
   done
@@ -2961,6 +3033,10 @@ purge_others() {
   fi
   if [[ -f "${STATE_DIR}/setup-created-nodesource-key" ]]; then
     rm -f /usr/share/keyrings/nodesource.gpg
+  fi
+  if [[ -f "${STATE_DIR}/setup-created-composer-phar" ]]; then
+    rm -f /usr/local/bin/composer
+    rm -f "${STATE_DIR}/setup-created-composer-phar"
   fi
   ok "Other packages purged"
 }

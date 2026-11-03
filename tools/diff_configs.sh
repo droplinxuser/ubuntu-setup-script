@@ -52,6 +52,7 @@ declare -A config_files=(
     ["angie_additional"]="${CONFIG_REPO}/http.d/ppa_eilander_conf /etc/angie/http.d/ppa_eilander.conf"
     ["brotli_conf"]="${CONFIG_REPO}/http.d/brotli_conf /etc/angie/http.d/brotli.conf"
     ["http_trim_filter_conf"]="${CONFIG_REPO}/http.d/http_trim_filter_conf /etc/angie/http.d/http_trim_filter.conf"
+    ["wordpress_cache"]="${CONFIG_REPO}/h5bp/wordpress_cache.conf /etc/angie/h5bp/wordpress_cache.conf"
 )
 
 # PHP Versions
