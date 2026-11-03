@@ -25,6 +25,19 @@ Non-Angie/non-PHP-FPM configuration lives here.
 `setup.sh` prefers the local files under `configs/` when it is run from this
 checkout, but keeps embedded fallbacks so it still works as a single file.
 
+## What's new in 1.6.3
+
+- Fixed `--domain` parsing when `app=TYPE` appears before another domain:
+  `--domain a.test app=xf b.test` now gives `a.test` XenForo and `b.test`
+  blank instead of applying `xf` to both. A single trailing `app=TYPE` after
+  the whole list still applies to every domain, as documented.
+- ShellCheck is clean at warning level; the log-directory helpers no longer
+  shadow the `group` array used by the argument parser.
+- Added `tests/test-dry-run-matrix.sh`, a 55-case validation matrix covering
+  every service, domain app, purge mode and representative invalid inputs.
+- Verified install, update, PHP 8.4 -> 8.3 switch, selective purge, full
+  purge (twice) and clean reinstall in a disposable Ubuntu 26.04 KVM guest.
+
 ## What's new in 1.6.2
 
 - Added `php<ver>-opcache` and `php<ver>-cli` back to the XenForo profile.
@@ -639,6 +652,10 @@ The script was tested on Ubuntu 26.04.1 LTS (16 CPU threads, 32 GB installed RAM
 | Elasticsearch hardening | `bootstrap.memory_lock: true`, `LimitMEMLOCK=infinity`, heap ≤ 50% RAM warning | PASS |
 
 Also checked at CLI level (all using `--dry-run`, no system changes):
+
+- `tests/test-dry-run-matrix.sh` covers 55 cases: every service flag, every
+  domain app type, per-domain and trailing group `app=` forms, every purge
+  mode, and representative invalid inputs.
 
 - All 64 combinations of the six install service flags (`angie`, `php`, `mariadb`, `valkey`, `elastic`, `others`) plus `--basic` parse and validate.
 - All 128 bare purge target subsets (including empty/implicit/explicit `all`) parse and validate.
