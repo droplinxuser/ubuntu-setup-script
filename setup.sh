@@ -23,6 +23,8 @@ umask 022
 
 readonly SCRIPT_NAME="${0##*/}"
 readonly SCRIPT_VERSION="1.5.0"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
 readonly BACKUP_DIR="${STATE_DIR}/backup"
 # Angie and PHP configuration is owned by this repository, not by setup.sh.
@@ -1031,11 +1033,16 @@ configure_dns() {
   record_original /etc/systemd/resolved.conf.d resolved.conf.d
   mkdir -p /etc/systemd/resolved.conf.d
   # Only manage our own drop-in; do not delete unrelated resolver configs.
+  local dns_src="${SCRIPT_DIR}/configs/system/dns_servers.conf"
   rm -f /etc/systemd/resolved.conf.d/dns_servers.conf
-  cat > /etc/systemd/resolved.conf.d/dns_servers.conf <<'EOF'
+  if [[ -f $dns_src ]]; then
+    install -m 644 "$dns_src" /etc/systemd/resolved.conf.d/dns_servers.conf
+  else
+    cat > /etc/systemd/resolved.conf.d/dns_servers.conf <<'EOF'
 [Resolve]
 DNS=8.8.8.8 1.1.1.1
 EOF
+  fi
   chmod 644 /etc/systemd/resolved.conf.d/dns_servers.conf
   retry 3 3 systemctl restart systemd-resolved || warn "systemd-resolved restart failed"
   resolvectl status || true
@@ -1060,7 +1067,12 @@ configure_cpu_governor() {
   fi
   record_original /etc/default/cpufrequtils cpufrequtils-default
   apt_install cpufrequtils
-  printf 'GOVERNOR="performance"\n' > /etc/default/cpufrequtils
+  local cpu_src="${SCRIPT_DIR}/configs/system/cpufrequtils"
+  if [[ -f $cpu_src ]]; then
+    install -m 644 "$cpu_src" /etc/default/cpufrequtils
+  else
+    printf 'GOVERNOR="performance"\n' > /etc/default/cpufrequtils
+  fi
   cat /etc/default/cpufrequtils
 
   systemctl daemon-reload || true
@@ -1203,9 +1215,14 @@ configure_sysctl() {
   record_original /etc/sysctl.conf sysctl.conf
   record_original /etc/sysctl.d/99-sysctl.conf sysctl.d-99-sysctl.conf
 
-  blob_sysctl > /etc/sysctl.conf
+  local sysctl_src="${SCRIPT_DIR}/configs/system/sysctl.conf"
+  if [[ -f $sysctl_src ]]; then
+    install -m 644 "$sysctl_src" /etc/sysctl.conf
+  else
+    blob_sysctl > /etc/sysctl.conf
+  fi
 
-  # Layered, hardware-aware overrides on top of the embedded profile.  These
+  # Layered, hardware-aware overrides on top of the base profile.  These
   # matter on busy web/database hosts: larger socket buffers, more orphan
   # sockets, a 1 GiB SysV shared-memory segment and a small security baseline.
   local ram_mb min_free shmall
@@ -1255,7 +1272,11 @@ EOF
 configure_limits() {
   step "Security limits"
   record_original /etc/security/limits.conf limits.conf
-  cat > /etc/security/limits.conf <<'EOF'
+  local limits_src="${SCRIPT_DIR}/configs/system/limits.conf"
+  if [[ -f $limits_src ]]; then
+    install -m 644 "$limits_src" /etc/security/limits.conf
+  else
+    cat > /etc/security/limits.conf <<'EOF'
 elasticsearch soft nofile 10485760
 elasticsearch hard nofile 10485760
 mysql         soft nofile 10485760
@@ -1273,6 +1294,7 @@ angie         hard nofile 10485760
 *             soft nofile 10485760
 *             hard nofile 10485760
 EOF
+  fi
   chmod 644 /etc/security/limits.conf
   cat /etc/security/limits.conf
 }
@@ -1778,7 +1800,12 @@ install_mariadb() {
   systemctl status mariadb --no-pager || true
 
   mkdir -p /etc/systemd/system/mariadb.service.d
-  cat > /etc/systemd/system/mariadb.service.d/limits.conf <<'EOF'
+  local mariadb_limits_src="${SCRIPT_DIR}/configs/mariadb/limit_nofile.conf"
+  if [[ -f $mariadb_limits_src ]]; then
+    install -m 644 "$mariadb_limits_src" \
+      /etc/systemd/system/mariadb.service.d/limits.conf
+  else
+    cat > /etc/systemd/system/mariadb.service.d/limits.conf <<'EOF'
 [Service]
 LimitNOFILE=1048576
 LimitCORE=0
@@ -1786,6 +1813,7 @@ LimitCORE=0
 Environment=MYSQLD_OPTS=
 Environment=_WSREP_NEW_CLUSTER=
 EOF
+  fi
 
   configure_mariadb "$size_mb" "$bind"
 
