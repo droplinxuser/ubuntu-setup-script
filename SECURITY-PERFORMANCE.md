@@ -1,7 +1,7 @@
 # Security, performance and large-site review
 
 This document is the audit and action list for the machine provisioned by
-`setup.sh` 1.4.0. It combines the live configuration review with the stress
+`setup.sh` 1.6.0. It combines the live configuration review with the stress
 results in `tests/stress-site/RESULTS.md`.
 
 The script now produces a solid single-host baseline. The remaining work is
