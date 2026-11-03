@@ -1,8 +1,18 @@
 # Ubuntu Setup Script
 
-A single, idempotent Bash provisioning script for **Ubuntu 26.04 LTS** (and newer LTS releases such as 28.04). It installs and configures a complete web/database stack from one command, embeds all previously manual downloaded files, and can uninstall everything again with a `--purge` mode.
+A single, idempotent Bash provisioning script for **Ubuntu 26.04 LTS** (and newer LTS releases such as 28.04). It installs and configures a complete web/database stack from one command and can uninstall everything again with a `--purge` mode.
+
+Angie and PHP-FPM/php.ini configuration is **not** hard-coded in this script. It is downloaded at install time from [`droplinxuser/server-configs-nginx`](https://github.com/droplinxuser/server-configs-nginx), which is the single source of truth for those configs. Update that repository, not `setup.sh`, for Angie/PHP configuration changes.
 
 The script is designed for a fresh server but is safe to re-run on an already configured machine. Only the services named on the command line are touched.
+
+## What's new in 1.5.0
+
+- Removed the embedded Angie config archive and all duplicated Angie/PHP config patching from `setup.sh`.
+- `setup.sh` now downloads `server-configs-nginx` once per run and delegates deployment to its `scripts/nginx_conf.sh`.
+- PHP-FPM pool and `php.ini` templates now come from `server-configs-nginx/scripts/www_<ver>.conf` and `scripts/custom_dan.ini`.
+- Added `CONFIG_SOURCE_DIR` for local/offline testing, plus `CONFIG_REPO_URL` / `CONFIG_REPO_REF` overrides.
+- The repo deployer removes old setup.sh override files and pre-refactor config filenames during upgrades.
 
 ## What's new in 1.4.0
 
@@ -22,7 +32,7 @@ The script is designed for a fresh server but is safe to re-run on an already co
 
 - Ubuntu 26.04 LTS or newer (the script checks `ID=ubuntu` and `VERSION_ID >= 26.04`).
 - Root access (`sudo bash setup.sh ...`).
-- Internet access to the Ubuntu, Angie, Sury, Elastic and NodeSource package repositories.
+- Internet access to the Ubuntu, Angie, Sury, Elastic and NodeSource package repositories, plus GitHub for the Angie/PHP configuration repository. For offline/testing use, set `CONFIG_SOURCE_DIR` to a local checkout.
 - Enough disk/RAM for the selected services:
   - Elasticsearch: roughly 1.5 GB of disk plus the requested JVM heap.
   - MariaDB: the requested InnoDB buffer pool plus normal database growth.
@@ -227,35 +237,28 @@ Before changing basic settings, the script records the originals under `/var/lib
 ### Angie (`--angie`)
 
 - Installs the Angie signing key and APT repository.
-- Installs `angie` and deploys the embedded `server-configs-nginx` config tree to `/etc/angie`.
-- Applies the systemd `LimitNOFILE=524288` drop-in and `/etc/default/angie`.
-- Aligns `client_max_body_size` with PHP (100 MB) and adds a managed `open_file_cache` override for static-heavy sites.
-- Reduces `worker_connections` from the upstream 300k to 65k per worker. On a 16-core host this cut Angie RSS from ~2 GB to ~0.5 GB with no throughput loss.
-- Fixes the upstream `resolver 127.0.0.1` (nothing listens there; systemd-resolved uses `127.0.0.53`).
-- Removes the global 16 MB/s `limit_rate` cap; per-vhost limits remain available.
-- Raises the FastCGI upstream keepalive pool from 3 to 64 idle connections per worker and creates the missing Ubuntu-compatible `snippets/fastcgi-php.conf` (Angie does not ship it, but every PHP template includes it).
-- Enables the safe optional snippets without extra modules: FastCGI cache (`fastcgicache`, `fastcgicache_chev`), XenForo proxy/WebSocket cache, per-IP rate limiting and the referer map. Brotli/zstd/Naxsi/ngx_waf/trim remain disabled because the distro Angie build does not compile those modules.
-- Grants loopback an exemption from `limit_req` so health checks and local load tests are not throttled; external clients get 100 GET/s and 30 POST/HEAD/s with larger bursts, and the reject status is `429` instead of a connection-dropping `444`.
-- Disables TLS session tickets and 0-RTT early data by default (replay risk); enable per vhost only when the app handles replay protection.
-- Fixes `PATH_TRANSLATED` in the embedded PHP configs, which otherwise makes PHP-FPM reject the first request with “Access denied”.
-- Repairs the upstream sample templates (duplicate SSL/proxy includes, double `;;`, missing `error_log` directories) so every shipped template passes `angie -t`.
-- Generates `/etc/angie/http.d/cloudflare.conf` from the current Cloudflare IPv4/IPv6 ranges and reloads Angie.
-- Runs `angie -t` before reloading.
+- Installs `angie`.
+- Downloads [`droplinxuser/server-configs-nginx`](https://github.com/droplinxuser/server-configs-nginx) once per run and delegates deployment to its `scripts/nginx_conf.sh`.
+- The repository (not `setup.sh`) owns `angie.conf`, `h5bp/`, `conf.d/`, `http.d/`, `snippets/`, the cache/rate-limit settings, template repairs and the Cloudflare helper.
+- Uses the repo's `scripts/limit_nofile.conf` and `scripts/etc_default_nginx` for the systemd `LimitNOFILE` drop-in and `/etc/default/angie`.
+- The repo deployer creates cache directories, removes obsolete setup.sh/pre-refactor config filenames, runs `angie -t`, and reloads Angie.
+- Configuration source overrides: `CONFIG_SOURCE_DIR=/path` (local checkout/testing), `CONFIG_REPO_URL=...`, `CONFIG_REPO_REF=main`.
+- Generates `/etc/angie/http.d/cloudflare.conf` via the repo's `scripts/cloudflare.sh` and reloads Angie.
 
 ### PHP (`--php [ver=8.5] [children=auto|N] [max_requests=N]`)
 
 - Adds the Sury APT repository (keyring embedded in the script).
 - If `ver=` is omitted, selects the **latest stable PHP** available to APT from the Sury repository (currently 8.5; pre-release packages such as `8.6.0~rc3` are ignored).
 - Installs `php<ver>-fpm`, `php<ver>-cli` and the extensions needed by XenForo, WordPress, Chevereto, Polr, Lychee and similar apps: `mysql`, `gd`, `curl`, `xml`, `zip`, `gmp`, `mbstring`, `redis`, `intl`, `bcmath`, `imagick`, `soap`, `ldap`, `apcu`, `igbinary`, `msgpack`, `sqlite3`, `bz2`.
-- Deploys `www.conf` and `custom_dan.ini`, then computes:
+- Deploys `www.conf` from the repo's `scripts/www_<ver>.conf` and `custom_dan.ini` from `scripts/custom_dan.ini`. Add a new `scripts/www_<ver>.conf` to the repo to support a new PHP version; `setup.sh` does not carry pool/ini content.
+- Fills in the dynamic values from `setup.sh`:
   - `pm.max_children = RAM_MB / 256` (~50% of RAM at 128 MB per worker), capped at `CPU threads × 8`
   - `pm.max_requests = CPU threads × 1024`
   - override either with `children=` / `max_requests=`
 - Sizes OPcache, JIT and `memory_limit` from RAM instead of fixed 512 MB values:
   - OPcache 128–512 MB, JIT 64–256 MB, `memory_limit` 256–512 MB, realpath cache 4–16 MB.
-- Adds OPcache file cache under `/var/cache/php/opcache`, `request_slowlog_timeout=5s`, `catch_workers_output=yes`, and a systemd `LimitNOFILE=524288` drop-in.
-- Adds PHP session hardening (`use_strict_mode`, cookies only, `HttpOnly`, `SameSite=Lax`, longer IDs) and `cgi.fix_pathinfo=0`.
-- Uses the MariaDB Unix socket by default (`mysqli.default_socket` / `pdo_mysql.default_socket`) and disables `mysqlnd` statistics collection.
+- The repo templates provide OPcache file cache under `/var/cache/php/opcache`, `request_slowlog_timeout=5s`, `catch_workers_output=yes`, session hardening, `cgi.fix_pathinfo=0`, MariaDB Unix-socket defaults and `mysqlnd` statistics disabled.
+- `setup.sh` creates the log/cache directories and the systemd `LimitNOFILE=524288` drop-in.
 - Sets the PHP timezone from `--basic time=`.
 - Enables and restarts `php<ver>-fpm` and prints `php<ver> -v`.
 
@@ -289,7 +292,7 @@ Installing a second version while the first is active is refused **before any pa
 - Comments out `expire_logs_days`.
 - Creates the requested admin user with `GRANT ALL ... WITH GRANT OPTION` for `localhost`, `127.0.0.1` and `::1` (idempotent `CREATE USER IF NOT EXISTS` + `ALTER USER`). The extra loopback hosts are required because `skip_name_resolve=1` means a TCP connection to `127.0.0.1` does **not** match `'user'@'localhost'`.
 - Creates `/var/log/mariadb`, sets ownership, reloads systemd and restarts MariaDB.
-- Downloads nothing at runtime: `mysqltuner.pl` and the `mysqlbackup` repository are embedded. It installs `mysqltuner.pl` to `/root/mysqltuner.pl`, installs the backup utility under `/root/tools/mysqlbackup-master`, and writes `/etc/mysqlbkup.cnf` with the requested user/password.
+- Does not download MariaDB tools at runtime: `mysqltuner.pl` and the `mysqlbackup` repository are embedded. It installs `mysqltuner.pl` to `/root/mysqltuner.pl`, installs the backup utility under `/root/tools/mysqlbackup-master`, and writes `/etc/mysqlbkup.cnf` with the requested user/password.
 - Verifies `mysqldump` and `mariadb-check` are present.
 
 **Multiple bind addresses / remote access:** `bind=` accepts a comma-separated list of IPv4 addresses, `::1`, and the special token `IPV4`:
@@ -410,7 +413,7 @@ sudo bash setup.sh --domain node.example.com app=node
 
 `app=TYPE` applies to every domain in that `--domain` group; use separate `--domain ... app=...` groups for different apps. Supported values: `blank` (default), `xf`, `wordpress`, `pingvin`, `chevereto`, `polr`, `lychee`, `php`, `node`.
 
-- `xf`, `wordpress`, `pingvin`, `chevereto` and `polr` use the embedded, repaired templates. `lychee` and `php` use a Laravel/front-controller vhost. `node` proxies to `127.0.0.1:3000` and adds a WebSocket location.
+- `xf`, `wordpress`, `pingvin`, `chevereto` and `polr` use the templates from `server-configs-nginx` (the repo is the single source of truth). `lychee` and `php` use a Laravel/front-controller vhost. `node` proxies to `127.0.0.1:3000` and adds a WebSocket location.
 - The vhost is tested with `angie -t` before it is kept; a broken generated config is removed and the script fails loudly.
 - The certificate is self-signed and valid for the domain and `www.` name. Replace it with ACME/Let's Encrypt (Angie has `http_acme` built in) for production.
 - App code is **not** downloaded. The script provisions the vhost, certificate, document root and database; install the application itself (Composer, WP-CLI, Node, etc.) on top.
@@ -502,26 +505,31 @@ If any service fails, it is marked `FAILED`, the remaining services still run, a
 
 ---
 
-## Embedded payloads
+## Embedded and downloaded payloads
 
-The following are embedded so the script does not depend on GitHub/vendor file downloads at run time:
+Embedded in `setup.sh` for offline/reproducible installation:
 
 - `dns_servers.conf`
 - `sysctl.conf`
 - `limits.conf`
-- A snapshot of `droplinxuser/server-configs-nginx` (commit `5331e5e`, identical to the current local clone), including `angie.conf`, `h5bp/`, `conf.d/`, `http.d/`, `mime.types`, `install_angie.sh`, `nginx_conf.sh`, `www_85.conf`, `custom_dan.ini`, `cloudflare.sh`, `limit_nofile.conf` and `etc_default_nginx`
 - `mysqltuner.pl` 2.9.3
 - The `mysqlbackup` utility (`install`, `mysqlbkup.sh`, sample config and sample CNF)
 - Angie, Elasticsearch and NodeSource signing keys
 - The Sury `debsuryorg-archive-keyring` .deb
 
-Cloudflare IP ranges are fetched live from Cloudflare at install time. Package repositories are fetched live by APT.
+Downloaded at install time (single source of truth):
+
+- Angie and PHP configuration from [`droplinxuser/server-configs-nginx`](https://github.com/droplinxuser/server-configs-nginx): `angie.conf`, `h5bp/`, `conf.d/`, `http.d/`, `snippets/`, `scripts/www_<ver>.conf`, `scripts/custom_dan.ini`, `scripts/cloudflare.sh`, `scripts/limit_nofile.conf`, `scripts/etc_default_nginx`, and `scripts/nginx_conf.sh`.
+- Cloudflare IP ranges from Cloudflare.
+- Package repositories via APT.
+
+`setup.sh` does not contain Angie or PHP-FPM/php.ini config content. To change those, update `server-configs-nginx` and re-run the install. Use `CONFIG_SOURCE_DIR=/path/to/checkout` to test a local checkout before pushing.
 
 ---
 
 ## Tested combinations
 
-The script was tested on Ubuntu 26.04.1 LTS (16 CPU threads, 32 GB installed RAM / 27 GiB usable) with the following real install/re-run/purge cycles (v1.4.0):
+The script was tested on Ubuntu 26.04.1 LTS (16 CPU threads, 32 GB installed RAM / 27 GiB usable) with the following real install/re-run/purge cycles (v1.5.0):
 
 | Case | Configuration | Result |
 |---|---|---|
@@ -544,7 +552,7 @@ The script was tested on Ubuntu 26.04.1 LTS (16 CPU threads, 32 GB installed RAM
 | Domain idempotency | re-run preserves existing vhost config; database creation is idempotent | PASS |
 | Domain app vhosts | `app=blank,xf,wordpress,pingvin,chevereto,polr,lychee,php,node` created; every generated vhost passed `angie -t` | PASS |
 | Domain validation | invalid/traversal domains rejected; `--purge --domain` rejected | PASS |
-| App templates | all 12 embedded templates pass `angie -t` after the repair pass | PASS |
+| App templates | all 16 repository templates pass `angie -t` after the repair pass | PASS |
 | Auto MariaDB size | `size=auto` → 11.1 GB buffer pool on this host (40% of RAM) | PASS |
 | Valkey options | `ram=`, `policy=`, `io_threads=` accepted and written without duplicates | PASS |
 | PHP overrides | `children=` / `max_requests=` accepted and applied | PASS |
@@ -568,7 +576,7 @@ Also checked at CLI level (all using `--dry-run`, no system changes):
 
 A local site (`stress.test`) exercises Angie → PHP-FPM → MariaDB + Valkey + Elasticsearch + Node.js + GifSicle. The repeatable harness is in `tests/stress-site/`; it used `wrk`, `valkey-benchmark`, `pidstat` and the Angie/PHP-FPM status endpoints on 16 CPU threads, 27 GiB RAM, NVMe.
 
-| Target | Concurrency | Result (v1.4.0) |
+| Target | Concurrency | Result (v1.5.0) |
 |---|---|---|
 | Static file (Angie) | 100 | ~255k req/s, p99 3.4 ms |
 | PHP hello (OPcache) | 100 | ~116k req/s |
@@ -590,7 +598,7 @@ Findings and the adjustments applied:
 - **Ephemeral-port/TIME_WAIT pressure caused p99 tails.** At 15k new TCP connections/s the host had 83k TIME_WAIT sockets against a 55k port range. MariaDB and Valkey now use Unix sockets (PHP defaults to them), raising MariaDB to ~27k req/s and Valkey to ~29k req/s with much lower p99.
 - **MariaDB thread pool fixed connection-churn tails.** `thread_handling=pool-of-threads` cut short-query p99 from ~745 ms to ~9 ms without reducing throughput.
 - **Angie memory was oversized.** 300k connections/worker cost ~2 GB RSS. 65k/worker keeps ~1M total connection capacity at ~0.5 GB RSS.
-- **Template and snippet fixes.** Angie does not ship `snippets/fastcgi-php.conf`; without it every PHP vhost failed `angie -t`. `PATH_TRANSLATED` also had to point at the script, not the document root. All 12 templates now pass.
+- **Template and snippet fixes.** Angie does not ship `snippets/fastcgi-php.conf`; without it every PHP vhost failed `angie -t`. `PATH_TRANSLATED` also had to point at the script, not the document root. All 18 repository templates now pass.
 - Remaining ceiling is application work per request (DB + cache + search). For higher full-stack throughput, add FastCGI microcaching, avoid doing all lookups on every request, use persistent/Unix-socket connections, and scale horizontally (CDN, multiple Angie/PHP nodes, separate ES/DB hosts).
 
 ---
@@ -712,9 +720,9 @@ By default `--elastic host=localhost` binds to loopback and security is disabled
 | `/var/lib/setup.sh/swapfile-managed` | Marker: the script created/resized `/swapfile` |
 | `/var/lib/setup.sh/setup-installed-pkg-*`, `preexisting-pkg-*` | Package-origin markers used by `--purge others` |
 | `/etc/angie/` | Angie configuration tree |
-| `/etc/angie/http.d/98_setup_cache.conf`, `99_setup_overrides.conf` | Managed cache zones, open-file cache, log format and gzip_static |
+| `/etc/angie/http.d/*.conf` | Repo-managed cache zones, rate limiting, WebSocket/proxy and referer maps (deployed from `server-configs-nginx`) |
 | `/etc/angie/http.d/limit_req*.conf` | Per-IP limiter zones and loopback exemption |
-| `/etc/angie/snippets/fastcgi-php.conf` | Ubuntu-compatible FastCGI snippet (not shipped by Angie) |
+| `/etc/angie/snippets/fastcgi-php.conf` | Repo-provided Ubuntu-compatible FastCGI snippet (not shipped by Angie) |
 | `/etc/angie/conf.d/<domain>.conf` | Blank or app vhost created by `--domain` |
 | `/etc/angie/ssl/<domain>/` | Per-domain self-signed certificate (replace with ACME/Let's Encrypt) |
 | `/var/www/<domain>/public/` | Document root created by `--domain` (owned by `www-data`) |
@@ -748,4 +756,5 @@ By default `--elastic host=localhost` binds to loopback and security is disabled
 - The script never stores credentials in the repository. MariaDB credentials are written only to `/etc/mysqlbkup.cnf` on the target server (mode 600).
 - `--dry-run` / `--check` is safe as a normal user and makes no changes; use it to validate a command before running it.
 - Package-origin markers in `/var/lib/setup.sh` let purge avoid removing software that existed before setup.sh. Do not delete that directory if you intend to purge later.
-- Package versions follow the upstream repositories at install time; the embedded configuration files are a snapshot, but package repositories are always fetched live.
+- Package versions follow the upstream repositories at install time. Angie/PHP configuration follows the current `server-configs-nginx` branch at install time; other embedded payloads are fixed snapshots.
+- Set `CONFIG_SOURCE_DIR=/path/to/server-configs-nginx` to use a local checkout (for testing or offline installs), `CONFIG_REPO_REF=<branch|tag>` to choose a branch/tag, or `CONFIG_REPO_URL=<url>` for a fork.
