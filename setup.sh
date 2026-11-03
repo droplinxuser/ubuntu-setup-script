@@ -25,7 +25,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.6.2"
+readonly SCRIPT_VERSION="1.6.3"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
@@ -294,7 +294,7 @@ parse_args() {
       --domain)
         ENABLED[domain]=1; shift
         local got_domain=0 d app="" key default_app="" last_app=""
-        local app_count=0
+        local app_count=0 app_at_end=0
         local -a group=()
         while (( $# )) && [[ $1 != --* ]]; do
           case "$1" in
@@ -302,6 +302,7 @@ parse_args() {
               app=${1#*=}
               app_count=$(( app_count + 1 ))
               last_app=$app
+              app_at_end=1
               if (( ${#group[@]} > 0 )); then
                 # app=TYPE belongs to the domain immediately before it.
                 key=${group[-1],,}; key=${key%.}
@@ -316,6 +317,9 @@ parse_args() {
           esac
           d=${1,,}; d=${d%.}
           group+=("$d"); got_domain=1
+          # A domain after app= means that app= was per-domain, not a
+          # trailing group default.
+          app_at_end=0
           [[ -n $default_app ]] && DOMAIN_APP[$d]=$default_app
           shift
         done
@@ -324,8 +328,8 @@ parse_args() {
           DOMAINS+=("$d")
           key=${d,,}; key=${key%.}
           # Preserve the documented single app=TYPE behaviour: one app= after
-          # a list of domains applies to every domain in this group.
-          if (( app_count == 1 )) && [[ -n $last_app ]]; then
+          # the whole list applies to every domain in this group.
+          if (( app_count == 1 && app_at_end == 1 )) && [[ -n $last_app ]]; then
             DOMAIN_APP[$key]=$last_app
           fi
         done
@@ -802,23 +806,25 @@ ensure_state() { mkdir -p "$BACKUP_DIR"; }
 # Centralised logs (/var/www/logs/<service>/)
 # ---------------------------------------------------------------------------
 ensure_log_dir() {
-  local name=$1 user=$2 group=$3 dir="${LOG_ROOT}/$1"
+  local svc=$1 owner=$2 grp=$3
+  local dir="${LOG_ROOT}/${svc}"
   mkdir -p "$dir"
   chmod 750 "$dir"
-  if getent passwd "$user" >/dev/null 2>&1; then
-    chown "$user:$group" "$dir" 2>/dev/null || true
+  if getent passwd "$owner" >/dev/null 2>&1; then
+    chown "$owner:$grp" "$dir" 2>/dev/null || true
   else
     chown root:root "$dir" 2>/dev/null || true
   fi
 }
 
 log_file() {
-  local rel=$1 user=$2 group=$3 file="${LOG_ROOT}/$1"
+  local owner=$2 grp=$3
+  local file="${LOG_ROOT}/$1"
   mkdir -p "$(dirname "$file")"
   [[ -e $file ]] || : > "$file"
   chmod 640 "$file"
-  if getent passwd "$user" >/dev/null 2>&1; then
-    chown "$user:$group" "$file" 2>/dev/null || true
+  if getent passwd "$owner" >/dev/null 2>&1; then
+    chown "$owner:$grp" "$file" 2>/dev/null || true
   else
     chown root:root "$file" 2>/dev/null || true
   fi
@@ -2442,8 +2448,16 @@ EOF
         pkg_record_origin composer
         # Composer needs a CLI binary.  The XenForo-minimal PHP profile does
         # not install php-cli, so add the matching CLI only when requested.
-        local php_ver=""
-        php_ver=$(ls -1 /etc/php 2>/dev/null | grep -E '^[0-9]+\.[0-9]+$' | sort -V | tail -n1)
+        local php_ver="" d v
+        for d in /etc/php/*; do
+          [[ -d $d ]] || continue
+          v=${d##*/}
+          [[ $v =~ ^[0-9]+\.[0-9]+$ ]] || continue
+          if [[ -z $php_ver ]] \
+             || [[ $(printf '%s\n%s\n' "$php_ver" "$v" | sort -V | tail -n1) == "$v" ]]; then
+            php_ver=$v
+          fi
+        done
         if [[ -n $php_ver ]]; then
           apt_install "php${php_ver}-cli" composer
         else
