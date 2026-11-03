@@ -121,7 +121,7 @@ Basic (always required for an install; all values are optional):
 Services (optional; only the ones listed are installed):
   --angie
   --php       [ver=8.5]                            (default: latest stable in Sury)
-  --mariadb   user=dan pass=temp size=4gb [bind=127.0.0.1[,ADDR...]|IPV4]
+  --mariadb   user=demo pass=temp size=4gb [bind=127.0.0.1[,ADDR...]|IPV4]
       bind     comma-separated IPv4 addresses and/or ::1 (default 127.0.0.1)
                IPV4 auto-detects the server's public IPv4; on NAT it falls
                back to the local outbound IPv4
@@ -163,12 +163,12 @@ Notes:
 
 Examples:
   bash setup.sh --basic server=dedi host=custom.host time=Asia/Manila swap=8G \
-      --angie --php ver=8.5 --mariadb user=dan pass=temp size=4gb bind=127.0.0.1 \
+      --angie --php ver=8.5 --mariadb user=demo pass=temp size=4gb bind=127.0.0.1 \
       --valkey --elastic host=localhost ram=4g --others smartmon nvme gif nodejs
 
   bash setup.sh --basic --angie --php
 
-  bash setup.sh --basic --mariadb user=dan pass=temp size=4gb \
+  bash setup.sh --basic --mariadb user=demo pass=temp size=4gb \
       bind=127.0.0.1,IPV4
 
   bash setup.sh --domain google.com
