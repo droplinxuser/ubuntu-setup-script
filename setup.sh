@@ -20,7 +20,7 @@ shopt -s inherit_errexit 2>/dev/null || true
 umask 022
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.3.0"
+readonly SCRIPT_VERSION="1.4.0"
 readonly STATE_DIR="/var/lib/setup.sh"
 readonly BACKUP_DIR="${STATE_DIR}/backup"
 readonly CRON_BEGIN="# BEGIN setup.sh managed cron"
@@ -93,6 +93,7 @@ apt_clean() {
 # ---------------------------------------------------------------------------
 declare -A ENABLED=()
 declare -A OPT=()
+declare -A DOMAIN_APP=()
 OTHERS=()
 DOMAINS=()
 PURGE=0
@@ -120,27 +121,48 @@ Basic (always required for an install; all values are optional):
 
 Services (optional; only the ones listed are installed):
   --angie
-  --php       [ver=8.5]                            (default: latest stable in Sury)
-  --mariadb   user=demo pass=temp size=4gb [bind=127.0.0.1[,ADDR...]|IPV4]
+  --php       [ver=8.5] [children=auto|N] [max_requests=N]
+      ver          PHP version (default: latest stable in Sury)
+      children     PHP-FPM worker count (default: auto from RAM/CPU)
+      max_requests recycle a worker after N requests (default: threads x 1024)
+  --mariadb   user=demo pass=temp size=4gb|auto [bind=127.0.0.1[,ADDR...]|IPV4]
+      size     auto = 40% of RAM (clamped to 256 MB..32 GB), sized to leave
+               room for Elasticsearch, Valkey and PHP workers.
       bind     comma-separated IPv4 addresses and/or ::1 (default 127.0.0.1)
                IPV4 auto-detects the server's public IPv4; on NAT it falls
                back to the local outbound IPv4
                e.g. bind=127.0.0.1,2.3.4.5  or  bind=127.0.0.1,IPV4
-  --valkey
+  --valkey    [ram=2g] [policy=allkeys-lru] [io_threads=1]
+      ram        maxmemory (default: 10% of RAM, clamped to 256 MB..8 GB)
+      policy     maxmemory-policy (default allkeys-lru; use noeviction or
+                 volatile-lru when Valkey stores sessions/jobs that must survive)
+      io_threads extra socket I/O threads (default 1; raise only after
+                 valkey-benchmark shows the main thread is saturated)
   --elastic   ram=4g [host=localhost]
-  --others    smartmon nvme gif nodejs            (or: --others all)
+  --others    smartmon nvme gif nodejs fail2ban unattended sysstat composer
+              (or: --others all)
       nvme-cli is installed only on a dedicated server with NVMe storage.
+      fail2ban   UFW-backed SSH brute-force protection
+      unattended automatic security updates
+      sysstat    sar/iostat performance history
+      composer   Composer 2 for PHP projects
 
 Domain setup (standalone; Angie + MariaDB must already be installed/running):
-  --domain DOMAIN [DOMAIN...]
+  --domain DOMAIN [DOMAIN...] [app=TYPE]
       Creates:
         /var/www/<domain>/public/
-        /etc/angie/conf.d/<domain>.conf   (empty; existing content is kept)
+        /etc/angie/conf.d/<domain>.conf   (ready vhost, or empty when app=blank)
         MariaDB database <domain with dots replaced by underscores>
-      Example: --domain google.com
-        -> /var/www/google.com/public/
-        -> /etc/angie/conf.d/google.com.conf
-        -> database google_com
+      app=TYPE may be given inside a --domain group and applies to every
+      domain in that group. TYPE is one of:
+        blank (default) xf wordpress pingvin chevereto polr lychee php node
+      Existing non-empty vhost files are preserved. A self-signed certificate
+      is generated under /etc/angie/ssl/<domain>/; replace it with an ACME /
+      Let's Encrypt certificate for production.
+      Example: --domain forum.example.com app=xf
+        -> /var/www/forum.example.com/public/
+        -> /etc/angie/conf.d/forum.example.com.conf  (XenForo vhost)
+        -> database forum_example_com
       --domain can be repeated and combined with a normal install. There is
       no --purge for domains; remove the files/database manually.
 
@@ -182,8 +204,9 @@ kv_set() {
   local ctx=$1 key=$2 val=$3
   case "${ctx}:${key}" in
     basic:server|basic:host|basic:time|basic:swap) ;;
-    php:ver) ;;
+    php:ver|php:children|php:max_requests) ;;
     mariadb:user|mariadb:pass|mariadb:size|mariadb:bind) ;;
+    valkey:ram|valkey:policy|valkey:io_threads) ;;
     elastic:host|elastic:ram) ;;
     *) die "--${ctx}: unknown option '${key}'" ;;
   esac
@@ -231,7 +254,13 @@ parse_args() {
         done
         ;;
       --angie) ENABLED[angie]=1; shift ;;
-      --valkey) ENABLED[valkey]=1; shift ;;
+      --valkey)
+        ENABLED[valkey]=1; shift
+        while (( $# )) && [[ $1 != --* ]]; do
+          [[ $1 == *=* ]] || die "--valkey: expected key=value, got '$1'"
+          kv_set valkey "${1%%=*}" "${1#*=}"; shift
+        done
+        ;;
       --others)
         ENABLED[others]=1; shift
         while (( $# )) && [[ $1 != --* ]]; do
@@ -240,11 +269,20 @@ parse_args() {
         ;;
       --domain)
         ENABLED[domain]=1; shift
-        local got_domain=0
+        local got_domain=0 d app="" key
+        local -a group=()
         while (( $# )) && [[ $1 != --* ]]; do
-          DOMAINS+=("$1"); got_domain=1; shift
+          case "$1" in
+            app=*) app=${1#*=}; shift; continue ;;
+          esac
+          group+=("$1"); got_domain=1; shift
         done
         (( got_domain )) || die "--domain requires at least one domain name"
+        for d in "${group[@]}"; do
+          DOMAINS+=("$d")
+          key=${d,,}; key=${key%.}
+          if [[ -n $app ]]; then DOMAIN_APP[$key]=$app; fi
+        done
         ;;
       --purge)
         PURGE=1; shift
@@ -438,6 +476,22 @@ domain_to_db() {
   printf '%s' "$d" | sed 's/[^a-z0-9_]/_/g'
 }
 
+normalize_app() {
+  local a=${1,,}
+  case "$a" in
+    ""|blank|none|plain) printf 'blank' ;;
+    xf|xenforo)          printf 'xf' ;;
+    wp|wordpress)        printf 'wordpress' ;;
+    pingvin)             printf 'pingvin' ;;
+    chev|chevereto)      printf 'chevereto' ;;
+    polr)                printf 'polr' ;;
+    lychee)              printf 'lychee' ;;
+    node|nodejs)         printf 'node' ;;
+    php|generic)         printf 'php' ;;
+    *) return 1 ;;
+  esac
+}
+
 detect_server_type() {
   # Prefer systemd's virtualization probe: exit 0 means a VM/container.
   if command -v systemd-detect-virt >/dev/null 2>&1; then
@@ -554,6 +608,10 @@ validate_all() {
     if [[ ${#PURGE_TARGETS[@]} -eq 0 ]] && [[ ${#ENABLED[@]} -eq 0 ]]; then
       PURGE_TARGETS=(all)
     fi
+    if [[ -n ${OPT[php.ver]:-} ]]; then
+      [[ ${OPT[php.ver]} =~ ^[0-9]+\.[0-9]+$ ]] \
+        || die "--purge --php ver='${OPT[php.ver]}' is invalid (use e.g. 8.5)"
+    fi
     return 0
   fi
 
@@ -587,7 +645,7 @@ validate_all() {
   OPT[basic.time]=$tz
 
   if [[ ${#DOMAINS[@]} -gt 0 ]]; then
-    local d db seen=" "
+    local d db app seen=" "
     local -a dedup=()
     for d in "${DOMAINS[@]}"; do
       d=${d,,}
@@ -595,6 +653,10 @@ validate_all() {
       validate_domain "$d" || die "--domain '${d}' is not a valid domain name"
       db=$(domain_to_db "$d")
       (( ${#db} <= 64 )) || die "Database name '${db}' for '${d}' exceeds 64 characters"
+      app=${DOMAIN_APP[$d]:-blank}
+      app=$(normalize_app "$app") \
+        || die "--domain '${d}': unknown app='${app}' (use blank, xf, wordpress, pingvin, chevereto, polr, lychee, php or node)"
+      DOMAIN_APP[$d]=$app
       [[ $seen == *" $d "* ]] && continue
       seen+="${d} "
       dedup+=("$d")
@@ -607,6 +669,14 @@ validate_all() {
       [[ ${OPT[php.ver]} =~ ^[0-9]+\.[0-9]+$ ]] \
         || die "--php ver='${OPT[php.ver]}' is invalid (use e.g. 8.5)"
     fi
+    if [[ -n ${OPT[php.children]:-} ]]; then
+      [[ ${OPT[php.children]} == auto || ${OPT[php.children]} =~ ^[1-9][0-9]*$ ]] \
+        || die "--php children='${OPT[php.children]}' is invalid (use auto or a positive integer)"
+    fi
+    if [[ -n ${OPT[php.max_requests]:-} ]]; then
+      [[ ${OPT[php.max_requests]} =~ ^[1-9][0-9]*$ ]] \
+        || die "--php max_requests='${OPT[php.max_requests]}' is invalid (use a positive integer)"
+    fi
   fi
 
   if [[ ${ENABLED[mariadb]:-0} -eq 1 ]]; then
@@ -616,13 +686,30 @@ validate_all() {
     [[ ${OPT[mariadb.user]} =~ ^[A-Za-z0-9_]+$ ]] \
       || die "--mariadb user= may only contain letters, digits and underscore"
     [[ ${OPT[mariadb.pass]} != *$'\n'* ]] || die "--mariadb pass= must not contain a newline"
-    [[ ${OPT[mariadb.size]} =~ ^[1-9][0-9]*([mM][bB]?|[gG][bB]?)$ ]] \
-      || die "--mariadb size='${OPT[mariadb.size]}' is invalid (use e.g. 4gb)"
+    [[ ${OPT[mariadb.size]} == auto || ${OPT[mariadb.size]} =~ ^[1-9][0-9]*([mM][bB]?|[gG][bB]?)$ ]] \
+      || die "--mariadb size='${OPT[mariadb.size]}' is invalid (use auto, 4gb, 512m, ...)"
     local bind=${OPT[mariadb.bind]:-127.0.0.1}
     if ! normalize_mariadb_bind "$bind"; then
       die "--mariadb bind='${bind}' contains an invalid address '${BIND_BAD_TOKEN}'. Use comma-separated IPv4 addresses, ::1, and/or IPV4."
     fi
     OPT[mariadb.bind]=$REPLY
+  fi
+
+  if [[ ${ENABLED[valkey]:-0} -eq 1 ]]; then
+    if [[ -n ${OPT[valkey.ram]:-} ]]; then
+      [[ ${OPT[valkey.ram]} =~ ^[1-9][0-9]*[gGmM]$ ]] \
+        || die "--valkey ram='${OPT[valkey.ram]}' is invalid (use e.g. 2g)"
+    fi
+    local vpol=${OPT[valkey.policy]:-allkeys-lru}
+    case "$vpol" in
+      allkeys-lru|allkeys-lfu|volatile-lru|volatile-lfu|volatile-ttl|allkeys-random|volatile-random|noeviction) ;;
+      *) die "--valkey policy='${vpol}' is invalid" ;;
+    esac
+    OPT[valkey.policy]=$vpol
+    local vio=${OPT[valkey.io_threads]:-1}
+    [[ $vio =~ ^[1-9][0-9]*$ ]] && (( vio <= 64 )) \
+      || die "--valkey io_threads='${vio}' is invalid (use 1..64)"
+    OPT[valkey.io_threads]=$vio
   fi
 
   if [[ ${ENABLED[elastic]:-0} -eq 1 ]]; then
@@ -639,12 +726,13 @@ validate_all() {
   fi
 
   if [[ ${ENABLED[others]:-0} -eq 1 ]]; then
-    [[ ${#OTHERS[@]} -gt 0 ]] || die "--others requires at least one of: smartmon nvme gif nodejs"
+    [[ ${#OTHERS[@]} -gt 0 ]] || die "--others requires at least one of: smartmon nvme gif nodejs fail2ban unattended sysstat composer"
     local item expanded=()
     for item in "${OTHERS[@]}"; do
       case "$item" in
-        all) expanded+=(smartmon nvme gif nodejs) ;;
-        smartmon|nvme|gif|nodejs) expanded+=("$item") ;;
+        all) expanded+=(smartmon nvme gif nodejs fail2ban unattended sysstat composer) ;;
+        smartmon|nvme|gif|nodejs|fail2ban|unattended|sysstat|composer) expanded+=("$item") ;;
+        security) expanded+=(fail2ban unattended) ;;
         *) die "--others: unknown package '${item}'" ;;
       esac
     done
@@ -933,7 +1021,7 @@ configure_hostname() {
 
 install_basic_tools() {
   step "Basic tools"
-  apt_install wget unzip nano zip software-properties-common rsync ca-certificates curl gnupg dmidecode
+  apt_install wget unzip nano zip software-properties-common rsync ca-certificates curl gnupg dmidecode git jq htop iotop openssl
 }
 
 configure_timezone() {
@@ -1051,6 +1139,45 @@ configure_sysctl() {
   record_original /etc/sysctl.d/99-sysctl.conf sysctl.d-99-sysctl.conf
 
   blob_sysctl > /etc/sysctl.conf
+
+  # Layered, hardware-aware overrides on top of the embedded profile.  These
+  # matter on busy web/database hosts: larger socket buffers, more orphan
+  # sockets, a 1 GiB SysV shared-memory segment and a small security baseline.
+  local ram_mb min_free shmall
+  ram_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
+  min_free=$(( ram_mb * 1024 / 100 ))       # 1% of RAM, in kB
+  (( min_free < 67584 ))  && min_free=67584
+  (( min_free > 262144 )) && min_free=262144
+  shmall=$(( 1073741824 / 4096 ))
+  cat >> /etc/sysctl.conf <<EOF
+
+# BEGIN setup.sh tuning
+# Larger socket buffers and connection headroom for high-request-rate sites.
+net.core.optmem_max = 262144
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.ipv4.tcp_rmem = 8192 262144 33554432
+net.ipv4.tcp_wmem = 8192 262144 33554432
+net.ipv4.tcp_max_orphans = 262144
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_keepalive_time = 120
+vm.min_free_kbytes = ${min_free}
+kernel.shmmax = 1073741824
+kernel.shmall = ${shmall}
+
+# Security hardening.
+kernel.dmesg_restrict = 1
+kernel.yama.ptrace_scope = 1
+fs.protected_hardlinks = 1
+fs.protected_symlinks = 1
+fs.protected_fifos = 2
+fs.protected_regular = 2
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+# END setup.sh tuning
+EOF
   chmod 644 /etc/sysctl.conf
   if [[ -d /etc/sysctl.d ]] && [[ ! -e /etc/sysctl.d/99-sysctl.conf ]]; then
     ln -s ../sysctl.conf /etc/sysctl.d/99-sysctl.conf
@@ -1194,6 +1321,158 @@ deploy_angie_configs() {
   sed -i -E 's|^([[:space:]]*)client_max_body_size[[:space:]]+.*|\1client_max_body_size 100m;|' \
     /etc/angie/angie.conf
 
+  # The upstream profile is intentionally aggressive.  300k connections per
+  # worker costs gigabytes of connection-slot memory on a 16-core host; 65k
+  # per worker (about 1M total here) is already far beyond a normal workload.
+  sed -i -E 's|^([[:space:]]*)worker_connections[[:space:]]+.*|\1worker_connections 65535;|' \
+    /etc/angie/angie.conf
+
+  # systemd-resolved listens on 127.0.0.53, not 127.0.0.1.  Keeping 127.0.0.1
+  # first made every dynamic DNS lookup wait for a timeout.
+  sed -i -E 's|^([[:space:]]*)resolver 127\.0\.0\.1 |\1resolver 127.0.0.53 |' \
+    /etc/angie/angie.conf
+
+  # A global 16 MB/s cap is wrong for media sites and large downloads.  The
+  # per-vhost limit_rate_after directives remain available for app templates.
+  sed -i -E 's|^([[:space:]]*)limit_rate_after[[:space:]]+.*|\1# limit_rate_after disabled by setup.sh|' \
+    /etc/angie/angie.conf
+  sed -i -E 's|^([[:space:]]*)limit_rate[[:space:]]+.*|\1# limit_rate disabled by setup.sh|' \
+    /etc/angie/angie.conf
+
+  # Three idle FastCGI connections per worker is far too few for a busy PHP
+  # app; reuse 64 per upstream worker instead.
+  sed -i -E 's|^([[:space:]]*)keepalive 3;|\1keepalive 64;|' /etc/angie/angie.conf
+
+  # Angie does not ship the Ubuntu nginx FastCGI snippet, but every embedded
+  # PHP template includes it.  Without this file every PHP vhost fails -t.
+  mkdir -p /etc/angie/snippets
+  cat > /etc/angie/snippets/fastcgi-php.conf <<'EOF'
+# Managed by setup.sh (compatible with the Ubuntu nginx snippet)
+fastcgi_split_path_info ^(.+?\.php)(/.*)$;
+try_files $fastcgi_script_name =404;
+set $path_info $fastcgi_path_info;
+fastcgi_param PATH_INFO $path_info;
+fastcgi_index index.php;
+include fastcgi.conf;
+EOF
+  chmod 644 /etc/angie/snippets/fastcgi-php.conf
+
+  # The embedded repository stores optional snippets without a .conf suffix,
+  # so Angie's "include http.d/*.conf" silently skipped them.  Enable only the
+  # snippets that need no extra Angie modules (brotli/zstd/waf/trim are not
+  # compiled into the distro package).
+  local f lr pair
+  for lr in high medium; do
+    if [[ -f "/etc/angie/h5bp/limit_req/_${lr}_conf" ]]; then
+      install -m 644 "/etc/angie/h5bp/limit_req/_${lr}_conf" \
+        "/etc/angie/h5bp/limit_req/_${lr}.conf"
+      if [[ $lr == medium ]]; then
+        sed -i -E 's/burst=10 /burst=30 /; s/burst=20 /burst=100 /' \
+          "/etc/angie/h5bp/limit_req/_${lr}.conf"
+      else
+        sed -i -E 's/burst=10 /burst=50 /; s/burst=200 /burst=500 /' \
+          "/etc/angie/h5bp/limit_req/_${lr}.conf"
+      fi
+    fi
+  done
+  for pair in \
+      "fastcgi_cache_conf:fastcgi_cache" \
+      "fastcgi_cache_chev_conf:fastcgi_cache_chev" \
+      "xf_proxy_cache_conf:xf_proxy_cache" \
+      "xf_websocket_conf:xf_websocket" \
+      "limit_req_conf:limit_req" \
+      "referer_map_conf:referer_map"; do
+    f="/etc/angie/http.d/${pair%%:*}"
+    [[ -f $f ]] && install -m 644 "$f" "/etc/angie/http.d/${pair##*:}.conf"
+  done
+
+  # Rate limiting is useful against one abusive client, but it must not punish
+  # local health checks, load balancers or a busy reverse proxy that does not
+  # set real_ip.  Loopback is exempt; the per-IP rates are also raised for
+  # modern forum/API traffic.
+  if [[ -f /etc/angie/http.d/limit_req.conf ]]; then
+    cat > /etc/angie/http.d/limit_req_whitelist.conf <<'EOF'
+# Managed by setup.sh
+geo $limit_req_whitelist {
+    default 0;
+    127.0.0.0/8 1;
+    ::1/128     1;
+}
+map $limit_req_whitelist $limit_req_key {
+    default $binary_remote_addr;
+    1       "";
+}
+EOF
+    chmod 644 /etc/angie/http.d/limit_req_whitelist.conf
+    sed -i -E \
+      -e 's/\$binary_remote_addr/$limit_req_key/g' \
+      -e 's/rate=30r\/s/rate=100r\/s/' \
+      -e 's/rate=15r\/s/rate=30r\/s/' \
+      -e 's/limit_req_status 444/limit_req_status 429/' \
+      /etc/angie/http.d/limit_req.conf
+    grep -q '^limit_req_log_level' /etc/angie/http.d/limit_req.conf \
+      || printf 'limit_req_log_level warn;\n' >> /etc/angie/http.d/limit_req.conf
+  fi
+
+  for f in /home/nginx_cache /home/nginx_cache_chev /home/xf_proxy_cache \
+           /home/proxy_cache /home/proxy_cdn; do
+    mkdir -p "$f"
+    chown www-data:www-data "$f"
+    chmod 750 "$f"
+  done
+  cat > /etc/angie/http.d/98_setup_cache.conf <<'EOF'
+# Managed by setup.sh
+proxy_cache_path /home/proxy_cache levels=1:2 keys_zone=proxy_cache:128m
+                 max_size=16g inactive=7d use_temp_path=off;
+proxy_cache_path /home/proxy_cdn levels=1:2 keys_zone=proxy_cdn:128m
+                 max_size=16g inactive=7d use_temp_path=off;
+EOF
+  chmod 644 /etc/angie/http.d/98_setup_cache.conf
+
+  # Repair a few known defects in the embedded upstream templates so every
+  # shipped sample passes "angie -t" without hand editing.
+  if [[ -f /etc/angie/conf.d/templates/sample_psi.conf ]]; then
+    sed -i '/include h5bp\/hostname_ssl.conf;/d' \
+      /etc/angie/conf.d/templates/sample_psi.conf
+    sed -i 's#/var/www/psi_data/error.log#/var/log/angie/psi_error.log#' \
+      /etc/angie/conf.d/templates/sample_psi.conf
+  fi
+  if [[ -f /etc/angie/conf.d/templates/sample_proxy_pass.conf ]]; then
+    sed -i '/include h5bp\/proxy_pass.conf;/d' \
+      /etc/angie/conf.d/templates/sample_proxy_pass.conf
+    sed -i 's/;;/;/g' /etc/angie/conf.d/templates/sample_proxy_pass.conf
+  fi
+  if [[ -f /etc/angie/conf.d/templates/sample_proxy.conf ]]; then
+    sed -i 's#/var/www/cdn.domain.com/error.log#/var/log/angie/cdn_error.log#' \
+      /etc/angie/conf.d/templates/sample_proxy.conf
+  fi
+  if [[ -f /etc/angie/conf.d/templates/sample_pingvin.conf ]]; then
+    sed -i 's#/var/www/pingvin_data/nginx_error.log#/var/log/angie/pingvin_error.log#' \
+      /etc/angie/conf.d/templates/sample_pingvin.conf
+  fi
+
+  # Session tickets are not rotated; 0-RTT early data is replayable for
+  # state-changing requests.  Disable both by default (enable per vhost if the
+  # app explicitly handles replay protection).
+  sed -i -E 's|^([[:space:]]*)ssl_session_tickets[[:space:]]+on;|\1ssl_session_tickets off;|' \
+    /etc/angie/h5bp/tls/ssl_engine.conf
+  sed -i -E 's|^([[:space:]]*)ssl_early_data[[:space:]]+on;|\1ssl_early_data off;|' \
+    /etc/angie/h5bp/tls/policy_balanced.conf
+
+  # 512 x 32k buffers per FastCGI response can pin ~16 MB for every concurrent
+  # PHP request.  128 x 32k (4 MB) still handles large pages and uploads.
+  local phpconf
+  for phpconf in /etc/angie/h5bp/php*.conf; do
+    [[ -f $phpconf ]] || continue
+    sed -i -E \
+      -e 's|fastcgi_buffers 512 32k;|fastcgi_buffers 128 32k;|' \
+      -e 's|fastcgi_busy_buffers_size 1m;|fastcgi_busy_buffers_size 2m;|' \
+      -e 's|fastcgi_temp_file_write_size 4m;|fastcgi_temp_file_write_size 16m;|' \
+      -e 's|fastcgi_max_temp_file_size 4m;|fastcgi_max_temp_file_size 16m;|' \
+      -e 's|fastcgi_param PATH_TRANSLATED \$document_root\$fastcgi_path_info;|fastcgi_param PATH_TRANSLATED $document_root$fastcgi_script_name;|' \
+      "$phpconf"
+  done
+
   # Small managed overrides layered on top of the embedded tree.  open_file_cache
   # helps static-heavy sites by caching file descriptors and metadata.
   cat > /etc/angie/http.d/99_setup_overrides.conf <<'EOF'
@@ -1201,6 +1480,23 @@ deploy_angie_configs() {
 open_file_cache max=100000 inactive=30s;
 open_file_cache_min_uses 2;
 open_file_cache_errors on;
+gzip_static on;
+
+# Cache tuning for the XenForo / Chevereto snippets.
+fastcgi_cache_background_update on;
+fastcgi_cache_lock_age 5s;
+fastcgi_cache_lock_timeout 10s;
+fastcgi_cache_revalidate on;
+
+# Per-IP connection accounting.  Apply with "limit_conn perip 200;" in a
+# vhost only when traffic is not proxied through a shared CDN address.
+limit_conn_zone $binary_remote_addr zone=perip:32m;
+
+# Useful for diagnosing slow PHP/DB requests; use with access_log ... perf;
+log_format perf '$remote_addr - $remote_user [$time_local] "$request" '
+                '$status $body_bytes_sent "$http_referer" "$http_user_agent" '
+                'rt=$request_time uct=$upstream_connect_time '
+                'uht=$upstream_header_time urt=$upstream_response_time';
 EOF
   chmod 644 /etc/angie/http.d/99_setup_overrides.conf
 
@@ -1325,9 +1621,15 @@ install_php() {
     die "Port 9000 is already in use by another process. Only one PHP version can run at a time; free the port first."
   fi
 
+  # Extensions required by XenForo, WordPress, Chevereto, Polr, Lychee and
+  # most other PHP applications.  They are small and avoid the usual
+  # "missing intl / bcmath / imagick / exif" support tickets later.
   apt_install "php${ver}-fpm" "php${ver}-cli" "php${ver}-mysql" "php${ver}-gd" \
     "php${ver}-curl" "php${ver}-xml" "php${ver}-zip" "php${ver}-gmp" \
-    "php${ver}-mbstring" "php${ver}-redis"
+    "php${ver}-mbstring" "php${ver}-redis" "php${ver}-intl" \
+    "php${ver}-bcmath" "php${ver}-imagick" "php${ver}-soap" \
+    "php${ver}-ldap" "php${ver}-apcu" "php${ver}-igbinary" \
+    "php${ver}-msgpack" "php${ver}-sqlite3" "php${ver}-bz2"
 
   cat > "/etc/php/${ver}/fpm/pool.d/www.conf" <<'EOF'
 [global]
@@ -1357,7 +1659,7 @@ listen.mode = 0660
 
 pm = static
 
-; 50% of RAM / 256 MB per worker, capped at CPU threads x 8
+; ~50% of RAM / 128 MB per worker, capped at CPU threads x 8
 pm.max_children = 64
 
 ; CPU_thread x 1024
@@ -1367,17 +1669,40 @@ rlimit_files = 524288
 rlimit_core = 0
 
 request_terminate_timeout = 100s
+request_slowlog_timeout = 5s
 slowlog = /var/log/php-fpm/www-slow.log
+catch_workers_output = yes
 security.limit_extensions = .php
 EOF
 
   local ram_mb max_children max_requests max_by_cpu
+  local opcache_mb jit_mb memory_mb realpath_kb
   ram_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
   max_children=$(( ram_mb / 256 ))         # ~50% of RAM at 128 MB/worker
   max_by_cpu=$(( $(nproc) * 8 ))
   (( max_children > max_by_cpu )) && max_children=$max_by_cpu
   (( max_children < 1 )) && max_children=1
   max_requests=$(( $(nproc) * 1024 ))       # CPU threads * 1024
+  if [[ -n ${OPT[php.children]:-} && ${OPT[php.children]} != auto ]]; then
+    max_children=${OPT[php.children]}
+    info "PHP max_children overridden to ${max_children}"
+  fi
+  if [[ -n ${OPT[php.max_requests]:-} ]]; then
+    max_requests=${OPT[php.max_requests]}
+  fi
+
+  opcache_mb=$(( ram_mb / 16 ))
+  (( opcache_mb < 128 )) && opcache_mb=128
+  (( opcache_mb > 512 )) && opcache_mb=512
+  jit_mb=$(( ram_mb / 64 ))
+  (( jit_mb < 64 )) && jit_mb=64
+  (( jit_mb > 256 )) && jit_mb=256
+  memory_mb=$(( ram_mb / 8 ))
+  (( memory_mb < 256 )) && memory_mb=256
+  (( memory_mb > 512 )) && memory_mb=512
+  realpath_kb=$(( ram_mb * 2 ))
+  (( realpath_kb < 4096 )) && realpath_kb=4096
+  (( realpath_kb > 16384 )) && realpath_kb=16384
 
   sed -i -E "s|^pm\.max_children[[:space:]]*=.*|pm.max_children = ${max_children}|" \
     "/etc/php/${ver}/fpm/pool.d/www.conf"
@@ -1389,12 +1714,17 @@ EOF
 expose_php = Off
 allow_url_fopen = Off
 allow_url_include = Off
+cgi.fix_pathinfo = 0
 
+realpath_cache_size = 4096k
 realpath_cache_ttl = 43200
 max_input_nesting_level = 128
 max_input_vars = 10000
-mysqlnd.net_cmd_buffer_size = 16384
-always_populate_raw_post_data = -1
+mysqlnd.net_cmd_buffer_size = 524288
+mysqli.default_socket = /run/mysqld/mysqld.sock
+pdo_mysql.default_socket = /run/mysqld/mysqld.sock
+mysqlnd.collect_statistics = Off
+mysqlnd.collect_memory_statistics = Off
 
 date.timezone = Asia/Manila
 
@@ -1402,33 +1732,64 @@ max_execution_time = 100
 max_input_time = 100
 
 memory_limit = 512M
+opcache.enable = 1
+opcache.enable_cli = 0
 opcache.memory_consumption = 512
+opcache.interned_strings_buffer = 32
+opcache.max_wasted_percentage = 10
 opcache.jit_buffer_size = 512M
 opcache.jit = tracing
+opcache.file_cache = /var/cache/php/opcache
+opcache.file_cache_only = 0
 
+opcache.validate_timestamps = 1
 opcache.revalidate_freq = 60
 opcache.max_accelerated_files = 128256
 
 upload_max_filesize = 100M
 post_max_size = 100M
 
-; Default PHP
-;disable_functions = show_source,system,shell_exec,passthru,exec,phpinfo,popen,proc_open,allow_url_fopen,curl_exec,curl_multi_exec
+; Session hardening (apps may override cookie_samesite as needed).
+session.use_strict_mode = 1
+session.use_only_cookies = 1
+session.cookie_httponly = 1
+session.cookie_samesite = Lax
+session.sid_length = 48
+session.sid_bits_per_character = 6
 
-; XF2
-disable_functions = show_source,system,passthru,allow_url_fopen
+; Default PHP
+;disable_functions = show_source,system,shell_exec,passthru,exec,phpinfo,popen,proc_open,curl_exec,curl_multi_exec
+
+; XF2 / WordPress / Chevereto / Lychee / Polr
+disable_functions = show_source,system,passthru,phpinfo
 
 ; Chev
-;disable_functions = show_source,system,shell_exec,passthru,exec,phpinfo,popen,allow_url_fopen,curl_multi_exec
+;disable_functions = show_source,system,shell_exec,passthru,exec,phpinfo,popen,curl_multi_exec
 
 ; Lychee
-;disable_functions = show_source,system,shell_exec,passthru,phpinfo,popen,allow_url_fopen,curl_exec,curl_multi_exec
+;disable_functions = show_source,system,shell_exec,passthru,phpinfo,popen,curl_exec,curl_multi_exec
 
 ; WP
-;disable_functions = php_uname,getmyuid,getmypid,passthru,leak,listen,diskfreespace,tmpfile,link,ignore_user_abord,shell_exec,dl,exec,system,highlight_file,source,show_source,fpaththru,virtual,posix_ctermid,posix_getcwd,posix_getegid,posix_geteuid,posix_getgid,posix_getgrgid,posix_getgrnam,posix_getgroups,posix_getlogin,posix_getpgid,posix_getpgrp,posix_getpid,posix_getppid,posix_getpwnam,posix_getpwuid,posix_getrlimit,posix_getsid,posix_getuid,posix_isatty,posix_kill,posix_mkfifo,posix_setegid,posix_seteuid,posix_setgid,posix_setpgid,posix_setsid,posix_setuid,posix_times,posix_ttyname,posix_uname,proc_open,proc_close,proc_get_status,proc_nice,proc_terminate,phpinfo,popen,allow_url_fopen,curl_exec,curl_multi_exec
+;disable_functions = php_uname,getmyuid,getmypid,passthru,leak,listen,diskfreespace,tmpfile,link,ignore_user_abord,shell_exec,dl,exec,system,highlight_file,source,show_source,fpaththru,virtual,posix_ctermid,posix_getcwd,posix_getegid,posix_geteuid,posix_getgid,posix_getgrgid,posix_getgrnam,posix_getgroups,posix_getlogin,posix_getpgid,posix_getpgrp,posix_getpid,posix_getppid,posix_getpwnam,posix_getpwuid,posix_getrlimit,posix_getsid,posix_getuid,posix_isatty,posix_kill,posix_mkfifo,posix_setegid,posix_seteuid,posix_setgid,posix_setpgid,posix_setsid,posix_setuid,posix_times,posix_ttyname,posix_uname,proc_open,proc_close,proc_get_status,proc_nice,proc_terminate,phpinfo,popen,curl_exec,curl_multi_exec
 EOF
-  sed -i "s|^date\.timezone = .*|date.timezone = ${tz}|" \
+  sed -i -E \
+    -e "s|^date\.timezone = .*|date.timezone = ${tz}|" \
+    -e "s|^memory_limit = .*|memory_limit = ${memory_mb}M|" \
+    -e "s|^opcache\.memory_consumption = .*|opcache.memory_consumption = ${opcache_mb}|" \
+    -e "s|^opcache\.jit_buffer_size = .*|opcache.jit_buffer_size = ${jit_mb}M|" \
+    -e "s|^realpath_cache_size = .*|realpath_cache_size = ${realpath_kb}k|" \
     "/etc/php/${ver}/fpm/conf.d/custom_dan.ini"
+
+  mkdir -p /var/cache/php/opcache /var/log/php-fpm
+  chown -R www-data:www-data /var/cache/php /var/log/php-fpm
+  chmod 750 /var/cache/php /var/cache/php/opcache /var/log/php-fpm
+
+  mkdir -p "/etc/systemd/system/php${ver}-fpm.service.d"
+  cat > "/etc/systemd/system/php${ver}-fpm.service.d/limits.conf" <<'EOF'
+[Service]
+LimitNOFILE=524288
+EOF
+  systemctl daemon-reload
 
   # Only one PHP-FPM version can own the documented 127.0.0.1:9000 socket.
   # (The conflict was checked before apt_install; this just clears any
@@ -1437,7 +1798,7 @@ EOF
   systemctl enable --now "php${ver}-fpm"
   systemctl restart "php${ver}-fpm"
   systemctl status "php${ver}-fpm" --no-pager || true
-  php -v
+  "php${ver}" -v
   ok "PHP ${ver} installed"
 }
 
@@ -1487,15 +1848,39 @@ configure_mariadb_apparmor() {
   fi
 }
 
+mariadb_io_capacity() {
+  if is_nvme_storage; then
+    printf '4000 8000'
+  elif lsblk -d -n -o ROTA 2>/dev/null | grep -q '^0'; then
+    printf '2000 4000'
+  else
+    printf '400 800'
+  fi
+}
+
 configure_mariadb() {
   local size_mb=$1 bind=$2
   local cnf=/etc/mysql/mariadb.conf.d/50-server.cnf
-  local buffer logsize threads max_conn
+  local buffer logsize threads max_conn instances open_cache aria_mb
+  local io_read io_write
   [[ -f $cnf ]] || die "MariaDB config ${cnf} not found"
 
+  logsize=$(( size_mb / 4 ))
+  (( logsize < 64 )) && logsize=64
+  (( logsize > 2048 )) && logsize=2048
   buffer=$(mb_to_config "$size_mb")
-  logsize=$(mb_to_config "$(( size_mb / 4 ))")
+  logsize=$(mb_to_config "$logsize")
+  instances=$(( size_mb / 1024 ))
+  (( instances < 1 )) && instances=1
+  (( instances > 8 )) && instances=8
+  open_cache=4000
+  (( size_mb >= 4096 )) && open_cache=8000
+  aria_mb=$(( size_mb / 16 ))
+  (( aria_mb < 16 )) && aria_mb=16
+  (( aria_mb > 256 )) && aria_mb=256
+  read -r io_read io_write <<< "$(mariadb_io_capacity)"
   threads=$(nproc)
+  (( threads > 64 )) && threads=64
   max_conn=$(( threads * 25 ))
   (( max_conn > 500 )) && max_conn=500
   (( max_conn < 100 )) && max_conn=100
@@ -1527,39 +1912,63 @@ skip_name_resolve = 1
 query_cache_size = 0
 query_cache_type = 0
 open_files_limit = 524288
+secure_file_priv = /var/lib/mysql-files
+local_infile = 0
 
 max_connections = ${max_conn}
 max_connect_errors = 524288
 thread_cache_size = 64
+# PHP opens a fresh, short-lived connection for most requests.  The thread
+# pool removes the connection/thread-creation tail latency that otherwise
+# shows up as multi-hundred-ms p99 spikes in web workloads.
+thread_handling = pool-of-threads
+thread_pool_size = ${threads}
+max_allowed_packet = 64M
+wait_timeout = 600
+interactive_timeout = 600
+net_read_timeout = 120
+net_write_timeout = 120
 
 innodb_log_buffer_size = 64M
 innodb_log_file_size = ${logsize}
 innodb_buffer_pool_size = ${buffer}
+innodb_buffer_pool_instances = ${instances}
 
 innodb_flush_log_at_trx_commit = 2
 innodb_read_only_compressed = OFF
 innodb_lock_wait_timeout = 100
 innodb_flush_neighbors = 0
+innodb_stats_persistent = ON
+innodb_stats_auto_recalc = ON
+innodb_lru_scan_depth = 2048
 
-innodb_io_capacity = 3000
-innodb_io_capacity_max = 6000
+innodb_io_capacity = ${io_read}
+innodb_io_capacity_max = ${io_write}
 
 innodb_read_io_threads = ${threads}
 innodb_write_io_threads = ${threads}
 
-join_buffer_size = 1M
-read_buffer_size = 1M
-sort_buffer_size = 2M
+join_buffer_size = 512K
+read_buffer_size = 512K
+read_rnd_buffer_size = 512K
+sort_buffer_size = 1M
 
 tmp_table_size = 64M
 max_heap_table_size = 64M
 
-table_open_cache = 4000
-table_definition_cache = 4000
-innodb_open_files = 4000
+table_open_cache = ${open_cache}
+table_definition_cache = ${open_cache}
+innodb_open_files = ${open_cache}
 key_buffer_size = 32M
 
-aria_pagecache_buffer_size = 256M
+aria_pagecache_buffer_size = ${aria_mb}M
+
+slow_query_log = 1
+slow_query_log_file = /var/log/mariadb/slow.log
+long_query_time = 1
+min_examined_row_limit = 100
+log_slow_verbosity = query_plan,explain
+
 log_error = /var/log/mariadb/error.log
 bind-address = ${bind}
 ${MARIADB_END}
@@ -1574,8 +1983,17 @@ install_mariadb() {
   local size_mb
   step "MariaDB"
 
-  size_mb=$(size_to_mb "$size")
-  [[ -n $size_mb ]] || die "Could not parse MariaDB size '${size}'"
+  if [[ ${size,,} == auto ]]; then
+    local ram_mb
+    ram_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
+    size_mb=$(( ram_mb * 40 / 100 ))
+    (( size_mb < 256 )) && size_mb=256
+    (( size_mb > 32768 )) && size_mb=32768
+    info "MariaDB size=auto resolved to $(mb_to_config "$size_mb") (40% of RAM)"
+  else
+    size_mb=$(size_to_mb "$size")
+    [[ -n $size_mb ]] || die "Could not parse MariaDB size '${size}'"
+  fi
 
   bind=${OPT[mariadb.bind]:-127.0.0.1}
   if ! resolve_mariadb_bind "$bind"; then
@@ -1609,13 +2027,18 @@ install_mariadb() {
   mkdir -p /etc/systemd/system/mariadb.service.d
   cat > /etc/systemd/system/mariadb.service.d/limits.conf <<'EOF'
 [Service]
-LimitNOFILE=524288
+LimitNOFILE=1048576
+LimitCORE=0
+# Silence the package unit's "unset environment variable" journal warning.
+Environment=MYSQLD_OPTS=
+Environment=_WSREP_NEW_CLUSTER=
 EOF
 
   configure_mariadb "$size_mb" "$bind"
 
-  mkdir -p /var/log/mariadb
-  chown -R mysql:mysql /var/log/mariadb
+  mkdir -p /var/log/mariadb /var/lib/mysql-files
+  chown -R mysql:mysql /var/log/mariadb /var/lib/mysql-files
+  chmod 750 /var/lib/mysql-files
   systemctl daemon-reload
 
   local i
@@ -1686,36 +2109,92 @@ EOF
 # ---------------------------------------------------------------------------
 install_valkey() {
   step "Valkey"
-  apt-get purge -y redis-server || true
+  if pkg_ok redis-server; then
+    warn "redis-server is installed; Valkey replaces it because both bind port 6379"
+    apt-get purge -y redis-server || true
+  fi
   apt_clean
   apt_install valkey-server
 
   local conf=/etc/valkey/valkey.conf
   [[ -f $conf ]] || die "Valkey config ${conf} not found"
 
-  local line ram_mb valkey_mb
+  local line ram_mb valkey_mb policy io_threads
   ram_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
-  valkey_mb=$(( ram_mb / 10 ))          # ~10% of RAM for cache
-  (( valkey_mb < 256 )) && valkey_mb=256
-  (( valkey_mb > 8192 )) && valkey_mb=8192
+  if [[ -n ${OPT[valkey.ram]:-} ]]; then
+    valkey_mb=$(size_to_mb "${OPT[valkey.ram]}")
+  else
+    valkey_mb=$(( ram_mb / 10 ))          # ~10% of RAM for cache
+    (( valkey_mb < 256 )) && valkey_mb=256
+    (( valkey_mb > 8192 )) && valkey_mb=8192
+  fi
+  policy=${OPT[valkey.policy]:-allkeys-lru}
+  # For typical web-cache command sizes, extra I/O threads add more CPU
+  # contention than throughput.  Benchmarks on a 16-core host showed
+  # io-threads=1 at 6.5k full-page req/s vs 5.1k at io-threads=8.
+  io_threads=${OPT[valkey.io_threads]:-1}
 
   # Normalise the directives this script owns: remove active copies, then
   # append the canonical values once.  This also upgrades old profiles that
   # had "protected-mode no" without leaving contradictory duplicates.
-  sed -i -E '/^[[:space:]]*(bind|protected-mode|save|maxmemory|maxmemory-policy|maxmemory-samples|supervised)[[:space:]]/d' "$conf"
-  local -a vlines=('supervised systemd' 'save ""' "maxmemory ${valkey_mb}mb"
-                   'maxmemory-policy allkeys-lru' 'maxmemory-samples 10'
-                   'bind 127.0.0.1 -::1' 'protected-mode yes')
+  sed -i -E '/^[[:space:]]*(bind|protected-mode|save|maxmemory|maxmemory-policy|maxmemory-samples|supervised|io-threads|io-threads-do-reads|tcp-backlog|tcp-keepalive|timeout|maxclients|hz|appendonly|lazyfree-[a-z-]+|unixsocket|unixsocketperm)[[:space:]]/d' "$conf"
+  local -a vlines=(
+    'supervised systemd'
+    'save ""'
+    'appendonly no'
+    "maxmemory ${valkey_mb}mb"
+    "maxmemory-policy ${policy}"
+    'maxmemory-samples 10'
+    'bind 127.0.0.1 -::1'
+    'protected-mode yes'
+    'unixsocket /run/valkey/valkey.sock'
+    'unixsocketperm 770'
+    'tcp-backlog 65535'
+    'timeout 0'
+    'tcp-keepalive 300'
+    'maxclients 20000'
+    'hz 10'
+    "io-threads ${io_threads}"
+    'io-threads-do-reads yes'
+    'lazyfree-lazy-eviction yes'
+    'lazyfree-lazy-expire yes'
+    'lazyfree-lazy-server-del yes'
+    'lazyfree-lazy-user-del yes'
+    'lazyfree-lazy-user-flush yes'
+  )
   for line in "${vlines[@]}"; do
     printf '%s\n' "$line" >> "$conf"
   done
-  info "Valkey maxmemory: ${valkey_mb} MB (~10% of RAM)"
-  tail -8 "$conf"
+  info "Valkey maxmemory: ${valkey_mb} MB ($(printf '%s' "$policy"); ~10% of RAM by default)"
+  tail -20 "$conf"
+
+  mkdir -p /etc/systemd/system/valkey-server.service.d
+  cat > /etc/systemd/system/valkey-server.service.d/limits.conf <<'EOF'
+[Service]
+LimitNOFILE=524288
+LimitCORE=0
+EOF
+  systemctl daemon-reload
+
+  # Local PHP workers should use the Unix socket instead of opening a fresh
+  # TCP connection (and burning an ephemeral port) for every request.
+  if getent group valkey >/dev/null 2>&1; then
+    if ! id -nG www-data 2>/dev/null | grep -qw valkey; then
+      usermod -aG valkey www-data || warn "Could not add www-data to the valkey group"
+    fi
+  fi
 
   valkey-server -v
   systemctl enable --now valkey-server
   systemctl restart valkey-server
   systemctl status valkey-server -l --no-pager || true
+
+  # Refresh PHP-FPM workers so they inherit the valkey supplementary group.
+  local unit
+  while IFS= read -r unit; do
+    [[ -n $unit ]] || continue
+    systemctl restart "$unit" 2>/dev/null || true
+  done < <(systemctl list-units --type=service --state=active --no-legend 'php*-fpm.service' 2>/dev/null | awk '{print $1}')
 
   local i
   for i in {1..20}; do
@@ -1774,8 +2253,13 @@ install_elastic() {
   fi
   sysctl -w vm.max_map_count=1048576 >/dev/null || warn "Could not set vm.max_map_count"
 
-  local yml=/etc/elasticsearch/elasticsearch.yml
+  local yml=/etc/elasticsearch/elasticsearch.yml es_url
   [[ -f $yml ]] || die "Elasticsearch config ${yml} not found"
+  if [[ $host == *:* ]]; then
+    es_url="http://[${host}]:9200"
+  else
+    es_url="http://${host}:9200"
+  fi
 
   # Remove previous managed block.
   awk -v b="$ES_BEGIN" -v e="$ES_END" '
@@ -1790,17 +2274,26 @@ install_elastic() {
   for key in cluster.name network.host http.host transport.host http.port \
              indices.query.bool.max_clause_count discovery.type \
              xpack.security.enabled xpack.security.enrollment.enabled \
-             cluster.initial_master_nodes; do
+             cluster.initial_master_nodes indices.memory.index_buffer_size \
+             indices.fielddata.cache.size search.max_buckets \
+             action.destructive_requires_name http.compression \
+             http.max_content_length; do
     sed -i -E "s|^[[:space:]]*${key}[[:space:]]*:.*|#&|" "$yml"
   done
 
   cat >> "$yml" <<EOF
 ${ES_BEGIN}
 cluster.name: essearch
-network.host: ${host}
+network.host: "${host}"
 http.port: 9200
 bootstrap.memory_lock: true
 indices.query.bool.max_clause_count: 4096
+indices.memory.index_buffer_size: 20%
+indices.fielddata.cache.size: 20%
+search.max_buckets: 65536
+action.destructive_requires_name: true
+http.compression: true
+http.max_content_length: 200mb
 discovery.type: single-node
 xpack.security.enabled: false
 xpack.security.enrollment.enabled: false
@@ -1812,13 +2305,17 @@ EOF
   cat > /etc/systemd/system/elasticsearch.service.d/limits.conf <<'EOF'
 [Service]
 LimitMEMLOCK=infinity
-LimitNOFILE=65535
+LimitNOFILE=1048576
+LimitNPROC=4096
 EOF
 
   mkdir -p /etc/elasticsearch/jvm.options.d
   cat > /etc/elasticsearch/jvm.options.d/jvm.options <<EOF
 -Xms${ram_lc}
 -Xmx${ram_lc}
+-XX:+UseG1GC
+-XX:MaxGCPauseMillis=200
+-XX:+HeapDumpOnOutOfMemoryError
 -Dlog4j2.formatMsgNoLookups=true
 EOF
   chown root:elasticsearch /etc/elasticsearch/jvm.options.d/jvm.options 2>/dev/null || true
@@ -1836,7 +2333,7 @@ EOF
 
   local i
   for i in {1..180}; do
-    if curl -fsS "http://${host}:9200" >/dev/null 2>&1; then
+    if curl -fsS "$es_url" >/dev/null 2>&1; then
       break
     fi
     if (( i >= 180 )); then
@@ -1845,12 +2342,12 @@ EOF
     sleep 1
   done
 
-  if ! curl -fsS "http://${host}:9200" >/dev/null 2>&1; then
+  if ! curl -fsS "$es_url" >/dev/null 2>&1; then
     journalctl -u elasticsearch -n 80 --no-pager || true
     die "Elasticsearch did not become ready on ${host}:9200"
   fi
 
-  curl -fsS "http://${host}:9200" || true
+  curl -fsS "$es_url" || true
   echo
   ok "Elasticsearch installed and running"
 }
@@ -1910,6 +2407,60 @@ EOF
         apt_install nodejs
         node -v
         ;;
+      fail2ban)
+        info "Installing fail2ban (UFW-backed SSH protection)"
+        pkg_record_origin fail2ban
+        pkg_record_origin python3-systemd
+        apt_install fail2ban python3-systemd
+        mkdir -p /etc/fail2ban/jail.d
+        cat > /etc/fail2ban/jail.d/setup-ssh.local <<'EOF'
+[DEFAULT]
+backend = systemd
+banaction = ufw
+bantime = 1h
+findtime = 10m
+maxretry = 5
+
+[sshd]
+enabled = true
+EOF
+        chmod 644 /etc/fail2ban/jail.d/setup-ssh.local
+        systemctl enable --now fail2ban 2>/dev/null || warn "fail2ban could not be started"
+        fail2ban-client status 2>/dev/null || true
+        ;;
+      unattended)
+        info "Enabling unattended security updates"
+        pkg_record_origin unattended-upgrades
+        apt_install unattended-upgrades
+        cat > /etc/apt/apt.conf.d/52setup-unattended <<'EOF'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Automatic-Reboot "false";
+EOF
+        chmod 644 /etc/apt/apt.conf.d/52setup-unattended
+        systemctl enable --now apt-daily.timer apt-daily-upgrade.timer 2>/dev/null \
+          || warn "Could not enable apt daily timers"
+        ;;
+      sysstat)
+        info "Installing sysstat (sar/iostat history)"
+        pkg_record_origin sysstat
+        apt_install sysstat
+        if [[ -f /etc/default/sysstat ]]; then
+          sed -i -E 's/^ENABLED=.*/ENABLED="true"/' /etc/default/sysstat
+        fi
+        systemctl enable --now sysstat-collect.timer sysstat-summary.timer 2>/dev/null \
+          || systemctl enable --now sysstat 2>/dev/null \
+          || warn "sysstat timers could not be enabled"
+        ;;
+      composer)
+        info "Installing Composer"
+        pkg_record_origin composer
+        apt_install composer
+        composer --version 2>/dev/null | head -n 1 || true
+        ;;
     esac
   done
   ok "Other packages installed"
@@ -1928,24 +2479,206 @@ create_domains() {
     || die "MariaDB client not found. Install MariaDB with --mariadb first."
   systemctl is-active --quiet mariadb \
     || die "MariaDB is not running. Install/start it with --mariadb first."
+  command -v openssl >/dev/null 2>&1 || apt_install openssl
 
-  local d db dir conf
+  local d db dir conf app certdir src tmp changed=0
   for d in "${DOMAINS[@]}"; do
+    app=${DOMAIN_APP[$d]:-blank}
     db=$(domain_to_db "$d")
     dir="/var/www/${d}/public"
     conf="/etc/angie/conf.d/${d}.conf"
+    certdir="/etc/angie/ssl/${d}"
 
-    mkdir -p "$dir"
+    mkdir -p "$dir" /var/log/angie
     chown -R www-data:www-data "/var/www/${d}"
     chmod 755 "/var/www/${d}" "$dir"
     info "Directory: ${dir}"
 
-    if [[ -e $conf || -L $conf ]]; then
-      info "Angie config already exists: ${conf}"
+    if [[ $app != blank ]]; then
+      mkdir -p "$certdir"
+      chmod 700 "$certdir"
+      if [[ ! -s "${certdir}/fullchain.pem" || ! -s "${certdir}/privkey.pem" ]]; then
+        info "Generating a self-signed certificate for ${d}"
+        openssl req -x509 -nodes -newkey rsa:2048 -days 397 \
+          -subj "/CN=${d}" \
+          -addext "subjectAltName=DNS:${d},DNS:www.${d}" \
+          -keyout "${certdir}/privkey.pem" \
+          -out "${certdir}/fullchain.pem" >/dev/null 2>&1 \
+          || die "Could not generate a certificate for ${d}"
+        chmod 600 "${certdir}/privkey.pem"
+        chmod 644 "${certdir}/fullchain.pem"
+      fi
+    fi
+
+    # Never overwrite an existing non-empty vhost; the operator may have
+    # customised it.  Empty placeholder files are upgraded.
+    if [[ -e $conf && -s $conf ]]; then
+      info "Angie config already exists and is non-empty; keeping ${conf}"
     else
-      : > "$conf"
-      chmod 644 "$conf"
-      info "Created blank Angie config: ${conf}"
+      tmp=$(mktemp)
+      case "$app" in
+        blank)
+          : > "$tmp"
+          ;;
+        xf)
+          src=/etc/angie/conf.d/templates/sample_xf.conf
+          [[ -f $src ]] || die "Missing Angie template ${src}"
+          cp "$src" "$tmp"
+          sed -i -e "s|domain\.com|${d}|g" -e "s|sample\.com|${d}|g" \
+            -e "s#/etc/letsencrypt/live/${d}/fullchain.pem#${certdir}/fullchain.pem#g" \
+            -e "s#/etc/letsencrypt/live/${d}/privkey.pem#${certdir}/privkey.pem#g" \
+            -e "s#/var/www/html/${d}/websocket.log#/var/log/angie/${d}-websocket.log#g" \
+            "$tmp"
+          ;;
+        wordpress)
+          src=/etc/angie/conf.d/templates/sample_wordpress.conf
+          [[ -f $src ]] || die "Missing Angie template ${src}"
+          cp "$src" "$tmp"
+          sed -i -e "s|domain\.com|${d}|g" -e "s|sample\.com|${d}|g" \
+            -e "s|include h5bp/hostname_ssl.conf;|include h5bp/tls/ssl_engine.conf;\n    include h5bp/tls/policy_balanced.conf;\n    ssl_certificate     ${certdir}/fullchain.pem;\n    ssl_certificate_key ${certdir}/privkey.pem;|g" \
+            "$tmp"
+          ;;
+        pingvin)
+          src=/etc/angie/conf.d/templates/sample_pingvin.conf
+          [[ -f $src ]] || die "Missing Angie template ${src}"
+          cp "$src" "$tmp"
+          mkdir -p "/var/www/${d}/data" "/var/www/${d}/frontend"
+          sed -i -e "s|domain\.com|${d}|g" -e "s|sample\.com|${d}|g" \
+            -e "s#/var/www/pingvin_source#/var/www/${d}/frontend#g" \
+            -e "s#/var/www/pingvin_data#/var/www/${d}/data#g" \
+            -e '/set_real_ip_from 1\.2\.3\.4;/d' \
+            -e '/real_ip_header X-Forwarded-For;/d' \
+            -e '/real_ip_recursive on;/d' \
+            -e '/realip_remote_addr/d' \
+            -e "s|include h5bp/hostname_ssl.conf;|include h5bp/tls/ssl_engine.conf;\n    include h5bp/tls/policy_balanced.conf;\n    ssl_certificate     ${certdir}/fullchain.pem;\n    ssl_certificate_key ${certdir}/privkey.pem;|g" \
+            "$tmp"
+          ;;
+        chevereto)
+          src=/etc/angie/conf.d/templates/sample_chev.conf
+          [[ -f $src ]] || die "Missing Angie template ${src}"
+          cp "$src" "$tmp"
+          sed -i -e "s|domain\.com|${d}|g" -e "s|sample\.com|${d}|g" \
+            -e "s#/etc/letsencrypt/live/${d}/fullchain.pem#${certdir}/fullchain.pem#g" \
+            -e "s#/etc/letsencrypt/live/${d}/privkey.pem#${certdir}/privkey.pem#g" \
+            "$tmp"
+          ;;
+        polr)
+          src=/etc/angie/conf.d/templates/sample_polr.conf
+          [[ -f $src ]] || die "Missing Angie template ${src}"
+          cp "$src" "$tmp"
+          sed -i -e "s|domain\.com|${d}|g" -e "s|sample\.com|${d}|g" \
+            -e "s|include h5bp/hostname_ssl.conf;|include h5bp/tls/ssl_engine.conf;\n    include h5bp/tls/policy_balanced.conf;\n    ssl_certificate     ${certdir}/fullchain.pem;\n    ssl_certificate_key ${certdir}/privkey.pem;|g" \
+            "$tmp"
+          ;;
+        php|lychee)
+          cat > "$tmp" <<'EOF'
+server {
+    listen      80;
+    listen      [::]:80;
+    server_name @DOMAIN@ www.@DOMAIN@;
+    return 301 https://@DOMAIN@$request_uri;
+}
+server {
+    listen      443 ssl;
+    listen      [::]:443 ssl;
+    server_name www.@DOMAIN@;
+    http2 on;
+    include h5bp/tls/ssl_engine.conf;
+    include h5bp/tls/policy_balanced.conf;
+    ssl_certificate     @CERTDIR@/fullchain.pem;
+    ssl_certificate_key @CERTDIR@/privkey.pem;
+    return 301 https://@DOMAIN@$request_uri;
+}
+server {
+    listen      443 ssl;
+    listen      [::]:443 ssl;
+    server_name @DOMAIN@;
+    http2 on;
+    include h5bp/tls/ssl_engine.conf;
+    include h5bp/tls/policy_balanced.conf;
+    ssl_certificate     @CERTDIR@/fullchain.pem;
+    ssl_certificate_key @CERTDIR@/privkey.pem;
+
+    root  @ROOT@;
+    index index.php index.html;
+    error_log  /var/log/angie/@DOMAIN@.error.log;
+    access_log /var/log/angie/@DOMAIN@.access.log perf;
+    client_max_body_size 100m;
+
+    location / {
+        try_files $uri $uri/ /index.php?$is_args$args;
+    }
+
+    include h5bp/php.conf;
+    include h5bp/basic.conf;
+}
+EOF
+          sed -i -e "s|@DOMAIN@|${d}|g" -e "s|@ROOT@|${dir}|g" \
+            -e "s|@CERTDIR@|${certdir}|g" "$tmp"
+          ;;
+        node)
+          cat > "$tmp" <<'EOF'
+server {
+    listen      80;
+    listen      [::]:80;
+    server_name @DOMAIN@ www.@DOMAIN@;
+    return 301 https://@DOMAIN@$request_uri;
+}
+server {
+    listen      443 ssl;
+    listen      [::]:443 ssl;
+    server_name www.@DOMAIN@;
+    http2 on;
+    include h5bp/tls/ssl_engine.conf;
+    include h5bp/tls/policy_balanced.conf;
+    ssl_certificate     @CERTDIR@/fullchain.pem;
+    ssl_certificate_key @CERTDIR@/privkey.pem;
+    return 301 https://@DOMAIN@$request_uri;
+}
+server {
+    listen      443 ssl;
+    listen      [::]:443 ssl;
+    server_name @DOMAIN@;
+    http2 on;
+    include h5bp/tls/ssl_engine.conf;
+    include h5bp/tls/policy_balanced.conf;
+    ssl_certificate     @CERTDIR@/fullchain.pem;
+    ssl_certificate_key @CERTDIR@/privkey.pem;
+
+    root  @ROOT@;
+    error_log  /var/log/angie/@DOMAIN@.error.log;
+    access_log /var/log/angie/@DOMAIN@.access.log perf;
+    client_max_body_size 512m;
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        include h5bp/proxy_non_php.conf;
+    }
+    location /ws/ {
+        proxy_pass http://127.0.0.1:3000;
+        include h5bp/proxy_ws.conf;
+    }
+    include h5bp/basic.conf;
+}
+EOF
+          sed -i -e "s|@DOMAIN@|${d}|g" -e "s|@ROOT@|${dir}|g" \
+            -e "s|@CERTDIR@|${certdir}|g" "$tmp"
+          ;;
+        *)
+          rm -f "$tmp"
+          die "Internal error: unhandled app '${app}' for ${d}"
+          ;;
+      esac
+
+      install -m 644 "$tmp" "$conf"
+      if ! /usr/sbin/angie -t >/tmp/angie-domain-test.log 2>&1; then
+        rm -f "$conf"
+        cat /tmp/angie-domain-test.log >&2 || true
+        die "Angie rejected the generated vhost for ${d} (app=${app})"
+      fi
+      rm -f "$tmp" /tmp/angie-domain-test.log
+      changed=1
+      info "Created Angie vhost: ${conf} (app=${app})"
     fi
 
     mariadb -e "CREATE DATABASE IF NOT EXISTS \`${db}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
@@ -1955,6 +2688,10 @@ create_domains() {
     info "Database: ${db}"
   done
 
+  if (( changed )); then
+    systemctl reload angie 2>/dev/null || systemctl restart angie 2>/dev/null \
+      || warn "Could not reload Angie after creating vhosts"
+  fi
   ok "Domain setup complete"
 }
 
@@ -2075,34 +2812,89 @@ purge_angie() {
   purge_service_stop angie
   apt_purge_pkgs angie
   rm -rf /etc/angie /var/lib/angie /var/log/angie /var/cache/angie
+  rm -rf /home/nginx_cache /home/nginx_cache_chev /home/xf_proxy_cache \
+         /home/proxy_cache /home/proxy_cdn
   rm -f /root/install_angie.sh /root/nginx_conf.sh
   rm -f /etc/apt/sources.list.d/angie.list /etc/apt/trusted.gpg.d/angie-signing.gpg
-  rm -f /etc/systemd/system/angie.service.d/limits.conf /etc/default/angie
-  rmdir /etc/systemd/system/angie.service.d 2>/dev/null || true
+  rm -f /etc/default/angie
+  rm -rf /etc/systemd/system/angie.service.d
   cron_remove_line '/etc/angie/scripts/cloudflare.sh'
   cron_remove_line '/usr/bin/chown www-data:www-data -R /var/www/'
   systemctl daemon-reload || true
   ok "Angie purged"
 }
 
+purge_php_dependents() {
+  # Composer and its library packages depend on virtual php-cli/php-json/
+  # php-intl providers.  If they are left installed, apt "satisfies" them by
+  # installing an unrelated old PHP/Apache stack during the purge.  Remove the
+  # setup-installed dependency tree first.
+  if pkg_installed_by_setup composer; then
+    apt_purge_pkgs composer jsonlint
+  elif pkg_ok composer && pkg_preexisting composer; then
+    die "Composer was installed before setup.sh and depends on PHP. Remove Composer first, or use --purge all."
+  fi
+
+  local p
+  local -a libs=()
+  while IFS= read -r p; do
+    [[ -n $p ]] || continue
+    case "$p" in php[0-9]*) continue ;; esac
+    pkg_ok "$p" || continue
+    pkg_preexisting "$p" && continue
+    libs+=("$p")
+  done < <(dpkg-query -W -f='${Package}\n' 'php-*' 2>/dev/null || true)
+  (( ${#libs[@]} == 0 )) || apt_purge_pkgs "${libs[@]}"
+  apt-get autoremove --purge -y || true
+}
+
 purge_php() {
   step "Purge PHP"
   local ver=${OPT[php.ver]:-}
+  local other_php=0 pkg
+  if [[ -n $ver ]]; then
+    while IFS= read -r pkg; do
+      [[ $pkg =~ ^php[0-9]+\.[0-9]+-fpm$ ]] || continue
+      [[ $pkg == "php${ver}-fpm" ]] && continue
+      other_php=1
+    done < <(dpkg-query -W -f='${Package}\n' 'php*-fpm' 2>/dev/null || true)
+  fi
+  if (( other_php == 0 )); then
+    purge_php_dependents
+  fi
+
   if [[ -n $ver ]]; then
     purge_service_stop "php${ver}-fpm"
     apt_purge_pattern "php${ver}-*"
-    rm -rf "/etc/php/${ver}"
+    rm -rf "/etc/php/${ver}" "/etc/systemd/system/php${ver}-fpm.service.d"
   else
-    local d
+    local d v pkg
+    local -a vers=()
     for d in /etc/php/*; do
       [[ -d $d ]] || continue
-      purge_service_stop "php$(basename "$d")-fpm"
+      v=$(basename "$d")
+      [[ $v =~ ^[0-9]+\.[0-9]+$ ]] && vers+=("$v")
     done
-    apt_purge_pattern 'php8.*'
+    while IFS= read -r pkg; do
+      [[ -n $pkg ]] || continue
+      v=${pkg#php}
+      v=${v%-fpm}
+      [[ $v =~ ^[0-9]+\.[0-9]+$ ]] && vers+=("$v")
+    done < <(dpkg-query -W -f='${Package}\n' 'php*-fpm' 2>/dev/null || true)
+    # de-duplicate while keeping order
+    local seen=" "
+    for v in "${vers[@]}"; do
+      [[ $seen == *" ${v} "* ]] && continue
+      seen+="${v} "
+      purge_service_stop "php${v}-fpm"
+      apt_purge_pattern "php${v}-*"
+      rm -rf "/etc/php/${v}" "/etc/systemd/system/php${v}-fpm.service.d"
+    done
     rm -rf /etc/php
   fi
   rm -rf /var/log/php* /var/log/php-fpm
-  rm -rf /run/php /var/lib/php
+  rm -rf /run/php /var/lib/php /var/cache/php
+  rm -rf /etc/systemd/system/php*-fpm.service.d
   systemctl disable --now phpsessionclean.timer 2>/dev/null || true
   rm -f /etc/systemd/system/timers.target.wants/phpsessionclean.timer
   systemctl daemon-reload || true
@@ -2164,6 +2956,8 @@ purge_valkey() {
   purge_service_stop valkey-server
   apt_purge_pattern 'valkey-*'
   rm -rf /etc/valkey /var/lib/valkey /var/log/valkey /run/valkey
+  rm -rf /etc/systemd/system/valkey-server.service.d
+  systemctl daemon-reload || true
   ok "Valkey purged"
 }
 
@@ -2183,7 +2977,10 @@ purge_others() {
   step "Purge other packages"
   local pkg
   local -a removable=()
-  for pkg in smartmontools nvme-cli gifsicle; do
+  rm -f /etc/fail2ban/jail.d/setup-ssh.local 2>/dev/null || true
+  rm -f /etc/apt/apt.conf.d/52setup-unattended 2>/dev/null || true
+  for pkg in smartmontools nvme-cli gifsicle fail2ban unattended-upgrades \
+             sysstat composer; do
     if pkg_preexisting "$pkg" || ! pkg_installed_by_setup "$pkg"; then
       info "Keeping package not installed by setup.sh: ${pkg}"
     else
@@ -2232,9 +3029,11 @@ build_purge_order() {
 
   PURGE_ORDER=()
   if [[ -n ${wanted[all]:-} ]]; then
-    PURGE_ORDER=(angie php mariadb valkey elastic others basic)
+    # Remove "others" (Composer/Node/fail2ban) before PHP so Composer's PHP
+    # dependencies cannot make apt install an old alternative PHP stack.
+    PURGE_ORDER=(angie others php mariadb valkey elastic basic)
   else
-    for t in angie php mariadb valkey elastic others basic; do
+    for t in angie others php mariadb valkey elastic basic; do
       if [[ -n ${wanted[$t]:-} ]]; then
         PURGE_ORDER+=("$t")
       fi
@@ -2313,7 +3112,7 @@ resolve_basic_defaults() {
 }
 
 print_plan() {
-  local s bind_display
+  local s bind_display dd
   printf '\n%sDRY RUN%s - validation only, no changes will be made.\n' "$C_BOLD" "$C_RESET"
 
   if [[ ${PURGE} -eq 1 ]]; then
@@ -2334,13 +3133,21 @@ print_plan() {
           "${OPT[basic.time]:-Asia/Manila}" "${OPT[basic.swap]:-auto (50% of RAM)}"
         ;;
       php)
-        printf '  %-10s version=%s\n' "$s" "${OPT[php.ver]:-auto (latest stable in Sury)}"
+        printf '  %-10s version=%s children=%s max_requests=%s\n' "$s" \
+          "${OPT[php.ver]:-auto (latest stable in Sury)}" \
+          "${OPT[php.children]:-auto}" "${OPT[php.max_requests]:-auto}"
         ;;
       mariadb)
         bind_display=${OPT[mariadb.bind]:-127.0.0.1}
         [[ $bind_display == *IPV4* ]] && bind_display+=" (IPV4 resolved at install)"
         printf '  %-10s user=%s size=%s bind=%s\n' "$s" \
           "${OPT[mariadb.user]:-}" "${OPT[mariadb.size]:-}" "$bind_display"
+        ;;
+      valkey)
+        printf '  %-10s ram=%s policy=%s io_threads=%s\n' "$s" \
+          "${OPT[valkey.ram]:-auto (10%% of RAM)}" \
+          "${OPT[valkey.policy]:-allkeys-lru}" \
+          "${OPT[valkey.io_threads]:-1}"
         ;;
       elastic)
         printf '  %-10s host=%s ram=%s\n' "$s" \
@@ -2350,7 +3157,9 @@ print_plan() {
         printf '  %-10s %s\n' "$s" "${OTHERS[*]:-}"
         ;;
       domain)
-        printf '  %-10s %s\n' "$s" "${DOMAINS[*]:-}"
+        for dd in "${DOMAINS[@]}"; do
+          printf '  %-10s %s app=%s\n' "$s" "$dd" "${DOMAIN_APP[$dd]:-blank}"
+        done
         ;;
       *)
         printf '  %-10s install\n' "$s"
