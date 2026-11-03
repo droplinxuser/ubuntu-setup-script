@@ -20,13 +20,19 @@
 set -Eeuo pipefail
 shopt -s inherit_errexit 2>/dev/null || true
 umask 022
+# Providers often ship an ungenerated locale (e.g. en_PH.UTF-8), which makes
+# apt/perl print noisy warnings. C.UTF-8 always exists on Ubuntu.
+export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.5.0"
+readonly SCRIPT_VERSION="1.6.0"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
 readonly BACKUP_DIR="${STATE_DIR}/backup"
+# Every service writes its logs below this single directory so an operator can
+# collect one tree (tar -czf /tmp/logs.tgz -C /var/www logs) for inspection.
+readonly LOG_ROOT="/var/www/logs"
 # Angie and PHP configuration is owned by this repository, not by setup.sh.
 # Override the ref or point CONFIG_SOURCE_DIR at a local checkout for testing.
 readonly CONFIG_REPO_URL="${CONFIG_REPO_URL:-https://github.com/droplinxuser/server-configs-nginx}"
@@ -197,7 +203,7 @@ Testing:
                                         a normal user and with --purge)
 
 Notes:
-  * Only one PHP-FPM version can listen on 127.0.0.1:9000 at a time.
+  * Only one PHP-FPM version can own the shared Unix socket at a time.
     Switch versions by purging the old one first:
       --purge --php ver=8.4   then   --basic ... --php ver=8.5
 
@@ -287,19 +293,41 @@ parse_args() {
         ;;
       --domain)
         ENABLED[domain]=1; shift
-        local got_domain=0 d app="" key
+        local got_domain=0 d app="" key default_app="" last_app=""
+        local app_count=0
         local -a group=()
         while (( $# )) && [[ $1 != --* ]]; do
           case "$1" in
-            app=*) app=${1#*=}; shift; continue ;;
+            app=*)
+              app=${1#*=}
+              app_count=$(( app_count + 1 ))
+              last_app=$app
+              if (( ${#group[@]} > 0 )); then
+                # app=TYPE belongs to the domain immediately before it.
+                key=${group[-1],,}; key=${key%.}
+                DOMAIN_APP[$key]=$app
+              else
+                # app=TYPE before any domain sets the group default.
+                default_app=$app
+              fi
+              shift
+              continue
+              ;;
           esac
-          group+=("$1"); got_domain=1; shift
+          d=${1,,}; d=${d%.}
+          group+=("$d"); got_domain=1
+          [[ -n $default_app ]] && DOMAIN_APP[$d]=$default_app
+          shift
         done
         (( got_domain )) || die "--domain requires at least one domain name"
         for d in "${group[@]}"; do
           DOMAINS+=("$d")
           key=${d,,}; key=${key%.}
-          if [[ -n $app ]]; then DOMAIN_APP[$key]=$app; fi
+          # Preserve the documented single app=TYPE behaviour: one app= after
+          # a list of domains applies to every domain in this group.
+          if (( app_count == 1 )) && [[ -n $last_app ]]; then
+            DOMAIN_APP[$key]=$last_app
+          fi
         done
         ;;
       --purge)
@@ -770,6 +798,91 @@ validate_all() {
 # ---------------------------------------------------------------------------
 ensure_state() { mkdir -p "$BACKUP_DIR"; }
 
+# ---------------------------------------------------------------------------
+# Centralised logs (/var/www/logs/<service>/)
+# ---------------------------------------------------------------------------
+ensure_log_dir() {
+  local name=$1 user=$2 group=$3 dir="${LOG_ROOT}/$1"
+  mkdir -p "$dir"
+  chmod 750 "$dir"
+  if getent passwd "$user" >/dev/null 2>&1; then
+    chown "$user:$group" "$dir" 2>/dev/null || true
+  else
+    chown root:root "$dir" 2>/dev/null || true
+  fi
+}
+
+log_file() {
+  local rel=$1 user=$2 group=$3 file="${LOG_ROOT}/$1"
+  mkdir -p "$(dirname "$file")"
+  [[ -e $file ]] || : > "$file"
+  chmod 640 "$file"
+  if getent passwd "$user" >/dev/null 2>&1; then
+    chown "$user:$group" "$file" 2>/dev/null || true
+  else
+    chown root:root "$file" 2>/dev/null || true
+  fi
+}
+
+ensure_log_dirs() {
+  mkdir -p "$LOG_ROOT"
+  chmod 755 "$LOG_ROOT"
+  ensure_log_dir angie         www-data     www-data
+  ensure_log_dir php           www-data     www-data
+  ensure_log_dir nodejs        www-data     www-data
+  ensure_log_dir gifsicle      www-data     www-data
+  getent passwd mysql         >/dev/null 2>&1 && ensure_log_dir mariadb       mysql        mysql
+  getent passwd valkey        >/dev/null 2>&1 && ensure_log_dir valkey        valkey       valkey
+  getent passwd elasticsearch >/dev/null 2>&1 && ensure_log_dir elasticsearch elasticsearch elasticsearch
+
+  log_file angie/error.log        www-data www-data
+  log_file php/php-fpm.log        www-data www-data
+  log_file php/php-fpm-slow.log   www-data www-data
+  log_file php/php-error.log      www-data www-data
+  log_file nodejs/nodejs.log      www-data www-data
+  log_file gifsicle/gifsicle.log  www-data www-data
+  getent passwd mysql         >/dev/null 2>&1 && log_file mariadb/error.log mysql mysql
+  getent passwd mysql         >/dev/null 2>&1 && log_file mariadb/slow.log  mysql mysql
+  getent passwd mysql         >/dev/null 2>&1 && log_file mariadb/backup.log mysql mysql
+  getent passwd mysql         >/dev/null 2>&1 && log_file mariadb/backup-err.log mysql mysql
+  getent passwd valkey        >/dev/null 2>&1 && log_file valkey/valkey.log valkey valkey
+  getent passwd elasticsearch >/dev/null 2>&1 && log_file elasticsearch/essearch.log elasticsearch elasticsearch
+  # getent returns 2 when a service user is not installed yet; a chain ending
+  # in that test must not fail the whole basic step.
+  return 0
+}
+
+configure_logrotate() {
+  step "Log rotation (/var/www/logs)"
+  apt_install logrotate
+  cat > /etc/logrotate.d/setup-logs <<'EOF'
+# Managed by setup.sh: keep all service logs under /var/www/logs.
+# copytruncate is used so services do not need a reopen signal. Rotation runs
+# as root; per-service `su` lines would fail on a basic-only install where the
+# valkey/elasticsearch users do not exist yet.
+/var/www/logs/*/*.log /var/www/logs/elasticsearch/*.json {
+    daily
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
+EOF
+  chmod 644 /etc/logrotate.d/setup-logs
+  # Debug mode exits non-zero when a glob has no matches on a fresh install,
+  # which is not an error. Surface only real syntax problems.
+  local lr_out
+  lr_out=$(logrotate -d /etc/logrotate.d/setup-logs 2>&1 || true)
+  # Only real diagnostics start with "error:". Filenames such as error.log and
+  # the word "considering" must not trigger the warning.
+  if grep -qiE '^error:' <<<"$lr_out"; then
+    warn "logrotate reported an issue: $(grep -iE '^error:' <<<"$lr_out" | head -n1)"
+  fi
+  ok "Log rotation configured"
+}
+
 record_original() {
   local path=$1 name=$2
   ensure_state
@@ -956,7 +1069,7 @@ write_cron() {
     lines+=('2 1 * * * /etc/angie/scripts/cloudflare.sh >/dev/null 2>&1')
   fi
   if [[ ${ENABLED[mariadb]:-0} -eq 1 ]]; then
-    lines+=('3 3 * * * /usr/local/bin/mysqlbkup.sh 1>> /var/www/mysql_database/mysqlbkup.log 2>> /var/www/mysql_database/mysqlbkup-err.log')
+    lines+=("3 3 * * * /usr/local/bin/mysqlbkup.sh 1>> ${LOG_ROOT}/mariadb/backup.log 2>> ${LOG_ROOT}/mariadb/backup-err.log")
     lines+=('4 4 4 * * /usr/bin/mariadb-check -Aos --auto-repair > /dev/null 2>&1')
   fi
 
@@ -1098,7 +1211,7 @@ configure_hostname() {
 
 install_basic_tools() {
   step "Basic tools"
-  apt_install wget unzip nano zip software-properties-common rsync ca-certificates curl gnupg dmidecode git jq htop iotop openssl
+  apt_install wget unzip nano zip software-properties-common rsync ca-certificates curl gnupg dmidecode git jq htop iotop openssl logrotate
 }
 
 configure_timezone() {
@@ -1271,12 +1384,16 @@ EOF
 
 configure_limits() {
   step "Security limits"
-  record_original /etc/security/limits.conf limits.conf
   local limits_src="${SCRIPT_DIR}/configs/system/limits.conf"
+  local dropin=/etc/security/limits.d/99-setup.conf
+  mkdir -p /etc/security/limits.d
+  # Record the original files so --purge can put the machine back.
+  record_original /etc/security/limits.conf limits.conf
+  record_original "$dropin" limits.d-99-setup.conf
   if [[ -f $limits_src ]]; then
-    install -m 644 "$limits_src" /etc/security/limits.conf
+    install -m 644 "$limits_src" "$dropin"
   else
-    cat > /etc/security/limits.conf <<'EOF'
+    cat > "$dropin" <<'EOF'
 elasticsearch soft nofile 10485760
 elasticsearch hard nofile 10485760
 mysql         soft nofile 10485760
@@ -1295,8 +1412,17 @@ angie         hard nofile 10485760
 *             hard nofile 10485760
 EOF
   fi
-  chmod 644 /etc/security/limits.conf
-  cat /etc/security/limits.conf
+  chmod 644 "$dropin"
+  # Older setup.sh releases replaced /etc/security/limits.conf wholesale.
+  # Put the distribution file back when we can prove it is our old copy.
+  if [[ -f "${BACKUP_DIR}/limits.conf.recorded" ]] \
+     && [[ $(<"${BACKUP_DIR}/limits.conf.recorded") == present ]] \
+     && [[ -f "${BACKUP_DIR}/limits.conf" ]] \
+     && cmp -s /etc/security/limits.conf "$limits_src"; then
+    cp -a "${BACKUP_DIR}/limits.conf" /etc/security/limits.conf
+    info "Restored original /etc/security/limits.conf; limits now use the drop-in"
+  fi
+  cat "$dropin"
 }
 
 configure_ufw() {
@@ -1319,7 +1445,13 @@ configure_ufw() {
 
   ufw --force default deny incoming
   ufw --force default allow outgoing
-  ufw limit 22 || true
+  # Put the rate-limited SSH rule FIRST.  A provider image often already has
+  # "allow 22/tcp"; deleting it can lock an operator out if the purge later
+  # removes the replacement rule.  Inserting the LIMIT rule keeps the original
+  # allow as a safety net and makes the limiter effective.
+  if ! ufw status 2>/dev/null | grep -qE '^22(/tcp)?[[:space:]]+LIMIT'; then
+    ufw insert 1 limit 22 || ufw limit 22 || true
+  fi
   ufw allow 80 || true
   ufw allow 443 || true
   ufw --force enable
@@ -1374,6 +1506,8 @@ install_basic() {
 
   configure_sysctl
   configure_limits
+  ensure_log_dirs
+  configure_logrotate
 
   apt_install cron
   systemctl enable --now cron || warn "Could not enable/start cron"
@@ -1408,7 +1542,7 @@ deploy_angie_configs() {
 
 install_angie() {
   step "Angie web server"
-  apt_install ca-certificates curl wget unzip rsync
+  apt_install ca-certificates curl wget unzip rsync openssl
 
   if [[ ! -s /etc/apt/trusted.gpg.d/angie-signing.gpg ]]; then
     blob_angie_key > /etc/apt/trusted.gpg.d/angie-signing.gpg
@@ -1477,7 +1611,7 @@ install_php() {
     info "Auto-selected latest stable PHP: ${ver}"
   fi
 
-  # Refuse to start a second PHP-FPM version on the shared :9000 socket.
+  # Refuse to start a second PHP-FPM version on the shared FastCGI socket.
   # Check before apt_install, because the package post-install script would
   # otherwise start the new version and fail with a cryptic bind error.
   local active_same=0 unit
@@ -1487,11 +1621,19 @@ install_php() {
       active_same=1
       continue
     fi
-    die "Another PHP-FPM version is active (${unit}). Only one PHP version can listen on 127.0.0.1:9000 at a time. Purge it first, e.g. --purge --php ver=<old>"
+    die "Another PHP-FPM version is active (${unit}). Only one PHP version can own the shared FastCGI socket at a time. Purge it first, e.g. --purge --php ver=<old>"
   done < <(systemctl list-units --type=service --state=active --no-legend 'php*-fpm.service' 2>/dev/null | awk '{print $1}')
-  if (( ! active_same )) && ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE '(^|:)9000$'; then
-    die "Port 9000 is already in use by another process. Only one PHP version can run at a time; free the port first."
+  if (( ! active_same )); then
+    if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE '(^|:)9000$'; then
+      die "Port 9000 is already in use by another process. Only one PHP version can run at a time; free the port first."
+    fi
+    # Remove a stale socket left by a purged/crashed pool. FastCGI now uses
+    # the stable /run/php/php-fpm.sock path shared with Angie.
+    rm -f /run/php/php-fpm.sock
   fi
+  mkdir -p /run/php
+  chown www-data:www-data /run/php 2>/dev/null || true
+  chmod 755 /run/php
 
   # Extensions required by XenForo, WordPress, Chevereto, Polr, Lychee and
   # most other PHP applications.  They are small and avoid the usual
@@ -1557,16 +1699,17 @@ install_php() {
     -e "s|^realpath_cache_size = .*|realpath_cache_size = ${realpath_kb}k|" \
     "/etc/php/${ver}/fpm/conf.d/custom_dan.ini"
 
-  mkdir -p /var/cache/php/opcache /var/log/php-fpm
-  chown -R www-data:www-data /var/cache/php /var/log/php-fpm
-  chmod 750 /var/cache/php /var/cache/php/opcache /var/log/php-fpm
+  mkdir -p /var/cache/php/opcache
+  chown -R www-data:www-data /var/cache/php
+  chmod 750 /var/cache/php /var/cache/php/opcache
+  ensure_log_dirs
 
   mkdir -p "/etc/systemd/system/php${ver}-fpm.service.d"
   install -m 644 "${CONFIG_SOURCE_DIR}/scripts/php-fpm-limits.conf" \
     "/etc/systemd/system/php${ver}-fpm.service.d/limits.conf"
   systemctl daemon-reload
 
-  # Only one PHP-FPM version can own the documented 127.0.0.1:9000 socket.
+  # Only one PHP-FPM version can own the shared /run/php/php-fpm.sock socket.
   # (The conflict was checked before apt_install; this just clears any
   # previous failed state for the same version.)
   systemctl reset-failed "php${ver}-fpm" 2>/dev/null || true
@@ -1593,17 +1736,28 @@ configure_mariadb_apparmor() {
   local end='# END setup.sh mariadb apparmor'
 
   mkdir -p /etc/apparmor.d/local
-  if [[ ! -f $localfile ]] || ! grep -qF -- "$begin" "$localfile"; then
-    {
-      printf '%s\n' "$begin"
-      printf '# Allow mariadb-install-db to bootstrap the server as root.\n'
-      printf 'capability dac_override,\n'
-      printf 'capability dac_read_search,\n'
-      printf 'capability setuid,\n'
-      printf 'capability setgid,\n'
-      printf '%s\n' "$end"
-    } >> "$localfile"
+  # Always refresh the managed block so new log paths are picked up on
+  # upgrades; keep any unrelated operator rules outside the markers.
+  if [[ -f $localfile ]]; then
+    awk -v b="$begin" -v e="$end" '
+      $0 == b { skip = 1; next }
+      $0 == e { skip = 0; next }
+      !skip { print }
+    ' "$localfile" > "${localfile}.new"
+    mv "${localfile}.new" "$localfile"
   fi
+  {
+    printf '%s\n' "$begin"
+    printf '# Allow mariadb-install-db to bootstrap the server as root.\n'
+    printf 'capability dac_override,\n'
+    printf 'capability dac_read_search,\n'
+    printf 'capability setuid,\n'
+    printf 'capability setgid,\n'
+    printf '# Central log tree (/var/www/logs).\n'
+    printf '/var/www/logs/mariadb/ r,\n'
+    printf '/var/www/logs/mariadb/** rw,\n'
+    printf '%s\n' "$end"
+  } >> "$localfile"
 
   # If a previous install was purged, the profile file is gone but the old
   # profile can still be loaded in the kernel.  That stale profile is what
@@ -1636,7 +1790,7 @@ mariadb_io_capacity() {
 configure_mariadb() {
   local size_mb=$1 bind=$2
   local cnf=/etc/mysql/mariadb.conf.d/50-server.cnf
-  local buffer logsize threads max_conn instances open_cache aria_mb
+  local buffer logsize threads max_conn open_cache aria_mb
   local io_read io_write
   [[ -f $cnf ]] || die "MariaDB config ${cnf} not found"
 
@@ -1645,9 +1799,6 @@ configure_mariadb() {
   (( logsize > 2048 )) && logsize=2048
   buffer=$(mb_to_config "$size_mb")
   logsize=$(mb_to_config "$logsize")
-  instances=$(( size_mb / 1024 ))
-  (( instances < 1 )) && instances=1
-  (( instances > 8 )) && instances=8
   open_cache=4000
   (( size_mb >= 4096 )) && open_cache=8000
   aria_mb=$(( size_mb / 16 ))
@@ -1707,9 +1858,18 @@ net_write_timeout = 120
 innodb_log_buffer_size = 64M
 innodb_log_file_size = ${logsize}
 innodb_buffer_pool_size = ${buffer}
-innodb_buffer_pool_instances = ${instances}
 
 innodb_flush_log_at_trx_commit = 2
+# MariaDB 11.8 replaced innodb_flush_method with per-file buffering knobs.
+# OFF = O_DIRECT for data/log files, which avoids double buffering on NVMe.
+innodb_data_file_buffering = OFF
+innodb_data_file_write_through = OFF
+innodb_log_file_buffering = OFF
+innodb_log_file_write_through = OFF
+innodb_buffer_pool_dump_at_shutdown = ON
+innodb_buffer_pool_load_at_startup = ON
+innodb_buffer_pool_dump_pct = 25
+innodb_stats_on_metadata = OFF
 innodb_read_only_compressed = OFF
 innodb_lock_wait_timeout = 100
 innodb_flush_neighbors = 0
@@ -1739,12 +1899,12 @@ key_buffer_size = 32M
 aria_pagecache_buffer_size = ${aria_mb}M
 
 slow_query_log = 1
-slow_query_log_file = /var/log/mariadb/slow.log
+slow_query_log_file = /var/www/logs/mariadb/slow.log
 long_query_time = 1
 min_examined_row_limit = 100
 log_slow_verbosity = query_plan,explain
 
-log_error = /var/log/mariadb/error.log
+log_error = /var/www/logs/mariadb/error.log
 bind-address = ${bind}
 ${MARIADB_END}
 EOF
@@ -1817,9 +1977,10 @@ EOF
 
   configure_mariadb "$size_mb" "$bind"
 
-  mkdir -p /var/log/mariadb /var/lib/mysql-files
-  chown -R mysql:mysql /var/log/mariadb /var/lib/mysql-files
+  mkdir -p /var/lib/mysql-files
+  chown -R mysql:mysql /var/lib/mysql-files
   chmod 750 /var/lib/mysql-files
+  ensure_log_dirs
   systemctl daemon-reload
 
   local i
@@ -1896,6 +2057,7 @@ install_valkey() {
   fi
   apt_clean
   apt_install valkey-server
+  ensure_log_dirs
 
   local conf=/etc/valkey/valkey.conf
   [[ -f $conf ]] || die "Valkey config ${conf} not found"
@@ -1918,9 +2080,10 @@ install_valkey() {
   # Normalise the directives this script owns: remove active copies, then
   # append the canonical values once.  This also upgrades old profiles that
   # had "protected-mode no" without leaving contradictory duplicates.
-  sed -i -E '/^[[:space:]]*(bind|protected-mode|save|maxmemory|maxmemory-policy|maxmemory-samples|supervised|io-threads|io-threads-do-reads|tcp-backlog|tcp-keepalive|timeout|maxclients|hz|appendonly|lazyfree-[a-z-]+|unixsocket|unixsocketperm)[[:space:]]/d' "$conf"
+  sed -i -E '/^[[:space:]]*(bind|protected-mode|save|maxmemory|maxmemory-policy|maxmemory-samples|supervised|io-threads|io-threads-do-reads|tcp-backlog|tcp-keepalive|timeout|maxclients|hz|appendonly|lazyfree-[a-z-]+|unixsocket|unixsocketperm|logfile)[[:space:]]/d' "$conf"
   local -a vlines=(
     'supervised systemd'
+    "logfile ${LOG_ROOT}/valkey/valkey.log"
     'save ""'
     'appendonly no'
     "maxmemory ${valkey_mb}mb"
@@ -1950,10 +2113,12 @@ install_valkey() {
   tail -20 "$conf"
 
   mkdir -p /etc/systemd/system/valkey-server.service.d
-  cat > /etc/systemd/system/valkey-server.service.d/limits.conf <<'EOF'
+  cat > /etc/systemd/system/valkey-server.service.d/limits.conf <<EOF
 [Service]
 LimitNOFILE=524288
 LimitCORE=0
+# The packaged unit uses ProtectSystem=strict; allow the central log tree.
+ReadWritePaths=${LOG_ROOT}/valkey
 EOF
   systemctl daemon-reload
 
@@ -2027,6 +2192,7 @@ install_elastic() {
 
   apt_update
   apt_install elasticsearch
+  ensure_log_dirs
 
   # Elasticsearch's bootstrap check needs a large vm.max_map_count.
   if [[ ! -f /etc/sysctl.d/99-elasticsearch.conf ]]; then
@@ -2053,6 +2219,7 @@ install_elastic() {
   # Comment out keys that we are about to set (keeps YAML free of duplicates).
   local key
   for key in cluster.name network.host http.host transport.host http.port \
+             path.logs path.data \
              indices.query.bool.max_clause_count discovery.type \
              xpack.security.enabled xpack.security.enrollment.enabled \
              cluster.initial_master_nodes indices.memory.index_buffer_size \
@@ -2067,6 +2234,8 @@ ${ES_BEGIN}
 cluster.name: essearch
 network.host: "${host}"
 http.port: 9200
+path.data: /var/lib/elasticsearch
+path.logs: ${LOG_ROOT}/elasticsearch
 bootstrap.memory_lock: true
 indices.query.bool.max_clause_count: 4096
 indices.memory.index_buffer_size: 20%
@@ -2261,6 +2430,7 @@ create_domains() {
   systemctl is-active --quiet mariadb \
     || die "MariaDB is not running. Install/start it with --mariadb first."
   command -v openssl >/dev/null 2>&1 || apt_install openssl
+  ensure_log_dirs
 
   local d db dir conf app certdir src tmp changed=0
   for d in "${DOMAINS[@]}"; do
@@ -2270,7 +2440,7 @@ create_domains() {
     conf="/etc/angie/conf.d/${d}.conf"
     certdir="/etc/angie/ssl/${d}"
 
-    mkdir -p "$dir" /var/log/angie
+    mkdir -p "$dir" "${LOG_ROOT}/angie"
     chown -R www-data:www-data "/var/www/${d}"
     chmod 755 "/var/www/${d}" "$dir"
     info "Directory: ${dir}"
@@ -2308,7 +2478,7 @@ create_domains() {
           sed -i -e "s|domain\.com|${d}|g" -e "s|sample\.com|${d}|g" \
             -e "s#/etc/letsencrypt/live/${d}/fullchain.pem#${certdir}/fullchain.pem#g" \
             -e "s#/etc/letsencrypt/live/${d}/privkey.pem#${certdir}/privkey.pem#g" \
-            -e "s#/var/www/html/${d}/websocket.log#/var/log/angie/${d}-websocket.log#g" \
+            -e "s#/var/www/html/${d}/websocket.log#${LOG_ROOT}/angie/${d}-websocket.log#g" \
             "$tmp"
           ;;
         wordpress)
@@ -2325,7 +2495,7 @@ create_domains() {
           cp "$src" "$tmp"
           mkdir -p "/var/www/${d}/data" "/var/www/${d}/frontend"
           sed -i -e "s|domain\.com|${d}|g" -e "s|sample\.com|${d}|g" \
-            -e "s#/var/www/pingvin_source#/var/www/${d}/frontend#g" \
+            -e "s#/var/www/pingvin_source#/var/www/${d}#g" \
             -e "s#/var/www/pingvin_data#/var/www/${d}/data#g" \
             -e '/set_real_ip_from 1\.2\.3\.4;/d' \
             -e '/real_ip_header X-Forwarded-For;/d' \
@@ -2382,6 +2552,9 @@ create_domains() {
         die "Angie rejected the generated vhost for ${d} (app=${app})"
       fi
       rm -f "$tmp" /tmp/angie-domain-test.log
+      # "angie -t" runs from this shell (umask 022) and creates the per-vhost
+      # log files before systemd's UMask=0027 applies. Normalise them now.
+      find "${LOG_ROOT}/angie" -type f -name '*.log' -exec chmod 640 {} + 2>/dev/null || true
       changed=1
       info "Created Angie vhost: ${conf} (app=${app})"
     fi
@@ -2458,11 +2631,25 @@ purge_basic() {
     info "Removed managed cron entries"
   fi
 
+  # Last-resort lockout guard: if UFW is active but no SSH rule exists, add
+  # one before touching the remaining rules.
+  if ufw status 2>/dev/null | grep -q '^Status: active' \
+     && ! ufw status 2>/dev/null | grep -qE '^22(/tcp)?[[:space:]]+(ALLOW|LIMIT)'; then
+    ufw allow 22/tcp || true
+  fi
+
   if [[ -f "${STATE_DIR}/ufw-added" ]]; then
     local line
     local -a rule
     while IFS= read -r line; do
       [[ $line == ufw\ * ]] || continue
+      # Never remove an SSH rule during purge.  If the provider image had no
+      # SSH allow rule and UFW is active, removing ours is a guaranteed
+      # lockout for a remote operator.
+      if [[ $line =~ (^|[[:space:]])22(/tcp)?([[:space:]]|$) ]]; then
+        info "Keeping SSH firewall rule: ${line}"
+        continue
+      fi
       info "Removing firewall rule: ${line}"
       read -r -a rule <<< "${line#ufw }"
       ufw delete "${rule[@]}" || true
@@ -2481,6 +2668,7 @@ purge_basic() {
   fi
 
   restore_original /etc/security/limits.conf limits.conf
+  restore_original /etc/security/limits.d/99-setup.conf limits.d-99-setup.conf
   restore_original /etc/sysctl.conf sysctl.conf
   restore_original /etc/sysctl.d/99-sysctl.conf sysctl.d-99-sysctl.conf
   restore_original /etc/systemd/resolved.conf.d resolved.conf.d
@@ -2517,6 +2705,7 @@ purge_angie() {
   purge_service_stop angie
   apt_purge_pkgs angie
   rm -rf /etc/angie /var/lib/angie /var/log/angie /var/cache/angie
+  rm -rf "${LOG_ROOT}/angie"
   rm -rf /home/nginx_cache /home/nginx_cache_chev /home/xf_proxy_cache \
          /home/proxy_cache /home/proxy_cdn
   rm -f /root/install_angie.sh /root/nginx_conf.sh
@@ -2598,6 +2787,8 @@ purge_php() {
     rm -rf /etc/php
   fi
   rm -rf /var/log/php* /var/log/php-fpm
+  rm -rf "${LOG_ROOT}/php"
+  rm -f /run/php/php-fpm.sock
   rm -rf /run/php /var/lib/php /var/cache/php
   rm -rf /etc/systemd/system/php*-fpm.service.d
   systemctl disable --now phpsessionclean.timer 2>/dev/null || true
@@ -2624,6 +2815,7 @@ purge_mariadb() {
   apt_purge_pattern 'mariadb-plugin-*'
   apt_purge_pkgs mysql-common
   rm -rf /etc/mysql /var/lib/mysql /var/lib/mariadb /var/log/mariadb /var/log/mysql
+  rm -rf "${LOG_ROOT}/mariadb"
   rm -rf /var/lib/mysql-files /var/lib/mysql-keyring /run/mysqld
   rm -rf /etc/systemd/system/mariadb.service.d
   rm -rf /root/tools /root/mysqltuner.pl
@@ -2661,6 +2853,7 @@ purge_valkey() {
   purge_service_stop valkey-server
   apt_purge_pattern 'valkey-*'
   rm -rf /etc/valkey /var/lib/valkey /var/log/valkey /run/valkey
+  rm -rf "${LOG_ROOT}/valkey"
   rm -rf /etc/systemd/system/valkey-server.service.d
   systemctl daemon-reload || true
   ok "Valkey purged"
@@ -2671,6 +2864,7 @@ purge_elastic() {
   purge_service_stop elasticsearch
   apt_purge_pkgs elasticsearch
   rm -rf /etc/elasticsearch /var/lib/elasticsearch /var/log/elasticsearch /run/elasticsearch
+  rm -rf "${LOG_ROOT}/elasticsearch"
   rm -rf /etc/systemd/system/elasticsearch.service.d
   rm -f /etc/apt/sources.list.d/elastic-9.x.list /usr/share/keyrings/elasticsearch-keyring.gpg
   rm -f /etc/sysctl.d/99-elasticsearch.conf
@@ -2693,6 +2887,7 @@ purge_others() {
     fi
   done
   (( ${#removable[@]} == 0 )) || apt_purge_pkgs "${removable[@]}"
+  rm -rf "${LOG_ROOT}/nodejs" "${LOG_ROOT}/gifsicle"
 
   if pkg_ok nodejs; then
     if pkg_preexisting nodejs || ! pkg_installed_by_setup nodejs; then
@@ -2763,6 +2958,12 @@ run_purge() {
   done
 
   apt_clean
+  # When every service log directory is gone, remove the shared log root and
+  # its rotation policy too.
+  if [[ -d $LOG_ROOT ]] && [[ -z $(ls -A "$LOG_ROOT" 2>/dev/null) ]]; then
+    rm -f /etc/logrotate.d/setup-logs
+    rmdir "$LOG_ROOT" 2>/dev/null || true
+  fi
   printf '\n%sPurge complete.%s\n' "$C_GREEN" "$C_RESET"
 }
 
@@ -2850,7 +3051,7 @@ print_plan() {
         ;;
       valkey)
         printf '  %-10s ram=%s policy=%s io_threads=%s\n' "$s" \
-          "${OPT[valkey.ram]:-auto (10%% of RAM)}" \
+          "${OPT[valkey.ram]:-auto (10% of RAM)}" \
           "${OPT[valkey.policy]:-allkeys-lru}" \
           "${OPT[valkey.io_threads]:-1}"
         ;;

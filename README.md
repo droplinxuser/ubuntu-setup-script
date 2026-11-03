@@ -14,6 +14,7 @@ The script is designed for a fresh server but is safe to re-run on an already co
 | `configs/system/` | DNS, CPU governor, sysctl and limits profiles |
 | `configs/mariadb/` | MariaDB reference profile and systemd limits |
 | `tests/stress-site/` | Full-stack test site and stress harness |
+| `/var/www/logs/` (live) | One directory tree for Angie, PHP, MariaDB, Valkey, Node.js, GifSicle and Elasticsearch logs |
 | `tools/diff_configs.sh` | Compare canonical configs (both repos) with live `/etc` |
 | `legacy/basic_setup.sh` | Old standalone basic setup script (superseded) |
 
@@ -23,6 +24,38 @@ Non-Angie/non-PHP-FPM configuration lives here.
 
 `setup.sh` prefers the local files under `configs/` when it is run from this
 checkout, but keeps embedded fallbacks so it still works as a single file.
+
+## What's new in 1.6.0
+
+- **Centralised logs.** Every service now writes below `/var/www/logs/`:
+  `angie/`, `php/`, `mariadb/`, `valkey/`, `nodejs/`, `gifsicle/` and
+  `elasticsearch/`. Collect the whole tree with
+  `tar -czf /tmp/logs.tgz -C /var/www logs`. Logrotate rules are installed for
+  the tree.
+- **FastCGI over a Unix socket.** PHP-FPM listens on
+  `/run/php/php-fpm.sock`; Angie's `local_php` upstream uses the same socket.
+  This removed the loopback TCP overhead in local tests (about +10% PHP
+  throughput and a lower p99).
+- **Security fixes.** Config deployments no longer preserve the ownership of a
+  local Git checkout in `/etc/angie`; the shared sample TLS key is no longer
+  installed (a unique default certificate is generated per host); service
+  umasks create group-readable logs; AppArmor is allowed to write the MariaDB
+  log tree; limits are written as a drop-in instead of replacing
+  `/etc/security/limits.conf`.
+- **SSH cannot be locked out by `--purge`.** The SSH rate-limit rule is
+  inserted before any pre-existing `allow 22` rule, and purge never removes
+  SSH rules. It also adds `allow 22` first if UFW is active without one.
+- **Domain fix.** `--domain a.com app=xf b.com app=wordpress` now assigns each
+  `app=` to its own domain instead of applying the last app to every domain.
+  A single `app=` after a list still applies to the whole group, as documented.
+- **Pingvin fix.** Generated Pingvin vhosts use
+  `/var/www/<domain>/frontend/public` instead of a doubled `frontend` path.
+- **Compatibility fix.** PHP no longer disables `system`/`passthru`, which
+  broke Chevereto video processing and some WordPress plugins by default.
+- Added MariaDB `O_DIRECT`, buffer-pool dump/load and smaller Angie header and
+  gzip buffers for large-site memory efficiency.
+- `--others` includes GifSicle and Node.js logging; the stress site creates its
+  own database and writes Node/GifSicle output to the central tree.
 
 ## What's new in 1.5.0
 
@@ -277,18 +310,18 @@ Before changing basic settings, the script records the originals under `/var/lib
 - Sizes OPcache, JIT and `memory_limit` from RAM instead of fixed 512 MB values:
   - OPcache 128–512 MB, JIT 64–256 MB, `memory_limit` 256–512 MB, realpath cache 4–16 MB.
 - The repo templates provide OPcache file cache under `/var/cache/php/opcache`, `request_slowlog_timeout=5s`, `catch_workers_output=yes`, session hardening, `cgi.fix_pathinfo=0`, MariaDB Unix-socket defaults and `mysqlnd` statistics disabled.
-- `setup.sh` creates the log/cache directories and the systemd `LimitNOFILE=524288` drop-in.
+- `setup.sh` creates the log/cache directories and the systemd `LimitNOFILE=524288`, `UMask=0027` drop-in. PHP-FPM and Angie use the Unix socket `/run/php/php-fpm.sock`.
 - Sets the PHP timezone from `--basic time=`.
 - Enables and restarts `php<ver>-fpm` and prints `php<ver> -v`.
 
-**PHP version policy:** the pool listens on `127.0.0.1:9000`, and the Angie `local_php` upstream also points to `127.0.0.1:9000`. Therefore **only one PHP-FPM version can be active at a time**. You can install any version Sury provides (`ver=8.3`, `ver=8.4`, `ver=8.5`, ...), but to switch versions you must purge the old one first:
+**PHP version policy:** the pool listens on `/run/php/php-fpm.sock`, and the Angie `local_php` upstream points to the same socket. Therefore **only one PHP-FPM version can be active at a time**. You can install any version Sury provides (`ver=8.3`, `ver=8.4`, `ver=8.5`, ...), but to switch versions you must purge the old one first:
 
 ```bash
 sudo bash setup.sh --purge --php ver=8.4
 sudo bash setup.sh --basic ... --php ver=8.5
 ```
 
-Installing a second version while the first is active is refused **before any packages are installed**, with a clear message instead of a cryptic “Address already in use”. Running multiple PHP-FPM pools simultaneously would require different `listen` ports and a matching Angie upstream per version; that is not automated.
+Installing a second version while the first is active is refused **before any packages are installed**, with a clear message instead of a cryptic “Address already in use” or a socket collision. Running multiple PHP-FPM pools simultaneously would require different `listen` ports and a matching Angie upstream per version; that is not automated.
 
 ### MariaDB (`--mariadb user=... pass=... size=4gb|auto [bind=...]`)
 
@@ -676,7 +709,7 @@ The script produces a working, internet-facing baseline. For a large or security
 
 ## Troubleshooting
 
-### “Port 9000 is already in use”
+### “Another PHP-FPM version is active”
 
 Another PHP-FPM version is already running. Purge it first:
 
@@ -684,7 +717,7 @@ Another PHP-FPM version is already running. Purge it first:
 sudo bash setup.sh --purge --php ver=8.4
 ```
 
-Then install the desired version. Only one PHP-FPM version can own `127.0.0.1:9000`.
+Then install the desired version. Only one PHP-FPM version can own `/run/php/php-fpm.sock`.
 
 ### “Installation of system tables failed” on MariaDB
 

@@ -119,10 +119,15 @@ foreach ([
     $frameFiles[] = $file;
 }
 $out = $root . '/assets/logo.gif';
+$gifLog = '/var/www/logs/gifsicle/gifsicle.log';
+if (!is_dir(dirname($gifLog))) {
+    @mkdir(dirname($gifLog), 0750, true);
+}
 $cmd = sprintf(
-    'gifsicle --delay=30 --loopcount=0 -O3 --colors 64 %s > %s',
+    'gifsicle --delay=30 --loopcount=0 -O3 --colors 64 %s > %s 2>> %s',
     implode(' ', array_map('escapeshellarg', $frameFiles)),
-    escapeshellarg($out)
+    escapeshellarg($out),
+    escapeshellarg($gifLog)
 );
 exec($cmd, $output, $status);
 if ($status !== 0 || !is_file($out)) {

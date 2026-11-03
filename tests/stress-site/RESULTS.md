@@ -1,4 +1,42 @@
-# Full-stack local stress report (setup.sh 1.4.0)
+# Full-stack local stress report
+
+## setup.sh 1.6.0 - 8 vCPU VPS
+
+- Generated: 2026-11-03T02:33:00Z
+- Host: stress1.test, 8 vCPU, 15.1 GiB RAM, Ubuntu 26.04.1, NVMe
+- Angie: Angie/1.12.4
+- PHP: PHP 8.5.12 with OPcache/JIT
+- MariaDB: 11.8.6
+- Valkey: 9.0.4
+- Elasticsearch: 9.5.6
+- Node.js: v26.13.0
+- GifSicle: 1.96
+- FastCGI: Unix socket `/run/php/php-fpm.sock`
+
+| Scenario | Requests/sec | p50 | p90 | p99 | Client socket errors |
+|---|---:|---:|---:|---:|---|
+| static | 94056.02 | 449.00us | 2.45ms | 5.32ms | none |
+| php-hello | 43119.22 | 1.41ms | 481.97ms | 884.25ms | none |
+| mariadb-json | 11100.58 | 4.68ms | 9.89ms | 929.62ms | timeouts 37 |
+| valkey-json | 15947.22 | 3.70ms | 5.25ms | 1.26s | timeouts 46 |
+| elasticsearch | 2349.98 | 17.22ms | 31.55ms | 181.19ms | timeouts 5 |
+| node-proxy | 12724.60 | 7.59ms | 9.37ms | 13.19ms | none |
+| full-uncached-200 | 2525.37 | 22.26ms | 35.12ms | 67.01ms | timeouts 24 |
+| full-cached-200 | 66951.16 | 2.07ms | 3.46ms | 5.92ms | none |
+| slow-1s-200 | 53.89 | 1.00s | 1.00s | 1.02s | none |
+
+Interpretation for an 8 vCPU host:
+
+- The server is CPU-bound during uncached PHP work. `wrk` competes for the
+  same cores, so its client-side p99 is much worse than Angie's server-side
+  `$request_time` (p50 ~4.8 ms, ~0.15% >500 ms for the MariaDB page).
+- FastCGI over a Unix socket improved PHP hello throughput from ~39.7k to
+  ~43.3k req/s and removed loopback TCP overhead.
+- FastCGI page caching is still the largest win: ~2.5k -> ~67k req/s on the
+  same full-stack page.
+- Logs for this run are in `/var/www/logs/{angie,php,mariadb,valkey,nodejs,gifsicle,elasticsearch}`.
+
+## setup.sh 1.4.0 - 16 vCPU reference
 
 This is the measured baseline from `tests/stress-site/run-stress.sh` after all
 v1.4.0 fixes (Angie cache/rate-limit fixes, PHP extensions/OPcache, MariaDB
@@ -53,7 +91,11 @@ Notes on the numbers:
 - Memory: 13461/27806 MB used -> 13530/27806 MB used
 - PHP-FPM: pool:                 www;process manager:      static;start time:           03/Nov/2026:09:17:17 +0800;start since:          267;accepted conn:        1534834;listen queue:         18;max listen queue:     194;listen queue len:     65535;idle processes:       3;active processes:     128;total processes:      131;max active processes: 119694;max children reached: 0;slow requests:        0;memory peak:          2097152;
 - MariaDB: Aborted_connects	0;Max_used_connections	134;Questions	1655055;Slow_queries	0;Threads_connected	1;Threads_running	1;
-- Valkey: total_commands_processed:2770078;instantaneous_ops_per_sec:0;rejected_connections:0;evicted_keys:0;
+- Valkey: total_commands_processed:2770078
+;instantaneous_ops_per_sec:0
+;rejected_connections:0
+;evicted_keys:0
+;
 - Elasticsearch: {"nodes":{"node":{"indices":{"search":{"query_total":1419939}},"jvm":{"mem":{"heap_used_in_bytes":1401520728},"gc":{"collectors":{"young":{"collection_count":90}}}}}}} -> {"nodes":{"node":{"indices":{"search":{"query_total":1571489}},"jvm":{"mem":{"heap_used_in_bytes":1598405688},"gc":{"collectors":{"young":{"collection_count":99}}}}}}}
 
 ## Notes

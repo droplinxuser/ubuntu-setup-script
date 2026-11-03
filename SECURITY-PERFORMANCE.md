@@ -10,6 +10,58 @@ monitoring and scaling beyond one 16-core machine.
 
 ---
 
+## 0. 1.6.0 live validation on an 8 vCPU VPS
+
+Validated on 2026-11-03 against a clean Ubuntu 26.04.1 VPS (8 vCPU, 15.1 GiB
+RAM, 141 GB NVMe) with every service installed from `setup.sh` and the full
+stress site running.
+
+Versions: Angie 1.12.4, PHP 8.5.12, MariaDB 11.8.6, Valkey 9.0.4,
+Elasticsearch 9.5.6, Node.js 26.13.0, GifSicle 1.96.
+
+| Scenario | req/s | p50 | p90 | p99 | Client timeouts |
+|---|---:|---:|---:|---:|---:|
+| static (Angie only) | 94,056 | 0.45 ms | 2.45 ms | 5.32 ms | 0 |
+| PHP hello + OPcache | 43,119 | 1.41 ms | 482 ms | 884 ms | 0 |
+| MariaDB indexed read via PHP | 11,101 | 4.68 ms | 9.89 ms | 930 ms | 37 |
+| Valkey via PHP | 15,947 | 3.70 ms | 5.25 ms | 1.26 s | 46 |
+| Elasticsearch search via PHP | 2,350 | 17.2 ms | 31.6 ms | 181 ms | 5 |
+| Node.js cluster proxy | 12,725 | 7.59 ms | 9.37 ms | 13.2 ms | 0 |
+| Full stack, uncached, 200 clients | 2,525 | 22.3 ms | 35.1 ms | 67.0 ms | 24 |
+| Full stack, FastCGI cache 5 s | 66,951 | 2.07 ms | 3.46 ms | 5.92 ms | 0 |
+| Deliberate 1 s PHP sleep, 200 clients | 53.9 | 1.00 s | 1.00 s | 1.02 s | 0 |
+
+What the live run proved:
+
+1. **Caching is the single largest lever.** The same heavy page went from
+   ~2.5k req/s uncached to ~67k req/s from Angie's FastCGI cache, with p99
+   under 6 ms. Every guest-facing app should use page/object caching.
+2. **The 8 vCPU host is CPU-bound during uncached PHP work.** `vmstat` showed
+   ~49% user and ~49% system time and ~190k context switches/s during the PHP
+   tests. The `wrk` client shares those cores, so its p99 is inflated;
+   Angie's own access log showed p50 4.8 ms and only ~0.15% of requests above
+   500 ms for the MariaDB page. Measure server-side `$request_time`/`$urt` for
+   real p99, and generate load from a separate machine for final numbers.
+3. **FastCGI over `/run/php/php-fpm.sock`** raised PHP hello throughput from
+   ~39.7k to ~43.3k req/s (+10%) and removed the loopback TCP overhead.
+4. **MariaDB thread pool vs one-thread-per-connection** made no material
+   difference to server-side latency on this host (p50 ~4.5-5 ms, throughput
+   ~11-12k/s, ~200 requests >500 ms in 10 s in both cases). Keep
+   `pool-of-threads` for connection-memory efficiency; do not expect it to fix
+   CPU saturation.
+5. **Valkey was never the bottleneck**: zero rejected connections and zero
+   evictions at ~40k commands/s in the suite.
+6. **Elasticsearch 9.5 with a 4 GB heap** handled ~2.3k searches/s while
+   sharing the host. It is the most memory- and CPU-expensive service; move it
+   to its own node before traffic grows.
+7. **Centralised logs worked**: Angie, PHP, MariaDB, Valkey, Node.js, GifSicle
+   and Elasticsearch all wrote under `/var/www/logs/`, with no PHP warnings,
+   no MariaDB slow queries and no Angie errors. MariaDB's AppArmor profile
+   needed explicit `/var/www/logs/mariadb/** rw` rules; the script now adds
+   them.
+
+---
+
 ## 1. Measured baseline (this host)
 
 16 vCPU (AMD Zen 4), 27 GiB usable RAM, NVMe, Ubuntu 26.04.1.

@@ -100,8 +100,8 @@ ES_AFTER=$(curl -fsS 'http://127.0.0.1:9200/_nodes/stats/jvm,indices?filter_path
   echo "  on every request). It is limited by PHP worker occupancy and CPU."
   echo "- Client socket timeouts under the slow-1s scenario mean the PHP-FPM"
   echo "  listen queue is full; add workers or cache the endpoint."
-  echo "- Check /var/log/angie/${DOMAIN}.error.log and"
-  echo "  /var/log/php-fpm/www-slow.log for server-side warnings."
+  echo "- Check /var/www/logs/angie/${DOMAIN}.error.log and"
+  echo "  /var/www/logs/php/php-fpm-slow.log for server-side warnings."
 } >>"$REPORT"
 
 echo >&2
