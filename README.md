@@ -20,9 +20,104 @@ The script is designed for a fresh server but is safe to re-run on an already co
 
 ## Quick start
 
+The commands below are complete and copy-paste ready for a brand new Ubuntu 26.04 server. Only the services named on a command are installed. `--basic` is required for every install profile; its values are auto-detected when omitted.
+
+> Replace `pass=temp` with a strong password before running any MariaDB command. The password is also written to the local backup configuration.
+
+### Full stack (all services)
+
 ```bash
 sudo bash setup.sh \
-  --basic server=dedi host=custom.host time=Asia/Manila swap=8G \
+  --basic server=dedi host=web1.example.com time=Asia/Manila swap=8G \
+  --angie \
+  --php ver=8.5 \
+  --mariadb user=demo pass=temp size=4gb bind=127.0.0.1 \
+  --valkey \
+  --elastic host=localhost ram=4g \
+  --others all
+```
+
+### Basic-only and minimal profiles
+
+```bash
+# Basic hardening only; auto-detect server type, hostname and swap
+sudo bash setup.sh --basic
+
+# Minimal Angie + PHP, with all basic values auto-detected
+sudo bash setup.sh --basic --angie --php
+
+# Basic with explicit dedicated-server values
+sudo bash setup.sh --basic server=dedi host=web1.example.com time=Asia/Manila swap=8G
+
+# Basic on a VPS; the CPU governor step is skipped automatically
+sudo bash setup.sh --basic server=vps host=web-vps.example.com time=UTC swap=2G
+
+# Angie only
+sudo bash setup.sh --basic server=dedi host=web1.example.com time=Asia/Manila swap=8G --angie
+
+# PHP-FPM only, using the latest stable PHP in Sury
+sudo bash setup.sh --basic server=dedi host=web1.example.com time=Asia/Manila swap=8G --php
+
+# Angie + PHP
+sudo bash setup.sh --basic server=dedi host=web1.example.com time=Asia/Manila swap=8G --angie --php ver=8.5
+
+# Valkey only
+sudo bash setup.sh --basic server=dedi host=web1.example.com time=Asia/Manila swap=8G --valkey
+
+# Elasticsearch only
+sudo bash setup.sh --basic server=dedi host=web1.example.com time=Asia/Manila swap=8G --elastic host=localhost ram=4g
+
+# Other utilities only
+sudo bash setup.sh --basic server=dedi host=web1.example.com time=Asia/Manila swap=8G --others all
+```
+
+### MariaDB profiles
+
+```bash
+# Local-only MariaDB (recommended default)
+sudo bash setup.sh \
+  --basic server=dedi host=db1.example.com time=Asia/Manila swap=8G \
+  --mariadb user=demo pass=temp size=4gb bind=127.0.0.1
+
+# Local MariaDB plus the detected public IPv4 (use for remote clients)
+sudo bash setup.sh \
+  --basic server=dedi host=db1.example.com time=Asia/Manila swap=8G \
+  --mariadb user=demo pass=temp size=8gb bind=127.0.0.1,IPV4
+
+# Local MariaDB plus explicit interfaces
+sudo bash setup.sh \
+  --basic server=dedi host=db1.example.com time=Asia/Manila swap=8G \
+  --mariadb user=demo pass=temp size=8gb bind=127.0.0.1,10.0.0.5
+
+# Local MariaDB plus IPv6 loopback
+sudo bash setup.sh \
+  --basic server=dedi host=db1.example.com time=Asia/Manila swap=8G \
+  --mariadb user=demo pass=temp size=8gb bind=127.0.0.1,::1
+```
+
+### Common web stacks
+
+```bash
+# Web app without search: Angie + PHP + MariaDB + Valkey
+sudo bash setup.sh \
+  --basic server=dedi host=web1.example.com time=Asia/Manila swap=8G \
+  --angie \
+  --php ver=8.5 \
+  --mariadb user=demo pass=temp size=4gb bind=127.0.0.1 \
+  --valkey
+
+# Web app with search: Angie + PHP + MariaDB + Valkey + Elasticsearch
+sudo bash setup.sh \
+  --basic server=dedi host=web1.example.com time=Asia/Manila swap=8G \
+  --angie \
+  --php ver=8.5 \
+  --mariadb user=demo pass=temp size=4gb bind=127.0.0.1 \
+  --valkey \
+  --elastic host=localhost ram=4g
+
+# Web app with search and all utilities
+sudo bash setup.sh \
+  --basic server=dedi host=web1.example.com time=Asia/Manila swap=8G \
   --angie \
   --php ver=8.5 \
   --mariadb user=demo pass=temp size=4gb bind=127.0.0.1 \
@@ -31,22 +126,37 @@ sudo bash setup.sh \
   --others smartmon nvme gif nodejs
 ```
 
-If a service flag is omitted, that service is **not** installed. `--basic` is required for every install run, but its `server`, `host` and `swap` values are optional and auto-detected when omitted. `--domain` is a standalone action and does **not** require `--basic`.
+### Domains
+
+`--domain` is standalone: Angie and MariaDB must already be installed and MariaDB must be running. It creates the document root, a blank Angie vhost and the database. Existing vhost files are preserved.
 
 ```bash
-# Minimal: auto-detect server, hostname and swap
-sudo bash setup.sh --basic --angie --php
-
-# Add domains after Angie + MariaDB are installed
+# One domain
 sudo bash setup.sh --domain google.com
+
+# Multiple domains
+sudo bash setup.sh --domain google.com example.org my-site.example.com
+
+# Full install and domain creation in one command
+sudo bash setup.sh \
+  --basic server=dedi host=web1.example.com time=Asia/Manila swap=8G \
+  --angie \
+  --php ver=8.5 \
+  --mariadb user=demo pass=temp size=4gb bind=127.0.0.1 \
+  --valkey \
+  --elastic host=localhost ram=4g \
+  --others all \
+  --domain google.com example.org
 ```
+
+If a service flag is omitted, that service is **not** installed. `--basic` values are optional and auto-detected when omitted. `--domain` does **not** require `--basic` when used by itself.
 
 ### Dry run / validation
 
 `--dry-run` (alias `--check`) parses and validates the command, then prints the resolved install or purge plan without touching the system. It works as a normal user, which makes it safe for CI and for checking combinations:
 
 ```bash
-./setup.sh --dry-run --basic server=dedi host=web1 time=Asia/Manila \
+./setup.sh --dry-run --basic server=dedi host=web1.example.com time=Asia/Manila \
   --angie --php --mariadb user=demo pass=temp size=4gb --valkey --elastic ram=4g
 ./setup.sh --dry-run --purge --angie --php ver=8.5
 ```
