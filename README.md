@@ -339,11 +339,11 @@ Installing a second version while the first is active is refused **before any pa
   - `innodb_io_capacity` chosen for NVMe (4000/8000), SSD (2000/4000) or HDD (400/800)
   - 512k join/read buffers, 1M sort buffer, 64M temp tables, 8k table/open-file caches on ≥4 GB pools
   - `secure_file_priv=/var/lib/mysql-files`, `local_infile=0`, `wait_timeout=600`, `max_allowed_packet=64M`
-  - Slow query log at `/var/log/mariadb/slow.log` (`long_query_time=1`, `min_examined_row_limit=100`, query plan + explain)
+  - Slow query log at `/var/www/logs/mariadb/slow.log` (`long_query_time=1`, `min_examined_row_limit=100`, query plan + explain)
   - `bind-address` from `bind=` (default `127.0.0.1`)
 - Comments out `expire_logs_days`.
 - Creates the requested admin user with `GRANT ALL ... WITH GRANT OPTION` for `localhost`, `127.0.0.1` and `::1` (idempotent `CREATE USER IF NOT EXISTS` + `ALTER USER`). The extra loopback hosts are required because `skip_name_resolve=1` means a TCP connection to `127.0.0.1` does **not** match `'user'@'localhost'`.
-- Creates `/var/log/mariadb`, sets ownership, reloads systemd and restarts MariaDB.
+- Creates `/var/www/logs/mariadb`, sets ownership, reloads systemd and restarts MariaDB.
 - Does not download MariaDB tools at runtime: `mysqltuner.pl` and the `mysqlbackup` repository are embedded. It installs `mysqltuner.pl` to `/root/mysqltuner.pl`, installs the backup utility under `/root/tools/mysqlbackup-master`, and writes `/etc/mysqlbkup.cnf` with the requested user/password.
 - Verifies `mysqldump` and `mariadb-check` are present.
 
@@ -782,7 +782,7 @@ By default `--elastic host=localhost` binds to loopback and security is disabled
 | `/home/nginx_cache*`, `/home/xf_proxy_cache`, `/home/proxy_cache*` | Angie FastCGI/proxy cache directories (owned by `www-data`) |
 | `/etc/php/<version>/` | PHP-FPM configuration |
 | `/var/cache/php/opcache` | OPcache file cache (owned by `www-data`) |
-| `/var/log/php-fpm/www-slow.log` | PHP-FPM slow-request log |
+| `/var/www/logs/php/php-fpm-slow.log` | PHP-FPM slow-request log |
 | `/etc/systemd/system/php<ver>-fpm.service.d/limits.conf` | PHP-FPM nofile drop-in |
 | `/etc/mysql/mariadb.conf.d/50-server.cnf` | MariaDB managed block |
 | `/etc/valkey/valkey.conf`, `/run/valkey/valkey.sock` | Valkey settings and local Unix socket |
