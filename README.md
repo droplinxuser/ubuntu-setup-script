@@ -136,6 +136,30 @@ Installing a second version while the first is active is refused **before any pa
 - Downloads nothing at runtime: `mysqltuner.pl` and the `mysqlbackup` repository are embedded. It installs `mysqltuner.pl` to `/root/mysqltuner.pl`, installs the backup utility under `/root/tools/mysqlbackup-master`, and writes `/etc/mysqlbkup.cnf` with the requested user/password.
 - Verifies `mysqldump` and `mariadb-check` are present.
 
+**Multiple bind addresses / remote access:** `bind=` accepts a comma-separated list of IPv4 addresses, `::1`, and the special token `IPV4`:
+
+```bash
+# Listen on loopback and a specific interface
+sudo bash setup.sh --basic ... --mariadb user=dan pass=temp size=4gb \
+  bind=127.0.0.1,10.0.0.5
+
+# Listen on loopback plus the detected public IPv4
+sudo bash setup.sh --basic ... --mariadb user=dan pass=temp size=4gb \
+  bind=127.0.0.1,IPV4
+```
+
+`IPV4` first asks an external service for the public address. If that address is not assigned to a local interface (typical behind NAT), it warns and falls back to the local outbound IPv4 instead of writing an unusable bind. Whitespace and duplicate addresses are removed.
+
+The script does **not** open TCP 3306 in UFW and does not create `'user'@'%'` accounts. For remote clients, allow only trusted source addresses and create a matching account:
+
+```bash
+sudo ufw allow from 203.0.113.10 to any port 3306 proto tcp
+sudo mariadb -e "CREATE USER 'app'@'203.0.113.10' IDENTIFIED BY 'strong-password'; \
+  GRANT SELECT,INSERT,UPDATE,DELETE ON appdb.* TO 'app'@'203.0.113.10';"
+```
+
+Use TLS (`require_secure_transport=ON`) if traffic crosses an untrusted network.
+
 The MariaDB backup cron entry is added only when MariaDB is selected.
 
 **Ubuntu 26.04 AppArmor note:** the packaged `mariadbd` AppArmor profile omits `dac_override`/`setuid`/`setgid`, which breaks `mariadb-install-db` on re-installs. The script adds a managed capability override to `/etc/apparmor.d/local/mariadbd` and removes a stale loaded profile before reinstalling. `--purge mariadb` removes the override.
@@ -315,6 +339,8 @@ The script was tested on Ubuntu 26.04.1 LTS (16 CPU threads, 32 GB installed RAM
 | Angie + PHP 8.5 | `--basic ... --angie --php ver=8.5` | PASS |
 | PHP default | `--php` with no `ver=` (auto-selected latest stable, 8.5) | PASS |
 | MariaDB only | `--basic ... --mariadb user=tester pass='t3st&p\|w' size=2gb bind=127.0.0.1` | PASS |
+| MariaDB multi-bind | `bind=127.0.0.1,127.0.0.2` (and whitespace/duplicates) writes and listens on both addresses | PASS |
+| MariaDB `IPV4` bind | `bind=127.0.0.1,IPV4` resolves the public address (or warns/falls back to the local outbound IPv4 on NAT) | PASS |
 | PHP 8.4 only | `--basic ... --php ver=8.4` | PASS |
 | PHP 8.4 → 8.5 switch | second version rejected before packages are installed; purge 8.4, then install 8.5 | PASS |
 | Everything except Elasticsearch | basic + Angie + PHP 8.5 + MariaDB + Valkey + all others | PASS |
@@ -387,7 +413,7 @@ The script produces a working, internet-facing baseline. For a large or security
 **MariaDB**
 - The setup admin user gets `GRANT ALL ... WITH GRANT OPTION`. Create per-application users limited to their own database and remove `GRANT OPTION`; never use the admin account in application config.
 - `innodb_flush_log_at_trx_commit=2` survives a database crash but can lose the last second of commits on an OS/power failure. Use `1` for financial or otherwise critical data.
-- Keep `bind-address=127.0.0.1` unless you really need remote access; if remote, enable TLS and restrict with UFW. `skip_name_resolve=1` is good for latency.
+- Keep `bind-address=127.0.0.1` unless you really need remote access; if remote, use explicit addresses (or `IPV4`), enable TLS, open 3306 only for trusted source IPs in UFW, and create per-client accounts. `skip_name_resolve=1` is good for latency.
 - Test the embedded `mysqlbkup` job and store encrypted, off-site copies. A local backup on the same NVMe is not disaster recovery.
 - Run `/root/mysqltuner.pl` after the site has real traffic and review slow queries; add indexes rather than raising buffers blindly. Consider a read replica or separate database host at scale.
 
