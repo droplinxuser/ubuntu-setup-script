@@ -25,7 +25,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.6.1"
+readonly SCRIPT_VERSION="1.6.2"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
@@ -1666,11 +1666,12 @@ install_php() {
   chown www-data:www-data /run/php 2>/dev/null || true
   chmod 755 /run/php
 
-  # XenForo-focused extension set.  Keep this list minimal; the operator can
-  # add intl/imagick/bcmath/apcu or OPcache later if an add-on needs them.
-  apt_install "php${ver}-fpm" "php${ver}-mysql" "php${ver}-gd" \
-    "php${ver}-curl" "php${ver}-xml" "php${ver}-zip" "php${ver}-gmp" \
-    "php${ver}-mbstring" "php${ver}-redis"
+  # XenForo-focused extension set: runtime, database, media, HTTP, XML,
+  # archives, math, multibyte, Redis, OPcache and the CLI for XenForo cmd.php.
+  # Add intl/imagick/bcmath/apcu only if a specific add-on needs them.
+  apt_install "php${ver}-fpm" "php${ver}-cli" "php${ver}-opcache" \
+    "php${ver}-mysql" "php${ver}-gd" "php${ver}-curl" "php${ver}-xml" \
+    "php${ver}-zip" "php${ver}-gmp" "php${ver}-mbstring" "php${ver}-redis"
 
   fetch_server_configs
   local pool_template="${CONFIG_SOURCE_DIR}/scripts/www_${ver//./}.conf"

@@ -25,6 +25,12 @@ Non-Angie/non-PHP-FPM configuration lives here.
 `setup.sh` prefers the local files under `configs/` when it is run from this
 checkout, but keeps embedded fallbacks so it still works as a single file.
 
+## What's new in 1.6.2
+
+- Added `php<ver>-opcache` and `php<ver>-cli` back to the XenForo profile.
+  OPcache enables the pre-wired OPcache/JIT settings and is strongly
+  recommended for XenForo; the CLI is needed for `cmd.php` and Composer.
+
 ## What's new in 1.6.1
 
 - Angie no longer writes access logs at all. Only `error_log` is enabled; the
@@ -35,9 +41,9 @@ checkout, but keeps embedded fallbacks so it still works as a single file.
   `php<ver>-cli` is added only when `--others composer` is selected. The
   optional stress harness installs CLI for its seeder and can be removed
   afterwards.
-- OPcache/JIT and `intl`/`imagick`/`bcmath`/`apcu` are intentionally not
-  installed. Install `php<ver>-opcache` for production XenForo performance;
-  the ini settings are already in `custom_dan.ini`.
+- `intl`/`imagick`/`bcmath`/`apcu` are intentionally not installed. OPcache
+  and CLI are included; `custom_dan.ini` OPcache/JIT settings take effect
+  immediately.
 
 ## What's new in 1.6.0
 
@@ -127,7 +133,7 @@ sudo bash setup.sh \
 
 ### Large-site starting profile
 
-`size=auto` sizes InnoDB to 40% of RAM; PHP memory/realpath settings and Valkey are sized from RAM automatically. OPcache/JIT settings are pre-wired but only take effect if you install `php<ver>-opcache`. Add `children=` only after measuring worker RSS.
+`size=auto` sizes InnoDB to 40% of RAM; PHP, OPcache/JIT, memory/realpath settings and Valkey are sized from RAM automatically. Add `children=` only after measuring worker RSS.
 
 ```bash
 sudo bash setup.sh \
@@ -315,8 +321,8 @@ Before changing basic settings, the script records the originals under `/var/lib
 
 - Adds the Sury APT repository (keyring embedded in the script).
 - If `ver=` is omitted, selects the **latest stable PHP** available to APT from the Sury repository (currently 8.5; pre-release packages such as `8.6.0~rc3` are ignored).
-- Installs the XenForo-minimal profile: `php<ver>-fpm`, `php<ver>-mysql`, `php<ver>-gd`, `php<ver>-curl`, `php<ver>-xml`, `php<ver>-zip`, `php<ver>-gmp`, `php<ver>-mbstring`, `php<ver>-redis`. No CLI, OPcache, `intl`, `imagick`, `bcmath`, `apcu`, `igbinary`, `msgpack`, `sqlite3` or `bz2` unless you add them yourself or select `--others composer` (which adds the matching `php<ver>-cli`).
-  - XenForo recommends OPcache for production. If you want it, install `php<ver>-opcache`; the `custom_dan.ini` OPcache settings are already present and take effect automatically. Add `php<ver>-intl` only if an add-on needs it.
+- Installs the XenForo profile: `php<ver>-fpm`, `php<ver>-cli`, `php<ver>-opcache`, `php<ver>-mysql`, `php<ver>-gd`, `php<ver>-curl`, `php<ver>-xml`, `php<ver>-zip`, `php<ver>-gmp`, `php<ver>-mbstring`, `php<ver>-redis`. It does not install `intl`, `imagick`, `bcmath`, `apcu`, `igbinary`, `msgpack`, `sqlite3` or `bz2` unless you add them yourself.
+  - OPcache/JIT settings in `custom_dan.ini` are active because `php<ver>-opcache` is installed. Add `php<ver>-intl` only if an add-on needs it.
 - Deploys `www.conf` from the repo's `scripts/www_<ver>.conf` and `custom_dan.ini` from `scripts/custom_dan.ini`. Add a new `scripts/www_<ver>.conf` to the repo to support a new PHP version; `setup.sh` does not carry pool/ini content.
 - Fills in the dynamic values from `setup.sh`:
   - `pm.max_children = RAM_MB / 256` (~50% of RAM at 128 MB per worker), capped at `CPU threads × 8`
