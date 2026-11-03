@@ -36,6 +36,26 @@ Interpretation for an 8 vCPU host:
   same full-stack page.
 - Logs for this run are in `/var/www/logs/{angie,php,mariadb,valkey,nodejs,gifsicle,elasticsearch}`.
 
+## Soak test (same 8 vCPU VPS)
+
+Run after the final configuration, without other load:
+
+| Scenario | Duration | Requests/sec | p50 | p90 | p99 | Errors |
+|---|---:|---:|---:|---:|---:|---|
+| Full stack uncached, 50 clients | 15 min | 3,212 | 14.5 ms | 21.5 ms | 29.7 ms | none |
+| FastCGI-cached page, 200 clients | 5 min | 67,010 | 1.82 ms | 5.37 ms | 9.97 ms | none |
+
+The 5-minute cache run served 20,107,871 requests (38.7 GB) with zero socket
+errors. MariaDB reported no slow queries or aborted connections; Valkey
+reported no rejected connections or evictions; Elasticsearch stayed green.
+Load average was high during the uncached run (about 55 on 8 vCPU) because the
+load generator shares the same cores, but server-side p99 stayed under 30 ms.
+
+Access logs reached 2.6 GB during the soak. For production, the templates now
+use `buffer=64k flush=5s` and logrotate caps rotation at 1 GB / 14 days; ship
+access logs off-box or disable them for static/cached assets on very large
+sites.
+
 ## setup.sh 1.4.0 - 16 vCPU reference
 
 This is the measured baseline from `tests/stress-site/run-stress.sh` after all
