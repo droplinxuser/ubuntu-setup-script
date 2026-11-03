@@ -1,0 +1,75 @@
+# Reference MariaDB 11.x profile for Ubuntu 26.04.
+#
+# setup.sh generates the live /etc/mysql/mariadb.conf.d/50-server.cnf with
+# hardware-aware values (buffer pool size, log size, I/O capacity, thread
+# pool, slow query log, etc.).  This file documents the intended baseline.
+
+[server]
+
+[mariadbd]
+collation-server = utf8mb4_general_ci
+character-set-server = utf8mb4
+
+innodb_snapshot_isolation = 1
+skip_name_resolve = 1
+query_cache_size = 0
+query_cache_type = 0
+open_files_limit = 524288
+secure_file_priv = /var/lib/mysql-files
+local_infile = 0
+
+max_connections = 400
+max_connect_errors = 524288
+thread_cache_size = 64
+# Many short PHP requests: the thread pool avoids connection-thread churn.
+thread_handling = pool-of-threads
+thread_pool_size = 16
+max_allowed_packet = 64M
+wait_timeout = 600
+interactive_timeout = 600
+net_read_timeout = 120
+net_write_timeout = 120
+
+# Size these from RAM; 4G/1G is a reasonable starting point for 16-32 GB.
+innodb_log_buffer_size = 64M
+innodb_log_file_size = 1G
+innodb_buffer_pool_size = 4G
+innodb_buffer_pool_instances = 4
+
+innodb_flush_log_at_trx_commit = 2
+innodb_read_only_compressed = OFF
+innodb_lock_wait_timeout = 100
+innodb_flush_neighbors = 0
+innodb_stats_persistent = ON
+innodb_stats_auto_recalc = ON
+innodb_lru_scan_depth = 2048
+
+innodb_io_capacity = 4000
+innodb_io_capacity_max = 8000
+
+innodb_read_io_threads = 16
+innodb_write_io_threads = 16
+
+join_buffer_size = 512K
+read_buffer_size = 512K
+read_rnd_buffer_size = 512K
+sort_buffer_size = 1M
+
+tmp_table_size = 64M
+max_heap_table_size = 64M
+
+table_open_cache = 8000
+table_definition_cache = 8000
+innodb_open_files = 8000
+key_buffer_size = 32M
+
+aria_pagecache_buffer_size = 256M
+
+slow_query_log = 1
+slow_query_log_file = /var/log/mariadb/slow.log
+long_query_time = 1
+min_examined_row_limit = 100
+log_slow_verbosity = query_plan,explain
+
+log_error = /var/log/mariadb/error.log
+bind-address = 127.0.0.1

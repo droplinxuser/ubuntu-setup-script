@@ -6,11 +6,30 @@ Angie and PHP-FPM/php.ini configuration is **not** hard-coded in this script. It
 
 The script is designed for a fresh server but is safe to re-run on an already configured machine. Only the services named on the command line are touched.
 
+## Repository layout
+
+| Path | Contents |
+|---|---|
+| `setup.sh` | Installer/provisioner (packages, services, domains, purge) |
+| `configs/system/` | DNS, CPU governor, sysctl and limits profiles |
+| `configs/mariadb/` | MariaDB reference profile and systemd limits |
+| `tests/stress-site/` | Full-stack test site and stress harness |
+| `tools/diff_configs.sh` | Compare canonical configs (both repos) with live `/etc` |
+| `legacy/basic_setup.sh` | Old standalone basic setup script (superseded) |
+
+Angie, Nginx and PHP-FPM configuration lives only in
+[`droplinxuser/server-configs-nginx`](https://github.com/droplinxuser/server-configs-nginx).
+Non-Angie/non-PHP-FPM configuration lives here.
+
+`setup.sh` prefers the local files under `configs/` when it is run from this
+checkout, but keeps embedded fallbacks so it still works as a single file.
+
 ## What's new in 1.5.0
 
 - Removed the embedded Angie config archive and all duplicated Angie/PHP config patching from `setup.sh`.
 - `setup.sh` now downloads `server-configs-nginx` once per run and delegates deployment to its `scripts/nginx_conf.sh`.
 - PHP-FPM pool and `php.ini` templates now come from `server-configs-nginx/scripts/www_<ver>.conf` and `scripts/custom_dan.ini`.
+- Moved non-Angie/non-PHP-FPM files out of `server-configs-nginx` into this repo: `configs/system/`, `configs/mariadb/`, `tools/diff_configs.sh`, `legacy/basic_setup.sh`.
 - Added `CONFIG_SOURCE_DIR` for local/offline testing, plus `CONFIG_REPO_URL` / `CONFIG_REPO_REF` overrides.
 - The repo deployer removes old setup.sh override files and pre-refactor config filenames during upgrades.
 
