@@ -42,9 +42,10 @@ declare -A config_files=(
     ["dns_servers"]="${SETUP_REPO}/configs/system/dns_servers.conf /etc/systemd/resolved.conf.d/dns_servers.conf"
     ["cpufrequtils"]="${SETUP_REPO}/configs/system/cpufrequtils /etc/default/cpufrequtils"
     ["sysctl"]="${SETUP_REPO}/configs/system/sysctl.conf /etc/sysctl.conf"
-    ["limits"]="${SETUP_REPO}/configs/system/limits.conf /etc/security/limits.conf"
+    ["limits"]="${SETUP_REPO}/configs/system/limits.conf /etc/security/limits.d/99-setup.conf"
     ["mariadb_service_limits"]="${SETUP_REPO}/configs/mariadb/limit_nofile.conf /etc/systemd/system/mariadb.service.d/limits.conf"
     ["mariadb_server"]="${SETUP_REPO}/configs/mariadb/mariadb_server.cnf /etc/mysql/mariadb.conf.d/50-server.cnf"
+    ["angie_conf"]="${CONFIG_REPO}/angie.conf /etc/angie/angie.conf"
     ["angie_conf_deployer"]="${CONFIG_REPO}/scripts/nginx_conf.sh /etc/angie/scripts/nginx_conf.sh"
     ["angie_service_limits"]="${CONFIG_REPO}/scripts/limit_nofile.conf /etc/systemd/system/angie.service.d/limits.conf"
     ["angie_default"]="${CONFIG_REPO}/scripts/etc_default_nginx /etc/default/angie"
@@ -54,7 +55,7 @@ declare -A config_files=(
 )
 
 # PHP Versions
-php_versions=(3 4 5)
+php_versions=(1 2 3 4 5)
 
 # Compare configurations
 for file_name in "${!config_files[@]}"; do

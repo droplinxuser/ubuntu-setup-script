@@ -9,11 +9,18 @@ set -Eeuo pipefail
 DOMAIN=${DOMAIN:-stress.test}
 ROOT="/var/www/${DOMAIN}/public"
 CERTDIR="/etc/angie/ssl/${DOMAIN}"
+LOG_DIR=/var/www/logs/angie
+NODE_LOG_DIR=/var/www/logs/nodejs
+GIF_LOG_DIR=/var/www/logs/gifsicle
 NODE_DIR=/opt/stress-node
-PHP_BIN=${PHP_BIN:-$(command -v php8.5 || command -v php)}
+PHP_BIN=${PHP_BIN:-$(command -v php)}
+PHP_VER=$("$PHP_BIN" -r 'echo PHP_MAJOR_VERSION . "." . PHP_MINOR_VERSION;')
+FPM_SVC="php${PHP_VER}-fpm"
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
-for svc in angie php8.5-fpm mariadb valkey-server elasticsearch; do
+install -d -m 750 -o www-data -g www-data "$LOG_DIR" "$NODE_LOG_DIR" "$GIF_LOG_DIR"
+
+for svc in angie "$FPM_SVC" mariadb valkey-server elasticsearch; do
   systemctl is-active --quiet "$svc" || {
     echo "service ${svc} is not active; run setup.sh first" >&2
     exit 1
@@ -71,7 +78,9 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/opt/stress-node
+ReadWritePaths=/opt/stress-node /var/www/logs/nodejs
+StandardOutput=append:/var/www/logs/nodejs/nodejs.log
+StandardError=append:/var/www/logs/nodejs/nodejs.log
 
 [Install]
 WantedBy=multi-user.target
@@ -83,10 +92,10 @@ systemctl restart stress-node.service
 # ---------------------------------------------------------------------------
 # PHP-FPM status endpoint (localhost only, used by the stress harness)
 # ---------------------------------------------------------------------------
-POOL=/etc/php/8.5/fpm/pool.d/www.conf
+POOL="/etc/php/${PHP_VER}/fpm/pool.d/www.conf"
 if [[ -f $POOL ]] && ! grep -q '^pm\.status_path' "$POOL"; then
   printf '\npm.status_path = /fpm-status\n' >> "$POOL"
-  systemctl restart php8.5-fpm
+  systemctl restart "$FPM_SVC"
 fi
 
 # ---------------------------------------------------------------------------
@@ -123,8 +132,8 @@ server {
 
     root  ${ROOT};
     index index.php index.html;
-    error_log  /var/log/angie/${DOMAIN}.error.log warn;
-    access_log /var/log/angie/${DOMAIN}.access.log perf;
+    error_log  ${LOG_DIR}/${DOMAIN}.error.log warn;
+    access_log ${LOG_DIR}/${DOMAIN}.access.log perf;
     client_max_body_size 100m;
 
     location / {
@@ -182,10 +191,12 @@ fi
 
 angie -t
 systemctl reload angie
+find "$LOG_DIR" -type f -name '*.log' -exec chmod 640 {} + 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # Seed MariaDB, Elasticsearch and the GIF
 # ---------------------------------------------------------------------------
+mariadb -e "CREATE DATABASE IF NOT EXISTS ${STRESS_DB_NAME:-stress_test} CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
 STRESS_DB_PASS=${STRESS_DB_PASS:-temp} "$PHP_BIN" "${HERE}/seed.php"
 
 # ---------------------------------------------------------------------------
