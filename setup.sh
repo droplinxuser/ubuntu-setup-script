@@ -2035,6 +2035,56 @@ tune_angie_configs() {
     tune_miss "http.d/limit_req.conf: file not found"
   fi
 
+  # Bound custom/legacy cache paths that are not part of the standard set.
+  # A stale "keys_zone=...:5120m" on a 4 GB host maps gigabytes of shared
+  # memory for a cache that may never be used.  Keep these caches available
+  # but conservative instead of sizing them like a primary cache.
+  local extra_zone extra_max file
+  extra_zone=$(tune_clamp $(( cache_total_mb / 16 )) 8 128)
+  extra_max=$(tune_clamp $(( cache_total_mb / 8 )) 64 1024)
+  while IFS= read -r file; do
+    [[ -n $file ]] || continue
+    if [[ $file == "${f_fcgi:-}" || $file == "${f_chev:-}" || \
+          $file == "${f_xf:-}" || $file == "${f_proxy:-}" ]]; then
+      continue
+    fi
+    awk -v zcap="$extra_zone" -v mcap="$extra_max" '
+      function cap_zone(line,    s, n, unit, mb, repl) {
+        if (!match(line, /keys_zone=[A-Za-z0-9_]+:[0-9]+[mMgG]/)) return line
+        s = substr(line, RSTART, RLENGTH)
+        n = s; sub(/^.*:/, "", n)
+        unit = substr(n, length(n), 1); sub(/[mMgG]$/, "", n)
+        mb = (unit == "g" || unit == "G") ? n * 1024 : n
+        if (mb + 0 <= zcap) return line
+        repl = s; sub(/:[0-9]+[mMgG]$/, ":" zcap "m", repl)
+        return substr(line, 1, RSTART - 1) repl substr(line, RSTART + RLENGTH)
+      }
+      {
+        line = cap_zone($0)
+        if (match(line, /max_size=[0-9]+[mMgG]/)) {
+          s = substr(line, RSTART, RLENGTH)
+          n = s; sub(/^max_size=/, "", n)
+          unit = substr(n, length(n), 1); sub(/[mMgG]$/, "", n)
+          mb = (unit == "g" || unit == "G") ? n * 1024 : n
+          if (mb + 0 > mcap) {
+            repl = "max_size=" mcap "M"
+            line = substr(line, 1, RSTART - 1) repl substr(line, RSTART + RLENGTH)
+          }
+        } else if (line ~ /^[[:space:]]*(fastcgi|proxy)_cache_path[[:space:]]/ \
+                   && line ~ /;[[:space:]]*$/) {
+          sub(/;[[:space:]]*$/, " max_size=" mcap "M;", line)
+        }
+        print line
+      }
+    ' "$file" > "${file}.new"
+    if ! cmp -s "$file" "${file}.new"; then
+      cat "${file}.new" > "$file"
+      tune_note "${file#"${target}"/}: custom cache capped at ${extra_zone}m zone / ${extra_max}M max"
+    fi
+    rm -f "${file}.new"
+  done < <(grep -rlE '^[[:space:]]*(fastcgi|proxy)_cache_path[[:space:]]' \
+             "$target/http.d" 2>/dev/null || true)
+
   tune_replace "$target/h5bp/tls/ssl_engine.conf" \
     '^([[:space:]]*ssl_session_cache[[:space:]]+shared:SSL:)[0-9]+m;' \
     "\\1${ssl_cache_mb}m;" "h5bp/tls/ssl_engine.conf: SSL cache=${ssl_cache_mb}m"
