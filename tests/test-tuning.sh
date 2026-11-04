@@ -47,6 +47,20 @@ check "Angie-only cache budget uses 50% RAM" \
 check "Angie+PHP cache budget uses 30% RAM" \
   test "$(tune_cache_total_mb 7747 59000 30 5)" = 2304
 
+# The shared helper must produce the same number the real tuner uses.
+OPT_DETECTED=(angie)
+check "Angie-only cache budget uses 50% RAM" \
+  test "$(angie_cache_budget_mb 3815 57000)" = 1792
+OPT_DETECTED=(angie php:8.5)
+check "Angie+PHP cache budget uses 30% RAM" \
+  test "$(angie_cache_budget_mb 3815 57000)" = 1024
+OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
+check "full-stack cache budget uses 25% RAM" \
+  test "$(angie_cache_budget_mb 3815 57000)" = 768
+OPT_DETECTED=()
+check "no detected services uses the shared 25% default" \
+  test "$(angie_cache_budget_mb 3815 57000)" = 768
+
 # ---------------------------------------------------------------------------
 # SSH/firewall helpers
 # ---------------------------------------------------------------------------
