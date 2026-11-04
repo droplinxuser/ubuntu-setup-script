@@ -31,7 +31,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.7.0"
+readonly SCRIPT_VERSION="1.7.1"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
@@ -103,7 +103,7 @@ retry() {
   done
 }
 
-apt_update()  { retry 3 5 apt-get update -y; }
+apt_update()  { retry 3 5 apt-get -o DPkg::Lock::Timeout=300 update -y; }
 apt_install() {
   apt-get install "${APT_OPTS[@]}" --no-install-recommends "$@"
 }
@@ -1743,15 +1743,20 @@ install_basic() {
 # only rewrite live configuration; they never install packages.
 # =============================================================================
 TUNE_CHANGES=()
+TUNE_MISSES=()
 TUNE_DIRTY=0
 # Only repoint Angie's FastCGI upstream at the local socket when a local
 # PHP-FPM installation was detected and its optimization succeeded.
 OPT_PHP_OK=0
-tune_reset_changes() { TUNE_CHANGES=(); TUNE_DIRTY=0; }
+tune_reset_changes() { TUNE_CHANGES=(); TUNE_MISSES=(); TUNE_DIRTY=0; }
 tune_note() { TUNE_CHANGES+=("$*"); TUNE_DIRTY=1; }
 # Informational line that must not count as a configuration change (and must
 # not trigger a service restart on an otherwise unchanged run).
 tune_summary() { TUNE_CHANGES+=("$*"); }
+# A directive that was expected in an existing file but could not be found.
+# Recorded instead of silently doing nothing, so config drift is visible in
+# the report without forcing a restart.
+tune_miss() { TUNE_MISSES+=("$*"); }
 
 tune_clamp() {
   local value=$1 min=$2 max=$3
@@ -1772,7 +1777,10 @@ tune_size_value() {
 tune_replace() {
   local file=$1 pattern=$2 replacement=$3 desc=$4 before after
   [[ -f $file ]] || return 0
-  grep -qE "$pattern" "$file" || return 0
+  if ! grep -qE "$pattern" "$file"; then
+    tune_miss "no match for ${desc}"
+    return 0
+  fi
   before=$(md5sum "$file" | awk '{print $1}')
   # Use a delimiter that does not collide with regex alternation (`|`) or
   # common path characters in these directives.
@@ -1785,7 +1793,10 @@ tune_replace() {
 tune_insert_after() {
   local file=$1 anchor=$2 line=$3 desc=$4
   [[ -f $file ]] || return 0
-  grep -qE "$anchor" "$file" || return 0
+  if ! grep -qE "$anchor" "$file"; then
+    tune_miss "no insertion anchor for ${desc}"
+    return 0
+  fi
   local tmp
   tmp=$(mktemp)
   awk -v anchor="$anchor" -v line="$line" '
@@ -1886,11 +1897,13 @@ tune_angie_configs() {
       "worker_rlimit_nofile ${worker_rlimit};" "angie.conf: inserted worker_rlimit_nofile=${worker_rlimit}"
   fi
   if ! grep -qE '^[[:space:]]*worker_connections[[:space:]]' "$nginx_conf"; then
-    tune_insert_after "$nginx_conf" '^[[:space:]]*events[[:space:]]*' \
+    tune_insert_after "$nginx_conf" '^[[:space:]]*events[[:space:]]*[{]' \
       "  worker_connections ${worker_connections};" "angie.conf: inserted worker_connections=${worker_connections}"
   fi
   if ! grep -qE '^[[:space:]]*client_body_buffer_size[[:space:]]' "$nginx_conf"; then
-    tune_insert_after "$nginx_conf" '^[[:space:]]*http[[:space:]]*' \
+    # Anchor on the real block opener: a bare `http[[:space:]]*` also matches
+    # directives such as `http2 on;` and would insert inside a server block.
+    tune_insert_after "$nginx_conf" '^[[:space:]]*http[[:space:]]*[{]' \
       "  client_body_buffer_size ${body_buffer};" "angie.conf: inserted client_body_buffer_size=${body_buffer}"
   fi
 
@@ -1905,12 +1918,14 @@ tune_angie_configs() {
       before=$(md5sum "$file" | awk '{print $1}')
       sed -i -E 's#^([[:space:]]*fastcgi_pass[[:space:]]+)(127\.0\.0\.1|localhost):9000;#\1unix:/run/php/php-fpm.sock;#g' "$file"
       after=$(md5sum "$file" | awk '{print $1}')
-      [[ $before != "$after" ]] && tune_note "${file#${target}/}: fastcgi_pass -> unix:/run/php/php-fpm.sock"
+      [[ $before != "$after" ]] && tune_note "${file#"${target}"/}: fastcgi_pass -> unix:/run/php/php-fpm.sock"
     done < <(grep -rlE '^[[:space:]]*fastcgi_pass[[:space:]]+(127\.0\.0\.1|localhost):9000;' "$target" 2>/dev/null || true)
 
-    tune_replace "$nginx_conf" \
-      '^([[:space:]]*server[[:space:]]+)(127\.0\.0\.1|localhost):9000;' \
-      '\1unix:/run/php/php-fpm.sock;' "angie.conf: local_php upstream -> Unix socket"
+    if grep -qE '^([[:space:]]*server[[:space:]]+)(127\.0\.0\.1|localhost):9000;' "$nginx_conf"; then
+      tune_replace "$nginx_conf" \
+        '^([[:space:]]*server[[:space:]]+)(127\.0\.0\.1|localhost):9000;' \
+        '\1unix:/run/php/php-fpm.sock;' "angie.conf: local_php upstream -> Unix socket"
+    fi
   fi
 
   # Cache sizes and zones.
@@ -1936,10 +1951,20 @@ tune_angie_configs() {
   if [[ -f $target/http.d/proxy_cache.conf ]]; then
     local before
     before=$(md5sum "$target/http.d/proxy_cache.conf" | awk '{print $1}')
+    # proxy_cache_path directives commonly wrap onto a second line, so track
+    # the active cache path and rewrite the first max_size seen afterwards
+    # instead of only looking at the line that starts the directive.
     awk -v a="$proxy_size" -v b="$cdn_size" '
-      /proxy_cache_path \/home\/proxy_cache / { sub(/max_size=[0-9]+[mgMG]/, "max_size=" a) }
-      /proxy_cache_path \/home\/proxy_cdn /   { sub(/max_size=[0-9]+[mgMG]/, "max_size=" b) }
-      { print }
+      {
+        if ($0 ~ /proxy_cache_path[[:space:]]+\/home\/proxy_cache[[:space:]]/) target = a
+        else if ($0 ~ /proxy_cache_path[[:space:]]+\/home\/proxy_cdn[[:space:]]/) target = b
+        if (target != "" && $0 ~ /max_size=[0-9]+[mgMG]/) {
+          sub(/max_size=[0-9]+[mgMG]/, "max_size=" target)
+          target = ""
+        }
+        print
+        if ($0 ~ /;[[:space:]]*$/) target = ""
+      }
     ' "$target/http.d/proxy_cache.conf" > "$target/http.d/proxy_cache.conf.new"
     mv "$target/http.d/proxy_cache.conf.new" "$target/http.d/proxy_cache.conf"
     [[ $(md5sum "$target/http.d/proxy_cache.conf" | awk '{print $1}') != "$before" ]] \
@@ -1968,9 +1993,9 @@ tune_angie_configs() {
   local php_conf
   for php_conf in "$target"/h5bp/php*.conf; do
     [[ -f $php_conf ]] || continue
-    tune_replace "$php_conf" '^([[:space:]]*fastcgi_buffer_size[[:space:]]+).*;' "\\1${body_buffer};" "${php_conf#${target}/}: fastcgi_buffer_size=${body_buffer}"
-    tune_replace "$php_conf" '^([[:space:]]*fastcgi_buffers[[:space:]]+).*;' "\\1${fastcgi_buffers};" "${php_conf#${target}/}: fastcgi_buffers=${fastcgi_buffers}"
-    tune_replace "$php_conf" '^([[:space:]]*fastcgi_busy_buffers_size[[:space:]]+).*;' "\\1${fastcgi_busy};" "${php_conf#${target}/}: fastcgi_busy_buffers_size=${fastcgi_busy}"
+    tune_replace "$php_conf" '^([[:space:]]*fastcgi_buffer_size[[:space:]]+).*;' "\\1${body_buffer};" "${php_conf#"${target}"/}: fastcgi_buffer_size=${body_buffer}"
+    tune_replace "$php_conf" '^([[:space:]]*fastcgi_buffers[[:space:]]+).*;' "\\1${fastcgi_buffers};" "${php_conf#"${target}"/}: fastcgi_buffers=${fastcgi_buffers}"
+    tune_replace "$php_conf" '^([[:space:]]*fastcgi_busy_buffers_size[[:space:]]+).*;' "\\1${fastcgi_busy};" "${php_conf#"${target}"/}: fastcgi_busy_buffers_size=${fastcgi_busy}"
   done
 
   tune_summary "angie summary: ${nproc} CPU / ${mem_mb}MB RAM / ${disk_class} / cache=${cache_total_mb}MB"
@@ -2182,6 +2207,7 @@ deploy_angie_configs() {
   tune_angie_configs /etc/angie || die "Angie tuning failed"
   local change
   for change in "${TUNE_CHANGES[@]}"; do info "tune: ${change}"; done
+  for change in "${TUNE_MISSES[@]}"; do warn "tune not applied: ${change}"; done
 }
 
 install_angie() {
@@ -4001,6 +4027,7 @@ optimize_angie() {
   fi
   rm -f /tmp/angie-optimize-test.log
   for change in "${TUNE_CHANGES[@]}"; do opt_report "- ${change}"; done
+  for change in "${TUNE_MISSES[@]}"; do opt_report "- Not applied: ${change}"; done
   if (( active )); then
     if (( TUNE_DIRTY == 0 )); then
       opt_report "- Restart: skipped (configuration already optimized)"
@@ -4021,7 +4048,13 @@ optimize_angie() {
 optimize_php_services() {
   local primary ver active socket rc=0 angie_present=0
   primary=$(php_primary_version)
-  [[ -n $primary ]] || return 0
+  if [[ -z $primary ]]; then
+    # No pool we can safely identify: leave Angie's FastCGI upstream alone
+    # rather than pointing it at a socket that was never created.
+    OPT_PHP_OK=0
+    opt_report "- No PHP-FPM pool with a usable www.conf; Angie upstream left unchanged"
+    return 0
+  fi
   [[ -f /etc/angie/angie.conf ]] && angie_present=1
   while IFS= read -r ver; do
     active=0
@@ -4050,17 +4083,29 @@ optimize_php_services() {
     fi
     local change
     for change in "${TUNE_CHANGES[@]}"; do opt_report "- ${change}"; done
+    for change in "${TUNE_MISSES[@]}"; do opt_report "- Not applied: ${change}"; done
     if (( active )); then
       if (( TUNE_DIRTY == 0 )); then
         opt_report "- Restart: skipped (configuration already optimized)"
       elif systemctl restart "php${ver}-fpm" 2>/dev/null \
          && systemctl is-active --quiet "php${ver}-fpm"; then
-        opt_report "- Restart: **OK**"
+        # Type=notify only returns once the master is ready, so a missing
+        # socket here means Angie must not be repointed at it.
+        if [[ -n $socket && ! -S $socket ]]; then
+          opt_report "- **FAILED** ${socket} was not created; rolling back"
+          opt_restore "/etc/php/${ver}" "php-${ver}"
+          systemctl restart "php${ver}-fpm" 2>/dev/null || true
+          rc=1
+          OPT_PHP_OK=0
+        else
+          opt_report "- Restart: **OK**"
+        fi
       else
         opt_report "- Restart: **FAILED**; rolling back"
         opt_restore "/etc/php/${ver}" "php-${ver}"
         systemctl restart "php${ver}-fpm" 2>/dev/null || true
         rc=1
+        OPT_PHP_OK=0
       fi
     else
       opt_report "- Restart: skipped (service was not active)"
@@ -4236,6 +4281,9 @@ optimize_valkey() {
   opt_report "## Valkey"
   opt_report "- Active: ${active}; config: \`${conf}\`"
   opt_backup /etc/valkey valkey
+  # Reset the shared change tracker so a previous service's restart does not
+  # force an unnecessary Valkey restart on an otherwise unchanged run.
+  tune_reset_changes
   if [[ ${OPT_VALKEY_BUDGET_MB:-0} -gt 0 ]]; then
     max_mb=$OPT_VALKEY_BUDGET_MB
   else
@@ -4449,9 +4497,66 @@ EOF
   return 0
 }
 
+verify_optimized_services() {
+  local rc=0 ver sock
+  opt_report "## Verification"
+  if [[ -x /usr/sbin/angie ]] && systemctl is-active --quiet angie; then
+    if /usr/sbin/angie -t >/dev/null 2>&1; then
+      opt_report "- Angie: configuration valid and service active"
+    else
+      opt_report "- Angie: **FAILED** configuration test while active"
+      rc=1
+    fi
+  fi
+  if [[ " ${OPT_DETECTED[*]} " == *" php:"* ]]; then
+    local fpm_bin
+    while IFS= read -r ver; do
+      systemctl is-active --quiet "php${ver}-fpm" || continue
+      sock=$(php_pool_listen "$ver")
+      fpm_bin="/usr/sbin/php-fpm${ver}"
+      if [[ -n $sock && $sock == /* && ! -S $sock ]]; then
+        opt_report "- PHP ${ver}: **FAILED** active but socket \`${sock}\` is missing"
+        rc=1
+      elif [[ -x $fpm_bin ]] && ! "$fpm_bin" -t >/dev/null 2>&1; then
+        opt_report "- PHP ${ver}: **FAILED** configuration test"
+        rc=1
+      else
+        opt_report "- PHP ${ver}: active, listener \`${sock:-unknown}\`"
+      fi
+    done < <(php_fpm_versions)
+  fi
+  if [[ " ${OPT_DETECTED[*]} " == *" mariadb "* ]] && systemctl is-active --quiet mariadb; then
+    if mariadb -e 'SELECT 1' >/dev/null 2>&1; then
+      opt_report "- MariaDB: active and accepting SQL"
+    else
+      opt_report "- MariaDB: **FAILED** active but SQL probe failed"
+      rc=1
+    fi
+  fi
+  if [[ " ${OPT_DETECTED[*]} " == *" valkey "* ]] && systemctl is-active --quiet valkey-server; then
+    if valkey-cli ping 2>/dev/null | grep -qx 'PONG'; then
+      opt_report "- Valkey: active and responding to PING"
+    else
+      opt_report "- Valkey: **FAILED** active but PING failed"
+      rc=1
+    fi
+  fi
+  if [[ " ${OPT_DETECTED[*]} " == *" elastic "* ]] && systemctl is-active --quiet elasticsearch; then
+    if curl -fsS http://127.0.0.1:9200 >/dev/null 2>&1; then
+      opt_report "- Elasticsearch: active and answering HTTP"
+    else
+      opt_report "- Elasticsearch: **FAILED** active but HTTP probe failed"
+      rc=1
+    fi
+  fi
+  (( rc == 0 )) || opt_report "- Result: **one or more health checks failed**"
+  return "$rc"
+}
+
 write_optimize_report() {
   local file line
-  file="/var/log/setup-optimize-$(date +%Y%m%d-%H%M%S).md"
+  # Nanoseconds keep two runs in the same second from overwriting each other.
+  file="/var/log/setup-optimize-$(date +%Y%m%d-%H%M%S-%N).md"
   {
     echo "# setup.sh --optimize report"
     echo
@@ -4573,6 +4678,8 @@ run_optimize() {
       elastic) optimize_elastic || rc=1 ;;
     esac
   done
+
+  verify_optimized_services || rc=1
 
   local report
   report=$(write_optimize_report)
@@ -7549,4 +7656,8 @@ kwMt6f/s0T+9nREXtQYAAA==
 B64
 }
 
-main "$@"
+# Tests source this file with SETUP_TEST_SOURCE_ONLY=1 to exercise the pure
+# helper functions without running an installation.
+if [[ ${SETUP_TEST_SOURCE_ONLY:-0} != 1 ]]; then
+  main "$@"
+fi
