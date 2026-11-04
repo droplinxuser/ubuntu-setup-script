@@ -15,6 +15,8 @@ The script is designed for a fresh server but is safe to re-run on an already co
 | `configs/mariadb/` | MariaDB reference profile and systemd limits |
 | `configs/php/` | PHP-FPM pool templates, `custom_dan.ini` and systemd limits |
 | `tests/stress-site/` | Full-stack test site and stress harness |
+| `tests/test-dry-run-matrix.sh` | CLI/dry-run validation matrix |
+| `tests/test-tuning.sh` | Unit tests for the hardware-aware tuning helpers |
 | `/var/www/logs/` (live) | One directory tree for Angie, PHP, MariaDB, Valkey, Node.js, GifSicle and Elasticsearch logs |
 | `tools/diff_configs.sh` | Compare canonical configs (both repos) with live `/etc` |
 
@@ -28,6 +30,36 @@ checkout. System/MariaDB/systemd blobs still have embedded fallbacks, but the
 PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
+
+## What's new in 1.7.1
+
+- **`--optimize` tuning is now covered by tests.** New
+  `tests/test-tuning.sh` (29 checks) sources the helper functions and
+  exercises Angie rewriting, PHP pool editing and the shared memory budget
+  against the repository fixtures, including a second-run idempotency check.
+- **Fixed multi-line `proxy_cache_path` tuning.** `max_size` for
+  `/home/proxy_cache` and `/home/proxy_cdn` sits on a continuation line, so
+  the previous one-line `awk` silently left both at `16g`. The rewriter now
+  follows the directive across lines.
+- **Config drift is visible.** A pattern that no longer matches an existing
+  tuning target is recorded as `Not applied: …` in the Markdown report (and
+  as a warning during install) instead of failing silently. Informational
+  misses do not trigger a restart.
+- **Stricter insertion anchors.** `client_body_buffer_size` and
+  `worker_connections` are only inserted after the real `http {` / `events {`
+  block openers; the loose anchor also matched `http2 on;`.
+- **Valkey no longer restarts on a no-op run.** `optimize_valkey` inherited
+  the previous service's dirty flag, which forced a restart while the Angie
+  and PHP restarts were being skipped.
+- **Safer PHP/Angie ordering.** A pool that cannot be identified leaves
+  Angie's FastCGI upstream untouched, and a missing socket after restart
+  aborts the repoint and rolls the PHP configuration back.
+- **Shorter failure detection.** `/var/log/setup-optimize-*` names include
+  nanoseconds, so two runs in the same second cannot overwrite each other.
+- **Post-run health checks.** `--optimize` ends with `angie -t`, a PHP socket
+  and config check, `SELECT 1` for MariaDB, `PING` for Valkey and an HTTP
+  probe for Elasticsearch; results land in the report and the exit status.
+- `apt-get update` now honours the same 300 s dpkg lock timeout as installs.
 
 ## What's new in 1.7.0
 
@@ -848,9 +880,14 @@ The script was tested on Ubuntu 26.04.1 LTS (16 CPU threads, 32 GB installed RAM
 
 Also checked at CLI level (all using `--dry-run`, no system changes):
 
-- `tests/test-dry-run-matrix.sh` covers 65 cases: every service flag, every
+- `tests/test-dry-run-matrix.sh` covers 67 cases: every service flag, every
   domain app type, per-domain and trailing group `app=` forms, every purge
   mode, `--optimize` and representative invalid inputs.
+
+- `tests/test-tuning.sh` covers 29 cases: Angie directive rewriting, the
+  multi-line `proxy_cache_path` fix, insertion anchors, miss reporting,
+  PHP pool editing/deduplication, the shared memory budget and a second-run
+  no-op check.
 
 - All 64 combinations of the six install service flags (`angie`, `php`, `mariadb`, `valkey`, `elastic`, `others`) plus `--basic` parse and validate.
 - All 128 bare purge target subsets (including empty/implicit/explicit `all`) parse and validate.
