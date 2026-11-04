@@ -755,6 +755,28 @@ check "inert detection reports only non-included cache/limit files" \
        "$TMP/inert/http.d/fastcgi_cache_conf,$TMP/inert/http.d/limit_req_conf"
 
 # ---------------------------------------------------------------------------
+# Cache objects written during a restart window
+# ---------------------------------------------------------------------------
+mkdir -p "$TMP/cachetree/http.d" "$TMP/cache/sub"
+printf 'include http.d/*.conf;\n' > "$TMP/cachetree/angie.conf"
+printf 'fastcgi_cache_path %s levels=1:2 keys_zone=live:1m;\n' "$TMP/cache" \
+  > "$TMP/cachetree/http.d/fastcgi_cache.conf"
+printf 'proxy_cache_path %s/proxy levels=1:2 keys_zone=px:1m;\n' "$TMP/cache" \
+  > "$TMP/cachetree/http.d/proxy_cache.conf"
+check "angie_cache_dirs returns the included cache paths" \
+  test "$(angie_cache_dirs "$TMP/cachetree" | sort | paste -sd, -)" = \
+       "$TMP/cache,$TMP/cache/proxy"
+: > "$TMP/cache/old"
+touch -d '1 hour ago' "$TMP/cache/old"
+now=$(date +%s)
+sleep 1
+: > "$TMP/cache/sub/new"
+removed=$(purge_optimize_cache_entries "$now" "$TMP/cachetree")
+check "cache purge removes objects written during the run" test "$removed" -eq 1
+check "cache purge removes the new object" test ! -e "$TMP/cache/sub/new"
+check "cache purge keeps older objects" test -f "$TMP/cache/old"
+
+# ---------------------------------------------------------------------------
 # Small-host budget floors
 # ---------------------------------------------------------------------------
 mem_total_mb() { printf '1024'; }

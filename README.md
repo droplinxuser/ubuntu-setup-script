@@ -31,6 +31,22 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.23
+
+- **A restart window can no longer leave a blank guest page cached.** If a
+  backend is restarting (MariaDB, PHP-FPM), XenForo/WordPress can emit an
+  empty `200` that Angie's FastCGI guest cache stores for its 5-minute 200
+  validity. During the live validation on a XenForo host the cutover produced
+  exactly that and every guest received a blank homepage. `--optimize` now
+  discovers the included `fastcgi_cache_path`/`proxy_cache_path` directories
+  and deletes only the objects written during the run, so the next request
+  refills them from a healthy backend. The report lists the count removed.
+- **MariaDB is not restarted just to apply a larger fd limit.** When the only
+  change is the systemd `LimitNOFILE` drop-in and the running limit is already
+  at least 65536 (far above what `max_connections` needs), the drop-in is
+  written and applies on the next planned restart instead of interrupting
+  in-flight queries. Real `my.cnf` changes still restart immediately.
+
 ## What's new in 1.8.22
 
 - **An OS-only `--optimize` run no longer leaves an empty backup tree.** The
