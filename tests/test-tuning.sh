@@ -99,6 +99,7 @@ check "tune_insert_after leaves http2 on intact" \
 mkdir -p "$TMP/angie"
 cp -a "$FIXTURES/." "$TMP/angie/"
 OPT_PHP_OK=1
+OPT_PHP_SOCKET=/run/php/php-fpm.sock
 tune_reset_changes
 tune_angie_configs "$TMP/angie"
 
@@ -143,6 +144,33 @@ tune_reset_changes
 tune_angie_configs "$TMP/angie"
 check "second tune run is a no-op" test "$TUNE_DIRTY" -eq 0
 
+# A pool that stays on TCP must leave Angie's TCP upstream alone.
+mkdir -p "$TMP/angie-tcp"
+cp -a "$FIXTURES/." "$TMP/angie-tcp/"
+OPT_PHP_SOCKET=""
+tune_reset_changes
+tune_angie_configs "$TMP/angie-tcp"
+check "TCP FastCGI upstream is preserved when PHP stays on TCP" \
+  grep -q '^[[:space:]]*server 127.0.0.1:9000;' "$TMP/angie-tcp/angie.conf"
+
+# An active .conf file must win over an inert _conf leftover with the same zone.
+mkdir -p "$TMP/active"
+cp -a "$FIXTURES/." "$TMP/active/"
+cat > "$TMP/active/http.d/fastcgi_cache.conf" <<'EOF'
+fastcgi_cache_path /home/nginx_cache levels=1:2 keys_zone=fastcgicache:256m inactive=8h;
+EOF
+cat > "$TMP/active/http.d/fastcgi_cache_conf" <<'EOF'
+fastcgi_cache_path /home/nginx_cache levels=1:2 keys_zone=fastcgicache:256m max_size=16g inactive=1h;
+EOF
+OPT_PHP_SOCKET=""
+tune_reset_changes
+tune_angie_configs "$TMP/active"
+check "active fastcgi_cache.conf gains a max_size" \
+  grep -qE 'keys_zone=fastcgicache:[0-9]+m max_size=[0-9]+M' \
+  "$TMP/active/http.d/fastcgi_cache.conf"
+check "inert legacy fastcgi_cache_conf is left untouched" \
+  grep -q 'max_size=16g' "$TMP/active/http.d/fastcgi_cache_conf"
+
 # ---------------------------------------------------------------------------
 # Legacy underscore layouts (older server-configs-nginx deployments)
 # ---------------------------------------------------------------------------
@@ -151,6 +179,7 @@ cp -a "$FIXTURES/." "$TMP/legacy/"
 for name in fastcgi_cache fastcgi_cache_chev xf_proxy_cache proxy_cache limit_req; do
   mv "$TMP/legacy/http.d/${name}.conf" "$TMP/legacy/http.d/${name}_conf"
 done
+sed -i 's#include http.d/\*\.conf;#include http.d/*_conf;#' "$TMP/legacy/angie.conf"
 cat > "$TMP/legacy/http.d/fastcgi_cache_custom_conf" <<'EOF'
 fastcgi_cache_path /home/nginx_cache_custom levels=1:2 keys_zone=customcache:5120m inactive=30d;
 EOF
@@ -202,6 +231,8 @@ check "tune_pool_dedupe keeps the value set by tune_pool_set" \
 # Shared memory budget
 # ---------------------------------------------------------------------------
 mem_total_mb() { printf '131072'; }
+mariadb_data_size_mb() { printf '0'; }
+elasticsearch_data_size_mb() { printf '0'; }
 OPT_DETECTED=(angie php:8.4 mariadb valkey elastic)
 plan_memory_budget
 check "PHP budget is at most 50% of RAM" \
@@ -211,6 +242,54 @@ check "service budgets stay under 95% of RAM" \
        -le $(( 131072 * 95 / 100 ))
 check "all fixed budgets are positive" \
   test "$OPT_MARIADB_BUDGET_MB" -gt 0 -a "$OPT_VALKEY_BUDGET_MB" -gt 0 -a "$OPT_ES_BUDGET_MB" -gt 0
+
+# A 64 GB host with a 128-worker PHP pool must keep that capacity; the data
+# services are fitted into what remains after the PHP reservation.
+mem_total_mb() { printf '65536'; }
+php_pool_max_children() { printf '128'; }
+OPT_DETECTED=(angie php:8.3 mariadb redis elastic)
+plan_memory_budget
+check "PHP budget preserves a 128-worker pool" \
+  test "$OPT_PHP_BUDGET_MB" -ge $(( 128 * 96 ))
+check "PHP budget is still capped at 50% of RAM" \
+  test "$OPT_PHP_BUDGET_MB" -le $(( 65536 * 50 / 100 ))
+check "Redis enables the shared cache budget" \
+  test "$OPT_VALKEY_BUDGET_MB" -gt 0
+check "PHP-first plan stays inside the 80% budget" \
+  test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
+       -le $(( 65536 * 80 / 100 ))
+
+# The buffer pool should hold the live data+index working set when possible.
+mariadb_data_size_mb() { printf '20000'; }
+plan_memory_budget
+check "buffer pool covers a 20 GB database" \
+  test "$OPT_MARIADB_BUDGET_MB" -ge 20000
+check "database-fit plan stays inside the 80% budget" \
+  test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
+       -le $(( 65536 * 80 / 100 ))
+
+# A database larger than the remaining budget gets the largest feasible pool.
+mariadb_data_size_mb() { printf '40960'; }
+plan_memory_budget
+check "oversized database gets the largest feasible buffer pool" \
+  test "$OPT_MARIADB_BUDGET_MB" -ge 32768
+check "oversized database is not falsely reported as fitting" \
+  test "$OPT_DB_SIZE_MB" -eq 40960 -a "$OPT_MARIADB_BUDGET_MB" -lt 40960
+
+# Elasticsearch heap follows the live index store size.
+mariadb_data_size_mb() { printf '20000'; }
+elasticsearch_data_size_mb() { printf '4096'; }
+plan_memory_budget
+check "small Elasticsearch index fits the planned heap" \
+  test "$OPT_ES_BUDGET_MB" -ge 4096
+check "Elasticsearch index size is recorded" \
+  test "$OPT_ES_SIZE_MB" -eq 4096
+elasticsearch_data_size_mb() { printf '20000'; }
+plan_memory_budget
+check "large Elasticsearch index raises the heap target" \
+  test "$OPT_ES_BUDGET_MB" -gt 8192
+check "large index is not falsely reported as fitting" \
+  test "$OPT_ES_BUDGET_MB" -lt 20000
 
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
