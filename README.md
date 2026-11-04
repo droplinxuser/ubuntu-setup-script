@@ -29,6 +29,35 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.7.0
+
+- **One shared memory budget for `--optimize`.** MariaDB (40%), PHP workers
+  (50%), Valkey (10%) and Elasticsearch (25%) used to size themselves
+  independently, so a host running three or four services could commit
+  100-125% of RAM before the kernel got a byte. Allocations now come from a
+  single 80%-of-RAM budget and are scaled down when needed; an 8-core/12 GB
+  server with Angie, PHP, MariaDB and Valkey now plans 37 PHP workers instead
+  of 62, leaving headroom for page cache and traffic spikes.
+- **Truly idempotent restarts.** A repeat `--optimize` run detects that the
+  generated Angie/PHP/MariaDB/Valkey/Elasticsearch files are unchanged and
+  skips the restart entirely (verified by PID comparison on the live server).
+- **PHP-FPM socket safety.** The shared `/run/php/php-fpm.sock` is only
+  assigned when Angie is present and only for the pool Angie uses; a
+  standalone PHP host, or a second PHP version serving another application
+  over TCP, keeps its existing listener.
+- **Backlog values follow the live kernel.** PHP-FPM and Valkey request
+  `min(65535, somaxconn)` instead of 65535 unconditionally, so `--optimize`
+  does not create a backlog the running kernel will silently clamp.
+- Valkey gets a dedicated systemd fd-limit drop-in when its unit still caps
+  `LimitNOFILE` below `maxclients`.
+- Duplicate managed directives in a PHP-FPM pool are collapsed per section
+  (the `[global]` master limit and the `[www]` worker limit are preserved).
+- Typographic em/en dashes are normalized, so pasted commands such as
+  `setup.sh —optimize` work. Bash 4.0+ is checked explicitly, and APT waits
+  up to 300 s for a concurrent dpkg lock instead of failing.
+- Rollback backups under `/var/backups/setup-optimize-*` are pruned to the ten
+  newest runs.
+
 ## What's new in 1.6.12
 
 - Removed the obsolete `legacy/basic_setup.sh` tree and its documentation.
@@ -65,7 +94,8 @@ alongside `setup.sh`).
   purges or starts a service that was not already running.
 - PHP-FPM pools are moved to the shared `/run/php/php-fpm.sock`, and Angie
   `fastcgi_pass`/`local_php` directives are repointed when a TCP listener is
-  found. Multiple active PHP versions get distinct versioned sockets.
+  found. The shared socket is used only when Angie is installed; other PHP
+  versions keep their existing listener.
 - `--optimize` backs up every touched configuration directory under
   `/var/backups/setup-optimize-*`, validates each config, restarts only active
   services, rolls back automatically on failure, and writes a Markdown report
@@ -243,7 +273,8 @@ alongside `setup.sh`).
 
 ## Requirements
 
-- Ubuntu 26.04 LTS or newer (the script checks `ID=ubuntu` and `VERSION_ID >= 26.04`).
+- Ubuntu 26.04 LTS or newer for installation (`--optimize` also supports 24.04); the script checks `ID=ubuntu` and the version.
+- Bash 4.0 or newer (associative arrays); Ubuntu ships Bash 5.x.
 - Root access (`sudo bash setup.sh ...`).
 - Internet access to the Ubuntu, Angie, Sury, Elastic and NodeSource package repositories, plus GitHub for the Angie/PHP configuration repository. For offline/testing use, set `CONFIG_SOURCE_DIR` to a local checkout.
 - Enough disk/RAM for the selected services:
@@ -661,9 +692,12 @@ bash setup.sh --optimize --dry-run
 It applies the same hardware-aware values used by a normal install: Angie
 workers/connections/buffers/cache sizes, PHP-FPM `static` pool sizing and the
 shared `/run/php/php-fpm.sock` listener, MariaDB buffer pool/connection
-backlog, Valkey maxmemory, and Elasticsearch heap. Each configuration is
-validated; active services are restarted; a failure rolls back the affected
-service from `/var/backups/setup-optimize-*`. The Markdown report is written to
+backlog, Valkey maxmemory, and Elasticsearch heap. Service allocations are
+planned together from one 80%-of-RAM budget, so MariaDB + PHP + Valkey +
+Elasticsearch cannot collectively exhaust memory. Each configuration is
+validated and active services are restarted only when their generated files
+actually changed; a failure rolls back the affected service from
+`/var/backups/setup-optimize-*`. The Markdown report is written to
 `/var/log/setup-optimize-<timestamp>.md` and copied to
 `/var/log/setup-optimize-latest.md`.
 
@@ -681,7 +715,7 @@ The script is safe to re-run:
 - Package-origin markers prevent `--purge others` from removing packages that existed before setup.sh, even after a previous purge removed the state directory.
 - Package repositories and keys are re-written only when missing.
 - Domain directories and databases use idempotent creation; existing Angie domain configs are preserved.
-- PHP, MariaDB, Angie, Valkey and Elasticsearch services are restarted after configuration changes so changed parameters take effect.
+- PHP, MariaDB, Angie, Valkey and Elasticsearch services are restarted after configuration changes so changed parameters take effect; a repeat `--optimize` run with unchanged files restarts nothing.
 
 A second run is normally much faster than the first (typically under a minute for the full stack).
 
