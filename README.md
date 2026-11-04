@@ -31,6 +31,17 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.27
+
+- **A PHP-FPM restart can no longer hang in “deactivating”.** With the
+  package default `process_control_timeout = 0`, a busy pool waits forever
+  for its workers on stop; systemd then holds the unit for its 90 s
+  `TimeoutStopSec` while the shared socket is gone — every PHP vhost returns
+  502 for the whole window (observed on a saturated 8-core host). The tuner
+  and installer now write `process_control_timeout = 10s` in the global
+  `php-fpm.conf` and `TimeoutStopSec=15` in the systemd drop-in, so a restart
+  completes in seconds.
+
 ## What's new in 1.8.26
 
 - **The network profile can be pinned per host.** BBR is a good default on
