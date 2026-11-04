@@ -41,8 +41,14 @@ New issues found and fixed during the live run:
    Composer/CLI changes.
 3. fail2ban could ban the operator during a long deploy. The SSH client address
    is now in `ignoreip` (read from the parent process environment or the
-   established `:22` socket).
-4. PHP-FPM sometimes returned `Unable to open primary script ... (Operation not
+   established sshd socket). The socket fallback previously read a fixed `ss`
+   column, which is the server address in the five-field form but the client
+   in the four-field form; it now reads the last two fields (local, peer) and
+   every effective sshd port.
+4. UFW only allowed port 22. `--basic` now reads `sshd -T` and opens every
+   effective SSH port before enabling the firewall, so a host moved to a
+   custom port cannot be locked out. `--purge` protects the same rules.
+5. PHP-FPM sometimes returned `Unable to open primary script ... (Operation not
    permitted)` for files created after workers started. Restarting the pool
    clears it; app deploys must reload/restart FPM after syncing files.
 
@@ -343,10 +349,12 @@ Recommended changes:
 
 Already good:
 
-- UFW default deny incoming, allow outgoing; 22 limited, 80/443 allowed.
+- UFW default deny incoming, allow outgoing; every effective SSH port plus
+  80/443 allowed (no rate limit on SSH, so automation is not banned).
 - fail2ban SSH jail using UFW; unattended security updates; sysstat history.
 - BBR/fq, large connection backlogs, file-max/nr_open, security sysctls,
-  protected links/symlinks/fifos/regular files.
+  protected links/symlinks/fifos/regular files. A sysctl.d drop-in keeps fq
+  as the default qdisc when a package upgrade restarts systemd-sysctl.
 - Performance CPU governor on this dedicated server.
 - 50%-of-RAM swap policy; existing swap partition preserved.
 - MariaDB/Valkey/Angie/Elasticsearch systemd nofile drop-ins.

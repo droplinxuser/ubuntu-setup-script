@@ -107,7 +107,7 @@ run fail --dry-run --bogus
 
 # The single optimize command must include the OS layer.
 out=$(bash setup.sh --dry-run --optimize 2>&1)
-if [[ $out == *"OS: governor=performance"* ]]; then
+if [[ $out == *"OS: governor="* && $out == *"limits=1M-nofile"* ]]; then
   PASS=$((PASS + 1))
   printf 'PASS  --optimize includes the OS tuning plan\n'
 else

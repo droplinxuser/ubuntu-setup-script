@@ -17,6 +17,10 @@ trap 'rm -rf "$TMP"' EXIT
 export SETUP_TEST_SOURCE_ONLY=1
 # shellcheck disable=SC1090
 source "$ROOT/setup.sh"
+# setup.sh installs an ERR trap for production diagnostics.  These tests
+# deliberately exercise failure paths, so drop the trap; set -e still catches
+# genuinely unexpected errors.
+trap - ERR
 
 t_pass() { PASS=$((PASS + 1)); printf 'PASS  %s\n' "$*"; }
 t_fail() { FAIL=$((FAIL + 1)); printf 'FAIL  %s\n' "$*"; }
@@ -42,6 +46,61 @@ check "Angie-only cache budget uses 50% RAM" \
   test "$(tune_cache_total_mb 7747 59000 50 10)" = 3840
 check "Angie+PHP cache budget uses 30% RAM" \
   test "$(tune_cache_total_mb 7747 59000 30 5)" = 2304
+
+# ---------------------------------------------------------------------------
+# SSH/firewall helpers
+# ---------------------------------------------------------------------------
+check "SSH peer parser uses the client column, not the server address" \
+  test "$(printf 'ESTAB 0 0 10.0.0.5:22 203.0.113.9:54321\n' | ssh_peer_from_ss ':22$')" = \
+       "203.0.113.9"
+# `ss -tnH state established` on Ubuntu 26.04 omits the State column, so the
+# same parser must work with four fields as well.
+check "SSH peer parser handles ss output without a state column" \
+  test "$(printf '0 0 10.0.0.5:22 203.0.113.9:54321\n' | ssh_peer_from_ss ':22$')" = \
+       "203.0.113.9"
+check "SSH peer parser ignores non-SSH local ports" \
+  test -z "$(printf 'ESTAB 0 0 10.0.0.5:443 198.51.100.7:40000\n' | ssh_peer_from_ss ':22$')"
+check "SSH peer parser handles bracketed IPv6 peers" \
+  test "$(printf 'ESTAB 0 0 [2001:db8::5]:22 [2001:db8::9]:54321\n' | ssh_peer_from_ss ':22$')" = \
+       "2001:db8::9"
+check "SSH peer parser drops loopback peers" \
+  test -z "$(printf 'ESTAB 0 0 10.0.0.5:22 127.0.0.1:5000\n' | ssh_peer_from_ss ':22$')"
+
+ssh_ports_ok() {
+  local p n=0
+  while IFS= read -r p; do
+    [[ $p =~ ^[0-9]+$ ]] || return 1
+    n=$((n + 1))
+  done < <(sshd_listen_ports)
+  (( n > 0 ))
+}
+check "sshd port discovery always returns at least one numeric port" ssh_ports_ok
+
+# The probe must agree with sysfs; a VM that only offers powersave/schedutil
+# must not make --optimize claim it set the performance governor.
+gov_dir=/sys/devices/system/cpu/cpu0/cpufreq
+if [[ -d $gov_dir ]] && grep -qw performance "$gov_dir/scaling_available_governors" 2>/dev/null; then
+  check "CPU governor probe finds the performance governor" \
+    cpu_performance_governor_available
+elif [[ -d $gov_dir ]]; then
+  if cpu_performance_governor_available; then
+    t_fail "CPU governor probe ignores an unavailable performance governor"
+  else
+    t_pass "CPU governor probe ignores an unavailable performance governor"
+  fi
+else
+  if cpu_performance_governor_available; then
+    t_fail "CPU governor probe reports performance without a cpufreq interface"
+  else
+    t_pass "CPU governor probe reports no cpufreq interface"
+  fi
+fi
+
+# The single-file fallback must stay byte-identical to the canonical profile,
+# otherwise a run without configs/ silently writes values we already removed
+# (for example the boot-time route.flush errors).
+check "embedded sysctl fallback matches configs/system/sysctl.conf" \
+  diff -q <(blob_sysctl) "$ROOT/configs/system/sysctl.conf"
 
 # ---------------------------------------------------------------------------
 # Optimize OS gate and fd-limit profile
@@ -167,6 +226,10 @@ check "fastcgi_cache zone is resized" \
 check "fastcgi_cache_chev gains a max_size" \
   grep -qE 'keys_zone=fastcgicache_chev:[0-9]+m max_size=[0-9]+[MG]' \
   "$TMP/angie/http.d/fastcgi_cache_chev.conf"
+check "tuning preserves use_temp_path=off on the FastCGI cache" \
+  grep -q 'use_temp_path=off' "$TMP/angie/http.d/fastcgi_cache.conf"
+check "tuning preserves use_temp_path=off on the XenForo proxy cache" \
+  grep -q 'use_temp_path=off' "$TMP/angie/http.d/xf_proxy_cache.conf"
 check "PHP fastcgi buffers are tuned" \
   grep -qE '^fastcgi_busy_buffers_size [0-9]+[mk];' "$TMP/angie/h5bp/php.conf"
 
