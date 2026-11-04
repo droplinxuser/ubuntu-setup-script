@@ -31,7 +31,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.21"
+readonly SCRIPT_VERSION="1.8.22"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
@@ -6196,7 +6196,8 @@ run_optimize() {
   OPT_REPORT_STARTED=1
   OPT_START_TS=$(date -Is)
   OPT_BACKUP_DIR="/var/backups/setup-optimize-$(date +%Y%m%d-%H%M%S)"
-  install -d -m 700 "$OPT_BACKUP_DIR"
+  # The directory is created lazily by opt_backup() so a host with no
+  # supported services (OS tuning only) does not leave an empty backup tree.
   # Keep the ten newest rollback points; these directories contain full copies
   # of /etc/angie, /etc/php/<ver> and /etc/mysql and can grow quickly.
   local old_backup
@@ -6227,6 +6228,8 @@ run_optimize() {
   if (( ${#OPT_DETECTED[@]} == 0 )); then
     info "No supported installed services detected (Angie, PHP-FPM, MariaDB, Valkey/Redis, Elasticsearch)"
     opt_report "No supported installed services detected."
+    # No service configuration was touched, so there is nothing to roll back.
+    OPT_BACKUP_DIR=""
     local report
     report=$(write_optimize_report)
     # write_optimize_report runs in a command substitution (subshell), so its
