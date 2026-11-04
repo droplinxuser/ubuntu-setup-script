@@ -31,6 +31,13 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.2
+
+- **Hostname changes keep `/etc/hosts` in sync.** `--basic host=...` now
+  updates the `127.0.1.1` entry (or adds one) so `sudo` and `hostname -f` do
+  not keep resolving the old name. `--purge basic` restores the original
+  `/etc/hosts` from the recorded backup.
+
 ## What's new in 1.8.1
 
 - **Redis is optimized when Valkey is not installed.** Existing hosts often
