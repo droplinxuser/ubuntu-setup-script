@@ -30,6 +30,17 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.6.11
+
+- `--optimize` on Ubuntu 24.04 live-server validation: PHP-FPM 8.4 moved from
+  `127.0.0.1:9000` to `/run/php/php-fpm.sock`, Angie's `local_php` upstream
+  repointed, MariaDB 10.11 tuned through the `[mysqld]` drop-in, Valkey
+  resized, and no Elasticsearch was installed or touched.
+- Removed `listen.allowed_clients` when switching a PHP-FPM pool to a Unix
+  socket; it is meaningless there and was present on older pools.
+- The FastCGI rewrite now matches only active `fastcgi_pass` directives, not
+  commented examples in `sites-available/` or docs.
+
 ## What's new in 1.6.10
 
 - Moved PHP-FPM pool templates (`www_81.conf` … `www_85.conf`),
