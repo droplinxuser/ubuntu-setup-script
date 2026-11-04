@@ -37,6 +37,20 @@ check "mb_to_config whole GiB"    test "$(mb_to_config 4096)" = 4G
 check "size_to_mb 2g"             test "$(size_to_mb 2g)" = 2048
 
 # ---------------------------------------------------------------------------
+# Optimize OS gate and fd-limit profile
+# ---------------------------------------------------------------------------
+check "optimize supports Ubuntu 22.04" optimize_os_supported 22.04
+check "optimize supports Ubuntu 24.04" optimize_os_supported 24.04
+check "optimize supports Ubuntu 26.04" optimize_os_supported 26.04
+if optimize_os_supported 20.04; then
+  t_fail "optimize rejects Ubuntu 20.04"
+else
+  t_pass "optimize rejects Ubuntu 20.04"
+fi
+check "PAM nofile does not exceed the minimum fs.nr_open" \
+  bash -c "! grep -q '10485760' '$ROOT/configs/system/limits.conf'"
+
+# ---------------------------------------------------------------------------
 # tune_replace / tune_insert_after reporting
 # ---------------------------------------------------------------------------
 printf 'listen.owner = www-data\n' > "$TMP/pool.conf"
@@ -52,6 +66,19 @@ tune_replace "$TMP/pool.conf" 'absent_directive = [0-9]+' 'absent_directive = 1'
 check "tune_replace records a miss instead of failing silently" \
   test "${#TUNE_MISSES[@]}" -eq 1
 check "a miss does not mark configuration dirty" test "$TUNE_DIRTY" -eq 0
+
+tune_reset_changes
+tune_replace "$TMP/does-not-exist.conf" 'x = 1' 'x = 2' "missing file test"
+check "tune_replace records a missing file as a miss" \
+  test "${#TUNE_MISSES[@]}" -eq 1
+
+check "tune_first_file prefers the current file name" \
+  test "$(mkdir -p "$TMP/pick" && : > "$TMP/pick/fastcgi_cache.conf" && : > "$TMP/pick/fastcgi_cache_conf" && tune_first_file "$TMP/pick" fastcgi_cache.conf fastcgi_cache_conf)" = \
+       "$TMP/pick/fastcgi_cache.conf"
+rm -f "$TMP/pick/fastcgi_cache.conf"
+check "tune_first_file falls back to the legacy _conf layout" \
+  test "$(tune_first_file "$TMP/pick" fastcgi_cache.conf fastcgi_cache_conf)" = \
+       "$TMP/pick/fastcgi_cache_conf"
 
 # ---------------------------------------------------------------------------
 # tune_insert_after anchors on the block opener
@@ -79,9 +106,17 @@ check "angie.conf FastCGI upstream moves to the shared socket" \
   grep -q 'server unix:/run/php/php-fpm.sock;' "$TMP/angie/angie.conf"
 check "angie.conf keeps exactly one client_body_buffer_size" \
   test "$(grep -c '^[[:space:]]*client_body_buffer_size' "$TMP/angie/angie.conf")" -eq 1
-check "client_body_buffer_size is inside the http block" \
+mem_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+if (( mem_kb < 2048 * 1024 )); then
+  exp_body_buffer=64k
+elif (( mem_kb < 8192 * 1024 )); then
+  exp_body_buffer=128k
+else
+  exp_body_buffer=256k
+fi
+check "client_body_buffer_size is inside the http block and sized for RAM" \
   test "$(awk '/^http \{/{getline; print}' "$TMP/angie/angie.conf")" = \
-       "  client_body_buffer_size 256k;"
+       "  client_body_buffer_size ${exp_body_buffer};"
 check "worker_rlimit_nofile is inserted after worker_processes" \
   test "$(awk '/^worker_processes/{getline; print}' "$TMP/angie/angie.conf")" = \
        "$(grep 'worker_rlimit_nofile' "$TMP/angie/angie.conf")"
@@ -107,6 +142,27 @@ check "PHP fastcgi buffers are tuned" \
 tune_reset_changes
 tune_angie_configs "$TMP/angie"
 check "second tune run is a no-op" test "$TUNE_DIRTY" -eq 0
+
+# ---------------------------------------------------------------------------
+# Legacy underscore layouts (older server-configs-nginx deployments)
+# ---------------------------------------------------------------------------
+mkdir -p "$TMP/legacy"
+cp -a "$FIXTURES/." "$TMP/legacy/"
+for name in fastcgi_cache fastcgi_cache_chev xf_proxy_cache proxy_cache limit_req; do
+  mv "$TMP/legacy/http.d/${name}.conf" "$TMP/legacy/http.d/${name}_conf"
+done
+tune_reset_changes
+tune_angie_configs "$TMP/legacy"
+check "legacy fastcgi_cache_conf is resized in place" \
+  grep -qE 'keys_zone=fastcgicache:[0-9]+m max_size=[0-9]+[MG]' \
+  "$TMP/legacy/http.d/fastcgi_cache_conf"
+check "legacy limit_req_conf zones are resized in place" \
+  grep -qE 'zone=limit_req_post_head:[0-9]+m' "$TMP/legacy/http.d/limit_req_conf"
+check "legacy tuning does not create a duplicate .conf file" \
+  test ! -e "$TMP/legacy/http.d/fastcgi_cache.conf"
+tune_reset_changes
+tune_angie_configs "$TMP/legacy"
+check "legacy layout second run is a no-op" test "$TUNE_DIRTY" -eq 0
 
 # ---------------------------------------------------------------------------
 # PHP pool helpers
