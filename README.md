@@ -31,6 +31,15 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.11
+
+- **The Angie cache budget now follows the cache types actually present.**
+  Previously the 25%-of-RAM cache budget was split 50/25/15/5/5 across
+  FastCGI, Chevereto, XenForo-proxy, proxy and CDN caches even when only one
+  existed. A dedicated proxy with only `xfproxycache` now receives the whole
+  budget, as does an Angie+PHP host with only `fastcgicache`; custom-only
+  cache paths also use the full budget.
+
 ## What's new in 1.8.10
 
 - **Elasticsearch replica cleanup now waits for shard recovery.** After a
@@ -868,7 +877,11 @@ bash setup.sh --optimize --dry-run
 It applies the same hardware-aware values used by a normal install: Angie
 workers/connections/buffers/cache sizes, PHP-FPM `static` pool sizing, MariaDB
 buffer pool/connection backlog, Valkey/Redis maxmemory, and Elasticsearch
-heap. MariaDB's pool and Elasticsearch's heap are sized to the live
+heap. The Angie cache budget is shared only across the cache types that are
+actually present, so a dedicated proxy with one cache type gets the whole
+budget. When PHP is absent, MariaDB receives the full fixed budget (no PHP
+worker reservation), though its data+5% target still prevents
+over-allocation. MariaDB's pool and Elasticsearch's heap are sized to the live
 data/index store plus 5%, bounded by the shared budget after reserving the
 other services; a 40%-of-RAM (MariaDB) or 25%-of-RAM (Elasticsearch)
 fallback is used only when the data size cannot be measured. Oversized live
