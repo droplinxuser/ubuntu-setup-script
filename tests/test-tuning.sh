@@ -35,6 +35,9 @@ check "tune_size_value whole GiB" test "$(tune_size_value 2048)" = 2G
 check "tune_size_value MiB"       test "$(tune_size_value 1536)" = 1536M
 check "mb_to_config whole GiB"    test "$(mb_to_config 4096)" = 4G
 check "size_to_mb 2g"             test "$(size_to_mb 2g)" = 2048
+check "cache budget rounds to 256 MB" test "$(tune_cache_total_mb 7747 19000)" = 768
+check "cache budget is stable across small disk changes" \
+  test "$(tune_cache_total_mb 7747 19000)" = "$(tune_cache_total_mb 7747 17700)"
 
 # ---------------------------------------------------------------------------
 # Optimize OS gate and fd-limit profile
@@ -258,6 +261,21 @@ check "Redis enables the shared cache budget" \
 check "PHP-first plan stays inside the 80% budget" \
   test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
        -le $(( 65536 * 80 / 100 ))
+
+# The planner must use the same 8-worker floor as tune_php_fpm_version().
+php_pool_max_children() { printf '6'; }
+mariadb_data_size_mb() { printf '20000'; }
+elasticsearch_data_size_mb() { printf '0'; }
+OPT_DETECTED=(angie php:8.3 mariadb)
+plan_memory_budget
+check "PHP budget uses the 8-worker floor" \
+  test "$OPT_PHP_BUDGET_MB" -ge 768
+check "MariaDB gets the remaining budget after the PHP floor" \
+  test "$OPT_MARIADB_BUDGET_MB" -gt 0
+
+# Restore the 128-worker context used by the database/index cases below.
+php_pool_max_children() { printf '128'; }
+OPT_DETECTED=(angie php:8.3 mariadb redis elastic)
 
 # The buffer pool should hold the live data+index working set when possible.
 mariadb_data_size_mb() { printf '20000'; }

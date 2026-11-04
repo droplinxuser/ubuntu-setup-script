@@ -31,7 +31,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.2"
+readonly SCRIPT_VERSION="1.8.3"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
@@ -1792,6 +1792,20 @@ tune_size_value() {
   fi
 }
 
+# Cache budget in MB: 25% of RAM, capped at 5% of free disk, then rounded
+# down to 256 MB.  The rounding keeps small free-space changes between runs
+# (backups, logs) from resizing every cache zone and forcing a restart.
+tune_cache_total_mb() {
+  local ram_mb=$1 disk_free_mb=$2 total
+  total=$(( ram_mb * 25 / 100 ))
+  (( total > 65536 )) && total=65536
+  (( total > disk_free_mb * 5 / 100 )) && total=$(( disk_free_mb * 5 / 100 ))
+  (( total < 256 )) && total=256
+  total=$(( total / 256 * 256 ))
+  (( total < 256 )) && total=256
+  printf '%s' "$total"
+}
+
 # Pick the first existing file from a list.  Older server-configs-nginx
 # releases installed http.d files with underscore names (fastcgi_cache_conf);
 # current releases use dots (fastcgi_cache.conf).  --optimize must tune a live
@@ -1929,10 +1943,7 @@ tune_angie_configs() {
 
   ssl_cache_mb=$(tune_clamp $(( mem_mb / 512 )) 10 256)
 
-  cache_total_mb=$(( mem_mb * 25 / 100 ))
-  (( cache_total_mb > 65536 )) && cache_total_mb=65536
-  (( cache_total_mb > disk_free_mb * 5 / 100 )) && cache_total_mb=$(( disk_free_mb * 5 / 100 ))
-  (( cache_total_mb < 256 )) && cache_total_mb=256
+  cache_total_mb=$(tune_cache_total_mb "$mem_mb" "$disk_free_mb")
 
   fcgi_mb=$(( cache_total_mb * 50 / 100 ))
   chev_mb=$(( cache_total_mb * 25 / 100 ))
@@ -4129,6 +4140,9 @@ plan_memory_budget() {
   if (( has_php )); then
     children=$(php_pool_max_children)
     (( children > 0 )) || children=$(( $(nproc) * 16 ))
+    # tune_php_fpm_version() never goes below 8 workers; use the same floor
+    # here so a first run and a second run calculate the same PHP budget.
+    (( children < 8 )) && children=8
     OPT_PHP_BUDGET_MB=$(( children * 96 ))
     (( OPT_PHP_BUDGET_MB < 512 )) && OPT_PHP_BUDGET_MB=512
     php_cap=$(( total * 50 / 100 ))

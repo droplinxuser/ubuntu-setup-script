@@ -31,6 +31,17 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.3
+
+- **`--optimize` is stable across repeated runs.** The memory planner now
+  applies the same 8-worker PHP floor as the pool tuner, so the first run
+  cannot change the PHP budget that the second run recalculates. The Angie
+  cache budget is rounded down to 256 MB so small disk-free changes from
+  backups or logs do not resize cache zones and force a restart.
+- **MariaDB/Elasticsearch size-fit reporting** remains in place: a database
+  or index larger than the feasible pool/heap is reported as not fully
+  fitting instead of silently overcommitting RAM.
+
 ## What's new in 1.8.2
 
 - **Hostname changes keep `/etc/hosts` in sync.** `--basic host=...` now
