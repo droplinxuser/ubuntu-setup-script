@@ -31,6 +31,22 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.4
+
+- **`--optimize` enables a WordPress guest FastCGI cache automatically.** It
+  detects vhosts that include `h5bp/php_wp.conf`/`h5bp/wordpress.conf` and have
+  a real `wp-config.php`, deploys the Angie repository's cache templates, and
+  invokes the cache only for anonymous GET/HEAD requests. Logged-in users,
+  POST/PUT/DELETE/PATCH, authorization headers, wp-admin/wp-login/wp-cron/
+  wp-json/XML-RPC, feeds, previews, cart/checkout/account pages and shop
+  session cookies bypass the cache. Cache state is exposed through
+  `X-Cache-Status` for verification.
+- **Single-node Elasticsearch yellow health is fixed automatically.** When
+  the cluster has one node and only replica shards are unassigned,
+  `--optimize` sets `number_of_replicas=0` on existing indices and installs a
+  low-priority index template so new indices stay green. Multi-node clusters
+  and unassigned primary shards are left untouched.
+
 ## What's new in 1.8.3
 
 - **`--optimize` is stable across repeated runs.** The memory planner now
@@ -816,6 +832,18 @@ lists recent error-level journal entries. The Markdown report is written to
 
 Older Angie installs whose `http.d` files use underscore names
 (`fastcgi_cache_conf`, `limit_req_conf`, …) are tuned in place as well.
+
+When WordPress vhosts are detected, `--optimize` deploys the Angie
+repository's guest FastCGI cache templates and includes them in
+`h5bp/php_wp.conf`. Only anonymous GET/HEAD responses are cached; logged-in,
+POST/PUT/DELETE/PATCH, authorization, admin/login/REST/XML-RPC, feeds,
+previews, cart/checkout/account and shop-session requests bypass the cache.
+The report and the `X-Cache-Status` header show cache behavior.
+
+On a single-node Elasticsearch cluster, yellow health caused solely by
+unassigned replicas is corrected automatically: replicas are set to zero on
+existing indices and a low-priority template keeps new indices green.
+Multi-node clusters and unassigned primary shards are left unchanged.
 
 ---
 

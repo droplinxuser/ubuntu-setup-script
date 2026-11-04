@@ -309,5 +309,43 @@ check "large Elasticsearch index raises the heap target" \
 check "large index is not falsely reported as fitting" \
   test "$OPT_ES_BUDGET_MB" -lt 20000
 
+# ---------------------------------------------------------------------------
+# Single-node Elasticsearch replica detection
+# ---------------------------------------------------------------------------
+check "single-node yellow replica issue is detected" \
+  elasticsearch_single_node_replica_issue \
+    '{"status":"yellow","number_of_nodes":1,"unassigned_shards":1,"unassigned_primary_shards":0}'
+if elasticsearch_single_node_replica_issue \
+     '{"status":"green","number_of_nodes":1,"unassigned_shards":0,"unassigned_primary_shards":0}'; then
+  t_fail "green cluster is not treated as a replica issue"
+else
+  t_pass "green cluster is not treated as a replica issue"
+fi
+if elasticsearch_single_node_replica_issue \
+     '{"status":"yellow","number_of_nodes":2,"unassigned_shards":1,"unassigned_primary_shards":0}'; then
+  t_fail "multi-node yellow cluster is not auto-modified"
+else
+  t_pass "multi-node yellow cluster is not auto-modified"
+fi
+if elasticsearch_single_node_replica_issue \
+     '{"status":"yellow","number_of_nodes":1,"unassigned_shards":1,"unassigned_primary_shards":1}'; then
+  t_fail "unassigned primary shard is not treated as a replica issue"
+else
+  t_pass "unassigned primary shard is not treated as a replica issue"
+fi
+
+# ---------------------------------------------------------------------------
+# WordPress vhost detection
+# ---------------------------------------------------------------------------
+mkdir -p "$TMP/wpangie/conf.d" "$TMP/wpangie/h5bp" "$TMP/wpangie/www/site/public"
+: > "$TMP/wpangie/www/site/public/wp-config.php"
+printf 'server {\n  root %s;\n  include h5bp/php_wp.conf;\n}\n' \
+  "$TMP/wpangie/www/site/public" > "$TMP/wpangie/conf.d/site.conf"
+check "WordPress vhost detection finds a real installation" \
+  test "$(angie_wordpress_vhosts "$TMP/wpangie")" = "$TMP/wpangie/conf.d/site.conf"
+rm -f "$TMP/wpangie/www/site/public/wp-config.php"
+check "WordPress vhost detection ignores a missing wp-config" \
+  test -z "$(angie_wordpress_vhosts "$TMP/wpangie")"
+
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
