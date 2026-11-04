@@ -1,5 +1,62 @@
 # Full-stack local stress report
 
+## Final re-validation - setup.sh 1.6.11, 48 vCPU / 128 GiB
+
+Re-run on 2026-11-04 after the `--optimize` command, PHP socket migration and
+Angie repository ownership cleanup. Host: 48 vCPU, 125 GiB RAM, Ubuntu 26.04,
+Angie 1.12.4, PHP 8.5.12 FPM (512 static workers), MariaDB 11.8.6, Valkey
+9.0.4, Elasticsearch 9.5.6, Node 26.13.0. PHP-FPM and Angie both use
+`/run/php/php-fpm.sock`.
+
+Standard suite (`tests/stress-site/run-stress.sh`, 8 threads / 200 clients):
+
+| Scenario | Requests/sec | p50 | p90 | p99 | Client socket errors |
+|---|---:|---:|---:|---:|---|
+| static | 128738.24 | 377.00us | 0.73ms | 0.94ms | none |
+| php-hello | 117206.06 | 688.00us | 0.84ms | 1.46ms | none |
+| mariadb-json | 27733.21 | 3.37ms | 5.34ms | 8.40ms | none |
+| valkey-json | 14396.78 | 6.86ms | 7.09ms | 7.53ms | none |
+| elasticsearch | 3846.13 | 10.87ms | 20.26ms | 34.24ms | none |
+| node-proxy | 14625.33 | 6.66ms | 7.45ms | 10.38ms | none |
+| full-uncached-200 | 6163.31 | 27.94ms | 52.06ms | 112.94ms | none |
+| full-cached-200 | 128810.82 | 1.05ms | 1.67ms | 3.89ms | none |
+| slow-1s-200 | 179.72 | 1.00s | 1.00s | 1.00s | none |
+
+Aggressive run (16 threads):
+
+| Scenario | Requests/sec | p50 | p99 | Client socket errors |
+|---|---:|---:|---:|---|
+| static (1000c) | 279976.75 | 1.75ms | 7.76ms | none |
+| php-hello (500c) | 115270.56 | 2.82ms | 180.62ms | none |
+| mariadb-json (400c) | 26614.63 | 13.86ms | 45.22ms | none |
+| valkey-json (400c) | 12991.22 | 30.90ms | 34.55ms | none |
+| full-cached (1000c) | 178597.73 | 3.71ms | 10.32ms | none |
+| full-uncached (400c) | 7808.82 | 49.90ms | 102.03ms | none |
+
+Post-test: Angie/PHP error logs empty, MariaDB `Slow_queries=0`,
+`Aborted_connects=0`, `Max_used_connections=707` (limit 1536), no failed units,
+no OOM or swap use.
+
+## Ubuntu 24.04 live `--optimize` validation
+
+On a live 12 vCPU / 62.7 GiB Ubuntu 24.04.5 host (Angie 1.12.4, PHP 8.4.27,
+MariaDB 10.11.14, Valkey 7.2.13, no Elasticsearch):
+
+- PHP-FPM moved from `127.0.0.1:9000` to `/run/php/php-fpm.sock`; 192 workers,
+  12,288 max requests, 300 s terminate timeout.
+- Angie `local_php` repointed to the socket; `worker_connections` 300000 →
+  24576; `worker_rlimit_nofile` 520000 → 98304; keepalive 3 → 24.
+- MariaDB 10.11 `[mysqld]` drop-in: 25 GB buffer pool, `max_connections=384`,
+  `back_log=65535`, `pool-of-threads`.
+- Valkey `maxmemory` 1 GB → 6.4 GB, `maxclients=20000`, backlog 65535.
+- Elasticsearch absent → untouched.
+- A second `--optimize` run was idempotent. 1,000 concurrent HTTP requests
+  returned 200 with zero client errors; live XenForo sites stayed up.
+- Certificate path validated separately with Angie built-in ACME: a new
+  Let's Encrypt certificate for `xf23.jamii.app`, `uganda.jamii.app` and
+  `kenya.jamii.app` is valid through 2027-02-02 and public TLS verification
+  returns 0.
+
 ## Live dedicated validation - setup.sh 1.6.8, 48 vCPU / 128 GiB
 
 - Host: 48 vCPU, 125 GiB usable RAM, 2× 894 GB NVMe, Ubuntu 26.04 LTS
