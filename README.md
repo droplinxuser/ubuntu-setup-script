@@ -31,6 +31,19 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.12
+
+- **Per-service budgets now scale with the services actually installed.**
+  - Angie cache: 50% of RAM / 10% of free disk on an Angie-only host, 30% /
+    5% with Angie+PHP only, and 25% / 5% when a data/search tier is present.
+  - Valkey/Redis: 50% of RAM if it is the only service, 25% on a
+    web+cache-only host, and the previous 10% (8 GB cap) when MariaDB or
+    Elasticsearch is present.
+  - MariaDB-only hosts use the full 80%-of-RAM cap; the data+5% target still
+    prevents over-allocation when the database is smaller.
+  - Elasticsearch-only hosts fall back to 50% of RAM (capped at the 31 GB
+    compressed-oops limit) when the index size cannot be measured.
+
 ## What's new in 1.8.11
 
 - **The Angie cache budget now follows the cache types actually present.**
@@ -879,9 +892,11 @@ workers/connections/buffers/cache sizes, PHP-FPM `static` pool sizing, MariaDB
 buffer pool/connection backlog, Valkey/Redis maxmemory, and Elasticsearch
 heap. The Angie cache budget is shared only across the cache types that are
 actually present, so a dedicated proxy with one cache type gets the whole
-budget. When PHP is absent, MariaDB receives the full fixed budget (no PHP
-worker reservation), though its data+5% target still prevents
-over-allocation. MariaDB's pool and Elasticsearch's heap are sized to the live
+budget. The share also scales with installed services: Angie-only uses 50%
+of RAM / 10% of free disk, Angie+PHP only 30%, Valkey-only 50%, and the
+shared profile 25%/10% capped at 8 GB. When PHP is absent, MariaDB receives
+the full fixed budget (no PHP worker reservation), though its data+5% target
+still prevents over-allocation. MariaDB's pool and Elasticsearch's heap are sized to the live
 data/index store plus 5%, bounded by the shared budget after reserving the
 other services; a 40%-of-RAM (MariaDB) or 25%-of-RAM (Elasticsearch)
 fallback is used only when the data size cannot be measured. Oversized live

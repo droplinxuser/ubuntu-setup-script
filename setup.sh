@@ -31,7 +31,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.11"
+readonly SCRIPT_VERSION="1.8.12"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
@@ -1796,10 +1796,10 @@ tune_size_value() {
 # down to 256 MB.  The rounding keeps small free-space changes between runs
 # (backups, logs) from resizing every cache zone and forcing a restart.
 tune_cache_total_mb() {
-  local ram_mb=$1 disk_free_mb=$2 total
-  total=$(( ram_mb * 25 / 100 ))
+  local ram_mb=$1 disk_free_mb=$2 ram_pct=${3:-25} disk_pct=${4:-5} total
+  total=$(( ram_mb * ram_pct / 100 ))
   (( total > 65536 )) && total=65536
-  (( total > disk_free_mb * 5 / 100 )) && total=$(( disk_free_mb * 5 / 100 ))
+  (( total > disk_free_mb * disk_pct / 100 )) && total=$(( disk_free_mb * disk_pct / 100 ))
   (( total < 256 )) && total=256
   total=$(( total / 256 * 256 ))
   (( total < 256 )) && total=256
@@ -1943,7 +1943,32 @@ tune_angie_configs() {
 
   ssl_cache_mb=$(tune_clamp $(( mem_mb / 512 )) 10 256)
 
-  cache_total_mb=$(tune_cache_total_mb "$mem_mb" "$disk_free_mb")
+  # Scale the disk-cache budget with the services actually present.  A
+  # dedicated Angie proxy has no PHP/DB/search tier to share RAM with, and an
+  # Angie+PHP host has no database/search tier.
+  local has_php=0 has_maria=0 has_cache=0 has_es=0 svc
+  local cache_ram_pct=25 cache_disk_pct=5
+  # During install, OPT_DETECTED is empty because the whole stack has not
+  # been installed yet; keep the shared 25%/5% default there.
+  if (( ${#OPT_DETECTED[@]} > 0 )); then
+    for svc in "${OPT_DETECTED[@]}"; do
+      case $svc in
+        php:*) has_php=1 ;;
+        mariadb) has_maria=1 ;;
+        valkey|redis) has_cache=1 ;;
+        elastic) has_es=1 ;;
+      esac
+    done
+    if (( !has_php && !has_maria && !has_cache && !has_es )); then
+      cache_ram_pct=50
+      cache_disk_pct=10
+    elif (( has_php && !has_maria && !has_cache && !has_es )); then
+      cache_ram_pct=30
+    fi
+  fi
+
+  cache_total_mb=$(tune_cache_total_mb "$mem_mb" "$disk_free_mb" \
+    "$cache_ram_pct" "$cache_disk_pct")
 
   # Resolve the cache files Angie actually includes before sizing them, so a
   # host that only runs one cache type can use the whole cache budget instead
@@ -4188,7 +4213,8 @@ elasticsearch_current_heap_mb() {
 }
 
 plan_memory_budget() {
-  local total usable has_php=0 fixed_available children php_cap
+  local total usable has_php=0 has_angie=0 has_maria=0 has_cache=0 has_es=0
+  local fixed_available children php_cap
   local es_base_cap=31744 es_hard_cap=31744 es_size_mb=0 es_base=0
   local es_cap=0 current_heap=0 current_pool=0
   total=$(mem_total_mb)
@@ -4204,6 +4230,10 @@ plan_memory_budget() {
   OPT_ES_KEPT_MB=0
 
   [[ " ${OPT_DETECTED[*]} " == *" php:"* ]] && has_php=1
+  [[ " ${OPT_DETECTED[*]} " == *" angie "* ]] && has_angie=1
+  [[ " ${OPT_DETECTED[*]} " == *" mariadb "* ]] && has_maria=1
+  [[ " ${OPT_DETECTED[*]} " == *" valkey "* || " ${OPT_DETECTED[*]} " == *" redis "* ]] && has_cache=1
+  [[ " ${OPT_DETECTED[*]} " == *" elastic "* ]] && has_es=1
 
   # Reserve PHP workers before sizing the data services.  PHP is the
   # request-serving tier: starving it to give Elasticsearch a larger heap
@@ -4226,8 +4256,21 @@ plan_memory_budget() {
     fixed_available=$usable
   fi
 
-  [[ " ${OPT_DETECTED[*]} " == *" valkey "* || " ${OPT_DETECTED[*]} " == *" redis "* ]] \
-    && OPT_VALKEY_BUDGET_MB=$(opt_clamp $(( total / 10 )) 256 8192)
+  if (( has_cache )); then
+    local cache_pct=10 cache_cap=8192
+    if (( !has_maria && !has_es )); then
+      if (( has_angie || has_php )); then
+        # Web/cache-only host: give the in-memory cache a larger share.
+        cache_pct=25
+        cache_cap=32768
+      else
+        # Cache-only host.
+        cache_pct=50
+        cache_cap=65536
+      fi
+    fi
+    OPT_VALKEY_BUDGET_MB=$(opt_clamp $(( total * cache_pct / 100 )) 256 "$cache_cap")
+  fi
 
   # The heap follows the live index store (+5%) up to the 31 GB
   # compressed-oops ceiling; 25%-of-RAM (8 GB on shared hosts) is used only
@@ -4245,7 +4288,11 @@ plan_memory_budget() {
     if (( es_size_mb > 0 )); then
       es_base=$(( es_size_mb * 105 / 100 ))
     else
-      es_base=$(opt_clamp $(( total * 25 / 100 )) 512 "$es_base_cap")
+      local es_fallback_pct=25
+      if (( !has_angie && !has_php && !has_maria && !has_cache )); then
+        es_fallback_pct=50
+      fi
+      es_base=$(opt_clamp $(( total * es_fallback_pct / 100 )) 512 "$es_base_cap")
     fi
     (( es_base < 512 )) && es_base=512
     (( es_base > es_hard_cap )) && es_base=$es_hard_cap
@@ -4272,7 +4319,11 @@ plan_memory_budget() {
     if (( db_size_mb > 0 )); then
       OPT_MARIADB_BUDGET_MB=$(( db_size_mb * 105 / 100 ))
     else
-      OPT_MARIADB_BUDGET_MB=$(opt_clamp $(( total * 40 / 100 )) 256 "$db_cap")
+      local db_fallback_pct=40
+      if (( !has_php && !has_cache && !has_es )); then
+        db_fallback_pct=80
+      fi
+      OPT_MARIADB_BUDGET_MB=$(opt_clamp $(( total * db_fallback_pct / 100 )) 256 "$db_cap")
     fi
     (( OPT_MARIADB_BUDGET_MB < 256 )) && OPT_MARIADB_BUDGET_MB=256
     (( OPT_MARIADB_BUDGET_MB > db_cap )) && OPT_MARIADB_BUDGET_MB=$db_cap
