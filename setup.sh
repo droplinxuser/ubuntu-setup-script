@@ -31,7 +31,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.6"
+readonly SCRIPT_VERSION="1.8.7"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
@@ -4079,6 +4079,7 @@ OPT_MARIADB_BUDGET_MB=0
 OPT_MARIADB_KEPT_MB=0
 OPT_VALKEY_BUDGET_MB=0
 OPT_ES_BUDGET_MB=0
+OPT_ES_KEPT_MB=0
 
 mem_total_mb() {
   awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || printf '1024'
@@ -4128,10 +4129,40 @@ elasticsearch_data_size_mb() {
   printf '%s' $(( bytes / 1024 / 1024 ))
 }
 
+# Current JVM heap in MB.  Prefer the live node stats, then the -Xmx value
+# from jvm.options.d, so an operator-sized heap is not shrunk.
+elasticsearch_current_heap_mb() {
+  local bytes val file mb
+  if command -v curl >/dev/null 2>&1; then
+    bytes=$(curl -fsS --max-time 3 \
+      'http://127.0.0.1:9200/_nodes/stats/jvm?filter_path=nodes.*.jvm.mem.heap_max_in_bytes' \
+      2>/dev/null \
+      | sed -n 's/.*"heap_max_in_bytes"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+      | sort -n | tail -n1)
+    if [[ $bytes =~ ^[0-9]+$ ]]; then
+      printf '%s' $(( bytes / 1024 / 1024 ))
+      return 0
+    fi
+  fi
+  for file in /etc/elasticsearch/jvm.options /etc/elasticsearch/jvm.options.d/*.options; do
+    [[ -f $file ]] || continue
+    val=$(sed -n 's/^-Xmx\([0-9][0-9]*[kKmMgG]\)$/\1/p' "$file" | tail -n1)
+    [[ -n $val ]] || continue
+    case ${val: -1} in
+      k|K) mb=$(( ${val%?} / 1024 )) ;;
+      m|M) mb=${val%?} ;;
+      g|G) mb=$(( ${val%?} * 1024 )) ;;
+      *) continue ;;
+    esac
+    printf '%s' "$mb"
+    return 0
+  done
+}
+
 plan_memory_budget() {
   local total usable has_php=0 fixed_available children php_cap
   local es_base_cap=31744 es_hard_cap=31744 es_size_mb=0 es_base=0
-  local current_pool=0
+  local es_target=0 es_cap=0 current_heap=0 current_pool=0
   total=$(mem_total_mb)
   (( total > 0 )) || total=1024
   OPT_MEM_TOTAL_MB=$total
@@ -4142,6 +4173,7 @@ plan_memory_budget() {
   OPT_MARIADB_KEPT_MB=0
   OPT_VALKEY_BUDGET_MB=0
   OPT_ES_BUDGET_MB=0
+  OPT_ES_KEPT_MB=0
 
   [[ " ${OPT_DETECTED[*]} " == *" php:"* ]] && has_php=1
 
@@ -4166,27 +4198,32 @@ plan_memory_budget() {
     fixed_available=$usable
   fi
 
+  [[ " ${OPT_DETECTED[*]} " == *" valkey "* || " ${OPT_DETECTED[*]} " == *" redis "* ]] \
+    && OPT_VALKEY_BUDGET_MB=$(opt_clamp $(( total / 10 )) 256 8192)
+
   # A shared web/data host starts Elasticsearch at 8 GB rather than
-  # 25%-of-RAM.  If the live index is larger, raise the heap up to 16 GB
-  # (or 31 GB on a dedicated search node) so the working set can fit.
+  # 25%-of-RAM.  The heap follows the live index store (+5%) up to the
+  # 31 GB compressed-oops ceiling; the shared budget caps it below so the
+  # other services keep their memory.
   if [[ " ${OPT_DETECTED[*]} " == *" php:"* || " ${OPT_DETECTED[*]} " == *" mariadb "* ]]; then
     es_base_cap=8192
-    es_hard_cap=16384
   fi
+  es_hard_cap=31744
   OPT_ES_SIZE_MB=0
   if [[ " ${OPT_DETECTED[*]} " == *" elastic "* ]]; then
     es_size_mb=$(elasticsearch_data_size_mb)
     [[ $es_size_mb =~ ^[0-9]+$ ]] || es_size_mb=0
     OPT_ES_SIZE_MB=$es_size_mb
     es_base=$(opt_clamp $(( total * 25 / 100 )) 512 "$es_base_cap")
-    if (( es_size_mb > es_base )); then
-      es_base=$es_size_mb
-      (( es_base > es_hard_cap )) && es_base=$es_hard_cap
+    if (( es_size_mb > 0 )); then
+      es_target=$(( es_size_mb * 105 / 100 ))
+      (( es_target > es_base )) && es_base=$es_target
     fi
+    (( es_base > es_hard_cap )) && es_base=$es_hard_cap
+    es_base=$(( (es_base + 511) / 512 * 512 ))
+    (( es_base < 512 )) && es_base=512
     OPT_ES_BUDGET_MB=$es_base
   fi
-  [[ " ${OPT_DETECTED[*]} " == *" valkey "* || " ${OPT_DETECTED[*]} " == *" redis "* ]] \
-    && OPT_VALKEY_BUDGET_MB=$(opt_clamp $(( total / 10 )) 256 8192)
   local db_size_mb=0 db_target=0 db_cap=0 base_target=0 remaining=0 others=0
   OPT_DB_SIZE_MB=0
   if [[ " ${OPT_DETECTED[*]} " == *" mariadb "* ]]; then
@@ -4223,6 +4260,26 @@ plan_memory_budget() {
       elif (( current_pool > OPT_MARIADB_BUDGET_MB )); then
         OPT_MARIADB_BUDGET_MB=$current_pool
         OPT_MARIADB_KEPT_MB=$current_pool
+      fi
+    fi
+  fi
+
+  # Elasticsearch gets what remains after MariaDB and the cache tier, so a
+  # larger heap cannot crowd the database out.  Keep a live heap within 2%
+  # of the target (or larger, if it still fits) to avoid restart churn.
+  if [[ " ${OPT_DETECTED[*]} " == *" elastic "* ]]; then
+    es_cap=$(( fixed_available - OPT_MARIADB_BUDGET_MB - OPT_VALKEY_BUDGET_MB ))
+    (( es_cap < 512 )) && es_cap=512
+    (( OPT_ES_BUDGET_MB > es_cap )) && OPT_ES_BUDGET_MB=$es_cap
+    current_heap=$(elasticsearch_current_heap_mb)
+    if [[ $current_heap =~ ^[0-9]+$ ]] && (( current_heap > 0 && current_heap <= es_cap )); then
+      if (( current_heap * 100 >= OPT_ES_BUDGET_MB * 98 \
+            && current_heap * 100 <= OPT_ES_BUDGET_MB * 102 )); then
+        OPT_ES_BUDGET_MB=$current_heap
+        OPT_ES_KEPT_MB=$current_heap
+      elif (( current_heap > OPT_ES_BUDGET_MB )); then
+        OPT_ES_BUDGET_MB=$current_heap
+        OPT_ES_KEPT_MB=$current_heap
       fi
     fi
   fi
@@ -4942,6 +4999,8 @@ optimize_elastic() {
   if (( OPT_ES_SIZE_MB > 0 )); then
     if (( heap_mb >= OPT_ES_SIZE_MB )); then
       opt_report "- Index store=${OPT_ES_SIZE_MB}MB; heap=${heap_mb}MB (fits)"
+    elif (( ${OPT_ES_KEPT_MB:-0} > 0 )); then
+      opt_report "- Index store=${OPT_ES_SIZE_MB}MB; heap=${heap_mb}MB (kept existing heap)"
     else
       opt_report "- Index store=${OPT_ES_SIZE_MB}MB; heap=${heap_mb}MB (does not fully fit; OS page cache serves the remainder)"
     fi

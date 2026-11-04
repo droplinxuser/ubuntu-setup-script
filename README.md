@@ -31,6 +31,15 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.7
+
+- **Elasticsearch's heap now follows the live index store.** `--optimize`
+  sizes the JVM heap to the measured index store plus 5%, up to the 31 GB
+  compressed-oops ceiling, and only when it fits the shared budget after
+  PHP, MariaDB and Valkey/Redis reservations. A larger existing heap is
+  preserved, and a heap within ±2% of the computed target is kept as-is to
+  avoid restart churn.
+
 ## What's new in 1.8.6
 
 - **MariaDB's buffer pool now sizes to the live database working set.** When
@@ -837,8 +846,10 @@ buffer pool/connection backlog, Valkey/Redis maxmemory, and Elasticsearch
 heap. The MariaDB pool is sized to the live data+index working set plus 5%
 when that fits the shared budget after reserving the other services; smaller
 databases keep the conservative 40%-of-RAM/32 GB target, and an existing
-larger pool is preserved instead of being shrunk. PHP listeners are
-preserved: Angie is repointed only when the pool
+larger pool is preserved instead of being shrunk. Elasticsearch's heap is
+likewise sized to the index store plus 5%, capped at the 31 GB
+compressed-oops limit and the budget left after the other services. PHP
+listeners are preserved: Angie is repointed only when the pool
 already owns a Unix socket, so a live TCP pool is never broken by a
 configuration change. Service allocations
 are planned together from one 80%-of-RAM budget, with PHP worker capacity

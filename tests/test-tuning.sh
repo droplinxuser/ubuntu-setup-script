@@ -237,6 +237,7 @@ mem_total_mb() { printf '131072'; }
 mariadb_data_size_mb() { printf '0'; }
 mariadb_current_pool_mb() { printf '0'; }
 elasticsearch_data_size_mb() { printf '0'; }
+elasticsearch_current_heap_mb() { printf '0'; }
 OPT_DETECTED=(angie php:8.4 mariadb valkey elastic)
 plan_memory_budget
 check "PHP budget is at most 50% of RAM" \
@@ -348,17 +349,64 @@ OPT_DETECTED=(angie php:8.3 mariadb redis elastic)
 # Elasticsearch heap follows the live index store size.
 mariadb_data_size_mb() { printf '20000'; }
 elasticsearch_data_size_mb() { printf '4096'; }
+elasticsearch_current_heap_mb() { printf '0'; }
 plan_memory_budget
-check "small Elasticsearch index fits the planned heap" \
-  test "$OPT_ES_BUDGET_MB" -ge 4096
+check "small Elasticsearch index keeps the 8 GB shared base" \
+  test "$OPT_ES_BUDGET_MB" -eq 8192
 check "Elasticsearch index size is recorded" \
   test "$OPT_ES_SIZE_MB" -eq 4096
+
 elasticsearch_data_size_mb() { printf '20000'; }
 plan_memory_budget
-check "large Elasticsearch index raises the heap target" \
-  test "$OPT_ES_BUDGET_MB" -gt 8192
-check "large index is not falsely reported as fitting" \
-  test "$OPT_ES_BUDGET_MB" -lt 20000
+check "large Elasticsearch index gets index+5% headroom" \
+  test "$OPT_ES_BUDGET_MB" -eq 21504
+check "Elasticsearch heap fits the 20 GB index" \
+  test "$OPT_ES_BUDGET_MB" -ge 20000
+check "Elasticsearch plan stays inside the 80% budget" \
+  test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
+       -le $(( 65536 * 80 / 100 ))
+
+# A huge index is capped at the 31 GB compressed-oops ceiling.
+mem_total_mb() { printf '262144'; }
+OPT_DETECTED=(angie php:8.4 elastic)
+elasticsearch_data_size_mb() { printf '100000'; }
+plan_memory_budget
+check "Elasticsearch heap is capped at 31 GB" \
+  test "$OPT_ES_BUDGET_MB" -eq 31744
+check "Elasticsearch index size is recorded for huge stores" \
+  test "$OPT_ES_SIZE_MB" -eq 100000
+
+# A larger existing heap is preserved instead of being shrunk.
+OPT_DETECTED=(angie php:8.4 mariadb valkey elastic)
+mariadb_data_size_mb() { printf '20000'; }
+elasticsearch_data_size_mb() { printf '13000'; }
+elasticsearch_current_heap_mb() { printf '20000'; }
+plan_memory_budget
+check "existing 20 GB Elasticsearch heap is preserved" \
+  test "$OPT_ES_BUDGET_MB" -eq 20000
+check "preserved Elasticsearch heap is recorded" \
+  test "$OPT_ES_KEPT_MB" -eq 20000
+
+# Small statistics drift must not change the heap on every run.
+elasticsearch_current_heap_mb() { printf '14000'; }
+plan_memory_budget
+check "Elasticsearch statistics drift keeps the live heap" \
+  test "$OPT_ES_BUDGET_MB" -eq 14000
+
+# A heap that would exceed the shared budget is capped.
+mem_total_mb() { printf '65536'; }
+OPT_DETECTED=(angie php:8.3 mariadb redis elastic)
+mariadb_data_size_mb() { printf '40000'; }
+elasticsearch_data_size_mb() { printf '4096'; }
+elasticsearch_current_heap_mb() { printf '30000'; }
+plan_memory_budget
+check "Elasticsearch heap above the shared budget is capped" \
+  test "$OPT_ES_BUDGET_MB" -eq 8192
+
+elasticsearch_current_heap_mb() { printf '0'; }
+elasticsearch_data_size_mb() { printf '0'; }
+mariadb_data_size_mb() { printf '20000'; }
+OPT_DETECTED=(angie php:8.3 mariadb redis elastic)
 
 # ---------------------------------------------------------------------------
 # Single-node Elasticsearch replica detection
