@@ -1,4 +1,61 @@
-# Full-stack local stress report
+# Full-stack stress test reports
+
+## Remote stress test - live origin host (2026-11-04)
+
+Origin-direct load test from a separate 48 vCPU dev server
+(`198.51.100.20`, Ubuntu 26.04.1, `wrk` 4.1.0). Public DNS for the site is
+behind Cloudflare (and returns 403 to non-browser
+requests), so the dev server mapped the name directly to the origin and ran
+`wrk` over HTTPS/1.1. The origin uses a Cloudflare Origin certificate, so the
+load generator does not validate the certificate.
+
+Target stack: Ubuntu 24.04.5, 12 vCPU / 62.4 GiB, Angie 1.12.4, PHP 8.3.36
+FPM (128 static workers, TCP 9000), MariaDB 10.11.14 (25.6 GB buffer pool,
+1500 connections, thread pool), Redis 7.0.15, Elasticsearch 8.19.23.
+
+| Scenario | Connections | Requests/sec | p50 | p90 | p99 | Client errors/timeouts |
+|---|---:|---:|---:|---:|---:|---|
+| static JS | 4000 | 29117.53 | 133.60ms | 134.84ms | 136.16ms | none |
+| cached forum index | 800 | 4362.82 | 177.12ms | 179.42ms | 284.22ms | none |
+| uncached thread | 20 | 72.63 | 193.65ms | 213.96ms | 722.61ms | none |
+| uncached thread | 100 | 410.13 | 194.06ms | 371.90ms | 685.46ms | none |
+| uncached thread | 400 | 1909.63 | 194.64ms | 201.29ms | 634.79ms | none |
+| uncached thread | 800 | 2844.20 | 297.02ms | 325.40ms | 527.29ms | none |
+| uncached thread | 1600 | 2971.77 | 476.52ms | 833.96ms | 1.61s | timeout 2 (5s) |
+| uncached thread | 1600 (10s timeout) | 2593.74 | 586.74ms | 770.29ms | 1.22s | none |
+| uncached thread | 2400 | 2297.59 | 942.84ms | 1.20s | 1.79s | timeout 1 (5s) |
+| mixed cached + uncached, 60s | 400 + 400 | 2144.82 + 1632.13 | 180.95ms / 198.88ms | 189.70ms / 447.73ms | 315.62ms / 763.68ms | none |
+| login page | 200 | 767.51 | 195.99ms | 200.70ms | 202.98ms | none |
+| missing page (expected 404) | 200 | 1230.18 | 150.94ms | 152.52ms | 153.51ms | none (all 404) |
+
+Server-side observations:
+
+- During the 1,600-connection uncached run, `vmstat` showed ~88–89% user,
+  11–12% system, 0% idle across 12 cores. Load average peaked at 17.93 during
+  the 2,400-connection run; the uncached PHP path is CPU-bound at ~2.6–3.0k
+  req/s.
+- PHP-FPM stayed at 129 processes (128 workers + master); MariaDB held 129
+  connections (`Max_used_connections=130`), with `Aborted_connects=0`,
+  `Slow_queries=0`, and `Innodb_buffer_pool_wait_free=0`.
+- No Angie, PHP-FPM or MariaDB error-log entries appeared during the test;
+  the dev server IP does not appear in any error log. Memory stayed at
+  ~26.9 GB used / ~37 GB available, swap unchanged at ~31 MB, no OOM events,
+  no failed services from the test.
+- Redis reported `rejected_connections=0` and `evicted_keys=0`.
+  Elasticsearch heap stayed around 1.2 GB.
+- The only client timeouts were 2/59,707 at 1,600 connections and 1/34,695 at
+  2,400 connections with a 5-second `wrk` timeout. Re-running 1,600
+  connections with a 10-second timeout produced zero timeouts, and there were
+  no matching server-side timeout or error entries; these were extreme-
+  concurrency client/queue effects, not service failures.
+- Pre-existing conditions, not caused by the test: Angie logs an unused ACME
+  client warning; Elasticsearch is yellow with 2 unassigned replica shards on
+  a single node; `hetrixtools_agent.service` is failed/not-found; and the
+  vhost/PHP error logs contain older application exception stacks (line
+  counts did not change during the test).
+
+The `/etc/hosts` override, load generator scripts, `wrk` output files,
+monitoring CSV and all live-server temp files were removed after the run.
 
 ## Final re-validation - setup.sh 1.6.11, 48 vCPU / 128 GiB
 
