@@ -151,6 +151,12 @@ cp -a "$FIXTURES/." "$TMP/legacy/"
 for name in fastcgi_cache fastcgi_cache_chev xf_proxy_cache proxy_cache limit_req; do
   mv "$TMP/legacy/http.d/${name}.conf" "$TMP/legacy/http.d/${name}_conf"
 done
+cat > "$TMP/legacy/http.d/fastcgi_cache_custom_conf" <<'EOF'
+fastcgi_cache_path /home/nginx_cache_custom levels=1:2 keys_zone=customcache:5120m inactive=30d;
+EOF
+cat > "$TMP/legacy/http.d/proxy_cache_extra_conf" <<'EOF'
+proxy_cache_path /home/proxy_extra levels=1:2 keys_zone=extracache:128m max_size=512g inactive=30d;
+EOF
 tune_reset_changes
 tune_angie_configs "$TMP/legacy"
 check "legacy fastcgi_cache_conf is resized in place" \
@@ -160,6 +166,15 @@ check "legacy limit_req_conf zones are resized in place" \
   grep -qE 'zone=limit_req_post_head:[0-9]+m' "$TMP/legacy/http.d/limit_req_conf"
 check "legacy tuning does not create a duplicate .conf file" \
   test ! -e "$TMP/legacy/http.d/fastcgi_cache.conf"
+custom_zone=$(grep -oE 'keys_zone=customcache:[0-9]+m' \
+  "$TMP/legacy/http.d/fastcgi_cache_custom_conf" | head -n1 | sed 's/.*://; s/m$//')
+check "custom 5G cache zone is capped" test "$custom_zone" -le 128
+check "custom unbounded cache gains a max_size" \
+  grep -qE 'keys_zone=customcache:[0-9]+m .*max_size=[0-9]+M' \
+  "$TMP/legacy/http.d/fastcgi_cache_custom_conf"
+extra_max=$(grep -oE 'max_size=[0-9]+[mM]' \
+  "$TMP/legacy/http.d/proxy_cache_extra_conf" | head -n1 | sed 's/.*=//; s/[mM]$//')
+check "custom proxy cache max_size is capped" test "$extra_max" -le 1024
 tune_reset_changes
 tune_angie_configs "$TMP/legacy"
 check "legacy layout second run is a no-op" test "$TUNE_DIRTY" -eq 0
