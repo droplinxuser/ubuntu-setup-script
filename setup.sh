@@ -31,7 +31,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.19"
+readonly SCRIPT_VERSION="1.8.20"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
@@ -58,7 +58,8 @@ export APT_LISTCHANGES_FRONTEND=none
 # Wait for a concurrent apt/dpkg run instead of failing outright (unattended
 # upgrades and configuration management often hold the lock briefly).
 APT_OPTS=(-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
-          -o DPkg::Lock::Timeout=300 -o Dpkg::Use-Pty=0)
+          -o DPkg::Lock::Timeout=300 -o Dpkg::Use-Pty=0
+          -o Acquire::Retries=3 -o Acquire::http::Timeout=30)
 
 if [[ -t 1 ]]; then
   C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_RED=$'\033[31m'
@@ -74,15 +75,46 @@ _timestamp() { date '+%Y-%m-%d %H:%M:%S'; }
 info() { printf '%s %s[INFO]%s %s\n' "$(_timestamp)" "$C_BLUE" "$C_RESET" "$*"; }
 ok()   { printf '%s %s[ OK ]%s %s\n' "$(_timestamp)" "$C_GREEN" "$C_RESET" "$*"; }
 warn() { printf '%s %s[WARN]%s %s\n' "$(_timestamp)" "$C_YELLOW" "$C_RESET" "$*" >&2; }
-die()  { printf '%s %s[FAIL]%s %s\n' "$(_timestamp)" "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
+die()  { trap - ERR; printf '%s %s[FAIL]%s %s\n' "$(_timestamp)" "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 step() { printf '\n%s%s==> %s%s\n' "$C_BOLD" "$C_BLUE" "$*" "$C_RESET"; }
 
 on_error() {
-  local rc=$? line=${1:-?}
-  printf '%s %s[ERR ]%s command failed (exit %s) at line %s\n' \
-    "$(_timestamp)" "$C_RED" "$C_RESET" "$rc" "$line" >&2
+  local rc=$? line=${1:-?} cmd=${BASH_COMMAND:-unknown}
+  # Keep the failing command on one line and bounded, so a large heredoc or a
+  # generated SQL statement does not flood the operator's terminal/log.
+  cmd=$(printf '%s' "$cmd" | tr '\n' ' ' | cut -c1-200)
+  printf '%s %s[ERR ]%s command failed (exit %s) at line %s: %s\n' \
+    "$(_timestamp)" "$C_RED" "$C_RESET" "$rc" "$line" "$cmd" >&2
 }
 trap 'on_error $LINENO' ERR
+
+# Serialise real runs.  Two concurrent invocations (an operator plus a cron or
+# CI job) can interleave config rewrites and leave a half-written service
+# file behind.  Dry-runs do not touch the system and are always allowed.
+readonly LOCK_FILE="/run/setup.sh.lock"
+LOCK_HELD=0
+
+acquire_run_lock() {
+  (( DRY_RUN )) && return 0
+  if ! command -v flock >/dev/null 2>&1; then
+    warn "flock not available; continuing without a run lock"
+    return 0
+  fi
+  exec 9>"$LOCK_FILE" || die "Could not open the run lock ${LOCK_FILE}"
+  if ! flock -n 9; then
+    exec 9>&-
+    die "Another setup.sh run is already in progress (lock: ${LOCK_FILE})"
+  fi
+  LOCK_HELD=1
+}
+
+release_run_lock() {
+  (( LOCK_HELD )) || return 0
+  flock -u 9 2>/dev/null || true
+  exec 9>&-
+  LOCK_HELD=0
+  return 0
+}
 
 format_duration() {
   local s=${1:-0}
@@ -943,7 +975,10 @@ ensure_log_dir() {
   mkdir -p "$dir"
   chmod 750 "$dir"
   if getent passwd "$owner" >/dev/null 2>&1; then
-    chown "$owner:$grp" "$dir" 2>/dev/null || true
+    # Recursive: logrotate leaves rotated files (app.log.1, *.gz, audit json)
+    # behind.  A service restart (Valkey, Elasticsearch) fails when it cannot
+    # reopen or rotate files still owned by the previous account.
+    chown -R "$owner:$grp" "$dir" 2>/dev/null || true
   else
     chown root:root "$dir" 2>/dev/null || true
   fi
@@ -1640,7 +1675,7 @@ net.ipv6.conf.default.accept_redirects = 0
 # END setup.sh tuning
 EOF
   chmod 644 /etc/sysctl.conf
-  if [[ -d /etc/sysctl.d ]] && [[ ! -e /etc/sysctl.d/99-sysctl.conf ]]; then
+  if [[ -d /etc/sysctl.d ]] && [[ ! -e /etc/sysctl.d/99-sysctl.conf && ! -L /etc/sysctl.d/99-sysctl.conf ]]; then
     ln -s ../sysctl.conf /etc/sysctl.d/99-sysctl.conf
   fi
 
@@ -2458,7 +2493,7 @@ tune_php_fpm_version() {
   local ini_dir="/etc/php/${ver}/fpm/conf.d"
   local ini="${ini_dir}/zz-setup-optimize.ini"
   [[ -d /etc/php/${ver}/fpm ]] || return 0
-  [[ -f $pool ]] || { tune_note "PHP ${ver}: no pool.d/www.conf, skipped"; return 0; }  # With no explicit socket request, keep whatever the pool already listens on
+  [[ -f $pool ]] || { tune_miss "PHP ${ver}: no pool.d/www.conf, skipped"; return 0; }  # With no explicit socket request, keep whatever the pool already listens on
   # (TCP for a standalone PHP host, Unix socket for an Angie deployment).
   if [[ -z $socket ]]; then
     socket=$(php_pool_listen "$ver")
@@ -4305,6 +4340,8 @@ OPT_BACKUP_DIR=""
 OPT_REPORT=()
 OPT_DETECTED=()
 OPT_START_TS=""
+OPT_REPORT_STARTED=0
+OPT_REPORT_WRITTEN=0
 
 opt_report() { OPT_REPORT+=("$*"); }
 
@@ -5881,6 +5918,7 @@ write_optimize_report() {
     fi
   } > "$file"
   cp -f "$file" /var/log/setup-optimize-latest.md
+  OPT_REPORT_WRITTEN=1
   printf '%s\n' "$file"
 }
 
@@ -5981,12 +6019,16 @@ run_os_tuning() {
   # same hardware-aware profile as a fresh build.  Each tuner is idempotent
   # and records the original files for a later --purge.
   configure_cpu_governor
-  configure_limits
+  # Raise fs.nr_open/file-max before writing the 1M-nofile PAM limits: a
+  # limits value above the kernel's fs.nr_open makes PAM fail to raise the
+  # hard limit for the next login.
   configure_sysctl
+  configure_limits
 }
 
 run_optimize() {
   local rc=0 service
+  OPT_REPORT_STARTED=1
   OPT_START_TS=$(date -Is)
   OPT_BACKUP_DIR="/var/backups/setup-optimize-$(date +%Y%m%d-%H%M%S)"
   mkdir -p "$OPT_BACKUP_DIR"
@@ -6000,6 +6042,12 @@ run_optimize() {
   detect_installed_services
   plan_memory_budget
   run_os_tuning
+  # A service restart fails when its log directory is owned by another
+  # account (seen on hosts upgraded from an older setup.sh that created every
+  # log directory as www-data): Valkey cannot open its logfile and
+  # Elasticsearch cannot use path.logs as its working directory.  Repair the
+  # ownership before any service is restarted.
+  ensure_log_dirs
   opt_report "## Operating system"
   opt_report "- CPU governor, PAM limits and kernel/network/memory sysctls tuned for ${OPT_MEM_TOTAL_MB}MB RAM / $(nproc) CPUs"
   step "Optimizing installed services"
@@ -6049,6 +6097,19 @@ run_optimize() {
   return "$rc"
 }
 
+on_exit() {
+  local rc=$?
+  # A hard failure mid-run (set -e, a die, or a provider console reset) would
+  # otherwise leave no diagnostic report.  Write what was collected so far.
+  if (( ${OPTIMIZE:-0} )) && (( ${OPT_REPORT_STARTED:-0} )) \
+     && (( ! ${OPT_REPORT_WRITTEN:-0} )); then
+    write_optimize_report >/dev/null 2>&1 || true
+  fi
+  cleanup_configs
+  release_run_lock
+  return "$rc"
+}
+
 main() {
   normalize_cli_args "$@"
   set -- "${NORMALIZED_ARGS[@]}"
@@ -6077,7 +6138,10 @@ main() {
     exit 0
   fi
 
+  trap on_exit EXIT
+
   [[ ${EUID} -eq 0 ]] || die "This script must be run as root (use: sudo bash ${SCRIPT_NAME} ...)"
+  acquire_run_lock
 
   [[ -r /etc/os-release ]] || die "Cannot read /etc/os-release"
   # shellcheck disable=SC1091
@@ -6093,7 +6157,12 @@ main() {
 
   if (( OPTIMIZE )); then
     printf '%s%sUbuntu %s optimization%s\n' "$C_BOLD" "$C_BLUE" "${VERSION_ID}" "$C_RESET"
-    run_optimize || exit $?
+    if ! run_optimize; then
+      # The report already explains the failure; suppress a duplicate ERR
+      # trap message from this intentional non-zero exit.
+      trap - ERR
+      exit 1
+    fi
     exit 0
   fi
 

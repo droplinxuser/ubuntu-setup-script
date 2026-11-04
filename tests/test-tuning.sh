@@ -441,7 +441,7 @@ elasticsearch_data_size_mb() { printf '0'; }
 OPT_DETECTED=(angie php:8.3 mariadb)
 plan_memory_budget
 check "PHP budget uses the 8-worker floor" \
-  test "$OPT_PHP_BUDGET_MB" -ge 768
+  test "$OPT_PHP_BUDGET_MB" -eq 768
 check "MariaDB gets the remaining budget after the PHP floor" \
   test "$OPT_MARIADB_BUDGET_MB" -gt 0
 
@@ -677,6 +677,19 @@ check "WordPress vhost detection finds a real installation" \
 rm -f "$TMP/wpangie/www/site/public/wp-config.php"
 check "WordPress vhost detection ignores a missing wp-config" \
   test -z "$(angie_wordpress_vhosts "$TMP/wpangie")"
+
+# ---------------------------------------------------------------------------
+# Failure diagnostics and OS-tuning order
+# ---------------------------------------------------------------------------
+err_out=$(bash -c 'set -E; source "$1"; trap - ERR; trap "on_error $LINENO" ERR; false' _ "$ROOT/setup.sh" 2>&1 || true)
+check "ERR trap reports the failing command" grep -q 'false' <<<"$err_out"
+check "ERR trap reports the failing line" grep -qE 'line [0-9]+' <<<"$err_out"
+
+tuning_body=$(sed -n '/^run_os_tuning()/,/^}/p' "$ROOT/setup.sh")
+sysctl_line=$(printf '%s\n' "$tuning_body" | grep -n 'configure_sysctl' | head -n1 | cut -d: -f1)
+limits_line=$(printf '%s\n' "$tuning_body" | grep -n 'configure_limits' | head -n1 | cut -d: -f1)
+check "OS tuning applies sysctl before the PAM nofile limits" \
+  test -n "$sysctl_line" -a -n "$limits_line" -a "$sysctl_line" -lt "$limits_line"
 
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
