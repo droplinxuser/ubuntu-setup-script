@@ -31,7 +31,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.16"
+readonly SCRIPT_VERSION="1.8.17"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
@@ -1899,6 +1899,32 @@ tune_cache_total_mb() {
   printf '%s' "$total"
 }
 
+# Angie cache budget for the current service set.  A dedicated Angie proxy
+# gets 50% of RAM (10% of free disk); Angie+PHP gets 30%; a host with a data
+# or search tier gets 25% (5% of free disk).  Callers pass the live RAM and
+# free disk so --dry-run and the real tuner report the same number.
+angie_cache_budget_mb() {
+  local ram_mb=$1 disk_free_mb=$2 pct=25 disk_pct=5 svc
+  local has_php=0 has_maria=0 has_cache=0 has_es=0
+  if (( ${#OPT_DETECTED[@]} > 0 )); then
+    for svc in "${OPT_DETECTED[@]}"; do
+      case $svc in
+        php:*) has_php=1 ;;
+        mariadb) has_maria=1 ;;
+        valkey|redis) has_cache=1 ;;
+        elastic) has_es=1 ;;
+      esac
+    done
+    if (( !has_php && !has_maria && !has_cache && !has_es )); then
+      pct=50
+      disk_pct=10
+    elif (( has_php && !has_maria && !has_cache && !has_es )); then
+      pct=30
+    fi
+  fi
+  tune_cache_total_mb "$ram_mb" "$disk_free_mb" "$pct" "$disk_pct"
+}
+
 # Pick the first existing file from a list.  Older server-configs-nginx
 # releases installed http.d files with underscore names (fastcgi_cache_conf);
 # current releases use dots (fastcgi_cache.conf).  --optimize must tune a live
@@ -2072,30 +2098,9 @@ tune_angie_configs() {
 
   # Scale the disk-cache budget with the services actually present.  A
   # dedicated Angie proxy has no PHP/DB/search tier to share RAM with, and an
-  # Angie+PHP host has no database/search tier.
-  local has_php=0 has_maria=0 has_cache=0 has_es=0 svc
-  local cache_ram_pct=25 cache_disk_pct=5
-  # During install, OPT_DETECTED is empty because the whole stack has not
-  # been installed yet; keep the shared 25%/5% default there.
-  if (( ${#OPT_DETECTED[@]} > 0 )); then
-    for svc in "${OPT_DETECTED[@]}"; do
-      case $svc in
-        php:*) has_php=1 ;;
-        mariadb) has_maria=1 ;;
-        valkey|redis) has_cache=1 ;;
-        elastic) has_es=1 ;;
-      esac
-    done
-    if (( !has_php && !has_maria && !has_cache && !has_es )); then
-      cache_ram_pct=50
-      cache_disk_pct=10
-    elif (( has_php && !has_maria && !has_cache && !has_es )); then
-      cache_ram_pct=30
-    fi
-  fi
-
-  cache_total_mb=$(tune_cache_total_mb "$mem_mb" "$disk_free_mb" \
-    "$cache_ram_pct" "$cache_disk_pct")
+  # Angie+PHP host has no database/search tier.  The helper is shared with
+  # --dry-run so the plan and the applied value match.
+  cache_total_mb=$(angie_cache_budget_mb "$mem_mb" "$disk_free_mb")
 
   # Resolve the cache files Angie actually includes before sizing them, so a
   # host that only runs one cache type can use the whole cache budget instead
@@ -5608,13 +5613,17 @@ write_optimize_report() {
 
 optimize_plan() {
   local nproc ram_mb size_mb max_children max_mb heap_mb backlog max_conn current_max db_fit db_size_mb es_fit es_size_mb
-  local governor_desc=performance
+  local governor_desc=performance disk_free_mb cache_mb
   nproc=$(nproc)
   ram_mb=$(mem_total_mb)
   backlog=$(effective_backlog)
   detect_installed_services
   plan_memory_budget
   cpu_performance_governor_available || governor_desc="skipped (no performance governor)"
+  disk_free_mb=$(df -Pm /var/www 2>/dev/null | awk 'NR==2{print $4}')
+  [[ $disk_free_mb =~ ^[0-9]+$ ]] || disk_free_mb=$(df -Pm / 2>/dev/null | awk 'NR==2{print $4}')
+  [[ $disk_free_mb =~ ^[0-9]+$ ]] || disk_free_mb=10240
+  cache_mb=$(angie_cache_budget_mb "$ram_mb" "$disk_free_mb")
   printf '\n%sDRY RUN%s - optimize scan only, no changes will be made.\n' "$C_BOLD" "$C_RESET"
   printf 'Host: %s  %s CPU  %s MB RAM  %s\n' "$(hostname 2>/dev/null || echo unknown)" \
     "$nproc" "$ram_mb" "$(df -h / | awk 'NR==2{print $4 " free"}')"
@@ -5633,7 +5642,7 @@ optimize_plan() {
       "$(tune_clamp $(( nproc * 2048 )) 8192 65535)" \
       "$(tune_clamp $(( nproc * 8192 )) 65536 524288)" \
       "$(tune_clamp $(( nproc * 2 )) 16 128)" \
-      "$(( ram_mb * 25 / 100 ))"
+      "$cache_mb"
   fi
   if [[ ${OPT_DETECTED[*]} == *php:* ]]; then
     if (( OPT_PHP_BUDGET_MB > 0 )); then

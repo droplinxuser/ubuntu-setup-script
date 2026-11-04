@@ -31,6 +31,15 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.17
+
+- **The dry-run cache estimate matches the applied value.** `--optimize
+  --dry-run` now uses the same service-aware budget as the tuner (50% of RAM
+  for an Angie-only host, 30% for Angie+PHP, 25% with a data/search tier)
+  instead of always printing 25%. Every `h5bp/php*.conf` template is still
+  tuned even when no current vhost includes it, so a vhost created later
+  inherits the optimized buffers.
+
 ## What's new in 1.8.16
 
 - **SSH firewall rules follow the real sshd port.** `--basic` now reads
