@@ -38,6 +38,10 @@ check "size_to_mb 2g"             test "$(size_to_mb 2g)" = 2048
 check "cache budget rounds to 256 MB" test "$(tune_cache_total_mb 7747 19000)" = 768
 check "cache budget is stable across small disk changes" \
   test "$(tune_cache_total_mb 7747 19000)" = "$(tune_cache_total_mb 7747 17700)"
+check "Angie-only cache budget uses 50% RAM" \
+  test "$(tune_cache_total_mb 7747 59000 50 10)" = 3840
+check "Angie+PHP cache budget uses 30% RAM" \
+  test "$(tune_cache_total_mb 7747 59000 30 5)" = 2304
 
 # ---------------------------------------------------------------------------
 # Optimize OS gate and fd-limit profile
@@ -103,6 +107,7 @@ mkdir -p "$TMP/angie"
 cp -a "$FIXTURES/." "$TMP/angie/"
 OPT_PHP_OK=1
 OPT_PHP_SOCKET=/run/php/php-fpm.sock
+OPT_DETECTED=(angie php:8.3 mariadb valkey elastic)
 tune_reset_changes
 tune_angie_configs "$TMP/angie"
 
@@ -216,7 +221,8 @@ cache_mem_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
 cache_disk_mb=$(df -Pm /var/www 2>/dev/null | awk 'NR==2{print $4}' || true)
 [[ $cache_disk_mb =~ ^[0-9]+$ ]] || cache_disk_mb=$(df -Pm / 2>/dev/null | awk 'NR==2{print $4}')
 [[ $cache_disk_mb =~ ^[0-9]+$ ]] || cache_disk_mb=10240
-expected_cache=$(tune_cache_total_mb "$cache_mem_mb" "$cache_disk_mb")
+expected_cache_angie=$(tune_cache_total_mb "$cache_mem_mb" "$cache_disk_mb" 50 10)
+expected_cache_php=$(tune_cache_total_mb "$cache_mem_mb" "$cache_disk_mb" 30 5)
 
 mkdir -p "$TMP/xfonly"
 cp -a "$FIXTURES/." "$TMP/xfonly/"
@@ -225,10 +231,11 @@ rm -f "$TMP/xfonly/http.d/fastcgi_cache.conf" \
       "$TMP/xfonly/http.d/proxy_cache.conf" \
       "$TMP/xfonly/http.d/limit_req.conf"
 OPT_PHP_SOCKET=""
+OPT_DETECTED=(angie)
 tune_reset_changes
 tune_angie_configs "$TMP/xfonly"
-check "proxy-only host gives the whole cache budget to xfproxycache" \
-  grep -q "max_size=$(tune_size_value "$expected_cache")" \
+check "proxy-only host gives the whole Angie-only budget to xfproxycache" \
+  grep -q "max_size=$(tune_size_value "$expected_cache_angie")" \
   "$TMP/xfonly/http.d/xf_proxy_cache.conf"
 
 mkdir -p "$TMP/fcgionly"
@@ -238,10 +245,11 @@ rm -f "$TMP/fcgionly/http.d/fastcgi_cache_chev.conf" \
       "$TMP/fcgionly/http.d/xf_proxy_cache.conf" \
       "$TMP/fcgionly/http.d/limit_req.conf"
 OPT_PHP_SOCKET=""
+OPT_DETECTED=(angie php:8.3)
 tune_reset_changes
 tune_angie_configs "$TMP/fcgionly"
-check "PHP-only host gives the whole cache budget to fastcgicache" \
-  grep -q "max_size=$(tune_size_value "$expected_cache")" \
+check "PHP-only host gives the whole Angie+PHP budget to fastcgicache" \
+  grep -q "max_size=$(tune_size_value "$expected_cache_php")" \
   "$TMP/fcgionly/http.d/fastcgi_cache.conf"
 
 # ---------------------------------------------------------------------------
@@ -386,6 +394,33 @@ check "MariaDB-only host reserves no PHP budget" \
   test "$OPT_PHP_BUDGET_MB" -eq 0
 check "MariaDB-only large database can use the full 80% budget" \
   test "$OPT_MARIADB_BUDGET_MB" -eq 52428
+
+# Unknown data size falls back to the larger MariaDB-only share.
+mariadb_data_size_mb() { printf '0'; }
+OPT_DETECTED=(mariadb)
+plan_memory_budget
+check "MariaDB-only unknown data falls back to 80% RAM" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 52428
+
+# Valkey gets a larger share when no database/search tier shares the host.
+mariadb_data_size_mb() { printf '0'; }
+OPT_DETECTED=(valkey)
+plan_memory_budget
+check "Valkey-only budget uses 50% of RAM" \
+  test "$OPT_VALKEY_BUDGET_MB" -eq 32768
+php_pool_max_children() { printf '128'; }
+OPT_DETECTED=(angie php:8.3 valkey)
+plan_memory_budget
+check "Angie+PHP+Valkey budget uses 25% of RAM" \
+  test "$OPT_VALKEY_BUDGET_MB" -eq 16384
+
+# Elasticsearch-only fallback when the index size is unknown.
+elasticsearch_data_size_mb() { printf '0'; }
+elasticsearch_current_heap_mb() { printf '0'; }
+OPT_DETECTED=(elastic)
+plan_memory_budget
+check "Elasticsearch-only unknown index falls back to 50% RAM" \
+  test "$OPT_ES_BUDGET_MB" -eq 31744
 
 mariadb_current_pool_mb() { printf '0'; }
 mariadb_data_size_mb() { printf '20000'; }
