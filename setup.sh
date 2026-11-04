@@ -31,7 +31,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.10"
+readonly SCRIPT_VERSION="1.8.11"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
@@ -1945,16 +1945,57 @@ tune_angie_configs() {
 
   cache_total_mb=$(tune_cache_total_mb "$mem_mb" "$disk_free_mb")
 
-  fcgi_mb=$(( cache_total_mb * 50 / 100 ))
-  chev_mb=$(( cache_total_mb * 25 / 100 ))
-  xf_mb=$(( cache_total_mb * 15 / 100 ))
-  proxy_mb=$(( cache_total_mb * 5 / 100 ))
-  cdn_mb=$(( cache_total_mb * 5 / 100 ))
-  (( fcgi_mb < 64 )) && fcgi_mb=64
-  (( chev_mb < 32 )) && chev_mb=32
-  (( xf_mb < 32 )) && xf_mb=32
-  (( proxy_mb < 16 )) && proxy_mb=16
-  (( cdn_mb < 16 )) && cdn_mb=16
+  # Resolve the cache files Angie actually includes before sizing them, so a
+  # host that only runs one cache type can use the whole cache budget instead
+  # of leaving most of it assigned to caches that do not exist.
+  local f_fcgi f_chev f_xf f_proxy f_limit
+  TUNE_ACTIVE_HTTP=()
+  mapfile -t TUNE_ACTIVE_HTTP < <(angie_active_http_files "$target")
+  if (( ${#TUNE_ACTIVE_HTTP[@]} > 0 )); then
+    f_fcgi=$(tune_active_file 'keys_zone=fastcgicache:') || f_fcgi=""
+    f_chev=$(tune_active_file 'keys_zone=fastcgicache_chev:') || f_chev=""
+    f_xf=$(tune_active_file 'keys_zone=xfproxycache:') || f_xf=""
+    f_proxy=$(tune_active_file 'keys_zone=(proxy_cache|proxy_cdn|cdn_proxy):') || f_proxy=""
+    f_limit=$(tune_active_file 'limit_req_zone') || f_limit=""
+  else
+    f_fcgi=$(tune_first_file "$target/http.d" fastcgi_cache.conf fastcgi_cache_conf) || f_fcgi=""
+    f_chev=$(tune_first_file "$target/http.d" fastcgi_cache_chev.conf fastcgi_cache_chev_conf) || f_chev=""
+    f_xf=$(tune_first_file "$target/http.d" xf_proxy_cache.conf xf_proxy_cache_conf) || f_xf=""
+    f_proxy=$(tune_first_file "$target/http.d" proxy_cache.conf proxy_cache_conf) || f_proxy=""
+    f_limit=$(tune_first_file "$target/http.d" limit_req.conf limit_req_conf) || f_limit=""
+  fi
+
+  local have_fcgi=0 have_chev=0 have_xf=0 have_proxy=0 have_cdn=0 active_weight=0
+  [[ -n $f_fcgi ]] && have_fcgi=1
+  [[ -n $f_chev ]] && have_chev=1
+  [[ -n $f_xf ]] && have_xf=1
+  if [[ -n $f_proxy ]]; then
+    grep -qE 'keys_zone=proxy_cache:' "$f_proxy" && have_proxy=1
+    grep -qE 'keys_zone=(proxy_cdn|cdn_proxy):' "$f_proxy" && have_cdn=1
+  fi
+  (( have_fcgi )) && active_weight=$(( active_weight + 50 ))
+  (( have_chev )) && active_weight=$(( active_weight + 25 ))
+  (( have_xf )) && active_weight=$(( active_weight + 15 ))
+  (( have_proxy )) && active_weight=$(( active_weight + 5 ))
+  (( have_cdn )) && active_weight=$(( active_weight + 5 ))
+
+  fcgi_mb=0; chev_mb=0; xf_mb=0; proxy_mb=0; cdn_mb=0
+  if (( active_weight > 0 )); then
+    (( have_fcgi )) && fcgi_mb=$(( cache_total_mb * 50 / active_weight ))
+    (( have_chev )) && chev_mb=$(( cache_total_mb * 25 / active_weight ))
+    (( have_xf )) && xf_mb=$(( cache_total_mb * 15 / active_weight ))
+    (( have_proxy )) && proxy_mb=$(( cache_total_mb * 5 / active_weight ))
+    (( have_cdn )) && cdn_mb=$(( cache_total_mb * 5 / active_weight ))
+    # A proxy file containing only one of the standard paths must not rewrite
+    # the other path to max_size=0.
+    (( have_proxy && !have_cdn )) && cdn_mb=$proxy_mb
+    (( have_cdn && !have_proxy )) && proxy_mb=$cdn_mb
+  fi
+  (( have_fcgi && fcgi_mb < 64 )) && fcgi_mb=64
+  (( have_chev && chev_mb < 32 )) && chev_mb=32
+  (( have_xf && xf_mb < 32 )) && xf_mb=32
+  (( have_proxy && proxy_mb < 16 )) && proxy_mb=16
+  (( have_cdn && cdn_mb < 16 )) && cdn_mb=16
 
   fcgi_zone=$(tune_clamp $(( cache_total_mb / 4 )) 16 512)
   chev_zone=$(tune_clamp $(( cache_total_mb / 8 )) 8 512)
@@ -2007,25 +2048,6 @@ tune_angie_configs() {
         '^([[:space:]]*server[[:space:]]+)(127\.0\.0\.1|localhost):9000;' \
         "\\1unix:${php_socket};" "angie.conf: local_php upstream -> Unix socket"
     fi
-  fi
-
-  # Cache sizes and zones.  Resolve the files Angie actually includes; fall
-  # back to the legacy name list only when no include pattern was parsed.
-  local f_fcgi f_chev f_xf f_proxy f_limit
-  TUNE_ACTIVE_HTTP=()
-  mapfile -t TUNE_ACTIVE_HTTP < <(angie_active_http_files "$target")
-  if (( ${#TUNE_ACTIVE_HTTP[@]} > 0 )); then
-    f_fcgi=$(tune_active_file 'keys_zone=fastcgicache:') || f_fcgi=""
-    f_chev=$(tune_active_file 'keys_zone=fastcgicache_chev:') || f_chev=""
-    f_xf=$(tune_active_file 'keys_zone=xfproxycache:') || f_xf=""
-    f_proxy=$(tune_active_file 'keys_zone=(proxy_cache|proxy_cdn|cdn_proxy):') || f_proxy=""
-    f_limit=$(tune_active_file 'limit_req_zone') || f_limit=""
-  else
-    f_fcgi=$(tune_first_file "$target/http.d" fastcgi_cache.conf fastcgi_cache_conf) || f_fcgi=""
-    f_chev=$(tune_first_file "$target/http.d" fastcgi_cache_chev.conf fastcgi_cache_chev_conf) || f_chev=""
-    f_xf=$(tune_first_file "$target/http.d" xf_proxy_cache.conf xf_proxy_cache_conf) || f_xf=""
-    f_proxy=$(tune_first_file "$target/http.d" proxy_cache.conf proxy_cache_conf) || f_proxy=""
-    f_limit=$(tune_first_file "$target/http.d" limit_req.conf limit_req_conf) || f_limit=""
   fi
 
   if [[ -n $f_fcgi ]]; then
@@ -2102,7 +2124,14 @@ tune_angie_configs() {
   local extra_zone extra_max file
   local -a cache_files=()
   extra_zone=$(tune_clamp $(( cache_total_mb / 16 )) 8 128)
-  extra_max=$(tune_clamp $(( cache_total_mb / 8 )) 64 1024)
+  if (( active_weight == 0 )); then
+    # No standard cache type is present: the whole budget is available to
+    # whatever custom cache path the host actually uses.
+    extra_max=$cache_total_mb
+    (( extra_max < 64 )) && extra_max=64
+  else
+    extra_max=$(tune_clamp $(( cache_total_mb / 8 )) 64 1024)
+  fi
   if (( ${#TUNE_ACTIVE_HTTP[@]} > 0 )); then
     cache_files=("${TUNE_ACTIVE_HTTP[@]}")
   else

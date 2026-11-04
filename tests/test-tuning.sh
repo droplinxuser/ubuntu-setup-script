@@ -211,6 +211,39 @@ tune_reset_changes
 tune_angie_configs "$TMP/legacy"
 check "legacy layout second run is a no-op" test "$TUNE_DIRTY" -eq 0
 
+# A host with only one active cache type gets the whole cache budget.
+cache_mem_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
+cache_disk_mb=$(df -Pm /var/www 2>/dev/null | awk 'NR==2{print $4}' || true)
+[[ $cache_disk_mb =~ ^[0-9]+$ ]] || cache_disk_mb=$(df -Pm / 2>/dev/null | awk 'NR==2{print $4}')
+[[ $cache_disk_mb =~ ^[0-9]+$ ]] || cache_disk_mb=10240
+expected_cache=$(tune_cache_total_mb "$cache_mem_mb" "$cache_disk_mb")
+
+mkdir -p "$TMP/xfonly"
+cp -a "$FIXTURES/." "$TMP/xfonly/"
+rm -f "$TMP/xfonly/http.d/fastcgi_cache.conf" \
+      "$TMP/xfonly/http.d/fastcgi_cache_chev.conf" \
+      "$TMP/xfonly/http.d/proxy_cache.conf" \
+      "$TMP/xfonly/http.d/limit_req.conf"
+OPT_PHP_SOCKET=""
+tune_reset_changes
+tune_angie_configs "$TMP/xfonly"
+check "proxy-only host gives the whole cache budget to xfproxycache" \
+  grep -q "max_size=$(tune_size_value "$expected_cache")" \
+  "$TMP/xfonly/http.d/xf_proxy_cache.conf"
+
+mkdir -p "$TMP/fcgionly"
+cp -a "$FIXTURES/." "$TMP/fcgionly/"
+rm -f "$TMP/fcgionly/http.d/fastcgi_cache_chev.conf" \
+      "$TMP/fcgionly/http.d/proxy_cache.conf" \
+      "$TMP/fcgionly/http.d/xf_proxy_cache.conf" \
+      "$TMP/fcgionly/http.d/limit_req.conf"
+OPT_PHP_SOCKET=""
+tune_reset_changes
+tune_angie_configs "$TMP/fcgionly"
+check "PHP-only host gives the whole cache budget to fastcgicache" \
+  grep -q "max_size=$(tune_size_value "$expected_cache")" \
+  "$TMP/fcgionly/http.d/fastcgi_cache.conf"
+
 # ---------------------------------------------------------------------------
 # PHP pool helpers
 # ---------------------------------------------------------------------------
@@ -341,8 +374,22 @@ check "capped data-sized plan still fits the 80% budget" \
   test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
        -le $(( 262144 * 80 / 100 ))
 
+# A MariaDB-only host reserves no PHP budget; a database larger than 80% of
+# RAM can use the whole usable budget, while the data+5% target still applies.
+mem_total_mb() { printf '65536'; }
+php_pool_max_children() { printf '0'; }
+mariadb_current_pool_mb() { printf '0'; }
+mariadb_data_size_mb() { printf '60000'; }
+OPT_DETECTED=(mariadb)
+plan_memory_budget
+check "MariaDB-only host reserves no PHP budget" \
+  test "$OPT_PHP_BUDGET_MB" -eq 0
+check "MariaDB-only large database can use the full 80% budget" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 52428
+
 mariadb_current_pool_mb() { printf '0'; }
 mariadb_data_size_mb() { printf '20000'; }
+php_pool_max_children() { printf '128'; }
 mem_total_mb() { printf '65536'; }
 OPT_DETECTED=(angie php:8.3 mariadb redis elastic)
 
