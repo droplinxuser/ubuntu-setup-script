@@ -31,6 +31,34 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.20
+
+- **Real runs are serialised with a `flock` lock.** Two invocations (an
+  operator plus cron/CI) can no longer interleave config rewrites and leave a
+  half-written service file. Dry-runs never take the lock.
+- **`--optimize` always leaves a report, even on a hard failure.** A `die`,
+  `set -e` exit, or dropped session now writes the partial
+  `/var/log/setup-optimize-*.md` report before exiting, so the remote operator
+  can see which step failed. The ERR trap also prints the failing command
+  (bounded to one line) instead of only a line number.
+- **OS tuning raises sysctl values before writing the PAM nofile limits.** A
+  limits value above the kernel's `fs.nr_open` makes PAM fail to raise the
+  hard limit on the next login.
+- **`--optimize` repairs service log-directory ownership before restarting
+  anything.** Hosts upgraded from older releases can have
+  `/var/www/logs/valkey` or `/var/www/logs/elasticsearch` owned by
+  `www-data`. A restart then fails: Valkey cannot open its logfile and
+  Elasticsearch cannot rotate its logs (`Null object returned for RollingFile`
+  / `Exec failed, error: 13`). The ownership fix is recursive so rotated
+  `.log.1`, `.gz` and audit files are included.
+- **Temporary config checkouts are cleaned on every exit path**, not only
+  after a successful install.
+- **APT downloads retry automatically** (`Acquire::Retries=3`, 30 s HTTP
+  timeout) in addition to the existing dpkg lock wait.
+- A PHP version directory without `pool.d/www.conf` is reported as a miss
+  instead of marking the configuration dirty and forcing an unnecessary
+  PHP-FPM restart.
+
 ## What's new in 1.8.19
 
 - **`--optimize` automatically migrates old PHP-FPM TCP pools to the shared
