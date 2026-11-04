@@ -112,5 +112,18 @@ run fail --dry-run --domain example.com --purge
 run fail --dry-run --angie
 run fail --dry-run --bogus
 
+# The single optimize command must include the OS layer; --auto-tune is an
+# alias and must produce the same plan.
+for flag in --optimize --auto-tune; do
+  out=$(bash setup.sh --dry-run "$flag" 2>&1)
+  if [[ $out == *"OS: governor=performance"* ]]; then
+    PASS=$((PASS + 1))
+    printf 'PASS  %s includes the OS tuning plan\n' "$flag"
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL  %s does not include the OS tuning plan\n' "$flag"
+  fi
+done
+
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
