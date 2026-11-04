@@ -6,7 +6,7 @@ set -Eeuo pipefail
 
 [[ ${EUID} -eq 0 ]] || { echo "run as root" >&2; exit 1; }
 
-DOMAIN=${DOMAIN:-stress.test}
+DOMAIN=${DOMAIN:-stress.invalid}
 ROOT="/var/www/${DOMAIN}/public"
 CERTDIR="/etc/angie/ssl/${DOMAIN}"
 LOG_DIR=/var/www/logs/angie
@@ -31,6 +31,7 @@ HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
 # PHP-FPM clears the environment, so persist the same connection settings that
 # the seeder uses.  The web pages merge this file in public/config.php.
+export STRESS_DOMAIN="$DOMAIN"
 export STRESS_DB_HOST=${STRESS_DB_HOST:-localhost}
 export STRESS_DB_NAME=${STRESS_DB_NAME:-stress_test}
 export STRESS_DB_USER=${STRESS_DB_USER:-demo}

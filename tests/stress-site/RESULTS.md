@@ -53,9 +53,8 @@ MariaDB 10.11.14, Valkey 7.2.13, no Elasticsearch):
 - A second `--optimize` run was idempotent. 1,000 concurrent HTTP requests
   returned 200 with zero client errors; live XenForo sites stayed up.
 - Certificate path validated separately with Angie built-in ACME: a new
-  Let's Encrypt certificate for `xf23.jamii.app`, `uganda.jamii.app` and
-  `kenya.jamii.app` is valid through 2027-02-02 and public TLS verification
-  returns 0.
+  Let's Encrypt certificate for a multi-name production vhost is valid through
+  2027-02-02 and public TLS verification returns 0.
 
 ## Live dedicated validation - setup.sh 1.6.8, 48 vCPU / 128 GiB
 
@@ -107,7 +106,7 @@ client connections is the sustainable zero-timeout ceiling in this setup.
 
 ## Live VPS validation - setup.sh 1.6.7, 16 vCPU / 30 GiB
 
-- Host: `web01.stress.test`, 16 vCPU, 30 GiB RAM, 281 GiB ext4, Ubuntu 26.04.1
+- Host: `web01`, 16 vCPU, 30 GiB RAM, 281 GiB ext4, Ubuntu 26.04.1
 - Angie/1.12.4, PHP 8.4.27 FPM (and a parallel PHP 8.3.36 pool), MariaDB 11.8.6,
   Valkey 9.0.4, Elasticsearch 9.5.6, Node.js v26.13.0, Gifsicle 1.96
 - FastCGI: Unix socket `/run/php/php-fpm.sock`; PHP-FPM `static`, 121 workers,
@@ -280,5 +279,5 @@ Notes on the numbers:
   on every request). It is limited by PHP worker occupancy and CPU.
 - Client socket timeouts under the slow-1s scenario mean the PHP-FPM
   listen queue is full; add workers or cache the endpoint.
-- Check /var/log/angie/stress.test.error.log and
+- Check /var/log/angie/stress.invalid.error.log and
   /var/log/php-fpm/www-slow.log for server-side warnings.
