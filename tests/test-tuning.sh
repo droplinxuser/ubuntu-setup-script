@@ -303,33 +303,33 @@ mariadb_data_size_mb() { printf '73599'; }
 elasticsearch_data_size_mb() { printf '0'; }
 OPT_DETECTED=(angie php:8.4 mariadb valkey)
 plan_memory_budget
-check "large host uses the 40% RAM baseline" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 104857
-check "baseline pool is not marked as preserved" \
+check "large host sizes the pool to data+5%" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 77278
+check "data-sized pool is not marked as preserved" \
   test "$OPT_MARIADB_KEPT_MB" -eq 0
-check "baseline pool keeps the plan inside the 80% budget" \
+check "data-sized pool keeps the plan inside the 80% budget" \
   test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
        -le $(( 262144 * 80 / 100 ))
 
 # Tiny statistics drift must not change the planned size on every run.
-mariadb_current_pool_mb() { printf '104000'; }
+mariadb_current_pool_mb() { printf '77300'; }
 plan_memory_budget
 check "small statistics drift keeps the live pool" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 104000
+  test "$OPT_MARIADB_BUDGET_MB" -eq 77300
 
-# A larger pool already configured by an operator is still preserved.
+# An oversized live pool is reduced to the data-sized target.
 mariadb_current_pool_mb() { printf '120000'; }
 plan_memory_budget
-check "existing 120 GB pool is preserved over the baseline" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 120000
-check "preserved pool is recorded for reporting" \
-  test "$OPT_MARIADB_KEPT_MB" -eq 120000
+check "oversized live pool is reduced to data+5%" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 77278
+check "shrunk pool is not marked as preserved" \
+  test "$OPT_MARIADB_KEPT_MB" -eq 0
 
 # A pool that would exceed the shared budget is capped.
 mariadb_current_pool_mb() { printf '200000'; }
 plan_memory_budget
-check "pool above the shared budget is not preserved" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 104857
+check "pool above the shared budget is capped to the target" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 77278
 
 # A database larger than the shared budget receives the capped pool.
 mariadb_current_pool_mb() { printf '0'; }
@@ -351,8 +351,8 @@ mariadb_data_size_mb() { printf '20000'; }
 elasticsearch_data_size_mb() { printf '4096'; }
 elasticsearch_current_heap_mb() { printf '0'; }
 plan_memory_budget
-check "small Elasticsearch index keeps the 8 GB shared base" \
-  test "$OPT_ES_BUDGET_MB" -eq 8192
+check "small Elasticsearch index uses index+5%" \
+  test "$OPT_ES_BUDGET_MB" -eq 4608
 check "Elasticsearch index size is recorded" \
   test "$OPT_ES_SIZE_MB" -eq 4096
 
@@ -376,16 +376,16 @@ check "Elasticsearch heap is capped at 31 GB" \
 check "Elasticsearch index size is recorded for huge stores" \
   test "$OPT_ES_SIZE_MB" -eq 100000
 
-# A larger existing heap is preserved instead of being shrunk.
+# An oversized live heap is reduced to the data-sized target.
 OPT_DETECTED=(angie php:8.4 mariadb valkey elastic)
 mariadb_data_size_mb() { printf '20000'; }
 elasticsearch_data_size_mb() { printf '13000'; }
 elasticsearch_current_heap_mb() { printf '20000'; }
 plan_memory_budget
-check "existing 20 GB Elasticsearch heap is preserved" \
-  test "$OPT_ES_BUDGET_MB" -eq 20000
-check "preserved Elasticsearch heap is recorded" \
-  test "$OPT_ES_KEPT_MB" -eq 20000
+check "oversized Elasticsearch heap is reduced to index+5%" \
+  test "$OPT_ES_BUDGET_MB" -eq 13824
+check "shrunk Elasticsearch heap is not marked as preserved" \
+  test "$OPT_ES_KEPT_MB" -eq 0
 
 # Small statistics drift must not change the heap on every run.
 elasticsearch_current_heap_mb() { printf '14000'; }
@@ -401,7 +401,7 @@ elasticsearch_data_size_mb() { printf '4096'; }
 elasticsearch_current_heap_mb() { printf '30000'; }
 plan_memory_budget
 check "Elasticsearch heap above the shared budget is capped" \
-  test "$OPT_ES_BUDGET_MB" -eq 8192
+  test "$OPT_ES_BUDGET_MB" -eq 4608
 
 elasticsearch_current_heap_mb() { printf '0'; }
 elasticsearch_data_size_mb() { printf '0'; }
