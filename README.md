@@ -31,6 +31,36 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.16
+
+- **SSH firewall rules follow the real sshd port.** `--basic` now reads
+  `sshd -T` and allows every effective SSH port before enabling UFW instead of
+  hard-coding 22. `--purge` protects the same ports, and the fail2ban jail is
+  written with the detected port. This removes a lockout risk on hosts that
+  moved SSH to a custom port.
+- **fail2ban whitelists the operator, not the server.** The fallback that
+  reads established sockets assumed a fixed `ss` column, but the state column
+  is omitted when `ss -H` is combined with a state filter, so that column is
+  the server address in one form and the client in the other. It now reads
+  the last two fields (local, peer) and the live sshd ports.
+- **The `fq` qdisc survives package upgrades.** A late
+  `/etc/sysctl.d/90-setup-network.conf` keeps `net.core.default_qdisc=fq`
+  when `systemd-sysctl` re-runs (observed after an upgrade reset it to
+  `fq_codel`); BBR itself remains in the oneshot unit that runs after
+  `tcp_bbr` loads.
+- **The single-file sysctl fallback is back in sync.** The embedded
+  `blob_sysctl` no longer writes `net.ipv4.route.flush` / `net.ipv6.route.flush`,
+  which made `systemd-sysctl` log a failure at boot. A test now fails if the
+  embedded copy drifts from `configs/system/sysctl.conf`.
+- **The CPU governor report tells the truth.** Hosts without a performance
+  governor (or without cpufreq at all) are reported as skipped instead of
+  claiming `governor=performance`. The script no longer removes a provider's
+  `tuned` package; it warns instead.
+- **APT is more resilient.** `dpkg --configure -a` plus a one-time
+  `apt-get -f install` repair a half-configured dpkg state before the upgrade
+  is retried, and package operations now disable the dpkg pty and use
+  `Acquire::Retries`.
+
 ## What's new in 1.8.15
 
 - **The old auto-tune switch is gone.** `--optimize` is the only entry point;

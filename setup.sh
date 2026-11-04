@@ -31,7 +31,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.15"
+readonly SCRIPT_VERSION="1.8.16"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
@@ -58,7 +58,7 @@ export APT_LISTCHANGES_FRONTEND=none
 # Wait for a concurrent apt/dpkg run instead of failing outright (unattended
 # upgrades and configuration management often hold the lock briefly).
 APT_OPTS=(-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
-          -o DPkg::Lock::Timeout=300)
+          -o DPkg::Lock::Timeout=300 -o Dpkg::Use-Pty=0)
 
 if [[ -t 1 ]]; then
   C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_RED=$'\033[31m'
@@ -103,7 +103,8 @@ retry() {
   done
 }
 
-apt_update()  { retry 3 5 apt-get -o DPkg::Lock::Timeout=300 update -y; }
+apt_update()  { retry 3 5 apt-get -o DPkg::Lock::Timeout=300 \
+  -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update -y; }
 apt_install() {
   apt-get install "${APT_OPTS[@]}" --no-install-recommends "$@"
 }
@@ -484,9 +485,46 @@ is_local_ipv4() {
   fi
 }
 
+# Effective sshd TCP ports, one per line.  `sshd -T` respects Include files,
+# drop-ins and package defaults; the sshd_config scan is a fallback for a
+# non-root caller.  Always returns at least port 22.
+sshd_listen_ports() {
+  local ports=""
+  if command -v sshd >/dev/null 2>&1; then
+    ports=$(sshd -T 2>/dev/null | awk 'tolower($1) == "port" {print $2}')
+  fi
+  if [[ -z $ports && -r /etc/ssh/sshd_config ]]; then
+    ports=$(awk 'tolower($1) == "port" {print $2}' /etc/ssh/sshd_config)
+  fi
+  ports=$(printf '%s\n' "$ports" | grep -E '^[0-9]+$' | sort -nu)
+  [[ -n $ports ]] || ports=22
+  printf '%s\n' "$ports"
+}
+
+# Peer address from `ss -t` output.  The last two fields are always
+# Local Address:Port and Peer Address:Port; the State column is present or
+# absent depending on the ss version and flags (with -H + a state filter this
+# host emits four fields).  Reading a fixed column is therefore unsafe:
+# field 4 is the server address in the five-field form and the client address
+# in the four-field form.  An optional local-port regex keeps ordinary web
+# connections out of the result.
+ssh_peer_from_ss() {
+  local port_re=${1:-}
+  awk -v re="$port_re" '
+    NF >= 4 {
+      local_addr = $(NF - 1)
+      peer = $NF
+      if (re != "" && local_addr !~ re) next
+      print peer
+    }' \
+    | sed -E 's/:[0-9]+$//; s/^\[//; s/\]$//' \
+    | grep -vE '^(127\.|::1$|0\.0\.0\.0$|::$)' \
+    | head -n1
+}
+
 # Best-effort detection of the SSH client address that started this run.
 # sudo normally strips SSH_CONNECTION from the child environment, so also walk
-# the parent process chain and, as a last resort, inspect established :22
+# the parent process chain and, as a last resort, inspect established sshd
 # sockets.  Only used to add an operator whitelist to fail2ban.
 detect_ssh_client_ip() {
   local ip="${SSH_CONNECTION:-}" pid=$PPID i env
@@ -501,9 +539,10 @@ detect_ssh_client_ip() {
     pid=$(awk '{print $4}' "/proc/${pid}/stat" 2>/dev/null || true)
     [[ -n $pid && $pid != 0 ]] || break
   done
-  ip=$(ss -tnH state established '( sport = :22 )' 2>/dev/null \
-    | awk '{print $4}' | sed -E 's/:[0-9]+$//; s/^\[//; s/\]$//' \
-    | grep -vE '^(127\.|::1$)' | head -n1 || true)
+  local ssh_ports_re
+  ssh_ports_re=$(sshd_listen_ports | paste -sd'|' -)
+  ip=$(ss -tnH state established 2>/dev/null \
+    | ssh_peer_from_ss ":(${ssh_ports_re})$" || true)
   [[ $ip =~ ^[0-9a-fA-F:.]+$ ]] && printf '%s' "$ip"
   return 0
 }
@@ -1277,21 +1316,48 @@ update_system() {
   step "Ubuntu update / remove snapd"
   apt-get autopurge -y snapd || true
   apt_update
-  apt-get upgrade "${APT_OPTS[@]}" || warn "apt upgrade reported an issue; continuing"
+  # A failed upgrade can leave dpkg half-configured (for example when a
+  # postinst is interrupted by a full disk or a provider console reset).
+  # Repair the package state once and retry, instead of continuing a
+  # provisioning run on top of a broken dpkg database.
+  if ! apt-get upgrade "${APT_OPTS[@]}"; then
+    warn "apt upgrade failed; repairing dpkg state and retrying once"
+    dpkg --configure -a || warn "dpkg --configure -a reported an issue"
+    apt-get -f install "${APT_OPTS[@]}" || warn "apt-get -f install reported an issue"
+    apt-get upgrade "${APT_OPTS[@]}" \
+      || warn "apt upgrade still failing; continuing with a partially upgraded system"
+  fi
   apt-get autoremove --purge -y || true
   apt-get autoclean -y || true
   apt-get clean -y || true
+}
+
+# True when this CPU exposes frequency scaling and actually offers the
+# performance governor.  Some VMs expose a cpufreq directory but only list
+# powersave/schedutil; claiming "governor=performance" there is misleading.
+cpu_performance_governor_available() {
+  local dir=/sys/devices/system/cpu/cpu0/cpufreq
+  [[ -d $dir ]] || return 1
+  if [[ -r $dir/scaling_available_governors ]]; then
+    grep -qw performance "$dir/scaling_available_governors" || return 1
+  fi
+  return 0
 }
 
 configure_cpu_governor() {
   step "CPU governor (dedicated server)"
   # Many dedicated hosts, and every VM, expose no cpufreq interface.  Treat
   # that as an informational skip instead of a failed service/warning.
-  if [[ ! -d /sys/devices/system/cpu/cpu0/cpufreq ]]; then
-    info "No CPU frequency-scaling interface on this host; skipping governor setup"
+  if ! cpu_performance_governor_available; then
+    info "No performance CPU governor on this host; skipping governor setup"
     return 0
   fi
-  apt-get remove -y tuned || true
+  # Removing a provider's tuned profile is a destructive change outside this
+  # script's ownership.  Warn instead; the operator can disable it if the
+  # governor does not stick.
+  if pkg_ok tuned; then
+    warn "tuned is installed and may override the performance governor; leaving it in place"
+  fi
   ensure_state
   if ! dpkg-query -W -f='${Status}' cpufrequtils 2>/dev/null | grep -q 'ok installed'; then
     touch "${STATE_DIR}/cpufrequtils-installed"
@@ -1588,6 +1654,23 @@ EOF
   modprobe tcp_bbr || warn "Could not load tcp_bbr (kernel may not provide it)"
   modprobe sch_fq || warn "Could not load sch_fq (kernel may not provide it)"
   modprobe nf_conntrack || warn "Could not load nf_conntrack; conntrack sysctls may be skipped"
+
+  # Keep fq as the default qdisc even when systemd-sysctl runs again (a
+  # package upgrade restarts it, and /usr/lib/sysctl.d/55-bufferbloat.conf
+  # would otherwise put fq_codel back).  This drop-in has no dependency on
+  # tcp_bbr, so it is safe to apply before modules-load.  BBR itself stays in
+  # the oneshot unit below, which runs after the modules are available.
+  record_original /etc/sysctl.d/90-setup-network.conf sysctl.d-90-setup-network.conf
+  cat > /etc/sysctl.d/90-setup-network.conf <<'EOF'
+# Managed by setup.sh: keep the fq qdisc after systemd-sysctl re-runs.
+# tcp_congestion_control=bbr is applied by setup-network-tuning.service once
+# the tcp_bbr module is loaded.
+net.core.default_qdisc = fq
+EOF
+  chmod 644 /etc/sysctl.d/90-setup-network.conf
+  sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 \
+    || warn "Could not set net.core.default_qdisc=fq"
+
   sysctl -e -p /etc/sysctl.conf || warn "One or more sysctl values could not be applied"
 
   # BBR/fq are module-owned and systemd-sysctl runs before modules-load on
@@ -1680,9 +1763,16 @@ configure_ufw() {
   # automation/operators who open several short sessions (observed during the
   # validation run).  Brute-force protection is handled by fail2ban.  Keeping
   # an existing provider ALLOW or LIMIT rule intact also makes --purge safe.
-  if ! ufw status 2>/dev/null | grep -qE '^22(/tcp)?[[:space:]]+ALLOW'; then
-    ufw insert 1 allow 22/tcp || ufw allow 22/tcp || true
-  fi
+  # Allow every effective sshd port, not just 22: a host moved to a custom
+  # port would otherwise lose remote access the moment UFW is enabled.
+  local ssh_port
+  while IFS= read -r ssh_port; do
+    [[ $ssh_port =~ ^[0-9]+$ ]] || continue
+    if ! ufw status 2>/dev/null | grep -qE "^${ssh_port}(/tcp)?[[:space:]]+(ALLOW|LIMIT)"; then
+      ufw insert 1 allow "${ssh_port}/tcp" || ufw allow "${ssh_port}/tcp" || true
+      info "UFW: allowed SSH port ${ssh_port}/tcp"
+    fi
+  done < <(sshd_listen_ports)
   ufw allow 80 || true
   ufw allow 443 || true
   ufw --force enable
@@ -3333,9 +3423,15 @@ EOF
         # is "<client-ip> <client-port> <server-ip> <server-port>"; keep the
         # client address so a later typo or automation retry cannot lock the
         # deploying session out for an hour.
-        local ssh_client_ip=""
+        local ssh_client_ip="" ssh_port="" ssh_port_line=""
         ssh_client_ip=$(detect_ssh_client_ip || true)
         [[ $ssh_client_ip =~ ^[0-9a-fA-F:.]+$ ]] || ssh_client_ip=""
+        # The jail must watch the port sshd actually listens on; the packaged
+        # [sshd] defaults to 22 and misses a custom port entirely.
+        ssh_port=$(sshd_listen_ports | head -n1)
+        if [[ $ssh_port =~ ^[0-9]+$ && $ssh_port != 22 ]]; then
+          ssh_port_line="port = ${ssh_port}"
+        fi
         cat > /etc/fail2ban/jail.d/setup-ssh.local <<EOF
 [DEFAULT]
 backend = systemd
@@ -3347,9 +3443,15 @@ ignoreip = 127.0.0.1/8 ::1 ${ssh_client_ip}
 
 [sshd]
 enabled = true
+${ssh_port_line}
 EOF
         chmod 644 /etc/fail2ban/jail.d/setup-ssh.local
         systemctl enable --now fail2ban 2>/dev/null || warn "fail2ban could not be started"
+        # Apply a changed operator whitelist/port to the running jails; a
+        # plain `enable --now` is a no-op when the service is already active.
+        if systemctl is-active --quiet fail2ban; then
+          fail2ban-client reload 2>/dev/null || warn "fail2ban reload failed"
+        fi
         fail2ban-client status 2>/dev/null || true
         ;;
       unattended)
@@ -3665,22 +3767,35 @@ purge_basic() {
     info "Removed managed cron entries"
   fi
 
-  # Last-resort lockout guard: if UFW is active but no SSH rule exists, add
-  # one before touching the remaining rules.
-  if ufw status 2>/dev/null | grep -q '^Status: active' \
-     && ! ufw status 2>/dev/null | grep -qE '^22(/tcp)?[[:space:]]+(ALLOW|LIMIT)'; then
-    ufw allow 22/tcp || true
+  # Last-resort lockout guard: if UFW is active but an SSH rule is missing,
+  # add one for every effective sshd port before touching the remaining
+  # rules.  A custom SSH port must be protected exactly like 22.
+  local -a ssh_ports=()
+  mapfile -t ssh_ports < <(sshd_listen_ports)
+  if ufw status 2>/dev/null | grep -q '^Status: active'; then
+    local p
+    for p in "${ssh_ports[@]}"; do
+      ufw status 2>/dev/null | grep -qE "^${p}(/tcp)?[[:space:]]+(ALLOW|LIMIT)" \
+        || ufw allow "${p}/tcp" || true
+    done
   fi
 
   if [[ -f "${STATE_DIR}/ufw-added" ]]; then
-    local line
+    local line is_ssh
     local -a rule
     while IFS= read -r line; do
       [[ $line == ufw\ * ]] || continue
       # Never remove an SSH rule during purge.  If the provider image had no
       # SSH allow rule and UFW is active, removing ours is a guaranteed
       # lockout for a remote operator.
-      if [[ $line =~ (^|[[:space:]])22(/tcp)?([[:space:]]|$) ]]; then
+      is_ssh=0
+      for p in "${ssh_ports[@]}"; do
+        if [[ $line =~ (^|[[:space:]])${p}(/tcp)?([[:space:]]|$) ]]; then
+          is_ssh=1
+          break
+        fi
+      done
+      if (( is_ssh )); then
         info "Keeping SSH firewall rule: ${line}"
         continue
       fi
@@ -3705,6 +3820,7 @@ purge_basic() {
   restore_original /etc/security/limits.d/99-setup.conf limits.d-99-setup.conf
   restore_original /etc/sysctl.conf sysctl.conf
   restore_original /etc/sysctl.d/99-sysctl.conf sysctl.d-99-sysctl.conf
+  restore_original /etc/sysctl.d/90-setup-network.conf sysctl.d-90-setup-network.conf
   rm -f /etc/modules-load.d/setup-network.conf /etc/modules-load.d/setup-conntrack.conf
   systemctl disable --now setup-network-tuning.service 2>/dev/null || true
   rm -f /etc/systemd/system/setup-network-tuning.service
@@ -5492,16 +5608,18 @@ write_optimize_report() {
 
 optimize_plan() {
   local nproc ram_mb size_mb max_children max_mb heap_mb backlog max_conn current_max db_fit db_size_mb es_fit es_size_mb
+  local governor_desc=performance
   nproc=$(nproc)
   ram_mb=$(mem_total_mb)
   backlog=$(effective_backlog)
   detect_installed_services
   plan_memory_budget
+  cpu_performance_governor_available || governor_desc="skipped (no performance governor)"
   printf '\n%sDRY RUN%s - optimize scan only, no changes will be made.\n' "$C_BOLD" "$C_RESET"
   printf 'Host: %s  %s CPU  %s MB RAM  %s\n' "$(hostname 2>/dev/null || echo unknown)" \
     "$nproc" "$ram_mb" "$(df -h / | awk 'NR==2{print $4 " free"}')"
-  printf '  OS: governor=performance limits=1M-nofile sysctl=hardware-scaled (%s CPUs / %sMB RAM)\n' \
-    "$nproc" "$ram_mb"
+  printf '  OS: governor=%s limits=1M-nofile sysctl=hardware-scaled (%s CPUs / %sMB RAM)\n' \
+    "$governor_desc" "$nproc" "$ram_mb"
   if (( ${#OPT_DETECTED[@]} == 0 )); then
     printf 'No supported installed services detected.\n'
     return 0
@@ -5751,57 +5869,58 @@ main() {
 
 blob_sysctl() {
   base64 -d <<'B64' | gzip -dc
-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
-xVQNuBwAAA==
+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
+wvF2xb9R/B/i0SKoHh0AAA==
 B64
 }
 
