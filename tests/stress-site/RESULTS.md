@@ -1,5 +1,53 @@
 # Full-stack local stress report
 
+## Live dedicated validation - setup.sh 1.6.8, 48 vCPU / 128 GiB
+
+- Host: 48 vCPU, 125 GiB usable RAM, 2× 894 GB NVMe, Ubuntu 26.04 LTS
+- Angie/1.12.4, PHP 8.5.12 FPM (512 static workers), MariaDB 11.8.6,
+  Valkey 9.0.4, Elasticsearch 9.5.6, Node.js v26.13.0, Gifsicle 1.96
+- Auto-tuned: Angie `worker_rlimit_nofile=393216`,
+  `worker_connections=65535`, FastCGI upstream keepalive 96, 32 GiB total
+  HTTP cache budget; MariaDB buffer pool 32 GB, `max_connections=1536`,
+  `back_log=65535`; Valkey 8 GB; ES heap 31 GB; PHP OPcache 512 MB /
+  JIT 128 MB.
+- `setup.sh` run from a clean host, then idempotent re-runs, two full purges,
+  a clean reinstall and `--purge basic` + `--basic` were exercised.
+
+Standard suite (`tests/stress-site/run-stress.sh`, 8 threads / 200 clients):
+
+| Scenario | Requests/sec | p50 | p90 | p99 | Client socket errors |
+|---|---:|---:|---:|---:|---|
+| static | 130949.37 | 374.00us | 0.74ms | 0.88ms | none |
+| php-hello | 112497.63 | 681.00us | 0.90ms | 3.20ms | none |
+| mariadb-json | 23934.99 | 3.90ms | 6.59ms | 10.18ms | none |
+| valkey-json | 15098.41 | 6.63ms | 6.89ms | 7.31ms | none |
+| elasticsearch | 3933.37 | 10.56ms | 20.70ms | 36.11ms | none |
+| node-proxy | 14531.15 | 6.56ms | 7.91ms | 11.34ms | none |
+| full-uncached-200 | 6600.93 | 27.06ms | 46.72ms | 118.33ms | none |
+| full-cached-200 | 135207.21 | 1.00ms | 1.58ms | 3.54ms | none |
+| slow-1s-200 | 179.68 | 1.00s | 1.00s | 1.00s | none |
+
+Aggressive run (16 threads, 400 clients except static/cached at 1000):
+
+| Scenario | Requests/sec | p50 | p99 | Client socket errors |
+|---|---:|---:|---:|---|
+| static (1000c) | 279504.58 | 1.78ms | 7.74ms | none |
+| php-hello (500c) | 137748.05 | 2.35ms | 90.10ms | none |
+| mariadb-json (400c) | 25055.49 | 14.54ms | 53.52ms | none |
+| valkey-json (400c) | 12952.82 | 31.18ms | 34.55ms | none |
+| elasticsearch (200c) | 14793.68 | 12.32ms | 223.20ms | none |
+| node-proxy (500c) | 15274.63 | 32.00ms | 42.29ms | none |
+| full-uncached (400c) | 7631.19 | 48.09ms | 183.40ms | none |
+| full-cached (1000c) | 178510.27 | 3.76ms | 10.29ms | none |
+
+Three-minute mixed soak (370 clients across static/PHP/DB/Valkey/ES/Node/
+cached): zero socket errors and zero non-2xx responses; service RSS growth
+was < 20 MB per service, no swap use and no OOM events. A 500-client probe
+first exposed the MariaDB 357-entry Unix-socket backlog and 500-connection
+cap; those were fixed (`back_log=65535`, `max_connections` scaled to 1536)
+before the final runs. The load generator runs on the same 48 cores, so 400
+client connections is the sustainable zero-timeout ceiling in this setup.
+
 ## Live VPS validation - setup.sh 1.6.7, 16 vCPU / 30 GiB
 
 - Host: `web01.stress.test`, 16 vCPU, 30 GiB RAM, 281 GiB ext4, Ubuntu 26.04.1

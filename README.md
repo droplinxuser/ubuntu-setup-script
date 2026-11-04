@@ -25,6 +25,36 @@ Non-Angie/non-PHP-FPM configuration lives here.
 `setup.sh` prefers the local files under `configs/` when it is run from this
 checkout, but keeps embedded fallbacks so it still works as a single file.
 
+## What's new in 1.6.8
+
+- **Hardware-aware auto-tuning is now applied on every deploy.** The new
+  `server-configs-nginx/scripts/auto_tune.sh` derives Angie worker descriptors
+  and connections, FastCGI buffers, upstream keepalive, TLS session cache,
+  open-file caches, request-limit zones and all HTTP cache sizes from `nproc`,
+  `MemTotal`, free disk space and the NVMe/SSD/HDD class. The same repository
+  now scales from a 1 GB VPS to a 128 GB dedicated host without edits.
+- PHP 8.5 made OPcache mandatory and removed the `php8.5-opcache` package.
+  `--php` now detects that case instead of failing the whole PHP step.
+- MariaDB now sizes `max_connections` from the CPU count (up to 2000) and sets
+  `back_log = 65535`; a 500-connection run previously produced
+  `SQLSTATE[HY000] [2002] Resource temporarily unavailable` on the Unix socket.
+- `--elastic ram=auto` (25% of RAM, 512 MB..31 GB) and `--valkey ram=auto` are
+  supported; `--elastic` no longer requires an explicit heap size.
+- PHP request timeouts are 300 s (aligned with Angie's 360 s FastCGI timeout)
+  so a first XenForo install/template rebuild is not killed halfway through.
+- SSH is protected by a plain UFW `allow` rule instead of `limit`; the previous
+  rule rate-limited automation and could lock out an operator after several
+  short sessions. fail2ban remains the brute-force layer.
+- `--purge` records and restores the live kernel values for every sysctl it
+  changes, including keys absent from the original `/etc/sysctl.conf`.
+- `--others smartmon` handles Ubuntu's `smartmontools.service` unit name.
+- The stress harness persists DB/Valkey/ES credentials for PHP-FPM, so web
+  workers no longer fall back to `demo/temp` and fill MariaDB's error log.
+- Validated on Ubuntu 26.04 (48 vCPU, 128 GB RAM, NVMe): full install, all
+  service flags, idempotent re-run, two full purges, clean reinstall, three
+  applications, and aggressive `wrk` runs with zero socket errors at 400
+  connections.
+
 ## What's new in 1.6.7
 
 - Composer is installed from the official `composer.phar` into
