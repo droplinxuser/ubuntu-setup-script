@@ -46,6 +46,28 @@ check "Valkey size parser handles MB" test "$(valkey_mb_from_config 8192mb)" = 8
 check "Valkey size parser handles GB" test "$(valkey_mb_from_config 8gb)" = 8192
 check "Valkey size parser handles raw bytes" test "$(valkey_mb_from_config 1048576)" = 1
 check "Valkey size parser rejects an unknown unit" test "$(valkey_mb_from_config 1xb)" = 0
+
+# MariaDB config diff: only the buffer-pool line may be applied online.
+cat > "$TMP/cnf-a" <<'EOF'
+[mysqld]
+innodb_buffer_pool_size = 1000M
+max_connections = 500
+EOF
+cat > "$TMP/cnf-b" <<'EOF'
+[mysqld]
+innodb_buffer_pool_size = 2000M
+max_connections = 500
+EOF
+cat > "$TMP/cnf-c" <<'EOF'
+[mysqld]
+innodb_buffer_pool_size = 2000M
+max_connections = 600
+EOF
+check "cnf_only_pool_changed accepts a pool-only change" \
+  cnf_only_pool_changed "$TMP/cnf-a" "$TMP/cnf-b"
+cnf_other_changed() { ! cnf_only_pool_changed "$1" "$2"; }
+check "cnf_only_pool_changed rejects other setting changes" \
+  cnf_other_changed "$TMP/cnf-a" "$TMP/cnf-c"
 check "Angie-only cache budget uses 50% RAM" \
   test "$(tune_cache_total_mb 7747 59000 50 10)" = 3840
 check "Angie+PHP cache budget uses 30% RAM" \

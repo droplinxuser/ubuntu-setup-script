@@ -31,7 +31,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.24"
+readonly SCRIPT_VERSION="1.8.25"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
@@ -5139,8 +5139,12 @@ migrate_php_pool_to_socket() {
     cp -a "$bak/angie.conf" "$angie_conf"
     "$fpm_bin" -t >/dev/null 2>&1 && systemctl reload "php${ver}-fpm" 2>/dev/null || true
     /usr/sbin/angie -t >/dev/null 2>&1 && systemctl reload angie 2>/dev/null || true
-    MIGRATE_REASON="the socket did not appear after the PHP-FPM reload"
-    return 1
+    # Not every PHP-FPM build applies a listener change on SIGUSR2 (PHP 8.4
+    # kept the old TCP listener in validation).  Forcing a restart here would
+    # cut a live site for a marginal gain, so leave the working TCP pool and
+    # let an operator complete the move during a maintenance restart.
+    MIGRATE_REASON="this PHP-FPM build did not open the socket on reload; kept TCP (a PHP-FPM restart applies it)"
+    return 2
   fi
 
   # 3. Drop the TCP backup; the socket is proven live.
@@ -5207,7 +5211,7 @@ optimize_php_services() {
     local change
     for change in "${TUNE_CHANGES[@]}"; do opt_report "- ${change}"; done
     for change in "${TUNE_MISSES[@]}"; do opt_report "- Not applied: ${change}"; done
-    local migrated=0 migration_failed=0
+    local migrated=0 migration_failed=0 migration_rc=0
     if (( active )) && [[ $ver == "$primary" ]] \
        && [[ $listen_path =~ ^(127\.0\.0\.1|localhost):[0-9]+$ ]]; then
       if systemctl is-active --quiet angie \
@@ -5217,10 +5221,17 @@ optimize_php_services() {
           migrated=1
           opt_report "- Migrated listener: ${listen_path} -> unix:${OPT_PHP_SOCKET}"
         else
-          opt_report "- **FAILED** socket migration; kept ${listen_path} (${MIGRATE_REASON:-no reason recorded})"
-          rc=1
-          OPT_PHP_OK=0
-          migration_failed=1
+          migration_rc=$?
+          if (( migration_rc == 2 )); then
+            # The pool is healthy on TCP; only the optional socket move was
+            # skipped.  Do not fail the whole optimize run for that.
+            opt_report "- Socket migration skipped: ${MIGRATE_REASON:-the listener did not move}"
+          else
+            opt_report "- **FAILED** socket migration; kept ${listen_path} (${MIGRATE_REASON:-no reason recorded})"
+            rc=1
+            OPT_PHP_OK=0
+            migration_failed=1
+          fi
         fi
       else
         opt_report "- Socket migration skipped: Angie inactive or vhosts use a direct fastcgi_pass/next_upstream off"
@@ -5274,6 +5285,17 @@ mariadb_server_version() {
   v=$(mariadbd --version 2>/dev/null | awk '{print $3}' || true)
   [[ -n $v ]] || v=$(mariadb --version 2>/dev/null | awk '{print $5}' || true)
   printf '%s' "${v%%-*}"
+}
+
+# True when two generated MariaDB configs differ only in the buffer-pool size,
+# so the value can be applied online without a restart.
+cnf_only_pool_changed() {
+  local old=$1 new=$2
+  [[ -f $old && -f $new ]] || return 1
+  diff -q \
+    <(grep -vE '^[[:space:]]*innodb_buffer_pool_size[[:space:]]*=' "$old") \
+    <(grep -vE '^[[:space:]]*innodb_buffer_pool_size[[:space:]]*=' "$new") \
+    >/dev/null 2>&1
 }
 
 optimize_mariadb() {
@@ -5363,6 +5385,11 @@ optimize_mariadb() {
 
   cnf_before=""
   [[ -f $cnf ]] && cnf_before=$(md5sum "$cnf" | awk '{print $1}')
+  local cnf_old=""
+  if [[ -f $cnf ]]; then
+    cnf_old=$(mktemp)
+    cp -a "$cnf" "$cnf_old"
+  fi
 
   cat > "$cnf" <<EOF
 # BEGIN setup.sh optimize
@@ -5431,6 +5458,33 @@ EOF
   cnf_after=$(md5sum "$cnf" | awk '{print $1}')
   opt_report "- Wrote \`${cnf}\` (buffer=${buffer}, max_connections=${max_conn}, back_log=${backlog})"
   opt_report "- innodb_io_capacity=${io_read}/${io_write}, thread_pool_size=${threads}"
+
+  # A running server can resize the buffer pool online.  Restarting a busy
+  # database just to grow it by a few percent empties every application cache
+  # at once; on XenForo that produced a thousand-request lock convoy on the
+  # same registry row.  Only fall back to a restart when the pool is not the
+  # only change (or the resize fails).
+  local online_mb=""
+  if [[ -n $cnf_old ]] && (( active )) && cnf_only_pool_changed "$cnf_old" "$cnf"; then
+    if mariadb -e "SET GLOBAL innodb_buffer_pool_size = $(( size_mb * 1024 * 1024 ))" 2>/dev/null; then
+      online_mb=$(mariadb -N -B -e 'SELECT @@innodb_buffer_pool_size' 2>/dev/null \
+        | awk '{printf "%d", $1 / 1024 / 1024}')
+      opt_report "- Applied buffer pool online: ${online_mb:-$size_mb}MB (no restart)"
+      if (( unit_changed == 0 )); then
+        rm -f "$cnf_old"
+        return 0
+      fi
+      if [[ $limit_before =~ ^[0-9]+$ ]] && (( limit_before >= 65536 )); then
+        opt_report "- Restart: deferred (LimitNOFILE=${limit_before} is already sufficient; the drop-in applies on the next restart)"
+        rm -f "$cnf_old"
+        return 0
+      fi
+      # The fd drop-in still needs a restart; fall through to apply it.
+    else
+      opt_report "- Online buffer-pool resize failed; falling back to a restart"
+    fi
+  fi
+  rm -f "$cnf_old"
   if [[ -n $cnf_before && $cnf_before == "$cnf_after" ]]; then
     if (( unit_changed == 0 )); then
       opt_report "- Restart: skipped (configuration already optimized)"

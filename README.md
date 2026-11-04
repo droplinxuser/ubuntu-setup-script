@@ -31,6 +31,24 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.25
+
+- **The MariaDB buffer pool is resized online instead of restarting the
+  database.** Restarting a busy host just to grow the pool by a few percent
+  empties every application cache at once; on a live XenForo forum that caused
+  ~990 simultaneous `INSERT … ON DUPLICATE KEY UPDATE` calls on the same
+  `xf_data_registry` row, a lock convoy that took the site down until the
+  database was restarted again. When the buffer-pool line is the only change
+  to `99-setup-optimize.cnf`, `--optimize` now runs
+  `SET GLOBAL innodb_buffer_pool_size` and keeps serving. Other changes still
+  restart immediately, and a failed online resize falls back to the restart.
+  The report shows the effective size applied.
+- **The PHP socket migration no longer fails the run when a build ignores the
+  listener change on reload.** PHP 8.4 was observed to keep the old TCP
+  listener after `SIGUSR2`; `--optimize` now restores the TCP pool, reports
+  `Socket migration skipped …`, and exits successfully. A planned PHP-FPM
+  restart completes the move without cutting the site unexpectedly.
+
 ## What's new in 1.8.24
 
 - **The PHP-FPM socket migration now works where a reload does not add
