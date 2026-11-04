@@ -1,8 +1,9 @@
-# Non-Angie / non-PHP-FPM configuration
+# Non-Angie configuration
 
 This directory owns the server-side configuration that does **not** belong in
 [`server-configs-nginx`](https://github.com/droplinxuser/server-configs-nginx).
-That repository is deliberately limited to Angie/Nginx and PHP-FPM config.
+That repository is deliberately limited to Angie/Nginx config; PHP-FPM and all
+other service configs live here.
 
 | Path | Purpose |
 |---|---|
@@ -12,6 +13,7 @@ That repository is deliberately limited to Angie/Nginx and PHP-FPM config.
 | `system/limits.conf` | PAM/security file-descriptor limits |
 | `mariadb/mariadb_server.cnf` | reference MariaDB server profile |
 | `mariadb/limit_nofile.conf` | MariaDB systemd `LimitNOFILE` drop-in |
+| `php/` | PHP-FPM pool templates, `custom_dan.ini`, systemd limits |
 
 `setup.sh` embeds equivalent fallbacks so it still works as a single file, but
 when it is run from this checkout it prefers the files in this directory. The
@@ -20,9 +22,8 @@ MariaDB profile is a reference; `setup.sh` generates a hardware-aware variant
 
 Related items:
 
-- `legacy/basic_setup.sh` is the old standalone basic-setup script, superseded
-  by `setup.sh`.
 - `tools/diff_configs.sh` compares both repositories' canonical files with the
   live `/etc` configuration.
-- Angie, Nginx and PHP-FPM configs live in
+- Angie/Nginx configs live in
   [`server-configs-nginx`](https://github.com/droplinxuser/server-configs-nginx).
+  PHP-FPM configs live in `configs/php/` here.
