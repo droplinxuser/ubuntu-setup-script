@@ -235,6 +235,7 @@ check "tune_pool_dedupe keeps the value set by tune_pool_set" \
 # ---------------------------------------------------------------------------
 mem_total_mb() { printf '131072'; }
 mariadb_data_size_mb() { printf '0'; }
+mariadb_current_pool_mb() { printf '0'; }
 elasticsearch_data_size_mb() { printf '0'; }
 OPT_DETECTED=(angie php:8.4 mariadb valkey elastic)
 plan_memory_budget
@@ -293,6 +294,32 @@ check "oversized database gets the largest feasible buffer pool" \
   test "$OPT_MARIADB_BUDGET_MB" -ge 32768
 check "oversized database is not falsely reported as fitting" \
   test "$OPT_DB_SIZE_MB" -eq 40960 -a "$OPT_MARIADB_BUDGET_MB" -lt 40960
+
+# A larger pool already configured by an operator is preserved rather than
+# silently shrunk back to the automatic 32 GB target.
+mem_total_mb() { printf '262144'; }
+mariadb_current_pool_mb() { printf '73728'; }
+mariadb_data_size_mb() { printf '94876'; }
+elasticsearch_data_size_mb() { printf '0'; }
+OPT_DETECTED=(angie php:8.4 mariadb valkey)
+plan_memory_budget
+check "existing 72 GB pool is preserved on a 256 GB host" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 73728
+check "preserved pool is recorded for reporting" \
+  test "$OPT_MARIADB_KEPT_MB" -eq 73728
+check "preserved pool keeps the plan inside the 80% budget" \
+  test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
+       -le $(( 262144 * 80 / 100 ))
+
+# A pool above 50% of RAM is not preserved.
+mariadb_current_pool_mb() { printf '160000'; }
+plan_memory_budget
+check "pool above 50% of RAM is not preserved" \
+  test "$OPT_MARIADB_BUDGET_MB" -lt 160000
+
+mariadb_current_pool_mb() { printf '0'; }
+mem_total_mb() { printf '65536'; }
+OPT_DETECTED=(angie php:8.3 mariadb redis elastic)
 
 # Elasticsearch heap follows the live index store size.
 mariadb_data_size_mb() { printf '20000'; }
