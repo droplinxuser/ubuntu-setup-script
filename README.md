@@ -17,7 +17,6 @@ The script is designed for a fresh server but is safe to re-run on an already co
 | `tests/stress-site/` | Full-stack test site and stress harness |
 | `/var/www/logs/` (live) | One directory tree for Angie, PHP, MariaDB, Valkey, Node.js, GifSicle and Elasticsearch logs |
 | `tools/diff_configs.sh` | Compare canonical configs (both repos) with live `/etc` |
-| `legacy/basic_setup.sh` | Old standalone basic setup script (superseded) |
 
 Angie/Nginx configuration lives only in
 [`droplinxuser/server-configs-nginx`](https://github.com/droplinxuser/server-configs-nginx).
@@ -29,6 +28,11 @@ checkout. System/MariaDB/systemd blobs still have embedded fallbacks, but the
 PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
+
+## What's new in 1.6.12
+
+- Removed the obsolete `legacy/basic_setup.sh` tree and its documentation.
+- Repository cleanup only; installation and `--optimize` behavior is unchanged.
 
 ## What's new in 1.6.11
 
@@ -219,7 +223,7 @@ alongside `setup.sh`).
 - Removed the embedded Angie config archive and all duplicated Angie/PHP config patching from `setup.sh`.
 - `setup.sh` now downloads `server-configs-nginx` once per run and delegates deployment to its `scripts/nginx_conf.sh`.
 - PHP-FPM pool and `php.ini` templates were sourced from `server-configs-nginx/scripts/www_<ver>.conf` and `scripts/custom_dan.ini` in this release (moved back to `configs/php/` in 1.6.10).
-- Moved non-Angie/non-PHP-FPM files out of `server-configs-nginx` into this repo: `configs/system/`, `configs/mariadb/`, `tools/diff_configs.sh`, `legacy/basic_setup.sh`.
+- Moved non-Angie/non-PHP-FPM files out of `server-configs-nginx` into this repo: `configs/system/`, `configs/mariadb/`, `tools/diff_configs.sh`.
 - Added `CONFIG_SOURCE_DIR` for local/offline testing, plus `CONFIG_REPO_URL` / `CONFIG_REPO_REF` overrides.
 - The repo deployer removes old setup.sh override files and pre-refactor config filenames during upgrades.
 
