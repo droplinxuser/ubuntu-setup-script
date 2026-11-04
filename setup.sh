@@ -31,7 +31,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.26"
+readonly SCRIPT_VERSION="1.8.27"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -2626,6 +2626,31 @@ ensure_fpm_log_path() {
   return 0
 }
 
+# The php-fpm master waits forever for workers when process_control_timeout is
+# 0 (the package default).  On a busy pool a stop/restart then sits in
+# systemd's "deactivating" state until TimeoutStopSec, and the shared socket
+# is gone for the whole window (all PHP vhosts return 502).  Bound it.
+ensure_fpm_global_timeout() {
+  local ver=$1
+  local conf="/etc/php/${ver}/fpm/php-fpm.conf"
+  [[ -f $conf ]] || return 0
+  if grep -qE '^[[:space:]]*process_control_timeout[[:space:]]*=' "$conf"; then
+    grep -qE '^[[:space:]]*process_control_timeout[[:space:]]*=[[:space:]]*10s' "$conf" \
+      && return 0
+    sed -i -E 's|^[[:space:]]*process_control_timeout[[:space:]]*=.*|process_control_timeout = 10s|' "$conf"
+  elif grep -qE '^[[:space:]]*include[[:space:]]*=' "$conf"; then
+    # Everything after the pool include is parsed inside the last included
+    # pool section, so a global directive must go *before* it.
+    sed -i -E '/^[[:space:]]*include[[:space:]]*=/i\
+; setup.sh: bound master/worker shutdown so a busy pool restarts in seconds\
+process_control_timeout = 10s' "$conf"
+  else
+    printf '\n; setup.sh: bound master/worker shutdown so a busy pool restarts in seconds\nprocess_control_timeout = 10s\n' >> "$conf"
+  fi
+  tune_note "PHP ${ver}: process_control_timeout=10s"
+  return 0
+}
+
 tune_php_fpm_version() {
   local ver=$1
   local socket=${2:-}
@@ -2705,6 +2730,8 @@ tune_php_fpm_version() {
   tune_pool_set "$pool" security.limit_extensions .php "PHP ${ver}: security.limit_extensions=.php"
   tune_pool_set "$pool" rlimit_files 524288 "PHP ${ver}: rlimit_files=524288"
   tune_pool_set "$pool" rlimit_core 0 "PHP ${ver}: rlimit_core=0"
+  # Bound master/worker shutdown; see ensure_fpm_global_timeout().
+  ensure_fpm_global_timeout "$ver"
 
   # Older releases appended the same directive more than once (the live
   # 8.3 pool carried two rlimit_files/rlimit_core pairs).  php-fpm lets the
@@ -2961,6 +2988,8 @@ install_php() {
   mkdir -p "/etc/systemd/system/php${ver}-fpm.service.d"
   install -m 644 "${SCRIPT_DIR}/configs/php/php-fpm-limits.conf" \
     "/etc/systemd/system/php${ver}-fpm.service.d/limits.conf"
+  # Bound worker shutdown so a restart cannot sit in "deactivating".
+  ensure_fpm_global_timeout "$ver"
   systemctl daemon-reload
 
   # Only one PHP-FPM version can own the shared /run/php/php-fpm.sock socket.
@@ -5228,7 +5257,7 @@ optimize_php_services() {
     if [[ -f $limits_src ]]; then
       install -m 644 "$limits_src" "$limits_dst"
     else
-      printf '[Service]\nLimitNOFILE=524288\nLimitCORE=0\nUMask=0027\n' > "$limits_dst"
+      printf '[Service]\nLimitNOFILE=524288\nLimitCORE=0\nTimeoutStopSec=15\nUMask=0027\n' > "$limits_dst"
       chmod 644 "$limits_dst"
     fi
     if [[ $limits_before != "$(md5sum "$limits_dst" | awk '{print $1}')" ]]; then
