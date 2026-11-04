@@ -31,7 +31,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.3"
+readonly SCRIPT_VERSION="1.8.4"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
@@ -4269,6 +4269,140 @@ php_primary_version() {
   php_fpm_versions | tail -n1
 }
 
+# WordPress guest-cache support: the Angie repository owns the templates.
+angie_wordpress_vhosts() {
+  local target=$1 file root
+  for file in "$target"/conf.d/*.conf; do
+    [[ -f $file ]] || continue
+    grep -qE '^[[:space:]]*include[[:space:]]+h5bp/(php_wp|wordpress)\.conf;' "$file" || continue
+    root=$(grep -m1 -E '^[[:space:]]*root[[:space:]]+' "$file" 2>/dev/null \
+      | sed -E 's/^[[:space:]]*root[[:space:]]+//; s/;.*//; s/^[[:space:]]+//; s/[[:space:]]+$//')
+    root=${root%\"}; root=${root#\"}
+    [[ -n $root && -f "${root%/}/wp-config.php" ]] && printf '%s\n' "$file"
+  done
+}
+
+# Download the cache templates from the Angie config repository.  Kept
+# separate from the installer fetch path so a failed download is a reported
+# miss instead of aborting --optimize.
+wordpress_cache_templates() {
+  local base=${CONFIG_REPO_URL%.git} repo raw temp file
+  case "$base" in
+    https://github.com/*) ;;
+    *) return 1 ;;
+  esac
+  repo=${base#https://github.com/}
+  raw="https://raw.githubusercontent.com/${repo}/${CONFIG_REPO_REF}"
+  command -v curl >/dev/null 2>&1 || return 1
+  temp=$(mktemp -d) || return 1
+  for file in h5bp/wordpress_cache.conf \
+              http.d/wordpress_cache_map.conf \
+              http.d/fastcgi_cache.conf; do
+    mkdir -p "${temp}/$(dirname "$file")"
+    if ! retry 3 2 curl -fsSL --proto '=https' --tlsv1.2 \
+         "${raw}/${file}" -o "${temp}/${file}" 2>/dev/null; then
+      rm -rf "$temp"
+      return 1
+    fi
+  done
+  printf '%s' "$temp"
+}
+
+optimize_wordpress_cache() {
+  local target=${1:-/etc/angie}
+  local -a wp_vhosts=()
+  mapfile -t wp_vhosts < <(angie_wordpress_vhosts "$target")
+  (( ${#wp_vhosts[@]} > 0 )) || return 0
+
+  local -a active=()
+  mapfile -t active < <(angie_active_http_files "$target")
+  if (( ${#active[@]} == 0 )); then
+    tune_miss "WordPress cache: no active http.d include pattern"
+    return 0
+  fi
+
+  local has_php_wp=0
+  [[ -f "${target}/h5bp/php_wp.conf" ]] && has_php_wp=1
+  if (( has_php_wp == 0 )) \
+     && ! grep -qRE 'include[[:space:]]+h5bp/wordpress_cache\.conf;' "${target}/conf.d" 2>/dev/null; then
+    tune_miss "WordPress cache: no h5bp/php_wp.conf or server-level cache include"
+    return 0
+  fi
+
+  local suffix=".conf" file active_zone=0 active_map=0
+  for file in "${active[@]}"; do
+    case "$file" in *_conf) suffix="_conf"; break ;; esac
+  done
+  for file in "${active[@]}"; do
+    grep -qE 'fastcgi_cache_path.*keys_zone=fastcgicache:' "$file" && active_zone=1
+    grep -qE 'map[[:space:]].*\$skip_cache' "$file" && active_map=1
+  done
+
+  local include_ready=0
+  if (( has_php_wp )) \
+     && grep -qE 'include[[:space:]]+h5bp/wordpress_cache\.conf;' "${target}/h5bp/php_wp.conf"; then
+    include_ready=1
+  elif grep -qRE 'include[[:space:]]+h5bp/wordpress_cache\.conf;' "${target}/conf.d" 2>/dev/null; then
+    include_ready=1
+  fi
+
+  if (( active_zone && active_map && include_ready )) \
+     && [[ -f "${target}/h5bp/wordpress_cache.conf" ]]; then
+    opt_report "- WordPress: FastCGI guest cache already enabled for ${#wp_vhosts[@]} vhost(s)"
+    return 0
+  fi
+
+  local src="" temp="" changed=0
+  if [[ -n ${CONFIG_SOURCE_DIR:-} \
+        && -f ${CONFIG_SOURCE_DIR}/h5bp/wordpress_cache.conf \
+        && -f ${CONFIG_SOURCE_DIR}/http.d/wordpress_cache_map.conf \
+        && -f ${CONFIG_SOURCE_DIR}/http.d/fastcgi_cache.conf ]]; then
+    src=$CONFIG_SOURCE_DIR
+  else
+    temp=$(wordpress_cache_templates) || {
+      tune_miss "WordPress cache templates could not be downloaded"
+      return 0
+    }
+    src=$temp
+  fi
+
+  local cache_file="${target}/http.d/zz-setup-wordpress-cache${suffix}"
+  local map_file="${target}/http.d/zz-setup-wordpress-cache-map${suffix}"
+  if (( active_zone == 0 )); then
+    install -m 644 "${src}/http.d/fastcgi_cache.conf" "$cache_file"
+    changed=1
+  fi
+  if (( active_map == 0 )); then
+    install -m 644 "${src}/http.d/wordpress_cache_map.conf" "$map_file"
+    changed=1
+  fi
+  if ! cmp -s "${src}/h5bp/wordpress_cache.conf" \
+       "${target}/h5bp/wordpress_cache.conf" 2>/dev/null; then
+    install -m 644 "${src}/h5bp/wordpress_cache.conf" \
+      "${target}/h5bp/wordpress_cache.conf"
+    changed=1
+  fi
+  if (( has_php_wp )) \
+     && ! grep -qE 'include[[:space:]]+h5bp/wordpress_cache\.conf;' "${target}/h5bp/php_wp.conf" \
+     && ! grep -qRE 'include[[:space:]]+h5bp/wordpress_cache\.conf;' "${target}/conf.d" 2>/dev/null; then
+    printf '\n# BEGIN setup.sh WordPress FastCGI cache\ninclude h5bp/wordpress_cache.conf;\n# END setup.sh WordPress FastCGI cache\n' \
+      >> "${target}/h5bp/php_wp.conf"
+    changed=1
+  fi
+  if (( active_zone == 0 )); then
+    install -d -m 700 /home/nginx_cache 2>/dev/null || mkdir -p /home/nginx_cache
+    chown www-data:www-data /home/nginx_cache 2>/dev/null || true
+  fi
+
+  if (( changed )); then
+    tune_note "WordPress: FastCGI guest cache enabled for ${#wp_vhosts[@]} vhost(s)"
+  else
+    opt_report "- WordPress: FastCGI guest cache already enabled for ${#wp_vhosts[@]} vhost(s)"
+  fi
+  [[ -n $temp ]] && rm -rf "$temp"
+  return 0
+}
+
 optimize_angie() {
   local active=0 change version
   systemctl is-active --quiet angie 2>/dev/null && active=1
@@ -4277,6 +4411,7 @@ optimize_angie() {
   opt_report "- Version: \`${version:-unknown}\`; active: ${active}"
   opt_backup /etc/angie angie
   tune_reset_changes
+  optimize_wordpress_cache /etc/angie || true
   if ! tune_angie_configs /etc/angie; then
     opt_restore /etc/angie angie
     opt_report "- **FAILED** tuning returned an error; configuration rolled back"
@@ -4673,6 +4808,83 @@ optimize_valkey() {
   return 0
 }
 
+elasticsearch_single_node_replica_issue() {
+  local json=$1 nodes status unassigned primary
+  nodes=$(printf '%s' "$json" | sed -n 's/.*"number_of_nodes"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -n1)
+  status=$(printf '%s' "$json" | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([a-z]*\)".*/\1/p' | head -n1)
+  unassigned=$(printf '%s' "$json" | sed -n 's/.*"unassigned_shards"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -n1)
+  primary=$(printf '%s' "$json" | sed -n 's/.*"unassigned_primary_shards"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -n1)
+  [[ $nodes =~ ^[0-9]+$ && $nodes -eq 1 ]] || return 1
+  [[ $status == yellow ]] || return 1
+  [[ $unassigned =~ ^[0-9]+$ && $unassigned -gt 0 ]] || return 1
+  [[ $primary =~ ^[0-9]+$ && $primary -eq 0 ]] || return 1
+  return 0
+}
+
+elasticsearch_ensure_single_node_template() {
+  local resp
+  resp=$(curl -fsS --max-time 15 -X PUT -H 'Content-Type: application/json' \
+    http://127.0.0.1:9200/_index_template/setup-single-node-zero-replicas \
+    -d '{"index_patterns":["*"],"priority":1,"template":{"settings":{"number_of_replicas":0}}}' \
+    2>/dev/null) || resp=""
+  if [[ $resp == *'"acknowledged":true'* ]]; then
+    opt_report "- Single-node template ensured (priority 1, replicas=0)"
+    return 0
+  fi
+  opt_report "- Single-node template install failed"
+  return 1
+}
+
+# A single-node cluster cannot assign replicas.  Yellow health with only
+# unassigned replicas is expected there; set replicas=0 on existing indices
+# and keep a low-priority template for future indices.
+elasticsearch_fix_single_node_replicas() {
+  local health status nodes unassigned primary resp i
+  command -v curl >/dev/null 2>&1 || return 0
+  health=$(curl -fsS --max-time 5 http://127.0.0.1:9200/_cluster/health 2>/dev/null) || return 0
+  nodes=$(printf '%s' "$health" | sed -n 's/.*"number_of_nodes"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -n1)
+  status=$(printf '%s' "$health" | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([a-z]*\)".*/\1/p' | head -n1)
+  unassigned=$(printf '%s' "$health" | sed -n 's/.*"unassigned_shards"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -n1)
+  primary=$(printf '%s' "$health" | sed -n 's/.*"unassigned_primary_shards"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -n1)
+
+  if [[ ! $nodes =~ ^[0-9]+$ || $nodes -ne 1 ]]; then
+    [[ -n $status ]] && opt_report "- Cluster health: ${status} (multi-node; replicas left unchanged)"
+    return 0
+  fi
+  if [[ $status == green ]]; then
+    opt_report "- Cluster health: green"
+    elasticsearch_ensure_single_node_template || true
+    return 0
+  fi
+  if ! elasticsearch_single_node_replica_issue "$health"; then
+    opt_report "- Cluster health: ${status:-unknown} (not a single-node replica issue; left unchanged)"
+    return 0
+  fi
+
+  resp=$(curl -fsS --max-time 30 -X PUT -H 'Content-Type: application/json' \
+    http://127.0.0.1:9200/_all/_settings \
+    -d '{"index":{"number_of_replicas":0}}' 2>/dev/null) || resp=""
+  if [[ $resp != *'"acknowledged":true'* ]]; then
+    opt_report "- Single-node cluster: **FAILED** to set number_of_replicas=0"
+    return 1
+  fi
+  opt_report "- Single-node cluster: set number_of_replicas=0 on existing indices"
+  elasticsearch_ensure_single_node_template || true
+
+  for i in {1..30}; do
+    health=$(curl -fsS --max-time 5 http://127.0.0.1:9200/_cluster/health 2>/dev/null) || true
+    status=$(printf '%s' "$health" | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([a-z]*\)".*/\1/p' | head -n1)
+    [[ $status == green ]] && break
+    sleep 1
+  done
+  if [[ $status == green ]]; then
+    opt_report "- Cluster health: green"
+    return 0
+  fi
+  opt_report "- Cluster health: ${status:-unknown} after replica fix"
+  return 1
+}
+
 optimize_elastic() {
   local active=0 yml=/etc/elasticsearch/elasticsearch.yml ram_mb heap_mb
   local jvm=/etc/elasticsearch/jvm.options.d/zz-setup-optimize.options
@@ -4776,6 +4988,7 @@ EOF
   if (( active )); then
     if (( changed == 0 )); then
       opt_report "- Restart: skipped (configuration already optimized)"
+      elasticsearch_fix_single_node_replicas || return 1
       return 0
     fi
     if systemctl restart elasticsearch 2>/dev/null; then
@@ -4787,6 +5000,7 @@ EOF
       done
       if curl -fsS http://127.0.0.1:9200 >/dev/null 2>&1; then
         opt_report "- Restart: **OK**"
+        elasticsearch_fix_single_node_replicas || return 1
       else
         opt_report "- Restart: **FAILED** (HTTP probe); rolling back"
         opt_restore /etc/elasticsearch elasticsearch
