@@ -31,6 +31,14 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.10
+
+- **Elasticsearch replica cleanup now waits for shard recovery.** After a
+  heap change restarts Elasticsearch, the cluster can be red for a few
+  seconds while primaries are assigned. `--optimize` now waits up to two
+  minutes for primaries to recover before deciding whether to clear
+  unassigned replicas, so a single run completes the fix.
+
 ## What's new in 1.8.9
 
 - **MariaDB and Elasticsearch are sized from the live data, not RAM.** The

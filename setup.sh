@@ -31,7 +31,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.9"
+readonly SCRIPT_VERSION="1.8.10"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
@@ -4913,12 +4913,31 @@ elasticsearch_ensure_single_node_template() {
   return 1
 }
 
+# Wait until a freshly restarted node has assigned its primaries.  The
+# cluster can be red for a few seconds while shards recover; deciding before
+# then skips the single-node replica fix.
+elasticsearch_wait_primaries() {
+  local i health status primary
+  for i in {1..120}; do
+    health=$(curl -fsS --max-time 5 http://127.0.0.1:9200/_cluster/health 2>/dev/null) || true
+    status=$(printf '%s' "$health" | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([a-z]*\)".*/\1/p' | head -n1)
+    primary=$(printf '%s' "$health" | sed -n 's/.*"unassigned_primary_shards"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -n1)
+    [[ $status == green ]] && return 0
+    if [[ $status == yellow && $primary =~ ^[0-9]+$ && $primary -eq 0 ]]; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
 # A single-node cluster cannot assign replicas.  Yellow health with only
 # unassigned replicas is expected there; set replicas=0 on existing indices
 # and keep a low-priority template for future indices.
 elasticsearch_fix_single_node_replicas() {
   local health status nodes unassigned primary resp i
   command -v curl >/dev/null 2>&1 || return 0
+  elasticsearch_wait_primaries || true
   health=$(curl -fsS --max-time 5 http://127.0.0.1:9200/_cluster/health 2>/dev/null) || return 0
   nodes=$(printf '%s' "$health" | sed -n 's/.*"number_of_nodes"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -n1)
   status=$(printf '%s' "$health" | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([a-z]*\)".*/\1/p' | head -n1)
