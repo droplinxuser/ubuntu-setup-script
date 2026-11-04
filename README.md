@@ -31,6 +31,42 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.21
+
+- **Elasticsearch now has one managed heap file.** The installer wrote
+  `jvm.options.d/jvm.options` and `--optimize` wrote
+  `jvm.options.d/zz-setup-optimize.options`, so a host that had both passed
+  two conflicting `-Xms/-Xmx` pairs to the JVM (the last one silently won).
+  Both paths now own `zz-setup-optimize.options`; the old generated file is
+  removed when it matches the exact script-generated shape, and an operator's
+  own `jvm.options` is preserved.
+- **`/etc/sysctl.conf` no longer contains duplicate keys.** The base profile
+  and the hardware-aware block set some of the same tunables
+  (`somaxconn`, `tcp_max_syn_backlog`, `file-max`, ...), with the last line
+  winning. `--optimize` now keeps only the final definition of each key, so
+  the effective value is unambiguous, and caps
+  `net.ipv4.tcp_challenge_ack_limit` at 1000 (CVE-2019-11479) instead of the
+  legacy maximum.
+- **Valkey is never shrunk below its live working set.** A restart applies
+  `maxmemory` immediately, so a plan below the stored data would mass-evict a
+  cache or session store. `--optimize` now gives `used_memory` 10% headroom
+  and reports the raised value.
+- **Small hosts keep usable service floors.** Proportional scaling could hand
+  a 1 GB host a 17 MB Valkey budget; Valkey and Elasticsearch now keep their
+  256 MB / 512 MB minimums.
+- **Rollback backups are root-only.** `/var/backups/setup-optimize-*` is
+  created with mode 0700 because it contains copies of
+  `/etc/angie/ssl/*/privkey.pem` and `/etc/mysql/debian.cnf`.
+- **Legacy Angie files are reported, not silently ignored.** When `http.d`
+  still contains pre-rename `*_conf` cache/limit files that `angie.conf`
+  never includes, the report lists them and points at the config deploy
+  instead of only printing "no active fastcgi_cache_path".
+- **Smaller hardening and hygiene fixes.** `angie -t` output uses `mktemp`
+  instead of a predictable `/tmp` path written by root; an unchanged Angie
+  fd-limit drop-in no longer forces a restart on every run; optimize reports
+  keep the twenty newest files; and a missing report file no longer aborts
+  the final summary.
+
 ## What's new in 1.8.20
 
 - **Real runs are serialised with a `flock` lock.** Two invocations (an

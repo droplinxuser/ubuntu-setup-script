@@ -31,7 +31,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.20"
+readonly SCRIPT_VERSION="1.8.21"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
@@ -1587,6 +1587,42 @@ restore_sysctl_values() {
   done
 }
 
+# Keep only the last definition of each sysctl key so an overlapping base
+# profile and hardware block cannot silently contradict each other.
+sysctl_dedupe_keys() {
+  local file=$1 tmp
+  [[ -f $file ]] || return 0
+  tmp=$(mktemp)
+  awk '
+    {
+      lines[NR] = $0
+      if (match($0, /^[[:space:]]*[A-Za-z0-9_.\/-]+[[:space:]]*=/)) {
+        key = $0
+        sub(/^[[:space:]]*/, "", key)
+        sub(/[[:space:]]*=.*/, "", key)
+        last[key] = NR
+      }
+    }
+    END {
+      for (i = 1; i <= NR; i++) {
+        line = lines[i]
+        if (match(line, /^[[:space:]]*[A-Za-z0-9_.\/-]+[[:space:]]*=/)) {
+          key = line
+          sub(/^[[:space:]]*/, "", key)
+          sub(/[[:space:]]*=.*/, "", key)
+          if (last[key] != i) continue
+        }
+        print line
+      }
+    }
+  ' "$file" > "$tmp"
+  if ! cmp -s "$file" "$tmp"; then
+    cat "$tmp" > "$file"
+  fi
+  rm -f "$tmp"
+  return 0
+}
+
 configure_sysctl() {
   step "sysctl tweaks"
   record_sysctl_values
@@ -1672,9 +1708,19 @@ net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.default.accept_redirects = 0
 net.ipv6.conf.all.accept_redirects = 0
 net.ipv6.conf.default.accept_redirects = 0
+# CVE-2019-11479: cap the TCP challenge-ACK rate.  The upstream profile left
+# the legacy maximum (1073741823), which is the vulnerable setting.
+net.ipv4.tcp_challenge_ack_limit = 1000
 # END setup.sh tuning
 EOF
   chmod 644 /etc/sysctl.conf
+
+  # The base profile above and the hardware-aware block both define some of
+  # the same keys (somaxconn, tcp_max_syn_backlog, file-max, ...).  Whichever
+  # line comes last wins, so the file works, but it is ambiguous to audit and
+  # one edit can silently undo the other.  Keep only the final definition of
+  # each key; order and comments for distinct keys are preserved.
+  sysctl_dedupe_keys /etc/sysctl.conf
   if [[ -d /etc/sysctl.d ]] && [[ ! -e /etc/sysctl.d/99-sysctl.conf && ! -L /etc/sysctl.d/99-sysctl.conf ]]; then
     ln -s ../sysctl.conf /etc/sysctl.d/99-sysctl.conf
   fi
@@ -2002,6 +2048,26 @@ tune_active_file() {
     grep -qE "$pattern" "$file" && { printf '%s' "$file"; return 0; }
   done
   return 1
+}
+
+# Cache or limiter files under http.d that angie.conf never includes.  Older
+# deployments kept the *_conf names after the repository renamed them to
+# *.conf; those files look active but silently change nothing, which is why
+# --optimize reports "no active fastcgi_cache_path" on such a host.
+angie_inert_cache_files() {
+  local target=$1 file active is_active
+  local -a active_files=()
+  mapfile -t active_files < <(angie_active_http_files "$target")
+  for file in "$target"/http.d/*; do
+    [[ -f $file ]] || continue
+    grep -qE '^[[:space:]]*(fastcgi_cache_path|proxy_cache_path|limit_req_zone)[[:space:]]' "$file" || continue
+    is_active=0
+    for active in "${active_files[@]}"; do
+      [[ $file == "$active" ]] && { is_active=1; break; }
+    done
+    (( is_active )) || printf '%s\n' "$file"
+  done
+  return 0
 }
 
 tune_replace() {
@@ -2393,7 +2459,7 @@ tune_angie_configs() {
   tune_cache_error_policy "$target/h5bp/wordpress_cache.conf" "h5bp/wordpress_cache.conf"
   tune_cache_error_policy "$target/h5bp/php_xf.conf" "h5bp/php_xf.conf"
 
-  tune_summary "angie summary: ${nproc} CPU / ${mem_mb}MB RAM / ${disk_class} / cache=${cache_total_mb}MB"
+  tune_summary "angie summary: ${nproc} CPU / ${mem_mb}MB RAM / ${disk_class} / cache_budget=${cache_total_mb}MB"
   return 0
 }
 
@@ -3398,15 +3464,7 @@ LimitNPROC=4096
 EOF
 
   mkdir -p /etc/elasticsearch/jvm.options.d
-  cat > /etc/elasticsearch/jvm.options.d/jvm.options <<EOF
--Xms${ram_lc}
--Xmx${ram_lc}
--XX:+UseG1GC
--XX:MaxGCPauseMillis=200
--XX:+HeapDumpOnOutOfMemoryError
--Dlog4j2.formatMsgNoLookups=true
-EOF
-  chown root:elasticsearch /etc/elasticsearch/jvm.options.d/jvm.options 2>/dev/null || true
+  write_es_jvm_options "$ram_mb"
 
   mkdir -p /etc/elasticsearch/scripts
   cat > /etc/elasticsearch/scripts/xf-date-weighted.groovy <<'EOF'
@@ -3773,12 +3831,15 @@ create_domains() {
       esac
 
       install -m 644 "$tmp" "$conf"
-      if ! /usr/sbin/angie -t >/tmp/angie-domain-test.log 2>&1; then
+      local domain_test_log
+      domain_test_log=$(mktemp)
+      if ! /usr/sbin/angie -t >"$domain_test_log" 2>&1; then
         rm -f "$conf"
-        cat /tmp/angie-domain-test.log >&2 || true
+        cat "$domain_test_log" >&2 || true
+        rm -f "$domain_test_log"
         die "Angie rejected the generated vhost for ${d} (app=${app})"
       fi
-      rm -f "$tmp" /tmp/angie-domain-test.log
+      rm -f "$tmp" "$domain_test_log"
       # "angie -t" runs from this shell (umask 022) and creates the per-vhost
       # log files before systemd's UMask=0027 applies. Normalise them now.
       find "${LOG_ROOT}/angie" -type f -name '*.log' -exec chmod 640 {} + 2>/dev/null || true
@@ -4348,7 +4409,9 @@ opt_report() { OPT_REPORT+=("$*"); }
 opt_backup() {
   local path=$1 name=$2
   [[ -n $OPT_BACKUP_DIR ]] || OPT_BACKUP_DIR="/var/backups/setup-optimize-$(date +%Y%m%d-%H%M%S)"
-  mkdir -p "$OPT_BACKUP_DIR"
+  # Copies include /etc/angie/ssl/*/privkey.pem and /etc/mysql/debian.cnf.
+  # 0700 keeps the rollback tree (and its filenames) private to root.
+  install -d -m 700 "$OPT_BACKUP_DIR"
   [[ -e "$OPT_BACKUP_DIR/${name}" || -e "$OPT_BACKUP_DIR/${name}.absent" ]] && return 0
   if [[ -e $path ]]; then
     cp -a "$path" "$OPT_BACKUP_DIR/${name}"
@@ -4650,6 +4713,16 @@ plan_memory_budget() {
       OPT_VALKEY_BUDGET_MB=$(( OPT_VALKEY_BUDGET_MB * remaining / others ))
     fi
   fi
+  # Proportional scaling must not hand a small host an unusable slice (a
+  # 1 GB host used to end up with a 17 MB cache).  Apply the same floors the
+  # per-service tuners use; the small overcommit is bounded and safer than a
+  # cache that evicts everything immediately.
+  if (( has_cache )); then
+    (( OPT_VALKEY_BUDGET_MB < 256 )) && OPT_VALKEY_BUDGET_MB=256
+  fi
+  if (( has_es )); then
+    (( OPT_ES_BUDGET_MB < 512 )) && OPT_ES_BUDGET_MB=512
+  fi
   return 0
 }
 
@@ -4850,16 +4923,23 @@ optimize_angie() {
   opt_report "- Version: \`${version:-unknown}\`; active: ${active}"
   opt_backup /etc/angie angie
   tune_reset_changes
-  # Match the installer's systemd fd/log-umask limits on old servers too.
-  local angie_limit
+  # Match the installer's systemd fd limit on old servers too.  Only the fd
+  # limit is checked: Angie daemonises with umask(0), so a UMask= drop-in does
+  # not change the modes of the files its workers create.  Rewriting an
+  # unchanged file would force a needless restart, so compare first.
+  local angie_limit angie_dropin=/etc/systemd/system/angie.service.d/limits.conf
+  local angie_before=""
   angie_limit=$(systemctl show -p LimitNOFILE --value angie 2>/dev/null || true)
-  if ! [[ $angie_limit =~ ^[0-9]+$ ]] || (( angie_limit < 524288 )); then
+  [[ -f $angie_dropin ]] && angie_before=$(md5sum "$angie_dropin" | awk '{print $1}')
+  if [[ $angie_limit != infinity ]] \
+     && { ! [[ $angie_limit =~ ^[0-9]+$ ]] || (( angie_limit < 524288 )); }; then
     mkdir -p /etc/systemd/system/angie.service.d
-    printf '[Service]\nLimitNOFILE=524288\nUMask=0027\n' \
-      > /etc/systemd/system/angie.service.d/limits.conf
-    chmod 644 /etc/systemd/system/angie.service.d/limits.conf
-    systemctl daemon-reload || true
-    tune_note "Angie: systemd LimitNOFILE=524288"
+    printf '[Service]\nLimitNOFILE=524288\nUMask=0027\n' > "$angie_dropin"
+    chmod 644 "$angie_dropin"
+    if [[ $angie_before != "$(md5sum "$angie_dropin" | awk '{print $1}')" ]]; then
+      systemctl daemon-reload || true
+      tune_note "Angie: systemd LimitNOFILE=524288"
+    fi
   fi
   optimize_wordpress_cache /etc/angie || true
   if ! tune_angie_configs /etc/angie; then
@@ -4867,17 +4947,27 @@ optimize_angie() {
     opt_report "- **FAILED** tuning returned an error; configuration rolled back"
     return 1
   fi
-  if ! /usr/sbin/angie -t >/tmp/angie-optimize-test.log 2>&1; then
+  local angie_test_log
+  angie_test_log=$(mktemp)
+  if ! /usr/sbin/angie -t >"$angie_test_log" 2>&1; then
     opt_report "- **FAILED** \`angie -t\`:"
-    while IFS= read -r change; do opt_report "  \`${change}\`"; done < /tmp/angie-optimize-test.log
-    rm -f /tmp/angie-optimize-test.log
+    while IFS= read -r change; do opt_report "  \`${change}\`"; done < "$angie_test_log"
+    rm -f "$angie_test_log"
     opt_restore /etc/angie angie
     /usr/sbin/angie -t >/dev/null 2>&1 && systemctl restart angie 2>/dev/null || true
     return 1
   fi
-  rm -f /tmp/angie-optimize-test.log
+  rm -f "$angie_test_log"
   for change in "${TUNE_CHANGES[@]}"; do opt_report "- ${change}"; done
   for change in "${TUNE_MISSES[@]}"; do opt_report "- Not applied: ${change}"; done
+  local -a inert=()
+  mapfile -t inert < <(angie_inert_cache_files /etc/angie)
+  if (( ${#inert[@]} > 0 )); then
+    local inert_file
+    opt_report "- Warning: ${#inert[@]} cache/limit file(s) under http.d are not included by angie.conf:"
+    for inert_file in "${inert[@]}"; do opt_report "  \`${inert_file}\`"; done
+    opt_report "  Re-run the Angie config deployment (install or scripts/nginx_conf.sh) to activate the current file names."
+  fi
   if (( active )); then
     if (( TUNE_DIRTY == 0 )); then
       opt_report "- Restart: skipped (configuration already optimized)"
@@ -5410,6 +5500,22 @@ EOF
   return 0
 }
 
+# Valkey/Redis size values may be written as 8192mb, 8gb, 512kb or raw bytes.
+# Return whole MB so the memory plan and the live config agree.
+valkey_mb_from_config() {
+  local value=${1,,} n unit
+  [[ $value =~ ^([0-9]+)([a-z]*)$ ]] || { printf '0'; return 0; }
+  n=${BASH_REMATCH[1]}
+  unit=${BASH_REMATCH[2]}
+  case $unit in
+    gb|g) printf '%s' $(( n * 1024 )) ;;
+    mb|m) printf '%s' "$n" ;;
+    kb|k) printf '%s' $(( n / 1024 )) ;;
+    ""|b) printf '%s' $(( n / 1024 / 1024 )) ;;
+    *) printf '0' ;;
+  esac
+}
+
 optimize_valkey() {
   local kind=${1:-valkey}
   local label=Valkey conf=/etc/valkey/valkey.conf conf_dir=/etc/valkey
@@ -5437,6 +5543,21 @@ optimize_valkey() {
     (( max_mb > 8192 )) && max_mb=8192
   fi
   backlog=$(effective_backlog)
+  # A restart applies maxmemory immediately.  Lowering it below the data that
+  # is already stored mass-evicts the cache (and any sessions/jobs using it),
+  # so give the live working set 10% of headroom instead of following the
+  # hardware plan blindly.
+  local used_mb=0 needed_mb
+  if (( active )); then
+    used_mb=$("$cli" info memory 2>/dev/null \
+      | awk -F: '/^used_memory:/{gsub(/\r/, "", $2); print int($2 / 1048576)}')
+    [[ $used_mb =~ ^[0-9]+$ ]] || used_mb=0
+    needed_mb=$(( used_mb * 110 / 100 ))
+    if (( needed_mb > max_mb )); then
+      opt_report "- maxmemory raised to ${needed_mb}mb (in use=${used_mb}mb; refusing to evict live data)"
+      max_mb=$needed_mb
+    fi
+  fi
   policy=$(awk '/^[[:space:]]*maxmemory-policy[[:space:]]/{print $2; exit}' "$conf")
   [[ -n $policy ]] || policy=allkeys-lru
   # Preserve an explicit install-time io-threads value (the installer defaults
@@ -5520,6 +5641,52 @@ optimize_valkey() {
     fi
   else
     opt_report "- Restart: skipped (service was not active)"
+  fi
+  return 0
+}
+
+# Elasticsearch reads every *.options file in jvm.options.d in lexical order,
+# and the JVM keeps the last -Xms/-Xmx.  Older setup.sh releases wrote the heap
+# to jvm.options during install and to zz-setup-optimize.options during
+# --optimize, leaving two conflicting heap pairs behind (the 31 GB install
+# value and the optimized one).  Always own one file and remove the legacy one
+# when it is recognisably the file this script generated.
+readonly ES_JVM_OPTIONS="/etc/elasticsearch/jvm.options.d/zz-setup-optimize.options"
+
+es_jvm_options_is_managed() {
+  local file=$1 line count=0 xs=0 xx=0 other=0
+  [[ -f $file ]] || return 1
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    count=$(( count + 1 ))
+    case $line in
+      -Xms*m|-Xmx*m)
+        [[ $line == -Xms* ]] && xs=$(( xs + 1 )) || xx=$(( xx + 1 ))
+        ;;
+      -XX:+UseG1GC|-XX:MaxGCPauseMillis=200|-XX:+HeapDumpOnOutOfMemoryError|-Dlog4j2.formatMsgNoLookups=true) ;;
+      *) other=$(( other + 1 )) ;;
+    esac
+  done < "$file"
+  (( other == 0 && xs == 1 && xx == 1 && count >= 4 && count <= 6 ))
+}
+
+write_es_jvm_options() {
+  local heap_mb=$1 dir=${2:-/etc/elasticsearch/jvm.options.d}
+  local jvm="${dir}/zz-setup-optimize.options"
+  cat > "$jvm" <<EOF
+-Xms${heap_mb}m
+-Xmx${heap_mb}m
+-XX:+UseG1GC
+-XX:MaxGCPauseMillis=200
+-XX:+HeapDumpOnOutOfMemoryError
+-Dlog4j2.formatMsgNoLookups=true
+EOF
+  chmod 644 "$jvm"
+  chown root:elasticsearch "$jvm" 2>/dev/null || true
+  # Never delete an operator's own jvm.options; only the exact shape written
+  # by install_elastic() before 1.8.20.
+  if es_jvm_options_is_managed "${dir}/jvm.options"; then
+    rm -f "${dir}/jvm.options"
   fi
   return 0
 }
@@ -5622,9 +5789,10 @@ elasticsearch_fix_single_node_replicas() {
 
 optimize_elastic() {
   local active=0 yml=/etc/elasticsearch/elasticsearch.yml ram_mb heap_mb
-  local jvm=/etc/elasticsearch/jvm.options.d/zz-setup-optimize.options
+  local jvm=$ES_JVM_OPTIONS
+  local legacy=/etc/elasticsearch/jvm.options.d/jvm.options
   local unit=/etc/systemd/system/elasticsearch.service.d/optimize.conf
-  local es_before jvm_before unit_before es_after jvm_after unit_after changed=0
+  local es_before jvm_before legacy_before unit_before es_after jvm_after unit_after changed=0
   systemctl is-active --quiet elasticsearch 2>/dev/null && active=1
   opt_report "## Elasticsearch"
   opt_report "- Active: ${active}; config: \`${yml}\`"
@@ -5667,19 +5835,10 @@ optimize_elastic() {
 
   es_before=$([[ -f $yml ]] && md5sum "$yml" | awk '{print $1}' || echo absent)
   jvm_before=$([[ -f $jvm ]] && md5sum "$jvm" | awk '{print $1}' || echo absent)
+  legacy_before=$([[ -f $legacy ]] && md5sum "$legacy" | awk '{print $1}' || echo absent)
   unit_before=$([[ -f $unit ]] && md5sum "$unit" | awk '{print $1}' || echo absent)
 
-  mkdir -p /etc/elasticsearch/jvm.options.d
-  cat > "$jvm" <<EOF
--Xms${heap_mb}m
--Xmx${heap_mb}m
--XX:+UseG1GC
--XX:MaxGCPauseMillis=200
--XX:+HeapDumpOnOutOfMemoryError
--Dlog4j2.formatMsgNoLookups=true
-EOF
-  chmod 644 "$jvm"
-  chown root:elasticsearch "$jvm" 2>/dev/null || true
+  write_es_jvm_options "$heap_mb"
 
   # Drop a previous optimize block so repeated runs stay idempotent.
   awk -v b='# BEGIN setup.sh optimize' -v e='# END setup.sh optimize' '
@@ -5723,8 +5882,14 @@ EOF
   es_after=$([[ -f $yml ]] && md5sum "$yml" | awk '{print $1}' || echo absent)
   jvm_after=$([[ -f $jvm ]] && md5sum "$jvm" | awk '{print $1}' || echo absent)
   unit_after=$([[ -f $unit ]] && md5sum "$unit" | awk '{print $1}' || echo absent)
-  [[ $es_before != "$es_after" || $jvm_before != "$jvm_after" || $unit_before != "$unit_after" ]] \
-    && changed=1
+  [[ $es_before != "$es_after" || $jvm_before != "$jvm_after" \
+     || $unit_before != "$unit_after" ]] && changed=1
+  # Removing the legacy jvm.options file changes the effective heap without
+  # changing the managed file, so count it as a change too.
+  if [[ $legacy_before != "$([[ -f $legacy ]] && md5sum "$legacy" | awk '{print $1}' || echo absent)" ]]; then
+    changed=1
+    opt_report "- Removed legacy \`${legacy}\` (superseded by zz-setup-optimize.options)"
+  fi
   if (( changed )); then
     opt_report "- Heap=${heap_mb}m; bootstrap.memory_lock=true; performance block written"
   else
@@ -5949,7 +6114,7 @@ optimize_plan() {
     "$OPT_MEM_BUDGET_MB" "$OPT_MEM_TOTAL_MB" "$OPT_PHP_BUDGET_MB" \
     "$OPT_MARIADB_BUDGET_MB" "$OPT_VALKEY_BUDGET_MB" "$OPT_ES_BUDGET_MB"
   if [[ " ${OPT_DETECTED[*]} " == *" angie "* ]]; then
-    printf '  Angie: workers=auto connections=%s rlimit=%s keepalive=%s cache=%sMB\n' \
+    printf '  Angie: workers=auto connections=%s rlimit=%s keepalive=%s cache_budget=%sMB\n' \
       "$(tune_clamp $(( nproc * 2048 )) 8192 65535)" \
       "$(tune_clamp $(( nproc * 8192 )) 65536 524288)" \
       "$(tune_clamp $(( nproc * 2 )) 16 128)" \
@@ -6031,13 +6196,21 @@ run_optimize() {
   OPT_REPORT_STARTED=1
   OPT_START_TS=$(date -Is)
   OPT_BACKUP_DIR="/var/backups/setup-optimize-$(date +%Y%m%d-%H%M%S)"
-  mkdir -p "$OPT_BACKUP_DIR"
+  install -d -m 700 "$OPT_BACKUP_DIR"
   # Keep the ten newest rollback points; these directories contain full copies
   # of /etc/angie, /etc/php/<ver> and /etc/mysql and can grow quickly.
   local old_backup
   while IFS= read -r old_backup; do
     [[ -n $old_backup && $old_backup != "$OPT_BACKUP_DIR" ]] && rm -rf -- "$old_backup"
   done < <(ls -1dt /var/backups/setup-optimize-* 2>/dev/null | tail -n +11)
+  # Reports are tiny but accumulate one file per run; keep the twenty newest
+  # alongside the always-current -latest.md copy.
+  local old_report
+  while IFS= read -r old_report; do
+    [[ -n $old_report ]] && rm -f -- "$old_report"
+  done < <(find /var/log -maxdepth 1 -type f -name 'setup-optimize-*.md' \
+             ! -name 'setup-optimize-latest.md' -printf '%T@ %p\n' 2>/dev/null \
+             | sort -rn | cut -d' ' -f2- | tail -n +21)
   OPT_REPORT=()
   detect_installed_services
   plan_memory_budget
@@ -6093,7 +6266,7 @@ run_optimize() {
   OPT_REPORT_WRITTEN=1
   printf '\n%sOptimization report: %s%s\n' "$C_BOLD" "$report" "$C_RESET"
   printf '%s\n' "--- report ---"
-  cat "$report"
+  [[ -n $report && -r $report ]] && cat "$report"
   if (( rc == 0 )); then
     ok "All detected services are optimized and running"
   else
