@@ -31,6 +31,14 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.5
+
+- **`--optimize` no longer shrinks an existing larger MariaDB buffer pool.**
+  Automatic sizing still targets at most 32 GB, but when the live pool is
+  larger and fits within 50% of RAM and the shared service budget, the
+  existing size is kept. This prevents a large-memory host with a
+  deliberately sized pool from being reduced on every optimize run.
+
 ## What's new in 1.8.4
 
 - **`--optimize` enables a WordPress guest FastCGI cache automatically.** It
@@ -816,7 +824,9 @@ bash setup.sh --optimize --dry-run
 It applies the same hardware-aware values used by a normal install: Angie
 workers/connections/buffers/cache sizes, PHP-FPM `static` pool sizing, MariaDB
 buffer pool/connection backlog, Valkey/Redis maxmemory, and Elasticsearch
-heap. PHP listeners are preserved: Angie is repointed only when the pool
+heap. An existing MariaDB buffer pool larger than the automatic 32 GB target
+is preserved (up to 50% of RAM and the shared budget) instead of being
+shrunk. PHP listeners are preserved: Angie is repointed only when the pool
 already owns a Unix socket, so a live TCP pool is never broken by a
 configuration change. Service allocations
 are planned together from one 80%-of-RAM budget, with PHP worker capacity
