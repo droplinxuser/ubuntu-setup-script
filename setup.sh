@@ -6056,6 +6056,10 @@ run_optimize() {
     opt_report "No supported installed services detected."
     local report
     report=$(write_optimize_report)
+    # write_optimize_report runs in a command substitution (subshell), so its
+    # OPT_REPORT_WRITTEN flag does not reach this shell.  Set it here so the
+    # EXIT trap does not write a duplicate partial report.
+    OPT_REPORT_WRITTEN=1
     info "Report: ${report}"
     return 0
   fi
@@ -6086,6 +6090,7 @@ run_optimize() {
 
   local report
   report=$(write_optimize_report)
+  OPT_REPORT_WRITTEN=1
   printf '\n%sOptimization report: %s%s\n' "$C_BOLD" "$report" "$C_RESET"
   printf '%s\n' "--- report ---"
   cat "$report"
