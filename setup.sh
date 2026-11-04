@@ -27,7 +27,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.6.10"
+readonly SCRIPT_VERSION="1.6.11"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
@@ -1862,10 +1862,10 @@ tune_angie_configs() {
       [[ -n $file ]] || continue
       local before after
       before=$(md5sum "$file" | awk '{print $1}')
-      sed -i -E 's#fastcgi_pass[[:space:]]+(127\.0\.0\.1|localhost):9000;#fastcgi_pass unix:/run/php/php-fpm.sock;#g' "$file"
+      sed -i -E 's#^([[:space:]]*fastcgi_pass[[:space:]]+)(127\.0\.0\.1|localhost):9000;#\1unix:/run/php/php-fpm.sock;#g' "$file"
       after=$(md5sum "$file" | awk '{print $1}')
       [[ $before != "$after" ]] && tune_note "${file#${target}/}: fastcgi_pass -> unix:/run/php/php-fpm.sock"
-    done < <(grep -rlE 'fastcgi_pass[[:space:]]+(127\.0\.0\.1|localhost):9000;' "$target" 2>/dev/null || true)
+    done < <(grep -rlE '^[[:space:]]*fastcgi_pass[[:space:]]+(127\.0\.0\.1|localhost):9000;' "$target" 2>/dev/null || true)
 
     tune_replace "$nginx_conf" \
       '^([[:space:]]*server[[:space:]]+)(127\.0\.0\.1|localhost):9000;' \
@@ -1988,6 +1988,11 @@ tune_php_fpm_version() {
   tune_pool_set "$pool" pm.max_children "$max_children" "PHP ${ver}: max_children=${max_children}"
   tune_pool_set "$pool" pm.max_requests "$max_requests" "PHP ${ver}: max_requests=${max_requests}"
   tune_pool_set "$pool" listen "$socket" "PHP ${ver}: listen=${socket}"
+  # listen.allowed_clients is meaningless (and noisy) for a Unix socket.
+  if [[ $socket == /* ]] && grep -qE '^[[:space:]]*listen\.allowed_clients[[:space:]]*=' "$pool"; then
+    sed -i -E '/^[[:space:]]*listen\.allowed_clients[[:space:]]*=/d' "$pool"
+    tune_note "PHP ${ver}: removed listen.allowed_clients (Unix socket)"
+  fi
   tune_pool_set "$pool" listen.backlog 65535 "PHP ${ver}: listen.backlog=65535"
   tune_pool_set "$pool" listen.owner www-data "PHP ${ver}: listen.owner=www-data"
   tune_pool_set "$pool" listen.group www-data "PHP ${ver}: listen.group=www-data"
