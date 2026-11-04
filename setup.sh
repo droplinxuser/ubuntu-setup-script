@@ -31,7 +31,26 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.25"
+readonly SCRIPT_VERSION="1.8.26"
+# Congestion control and qdisc for the OS profile.  BBR is a good default on
+# lossy long-haul links, but it can regress a busy reverse proxy badly (a
+# 40% throughput drop was measured on one host).  Operators can pin a host
+# with SETUP_TCP_CC / SETUP_QDISC or /etc/default/setup-tuning:
+#   TCP_CC="cubic"
+#   QDISC="fq_codel"
+TCP_CC=bbr
+QDISC=fq
+if [[ -r /etc/default/setup-tuning ]]; then
+  # shellcheck disable=SC1091
+  . /etc/default/setup-tuning
+  TCP_CC="${TCP_CC:-bbr}"
+  QDISC="${QDISC:-fq}"
+fi
+# The environment wins over the host file so a one-off run can be tested.
+TCP_CC="${SETUP_TCP_CC:-$TCP_CC}"
+QDISC="${SETUP_QDISC:-$QDISC}"
+[[ $TCP_CC =~ ^[a-z0-9_]+$ ]] || TCP_CC=bbr
+[[ $QDISC =~ ^[a-z0-9_]+$ ]] || QDISC=fq
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
@@ -1729,51 +1748,66 @@ EOF
   # boot; otherwise every boot logs "No such file or directory" for bbr/fq/
   # conntrack even though the values are applied later.
   mkdir -p /etc/modules-load.d
-  printf 'tcp_bbr\nsch_fq\nnf_conntrack\n' > /etc/modules-load.d/setup-network.conf
+  local -a net_mods=(nf_conntrack)
+  [[ $QDISC == fq ]] && net_mods+=(sch_fq)
+  [[ $TCP_CC == bbr ]] && net_mods+=(tcp_bbr)
+  printf '%s\n' "${net_mods[@]}" > /etc/modules-load.d/setup-network.conf
   chmod 644 /etc/modules-load.d/setup-network.conf
   rm -f /etc/modules-load.d/setup-conntrack.conf
-  modprobe tcp_bbr || warn "Could not load tcp_bbr (kernel may not provide it)"
-  modprobe sch_fq || warn "Could not load sch_fq (kernel may not provide it)"
-  modprobe nf_conntrack || warn "Could not load nf_conntrack; conntrack sysctls may be skipped"
+  local mod
+  for mod in "${net_mods[@]}"; do
+    modprobe "$mod" || warn "Could not load ${mod} (kernel may not provide it)"
+  done
 
-  # Keep fq as the default qdisc even when systemd-sysctl runs again (a
-  # package upgrade restarts it, and /usr/lib/sysctl.d/55-bufferbloat.conf
-  # would otherwise put fq_codel back).  This drop-in has no dependency on
-  # tcp_bbr, so it is safe to apply before modules-load.  BBR itself stays in
-  # the oneshot unit below, which runs after the modules are available.
+  # Keep the selected qdisc even when systemd-sysctl runs again (a package
+  # upgrade restarts it, and /usr/lib/sysctl.d/55-bufferbloat.conf would
+  # otherwise put fq_codel back).  This drop-in has no dependency on a
+  # congestion-control module, so it is safe to apply before modules-load.
+  # The congestion control stays in the oneshot unit below, which runs after
+  # the modules are available.
   record_original /etc/sysctl.d/90-setup-network.conf sysctl.d-90-setup-network.conf
-  cat > /etc/sysctl.d/90-setup-network.conf <<'EOF'
-# Managed by setup.sh: keep the fq qdisc after systemd-sysctl re-runs.
-# tcp_congestion_control=bbr is applied by setup-network-tuning.service once
-# the tcp_bbr module is loaded.
-net.core.default_qdisc = fq
+  cat > /etc/sysctl.d/90-setup-network.conf <<EOF
+# Managed by setup.sh: keep the ${QDISC} qdisc after systemd-sysctl re-runs.
+# tcp_congestion_control=${TCP_CC} is applied by setup-network-tuning.service
+# once the required modules are loaded.
+net.core.default_qdisc = ${QDISC}
 EOF
   chmod 644 /etc/sysctl.d/90-setup-network.conf
-  sysctl -w net.core.default_qdisc=fq >/dev/null 2>&1 \
-    || warn "Could not set net.core.default_qdisc=fq"
+  sysctl -w "net.core.default_qdisc=${QDISC}" >/dev/null 2>&1 \
+    || warn "Could not set net.core.default_qdisc=${QDISC}"
 
   sysctl -e -p /etc/sysctl.conf || warn "One or more sysctl values could not be applied"
 
-  # BBR/fq are module-owned and systemd-sysctl runs before modules-load on
-  # Ubuntu, which logs "No such file or directory" on every boot. Apply them
-  # from a small oneshot unit after the modules are available instead.
-  cat > /etc/systemd/system/setup-network-tuning.service <<'EOF'
+  # The congestion-control module and qdisc are module-owned and
+  # systemd-sysctl runs before modules-load on Ubuntu, which logs "No such
+  # file or directory" on every boot. Apply them from a small oneshot unit
+  # after the modules are available instead.
+  {
+    cat <<'EOF'
 [Unit]
-Description=Apply BBR/fq network tuning after kernel modules load
+Description=Apply network qdisc/congestion-control tuning after kernel modules load
 After=systemd-modules-load.service
 [Service]
 Type=oneshot
-ExecStart=/sbin/modprobe tcp_bbr
-ExecStart=/sbin/modprobe sch_fq
-ExecStart=/sbin/sysctl -w net.core.default_qdisc=fq net.ipv4.tcp_congestion_control=bbr
+EOF
+    for mod in "${net_mods[@]}"; do
+      printf 'ExecStart=/sbin/modprobe %s\n' "$mod"
+    done
+    printf 'ExecStart=/sbin/sysctl -w net.core.default_qdisc=%s net.ipv4.tcp_congestion_control=%s\n' \
+      "$QDISC" "$TCP_CC"
+    cat <<'EOF'
 RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
+  } > /etc/systemd/system/setup-network-tuning.service
   chmod 644 /etc/systemd/system/setup-network-tuning.service
   systemctl daemon-reload || true
   systemctl enable setup-network-tuning.service >/dev/null 2>&1 || true
-  systemctl start setup-network-tuning.service || warn "Could not apply BBR/fq tuning"
+  # restart (not start): the oneshot stays "active" from a previous run, and a
+  # start would not re-apply a changed qdisc/congestion-control value.
+  systemctl restart setup-network-tuning.service \
+    || warn "Could not apply ${TCP_CC}/${QDISC} tuning"
 }
 
 configure_limits() {
