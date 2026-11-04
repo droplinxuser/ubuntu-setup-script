@@ -31,12 +31,18 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.14
+
+- **One command for the whole host: `--optimize`.** The operating-system
+  layer (CPU governor, PAM limits, hardware-scaled kernel/network/memory
+  sysctls) is now applied by `--optimize` together with Angie, PHP-FPM,
+  MariaDB, Valkey/Redis and Elasticsearch. Existing servers get the complete
+  treatment with `sudo bash setup.sh --optimize`. `--auto-tune` is retained
+  as a silent backward-compatible alias, and the separate
+  `tools/auto-tune.sh` wrapper was removed.
+
 ## What's new in 1.8.13
 
-- **`--auto-tune` (and `tools/auto-tune.sh`) tunes the whole host.** It runs
-  the OS layer (CPU governor, PAM limits, hardware-scaled kernel/network/memory
-  sysctls) and then every detected service, in one idempotent pass. Use it on
-  an existing server; `--optimize` remains the service-only variant.
 - **MariaDB keeps a hardware-scaled buffer-pool floor.** A freshly installed
   database with a few MB of data no longer collapses a 128 GB host to a 256 MB
   pool; the floor is 1/16 of RAM, capped at 8 GB, and still bounded by the
@@ -892,14 +898,17 @@ sudo bash setup.sh --domain node.example.com app=node
 ## Optimize an existing server (Ubuntu 22.04, 24.04 or 26.04)
 
 ```bash
-# Detect installed services and tune them in place
+# Tune the OS and every installed service in place
 sudo bash setup.sh --optimize
 
 # Show what would be detected and changed, without touching anything
 bash setup.sh --optimize --dry-run
 ```
 
-`--optimize` never installs, purges or starts a missing service. It looks for:
+`--optimize` never installs, purges or starts a managed service. The only
+package it may add is the small `cpufrequtils` helper when the CPU exposes
+frequency scaling. It applies the OS profile first (CPU governor, PAM limits,
+hardware-scaled kernel/network/memory sysctls) and then looks for:
 
 - `angie` + `/etc/angie/angie.conf`
 - every `/etc/php/<version>/fpm` tree
@@ -907,7 +916,14 @@ bash setup.sh --optimize --dry-run
 - Valkey + `/etc/valkey/valkey.conf`, or Redis + `/etc/redis/redis.conf`
 - Elasticsearch + `/etc/elasticsearch/elasticsearch.yml`
 
-It applies the same hardware-aware values used by a normal install: Angie
+The OS profile is the same one used by a fresh `--basic` install: performance
+CPU governor (when the host exposes cpufreq), the 1M-nofile PAM limits, and
+the hardware-scaled sysctl set (socket buffers, backlogs, conntrack, file
+descriptors, `vm.min_free_kbytes`, BBR/fq). It is idempotent and safe to run
+on a live server.
+
+It then applies the same hardware-aware service values used by a normal
+install: Angie
 workers/connections/buffers/cache sizes, PHP-FPM `static` pool sizing, MariaDB
 buffer pool/connection backlog, Valkey/Redis maxmemory, and Elasticsearch
 heap. It also applies the installer's systemd `LimitNOFILE` drop-ins for
@@ -942,27 +958,8 @@ lists recent error-level journal entries. The Markdown report is written to
 `/var/log/setup-optimize-<timestamp>.md` and copied to
 `/var/log/setup-optimize-latest.md`.
 
-### Full host auto-tune (OS + services)
-
-`--optimize` intentionally leaves the operating system alone. To apply the
-install-time OS profile as well — CPU governor, PAM limits, and the
-hardware-scaled kernel/network/memory sysctls — use the full auto-tune mode:
-
-```bash
-# Everything: OS + Angie + PHP-FPM + MariaDB + Valkey/Redis + Elasticsearch
-sudo bash setup.sh --auto-tune
-
-# Equivalent convenience wrapper
-sudo bash tools/auto-tune.sh
-
-# Preview without changing anything
-bash setup.sh --auto-tune --dry-run
-```
-
-`--auto-tune` is safe on an existing server: it never installs, purges or
-starts a missing service, restarts a service only when its configuration
-actually changed, and writes the same report/backup set as `--optimize`.
-Use `--optimize` when you deliberately want service-only changes.
+`--auto-tune` is accepted as a silent alias for older runbooks; new
+deployments should use `--optimize`.
 
 
 Older Angie installs whose `http.d` files use underscore names

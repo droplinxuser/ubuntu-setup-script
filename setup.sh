@@ -31,7 +31,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.13"
+readonly SCRIPT_VERSION="1.8.14"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
@@ -123,7 +123,6 @@ OTHERS=()
 DOMAINS=()
 PURGE=0
 OPTIMIZE=0
-OS_TUNE=0
 DRY_RUN=0
 PURGE_TARGETS=()
 PURGE_ORDER=()
@@ -197,10 +196,13 @@ Domain setup (standalone; Angie + MariaDB must already be installed/running):
 
 Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
   --optimize [--dry-run]
-      Detects installed services (Angie, PHP-FPM, MariaDB, Valkey or
-      Redis, Elasticsearch) and tunes their live configuration for the current
-      CPU/RAM/disk.  It never installs, purges or starts a service that was
-      not already running.  Allocations are planned together from one
+      One command for the whole host.  It applies the hardware-aware OS
+      profile (CPU governor, PAM security limits, kernel/network/memory
+      sysctls) and then tunes every installed service (Angie, PHP-FPM,
+      MariaDB, Valkey or Redis, Elasticsearch) for the current CPU/RAM/disk.
+      It never installs, purges or starts a managed service; the only package
+      it may add is the small cpufrequtils helper when the CPU exposes
+      frequency scaling.  Allocations are planned together from one
       80%-of-RAM budget, and a service is restarted only when its generated
       configuration actually changed.  Existing PHP-FPM listeners are kept;
       when a pool already listens on a Unix socket, Angie's fastcgi_pass is
@@ -209,17 +211,8 @@ Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
       Configuration files are backed up under /var/backups/setup-optimize-*
       and a Markdown report is written to /var/log/setup-optimize-*.md.
       Existing application vhosts and credentials are preserved.
-      --dry-run only prints the detected services and planned values.
-
-Auto-tune mode (Ubuntu 22.04, 24.04 or 26.04):
-  --auto-tune [--dry-run]
-      Runs the full hardware-aware tuning pass: the operating-system layer
-      (CPU governor, security limits, kernel/network/memory sysctls) plus
-      every detected service (Angie, PHP-FPM, MariaDB, Valkey/Redis,
-      Elasticsearch).  This is safe to run repeatedly and never installs,
-      purges or starts a service that was not already present.  It is the
-      recommended entry point for an existing server; use --optimize when
-      only the service configuration should be touched.
+      --dry-run only prints the planned OS and service values.
+      --auto-tune is accepted as a backward-compatible alias.
 
 Purge (uninstall) mode:
   --purge [all|basic|angie|php|mariadb|valkey|elastic|others]
@@ -393,7 +386,8 @@ parse_args() {
       --optimize)
         OPTIMIZE=1; shift ;;
       --auto-tune)
-        OPTIMIZE=1; OS_TUNE=1; shift ;;
+        # Backward-compatible alias: --optimize now performs the OS tuning too.
+        OPTIMIZE=1; shift ;;
       --purge)
         PURGE=1; shift
         while (( $# )) && [[ $1 != --* ]]; do
@@ -5510,10 +5504,8 @@ optimize_plan() {
   printf '\n%sDRY RUN%s - optimize scan only, no changes will be made.\n' "$C_BOLD" "$C_RESET"
   printf 'Host: %s  %s CPU  %s MB RAM  %s\n' "$(hostname 2>/dev/null || echo unknown)" \
     "$nproc" "$ram_mb" "$(df -h / | awk 'NR==2{print $4 " free"}')"
-  if (( OS_TUNE )); then
-    printf '  OS: governor=performance limits=1M-nofile sysctl=hardware-scaled (%s CPUs / %sMB RAM)\n' \
-      "$nproc" "$ram_mb"
-  fi
+  printf '  OS: governor=performance limits=1M-nofile sysctl=hardware-scaled (%s CPUs / %sMB RAM)\n' \
+    "$nproc" "$ram_mb"
   if (( ${#OPT_DETECTED[@]} == 0 )); then
     printf 'No supported installed services detected.\n'
     return 0
@@ -5611,11 +5603,9 @@ run_optimize() {
   OPT_REPORT=()
   detect_installed_services
   plan_memory_budget
-  if (( OS_TUNE )); then
-    run_os_tuning
-    opt_report "## Operating system"
-    opt_report "- CPU governor, PAM limits and kernel/network/memory sysctls tuned for ${OPT_MEM_TOTAL_MB}MB RAM / $(nproc) CPUs"
-  fi
+  run_os_tuning
+  opt_report "## Operating system"
+  opt_report "- CPU governor, PAM limits and kernel/network/memory sysctls tuned for ${OPT_MEM_TOTAL_MB}MB RAM / $(nproc) CPUs"
   step "Optimizing installed services"
   if (( ${#OPT_DETECTED[@]} == 0 )); then
     info "No supported installed services detected (Angie, PHP-FPM, MariaDB, Valkey/Redis, Elasticsearch)"
