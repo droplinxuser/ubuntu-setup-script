@@ -75,6 +75,13 @@ run fail --dry-run --optimize --angie
 run fail --dry-run --optimize --purge
 run fail --dry-run --optimize --domain example.com
 
+# Full auto-tune mode (OS + every installed service).
+run ok   --dry-run --auto-tune
+run ok   --auto-tune --dry-run
+run fail --dry-run --auto-tune --basic
+run fail --dry-run --auto-tune --purge
+run fail --dry-run --auto-tune --domain example.com
+
 # Purge modes and bare names.
 run ok   --dry-run --purge
 run ok   --dry-run --purge all

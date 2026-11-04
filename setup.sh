@@ -31,7 +31,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.12"
+readonly SCRIPT_VERSION="1.8.13"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
@@ -123,6 +123,7 @@ OTHERS=()
 DOMAINS=()
 PURGE=0
 OPTIMIZE=0
+OS_TUNE=0
 DRY_RUN=0
 PURGE_TARGETS=()
 PURGE_ORDER=()
@@ -209,6 +210,16 @@ Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
       and a Markdown report is written to /var/log/setup-optimize-*.md.
       Existing application vhosts and credentials are preserved.
       --dry-run only prints the detected services and planned values.
+
+Auto-tune mode (Ubuntu 22.04, 24.04 or 26.04):
+  --auto-tune [--dry-run]
+      Runs the full hardware-aware tuning pass: the operating-system layer
+      (CPU governor, security limits, kernel/network/memory sysctls) plus
+      every detected service (Angie, PHP-FPM, MariaDB, Valkey/Redis,
+      Elasticsearch).  This is safe to run repeatedly and never installs,
+      purges or starts a service that was not already present.  It is the
+      recommended entry point for an existing server; use --optimize when
+      only the service configuration should be touched.
 
 Purge (uninstall) mode:
   --purge [all|basic|angie|php|mariadb|valkey|elastic|others]
@@ -381,6 +392,8 @@ parse_args() {
         ;;
       --optimize)
         OPTIMIZE=1; shift ;;
+      --auto-tune)
+        OPTIMIZE=1; OS_TUNE=1; shift ;;
       --purge)
         PURGE=1; shift
         while (( $# )) && [[ $1 != --* ]]; do
@@ -1892,6 +1905,40 @@ tune_insert_after() {
   rm -f "$tmp"
 }
 
+# A cached 500 (or a stale 500 served by fastcgi_cache_use_stale) hides a
+# recovered application and makes the error look permanent.  Older installs
+# carry the original policy; --optimize upgrades them in place so an existing
+# server gets the fix without a full reinstall.
+tune_cache_error_policy() {
+  local file=$1 label=$2 before after tmp
+  [[ -f $file ]] || return 0
+  before=$(md5sum "$file" | awk '{print $1}')
+  sed -i -E '/^[[:space:]]*fastcgi_cache_use_stale/ s/[[:space:]]+http_500([[:space:]]|;)/\1/g' "$file"
+  if ! grep -qE '^[[:space:]]*fastcgi_cache_valid[[:space:]]+500([[:space:]]+[0-9]+)+[[:space:]]+0s;' "$file"; then
+    tmp=$(mktemp)
+    if grep -qE '^[[:space:]]*fastcgi_cache_valid[[:space:]]+any[[:space:]]' "$file"; then
+      awk '
+        /^[[:space:]]*fastcgi_cache_valid[[:space:]]+any[[:space:]]/ && !done {
+          print
+          print "fastcgi_cache_valid 500 502 503 504 0s;"
+          done = 1
+          next
+        }
+        { print }
+      ' "$file" > "$tmp"
+    else
+      cat "$file" > "$tmp"
+      printf '\nfastcgi_cache_valid 500 502 503 504 0s;\n' >> "$tmp"
+    fi
+    cat "$tmp" > "$file"
+    rm -f "$tmp"
+  fi
+  after=$(md5sum "$file" | awk '{print $1}')
+  [[ $before != "$after" ]] \
+    && tune_note "${label}: never cache error responses; stale 500 disabled"
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # Angie
 # ---------------------------------------------------------------------------
@@ -2223,6 +2270,9 @@ tune_angie_configs() {
     tune_replace "$php_conf" '^([[:space:]]*fastcgi_busy_buffers_size[[:space:]]+).*;' "\\1${fastcgi_busy};" "${php_conf#"${target}"/}: fastcgi_busy_buffers_size=${fastcgi_busy}"
   done
 
+  tune_cache_error_policy "$target/h5bp/wordpress_cache.conf" "h5bp/wordpress_cache.conf"
+  tune_cache_error_policy "$target/h5bp/php_xf.conf" "h5bp/php_xf.conf"
+
   tune_summary "angie summary: ${nproc} CPU / ${mem_mb}MB RAM / ${disk_class} / cache=${cache_total_mb}MB"
   return 0
 }
@@ -2350,6 +2400,7 @@ tune_php_fpm_version() {
   tune_pool_set "$pool" listen.group www-data "PHP ${ver}: listen.group=www-data"
   tune_pool_set "$pool" listen.mode 0660 "PHP ${ver}: listen.mode=0660"
   tune_pool_set "$pool" request_terminate_timeout 300s "PHP ${ver}: request_terminate_timeout=300s"
+  tune_pool_set "$pool" request_slowlog_timeout 10s "PHP ${ver}: request_slowlog_timeout=10s"
   tune_pool_set "$pool" catch_workers_output yes "PHP ${ver}: catch_workers_output=yes"
   tune_pool_set "$pool" security.limit_extensions .php "PHP ${ver}: security.limit_extensions=.php"
   tune_pool_set "$pool" rlimit_files 524288 "PHP ${ver}: rlimit_files=524288"
@@ -3122,10 +3173,12 @@ install_elastic() {
     es_url="http://${host}:9200"
   fi
 
-  # Remove previous managed block.
+  # Remove previous managed block, including the one written by
+  # `setup.sh --optimize`; otherwise a reinstall leaves two copies of
+  # bootstrap.memory_lock and Elasticsearch refuses to start.
   awk -v b="$ES_BEGIN" -v e="$ES_END" '
-    $0 == b { skip = 1; next }
-    $0 == e { skip = 0; next }
+    $0 == b || $0 == "# BEGIN setup.sh optimize" { skip = 1; next }
+    $0 == e || $0 == "# END setup.sh optimize" { skip = 0; next }
     !skip { print }
   ' "$yml" > "${yml}.new"
   mv "${yml}.new" "$yml"
@@ -3133,7 +3186,7 @@ install_elastic() {
   # Comment out keys that we are about to set (keeps YAML free of duplicates).
   local key
   for key in cluster.name network.host http.host transport.host http.port \
-             path.logs path.data \
+             path.logs path.data bootstrap.memory_lock \
              indices.query.bool.max_clause_count discovery.type \
              xpack.security.enabled xpack.security.enrollment.enabled \
              cluster.initial_master_nodes indices.memory.index_buffer_size \
@@ -3408,13 +3461,28 @@ create_domains() {
   command -v openssl >/dev/null 2>&1 || apt_install openssl
   ensure_log_dirs
 
-  local d db dir conf app certdir src tmp changed=0
+  local d db dir conf app certdir src tmp changed=0 pv
   for d in "${DOMAINS[@]}"; do
     app=${DOMAIN_APP[$d]:-blank}
     db=$(domain_to_db "$d")
     dir="/var/www/${d}/public"
     conf="/etc/angie/conf.d/${d}.conf"
     certdir="/etc/angie/ssl/${d}"
+
+    # Imagick is required by Chevereto, but it is not part of the
+    # XenForo/WordPress default PHP profile.  Install it only when a
+    # Chevereto vhost is explicitly requested (including an existing one).
+    if [[ $app == chevereto ]] && ! php -m 2>/dev/null | grep -qix imagick; then
+      pv=$(php -r 'echo PHP_MAJOR_VERSION, ".", PHP_MINOR_VERSION;' 2>/dev/null || true)
+      if [[ -n $pv ]]; then
+        info "Chevereto requires Imagick; installing php${pv}-imagick (Chevereto only)"
+        apt_install "php${pv}-imagick" \
+          || warn "Could not install php${pv}-imagick; Chevereto may fail its image checks"
+        systemctl restart "php${pv}-fpm" 2>/dev/null || true
+      else
+        warn "Chevereto requires the PHP Imagick extension, but the PHP version could not be detected"
+      fi
+    fi
 
     mkdir -p "$dir" "${LOG_ROOT}/angie"
     chown -R www-data:www-data "/var/www/${d}"
@@ -3835,7 +3903,13 @@ purge_mariadb() {
 purge_valkey() {
   step "Purge Valkey"
   purge_service_stop valkey-server
+  # The installer adds www-data to the valkey group; drop the membership
+  # first so userdel/groupdel can remove the service account cleanly.
+  if getent group valkey >/dev/null 2>&1; then
+    gpasswd -d www-data valkey >/dev/null 2>&1 || true
+  fi
   apt_purge_pattern 'valkey-*'
+  groupdel valkey >/dev/null 2>&1 || true
   rm -rf /etc/valkey /var/lib/valkey /var/log/valkey /run/valkey
   rm -rf "${LOG_ROOT}/valkey"
   rm -rf /etc/systemd/system/valkey-server.service.d
@@ -4315,9 +4389,18 @@ plan_memory_budget() {
 
     # Size to the live working set plus 5% headroom.  Fall back to 40% of
     # RAM only when the data size cannot be measured (for example a stopped
-    # server); never allocate a large pool for a small database.
+    # server).  Keep a hardware-scaled floor as well: a freshly installed
+    # database can be only a few MB, but collapsing a 128 GB host to a 256 MB
+    # buffer pool makes the next traffic spike hit disk for every page.  The
+    # floor is 1/16 of RAM, capped at 8 GB, so small hosts stay conservative.
+    local db_floor
+    db_floor=$(( total / 16 ))
+    (( db_floor > 8192 )) && db_floor=8192
+    (( db_floor < 256 )) && db_floor=256
+    (( db_floor > db_cap )) && db_floor=$db_cap
     if (( db_size_mb > 0 )); then
       OPT_MARIADB_BUDGET_MB=$(( db_size_mb * 105 / 100 ))
+      (( OPT_MARIADB_BUDGET_MB < db_floor )) && OPT_MARIADB_BUDGET_MB=$db_floor
     else
       local db_fallback_pct=40
       if (( !has_php && !has_cache && !has_es )); then
@@ -4471,9 +4554,9 @@ optimize_wordpress_cache() {
   mapfile -t wp_vhosts < <(angie_wordpress_vhosts "$target")
   (( ${#wp_vhosts[@]} > 0 )) || return 0
 
-  local -a active=()
-  mapfile -t active < <(angie_active_http_files "$target")
-  if (( ${#active[@]} == 0 )); then
+  local -a wp_active=()
+  mapfile -t wp_active < <(angie_active_http_files "$target")
+  if (( ${#wp_active[@]} == 0 )); then
     tune_miss "WordPress cache: no active http.d include pattern"
     return 0
   fi
@@ -4487,10 +4570,10 @@ optimize_wordpress_cache() {
   fi
 
   local suffix=".conf" file active_zone=0 active_map=0
-  for file in "${active[@]}"; do
+  for file in "${wp_active[@]}"; do
     case "$file" in *_conf) suffix="_conf"; break ;; esac
   done
-  for file in "${active[@]}"; do
+  for file in "${wp_active[@]}"; do
     grep -qE 'fastcgi_cache_path.*keys_zone=fastcgicache:' "$file" && active_zone=1
     grep -qE 'map[[:space:]].*\$skip_cache' "$file" && active_map=1
   done
@@ -4568,6 +4651,17 @@ optimize_angie() {
   opt_report "- Version: \`${version:-unknown}\`; active: ${active}"
   opt_backup /etc/angie angie
   tune_reset_changes
+  # Match the installer's systemd fd/log-umask limits on old servers too.
+  local angie_limit
+  angie_limit=$(systemctl show -p LimitNOFILE --value angie 2>/dev/null || true)
+  if ! [[ $angie_limit =~ ^[0-9]+$ ]] || (( angie_limit < 524288 )); then
+    mkdir -p /etc/systemd/system/angie.service.d
+    printf '[Service]\nLimitNOFILE=524288\nUMask=0027\n' \
+      > /etc/systemd/system/angie.service.d/limits.conf
+    chmod 644 /etc/systemd/system/angie.service.d/limits.conf
+    systemctl daemon-reload || true
+    tune_note "Angie: systemd LimitNOFILE=524288"
+  fi
   optimize_wordpress_cache /etc/angie || true
   if ! tune_angie_configs /etc/angie; then
     opt_restore /etc/angie angie
@@ -4623,6 +4717,24 @@ optimize_php_services() {
     opt_report "- Active: ${active}; listen kept: \`${listen_path:-unknown}\`"
     opt_backup "/etc/php/${ver}" "php-${ver}"
     tune_reset_changes
+    # Keep the systemd fd/core limits in sync with the installer; an old
+    # server may still be capped at the package default (1024 fds) while the
+    # pool asks for 524288.
+    local limits_src="${SCRIPT_DIR}/configs/php/php-fpm-limits.conf"
+    local limits_dst="/etc/systemd/system/php${ver}-fpm.service.d/limits.conf"
+    local limits_before=""
+    [[ -f $limits_dst ]] && limits_before=$(md5sum "$limits_dst" | awk '{print $1}')
+    mkdir -p "$(dirname "$limits_dst")"
+    if [[ -f $limits_src ]]; then
+      install -m 644 "$limits_src" "$limits_dst"
+    else
+      printf '[Service]\nLimitNOFILE=524288\nLimitCORE=0\nUMask=0027\n' > "$limits_dst"
+      chmod 644 "$limits_dst"
+    fi
+    if [[ $limits_before != "$(md5sum "$limits_dst" | awk '{print $1}')" ]]; then
+      systemctl daemon-reload || true
+      tune_note "PHP ${ver}: systemd LimitNOFILE=524288"
+    fi
     if ! tune_php_fpm_version "$ver"; then
       opt_restore "/etc/php/${ver}" "php-${ver}"
       opt_report "- **FAILED** PHP-FPM configuration test; rolled back"
@@ -4684,7 +4796,7 @@ mariadb_server_version() {
 optimize_mariadb() {
   local active=0 ver major minor size_mb buffer logsize open_cache aria_mb
   local threads max_conn io_read io_write cnf_dir cnf backlog cnf_before cnf_after
-  local current_max=""
+  local current_max="" unit_changed=0
   systemctl is-active --quiet mariadb 2>/dev/null && active=1
   ver=$(mariadb_server_version)
   opt_report "## MariaDB"
@@ -4740,6 +4852,25 @@ optimize_mariadb() {
 
   cnf_dir=/etc/mysql/mariadb.conf.d
   mkdir -p "$cnf_dir"
+
+  # An existing server may still carry the package's default 1024-fd limit.
+  # Keep the same systemd drop-in the installer uses.
+  local limits_src="${SCRIPT_DIR}/configs/mariadb/limit_nofile.conf"
+  local limits_dst=/etc/systemd/system/mariadb.service.d/limits.conf
+  local limits_before=""
+  [[ -f $limits_dst ]] && limits_before=$(md5sum "$limits_dst" | awk '{print $1}')
+  mkdir -p "$(dirname "$limits_dst")"
+  if [[ -f $limits_src ]]; then
+    install -m 644 "$limits_src" "$limits_dst"
+  else
+    printf '[Service]\nLimitNOFILE=1048576\nLimitCORE=0\nEnvironment=MYSQLD_OPTS=\nEnvironment=_WSREP_NEW_CLUSTER=\n' > "$limits_dst"
+    chmod 644 "$limits_dst"
+  fi
+  if [[ $limits_before != "$(md5sum "$limits_dst" | awk '{print $1}')" ]]; then
+    systemctl daemon-reload || true
+    unit_changed=1
+    opt_report "- systemd LimitNOFILE=1048576"
+  fi
   cnf="${cnf_dir}/99-setup-optimize.cnf"
   major=${ver%%.*}
   minor=${ver#*.}; minor=${minor%%.*}
@@ -4816,7 +4947,7 @@ EOF
   cnf_after=$(md5sum "$cnf" | awk '{print $1}')
   opt_report "- Wrote \`${cnf}\` (buffer=${buffer}, max_connections=${max_conn}, back_log=${backlog})"
   opt_report "- innodb_io_capacity=${io_read}/${io_write}, thread_pool_size=${threads}"
-  if [[ -n $cnf_before && $cnf_before == "$cnf_after" ]]; then
+  if [[ -n $cnf_before && $cnf_before == "$cnf_after" ]] && (( unit_changed == 0 )); then
     opt_report "- Restart: skipped (configuration already optimized)"
     return 0
   fi
@@ -4866,7 +4997,7 @@ optimize_valkey() {
     label=Redis conf=/etc/redis/redis.conf conf_dir=/etc/redis
     unit=redis-server cli=redis-cli
   fi
-  local active=0 ram_mb max_mb policy backlog
+  local active=0 ram_mb max_mb policy backlog io_threads
   local conf_before conf_after fd_limit dropin unit_changed=0
   [[ -f $conf ]] || return 0
   systemctl is-active --quiet "$unit" 2>/dev/null && active=1
@@ -4887,6 +5018,12 @@ optimize_valkey() {
   backlog=$(effective_backlog)
   policy=$(awk '/^[[:space:]]*maxmemory-policy[[:space:]]/{print $2; exit}' "$conf")
   [[ -n $policy ]] || policy=allkeys-lru
+  # Preserve an explicit install-time io-threads value (the installer defaults
+  # to 1); forcing 1 here would silently undo `--valkey io_threads=N`.
+  io_threads=$(awk '/^[[:space:]]*io-threads[[:space:]]/{print $2; exit}' "$conf")
+  [[ $io_threads =~ ^[0-9]+$ ]] || io_threads=1
+  (( io_threads < 1 )) && io_threads=1
+  (( io_threads > 8 )) && io_threads=8
   conf_before=$(md5sum "$conf" | awk '{print $1}')
 
   conf_set() {
@@ -4905,7 +5042,7 @@ optimize_valkey() {
   conf_set timeout 0
   conf_set tcp-keepalive 300
   conf_set hz 10
-  conf_set io-threads 1
+  conf_set io-threads "$io_threads"
   conf_set io-threads-do-reads yes
   conf_set lazyfree-lazy-eviction yes
   conf_set lazyfree-lazy-expire yes
@@ -5072,6 +5209,15 @@ optimize_elastic() {
   opt_report "- Active: ${active}; config: \`${yml}\`"
   opt_backup /etc/elasticsearch elasticsearch
   opt_backup /etc/systemd/system/elasticsearch.service.d elasticsearch-systemd
+
+  # Elasticsearch refuses to start when vm.max_map_count is too low.  The
+  # installer wrote this once; ensure an existing/manually installed server
+  # gets the same requirement during --optimize.
+  if [[ $(sysctl -n vm.max_map_count 2>/dev/null || echo 0) -lt 1048576 ]]; then
+    printf 'vm.max_map_count = 1048576\n' > /etc/sysctl.d/99-elasticsearch.conf
+    sysctl -w vm.max_map_count=1048576 >/dev/null 2>&1 || true
+    opt_report "- vm.max_map_count raised to 1048576"
+  fi
 
   if [[ ${OPT_ES_BUDGET_MB:-0} -gt 0 ]]; then
     heap_mb=$OPT_ES_BUDGET_MB
@@ -5267,6 +5413,7 @@ verify_optimized_services() {
     opt_log_errors angie Angie
   fi
   if [[ " ${OPT_DETECTED[*]} " == *" php:"* ]]; then
+    (( ${OPT_PHP_OK:-0} )) || opt_report "- PHP: no primary pool was optimized; Angie upstream left unchanged"
     local fpm_bin
     while IFS= read -r ver; do
       systemctl is-active --quiet "php${ver}-fpm" || continue
@@ -5363,6 +5510,10 @@ optimize_plan() {
   printf '\n%sDRY RUN%s - optimize scan only, no changes will be made.\n' "$C_BOLD" "$C_RESET"
   printf 'Host: %s  %s CPU  %s MB RAM  %s\n' "$(hostname 2>/dev/null || echo unknown)" \
     "$nproc" "$ram_mb" "$(df -h / | awk 'NR==2{print $4 " free"}')"
+  if (( OS_TUNE )); then
+    printf '  OS: governor=performance limits=1M-nofile sysctl=hardware-scaled (%s CPUs / %sMB RAM)\n' \
+      "$nproc" "$ram_mb"
+  fi
   if (( ${#OPT_DETECTED[@]} == 0 )); then
     printf 'No supported installed services detected.\n'
     return 0
@@ -5435,6 +5586,17 @@ optimize_plan() {
   fi
 }
 
+run_os_tuning() {
+  step "OS auto-tuning (CPU, memory, networking)"
+  ensure_state
+  # Reuse the install-time tuners so an existing server receives exactly the
+  # same hardware-aware profile as a fresh build.  Each tuner is idempotent
+  # and records the original files for a later --purge.
+  configure_cpu_governor
+  configure_limits
+  configure_sysctl
+}
+
 run_optimize() {
   local rc=0 service
   OPT_START_TS=$(date -Is)
@@ -5449,6 +5611,11 @@ run_optimize() {
   OPT_REPORT=()
   detect_installed_services
   plan_memory_budget
+  if (( OS_TUNE )); then
+    run_os_tuning
+    opt_report "## Operating system"
+    opt_report "- CPU governor, PAM limits and kernel/network/memory sysctls tuned for ${OPT_MEM_TOTAL_MB}MB RAM / $(nproc) CPUs"
+  fi
   step "Optimizing installed services"
   if (( ${#OPT_DETECTED[@]} == 0 )); then
     info "No supported installed services detected (Angie, PHP-FPM, MariaDB, Valkey/Redis, Elasticsearch)"
