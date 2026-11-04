@@ -31,6 +31,18 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.24
+
+- **The PHP-FPM socket migration now works where a reload does not add
+  pools.** PHP 8.3's `SIGUSR2` reload applies changes to existing pools but
+  does not start a newly added bridge pool, so the former cutover waited ten
+  seconds and rolled back to TCP. The migration now gives Angie the socket as
+  primary plus the existing TCP listener as backup, moves the existing pool
+  on reload, and removes the backup once the socket is live. A request that
+  lands exactly in the cutover can fail over to the backup; the cache purge
+  covers any blank page. Failures now report the exact stage instead of only
+  "socket migration failed".
+
 ## What's new in 1.8.23
 
 - **A restart window can no longer leave a blank guest page cached.** If a
