@@ -8,7 +8,8 @@ declare(strict_types=1);
  */
 
 $cfg = require __DIR__ . '/public/config.php';
-$root = '/var/www/stress.test/public';
+$domain = getenv('STRESS_DOMAIN') ?: 'stress.invalid';
+$root = '/var/www/' . $domain . '/public';
 
 function es_request(string $method, string $url, ?string $body = null, string $contentType = 'application/json'): array
 {

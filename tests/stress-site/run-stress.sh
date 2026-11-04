@@ -6,7 +6,7 @@ set -Eeuo pipefail
 [[ ${EUID} -eq 0 ]] || { echo "run as root" >&2; exit 1; }
 command -v wrk >/dev/null || { echo "wrk is required (apt install wrk)" >&2; exit 1; }
 
-DOMAIN=${DOMAIN:-stress.test}
+DOMAIN=${DOMAIN:-stress.invalid}
 REPORT=${1:-/tmp/stress-report.md}
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT

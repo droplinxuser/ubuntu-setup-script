@@ -821,7 +821,7 @@ Also checked at CLI level (all using `--dry-run`, no system changes):
 
 ### Stress test (this machine)
 
-A local site (`stress.test`) exercises Angie → PHP-FPM → MariaDB + Valkey + Elasticsearch + Node.js + GifSicle. The repeatable harness is in `tests/stress-site/`; it used `wrk`, `valkey-benchmark`, `pidstat` and the Angie/PHP-FPM status endpoints on 16 CPU threads, 27 GiB RAM, NVMe.
+A local site (`stress.invalid`) exercises Angie → PHP-FPM → MariaDB + Valkey + Elasticsearch + Node.js + GifSicle. The repeatable harness is in `tests/stress-site/`; it used `wrk`, `valkey-benchmark`, `pidstat` and the Angie/PHP-FPM status endpoints on 16 CPU threads, 27 GiB RAM, NVMe.
 
 | Target | Concurrency | Result (v1.5.0) |
 |---|---|---|
@@ -898,7 +898,7 @@ The script produces a working, internet-facing baseline. For a large or security
 - Ship Angie access/error logs, PHP-FPM slow log, MariaDB slow query log, Elasticsearch and Valkey metrics to a central monitor; alert on 5xx rate, p99 latency, disk, memory and queue depth. `--others sysstat` provides `sar`/`iostat`/`pidstat` history.
 - Load-test after every application or config change. The local `tests/stress-site/` harness is a starting point; tune `pm.max_children`, MariaDB buffers and Elasticsearch heap from measured RSS/CPU, not guesswork.
 - For very large traffic, scale horizontally: CDN for static, multiple Angie/PHP nodes behind a load balancer, MariaDB read replicas, and a separate Elasticsearch cluster. A single 16-core host tops out around the measured full-stack numbers above.
-- Keep the `stress.test` site and its `/etc/hosts` entry only on test machines; remove it from production.
+- Keep the `stress.invalid` site and its `/etc/hosts` entry only on test machines; remove it from production.
 
 ---
 

@@ -370,7 +370,7 @@ Recommended changes (priority order):
    registration, search and API endpoints; add bot management if needed.
 9. **Patch policy**: unattended security updates are enabled; review held-back
    packages (currently `libgd3`) and reboot-required. Consider livepatch.
-10. **Remove test artifacts** from production: `stress.test`, its `/etc/hosts`
+10. **Remove test artifacts** from production: `stress.invalid`, its `/etc/hosts`
     entry, the `stress-node` service, test databases and the test certificates.
 
 ---
@@ -410,6 +410,6 @@ sudo bash tests/stress-site/setup-stress-site.sh
 sudo bash tests/stress-site/run-stress.sh /tmp/stress-report.md
 ```
 
-The test site is available at `https://stress.test/` (self-signed certificate),
+The test site is available at `https://stress.invalid/` (self-signed certificate),
 with `/cached.php` for the FastCGI-cache comparison and `/nginx-status` /
 `/fpm-status` restricted to localhost. Remove it from production.
