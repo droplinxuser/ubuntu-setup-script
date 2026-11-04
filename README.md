@@ -31,6 +31,17 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.26
+
+- **The network profile can be pinned per host.** BBR is a good default on
+  long-haul links, but a busy reverse proxy measured **233 req/s with
+  `bbr/fq` versus 335 req/s with `cubic/fq_codel`** (plus 65 ms lower median
+  latency). `--optimize` now honours `SETUP_TCP_CC` / `SETUP_QDISC`
+  (environment) or `/etc/default/setup-tuning` (`TCP_CC="cubic"`,
+  `QDISC="fq_codel"`), and writes the matching modules-load list, sysctl.d
+  drop-in and oneshot unit. The unit is restarted (not just started) so a
+  changed value applies on the same run. Unsafe values fall back to BBR/fq.
+
 ## What's new in 1.8.25
 
 - **The MariaDB buffer pool is resized online instead of restarting the

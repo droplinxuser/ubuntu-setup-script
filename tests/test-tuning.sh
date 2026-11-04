@@ -47,6 +47,12 @@ check "Valkey size parser handles GB" test "$(valkey_mb_from_config 8gb)" = 8192
 check "Valkey size parser handles raw bytes" test "$(valkey_mb_from_config 1048576)" = 1
 check "Valkey size parser rejects an unknown unit" test "$(valkey_mb_from_config 1xb)" = 0
 
+# Network profile selection (BBR can regress some proxy hosts).
+check "network profile honours SETUP_TCP_CC/SETUP_QDISC" \
+  test "$(SETUP_TCP_CC=cubic SETUP_QDISC=fq_codel bash -c 'source "$1"; printf "%s/%s" "$TCP_CC" "$QDISC"' _ "$ROOT/setup.sh")" = "cubic/fq_codel"
+check "network profile falls back for unsafe values" \
+  test "$(SETUP_TCP_CC='x;y' SETUP_QDISC='a/b' bash -c 'source "$1"; printf "%s/%s" "$TCP_CC" "$QDISC"' _ "$ROOT/setup.sh")" = "bbr/fq"
+
 # MariaDB config diff: only the buffer-pool line may be applied online.
 cat > "$TMP/cnf-a" <<'EOF'
 [mysqld]
