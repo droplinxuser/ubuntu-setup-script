@@ -31,6 +31,15 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.9
+
+- **MariaDB and Elasticsearch are sized from the live data, not RAM.** The
+  optimizer now uses `current data size + 5%` for both the InnoDB buffer pool
+  and the Elasticsearch heap, capped by the shared budget (and 31 GB for
+  Elasticsearch). A 40%-of-RAM / 25%-of-RAM fallback is used only when the
+  data size cannot be measured. Oversized live pools/heaps are reduced to the
+  data-sized target, so memory is not reserved for data that does not exist.
+
 ## What's new in 1.8.8
 
 - **MariaDB is no longer capped at 32 GB.** `--optimize` and
@@ -851,13 +860,13 @@ bash setup.sh --optimize --dry-run
 It applies the same hardware-aware values used by a normal install: Angie
 workers/connections/buffers/cache sizes, PHP-FPM `static` pool sizing, MariaDB
 buffer pool/connection backlog, Valkey/Redis maxmemory, and Elasticsearch
-heap. The MariaDB pool uses 40% of RAM as its baseline (no fixed 32 GB
-ceiling) and can rise to the live data+index working set plus 5%, bounded by
-the shared budget after reserving the other services; an existing larger
-pool is preserved instead of being shrunk. Elasticsearch's heap is
-likewise sized to the index store plus 5%, capped at the 31 GB
-compressed-oops limit and the budget left after the other services. PHP
-listeners are preserved: Angie is repointed only when the pool
+heap. MariaDB's pool and Elasticsearch's heap are sized to the live
+data/index store plus 5%, bounded by the shared budget after reserving the
+other services; a 40%-of-RAM (MariaDB) or 25%-of-RAM (Elasticsearch)
+fallback is used only when the data size cannot be measured. Oversized live
+allocations are reduced to the data-sized target. Elasticsearch keeps its
+31 GB compressed-oops ceiling. PHP listeners are preserved: Angie is
+repointed only when the pool
 already owns a Unix socket, so a live TCP pool is never broken by a
 configuration change. Service allocations
 are planned together from one 80%-of-RAM budget, with PHP worker capacity
