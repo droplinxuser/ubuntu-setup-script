@@ -31,7 +31,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.7.1"
+readonly SCRIPT_VERSION="1.8.0"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
@@ -194,7 +194,7 @@ Domain setup (standalone; Angie + MariaDB must already be installed/running):
       --domain can be repeated and combined with a normal install. There is
       no --purge for domains; remove the files/database manually.
 
-Optimize-only mode (Ubuntu 24.04 or 26.04):
+Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
   --optimize [--dry-run]
       Detects installed services (Angie, PHP-FPM, MariaDB, Valkey,
       Elasticsearch) and tunes their live configuration for the current
@@ -397,6 +397,16 @@ parse_args() {
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
+# --optimize touches only service configuration, so it is safe on every LTS
+# that still supports the installed packages.  Ubuntu 22.04 shares the same
+# Angie/PHP/MariaDB/Valkey service layout and is supported until 2027.
+optimize_os_supported() {
+  case "${1%%.*}" in
+    22|24|26) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 validate_timezone() {
   local tz=$1
   [[ $tz =~ ^[A-Za-z][A-Za-z0-9_+-]*(/[A-Za-z0-9_+-]+)*$ ]] || return 1
@@ -1605,22 +1615,22 @@ configure_limits() {
     install -m 644 "$limits_src" "$dropin"
   else
     cat > "$dropin" <<'EOF'
-elasticsearch soft nofile 10485760
-elasticsearch hard nofile 10485760
-mysql         soft nofile 10485760
-mysql         hard nofile 10485760
-valkey        soft nofile 10485760
-valkey        hard nofile 10485760
-root          soft nofile 10485760
-root          hard nofile 10485760
-tinyproxy     soft nofile 10485760
-tinyproxy     hard nofile 10485760
-www-data      soft nofile 10485760
-www-data      hard nofile 10485760
-angie         soft nofile 10485760
-angie         hard nofile 10485760
-*             soft nofile 10485760
-*             hard nofile 10485760
+elasticsearch soft nofile 1048576
+elasticsearch hard nofile 1048576
+mysql         soft nofile 1048576
+mysql         hard nofile 1048576
+valkey        soft nofile 1048576
+valkey        hard nofile 1048576
+root          soft nofile 1048576
+root          hard nofile 1048576
+tinyproxy     soft nofile 1048576
+tinyproxy     hard nofile 1048576
+www-data      soft nofile 1048576
+www-data      hard nofile 1048576
+angie         soft nofile 1048576
+angie         hard nofile 1048576
+*             soft nofile 1048576
+*             hard nofile 1048576
 EOF
   fi
   chmod 644 "$dropin"
@@ -1774,9 +1784,25 @@ tune_size_value() {
   fi
 }
 
+# Pick the first existing file from a list.  Older server-configs-nginx
+# releases installed http.d files with underscore names (fastcgi_cache_conf);
+# current releases use dots (fastcgi_cache.conf).  --optimize must tune a live
+# server regardless of which layout it was installed with.
+tune_first_file() {
+  local dir=$1 name
+  shift
+  for name in "$@"; do
+    [[ -f "${dir}/${name}" ]] && { printf '%s' "${dir}/${name}"; return 0; }
+  done
+  return 1
+}
+
 tune_replace() {
   local file=$1 pattern=$2 replacement=$3 desc=$4 before after
-  [[ -f $file ]] || return 0
+  if [[ ! -f $file ]]; then
+    tune_miss "file not found for ${desc}: ${file}"
+    return 0
+  fi
   if ! grep -qE "$pattern" "$file"; then
     tune_miss "no match for ${desc}"
     return 0
@@ -1792,7 +1818,10 @@ tune_replace() {
 
 tune_insert_after() {
   local file=$1 anchor=$2 line=$3 desc=$4
-  [[ -f $file ]] || return 0
+  if [[ ! -f $file ]]; then
+    tune_miss "file not found for ${desc}: ${file}"
+    return 0
+  fi
   if ! grep -qE "$anchor" "$file"; then
     tune_miss "no insertion anchor for ${desc}"
     return 0
@@ -1928,57 +1957,83 @@ tune_angie_configs() {
     fi
   fi
 
-  # Cache sizes and zones.
-  tune_replace "$target/http.d/fastcgi_cache.conf" \
-    'keys_zone=fastcgicache:[0-9]+m max_size=[0-9]+[mgMG]' \
-    "keys_zone=fastcgicache:${fcgi_zone}m max_size=${fcgi_size}" \
-    "http.d/fastcgi_cache.conf: ${fcgi_zone}m zone / ${fcgi_size} max"
-  tune_replace "$target/http.d/fastcgi_cache_chev.conf" \
-    '^(fastcgi_cache_path /home/nginx_cache_chev levels=1:2 keys_zone=fastcgicache_chev:)[0-9]+m( max_size=[0-9]+[mgMG])?(.*)$' \
-    "\\1${chev_zone}m max_size=${chev_size}\\3" \
-    "http.d/fastcgi_cache_chev.conf: ${chev_zone}m zone / ${chev_size} max"
-  tune_replace "$target/http.d/xf_proxy_cache.conf" \
-    'keys_zone=xfproxycache:[0-9]+m max_size=[0-9]+[mgMG]' \
-    "keys_zone=xfproxycache:${xf_zone}m max_size=${xf_size}" \
-    "http.d/xf_proxy_cache.conf: ${xf_zone}m zone / ${xf_size} max"
-  tune_replace "$target/http.d/proxy_cache.conf" \
-    'keys_zone=proxy_cache:[0-9]+m' "keys_zone=proxy_cache:${proxy_zone}m" \
-    "http.d/proxy_cache.conf: proxy zone=${proxy_zone}m"
-  tune_replace "$target/http.d/proxy_cache.conf" \
-    'keys_zone=proxy_cdn:[0-9]+m' "keys_zone=proxy_cdn:${cdn_zone}m" \
-    "http.d/proxy_cache.conf: cdn zone=${cdn_zone}m"
+  # Cache sizes and zones.  Resolve both the current (.conf) and legacy
+  # (_conf) names so an older live deployment is still tuned.
+  local f_fcgi f_chev f_xf f_proxy f_limit
+  f_fcgi=$(tune_first_file "$target/http.d" fastcgi_cache.conf fastcgi_cache_conf) || f_fcgi=""
+  f_chev=$(tune_first_file "$target/http.d" fastcgi_cache_chev.conf fastcgi_cache_chev_conf) || f_chev=""
+  f_xf=$(tune_first_file "$target/http.d" xf_proxy_cache.conf xf_proxy_cache_conf) || f_xf=""
+  f_proxy=$(tune_first_file "$target/http.d" proxy_cache.conf proxy_cache_conf) || f_proxy=""
+  f_limit=$(tune_first_file "$target/http.d" limit_req.conf limit_req_conf) || f_limit=""
 
-  if [[ -f $target/http.d/proxy_cache.conf ]]; then
+  if [[ -n $f_fcgi ]]; then
+    tune_replace "$f_fcgi" \
+      'keys_zone=fastcgicache:[0-9]+m max_size=[0-9]+[mgMG]' \
+      "keys_zone=fastcgicache:${fcgi_zone}m max_size=${fcgi_size}" \
+      "${f_fcgi#"${target}"/}: ${fcgi_zone}m zone / ${fcgi_size} max"
+  else
+    tune_miss "http.d/fastcgi_cache.conf: file not found"
+  fi
+  if [[ -n $f_chev ]]; then
+    tune_replace "$f_chev" \
+      '^(fastcgi_cache_path /home/nginx_cache_chev levels=1:2 keys_zone=fastcgicache_chev:)[0-9]+m( max_size=[0-9]+[mgMG])?(.*)$' \
+      "\\1${chev_zone}m max_size=${chev_size}\\3" \
+      "${f_chev#"${target}"/}: ${chev_zone}m zone / ${chev_size} max"
+  else
+    tune_miss "http.d/fastcgi_cache_chev.conf: file not found"
+  fi
+  if [[ -n $f_xf ]]; then
+    tune_replace "$f_xf" \
+      'keys_zone=xfproxycache:[0-9]+m max_size=[0-9]+[mgMG]' \
+      "keys_zone=xfproxycache:${xf_zone}m max_size=${xf_size}" \
+      "${f_xf#"${target}"/}: ${xf_zone}m zone / ${xf_size} max"
+  else
+    tune_miss "http.d/xf_proxy_cache.conf: file not found"
+  fi
+  if [[ -n $f_proxy ]]; then
+    tune_replace "$f_proxy" \
+      'keys_zone=proxy_cache:[0-9]+m' "keys_zone=proxy_cache:${proxy_zone}m" \
+      "${f_proxy#"${target}"/}: proxy zone=${proxy_zone}m"
+    tune_replace "$f_proxy" \
+      'keys_zone=proxy_cdn:[0-9]+m' "keys_zone=proxy_cdn:${cdn_zone}m" \
+      "${f_proxy#"${target}"/}: cdn zone=${cdn_zone}m"
+
     local before
-    before=$(md5sum "$target/http.d/proxy_cache.conf" | awk '{print $1}')
+    before=$(md5sum "$f_proxy" | awk '{print $1}')
     # proxy_cache_path directives commonly wrap onto a second line, so track
     # the active cache path and rewrite the first max_size seen afterwards
     # instead of only looking at the line that starts the directive.
     awk -v a="$proxy_size" -v b="$cdn_size" '
       {
-        if ($0 ~ /proxy_cache_path[[:space:]]+\/home\/proxy_cache[[:space:]]/) target = a
-        else if ($0 ~ /proxy_cache_path[[:space:]]+\/home\/proxy_cdn[[:space:]]/) target = b
-        if (target != "" && $0 ~ /max_size=[0-9]+[mgMG]/) {
-          sub(/max_size=[0-9]+[mgMG]/, "max_size=" target)
-          target = ""
+        if ($0 ~ /proxy_cache_path[[:space:]]+\/home\/proxy_cache[[:space:]]/) cache = a
+        else if ($0 ~ /proxy_cache_path[[:space:]]+\/home\/proxy_cdn[[:space:]]/) cache = b
+        if (cache != "" && $0 ~ /max_size=[0-9]+[mgMG]/) {
+          sub(/max_size=[0-9]+[mgMG]/, "max_size=" cache)
+          cache = ""
         }
         print
-        if ($0 ~ /;[[:space:]]*$/) target = ""
+        if ($0 ~ /;[[:space:]]*$/) cache = ""
       }
-    ' "$target/http.d/proxy_cache.conf" > "$target/http.d/proxy_cache.conf.new"
-    mv "$target/http.d/proxy_cache.conf.new" "$target/http.d/proxy_cache.conf"
-    [[ $(md5sum "$target/http.d/proxy_cache.conf" | awk '{print $1}') != "$before" ]] \
-      && tune_note "http.d/proxy_cache.conf: proxy=${proxy_size} cdn=${cdn_size}"
+    ' "$f_proxy" > "${f_proxy}.new"
+    mv "${f_proxy}.new" "$f_proxy"
+    [[ $(md5sum "$f_proxy" | awk '{print $1}') != "$before" ]] \
+      && tune_note "${f_proxy#"${target}"/}: proxy=${proxy_size} cdn=${cdn_size}"
+  else
+    tune_miss "http.d/proxy_cache.conf: file not found"
   fi
 
   limit_post=$(tune_clamp $(( mem_mb / 4096 )) 8 32)
   limit_get=$(tune_clamp $(( mem_mb / 2048 )) 16 64)
-  tune_replace "$target/http.d/limit_req.conf" \
-    'zone=limit_req_post_head:[0-9]+m' "zone=limit_req_post_head:${limit_post}m" \
-    "http.d/limit_req.conf: POST zone=${limit_post}m"
-  tune_replace "$target/http.d/limit_req.conf" \
-    'zone=limit_req_get_perip:[0-9]+m' "zone=limit_req_get_perip:${limit_get}m" \
-    "http.d/limit_req.conf: GET zone=${limit_get}m"
+  if [[ -n $f_limit ]]; then
+    tune_replace "$f_limit" \
+      'zone=limit_req_post_head:[0-9]+m' "zone=limit_req_post_head:${limit_post}m" \
+      "${f_limit#"${target}"/}: POST zone=${limit_post}m"
+    tune_replace "$f_limit" \
+      'zone=limit_req_get_perip:[0-9]+m' "zone=limit_req_get_perip:${limit_get}m" \
+      "${f_limit#"${target}"/}: GET zone=${limit_get}m"
+  else
+    tune_miss "http.d/limit_req.conf: file not found"
+  fi
 
   tune_replace "$target/h5bp/tls/ssl_engine.conf" \
     '^([[:space:]]*ssl_session_cache[[:space:]]+shared:SSL:)[0-9]+m;' \
@@ -3843,6 +3898,7 @@ print_plan() {
 OPT_BACKUP_DIR=""
 OPT_REPORT=()
 OPT_DETECTED=()
+OPT_START_TS=""
 
 opt_report() { OPT_REPORT+=("$*"); }
 
@@ -4497,16 +4553,69 @@ EOF
   return 0
 }
 
+# Ports actually held by a process name, e.g. "80,443".  A systemd unit can
+# be active while its worker processes never bound a socket (a stale master
+# or a config-test-only reload), so check the kernel's listener table too.
+opt_listen_ports() {
+  command -v ss >/dev/null 2>&1 || return 0
+  ss -H -ltnp 2>/dev/null \
+    | grep -F "(\"${1}\"" \
+    | awk '{print $4}' | awk -F: '{print $NF}' \
+    | grep -E '^[0-9]+$' | sort -nu | paste -sd, - || true
+}
+
+opt_listener_ok() {
+  local listen=$1 port
+  [[ -z $listen ]] && return 0
+  if [[ $listen == /* ]]; then
+    [[ -S $listen ]]
+    return
+  fi
+  command -v ss >/dev/null 2>&1 || return 0
+  port=${listen##*:}
+  [[ $port =~ ^[0-9]+$ ]] || return 0
+  ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${port}$"
+}
+
+# Report (but do not fail on) error-level journal entries written after the
+# optimize run started.  Probes below decide success; logs add context for
+# warnings that do not take a service down.
+opt_log_errors() {
+  local unit=$1 label=$2 out line
+  command -v journalctl >/dev/null 2>&1 || return 0
+  [[ -n ${OPT_START_TS:-} ]] || return 0
+  out=$(journalctl -u "$unit" --since "$OPT_START_TS" -p err -q --no-pager 2>/dev/null \
+    | tail -n 3 || true)
+  if [[ -n $out ]]; then
+    opt_report "- ${label}: error-level journal entries since start (review):"
+    while IFS= read -r line; do
+      line=$(printf '%s' "$line" | tr '`' "'")
+      opt_report "  \`${line}\`"
+    done <<< "$out"
+  else
+    opt_report "- ${label}: no error-level journal entries since start"
+  fi
+}
+
 verify_optimized_services() {
   local rc=0 ver sock
   opt_report "## Verification"
+
   if [[ -x /usr/sbin/angie ]] && systemctl is-active --quiet angie; then
     if /usr/sbin/angie -t >/dev/null 2>&1; then
-      opt_report "- Angie: configuration valid and service active"
+      local ports
+      ports=$(opt_listen_ports angie)
+      if [[ -n $ports ]]; then
+        opt_report "- Angie: configuration valid; listening on \`${ports}\`"
+      else
+        opt_report "- Angie: **FAILED** active but no listening socket found"
+        rc=1
+      fi
     else
       opt_report "- Angie: **FAILED** configuration test while active"
       rc=1
     fi
+    opt_log_errors angie Angie
   fi
   if [[ " ${OPT_DETECTED[*]} " == *" php:"* ]]; then
     local fpm_bin
@@ -4514,15 +4623,16 @@ verify_optimized_services() {
       systemctl is-active --quiet "php${ver}-fpm" || continue
       sock=$(php_pool_listen "$ver")
       fpm_bin="/usr/sbin/php-fpm${ver}"
-      if [[ -n $sock && $sock == /* && ! -S $sock ]]; then
-        opt_report "- PHP ${ver}: **FAILED** active but socket \`${sock}\` is missing"
-        rc=1
-      elif [[ -x $fpm_bin ]] && ! "$fpm_bin" -t >/dev/null 2>&1; then
+      if [[ -x $fpm_bin ]] && ! "$fpm_bin" -t >/dev/null 2>&1; then
         opt_report "- PHP ${ver}: **FAILED** configuration test"
+        rc=1
+      elif ! opt_listener_ok "$sock"; then
+        opt_report "- PHP ${ver}: **FAILED** active but listener \`${sock:-unknown}\` is missing"
         rc=1
       else
         opt_report "- PHP ${ver}: active, listener \`${sock:-unknown}\`"
       fi
+      opt_log_errors "php${ver}-fpm" "PHP ${ver}"
     done < <(php_fpm_versions)
   fi
   if [[ " ${OPT_DETECTED[*]} " == *" mariadb "* ]] && systemctl is-active --quiet mariadb; then
@@ -4532,6 +4642,7 @@ verify_optimized_services() {
       opt_report "- MariaDB: **FAILED** active but SQL probe failed"
       rc=1
     fi
+    opt_log_errors mariadb MariaDB
   fi
   if [[ " ${OPT_DETECTED[*]} " == *" valkey "* ]] && systemctl is-active --quiet valkey-server; then
     if valkey-cli ping 2>/dev/null | grep -qx 'PONG'; then
@@ -4540,6 +4651,7 @@ verify_optimized_services() {
       opt_report "- Valkey: **FAILED** active but PING failed"
       rc=1
     fi
+    opt_log_errors valkey-server Valkey
   fi
   if [[ " ${OPT_DETECTED[*]} " == *" elastic "* ]] && systemctl is-active --quiet elasticsearch; then
     if curl -fsS http://127.0.0.1:9200 >/dev/null 2>&1; then
@@ -4548,6 +4660,7 @@ verify_optimized_services() {
       opt_report "- Elasticsearch: **FAILED** active but HTTP probe failed"
       rc=1
     fi
+    opt_log_errors elasticsearch Elasticsearch
   fi
   (( rc == 0 )) || opt_report "- Result: **one or more health checks failed**"
   return "$rc"
@@ -4638,6 +4751,7 @@ optimize_plan() {
 
 run_optimize() {
   local rc=0 service
+  OPT_START_TS=$(date -Is)
   OPT_BACKUP_DIR="/var/backups/setup-optimize-$(date +%Y%m%d-%H%M%S)"
   mkdir -p "$OPT_BACKUP_DIR"
   # Keep the ten newest rollback points; these directories contain full copies
@@ -4729,10 +4843,9 @@ main() {
   . /etc/os-release
   [[ ${ID:-} == ubuntu ]] || die "This script only supports Ubuntu (found: ${ID:-unknown})"
   if (( OPTIMIZE )); then
-    case "${VERSION_ID%%.*}" in
-      24|26) ;;
-      *) die "--optimize supports Ubuntu 24.04 or 26.04 (found ${VERSION_ID})" ;;
-    esac
+    if ! optimize_os_supported "${VERSION_ID:-}"; then
+      die "--optimize supports Ubuntu 22.04, 24.04 or 26.04 (found ${VERSION_ID:-unknown})"
+    fi
   elif (( ${VERSION_ID%%.*} < 26 )); then
     die "This script requires Ubuntu 26.04 or newer (found ${VERSION_ID})"
   fi

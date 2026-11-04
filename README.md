@@ -31,6 +31,28 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.0
+
+- **`--optimize` now supports Ubuntu 22.04.** The optimize path only rewrites
+  service configuration and never installs packages, so it is safe on 22.04,
+  24.04 and 26.04. This makes the command usable on existing production hosts
+  that predate the 26.04 installer requirement.
+- **Legacy Angie layouts are tuned too.** Older releases installed
+  `http.d/fastcgi_cache_conf` (underscores); current releases use
+  `fastcgi_cache.conf` (dots). `--optimize` now resolves both names instead of
+  silently skipping cache and request-limit tuning on an older live server.
+- **Missing tuning targets are reported.** A missing cache/limit file or a
+  directive that no longer exists is recorded as `Not applied: …` instead of
+  being ignored.
+- **File-descriptor limits match `fs.nr_open`.** The PAM profile now requests
+  1,048,576 descriptors, the minimum `fs.nr_open` this script configures, so
+  `pam_limits` can always raise the hard limit on a small VPS. Service units
+  keep their smaller, explicit `LimitNOFILE` drop-ins.
+- **Post-restart verification checks listeners and logs.** Angie must hold a
+  real listening socket (from `ss`), PHP must own its socket or TCP port,
+  MariaDB/Valkey/Elasticsearch keep their SQL/PING/HTTP probes, and recent
+  error-level journal entries are included in the report.
+
 ## What's new in 1.7.1
 
 - **`--optimize` tuning is now covered by tests.** New
@@ -305,7 +327,7 @@ alongside `setup.sh`).
 
 ## Requirements
 
-- Ubuntu 26.04 LTS or newer for installation (`--optimize` also supports 24.04); the script checks `ID=ubuntu` and the version.
+- Ubuntu 26.04 LTS or newer for installation (`--optimize` also supports 22.04 and 24.04); the script checks `ID=ubuntu` and the version.
 - Bash 4.0 or newer (associative arrays); Ubuntu ships Bash 5.x.
 - Root access (`sudo bash setup.sh ...`).
 - Internet access to the Ubuntu, Angie, Sury, Elastic and NodeSource package repositories, plus GitHub for the Angie/PHP configuration repository. For offline/testing use, set `CONFIG_SOURCE_DIR` to a local checkout.
@@ -703,7 +725,7 @@ sudo bash setup.sh --domain node.example.com app=node
 
 ---
 
-## Optimize an existing server (Ubuntu 24.04 or 26.04)
+## Optimize an existing server (Ubuntu 22.04, 24.04 or 26.04)
 
 ```bash
 # Detect installed services and tune them in place
@@ -729,9 +751,14 @@ planned together from one 80%-of-RAM budget, so MariaDB + PHP + Valkey +
 Elasticsearch cannot collectively exhaust memory. Each configuration is
 validated and active services are restarted only when their generated files
 actually changed; a failure rolls back the affected service from
-`/var/backups/setup-optimize-*`. The Markdown report is written to
+`/var/backups/setup-optimize-*`. The final verification checks each service's
+real listener (Angie via `ss`, PHP socket/TCP) plus SQL/PING/HTTP probes and
+lists recent error-level journal entries. The Markdown report is written to
 `/var/log/setup-optimize-<timestamp>.md` and copied to
 `/var/log/setup-optimize-latest.md`.
+
+Older Angie installs whose `http.d` files use underscore names
+(`fastcgi_cache_conf`, `limit_req_conf`, …) are tuned in place as well.
 
 ---
 
