@@ -31,6 +31,17 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.18
+
+- **PHP-FPM pools with a missing slowlog directory no longer fail
+  `--optimize`.** A pool upgraded from an older package can still point
+  `slowlog` at a path whose directory was removed (seen on an Ubuntu 24.04
+  host: `/var/log/php-fpm/www-slow.log`). The tuner now creates the configured
+  `slowlog`, `access.log` and pool `error_log` directories (and the file when
+  the name has no runtime variable) before enabling `request_slowlog_timeout`.
+  It also prints the real `php-fpm -t` error instead of only reporting a
+  generic configuration failure.
+
 ## What's new in 1.8.17
 
 - **The dry-run cache estimate matches the applied value.** `--optimize
