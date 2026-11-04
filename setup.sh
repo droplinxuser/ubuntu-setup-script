@@ -31,7 +31,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.7"
+readonly SCRIPT_VERSION="1.8.8"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
@@ -152,8 +152,8 @@ Services (optional; only the ones listed are installed):
       children     PHP-FPM worker count (default: auto from RAM/CPU)
       max_requests recycle a worker after N requests (default: threads x 1024)
   --mariadb   user=demo pass=temp size=4gb|auto [bind=127.0.0.1[,ADDR...]|IPV4]
-      size     auto = 40% of RAM (clamped to 256 MB..32 GB), sized to leave
-               room for Elasticsearch, Valkey and PHP workers.
+      size     auto = 40% of RAM (minimum 256 MB), sized to leave room for
+               Elasticsearch, Valkey and PHP workers.
       bind     comma-separated IPv4 addresses and/or ::1 (default 127.0.0.1)
                IPV4 auto-detects the server's public IPv4; on NAT it falls
                back to the local outbound IPv4
@@ -2773,7 +2773,6 @@ install_mariadb() {
     ram_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
     size_mb=$(( ram_mb * 40 / 100 ))
     (( size_mb < 256 )) && size_mb=256
-    (( size_mb > 32768 )) && size_mb=32768
     info "MariaDB size=auto resolved to $(mb_to_config "$size_mb") (40% of RAM)"
   else
     size_mb=$(size_to_mb "$size")
@@ -4238,9 +4237,10 @@ plan_memory_budget() {
     db_cap=$(( fixed_available - OPT_VALKEY_BUDGET_MB - OPT_ES_BUDGET_MB ))
     (( db_cap < 256 )) && db_cap=256
 
-    # Keep the conservative 40%-of-RAM target (capped at 32 GB) for small
-    # databases, but honour a larger working set when it fits.
-    base_target=$(opt_clamp $(( total * 40 / 100 )) 256 32768)
+    # Baseline at 40% of RAM (no fixed 32 GB ceiling), bounded by the budget
+    # left after the cache and search tiers.  A larger working set can still
+    # raise it.
+    base_target=$(opt_clamp $(( total * 40 / 100 )) 256 "$db_cap")
     if (( db_size_mb > 0 )); then
       db_target=$(( db_size_mb * 105 / 100 ))
       (( db_target > base_target )) && base_target=$db_target
@@ -4623,7 +4623,6 @@ optimize_mariadb() {
     size_mb=$(mem_total_mb)
     size_mb=$(( size_mb * 40 / 100 ))
     (( size_mb < 256 )) && size_mb=256
-    (( size_mb > 32768 )) && size_mb=32768
   fi
   if (( ${OPT_DB_SIZE_MB:-0} == 0 )); then
     OPT_DB_SIZE_MB=$(mariadb_data_size_mb)

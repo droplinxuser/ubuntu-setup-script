@@ -303,33 +303,33 @@ mariadb_data_size_mb() { printf '73599'; }
 elasticsearch_data_size_mb() { printf '0'; }
 OPT_DETECTED=(angie php:8.4 mariadb valkey)
 plan_memory_budget
-check "72 GB database sizes the pool to data+5%" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 77278
-check "data-sized pool is not marked as preserved" \
+check "large host uses the 40% RAM baseline" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 104857
+check "baseline pool is not marked as preserved" \
   test "$OPT_MARIADB_KEPT_MB" -eq 0
-check "data-sized pool keeps the plan inside the 80% budget" \
+check "baseline pool keeps the plan inside the 80% budget" \
   test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
        -le $(( 262144 * 80 / 100 ))
 
 # Tiny statistics drift must not change the planned size on every run.
-mariadb_current_pool_mb() { printf '77300'; }
+mariadb_current_pool_mb() { printf '104000'; }
 plan_memory_budget
 check "small statistics drift keeps the live pool" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 77300
+  test "$OPT_MARIADB_BUDGET_MB" -eq 104000
 
 # A larger pool already configured by an operator is still preserved.
-mariadb_current_pool_mb() { printf '80000'; }
+mariadb_current_pool_mb() { printf '120000'; }
 plan_memory_budget
-check "existing 80 GB pool is preserved over the data target" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 80000
+check "existing 120 GB pool is preserved over the baseline" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 120000
 check "preserved pool is recorded for reporting" \
-  test "$OPT_MARIADB_KEPT_MB" -eq 80000
+  test "$OPT_MARIADB_KEPT_MB" -eq 120000
 
 # A pool that would exceed the shared budget is capped.
 mariadb_current_pool_mb() { printf '200000'; }
 plan_memory_budget
 check "pool above the shared budget is not preserved" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 77278
+  test "$OPT_MARIADB_BUDGET_MB" -eq 104857
 
 # A database larger than the shared budget receives the capped pool.
 mariadb_current_pool_mb() { printf '0'; }

@@ -31,6 +31,14 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.8
+
+- **MariaDB is no longer capped at 32 GB.** `--optimize` and
+  `--mariadb size=auto` use 40% of RAM as the automatic baseline, bounded
+  only by the shared budget left after the cache and search tiers. On a
+  256 GB host this allows a ~103 GB buffer pool. Elasticsearch keeps its
+  31 GB compressed-oops ceiling.
+
 ## What's new in 1.8.7
 
 - **Elasticsearch's heap now follows the live index store.** `--optimize`
@@ -673,7 +681,7 @@ Installing a second version while the first is active is refused **before any pa
 - Adds a systemd `LimitNOFILE=1048576` drop-in and silences the package's unset-environment warning.
 - Writes a managed `[mariadbd]` block into `/etc/mysql/mariadb.conf.d/50-server.cnf`:
   - `max_connections = CPU threads × 25` (clamped to 100–500)
-  - `innodb_buffer_pool_size = size` (`size=auto` = 40% of RAM, 256 MB–32 GB)
+  - `innodb_buffer_pool_size = size` (`size=auto` = 40% of RAM, minimum 256 MB)
   - `innodb_buffer_pool_instances` scaled 1–8 with the pool size
   - `innodb_log_file_size = size / 4` (clamped 64 MB–2 GB), `innodb_log_buffer_size = 64M`
   - `innodb_flush_log_at_trx_commit = 2` (durable across server crash; use `1` if every committed transaction must survive an OS crash)
@@ -843,10 +851,10 @@ bash setup.sh --optimize --dry-run
 It applies the same hardware-aware values used by a normal install: Angie
 workers/connections/buffers/cache sizes, PHP-FPM `static` pool sizing, MariaDB
 buffer pool/connection backlog, Valkey/Redis maxmemory, and Elasticsearch
-heap. The MariaDB pool is sized to the live data+index working set plus 5%
-when that fits the shared budget after reserving the other services; smaller
-databases keep the conservative 40%-of-RAM/32 GB target, and an existing
-larger pool is preserved instead of being shrunk. Elasticsearch's heap is
+heap. The MariaDB pool uses 40% of RAM as its baseline (no fixed 32 GB
+ceiling) and can rise to the live data+index working set plus 5%, bounded by
+the shared budget after reserving the other services; an existing larger
+pool is preserved instead of being shrunk. Elasticsearch's heap is
 likewise sized to the index store plus 5%, capped at the 31 GB
 compressed-oops limit and the budget left after the other services. PHP
 listeners are preserved: Angie is repointed only when the pool
