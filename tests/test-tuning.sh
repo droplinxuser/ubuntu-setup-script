@@ -62,6 +62,18 @@ check "no detected services uses the shared 25% default" \
   test "$(angie_cache_budget_mb 3815 57000)" = 768
 
 # ---------------------------------------------------------------------------
+# PHP-FPM pool log paths
+# ---------------------------------------------------------------------------
+ensure_fpm_log_path "$TMP/fpm/logs/www-slow.log" www-data www-data
+check "ensure_fpm_log_path creates the missing parent directory" \
+  test -d "$TMP/fpm/logs"
+check "ensure_fpm_log_path creates the slowlog file" \
+  test -f "$TMP/fpm/logs/www-slow.log"
+ensure_fpm_log_path "$TMP/fpm/logs/\$pool.access.log" www-data www-data
+check "ensure_fpm_log_path does not create a literal runtime-variable file" \
+  test ! -e "$TMP/fpm/logs/\$pool.access.log"
+
+# ---------------------------------------------------------------------------
 # SSH/firewall helpers
 # ---------------------------------------------------------------------------
 check "SSH peer parser uses the client column, not the server address" \

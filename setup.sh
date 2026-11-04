@@ -31,7 +31,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.17"
+readonly SCRIPT_VERSION="1.8.18"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
@@ -2427,6 +2427,30 @@ tune_pool_dedupe() {
   return 0
 }
 
+# PHP-FPM opens the pool slowlog/access log when the master starts.  A pool
+# upgraded from an older package can still point at a directory that no
+# longer exists; enabling request_slowlog_timeout then makes `php-fpm -t`
+# fail.  Create the configured parent directory first and, for a fixed path,
+# the file itself.  Paths containing a runtime variable (for example
+# "$pool.access.log") only get their directory created.
+ensure_fpm_log_path() {
+  local path=$1 user=${2:-www-data} group=${3:-www-data} dir created=0
+  [[ $path == /* ]] || return 0
+  dir=$(dirname -- "$path")
+  mkdir -p "$dir" 2>/dev/null || return 0
+  if [[ ${path##*/} != *'$'* ]]; then
+    if [[ ! -e $path ]]; then
+      : > "$path" 2>/dev/null || true
+      created=1
+    fi
+    chmod 640 "$path" 2>/dev/null || true
+    if (( created )) && getent passwd "$user" >/dev/null 2>&1; then
+      chown "$user:$group" "$path" 2>/dev/null || true
+    fi
+  fi
+  return 0
+}
+
 tune_php_fpm_version() {
   local ver=$1
   local socket=${2:-}
@@ -2434,8 +2458,7 @@ tune_php_fpm_version() {
   local ini_dir="/etc/php/${ver}/fpm/conf.d"
   local ini="${ini_dir}/zz-setup-optimize.ini"
   [[ -d /etc/php/${ver}/fpm ]] || return 0
-  [[ -f $pool ]] || { tune_note "PHP ${ver}: no pool.d/www.conf, skipped"; return 0; }
-  # With no explicit socket request, keep whatever the pool already listens on
+  [[ -f $pool ]] || { tune_note "PHP ${ver}: no pool.d/www.conf, skipped"; return 0; }  # With no explicit socket request, keep whatever the pool already listens on
   # (TCP for a standalone PHP host, Unix socket for an Angie deployment).
   if [[ -z $socket ]]; then
     socket=$(php_pool_listen "$ver")
@@ -2484,6 +2507,23 @@ tune_php_fpm_version() {
   tune_pool_set "$pool" listen.owner www-data "PHP ${ver}: listen.owner=www-data"
   tune_pool_set "$pool" listen.group www-data "PHP ${ver}: listen.group=www-data"
   tune_pool_set "$pool" listen.mode 0660 "PHP ${ver}: listen.mode=0660"
+  # Ensure the pool's log destinations exist before enabling slow logging.  A
+  # pool upgraded from an older package may still point slowlog at a
+  # directory that no longer exists (seen on Ubuntu 24.04); php-fpm -t then
+  # fails as soon as request_slowlog_timeout is set.
+  local fpm_user fpm_group slowlog accesslog poollog
+  fpm_user=$(awk -F= '/^[[:space:]]*user[[:space:]]*=/{v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/,"",v); print v; exit}' "$pool")
+  fpm_group=$(awk -F= '/^[[:space:]]*group[[:space:]]*=/{v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/,"",v); print v; exit}' "$pool")
+  slowlog=$(awk -F= '/^[[:space:]]*slowlog[[:space:]]*=/{v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/,"",v); print v; exit}' "$pool")
+  accesslog=$(awk -F= '/^[[:space:]]*access\.log[[:space:]]*=/{v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/,"",v); print v; exit}' "$pool")
+  poollog=$(awk -F= '/^[[:space:]]*error_log[[:space:]]*=/{v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/,"",v); print v; exit}' "$pool")
+  if [[ -z $slowlog ]]; then
+    slowlog=/var/www/logs/php/php-fpm-slow.log
+    tune_pool_set "$pool" slowlog "$slowlog" "PHP ${ver}: slowlog=${slowlog}"
+  fi
+  ensure_fpm_log_path "$slowlog" "${fpm_user:-www-data}" "${fpm_group:-www-data}"
+  ensure_fpm_log_path "$accesslog" "${fpm_user:-www-data}" "${fpm_group:-www-data}"
+  ensure_fpm_log_path "$poollog" "${fpm_user:-www-data}" "${fpm_group:-www-data}"
   tune_pool_set "$pool" request_terminate_timeout 300s "PHP ${ver}: request_terminate_timeout=300s"
   tune_pool_set "$pool" request_slowlog_timeout 10s "PHP ${ver}: request_slowlog_timeout=10s"
   tune_pool_set "$pool" catch_workers_output yes "PHP ${ver}: catch_workers_output=yes"
@@ -2535,10 +2575,21 @@ EOF
   [[ $ini_before != "$ini_after" ]] \
     && tune_note "PHP ${ver}: memory_limit=${memory_mb}M opcache=${opcache_mb}M jit=${jit_mb}M"
 
+  local fpm_bin="" fpm_test
   if command -v "php-fpm${ver}" >/dev/null 2>&1; then
-    "php-fpm${ver}" -t >/dev/null 2>&1 || return 1
+    fpm_bin=$(command -v "php-fpm${ver}")
   elif [[ -x "/usr/sbin/php-fpm${ver}" ]]; then
-    "/usr/sbin/php-fpm${ver}" -t >/dev/null 2>&1 || return 1
+    fpm_bin="/usr/sbin/php-fpm${ver}"
+  fi
+  if [[ -n $fpm_bin ]]; then
+    fpm_test=$(mktemp)
+    if ! "$fpm_bin" -t >"$fpm_test" 2>&1; then
+      printf 'PHP %s: php-fpm -t failed:\n' "$ver" >&2
+      sed 's/^/  /' "$fpm_test" >&2 || true
+      rm -f "$fpm_test"
+      return 1
+    fi
+    rm -f "$fpm_test"
   fi
   return 0
 }
