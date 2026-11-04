@@ -31,7 +31,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.1"
+readonly SCRIPT_VERSION="1.8.2"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
@@ -1320,7 +1320,12 @@ configure_hostname() {
   if [[ ! -f "${STATE_DIR}/original-hostname" ]]; then
     hostnamectl hostname > "${STATE_DIR}/original-hostname" 2>/dev/null || cat /etc/hostname > "${STATE_DIR}/original-hostname"
   fi
+  record_original /etc/hosts hosts
   hostnamectl set-hostname "$host"
+  # Keep the local 127.0.1.1 entry in sync; otherwise sudo and hostname -f
+  # keep resolving the old name from /etc/hosts after the rename.
+  sed -i -E '/^[[:space:]]*127\.0\.1\.1[[:space:]]/d' /etc/hosts
+  printf '127.0.1.1\t%s\n' "$host" >> /etc/hosts
   hostnamectl status || true
 }
 
@@ -1897,12 +1902,14 @@ tune_angie_configs() {
   disk_class=hdd
   if compgen -G '/sys/block/nvme*' >/dev/null 2>&1; then
     disk_class=nvme
-  elif command -v lsblk >/dev/null 2>&1 && lsblk -d -n -o ROTA 2>/dev/null | grep -q '^0'; then
-    disk_class=ssd
+  elif command -v lsblk >/dev/null 2>&1; then
+    if lsblk -d -n -o ROTA 2>/dev/null | grep -q '^0'; then
+      disk_class=ssd
+    fi
   fi
 
-  disk_free_mb=$(df -Pm /var/www 2>/dev/null | awk 'NR==2{print $4}')
-  [[ $disk_free_mb =~ ^[0-9]+$ ]] || disk_free_mb=$(df -Pm / | awk 'NR==2{print $4}')
+  disk_free_mb=$(df -Pm /var/www 2>/dev/null | awk 'NR==2{print $4}' || true)
+  [[ $disk_free_mb =~ ^[0-9]+$ ]] || disk_free_mb=$(df -Pm / 2>/dev/null | awk 'NR==2{print $4}' || true)
   [[ $disk_free_mb =~ ^[0-9]+$ ]] || disk_free_mb=10240
 
   worker_rlimit=$(tune_clamp $(( nproc * 8192 )) 65536 524288)
@@ -3593,6 +3600,7 @@ purge_basic() {
     orig_host=$(<"${STATE_DIR}/original-hostname")
     if [[ -n $orig_host ]]; then hostnamectl set-hostname "$orig_host" || true; fi
   fi
+  restore_original /etc/hosts hosts
   if [[ -f "${STATE_DIR}/original-timezone" ]]; then
     local orig_tz
     orig_tz=$(<"${STATE_DIR}/original-timezone")
