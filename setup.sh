@@ -8,9 +8,11 @@
 #   * Runs as root only.
 #   * Idempotent: every step can be re-run on an already configured machine.
 #   * Only the services named on the command line are touched.
-#   * Angie and PHP-FPM/php.ini configuration is owned by
+#   * Angie configuration is owned by
 #     https://github.com/droplinxuser/server-configs-nginx and downloaded at
-#     install time.  Do not add config content to this script; update the repo.
+#     install time.  PHP-FPM pool/php.ini templates are non-Angie config and
+#     live locally in configs/php.  Do not add Angie config content to this
+#     script; update the Angie repo.
 #     Other vendor payloads that must be reproducible offline are embedded in
 #     the "EMBEDDED PAYLOADS" section at the bottom.
 #   * Each service is timed; a summary is printed at the end.
@@ -25,7 +27,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.6.9"
+readonly SCRIPT_VERSION="1.6.10"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
@@ -205,8 +207,10 @@ Purge (uninstall) mode:
   --purge php mariadb                   bare names are also accepted
 
 Configuration source:
-  Angie and PHP-FPM/php.ini configuration is downloaded from
+  Angie configuration is downloaded from
   https://github.com/droplinxuser/server-configs-nginx at install time.
+  PHP-FPM pool and php.ini templates are local to this repository
+  (configs/php) because they are not Angie configuration.
   Environment overrides:
     CONFIG_SOURCE_DIR=/path/to/checkout   use a local checkout (testing/offline)
     CONFIG_REPO_URL=https://github.com/... alternate repository
@@ -1008,8 +1012,8 @@ cleanup_configs() {
   fi
 }
 
-# Download/extract server-configs-nginx once for the whole run.  The Angie and
-# PHP installers both consume this tree; no config content lives in setup.sh.
+# Download/extract server-configs-nginx once for the whole run.  Only the
+# Angie installer consumes this tree; PHP-FPM templates are local configs/php.
 fetch_server_configs() {
   if [[ -n ${CONFIG_SOURCE_DIR:-} && -d ${CONFIG_SOURCE_DIR} ]]; then
     info "Using server configs from ${CONFIG_SOURCE_DIR}"
@@ -2190,13 +2194,15 @@ install_php() {
       || warn "Could not pin /usr/bin/php to PHP ${ver}"
   fi
 
-  fetch_server_configs
-  local pool_template="${CONFIG_SOURCE_DIR}/scripts/www_${ver//./}.conf"
-  local ini_template="${CONFIG_SOURCE_DIR}/scripts/custom_dan.ini"
+  # PHP-FPM is not an Angie concern: its pool/ini templates live in this
+  # repository under configs/php and no longer depend on the Angie config
+  # repository being fetched.
+  local pool_template="${SCRIPT_DIR}/configs/php/www_${ver//./}.conf"
+  local ini_template="${SCRIPT_DIR}/configs/php/custom_dan.ini"
   [[ -f $pool_template ]] \
-    || die "PHP ${ver} FPM pool template not found in server-configs-nginx: scripts/www_${ver//./}.conf"
+    || die "PHP ${ver} FPM pool template not found: configs/php/www_${ver//./}.conf"
   [[ -f $ini_template ]] \
-    || die "PHP php.ini template not found in server-configs-nginx: scripts/custom_dan.ini"
+    || die "PHP php.ini template not found: configs/php/custom_dan.ini"
 
   install -m 644 "$pool_template" "/etc/php/${ver}/fpm/pool.d/www.conf"
   install -m 644 "$ini_template" "/etc/php/${ver}/fpm/conf.d/custom_dan.ini"
@@ -2224,7 +2230,7 @@ install_php() {
   ensure_log_dirs
 
   mkdir -p "/etc/systemd/system/php${ver}-fpm.service.d"
-  install -m 644 "${CONFIG_SOURCE_DIR}/scripts/php-fpm-limits.conf" \
+  install -m 644 "${SCRIPT_DIR}/configs/php/php-fpm-limits.conf" \
     "/etc/systemd/system/php${ver}-fpm.service.d/limits.conf"
   systemctl daemon-reload
 
@@ -4340,8 +4346,10 @@ main() {
 
   if [[ ${ENABLED[basic]:-0} -eq 1 ]];   then run_service basic   install_basic; fi
 
-  # One download for both installers; the repo owns all Angie/PHP configs.
-  if [[ ${ENABLED[angie]:-0} -eq 1 || ${ENABLED[php]:-0} -eq 1 ]]; then
+  # The external repository now owns Angie config only. PHP-FPM templates are
+  # local to this repository (configs/php), so a PHP-only install needs no
+  # network fetch.
+  if [[ ${ENABLED[angie]:-0} -eq 1 ]]; then
     fetch_server_configs
   fi
 
