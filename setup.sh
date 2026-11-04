@@ -31,7 +31,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.5"
+readonly SCRIPT_VERSION="1.8.6"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
@@ -4131,7 +4131,7 @@ elasticsearch_data_size_mb() {
 plan_memory_budget() {
   local total usable has_php=0 fixed_available children php_cap
   local es_base_cap=31744 es_hard_cap=31744 es_size_mb=0 es_base=0
-  local current_pool=0 pool_safe_cap=0
+  local current_pool=0
   total=$(mem_total_mb)
   (( total > 0 )) || total=1024
   OPT_MEM_TOTAL_MB=$total
@@ -4187,10 +4187,7 @@ plan_memory_budget() {
   fi
   [[ " ${OPT_DETECTED[*]} " == *" valkey "* || " ${OPT_DETECTED[*]} " == *" redis "* ]] \
     && OPT_VALKEY_BUDGET_MB=$(opt_clamp $(( total / 10 )) 256 8192)
-  [[ " ${OPT_DETECTED[*]} " == *" mariadb "* ]] \
-    && OPT_MARIADB_BUDGET_MB=$(opt_clamp $(( total * 40 / 100 )) 256 32768)
-
-  local db_size_mb=0 db_target=0 reserve=0 remaining=0 others=0
+  local db_size_mb=0 db_target=0 db_cap=0 base_target=0 remaining=0 others=0
   OPT_DB_SIZE_MB=0
   if [[ " ${OPT_DETECTED[*]} " == *" mariadb "* ]]; then
     # Prefer a buffer pool that holds the live data+index working set.  The
@@ -4198,34 +4195,35 @@ plan_memory_budget() {
     db_size_mb=$(mariadb_data_size_mb)
     [[ $db_size_mb =~ ^[0-9]+$ ]] || db_size_mb=0
     OPT_DB_SIZE_MB=$db_size_mb
-    db_target=$(( db_size_mb * 105 / 100 ))
-    (( db_target > OPT_MARIADB_BUDGET_MB )) && OPT_MARIADB_BUDGET_MB=$db_target
-    (( OPT_MARIADB_BUDGET_MB > 32768 )) && OPT_MARIADB_BUDGET_MB=32768
 
-    # Leave small floors for Elasticsearch and the cache tier, then give
-    # MariaDB the rest of its target.  If the database still cannot fit, it
-    # receives the largest feasible pool and optimize_mariadb reports that.
-    [[ " ${OPT_DETECTED[*]} " == *" elastic "* ]] && reserve=$(( reserve + 512 ))
-    [[ " ${OPT_DETECTED[*]} " == *" valkey "* || " ${OPT_DETECTED[*]} " == *" redis "* ]] \
-      && reserve=$(( reserve + 256 ))
-    if (( OPT_MARIADB_BUDGET_MB > fixed_available - reserve )); then
-      OPT_MARIADB_BUDGET_MB=$(( fixed_available - reserve ))
-      (( OPT_MARIADB_BUDGET_MB < 256 )) && OPT_MARIADB_BUDGET_MB=256
+    # Reserve the full cache and search budgets before sizing MariaDB, so a
+    # large database cannot crowd them out.
+    db_cap=$(( fixed_available - OPT_VALKEY_BUDGET_MB - OPT_ES_BUDGET_MB ))
+    (( db_cap < 256 )) && db_cap=256
+
+    # Keep the conservative 40%-of-RAM target (capped at 32 GB) for small
+    # databases, but honour a larger working set when it fits.
+    base_target=$(opt_clamp $(( total * 40 / 100 )) 256 32768)
+    if (( db_size_mb > 0 )); then
+      db_target=$(( db_size_mb * 105 / 100 ))
+      (( db_target > base_target )) && base_target=$db_target
     fi
+    OPT_MARIADB_BUDGET_MB=$base_target
+    (( OPT_MARIADB_BUDGET_MB > db_cap )) && OPT_MARIADB_BUDGET_MB=$db_cap
 
-    # Do not shrink a larger pool that is already live.  Automatic sizing
-    # stays conservative (32 GB cap), but on very large hosts an operator may
-    # deliberately run a bigger pool; keep it as long as it fits 50% of RAM
-    # and the shared budget after the other service reservations.
+    # Keep a live pool that is already within 2% of the computed target so
+    # small information_schema statistics drift does not cause a restart on
+    # every run.  Also never shrink a larger pool that still fits.
     current_pool=$(mariadb_current_pool_mb)
-    pool_safe_cap=$(( total * 50 / 100 ))
-    (( pool_safe_cap > 131072 )) && pool_safe_cap=131072
-    if [[ $current_pool =~ ^[0-9]+$ ]] \
-       && (( current_pool > OPT_MARIADB_BUDGET_MB )) \
-       && (( current_pool <= pool_safe_cap )) \
-       && (( current_pool + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB <= fixed_available )); then
-      OPT_MARIADB_BUDGET_MB=$current_pool
-      OPT_MARIADB_KEPT_MB=$current_pool
+    if [[ $current_pool =~ ^[0-9]+$ ]] && (( current_pool > 0 && current_pool <= db_cap )); then
+      if (( current_pool * 100 >= OPT_MARIADB_BUDGET_MB * 98 \
+            && current_pool * 100 <= OPT_MARIADB_BUDGET_MB * 102 )); then
+        OPT_MARIADB_BUDGET_MB=$current_pool
+        OPT_MARIADB_KEPT_MB=$current_pool
+      elif (( current_pool > OPT_MARIADB_BUDGET_MB )); then
+        OPT_MARIADB_BUDGET_MB=$current_pool
+        OPT_MARIADB_KEPT_MB=$current_pool
+      fi
     fi
   fi
 

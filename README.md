@@ -31,6 +31,16 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.6
+
+- **MariaDB's buffer pool now sizes to the live database working set.** When
+  the measured data+index size plus 5% headroom fits the shared 80%-of-RAM
+  budget after reserving PHP, Valkey/Redis and Elasticsearch, `--optimize`
+  uses it. Smaller databases keep the previous conservative target
+  (40% of RAM, capped at 32 GB), and an existing larger pool is still
+  preserved instead of being shrunk. A live pool within ±2% of the computed
+  target is kept as-is so small statistics drift does not cause restarts.
+
 ## What's new in 1.8.5
 
 - **`--optimize` no longer shrinks an existing larger MariaDB buffer pool.**
@@ -824,9 +834,11 @@ bash setup.sh --optimize --dry-run
 It applies the same hardware-aware values used by a normal install: Angie
 workers/connections/buffers/cache sizes, PHP-FPM `static` pool sizing, MariaDB
 buffer pool/connection backlog, Valkey/Redis maxmemory, and Elasticsearch
-heap. An existing MariaDB buffer pool larger than the automatic 32 GB target
-is preserved (up to 50% of RAM and the shared budget) instead of being
-shrunk. PHP listeners are preserved: Angie is repointed only when the pool
+heap. The MariaDB pool is sized to the live data+index working set plus 5%
+when that fits the shared budget after reserving the other services; smaller
+databases keep the conservative 40%-of-RAM/32 GB target, and an existing
+larger pool is preserved instead of being shrunk. PHP listeners are
+preserved: Angie is repointed only when the pool
 already owns a Unix socket, so a live TCP pool is never broken by a
 configuration change. Service allocations
 are planned together from one 80%-of-RAM budget, with PHP worker capacity
