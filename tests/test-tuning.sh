@@ -101,6 +101,29 @@ check "tune_insert_after leaves http2 on intact" \
   grep -qx 'http2 on;' "$TMP/anchor.conf"
 
 # ---------------------------------------------------------------------------
+# Error-response cache policy (applies to old installs during --optimize)
+# ---------------------------------------------------------------------------
+cat > "$TMP/cache-policy.conf" <<'EOF'
+fastcgi_cache_valid any 5s;
+fastcgi_cache_use_stale error timeout updating http_500 http_503;
+EOF
+tune_reset_changes
+tune_cache_error_policy "$TMP/cache-policy.conf" "test cache"
+check "error policy removes http_500 from use_stale" \
+  bash -c "! grep -q 'http_500' '$TMP/cache-policy.conf'"
+check "error policy keeps http_503 stale handling" \
+  grep -q 'http_503' "$TMP/cache-policy.conf"
+check "error policy disables caching of 5xx responses" \
+  grep -qx 'fastcgi_cache_valid 500 502 503 504 0s;' "$TMP/cache-policy.conf"
+check "error policy records the change" test "${#TUNE_CHANGES[@]}" -eq 1
+
+tune_reset_changes
+tune_cache_error_policy "$TMP/cache-policy.conf" "test cache"
+check "error policy is idempotent" test "${#TUNE_CHANGES[@]}" -eq 0
+check "error policy keeps a single 5xx rule" \
+  test "$(grep -c 'fastcgi_cache_valid 500' "$TMP/cache-policy.conf")" -eq 1
+
+# ---------------------------------------------------------------------------
 # Angie tuning against the repository fixture
 # ---------------------------------------------------------------------------
 mkdir -p "$TMP/angie"
@@ -328,6 +351,27 @@ check "buffer pool covers a 20 GB database" \
 check "database-fit plan stays inside the 80% budget" \
   test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
        -le $(( 65536 * 80 / 100 ))
+
+# A freshly installed database can be only a few MB.  Do not collapse the
+# buffer pool on a large host; keep a 1/16-RAM floor (capped at 8 GB).
+mem_total_mb() { printf '262144'; }
+mariadb_current_pool_mb() { printf '0'; }
+mariadb_data_size_mb() { printf '81'; }
+elasticsearch_data_size_mb() { printf '0'; }
+php_pool_max_children() { printf '128'; }
+OPT_DETECTED=(angie php:8.4 mariadb valkey elastic)
+plan_memory_budget
+check "tiny fresh database keeps the hardware-scaled floor" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 8192
+check "tiny database floor stays inside the 80% budget" \
+  test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
+       -le $(( 262144 * 80 / 100 ))
+
+# Restore the 64 GB context for the oversized-database cases below.
+mem_total_mb() { printf '65536'; }
+mariadb_current_pool_mb() { printf '0'; }
+php_pool_max_children() { printf '128'; }
+OPT_DETECTED=(angie php:8.3 mariadb redis elastic)
 
 # A database larger than the remaining budget gets the largest feasible pool.
 mariadb_data_size_mb() { printf '40960'; }

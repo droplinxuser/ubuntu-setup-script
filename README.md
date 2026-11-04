@@ -31,6 +31,25 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.13
+
+- **`--auto-tune` (and `tools/auto-tune.sh`) tunes the whole host.** It runs
+  the OS layer (CPU governor, PAM limits, hardware-scaled kernel/network/memory
+  sysctls) and then every detected service, in one idempotent pass. Use it on
+  an existing server; `--optimize` remains the service-only variant.
+- **MariaDB keeps a hardware-scaled buffer-pool floor.** A freshly installed
+  database with a few MB of data no longer collapses a 128 GB host to a 256 MB
+  pool; the floor is 1/16 of RAM, capped at 8 GB, and still bounded by the
+  shared 80%-of-RAM budget.
+- **`--optimize` now upgrades old installs consistently.** It applies the
+  systemd `LimitNOFILE` drop-ins used by the installer (Angie, PHP-FPM,
+  MariaDB), raises `vm.max_map_count` for Elasticsearch, preserves an explicit
+  Valkey `io_threads` value, and disables caching/stale serving of 5xx
+  responses for WordPress and XenForo FastCGI caches.
+- **Chevereto-only Imagick is installed on demand.** `--domain ... app=chevereto`
+  installs `php<ver>-imagick`; the default XenForo/WordPress PHP profile stays
+  lean and does not add Imagick.
+
 ## What's new in 1.8.12
 
 - **Per-service budgets now scale with the services actually installed.**
@@ -410,9 +429,10 @@ alongside `setup.sh`).
   `php<ver>-cli` is added only when `--others composer` is selected. The
   optional stress harness installs CLI for its seeder and can be removed
   afterwards.
-- `intl`/`imagick`/`bcmath`/`apcu` are intentionally not installed. OPcache
-  and CLI are included; `custom_dan.ini` OPcache/JIT settings take effect
-  immediately.
+- `intl`/`imagick`/`bcmath`/`apcu` are intentionally not installed by
+  default. OPcache and CLI are included; `custom_dan.ini` OPcache/JIT settings
+  take effect immediately. Chevereto deployments (`--domain ... app=chevereto`)
+  install `php<ver>-imagick` automatically because Chevereto requires it.
 
 ## What's new in 1.6.0
 
@@ -890,7 +910,11 @@ bash setup.sh --optimize --dry-run
 It applies the same hardware-aware values used by a normal install: Angie
 workers/connections/buffers/cache sizes, PHP-FPM `static` pool sizing, MariaDB
 buffer pool/connection backlog, Valkey/Redis maxmemory, and Elasticsearch
-heap. The Angie cache budget is shared only across the cache types that are
+heap. It also applies the installer's systemd `LimitNOFILE` drop-ins for
+Angie/PHP-FPM/MariaDB, raises `vm.max_map_count` for Elasticsearch, preserves
+an explicit Valkey `io_threads` value, and disables caching/stale serving of
+5xx responses in the WordPress and XenForo FastCGI caches. The Angie cache
+budget is shared only across the cache types that are
 actually present, so a dedicated proxy with one cache type gets the whole
 budget. The share also scales with installed services: Angie-only uses 50%
 of RAM / 10% of free disk, Angie+PHP only 30%, Valkey-only 50%, and the
@@ -898,7 +922,9 @@ shared profile 25%/10% capped at 8 GB. When PHP is absent, MariaDB receives
 the full fixed budget (no PHP worker reservation), though its data+5% target
 still prevents over-allocation. MariaDB's pool and Elasticsearch's heap are sized to the live
 data/index store plus 5%, bounded by the shared budget after reserving the
-other services; a 40%-of-RAM (MariaDB) or 25%-of-RAM (Elasticsearch)
+other services; MariaDB additionally keeps a 1/16-RAM floor (capped at 8 GB)
+so a freshly installed database cannot collapse a large host to a 256 MB
+pool. A 40%-of-RAM (MariaDB) or 25%-of-RAM (Elasticsearch)
 fallback is used only when the data size cannot be measured. Oversized live
 allocations are reduced to the data-sized target. Elasticsearch keeps its
 31 GB compressed-oops ceiling. PHP listeners are preserved: Angie is
@@ -915,6 +941,29 @@ real listener (Angie via `ss`, PHP socket/TCP) plus SQL/PING/HTTP probes and
 lists recent error-level journal entries. The Markdown report is written to
 `/var/log/setup-optimize-<timestamp>.md` and copied to
 `/var/log/setup-optimize-latest.md`.
+
+### Full host auto-tune (OS + services)
+
+`--optimize` intentionally leaves the operating system alone. To apply the
+install-time OS profile as well — CPU governor, PAM limits, and the
+hardware-scaled kernel/network/memory sysctls — use the full auto-tune mode:
+
+```bash
+# Everything: OS + Angie + PHP-FPM + MariaDB + Valkey/Redis + Elasticsearch
+sudo bash setup.sh --auto-tune
+
+# Equivalent convenience wrapper
+sudo bash tools/auto-tune.sh
+
+# Preview without changing anything
+bash setup.sh --auto-tune --dry-run
+```
+
+`--auto-tune` is safe on an existing server: it never installs, purges or
+starts a missing service, restarts a service only when its configuration
+actually changed, and writes the same report/backup set as `--optimize`.
+Use `--optimize` when you deliberately want service-only changes.
+
 
 Older Angie installs whose `http.d` files use underscore names
 (`fastcgi_cache_conf`, `limit_req_conf`, …) are tuned in place as well.
