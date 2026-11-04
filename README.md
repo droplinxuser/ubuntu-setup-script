@@ -31,6 +31,42 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.1
+
+- **Redis is optimized when Valkey is not installed.** Existing hosts often
+  run `redis-server`; `--optimize` now detects `/etc/redis/redis.conf`,
+  tunes it with the same cache logic, and raises the Redis unit's
+  `LimitNOFILE`. Valkey still takes precedence when both are present.
+- **PHP capacity is reserved before data-service sizing.** The previous plan
+  split 80% of RAM among MariaDB/Elasticsearch/cache first and gave PHP the
+  remainder, which could cut a live 128-worker pool to ~34 workers. The
+  planner now reserves the pool's current `max_children` (at 96 MB/worker,
+  capped at 50% of RAM) and fits the data services into what remains.
+- **Shared hosts cap the Elasticsearch heap at 8 GB** instead of 25% of RAM,
+  so the freed memory goes to MariaDB. A dedicated search node still uses the
+  larger 25% allowance.
+- **Elasticsearch heap follows the live index size.** The planner reads the
+  allocated store size from `_cluster/stats`; if the index is larger than the
+  base heap it raises the target (up to 16 GB on a shared host, 31 GB on a
+  dedicated search node) and reports when the index still exceeds the heap.
+- **MariaDB is sized to the live database.** `--optimize` reads the actual
+  data+index size from `information_schema` and targets a buffer pool that
+  holds it (with 5% headroom) when the RAM budget allows. If the database is
+  too large, it receives the largest feasible pool and the report states that
+  it does not fully fit.
+- **Existing MariaDB connection ceilings are preserved.** If the live server
+  already allows more than `threads × 32` connections (up to 2000), the
+  generated config keeps that headroom instead of lowering it.
+- **PHP listeners are preserved on live hosts.** `--optimize` no longer moves
+  a TCP PHP-FPM pool to a Unix socket (which briefly leaves Angie pointing at
+  the old port). It keeps the existing listener and repoints Angie only when
+  the pool already uses a socket. New installs still use the socket template.
+- **Only Angie-included http.d files are tuned.** Discovery follows the actual
+  `include` patterns, so inert `_conf` leftovers from older layouts are left
+  untouched and the active `*.conf` cache file is the one that gets resized.
+- **Clearer budget reporting.** The shared cache allocation is reported as
+  `Cache` so the same line is accurate for Valkey and Redis.
+
 ## What's new in 1.8.0
 
 - **`--optimize` now supports Ubuntu 22.04.** The optimize path only rewrites
@@ -740,15 +776,18 @@ bash setup.sh --optimize --dry-run
 - `angie` + `/etc/angie/angie.conf`
 - every `/etc/php/<version>/fpm` tree
 - MariaDB + `/etc/mysql`
-- Valkey + `/etc/valkey/valkey.conf`
+- Valkey + `/etc/valkey/valkey.conf`, or Redis + `/etc/redis/redis.conf`
 - Elasticsearch + `/etc/elasticsearch/elasticsearch.yml`
 
 It applies the same hardware-aware values used by a normal install: Angie
-workers/connections/buffers/cache sizes, PHP-FPM `static` pool sizing and the
-shared `/run/php/php-fpm.sock` listener, MariaDB buffer pool/connection
-backlog, Valkey maxmemory, and Elasticsearch heap. Service allocations are
-planned together from one 80%-of-RAM budget, so MariaDB + PHP + Valkey +
-Elasticsearch cannot collectively exhaust memory. Each configuration is
+workers/connections/buffers/cache sizes, PHP-FPM `static` pool sizing, MariaDB
+buffer pool/connection backlog, Valkey/Redis maxmemory, and Elasticsearch
+heap. PHP listeners are preserved: Angie is repointed only when the pool
+already owns a Unix socket, so a live TCP pool is never broken by a
+configuration change. Service allocations
+are planned together from one 80%-of-RAM budget, with PHP worker capacity
+reserved first, so MariaDB + PHP + cache + Elasticsearch cannot collectively
+exhaust memory. Each configuration is
 validated and active services are restarted only when their generated files
 actually changed; a failure rolls back the affected service from
 `/var/backups/setup-optimize-*`. The final verification checks each service's

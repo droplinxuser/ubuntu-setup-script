@@ -31,7 +31,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.0"
+readonly SCRIPT_VERSION="1.8.1"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
@@ -196,14 +196,15 @@ Domain setup (standalone; Angie + MariaDB must already be installed/running):
 
 Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
   --optimize [--dry-run]
-      Detects installed services (Angie, PHP-FPM, MariaDB, Valkey,
-      Elasticsearch) and tunes their live configuration for the current
+      Detects installed services (Angie, PHP-FPM, MariaDB, Valkey or
+      Redis, Elasticsearch) and tunes their live configuration for the current
       CPU/RAM/disk.  It never installs, purges or starts a service that was
       not already running.  Allocations are planned together from one
       80%-of-RAM budget, and a service is restarted only when its generated
-      configuration actually changed.  PHP-FPM pools are moved to the shared
-      Unix socket /run/php/php-fpm.sock and Angie's fastcgi_pass is repointed
-      when Angie is installed; other PHP versions keep their listener.
+      configuration actually changed.  Existing PHP-FPM listeners are kept;
+      when a pool already listens on a Unix socket, Angie's fastcgi_pass is
+      repointed to it.  TCP pools stay on TCP so a live site is never left
+      pointing at a missing socket.
       Configuration files are backed up under /var/backups/setup-optimize-*
       and a Markdown report is written to /var/log/setup-optimize-*.md.
       Existing application vhosts and credentials are preserved.
@@ -1755,9 +1756,11 @@ install_basic() {
 TUNE_CHANGES=()
 TUNE_MISSES=()
 TUNE_DIRTY=0
-# Only repoint Angie's FastCGI upstream at the local socket when a local
-# PHP-FPM installation was detected and its optimization succeeded.
+# Only repoint Angie's FastCGI upstream when the optimized PHP pool already
+# owns a Unix socket.  --optimize preserves an existing TCP listener so a live
+# site is never pointed at a socket that does not exist.
 OPT_PHP_OK=0
+OPT_PHP_SOCKET=""
 tune_reset_changes() { TUNE_CHANGES=(); TUNE_MISSES=(); TUNE_DIRTY=0; }
 tune_note() { TUNE_CHANGES+=("$*"); TUNE_DIRTY=1; }
 # Informational line that must not count as a configuration change (and must
@@ -1793,6 +1796,37 @@ tune_first_file() {
   shift
   for name in "$@"; do
     [[ -f "${dir}/${name}" ]] && { printf '%s' "${dir}/${name}"; return 0; }
+  done
+  return 1
+}
+
+# Files under http.d that Angie actually includes.  Hosts upgraded from older
+# layouts often keep inert *_conf leftovers next to the active *.conf files;
+# tuning those leftovers changes nothing and hides the real cache/limit files.
+TUNE_ACTIVE_HTTP=()
+angie_active_http_files() {
+  local target=$1 conf="${1}/angie.conf" pattern path
+  [[ -f $conf ]] || return 0
+  while IFS= read -r pattern; do
+    pattern=${pattern#*include}
+    pattern=${pattern%%;*}
+    pattern=$(printf '%s' "$pattern" | tr -d '"' | awk '{print $1}')
+    [[ -n $pattern ]] || continue
+    [[ $pattern == /* ]] || pattern="${target}/${pattern}"
+    while IFS= read -r path; do
+      [[ -n $path && -f $path ]] || continue
+      case "$path" in
+        "${target}/http.d/"*) printf '%s\n' "$path" ;;
+      esac
+    done < <(compgen -G "$pattern" 2>/dev/null | sort || true)
+  done < <(grep -hE '^[[:space:]]*include[[:space:]]+' "$conf" 2>/dev/null || true)
+}
+
+tune_active_file() {
+  local pattern=$1 file
+  for file in "${TUNE_ACTIVE_HTTP[@]}"; do
+    [[ -f $file ]] || continue
+    grep -qE "$pattern" "$file" && { printf '%s' "$file"; return 0; }
   done
   return 1
 }
@@ -1936,59 +1970,69 @@ tune_angie_configs() {
       "  client_body_buffer_size ${body_buffer};" "angie.conf: inserted client_body_buffer_size=${body_buffer}"
   fi
 
-  # Point any remaining TCP FastCGI handlers at the shared Unix socket.  If
-  # PHP optimization failed and rolled back, leave Angie's existing upstream
-  # alone so the web server cannot be pointed at a missing socket.
-  if (( ${OPT_PHP_OK:-1} )); then
-    local file
+  # Point any remaining TCP FastCGI handlers at the pool's Unix socket, but
+  # only when optimize_php_services found an existing socket listener.  A pool
+  # kept on TCP (the usual live-server case) must keep Angie on TCP as well.
+  if [[ -n ${OPT_PHP_SOCKET:-} ]]; then
+    local file php_socket=${OPT_PHP_SOCKET}
     while IFS= read -r file; do
       [[ -n $file ]] || continue
       local before after
       before=$(md5sum "$file" | awk '{print $1}')
-      sed -i -E 's#^([[:space:]]*fastcgi_pass[[:space:]]+)(127\.0\.0\.1|localhost):9000;#\1unix:/run/php/php-fpm.sock;#g' "$file"
+      sed -i -E "s#^([[:space:]]*fastcgi_pass[[:space:]]+)(127\.0\.0\.1|localhost):9000;#\\1unix:${php_socket};#g" "$file"
       after=$(md5sum "$file" | awk '{print $1}')
-      [[ $before != "$after" ]] && tune_note "${file#"${target}"/}: fastcgi_pass -> unix:/run/php/php-fpm.sock"
+      [[ $before != "$after" ]] && tune_note "${file#"${target}"/}: fastcgi_pass -> unix:${php_socket}"
     done < <(grep -rlE '^[[:space:]]*fastcgi_pass[[:space:]]+(127\.0\.0\.1|localhost):9000;' "$target" 2>/dev/null || true)
 
     if grep -qE '^([[:space:]]*server[[:space:]]+)(127\.0\.0\.1|localhost):9000;' "$nginx_conf"; then
       tune_replace "$nginx_conf" \
         '^([[:space:]]*server[[:space:]]+)(127\.0\.0\.1|localhost):9000;' \
-        '\1unix:/run/php/php-fpm.sock;' "angie.conf: local_php upstream -> Unix socket"
+        "\\1unix:${php_socket};" "angie.conf: local_php upstream -> Unix socket"
     fi
   fi
 
-  # Cache sizes and zones.  Resolve both the current (.conf) and legacy
-  # (_conf) names so an older live deployment is still tuned.
+  # Cache sizes and zones.  Resolve the files Angie actually includes; fall
+  # back to the legacy name list only when no include pattern was parsed.
   local f_fcgi f_chev f_xf f_proxy f_limit
-  f_fcgi=$(tune_first_file "$target/http.d" fastcgi_cache.conf fastcgi_cache_conf) || f_fcgi=""
-  f_chev=$(tune_first_file "$target/http.d" fastcgi_cache_chev.conf fastcgi_cache_chev_conf) || f_chev=""
-  f_xf=$(tune_first_file "$target/http.d" xf_proxy_cache.conf xf_proxy_cache_conf) || f_xf=""
-  f_proxy=$(tune_first_file "$target/http.d" proxy_cache.conf proxy_cache_conf) || f_proxy=""
-  f_limit=$(tune_first_file "$target/http.d" limit_req.conf limit_req_conf) || f_limit=""
+  TUNE_ACTIVE_HTTP=()
+  mapfile -t TUNE_ACTIVE_HTTP < <(angie_active_http_files "$target")
+  if (( ${#TUNE_ACTIVE_HTTP[@]} > 0 )); then
+    f_fcgi=$(tune_active_file 'keys_zone=fastcgicache:') || f_fcgi=""
+    f_chev=$(tune_active_file 'keys_zone=fastcgicache_chev:') || f_chev=""
+    f_xf=$(tune_active_file 'keys_zone=xfproxycache:') || f_xf=""
+    f_proxy=$(tune_active_file 'keys_zone=(proxy_cache|proxy_cdn|cdn_proxy):') || f_proxy=""
+    f_limit=$(tune_active_file 'limit_req_zone') || f_limit=""
+  else
+    f_fcgi=$(tune_first_file "$target/http.d" fastcgi_cache.conf fastcgi_cache_conf) || f_fcgi=""
+    f_chev=$(tune_first_file "$target/http.d" fastcgi_cache_chev.conf fastcgi_cache_chev_conf) || f_chev=""
+    f_xf=$(tune_first_file "$target/http.d" xf_proxy_cache.conf xf_proxy_cache_conf) || f_xf=""
+    f_proxy=$(tune_first_file "$target/http.d" proxy_cache.conf proxy_cache_conf) || f_proxy=""
+    f_limit=$(tune_first_file "$target/http.d" limit_req.conf limit_req_conf) || f_limit=""
+  fi
 
   if [[ -n $f_fcgi ]]; then
     tune_replace "$f_fcgi" \
-      'keys_zone=fastcgicache:[0-9]+m max_size=[0-9]+[mgMG]' \
-      "keys_zone=fastcgicache:${fcgi_zone}m max_size=${fcgi_size}" \
+      '^(.*keys_zone=fastcgicache:)[0-9]+m( max_size=[0-9]+[mgMG])?(.*)$' \
+      "\\1${fcgi_zone}m max_size=${fcgi_size}\\3" \
       "${f_fcgi#"${target}"/}: ${fcgi_zone}m zone / ${fcgi_size} max"
   else
-    tune_miss "http.d/fastcgi_cache.conf: file not found"
+    tune_miss "http.d: no active fastcgi_cache_path"
   fi
   if [[ -n $f_chev ]]; then
     tune_replace "$f_chev" \
-      '^(fastcgi_cache_path /home/nginx_cache_chev levels=1:2 keys_zone=fastcgicache_chev:)[0-9]+m( max_size=[0-9]+[mgMG])?(.*)$' \
+      '^(.*keys_zone=fastcgicache_chev:)[0-9]+m( max_size=[0-9]+[mgMG])?(.*)$' \
       "\\1${chev_zone}m max_size=${chev_size}\\3" \
       "${f_chev#"${target}"/}: ${chev_zone}m zone / ${chev_size} max"
   else
-    tune_miss "http.d/fastcgi_cache_chev.conf: file not found"
+    tune_miss "http.d: no active fastcgicache_chev cache_path"
   fi
   if [[ -n $f_xf ]]; then
     tune_replace "$f_xf" \
-      'keys_zone=xfproxycache:[0-9]+m max_size=[0-9]+[mgMG]' \
-      "keys_zone=xfproxycache:${xf_zone}m max_size=${xf_size}" \
+      '^(.*keys_zone=xfproxycache:)[0-9]+m( max_size=[0-9]+[mgMG])?(.*)$' \
+      "\\1${xf_zone}m max_size=${xf_size}\\3" \
       "${f_xf#"${target}"/}: ${xf_zone}m zone / ${xf_size} max"
   else
-    tune_miss "http.d/xf_proxy_cache.conf: file not found"
+    tune_miss "http.d: no active xfproxycache cache_path"
   fi
   if [[ -n $f_proxy ]]; then
     tune_replace "$f_proxy" \
@@ -2019,7 +2063,7 @@ tune_angie_configs() {
     [[ $(md5sum "$f_proxy" | awk '{print $1}') != "$before" ]] \
       && tune_note "${f_proxy#"${target}"/}: proxy=${proxy_size} cdn=${cdn_size}"
   else
-    tune_miss "http.d/proxy_cache.conf: file not found"
+    tune_miss "http.d: no active proxy_cache_path"
   fi
 
   limit_post=$(tune_clamp $(( mem_mb / 4096 )) 8 32)
@@ -2032,17 +2076,22 @@ tune_angie_configs() {
       'zone=limit_req_get_perip:[0-9]+m' "zone=limit_req_get_perip:${limit_get}m" \
       "${f_limit#"${target}"/}: GET zone=${limit_get}m"
   else
-    tune_miss "http.d/limit_req.conf: file not found"
+    tune_miss "http.d: no active limit_req_zone"
   fi
 
-  # Bound custom/legacy cache paths that are not part of the standard set.
-  # A stale "keys_zone=...:5120m" on a 4 GB host maps gigabytes of shared
-  # memory for a cache that may never be used.  Keep these caches available
-  # but conservative instead of sizing them like a primary cache.
+  # Bound custom cache paths that are not part of the standard set.  Scan
+  # only files Angie includes, so inert legacy leftovers are left untouched.
   local extra_zone extra_max file
+  local -a cache_files=()
   extra_zone=$(tune_clamp $(( cache_total_mb / 16 )) 8 128)
   extra_max=$(tune_clamp $(( cache_total_mb / 8 )) 64 1024)
-  while IFS= read -r file; do
+  if (( ${#TUNE_ACTIVE_HTTP[@]} > 0 )); then
+    cache_files=("${TUNE_ACTIVE_HTTP[@]}")
+  else
+    mapfile -t cache_files < <(grep -rlE '^[[:space:]]*(fastcgi|proxy)_cache_path[[:space:]]' \
+      "$target/http.d" 2>/dev/null || true)
+  fi
+  for file in "${cache_files[@]}"; do
     [[ -n $file ]] || continue
     if [[ $file == "${f_fcgi:-}" || $file == "${f_chev:-}" || \
           $file == "${f_xf:-}" || $file == "${f_proxy:-}" ]]; then
@@ -2082,8 +2131,7 @@ tune_angie_configs() {
       tune_note "${file#"${target}"/}: custom cache capped at ${extra_zone}m zone / ${extra_max}M max"
     fi
     rm -f "${file}.new"
-  done < <(grep -rlE '^[[:space:]]*(fastcgi|proxy)_cache_path[[:space:]]' \
-             "$target/http.d" 2>/dev/null || true)
+  done
 
   tune_replace "$target/h5bp/tls/ssl_engine.conf" \
     '^([[:space:]]*ssl_session_cache[[:space:]]+shared:SSL:)[0-9]+m;' \
@@ -3990,6 +4038,7 @@ detect_installed_services() {
     [[ -d /etc/mysql ]] && OPT_DETECTED+=(mariadb)
   fi
   [[ -f /etc/valkey/valkey.conf ]] && OPT_DETECTED+=(valkey)
+  [[ -f /etc/redis/redis.conf ]] && OPT_DETECTED+=(redis)
   [[ -f /etc/elasticsearch/elasticsearch.yml ]] && OPT_DETECTED+=(elastic)
   return 0
 }
@@ -4003,6 +4052,8 @@ detect_installed_services() {
 # so the first traffic spike ends in the OOM killer.  Allocate once, from a
 # single budget, and leave 20% of RAM for the OS and the web server.
 OPT_MEM_TOTAL_MB=0
+OPT_DB_SIZE_MB=0
+OPT_ES_SIZE_MB=0
 OPT_MEM_BUDGET_MB=0
 OPT_PHP_BUDGET_MB=0
 OPT_MARIADB_BUDGET_MB=0
@@ -4020,8 +4071,36 @@ opt_clamp() {
   printf '%s' "$value"
 }
 
+# Data + index bytes for user schemas as whole MB.  The InnoDB buffer pool
+# should be able to hold this working set when the RAM budget permits.
+mariadb_data_size_mb() {
+  local bytes
+  command -v mariadb >/dev/null 2>&1 || return 0
+  bytes=$(mariadb -N -B -e "
+    SELECT COALESCE(SUM(data_length + index_length), 0)
+    FROM information_schema.tables
+    WHERE table_schema NOT IN
+      ('mysql','information_schema','performance_schema','sys');" 2>/dev/null || true)
+  [[ $bytes =~ ^[0-9]+$ ]] || return 0
+  printf '%s' $(( bytes / 1024 / 1024 ))
+}
+
+# Allocated index store size (primary + replicas) in whole MB.
+elasticsearch_data_size_mb() {
+  local bytes
+  command -v curl >/dev/null 2>&1 || return 0
+  bytes=$(curl -fsS --max-time 3 \
+    'http://127.0.0.1:9200/_cluster/stats?filter_path=indices.store.size_in_bytes' \
+    2>/dev/null \
+    | sed -n 's/.*"size_in_bytes"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+    | head -n1)
+  [[ $bytes =~ ^[0-9]+$ ]] || return 0
+  printf '%s' $(( bytes / 1024 / 1024 ))
+}
+
 plan_memory_budget() {
-  local total usable fixed target has_php=0
+  local total usable has_php=0 fixed_available children php_cap
+  local es_base_cap=31744 es_hard_cap=31744 es_size_mb=0 es_base=0
   total=$(mem_total_mb)
   (( total > 0 )) || total=1024
   OPT_MEM_TOTAL_MB=$total
@@ -4033,35 +4112,81 @@ plan_memory_budget() {
   OPT_ES_BUDGET_MB=0
 
   [[ " ${OPT_DETECTED[*]} " == *" php:"* ]] && has_php=1
-  [[ " ${OPT_DETECTED[*]} " == *" elastic "* ]] \
-    && OPT_ES_BUDGET_MB=$(opt_clamp $(( total * 25 / 100 )) 512 31744)
-  [[ " ${OPT_DETECTED[*]} " == *" valkey "* ]] \
+
+  # Reserve PHP workers before sizing the data services.  PHP is the
+  # request-serving tier: starving it to give Elasticsearch a larger heap
+  # turns a memory win into a throughput regression.  Use the pool's current
+  # max_children when available, with a 96 MB/worker allowance (the same
+  # divisor tune_php_fpm_version uses), capped at 50% of RAM.
+  if (( has_php )); then
+    children=$(php_pool_max_children)
+    (( children > 0 )) || children=$(( $(nproc) * 16 ))
+    OPT_PHP_BUDGET_MB=$(( children * 96 ))
+    (( OPT_PHP_BUDGET_MB < 512 )) && OPT_PHP_BUDGET_MB=512
+    php_cap=$(( total * 50 / 100 ))
+    (( OPT_PHP_BUDGET_MB > php_cap )) && OPT_PHP_BUDGET_MB=$php_cap
+    fixed_available=$(( usable - OPT_PHP_BUDGET_MB ))
+    (( fixed_available < 0 )) && fixed_available=0
+  else
+    fixed_available=$usable
+  fi
+
+  # A shared web/data host starts Elasticsearch at 8 GB rather than
+  # 25%-of-RAM.  If the live index is larger, raise the heap up to 16 GB
+  # (or 31 GB on a dedicated search node) so the working set can fit.
+  if [[ " ${OPT_DETECTED[*]} " == *" php:"* || " ${OPT_DETECTED[*]} " == *" mariadb "* ]]; then
+    es_base_cap=8192
+    es_hard_cap=16384
+  fi
+  OPT_ES_SIZE_MB=0
+  if [[ " ${OPT_DETECTED[*]} " == *" elastic "* ]]; then
+    es_size_mb=$(elasticsearch_data_size_mb)
+    [[ $es_size_mb =~ ^[0-9]+$ ]] || es_size_mb=0
+    OPT_ES_SIZE_MB=$es_size_mb
+    es_base=$(opt_clamp $(( total * 25 / 100 )) 512 "$es_base_cap")
+    if (( es_size_mb > es_base )); then
+      es_base=$es_size_mb
+      (( es_base > es_hard_cap )) && es_base=$es_hard_cap
+    fi
+    OPT_ES_BUDGET_MB=$es_base
+  fi
+  [[ " ${OPT_DETECTED[*]} " == *" valkey "* || " ${OPT_DETECTED[*]} " == *" redis "* ]] \
     && OPT_VALKEY_BUDGET_MB=$(opt_clamp $(( total / 10 )) 256 8192)
   [[ " ${OPT_DETECTED[*]} " == *" mariadb "* ]] \
     && OPT_MARIADB_BUDGET_MB=$(opt_clamp $(( total * 40 / 100 )) 256 32768)
 
-  fixed=$(( OPT_ES_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_MARIADB_BUDGET_MB ))
-  # Too many caches for this host (e.g. Elasticsearch + MariaDB + Valkey on a
-  # small VPS): scale the fixed allocations down proportionally, leaving a
-  # slice for PHP.
-  if (( fixed > usable )); then
-    target=$(( usable * 85 / 100 ))
-    if (( fixed > 0 )); then
-      OPT_ES_BUDGET_MB=$(( OPT_ES_BUDGET_MB * target / fixed ))
-      OPT_VALKEY_BUDGET_MB=$(( OPT_VALKEY_BUDGET_MB * target / fixed ))
-      OPT_MARIADB_BUDGET_MB=$(( OPT_MARIADB_BUDGET_MB * target / fixed ))
+  local db_size_mb=0 db_target=0 reserve=0 remaining=0 others=0
+  OPT_DB_SIZE_MB=0
+  if [[ " ${OPT_DETECTED[*]} " == *" mariadb "* ]]; then
+    # Prefer a buffer pool that holds the live data+index working set.  The
+    # 5% headroom covers InnoDB metadata and adaptive hash structures.
+    db_size_mb=$(mariadb_data_size_mb)
+    [[ $db_size_mb =~ ^[0-9]+$ ]] || db_size_mb=0
+    OPT_DB_SIZE_MB=$db_size_mb
+    db_target=$(( db_size_mb * 105 / 100 ))
+    (( db_target > OPT_MARIADB_BUDGET_MB )) && OPT_MARIADB_BUDGET_MB=$db_target
+    (( OPT_MARIADB_BUDGET_MB > 32768 )) && OPT_MARIADB_BUDGET_MB=32768
+
+    # Leave small floors for Elasticsearch and the cache tier, then give
+    # MariaDB the rest of its target.  If the database still cannot fit, it
+    # receives the largest feasible pool and optimize_mariadb reports that.
+    [[ " ${OPT_DETECTED[*]} " == *" elastic "* ]] && reserve=$(( reserve + 512 ))
+    [[ " ${OPT_DETECTED[*]} " == *" valkey "* || " ${OPT_DETECTED[*]} " == *" redis "* ]] \
+      && reserve=$(( reserve + 256 ))
+    if (( OPT_MARIADB_BUDGET_MB > fixed_available - reserve )); then
+      OPT_MARIADB_BUDGET_MB=$(( fixed_available - reserve ))
+      (( OPT_MARIADB_BUDGET_MB < 256 )) && OPT_MARIADB_BUDGET_MB=256
     fi
-    fixed=$(( OPT_ES_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_MARIADB_BUDGET_MB ))
   fi
 
-  if (( has_php )); then
-    OPT_PHP_BUDGET_MB=$(( usable - fixed ))
-    (( OPT_PHP_BUDGET_MB > total * 50 / 100 )) && OPT_PHP_BUDGET_MB=$(( total * 50 / 100 ))
-    (( OPT_PHP_BUDGET_MB < 512 )) && OPT_PHP_BUDGET_MB=512
-    # Hard ceiling: never commit more than 95% of RAM across services.
-    if (( fixed + OPT_PHP_BUDGET_MB > total * 95 / 100 )); then
-      OPT_PHP_BUDGET_MB=$(( total * 95 / 100 - fixed ))
-      (( OPT_PHP_BUDGET_MB < 0 )) && OPT_PHP_BUDGET_MB=0
+  # Scale the remaining data services into what MariaDB did not consume.
+  remaining=$(( fixed_available - OPT_MARIADB_BUDGET_MB ))
+  (( remaining < 0 )) && remaining=0
+  others=$(( OPT_ES_BUDGET_MB + OPT_VALKEY_BUDGET_MB ))
+  if (( others > remaining )); then
+    if (( others > 0 )); then
+      OPT_ES_BUDGET_MB=$(( OPT_ES_BUDGET_MB * remaining / others ))
+      OPT_VALKEY_BUDGET_MB=$(( OPT_VALKEY_BUDGET_MB * remaining / others ))
     fi
   fi
   return 0
@@ -4080,6 +4205,18 @@ php_pool_listen() {
   local ver=$1 pool="/etc/php/${1}/fpm/pool.d/www.conf"
   [[ -f $pool ]] || return 0
   awk -F= '/^[[:space:]]*listen[[:space:]]*=/{v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/,"",v); print v; exit}' "$pool"
+}
+
+php_pool_max_children() {
+  local ver pool cur max=0
+  while IFS= read -r ver; do
+    pool="/etc/php/${ver}/fpm/pool.d/www.conf"
+    [[ -f $pool ]] || continue
+    cur=$(awk -F= '/^[[:space:]]*pm\.max_children[[:space:]]*=/{v=$2; gsub(/[^0-9]/,"",v); print v; exit}' "$pool")
+    [[ $cur =~ ^[0-9]+$ ]] || continue
+    (( cur > max )) && max=$cur
+  done < <(php_fpm_versions)
+  printf '%s' "$max"
 }
 
 php_primary_version() {
@@ -4152,7 +4289,7 @@ optimize_angie() {
 }
 
 optimize_php_services() {
-  local primary ver active socket rc=0 angie_present=0
+  local primary ver active listen_path rc=0
   primary=$(php_primary_version)
   if [[ -z $primary ]]; then
     # No pool we can safely identify: leave Angie's FastCGI upstream alone
@@ -4161,30 +4298,22 @@ optimize_php_services() {
     opt_report "- No PHP-FPM pool with a usable www.conf; Angie upstream left unchanged"
     return 0
   fi
-  [[ -f /etc/angie/angie.conf ]] && angie_present=1
   while IFS= read -r ver; do
     active=0
     systemctl is-active --quiet "php${ver}-fpm" 2>/dev/null && active=1
-    # Only the pool Angie uses is moved to the shared socket.  A second PHP
-    # version may serve a different application over TCP, and moving it would
-    # silently break that consumer.
-    if (( angie_present )) && [[ $ver == "$primary" ]]; then
-      socket=/run/php/php-fpm.sock
-    else
-      socket=""
-    fi
+    # Preserve the pool's existing listener.  Migrating a live TCP pool to a
+    # Unix socket creates a window where Angie still points at port 9000 and
+    # every request returns 502.  Installations still use the socket template.
+    listen_path=$(php_pool_listen "$ver")
     opt_report "## PHP ${ver}"
-    if [[ -n $socket ]]; then
-      opt_report "- Active: ${active}; socket: \`${socket}\`"
-    else
-      opt_report "- Active: ${active}; listen kept: \`$(php_pool_listen "$ver")\`"
-    fi
+    opt_report "- Active: ${active}; listen kept: \`${listen_path:-unknown}\`"
     opt_backup "/etc/php/${ver}" "php-${ver}"
     tune_reset_changes
-    if ! tune_php_fpm_version "$ver" "$socket"; then
+    if ! tune_php_fpm_version "$ver"; then
       opt_restore "/etc/php/${ver}" "php-${ver}"
       opt_report "- **FAILED** PHP-FPM configuration test; rolled back"
       rc=1
+      OPT_PHP_OK=0
       continue
     fi
     local change
@@ -4195,10 +4324,10 @@ optimize_php_services() {
         opt_report "- Restart: skipped (configuration already optimized)"
       elif systemctl restart "php${ver}-fpm" 2>/dev/null \
          && systemctl is-active --quiet "php${ver}-fpm"; then
-        # Type=notify only returns once the master is ready, so a missing
-        # socket here means Angie must not be repointed at it.
-        if [[ -n $socket && ! -S $socket ]]; then
-          opt_report "- **FAILED** ${socket} was not created; rolling back"
+        # Type=notify only returns once the master is ready.  A pool that
+        # already used a Unix socket must have re-created it.
+        if [[ $listen_path == /* && ! -S $listen_path ]]; then
+          opt_report "- **FAILED** ${listen_path} was not created; rolling back"
           opt_restore "/etc/php/${ver}" "php-${ver}"
           systemctl restart "php${ver}-fpm" 2>/dev/null || true
           rc=1
@@ -4217,6 +4346,17 @@ optimize_php_services() {
       opt_report "- Restart: skipped (service was not active)"
     fi
   done < <(php_fpm_versions)
+
+  # Only hand a socket path to Angie when that pool is active and the socket
+  # actually exists.  TCP pools deliberately leave OPT_PHP_SOCKET empty.
+  if (( rc == 0 )); then
+    listen_path=$(php_pool_listen "$primary")
+    if [[ $listen_path == /* ]] \
+       && systemctl is-active --quiet "php${primary}-fpm" \
+       && [[ -S $listen_path ]]; then
+      OPT_PHP_SOCKET=$listen_path
+    fi
+  fi
   return "$rc"
 }
 
@@ -4230,6 +4370,7 @@ mariadb_server_version() {
 optimize_mariadb() {
   local active=0 ver major minor size_mb buffer logsize open_cache aria_mb
   local threads max_conn io_read io_write cnf_dir cnf backlog cnf_before cnf_after
+  local current_max=""
   systemctl is-active --quiet mariadb 2>/dev/null && active=1
   ver=$(mariadb_server_version)
   opt_report "## MariaDB"
@@ -4243,6 +4384,17 @@ optimize_mariadb() {
     size_mb=$(( size_mb * 40 / 100 ))
     (( size_mb < 256 )) && size_mb=256
     (( size_mb > 32768 )) && size_mb=32768
+  fi
+  if (( ${OPT_DB_SIZE_MB:-0} == 0 )); then
+    OPT_DB_SIZE_MB=$(mariadb_data_size_mb)
+    [[ ${OPT_DB_SIZE_MB:-} =~ ^[0-9]+$ ]] || OPT_DB_SIZE_MB=0
+  fi
+  if (( OPT_DB_SIZE_MB > 0 )); then
+    if (( size_mb >= OPT_DB_SIZE_MB )); then
+      opt_report "- Database data+index=${OPT_DB_SIZE_MB}MB; buffer pool=${size_mb}MB (fits)"
+    else
+      opt_report "- Database data+index=${OPT_DB_SIZE_MB}MB; buffer pool=${size_mb}MB (does not fully fit; largest feasible pool)"
+    fi
   fi
   backlog=$(effective_backlog)
   logsize=$(( size_mb / 4 ))
@@ -4259,6 +4411,15 @@ optimize_mariadb() {
   threads=$(nproc)
   (( threads > 64 )) && threads=64
   max_conn=$(( threads * 32 ))
+  # Keep an existing, larger connection ceiling.  A busy application may
+  # already allow more than threads*32 connections; silently lowering it can
+  # turn a performance tune into "Too many connections" during a traffic peak.
+  if (( active )); then
+    current_max=$(mariadb -N -B -e 'SELECT @@max_connections' 2>/dev/null || true)
+  fi
+  if [[ $current_max =~ ^[0-9]+$ ]] && (( current_max > max_conn )); then
+    max_conn=$current_max
+  fi
   (( max_conn > 2000 )) && max_conn=2000
   (( max_conn < 200 )) && max_conn=200
 
@@ -4356,7 +4517,9 @@ EOF
   if (( active )); then
     if systemctl restart mariadb 2>/dev/null; then
       local i
-      for i in {1..60}; do
+      # A large buffer pool may need to preload at startup; allow up to five
+      # minutes before declaring the restart failed.
+      for i in {1..300}; do
         mariadb -e 'SELECT 1' >/dev/null 2>&1 && break
         sleep 1
       done
@@ -4381,14 +4544,22 @@ EOF
 }
 
 optimize_valkey() {
-  local active=0 conf=/etc/valkey/valkey.conf ram_mb max_mb policy backlog
+  local kind=${1:-valkey}
+  local label=Valkey conf=/etc/valkey/valkey.conf conf_dir=/etc/valkey
+  local unit=valkey-server cli=valkey-cli
+  if [[ $kind == redis ]]; then
+    label=Redis conf=/etc/redis/redis.conf conf_dir=/etc/redis
+    unit=redis-server cli=redis-cli
+  fi
+  local active=0 ram_mb max_mb policy backlog
   local conf_before conf_after fd_limit dropin unit_changed=0
-  systemctl is-active --quiet valkey-server 2>/dev/null && active=1
-  opt_report "## Valkey"
+  [[ -f $conf ]] || return 0
+  systemctl is-active --quiet "$unit" 2>/dev/null && active=1
+  opt_report "## ${label}"
   opt_report "- Active: ${active}; config: \`${conf}\`"
-  opt_backup /etc/valkey valkey
+  opt_backup "$conf_dir" "$kind"
   # Reset the shared change tracker so a previous service's restart does not
-  # force an unnecessary Valkey restart on an otherwise unchanged run.
+  # force an unnecessary cache restart on an otherwise unchanged run.
   tune_reset_changes
   if [[ ${OPT_VALKEY_BUDGET_MB:-0} -gt 0 ]]; then
     max_mb=$OPT_VALKEY_BUDGET_MB
@@ -4431,10 +4602,10 @@ optimize_valkey() {
 
   # maxclients=20000 is unusable if systemd still caps the unit at 1024 fds.
   # Keep this in a dedicated drop-in so a package/admin file is never edited.
-  dropin=/etc/systemd/system/valkey-server.service.d/zz-setup-optimize.conf
-  fd_limit=$(systemctl show -p LimitNOFILE --value valkey-server 2>/dev/null || true)
+  dropin="/etc/systemd/system/${unit}.service.d/zz-setup-optimize.conf"
+  fd_limit=$(systemctl show -p LimitNOFILE --value "$unit" 2>/dev/null || true)
   if [[ $fd_limit =~ ^[0-9]+$ ]] && (( fd_limit < 32768 )); then
-    opt_backup "$(dirname "$dropin")" valkey-systemd
+    opt_backup "$(dirname "$dropin")" "${kind}-systemd"
     mkdir -p "$(dirname "$dropin")"
     printf '[Service]\nLimitNOFILE=524288\nLimitCORE=0\n' > "$dropin"
     chmod 644 "$dropin"
@@ -4450,28 +4621,28 @@ optimize_valkey() {
   fi
 
   if (( active )); then
-    if systemctl restart valkey-server 2>/dev/null; then
+    if systemctl restart "$unit" 2>/dev/null; then
       local i
       for i in {1..20}; do
-        valkey-cli ping 2>/dev/null | grep -q PONG && break
+        "$cli" ping 2>/dev/null | grep -q PONG && break
         sleep 1
       done
-      if valkey-cli ping 2>/dev/null | grep -q PONG; then
+      if "$cli" ping 2>/dev/null | grep -q PONG; then
         opt_report "- Restart: **OK**"
       else
         opt_report "- Restart: **FAILED** (PING); rolling back"
-        opt_restore /etc/valkey valkey
-        opt_restore /etc/systemd/system/valkey-server.service.d valkey-systemd
+        opt_restore "$conf_dir" "$kind"
+        opt_restore "/etc/systemd/system/${unit}.service.d" "${kind}-systemd"
         systemctl daemon-reload || true
-        systemctl restart valkey-server 2>/dev/null || true
+        systemctl restart "$unit" 2>/dev/null || true
         return 1
       fi
     else
       opt_report "- Restart: **FAILED**; rolling back"
-      opt_restore /etc/valkey valkey
-      opt_restore /etc/systemd/system/valkey-server.service.d valkey-systemd
+      opt_restore "$conf_dir" "$kind"
+      opt_restore "/etc/systemd/system/${unit}.service.d" "${kind}-systemd"
       systemctl daemon-reload || true
-      systemctl restart valkey-server 2>/dev/null || true
+      systemctl restart "$unit" 2>/dev/null || true
       return 1
     fi
   else
@@ -4501,6 +4672,18 @@ optimize_elastic() {
   fi
   heap_mb=$(( heap_mb / 512 * 512 ))
   (( heap_mb < 512 )) && heap_mb=512
+
+  if (( ${OPT_ES_SIZE_MB:-0} == 0 )); then
+    OPT_ES_SIZE_MB=$(elasticsearch_data_size_mb)
+    [[ ${OPT_ES_SIZE_MB:-} =~ ^[0-9]+$ ]] || OPT_ES_SIZE_MB=0
+  fi
+  if (( OPT_ES_SIZE_MB > 0 )); then
+    if (( heap_mb >= OPT_ES_SIZE_MB )); then
+      opt_report "- Index store=${OPT_ES_SIZE_MB}MB; heap=${heap_mb}MB (fits)"
+    else
+      opt_report "- Index store=${OPT_ES_SIZE_MB}MB; heap=${heap_mb}MB (does not fully fit; OS page cache serves the remainder)"
+    fi
+  fi
 
   es_before=$([[ -f $yml ]] && md5sum "$yml" | awk '{print $1}' || echo absent)
   jvm_before=$([[ -f $jvm ]] && md5sum "$jvm" | awk '{print $1}' || echo absent)
@@ -4575,7 +4758,8 @@ EOF
     fi
     if systemctl restart elasticsearch 2>/dev/null; then
       local i
-      for i in {1..180}; do
+      # Large heaps and many shards take time to become ready.
+      for i in {1..300}; do
         curl -fsS http://127.0.0.1:9200 >/dev/null 2>&1 && break
         sleep 1
       done
@@ -4703,6 +4887,15 @@ verify_optimized_services() {
     fi
     opt_log_errors valkey-server Valkey
   fi
+  if [[ " ${OPT_DETECTED[*]} " == *" redis "* ]] && systemctl is-active --quiet redis-server; then
+    if redis-cli ping 2>/dev/null | grep -qx 'PONG'; then
+      opt_report "- Redis: active and responding to PING"
+    else
+      opt_report "- Redis: **FAILED** active but PING failed"
+      rc=1
+    fi
+    opt_log_errors redis-server Redis
+  fi
   if [[ " ${OPT_DETECTED[*]} " == *" elastic "* ]] && systemctl is-active --quiet elasticsearch; then
     if curl -fsS http://127.0.0.1:9200 >/dev/null 2>&1; then
       opt_report "- Elasticsearch: active and answering HTTP"
@@ -4746,7 +4939,7 @@ write_optimize_report() {
 }
 
 optimize_plan() {
-  local nproc ram_mb size_mb max_children max_mb heap_mb backlog
+  local nproc ram_mb size_mb max_children max_mb heap_mb backlog max_conn current_max db_fit db_size_mb es_fit es_size_mb
   nproc=$(nproc)
   ram_mb=$(mem_total_mb)
   backlog=$(effective_backlog)
@@ -4760,7 +4953,7 @@ optimize_plan() {
     return 0
   fi
   printf 'Detected: %s\n' "${OPT_DETECTED[*]}"
-  printf '  Memory: %sMB usable of %sMB (PHP=%sMB MariaDB=%sMB Valkey=%sMB Elasticsearch=%sMB)\n' \
+  printf '  Memory: %sMB usable of %sMB (PHP=%sMB MariaDB=%sMB Cache=%sMB Elasticsearch=%sMB)\n' \
     "$OPT_MEM_BUDGET_MB" "$OPT_MEM_TOTAL_MB" "$OPT_PHP_BUDGET_MB" \
     "$OPT_MARIADB_BUDGET_MB" "$OPT_VALKEY_BUDGET_MB" "$OPT_ES_BUDGET_MB"
   if [[ " ${OPT_DETECTED[*]} " == *" angie "* ]]; then
@@ -4784,18 +4977,46 @@ optimize_plan() {
   fi
   if [[ " ${OPT_DETECTED[*]} " == *" mariadb "* ]]; then
     size_mb=$OPT_MARIADB_BUDGET_MB
-    printf '  MariaDB: buffer_pool=%sMB max_connections=%s back_log=%s\n' \
-      "$size_mb" "$(tune_clamp $(( nproc * 32 )) 200 2000)" "$backlog"
+    max_conn=$(tune_clamp $(( nproc * 32 )) 200 2000)
+    current_max=$(mariadb -N -B -e 'SELECT @@max_connections' 2>/dev/null || true)
+    if [[ $current_max =~ ^[0-9]+$ ]] && (( current_max > max_conn )); then
+      max_conn=$current_max
+    fi
+    (( max_conn > 2000 )) && max_conn=2000
+    db_size_mb=${OPT_DB_SIZE_MB:-0}
+    db_fit=""
+    if (( db_size_mb > 0 )); then
+      if (( size_mb >= db_size_mb )); then
+        db_fit=", database=${db_size_mb}MB (fits)"
+      else
+        db_fit=", database=${db_size_mb}MB (does not fully fit)"
+      fi
+    fi
+    printf '  MariaDB: buffer_pool=%sMB max_connections=%s back_log=%s%s\n' \
+      "$size_mb" "$max_conn" "$backlog" "$db_fit"
   fi
-  if [[ " ${OPT_DETECTED[*]} " == *" valkey "* ]]; then
+  if [[ " ${OPT_DETECTED[*]} " == *" valkey "* || " ${OPT_DETECTED[*]} " == *" redis "* ]]; then
     max_mb=$OPT_VALKEY_BUDGET_MB
-    printf '  Valkey: maxmemory=%sMB backlog=%s\n' "$max_mb" "$backlog"
+    if [[ " ${OPT_DETECTED[*]} " == *" redis "* ]]; then
+      printf '  Redis: maxmemory=%sMB backlog=%s\n' "$max_mb" "$backlog"
+    else
+      printf '  Valkey: maxmemory=%sMB backlog=%s\n' "$max_mb" "$backlog"
+    fi
   fi
   if [[ " ${OPT_DETECTED[*]} " == *" elastic "* ]]; then
     heap_mb=$OPT_ES_BUDGET_MB
     (( heap_mb < 512 )) && heap_mb=512
     heap_mb=$(( heap_mb / 512 * 512 ))
-    printf '  Elasticsearch: heap=%sMB\n' "$heap_mb"
+    es_size_mb=${OPT_ES_SIZE_MB:-0}
+    es_fit=""
+    if (( es_size_mb > 0 )); then
+      if (( heap_mb >= es_size_mb )); then
+        es_fit=", index=${es_size_mb}MB (fits)"
+      else
+        es_fit=", index=${es_size_mb}MB (does not fully fit)"
+      fi
+    fi
+    printf '  Elasticsearch: heap=%sMB%s\n' "$heap_mb" "$es_fit"
   fi
 }
 
@@ -4815,7 +5036,7 @@ run_optimize() {
   plan_memory_budget
   step "Optimizing installed services"
   if (( ${#OPT_DETECTED[@]} == 0 )); then
-    info "No supported installed services detected (Angie, PHP-FPM, MariaDB, Valkey, Elasticsearch)"
+    info "No supported installed services detected (Angie, PHP-FPM, MariaDB, Valkey/Redis, Elasticsearch)"
     opt_report "No supported installed services detected."
     local report
     report=$(write_optimize_report)
@@ -4824,21 +5045,23 @@ run_optimize() {
   fi
   info "Detected: ${OPT_DETECTED[*]}"
   info "Backups: ${OPT_BACKUP_DIR}"
-  info "Memory budget: ${OPT_MEM_BUDGET_MB}MB usable of ${OPT_MEM_TOTAL_MB}MB (PHP=${OPT_PHP_BUDGET_MB}MB MariaDB=${OPT_MARIADB_BUDGET_MB}MB Valkey=${OPT_VALKEY_BUDGET_MB}MB Elasticsearch=${OPT_ES_BUDGET_MB}MB)"
-  opt_report "- Memory budget: ${OPT_MEM_BUDGET_MB}MB usable of ${OPT_MEM_TOTAL_MB}MB (PHP=${OPT_PHP_BUDGET_MB}MB MariaDB=${OPT_MARIADB_BUDGET_MB}MB Valkey=${OPT_VALKEY_BUDGET_MB}MB Elasticsearch=${OPT_ES_BUDGET_MB}MB)"
+  info "Memory budget: ${OPT_MEM_BUDGET_MB}MB usable of ${OPT_MEM_TOTAL_MB}MB (PHP=${OPT_PHP_BUDGET_MB}MB MariaDB=${OPT_MARIADB_BUDGET_MB}MB Cache=${OPT_VALKEY_BUDGET_MB}MB Elasticsearch=${OPT_ES_BUDGET_MB}MB)"
+  opt_report "- Memory budget: ${OPT_MEM_BUDGET_MB}MB usable of ${OPT_MEM_TOTAL_MB}MB (PHP=${OPT_PHP_BUDGET_MB}MB MariaDB=${OPT_MARIADB_BUDGET_MB}MB Cache=${OPT_VALKEY_BUDGET_MB}MB Elasticsearch=${OPT_ES_BUDGET_MB}MB)"
 
-  # PHP first: it owns the FastCGI socket Angie will point at.
+  # PHP first: it owns the FastCGI socket Angie may point at.
   OPT_PHP_OK=0
+  OPT_PHP_SOCKET=""
   if [[ ${OPT_DETECTED[*]} == *php:* ]]; then
     OPT_PHP_OK=1
     optimize_php_services || { rc=1; OPT_PHP_OK=0; }
   fi
-  for service in angie mariadb valkey elastic; do
+  for service in angie mariadb valkey redis elastic; do
     [[ " ${OPT_DETECTED[*]} " == *" ${service} "* ]] || continue
     case "$service" in
       angie)   optimize_angie   || rc=1 ;;
       mariadb) optimize_mariadb || rc=1 ;;
-      valkey)  optimize_valkey  || rc=1 ;;
+      valkey)  optimize_valkey valkey || rc=1 ;;
+      redis)   optimize_valkey redis  || rc=1 ;;
       elastic) optimize_elastic || rc=1 ;;
     esac
   done
