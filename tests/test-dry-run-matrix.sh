@@ -66,6 +66,13 @@ run ok   --dry-run --domain a.example.com app=chevereto
 run ok   --dry-run --domain a.example.com app=polr
 run ok   --dry-run --domain a.example.com app=lychee
 
+# Optimize-only mode.
+run ok   --dry-run --optimize
+run fail --dry-run --optimize --basic
+run fail --dry-run --optimize --angie
+run fail --dry-run --optimize --purge
+run fail --dry-run --optimize --domain example.com
+
 # Purge modes and bare names.
 run ok   --dry-run --purge
 run ok   --dry-run --purge all
