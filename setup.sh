@@ -25,7 +25,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.6.8"
+readonly SCRIPT_VERSION="1.6.9"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
@@ -113,6 +113,7 @@ declare -A DOMAIN_APP=()
 OTHERS=()
 DOMAINS=()
 PURGE=0
+OPTIMIZE=0
 DRY_RUN=0
 PURGE_TARGETS=()
 PURGE_ORDER=()
@@ -183,6 +184,18 @@ Domain setup (standalone; Angie + MariaDB must already be installed/running):
         -> database forum_example_com
       --domain can be repeated and combined with a normal install. There is
       no --purge for domains; remove the files/database manually.
+
+Optimize-only mode (Ubuntu 24.04 or 26.04):
+  --optimize [--dry-run]
+      Detects installed services (Angie, PHP-FPM, MariaDB, Valkey,
+      Elasticsearch) and tunes their live configuration for the current
+      CPU/RAM/disk.  It never installs, purges or starts a service that was
+      not already running.  PHP-FPM pools are moved to the shared Unix socket
+      /run/php/php-fpm.sock and Angie's fastcgi_pass is repointed when needed.
+      Configuration files are backed up under /var/backups/setup-optimize-*
+      and a Markdown report is written to /var/log/setup-optimize-*.md.
+      Existing application vhosts and credentials are preserved.
+      --dry-run only prints the detected services and planned values.
 
 Purge (uninstall) mode:
   --purge [all|basic|angie|php|mariadb|valkey|elastic|others]
@@ -336,6 +349,8 @@ parse_args() {
           fi
         done
         ;;
+      --optimize)
+        OPTIMIZE=1; shift ;;
       --purge)
         PURGE=1; shift
         while (( $# )) && [[ $1 != --* ]]; do
@@ -662,6 +677,13 @@ latest_sury_php() {
 
 validate_all() {
   local svc
+
+  if (( OPTIMIZE )); then
+    (( PURGE )) && die "--optimize cannot be combined with --purge"
+    [[ ${#DOMAINS[@]} -eq 0 ]] || die "--optimize cannot be combined with --domain"
+    [[ ${#ENABLED[@]} -eq 0 ]] || die "--optimize scans installed services and cannot be combined with install flags"
+    return 0
+  fi
 
   for svc in "${!ENABLED[@]}"; do
     case "$svc" in
@@ -1673,6 +1695,348 @@ install_basic() {
 # ---------------------------------------------------------------------------
 # ANGIE
 # ---------------------------------------------------------------------------
+# =============================================================================
+# HARDWARE-AWARE LIVE TUNING
+# -----------------------------------------------------------------------------
+# These helpers are used both by the installers and by `--optimize`.  They
+# only rewrite live configuration; they never install packages.
+# =============================================================================
+TUNE_CHANGES=()
+# Only repoint Angie's FastCGI upstream at the local socket when a local
+# PHP-FPM installation was detected and its optimization succeeded.
+OPT_PHP_OK=0
+tune_reset_changes() { TUNE_CHANGES=(); }
+tune_note() { TUNE_CHANGES+=("$*"); }
+
+tune_clamp() {
+  local value=$1 min=$2 max=$3
+  (( value < min )) && value=$min
+  (( value > max )) && value=$max
+  printf '%s' "$value"
+}
+
+tune_size_value() {
+  local mb=$1
+  if (( mb >= 1024 && mb % 1024 == 0 )); then
+    printf '%sG' $(( mb / 1024 ))
+  else
+    printf '%sM' "$mb"
+  fi
+}
+
+tune_replace() {
+  local file=$1 pattern=$2 replacement=$3 desc=$4 before after
+  [[ -f $file ]] || return 0
+  grep -qE "$pattern" "$file" || return 0
+  before=$(md5sum "$file" | awk '{print $1}')
+  # Use a delimiter that does not collide with regex alternation (`|`) or
+  # common path characters in these directives.
+  sed -i -E "s#${pattern}#${replacement}#" "$file"
+  after=$(md5sum "$file" | awk '{print $1}')
+  [[ $before != "$after" ]] && tune_note "$desc"
+  return 0
+}
+
+tune_insert_after() {
+  local file=$1 anchor=$2 line=$3 desc=$4
+  [[ -f $file ]] || return 0
+  grep -qE "$anchor" "$file" || return 0
+  local tmp
+  tmp=$(mktemp)
+  awk -v anchor="$anchor" -v line="$line" '
+    $0 ~ anchor && !done { print; print line; done=1; next }
+    { print }
+  ' "$file" > "$tmp"
+  if ! cmp -s "$file" "$tmp"; then
+    cat "$tmp" > "$file"
+    tune_note "$desc"
+  fi
+  rm -f "$tmp"
+}
+
+# ---------------------------------------------------------------------------
+# Angie
+# ---------------------------------------------------------------------------
+tune_angie_configs() {
+  local target=${1:-/etc/angie}
+  local nginx_conf="${target}/angie.conf"
+  [[ -f $nginx_conf ]] || return 1
+
+  local nproc mem_mb disk_free_mb disk_class
+  local worker_rlimit worker_connections php_keepalive open_files
+  local fastcgi_buffers fastcgi_busy body_buffer ssl_cache_mb
+  local cache_total_mb fcgi_mb chev_mb xf_mb proxy_mb cdn_mb
+  local fcgi_zone chev_zone xf_zone proxy_zone cdn_zone
+  local fcgi_size chev_size xf_size proxy_size cdn_size
+  local limit_post limit_get
+
+  nproc=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+  (( nproc > 0 )) || nproc=1
+  mem_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 1024)
+  (( mem_mb > 0 )) || mem_mb=1024
+
+  disk_class=hdd
+  if compgen -G '/sys/block/nvme*' >/dev/null 2>&1; then
+    disk_class=nvme
+  elif command -v lsblk >/dev/null 2>&1 && lsblk -d -n -o ROTA 2>/dev/null | grep -q '^0'; then
+    disk_class=ssd
+  fi
+
+  disk_free_mb=$(df -Pm /var/www 2>/dev/null | awk 'NR==2{print $4}')
+  [[ $disk_free_mb =~ ^[0-9]+$ ]] || disk_free_mb=$(df -Pm / | awk 'NR==2{print $4}')
+  [[ $disk_free_mb =~ ^[0-9]+$ ]] || disk_free_mb=10240
+
+  worker_rlimit=$(tune_clamp $(( nproc * 8192 )) 65536 524288)
+  worker_connections=$(tune_clamp $(( nproc * 2048 )) 8192 65535)
+  (( worker_connections > worker_rlimit - 1024 )) && worker_connections=$(( worker_rlimit - 1024 ))
+  (( worker_connections < 1024 )) && worker_connections=1024
+  php_keepalive=$(tune_clamp $(( nproc * 2 )) 16 128)
+  open_files=$(tune_clamp $(( nproc * 2048 )) 10000 200000)
+
+  if (( mem_mb < 2048 )); then
+    fastcgi_buffers='32 16k'; fastcgi_busy='256k'; body_buffer='64k'
+  elif (( mem_mb < 8192 )); then
+    fastcgi_buffers='64 32k'; fastcgi_busy='1m'; body_buffer='128k'
+  else
+    fastcgi_buffers='128 32k'; fastcgi_busy='2m'; body_buffer='256k'
+  fi
+
+  ssl_cache_mb=$(tune_clamp $(( mem_mb / 512 )) 10 256)
+
+  cache_total_mb=$(( mem_mb * 25 / 100 ))
+  (( cache_total_mb > 65536 )) && cache_total_mb=65536
+  (( cache_total_mb > disk_free_mb * 5 / 100 )) && cache_total_mb=$(( disk_free_mb * 5 / 100 ))
+  (( cache_total_mb < 256 )) && cache_total_mb=256
+
+  fcgi_mb=$(( cache_total_mb * 50 / 100 ))
+  chev_mb=$(( cache_total_mb * 25 / 100 ))
+  xf_mb=$(( cache_total_mb * 15 / 100 ))
+  proxy_mb=$(( cache_total_mb * 5 / 100 ))
+  cdn_mb=$(( cache_total_mb * 5 / 100 ))
+  (( fcgi_mb < 64 )) && fcgi_mb=64
+  (( chev_mb < 32 )) && chev_mb=32
+  (( xf_mb < 32 )) && xf_mb=32
+  (( proxy_mb < 16 )) && proxy_mb=16
+  (( cdn_mb < 16 )) && cdn_mb=16
+
+  fcgi_zone=$(tune_clamp $(( cache_total_mb / 4 )) 16 512)
+  chev_zone=$(tune_clamp $(( cache_total_mb / 8 )) 8 512)
+  xf_zone=$(tune_clamp $(( cache_total_mb / 8 )) 8 256)
+  proxy_zone=$(tune_clamp $(( cache_total_mb / 16 )) 8 128)
+  cdn_zone=$(tune_clamp $(( cache_total_mb / 16 )) 8 128)
+
+  fcgi_size=$(tune_size_value "$fcgi_mb")
+  chev_size=$(tune_size_value "$chev_mb")
+  xf_size=$(tune_size_value "$xf_mb")
+  proxy_size=$(tune_size_value "$proxy_mb")
+  cdn_size=$(tune_size_value "$cdn_mb")
+
+  tune_replace "$nginx_conf" '^([[:space:]]*worker_rlimit_nofile[[:space:]]+)[0-9]+;' "\\1${worker_rlimit};" "angie.conf: worker_rlimit_nofile=${worker_rlimit}"
+  tune_replace "$nginx_conf" '^([[:space:]]*worker_connections[[:space:]]+)[0-9]+;' "\\1${worker_connections};" "angie.conf: worker_connections=${worker_connections}"
+  tune_replace "$nginx_conf" '^([[:space:]]*client_body_buffer_size[[:space:]]+).*;' "\\1${body_buffer};" "angie.conf: client_body_buffer_size=${body_buffer}"
+  tune_replace "$nginx_conf" '^([[:space:]]*keepalive[[:space:]]+)[0-9]+;' "\\1${php_keepalive};" "angie.conf: PHP upstream keepalive=${php_keepalive}"
+
+  if ! grep -qE '^[[:space:]]*worker_rlimit_nofile[[:space:]]' "$nginx_conf"; then
+    tune_insert_after "$nginx_conf" '^[[:space:]]*worker_processes[[:space:]]' \
+      "worker_rlimit_nofile ${worker_rlimit};" "angie.conf: inserted worker_rlimit_nofile=${worker_rlimit}"
+  fi
+  if ! grep -qE '^[[:space:]]*worker_connections[[:space:]]' "$nginx_conf"; then
+    tune_insert_after "$nginx_conf" '^[[:space:]]*events[[:space:]]*' \
+      "  worker_connections ${worker_connections};" "angie.conf: inserted worker_connections=${worker_connections}"
+  fi
+  if ! grep -qE '^[[:space:]]*client_body_buffer_size[[:space:]]' "$nginx_conf"; then
+    tune_insert_after "$nginx_conf" '^[[:space:]]*http[[:space:]]*' \
+      "  client_body_buffer_size ${body_buffer};" "angie.conf: inserted client_body_buffer_size=${body_buffer}"
+  fi
+
+  # Point any remaining TCP FastCGI handlers at the shared Unix socket.  If
+  # PHP optimization failed and rolled back, leave Angie's existing upstream
+  # alone so the web server cannot be pointed at a missing socket.
+  if (( ${OPT_PHP_OK:-1} )); then
+    local file
+    while IFS= read -r file; do
+      [[ -n $file ]] || continue
+      local before after
+      before=$(md5sum "$file" | awk '{print $1}')
+      sed -i -E 's#fastcgi_pass[[:space:]]+(127\.0\.0\.1|localhost):9000;#fastcgi_pass unix:/run/php/php-fpm.sock;#g' "$file"
+      after=$(md5sum "$file" | awk '{print $1}')
+      [[ $before != "$after" ]] && tune_note "${file#${target}/}: fastcgi_pass -> unix:/run/php/php-fpm.sock"
+    done < <(grep -rlE 'fastcgi_pass[[:space:]]+(127\.0\.0\.1|localhost):9000;' "$target" 2>/dev/null || true)
+
+    tune_replace "$nginx_conf" \
+      '^([[:space:]]*server[[:space:]]+)(127\.0\.0\.1|localhost):9000;' \
+      '\1unix:/run/php/php-fpm.sock;' "angie.conf: local_php upstream -> Unix socket"
+  fi
+
+  # Cache sizes and zones.
+  tune_replace "$target/http.d/fastcgi_cache.conf" \
+    'keys_zone=fastcgicache:[0-9]+m max_size=[0-9]+[mgMG]' \
+    "keys_zone=fastcgicache:${fcgi_zone}m max_size=${fcgi_size}" \
+    "http.d/fastcgi_cache.conf: ${fcgi_zone}m zone / ${fcgi_size} max"
+  tune_replace "$target/http.d/fastcgi_cache_chev.conf" \
+    '^(fastcgi_cache_path /home/nginx_cache_chev levels=1:2 keys_zone=fastcgicache_chev:)[0-9]+m( max_size=[0-9]+[mgMG])?(.*)$' \
+    "\\1${chev_zone}m max_size=${chev_size}\\3" \
+    "http.d/fastcgi_cache_chev.conf: ${chev_zone}m zone / ${chev_size} max"
+  tune_replace "$target/http.d/xf_proxy_cache.conf" \
+    'keys_zone=xfproxycache:[0-9]+m max_size=[0-9]+[mgMG]' \
+    "keys_zone=xfproxycache:${xf_zone}m max_size=${xf_size}" \
+    "http.d/xf_proxy_cache.conf: ${xf_zone}m zone / ${xf_size} max"
+  tune_replace "$target/http.d/proxy_cache.conf" \
+    'keys_zone=proxy_cache:[0-9]+m' "keys_zone=proxy_cache:${proxy_zone}m" \
+    "http.d/proxy_cache.conf: proxy zone=${proxy_zone}m"
+  tune_replace "$target/http.d/proxy_cache.conf" \
+    'keys_zone=proxy_cdn:[0-9]+m' "keys_zone=proxy_cdn:${cdn_zone}m" \
+    "http.d/proxy_cache.conf: cdn zone=${cdn_zone}m"
+
+  if [[ -f $target/http.d/proxy_cache.conf ]]; then
+    local before
+    before=$(md5sum "$target/http.d/proxy_cache.conf" | awk '{print $1}')
+    awk -v a="$proxy_size" -v b="$cdn_size" '
+      /proxy_cache_path \/home\/proxy_cache / { sub(/max_size=[0-9]+[mgMG]/, "max_size=" a) }
+      /proxy_cache_path \/home\/proxy_cdn /   { sub(/max_size=[0-9]+[mgMG]/, "max_size=" b) }
+      { print }
+    ' "$target/http.d/proxy_cache.conf" > "$target/http.d/proxy_cache.conf.new"
+    mv "$target/http.d/proxy_cache.conf.new" "$target/http.d/proxy_cache.conf"
+    [[ $(md5sum "$target/http.d/proxy_cache.conf" | awk '{print $1}') != "$before" ]] \
+      && tune_note "http.d/proxy_cache.conf: proxy=${proxy_size} cdn=${cdn_size}"
+  fi
+
+  limit_post=$(tune_clamp $(( mem_mb / 4096 )) 8 32)
+  limit_get=$(tune_clamp $(( mem_mb / 2048 )) 16 64)
+  tune_replace "$target/http.d/limit_req.conf" \
+    'zone=limit_req_post_head:[0-9]+m' "zone=limit_req_post_head:${limit_post}m" \
+    "http.d/limit_req.conf: POST zone=${limit_post}m"
+  tune_replace "$target/http.d/limit_req.conf" \
+    'zone=limit_req_get_perip:[0-9]+m' "zone=limit_req_get_perip:${limit_get}m" \
+    "http.d/limit_req.conf: GET zone=${limit_get}m"
+
+  tune_replace "$target/h5bp/tls/ssl_engine.conf" \
+    '^([[:space:]]*ssl_session_cache[[:space:]]+shared:SSL:)[0-9]+m;' \
+    "\\1${ssl_cache_mb}m;" "h5bp/tls/ssl_engine.conf: SSL cache=${ssl_cache_mb}m"
+  tune_replace "$target/h5bp/web_performance/cache-file-descriptors.conf" \
+    'open_file_cache max=[0-9]+' "open_file_cache max=${open_files}" \
+    "h5bp/web_performance/cache-file-descriptors.conf: max=${open_files}"
+  tune_replace "$target/h5bp/web_performance/cache-file-descriptors.conf" \
+    'open_log_file_cache max=[0-9]+' "open_log_file_cache max=$(( open_files / 4 ))" \
+    "h5bp/web_performance/cache-file-descriptors.conf: log max=$(( open_files / 4 ))"
+
+  local php_conf
+  for php_conf in "$target"/h5bp/php*.conf; do
+    [[ -f $php_conf ]] || continue
+    tune_replace "$php_conf" '^([[:space:]]*fastcgi_buffer_size[[:space:]]+).*;' "\\1${body_buffer};" "${php_conf#${target}/}: fastcgi_buffer_size=${body_buffer}"
+    tune_replace "$php_conf" '^([[:space:]]*fastcgi_buffers[[:space:]]+).*;' "\\1${fastcgi_buffers};" "${php_conf#${target}/}: fastcgi_buffers=${fastcgi_buffers}"
+    tune_replace "$php_conf" '^([[:space:]]*fastcgi_busy_buffers_size[[:space:]]+).*;' "\\1${fastcgi_busy};" "${php_conf#${target}/}: fastcgi_busy_buffers_size=${fastcgi_busy}"
+  done
+
+  tune_note "angie summary: ${nproc} CPU / ${mem_mb}MB RAM / ${disk_class} / cache=${cache_total_mb}MB"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# PHP-FPM
+# ---------------------------------------------------------------------------
+tune_pool_set() {
+  local file=$1 key=$2 value=$3 desc=$4 before after
+  local escaped=${key//./\\.}
+  before=$(md5sum "$file" | awk '{print $1}')
+  if grep -qE "^[[:space:]]*${escaped}[[:space:]]*=" "$file"; then
+    sed -i -E "s|^[[:space:]]*${escaped}[[:space:]]*=.*|${key} = ${value}|" "$file"
+  else
+    printf '%s = %s\n' "$key" "$value" >> "$file"
+  fi
+  after=$(md5sum "$file" | awk '{print $1}')
+  [[ $before != "$after" ]] && tune_note "$desc"
+  return 0
+}
+
+tune_php_fpm_version() {
+  local ver=$1
+  local socket=${2:-/run/php/php-fpm.sock}
+  local pool="/etc/php/${ver}/fpm/pool.d/www.conf"
+  local ini_dir="/etc/php/${ver}/fpm/conf.d"
+  local ini="${ini_dir}/zz-setup-optimize.ini"
+  [[ -d /etc/php/${ver}/fpm ]] || return 0
+  [[ -f $pool ]] || { tune_note "PHP ${ver}: no pool.d/www.conf, skipped"; return 0; }
+
+  local nproc ram_mb max_children max_requests max_by_cpu
+  local opcache_mb jit_mb memory_mb realpath_kb
+  nproc=$(nproc)
+  (( nproc > 0 )) || nproc=1
+  ram_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
+
+  max_children=$(( ram_mb * 50 / 100 / 96 ))
+  max_by_cpu=$(( nproc * 16 ))
+  (( max_children > max_by_cpu )) && max_children=$max_by_cpu
+  (( max_children > 512 )) && max_children=512
+  (( max_children < 8 )) && max_children=8
+  max_requests=$(( nproc * 1024 ))
+
+  opcache_mb=$(( ram_mb / 16 )); (( opcache_mb < 128 )) && opcache_mb=128; (( opcache_mb > 512 )) && opcache_mb=512
+  jit_mb=$(( ram_mb / 128 )); (( jit_mb < 32 )) && jit_mb=32; (( jit_mb > 128 )) && jit_mb=128
+  memory_mb=$(( ram_mb / 8 )); (( memory_mb < 256 )) && memory_mb=256; (( memory_mb > 512 )) && memory_mb=512
+  realpath_kb=$(( ram_mb * 2 )); (( realpath_kb < 4096 )) && realpath_kb=4096; (( realpath_kb > 16384 )) && realpath_kb=16384
+
+  mkdir -p /run/php
+  chown www-data:www-data /run/php 2>/dev/null || true
+  chmod 755 /run/php
+
+  tune_pool_set "$pool" pm static "PHP ${ver}: pm=static"
+  tune_pool_set "$pool" pm.max_children "$max_children" "PHP ${ver}: max_children=${max_children}"
+  tune_pool_set "$pool" pm.max_requests "$max_requests" "PHP ${ver}: max_requests=${max_requests}"
+  tune_pool_set "$pool" listen "$socket" "PHP ${ver}: listen=${socket}"
+  tune_pool_set "$pool" listen.backlog 65535 "PHP ${ver}: listen.backlog=65535"
+  tune_pool_set "$pool" listen.owner www-data "PHP ${ver}: listen.owner=www-data"
+  tune_pool_set "$pool" listen.group www-data "PHP ${ver}: listen.group=www-data"
+  tune_pool_set "$pool" listen.mode 0660 "PHP ${ver}: listen.mode=0660"
+  tune_pool_set "$pool" request_terminate_timeout 300s "PHP ${ver}: request_terminate_timeout=300s"
+  tune_pool_set "$pool" catch_workers_output yes "PHP ${ver}: catch_workers_output=yes"
+  tune_pool_set "$pool" security.limit_extensions .php "PHP ${ver}: security.limit_extensions=.php"
+  tune_pool_set "$pool" rlimit_files 524288 "PHP ${ver}: rlimit_files=524288"
+  tune_pool_set "$pool" rlimit_core 0 "PHP ${ver}: rlimit_core=0"
+
+  mkdir -p "$ini_dir" /var/cache/php/opcache
+  chown -R www-data:www-data /var/cache/php 2>/dev/null || true
+  chmod 750 /var/cache/php /var/cache/php/opcache 2>/dev/null || true
+  sed -i -E "s|php8\.[0-9]|php${ver}|g" "$pool"
+  local ini_before=""
+  [[ -f $ini ]] && ini_before=$(md5sum "$ini" | awk '{print $1}')
+  cat > "$ini" <<EOF
+; Managed by setup.sh --optimize (hardware-aware PHP tuning).
+; This file sorts last in conf.d so it wins over earlier defaults.
+memory_limit = ${memory_mb}M
+max_execution_time = 300
+max_input_time = 300
+realpath_cache_size = ${realpath_kb}k
+realpath_cache_ttl = 43200
+opcache.enable = 1
+opcache.enable_cli = 0
+opcache.memory_consumption = ${opcache_mb}
+opcache.interned_strings_buffer = 32
+opcache.jit_buffer_size = ${jit_mb}M
+opcache.jit = tracing
+opcache.max_accelerated_files = 128256
+opcache.validate_timestamps = 1
+opcache.revalidate_freq = 60
+opcache.file_cache = /var/cache/php/opcache
+opcache.file_cache_only = 0
+mysqlnd.net_cmd_buffer_size = 524288
+mysqli.default_socket = /run/mysqld/mysqld.sock
+pdo_mysql.default_socket = /run/mysqld/mysqld.sock
+EOF
+  chmod 644 "$ini"
+  local ini_after
+  ini_after=$(md5sum "$ini" | awk '{print $1}')
+  [[ $ini_before != "$ini_after" ]] \
+    && tune_note "PHP ${ver}: memory_limit=${memory_mb}M opcache=${opcache_mb}M jit=${jit_mb}M"
+
+  if command -v "php-fpm${ver}" >/dev/null 2>&1; then
+    "php-fpm${ver}" -t >/dev/null 2>&1 || return 1
+  elif [[ -x "/usr/sbin/php-fpm${ver}" ]]; then
+    "/usr/sbin/php-fpm${ver}" -t >/dev/null 2>&1 || return 1
+  fi
+  return 0
+}
+
 deploy_angie_configs() {
   step "Angie configuration (server-configs-nginx)"
   fetch_server_configs
@@ -1691,6 +2055,13 @@ deploy_angie_configs() {
   # old setup.sh overrides, the angie -t check and the reload.
   export CONFIG_SOURCE_DIR
   bash "${CONFIG_SOURCE_DIR}/scripts/nginx_conf.sh"
+
+  # Hardware-aware Angie tuning is owned by setup.sh so the same code runs
+  # during install and during `--optimize`.
+  tune_reset_changes
+  tune_angie_configs /etc/angie || die "Angie tuning failed"
+  local change
+  for change in "${TUNE_CHANGES[@]}"; do info "tune: ${change}"; done
 }
 
 install_angie() {
@@ -1830,65 +2201,21 @@ install_php() {
   install -m 644 "$pool_template" "/etc/php/${ver}/fpm/pool.d/www.conf"
   install -m 644 "$ini_template" "/etc/php/${ver}/fpm/conf.d/custom_dan.ini"
 
-  local ram_mb max_children max_requests max_by_cpu workers_per_core
-  local opcache_mb jit_mb memory_mb realpath_kb
-  ram_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
-  # Reserve roughly half of RAM for PHP workers and use a realistic 96 MB
-  # per-worker budget.  The old 256 MB divisor left a 128 GB host with only
-  # 512 workers and made small hosts needlessly slow to warm up.  The CPU
-  # ceiling (16 workers/core) prevents a RAM-heavy but CPU-poor VM from
-  # creating a process storm, and the absolute cap keeps static pools sane.
-  max_children=$(( ram_mb * 50 / 100 / 96 ))
-  workers_per_core=16
-  max_by_cpu=$(( $(nproc) * workers_per_core ))
-  (( max_children > max_by_cpu )) && max_children=$max_by_cpu
-  (( max_children > 512 )) && max_children=512
-  (( max_children < 8 )) && max_children=8
-  max_requests=$(( $(nproc) * 1024 ))       # CPU threads * 1024
+  # Hardware-aware pool/ini tuning lives in tune_php_fpm_version, shared with
+  # the --optimize command.  It writes the socket listener and the final
+  # performance values in conf.d/zz-setup-optimize.ini.
+  tune_reset_changes
+  tune_php_fpm_version "$ver"
   if [[ -n ${OPT[php.children]:-} && ${OPT[php.children]} != auto ]]; then
-    max_children=${OPT[php.children]}
-    info "PHP max_children overridden to ${max_children}"
+    tune_pool_set "/etc/php/${ver}/fpm/pool.d/www.conf" pm.max_children \
+      "${OPT[php.children]}" "PHP ${ver}: max_children override=${OPT[php.children]}"
+    info "PHP max_children overridden to ${OPT[php.children]}"
   fi
   if [[ -n ${OPT[php.max_requests]:-} ]]; then
-    max_requests=${OPT[php.max_requests]}
+    tune_pool_set "/etc/php/${ver}/fpm/pool.d/www.conf" pm.max_requests \
+      "${OPT[php.max_requests]}" "PHP ${ver}: max_requests override=${OPT[php.max_requests]}"
   fi
-
-  opcache_mb=$(( ram_mb / 16 ))
-  (( opcache_mb < 128 )) && opcache_mb=128
-  (( opcache_mb > 512 )) && opcache_mb=512
-  # A JIT buffer larger than 128 MB is wasted on PHP-FPM: the tracing JIT
-  # rarely fills it, and the reservation is per pool.  Keep the range tight
-  # so small VPS instances do not over-allocate.
-  jit_mb=$(( ram_mb / 128 ))
-  (( jit_mb < 32 )) && jit_mb=32
-  (( jit_mb > 128 )) && jit_mb=128
-  memory_mb=$(( ram_mb / 8 ))
-  (( memory_mb < 256 )) && memory_mb=256
-  (( memory_mb > 512 )) && memory_mb=512
-  realpath_kb=$(( ram_mb * 2 ))
-  (( realpath_kb < 4096 )) && realpath_kb=4096
-  (( realpath_kb > 16384 )) && realpath_kb=16384
-
-  sed -i -E "s|^pm\.max_children[[:space:]]*=.*|pm.max_children = ${max_children}|" \
-    "/etc/php/${ver}/fpm/pool.d/www.conf"
-  sed -i -E "s|^pm\.max_requests[[:space:]]*=.*|pm.max_requests = ${max_requests}|" \
-    "/etc/php/${ver}/fpm/pool.d/www.conf"
-  # XenForo's first-install rebuild compiles every template and can exceed a
-  # 100 s pool timeout on a busy database.  Keep this aligned with Angie's
-  # fastcgi_read_timeout (360 s) so an install or admin rebuild is not killed
-  # halfway through.
-  sed -i -E "s|^request_terminate_timeout[[:space:]]*=.*|request_terminate_timeout = 300s|" \
-    "/etc/php/${ver}/fpm/pool.d/www.conf"
-  sed -i -E "s|php8\.[0-9]|php${ver}|g" "/etc/php/${ver}/fpm/pool.d/www.conf"
-
-  sed -i -E \
-    -e "s|^date\.timezone = .*|date.timezone = ${tz}|" \
-    -e "s|^memory_limit = .*|memory_limit = ${memory_mb}M|" \
-    -e "s|^opcache\.memory_consumption = .*|opcache.memory_consumption = ${opcache_mb}|" \
-    -e "s|^opcache\.jit_buffer_size = .*|opcache.jit_buffer_size = ${jit_mb}M|" \
-    -e "s|^realpath_cache_size = .*|realpath_cache_size = ${realpath_kb}k|" \
-    -e "s|^max_execution_time = .*|max_execution_time = 300|" \
-    -e "s|^max_input_time = .*|max_input_time = 300|" \
+  sed -i -E "s|^date\.timezone = .*|date.timezone = ${tz}|" \
     "/etc/php/${ver}/fpm/conf.d/custom_dan.ini"
 
   mkdir -p /var/cache/php/opcache
@@ -3362,6 +3689,591 @@ print_plan() {
   done
 }
 
+# =============================================================================
+# --optimize: scan installed services and tune their live configuration
+# =============================================================================
+OPT_BACKUP_DIR=""
+OPT_REPORT=()
+OPT_DETECTED=()
+
+opt_report() { OPT_REPORT+=("$*"); }
+
+opt_backup() {
+  local path=$1 name=$2
+  [[ -n $OPT_BACKUP_DIR ]] || OPT_BACKUP_DIR="/var/backups/setup-optimize-$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$OPT_BACKUP_DIR"
+  [[ -e "$OPT_BACKUP_DIR/${name}" || -e "$OPT_BACKUP_DIR/${name}.absent" ]] && return 0
+  if [[ -e $path ]]; then
+    cp -a "$path" "$OPT_BACKUP_DIR/${name}"
+    opt_report "Backup: \`${path}\` -> \`${OPT_BACKUP_DIR}/${name}\`"
+  else
+    : > "$OPT_BACKUP_DIR/${name}.absent"
+  fi
+}
+
+opt_restore() {
+  local path=$1 name=$2
+  [[ -n $OPT_BACKUP_DIR ]] || return 1
+  if [[ -e "$OPT_BACKUP_DIR/${name}" ]]; then
+    rm -rf "$path"
+    cp -a "$OPT_BACKUP_DIR/${name}" "$path"
+    opt_report "ROLLBACK: restored \`${path}\` from backup"
+  elif [[ -e "$OPT_BACKUP_DIR/${name}.absent" ]]; then
+    rm -rf "$path"
+    opt_report "ROLLBACK: removed \`${path}\` (it did not exist before)"
+  fi
+}
+
+detect_installed_services() {
+  OPT_DETECTED=()
+  [[ -x /usr/sbin/angie && -f /etc/angie/angie.conf ]] && OPT_DETECTED+=(angie)
+  local d
+  for d in /etc/php/*/fpm; do
+    [[ -d $d ]] || continue
+    OPT_DETECTED+=("php:$(basename "$(dirname "$d")")")
+  done
+  if command -v mariadbd >/dev/null 2>&1 || command -v mariadb >/dev/null 2>&1; then
+    [[ -d /etc/mysql ]] && OPT_DETECTED+=(mariadb)
+  fi
+  [[ -f /etc/valkey/valkey.conf ]] && OPT_DETECTED+=(valkey)
+  [[ -f /etc/elasticsearch/elasticsearch.yml ]] && OPT_DETECTED+=(elastic)
+  return 0
+}
+
+php_fpm_versions() {
+  local d ver
+  for d in /etc/php/*/fpm; do
+    [[ -d $d ]] || continue
+    ver=$(basename "$(dirname "$d")")
+    [[ $ver =~ ^[0-9]+\.[0-9]+$ ]] && printf '%s\n' "$ver"
+  done | sort -V
+}
+
+php_primary_version() {
+  local ver
+  while IFS= read -r ver; do
+    if systemctl is-active --quiet "php${ver}-fpm" 2>/dev/null; then
+      printf '%s' "$ver"
+      return 0
+    fi
+  done < <(php_fpm_versions)
+  php_fpm_versions | tail -n1
+}
+
+optimize_angie() {
+  local active=0 change version
+  systemctl is-active --quiet angie 2>/dev/null && active=1
+  version=$(/usr/sbin/angie -v 2>&1 | head -n1 || true)
+  opt_report "## Angie"
+  opt_report "- Version: \`${version:-unknown}\`; active: ${active}"
+  opt_backup /etc/angie angie
+  tune_reset_changes
+  if ! tune_angie_configs /etc/angie; then
+    opt_restore /etc/angie angie
+    opt_report "- **FAILED** tuning returned an error; configuration rolled back"
+    return 1
+  fi
+  if ! /usr/sbin/angie -t >/tmp/angie-optimize-test.log 2>&1; then
+    opt_report "- **FAILED** \`angie -t\`:"
+    while IFS= read -r change; do opt_report "  \`${change}\`"; done < /tmp/angie-optimize-test.log
+    rm -f /tmp/angie-optimize-test.log
+    opt_restore /etc/angie angie
+    /usr/sbin/angie -t >/dev/null 2>&1 && systemctl restart angie 2>/dev/null || true
+    return 1
+  fi
+  rm -f /tmp/angie-optimize-test.log
+  for change in "${TUNE_CHANGES[@]}"; do opt_report "- ${change}"; done
+  if (( active )); then
+    if systemctl restart angie 2>/dev/null && systemctl is-active --quiet angie; then
+      opt_report "- Restart: **OK**"
+    else
+      opt_report "- Restart: **FAILED**; rolling back"
+      opt_restore /etc/angie angie
+      systemctl restart angie 2>/dev/null || true
+      return 1
+    fi
+  else
+    opt_report "- Restart: skipped (service was not active)"
+  fi
+  return 0
+}
+
+optimize_php_services() {
+  local primary ver active socket rc=0
+  primary=$(php_primary_version)
+  [[ -n $primary ]] || return 0
+  while IFS= read -r ver; do
+    active=0
+    systemctl is-active --quiet "php${ver}-fpm" 2>/dev/null && active=1
+    if [[ $ver == "$primary" ]]; then
+      socket=/run/php/php-fpm.sock
+    else
+      socket="/run/php/php${ver}-fpm.sock"
+    fi
+    opt_report "## PHP ${ver}"
+    opt_report "- Active: ${active}; socket: \`${socket}\`"
+    opt_backup "/etc/php/${ver}" "php-${ver}"
+    tune_reset_changes
+    if ! tune_php_fpm_version "$ver" "$socket"; then
+      opt_restore "/etc/php/${ver}" "php-${ver}"
+      opt_report "- **FAILED** PHP-FPM configuration test; rolled back"
+      rc=1
+      continue
+    fi
+    local change
+    for change in "${TUNE_CHANGES[@]}"; do opt_report "- ${change}"; done
+    if (( active )); then
+      if systemctl restart "php${ver}-fpm" 2>/dev/null \
+         && systemctl is-active --quiet "php${ver}-fpm"; then
+        opt_report "- Restart: **OK**"
+      else
+        opt_report "- Restart: **FAILED**; rolling back"
+        opt_restore "/etc/php/${ver}" "php-${ver}"
+        systemctl restart "php${ver}-fpm" 2>/dev/null || true
+        rc=1
+      fi
+    else
+      opt_report "- Restart: skipped (service was not active)"
+    fi
+  done < <(php_fpm_versions)
+  return "$rc"
+}
+
+mariadb_server_version() {
+  local v
+  v=$(mariadbd --version 2>/dev/null | awk '{print $3}' || true)
+  [[ -n $v ]] || v=$(mariadb --version 2>/dev/null | awk '{print $5}' || true)
+  printf '%s' "${v%%-*}"
+}
+
+optimize_mariadb() {
+  local active=0 ver major minor size_mb buffer logsize open_cache aria_mb
+  local threads max_conn io_read io_write cnf_dir cnf tmp
+  systemctl is-active --quiet mariadb 2>/dev/null && active=1
+  ver=$(mariadb_server_version)
+  opt_report "## MariaDB"
+  opt_report "- Version: \`${ver:-unknown}\`; active: ${active}"
+  opt_backup /etc/mysql mysql
+
+  size_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
+  size_mb=$(( size_mb * 40 / 100 ))
+  (( size_mb < 256 )) && size_mb=256
+  (( size_mb > 32768 )) && size_mb=32768
+  logsize=$(( size_mb / 4 ))
+  (( logsize < 64 )) && logsize=64
+  (( logsize > 2048 )) && logsize=2048
+  buffer=$(mb_to_config "$size_mb")
+  logsize=$(mb_to_config "$logsize")
+  open_cache=4000
+  (( size_mb >= 4096 )) && open_cache=8000
+  aria_mb=$(( size_mb / 16 ))
+  (( aria_mb < 16 )) && aria_mb=16
+  (( aria_mb > 256 )) && aria_mb=256
+  read -r io_read io_write <<< "$(mariadb_io_capacity)"
+  threads=$(nproc)
+  (( threads > 64 )) && threads=64
+  max_conn=$(( threads * 32 ))
+  (( max_conn > 2000 )) && max_conn=2000
+  (( max_conn < 200 )) && max_conn=200
+
+  cnf_dir=/etc/mysql/mariadb.conf.d
+  mkdir -p "$cnf_dir"
+  cnf="${cnf_dir}/99-setup-optimize.cnf"
+  major=${ver%%.*}
+  minor=${ver#*.}; minor=${minor%%.*}
+  [[ $major =~ ^[0-9]+$ ]] || major=0
+  [[ $minor =~ ^[0-9]+$ ]] || minor=0
+
+  cat > "$cnf" <<EOF
+# BEGIN setup.sh optimize
+# Hardware-aware MariaDB tuning; generated by setup.sh --optimize.
+# [mysqld] is understood by MariaDB 10.11 (Ubuntu 24.04) and 11.8 (26.04).
+[mysqld]
+max_connections = ${max_conn}
+max_connect_errors = 524288
+back_log = 65535
+thread_cache_size = 64
+thread_handling = pool-of-threads
+thread_pool_size = ${threads}
+max_allowed_packet = 64M
+wait_timeout = 600
+interactive_timeout = 600
+net_read_timeout = 120
+net_write_timeout = 120
+
+innodb_log_buffer_size = 64M
+innodb_log_file_size = ${logsize}
+innodb_buffer_pool_size = ${buffer}
+innodb_buffer_pool_dump_at_shutdown = ON
+innodb_buffer_pool_load_at_startup = ON
+innodb_buffer_pool_dump_pct = 25
+innodb_stats_on_metadata = OFF
+innodb_lock_wait_timeout = 100
+innodb_flush_neighbors = 0
+innodb_stats_persistent = ON
+innodb_stats_auto_recalc = ON
+innodb_lru_scan_depth = 2048
+innodb_io_capacity = ${io_read}
+innodb_io_capacity_max = ${io_write}
+innodb_read_io_threads = ${threads}
+innodb_write_io_threads = ${threads}
+innodb_flush_log_at_trx_commit = 2
+EOF
+  if (( major > 11 || (major == 11 && minor >= 8) )); then
+    cat >> "$cnf" <<'EOF'
+# MariaDB 11.8+ per-file buffering knobs (OFF = O_DIRECT).
+innodb_data_file_buffering = OFF
+innodb_data_file_write_through = OFF
+innodb_log_file_buffering = OFF
+innodb_log_file_write_through = OFF
+EOF
+  else
+    cat >> "$cnf" <<'EOF'
+# MariaDB <= 11.7 uses the legacy flush method.
+innodb_flush_method = O_DIRECT
+EOF
+  fi
+  cat >> "$cnf" <<EOF
+join_buffer_size = 512K
+read_buffer_size = 512K
+read_rnd_buffer_size = 512K
+sort_buffer_size = 1M
+tmp_table_size = 64M
+max_heap_table_size = 64M
+table_open_cache = ${open_cache}
+table_definition_cache = ${open_cache}
+innodb_open_files = ${open_cache}
+key_buffer_size = 32M
+aria_pagecache_buffer_size = ${aria_mb}M
+# END setup.sh optimize
+EOF
+  chmod 644 "$cnf"
+  opt_report "- Wrote \`${cnf}\` (buffer=${buffer}, max_connections=${max_conn}, back_log=65535)"
+  opt_report "- innodb_io_capacity=${io_read}/${io_write}, thread_pool_size=${threads}"
+
+  if command -v mariadbd >/dev/null 2>&1; then
+    if ! mariadbd --defaults-file=/etc/mysql/my.cnf --help --verbose >/dev/null 2>&1; then
+      opt_report "- **FAILED** MariaDB rejected the generated configuration; rolled back"
+      opt_restore /etc/mysql mysql
+      return 1
+    fi
+  fi
+
+  if (( active )); then
+    if systemctl restart mariadb 2>/dev/null; then
+      local i
+      for i in {1..60}; do
+        mariadb -e 'SELECT 1' >/dev/null 2>&1 && break
+        sleep 1
+      done
+      if mariadb -e 'SELECT 1' >/dev/null 2>&1; then
+        opt_report "- Restart: **OK**"
+      else
+        opt_report "- Restart: **FAILED** (SQL probe); rolling back"
+        opt_restore /etc/mysql mysql
+        systemctl restart mariadb 2>/dev/null || true
+        return 1
+      fi
+    else
+      opt_report "- Restart: **FAILED**; rolling back"
+      opt_restore /etc/mysql mysql
+      systemctl restart mariadb 2>/dev/null || true
+      return 1
+    fi
+  else
+    opt_report "- Restart: skipped (service was not active)"
+  fi
+  return 0
+}
+
+optimize_valkey() {
+  local active=0 conf=/etc/valkey/valkey.conf ram_mb max_mb policy
+  systemctl is-active --quiet valkey-server 2>/dev/null && active=1
+  opt_report "## Valkey"
+  opt_report "- Active: ${active}; config: \`${conf}\`"
+  opt_backup /etc/valkey valkey
+  ram_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
+  max_mb=$(( ram_mb / 10 ))
+  (( max_mb < 256 )) && max_mb=256
+  (( max_mb > 8192 )) && max_mb=8192
+  policy=$(awk '/^[[:space:]]*maxmemory-policy[[:space:]]/{print $2; exit}' "$conf")
+  [[ -n $policy ]] || policy=allkeys-lru
+
+  conf_set() {
+    local key=$1 value=$2
+    if grep -qE "^[[:space:]]*${key}[[:space:]]" "$conf"; then
+      sed -i -E "s|^[[:space:]]*${key}[[:space:]].*|${key} ${value}|" "$conf"
+    else
+      printf '%s %s\n' "$key" "$value" >> "$conf"
+    fi
+  }
+  conf_set maxmemory "${max_mb}mb"
+  conf_set maxmemory-policy "$policy"
+  conf_set maxmemory-samples 10
+  conf_set maxclients 20000
+  conf_set tcp-backlog 65535
+  conf_set timeout 0
+  conf_set tcp-keepalive 300
+  conf_set hz 10
+  conf_set io-threads 1
+  conf_set io-threads-do-reads yes
+  conf_set lazyfree-lazy-eviction yes
+  conf_set lazyfree-lazy-expire yes
+  conf_set lazyfree-lazy-server-del yes
+  conf_set lazyfree-lazy-user-del yes
+  conf_set lazyfree-lazy-user-flush yes
+  opt_report "- maxmemory=${max_mb}mb, policy=${policy}, maxclients=20000, tcp-backlog=65535"
+
+  if (( active )); then
+    if systemctl restart valkey-server 2>/dev/null; then
+      local i
+      for i in {1..20}; do
+        valkey-cli ping 2>/dev/null | grep -q PONG && break
+        sleep 1
+      done
+      if valkey-cli ping 2>/dev/null | grep -q PONG; then
+        opt_report "- Restart: **OK**"
+      else
+        opt_report "- Restart: **FAILED** (PING); rolling back"
+        opt_restore /etc/valkey valkey
+        systemctl restart valkey-server 2>/dev/null || true
+        return 1
+      fi
+    else
+      opt_report "- Restart: **FAILED**; rolling back"
+      opt_restore /etc/valkey valkey
+      systemctl restart valkey-server 2>/dev/null || true
+      return 1
+    fi
+  else
+    opt_report "- Restart: skipped (service was not active)"
+  fi
+  return 0
+}
+
+optimize_elastic() {
+  local active=0 yml=/etc/elasticsearch/elasticsearch.yml ram_mb heap_mb
+  systemctl is-active --quiet elasticsearch 2>/dev/null && active=1
+  opt_report "## Elasticsearch"
+  opt_report "- Active: ${active}; config: \`${yml}\`"
+  opt_backup /etc/elasticsearch elasticsearch
+  opt_backup /etc/systemd/system/elasticsearch.service.d elasticsearch-systemd
+
+  ram_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
+  heap_mb=$(( ram_mb * 25 / 100 ))
+  (( heap_mb > 31744 )) && heap_mb=31744
+  (( heap_mb < 512 )) && heap_mb=512
+  heap_mb=$(( heap_mb / 512 * 512 ))
+  (( heap_mb < 512 )) && heap_mb=512
+
+  mkdir -p /etc/elasticsearch/jvm.options.d
+  cat > /etc/elasticsearch/jvm.options.d/zz-setup-optimize.options <<EOF
+-Xms${heap_mb}m
+-Xmx${heap_mb}m
+-XX:+UseG1GC
+-XX:MaxGCPauseMillis=200
+-XX:+HeapDumpOnOutOfMemoryError
+-Dlog4j2.formatMsgNoLookups=true
+EOF
+  chmod 644 /etc/elasticsearch/jvm.options.d/zz-setup-optimize.options
+  chown root:elasticsearch /etc/elasticsearch/jvm.options.d/zz-setup-optimize.options 2>/dev/null || true
+
+  # Drop a previous optimize block so repeated runs stay idempotent.
+  awk -v b='# BEGIN setup.sh optimize' -v e='# END setup.sh optimize' '
+    $0 == b { skip=1; next }
+    $0 == e { skip=0; next }
+    !skip { print }
+  ' "$yml" > "${yml}.new"
+  mv "${yml}.new" "$yml"
+
+  local key
+  for key in bootstrap.memory_lock indices.query.bool.max_clause_count \
+             indices.memory.index_buffer_size indices.fielddata.cache.size \
+             search.max_buckets action.destructive_requires_name \
+             http.compression http.max_content_length; do
+    sed -i -E "s|^[[:space:]]*${key//./\\.}[[:space:]]*:.*|#&|" "$yml"
+  done
+  cat >> "$yml" <<'EOF'
+# BEGIN setup.sh optimize
+bootstrap.memory_lock: true
+indices.query.bool.max_clause_count: 4096
+indices.memory.index_buffer_size: 20%
+indices.fielddata.cache.size: 20%
+search.max_buckets: 65536
+action.destructive_requires_name: true
+http.compression: true
+http.max_content_length: 200mb
+# END setup.sh optimize
+EOF
+  chmod 644 "$yml"
+
+  mkdir -p /etc/systemd/system/elasticsearch.service.d
+  cat > /etc/systemd/system/elasticsearch.service.d/optimize.conf <<'EOF'
+[Service]
+LimitMEMLOCK=infinity
+LimitNOFILE=1048576
+LimitNPROC=4096
+EOF
+  chmod 644 /etc/systemd/system/elasticsearch.service.d/optimize.conf
+  systemctl daemon-reload || true
+  opt_report "- Heap=${heap_mb}m; bootstrap.memory_lock=true; performance block written"
+
+  if (( active )); then
+    if systemctl restart elasticsearch 2>/dev/null; then
+      local i
+      for i in {1..180}; do
+        curl -fsS http://127.0.0.1:9200 >/dev/null 2>&1 && break
+        sleep 1
+      done
+      if curl -fsS http://127.0.0.1:9200 >/dev/null 2>&1; then
+        opt_report "- Restart: **OK**"
+      else
+        opt_report "- Restart: **FAILED** (HTTP probe); rolling back"
+        opt_restore /etc/elasticsearch elasticsearch
+        opt_restore /etc/systemd/system/elasticsearch.service.d elasticsearch-systemd
+        systemctl daemon-reload || true
+        systemctl restart elasticsearch 2>/dev/null || true
+        return 1
+      fi
+    else
+      opt_report "- Restart: **FAILED**; rolling back"
+      opt_restore /etc/elasticsearch elasticsearch
+      opt_restore /etc/systemd/system/elasticsearch.service.d elasticsearch-systemd
+      systemctl daemon-reload || true
+      systemctl restart elasticsearch 2>/dev/null || true
+      return 1
+    fi
+  else
+    opt_report "- Restart: skipped (service was not active)"
+  fi
+  return 0
+}
+
+write_optimize_report() {
+  local file line
+  file="/var/log/setup-optimize-$(date +%Y%m%d-%H%M%S).md"
+  {
+    echo "# setup.sh --optimize report"
+    echo
+    echo "- Generated: $(date -Is)"
+    echo "- Host: $(hostname 2>/dev/null || echo unknown)"
+    echo "- OS: $(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-unknown}")"
+    echo "- CPU: $(nproc) threads"
+    echo "- RAM: $(awk '/^MemTotal:/{printf "%.1f GiB", $2/1024/1024}' /proc/meminfo)"
+    echo "- Disk: $(df -h / | awk 'NR==2{print $4 " free of " $2}')"
+    echo "- Backup directory: \`${OPT_BACKUP_DIR:-none}\`"
+    echo
+    if (( ${#OPT_DETECTED[@]} == 0 )); then
+      echo "No supported installed services were detected."
+    else
+      echo "Detected: ${OPT_DETECTED[*]}"
+      echo
+      for line in "${OPT_REPORT[@]}"; do
+        printf '%s\n' "$line"
+      done
+    fi
+  } > "$file"
+  cp -f "$file" /var/log/setup-optimize-latest.md
+  printf '%s\n' "$file"
+}
+
+optimize_plan() {
+  local nproc ram_mb size_mb max_children max_mb heap_mb
+  nproc=$(nproc)
+  ram_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
+  detect_installed_services
+  printf '\n%sDRY RUN%s - optimize scan only, no changes will be made.\n' "$C_BOLD" "$C_RESET"
+  printf 'Host: %s  %s CPU  %s MB RAM  %s\n' "$(hostname 2>/dev/null || echo unknown)" \
+    "$nproc" "$ram_mb" "$(df -h / | awk 'NR==2{print $4 " free"}')"
+  if (( ${#OPT_DETECTED[@]} == 0 )); then
+    printf 'No supported installed services detected.\n'
+    return 0
+  fi
+  printf 'Detected: %s\n' "${OPT_DETECTED[*]}"
+  if [[ " ${OPT_DETECTED[*]} " == *" angie "* ]]; then
+    printf '  Angie: workers=auto connections=%s rlimit=%s keepalive=%s cache=%sMB\n' \
+      "$(tune_clamp $(( nproc * 2048 )) 8192 65535)" \
+      "$(tune_clamp $(( nproc * 8192 )) 65536 524288)" \
+      "$(tune_clamp $(( nproc * 2 )) 16 128)" \
+      "$(( ram_mb * 25 / 100 ))"
+  fi
+  if [[ ${OPT_DETECTED[*]} == *php:* ]]; then
+    max_children=$(( ram_mb * 50 / 100 / 96 ))
+    (( max_children > nproc * 16 )) && max_children=$(( nproc * 16 ))
+    (( max_children > 512 )) && max_children=512
+    (( max_children < 8 )) && max_children=8
+    printf '  PHP-FPM:  socket=/run/php/php-fpm.sock max_children=%s max_requests=%s\n' \
+      "$max_children" "$(( nproc * 1024 ))"
+  fi
+  if [[ " ${OPT_DETECTED[*]} " == *" mariadb "* ]]; then
+    size_mb=$(( ram_mb * 40 / 100 ))
+    (( size_mb < 256 )) && size_mb=256
+    (( size_mb > 32768 )) && size_mb=32768
+    printf '  MariaDB: buffer_pool=%sMB max_connections=%s back_log=65535\n' \
+      "$size_mb" "$(tune_clamp $(( nproc * 32 )) 200 2000)"
+  fi
+  if [[ " ${OPT_DETECTED[*]} " == *" valkey "* ]]; then
+    max_mb=$(( ram_mb / 10 ))
+    (( max_mb < 256 )) && max_mb=256
+    (( max_mb > 8192 )) && max_mb=8192
+    printf '  Valkey: maxmemory=%sMB\n' "$max_mb"
+  fi
+  if [[ " ${OPT_DETECTED[*]} " == *" elastic "* ]]; then
+    heap_mb=$(( ram_mb * 25 / 100 ))
+    (( heap_mb > 31744 )) && heap_mb=31744
+    (( heap_mb < 512 )) && heap_mb=512
+    heap_mb=$(( heap_mb / 512 * 512 ))
+    printf '  Elasticsearch: heap=%sMB\n' "$heap_mb"
+  fi
+}
+
+run_optimize() {
+  local rc=0 service
+  OPT_BACKUP_DIR="/var/backups/setup-optimize-$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$OPT_BACKUP_DIR"
+  OPT_REPORT=()
+  detect_installed_services
+  step "Optimizing installed services"
+  if (( ${#OPT_DETECTED[@]} == 0 )); then
+    info "No supported installed services detected (Angie, PHP-FPM, MariaDB, Valkey, Elasticsearch)"
+    opt_report "No supported installed services detected."
+    local report
+    report=$(write_optimize_report)
+    info "Report: ${report}"
+    return 0
+  fi
+  info "Detected: ${OPT_DETECTED[*]}"
+  info "Backups: ${OPT_BACKUP_DIR}"
+
+  # PHP first: it owns the FastCGI socket Angie will point at.
+  OPT_PHP_OK=0
+  if [[ ${OPT_DETECTED[*]} == *php:* ]]; then
+    OPT_PHP_OK=1
+    optimize_php_services || { rc=1; OPT_PHP_OK=0; }
+  fi
+  for service in angie mariadb valkey elastic; do
+    [[ " ${OPT_DETECTED[*]} " == *" ${service} "* ]] || continue
+    case "$service" in
+      angie)   optimize_angie   || rc=1 ;;
+      mariadb) optimize_mariadb || rc=1 ;;
+      valkey)  optimize_valkey  || rc=1 ;;
+      elastic) optimize_elastic || rc=1 ;;
+    esac
+  done
+
+  local report
+  report=$(write_optimize_report)
+  printf '\n%sOptimization report: %s%s\n' "$C_BOLD" "$report" "$C_RESET"
+  printf '%s\n' "--- report ---"
+  cat "$report"
+  if (( rc == 0 )); then
+    ok "All detected services are optimized and running"
+  else
+    warn "One or more services failed to optimize; check the report and backups"
+  fi
+  return "$rc"
+}
+
 main() {
   # --help/--version are safe without root.
   local a
@@ -3378,6 +4290,10 @@ main() {
   validate_all
 
   if (( DRY_RUN )); then
+    if (( OPTIMIZE )); then
+      optimize_plan
+      exit 0
+    fi
     [[ ${ENABLED[basic]:-0} -eq 1 ]] && resolve_basic_defaults
     print_plan
     exit 0
@@ -3385,13 +4301,23 @@ main() {
 
   [[ ${EUID} -eq 0 ]] || die "This script must be run as root (use: sudo bash ${SCRIPT_NAME} ...)"
 
-  # Ubuntu 26.04+ only.
   [[ -r /etc/os-release ]] || die "Cannot read /etc/os-release"
   # shellcheck disable=SC1091
   . /etc/os-release
   [[ ${ID:-} == ubuntu ]] || die "This script only supports Ubuntu (found: ${ID:-unknown})"
-  if (( ${VERSION_ID%%.*} < 26 )); then
+  if (( OPTIMIZE )); then
+    case "${VERSION_ID%%.*}" in
+      24|26) ;;
+      *) die "--optimize supports Ubuntu 24.04 or 26.04 (found ${VERSION_ID})" ;;
+    esac
+  elif (( ${VERSION_ID%%.*} < 26 )); then
     die "This script requires Ubuntu 26.04 or newer (found ${VERSION_ID})"
+  fi
+
+  if (( OPTIMIZE )); then
+    printf '%s%sUbuntu %s optimization%s\n' "$C_BOLD" "$C_BLUE" "${VERSION_ID}" "$C_RESET"
+    run_optimize
+    exit $?
   fi
 
   if [[ ${PURGE} -eq 1 ]]; then

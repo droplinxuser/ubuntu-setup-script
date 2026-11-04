@@ -25,6 +25,30 @@ Non-Angie/non-PHP-FPM configuration lives here.
 `setup.sh` prefers the local files under `configs/` when it is run from this
 checkout, but keeps embedded fallbacks so it still works as a single file.
 
+## What's new in 1.6.9
+
+- **New `--optimize` command.** It scans only the services already installed
+  on Ubuntu 24.04 or 26.04 and tunes them in place: Angie, every installed
+  PHP-FPM version, MariaDB, Valkey and Elasticsearch. It never installs,
+  purges or starts a service that was not already running.
+- PHP-FPM pools are moved to the shared `/run/php/php-fpm.sock`, and Angie
+  `fastcgi_pass`/`local_php` directives are repointed when a TCP listener is
+  found. Multiple active PHP versions get distinct versioned sockets.
+- `--optimize` backs up every touched configuration directory under
+  `/var/backups/setup-optimize-*`, validates each config, restarts only active
+  services, rolls back automatically on failure, and writes a Markdown report
+  to `/var/log/setup-optimize-*.md` (latest at
+  `/var/log/setup-optimize-latest.md`).
+- **Hardware-aware Angie/PHP tuning now belongs to `setup.sh`.** The previous
+  `server-configs-nginx/scripts/auto_tune.sh` was moved into shared
+  `tune_angie_configs` / `tune_php_fpm_version` functions used by both the
+  installers and `--optimize`. `nginx_conf.sh` is now only a config deployer.
+- `--optimize --dry-run` prints the detected services and planned values
+  without changing anything or requiring root.
+- MariaDB tuning is version-aware: `[mysqld]` performance drop-in works on
+  10.11 (24.04) and 11.8 (26.04); 11.8 gets the new per-file buffering knobs,
+  older versions use `innodb_flush_method=O_DIRECT`.
+
 ## What's new in 1.6.8
 
 - **Hardware-aware auto-tuning is now applied on every deploy.** The new
@@ -581,6 +605,35 @@ sudo bash setup.sh --domain node.example.com app=node
 - Re-running is idempotent. An existing non-empty Angie config file is **not overwritten** (so your vhost content is preserved); an empty placeholder is upgraded. An existing database is left as-is.
 - `--domain` can be combined with a normal install, e.g. `--basic ... --angie --mariadb ... --domain google.com app=wordpress`; the domain step runs after Angie and MariaDB.
 - There is no domain purge target. Remove the directory, Angie config/certificate and database manually if needed.
+
+---
+
+## Optimize an existing server (Ubuntu 24.04 or 26.04)
+
+```bash
+# Detect installed services and tune them in place
+sudo bash setup.sh --optimize
+
+# Show what would be detected and changed, without touching anything
+bash setup.sh --optimize --dry-run
+```
+
+`--optimize` never installs, purges or starts a missing service. It looks for:
+
+- `angie` + `/etc/angie/angie.conf`
+- every `/etc/php/<version>/fpm` tree
+- MariaDB + `/etc/mysql`
+- Valkey + `/etc/valkey/valkey.conf`
+- Elasticsearch + `/etc/elasticsearch/elasticsearch.yml`
+
+It applies the same hardware-aware values used by a normal install: Angie
+workers/connections/buffers/cache sizes, PHP-FPM `static` pool sizing and the
+shared `/run/php/php-fpm.sock` listener, MariaDB buffer pool/connection
+backlog, Valkey maxmemory, and Elasticsearch heap. Each configuration is
+validated; active services are restarted; a failure rolls back the affected
+service from `/var/backups/setup-optimize-*`. The Markdown report is written to
+`/var/log/setup-optimize-<timestamp>.md` and copied to
+`/var/log/setup-optimize-latest.md`.
 
 ---
 
