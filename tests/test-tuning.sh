@@ -42,6 +42,10 @@ check "size_to_mb 2g"             test "$(size_to_mb 2g)" = 2048
 check "cache budget rounds to 256 MB" test "$(tune_cache_total_mb 7747 19000)" = 768
 check "cache budget is stable across small disk changes" \
   test "$(tune_cache_total_mb 7747 19000)" = "$(tune_cache_total_mb 7747 17700)"
+check "Valkey size parser handles MB" test "$(valkey_mb_from_config 8192mb)" = 8192
+check "Valkey size parser handles GB" test "$(valkey_mb_from_config 8gb)" = 8192
+check "Valkey size parser handles raw bytes" test "$(valkey_mb_from_config 1048576)" = 1
+check "Valkey size parser rejects an unknown unit" test "$(valkey_mb_from_config 1xb)" = 0
 check "Angie-only cache budget uses 50% RAM" \
   test "$(tune_cache_total_mb 7747 59000 50 10)" = 3840
 check "Angie+PHP cache budget uses 30% RAM" \
@@ -677,6 +681,96 @@ check "WordPress vhost detection finds a real installation" \
 rm -f "$TMP/wpangie/www/site/public/wp-config.php"
 check "WordPress vhost detection ignores a missing wp-config" \
   test -z "$(angie_wordpress_vhosts "$TMP/wpangie")"
+
+# ---------------------------------------------------------------------------
+# Managed Elasticsearch heap file
+# ---------------------------------------------------------------------------
+cat > "$TMP/es-managed.options" <<'EOF'
+-Xms8192m
+-Xmx8192m
+-XX:+UseG1GC
+-XX:MaxGCPauseMillis=200
+-XX:+HeapDumpOnOutOfMemoryError
+-Dlog4j2.formatMsgNoLookups=true
+EOF
+check "es_jvm_options_is_managed accepts the generated heap file" \
+  es_jvm_options_is_managed "$TMP/es-managed.options"
+printf -- '-Xms1g\n-Xmx1g\n' > "$TMP/es-operator.options"
+es_operator_refused() { ! es_jvm_options_is_managed "$1"; }
+check "es_jvm_options_is_managed ignores a minimal operator file" \
+  es_operator_refused "$TMP/es-operator.options"
+{ cat "$TMP/es-managed.options"; printf -- '-Xmn1g\n'; } > "$TMP/es-mixed.options"
+check "es_jvm_options_is_managed ignores a file with extra JVM flags" \
+  es_operator_refused "$TMP/es-mixed.options"
+
+mkdir -p "$TMP/esopt"
+cp "$TMP/es-managed.options" "$TMP/esopt/jvm.options"
+write_es_jvm_options 2048 "$TMP/esopt"
+check "write_es_jvm_options writes the managed heap file" \
+  grep -qx -- '-Xmx2048m' "$TMP/esopt/zz-setup-optimize.options"
+check "write_es_jvm_options removes the legacy managed heap file" \
+  test ! -e "$TMP/esopt/jvm.options"
+printf -- '-Xms1g\n-Xmx1g\n' > "$TMP/esopt/jvm.options"
+write_es_jvm_options 2048 "$TMP/esopt"
+check "write_es_jvm_options preserves an operator heap file" \
+  test -f "$TMP/esopt/jvm.options"
+
+# ---------------------------------------------------------------------------
+# sysctl duplicate keys
+# ---------------------------------------------------------------------------
+cat > "$TMP/sysctl.conf" <<'EOF'
+# managed base profile
+net.core.somaxconn = 524280
+vm.swappiness = 10
+net.core.somaxconn = 12288
+# security
+net.ipv4.tcp_challenge_ack_limit = 1000
+vm.swappiness = 10
+EOF
+sysctl_dedupe_keys "$TMP/sysctl.conf"
+check "sysctl dedupe keeps the last value" \
+  grep -qx 'net.core.somaxconn = 12288' "$TMP/sysctl.conf"
+check "sysctl dedupe keeps one definition per key" \
+  test "$(grep -c '^net.core.somaxconn' "$TMP/sysctl.conf")" -eq 1
+check "sysctl dedupe preserves comments" grep -qx '# security' "$TMP/sysctl.conf"
+before_hash=$(md5sum "$TMP/sysctl.conf" | awk '{print $1}')
+sysctl_dedupe_keys "$TMP/sysctl.conf"
+check "sysctl dedupe is idempotent" \
+  test "$before_hash" = "$(md5sum "$TMP/sysctl.conf" | awk '{print $1}')"
+
+# ---------------------------------------------------------------------------
+# Inert cache/limit files under http.d
+# ---------------------------------------------------------------------------
+mkdir -p "$TMP/inert/http.d"
+printf 'include http.d/*.conf;\n' > "$TMP/inert/angie.conf"
+printf 'fastcgi_cache_path /tmp levels=1:2 keys_zone=live:1m;\n' \
+  > "$TMP/inert/http.d/fastcgi_cache.conf"
+printf 'fastcgi_cache_path /tmp levels=1:2 keys_zone=legacy:1m;\n' \
+  > "$TMP/inert/http.d/fastcgi_cache_conf"
+printf 'limit_req_zone $binary_remote_addr zone=legacy:1m rate=1r/s;\n' \
+  > "$TMP/inert/http.d/limit_req_conf"
+printf 'map $http_user_agent $x { default 0; }\n' > "$TMP/inert/http.d/map.conf"
+check "inert detection reports only non-included cache/limit files" \
+  test "$(angie_inert_cache_files "$TMP/inert" | sort | paste -sd, -)" = \
+       "$TMP/inert/http.d/fastcgi_cache_conf,$TMP/inert/http.d/limit_req_conf"
+
+# ---------------------------------------------------------------------------
+# Small-host budget floors
+# ---------------------------------------------------------------------------
+mem_total_mb() { printf '1024'; }
+php_pool_max_children() { printf '8'; }
+mariadb_data_size_mb() { printf '0'; }
+mariadb_current_pool_mb() { printf '0'; }
+elasticsearch_data_size_mb() { printf '0'; }
+elasticsearch_current_heap_mb() { printf '0'; }
+OPT_DETECTED=(angie php:8.3 mariadb valkey elastic)
+plan_memory_budget
+check "small host keeps the 256 MB cache floor" test "$OPT_VALKEY_BUDGET_MB" -ge 256
+check "small host keeps the 512 MB search floor" test "$OPT_ES_BUDGET_MB" -ge 512
+OPT_DETECTED=(angie)
+plan_memory_budget
+check "a host without cache/search keeps a zero budget" \
+  test "$OPT_VALKEY_BUDGET_MB" -eq 0 -a "$OPT_ES_BUDGET_MB" -eq 0
 
 # ---------------------------------------------------------------------------
 # Failure diagnostics and OS-tuning order
