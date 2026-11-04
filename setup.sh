@@ -20,6 +20,10 @@
 # =============================================================================
 
 set -Eeuo pipefail
+if (( BASH_VERSINFO[0] < 4 )); then
+  printf '%s: bash 4.0 or newer is required (found %s)\n' "${0##*/}" "$BASH_VERSION" >&2
+  exit 1
+fi
 shopt -s inherit_errexit 2>/dev/null || true
 umask 022
 # Providers often ship an ungenerated locale (e.g. en_PH.UTF-8), which makes
@@ -27,7 +31,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.6.12"
+readonly SCRIPT_VERSION="1.7.0"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
@@ -51,7 +55,10 @@ readonly ES_END="# END setup.sh managed elasticsearch"
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 export APT_LISTCHANGES_FRONTEND=none
-APT_OPTS=(-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+# Wait for a concurrent apt/dpkg run instead of failing outright (unattended
+# upgrades and configuration management often hold the lock briefly).
+APT_OPTS=(-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
+          -o DPkg::Lock::Timeout=300)
 
 if [[ -t 1 ]]; then
   C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_RED=$'\033[31m'
@@ -192,8 +199,11 @@ Optimize-only mode (Ubuntu 24.04 or 26.04):
       Detects installed services (Angie, PHP-FPM, MariaDB, Valkey,
       Elasticsearch) and tunes their live configuration for the current
       CPU/RAM/disk.  It never installs, purges or starts a service that was
-      not already running.  PHP-FPM pools are moved to the shared Unix socket
-      /run/php/php-fpm.sock and Angie's fastcgi_pass is repointed when needed.
+      not already running.  Allocations are planned together from one
+      80%-of-RAM budget, and a service is restarted only when its generated
+      configuration actually changed.  PHP-FPM pools are moved to the shared
+      Unix socket /run/php/php-fpm.sock and Angie's fastcgi_pass is repointed
+      when Angie is installed; other PHP versions keep their listener.
       Configuration files are backed up under /var/backups/setup-optimize-*
       and a Markdown report is written to /var/log/setup-optimize-*.md.
       Existing application vhosts and credentials are preserved.
@@ -254,6 +264,21 @@ kv_set() {
     *) die "--${ctx}: unknown option '${key}'" ;;
   esac
   OPT["${ctx}.${key}"]=$val
+}
+
+NORMALIZED_ARGS=()
+# People paste commands from documentation into shells that keep typographic
+# dashes (em dash U+2014, en dash U+2013). Accept them instead of failing with
+# "Unknown argument" and rewrite them to ASCII "--".
+normalize_cli_args() {
+  local arg
+  NORMALIZED_ARGS=()
+  for arg in "$@"; do
+    case "$arg" in
+      —*|–*) arg="--${arg#?}" ;;
+    esac
+    NORMALIZED_ARGS+=("$arg")
+  done
 }
 
 parse_args() {
@@ -1003,6 +1028,18 @@ mb_to_config() {
   fi
 }
 
+# Largest listen backlog the kernel will honour.  somaxconn is owned by
+# configure_sysctl on install, but --optimize must respect whatever the live
+# kernel already allows instead of asking for 65535 unconditionally.
+effective_backlog() {
+  local somaxconn
+  somaxconn=$(cat /proc/sys/net/core/somaxconn 2>/dev/null || printf '4096')
+  [[ $somaxconn =~ ^[0-9]+$ ]] || somaxconn=4096
+  (( somaxconn > 65535 )) && somaxconn=65535
+  (( somaxconn < 1024 )) && somaxconn=1024
+  printf '%s' "$somaxconn"
+}
+
 # ---------------------------------------------------------------------------
 # Server configuration repository
 # ---------------------------------------------------------------------------
@@ -1706,11 +1743,15 @@ install_basic() {
 # only rewrite live configuration; they never install packages.
 # =============================================================================
 TUNE_CHANGES=()
+TUNE_DIRTY=0
 # Only repoint Angie's FastCGI upstream at the local socket when a local
 # PHP-FPM installation was detected and its optimization succeeded.
 OPT_PHP_OK=0
-tune_reset_changes() { TUNE_CHANGES=(); }
-tune_note() { TUNE_CHANGES+=("$*"); }
+tune_reset_changes() { TUNE_CHANGES=(); TUNE_DIRTY=0; }
+tune_note() { TUNE_CHANGES+=("$*"); TUNE_DIRTY=1; }
+# Informational line that must not count as a configuration change (and must
+# not trigger a service restart on an otherwise unchanged run).
+tune_summary() { TUNE_CHANGES+=("$*"); }
 
 tune_clamp() {
   local value=$1 min=$2 max=$3
@@ -1932,7 +1973,7 @@ tune_angie_configs() {
     tune_replace "$php_conf" '^([[:space:]]*fastcgi_busy_buffers_size[[:space:]]+).*;' "\\1${fastcgi_busy};" "${php_conf#${target}/}: fastcgi_busy_buffers_size=${fastcgi_busy}"
   done
 
-  tune_note "angie summary: ${nproc} CPU / ${mem_mb}MB RAM / ${disk_class} / cache=${cache_total_mb}MB"
+  tune_summary "angie summary: ${nproc} CPU / ${mem_mb}MB RAM / ${disk_class} / cache=${cache_total_mb}MB"
   return 0
 }
 
@@ -1953,22 +1994,83 @@ tune_pool_set() {
   return 0
 }
 
+# Collapse duplicate directives for keys this script owns, keeping the last
+# occurrence (php-fpm's own precedence), without reordering unrelated lines.
+tune_pool_dedupe() {
+  local file=$1
+  shift
+  local keys="$*" tmp
+  [[ -f $file ]] || return 0
+  tmp=$(mktemp)
+  awk -v keys="$keys" '
+    BEGIN { n = split(keys, k, " "); for (i = 1; i <= n; i++) managed[k[i]] = 1 }
+    {
+      # Directives are only duplicates inside the same [section]; rlimit_files
+      # is valid both globally (master) and in a pool (workers).
+      if (match($0, /^[ \t]*\[[^]]+\]/)) {
+        section = substr($0, RSTART, RLENGTH)
+        gsub(/^[ \t]+|[ \t]+$/, "", section)
+      }
+      key = ""
+      if (match($0, /^[ \t]*[^ \t=]+/)) {
+        key = substr($0, RSTART, RLENGTH)
+        gsub(/^[ \t]+|[ \t]+$/, "", key)
+      }
+      if (key in managed) last[section SUBSEP key] = NR
+      lines[NR] = $0
+    }
+    END {
+      for (i = 1; i <= NR; i++) {
+        if (match(lines[i], /^[ \t]*\[[^]]+\]/)) {
+          section = substr(lines[i], RSTART, RLENGTH)
+          gsub(/^[ \t]+|[ \t]+$/, "", section)
+        }
+        key = ""
+        if (match(lines[i], /^[ \t]*[^ \t=]+/)) {
+          key = substr(lines[i], RSTART, RLENGTH)
+          gsub(/^[ \t]+|[ \t]+$/, "", key)
+        }
+        if ((key in managed) && last[section SUBSEP key] != i) continue
+        print lines[i]
+      }
+    }' "$file" > "$tmp"
+  if ! cmp -s "$file" "$tmp"; then
+    cat "$tmp" > "$file"
+    tune_note "$(basename "$file"): removed duplicate managed directives"
+  fi
+  rm -f "$tmp"
+  return 0
+}
+
 tune_php_fpm_version() {
   local ver=$1
-  local socket=${2:-/run/php/php-fpm.sock}
+  local socket=${2:-}
   local pool="/etc/php/${ver}/fpm/pool.d/www.conf"
   local ini_dir="/etc/php/${ver}/fpm/conf.d"
   local ini="${ini_dir}/zz-setup-optimize.ini"
   [[ -d /etc/php/${ver}/fpm ]] || return 0
   [[ -f $pool ]] || { tune_note "PHP ${ver}: no pool.d/www.conf, skipped"; return 0; }
+  # With no explicit socket request, keep whatever the pool already listens on
+  # (TCP for a standalone PHP host, Unix socket for an Angie deployment).
+  if [[ -z $socket ]]; then
+    socket=$(php_pool_listen "$ver")
+    [[ -n $socket ]] || socket=/run/php/php-fpm.sock
+  fi
 
-  local nproc ram_mb max_children max_requests max_by_cpu
+  local nproc ram_mb max_children max_requests max_by_cpu php_budget backlog
   local opcache_mb jit_mb memory_mb realpath_kb
   nproc=$(nproc)
   (( nproc > 0 )) || nproc=1
   ram_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
+  backlog=$(effective_backlog)
 
-  max_children=$(( ram_mb * 50 / 100 / 96 ))
+  php_budget=${OPT_PHP_BUDGET_MB:-0}
+  if (( php_budget > 0 )); then
+    # Shared --optimize budget, already sized against MariaDB/Valkey/ES.
+    max_children=$(( php_budget / 96 ))
+  else
+    max_children=$(( ram_mb * 50 / 100 / 96 ))
+  fi
   max_by_cpu=$(( nproc * 16 ))
   (( max_children > max_by_cpu )) && max_children=$max_by_cpu
   (( max_children > 512 )) && max_children=512
@@ -1993,7 +2095,7 @@ tune_php_fpm_version() {
     sed -i -E '/^[[:space:]]*listen\.allowed_clients[[:space:]]*=/d' "$pool"
     tune_note "PHP ${ver}: removed listen.allowed_clients (Unix socket)"
   fi
-  tune_pool_set "$pool" listen.backlog 65535 "PHP ${ver}: listen.backlog=65535"
+  tune_pool_set "$pool" listen.backlog "$backlog" "PHP ${ver}: listen.backlog=${backlog}"
   tune_pool_set "$pool" listen.owner www-data "PHP ${ver}: listen.owner=www-data"
   tune_pool_set "$pool" listen.group www-data "PHP ${ver}: listen.group=www-data"
   tune_pool_set "$pool" listen.mode 0660 "PHP ${ver}: listen.mode=0660"
@@ -2002,6 +2104,15 @@ tune_php_fpm_version() {
   tune_pool_set "$pool" security.limit_extensions .php "PHP ${ver}: security.limit_extensions=.php"
   tune_pool_set "$pool" rlimit_files 524288 "PHP ${ver}: rlimit_files=524288"
   tune_pool_set "$pool" rlimit_core 0 "PHP ${ver}: rlimit_core=0"
+
+  # Older releases appended the same directive more than once (the live
+  # 8.3 pool carried two rlimit_files/rlimit_core pairs).  php-fpm lets the
+  # last value win, but duplicates make the file confusing and hide drift.
+  tune_pool_dedupe "$pool" \
+    user group listen listen.allowed_clients listen.backlog listen.owner \
+    listen.group listen.mode pm pm.max_children pm.max_requests \
+    request_terminate_timeout catch_workers_output security.limit_extensions \
+    rlimit_files rlimit_core
 
   mkdir -p "$ini_dir" /var/cache/php/opcache
   chown -R www-data:www-data /var/cache/php 2>/dev/null || true
@@ -2635,7 +2746,7 @@ install_valkey() {
     'protected-mode yes'
     'unixsocket /run/valkey/valkey.sock'
     'unixsocketperm 770'
-    'tcp-backlog 65535'
+    "tcp-backlog $(effective_backlog)"
     'timeout 0'
     'tcp-keepalive 300'
     'maxclients 20000'
@@ -3751,6 +3862,79 @@ detect_installed_services() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# Shared memory budget
+# ---------------------------------------------------------------------------
+# Each service used to choose its own slice of RAM (MariaDB 40%, PHP workers
+# 50%, Valkey 10%, Elasticsearch 25%).  With three or four services installed
+# that adds up to 100-125% before the kernel, Angie and page cache get a byte,
+# so the first traffic spike ends in the OOM killer.  Allocate once, from a
+# single budget, and leave 20% of RAM for the OS and the web server.
+OPT_MEM_TOTAL_MB=0
+OPT_MEM_BUDGET_MB=0
+OPT_PHP_BUDGET_MB=0
+OPT_MARIADB_BUDGET_MB=0
+OPT_VALKEY_BUDGET_MB=0
+OPT_ES_BUDGET_MB=0
+
+mem_total_mb() {
+  awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || printf '1024'
+}
+
+opt_clamp() {
+  local value=$1 min=$2 max=$3
+  (( value < min )) && value=$min
+  (( value > max )) && value=$max
+  printf '%s' "$value"
+}
+
+plan_memory_budget() {
+  local total usable fixed target has_php=0
+  total=$(mem_total_mb)
+  (( total > 0 )) || total=1024
+  OPT_MEM_TOTAL_MB=$total
+  usable=$(( total * 80 / 100 ))
+  OPT_MEM_BUDGET_MB=$usable
+  OPT_PHP_BUDGET_MB=0
+  OPT_MARIADB_BUDGET_MB=0
+  OPT_VALKEY_BUDGET_MB=0
+  OPT_ES_BUDGET_MB=0
+
+  [[ " ${OPT_DETECTED[*]} " == *" php:"* ]] && has_php=1
+  [[ " ${OPT_DETECTED[*]} " == *" elastic "* ]] \
+    && OPT_ES_BUDGET_MB=$(opt_clamp $(( total * 25 / 100 )) 512 31744)
+  [[ " ${OPT_DETECTED[*]} " == *" valkey "* ]] \
+    && OPT_VALKEY_BUDGET_MB=$(opt_clamp $(( total / 10 )) 256 8192)
+  [[ " ${OPT_DETECTED[*]} " == *" mariadb "* ]] \
+    && OPT_MARIADB_BUDGET_MB=$(opt_clamp $(( total * 40 / 100 )) 256 32768)
+
+  fixed=$(( OPT_ES_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_MARIADB_BUDGET_MB ))
+  # Too many caches for this host (e.g. Elasticsearch + MariaDB + Valkey on a
+  # small VPS): scale the fixed allocations down proportionally, leaving a
+  # slice for PHP.
+  if (( fixed > usable )); then
+    target=$(( usable * 85 / 100 ))
+    if (( fixed > 0 )); then
+      OPT_ES_BUDGET_MB=$(( OPT_ES_BUDGET_MB * target / fixed ))
+      OPT_VALKEY_BUDGET_MB=$(( OPT_VALKEY_BUDGET_MB * target / fixed ))
+      OPT_MARIADB_BUDGET_MB=$(( OPT_MARIADB_BUDGET_MB * target / fixed ))
+    fi
+    fixed=$(( OPT_ES_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_MARIADB_BUDGET_MB ))
+  fi
+
+  if (( has_php )); then
+    OPT_PHP_BUDGET_MB=$(( usable - fixed ))
+    (( OPT_PHP_BUDGET_MB > total * 50 / 100 )) && OPT_PHP_BUDGET_MB=$(( total * 50 / 100 ))
+    (( OPT_PHP_BUDGET_MB < 512 )) && OPT_PHP_BUDGET_MB=512
+    # Hard ceiling: never commit more than 95% of RAM across services.
+    if (( fixed + OPT_PHP_BUDGET_MB > total * 95 / 100 )); then
+      OPT_PHP_BUDGET_MB=$(( total * 95 / 100 - fixed ))
+      (( OPT_PHP_BUDGET_MB < 0 )) && OPT_PHP_BUDGET_MB=0
+    fi
+  fi
+  return 0
+}
+
 php_fpm_versions() {
   local d ver
   for d in /etc/php/*/fpm; do
@@ -3760,14 +3944,37 @@ php_fpm_versions() {
   done | sort -V
 }
 
+php_pool_listen() {
+  local ver=$1 pool="/etc/php/${1}/fpm/pool.d/www.conf"
+  [[ -f $pool ]] || return 0
+  awk -F= '/^[[:space:]]*listen[[:space:]]*=/{v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/,"",v); print v; exit}' "$pool"
+}
+
 php_primary_version() {
-  local ver
+  local ver listen angie_socket=""
+  # Prefer the pool that already owns the socket Angie talks to.
+  if [[ -f /etc/angie/angie.conf ]]; then
+    angie_socket=$(awk '/^[[:space:]]*server[[:space:]]+unix:/{
+        sub(/^[[:space:]]*server[[:space:]]+unix:/, ""); sub(/;.*/, ""); print; exit
+      }' /etc/angie/angie.conf)
+  fi
   while IFS= read -r ver; do
-    if systemctl is-active --quiet "php${ver}-fpm" 2>/dev/null; then
-      printf '%s' "$ver"
-      return 0
+    listen=$(php_pool_listen "$ver")
+    if [[ -n $angie_socket && $listen == "$angie_socket" ]]; then
+      printf '%s' "$ver"; return 0
+    fi
+    if [[ $listen == /run/php/php-fpm.sock ]]; then
+      printf '%s' "$ver"; return 0
     fi
   done < <(php_fpm_versions)
+
+  # Otherwise use the newest active version (not the oldest, which is what a
+  # plain ascending scan used to select when several were installed).
+  local newest=""
+  while IFS= read -r ver; do
+    systemctl is-active --quiet "php${ver}-fpm" 2>/dev/null && newest=$ver
+  done < <(php_fpm_versions)
+  [[ -n $newest ]] && { printf '%s' "$newest"; return 0; }
   php_fpm_versions | tail -n1
 }
 
@@ -3795,7 +4002,9 @@ optimize_angie() {
   rm -f /tmp/angie-optimize-test.log
   for change in "${TUNE_CHANGES[@]}"; do opt_report "- ${change}"; done
   if (( active )); then
-    if systemctl restart angie 2>/dev/null && systemctl is-active --quiet angie; then
+    if (( TUNE_DIRTY == 0 )); then
+      opt_report "- Restart: skipped (configuration already optimized)"
+    elif systemctl restart angie 2>/dev/null && systemctl is-active --quiet angie; then
       opt_report "- Restart: **OK**"
     else
       opt_report "- Restart: **FAILED**; rolling back"
@@ -3810,19 +4019,27 @@ optimize_angie() {
 }
 
 optimize_php_services() {
-  local primary ver active socket rc=0
+  local primary ver active socket rc=0 angie_present=0
   primary=$(php_primary_version)
   [[ -n $primary ]] || return 0
+  [[ -f /etc/angie/angie.conf ]] && angie_present=1
   while IFS= read -r ver; do
     active=0
     systemctl is-active --quiet "php${ver}-fpm" 2>/dev/null && active=1
-    if [[ $ver == "$primary" ]]; then
+    # Only the pool Angie uses is moved to the shared socket.  A second PHP
+    # version may serve a different application over TCP, and moving it would
+    # silently break that consumer.
+    if (( angie_present )) && [[ $ver == "$primary" ]]; then
       socket=/run/php/php-fpm.sock
     else
-      socket="/run/php/php${ver}-fpm.sock"
+      socket=""
     fi
     opt_report "## PHP ${ver}"
-    opt_report "- Active: ${active}; socket: \`${socket}\`"
+    if [[ -n $socket ]]; then
+      opt_report "- Active: ${active}; socket: \`${socket}\`"
+    else
+      opt_report "- Active: ${active}; listen kept: \`$(php_pool_listen "$ver")\`"
+    fi
     opt_backup "/etc/php/${ver}" "php-${ver}"
     tune_reset_changes
     if ! tune_php_fpm_version "$ver" "$socket"; then
@@ -3834,7 +4051,9 @@ optimize_php_services() {
     local change
     for change in "${TUNE_CHANGES[@]}"; do opt_report "- ${change}"; done
     if (( active )); then
-      if systemctl restart "php${ver}-fpm" 2>/dev/null \
+      if (( TUNE_DIRTY == 0 )); then
+        opt_report "- Restart: skipped (configuration already optimized)"
+      elif systemctl restart "php${ver}-fpm" 2>/dev/null \
          && systemctl is-active --quiet "php${ver}-fpm"; then
         opt_report "- Restart: **OK**"
       else
@@ -3859,17 +4078,22 @@ mariadb_server_version() {
 
 optimize_mariadb() {
   local active=0 ver major minor size_mb buffer logsize open_cache aria_mb
-  local threads max_conn io_read io_write cnf_dir cnf tmp
+  local threads max_conn io_read io_write cnf_dir cnf backlog cnf_before cnf_after
   systemctl is-active --quiet mariadb 2>/dev/null && active=1
   ver=$(mariadb_server_version)
   opt_report "## MariaDB"
   opt_report "- Version: \`${ver:-unknown}\`; active: ${active}"
   opt_backup /etc/mysql mysql
 
-  size_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
-  size_mb=$(( size_mb * 40 / 100 ))
-  (( size_mb < 256 )) && size_mb=256
-  (( size_mb > 32768 )) && size_mb=32768
+  if [[ ${OPT_MARIADB_BUDGET_MB:-0} -gt 0 ]]; then
+    size_mb=$OPT_MARIADB_BUDGET_MB
+  else
+    size_mb=$(mem_total_mb)
+    size_mb=$(( size_mb * 40 / 100 ))
+    (( size_mb < 256 )) && size_mb=256
+    (( size_mb > 32768 )) && size_mb=32768
+  fi
+  backlog=$(effective_backlog)
   logsize=$(( size_mb / 4 ))
   (( logsize < 64 )) && logsize=64
   (( logsize > 2048 )) && logsize=2048
@@ -3895,6 +4119,9 @@ optimize_mariadb() {
   [[ $major =~ ^[0-9]+$ ]] || major=0
   [[ $minor =~ ^[0-9]+$ ]] || minor=0
 
+  cnf_before=""
+  [[ -f $cnf ]] && cnf_before=$(md5sum "$cnf" | awk '{print $1}')
+
   cat > "$cnf" <<EOF
 # BEGIN setup.sh optimize
 # Hardware-aware MariaDB tuning; generated by setup.sh --optimize.
@@ -3902,7 +4129,7 @@ optimize_mariadb() {
 [mysqld]
 max_connections = ${max_conn}
 max_connect_errors = 524288
-back_log = 65535
+back_log = ${backlog}
 thread_cache_size = 64
 thread_handling = pool-of-threads
 thread_pool_size = ${threads}
@@ -3959,8 +4186,13 @@ aria_pagecache_buffer_size = ${aria_mb}M
 # END setup.sh optimize
 EOF
   chmod 644 "$cnf"
-  opt_report "- Wrote \`${cnf}\` (buffer=${buffer}, max_connections=${max_conn}, back_log=65535)"
+  cnf_after=$(md5sum "$cnf" | awk '{print $1}')
+  opt_report "- Wrote \`${cnf}\` (buffer=${buffer}, max_connections=${max_conn}, back_log=${backlog})"
   opt_report "- innodb_io_capacity=${io_read}/${io_write}, thread_pool_size=${threads}"
+  if [[ -n $cnf_before && $cnf_before == "$cnf_after" ]]; then
+    opt_report "- Restart: skipped (configuration already optimized)"
+    return 0
+  fi
 
   if command -v mariadbd >/dev/null 2>&1; then
     if ! mariadbd --defaults-file=/etc/mysql/my.cnf --help --verbose >/dev/null 2>&1; then
@@ -3998,17 +4230,24 @@ EOF
 }
 
 optimize_valkey() {
-  local active=0 conf=/etc/valkey/valkey.conf ram_mb max_mb policy
+  local active=0 conf=/etc/valkey/valkey.conf ram_mb max_mb policy backlog
+  local conf_before conf_after fd_limit dropin unit_changed=0
   systemctl is-active --quiet valkey-server 2>/dev/null && active=1
   opt_report "## Valkey"
   opt_report "- Active: ${active}; config: \`${conf}\`"
   opt_backup /etc/valkey valkey
-  ram_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
-  max_mb=$(( ram_mb / 10 ))
-  (( max_mb < 256 )) && max_mb=256
-  (( max_mb > 8192 )) && max_mb=8192
+  if [[ ${OPT_VALKEY_BUDGET_MB:-0} -gt 0 ]]; then
+    max_mb=$OPT_VALKEY_BUDGET_MB
+  else
+    ram_mb=$(mem_total_mb)
+    max_mb=$(( ram_mb / 10 ))
+    (( max_mb < 256 )) && max_mb=256
+    (( max_mb > 8192 )) && max_mb=8192
+  fi
+  backlog=$(effective_backlog)
   policy=$(awk '/^[[:space:]]*maxmemory-policy[[:space:]]/{print $2; exit}' "$conf")
   [[ -n $policy ]] || policy=allkeys-lru
+  conf_before=$(md5sum "$conf" | awk '{print $1}')
 
   conf_set() {
     local key=$1 value=$2
@@ -4022,7 +4261,7 @@ optimize_valkey() {
   conf_set maxmemory-policy "$policy"
   conf_set maxmemory-samples 10
   conf_set maxclients 20000
-  conf_set tcp-backlog 65535
+  conf_set tcp-backlog "$backlog"
   conf_set timeout 0
   conf_set tcp-keepalive 300
   conf_set hz 10
@@ -4033,7 +4272,28 @@ optimize_valkey() {
   conf_set lazyfree-lazy-server-del yes
   conf_set lazyfree-lazy-user-del yes
   conf_set lazyfree-lazy-user-flush yes
-  opt_report "- maxmemory=${max_mb}mb, policy=${policy}, maxclients=20000, tcp-backlog=65535"
+  conf_after=$(md5sum "$conf" | awk '{print $1}')
+  opt_report "- maxmemory=${max_mb}mb, policy=${policy}, maxclients=20000, tcp-backlog=${backlog}"
+
+  # maxclients=20000 is unusable if systemd still caps the unit at 1024 fds.
+  # Keep this in a dedicated drop-in so a package/admin file is never edited.
+  dropin=/etc/systemd/system/valkey-server.service.d/zz-setup-optimize.conf
+  fd_limit=$(systemctl show -p LimitNOFILE --value valkey-server 2>/dev/null || true)
+  if [[ $fd_limit =~ ^[0-9]+$ ]] && (( fd_limit < 32768 )); then
+    opt_backup "$(dirname "$dropin")" valkey-systemd
+    mkdir -p "$(dirname "$dropin")"
+    printf '[Service]\nLimitNOFILE=524288\nLimitCORE=0\n' > "$dropin"
+    chmod 644 "$dropin"
+    unit_changed=1
+    systemctl daemon-reload || true
+    opt_report "- systemd LimitNOFILE: ${fd_limit} -> 524288"
+  fi
+
+  if (( active )) && (( TUNE_DIRTY == 0 )) \
+     && [[ $conf_before == "$conf_after" ]] && (( unit_changed == 0 )); then
+    opt_report "- Restart: skipped (configuration already optimized)"
+    return 0
+  fi
 
   if (( active )); then
     if systemctl restart valkey-server 2>/dev/null; then
@@ -4047,12 +4307,16 @@ optimize_valkey() {
       else
         opt_report "- Restart: **FAILED** (PING); rolling back"
         opt_restore /etc/valkey valkey
+        opt_restore /etc/systemd/system/valkey-server.service.d valkey-systemd
+        systemctl daemon-reload || true
         systemctl restart valkey-server 2>/dev/null || true
         return 1
       fi
     else
       opt_report "- Restart: **FAILED**; rolling back"
       opt_restore /etc/valkey valkey
+      opt_restore /etc/systemd/system/valkey-server.service.d valkey-systemd
+      systemctl daemon-reload || true
       systemctl restart valkey-server 2>/dev/null || true
       return 1
     fi
@@ -4064,21 +4328,32 @@ optimize_valkey() {
 
 optimize_elastic() {
   local active=0 yml=/etc/elasticsearch/elasticsearch.yml ram_mb heap_mb
+  local jvm=/etc/elasticsearch/jvm.options.d/zz-setup-optimize.options
+  local unit=/etc/systemd/system/elasticsearch.service.d/optimize.conf
+  local es_before jvm_before unit_before es_after jvm_after unit_after changed=0
   systemctl is-active --quiet elasticsearch 2>/dev/null && active=1
   opt_report "## Elasticsearch"
   opt_report "- Active: ${active}; config: \`${yml}\`"
   opt_backup /etc/elasticsearch elasticsearch
   opt_backup /etc/systemd/system/elasticsearch.service.d elasticsearch-systemd
 
-  ram_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
-  heap_mb=$(( ram_mb * 25 / 100 ))
-  (( heap_mb > 31744 )) && heap_mb=31744
-  (( heap_mb < 512 )) && heap_mb=512
+  if [[ ${OPT_ES_BUDGET_MB:-0} -gt 0 ]]; then
+    heap_mb=$OPT_ES_BUDGET_MB
+  else
+    ram_mb=$(mem_total_mb)
+    heap_mb=$(( ram_mb * 25 / 100 ))
+    (( heap_mb > 31744 )) && heap_mb=31744
+    (( heap_mb < 512 )) && heap_mb=512
+  fi
   heap_mb=$(( heap_mb / 512 * 512 ))
   (( heap_mb < 512 )) && heap_mb=512
 
+  es_before=$([[ -f $yml ]] && md5sum "$yml" | awk '{print $1}' || echo absent)
+  jvm_before=$([[ -f $jvm ]] && md5sum "$jvm" | awk '{print $1}' || echo absent)
+  unit_before=$([[ -f $unit ]] && md5sum "$unit" | awk '{print $1}' || echo absent)
+
   mkdir -p /etc/elasticsearch/jvm.options.d
-  cat > /etc/elasticsearch/jvm.options.d/zz-setup-optimize.options <<EOF
+  cat > "$jvm" <<EOF
 -Xms${heap_mb}m
 -Xmx${heap_mb}m
 -XX:+UseG1GC
@@ -4086,8 +4361,8 @@ optimize_elastic() {
 -XX:+HeapDumpOnOutOfMemoryError
 -Dlog4j2.formatMsgNoLookups=true
 EOF
-  chmod 644 /etc/elasticsearch/jvm.options.d/zz-setup-optimize.options
-  chown root:elasticsearch /etc/elasticsearch/jvm.options.d/zz-setup-optimize.options 2>/dev/null || true
+  chmod 644 "$jvm"
+  chown root:elasticsearch "$jvm" 2>/dev/null || true
 
   # Drop a previous optimize block so repeated runs stay idempotent.
   awk -v b='# BEGIN setup.sh optimize' -v e='# END setup.sh optimize' '
@@ -4119,17 +4394,31 @@ EOF
   chmod 644 "$yml"
 
   mkdir -p /etc/systemd/system/elasticsearch.service.d
-  cat > /etc/systemd/system/elasticsearch.service.d/optimize.conf <<'EOF'
+  cat > "$unit" <<'EOF'
 [Service]
 LimitMEMLOCK=infinity
 LimitNOFILE=1048576
 LimitNPROC=4096
 EOF
-  chmod 644 /etc/systemd/system/elasticsearch.service.d/optimize.conf
+  chmod 644 "$unit"
   systemctl daemon-reload || true
-  opt_report "- Heap=${heap_mb}m; bootstrap.memory_lock=true; performance block written"
+
+  es_after=$([[ -f $yml ]] && md5sum "$yml" | awk '{print $1}' || echo absent)
+  jvm_after=$([[ -f $jvm ]] && md5sum "$jvm" | awk '{print $1}' || echo absent)
+  unit_after=$([[ -f $unit ]] && md5sum "$unit" | awk '{print $1}' || echo absent)
+  [[ $es_before != "$es_after" || $jvm_before != "$jvm_after" || $unit_before != "$unit_after" ]] \
+    && changed=1
+  if (( changed )); then
+    opt_report "- Heap=${heap_mb}m; bootstrap.memory_lock=true; performance block written"
+  else
+    opt_report "- Heap=${heap_mb}m; configuration already optimized"
+  fi
 
   if (( active )); then
+    if (( changed == 0 )); then
+      opt_report "- Restart: skipped (configuration already optimized)"
+      return 0
+    fi
     if systemctl restart elasticsearch 2>/dev/null; then
       local i
       for i in {1..180}; do
@@ -4189,10 +4478,12 @@ write_optimize_report() {
 }
 
 optimize_plan() {
-  local nproc ram_mb size_mb max_children max_mb heap_mb
+  local nproc ram_mb size_mb max_children max_mb heap_mb backlog
   nproc=$(nproc)
-  ram_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
+  ram_mb=$(mem_total_mb)
+  backlog=$(effective_backlog)
   detect_installed_services
+  plan_memory_budget
   printf '\n%sDRY RUN%s - optimize scan only, no changes will be made.\n' "$C_BOLD" "$C_RESET"
   printf 'Host: %s  %s CPU  %s MB RAM  %s\n' "$(hostname 2>/dev/null || echo unknown)" \
     "$nproc" "$ram_mb" "$(df -h / | awk 'NR==2{print $4 " free"}')"
@@ -4201,6 +4492,9 @@ optimize_plan() {
     return 0
   fi
   printf 'Detected: %s\n' "${OPT_DETECTED[*]}"
+  printf '  Memory: %sMB usable of %sMB (PHP=%sMB MariaDB=%sMB Valkey=%sMB Elasticsearch=%sMB)\n' \
+    "$OPT_MEM_BUDGET_MB" "$OPT_MEM_TOTAL_MB" "$OPT_PHP_BUDGET_MB" \
+    "$OPT_MARIADB_BUDGET_MB" "$OPT_VALKEY_BUDGET_MB" "$OPT_ES_BUDGET_MB"
   if [[ " ${OPT_DETECTED[*]} " == *" angie "* ]]; then
     printf '  Angie: workers=auto connections=%s rlimit=%s keepalive=%s cache=%sMB\n' \
       "$(tune_clamp $(( nproc * 2048 )) 8192 65535)" \
@@ -4209,29 +4503,28 @@ optimize_plan() {
       "$(( ram_mb * 25 / 100 ))"
   fi
   if [[ ${OPT_DETECTED[*]} == *php:* ]]; then
-    max_children=$(( ram_mb * 50 / 100 / 96 ))
+    if (( OPT_PHP_BUDGET_MB > 0 )); then
+      max_children=$(( OPT_PHP_BUDGET_MB / 96 ))
+    else
+      max_children=$(( ram_mb * 50 / 100 / 96 ))
+    fi
     (( max_children > nproc * 16 )) && max_children=$(( nproc * 16 ))
     (( max_children > 512 )) && max_children=512
     (( max_children < 8 )) && max_children=8
-    printf '  PHP-FPM:  socket=/run/php/php-fpm.sock max_children=%s max_requests=%s\n' \
-      "$max_children" "$(( nproc * 1024 ))"
+    printf '  PHP-FPM:  max_children=%s max_requests=%s backlog=%s\n' \
+      "$max_children" "$(( nproc * 1024 ))" "$backlog"
   fi
   if [[ " ${OPT_DETECTED[*]} " == *" mariadb "* ]]; then
-    size_mb=$(( ram_mb * 40 / 100 ))
-    (( size_mb < 256 )) && size_mb=256
-    (( size_mb > 32768 )) && size_mb=32768
-    printf '  MariaDB: buffer_pool=%sMB max_connections=%s back_log=65535\n' \
-      "$size_mb" "$(tune_clamp $(( nproc * 32 )) 200 2000)"
+    size_mb=$OPT_MARIADB_BUDGET_MB
+    printf '  MariaDB: buffer_pool=%sMB max_connections=%s back_log=%s\n' \
+      "$size_mb" "$(tune_clamp $(( nproc * 32 )) 200 2000)" "$backlog"
   fi
   if [[ " ${OPT_DETECTED[*]} " == *" valkey "* ]]; then
-    max_mb=$(( ram_mb / 10 ))
-    (( max_mb < 256 )) && max_mb=256
-    (( max_mb > 8192 )) && max_mb=8192
-    printf '  Valkey: maxmemory=%sMB\n' "$max_mb"
+    max_mb=$OPT_VALKEY_BUDGET_MB
+    printf '  Valkey: maxmemory=%sMB backlog=%s\n' "$max_mb" "$backlog"
   fi
   if [[ " ${OPT_DETECTED[*]} " == *" elastic "* ]]; then
-    heap_mb=$(( ram_mb * 25 / 100 ))
-    (( heap_mb > 31744 )) && heap_mb=31744
+    heap_mb=$OPT_ES_BUDGET_MB
     (( heap_mb < 512 )) && heap_mb=512
     heap_mb=$(( heap_mb / 512 * 512 ))
     printf '  Elasticsearch: heap=%sMB\n' "$heap_mb"
@@ -4242,8 +4535,15 @@ run_optimize() {
   local rc=0 service
   OPT_BACKUP_DIR="/var/backups/setup-optimize-$(date +%Y%m%d-%H%M%S)"
   mkdir -p "$OPT_BACKUP_DIR"
+  # Keep the ten newest rollback points; these directories contain full copies
+  # of /etc/angie, /etc/php/<ver> and /etc/mysql and can grow quickly.
+  local old_backup
+  while IFS= read -r old_backup; do
+    [[ -n $old_backup && $old_backup != "$OPT_BACKUP_DIR" ]] && rm -rf -- "$old_backup"
+  done < <(ls -1dt /var/backups/setup-optimize-* 2>/dev/null | tail -n +11)
   OPT_REPORT=()
   detect_installed_services
+  plan_memory_budget
   step "Optimizing installed services"
   if (( ${#OPT_DETECTED[@]} == 0 )); then
     info "No supported installed services detected (Angie, PHP-FPM, MariaDB, Valkey, Elasticsearch)"
@@ -4255,6 +4555,8 @@ run_optimize() {
   fi
   info "Detected: ${OPT_DETECTED[*]}"
   info "Backups: ${OPT_BACKUP_DIR}"
+  info "Memory budget: ${OPT_MEM_BUDGET_MB}MB usable of ${OPT_MEM_TOTAL_MB}MB (PHP=${OPT_PHP_BUDGET_MB}MB MariaDB=${OPT_MARIADB_BUDGET_MB}MB Valkey=${OPT_VALKEY_BUDGET_MB}MB Elasticsearch=${OPT_ES_BUDGET_MB}MB)"
+  opt_report "- Memory budget: ${OPT_MEM_BUDGET_MB}MB usable of ${OPT_MEM_TOTAL_MB}MB (PHP=${OPT_PHP_BUDGET_MB}MB MariaDB=${OPT_MARIADB_BUDGET_MB}MB Valkey=${OPT_VALKEY_BUDGET_MB}MB Elasticsearch=${OPT_ES_BUDGET_MB}MB)"
 
   # PHP first: it owns the FastCGI socket Angie will point at.
   OPT_PHP_OK=0
@@ -4286,6 +4588,9 @@ run_optimize() {
 }
 
 main() {
+  normalize_cli_args "$@"
+  set -- "${NORMALIZED_ARGS[@]}"
+
   # --help/--version are safe without root.
   local a
   for a in "$@"; do
@@ -4327,8 +4632,8 @@ main() {
 
   if (( OPTIMIZE )); then
     printf '%s%sUbuntu %s optimization%s\n' "$C_BOLD" "$C_BLUE" "${VERSION_ID}" "$C_RESET"
-    run_optimize
-    exit $?
+    run_optimize || exit $?
+    exit 0
   fi
 
   if [[ ${PURGE} -eq 1 ]]; then

@@ -68,6 +68,8 @@ run ok   --dry-run --domain a.example.com app=lychee
 
 # Optimize-only mode.
 run ok   --dry-run --optimize
+run ok   $'—optimize' --dry-run
+run ok   $'–optimize' --dry-run
 run fail --dry-run --optimize --basic
 run fail --dry-run --optimize --angie
 run fail --dry-run --optimize --purge

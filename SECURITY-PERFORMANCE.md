@@ -237,6 +237,11 @@ Already good:
 - 400 max connections, 64 thread cache, 600 s wait timeout.
 - Systemd `LimitNOFILE=1048576`, AppArmor bootstrap fix, embedded backups.
 
+> **Mixed-host note (1.7.0):** the 40%-of-RAM buffer pool is a ceiling, not an
+> independent guarantee. `--optimize` now sizes MariaDB, PHP-FPM, Valkey and
+> Elasticsearch from one shared 80%-of-RAM budget and scales the allocations
+> down when several services share a host.
+
 Recommended changes:
 
 - **Create per-application users** limited to their own database and required
