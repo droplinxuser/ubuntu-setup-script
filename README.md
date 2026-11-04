@@ -31,6 +31,13 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.22
+
+- **An OS-only `--optimize` run no longer leaves an empty backup tree.** The
+  rollback directory is created lazily by the first `opt_backup`, so a host
+  with no supported services (only sysctl/PAM/governor tuning) writes the
+  report and nothing else. The report shows `Backup directory: none`.
+
 ## What's new in 1.8.21
 
 - **Elasticsearch now has one managed heap file.** The installer wrote
