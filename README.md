@@ -31,15 +31,20 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.15
+
+- **The old auto-tune switch is gone.** `--optimize` is the only entry point;
+  it already performs the complete OS + service pass. The former alias and
+  the separate wrapper script were removed.
+
 ## What's new in 1.8.14
 
 - **One command for the whole host: `--optimize`.** The operating-system
   layer (CPU governor, PAM limits, hardware-scaled kernel/network/memory
   sysctls) is now applied by `--optimize` together with Angie, PHP-FPM,
   MariaDB, Valkey/Redis and Elasticsearch. Existing servers get the complete
-  treatment with `sudo bash setup.sh --optimize`. `--auto-tune` is retained
-  as a silent backward-compatible alias, and the separate
-  `tools/auto-tune.sh` wrapper was removed.
+  treatment with `sudo bash setup.sh --optimize`. The former separate
+  auto-tune mode and wrapper were removed; there is one command now.
 
 ## What's new in 1.8.13
 
@@ -957,10 +962,6 @@ real listener (Angie via `ss`, PHP socket/TCP) plus SQL/PING/HTTP probes and
 lists recent error-level journal entries. The Markdown report is written to
 `/var/log/setup-optimize-<timestamp>.md` and copied to
 `/var/log/setup-optimize-latest.md`.
-
-`--auto-tune` is accepted as a silent alias for older runbooks; new
-deployments should use `--optimize`.
-
 
 Older Angie installs whose `http.d` files use underscore names
 (`fastcgi_cache_conf`, `limit_req_conf`, …) are tuned in place as well.

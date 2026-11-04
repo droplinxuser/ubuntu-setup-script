@@ -31,7 +31,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.14"
+readonly SCRIPT_VERSION="1.8.15"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
@@ -212,7 +212,6 @@ Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
       and a Markdown report is written to /var/log/setup-optimize-*.md.
       Existing application vhosts and credentials are preserved.
       --dry-run only prints the planned OS and service values.
-      --auto-tune is accepted as a backward-compatible alias.
 
 Purge (uninstall) mode:
   --purge [all|basic|angie|php|mariadb|valkey|elastic|others]
@@ -384,9 +383,6 @@ parse_args() {
         done
         ;;
       --optimize)
-        OPTIMIZE=1; shift ;;
-      --auto-tune)
-        # Backward-compatible alias: --optimize now performs the OS tuning too.
         OPTIMIZE=1; shift ;;
       --purge)
         PURGE=1; shift
