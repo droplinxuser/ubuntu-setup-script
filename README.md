@@ -129,7 +129,7 @@ checkout, but keeps embedded fallbacks so it still works as a single file.
   the whole list still applies to every domain, as documented.
 - ShellCheck is clean at warning level; the log-directory helpers no longer
   shadow the `group` array used by the argument parser.
-- Added `tests/test-dry-run-matrix.sh`, a 55-case validation matrix covering
+- Added `tests/test-dry-run-matrix.sh`, a 65-case validation matrix covering
   every service, domain app, purge mode and representative invalid inputs.
 - Verified install, update, PHP 8.4 -> 8.3 switch, selective purge, full
   purge (twice) and clean reinstall in a disposable Ubuntu 26.04 KVM guest.
@@ -778,9 +778,9 @@ The script was tested on Ubuntu 26.04.1 LTS (16 CPU threads, 32 GB installed RAM
 
 Also checked at CLI level (all using `--dry-run`, no system changes):
 
-- `tests/test-dry-run-matrix.sh` covers 55 cases: every service flag, every
+- `tests/test-dry-run-matrix.sh` covers 65 cases: every service flag, every
   domain app type, per-domain and trailing group `app=` forms, every purge
-  mode, and representative invalid inputs.
+  mode, `--optimize` and representative invalid inputs.
 
 - All 64 combinations of the six install service flags (`angie`, `php`, `mariadb`, `valkey`, `elastic`, `others`) plus `--basic` parse and validate.
 - All 128 bare purge target subsets (including empty/implicit/explicit `all`) parse and validate.
