@@ -31,6 +31,23 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.19
+
+- **`--optimize` automatically migrates old PHP-FPM TCP pools to the shared
+  Unix socket.** When the primary pool listens on loopback TCP (for example
+  `127.0.0.1:9000`) and the active vhosts use the `local_php` upstream,
+  `--optimize` starts a temporary on-demand bridge pool on the next free
+  loopback port, points Angie at the bridge with the original TCP listener as
+  backup, moves the main pool to `/run/php/php-fpm.sock`, points Angie at the
+  socket, and removes the bridge. The old TCP listener stays alive until
+  Angie is already using the bridge, so the migration avoids the listener gap
+  that caused 502s. Direct `fastcgi_pass` handlers and
+  `fastcgi_next_upstream off` are left on TCP (the backup fallback would not
+  be safe); standalone PHP hosts without Angie also keep TCP. Any failure
+  restores the pool and Angie config and reloads both services back to TCP.
+  A few in-flight keepalive requests can still reset during the graceful
+  Angie/PHP reloads.
+
 ## What's new in 1.8.18
 
 - **PHP-FPM pools with a missing slowlog directory no longer fail

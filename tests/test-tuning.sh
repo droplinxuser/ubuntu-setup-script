@@ -74,6 +74,23 @@ check "ensure_fpm_log_path does not create a literal runtime-variable file" \
   test ! -e "$TMP/fpm/logs/\$pool.access.log"
 
 # ---------------------------------------------------------------------------
+# PHP-FPM TCP -> socket migration preconditions
+# ---------------------------------------------------------------------------
+mkdir -p "$TMP/socket-ok/conf.d" "$TMP/socket-direct/conf.d" "$TMP/socket-off/conf.d"
+printf 'fastcgi_pass local_php;\n' > "$TMP/socket-ok/conf.d/site.conf"
+printf 'server 127.0.0.1:9000;\n' > "$TMP/socket-ok/angie.conf"
+check "socket migration allowed for the local_php upstream" \
+  angie_uses_local_php_upstream "$TMP/socket-ok"
+printf 'fastcgi_pass 127.0.0.1:9000;\n' > "$TMP/socket-direct/conf.d/site.conf"
+printf 'fastcgi_pass local_php;\n' > "$TMP/socket-direct/conf.d/other.conf"
+socket_migration_refused() { ! angie_uses_local_php_upstream "$1"; }
+check "socket migration refused for a direct fastcgi_pass" \
+  socket_migration_refused "$TMP/socket-direct"
+printf 'fastcgi_pass local_php;\nfastcgi_next_upstream off;\n' > "$TMP/socket-off/conf.d/site.conf"
+check "socket migration refused when next_upstream is off" \
+  socket_migration_refused "$TMP/socket-off"
+
+# ---------------------------------------------------------------------------
 # SSH/firewall helpers
 # ---------------------------------------------------------------------------
 check "SSH peer parser uses the client column, not the server address" \
