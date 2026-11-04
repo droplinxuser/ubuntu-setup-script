@@ -2,7 +2,7 @@
 
 A single, idempotent Bash provisioning script for **Ubuntu 26.04 LTS** (and newer LTS releases such as 28.04). It installs and configures a complete web/database stack from one command and can uninstall everything again with a `--purge` mode.
 
-Angie and PHP-FPM/php.ini configuration is **not** hard-coded in this script. It is downloaded at install time from [`droplinxuser/server-configs-nginx`](https://github.com/droplinxuser/server-configs-nginx), which is the single source of truth for those configs. Update that repository, not `setup.sh`, for Angie/PHP configuration changes.
+Angie configuration is **not** hard-coded in this script. It is downloaded at install time from [`droplinxuser/server-configs-nginx`](https://github.com/droplinxuser/server-configs-nginx), which is the single source of truth for Angie/Nginx configs. PHP-FPM pool and `php.ini` templates are **non-Angie** configuration and live locally under `configs/php/` in this repository.
 
 The script is designed for a fresh server but is safe to re-run on an already configured machine. Only the services named on the command line are touched.
 
@@ -13,17 +13,34 @@ The script is designed for a fresh server but is safe to re-run on an already co
 | `setup.sh` | Installer/provisioner (packages, services, domains, purge) |
 | `configs/system/` | DNS, CPU governor, sysctl and limits profiles |
 | `configs/mariadb/` | MariaDB reference profile and systemd limits |
+| `configs/php/` | PHP-FPM pool templates, `custom_dan.ini` and systemd limits |
 | `tests/stress-site/` | Full-stack test site and stress harness |
 | `/var/www/logs/` (live) | One directory tree for Angie, PHP, MariaDB, Valkey, Node.js, GifSicle and Elasticsearch logs |
 | `tools/diff_configs.sh` | Compare canonical configs (both repos) with live `/etc` |
 | `legacy/basic_setup.sh` | Old standalone basic setup script (superseded) |
 
-Angie, Nginx and PHP-FPM configuration lives only in
+Angie/Nginx configuration lives only in
 [`droplinxuser/server-configs-nginx`](https://github.com/droplinxuser/server-configs-nginx).
-Non-Angie/non-PHP-FPM configuration lives here.
+All non-Angie configuration, including PHP-FPM, MariaDB, Valkey and
+Elasticsearch, lives here.
 
 `setup.sh` prefers the local files under `configs/` when it is run from this
-checkout, but keeps embedded fallbacks so it still works as a single file.
+checkout. System/MariaDB/systemd blobs still have embedded fallbacks, but the
+PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
+run the install from a repository checkout (or package that directory
+alongside `setup.sh`).
+
+## What's new in 1.6.10
+
+- Moved PHP-FPM pool templates (`www_81.conf` … `www_85.conf`),
+  `custom_dan.ini` and `php-fpm-limits.conf` from
+  `server-configs-nginx/scripts/` to this repository's `configs/php/`.
+  PHP-FPM is not Angie configuration, so a PHP-only install no longer fetches
+  the Angie repository at all.
+- `server-configs-nginx/scripts/nginx_conf.sh` now only syncs the Angie tree;
+  it removes stale PHP-FPM files from `/etc/angie/scripts` during upgrades.
+- Updated `tools/diff_configs.sh` to compare PHP configs against this
+  repository instead of the Angie repository.
 
 ## What's new in 1.6.9
 
@@ -190,7 +207,7 @@ checkout, but keeps embedded fallbacks so it still works as a single file.
 
 - Removed the embedded Angie config archive and all duplicated Angie/PHP config patching from `setup.sh`.
 - `setup.sh` now downloads `server-configs-nginx` once per run and delegates deployment to its `scripts/nginx_conf.sh`.
-- PHP-FPM pool and `php.ini` templates now come from `server-configs-nginx/scripts/www_<ver>.conf` and `scripts/custom_dan.ini`.
+- PHP-FPM pool and `php.ini` templates were sourced from `server-configs-nginx/scripts/www_<ver>.conf` and `scripts/custom_dan.ini` in this release (moved back to `configs/php/` in 1.6.10).
 - Moved non-Angie/non-PHP-FPM files out of `server-configs-nginx` into this repo: `configs/system/`, `configs/mariadb/`, `tools/diff_configs.sh`, `legacy/basic_setup.sh`.
 - Added `CONFIG_SOURCE_DIR` for local/offline testing, plus `CONFIG_REPO_URL` / `CONFIG_REPO_REF` overrides.
 - The repo deployer removes old setup.sh override files and pre-refactor config filenames during upgrades.
@@ -432,7 +449,7 @@ Before changing basic settings, the script records the originals under `/var/lib
 - If `ver=` is omitted, selects the **latest stable PHP** available to APT from the Sury repository (currently 8.5; pre-release packages such as `8.6.0~rc3` are ignored).
 - Installs the XenForo profile: `php<ver>-fpm`, `php<ver>-cli`, `php<ver>-opcache`, `php<ver>-mysql`, `php<ver>-gd`, `php<ver>-curl`, `php<ver>-xml`, `php<ver>-zip`, `php<ver>-gmp`, `php<ver>-mbstring`, `php<ver>-redis`. It does not install `intl`, `imagick`, `bcmath`, `apcu`, `igbinary`, `msgpack`, `sqlite3` or `bz2` unless you add them yourself.
   - OPcache/JIT settings in `custom_dan.ini` are active because `php<ver>-opcache` is installed. Add `php<ver>-intl` only if an add-on needs it.
-- Deploys `www.conf` from the repo's `scripts/www_<ver>.conf` and `custom_dan.ini` from `scripts/custom_dan.ini`. Add a new `scripts/www_<ver>.conf` to the repo to support a new PHP version; `setup.sh` does not carry pool/ini content.
+- Deploys `www.conf` from `configs/php/www_<ver>.conf` and `custom_dan.ini` from `configs/php/custom_dan.ini`. Add a new `configs/php/www_<ver>.conf` to support a new PHP version. These are local non-Angie configs; no Angie repo fetch is needed for a PHP-only install.
 - Fills in the dynamic values from `setup.sh`:
   - `pm.max_children = RAM_MB / 256` (~50% of RAM at 128 MB per worker), capped at `CPU threads × 8`
   - `pm.max_requests = CPU threads × 1024`
@@ -730,11 +747,15 @@ Embedded in `setup.sh` for offline/reproducible installation:
 
 Downloaded at install time (single source of truth):
 
-- Angie and PHP configuration from [`droplinxuser/server-configs-nginx`](https://github.com/droplinxuser/server-configs-nginx): `angie.conf`, `h5bp/`, `conf.d/`, `http.d/`, `snippets/`, `scripts/www_<ver>.conf`, `scripts/custom_dan.ini`, `scripts/cloudflare.sh`, `scripts/limit_nofile.conf`, `scripts/etc_default_nginx`, and `scripts/nginx_conf.sh`.
+- Angie configuration from [`droplinxuser/server-configs-nginx`](https://github.com/droplinxuser/server-configs-nginx): `angie.conf`, `h5bp/`, `conf.d/`, `http.d/`, `snippets/`, `scripts/cloudflare.sh`, `scripts/limit_nofile.conf`, `scripts/etc_default_nginx`, and `scripts/nginx_conf.sh`.
 - Cloudflare IP ranges from Cloudflare.
 - Package repositories via APT.
 
-`setup.sh` does not contain Angie or PHP-FPM/php.ini config content. To change those, update `server-configs-nginx` and re-run the install. Use `CONFIG_SOURCE_DIR=/path/to/checkout` to test a local checkout before pushing.
+PHP-FPM pool and `php.ini` templates are **not** downloaded from the Angie
+repository; they live in `configs/php/` here. To change Angie behavior, update
+`server-configs-nginx` and re-run the install. Use
+`CONFIG_SOURCE_DIR=/path/to/checkout` to test a local Angie checkout before
+pushing.
 
 ---
 

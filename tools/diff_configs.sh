@@ -31,8 +31,8 @@ compare_files() {
 
 # Compare configurations for Ubuntu Server 26.04
 #
-# Non-Angie/Nginx/PHP-FPM files live in ubuntu-setup-script; Angie/PHP-FPM
-# files live in server-configs-nginx.
+# Angie/Nginx files live in server-configs-nginx; PHP-FPM and all other
+# service files live in ubuntu-setup-script.
 
 SETUP_REPO="${SETUP_REPO:-https://raw.githubusercontent.com/droplinxuser/ubuntu-setup-script/main}"
 CONFIG_REPO="${CONFIG_REPO:-https://raw.githubusercontent.com/droplinxuser/server-configs-nginx/main}"
@@ -53,6 +53,7 @@ declare -A config_files=(
     ["brotli_conf"]="${CONFIG_REPO}/http.d/brotli_conf /etc/angie/http.d/brotli.conf"
     ["http_trim_filter_conf"]="${CONFIG_REPO}/http.d/http_trim_filter_conf /etc/angie/http.d/http_trim_filter.conf"
     ["wordpress_cache"]="${CONFIG_REPO}/h5bp/wordpress_cache.conf /etc/angie/h5bp/wordpress_cache.conf"
+    ["php_fpm_limits"]="${SETUP_REPO}/configs/php/php-fpm-limits.conf /etc/systemd/system/php8.5-fpm.service.d/limits.conf"
 )
 
 # PHP Versions
@@ -68,6 +69,6 @@ done
 
 # Compare PHP configurations for different versions
 for version in "${php_versions[@]}"; do
-    compare_files "${CONFIG_REPO}/scripts/www_8${version}.conf" "/etc/php/8.${version}/fpm/pool.d/www.conf"
-    compare_files "${CONFIG_REPO}/scripts/custom_dan.ini" "/etc/php/8.${version}/fpm/conf.d/custom_dan.ini"
+    compare_files "${SETUP_REPO}/configs/php/www_8${version}.conf" "/etc/php/8.${version}/fpm/pool.d/www.conf"
+    compare_files "${SETUP_REPO}/configs/php/custom_dan.ini" "/etc/php/8.${version}/fpm/conf.d/custom_dan.ini"
 done
