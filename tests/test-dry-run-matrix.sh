@@ -41,7 +41,10 @@ run ok   --dry-run --basic --mariadb user=demo pass=temp size=4gb
 run ok   --dry-run --basic --mariadb user=demo pass=temp size=auto bind=127.0.0.1,IPV4
 run ok   --dry-run --basic --valkey
 run ok   --dry-run --basic --valkey ram=2g policy=noeviction io_threads=2
+run ok   --dry-run --basic --valkey ram=auto
 run ok   --dry-run --basic --elastic ram=4g host=localhost
+run ok   --dry-run --basic --elastic
+run ok   --dry-run --basic --elastic ram=auto
 run ok   --dry-run --basic --others all
 run ok   --dry-run --basic --others smartmon gif nodejs fail2ban unattended sysstat composer
 run ok   --dry-run --basic --others security
@@ -83,7 +86,9 @@ run fail --dry-run --basic --php ver=8
 run fail --dry-run --basic --php children=0
 run fail --dry-run --basic --valkey policy=bogus
 run fail --dry-run --basic --valkey io_threads=0
+run fail --dry-run --basic --valkey ram=0
 run fail --dry-run --basic --elastic ram=x
+run fail --dry-run --basic --elastic ram=0
 run fail --dry-run --basic --others bogus
 run fail --dry-run --domain -bad.com
 run fail --dry-run --domain example.com app=bogus

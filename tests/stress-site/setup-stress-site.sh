@@ -29,6 +29,36 @@ fi
 FPM_SVC="php${PHP_VER}-fpm"
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
+# PHP-FPM clears the environment, so persist the same connection settings that
+# the seeder uses.  The web pages merge this file in public/config.php.
+export STRESS_DB_HOST=${STRESS_DB_HOST:-localhost}
+export STRESS_DB_NAME=${STRESS_DB_NAME:-stress_test}
+export STRESS_DB_USER=${STRESS_DB_USER:-demo}
+export STRESS_DB_PASS=${STRESS_DB_PASS:-temp}
+export STRESS_VALKEY_HOST=${STRESS_VALKEY_HOST:-127.0.0.1}
+export STRESS_VALKEY_PORT=${STRESS_VALKEY_PORT:-6379}
+export STRESS_VALKEY_SOCKET=${STRESS_VALKEY_SOCKET:-/run/valkey/valkey.sock}
+export STRESS_ELASTIC_URL=${STRESS_ELASTIC_URL:-http://127.0.0.1:9200}
+export STRESS_NODE_URL=${STRESS_NODE_URL:-http://127.0.0.1:3100/}
+
+"$PHP_BIN" -r '
+$keys = [
+    "STRESS_DB_HOST", "STRESS_DB_NAME", "STRESS_DB_USER", "STRESS_DB_PASS",
+    "STRESS_VALKEY_HOST", "STRESS_VALKEY_PORT", "STRESS_VALKEY_SOCKET",
+    "STRESS_ELASTIC_URL", "STRESS_NODE_URL",
+];
+$out = [];
+foreach ($keys as $key) {
+    $value = getenv($key);
+    if ($value !== false) {
+        $out[$key] = $value;
+    }
+}
+file_put_contents("/etc/stress-site-config.json", json_encode($out, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n");
+'
+chown root:www-data /etc/stress-site-config.json
+chmod 640 /etc/stress-site-config.json
+
 install -d -m 750 -o www-data -g www-data "$LOG_DIR" "$NODE_LOG_DIR" "$GIF_LOG_DIR"
 
 for svc in angie "$FPM_SVC" mariadb valkey-server elasticsearch; do

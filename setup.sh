@@ -25,7 +25,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.6.7"
+readonly SCRIPT_VERSION="1.6.8"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
@@ -154,7 +154,9 @@ Services (optional; only the ones listed are installed):
                  volatile-lru when Valkey stores sessions/jobs that must survive)
       io_threads extra socket I/O threads (default 1; raise only after
                  valkey-benchmark shows the main thread is saturated)
-  --elastic   ram=4g [host=localhost]
+  --elastic   [ram=4g|auto] [host=localhost]
+      ram        JVM heap (default: auto = 25% of RAM, clamped to
+                 512 MB..31 GB, leaving room for MariaDB/Valkey/PHP)
   --others    smartmon nvme gif nodejs fail2ban unattended sysstat composer
               (or: --others all)
       nvme-cli is installed only on a dedicated server with NVMe storage.
@@ -771,8 +773,9 @@ validate_all() {
 
   if [[ ${ENABLED[valkey]:-0} -eq 1 ]]; then
     if [[ -n ${OPT[valkey.ram]:-} ]]; then
-      [[ ${OPT[valkey.ram]} =~ ^[1-9][0-9]*[gGmM]$ ]] \
-        || die "--valkey ram='${OPT[valkey.ram]}' is invalid (use e.g. 2g)"
+      [[ ${OPT[valkey.ram],,} == auto || ${OPT[valkey.ram]} =~ ^[1-9][0-9]*[gGmM]$ ]] \
+        || die "--valkey ram='${OPT[valkey.ram]}' is invalid (use auto, 2g, 512m, ...)"
+      OPT[valkey.ram]=${OPT[valkey.ram],,}
     fi
     local vpol=${OPT[valkey.policy]:-allkeys-lru}
     case "$vpol" in
@@ -787,9 +790,10 @@ validate_all() {
   fi
 
   if [[ ${ENABLED[elastic]:-0} -eq 1 ]]; then
-    [[ -n ${OPT[elastic.ram]:-} ]] || die "--elastic ram= is required (for example ram=4g)"
-    [[ ${OPT[elastic.ram]} =~ ^[1-9][0-9]*[gGmM]$ ]] \
-      || die "--elastic ram='${OPT[elastic.ram]}' is invalid (use e.g. 4g)"
+    local eram=${OPT[elastic.ram]:-auto}
+    [[ ${eram,,} == auto || ${eram} =~ ^[1-9][0-9]*[gGmM]$ ]] \
+      || die "--elastic ram='${eram}' is invalid (use auto, 4g, 512m, ...)"
+    OPT[elastic.ram]=${eram,,}
     local ehost=${OPT[elastic.host]:-localhost}
     [[ $ehost =~ ^[A-Za-z0-9._:-]+$ ]] \
       || die "--elastic host='${ehost}' is invalid"
@@ -1204,6 +1208,12 @@ update_system() {
 
 configure_cpu_governor() {
   step "CPU governor (dedicated server)"
+  # Many dedicated hosts, and every VM, expose no cpufreq interface.  Treat
+  # that as an informational skip instead of a failed service/warning.
+  if [[ ! -d /sys/devices/system/cpu/cpu0/cpufreq ]]; then
+    info "No CPU frequency-scaling interface on this host; skipping governor setup"
+    return 0
+  fi
   apt-get remove -y tuned || true
   ensure_state
   if ! dpkg-query -W -f='${Status}' cpufrequtils 2>/dev/null | grep -q 'ok installed'; then
@@ -1354,8 +1364,49 @@ configure_swap_auto() {
   swapon --show
 }
 
+# Keys whose live kernel values are changed by setup.sh but may not exist in
+# the original /etc/sysctl.conf.  Record them so --purge can put the kernel
+# back without waiting for a reboot.
+SYSCTL_MANAGED_KEYS=(
+  net.core.somaxconn net.core.netdev_max_backlog net.core.optmem_max
+  net.core.rmem_max net.core.wmem_max
+  net.ipv4.tcp_rmem net.ipv4.tcp_wmem
+  net.ipv4.tcp_max_syn_backlog net.ipv4.tcp_max_tw_buckets
+  net.ipv4.tcp_max_orphans net.ipv4.ip_local_port_range
+  net.ipv4.tcp_keepalive_time
+  net.ipv4.neigh.default.gc_thresh1 net.ipv4.neigh.default.gc_thresh2
+  net.ipv4.neigh.default.gc_thresh3
+  net.ipv4.ipfrag_low_thresh net.ipv4.ipfrag_high_thresh
+  net.netfilter.nf_conntrack_max
+  fs.file-max fs.nr_open fs.inotify.max_user_watches
+  vm.min_free_kbytes kernel.shmmax kernel.shmall
+)
+
+record_sysctl_values() {
+  ensure_state
+  local key file
+  for key in "${SYSCTL_MANAGED_KEYS[@]}"; do
+    file="${STATE_DIR}/sysctl-orig-${key//\//_}"
+    [[ -f $file ]] && continue
+    sysctl -n "$key" > "$file" 2>/dev/null || true
+  done
+}
+
+restore_sysctl_values() {
+  local key file value
+  for key in "${SYSCTL_MANAGED_KEYS[@]}"; do
+    file="${STATE_DIR}/sysctl-orig-${key//\//_}"
+    [[ -s $file ]] || continue
+    value=$(<"$file")
+    sysctl -w "${key}=${value}" >/dev/null 2>&1 \
+      || warn "Could not restore ${key}=${value}"
+    rm -f "$file"
+  done
+}
+
 configure_sysctl() {
   step "sysctl tweaks"
+  record_sysctl_values
   record_original /etc/sysctl.conf sysctl.conf
   record_original /etc/sysctl.d/99-sysctl.conf sysctl.d-99-sysctl.conf
 
@@ -1369,12 +1420,33 @@ configure_sysctl() {
   # Layered, hardware-aware overrides on top of the base profile.  These
   # matter on busy web/database hosts: larger socket buffers, more orphan
   # sockets, a 1 GiB SysV shared-memory segment and a small security baseline.
-  local ram_mb min_free shmall
+  local cpu ram_mb min_free shmall
+  local somaxconn syn_backlog netdev_backlog tw_buckets max_orphans
+  local file_max inotify_watches conntrack_max ipfrag_high ipfrag_low
+  local arp_thresh3 arp_thresh2
+  cpu=$(nproc)
+  (( cpu > 0 )) || cpu=1
   ram_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
+  (( ram_mb > 0 )) || ram_mb=1024
   min_free=$(( ram_mb * 1024 / 100 ))       # 1% of RAM, in kB
   (( min_free < 67584 ))  && min_free=67584
   (( min_free > 262144 )) && min_free=262144
   shmall=$(( 1073741824 / 4096 ))
+  # Scale listener/connection limits with CPU count and RAM.  The clamps keep
+  # a 1 GB VPS conservative and stop a 256-core host from reserving absurd
+  # amounts of unswappable kernel memory.
+  somaxconn=$(( cpu * 4096 ));          (( somaxconn < 4096 )) && somaxconn=4096;             (( somaxconn > 262144 )) && somaxconn=262144
+  syn_backlog=$(( cpu * 4096 ));        (( syn_backlog < 1024 )) && syn_backlog=1024;          (( syn_backlog > 262144 )) && syn_backlog=262144
+  netdev_backlog=$(( cpu * 2048 ));     (( netdev_backlog < 4096 )) && netdev_backlog=4096;    (( netdev_backlog > 65536 )) && netdev_backlog=65536
+  tw_buckets=$(( ram_mb * 16 ));        (( tw_buckets < 65536 )) && tw_buckets=65536;          (( tw_buckets > 2621440 )) && tw_buckets=2621440
+  max_orphans=$(( ram_mb * 2 ));        (( max_orphans < 16384 )) && max_orphans=16384;        (( max_orphans > 262144 )) && max_orphans=262144
+  file_max=$(( ram_mb * 1024 ));        (( file_max < 1048576 )) && file_max=1048576;          (( file_max > 10485760 )) && file_max=10485760
+  inotify_watches=$(( ram_mb * 4096 )); (( inotify_watches < 524288 )) && inotify_watches=524288; (( inotify_watches > 2097152 )) && inotify_watches=2097152
+  conntrack_max=$(( ram_mb * 16 ));     (( conntrack_max < 65536 )) && conntrack_max=65536;    (( conntrack_max > 4194304 )) && conntrack_max=4194304
+  ipfrag_high=$(( ram_mb * 32 ));       (( ipfrag_high < 262144 )) && ipfrag_high=262144;      (( ipfrag_high > 4194304 )) && ipfrag_high=4194304
+  ipfrag_low=$(( ipfrag_high * 3 / 4 ))
+  arp_thresh3=$(( cpu * 1024 ));        (( arp_thresh3 < 2048 )) && arp_thresh3=2048;          (( arp_thresh3 > 262144 )) && arp_thresh3=262144
+  arp_thresh2=$(( arp_thresh3 / 2 ))
   cat >> /etc/sysctl.conf <<EOF
 
 # BEGIN setup.sh tuning
@@ -1384,9 +1456,24 @@ net.core.rmem_max = 33554432
 net.core.wmem_max = 33554432
 net.ipv4.tcp_rmem = 8192 262144 33554432
 net.ipv4.tcp_wmem = 8192 262144 33554432
-net.ipv4.tcp_max_orphans = 262144
+net.core.somaxconn = ${somaxconn}
+net.core.netdev_max_backlog = ${netdev_backlog}
+net.ipv4.tcp_max_syn_backlog = ${syn_backlog}
+net.ipv4.tcp_max_tw_buckets = ${tw_buckets}
+net.ipv4.tcp_max_orphans = ${max_orphans}
 net.ipv4.ip_local_port_range = 1024 65535
 net.ipv4.tcp_keepalive_time = 120
+net.ipv4.neigh.default.gc_thresh1 = 32
+net.ipv4.neigh.default.gc_thresh2 = ${arp_thresh2}
+net.ipv4.neigh.default.gc_thresh3 = ${arp_thresh3}
+# ipfrag_low_thresh must not exceed the current high threshold, so set the
+# high water mark first and the low mark second.
+net.ipv4.ipfrag_high_thresh = ${ipfrag_high}
+net.ipv4.ipfrag_low_thresh = ${ipfrag_low}
+net.netfilter.nf_conntrack_max = ${conntrack_max}
+fs.file-max = ${file_max}
+fs.nr_open = ${file_max}
+fs.inotify.max_user_watches = ${inotify_watches}
 vm.min_free_kbytes = ${min_free}
 kernel.shmmax = 1073741824
 kernel.shmall = ${shmall}
@@ -1506,12 +1593,13 @@ configure_ufw() {
 
   ufw --force default deny incoming
   ufw --force default allow outgoing
-  # Put the rate-limited SSH rule FIRST.  A provider image often already has
-  # "allow 22/tcp"; deleting it can lock an operator out if the purge later
-  # removes the replacement rule.  Inserting the LIMIT rule keeps the original
-  # allow as a safety net and makes the limiter effective.
-  if ! ufw status 2>/dev/null | grep -qE '^22(/tcp)?[[:space:]]+LIMIT'; then
-    ufw insert 1 limit 22 || ufw limit 22 || true
+  # SSH must be a plain ALLOW, inserted before any rate-limit rule.  A
+  # "ufw limit 22" rule counts every new TCP connection and locks out
+  # automation/operators who open several short sessions (observed during the
+  # validation run).  Brute-force protection is handled by fail2ban.  Keeping
+  # an existing provider ALLOW or LIMIT rule intact also makes --purge safe.
+  if ! ufw status 2>/dev/null | grep -qE '^22(/tcp)?[[:space:]]+ALLOW'; then
+    ufw insert 1 allow 22/tcp || ufw allow 22/tcp || true
   fi
   ufw allow 80 || true
   ufw allow 443 || true
@@ -1594,6 +1682,10 @@ deploy_angie_configs() {
     /etc/systemd/system/angie.service.d/limits.conf
   install -m 644 "${CONFIG_SOURCE_DIR}/scripts/etc_default_nginx" \
     /etc/default/angie
+
+  # Load the new drop-in before nginx_conf.sh reloads the unit; otherwise
+  # systemctl prints "unit file changed on disk" and may use stale limits.
+  systemctl daemon-reload || true
 
   # The repository owns the config tree, cache-directory creation, removal of
   # old setup.sh overrides, the angie -t check and the reload.
@@ -1699,9 +1791,22 @@ install_php() {
   # XenForo-focused extension set: runtime, database, media, HTTP, XML,
   # archives, math, multibyte, Redis, OPcache and the CLI for XenForo cmd.php.
   # Add intl/imagick/bcmath/apcu only if a specific add-on needs them.
-  apt_install "php${ver}-fpm" "php${ver}-cli" "php${ver}-opcache" \
-    "php${ver}-mysql" "php${ver}-gd" "php${ver}-curl" "php${ver}-xml" \
+  #
+  # PHP 8.5 made OPcache a mandatory, always-built-in extension: Sury (and
+  # Ubuntu) no longer publish php8.5-opcache.  Installing the separate package
+  # unconditionally made the whole PHP step fail on 26.04.  Keep the split
+  # package for 8.4 and older, and rely on the bundled extension for 8.5+.
+  local -a php_pkgs=(
+    "php${ver}-fpm" "php${ver}-cli"
+    "php${ver}-mysql" "php${ver}-gd" "php${ver}-curl" "php${ver}-xml"
     "php${ver}-zip" "php${ver}-gmp" "php${ver}-mbstring" "php${ver}-redis"
+  )
+  if apt-cache show "php${ver}-opcache" >/dev/null 2>&1; then
+    php_pkgs+=("php${ver}-opcache")
+  else
+    info "PHP ${ver} bundles OPcache in the core package; skipping php${ver}-opcache"
+  fi
+  apt_install "${php_pkgs[@]}"
 
   # Keep the CLI on the same version as FPM.  Without this, installing a
   # distro package such as composer can add a newer php-cli and make
@@ -1725,13 +1830,20 @@ install_php() {
   install -m 644 "$pool_template" "/etc/php/${ver}/fpm/pool.d/www.conf"
   install -m 644 "$ini_template" "/etc/php/${ver}/fpm/conf.d/custom_dan.ini"
 
-  local ram_mb max_children max_requests max_by_cpu
+  local ram_mb max_children max_requests max_by_cpu workers_per_core
   local opcache_mb jit_mb memory_mb realpath_kb
   ram_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
-  max_children=$(( ram_mb / 256 ))         # ~50% of RAM at 128 MB/worker
-  max_by_cpu=$(( $(nproc) * 8 ))
+  # Reserve roughly half of RAM for PHP workers and use a realistic 96 MB
+  # per-worker budget.  The old 256 MB divisor left a 128 GB host with only
+  # 512 workers and made small hosts needlessly slow to warm up.  The CPU
+  # ceiling (16 workers/core) prevents a RAM-heavy but CPU-poor VM from
+  # creating a process storm, and the absolute cap keeps static pools sane.
+  max_children=$(( ram_mb * 50 / 100 / 96 ))
+  workers_per_core=16
+  max_by_cpu=$(( $(nproc) * workers_per_core ))
   (( max_children > max_by_cpu )) && max_children=$max_by_cpu
-  (( max_children < 1 )) && max_children=1
+  (( max_children > 512 )) && max_children=512
+  (( max_children < 8 )) && max_children=8
   max_requests=$(( $(nproc) * 1024 ))       # CPU threads * 1024
   if [[ -n ${OPT[php.children]:-} && ${OPT[php.children]} != auto ]]; then
     max_children=${OPT[php.children]}
@@ -1744,9 +1856,12 @@ install_php() {
   opcache_mb=$(( ram_mb / 16 ))
   (( opcache_mb < 128 )) && opcache_mb=128
   (( opcache_mb > 512 )) && opcache_mb=512
-  jit_mb=$(( ram_mb / 64 ))
-  (( jit_mb < 64 )) && jit_mb=64
-  (( jit_mb > 256 )) && jit_mb=256
+  # A JIT buffer larger than 128 MB is wasted on PHP-FPM: the tracing JIT
+  # rarely fills it, and the reservation is per pool.  Keep the range tight
+  # so small VPS instances do not over-allocate.
+  jit_mb=$(( ram_mb / 128 ))
+  (( jit_mb < 32 )) && jit_mb=32
+  (( jit_mb > 128 )) && jit_mb=128
   memory_mb=$(( ram_mb / 8 ))
   (( memory_mb < 256 )) && memory_mb=256
   (( memory_mb > 512 )) && memory_mb=512
@@ -1758,6 +1873,12 @@ install_php() {
     "/etc/php/${ver}/fpm/pool.d/www.conf"
   sed -i -E "s|^pm\.max_requests[[:space:]]*=.*|pm.max_requests = ${max_requests}|" \
     "/etc/php/${ver}/fpm/pool.d/www.conf"
+  # XenForo's first-install rebuild compiles every template and can exceed a
+  # 100 s pool timeout on a busy database.  Keep this aligned with Angie's
+  # fastcgi_read_timeout (360 s) so an install or admin rebuild is not killed
+  # halfway through.
+  sed -i -E "s|^request_terminate_timeout[[:space:]]*=.*|request_terminate_timeout = 300s|" \
+    "/etc/php/${ver}/fpm/pool.d/www.conf"
   sed -i -E "s|php8\.[0-9]|php${ver}|g" "/etc/php/${ver}/fpm/pool.d/www.conf"
 
   sed -i -E \
@@ -1766,6 +1887,8 @@ install_php() {
     -e "s|^opcache\.memory_consumption = .*|opcache.memory_consumption = ${opcache_mb}|" \
     -e "s|^opcache\.jit_buffer_size = .*|opcache.jit_buffer_size = ${jit_mb}M|" \
     -e "s|^realpath_cache_size = .*|realpath_cache_size = ${realpath_kb}k|" \
+    -e "s|^max_execution_time = .*|max_execution_time = 300|" \
+    -e "s|^max_input_time = .*|max_input_time = 300|" \
     "/etc/php/${ver}/fpm/conf.d/custom_dan.ini"
 
   mkdir -p /var/cache/php/opcache
@@ -1880,9 +2003,13 @@ configure_mariadb() {
   read -r io_read io_write <<< "$(mariadb_io_capacity)"
   threads=$(nproc)
   (( threads > 64 )) && threads=64
-  max_conn=$(( threads * 25 ))
-  (( max_conn > 500 )) && max_conn=500
-  (( max_conn < 100 )) && max_conn=100
+  # PHP-FPM opens one MariaDB connection per active request.  A 500-connection
+  # cap was hit at 500 concurrent requests (observed as "Too many connections"
+  # / HTTP 503 during the aggressive run).  Size the server above the FPM pool
+  # plus admin/backup headroom; the thread pool makes extra sessions cheap.
+  max_conn=$(( threads * 32 ))
+  (( max_conn > 2000 )) && max_conn=2000
+  (( max_conn < 200 )) && max_conn=200
 
   # Comment out expire_logs_days if it is active.
   sed -i -E 's|^([[:space:]]*)expire_logs_days([[:space:]]*=)|\1#expire_logs_days\2|' "$cnf"
@@ -1916,6 +2043,10 @@ local_infile = 0
 
 max_connections = ${max_conn}
 max_connect_errors = 524288
+# PHP opens a short-lived connection per request.  The default listen backlog
+# (357 on this build) overflows under a few hundred concurrent requests and
+# PDO reports "Resource temporarily unavailable" (SQLSTATE 2002).
+back_log = 65535
 thread_cache_size = 64
 # PHP opens a fresh, short-lived connection for most requests.  The thread
 # pool removes the connection/thread-creation tail latency that otherwise
@@ -2137,7 +2268,7 @@ install_valkey() {
 
   local line ram_mb valkey_mb policy io_threads
   ram_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
-  if [[ -n ${OPT[valkey.ram]:-} ]]; then
+  if [[ -n ${OPT[valkey.ram]:-} && ${OPT[valkey.ram],,} != auto ]]; then
     valkey_mb=$(size_to_mb "${OPT[valkey.ram]}")
   else
     valkey_mb=$(( ram_mb / 10 ))          # ~10% of RAM for cache
@@ -2229,19 +2360,30 @@ EOF
 # ---------------------------------------------------------------------------
 install_elastic() {
   local host=${OPT[elastic.host]:-localhost}
-  local ram=${OPT[elastic.ram]}
+  local ram=${OPT[elastic.ram]:-auto}
   local ram_lc=${ram,,}
   local ram_mb ram_total_mb
   step "Elasticsearch"
 
-  if [[ $ram_lc == *g ]]; then
+  ram_total_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
+  if [[ $ram_lc == auto ]]; then
+    # 25% of RAM leaves room for MariaDB's buffer pool, Valkey, PHP-FPM and
+    # the kernel page cache.  Round down to a 512 MB boundary for predictable
+    # JVM heap ergonomics and honour Elasticsearch's practical 31 GB ceiling.
+    ram_mb=$(( ram_total_mb * 25 / 100 ))
+    (( ram_mb > 31744 )) && ram_mb=31744
+    (( ram_mb < 512 )) && ram_mb=512
+    ram_mb=$(( ram_mb / 512 * 512 ))
+    (( ram_mb < 512 )) && ram_mb=512
+    ram_lc="${ram_mb}m"
+    info "Elasticsearch heap auto-resolved to ${ram_mb} MB (25% of RAM)"
+  elif [[ $ram_lc == *g ]]; then
     ram_mb=$(( ${ram_lc%g} * 1024 ))
   else
     ram_mb=${ram_lc%m}
   fi
-  ram_total_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
   if (( ram_mb > ram_total_mb / 2 )); then
-    warn "Elasticsearch heap (${ram}) exceeds 50% of RAM; the kernel may OOM-kill it."
+    warn "Elasticsearch heap (${ram_lc}) exceeds 50% of RAM; the kernel may OOM-kill it."
   fi
 
   case "$host" in
@@ -2387,7 +2529,16 @@ install_others() {
         info "Installing smartmontools"
         pkg_record_origin smartmontools
         apt_install smartmontools
-        systemctl enable --now smartd 2>/dev/null || warn "smartd could not be enabled (no SMART devices?)"
+        # Ubuntu ships the unit as smartmontools.service; smartd.service is
+        # only an alias on some releases.  Try both before reporting a real
+        # failure (a host with no SMART-capable disk still has a valid unit).
+        if systemctl enable --now smartmontools 2>/dev/null; then
+          :
+        elif systemctl enable --now smartd 2>/dev/null; then
+          :
+        else
+          warn "smartmontools could not be enabled (no SMART-capable devices?)"
+        fi
         smartctl --version | head -n 1 || true
         ;;
       nvme)
@@ -2805,6 +2956,9 @@ purge_basic() {
   if [[ -f /etc/sysctl.conf ]]; then
     sysctl -e -p /etc/sysctl.conf || true
   fi
+  # Values that were not present in the original sysctl.conf (for example
+  # somaxconn) are still live in the kernel; restore the recorded originals.
+  restore_sysctl_values || true
 
   if [[ -f "${STATE_DIR}/original-hostname" ]]; then
     local orig_host
@@ -3023,7 +3177,7 @@ purge_others() {
     if pkg_preexisting nodejs || ! pkg_installed_by_setup nodejs; then
       info "Keeping Node.js (not installed by setup.sh)"
     else
-      warn "Removing Node.js (installed by setup.sh)"
+      info "Removing Node.js (installed by setup.sh)"
       apt_purge_pkgs nodejs
     fi
   fi
@@ -3191,7 +3345,7 @@ print_plan() {
         ;;
       elastic)
         printf '  %-10s host=%s ram=%s\n' "$s" \
-          "${OPT[elastic.host]:-localhost}" "${OPT[elastic.ram]:-}"
+          "${OPT[elastic.host]:-localhost}" "${OPT[elastic.ram]:-auto (25% of RAM)}"
         ;;
       others)
         printf '  %-10s %s\n' "$s" "${OTHERS[*]:-}"

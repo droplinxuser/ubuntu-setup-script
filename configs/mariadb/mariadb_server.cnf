@@ -18,8 +18,12 @@ open_files_limit = 524288
 secure_file_priv = /var/lib/mysql-files
 local_infile = 0
 
-max_connections = 400
+# setup.sh sizes this from CPU count (up to 2000) to cover the PHP-FPM pool.
+max_connections = 1536
 max_connect_errors = 524288
+# Default 357 overflows under high PHP connection churn; PDO then reports
+# "Resource temporarily unavailable" (SQLSTATE 2002) on the Unix socket.
+back_log = 65535
 thread_cache_size = 64
 # Many short PHP requests: the thread pool avoids connection-thread churn.
 thread_handling = pool-of-threads
