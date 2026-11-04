@@ -31,7 +31,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.23"
+readonly SCRIPT_VERSION="1.8.24"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 readonly STATE_DIR="/var/lib/setup.sh"
@@ -5044,123 +5044,74 @@ angie_uses_local_php_upstream() {
 }
 
 # Move the primary PHP-FPM pool from a loopback TCP listener to the shared
-# Unix socket without a 502 window.  Angie first gets both servers (socket
-# primary, TCP backup, max_fails=0), then PHP is reloaded, then the backup is
-# removed.  On any failure before the socket is live, both files are restored
-# and the services reload back to their original state.
+# Unix socket without dropping requests.  A temporary bridge pool cannot be
+# used: PHP-FPM's SIGUSR2 reload applies changes to existing pools but does
+# not start a newly added pool (verified on PHP 8.3), so the bridge never
+# listened.  Instead Angie gets the socket as primary and the TCP listener as
+# backup, the existing pool is switched and reloaded, and the backup is
+# removed once the socket is live.  A request that lands exactly while the
+# old TCP listener closes and the socket opens can fail over to the backup;
+# if both are unavailable for a moment Angie returns 502, and the caller's
+# cache purge removes any blank page cached in that window.  On failure both
+# files are restored and the services reload the original configuration.
+MIGRATE_REASON=""
+
 migrate_php_pool_to_socket() {
   local ver=$1 tcp=$2
   local pool="/etc/php/${ver}/fpm/pool.d/www.conf"
-  local bridge="/etc/php/${ver}/fpm/pool.d/zz-setup-tcp-bridge.conf"
   local angie_conf=/etc/angie/angie.conf
   local socket=/run/php/php-fpm.sock
   local bak="${OPT_BACKUP_DIR:-/var/backups/setup-php-socket-$(date +%Y%m%d-%H%M%S)}/php-socket"
-  local fpm_bin="" tcp_re port bridge_port i ok=0
-  local pool_user pool_group max_children max_requests
+  local fpm_bin="" tcp_re port i ok=0
+  MIGRATE_REASON=""
 
-  [[ -f $pool && -f $angie_conf ]] || return 1
-  systemctl is-active --quiet angie || return 1
+  [[ -f $pool && -f $angie_conf ]] || { MIGRATE_REASON="pool or angie.conf is missing"; return 1; }
+  systemctl is-active --quiet angie || { MIGRATE_REASON="Angie is not active"; return 1; }
   if command -v "php-fpm${ver}" >/dev/null 2>&1; then
     fpm_bin=$(command -v "php-fpm${ver}")
   elif [[ -x "/usr/sbin/php-fpm${ver}" ]]; then
     fpm_bin="/usr/sbin/php-fpm${ver}"
   else
+    MIGRATE_REASON="php-fpm${ver} binary not found"
     return 1
   fi
-  angie_uses_local_php_upstream /etc/angie || return 1
+  angie_uses_local_php_upstream /etc/angie \
+    || { MIGRATE_REASON="vhosts use a direct fastcgi_pass or fastcgi_next_upstream off"; return 1; }
   tcp_re=${tcp//./\\.}
   port=${tcp##*:}
-  grep -qE "^[[:space:]]*server[[:space:]]+${tcp_re};" "$angie_conf" || return 1
+  grep -qE "^[[:space:]]*server[[:space:]]+${tcp_re};" "$angie_conf" \
+    || { MIGRATE_REASON="upstream does not contain ${tcp}"; return 1; }
 
   if [[ -S $socket ]] && ! ss -lx 2>/dev/null | grep -qF "$socket"; then
     rm -f "$socket"
   fi
   if ss -lx 2>/dev/null | grep -qF "$socket"; then
+    MIGRATE_REASON="${socket} is already owned by another pool"
     return 1
   fi
-
-  # Use a second loopback port for the temporary bridge, so the original TCP
-  # listener never has to close before the replacement is accepting.
-  bridge_port=$((port + 1))
-  for i in {1..50}; do
-    if ! ss -ltn 2>/dev/null | grep -qE "[:.]${bridge_port}[[:space:]]"; then
-      break
-    fi
-    bridge_port=$((bridge_port + 1))
-  done
-  (( bridge_port <= 65535 )) || return 1
-
-  pool_user=$(awk -F= '/^[[:space:]]*user[[:space:]]*=/{v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/,"",v); print v; exit}' "$pool")
-  pool_group=$(awk -F= '/^[[:space:]]*group[[:space:]]*=/{v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/,"",v); print v; exit}' "$pool")
-  max_children=$(awk -F= '/^[[:space:]]*pm\.max_children[[:space:]]*=/{v=$2; gsub(/[^0-9]/,"",v); print v; exit}' "$pool")
-  max_requests=$(awk -F= '/^[[:space:]]*pm\.max_requests[[:space:]]*=/{v=$2; gsub(/[^0-9]/,"",v); print v; exit}' "$pool")
-  if ! [[ $max_children =~ ^[0-9]+$ ]] || (( max_children < 1 )); then max_children=32; fi
-  if ! [[ $max_requests =~ ^[0-9]+$ ]] || (( max_requests < 1 )); then max_requests=500; fi
 
   mkdir -p "$bak"
   cp -a "$pool" "$bak/www.conf"
   cp -a "$angie_conf" "$bak/angie.conf"
 
-  {
-    printf '[setup-tcp-bridge]\n'
-    printf 'user = %s\n' "${pool_user:-www-data}"
-    printf 'group = %s\n' "${pool_group:-www-data}"
-    printf 'listen = 127.0.0.1:%s\n' "$bridge_port"
-    printf 'listen.allowed_clients = 127.0.0.1\n'
-    printf 'listen.backlog = %s\n' "$(effective_backlog)"
-    printf 'pm = ondemand\n'
-    printf 'pm.max_children = %s\n' "$max_children"
-    printf 'pm.process_idle_timeout = 10s\n'
-    printf 'pm.max_requests = %s\n' "$max_requests"
-    printf 'request_terminate_timeout = 300s\n'
-    printf 'catch_workers_output = yes\n'
-    printf 'security.limit_extensions = .php\n'
-    grep -E '^[[:space:]]*(php_admin_value|php_admin_flag|php_value|php_flag|env|chdir|clear_env)' "$pool" 2>/dev/null || true
-  } > "$bridge"
-  chmod 644 "$bridge"
-  cp -a "$bridge" "$bak/bridge.conf"
-
-  # 1. Start the bridge on a new port while the main TCP pool stays live.
-  if ! "$fpm_bin" -t >/dev/null 2>&1 \
-     || ! systemctl reload "php${ver}-fpm" 2>/dev/null; then
-    rm -f "$bridge"
-    cp -a "$bak/www.conf" "$pool"
-    "$fpm_bin" -t >/dev/null 2>&1 && systemctl reload "php${ver}-fpm" 2>/dev/null || true
-    return 1
-  fi
-  for i in {1..50}; do
-    if ss -ltn 2>/dev/null | grep -qE "[:.]${bridge_port}[[:space:]]"; then
-      ok=1
-      break
-    fi
-    sleep 0.2
-  done
-  if (( ok == 0 )); then
-    rm -f "$bridge"
-    cp -a "$bak/www.conf" "$pool"
-    systemctl reload "php${ver}-fpm" 2>/dev/null || systemctl restart "php${ver}-fpm" 2>/dev/null || true
-    return 1
-  fi
-
-  # 2. Angie: bridge primary, original TCP backup.  Existing connections can
-  #    finish on the main pool; new ones use the bridge.
+  # 1. Angie: socket primary, current TCP listener as backup.  angie -t
+  #    accepts a unix: server whose socket does not exist yet; the connect
+  #    fails fast and the backup serves traffic until PHP creates the socket.
   sed -i -E \
-    "s|^([[:space:]]*)server[[:space:]]+${tcp_re};|\1server 127.0.0.1:${bridge_port} max_fails=0;\n\1server ${tcp} backup;|" \
+    "s|^([[:space:]]*)server[[:space:]]+${tcp_re};|\1server unix:${socket} max_fails=0;\n\1server ${tcp} backup;|" \
     "$angie_conf"
-  if ! grep -qF "server 127.0.0.1:${bridge_port} max_fails=0;" "$angie_conf" \
+  if ! grep -qF "server unix:${socket} max_fails=0;" "$angie_conf" \
      || ! /usr/sbin/angie -t >/dev/null 2>&1 \
      || ! systemctl reload angie 2>/dev/null; then
     cp -a "$bak/angie.conf" "$angie_conf"
     /usr/sbin/angie -t >/dev/null 2>&1 && systemctl reload angie 2>/dev/null || true
-    rm -f "$bridge"
-    cp -a "$bak/www.conf" "$pool"
-    systemctl reload "php${ver}-fpm" 2>/dev/null || systemctl restart "php${ver}-fpm" 2>/dev/null || true
+    MIGRATE_REASON="Angie rejected the socket+backup upstream"
     return 1
   fi
-  cp -a "$angie_conf" "$bak/angie-bridge.conf"
+  cp -a "$angie_conf" "$bak/angie-backup.conf"
 
-  # 3. Move the main pool to the socket.  Angie is already on the bridge, so
-  #    closing TCP 9000 here is invisible to clients.
+  # 2. Move the existing pool to the socket.  The reload is graceful: old
+  #    workers finish in-flight TCP requests while the master opens the socket.
   tune_pool_set "$pool" listen "$socket" "PHP ${ver}: listen=${socket}"
   sed -i -E '/^[[:space:]]*listen\.allowed_clients[[:space:]]*=/d' "$pool"
   tune_pool_set "$pool" listen.owner www-data "PHP ${ver}: listen.owner=www-data"
@@ -5172,11 +5123,12 @@ migrate_php_pool_to_socket() {
     "$fpm_bin" -t >/dev/null 2>&1 && systemctl reload "php${ver}-fpm" 2>/dev/null || true
     cp -a "$bak/angie.conf" "$angie_conf"
     /usr/sbin/angie -t >/dev/null 2>&1 && systemctl reload angie 2>/dev/null || true
-    rm -f "$bridge"
+    MIGRATE_REASON="PHP rejected the socket pool or the reload failed"
     return 1
   fi
   for i in {1..50}; do
-    if systemctl is-active --quiet "php${ver}-fpm" && [[ -S $socket ]]; then
+    if systemctl is-active --quiet "php${ver}-fpm" \
+       && ss -lx 2>/dev/null | grep -qF "$socket"; then
       ok=1
       break
     fi
@@ -5187,43 +5139,23 @@ migrate_php_pool_to_socket() {
     cp -a "$bak/angie.conf" "$angie_conf"
     "$fpm_bin" -t >/dev/null 2>&1 && systemctl reload "php${ver}-fpm" 2>/dev/null || true
     /usr/sbin/angie -t >/dev/null 2>&1 && systemctl reload angie 2>/dev/null || true
-    rm -f "$bridge"
+    MIGRATE_REASON="the socket did not appear after the PHP-FPM reload"
     return 1
   fi
 
-  # 4. Angie: socket primary, bridge backup; then remove the backup.
-  sed -i -E \
-    "s|^([[:space:]]*)server[[:space:]]+127\.0\.0\.1:${bridge_port}[[:space:]]+max_fails=0;|\1server unix:${socket} max_fails=0;|" \
-    "$angie_conf"
+  # 3. Drop the TCP backup; the socket is proven live.
   sed -i -E "/^[[:space:]]*server[[:space:]]+${tcp_re}[[:space:]]+backup;/d" "$angie_conf"
+  sed -i -E "s|server unix:${socket} max_fails=0;|server unix:${socket};|" "$angie_conf"
   if ! /usr/sbin/angie -t >/dev/null 2>&1 \
      || ! systemctl reload angie 2>/dev/null; then
-    cp -a "$bak/angie-bridge.conf" "$angie_conf"
+    # Keep the working socket+backup config rather than risking the site.
+    cp -a "$bak/angie-backup.conf" "$angie_conf"
     /usr/sbin/angie -t >/dev/null 2>&1 && systemctl reload angie 2>/dev/null || true
-    rm -f "$bridge"
+    MIGRATE_REASON="Angie could not drop the TCP backup (socket is live; backup kept)"
     return 1
-  fi
-  cp -a "$angie_conf" "$bak/angie-socket.conf"
-  sed -i -E "s|server unix:${socket} max_fails=0;|server unix:${socket};|" "$angie_conf"
-  if /usr/sbin/angie -t >/dev/null 2>&1; then
-    systemctl reload angie 2>/dev/null || true
-  else
-    cp -a "$bak/angie-socket.conf" "$angie_conf"
-    /usr/sbin/angie -t >/dev/null 2>&1 && systemctl reload angie 2>/dev/null || true
-  fi
-
-  # 5. Drop the bridge; the main pool is already serving the socket.
-  rm -f "$bridge"
-  if ! "$fpm_bin" -t >/dev/null 2>&1; then
-    cp -a "$bak/bridge.conf" "$bridge"
-    "$fpm_bin" -t >/dev/null 2>&1 || true
-    opt_report "- Socket migration: TCP bridge pool retained (config test failed)"
-  else
-    systemctl reload "php${ver}-fpm" 2>/dev/null || true
   fi
   return 0
 }
-
 optimize_php_services() {
 
 
@@ -5285,7 +5217,7 @@ optimize_php_services() {
           migrated=1
           opt_report "- Migrated listener: ${listen_path} -> unix:${OPT_PHP_SOCKET}"
         else
-          opt_report "- **FAILED** socket migration; kept ${listen_path}"
+          opt_report "- **FAILED** socket migration; kept ${listen_path} (${MIGRATE_REASON:-no reason recorded})"
           rc=1
           OPT_PHP_OK=0
           migration_failed=1
