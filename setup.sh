@@ -31,7 +31,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.27"
+readonly SCRIPT_VERSION="1.8.28"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -255,8 +255,10 @@ Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
       It never installs, purges or starts a managed service; the only package
       it may add is the small cpufrequtils helper when the CPU exposes
       frequency scaling.  Allocations are planned together from one
-      80%-of-RAM budget, and a service is restarted only when its generated
-      configuration actually changed.  Existing PHP-FPM listeners are kept;
+      80%-of-RAM budget, and a service is reloaded (Angie, PHP-FPM) or tuned
+      online (Valkey/Redis) only when its generated configuration actually
+      changed.  Startup-only settings are reported and apply on the next full
+      restart.  Existing PHP-FPM listeners are kept;
       when a pool already listens on a Unix socket, Angie's fastcgi_pass is
       repointed to it.  TCP pools stay on TCP so a live site is never left
       pointing at a missing socket.
@@ -2127,6 +2129,51 @@ angie_cache_dirs() {
   return 0
 }
 
+# Disk-cache max_size is planned from RAM, but a live cache can already hold
+# more than that plan (and may be configured larger by the operator).  Writing
+# a smaller value makes Angie's cache manager evict hot objects immediately,
+# and chasing usage every run would ratchet the value upward forever.  Rule:
+# never shrink below the existing max_size or the live usage (+5% headroom).
+# Sets ANGIE_CACHE_MB (size to write) and ANGIE_CACHE_NOTE (report line, if
+# the planned value was raised).  A global result is used instead of command
+# substitution so the note reaches the caller's TUNE_CHANGES array.
+angie_cache_keep_mb() {
+  local file=$1 planned=$2 dir usage existing=0 candidate val
+  ANGIE_CACHE_MB=$planned
+  ANGIE_CACHE_NOTE=""
+  [[ -f $file ]] || return 0
+  dir=$(awk '
+    $1 ~ /^(fastcgi|proxy|scgi|uwsgi)_cache_path$/ { print $2; exit }
+  ' "$file" | tr -d ';')
+  # Existing max_size in MB (k/m/g suffix); 0 when the directive has none.
+  val=$(grep -m1 -oE 'max_size=[0-9]+[kKmMgG]' "$file" 2>/dev/null || true)
+  val=${val#max_size=}
+  if [[ $val =~ ^([0-9]+)([kKmMgG])$ ]]; then
+    case ${BASH_REMATCH[2]} in
+      k|K) existing=$(( BASH_REMATCH[1] / 1024 )) ;;
+      m|M) existing=${BASH_REMATCH[1]} ;;
+      g|G) existing=$(( BASH_REMATCH[1] * 1024 )) ;;
+    esac
+  fi
+  candidate=$planned
+  usage=$(du -sm -- "$dir" 2>/dev/null | awk '{print $1}' || true)
+  [[ $usage =~ ^[0-9]+$ ]] || usage=0
+  if (( usage > planned )); then
+    if (( existing > 0 && existing >= usage )); then
+      # The configured cache already covers its live objects: keep it rather
+      # than writing a value that would evict them.
+      candidate=$existing
+    else
+      candidate=$(( usage * 105 / 100 ))
+    fi
+  fi
+  (( candidate > planned )) || return 0
+  candidate=$(( (candidate + 255) / 256 * 256 ))
+  ANGIE_CACHE_MB=$candidate
+  ANGIE_CACHE_NOTE="kept cache max_size=${candidate}M for ${dir:-cache} (live ${usage}MB; RAM plan was ${planned}M)"
+  return 0
+}
+
 # A backend that restarts during --optimize can send a truncated/empty 200
 # while connections are cut over, and the guest cache stores 200 responses
 # for minutes: every visitor then receives a blank page.  Remove objects
@@ -2329,6 +2376,24 @@ tune_angie_configs() {
   (( have_proxy && proxy_mb < 16 )) && proxy_mb=16
   (( have_cdn && cdn_mb < 16 )) && cdn_mb=16
 
+  # Do not force the cache manager to evict a cache that is already larger
+  # than the RAM-derived plan (live usage wins on an existing server).
+  if [[ -n $f_fcgi ]]; then
+    angie_cache_keep_mb "$f_fcgi" "$fcgi_mb"
+    fcgi_mb=$ANGIE_CACHE_MB
+    [[ -n $ANGIE_CACHE_NOTE ]] && tune_summary "${f_fcgi#"${target}"/}: ${ANGIE_CACHE_NOTE}"
+  fi
+  if [[ -n $f_chev ]]; then
+    angie_cache_keep_mb "$f_chev" "$chev_mb"
+    chev_mb=$ANGIE_CACHE_MB
+    [[ -n $ANGIE_CACHE_NOTE ]] && tune_summary "${f_chev#"${target}"/}: ${ANGIE_CACHE_NOTE}"
+  fi
+  if [[ -n $f_xf ]]; then
+    angie_cache_keep_mb "$f_xf" "$xf_mb"
+    xf_mb=$ANGIE_CACHE_MB
+    [[ -n $ANGIE_CACHE_NOTE ]] && tune_summary "${f_xf#"${target}"/}: ${ANGIE_CACHE_NOTE}"
+  fi
+
   fcgi_zone=$(tune_clamp $(( cache_total_mb / 4 )) 16 512)
   chev_zone=$(tune_clamp $(( cache_total_mb / 8 )) 8 512)
   xf_zone=$(tune_clamp $(( cache_total_mb / 8 )) 8 256)
@@ -2421,8 +2486,8 @@ tune_angie_configs() {
     # instead of only looking at the line that starts the directive.
     awk -v a="$proxy_size" -v b="$cdn_size" '
       {
-        if ($0 ~ /proxy_cache_path[[:space:]]+\/home\/proxy_cache[[:space:]]/) cache = a
-        else if ($0 ~ /proxy_cache_path[[:space:]]+\/home\/proxy_cdn[[:space:]]/) cache = b
+        if ($0 ~ /proxy_cache_path/ && $0 ~ /keys_zone=proxy_cache:/) cache = a
+        else if ($0 ~ /proxy_cache_path/ && $0 ~ /keys_zone=proxy_cdn:/) cache = b
         if (cache != "" && $0 ~ /max_size=[0-9]+[mgMG]/) {
           sub(/max_size=[0-9]+[mgMG]/, "max_size=" cache)
           cache = ""
@@ -2532,6 +2597,9 @@ tune_angie_configs() {
 
   tune_cache_error_policy "$target/h5bp/wordpress_cache.conf" "h5bp/wordpress_cache.conf"
   tune_cache_error_policy "$target/h5bp/php_xf.conf" "h5bp/php_xf.conf"
+  tune_cache_error_policy "$target/h5bp/php_xf_proxy.conf" "h5bp/php_xf_proxy.conf"
+  tune_cache_error_policy "$target/h5bp/php_chev.conf" "h5bp/php_chev.conf"
+  tune_cache_error_policy "$target/h5bp/php_flarum.conf" "h5bp/php_flarum.conf"
 
   tune_summary "angie summary: ${nproc} CPU / ${mem_mb}MB RAM / ${disk_class} / cache_budget=${cache_total_mb}MB"
   return 0
@@ -2732,6 +2800,16 @@ tune_php_fpm_version() {
   tune_pool_set "$pool" rlimit_core 0 "PHP ${ver}: rlimit_core=0"
   # Bound master/worker shutdown; see ensure_fpm_global_timeout().
   ensure_fpm_global_timeout "$ver"
+  # Older pool templates carried a [global] block inside pool.d/www.conf.
+  # pool.d is included after the global settings, so that copy wins over the
+  # 10s written above.  Normalise it in place so a restart cannot reintroduce
+  # the 60s shutdown wait.
+  if grep -qE '^[[:space:]]*process_control_timeout[[:space:]]*=' "$pool"; then
+    if ! grep -qE '^[[:space:]]*process_control_timeout[[:space:]]*=[[:space:]]*10s[[:space:]]*(;.*)?$' "$pool"; then
+      sed -i -E 's|^[[:space:]]*process_control_timeout[[:space:]]*=.*|process_control_timeout = 10s|' "$pool"
+      tune_note "PHP ${ver}: pool-level process_control_timeout=10s"
+    fi
+  fi
 
   # Older releases appended the same directive more than once (the live
   # 8.3 pool carried two rlimit_files/rlimit_core pairs).  php-fpm lets the
@@ -2740,7 +2818,7 @@ tune_php_fpm_version() {
     user group listen listen.allowed_clients listen.backlog listen.owner \
     listen.group listen.mode pm pm.max_children pm.max_requests \
     request_terminate_timeout catch_workers_output security.limit_extensions \
-    rlimit_files rlimit_core
+    rlimit_files rlimit_core process_control_timeout
 
   mkdir -p "$ini_dir" /var/cache/php/opcache
   chown -R www-data:www-data /var/cache/php 2>/dev/null || true
@@ -4506,6 +4584,10 @@ OPT_DETECTED=()
 OPT_START_TS=""
 OPT_REPORT_STARTED=0
 OPT_REPORT_WRITTEN=0
+# Set when any service actually reloaded/restarted during this run.  The
+# cache purge only matters for a cutover window; an idempotent run must not
+# delete healthy objects written by live traffic.
+OPT_CUTOVER=0
 
 opt_report() { OPT_REPORT+=("$*"); }
 
@@ -4540,11 +4622,13 @@ opt_restore() {
 detect_installed_services() {
   OPT_DETECTED=()
   [[ -x /usr/sbin/angie && -f /etc/angie/angie.conf ]] && OPT_DETECTED+=(angie)
-  local d
-  for d in /etc/php/*/fpm; do
-    [[ -d $d ]] || continue
-    OPT_DETECTED+=("php:$(basename "$(dirname "$d")")")
-  done
+  local ver
+  # A stale /etc/php/<ver>/fpm directory survives a purge on some hosts.  Only
+  # treat a version as installed when it still has a pool config; otherwise
+  # --optimize would create systemd drop-ins for a service that does not exist.
+  while IFS= read -r ver; do
+    OPT_DETECTED+=("php:${ver}")
+  done < <(php_fpm_versions)
   if command -v mariadbd >/dev/null 2>&1 || command -v mariadb >/dev/null 2>&1; then
     [[ -d /etc/mysql ]] && OPT_DETECTED+=(mariadb)
   fi
@@ -4834,7 +4918,12 @@ php_fpm_versions() {
   for d in /etc/php/*/fpm; do
     [[ -d $d ]] || continue
     ver=$(basename "$(dirname "$d")")
-    [[ $ver =~ ^[0-9]+\.[0-9]+$ ]] && printf '%s\n' "$ver"
+    [[ $ver =~ ^[0-9]+\.[0-9]+$ ]] || continue
+    # Require a real pool and the matching binary.  A leftover directory with
+    # no pool (common after `--purge --php ver=X`) is not an installed service.
+    compgen -G "${d}/pool.d/*.conf" >/dev/null 2>&1 || continue
+    [[ -x "/usr/sbin/php-fpm${ver}" ]] || command -v "php-fpm${ver}" >/dev/null 2>&1 || continue
+    printf '%s\n' "$ver"
   done | sort -V
 }
 
@@ -5031,7 +5120,7 @@ optimize_angie() {
   # not change the modes of the files its workers create.  Rewriting an
   # unchanged file would force a needless restart, so compare first.
   local angie_limit angie_dropin=/etc/systemd/system/angie.service.d/limits.conf
-  local angie_before=""
+  local angie_before="" unit_changed=0
   angie_limit=$(systemctl show -p LimitNOFILE --value angie 2>/dev/null || true)
   [[ -f $angie_dropin ]] && angie_before=$(md5sum "$angie_dropin" | awk '{print $1}')
   if [[ $angie_limit != infinity ]] \
@@ -5041,7 +5130,8 @@ optimize_angie() {
     chmod 644 "$angie_dropin"
     if [[ $angie_before != "$(md5sum "$angie_dropin" | awk '{print $1}')" ]]; then
       systemctl daemon-reload || true
-      tune_note "Angie: systemd LimitNOFILE=524288"
+      unit_changed=1
+      tune_summary "Angie: systemd LimitNOFILE=524288 (applies on next restart)"
     fi
   fi
   optimize_wordpress_cache /etc/angie || true
@@ -5057,7 +5147,8 @@ optimize_angie() {
     while IFS= read -r change; do opt_report "  \`${change}\`"; done < "$angie_test_log"
     rm -f "$angie_test_log"
     opt_restore /etc/angie angie
-    /usr/sbin/angie -t >/dev/null 2>&1 && systemctl restart angie 2>/dev/null || true
+    /usr/sbin/angie -t >/dev/null 2>&1 \
+      && { systemctl reload angie 2>/dev/null || systemctl restart angie 2>/dev/null; } || true
     return 1
   fi
   rm -f "$angie_test_log"
@@ -5073,13 +5164,24 @@ optimize_angie() {
   fi
   if (( active )); then
     if (( TUNE_DIRTY == 0 )); then
-      opt_report "- Restart: skipped (configuration already optimized)"
+      if (( unit_changed )); then
+        opt_report "- Restart: deferred (systemd LimitNOFILE drop-in applies on the next restart)"
+      else
+        opt_report "- Restart: skipped (configuration already optimized)"
+      fi
+    elif systemctl reload angie 2>/dev/null && systemctl is-active --quiet angie; then
+      OPT_CUTOVER=1
+      opt_report "- Reload: **OK** (graceful; in-flight requests keep running)"
+      if (( unit_changed )); then
+        opt_report "- Note: systemd LimitNOFILE drop-in applies on the next full restart"
+      fi
     elif systemctl restart angie 2>/dev/null && systemctl is-active --quiet angie; then
-      opt_report "- Restart: **OK**"
+      OPT_CUTOVER=1
+      opt_report "- Reload failed; Restart: **OK**"
     else
-      opt_report "- Restart: **FAILED**; rolling back"
+      opt_report "- Reload/Restart: **FAILED**; rolling back"
       opt_restore /etc/angie angie
-      systemctl restart angie 2>/dev/null || true
+      systemctl reload angie 2>/dev/null || systemctl restart angie 2>/dev/null || true
       return 1
     fi
   else
@@ -5281,6 +5383,7 @@ optimize_php_services() {
          && angie_uses_local_php_upstream /etc/angie; then
         if migrate_php_pool_to_socket "$ver" "$listen_path"; then
           OPT_PHP_SOCKET=/run/php/php-fpm.sock
+          OPT_CUTOVER=1
           migrated=1
           opt_report "- Migrated listener: ${listen_path} -> unix:${OPT_PHP_SOCKET}"
         else
@@ -5305,8 +5408,22 @@ optimize_php_services() {
         : # migration already reloaded PHP (success or rollback)
       elif (( TUNE_DIRTY == 0 )); then
         opt_report "- Restart: skipped (configuration already optimized)"
+      elif systemctl reload "php${ver}-fpm" 2>/dev/null \
+         && systemctl is-active --quiet "php${ver}-fpm" \
+         && { [[ $listen_path != /* ]] || [[ -S $listen_path ]]; }; then
+        # SIGUSR2 reloads the pool without closing the listening socket: old
+        # workers finish in-flight requests and new workers pick up the tuned
+        # values.  This is the difference between a zero-downtime tune and a
+        # 1-3 second 502 window on a busy site.
+        OPT_CUTOVER=1
+        opt_report "- Reload: **OK** (graceful; no request was dropped)"
+        if [[ -f "/etc/php/${ver}/fpm/php-fpm.conf" ]] \
+           && grep -q 'process_control_timeout' "/etc/php/${ver}/fpm/php-fpm.conf"; then
+          opt_report "- Note: master-level process_control_timeout applies on the next full restart"
+        fi
       elif systemctl restart "php${ver}-fpm" 2>/dev/null \
          && systemctl is-active --quiet "php${ver}-fpm"; then
+        OPT_CUTOVER=1
         # Type=notify only returns once the master is ready.  A pool that
         # already used a Unix socket must have re-created it.
         if [[ $listen_path == /* && ! -S $listen_path ]]; then
@@ -5316,10 +5433,10 @@ optimize_php_services() {
           rc=1
           OPT_PHP_OK=0
         else
-          opt_report "- Restart: **OK**"
+          opt_report "- Reload failed; Restart: **OK**"
         fi
       else
-        opt_report "- Restart: **FAILED**; rolling back"
+        opt_report "- Reload/Restart: **FAILED**; rolling back"
         opt_restore "/etc/php/${ver}" "php-${ver}"
         systemctl restart "php${ver}-fpm" 2>/dev/null || true
         rc=1
@@ -5528,7 +5645,8 @@ EOF
   # same registry row.  Only fall back to a restart when the pool is not the
   # only change (or the resize fails).
   local online_mb=""
-  if [[ -n $cnf_old ]] && (( active )) && cnf_only_pool_changed "$cnf_old" "$cnf"; then
+  if [[ -n $cnf_old ]] && (( active )) && [[ $cnf_before != "$cnf_after" ]] \
+     && cnf_only_pool_changed "$cnf_old" "$cnf"; then
     if mariadb -e "SET GLOBAL innodb_buffer_pool_size = $(( size_mb * 1024 * 1024 ))" 2>/dev/null; then
       online_mb=$(mariadb -N -B -e 'SELECT @@innodb_buffer_pool_size' 2>/dev/null \
         | awk '{printf "%d", $1 / 1024 / 1024}')
@@ -5573,6 +5691,7 @@ EOF
 
   if (( active )); then
     if systemctl restart mariadb 2>/dev/null; then
+      OPT_CUTOVER=1
       local i
       # A large buffer pool may need to preload at startup; allow up to five
       # minutes before declaring the restart failed.
@@ -5626,6 +5745,7 @@ optimize_valkey() {
   fi
   local active=0 ram_mb max_mb policy backlog io_threads
   local conf_before conf_after fd_limit dropin unit_changed=0
+  local online_ok=0 live_io="" live_backlog="" setting k v
   [[ -f $conf ]] || return 0
   systemctl is-active --quiet "$unit" 2>/dev/null && active=1
   opt_report "## ${label}"
@@ -5714,8 +5834,58 @@ optimize_valkey() {
     return 0
   fi
 
+  # Apply the runtime-settable values to the live process.  A restart throws
+  # away the whole cache when persistence is disabled (the installer writes
+  # `save ""` and `appendonly no`), so a tuning run must not restart a busy
+  # cache just to add timeout/hz/lazyfree defaults.
+  if (( active )); then
+    online_ok=1
+    local -a runtime_sets=(
+      "maxmemory ${max_mb}mb"
+      "maxmemory-policy ${policy}"
+      "maxmemory-samples 10"
+      "maxclients 20000"
+      "timeout 0"
+      "tcp-keepalive 300"
+      "hz 10"
+      "io-threads-do-reads yes"
+      "lazyfree-lazy-eviction yes"
+      "lazyfree-lazy-expire yes"
+      "lazyfree-lazy-server-del yes"
+      "lazyfree-lazy-user-del yes"
+      "lazyfree-lazy-user-flush yes"
+    )
+    for setting in "${runtime_sets[@]}"; do
+      read -r k v <<< "$setting"
+      if ! "$cli" CONFIG SET "$k" "$v" >/dev/null 2>&1; then
+        online_ok=0
+        opt_report "- Online \`CONFIG SET ${k} ${v}\` failed; a restart is required"
+        break
+      fi
+    done
+    # io-threads is fixed at startup.  A systemd fd drop-in also needs a new
+    # process before maxclients can exceed the old limit.
+    live_io=$("$cli" CONFIG GET io-threads 2>/dev/null | tail -n1 || true)
+    if [[ $live_io =~ ^[0-9]+$ ]] && [[ $live_io != "$io_threads" ]]; then
+      online_ok=0
+      opt_report "- io-threads=${io_threads} differs from live ${live_io}; a restart is required"
+    fi
+    if (( unit_changed )); then
+      online_ok=0
+    fi
+  fi
+  if (( active )) && (( online_ok )); then
+    live_backlog=$("$cli" CONFIG GET tcp-backlog 2>/dev/null | tail -n1 || true)
+    if [[ $live_backlog =~ ^[0-9]+$ ]] && [[ $live_backlog != "$backlog" ]]; then
+      opt_report "- tcp-backlog=${backlog} applies at startup (live ${live_backlog}); restart deferred"
+    fi
+    opt_report "- Applied online via CONFIG SET (no restart; cache retained)"
+    return 0
+  fi
+
   if (( active )); then
     if systemctl restart "$unit" 2>/dev/null; then
+      OPT_CUTOVER=1
       local i
       for i in {1..20}; do
         "$cli" ping 2>/dev/null | grep -q PONG && break
@@ -6003,6 +6173,7 @@ EOF
       return 0
     fi
     if systemctl restart elasticsearch 2>/dev/null; then
+      OPT_CUTOVER=1
       local i
       # Large heaps and many shards take time to become ready.
       for i in {1..300}; do
@@ -6365,10 +6536,16 @@ run_optimize() {
 
   verify_optimized_services || rc=1
 
-  local purged
-  purged=$(purge_optimize_cache_entries "${OPT_START_EPOCH:-0}")
-  if [[ $purged =~ ^[0-9]+$ ]] && (( purged > 0 )); then
-    opt_report "- Cleared ${purged} cache object(s) written during this run (a restart window must never stay cached as a blank page)"
+  if (( OPT_CUTOVER )); then
+    local purged
+    purged=$(purge_optimize_cache_entries "${OPT_START_EPOCH:-0}")
+    if [[ $purged =~ ^[0-9]+$ ]] && (( purged > 0 )); then
+      opt_report "- Cleared ${purged} cache object(s) written during this run (a restart window must never stay cached as a blank page)"
+    else
+      opt_report "- Cache: no objects were written during the cutover window"
+    fi
+  else
+    opt_report "- Cache: left intact (no service was reloaded or restarted)"
   fi
 
   local report

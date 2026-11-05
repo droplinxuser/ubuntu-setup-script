@@ -31,6 +31,42 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.28
+
+- **Live tuning no longer restarts a cache just to add defaults.** Valkey and
+  Redis refuse to change `maxclients` above the process fd limit, and a
+  restart discards the whole cache because the installer disables
+  persistence. `--optimize` now applies every runtime-settable value with
+  `CONFIG SET` and only restarts when a startup-only setting (`io-threads`)
+  actually changed or an online set fails. `tcp-backlog` is reported as
+  applying on the next restart instead of forcing one.
+- **Angie and PHP-FPM are reloaded gracefully, not restarted.** A `reload`
+  keeps the listening sockets open and lets in-flight requests finish; the
+  previous `restart` dropped them for 1-3 seconds on a busy host. The tuners
+  fall back to a restart only when the reload itself fails. Changes that the
+  master reads at startup (`process_control_timeout`, systemd fd drop-ins)
+  are reported as applying on the next full restart.
+- **A live cache is never shrunk below its current size.** The disk cache
+  `max_size` is derived from RAM, which is often smaller than an existing
+  cache on a media/forum host. Writing that value made Angie evict hot
+  objects immediately; the tuner now raises it to the current usage +5%
+  and reports why.
+- **Stale PHP version directories are ignored.** A leftover
+  `/etc/php/<ver>/fpm` with no pool config made `--optimize` create systemd
+  drop-ins and per-version reports for a service that was not installed.
+  Only versions with a real pool and binary are detected now.
+- **An idempotent run no longer deletes healthy cache entries.** The
+  post-run cache purge now runs only when a service actually reloaded or
+  restarted; a repeat run with unchanged files reports
+  `Cache: left intact` instead of deleting objects written by live traffic.
+- **The pool-level `process_control_timeout` is normalised too.** Older
+  `pool.d/www.conf` templates carried a `[global]` block with 60s; because
+  pool files are included last, that value overrode the 10s global setting.
+  Both the templates and the tuner now use 10s.
+- **The stale-5xx fix now covers every guest cache.** `php_chev.conf`,
+  `php_flarum.conf` and `php_xf_proxy.conf` still cached/`use_stale` a
+  transient 500; the tuner upgrades them like WordPress and XenForo.
+
 ## What's new in 1.8.27
 
 - **A PHP-FPM restart can no longer hang in “deactivating”.** With the
@@ -1198,7 +1234,7 @@ The script is safe to re-run:
 - Package-origin markers prevent `--purge others` from removing packages that existed before setup.sh, even after a previous purge removed the state directory.
 - Package repositories and keys are re-written only when missing.
 - Domain directories and databases use idempotent creation; existing Angie domain configs are preserved.
-- PHP, MariaDB, Angie, Valkey and Elasticsearch services are restarted after configuration changes so changed parameters take effect; a repeat `--optimize` run with unchanged files restarts nothing.
+- PHP, MariaDB, Angie, Valkey and Elasticsearch services are restarted after configuration changes so changed parameters take effect. Angie and PHP-FPM use a graceful `reload` when possible, Valkey applies runtime values with `CONFIG SET`, and startup-only changes are deferred; a repeat `--optimize` run with unchanged files restarts nothing.
 
 A second run is normally much faster than the first (typically under a minute for the full stack).
 
