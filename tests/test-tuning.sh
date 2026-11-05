@@ -164,6 +164,14 @@ ssh_ports_ok() {
 }
 check "sshd port discovery always returns at least one numeric port" ssh_ports_ok
 
+# SSH must be rate-limited by UFW, and an older plain ALLOW rule must be
+# removed so it cannot shadow the LIMIT rule.
+ufw_body=$(sed -n '/^configure_ufw()/,/^}/p' "$ROOT/setup.sh")
+check "UFW inserts a rate-limited SSH rule" \
+  grep -q 'insert 1 limit' <<<"$ufw_body"
+check "UFW removes a plain SSH allow rule" \
+  grep -q 'delete allow' <<<"$ufw_body"
+
 # The probe must agree with sysfs; a VM that only offers powersave/schedutil
 # must not make --optimize claim it set the performance governor.
 gov_dir=/sys/devices/system/cpu/cpu0/cpufreq

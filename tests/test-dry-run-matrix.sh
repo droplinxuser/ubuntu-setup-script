@@ -50,8 +50,11 @@ run ok   --dry-run --basic --elastic ram=4g host=localhost
 run ok   --dry-run --basic --elastic
 run ok   --dry-run --basic --elastic ram=auto
 run ok   --dry-run --basic --others all
-run ok   --dry-run --basic --others smartmon gif nodejs fail2ban unattended sysstat composer
-run ok   --dry-run --basic --others security
+run ok   --dry-run --basic --others smartmon gif nodejs sysstat
+run fail --dry-run --basic --others fail2ban
+run fail --dry-run --basic --others unattended
+run fail --dry-run --basic --others composer
+run fail --dry-run --basic --others security
 run ok   --dry-run --basic --angie --php --mariadb user=u pass=p size=auto \
   --valkey --elastic ram=2g --others all
 
@@ -117,6 +120,18 @@ if [[ $out == *"OS: governor="* && $out == *"limits=1M-nofile"* ]]; then
 else
   FAIL=$((FAIL + 1))
   printf 'FAIL  --optimize does not include the OS tuning plan\n'
+fi
+
+# --others all must expand to the supported packages only.  fail2ban,
+# unattended-upgrades and Composer were deliberately removed.
+out=$(bash "$SCRIPT_DIR/setup.sh" --dry-run --basic --others all 2>&1)
+if [[ $out == *"smartmon nvme gif nodejs sysstat"* ]] \
+   && [[ $out != *fail2ban* && $out != *unattended* && $out != *composer* ]]; then
+  PASS=$((PASS + 1))
+  printf 'PASS  --others all expands to the supported packages\n'
+else
+  FAIL=$((FAIL + 1))
+  printf 'FAIL  --others all includes a removed or missing package\n'
 fi
 
 # Every run must leave a complete log in the invocation directory.

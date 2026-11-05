@@ -34,7 +34,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.34"
+readonly SCRIPT_VERSION="1.8.35"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -84,8 +84,8 @@ readonly ES_END="# END setup.sh managed elasticsearch"
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 export APT_LISTCHANGES_FRONTEND=none
-# Wait for a concurrent apt/dpkg run instead of failing outright (unattended
-# upgrades and configuration management often hold the lock briefly).
+# Wait for a concurrent apt/dpkg run instead of failing outright (package
+# management tools often hold the lock briefly).
 APT_OPTS=(-y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold
           -o DPkg::Lock::Timeout=300 -o Dpkg::Use-Pty=0
           -o Acquire::Retries=3 -o Acquire::http::Timeout=30)
@@ -425,13 +425,10 @@ Services (optional; only the ones listed are installed):
   --elastic   [ram=4g|auto] [host=localhost]
       ram        JVM heap (default: auto = 25% of RAM, clamped to
                  512 MB..31 GB, leaving room for MariaDB/Valkey/PHP)
-  --others    smartmon nvme gif nodejs fail2ban unattended sysstat composer
+  --others    smartmon nvme gif nodejs sysstat
               (or: --others all)
       nvme-cli is installed only on a dedicated server with NVMe storage.
-      fail2ban   UFW-backed SSH brute-force protection
-      unattended automatic security updates
       sysstat    sar/iostat performance history
-      composer   Composer 2 for PHP projects
 
 Domain setup (standalone; Angie + MariaDB must already be installed/running):
   --domain DOMAIN [DOMAIN...] [app=TYPE]
@@ -790,7 +787,7 @@ ssh_peer_from_ss() {
 # Best-effort detection of the SSH client address that started this run.
 # sudo normally strips SSH_CONNECTION from the child environment, so also walk
 # the parent process chain and, as a last resort, inspect established sshd
-# sockets.  Only used to add an operator whitelist to fail2ban.
+# sockets.
 detect_ssh_client_ip() {
   local ip="${SSH_CONNECTION:-}" pid=$PPID i env
   ip=${ip%% *}
@@ -1186,13 +1183,12 @@ validate_all() {
   fi
 
   if [[ ${ENABLED[others]:-0} -eq 1 ]]; then
-    [[ ${#OTHERS[@]} -gt 0 ]] || die "--others requires at least one of: smartmon nvme gif nodejs fail2ban unattended sysstat composer"
+    [[ ${#OTHERS[@]} -gt 0 ]] || die "--others requires at least one of: smartmon nvme gif nodejs sysstat"
     local item expanded=()
     for item in "${OTHERS[@]}"; do
       case "$item" in
-        all) expanded+=(smartmon nvme gif nodejs fail2ban unattended sysstat composer) ;;
-        smartmon|nvme|gif|nodejs|fail2ban|unattended|sysstat|composer) expanded+=("$item") ;;
-        security) expanded+=(fail2ban unattended) ;;
+        all) expanded+=(smartmon nvme gif nodejs sysstat) ;;
+        smartmon|nvme|gif|nodejs|sysstat) expanded+=("$item") ;;
         *) die "--others: unknown package '${item}'" ;;
       esac
     done
@@ -2098,19 +2094,43 @@ configure_ufw() {
 
   ufw --force default deny incoming
   ufw --force default allow outgoing
-  # SSH must be a plain ALLOW, inserted before any rate-limit rule.  A
-  # "ufw limit 22" rule counts every new TCP connection and locks out
-  # automation/operators who open several short sessions (observed during the
-  # validation run).  Brute-force protection is handled by fail2ban.  Keeping
-  # an existing provider ALLOW or LIMIT rule intact also makes --purge safe.
-  # Allow every effective sshd port, not just 22: a host moved to a custom
-  # port would otherwise lose remote access the moment UFW is enabled.
-  local ssh_port
+  # SSH must be rate-limited, not wide open.  A plain `allow` rule lets an
+  # unauthenticated client open as many connections as it likes; `ufw limit`
+  # blocks an address that opens more than six connections in 30 seconds.
+  # Insert the LIMIT at the top so an older plain ALLOW rule (written by this
+  # script before 1.8.35 or by a provider image) cannot take precedence, then
+  # remove that ALLOW rule.  Allow every effective sshd port, not just 22: a
+  # host moved to a custom port would otherwise lose remote access the moment
+  # UFW is enabled.
+  local ssh_port ssh_limited
   while IFS= read -r ssh_port; do
     [[ $ssh_port =~ ^[0-9]+$ ]] || continue
-    if ! ufw status 2>/dev/null | grep -qE "^${ssh_port}(/tcp)?[[:space:]]+(ALLOW|LIMIT)"; then
-      ufw insert 1 allow "${ssh_port}/tcp" || ufw allow "${ssh_port}/tcp" || true
-      info "UFW: allowed SSH port ${ssh_port}/tcp"
+    ssh_limited=0
+    if ufw status 2>/dev/null | grep -qE "^${ssh_port}(/tcp)?( \(v6\))?[[:space:]]+LIMIT"; then
+      ssh_limited=1
+    elif ufw insert 1 limit "${ssh_port}/tcp" 2>/dev/null; then
+      ssh_limited=1
+      info "UFW: rate-limited SSH port ${ssh_port}/tcp (ufw limit)"
+    elif ufw limit "${ssh_port}/tcp" 2>/dev/null; then
+      ssh_limited=1
+      info "UFW: rate-limited SSH port ${ssh_port}/tcp (ufw limit)"
+    fi
+
+    if (( ssh_limited )); then
+      # Remove a previously managed or provider-supplied plain ALLOW rule so
+      # the LIMIT is the only SSH rule left and cannot be shadowed.  Both
+      # spellings are tried because ufw records `allow 22` and `allow 22/tcp`
+      # differently.
+      ufw delete allow "${ssh_port}/tcp" >/dev/null 2>&1 || true
+      ufw delete allow "${ssh_port}" >/dev/null 2>&1 || true
+    else
+      # Never remove the last SSH rule: a failed rate-limit insert must not
+      # leave the host unreachable after UFW is enabled.  Keep or add a plain
+      # rule as a lockout guard and make the failure visible.
+      warn "Could not rate-limit SSH port ${ssh_port}/tcp; keeping a plain ALLOW rule to avoid lockout"
+      ufw status 2>/dev/null | grep -qE "^${ssh_port}(/tcp)?( \(v6\))?[[:space:]]+ALLOW" \
+        || ufw insert 1 allow "${ssh_port}/tcp" 2>/dev/null \
+        || ufw allow "${ssh_port}/tcp" 2>/dev/null || true
     fi
   done < <(sshd_listen_ports)
   ufw allow 80 || true
@@ -3226,10 +3246,8 @@ install_php() {
   apt_install "${php_pkgs[@]}"
 
   # Keep the CLI on the same version as FPM.  Without this, installing a
-  # distro package such as composer can add a newer php-cli and make
-  # /usr/bin/php point at a binary whose extension set differs from the web
-  # pool (Composer then fails with "Class Normalizer not found" or missing
-  # ext-gd/ext-xml).
+  # distro package can add a newer php-cli and make /usr/bin/php point at a
+  # binary whose extension set differs from the web pool.
   if command -v update-alternatives >/dev/null 2>&1 \
      && [[ -x "/usr/bin/php${ver}" ]]; then
     update-alternatives --set php "/usr/bin/php${ver}" >/dev/null 2>&1 \
@@ -4061,66 +4079,6 @@ EOF
         apt_install nodejs
         node -v
         ;;
-      fail2ban)
-        info "Installing fail2ban (UFW-backed SSH protection)"
-        pkg_record_origin fail2ban
-        pkg_record_origin python3-systemd
-        apt_install fail2ban python3-systemd
-        mkdir -p /etc/fail2ban/jail.d
-        # Never ban the operator who is running this deployment. SSH_CONNECTION
-        # is "<client-ip> <client-port> <server-ip> <server-port>"; keep the
-        # client address so a later typo or automation retry cannot lock the
-        # deploying session out for an hour.
-        local ssh_client_ip="" ssh_port="" ssh_port_line=""
-        ssh_client_ip=$(detect_ssh_client_ip || true)
-        [[ $ssh_client_ip =~ ^[0-9a-fA-F:.]+$ ]] || ssh_client_ip=""
-        # The jail must watch the port sshd actually listens on; the packaged
-        # [sshd] defaults to 22 and misses a custom port entirely.
-        ssh_port=$(sshd_listen_ports | head -n1)
-        if [[ $ssh_port =~ ^[0-9]+$ && $ssh_port != 22 ]]; then
-          ssh_port_line="port = ${ssh_port}"
-        fi
-        cat > /etc/fail2ban/jail.d/setup-ssh.local <<EOF
-[DEFAULT]
-backend = systemd
-banaction = ufw
-bantime = 1h
-findtime = 10m
-maxretry = 5
-ignoreip = 127.0.0.1/8 ::1 ${ssh_client_ip}
-
-[sshd]
-enabled = true
-${ssh_port_line}
-EOF
-        chmod 644 /etc/fail2ban/jail.d/setup-ssh.local
-        systemctl enable --now fail2ban 2>/dev/null || warn "fail2ban could not be started"
-        # Apply a changed operator whitelist/port to the running jails; a
-        # plain `enable --now` is a no-op when the service is already active.
-        if systemctl is-active --quiet fail2ban; then
-          fail2ban-client reload 2>/dev/null || warn "fail2ban reload failed"
-        fi
-        fail2ban-client status 2>/dev/null || true
-        ;;
-      unattended)
-        info "Enabling unattended security updates"
-        pkg_record_origin unattended-upgrades
-        apt_install unattended-upgrades
-        cat > /etc/apt/apt.conf.d/52setup-unattended <<'EOF'
-APT::Periodic::Update-Package-Lists "1";
-APT::Periodic::Unattended-Upgrade "1";
-# Never let the unattended job clean caches, kernels or dependencies: those
-# actions permanently remove files and can break a live server.  Operators can
-# reclaim space manually after verifying what is safe to remove.
-APT::Periodic::AutocleanInterval "0";
-Unattended-Upgrade::Remove-Unused-Kernel-Packages "false";
-Unattended-Upgrade::Remove-Unused-Dependencies "false";
-Unattended-Upgrade::Automatic-Reboot "false";
-EOF
-        chmod 644 /etc/apt/apt.conf.d/52setup-unattended
-        systemctl enable --now apt-daily.timer apt-daily-upgrade.timer 2>/dev/null \
-          || warn "Could not enable apt daily timers"
-        ;;
       sysstat)
         info "Installing sysstat (sar/iostat history)"
         pkg_record_origin sysstat
@@ -4131,56 +4089,6 @@ EOF
         systemctl enable --now sysstat-collect.timer sysstat-summary.timer 2>/dev/null \
           || systemctl enable --now sysstat 2>/dev/null \
           || warn "sysstat timers could not be enabled"
-        ;;
-      composer)
-        info "Installing Composer"
-        # Composer's Symfony String dependency needs ext-intl (Normalizer).
-        # The XenForo-minimal runtime profile deliberately omits intl, so add
-        # it only for the Composer CLI.
-        local php_ver="" d v php_bin
-        for d in /etc/php/*/fpm; do
-          [[ -d $d ]] || continue
-          v=${d%/fpm}
-          v=${v##*/}
-          [[ $v =~ ^[0-9]+\.[0-9]+$ ]] || continue
-          if [[ -z $php_ver ]] \
-             || [[ $(printf '%s\n%s\n' "$php_ver" "$v" | sort -V | tail -n1) == "$v" ]]; then
-            php_ver=$v
-          fi
-        done
-        if [[ -z $php_ver ]]; then
-          die "--others composer requires PHP-FPM; install it with --php first"
-        fi
-        php_bin="/usr/bin/php${php_ver}"
-        apt_install "php${php_ver}-cli" "php${php_ver}-intl"
-        update-alternatives --set php "$php_bin" >/dev/null 2>&1 || true
-
-        # Do not use apt's composer package. Its virtual php-cli/php-common
-        # dependencies can pull unrelated PHP builds from Sury (for example
-        # php5.6-common and php8.5-cli), which then break /usr/bin/php and
-        # leave packages behind after purge. Install the official phar and
-        # execute it explicitly with the FPM-matched PHP binary.
-        ensure_state
-        if [[ -x /usr/local/bin/composer ]]; then
-          info "Composer already present at /usr/local/bin/composer; keeping it"
-        else
-          local tmp
-          tmp=$(tmp_file)
-          retry 3 5 curl -fsSL --proto '=https' --tlsv1.2 \
-            https://getcomposer.org/download/latest-stable/composer.phar \
-            -o "$tmp" \
-            || die "Could not download Composer from getcomposer.org"
-          "$php_bin" "$tmp" --version >/dev/null 2>&1 \
-            || die "Downloaded Composer phar is not runnable with PHP ${php_ver}"
-          install -m 755 "$tmp" /usr/local/bin/composer
-          touch "${STATE_DIR}/setup-created-composer-phar"
-        fi
-        "$php_bin" /usr/local/bin/composer --version 2>/dev/null | head -n 1 || true
-        # Installing the CLI/intl packages can leave running FPM workers with
-        # stale OPcache/realpath state (observed as "Unable to open primary
-        # script ... Operation not permitted"). Restart the matched FPM pool.
-        systemctl restart "php${php_ver}-fpm" 2>/dev/null \
-          || warn "Could not restart php${php_ver}-fpm after installing Composer"
         ;;
     esac
   done
@@ -4400,15 +4308,16 @@ purge_basic() {
   fi
 
   # Last-resort lockout guard: if UFW is active but an SSH rule is missing,
-  # add one for every effective sshd port before touching the remaining
-  # rules.  A custom SSH port must be protected exactly like 22.
+  # add a rate-limited rule for every effective sshd port before touching the
+  # remaining rules.  A custom SSH port must be protected exactly like 22.
   local -a ssh_ports=()
   mapfile -t ssh_ports < <(sshd_listen_ports)
   if ufw status 2>/dev/null | grep -q '^Status: active'; then
     local p
     for p in "${ssh_ports[@]}"; do
-      ufw status 2>/dev/null | grep -qE "^${p}(/tcp)?[[:space:]]+(ALLOW|LIMIT)" \
-        || ufw allow "${p}/tcp" || true
+      if ! ufw status 2>/dev/null | grep -qE "^${p}(/tcp)?( \(v6\))?[[:space:]]+(ALLOW|LIMIT)"; then
+        ufw limit "${p}/tcp" || ufw allow "${p}/tcp" || true
+      fi
     done
   fi
 

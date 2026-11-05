@@ -8,6 +8,11 @@ The script now produces a solid single-host baseline. The remaining work is
 mostly about identity/secrets, certificates, per-tenant isolation, backups,
 monitoring and scaling beyond one 16-core machine.
 
+> **Note:** this audit describes a host built with `setup.sh` 1.6.7. Current
+> releases no longer install `fail2ban`, `unattended-upgrades` or Composer;
+> where this document mentions them, treat the item as an operator-managed
+> recommendation rather than something the script provides.
+
 ---
 
 ## 0.1 1.6.7 live validation on a 16 vCPU / 30 GiB VPS
