@@ -872,6 +872,15 @@ check "OS tuning applies sysctl before the PAM nofile limits" \
   test -n "$sysctl_line" -a -n "$limits_line" -a "$sysctl_line" -lt "$limits_line"
 
 # ---------------------------------------------------------------------------
+# Embedded payload integrity
+# ---------------------------------------------------------------------------
+for blob in blob_sysctl blob_mysqltuner blob_mysqlbackup \
+            blob_angie_key blob_elastic_key blob_sury_deb blob_nodesource_key; do
+  check "embedded ${blob} decodes" \
+    bash -c 'source "$1"; "$2" >/dev/null' _ "$ROOT/setup.sh" "$blob"
+done
+
+# ---------------------------------------------------------------------------
 # Shared install/--optimize tuning helpers
 # ---------------------------------------------------------------------------
 mariadb_compute_profile 2048
