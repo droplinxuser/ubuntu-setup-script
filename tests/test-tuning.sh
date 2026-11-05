@@ -326,10 +326,10 @@ check "TCP FastCGI upstream is preserved when PHP stays on TCP" \
 mkdir -p "$TMP/active"
 cp -a "$FIXTURES/." "$TMP/active/"
 cat > "$TMP/active/http.d/fastcgi_cache.conf" <<'EOF'
-fastcgi_cache_path /home/nginx_cache levels=1:2 keys_zone=fastcgicache:256m inactive=8h;
+fastcgi_cache_path /home/nginx_cache_test levels=1:2 keys_zone=fastcgicache:256m inactive=8h;
 EOF
 cat > "$TMP/active/http.d/fastcgi_cache_conf" <<'EOF'
-fastcgi_cache_path /home/nginx_cache levels=1:2 keys_zone=fastcgicache:256m max_size=16g inactive=1h;
+fastcgi_cache_path /home/nginx_cache_test levels=1:2 keys_zone=fastcgicache:256m max_size=16g inactive=1h;
 EOF
 OPT_PHP_SOCKET=""
 tune_reset_changes
@@ -803,6 +803,28 @@ removed=$(purge_optimize_cache_entries "$now" "$TMP/cachetree")
 check "cache purge removes objects written during the run" test "$removed" -eq 1
 check "cache purge removes the new object" test ! -e "$TMP/cache/sub/new"
 check "cache purge keeps older objects" test -f "$TMP/cache/old"
+
+# ---------------------------------------------------------------------------
+# Live disk-cache safety: never shrink max_size below current usage
+# ---------------------------------------------------------------------------
+mkdir -p "$TMP/cache-keep/objects"
+dd if=/dev/zero of="$TMP/cache-keep/objects/obj" bs=1M count=5 status=none
+cat > "$TMP/cache-keep/fastcgi_cache.conf" <<EOF
+fastcgi_cache_path $TMP/cache-keep/objects levels=1:2 keys_zone=fastcgicache:16m inactive=1h;
+EOF
+angie_cache_keep_mb "$TMP/cache-keep/fastcgi_cache.conf" 2
+check "cache max_size is raised above live usage" test "$ANGIE_CACHE_MB" = 256
+check "cache keep records an explanatory note" test -n "$ANGIE_CACHE_NOTE"
+angie_cache_keep_mb "$TMP/cache-keep/fastcgi_cache.conf" 512
+check "cache max_size keeps a larger plan" test "$ANGIE_CACHE_MB" = 512
+check "cache keep is silent when the plan is larger" test -z "$ANGIE_CACHE_NOTE"
+cat > "$TMP/cache-keep/fastcgi_cache.conf" <<EOF
+fastcgi_cache_path $TMP/cache-keep/objects levels=1:2 keys_zone=fastcgicache:16m max_size=1g inactive=1h;
+EOF
+angie_cache_keep_mb "$TMP/cache-keep/fastcgi_cache.conf" 2
+check "cache max_size keeps a configured value above live usage" test "$ANGIE_CACHE_MB" = 1024
+angie_cache_keep_mb "$TMP/cache-keep/missing.conf" 128
+check "cache keep tolerates a missing config" test "$ANGIE_CACHE_MB" = 128
 
 # ---------------------------------------------------------------------------
 # Small-host budget floors
