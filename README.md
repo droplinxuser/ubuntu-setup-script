@@ -33,6 +33,33 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.30
+
+- **Every scratch write is staged under `/tmp`.** The shared `tmp_file`/`tmp_dir`
+  helpers force `--tmpdir=/tmp` and refuse an absolute caller template, and the
+  new `sed_in_place` helper replaces every GNU `sed -i` call. A config rewrite
+  no longer creates a `sed*` scratch file beside a live `/etc` file; the staged
+  copy lives under `/tmp` and the original inode keeps its mode, owner and hard
+  links.
+- **Unattended upgrades no longer delete anything.** The optional `unattended`
+  profile sets `APT::Periodic::AutocleanInterval "0"` and sets
+  `Remove-Unused-Kernel-Packages` / `Remove-Unused-Dependencies` to `false`, so
+  a background apt job cannot remove packages, kernels or cached archives on a
+  live server.
+- **Test and tool scratch data is explicitly under `/tmp`.** The tuning tests,
+  the stress runner and `tools/diff_configs.sh` use absolute `/tmp` templates
+  instead of relying on an inherited `TMPDIR`. The stress seeder now updates its
+  own fixed rows/documents instead of dropping its MariaDB table or deleting
+  its Elasticsearch index.
+- **Duplicate helpers merged.** `tune_size_value` now delegates to
+  `mb_to_config`, and a single `storage_class` helper feeds both the MariaDB
+  I/O-capacity and Angie cache tuners, so install and `--optimize` classify the
+  disk the same way.
+- **Install and `--optimize` parity re-verified.** Both paths still use the same
+  CPU governor, swap, sysctl/PAM, Angie, PHP-FPM, MariaDB, Valkey and
+  Elasticsearch sizing helpers and the same 80%-of-RAM memory plan; no service
+  lost a tuning step in this release.
+
 ## What's new in 1.8.29
 
 - **No permanent deletions anywhere.** Package purge/autoremove/clean calls,

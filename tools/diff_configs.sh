@@ -7,7 +7,7 @@ compare_files() {
 
     # Download remote file to a temporary location under /tmp.  The file is
     # left for the operating system to expire; this script never deletes it.
-    tmp_remote_file=$(TMPDIR=/tmp mktemp)
+    tmp_remote_file=$(mktemp /tmp/diff-configs.XXXXXX)
     if ! curl -sSL "$remote_url" -o "$tmp_remote_file"; then
         echo "Error: Failed to download remote file from $remote_url."
         exit 1
