@@ -34,7 +34,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.33"
+readonly SCRIPT_VERSION="1.8.34"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -69,6 +69,13 @@ CONFIG_SOURCE_DIR="${CONFIG_SOURCE_DIR:-}"
 CONFIG_TEMP_DIR=""
 readonly CRON_BEGIN="# BEGIN setup.sh managed cron"
 readonly CRON_END="# END setup.sh managed cron"
+# Keep web content owned by www-data without touching the shared log tree.
+# MariaDB, Valkey and Elasticsearch own subdirectories below /var/www/logs; a
+# blanket recursive chown changes their owner to www-data and their next start
+# or restart fails to open/rotate logs ("Permission denied", errno 13).
+readonly CRON_WWW_CHOWN='/usr/bin/find /var/www -mindepth 1 -path /var/www/logs -prune -o -exec /usr/bin/chown -h www-data:www-data {} +'
+# The form written by releases up to 1.8.33, kept so a re-run upgrades it.
+readonly CRON_WWW_CHOWN_LEGACY='/usr/bin/chown www-data:www-data -R /var/www/'
 readonly MARIADB_BEGIN="# BEGIN setup.sh managed mariadb"
 readonly MARIADB_END="# END setup.sh managed mariadb"
 readonly ES_BEGIN="# BEGIN setup.sh managed elasticsearch"
@@ -1493,7 +1500,7 @@ write_cron() {
   local -a lines=() existing=() preserved=()
 
   if [[ ${ENABLED[angie]:-0} -eq 1 ]]; then
-    lines+=('0 0 * * * /usr/bin/chown www-data:www-data -R /var/www/ >/dev/null 2>&1')
+    lines+=("0 0 * * * ${CRON_WWW_CHOWN} >/dev/null 2>&1")
     lines+=('1 1 * * * /usr/bin/chmod +x /etc/angie/scripts/cloudflare.sh >/dev/null 2>&1')
     lines+=('2 1 * * * /etc/angie/scripts/cloudflare.sh >/dev/null 2>&1')
   fi
@@ -1515,7 +1522,7 @@ write_cron() {
     [[ -n $line ]] || continue
     if [[ $line == *mysqlbkup* || $line == *mariadb-check* ]]; then
       group=mariadb
-    elif [[ $line == *'/etc/angie/'* || $line == *'chown www-data:www-data -R /var/www/'* ]]; then
+    elif [[ $line == *'/etc/angie/'* || $line == *"${CRON_WWW_CHOWN_LEGACY}"* || $line == *"${CRON_WWW_CHOWN}"* ]]; then
       group=angie
     else
       group=unknown
@@ -1530,6 +1537,12 @@ write_cron() {
         pkg_ok mariadb-server || continue
         ;;
     esac
+    # A preserved entry from an older release is rewritten in place so the
+    # destructive blanket chown cannot survive a --basic run that does not
+    # select --angie again.
+    if [[ $line == *"${CRON_WWW_CHOWN_LEGACY}"* ]]; then
+      line="0 0 * * * ${CRON_WWW_CHOWN} >/dev/null 2>&1"
+    fi
     [[ $seen == *" ${line} "* ]] && continue
     seen+="${line} "
     preserved+=("$line")
@@ -4487,7 +4500,8 @@ purge_angie() {
   info "Leaving Angie files under /etc/angie, /var/lib/angie, /var/log/angie, /var/cache/angie and ${LOG_ROOT}/angie"
   info "Leaving cache directories and /root installer files in place"
   cron_remove_line '/etc/angie/scripts/cloudflare.sh'
-  cron_remove_line '/usr/bin/chown www-data:www-data -R /var/www/'
+  cron_remove_line "$CRON_WWW_CHOWN_LEGACY"
+  cron_remove_line "$CRON_WWW_CHOWN"
   systemctl daemon-reload || true
   ok "Angie purged (files preserved)"
 }

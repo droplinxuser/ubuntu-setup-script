@@ -33,6 +33,21 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.34
+
+- **The nightly ownership job no longer breaks service logs.** The managed
+  Angie cron entry used `chown -R www-data:www-data /var/www/`, which also
+  changed `/var/www/logs/mariadb`, `/var/www/logs/valkey` and
+  `/var/www/logs/elasticsearch` to `www-data`. The next service start or
+  restart then failed to open or rotate its logs: MariaDB logged
+  `File '/var/www/logs/mariadb/slow.log' not found (Errcode: 13 "Permission
+  denied")` and disabled slow logging for the process, and Valkey exited with
+  status 1 because it could not open `valkey.log`. The job now walks
+  `/var/www` with `find` and prunes the `/var/www/logs` tree, so each service
+  keeps ownership of its own log directory. A crontab entry written by an
+  older release is upgraded in place on the next `--basic` run, and
+  `--purge --angie` removes both forms.
+
 ## What's new in 1.8.33
 
 - **The run log now reports the parsed selection accurately.** The old header
@@ -1034,7 +1049,7 @@ Basic performs:
 7. Replaces `/etc/sysctl.conf` with the tuned profile and applies it (`/etc/sysctl.d/99-sysctl.conf` symlink is added when needed).
 8. Replaces `/etc/security/limits.conf` with the high `nofile` limits.
 9. Installs/enables cron and writes a managed crontab block containing only the entries for the selected services:
-   - Angie: daily `chown` of `/var/www`, daily `chmod +x` and execution of `/etc/angie/scripts/cloudflare.sh`.
+   - Angie: daily ownership repair of `/var/www` that skips the shared log tree (`/var/www/logs`, owned per service), daily `chmod +x` and execution of `/etc/angie/scripts/cloudflare.sh`.
    - MariaDB: daily 03:03 mysql backup and monthly `mariadb-check`.
 10. Configures UFW: deny incoming, allow outgoing, limit 22, allow 80 and 443, enable the firewall. The original active state, added rules and default policies are recorded so `--purge basic` can restore them.
 
