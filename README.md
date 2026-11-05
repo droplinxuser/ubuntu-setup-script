@@ -33,6 +33,14 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.32
+
+- **Restored the embedded signing payloads.** The Angie, Sury, Elastic and
+  NodeSource key blobs had been truncated to empty functions, so a fresh server
+  failed at `gzip -dc` before installing Angie or PHP (`unexpected end of
+  file`). All four blobs are restored and a test now decodes every embedded
+  payload so this cannot regress silently.
+
 ## What's new in 1.8.31
 
 - **Every run writes a full diagnostic log.** `setup.sh` now mirrors its
