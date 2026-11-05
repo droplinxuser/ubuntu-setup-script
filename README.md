@@ -33,6 +33,14 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.33
+
+- **The run log now reports the parsed selection accurately.** The old header
+  printed `Enabled: none` and `Modes: ... 0` because it ran before argument
+  parsing. A new `selection` block after validation records the real modes,
+  enabled services, domains and explicit MariaDB/PHP/Valkey/Elasticsearch
+  options.
+
 ## What's new in 1.8.32
 
 - **Restored the embedded signing payloads.** The Angie, Sury, Elastic and
