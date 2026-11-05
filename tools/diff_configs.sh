@@ -5,8 +5,9 @@ compare_files() {
     local remote_url=$1
     local local_path=$2
 
-    # Download remote file to temporary location
-    tmp_remote_file=$(mktemp)
+    # Download remote file to a temporary location under /tmp.  The file is
+    # left for the operating system to expire; this script never deletes it.
+    tmp_remote_file=$(TMPDIR=/tmp mktemp)
     if ! curl -sSL "$remote_url" -o "$tmp_remote_file"; then
         echo "Error: Failed to download remote file from $remote_url."
         exit 1
@@ -25,8 +26,7 @@ compare_files() {
         printf "Differences in %s:\n%s\n" "$local_path" "$diff_result"
     fi
 
-    # Clean up temporary files
-    rm -f "$tmp_remote_file"
+    # Do not remove the temporary file; /tmp owns its expiry.
 }
 
 # Compare configurations for Ubuntu Server 26.04

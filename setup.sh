@@ -31,7 +31,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.28"
+readonly SCRIPT_VERSION="1.8.29"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -97,6 +97,27 @@ warn() { printf '%s %s[WARN]%s %s\n' "$(_timestamp)" "$C_YELLOW" "$C_RESET" "$*"
 die()  { trap - ERR; printf '%s %s[FAIL]%s %s\n' "$(_timestamp)" "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 step() { printf '\n%s%s==> %s%s\n' "$C_BOLD" "$C_BLUE" "$*" "$C_RESET"; }
 
+# Every transient file and directory must live below /tmp.  These wrappers also
+# ignore a caller's TMPDIR so an environment variable cannot move scratch data
+# onto a live configuration or data path.  Nothing here removes its leftovers:
+# the operating system expires them from /tmp.
+readonly TMP_ROOT="/tmp"
+# Make child tools that honour TMPDIR use /tmp as well.
+export TMPDIR="$TMP_ROOT"
+tmp_file() { TMPDIR="$TMP_ROOT" mktemp "$@"; }
+tmp_dir()  { TMPDIR="$TMP_ROOT" mktemp -d "$@"; }
+
+# Move a path that must leave its live location into a fresh /tmp directory.
+# The data is preserved (never unlinked) and /tmp expires it automatically.
+preserve_to_tmp() {
+  local path=$1 dest base
+  [[ -e $path || -L $path ]] || return 0
+  base=$(basename -- "$path")
+  dest=$(tmp_dir) || return 1
+  mv -- "$path" "${dest}/${base}"
+  printf '%s' "${dest}/${base}"
+}
+
 on_error() {
   local rc=$? line=${1:-?} cmd=${BASH_COMMAND:-unknown}
   # Keep the failing command on one line and bounded, so a large heredoc or a
@@ -110,7 +131,7 @@ trap 'on_error $LINENO' ERR
 # Serialise real runs.  Two concurrent invocations (an operator plus a cron or
 # CI job) can interleave config rewrites and leave a half-written service
 # file behind.  Dry-runs do not touch the system and are always allowed.
-readonly LOCK_FILE="/run/setup.sh.lock"
+readonly LOCK_FILE="${TMP_ROOT}/setup.sh.lock"
 LOCK_HELD=0
 
 acquire_run_lock() {
@@ -157,12 +178,13 @@ retry() {
 apt_update()  { retry 3 5 apt-get -o DPkg::Lock::Timeout=300 \
   -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update -y; }
 apt_install() {
-  apt-get install "${APT_OPTS[@]}" --no-install-recommends "$@"
+  # --no-remove aborts instead of letting APT uninstall a conflicting package.
+  apt-get install --no-remove "${APT_OPTS[@]}" --no-install-recommends "$@"
 }
 apt_clean() {
-  apt-get autoremove --purge -y || true
-  apt-get autoclean -y || true
-  apt-get clean -y || true
+  # Intentionally a no-op.  autoremove/autoclean/clean permanently delete
+  # packages and cached archives, which setup.sh must never do on a live host.
+  :
 }
 
 # ---------------------------------------------------------------------------
@@ -249,8 +271,8 @@ Domain setup (standalone; Angie + MariaDB must already be installed/running):
 Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
   --optimize [--dry-run]
       One command for the whole host.  It applies the hardware-aware OS
-      profile (CPU governor, PAM security limits, kernel/network/memory
-      sysctls) and then tunes every installed service (Angie, PHP-FPM,
+      profile (CPU governor, swap headroom, PAM security limits, and
+      kernel/network/memory sysctls) and then tunes every installed service (Angie, PHP-FPM,
       MariaDB, Valkey or Redis, Elasticsearch) for the current CPU/RAM/disk.
       It never installs, purges or starts a managed service; the only package
       it may add is the small cpufrequtils helper when the CPU exposes
@@ -262,17 +284,20 @@ Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
       when a pool already listens on a Unix socket, Angie's fastcgi_pass is
       repointed to it.  TCP pools stay on TCP so a live site is never left
       pointing at a missing socket.
-      Configuration files are backed up under /var/backups/setup-optimize-*
+      Configuration files are backed up under /tmp/setup-optimize-*
       and a Markdown report is written to /var/log/setup-optimize-*.md.
       Existing application vhosts and credentials are preserved.
       --dry-run only prints the planned OS and service values.
 
-Purge (uninstall) mode:
+Purge (stop/restore) mode:
   --purge [all|basic|angie|php|mariadb|valkey|elastic|others]
-  --purge --angie --php                 purge only the selected services
-  --purge                               purge everything this script manages
-  --purge --php ver=8.5                 purge one PHP version (note --php)
+  --purge --angie --php                 stop only the selected services
+  --purge                               stop everything this script manages
+  --purge --php ver=8.5                 stop one PHP version (note --php)
   --purge php mariadb                   bare names are also accepted
+  No file, package, database, certificate or log is deleted.  Configuration
+  is restored only by overwriting it with the recorded original.  Leftovers
+  under /tmp are allowed to expire on their own.
 
 Configuration source:
   Angie configuration is downloaded from
@@ -1091,17 +1116,21 @@ record_original() {
 }
 
 restore_original() {
-  local path=$1 name=$2
+  local path=$1 name=$2 src="${BACKUP_DIR}/${name}"
   [[ -f "${BACKUP_DIR}/${name}.recorded" ]] || return 0
-  if [[ $(<"${BACKUP_DIR}/${name}.recorded") == present ]]; then
-    rm -rf "$path"
-    cp -a "${BACKUP_DIR}/${name}" "$path"
-    info "Restored ${path}"
+  if [[ $(<"${BACKUP_DIR}/${name}.recorded") == present && -e $src ]]; then
+    # Copy over the existing path instead of unlinking it first.  Any extra
+    # files that are not part of the backup are intentionally left in place.
+    if [[ -d $src ]]; then
+      mkdir -p "$path"
+      cp -a "${src}/." "$path/"
+    else
+      cp -a "$src" "$path"
+    fi
+    info "Restored ${path} (existing files overwritten; nothing deleted)"
   else
-    rm -rf "$path"
-    info "Removed ${path}"
+    info "Leaving ${path} in place (setup.sh never deletes server files)"
   fi
-  rm -rf "${BACKUP_DIR:?}/${name}" "${BACKUP_DIR}/${name}.recorded"
 }
 
 sql_escape() {
@@ -1153,9 +1182,10 @@ effective_backlog() {
 # Server configuration repository
 # ---------------------------------------------------------------------------
 cleanup_configs() {
-  if [[ -n ${CONFIG_TEMP_DIR:-} && -d ${CONFIG_TEMP_DIR} ]]; then
-    rm -rf "$CONFIG_TEMP_DIR"
-  fi
+  # Downloaded configuration scratch data lives under /tmp.  It is deliberately
+  # not removed: the operating system expires it, and setup.sh never deletes
+  # files it did not just create in /tmp.
+  :
 }
 
 # Download/extract server-configs-nginx once for the whole run.  Only the
@@ -1169,7 +1199,7 @@ fetch_server_configs() {
     return 0
   fi
 
-  CONFIG_TEMP_DIR=$(mktemp -d)
+  CONFIG_TEMP_DIR=$(tmp_dir)
   local archive="${CONFIG_TEMP_DIR}/configs.tar.gz"
   local url="${CONFIG_REPO_URL}/archive/${CONFIG_REPO_REF}.tar.gz"
   local src=""
@@ -1183,7 +1213,7 @@ fetch_server_configs() {
             "${CONFIG_REPO_URL}.git" "${CONFIG_TEMP_DIR}/repo" 2>/dev/null; then
     src="${CONFIG_TEMP_DIR}/repo"
   else
-    rm -rf "$CONFIG_TEMP_DIR"
+    # Keep the failed download under /tmp for inspection; it expires on its own.
     CONFIG_TEMP_DIR=""
     die "Could not download server configs from ${CONFIG_REPO_URL} (${CONFIG_REPO_REF})"
   fi
@@ -1314,7 +1344,7 @@ write_cron() {
   done
 
   lines=("${preserved[@]}" "${lines[@]}")
-  tmp=$(mktemp)
+  tmp=$(tmp_file)
   {
     if [[ -n $cur ]]; then
       printf '%s\n' "$cur" | cron_strip_managed
@@ -1326,12 +1356,9 @@ write_cron() {
     fi
   } > "$tmp"
 
-  if [[ -s $tmp ]]; then
-    crontab "$tmp"
-  else
-    crontab -r 2>/dev/null || true
-  fi
-  rm -f "$tmp"
+  # Install the file even when it is empty instead of deleting the user's
+  # crontab; writing an empty crontab keeps the file in place.
+  crontab "$tmp"
   info "Managed crontab entries updated"
 }
 
@@ -1339,10 +1366,9 @@ cron_remove_line() {
   local needle=$1 cur tmp
   cur=$(crontab -l 2>/dev/null || true)
   [[ -n $cur ]] || return 0
-  tmp=$(mktemp)
+  tmp=$(tmp_file)
   printf '%s\n' "$cur" | grep -vF -- "$needle" | cron_compact_managed > "$tmp" || true
-  if [[ -s $tmp ]]; then crontab "$tmp"; else crontab -r 2>/dev/null || true; fi
-  rm -f "$tmp"
+  crontab "$tmp"
 }
 
 # ---------------------------------------------------------------------------
@@ -1354,7 +1380,6 @@ configure_dns() {
   mkdir -p /etc/systemd/resolved.conf.d
   # Only manage our own drop-in; do not delete unrelated resolver configs.
   local dns_src="${SCRIPT_DIR}/configs/system/dns_servers.conf"
-  rm -f /etc/systemd/resolved.conf.d/dns_servers.conf
   if [[ -f $dns_src ]]; then
     install -m 644 "$dns_src" /etc/systemd/resolved.conf.d/dns_servers.conf
   else
@@ -1369,8 +1394,7 @@ EOF
 }
 
 update_system() {
-  step "Ubuntu update / remove snapd"
-  apt-get autopurge -y snapd || true
+  step "Ubuntu update"
   apt_update
   # A failed upgrade can leave dpkg half-configured (for example when a
   # postinst is interrupted by a full disk or a provider console reset).
@@ -1379,13 +1403,10 @@ update_system() {
   if ! apt-get upgrade "${APT_OPTS[@]}"; then
     warn "apt upgrade failed; repairing dpkg state and retrying once"
     dpkg --configure -a || warn "dpkg --configure -a reported an issue"
-    apt-get -f install "${APT_OPTS[@]}" || warn "apt-get -f install reported an issue"
+    apt-get -f install --no-remove "${APT_OPTS[@]}" || warn "apt-get -f install reported an issue"
     apt-get upgrade "${APT_OPTS[@]}" \
       || warn "apt upgrade still failing; continuing with a partially upgraded system"
   fi
-  apt-get autoremove --purge -y || true
-  apt-get autoclean -y || true
-  apt-get clean -y || true
 }
 
 # True when this CPU exposes frequency scaling and actually offers the
@@ -1491,9 +1512,11 @@ ensure_swap_fstab() {
 
 create_swap_file() {
   local bytes=$1
+  # Reuse the path in place.  Unlinking a valid /swapfile is unnecessary and
+  # would make a failed re-create leave the host with no swap at all.
+  : > /swapfile
   if ! fallocate -l "$bytes" /swapfile 2>/dev/null; then
     warn "fallocate failed; falling back to dd"
-    rm -f /swapfile
     local count=$(( (bytes + 1048575) / 1048576 ))
     dd if=/dev/zero of=/swapfile bs=1M count="$count" status=none
   fi
@@ -1522,7 +1545,6 @@ configure_swap() {
       return 0
     fi
     swapoff /swapfile 2>/dev/null || true
-    rm -f /swapfile
   fi
 
   create_swap_file "$desired"
@@ -1558,7 +1580,6 @@ configure_swap_auto() {
     else
       new_size=$needed
     fi
-    rm -f /swapfile
   else
     new_size=$needed
   fi
@@ -1604,7 +1625,6 @@ restore_sysctl_values() {
     value=$(<"$file")
     sysctl -w "${key}=${value}" >/dev/null 2>&1 \
       || warn "Could not restore ${key}=${value}"
-    rm -f "$file"
   done
 }
 
@@ -1613,7 +1633,7 @@ restore_sysctl_values() {
 sysctl_dedupe_keys() {
   local file=$1 tmp
   [[ -f $file ]] || return 0
-  tmp=$(mktemp)
+  tmp=$(tmp_file)
   awk '
     {
       lines[NR] = $0
@@ -1640,7 +1660,6 @@ sysctl_dedupe_keys() {
   if ! cmp -s "$file" "$tmp"; then
     cat "$tmp" > "$file"
   fi
-  rm -f "$tmp"
   return 0
 }
 
@@ -1755,7 +1774,6 @@ EOF
   [[ $TCP_CC == bbr ]] && net_mods+=(tcp_bbr)
   printf '%s\n' "${net_mods[@]}" > /etc/modules-load.d/setup-network.conf
   chmod 644 /etc/modules-load.d/setup-network.conf
-  rm -f /etc/modules-load.d/setup-conntrack.conf
   local mod
   for mod in "${net_mods[@]}"; do
     modprobe "$mod" || warn "Could not load ${mod} (kernel may not provide it)"
@@ -1915,11 +1933,10 @@ install_basic() {
   configure_dns
   update_system
 
-  if [[ $server == dedi ]]; then
-    configure_cpu_governor
-  else
-    info "Server type is vps: skipping CPU governor setup"
-  fi
+  # Let the tuner decide from the actual cpufreq interface.  --optimize calls
+  # the same function, so a host with a usable performance governor gets it
+  # from either command.
+  configure_cpu_governor
 
   # dmidecode (installed here) gives the nominal installed RAM for the
   # generated hostname, even when the kernel reserves some of it.
@@ -2176,19 +2193,18 @@ angie_cache_keep_mb() {
 
 # A backend that restarts during --optimize can send a truncated/empty 200
 # while connections are cut over, and the guest cache stores 200 responses
-# for minutes: every visitor then receives a blank page.  Remove objects
-# written during this run; they are regenerated by the next request.
-purge_optimize_cache_entries() {
-  local epoch=${1:-0} target=${2:-/etc/angie} dir count removed=0
+# for minutes: every visitor then receives a blank page.  Older releases
+# deleted objects written during the run.  setup.sh now only reports them: a
+# cache file is still a file, and deleting the wrong entry is not recoverable.
+count_optimize_cache_entries() {
+  local epoch=${1:-0} target=${2:-/etc/angie} dir count total=0
   [[ $epoch =~ ^[0-9]+$ ]] && (( epoch > 0 )) || { printf '0'; return 0; }
   while IFS= read -r dir; do
     [[ -n $dir && $dir == /* && $dir != / && -d $dir ]] || continue
     count=$(find "$dir" -type f -newermt "@$epoch" 2>/dev/null | wc -l)
-    (( count > 0 )) || continue
-    find "$dir" -type f -newermt "@$epoch" -delete 2>/dev/null || true
-    removed=$(( removed + count ))
+    total=$(( total + count ))
   done < <(angie_cache_dirs "$target")
-  printf '%s' "$removed"
+  printf '%s' "$total"
 }
 
 tune_replace() {
@@ -2221,7 +2237,7 @@ tune_insert_after() {
     return 0
   fi
   local tmp
-  tmp=$(mktemp)
+  tmp=$(tmp_file)
   awk -v anchor="$anchor" -v line="$line" '
     $0 ~ anchor && !done { print; print line; done=1; next }
     { print }
@@ -2230,7 +2246,6 @@ tune_insert_after() {
     cat "$tmp" > "$file"
     tune_note "$desc"
   fi
-  rm -f "$tmp"
 }
 
 # A cached 500 (or a stale 500 served by fastcgi_cache_use_stale) hides a
@@ -2243,7 +2258,7 @@ tune_cache_error_policy() {
   before=$(md5sum "$file" | awk '{print $1}')
   sed -i -E '/^[[:space:]]*fastcgi_cache_use_stale/ s/[[:space:]]+http_500([[:space:]]|;)/\1/g' "$file"
   if ! grep -qE '^[[:space:]]*fastcgi_cache_valid[[:space:]]+500([[:space:]]+[0-9]+)+[[:space:]]+0s;' "$file"; then
-    tmp=$(mktemp)
+    tmp=$(tmp_file)
     if grep -qE '^[[:space:]]*fastcgi_cache_valid[[:space:]]+any[[:space:]]' "$file"; then
       awk '
         /^[[:space:]]*fastcgi_cache_valid[[:space:]]+any[[:space:]]/ && !done {
@@ -2259,7 +2274,6 @@ tune_cache_error_policy() {
       printf '\nfastcgi_cache_valid 500 502 503 504 0s;\n' >> "$tmp"
     fi
     cat "$tmp" > "$file"
-    rm -f "$tmp"
   fi
   after=$(md5sum "$file" | awk '{print $1}')
   [[ $before != "$after" ]] \
@@ -2479,8 +2493,9 @@ tune_angie_configs() {
       'keys_zone=proxy_cdn:[0-9]+m' "keys_zone=proxy_cdn:${cdn_zone}m" \
       "${f_proxy#"${target}"/}: cdn zone=${cdn_zone}m"
 
-    local before
+    local before tmp
     before=$(md5sum "$f_proxy" | awk '{print $1}')
+    tmp=$(tmp_file)
     # proxy_cache_path directives commonly wrap onto a second line, so track
     # the active cache path and rewrite the first max_size seen afterwards
     # instead of only looking at the line that starts the directive.
@@ -2495,8 +2510,8 @@ tune_angie_configs() {
         print
         if ($0 ~ /;[[:space:]]*$/) cache = ""
       }
-    ' "$f_proxy" > "${f_proxy}.new"
-    mv "${f_proxy}.new" "$f_proxy"
+    ' "$f_proxy" > "$tmp"
+    cat "$tmp" > "$f_proxy"
     [[ $(md5sum "$f_proxy" | awk '{print $1}') != "$before" ]] \
       && tune_note "${f_proxy#"${target}"/}: proxy=${proxy_size} cdn=${cdn_size}"
   else
@@ -2518,7 +2533,7 @@ tune_angie_configs() {
 
   # Bound custom cache paths that are not part of the standard set.  Scan
   # only files Angie includes, so inert legacy leftovers are left untouched.
-  local extra_zone extra_max file
+  local extra_zone extra_max file tmp
   local -a cache_files=()
   extra_zone=$(tune_clamp $(( cache_total_mb / 16 )) 8 128)
   if (( active_weight == 0 )); then
@@ -2541,6 +2556,7 @@ tune_angie_configs() {
           $file == "${f_xf:-}" || $file == "${f_proxy:-}" ]]; then
       continue
     fi
+    tmp=$(tmp_file)
     awk -v zcap="$extra_zone" -v mcap="$extra_max" '
       function cap_zone(line,    s, n, unit, mb, repl) {
         if (!match(line, /keys_zone=[A-Za-z0-9_]+:[0-9]+[mMgG]/)) return line
@@ -2569,12 +2585,11 @@ tune_angie_configs() {
         }
         print line
       }
-    ' "$file" > "${file}.new"
-    if ! cmp -s "$file" "${file}.new"; then
-      cat "${file}.new" > "$file"
+    ' "$file" > "$tmp"
+    if ! cmp -s "$file" "$tmp"; then
+      cat "$tmp" > "$file"
       tune_note "${file#"${target}"/}: custom cache capped at ${extra_zone}m zone / ${extra_max}M max"
     fi
-    rm -f "${file}.new"
   done
 
   tune_replace "$target/h5bp/tls/ssl_engine.conf" \
@@ -2629,7 +2644,7 @@ tune_pool_dedupe() {
   shift
   local keys="$*" tmp
   [[ -f $file ]] || return 0
-  tmp=$(mktemp)
+  tmp=$(tmp_file)
   awk -v keys="$keys" '
     BEGIN { n = split(keys, k, " "); for (i = 1; i <= n; i++) managed[k[i]] = 1 }
     {
@@ -2666,7 +2681,6 @@ tune_pool_dedupe() {
     cat "$tmp" > "$file"
     tune_note "$(basename "$file"): removed duplicate managed directives"
   fi
-  rm -f "$tmp"
   return 0
 }
 
@@ -2862,14 +2876,12 @@ EOF
     fpm_bin="/usr/sbin/php-fpm${ver}"
   fi
   if [[ -n $fpm_bin ]]; then
-    fpm_test=$(mktemp)
+    fpm_test=$(tmp_file)
     if ! "$fpm_bin" -t >"$fpm_test" 2>&1; then
       printf 'PHP %s: php-fpm -t failed:\n' "$ver" >&2
       sed 's/^/  /' "$fpm_test" >&2 || true
-      rm -f "$fpm_test"
       return 1
     fi
-    rm -f "$fpm_test"
   fi
   return 0
 }
@@ -2897,6 +2909,8 @@ deploy_angie_configs() {
   # during install and during `--optimize`.
   tune_reset_changes
   tune_angie_configs /etc/angie || die "Angie tuning failed"
+  # Enable the same WordPress FastCGI guest cache that --optimize installs.
+  optimize_wordpress_cache /etc/angie || warn "WordPress cache setup was skipped"
   local change
   for change in "${TUNE_CHANGES[@]}"; do info "tune: ${change}"; done
   for change in "${TUNE_MISSES[@]}"; do warn "tune not applied: ${change}"; done
@@ -2952,10 +2966,9 @@ install_php() {
 
   if [[ ! -s /usr/share/keyrings/debsuryorg-archive-keyring.gpg ]]; then
     local deb
-    deb=$(mktemp --suffix=.deb)
+    deb=$(tmp_file --suffix=.deb)
     blob_sury_deb > "$deb"
     dpkg -i "$deb"
-    rm -f "$deb"
   fi
 
   # shellcheck disable=SC1091
@@ -2989,9 +3002,11 @@ install_php() {
     if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE '(^|:)9000$'; then
       die "Port 9000 is already in use by another process. Only one PHP version can run at a time; free the port first."
     fi
-    # Remove a stale socket left by a purged/crashed pool. FastCGI now uses
-    # the stable /run/php/php-fpm.sock path shared with Angie.
-    rm -f /run/php/php-fpm.sock
+    # A stale socket left by a purged/crashed pool is replaced by PHP-FPM
+    # itself when it binds.  setup.sh does not unlink it in case the path is
+    # still in use by another process.
+    [[ -S /run/php/php-fpm.sock ]] \
+      && info "Leaving existing FastCGI socket for PHP-FPM to validate"
   fi
   mkdir -p /run/php
   chown www-data:www-data /run/php 2>/dev/null || true
@@ -3099,17 +3114,19 @@ configure_mariadb_apparmor() {
   local localfile=/etc/apparmor.d/local/mariadbd
   local begin='# BEGIN setup.sh mariadb apparmor'
   local end='# END setup.sh mariadb apparmor'
+  local tmp
 
   mkdir -p /etc/apparmor.d/local
   # Always refresh the managed block so new log paths are picked up on
   # upgrades; keep any unrelated operator rules outside the markers.
   if [[ -f $localfile ]]; then
+    tmp=$(tmp_file)
     awk -v b="$begin" -v e="$end" '
       $0 == b { skip = 1; next }
       $0 == e { skip = 0; next }
       !skip { print }
-    ' "$localfile" > "${localfile}.new"
-    mv "${localfile}.new" "$localfile"
+    ' "$localfile" > "$tmp"
+    cat "$tmp" > "$localfile"
   fi
   {
     printf '%s\n' "$begin"
@@ -3131,10 +3148,9 @@ configure_mariadb_apparmor() {
      && aa-status 2>/dev/null | grep -qE '^[[:space:]]*mariadbd[[:space:]]*$' \
      && [[ ! -f /etc/apparmor.d/mariadbd ]]; then
     local tmp
-    tmp=$(mktemp)
+    tmp=$(tmp_file)
     printf '#include <tunables/global>\nprofile mariadbd /usr/sbin/mariadbd { }\n' > "$tmp"
     apparmor_parser -R "$tmp" 2>/dev/null || true
-    rm -f "$tmp"
   fi
 
   if [[ -f /etc/apparmor.d/mariadbd ]] && command -v apparmor_parser >/dev/null 2>&1; then
@@ -3156,7 +3172,7 @@ configure_mariadb() {
   local size_mb=$1 bind=$2
   local cnf=/etc/mysql/mariadb.conf.d/50-server.cnf
   local buffer logsize threads max_conn open_cache aria_mb
-  local io_read io_write
+  local io_read io_write tmp backlog
   [[ -f $cnf ]] || die "MariaDB config ${cnf} not found"
 
   logsize=$(( size_mb / 4 ))
@@ -3179,6 +3195,7 @@ configure_mariadb() {
   max_conn=$(( threads * 32 ))
   (( max_conn > 2000 )) && max_conn=2000
   (( max_conn < 200 )) && max_conn=200
+  backlog=$(effective_backlog)
 
   # Comment out expire_logs_days if it is active.
   sed -i -E 's|^([[:space:]]*)expire_logs_days([[:space:]]*=)|\1#expire_logs_days\2|' "$cnf"
@@ -3189,12 +3206,13 @@ configure_mariadb() {
   fi
 
   # Drop a previous managed block, then append a fresh one.
+  tmp=$(tmp_file)
   awk -v b="$MARIADB_BEGIN" -v e="$MARIADB_END" '
     $0 == b { skip = 1; next }
     $0 == e { skip = 0; next }
     !skip { print }
-  ' "$cnf" > "${cnf}.new"
-  mv "${cnf}.new" "$cnf"
+  ' "$cnf" > "$tmp"
+  cat "$tmp" > "$cnf"
 
   cat >> "$cnf" <<EOF
 ${MARIADB_BEGIN}
@@ -3215,7 +3233,7 @@ max_connect_errors = 524288
 # PHP opens a short-lived connection per request.  The default listen backlog
 # (357 on this build) overflows under a few hundred concurrent requests and
 # PDO reports "Resource temporarily unavailable" (SQLSTATE 2002).
-back_log = 65535
+back_log = ${backlog}
 thread_cache_size = 64
 # PHP opens a fresh, short-lived connection for most requests.  The thread
 # pool removes the connection/thread-creation tail latency that otherwise
@@ -3293,10 +3311,15 @@ install_mariadb() {
 
   if [[ ${size,,} == auto ]]; then
     local ram_mb
-    ram_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
-    size_mb=$(( ram_mb * 40 / 100 ))
-    (( size_mb < 256 )) && size_mb=256
-    info "MariaDB size=auto resolved to $(mb_to_config "$size_mb") (40% of RAM)"
+    if (( ${OPT_MARIADB_BUDGET_MB:-0} > 0 )); then
+      size_mb=$OPT_MARIADB_BUDGET_MB
+      info "MariaDB size=auto resolved to $(mb_to_config "$size_mb") (shared memory plan)"
+    else
+      ram_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
+      size_mb=$(( ram_mb * 40 / 100 ))
+      (( size_mb < 256 )) && size_mb=256
+      info "MariaDB size=auto resolved to $(mb_to_config "$size_mb") (40% of RAM)"
+    fi
   else
     size_mb=$(size_to_mb "$size")
     [[ -n $size_mb ]] || die "Could not parse MariaDB size '${size}'"
@@ -3424,8 +3447,9 @@ EOF
 install_valkey() {
   step "Valkey"
   if pkg_ok redis-server; then
-    warn "redis-server is installed; Valkey replaces it because both bind port 6379"
-    apt-get purge -y redis-server || true
+    warn "redis-server is installed; leaving it untouched because setup.sh never removes packages."
+    warn "Stop/disable redis-server manually before installing Valkey if you need Valkey instead."
+    return 1
   fi
   apt_clean
   apt_install valkey-server
@@ -3438,6 +3462,8 @@ install_valkey() {
   ram_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
   if [[ -n ${OPT[valkey.ram]:-} && ${OPT[valkey.ram],,} != auto ]]; then
     valkey_mb=$(size_to_mb "${OPT[valkey.ram]}")
+  elif (( ${OPT_VALKEY_BUDGET_MB:-0} > 0 )); then
+    valkey_mb=$OPT_VALKEY_BUDGET_MB
   else
     valkey_mb=$(( ram_mb / 10 ))          # ~10% of RAM for cache
     (( valkey_mb < 256 )) && valkey_mb=256
@@ -3530,21 +3556,26 @@ install_elastic() {
   local host=${OPT[elastic.host]:-localhost}
   local ram=${OPT[elastic.ram]:-auto}
   local ram_lc=${ram,,}
-  local ram_mb ram_total_mb
+  local ram_mb ram_total_mb tmp
   step "Elasticsearch"
 
   ram_total_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
   if [[ $ram_lc == auto ]]; then
-    # 25% of RAM leaves room for MariaDB's buffer pool, Valkey, PHP-FPM and
-    # the kernel page cache.  Round down to a 512 MB boundary for predictable
-    # JVM heap ergonomics and honour Elasticsearch's practical 31 GB ceiling.
-    ram_mb=$(( ram_total_mb * 25 / 100 ))
-    (( ram_mb > 31744 )) && ram_mb=31744
-    (( ram_mb < 512 )) && ram_mb=512
-    ram_mb=$(( ram_mb / 512 * 512 ))
-    (( ram_mb < 512 )) && ram_mb=512
+    if (( ${OPT_ES_BUDGET_MB:-0} > 0 )); then
+      ram_mb=$OPT_ES_BUDGET_MB
+      info "Elasticsearch heap auto-resolved to ${ram_mb} MB (shared memory plan)"
+    else
+      # 25% of RAM leaves room for MariaDB's buffer pool, Valkey, PHP-FPM and
+      # the kernel page cache.  Round down to a 512 MB boundary for predictable
+      # JVM heap ergonomics and honour Elasticsearch's practical 31 GB ceiling.
+      ram_mb=$(( ram_total_mb * 25 / 100 ))
+      (( ram_mb > 31744 )) && ram_mb=31744
+      (( ram_mb < 512 )) && ram_mb=512
+      ram_mb=$(( ram_mb / 512 * 512 ))
+      (( ram_mb < 512 )) && ram_mb=512
+      info "Elasticsearch heap auto-resolved to ${ram_mb} MB (25% of RAM)"
+    fi
     ram_lc="${ram_mb}m"
-    info "Elasticsearch heap auto-resolved to ${ram_mb} MB (25% of RAM)"
   elif [[ $ram_lc == *g ]]; then
     ram_mb=$(( ${ram_lc%g} * 1024 ))
   else
@@ -3591,15 +3622,16 @@ install_elastic() {
     es_url="http://${host}:9200"
   fi
 
-  # Remove previous managed block, including the one written by
+  # Drop previous managed block, including the one written by
   # `setup.sh --optimize`; otherwise a reinstall leaves two copies of
   # bootstrap.memory_lock and Elasticsearch refuses to start.
+  tmp=$(tmp_file)
   awk -v b="$ES_BEGIN" -v e="$ES_END" '
     $0 == b || $0 == "# BEGIN setup.sh optimize" { skip = 1; next }
     $0 == e || $0 == "# END setup.sh optimize" { skip = 0; next }
     !skip { print }
-  ' "$yml" > "${yml}.new"
-  mv "${yml}.new" "$yml"
+  ' "$yml" > "$tmp"
+  cat "$tmp" > "$yml"
 
   # Comment out keys that we are about to set (keeps YAML free of duplicates).
   local key
@@ -3844,7 +3876,7 @@ EOF
           info "Composer already present at /usr/local/bin/composer; keeping it"
         else
           local tmp
-          tmp=$(mktemp)
+          tmp=$(tmp_file)
           retry 3 5 curl -fsSL --proto '=https' --tlsv1.2 \
             https://getcomposer.org/download/latest-stable/composer.phar \
             -o "$tmp" \
@@ -3852,7 +3884,6 @@ EOF
           "$php_bin" "$tmp" --version >/dev/null 2>&1 \
             || die "Downloaded Composer phar is not runnable with PHP ${php_ver}"
           install -m 755 "$tmp" /usr/local/bin/composer
-          rm -f "$tmp"
           touch "${STATE_DIR}/setup-created-composer-phar"
         fi
         "$php_bin" /usr/local/bin/composer --version 2>/dev/null | head -n 1 || true
@@ -3932,7 +3963,7 @@ create_domains() {
     if [[ -e $conf && -s $conf ]]; then
       info "Angie config already exists and is non-empty; keeping ${conf}"
     else
-      tmp=$(mktemp)
+      tmp=$(tmp_file)
       case "$app" in
         blank)
           : > "$tmp"
@@ -4006,21 +4037,21 @@ create_domains() {
             "$tmp"
           ;;
         *)
-          rm -f "$tmp"
           die "Internal error: unhandled app '${app}' for ${d}"
           ;;
       esac
 
       install -m 644 "$tmp" "$conf"
       local domain_test_log
-      domain_test_log=$(mktemp)
+      domain_test_log=$(tmp_file)
       if ! /usr/sbin/angie -t >"$domain_test_log" 2>&1; then
-        rm -f "$conf"
         cat "$domain_test_log" >&2 || true
-        rm -f "$domain_test_log"
+        # Keep the rejected file out of the live config without deleting it.
+        local rejected
+        rejected=$(preserve_to_tmp "$conf" || true)
+        [[ -n $rejected ]] && warn "Moved rejected vhost to ${rejected}"
         die "Angie rejected the generated vhost for ${d} (app=${app})"
       fi
-      rm -f "$tmp" "$domain_test_log"
       # "angie -t" runs from this shell (umask 022) and creates the per-vhost
       # log files before systemd's UMask=0027 applies. Normalise them now.
       find "${LOG_ROOT}/angie" -type f -name '*.log' -exec chmod 640 {} + 2>/dev/null || true
@@ -4046,27 +4077,13 @@ create_domains() {
 # PURGE
 # ---------------------------------------------------------------------------
 apt_purge_pkgs() {
-  local p pkgs=()
-  for p in "$@"; do
-    if dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q 'ok installed'; then
-      pkgs+=("$p")
-    fi
-  done
-  if (( ${#pkgs[@]} > 0 )); then
-    info "Purging: ${pkgs[*]}"
-    apt-get purge -y "${pkgs[@]}" || warn "purge of some packages failed"
-  fi
+  # Disabled by design: package purging permanently deletes files and can
+  # break a running server.  Keep the packages and say so in the log.
+  info "Leaving package(s) installed: $*"
 }
 
 apt_purge_pattern() {
-  local pattern=$1 name status pkgs=()
-  while IFS=$'\t' read -r name status; do
-    [[ $status == *'ok installed' ]] && pkgs+=("$name")
-  done < <(dpkg-query -W -f='${binary:Package}\t${Status}\n' "$pattern" 2>/dev/null || true)
-  if (( ${#pkgs[@]} > 0 )); then
-    info "Purging: ${pkgs[*]}"
-    apt-get purge -y "${pkgs[@]}" || warn "purge of ${pattern} failed"
-  fi
+  info "Leaving packages matching '$1' installed"
 }
 
 purge_service_stop() {
@@ -4077,15 +4094,9 @@ purge_service_stop() {
 purge_basic() {
   step "Purge basic setup"
   if [[ -f "${STATE_DIR}/swapfile-managed" ]]; then
-    if [[ -f /swapfile ]]; then
-      swapoff /swapfile 2>/dev/null || true
-      rm -f /swapfile
-      info "Removed /swapfile"
-    fi
-    if [[ -f /etc/fstab ]] && grep -qE '^[[:space:]]*/swapfile[[:space:]]' /etc/fstab; then
-      sed -i -E '\|^[[:space:]]*/swapfile[[:space:]]|d' /etc/fstab
-      info "Removed /swapfile from /etc/fstab"
-    fi
+    # Leave swap active and keep the /etc/fstab entry.  Turning swap off or
+    # unlinking the file can leave a busy host without emergency memory.
+    info "Leaving managed /swapfile and its /etc/fstab entry in place"
   else
     info "Leaving pre-existing swap configuration unchanged"
   fi
@@ -4093,10 +4104,9 @@ purge_basic() {
   local cur tmp
   cur=$(crontab -l 2>/dev/null || true)
   if [[ -n $cur ]]; then
-    tmp=$(mktemp)
+    tmp=$(tmp_file)
     printf '%s\n' "$cur" | cron_strip_managed > "$tmp"
-    if [[ -s $tmp ]]; then crontab "$tmp"; else crontab -r 2>/dev/null || true; fi
-    rm -f "$tmp"
+    crontab "$tmp"
     info "Removed managed cron entries"
   fi
 
@@ -4154,9 +4164,10 @@ purge_basic() {
   restore_original /etc/sysctl.conf sysctl.conf
   restore_original /etc/sysctl.d/99-sysctl.conf sysctl.d-99-sysctl.conf
   restore_original /etc/sysctl.d/90-setup-network.conf sysctl.d-90-setup-network.conf
-  rm -f /etc/modules-load.d/setup-network.conf /etc/modules-load.d/setup-conntrack.conf
+  # Keep the modules-load drop-ins and the oneshot unit on disk.  Disabling the
+  # unit is enough to stop it running; unlink them manually if they are truly
+  # unwanted.
   systemctl disable --now setup-network-tuning.service 2>/dev/null || true
-  rm -f /etc/systemd/system/setup-network-tuning.service
   systemctl daemon-reload || true
   restore_original /etc/systemd/resolved.conf.d resolved.conf.d
   if [[ -f /etc/sysctl.conf ]]; then
@@ -4181,13 +4192,13 @@ purge_basic() {
   if [[ -f "${STATE_DIR}/cpufrequtils-installed" ]]; then
     cpufreq-set -g powersave 2>/dev/null || true
     apt_purge_pkgs cpufrequtils
-    rm -f /etc/default/cpufrequtils
+    info "Leaving /etc/default/cpufrequtils in place"
   else
     restore_original /etc/default/cpufrequtils cpufrequtils-default
   fi
 
   systemctl restart systemd-resolved 2>/dev/null || true
-  rm -rf "$STATE_DIR"
+  info "Leaving setup state in ${STATE_DIR} for a future reinstall or rollback"
   ok "Basic setup purged"
 }
 
@@ -4195,106 +4206,39 @@ purge_angie() {
   step "Purge Angie"
   purge_service_stop angie
   apt_purge_pkgs angie
-  rm -rf /etc/angie /var/lib/angie /var/log/angie /var/cache/angie
-  rm -rf "${LOG_ROOT}/angie"
-  rm -rf /home/nginx_cache /home/nginx_cache_chev /home/xf_proxy_cache \
-         /home/proxy_cache /home/proxy_cdn
-  rm -f /root/install_angie.sh /root/nginx_conf.sh
-  rm -f /etc/apt/sources.list.d/angie.list /etc/apt/trusted.gpg.d/angie-signing.gpg
-  rm -f /etc/default/angie
-  rm -rf /etc/systemd/system/angie.service.d
+  # Configuration, data, caches and logs are left on disk.  Reinstalling Angie
+  # then restores the exact site instead of starting from an empty tree.
+  info "Leaving Angie files under /etc/angie, /var/lib/angie, /var/log/angie, /var/cache/angie and ${LOG_ROOT}/angie"
+  info "Leaving cache directories and /root installer files in place"
   cron_remove_line '/etc/angie/scripts/cloudflare.sh'
   cron_remove_line '/usr/bin/chown www-data:www-data -R /var/www/'
   systemctl daemon-reload || true
-  ok "Angie purged"
-}
-
-purge_php_dependents() {
-  # Composer and its library packages depend on virtual php-cli/php-json/
-  # php-intl providers.  If they are left installed, apt "satisfies" them by
-  # installing an unrelated old PHP/Apache stack during the purge.  Remove the
-  # setup-installed dependency tree first.
-  if pkg_installed_by_setup composer; then
-    apt_purge_pkgs composer jsonlint
-  elif pkg_ok composer && pkg_preexisting composer; then
-    die "Composer was installed before setup.sh and depends on PHP. Remove Composer first, or use --purge all."
-  fi
-
-  local p
-  local -a libs=()
-  while IFS= read -r p; do
-    [[ -n $p ]] || continue
-    case "$p" in php[0-9]*) continue ;; esac
-    pkg_ok "$p" || continue
-    pkg_preexisting "$p" && continue
-    libs+=("$p")
-  done < <(dpkg-query -W -f='${Package}\n' 'php-*' 2>/dev/null || true)
-  (( ${#libs[@]} == 0 )) || apt_purge_pkgs "${libs[@]}"
-  apt-get autoremove --purge -y || true
+  ok "Angie purged (files preserved)"
 }
 
 purge_php() {
   step "Purge PHP"
-  local ver=${OPT[php.ver]:-}
-  local other_php=0 pkg
-  if [[ -n $ver ]]; then
-    while IFS= read -r pkg; do
-      [[ $pkg =~ ^php[0-9]+\.[0-9]+-fpm$ ]] || continue
-      [[ $pkg == "php${ver}-fpm" ]] && continue
-      other_php=1
-    done < <(dpkg-query -W -f='${Package}\n' 'php*-fpm' 2>/dev/null || true)
-  fi
-  if (( other_php == 0 )); then
-    purge_php_dependents
-  fi
+  local ver=${OPT[php.ver]:-} d v
 
   if [[ -n $ver ]]; then
     purge_service_stop "php${ver}-fpm"
     apt_purge_pattern "php${ver}-*"
-    rm -rf "/etc/php/${ver}" "/etc/systemd/system/php${ver}-fpm.service.d"
   else
-    local d v pkg
     local -a vers=()
     for d in /etc/php/*; do
       [[ -d $d ]] || continue
       v=$(basename "$d")
       [[ $v =~ ^[0-9]+\.[0-9]+$ ]] && vers+=("$v")
     done
-    while IFS= read -r pkg; do
-      [[ -n $pkg ]] || continue
-      v=${pkg#php}
-      v=${v%-fpm}
-      [[ $v =~ ^[0-9]+\.[0-9]+$ ]] && vers+=("$v")
-    done < <(dpkg-query -W -f='${Package}\n' 'php*-fpm' 2>/dev/null || true)
-    # de-duplicate while keeping order
-    local seen=" "
     for v in "${vers[@]}"; do
-      [[ $seen == *" ${v} "* ]] && continue
-      seen+="${v} "
       purge_service_stop "php${v}-fpm"
       apt_purge_pattern "php${v}-*"
-      rm -rf "/etc/php/${v}" "/etc/systemd/system/php${v}-fpm.service.d"
     done
-    rm -rf /etc/php
   fi
-  rm -rf /var/log/php* /var/log/php-fpm
-  rm -rf "${LOG_ROOT}/php"
-  rm -f /run/php/php-fpm.sock
-  rm -rf /run/php /var/lib/php /var/cache/php
-  rm -rf /etc/systemd/system/php*-fpm.service.d
   systemctl disable --now phpsessionclean.timer 2>/dev/null || true
-  rm -f /etc/systemd/system/timers.target.wants/phpsessionclean.timer
   systemctl daemon-reload || true
-
-  if [[ -d /etc/php ]] && [[ -z $(ls -A /etc/php 2>/dev/null) ]]; then
-    rmdir /etc/php 2>/dev/null || true
-  fi
-  if [[ ! -d /etc/php ]] || [[ -z $(ls -A /etc/php 2>/dev/null) ]]; then
-    rm -f /etc/apt/sources.list.d/php.list
-    apt_purge_pkgs debsuryorg-archive-keyring
-    rm -f /usr/share/keyrings/debsuryorg-archive-keyring.gpg
-  fi
-  ok "PHP purged"
+  info "Leaving PHP configuration, logs, caches and packages in place"
+  ok "PHP purged (files preserved)"
 }
 
 purge_mariadb() {
@@ -4305,107 +4249,59 @@ purge_mariadb() {
   apt_purge_pattern 'mariadb-common'
   apt_purge_pattern 'mariadb-plugin-*'
   apt_purge_pkgs mysql-common
-  rm -rf /etc/mysql /var/lib/mysql /var/lib/mariadb /var/log/mariadb /var/log/mysql
-  rm -rf "${LOG_ROOT}/mariadb"
-  rm -rf /var/lib/mysql-files /var/lib/mysql-keyring /run/mysqld
-  rm -rf /etc/systemd/system/mariadb.service.d
-  rm -rf /root/tools /root/mysqltuner.pl
-  rm -f /etc/mysqlbkup.config /etc/mysqlbkup.cnf /usr/local/bin/mysqlbkup.sh
-  rm -rf /var/www/mysql_database
+  info "Leaving MariaDB databases, configuration, backups and logs in place"
 
-  # Remove the AppArmor override added for mariadb-install-db.
+  # Drop the AppArmor override added for mariadb-install-db, while keeping any
+  # operator rules outside the managed markers.
   local aflocal=/etc/apparmor.d/local/mariadbd
   if [[ -f $aflocal ]]; then
     local tmp
-    tmp=$(mktemp)
+    tmp=$(tmp_file)
     awk -v b='# BEGIN setup.sh mariadb apparmor' -v e='# END setup.sh mariadb apparmor' '
       $0 == b { skip = 1; next }
       $0 == e { skip = 0; next }
       !skip { print }
     ' "$aflocal" > "$tmp"
-    mv "$tmp" "$aflocal"
-    if [[ ! -s $aflocal ]]; then rm -f "$aflocal"; fi
+    cat "$tmp" > "$aflocal"
     if [[ -f /etc/apparmor.d/mariadbd ]] && command -v apparmor_parser >/dev/null 2>&1; then
       apparmor_parser -r /etc/apparmor.d/mariadbd 2>/dev/null || true
     fi
   fi
-  rmdir /var/www 2>/dev/null || true
   if [[ -f "${STATE_DIR}/lz4-installed" ]]; then
     apt_purge_pkgs lz4
   fi
   cron_remove_line '/usr/local/bin/mysqlbkup.sh'
   cron_remove_line '/usr/bin/mariadb-check'
   systemctl daemon-reload || true
-  ok "MariaDB purged"
+  ok "MariaDB purged (files preserved)"
 }
 
 purge_valkey() {
   step "Purge Valkey"
   purge_service_stop valkey-server
-  # The installer adds www-data to the valkey group; drop the membership
-  # first so userdel/groupdel can remove the service account cleanly.
-  if getent group valkey >/dev/null 2>&1; then
-    gpasswd -d www-data valkey >/dev/null 2>&1 || true
-  fi
   apt_purge_pattern 'valkey-*'
-  groupdel valkey >/dev/null 2>&1 || true
-  rm -rf /etc/valkey /var/lib/valkey /var/log/valkey /run/valkey
-  rm -rf "${LOG_ROOT}/valkey"
-  rm -rf /etc/systemd/system/valkey-server.service.d
+  # Keep the valkey group and www-data's membership.  Removing the account
+  # would break a reinstall and is an account change, not an uninstall.
+  info "Leaving Valkey data, configuration and logs in place"
   systemctl daemon-reload || true
-  ok "Valkey purged"
+  ok "Valkey purged (files preserved)"
 }
 
 purge_elastic() {
   step "Purge Elasticsearch"
   purge_service_stop elasticsearch
   apt_purge_pkgs elasticsearch
-  rm -rf /etc/elasticsearch /var/lib/elasticsearch /var/log/elasticsearch /run/elasticsearch
-  rm -rf "${LOG_ROOT}/elasticsearch"
-  rm -rf /etc/systemd/system/elasticsearch.service.d
-  rm -f /etc/apt/sources.list.d/elastic-9.x.list /usr/share/keyrings/elasticsearch-keyring.gpg
-  rm -f /etc/sysctl.d/99-elasticsearch.conf
+  info "Leaving Elasticsearch data, configuration and logs in place"
   systemctl daemon-reload || true
-  ok "Elasticsearch purged"
+  ok "Elasticsearch purged (files preserved)"
 }
 
 purge_others() {
   step "Purge other packages"
-  local pkg
-  local -a removable=()
-  rm -f /etc/fail2ban/jail.d/setup-ssh.local 2>/dev/null || true
-  rm -f /etc/apt/apt.conf.d/52setup-unattended 2>/dev/null || true
-  for pkg in smartmontools nvme-cli gifsicle fail2ban unattended-upgrades \
-             sysstat composer; do
-    if pkg_preexisting "$pkg" || ! pkg_installed_by_setup "$pkg"; then
-      info "Keeping package not installed by setup.sh: ${pkg}"
-    else
-      removable+=("$pkg")
-    fi
-  done
-  (( ${#removable[@]} == 0 )) || apt_purge_pkgs "${removable[@]}"
-  rm -rf "${LOG_ROOT}/nodejs" "${LOG_ROOT}/gifsicle"
-
-  if pkg_ok nodejs; then
-    if pkg_preexisting nodejs || ! pkg_installed_by_setup nodejs; then
-      info "Keeping Node.js (not installed by setup.sh)"
-    else
-      info "Removing Node.js (installed by setup.sh)"
-      apt_purge_pkgs nodejs
-    fi
-  fi
-  if [[ -f "${STATE_DIR}/setup-created-nodesource-repo" ]]; then
-    rm -f /etc/apt/sources.list.d/nodesource.sources /etc/apt/sources.list.d/nodesource.list
-    rm -f /etc/apt/preferences.d/nodejs /etc/apt/preferences.d/nsolid
-  fi
-  if [[ -f "${STATE_DIR}/setup-created-nodesource-key" ]]; then
-    rm -f /usr/share/keyrings/nodesource.gpg
-  fi
-  if [[ -f "${STATE_DIR}/setup-created-composer-phar" ]]; then
-    rm -f /usr/local/bin/composer
-    rm -f "${STATE_DIR}/setup-created-composer-phar"
-  fi
-  ok "Other packages purged"
+  # No package, repository, keyring or Composer file is removed.  Operators can
+  # remove anything they no longer want once they are sure it is unused.
+  info "Leaving optional packages, repositories, keyrings and Composer in place"
+  ok "Other packages left installed"
 }
 
 build_purge_order() {
@@ -4430,8 +4326,7 @@ build_purge_order() {
 
   PURGE_ORDER=()
   if [[ -n ${wanted[all]:-} ]]; then
-    # Remove "others" (Composer/Node/fail2ban) before PHP so Composer's PHP
-    # dependencies cannot make apt install an old alternative PHP stack.
+    # Stop dependents before the services they use.  No package is removed.
     PURGE_ORDER=(angie others php mariadb valkey elastic basic)
   else
     for t in angie others php mariadb valkey elastic basic; do
@@ -4459,13 +4354,8 @@ run_purge() {
   done
 
   apt_clean
-  # When every service log directory is gone, remove the shared log root and
-  # its rotation policy too.
-  if [[ -d $LOG_ROOT ]] && [[ -z $(ls -A "$LOG_ROOT" 2>/dev/null) ]]; then
-    rm -f /etc/logrotate.d/setup-logs
-    rmdir "$LOG_ROOT" 2>/dev/null || true
-  fi
-  printf '\n%sPurge complete.%s\n' "$C_GREEN" "$C_RESET"
+  info "Purge only stopped services; all configuration, data and log files were preserved"
+  printf '\n%sPurge complete (no files were deleted).%s\n' "$C_GREEN" "$C_RESET"
 }
 
 # ---------------------------------------------------------------------------
@@ -4525,7 +4415,7 @@ print_plan() {
   if [[ ${PURGE} -eq 1 ]]; then
     build_purge_order
     printf 'Purge order: %s\n' "${PURGE_ORDER[*]}"
-    printf 'Notes: MariaDB/PHP/Angie/Valkey/Elasticsearch data and configuration are removed.\n'
+    printf 'Notes: services are stopped/disabled; packages, data, configuration and logs are preserved.\n'
     printf '       Packages that existed before setup.sh are preserved for --others.\n'
     return 0
   fi
@@ -4593,7 +4483,7 @@ opt_report() { OPT_REPORT+=("$*"); }
 
 opt_backup() {
   local path=$1 name=$2
-  [[ -n $OPT_BACKUP_DIR ]] || OPT_BACKUP_DIR="/var/backups/setup-optimize-$(date +%Y%m%d-%H%M%S)"
+  [[ -n $OPT_BACKUP_DIR ]] || OPT_BACKUP_DIR="${TMP_ROOT}/setup-optimize-$(date +%Y%m%d-%H%M%S)"
   # Copies include /etc/angie/ssl/*/privkey.pem and /etc/mysql/debian.cnf.
   # 0700 keeps the rollback tree (and its filenames) private to root.
   install -d -m 700 "$OPT_BACKUP_DIR"
@@ -4607,15 +4497,22 @@ opt_backup() {
 }
 
 opt_restore() {
-  local path=$1 name=$2
+  local path=$1 name=$2 src="${OPT_BACKUP_DIR}/${name}" moved
   [[ -n $OPT_BACKUP_DIR ]] || return 1
-  if [[ -e "$OPT_BACKUP_DIR/${name}" ]]; then
-    rm -rf "$path"
-    cp -a "$OPT_BACKUP_DIR/${name}" "$path"
+  if [[ -e $src ]]; then
+    # Overwrite in place; never unlink the live path before restoring it.
+    if [[ -d $src ]]; then
+      mkdir -p "$path"
+      cp -a "${src}/." "$path/"
+    else
+      cp -a "$src" "$path"
+    fi
     opt_report "ROLLBACK: restored \`${path}\` from backup"
-  elif [[ -e "$OPT_BACKUP_DIR/${name}.absent" ]]; then
-    rm -rf "$path"
-    opt_report "ROLLBACK: removed \`${path}\` (it did not exist before)"
+  elif [[ -e "${OPT_BACKUP_DIR}/${name}.absent" ]]; then
+    # The file did not exist before tuning.  Move the generated file to /tmp
+    # instead of deleting it, so the original state is restored without loss.
+    moved=$(preserve_to_tmp "$path") || return 1
+    [[ -n $moved ]] && opt_report "ROLLBACK: moved \`${path}\` to \`${moved}\` (not deleted)"
   fi
 }
 
@@ -4659,13 +4556,6 @@ OPT_ES_KEPT_MB=0
 
 mem_total_mb() {
   awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || printf '1024'
-}
-
-opt_clamp() {
-  local value=$1 min=$2 max=$3
-  (( value < min )) && value=$min
-  (( value > max )) && value=$max
-  printf '%s' "$value"
 }
 
 # Data + index bytes for user schemas as whole MB.  The InnoDB buffer pool
@@ -4792,7 +4682,7 @@ plan_memory_budget() {
         cache_cap=65536
       fi
     fi
-    OPT_VALKEY_BUDGET_MB=$(opt_clamp $(( total * cache_pct / 100 )) 256 "$cache_cap")
+    OPT_VALKEY_BUDGET_MB=$(tune_clamp $(( total * cache_pct / 100 )) 256 "$cache_cap")
   fi
 
   # The heap follows the live index store (+5%) up to the 31 GB
@@ -4815,7 +4705,7 @@ plan_memory_budget() {
       if (( !has_angie && !has_php && !has_maria && !has_cache )); then
         es_fallback_pct=50
       fi
-      es_base=$(opt_clamp $(( total * es_fallback_pct / 100 )) 512 "$es_base_cap")
+      es_base=$(tune_clamp $(( total * es_fallback_pct / 100 )) 512 "$es_base_cap")
     fi
     (( es_base < 512 )) && es_base=512
     (( es_base > es_hard_cap )) && es_base=$es_hard_cap
@@ -4855,7 +4745,7 @@ plan_memory_budget() {
       if (( !has_php && !has_cache && !has_es )); then
         db_fallback_pct=80
       fi
-      OPT_MARIADB_BUDGET_MB=$(opt_clamp $(( total * db_fallback_pct / 100 )) 256 "$db_cap")
+      OPT_MARIADB_BUDGET_MB=$(tune_clamp $(( total * db_fallback_pct / 100 )) 256 "$db_cap")
     fi
     (( OPT_MARIADB_BUDGET_MB < 256 )) && OPT_MARIADB_BUDGET_MB=256
     (( OPT_MARIADB_BUDGET_MB > db_cap )) && OPT_MARIADB_BUDGET_MB=$db_cap
@@ -4911,6 +4801,21 @@ plan_memory_budget() {
     (( OPT_ES_BUDGET_MB < 512 )) && OPT_ES_BUDGET_MB=512
   fi
   return 0
+}
+
+# Build the same shared memory plan for a fresh install that --optimize builds
+# for an existing host.  Services that are about to be installed are treated as
+# present so PHP/MariaDB/Valkey/Elasticsearch are sized against one budget from
+# the first write instead of each claiming its own percentage of RAM.
+plan_install_budget() {
+  OPT_DETECTED=()
+  [[ ${ENABLED[angie]:-0} -eq 1 ]]   && OPT_DETECTED+=(angie)
+  [[ ${ENABLED[php]:-0} -eq 1 ]]     && OPT_DETECTED+=("php:${OPT[php.ver]:-auto}")
+  [[ ${ENABLED[mariadb]:-0} -eq 1 ]] && OPT_DETECTED+=(mariadb)
+  [[ ${ENABLED[valkey]:-0} -eq 1 ]]  && OPT_DETECTED+=(valkey)
+  [[ ${ENABLED[elastic]:-0} -eq 1 ]] && OPT_DETECTED+=(elastic)
+  plan_memory_budget
+  info "Memory plan: ${OPT_MEM_BUDGET_MB}MB usable of ${OPT_MEM_TOTAL_MB}MB (PHP=${OPT_PHP_BUDGET_MB}MB MariaDB=${OPT_MARIADB_BUDGET_MB}MB Cache=${OPT_VALKEY_BUDGET_MB}MB Elasticsearch=${OPT_ES_BUDGET_MB}MB)"
 }
 
 php_fpm_versions() {
@@ -4998,14 +4903,14 @@ wordpress_cache_templates() {
   repo=${base#https://github.com/}
   raw="https://raw.githubusercontent.com/${repo}/${CONFIG_REPO_REF}"
   command -v curl >/dev/null 2>&1 || return 1
-  temp=$(mktemp -d) || return 1
+  temp=$(tmp_dir) || return 1
   for file in h5bp/wordpress_cache.conf \
               http.d/wordpress_cache_map.conf \
               http.d/fastcgi_cache.conf; do
     mkdir -p "${temp}/$(dirname "$file")"
     if ! retry 3 2 curl -fsSL --proto '=https' --tlsv1.2 \
          "${raw}/${file}" -o "${temp}/${file}" 2>/dev/null; then
-      rm -rf "$temp"
+      # Leave the partial download in /tmp; it expires on its own.
       return 1
     fi
   done
@@ -5103,8 +5008,33 @@ optimize_wordpress_cache() {
   else
     opt_report "- WordPress: FastCGI guest cache already enabled for ${#wp_vhosts[@]} vhost(s)"
   fi
-  [[ -n $temp ]] && rm -rf "$temp"
   return 0
+}
+
+# Match the installer's systemd fd limit on an existing server too.  Only the
+# fd limit is checked: Angie daemonises with umask(0), so a UMask= drop-in
+# does not change the modes of the files its workers create.  Rewriting an
+# unchanged file would force a needless restart, so compare first.
+ANGIE_UNIT_CHANGED=0
+ensure_angie_limits() {
+  local angie_limit angie_dropin=/etc/systemd/system/angie.service.d/limits.conf
+  local angie_before="" changed=0
+  ANGIE_UNIT_CHANGED=0
+  angie_limit=$(systemctl show -p LimitNOFILE --value angie 2>/dev/null || true)
+  [[ -f $angie_dropin ]] && angie_before=$(md5sum "$angie_dropin" | awk '{print $1}')
+  if [[ $angie_limit != infinity ]] \
+     && { ! [[ $angie_limit =~ ^[0-9]+$ ]] || (( angie_limit < 524288 )); }; then
+    mkdir -p /etc/systemd/system/angie.service.d
+    printf '[Service]\nLimitNOFILE=524288\nUMask=0027\n' > "$angie_dropin"
+    chmod 644 "$angie_dropin"
+    if [[ $angie_before != "$(md5sum "$angie_dropin" | awk '{print $1}')" ]]; then
+      systemctl daemon-reload || true
+      changed=1
+      ANGIE_UNIT_CHANGED=1
+      tune_summary "Angie: systemd LimitNOFILE=524288 (applies on next restart)"
+    fi
+  fi
+  return "$changed"
 }
 
 optimize_angie() {
@@ -5115,25 +5045,8 @@ optimize_angie() {
   opt_report "- Version: \`${version:-unknown}\`; active: ${active}"
   opt_backup /etc/angie angie
   tune_reset_changes
-  # Match the installer's systemd fd limit on old servers too.  Only the fd
-  # limit is checked: Angie daemonises with umask(0), so a UMask= drop-in does
-  # not change the modes of the files its workers create.  Rewriting an
-  # unchanged file would force a needless restart, so compare first.
-  local angie_limit angie_dropin=/etc/systemd/system/angie.service.d/limits.conf
-  local angie_before="" unit_changed=0
-  angie_limit=$(systemctl show -p LimitNOFILE --value angie 2>/dev/null || true)
-  [[ -f $angie_dropin ]] && angie_before=$(md5sum "$angie_dropin" | awk '{print $1}')
-  if [[ $angie_limit != infinity ]] \
-     && { ! [[ $angie_limit =~ ^[0-9]+$ ]] || (( angie_limit < 524288 )); }; then
-    mkdir -p /etc/systemd/system/angie.service.d
-    printf '[Service]\nLimitNOFILE=524288\nUMask=0027\n' > "$angie_dropin"
-    chmod 644 "$angie_dropin"
-    if [[ $angie_before != "$(md5sum "$angie_dropin" | awk '{print $1}')" ]]; then
-      systemctl daemon-reload || true
-      unit_changed=1
-      tune_summary "Angie: systemd LimitNOFILE=524288 (applies on next restart)"
-    fi
-  fi
+  ensure_angie_limits || true
+  local unit_changed=$ANGIE_UNIT_CHANGED
   optimize_wordpress_cache /etc/angie || true
   if ! tune_angie_configs /etc/angie; then
     opt_restore /etc/angie angie
@@ -5141,17 +5054,15 @@ optimize_angie() {
     return 1
   fi
   local angie_test_log
-  angie_test_log=$(mktemp)
+  angie_test_log=$(tmp_file)
   if ! /usr/sbin/angie -t >"$angie_test_log" 2>&1; then
     opt_report "- **FAILED** \`angie -t\`:"
     while IFS= read -r change; do opt_report "  \`${change}\`"; done < "$angie_test_log"
-    rm -f "$angie_test_log"
     opt_restore /etc/angie angie
     /usr/sbin/angie -t >/dev/null 2>&1 \
       && { systemctl reload angie 2>/dev/null || systemctl restart angie 2>/dev/null; } || true
     return 1
   fi
-  rm -f "$angie_test_log"
   for change in "${TUNE_CHANGES[@]}"; do opt_report "- ${change}"; done
   for change in "${TUNE_MISSES[@]}"; do opt_report "- Not applied: ${change}"; done
   local -a inert=()
@@ -5226,7 +5137,7 @@ migrate_php_pool_to_socket() {
   local pool="/etc/php/${ver}/fpm/pool.d/www.conf"
   local angie_conf=/etc/angie/angie.conf
   local socket=/run/php/php-fpm.sock
-  local bak="${OPT_BACKUP_DIR:-/var/backups/setup-php-socket-$(date +%Y%m%d-%H%M%S)}/php-socket"
+  local bak="${OPT_BACKUP_DIR:-${TMP_ROOT}/setup-php-socket-$(date +%Y%m%d-%H%M%S)}/php-socket"
   local fpm_bin="" tcp_re port i ok=0
   MIGRATE_REASON=""
 
@@ -5247,9 +5158,6 @@ migrate_php_pool_to_socket() {
   grep -qE "^[[:space:]]*server[[:space:]]+${tcp_re};" "$angie_conf" \
     || { MIGRATE_REASON="upstream does not contain ${tcp}"; return 1; }
 
-  if [[ -S $socket ]] && ! ss -lx 2>/dev/null | grep -qF "$socket"; then
-    rm -f "$socket"
-  fi
   if ss -lx 2>/dev/null | grep -qF "$socket"; then
     MIGRATE_REASON="${socket} is already owned by another pool"
     return 1
@@ -5567,7 +5475,7 @@ optimize_mariadb() {
   [[ -f $cnf ]] && cnf_before=$(md5sum "$cnf" | awk '{print $1}')
   local cnf_old=""
   if [[ -f $cnf ]]; then
-    cnf_old=$(mktemp)
+    cnf_old=$(tmp_file)
     cp -a "$cnf" "$cnf_old"
   fi
 
@@ -5652,12 +5560,10 @@ EOF
         | awk '{printf "%d", $1 / 1024 / 1024}')
       opt_report "- Applied buffer pool online: ${online_mb:-$size_mb}MB (no restart)"
       if (( unit_changed == 0 )); then
-        rm -f "$cnf_old"
         return 0
       fi
       if [[ $limit_before =~ ^[0-9]+$ ]] && (( limit_before >= 65536 )); then
         opt_report "- Restart: deferred (LimitNOFILE=${limit_before} is already sufficient; the drop-in applies on the next restart)"
-        rm -f "$cnf_old"
         return 0
       fi
       # The fd drop-in still needs a restart; fall through to apply it.
@@ -5665,7 +5571,6 @@ EOF
       opt_report "- Online buffer-pool resize failed; falling back to a restart"
     fi
   fi
-  rm -f "$cnf_old"
   if [[ -n $cnf_before && $cnf_before == "$cnf_after" ]]; then
     if (( unit_changed == 0 )); then
       opt_report "- Restart: skipped (configuration already optimized)"
@@ -5953,10 +5858,11 @@ write_es_jvm_options() {
 EOF
   chmod 644 "$jvm"
   chown root:elasticsearch "$jvm" 2>/dev/null || true
-  # Never delete an operator's own jvm.options; only the exact shape written
-  # by install_elastic() before 1.8.20.
+  # Never delete an operator's own jvm.options; only move the exact shape
+  # written by install_elastic() before 1.8.20 to /tmp.  It stays recoverable
+  # and /tmp expires it automatically.
   if es_jvm_options_is_managed "${dir}/jvm.options"; then
-    rm -f "${dir}/jvm.options"
+    preserve_to_tmp "${dir}/jvm.options" >/dev/null || true
   fi
   return 0
 }
@@ -6062,7 +5968,7 @@ optimize_elastic() {
   local jvm=$ES_JVM_OPTIONS
   local legacy=/etc/elasticsearch/jvm.options.d/jvm.options
   local unit=/etc/systemd/system/elasticsearch.service.d/optimize.conf
-  local es_before jvm_before legacy_before unit_before es_after jvm_after unit_after changed=0
+  local es_before jvm_before legacy_before unit_before es_after jvm_after unit_after changed=0 tmp
   systemctl is-active --quiet elasticsearch 2>/dev/null && active=1
   opt_report "## Elasticsearch"
   opt_report "- Active: ${active}; config: \`${yml}\`"
@@ -6111,12 +6017,13 @@ optimize_elastic() {
   write_es_jvm_options "$heap_mb"
 
   # Drop a previous optimize block so repeated runs stay idempotent.
+  tmp=$(tmp_file)
   awk -v b='# BEGIN setup.sh optimize' -v e='# END setup.sh optimize' '
     $0 == b { skip=1; next }
     $0 == e { skip=0; next }
     !skip { print }
-  ' "$yml" > "${yml}.new"
-  mv "${yml}.new" "$yml"
+  ' "$yml" > "$tmp"
+  cat "$tmp" > "$yml"
 
   local key
   for key in bootstrap.memory_lock indices.query.bool.max_clause_count \
@@ -6455,6 +6362,10 @@ run_os_tuning() {
   # same hardware-aware profile as a fresh build.  Each tuner is idempotent
   # and records the original files for a later --purge.
   configure_cpu_governor
+  # The installer targets 50% of RAM as swap (and does nothing when the host
+  # already has enough).  Apply the same policy during --optimize so a live
+  # host has the same memory-pressure headroom.
+  configure_swap_auto
   # Raise fs.nr_open/file-max before writing the 1M-nofile PAM limits: a
   # limits value above the kernel's fs.nr_open makes PAM fail to raise the
   # hard limit for the next login.
@@ -6467,23 +6378,11 @@ run_optimize() {
   OPT_REPORT_STARTED=1
   OPT_START_TS=$(date -Is)
   OPT_START_EPOCH=$(date +%s)
-  OPT_BACKUP_DIR="/var/backups/setup-optimize-$(date +%Y%m%d-%H%M%S)"
+  OPT_BACKUP_DIR="${TMP_ROOT}/setup-optimize-$(date +%Y%m%d-%H%M%S)"
   # The directory is created lazily by opt_backup() so a host with no
   # supported services (OS tuning only) does not leave an empty backup tree.
-  # Keep the ten newest rollback points; these directories contain full copies
-  # of /etc/angie, /etc/php/<ver> and /etc/mysql and can grow quickly.
-  local old_backup
-  while IFS= read -r old_backup; do
-    [[ -n $old_backup && $old_backup != "$OPT_BACKUP_DIR" ]] && rm -rf -- "$old_backup"
-  done < <(ls -1dt /var/backups/setup-optimize-* 2>/dev/null | tail -n +11)
-  # Reports are tiny but accumulate one file per run; keep the twenty newest
-  # alongside the always-current -latest.md copy.
-  local old_report
-  while IFS= read -r old_report; do
-    [[ -n $old_report ]] && rm -f -- "$old_report"
-  done < <(find /var/log -maxdepth 1 -type f -name 'setup-optimize-*.md' \
-             ! -name 'setup-optimize-latest.md' -printf '%T@ %p\n' 2>/dev/null \
-             | sort -rn | cut -d' ' -f2- | tail -n +21)
+  # Rollback copies live under /tmp and are allowed to expire there; older
+  # releases pruned them, which permanently deleted operator-recoverable data.
   OPT_REPORT=()
   detect_installed_services
   plan_memory_budget
@@ -6537,10 +6436,10 @@ run_optimize() {
   verify_optimized_services || rc=1
 
   if (( OPT_CUTOVER )); then
-    local purged
-    purged=$(purge_optimize_cache_entries "${OPT_START_EPOCH:-0}")
-    if [[ $purged =~ ^[0-9]+$ ]] && (( purged > 0 )); then
-      opt_report "- Cleared ${purged} cache object(s) written during this run (a restart window must never stay cached as a blank page)"
+    local cached
+    cached=$(count_optimize_cache_entries "${OPT_START_EPOCH:-0}")
+    if [[ $cached =~ ^[0-9]+$ ]] && (( cached > 0 )); then
+      opt_report "- Found ${cached} cache object(s) written during this run; left in place (setup.sh does not delete cache files)"
     else
       opt_report "- Cache: no objects were written during the cutover window"
     fi
@@ -6618,6 +6517,12 @@ main() {
     fi
   elif (( ${VERSION_ID%%.*} < 26 )); then
     die "This script requires Ubuntu 26.04 or newer (found ${VERSION_ID})"
+  fi
+
+  # Size every service against one shared RAM budget on a fresh install, just
+  # as --optimize does on an existing host.
+  if (( ! OPTIMIZE && ! PURGE )); then
+    plan_install_budget
   fi
 
   if (( OPTIMIZE )); then
@@ -9220,328 +9125,83 @@ B64
 
 blob_mysqlbackup() {
   base64 -d <<'B64' | gzip -dc
-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
+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
 B64
 }
 
 blob_angie_key() {
   base64 -d <<'B64' | gzip -dc
-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
 B64
 }
 
 blob_elastic_key() {
   base64 -d <<'B64' | gzip -dc
-H4sIAAAAAAAC/43VOc+rWBIG4JxfcXN0BRgwEHTAYd/35ZCxYzCYzYD96/vrTkbTLY2mwqp6s3pU
-v3//FJAUzf7lKu4vNwKmJvwyJPgLmI5g/DX9jSCjJ9lA1kh1ewGBF1NxL2x9ugp3AcQh2ruwLV1N
-cYcMt8zmNCfbsrSdmVztu7ugAxHh0UKRnfPTFRWT7yTde33Cn4RDlg3cDH6UPyi/kqYqWENMvrJt
-1nkh1FphPafhUWIcIkTPh1eTN2o5nCK6ef7uUvIT/yZlU2ABG8Fvkiaa/NYX65A4K/chUZwROL6v
-JT9MJUN6MpCJwHXQENDeqg6rp4JtTFG9yu8VBZ87i+134bDO1rOf6/OrOVwSotC+fwN0W9QKIaCB
-5ZBeupdpdzOnYOrVlUEsDObCBsHeE1lGBFz/Bu4rjYkssYtLtpXT6TAbKs9KRG7DCBoStsJSm181
-7zZemg9+ZEOQMx6X3AiBPXggAZ5XcD+KN5jaeJ7Y3yyRP/DWtogh/bsZ3Z5TMT7f2QeYWTrMmngN
-WZo1BQm+nvLf+8hP4F2Q+uS+BhC2Xsh7Le/wWsGfWtoC2AEJ6sn2kQO53ZRHni2VzmXjF/aDgQNP
-HxDuWDPgbbrAlyLwI0PwWhP4UOBPiec7Sub5ly7Z/wnh3UtFT5hmRhsXZHIgFM9jaEhofMPU1dnm
-/UqzhfRZqu2OUcf9nYGpjvIl76LFSltT9lO6AsHKB0xxSFh/ISgA3oWus6xcwXnIdevXh0R8eSXe
-53aQvRT3Z780gnHY3mUArsfgY5U7cWmlB1Kcs8jhlhtBxOhNoveFNCWXoL66SVmDbngyHutPOopG
-wwyY6CZjGqDzdP1wUVJZ4XTa054iw/P2EPP4AWXKEu5XGNyot3na4i3Ycf3od/RSpLOoQHzMaJRh
-g3LXlAFadJ0o7vs1YIioHn1UnWHzcbiCvpRimWhZJ6MfHwCbnEBOVYtdN9UPsTvTqqX2ZKG8BF46
-a8PAiSRSCRA1HnWCv2ua93Ap6sv600oa7wSxXpKi/G5IcxujRpmjcRKWVzQyd2lZRvb6TLKkINlc
-fkOhG07e9/dyKJsc25SDZO492g94iXsMER2kNVmmq8joSRbzm23Mh1snWDntDYGw7+wuXvqh8tgr
-z7J77PZnpAR1/Kke7p41IdzK2mHF60m2c3Cf1IxTtqlZsaFUOYwgECFnSBXsoxJrg6MRY2ZYBW87
-bFmfEHswjXsF3ZsBuF+Q/RXbSvR++GXjP/IX3iYXHiGZMh9vdX7uzPMlp7ey2FSZn7lk66FUBK+u
-wCBuUPbwkTuTvVlNUW7SuaVu54dyqycnslHH/JZbbJDl53Titu3GLtHbumkLmwUsaXYJnhnulj9/
-nvYU8ZL3c+JwAHbrwb/cINoPHPH/QMMdm/pPF12yqQjGr8Y+ETfVIlGK+MIXtzjUGq4PBtVg2AcA
-08XQeW9Zm5kVpgozcXkvKtBu0nsl/f1CosBKDMKUavDd+lMMuU9c1rAeViAtUfzxrSCGPRrVmXHb
-KLNIR66g+iuN9/xxjIPFI/3+naZqFZlhHNl8QKMtm5/Nff5xGHBhxnX9+bLGk35ZeXAPs8EMKQMq
-Sf35qnoQgRSBjwHej20TvTcV6DgzEg2lfllCJznPKdXnRGu0Ghqs32FxJJeXPSktR97xlqbPZH7I
-SB2FtfV5pbOzN80j6h7OXvhwGwMo4CIlV/RHnxxyIuZziuN4sxifF263taR7TDzZykcUTf0hXsKk
-TkOYMEddnwYdbH8gfzR7gCN//y/JFv/Hc/sTTbIWDwIHAAA=
 B64
 }
 
 blob_sury_deb() {
   base64 -d <<'B64' | gzip -dc
-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
-qF4MHAAA
 B64
 }
 
 blob_nodesource_key() {
   base64 -d <<'B64' | gzip -dc
-H4sIAAAAAAAC/32Vuc6j2haEc56ic9QygwETdLCBDWY0o8FkzJMxZjPz9Oc/rasr3eQuqaKqqLQ+
-1e/fPydARbV+2Yr9yw4EQxV/6fD1SzAeov6v+xvDegdagpxLFgkEEUiJlV9UuqXnz5XIC8eqTq4W
-KGv18emICra7xn3ewOxRCquMOu8mYLXlsdzM08V8n3Z4cJAYtym+01SqJ6c5FvwpbUNCJ0+1R0db
-s95d5N/mHFKcZt/lwsQ81M38q7+TobmFmftgC+/FC7T9Tc5xqT9rmvS9sQRDG7nq3kloOFh5uwZ6
-H1iei2gK42F741p3cEmBujCcXn6p1xVfZUU5vbWmgex8hfvIkONk3YERsPjNbo1SnXHGt9ckdDFf
-wDsQf5y4S1THpD6I/NBDyyYd5QL/dcG71mjOSg7PCpapiNLpGNlbMLwY2RY+yzXGIN1I8TdRx01H
-xFQEItcAcjeZ4t4w3XyQg8DdgQAFABRC7Rg/pfZvLIJb+rHWVHl3mBHmW0wIS0q574ziyay33kb/
-Y/qsBoIrhBvUgVSJymaK9wqK8hWEquOuWRm8dbEWMG5G1yB11jCNmH5fqxkEYhKWymcLDNGp7qB6
-PcWqU8VNhXKlSsABuuiC/+ax2SBE4UL4/oJYeol8Ox1xTXCgz7Yf+EwkZPXfu3o5KddcWpKlq/7g
-xVncFIIlMtxXsfHsz7edZKnfKRkjMsRcRFRfTzijqXNd1maTuqxUHcRZeM9lnflQo30rFL5DyMCz
-SzCS8wAdrXwANY8qDjfngFFyvqKA9iYp+O4CIXqzqaZGNTlx967huq16oq+19xc4HhH2QCfce6Ki
-grbKu/QTo49/xKbARrfyVsb2QDiZcNirURSUNHd6AXEvfsvRsX7EM9sIjL/qV2Z9hx3M3bNvmhAo
-XLWc8RG/lEx8MHDQaCOweWKsUe8E5ZTO2VkMMCS5H7Um5g61MdyE8Xm8MlIE8jswVMkqPDppvsv/
-gCaOBFUtcz9NbNtI1MIQaw5cbKe1h5Lz1IxCt+TGO38xfX+Y3vUQXIwmqhNI7AwedPriphlaxPmY
-PxTFpmjdJELIH5ijfF83MgZ768uLHnxVqUf3DKkXi48MZOg7yXchnOdJtS3tUa37TRsKt3hEVG20
-WSpjZX/eClYida6I8bo1y4exS/x1Lmtne816Wm4loW2782TU2XHRkeMR7meA/hyrHDbaDXuePOWX
-ZKNwMR4lU5LEcklp0rIPTZx48YtbE5pnxLcIzaOTJzdVtko6BFZGOLtfggCbXuCKXk/OXXr1EeTh
-pwqPsD2fxyXTvRB44bVVGSCEEw7KwvXHPp5ZnBW4Qa1qJJA89h/SNODeoAKgCEAng/ff5n8A2sAP
-B45B9iQeT+nVcO2zKnnZL21A5JRFcyM2LUyy0ukr1vCN/a6hTCc6FecHX+SfWhRK2+rrVXAtto/C
-Zh8IadHh4Jjt89tFRI1GTODlHT430Y55/aItWnWa7mPkfJxzaZStuG+b+dbdUKuahdtsVC0bW4o0
-Yrus3IXefMyE3korZZQuPlEvsMh1LjXKUTGruR/NQrS6QeXcklYe1A6Q4rBxRiE/vxo8LjH3u4ep
-Nmz2TY49XCrSjPtW9DARqR7BaTTnZl6HTHw/wGJ/oq94EFf75/GJwEds/MwbFNYa9hhvHvKg62wj
-1K62eT/SRtK300NsnwmBiwpa4cjFB1+uvkiqZ/jf8mkmeSawxWCECLtcS2EsWhBWf/5gf7aa6bC/
-kwMt6f/s0T+9nREXtQYAAA==
 B64
 }
 
