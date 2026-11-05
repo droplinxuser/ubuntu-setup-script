@@ -9,7 +9,7 @@ FIXTURES="$ROOT/tests/fixtures/angie"
 
 PASS=0
 FAIL=0
-TMP=$(TMPDIR=/tmp mktemp -d)
+TMP=$(mktemp -d /tmp/setup-test-tuning.XXXXXX)
 # Scratch data stays under /tmp and is allowed to expire there; the tests do
 # not remove it, so a failed run remains inspectable.
 
@@ -30,6 +30,18 @@ check() {
   shift
   if "$@"; then t_pass "$desc"; else t_fail "$desc"; fi
 }
+
+# Scratch helpers must never place data outside /tmp, and sed_in_place must not
+# leave a sibling scratch file next to the live target.
+check_tmp_path() { case "$1" in /tmp/*) return 0 ;; *) return 1 ;; esac; }
+check "tmp_file creates under /tmp" check_tmp_path "$(tmp_file)"
+check "tmp_dir creates under /tmp" check_tmp_path "$(tmp_dir)"
+mkdir -p "$TMP/sed-in-place"
+printf 'key = old\n' > "$TMP/sed-in-place/file.conf"
+sed_in_place -E 's/^key = old$/key = new/' "$TMP/sed-in-place/file.conf"
+check "sed_in_place rewrites the file" grep -qx 'key = new' "$TMP/sed-in-place/file.conf"
+check "sed_in_place leaves no sibling scratch file" \
+  test "$(find "$TMP/sed-in-place" -mindepth 1 ! -name file.conf | wc -l)" -eq 0
 
 # ---------------------------------------------------------------------------
 # Small pure helpers
@@ -349,7 +361,7 @@ cp -a "$FIXTURES/." "$TMP/legacy/"
 for name in fastcgi_cache fastcgi_cache_chev xf_proxy_cache proxy_cache limit_req; do
   mv "$TMP/legacy/http.d/${name}.conf" "$TMP/legacy/http.d/${name}_conf"
 done
-sed -i 's#include http.d/\*\.conf;#include http.d/*_conf;#' "$TMP/legacy/angie.conf"
+sed_in_place 's#include http.d/\*\.conf;#include http.d/*_conf;#' "$TMP/legacy/angie.conf"
 cat > "$TMP/legacy/http.d/fastcgi_cache_custom_conf" <<'EOF'
 fastcgi_cache_path /home/nginx_cache_custom levels=1:2 keys_zone=customcache:5120m inactive=30d;
 EOF

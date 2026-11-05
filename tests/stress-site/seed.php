@@ -38,9 +38,10 @@ $pdo = new PDO(
     $cfg['db']['pass'],
     [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION]
 );
-$pdo->exec('DROP TABLE IF EXISTS bench_items');
+// Create or update only the stress rows.  The harness must not DROP a table
+// or index: a rerun on a live host must never remove data it does not own.
 $pdo->exec(<<<SQL
-CREATE TABLE bench_items (
+CREATE TABLE IF NOT EXISTS bench_items (
   id INT UNSIGNED NOT NULL PRIMARY KEY,
   title VARCHAR(255) NOT NULL,
   body TEXT NOT NULL,
@@ -56,6 +57,10 @@ SELECT seq,
               REPEAT('payload ', 20)),
        NOW() - INTERVAL seq SECOND
 FROM seq_1_to_50000
+ON DUPLICATE KEY UPDATE
+  title = VALUES(title),
+  body = VALUES(body),
+  created_at = VALUES(created_at)
 SQL);
 $count = (int)$pdo->query('SELECT COUNT(*) FROM bench_items')->fetchColumn();
 echo "MariaDB: {$count} rows in bench_items\n";
@@ -64,7 +69,6 @@ echo "MariaDB: {$count} rows in bench_items\n";
 // Elasticsearch
 // ---------------------------------------------------------------------------
 $es = rtrim($cfg['elastic'], '/');
-es_request('DELETE', $es . '/stress_pages');
 [$code, $response] = es_request('PUT', $es . '/stress_pages', json_encode([
     'settings' => ['number_of_shards' => 1, 'number_of_replicas' => 0, 'refresh_interval' => '1s'],
     'mappings' => [
@@ -75,7 +79,9 @@ es_request('DELETE', $es . '/stress_pages');
         ],
     ],
 ], JSON_THROW_ON_ERROR));
-if ($code !== 200) {
+// 400 means the index already exists from a previous seed.  Documents below
+// are indexed by fixed ID, so a rerun updates them without deleting the index.
+if ($code !== 200 && $code !== 400) {
     fwrite(STDERR, "Elasticsearch index create failed: {$code} {$response}\n");
     exit(1);
 }

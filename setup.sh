@@ -16,7 +16,8 @@
 #     Other vendor payloads that must be reproducible offline are embedded in
 #     the "EMBEDDED PAYLOADS" section at the bottom.
 #   * Each service is timed; a summary is printed at the end.
-#   * `--purge` uninstalls selected services (and restores basic settings).
+#   * `--purge` stops/disables selected services and restores recorded basic
+#     settings; it never removes packages, data, configuration or log files.
 # =============================================================================
 
 set -Eeuo pipefail
@@ -31,7 +32,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.29"
+readonly SCRIPT_VERSION="1.8.30"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -104,8 +105,36 @@ step() { printf '\n%s%s==> %s%s\n' "$C_BOLD" "$C_BLUE" "$*" "$C_RESET"; }
 readonly TMP_ROOT="/tmp"
 # Make child tools that honour TMPDIR use /tmp as well.
 export TMPDIR="$TMP_ROOT"
-tmp_file() { TMPDIR="$TMP_ROOT" mktemp "$@"; }
-tmp_dir()  { TMPDIR="$TMP_ROOT" mktemp -d "$@"; }
+
+# One implementation for both file and directory creation.  --tmpdir forces the
+# result below /tmp even when an inherited TMPDIR points somewhere else, and
+# the post-check refuses an absolute caller template instead of writing beside
+# a live config.
+_tmp_mktemp() {
+  local path
+  path=$(TMPDIR="$TMP_ROOT" mktemp --tmpdir="$TMP_ROOT" "$@") || return 1
+  [[ $path == "${TMP_ROOT}"/* ]] || {
+    warn "Refusing scratch path outside ${TMP_ROOT}: ${path}"
+    return 1
+  }
+  printf '%s\n' "$path"
+}
+tmp_file() { _tmp_mktemp "$@"; }
+tmp_dir()  { _tmp_mktemp -d "$@"; }
+
+# GNU sed -i creates its scratch file next to the target, which is outside
+# /tmp.  Stage the rewrite under /tmp and copy it over the original inode so
+# permissions, ownership and hard links are preserved.  The staging file is
+# deliberately left for /tmp to expire.
+sed_in_place() {
+  local file tmp
+  (( $# >= 2 )) || return 2
+  file=${!#}
+  tmp=$(tmp_file) || return 1
+  sed "$@" > "$tmp" || return 1
+  cmp -s -- "$file" "$tmp" && return 0
+  cat -- "$tmp" > "$file"
+}
 
 # Move a path that must leave its live location into a fresh /tmp directory.
 # The data is preserved (never unlinked) and /tmp expires it automatically.
@@ -816,6 +845,19 @@ is_nvme_storage() {
   return 1
 }
 
+# Storage class shared by the MariaDB I/O-capacity and Angie cache tuners so
+# install and --optimize classify the same disk the same way.
+storage_class() {
+  if is_nvme_storage; then
+    printf 'nvme'
+  elif command -v lsblk >/dev/null 2>&1 \
+       && lsblk -d -n -o ROTA 2>/dev/null | grep -q '^0'; then
+    printf 'ssd'
+  else
+    printf 'hdd'
+  fi
+}
+
 latest_sury_php() {
   local pkg ver cand upstream best=""
   while read -r pkg; do
@@ -1236,9 +1278,8 @@ pkg_ok() {
 }
 
 # Remember whether a package was already present before setup.sh installed it.
-# Purge removes only packages that carry a positive "installed by setup"
-# marker; without proof, a package is left alone.  This makes repeated purges
-# safe even after --purge basic has removed the rest of the state directory.
+# The marker is inventory only: --purge never removes a package, so a
+# pre-existing package and a setup-installed one are both left in place.
 pkg_record_origin() {
   local pkg=$1
   ensure_state
@@ -1470,7 +1511,7 @@ configure_hostname() {
   hostnamectl set-hostname "$host"
   # Keep the local 127.0.1.1 entry in sync; otherwise sudo and hostname -f
   # keep resolving the old name from /etc/hosts after the rename.
-  sed -i -E '/^[[:space:]]*127\.0\.1\.1[[:space:]]/d' /etc/hosts
+  sed_in_place -E '/^[[:space:]]*127\.0\.1\.1[[:space:]]/d' /etc/hosts
   printf '127.0.1.1\t%s\n' "$host" >> /etc/hosts
   hostnamectl status || true
 }
@@ -2010,14 +2051,9 @@ tune_clamp() {
   printf '%s' "$value"
 }
 
-tune_size_value() {
-  local mb=$1
-  if (( mb >= 1024 && mb % 1024 == 0 )); then
-    printf '%sG' $(( mb / 1024 ))
-  else
-    printf '%sM' "$mb"
-  fi
-}
+# Tuner-facing name for mb_to_config(); one implementation keeps the installer
+# and --optimize reporting identical.
+tune_size_value() { mb_to_config "$1"; }
 
 # Cache budget in MB: 25% of RAM, capped at 5% of free disk, then rounded
 # down to 256 MB.  The rounding keeps small free-space changes between runs
@@ -2220,7 +2256,7 @@ tune_replace() {
   before=$(md5sum "$file" | awk '{print $1}')
   # Use a delimiter that does not collide with regex alternation (`|`) or
   # common path characters in these directives.
-  sed -i -E "s#${pattern}#${replacement}#" "$file"
+  sed_in_place -E "s#${pattern}#${replacement}#" "$file"
   after=$(md5sum "$file" | awk '{print $1}')
   [[ $before != "$after" ]] && tune_note "$desc"
   return 0
@@ -2256,7 +2292,7 @@ tune_cache_error_policy() {
   local file=$1 label=$2 before after tmp
   [[ -f $file ]] || return 0
   before=$(md5sum "$file" | awk '{print $1}')
-  sed -i -E '/^[[:space:]]*fastcgi_cache_use_stale/ s/[[:space:]]+http_500([[:space:]]|;)/\1/g' "$file"
+  sed_in_place -E '/^[[:space:]]*fastcgi_cache_use_stale/ s/[[:space:]]+http_500([[:space:]]|;)/\1/g' "$file"
   if ! grep -qE '^[[:space:]]*fastcgi_cache_valid[[:space:]]+500([[:space:]]+[0-9]+)+[[:space:]]+0s;' "$file"; then
     tmp=$(tmp_file)
     if grep -qE '^[[:space:]]*fastcgi_cache_valid[[:space:]]+any[[:space:]]' "$file"; then
@@ -2302,14 +2338,7 @@ tune_angie_configs() {
   mem_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 1024)
   (( mem_mb > 0 )) || mem_mb=1024
 
-  disk_class=hdd
-  if compgen -G '/sys/block/nvme*' >/dev/null 2>&1; then
-    disk_class=nvme
-  elif command -v lsblk >/dev/null 2>&1; then
-    if lsblk -d -n -o ROTA 2>/dev/null | grep -q '^0'; then
-      disk_class=ssd
-    fi
-  fi
+  disk_class=$(storage_class)
 
   disk_free_mb=$(df -Pm /var/www 2>/dev/null | awk 'NR==2{print $4}' || true)
   [[ $disk_free_mb =~ ^[0-9]+$ ]] || disk_free_mb=$(df -Pm / 2>/dev/null | awk 'NR==2{print $4}' || true)
@@ -2449,7 +2478,7 @@ tune_angie_configs() {
       [[ -n $file ]] || continue
       local before after
       before=$(md5sum "$file" | awk '{print $1}')
-      sed -i -E "s#^([[:space:]]*fastcgi_pass[[:space:]]+)(127\.0\.0\.1|localhost):9000;#\\1unix:${php_socket};#g" "$file"
+      sed_in_place -E "s#^([[:space:]]*fastcgi_pass[[:space:]]+)(127\.0\.0\.1|localhost):9000;#\\1unix:${php_socket};#g" "$file"
       after=$(md5sum "$file" | awk '{print $1}')
       [[ $before != "$after" ]] && tune_note "${file#"${target}"/}: fastcgi_pass -> unix:${php_socket}"
     done < <(grep -rlE '^[[:space:]]*fastcgi_pass[[:space:]]+(127\.0\.0\.1|localhost):9000;' "$target" 2>/dev/null || true)
@@ -2628,7 +2657,7 @@ tune_pool_set() {
   local escaped=${key//./\\.}
   before=$(md5sum "$file" | awk '{print $1}')
   if grep -qE "^[[:space:]]*${escaped}[[:space:]]*=" "$file"; then
-    sed -i -E "s|^[[:space:]]*${escaped}[[:space:]]*=.*|${key} = ${value}|" "$file"
+    sed_in_place -E "s|^[[:space:]]*${escaped}[[:space:]]*=.*|${key} = ${value}|" "$file"
   else
     printf '%s = %s\n' "$key" "$value" >> "$file"
   fi
@@ -2719,11 +2748,11 @@ ensure_fpm_global_timeout() {
   if grep -qE '^[[:space:]]*process_control_timeout[[:space:]]*=' "$conf"; then
     grep -qE '^[[:space:]]*process_control_timeout[[:space:]]*=[[:space:]]*10s' "$conf" \
       && return 0
-    sed -i -E 's|^[[:space:]]*process_control_timeout[[:space:]]*=.*|process_control_timeout = 10s|' "$conf"
+    sed_in_place -E 's|^[[:space:]]*process_control_timeout[[:space:]]*=.*|process_control_timeout = 10s|' "$conf"
   elif grep -qE '^[[:space:]]*include[[:space:]]*=' "$conf"; then
     # Everything after the pool include is parsed inside the last included
     # pool section, so a global directive must go *before* it.
-    sed -i -E '/^[[:space:]]*include[[:space:]]*=/i\
+    sed_in_place -E '/^[[:space:]]*include[[:space:]]*=/i\
 ; setup.sh: bound master/worker shutdown so a busy pool restarts in seconds\
 process_control_timeout = 10s' "$conf"
   else
@@ -2782,7 +2811,7 @@ tune_php_fpm_version() {
   tune_pool_set "$pool" listen "$socket" "PHP ${ver}: listen=${socket}"
   # listen.allowed_clients is meaningless (and noisy) for a Unix socket.
   if [[ $socket == /* ]] && grep -qE '^[[:space:]]*listen\.allowed_clients[[:space:]]*=' "$pool"; then
-    sed -i -E '/^[[:space:]]*listen\.allowed_clients[[:space:]]*=/d' "$pool"
+    sed_in_place -E '/^[[:space:]]*listen\.allowed_clients[[:space:]]*=/d' "$pool"
     tune_note "PHP ${ver}: removed listen.allowed_clients (Unix socket)"
   fi
   tune_pool_set "$pool" listen.backlog "$backlog" "PHP ${ver}: listen.backlog=${backlog}"
@@ -2820,7 +2849,7 @@ tune_php_fpm_version() {
   # the 60s shutdown wait.
   if grep -qE '^[[:space:]]*process_control_timeout[[:space:]]*=' "$pool"; then
     if ! grep -qE '^[[:space:]]*process_control_timeout[[:space:]]*=[[:space:]]*10s[[:space:]]*(;.*)?$' "$pool"; then
-      sed -i -E 's|^[[:space:]]*process_control_timeout[[:space:]]*=.*|process_control_timeout = 10s|' "$pool"
+      sed_in_place -E 's|^[[:space:]]*process_control_timeout[[:space:]]*=.*|process_control_timeout = 10s|' "$pool"
       tune_note "PHP ${ver}: pool-level process_control_timeout=10s"
     fi
   fi
@@ -2837,7 +2866,7 @@ tune_php_fpm_version() {
   mkdir -p "$ini_dir" /var/cache/php/opcache
   chown -R www-data:www-data /var/cache/php 2>/dev/null || true
   chmod 750 /var/cache/php /var/cache/php/opcache 2>/dev/null || true
-  sed -i -E "s|php8\.[0-9]|php${ver}|g" "$pool"
+  sed_in_place -E "s|php8\.[0-9]|php${ver}|g" "$pool"
   local ini_before=""
   [[ -f $ini ]] && ini_before=$(md5sum "$ini" | awk '{print $1}')
   cat > "$ini" <<EOF
@@ -3070,7 +3099,7 @@ install_php() {
     tune_pool_set "/etc/php/${ver}/fpm/pool.d/www.conf" pm.max_requests \
       "${OPT[php.max_requests]}" "PHP ${ver}: max_requests override=${OPT[php.max_requests]}"
   fi
-  sed -i -E "s|^date\.timezone = .*|date.timezone = ${tz}|" \
+  sed_in_place -E "s|^date\.timezone = .*|date.timezone = ${tz}|" \
     "/etc/php/${ver}/fpm/conf.d/custom_dan.ini"
 
   mkdir -p /var/cache/php/opcache
@@ -3159,13 +3188,11 @@ configure_mariadb_apparmor() {
 }
 
 mariadb_io_capacity() {
-  if is_nvme_storage; then
-    printf '4000 8000'
-  elif lsblk -d -n -o ROTA 2>/dev/null | grep -q '^0'; then
-    printf '2000 4000'
-  else
-    printf '400 800'
-  fi
+  case $(storage_class) in
+    nvme) printf '4000 8000' ;;
+    ssd)  printf '2000 4000' ;;
+    *)    printf '400 800' ;;
+  esac
 }
 
 configure_mariadb() {
@@ -3198,11 +3225,11 @@ configure_mariadb() {
   backlog=$(effective_backlog)
 
   # Comment out expire_logs_days if it is active.
-  sed -i -E 's|^([[:space:]]*)expire_logs_days([[:space:]]*=)|\1#expire_logs_days\2|' "$cnf"
+  sed_in_place -E 's|^([[:space:]]*)expire_logs_days([[:space:]]*=)|\1#expire_logs_days\2|' "$cnf"
 
   # Configure bind-address in the packaged [mysqld] section if present.
   if grep -qE '^[[:space:]]*bind-address[[:space:]]*=' "$cnf"; then
-    sed -i -E "s|^[[:space:]]*bind-address[[:space:]]*=.*|bind-address = ${bind}|" "$cnf"
+    sed_in_place -E "s|^[[:space:]]*bind-address[[:space:]]*=.*|bind-address = ${bind}|" "$cnf"
   fi
 
   # Drop a previous managed block, then append a fresh one.
@@ -3419,13 +3446,13 @@ EOF
   blob_mysqlbackup | tar -xzf - -C /root/tools/mysqlbackup-master
   chmod +x /root/tools/mysqlbackup-master/install /root/tools/mysqlbackup-master/mysqlbkup.sh
   # The upstream installer uses "mkdir" without -p; make it idempotent.
-  sed -i 's|^mkdir "\$BACKUP_DIR"|mkdir -p "$BACKUP_DIR"|' \
+  sed_in_place 's|^mkdir "\$BACKUP_DIR"|mkdir -p "$BACKUP_DIR"|' \
     /root/tools/mysqlbackup-master/install
 
   local esc_user esc_pass
   esc_user=$(sed_escape_replacement "$user")
   esc_pass=$(sed_escape_replacement "$pass")
-  sed -i "s|user=dba|user=${esc_user}|g; s|password=dba_passwd|password=${esc_pass}|g" \
+  sed_in_place "s|user=dba|user=${esc_user}|g; s|password=dba_passwd|password=${esc_pass}|g" \
     /root/tools/mysqlbackup-master/mysqlbkup.cnf.sample
 
   ( cd /root/tools/mysqlbackup-master && ./install ) || warn "mysqlbkup installer reported an issue"
@@ -3478,7 +3505,7 @@ install_valkey() {
   # Normalise the directives this script owns: remove active copies, then
   # append the canonical values once.  This also upgrades old profiles that
   # had "protected-mode no" without leaving contradictory duplicates.
-  sed -i -E '/^[[:space:]]*(bind|protected-mode|save|maxmemory|maxmemory-policy|maxmemory-samples|supervised|io-threads|io-threads-do-reads|tcp-backlog|tcp-keepalive|timeout|maxclients|hz|appendonly|lazyfree-[a-z-]+|unixsocket|unixsocketperm|logfile)[[:space:]]/d' "$conf"
+  sed_in_place -E '/^[[:space:]]*(bind|protected-mode|save|maxmemory|maxmemory-policy|maxmemory-samples|supervised|io-threads|io-threads-do-reads|tcp-backlog|tcp-keepalive|timeout|maxclients|hz|appendonly|lazyfree-[a-z-]+|unixsocket|unixsocketperm|logfile)[[:space:]]/d' "$conf"
   local -a vlines=(
     'supervised systemd'
     "logfile ${LOG_ROOT}/valkey/valkey.log"
@@ -3643,7 +3670,7 @@ install_elastic() {
              indices.fielddata.cache.size search.max_buckets \
              action.destructive_requires_name http.compression \
              http.max_content_length; do
-    sed -i -E "s|^[[:space:]]*${key}[[:space:]]*:.*|#&|" "$yml"
+    sed_in_place -E "s|^[[:space:]]*${key}[[:space:]]*:.*|#&|" "$yml"
   done
 
   cat >> "$yml" <<EOF
@@ -3823,9 +3850,12 @@ EOF
         cat > /etc/apt/apt.conf.d/52setup-unattended <<'EOF'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
-APT::Periodic::AutocleanInterval "7";
-Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
-Unattended-Upgrade::Remove-Unused-Dependencies "true";
+# Never let the unattended job clean caches, kernels or dependencies: those
+# actions permanently remove files and can break a live server.  Operators can
+# reclaim space manually after verifying what is safe to remove.
+APT::Periodic::AutocleanInterval "0";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "false";
+Unattended-Upgrade::Remove-Unused-Dependencies "false";
 Unattended-Upgrade::Automatic-Reboot "false";
 EOF
         chmod 644 /etc/apt/apt.conf.d/52setup-unattended
@@ -3837,7 +3867,7 @@ EOF
         pkg_record_origin sysstat
         apt_install sysstat
         if [[ -f /etc/default/sysstat ]]; then
-          sed -i -E 's/^ENABLED=.*/ENABLED="true"/' /etc/default/sysstat
+          sed_in_place -E 's/^ENABLED=.*/ENABLED="true"/' /etc/default/sysstat
         fi
         systemctl enable --now sysstat-collect.timer sysstat-summary.timer 2>/dev/null \
           || systemctl enable --now sysstat 2>/dev/null \
@@ -3972,7 +4002,7 @@ create_domains() {
           src=/etc/angie/conf.d/templates/sample_xf.conf
           [[ -f $src ]] || die "Missing Angie template ${src}"
           cp "$src" "$tmp"
-          sed -i -e "s|domain\.com|${d}|g" -e "s|sample\.com|${d}|g" \
+          sed_in_place -e "s|domain\.com|${d}|g" -e "s|sample\.com|${d}|g" \
             -e "s#/etc/letsencrypt/live/${d}/fullchain.pem#${certdir}/fullchain.pem#g" \
             -e "s#/etc/letsencrypt/live/${d}/privkey.pem#${certdir}/privkey.pem#g" \
             -e "s#/var/www/html/${d}/websocket.log#${LOG_ROOT}/angie/${d}-websocket.log#g" \
@@ -3982,7 +4012,7 @@ create_domains() {
           src=/etc/angie/conf.d/templates/sample_wordpress.conf
           [[ -f $src ]] || die "Missing Angie template ${src}"
           cp "$src" "$tmp"
-          sed -i -e "s|domain\.com|${d}|g" -e "s|sample\.com|${d}|g" \
+          sed_in_place -e "s|domain\.com|${d}|g" -e "s|sample\.com|${d}|g" \
             -e "s|include h5bp/hostname_ssl.conf;|include h5bp/tls/ssl_engine.conf;\n    include h5bp/tls/policy_balanced.conf;\n    ssl_certificate     ${certdir}/fullchain.pem;\n    ssl_certificate_key ${certdir}/privkey.pem;|g" \
             "$tmp"
           ;;
@@ -3991,7 +4021,7 @@ create_domains() {
           [[ -f $src ]] || die "Missing Angie template ${src}"
           cp "$src" "$tmp"
           mkdir -p "/var/www/${d}/data" "/var/www/${d}/frontend"
-          sed -i -e "s|domain\.com|${d}|g" -e "s|sample\.com|${d}|g" \
+          sed_in_place -e "s|domain\.com|${d}|g" -e "s|sample\.com|${d}|g" \
             -e "s#/var/www/pingvin_source#/var/www/${d}#g" \
             -e "s#/var/www/pingvin_data#/var/www/${d}/data#g" \
             -e '/set_real_ip_from 1\.2\.3\.4;/d' \
@@ -4005,7 +4035,7 @@ create_domains() {
           src=/etc/angie/conf.d/templates/sample_chev.conf
           [[ -f $src ]] || die "Missing Angie template ${src}"
           cp "$src" "$tmp"
-          sed -i -e "s|domain\.com|${d}|g" -e "s|sample\.com|${d}|g" \
+          sed_in_place -e "s|domain\.com|${d}|g" -e "s|sample\.com|${d}|g" \
             -e "s#/etc/letsencrypt/live/${d}/fullchain.pem#${certdir}/fullchain.pem#g" \
             -e "s#/etc/letsencrypt/live/${d}/privkey.pem#${certdir}/privkey.pem#g" \
             "$tmp"
@@ -4014,7 +4044,7 @@ create_domains() {
           src=/etc/angie/conf.d/templates/sample_polr.conf
           [[ -f $src ]] || die "Missing Angie template ${src}"
           cp "$src" "$tmp"
-          sed -i -e "s|domain\.com|${d}|g" -e "s|sample\.com|${d}|g" \
+          sed_in_place -e "s|domain\.com|${d}|g" -e "s|sample\.com|${d}|g" \
             -e "s|include h5bp/hostname_ssl.conf;|include h5bp/tls/ssl_engine.conf;\n    include h5bp/tls/policy_balanced.conf;\n    ssl_certificate     ${certdir}/fullchain.pem;\n    ssl_certificate_key ${certdir}/privkey.pem;|g" \
             "$tmp"
           ;;
@@ -4022,7 +4052,7 @@ create_domains() {
           src=/etc/angie/conf.d/templates/sample_php.conf
           [[ -f $src ]] || die "Missing Angie template ${src}"
           cp "$src" "$tmp"
-          sed -i -e "s|domain\.com|${d}|g" \
+          sed_in_place -e "s|domain\.com|${d}|g" \
             -e "s#/etc/letsencrypt/live/${d}/fullchain.pem#${certdir}/fullchain.pem#g" \
             -e "s#/etc/letsencrypt/live/${d}/privkey.pem#${certdir}/privkey.pem#g" \
             "$tmp"
@@ -4031,7 +4061,7 @@ create_domains() {
           src=/etc/angie/conf.d/templates/sample_node.conf
           [[ -f $src ]] || die "Missing Angie template ${src}"
           cp "$src" "$tmp"
-          sed -i -e "s|domain\.com|${d}|g" \
+          sed_in_place -e "s|domain\.com|${d}|g" \
             -e "s#/etc/letsencrypt/live/${d}/fullchain.pem#${certdir}/fullchain.pem#g" \
             -e "s#/etc/letsencrypt/live/${d}/privkey.pem#${certdir}/privkey.pem#g" \
             "$tmp"
@@ -4474,9 +4504,9 @@ OPT_DETECTED=()
 OPT_START_TS=""
 OPT_REPORT_STARTED=0
 OPT_REPORT_WRITTEN=0
-# Set when any service actually reloaded/restarted during this run.  The
-# cache purge only matters for a cutover window; an idempotent run must not
-# delete healthy objects written by live traffic.
+# Set when any service actually reloaded/restarted during this run.  Cache
+# objects written during a cutover window are only counted and reported; they
+# are never deleted, and an idempotent run does not touch the live cache.
 OPT_CUTOVER=0
 
 opt_report() { OPT_REPORT+=("$*"); }
@@ -5125,11 +5155,11 @@ angie_uses_local_php_upstream() {
 # not start a newly added pool (verified on PHP 8.3), so the bridge never
 # listened.  Instead Angie gets the socket as primary and the TCP listener as
 # backup, the existing pool is switched and reloaded, and the backup is
-# removed once the socket is live.  A request that lands exactly while the
+# retired once the socket is live.  A request that lands exactly while the
 # old TCP listener closes and the socket opens can fail over to the backup;
-# if both are unavailable for a moment Angie returns 502, and the caller's
-# cache purge removes any blank page cached in that window.  On failure both
-# files are restored and the services reload the original configuration.
+# if both are unavailable for a moment Angie returns 502.  Cache objects
+# written in that window are reported, never deleted.  On failure both files
+# are restored and the services reload the original configuration.
 MIGRATE_REASON=""
 
 migrate_php_pool_to_socket() {
@@ -5170,7 +5200,7 @@ migrate_php_pool_to_socket() {
   # 1. Angie: socket primary, current TCP listener as backup.  angie -t
   #    accepts a unix: server whose socket does not exist yet; the connect
   #    fails fast and the backup serves traffic until PHP creates the socket.
-  sed -i -E \
+  sed_in_place -E \
     "s|^([[:space:]]*)server[[:space:]]+${tcp_re};|\1server unix:${socket} max_fails=0;\n\1server ${tcp} backup;|" \
     "$angie_conf"
   if ! grep -qF "server unix:${socket} max_fails=0;" "$angie_conf" \
@@ -5186,7 +5216,7 @@ migrate_php_pool_to_socket() {
   # 2. Move the existing pool to the socket.  The reload is graceful: old
   #    workers finish in-flight TCP requests while the master opens the socket.
   tune_pool_set "$pool" listen "$socket" "PHP ${ver}: listen=${socket}"
-  sed -i -E '/^[[:space:]]*listen\.allowed_clients[[:space:]]*=/d' "$pool"
+  sed_in_place -E '/^[[:space:]]*listen\.allowed_clients[[:space:]]*=/d' "$pool"
   tune_pool_set "$pool" listen.owner www-data "PHP ${ver}: listen.owner=www-data"
   tune_pool_set "$pool" listen.group www-data "PHP ${ver}: listen.group=www-data"
   tune_pool_set "$pool" listen.mode 0660 "PHP ${ver}: listen.mode=0660"
@@ -5221,8 +5251,8 @@ migrate_php_pool_to_socket() {
   fi
 
   # 3. Drop the TCP backup; the socket is proven live.
-  sed -i -E "/^[[:space:]]*server[[:space:]]+${tcp_re}[[:space:]]+backup;/d" "$angie_conf"
-  sed -i -E "s|server unix:${socket} max_fails=0;|server unix:${socket};|" "$angie_conf"
+  sed_in_place -E "/^[[:space:]]*server[[:space:]]+${tcp_re}[[:space:]]+backup;/d" "$angie_conf"
+  sed_in_place -E "s|server unix:${socket} max_fails=0;|server unix:${socket};|" "$angie_conf"
   if ! /usr/sbin/angie -t >/dev/null 2>&1 \
      || ! systemctl reload angie 2>/dev/null; then
     # Keep the working socket+backup config rather than risking the site.
@@ -5696,7 +5726,7 @@ optimize_valkey() {
   conf_set() {
     local key=$1 value=$2
     if grep -qE "^[[:space:]]*${key}[[:space:]]" "$conf"; then
-      sed -i -E "s|^[[:space:]]*${key}[[:space:]].*|${key} ${value}|" "$conf"
+      sed_in_place -E "s|^[[:space:]]*${key}[[:space:]].*|${key} ${value}|" "$conf"
     else
       printf '%s %s\n' "$key" "$value" >> "$conf"
     fi
@@ -6030,7 +6060,7 @@ optimize_elastic() {
              indices.memory.index_buffer_size indices.fielddata.cache.size \
              search.max_buckets action.destructive_requires_name \
              http.compression http.max_content_length; do
-    sed -i -E "s|^[[:space:]]*${key//./\\.}[[:space:]]*:.*|#&|" "$yml"
+    sed_in_place -E "s|^[[:space:]]*${key//./\\.}[[:space:]]*:.*|#&|" "$yml"
   done
   cat >> "$yml" <<'EOF'
 # BEGIN setup.sh optimize
@@ -6061,11 +6091,11 @@ EOF
   unit_after=$([[ -f $unit ]] && md5sum "$unit" | awk '{print $1}' || echo absent)
   [[ $es_before != "$es_after" || $jvm_before != "$jvm_after" \
      || $unit_before != "$unit_after" ]] && changed=1
-  # Removing the legacy jvm.options file changes the effective heap without
+  # Moving the legacy jvm.options file changes the effective heap without
   # changing the managed file, so count it as a change too.
   if [[ $legacy_before != "$([[ -f $legacy ]] && md5sum "$legacy" | awk '{print $1}' || echo absent)" ]]; then
     changed=1
-    opt_report "- Removed legacy \`${legacy}\` (superseded by zz-setup-optimize.options)"
+    opt_report "- Moved legacy \`${legacy}\` to /tmp (superseded by zz-setup-optimize.options; not deleted)"
   fi
   if (( changed )); then
     opt_report "- Heap=${heap_mb}m; bootstrap.memory_lock=true; performance block written"
