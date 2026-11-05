@@ -34,7 +34,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.35"
+readonly SCRIPT_VERSION="1.8.36"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -180,8 +180,8 @@ log_selection() {
   (( ${#ENABLED[@]} > 0 )) && services="${!ENABLED[*]}"
   (( ${#DOMAINS[@]} > 0 )) && domains="${DOMAINS[*]}"
   printf '\n--- selection ---\n'
-  printf 'Modes        : dry_run=%s optimize=%s purge=%s\n' \
-    "${DRY_RUN:-0}" "${OPTIMIZE:-0}" "${PURGE:-0}"
+  printf 'Modes        : dry_run=%s optimize=%s purge=%s diagnostics=%s\n' \
+    "${DRY_RUN:-0}" "${OPTIMIZE:-0}" "${PURGE:-0}" "${DIAGNOSTICS:-0}"
   printf 'Services     : %s\n' "$services"
   printf 'Domains      : %s\n' "$domains"
   if [[ ${ENABLED[mariadb]:-0} -eq 1 ]]; then
@@ -302,6 +302,38 @@ preserve_to_tmp() {
   printf '%s' "${dest}/${base}"
 }
 
+# Restore a backed-up directory tree over a live path without deleting files
+# that are not in the backup.  Used for install-time rollback of Angie/PHP.
+restore_tree() {
+  local source=$1 target=$2
+  [[ -n $source && -d $source ]] || return 0
+  mkdir -p "$target" || return 1
+  cp -a "${source}/." "$target/" 2>/dev/null || return 1
+  return 0
+}
+
+rollback_angie_tree() {
+  local backup=$1
+  [[ -n $backup && -d "${backup}/angie" ]] || return 0
+  restore_tree "${backup}/angie" /etc/angie \
+    || warn "Could not restore the previous /etc/angie tree"
+  if /usr/sbin/angie -t >/dev/null 2>&1; then
+    systemctl reload angie 2>/dev/null || systemctl restart angie 2>/dev/null || true
+    warn "Rolled back Angie configuration from ${backup}"
+  else
+    warn "Angie rollback restored files but angie -t still fails"
+  fi
+}
+
+rollback_php_tree() {
+  local backup=$1 ver=$2
+  [[ -n $backup && -d "${backup}/fpm" ]] || return 0
+  restore_tree "${backup}/fpm" "/etc/php/${ver}/fpm" \
+    || warn "Could not restore the previous PHP ${ver} tree"
+  systemctl restart "php${ver}-fpm" 2>/dev/null || true
+  warn "Rolled back PHP ${ver} configuration from ${backup}"
+}
+
 on_error() {
   local rc=$? line=${1:-?} cmd=${BASH_COMMAND:-unknown}
   # Keep the failing command on one line and bounded, so a large heredoc or a
@@ -314,8 +346,10 @@ trap 'on_error $LINENO' ERR
 
 # Serialise real runs.  Two concurrent invocations (an operator plus a cron or
 # CI job) can interleave config rewrites and leave a half-written service
-# file behind.  Dry-runs do not touch the system and are always allowed.
-readonly LOCK_FILE="${TMP_ROOT}/setup.sh.lock"
+# file behind.  The lock lives in /run (root-owned) rather than the
+# world-writable /tmp so another local user cannot pre-create a symlink and
+# make root truncate an arbitrary file.  Dry-runs do not take the lock.
+readonly LOCK_FILE="/run/setup.sh.lock"
 LOCK_HELD=0
 
 acquire_run_lock() {
@@ -324,6 +358,11 @@ acquire_run_lock() {
     warn "flock not available; continuing without a run lock"
     return 0
   fi
+  # /run is root-owned; refuse a symlink defensively in case an older install
+  # or a compromised account created the path.
+  [[ -L $LOCK_FILE ]] && die "Refusing symlinked run lock ${LOCK_FILE}"
+  ( umask 077; : >> "$LOCK_FILE" ) 2>/dev/null \
+    || die "Could not create the run lock ${LOCK_FILE}"
   exec 9>"$LOCK_FILE" || die "Could not open the run lock ${LOCK_FILE}"
   if ! flock -n 9; then
     exec 9>&-
@@ -381,6 +420,7 @@ OTHERS=()
 DOMAINS=()
 PURGE=0
 OPTIMIZE=0
+DIAGNOSTICS=0
 DRY_RUN=0
 PURGE_TARGETS=()
 PURGE_ORDER=()
@@ -494,6 +534,14 @@ Testing:
   --dry-run                             parse and validate only; show the plan
                                         without changing the system (works as
                                         a normal user and with --purge)
+
+Diagnostics:
+  --diagnostics
+      Collects host/hardware details, running services and their status,
+      Angie/PHP/MariaDB/Valkey/Redis/Elasticsearch runtime statistics,
+      slow-query and slow-request logs, service error logs and kernel/OOM
+      reports into diagnostics.log beside setup.sh.  Run as root; this mode
+      only reads state and writes that one file.
 
 Notes:
   * Every run mirrors its full output to setup_<timestamp>.log in the
@@ -647,6 +695,8 @@ parse_args() {
         ;;
       --optimize)
         OPTIMIZE=1; shift ;;
+      --diagnostics)
+        DIAGNOSTICS=1; shift ;;
       --purge)
         PURGE=1; shift
         while (( $# )) && [[ $1 != --* ]]; do
@@ -1036,9 +1086,17 @@ validate_all() {
   local svc
 
   if (( OPTIMIZE )); then
+    (( DIAGNOSTICS )) && die "--optimize cannot be combined with --diagnostics"
     (( PURGE )) && die "--optimize cannot be combined with --purge"
     [[ ${#DOMAINS[@]} -eq 0 ]] || die "--optimize cannot be combined with --domain"
     [[ ${#ENABLED[@]} -eq 0 ]] || die "--optimize scans installed services and cannot be combined with install flags"
+    return 0
+  fi
+
+  if (( DIAGNOSTICS )); then
+    (( PURGE )) && die "--diagnostics cannot be combined with --purge"
+    [[ ${#DOMAINS[@]} -eq 0 ]] || die "--diagnostics cannot be combined with --domain"
+    [[ ${#ENABLED[@]} -eq 0 ]] || die "--diagnostics only reads the host and cannot be combined with install flags"
     return 0
   fi
 
@@ -1270,6 +1328,7 @@ ensure_log_dirs() {
 configure_logrotate() {
   step "Log rotation (/var/www/logs)"
   apt_install logrotate
+  record_original /etc/logrotate.d/setup-logs logrotate-setup-logs
   cat > /etc/logrotate.d/setup-logs <<'EOF'
 # Managed by setup.sh: keep all service logs under /var/www/logs.
 # copytruncate is used so services do not need a reopen signal. Rotation runs
@@ -1312,7 +1371,8 @@ record_original() {
 }
 
 restore_original() {
-  local path=$1 name=$2 src="${BACKUP_DIR}/${name}"
+  local path=$1 name=$2
+  local src="${BACKUP_DIR}/${name}"
   [[ -f "${BACKUP_DIR}/${name}.recorded" ]] || return 0
   if [[ $(<"${BACKUP_DIR}/${name}.recorded") == present && -e $src ]]; then
     # Copy over the existing path instead of unlinking it first.  Any extra
@@ -1324,6 +1384,17 @@ restore_original() {
       cp -a "$src" "$path"
     fi
     info "Restored ${path} (existing files overwritten; nothing deleted)"
+  elif [[ -e $path || -L $path ]]; then
+    # The path did not exist before setup.  Move the generated file out of the
+    # live location instead of leaving a stale DNS/PAM/sysctl/unit override
+    # behind after --purge.  /tmp owns its expiry, so this is not a deletion.
+    local moved
+    moved=$(preserve_to_tmp "$path" 2>/dev/null || true)
+    if [[ -n $moved ]]; then
+      info "Moved generated ${path} to ${moved} (nothing deleted)"
+    else
+      warn "Could not move generated ${path}; leaving it in place"
+    fi
   else
     info "Leaving ${path} in place (setup.sh never deletes server files)"
   fi
@@ -1577,7 +1648,9 @@ cron_remove_line() {
 # ---------------------------------------------------------------------------
 configure_dns() {
   step "DNS"
-  record_original /etc/systemd/resolved.conf.d resolved.conf.d
+  # Track the drop-in itself, not the whole directory: other resolver drop-ins
+  # may belong to the operator and must survive a purge.
+  record_original /etc/systemd/resolved.conf.d/dns_servers.conf dns_servers.conf
   mkdir -p /etc/systemd/resolved.conf.d
   # Only manage our own drop-in; do not delete unrelated resolver configs.
   local dns_src="${SCRIPT_DIR}/configs/system/dns_servers.conf"
@@ -1678,7 +1751,7 @@ configure_hostname() {
 
 install_basic_tools() {
   step "Basic tools"
-  apt_install wget unzip nano zip software-properties-common rsync ca-certificates curl gnupg dmidecode git jq htop iotop openssl logrotate
+  apt_install wget unzip nano zip software-properties-common rsync ca-certificates curl gnupg dmidecode git
 }
 
 configure_timezone() {
@@ -1970,6 +2043,7 @@ EOF
   # boot; otherwise every boot logs "No such file or directory" for bbr/fq/
   # conntrack even though the values are applied later.
   mkdir -p /etc/modules-load.d
+  record_original /etc/modules-load.d/setup-network.conf modules-load-setup-network.conf
   local -a net_mods=(nf_conntrack)
   [[ $QDISC == fq ]] && net_mods+=(sch_fq)
   [[ $TCP_CC == bbr ]] && net_mods+=(tcp_bbr)
@@ -2003,6 +2077,7 @@ EOF
   # systemd-sysctl runs before modules-load on Ubuntu, which logs "No such
   # file or directory" on every boot. Apply them from a small oneshot unit
   # after the modules are available instead.
+  record_original /etc/systemd/system/setup-network-tuning.service setup-network-tuning.service
   {
     cat <<'EOF'
 [Unit]
@@ -2102,32 +2177,41 @@ configure_ufw() {
   # remove that ALLOW rule.  Allow every effective sshd port, not just 22: a
   # host moved to a custom port would otherwise lose remote access the moment
   # UFW is enabled.
-  local ssh_port ssh_limited
+  local ssh_port ssh_limited had_allow
   while IFS= read -r ssh_port; do
     [[ $ssh_port =~ ^[0-9]+$ ]] || continue
     ssh_limited=0
-    if ufw status 2>/dev/null | grep -qE "^${ssh_port}(/tcp)?( \(v6\))?[[:space:]]+LIMIT"; then
-      ssh_limited=1
-    elif ufw insert 1 limit "${ssh_port}/tcp" 2>/dev/null; then
-      ssh_limited=1
-      info "UFW: rate-limited SSH port ${ssh_port}/tcp (ufw limit)"
-    elif ufw limit "${ssh_port}/tcp" 2>/dev/null; then
-      ssh_limited=1
-      info "UFW: rate-limited SSH port ${ssh_port}/tcp (ufw limit)"
+    had_allow=0
+    if ufw show added 2>/dev/null | grep -qE "^ufw allow ${ssh_port}/tcp($| )|^ufw allow ${ssh_port}($| )"; then
+      had_allow=1
     fi
 
-    if (( ssh_limited )); then
-      # Remove a previously managed or provider-supplied plain ALLOW rule so
-      # the LIMIT is the only SSH rule left and cannot be shadowed.  Both
-      # spellings are tried because ufw records `allow 22` and `allow 22/tcp`
-      # differently.
-      ufw delete allow "${ssh_port}/tcp" >/dev/null 2>&1 || true
-      ufw delete allow "${ssh_port}" >/dev/null 2>&1 || true
+    if ufw show added 2>/dev/null | grep -qE "^ufw limit ${ssh_port}/tcp($| )|^ufw limit ${ssh_port}($| )"; then
+      ssh_limited=1
     else
-      # Never remove the last SSH rule: a failed rate-limit insert must not
-      # leave the host unreachable after UFW is enabled.  Keep or add a plain
-      # rule as a lockout guard and make the failure visible.
-      warn "Could not rate-limit SSH port ${ssh_port}/tcp; keeping a plain ALLOW rule to avoid lockout"
+      # ufw treats allow and limit for the same port as the same rule: it
+      # refuses to insert a limit while a plain allow exists, and a later
+      # `delete allow` would remove the limit too.  Remove the plain allow
+      # first, then insert the limit; if that fails, restore the allow so a
+      # remote operator cannot be locked out.
+      if (( had_allow )); then
+        if ufw show added 2>/dev/null | grep -qxF "ufw allow ${ssh_port}/tcp"; then
+          ufw delete allow "${ssh_port}/tcp" >/dev/null 2>&1 || true
+        fi
+        if ufw show added 2>/dev/null | grep -qxF "ufw allow ${ssh_port}"; then
+          ufw delete allow "${ssh_port}" >/dev/null 2>&1 || true
+        fi
+      fi
+      if ufw insert 1 limit "${ssh_port}/tcp" 2>/dev/null \
+         || ufw limit "${ssh_port}/tcp" 2>/dev/null; then
+        ssh_limited=1
+        info "UFW: rate-limited SSH port ${ssh_port}/tcp (ufw limit)"
+      fi
+    fi
+
+    if (( ! ssh_limited )); then
+      # Never leave the host without an SSH rule.
+      warn "Could not rate-limit SSH port ${ssh_port}/tcp; restoring a plain ALLOW rule to avoid lockout"
       ufw status 2>/dev/null | grep -qE "^${ssh_port}(/tcp)?( \(v6\))?[[:space:]]+ALLOW" \
         || ufw insert 1 allow "${ssh_port}/tcp" 2>/dev/null \
         || ufw allow "${ssh_port}/tcp" 2>/dev/null || true
@@ -2428,7 +2512,7 @@ count_optimize_cache_entries() {
 }
 
 tune_replace() {
-  local file=$1 pattern=$2 replacement=$3 desc=$4 before after
+  local file=$1 pattern=$2 replacement=$3 desc=$4 tmp
   if [[ ! -f $file ]]; then
     tune_miss "file not found for ${desc}: ${file}"
     return 0
@@ -2437,12 +2521,15 @@ tune_replace() {
     tune_miss "no match for ${desc}"
     return 0
   fi
-  before=$(md5sum "$file" | awk '{print $1}')
+  tmp=$(tmp_file) || return 1
   # Use a delimiter that does not collide with regex alternation (`|`) or
   # common path characters in these directives.
-  sed_in_place -E "s#${pattern}#${replacement}#" "$file"
-  after=$(md5sum "$file" | awk '{print $1}')
-  [[ $before != "$after" ]] && tune_note "$desc"
+  sed -E "s#${pattern}#${replacement}#" "$file" > "$tmp" || return 1
+  if cmp -s "$file" "$tmp"; then
+    return 0
+  fi
+  cat -- "$tmp" > "$file"
+  tune_note "$desc"
   return 0
 }
 
@@ -2837,16 +2924,21 @@ tune_angie_configs() {
 # PHP-FPM
 # ---------------------------------------------------------------------------
 tune_pool_set() {
-  local file=$1 key=$2 value=$3 desc=$4 before after
+  local file=$1 key=$2 value=$3 desc=$4 tmp
   local escaped=${key//./\\.}
-  before=$(md5sum "$file" | awk '{print $1}')
+  tmp=$(tmp_file) || return 1
   if grep -qE "^[[:space:]]*${escaped}[[:space:]]*=" "$file"; then
-    sed_in_place -E "s|^[[:space:]]*${escaped}[[:space:]]*=.*|${key} = ${value}|" "$file"
+    sed -E "s|^[[:space:]]*${escaped}[[:space:]]*=.*|${key} = ${value}|" "$file" > "$tmp" \
+      || return 1
   else
-    printf '%s = %s\n' "$key" "$value" >> "$file"
+    cat -- "$file" > "$tmp" || return 1
+    printf '%s = %s\n' "$key" "$value" >> "$tmp"
   fi
-  after=$(md5sum "$file" | awk '{print $1}')
-  [[ $before != "$after" ]] && tune_note "$desc"
+  if cmp -s "$file" "$tmp"; then
+    return 0
+  fi
+  cat -- "$tmp" > "$file"
+  tune_note "$desc"
   return 0
 }
 
@@ -3116,12 +3208,18 @@ deploy_angie_configs() {
   # The repository owns the config tree, cache-directory creation, removal of
   # old setup.sh overrides, the angie -t check and the reload.
   export CONFIG_SOURCE_DIR
-  bash "${CONFIG_SOURCE_DIR}/scripts/nginx_conf.sh"
+  if ! bash "${CONFIG_SOURCE_DIR}/scripts/nginx_conf.sh"; then
+    warn "Angie config deployment failed"
+    return 1
+  fi
 
   # Hardware-aware Angie tuning is owned by setup.sh so the same code runs
   # during install and during `--optimize`.
   tune_reset_changes
-  tune_angie_configs /etc/angie || die "Angie tuning failed"
+  if ! tune_angie_configs /etc/angie; then
+    warn "Angie tuning failed"
+    return 1
+  fi
   # Enable the same WordPress FastCGI guest cache that --optimize installs.
   optimize_wordpress_cache /etc/angie || warn "WordPress cache setup was skipped"
   local change
@@ -3129,33 +3227,161 @@ deploy_angie_configs() {
   for change in "${TUNE_MISSES[@]}"; do warn "tune not applied: ${change}"; done
 }
 
-install_angie() {
-  step "Angie web server"
-  apt_install ca-certificates curl wget unzip rsync openssl
-
-  if [[ ! -s /etc/apt/trusted.gpg.d/angie-signing.gpg ]]; then
-    blob_angie_key > /etc/apt/trusted.gpg.d/angie-signing.gpg
-    chmod 644 /etc/apt/trusted.gpg.d/angie-signing.gpg
+# Ensure an embedded key file is present and byte-identical to the payload.
+# A truncated file from an interrupted write, or an outdated key, otherwise
+# makes every later apt operation fail until an operator removes it manually.
+refresh_blob_key() {
+  local target=$1 blob=$2 tmp
+  tmp=$(tmp_file) || return 1
+  "$blob" > "$tmp" 2>/dev/null || { warn "Could not decode ${blob}"; return 1; }
+  [[ -s $tmp ]] || { warn "Embedded ${blob} decoded to an empty file"; return 1; }
+  if [[ -s $target ]] && cmp -s "$tmp" "$target"; then
+    return 0
   fi
+  install -m 644 "$tmp" "$target" || return 1
+  info "Refreshed embedded key: ${target}"
+}
 
+refresh_blob_key_dearmor() {
+  local target=$1 blob=$2 tmp
+  tmp=$(tmp_file) || return 1
+  "$blob" 2>/dev/null | gpg --dearmor --yes -o "$tmp" 2>/dev/null \
+    || { warn "Could not decode/dearmor ${blob}"; return 1; }
+  [[ -s $tmp ]] || { warn "Embedded ${blob} decoded to an empty key"; return 1; }
+  if [[ -s $target ]] && cmp -s "$tmp" "$target"; then
+    return 0
+  fi
+  install -m 644 "$tmp" "$target" || return 1
+  info "Refreshed embedded key: ${target}"
+}
+
+ensure_sury_keyring() {
+  local keyring=/usr/share/keyrings/debsuryorg-archive-keyring.gpg
+  local deb extract embedded
+  deb=$(tmp_file --suffix=.deb) || return 1
+  blob_sury_deb > "$deb" 2>/dev/null || { warn "Could not decode Sury keyring payload"; return 1; }
+  extract=$(tmp_dir) || return 1
+  dpkg-deb -x "$deb" "$extract" 2>/dev/null || true
+  embedded=$(find "$extract" -type f -name '*.gpg' 2>/dev/null | head -n1)
+  if [[ -s $keyring && -n $embedded ]] && cmp -s "$keyring" "$embedded"; then
+    return 0
+  fi
+  dpkg -i "$deb" || { warn "Could not install the Sury keyring package"; return 1; }
+  info "Refreshed embedded key: ${keyring}"
+}
+
+# ---------------------------------------------------------------------------
+# APT repositories
+# ---------------------------------------------------------------------------
+# Add every selected third-party repository first, then run one apt-get update
+# in prepare_repositories().  The service installers only install packages.
+configure_angie_repo() {
+  refresh_blob_key /etc/apt/trusted.gpg.d/angie-signing.gpg blob_angie_key \
+    || return 1
+  chmod 644 /etc/apt/trusted.gpg.d/angie-signing.gpg
   # shellcheck disable=SC1091
   . /etc/os-release
   printf 'deb https://download.angie.software/angie/%s/%s %s main\n' \
     "$ID" "$VERSION_ID" "$VERSION_CODENAME" > /etc/apt/sources.list.d/angie.list
   chmod 644 /etc/apt/sources.list.d/angie.list
+}
 
-  apt_update
+configure_php_repo() {
+  ensure_sury_keyring || return 1
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  printf 'deb [signed-by=/usr/share/keyrings/debsuryorg-archive-keyring.gpg] https://packages.sury.org/php/ %s main\n' \
+    "$VERSION_CODENAME" > /etc/apt/sources.list.d/php.list
+  chmod 644 /etc/apt/sources.list.d/php.list
+}
+
+configure_elastic_repo() {
+  refresh_blob_key_dearmor /usr/share/keyrings/elasticsearch-keyring.gpg blob_elastic_key \
+    || return 1
+  chmod 644 /usr/share/keyrings/elasticsearch-keyring.gpg
+  printf 'deb [signed-by=/usr/share/keyrings/elasticsearch-keyring.gpg] https://artifacts.elastic.co/packages/9.x/apt stable main\n' \
+    > /etc/apt/sources.list.d/elastic-9.x.list
+  chmod 644 /etc/apt/sources.list.d/elastic-9.x.list
+}
+
+configure_nodesource_repo() {
+  refresh_blob_key_dearmor /usr/share/keyrings/nodesource.gpg blob_nodesource_key \
+    || return 1
+  chmod 644 /usr/share/keyrings/nodesource.gpg
+  cat > /etc/apt/sources.list.d/nodesource.sources <<EOF
+Types: deb
+URIs: https://deb.nodesource.com/node_26.x
+Suites: nodistro
+Components: main
+Architectures: $(dpkg --print-architecture)
+Signed-By: /usr/share/keyrings/nodesource.gpg
+EOF
+  chmod 644 /etc/apt/sources.list.d/nodesource.sources
+}
+
+prepare_repositories() {
+  local configured=0 item
+  apt_install ca-certificates curl gnupg lsb-release apt-transport-https
+  if [[ ${ENABLED[angie]:-0} -eq 1 ]]; then
+    configure_angie_repo || die "Could not configure the Angie APT repository"
+    configured=1
+  fi
+  if [[ ${ENABLED[php]:-0} -eq 1 ]]; then
+    configure_php_repo || die "Could not configure the Sury APT repository"
+    configured=1
+  fi
+  if [[ ${ENABLED[elastic]:-0} -eq 1 ]]; then
+    configure_elastic_repo || die "Could not configure the Elastic APT repository"
+    configured=1
+  fi
+  if [[ ${ENABLED[others]:-0} -eq 1 ]]; then
+    for item in "${OTHERS[@]}"; do
+      if [[ $item == nodejs ]]; then
+        configure_nodesource_repo || die "Could not configure the NodeSource APT repository"
+        configured=1
+        break
+      fi
+    done
+  fi
+  if (( configured )); then
+    apt_update
+  fi
+}
+
+install_angie() {
+  step "Angie web server"
+  local angie_backup=""
+  apt_install ca-certificates curl wget unzip rsync openssl
+
   apt_install angie
 
   systemctl daemon-reload || true
   systemctl enable --now angie || warn "Angie did not start with the packaged config"
 
-  deploy_angie_configs
+  # Keep a copy of the deployed tree so a failed repo deploy/tune can be
+  # rolled back instead of leaving a live host with a broken configuration.
+  if [[ -d /etc/angie ]]; then
+    angie_backup=$(tmp_dir angie-install.XXXXXX) \
+      || die "Could not create an Angie backup directory"
+    cp -a /etc/angie "$angie_backup/" \
+      || die "Could not back up /etc/angie to ${angie_backup}"
+  fi
+
+  if ! deploy_angie_configs; then
+    rollback_angie_tree "$angie_backup"
+    return 1
+  fi
   chmod 755 /etc/angie/scripts/cloudflare.sh 2>/dev/null || true
 
   systemctl daemon-reload
-  /usr/sbin/angie -t
-  systemctl restart angie
+  if ! /usr/sbin/angie -t; then
+    rollback_angie_tree "$angie_backup"
+    return 1
+  fi
+  if ! systemctl restart angie; then
+    rollback_angie_tree "$angie_backup"
+    return 1
+  fi
 
   if ! /etc/angie/scripts/cloudflare.sh; then
     warn "Cloudflare IP update failed; keeping the existing cloudflare.conf"
@@ -3170,27 +3396,55 @@ install_angie() {
 # ---------------------------------------------------------------------------
 # PHP
 # ---------------------------------------------------------------------------
+# A clean PHP install is required: a stopped but installed second PHP version
+# still owns a pool that can later bind /run/php/php-fpm.sock and break the
+# selected version.  Remove every PHP package first, keeping the old /etc/php
+# tree recoverable under /tmp.
+purge_php_installations() {
+  local -a pkgs=() units=()
+  mapfile -t pkgs < <(dpkg-query -W -f='${binary:Package}\n' 2>/dev/null \
+    | grep -E '^php([0-9]+\.[0-9]+)?(-|$)' | sort -u)
+  (( ${#pkgs[@]} > 0 )) || return 0
+
+  mapfile -t units < <(systemctl list-units --all --no-legend --no-pager 'php*-fpm.service' 2>/dev/null \
+    | awk '{print $1}' | grep -E '^php.*-fpm\.service$' || true)
+  local unit
+  for unit in "${units[@]}"; do
+    systemctl disable --now "$unit" 2>/dev/null || true
+  done
+
+  local backup=""
+  if [[ -d /etc/php ]]; then
+    backup=$(tmp_dir php-config.XXXXXX) || die "Could not create a PHP config backup directory"
+    cp -a /etc/php "$backup/" 2>/dev/null \
+      || warn "Could not back up /etc/php to ${backup}"
+    info "Backed up the existing /etc/php tree to ${backup}"
+  fi
+
+  info "Purging existing PHP packages for a clean installation: ${pkgs[*]}"
+  apt-get purge "${APT_OPTS[@]}" "${pkgs[@]}" \
+    || die "Could not purge the existing PHP packages"
+
+  # apt purge normally removes the tree; if conffiles survived, keep them in
+  # /tmp instead of leaving a stale pool next to the new installation.
+  if [[ -e /etc/php ]]; then
+    local moved
+    moved=$(preserve_to_tmp /etc/php 2>/dev/null || true)
+    [[ -n $moved ]] && info "Moved leftover /etc/php to ${moved}"
+  fi
+  systemctl daemon-reload || true
+  systemctl reset-failed 'php*-fpm' 2>/dev/null || true
+}
+
 install_php() {
   local ver=${OPT[php.ver]:-}
   local tz=${OPT[basic.time]:-Asia/Manila}
+  local php_backup=""
   step "PHP ${ver:-auto}"
 
-  apt_install ca-certificates curl gnupg lsb-release
-
-  if [[ ! -s /usr/share/keyrings/debsuryorg-archive-keyring.gpg ]]; then
-    local deb
-    deb=$(tmp_file --suffix=.deb)
-    blob_sury_deb > "$deb"
-    dpkg -i "$deb"
-  fi
-
-  # shellcheck disable=SC1091
-  . /etc/os-release
-  printf 'deb [signed-by=/usr/share/keyrings/debsuryorg-archive-keyring.gpg] https://packages.sury.org/php/ %s main\n' \
-    "$VERSION_CODENAME" > /etc/apt/sources.list.d/php.list
-  chmod 644 /etc/apt/sources.list.d/php.list
-
-  apt_update
+  # The requested PHP version must be the only one installed, not merely the
+  # only one active.  Purge everything before selecting/installing.
+  purge_php_installations
 
   if [[ -z $ver ]]; then
     ver=$(latest_sury_php)
@@ -3198,29 +3452,19 @@ install_php() {
     OPT[php.ver]=$ver
     info "Auto-selected latest stable PHP: ${ver}"
   fi
+  # run_service executes installers in a subshell; persist the selected version
+  # so the parent shell reports and reuses the same value.
+  ensure_state
+  printf '%s\n' "$ver" > "${STATE_DIR}/php-selected-version"
 
-  # Refuse to start a second PHP-FPM version on the shared FastCGI socket.
-  # Check before apt_install, because the package post-install script would
-  # otherwise start the new version and fail with a cryptic bind error.
-  local active_same=0 unit
-  while IFS= read -r unit; do
-    [[ -n $unit ]] || continue
-    if [[ $unit == "php${ver}-fpm.service" ]]; then
-      active_same=1
-      continue
-    fi
-    die "Another PHP-FPM version is active (${unit}). Only one PHP version can own the shared FastCGI socket at a time. Purge it first, e.g. --purge --php ver=<old>"
-  done < <(systemctl list-units --type=service --state=active --no-legend 'php*-fpm.service' 2>/dev/null | awk '{print $1}')
-  if (( ! active_same )); then
-    if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE '(^|:)9000$'; then
-      die "Port 9000 is already in use by another process. Only one PHP version can run at a time; free the port first."
-    fi
-    # A stale socket left by a purged/crashed pool is replaced by PHP-FPM
-    # itself when it binds.  setup.sh does not unlink it in case the path is
-    # still in use by another process.
-    [[ -S /run/php/php-fpm.sock ]] \
-      && info "Leaving existing FastCGI socket for PHP-FPM to validate"
+  if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE '(^|:)9000$'; then
+    die "Port 9000 is already in use by another process. Only one PHP version can run at a time; free the port first."
   fi
+  # A stale socket left by a purged/crashed pool is replaced by PHP-FPM
+  # itself when it binds.  setup.sh does not unlink it in case the path is
+  # still in use by another process.
+  [[ -S /run/php/php-fpm.sock ]] \
+    && info "Leaving existing FastCGI socket for PHP-FPM to validate"
   mkdir -p /run/php
   chown www-data:www-data /run/php 2>/dev/null || true
   chmod 755 /run/php
@@ -3244,6 +3488,15 @@ install_php() {
     info "PHP ${ver} bundles OPcache in the core package; skipping php${ver}-opcache"
   fi
   apt_install "${php_pkgs[@]}"
+
+  # Preserve the package-created configuration so a bad template, tuning pass
+  # or failed start can be rolled back.
+  if [[ -d "/etc/php/${ver}/fpm" ]]; then
+    php_backup=$(tmp_dir php-install.XXXXXX) \
+      || die "Could not create a PHP backup directory"
+    cp -a "/etc/php/${ver}/fpm" "$php_backup/" \
+      || die "Could not back up PHP ${ver} configuration to ${php_backup}"
+  fi
 
   # Keep the CLI on the same version as FPM.  Without this, installing a
   # distro package can add a newer php-cli and make /usr/bin/php point at a
@@ -3271,7 +3524,10 @@ install_php() {
   # the --optimize command.  It writes the socket listener and the final
   # performance values in conf.d/zz-setup-optimize.ini.
   tune_reset_changes
-  tune_php_fpm_version "$ver"
+  if ! tune_php_fpm_version "$ver"; then
+    rollback_php_tree "$php_backup" "$ver"
+    return 1
+  fi
   if [[ -n ${OPT[php.children]:-} && ${OPT[php.children]} != auto ]]; then
     tune_pool_set "/etc/php/${ver}/fpm/pool.d/www.conf" pm.max_children \
       "${OPT[php.children]}" "PHP ${ver}: max_children override=${OPT[php.children]}"
@@ -3300,8 +3556,11 @@ install_php() {
   # (The conflict was checked before apt_install; this just clears any
   # previous failed state for the same version.)
   systemctl reset-failed "php${ver}-fpm" 2>/dev/null || true
-  systemctl enable --now "php${ver}-fpm"
-  systemctl restart "php${ver}-fpm"
+  if ! systemctl enable --now "php${ver}-fpm" \
+     || ! systemctl restart "php${ver}-fpm"; then
+    rollback_php_tree "$php_backup" "$ver"
+    return 1
+  fi
   systemctl status "php${ver}-fpm" --no-pager || true
   if command -v "php-fpm${ver}" >/dev/null 2>&1; then
     "php-fpm${ver}" -v
@@ -3389,6 +3648,31 @@ MARIADB_PROFILE_MAX_CONN=""
 MARIADB_PROFILE_IO_READ=""
 MARIADB_PROFILE_IO_WRITE=""
 MARIADB_PROFILE_BACKLOG=""
+
+# Remove only the performance directives from the installer-managed block in
+# 50-server.cnf once the optimize drop-in exists.  Base settings (charset,
+# secure_file_priv, slow log, bind-address, ...) stay in 50; the 99- drop-in is
+# the single owner of the tuning keys.
+mariadb_strip_install_block() {
+  local size_mb=$1 max_conn=$2
+  local cnf=/etc/mysql/mariadb.conf.d/50-server.cnf tmp keys
+  [[ -f $cnf ]] || return 0
+  keys=$(mariadb_performance_settings "$size_mb" "$max_conn" 2>/dev/null \
+    | sed -n 's/^\([a-z0-9_]*\)[[:space:]]*=.*/\1/p' | paste -sd'|' -)
+  [[ -n $keys ]] || return 0
+  tmp=$(tmp_file) || return 1
+  awk -v b="$MARIADB_BEGIN" -v e="$MARIADB_END" -v keys="$keys" '
+    $0 == b { inblock = 1; print; next }
+    $0 == e { inblock = 0; print; next }
+    inblock && $0 ~ ("^[[:space:]]*(" keys ")[[:space:]]*=") { next }
+    { print }
+  ' "$cnf" > "$tmp"
+  if ! cmp -s "$cnf" "$tmp"; then
+    cat "$tmp" > "$cnf"
+    info "Consolidated MariaDB performance settings into 99-setup-optimize.cnf"
+  fi
+  return 0
+}
 
 mariadb_compute_profile() {
   local size_mb=$1 logsize open_cache aria_mb threads max_conn current_max=""
@@ -3510,8 +3794,19 @@ EOF
 configure_mariadb() {
   local size_mb=$1 bind=$2
   local cnf=/etc/mysql/mariadb.conf.d/50-server.cnf
+  local optcnf=/etc/mysql/mariadb.conf.d/99-setup-optimize.cnf
   local tmp
   [[ -f $cnf ]] || die "MariaDB config ${cnf} not found"
+
+  # A fresh install writes performance values into 50-server.cnf.  If an
+  # earlier --optimize created the 99- drop-in, move it out of the live tree
+  # so the newly written 50- block is the single owner again instead of
+  # leaving two overlapping definitions.
+  if [[ -f $optcnf ]]; then
+    local moved
+    moved=$(preserve_to_tmp "$optcnf" 2>/dev/null || true)
+    [[ -n $moved ]] && info "Moved previous optimize tuning to ${moved}"
+  fi
 
   # Comment out expire_logs_days if it is active.
   sed_in_place -E 's|^([[:space:]]*)expire_logs_days([[:space:]]*=)|\1#expire_logs_days\2|' "$cnf"
@@ -3731,8 +4026,10 @@ install_valkey() {
   step "Valkey"
   if pkg_ok redis-server; then
     warn "redis-server is installed; leaving it untouched because setup.sh never removes packages."
-    warn "Stop/disable redis-server manually before installing Valkey if you need Valkey instead."
-    return 1
+    warn "Valkey was not installed. Run --optimize to tune the existing Redis server with the same cache profile."
+    # A pre-existing Redis is not a failed install: the requested service was
+    # already covered by a compatible cache and --optimize handles it.
+    return 0
   fi
   apt_clean
   apt_install valkey-server
@@ -3921,25 +4218,13 @@ install_elastic() {
       ;;
   esac
 
-  apt_install apt-transport-https ca-certificates curl gnupg
-
-  if [[ ! -s /usr/share/keyrings/elasticsearch-keyring.gpg ]]; then
-    blob_elastic_key | gpg --dearmor -o /usr/share/keyrings/elasticsearch-keyring.gpg
-    chmod 644 /usr/share/keyrings/elasticsearch-keyring.gpg
-  fi
-
-  printf 'deb [signed-by=/usr/share/keyrings/elasticsearch-keyring.gpg] https://artifacts.elastic.co/packages/9.x/apt stable main\n' \
-    > /etc/apt/sources.list.d/elastic-9.x.list
-  chmod 644 /etc/apt/sources.list.d/elastic-9.x.list
-
-  apt_update
   apt_install elasticsearch
   ensure_log_dirs
 
-  # Elasticsearch's bootstrap check needs a large vm.max_map_count.
-  if [[ ! -f /etc/sysctl.d/99-elasticsearch.conf ]]; then
-    printf 'vm.max_map_count = 1048576\n' > /etc/sysctl.d/99-elasticsearch.conf
-  fi
+  # Elasticsearch's bootstrap check needs a large vm.max_map_count.  Always
+  # rewrite the managed file: an older/lower value must not survive a reboot.
+  printf 'vm.max_map_count = 1048576\n' > /etc/sysctl.d/99-elasticsearch.conf
+  chmod 644 /etc/sysctl.d/99-elasticsearch.conf
   sysctl -w vm.max_map_count=1048576 >/dev/null || warn "Could not set vm.max_map_count"
 
   local yml=/etc/elasticsearch/elasticsearch.yml es_url
@@ -4057,25 +4342,8 @@ install_others() {
         gifsicle --version | head -n 1 || true
         ;;
       nodejs)
-        info "Configuring NodeSource 26.x and installing Node.js"
+        info "Installing Node.js from the prepared NodeSource 26.x repository"
         pkg_record_origin nodejs
-        [[ -e /etc/apt/sources.list.d/nodesource.sources ]] \
-          || touch "${STATE_DIR}/setup-created-nodesource-repo"
-        [[ -e /usr/share/keyrings/nodesource.gpg ]] \
-          || touch "${STATE_DIR}/setup-created-nodesource-key"
-        apt_install curl ca-certificates gnupg
-        blob_nodesource_key | gpg --dearmor --yes -o /usr/share/keyrings/nodesource.gpg
-        chmod 644 /usr/share/keyrings/nodesource.gpg
-        cat > /etc/apt/sources.list.d/nodesource.sources <<EOF
-Types: deb
-URIs: https://deb.nodesource.com/node_26.x
-Suites: nodistro
-Components: main
-Architectures: $(dpkg --print-architecture)
-Signed-By: /usr/share/keyrings/nodesource.gpg
-EOF
-        chmod 644 /etc/apt/sources.list.d/nodesource.sources
-        apt_update
         apt_install nodejs
         node -v
         ;;
@@ -4345,6 +4613,35 @@ purge_basic() {
       ufw delete "${rule[@]}" || true
     done < "${STATE_DIR}/ufw-added"
   fi
+
+  # A plain SSH ALLOW rule that existed before setup was replaced by the rate
+  # limit in configure_ufw().  Put it back on purge so the original firewall
+  # state is restored (the limit rule is kept as the last-resort lockout guard).
+  if [[ -f "${STATE_DIR}/ufw-added-before" ]]; then
+    local line is_ssh ssh_p
+    local -a rule
+    while IFS= read -r line; do
+      [[ $line == ufw\ allow* ]] || continue
+      is_ssh=0 ssh_p=""
+      for p in "${ssh_ports[@]}"; do
+        if [[ $line =~ (^|[[:space:]])${p}(/tcp)?([[:space:]]|$) ]]; then
+          is_ssh=1
+          ssh_p=$p
+          break
+        fi
+      done
+      (( is_ssh )) || continue
+      ufw show added 2>/dev/null | grep -qxF -- "$line" && continue
+      # allow and limit cannot coexist for the same port; remove the transient
+      # limit before restoring the operator's original allow rule.
+      if [[ -n $ssh_p ]] && ufw show added 2>/dev/null | grep -qxF "ufw limit ${ssh_p}/tcp"; then
+        ufw delete limit "${ssh_p}/tcp" >/dev/null 2>&1 || true
+      fi
+      read -r -a rule <<< "${line#ufw }"
+      ufw "${rule[@]}" || true
+      info "Restored pre-existing SSH rule: ${line}"
+    done < "${STATE_DIR}/ufw-added-before"
+  fi
   if [[ -f "${STATE_DIR}/ufw-active-before" ]] && [[ $(<"${STATE_DIR}/ufw-active-before") == inactive ]]; then
     ufw --force disable || true
   elif [[ -f "${STATE_DIR}/ufw-defaults-before" ]]; then
@@ -4362,12 +4659,13 @@ purge_basic() {
   restore_original /etc/sysctl.conf sysctl.conf
   restore_original /etc/sysctl.d/99-sysctl.conf sysctl.d-99-sysctl.conf
   restore_original /etc/sysctl.d/90-setup-network.conf sysctl.d-90-setup-network.conf
-  # Keep the modules-load drop-ins and the oneshot unit on disk.  Disabling the
-  # unit is enough to stop it running; unlink them manually if they are truly
-  # unwanted.
+  restore_original /etc/modules-load.d/setup-network.conf modules-load-setup-network.conf
+  restore_original /etc/logrotate.d/setup-logs logrotate-setup-logs
+  # Disable the oneshot before moving its unit file out of the live location.
   systemctl disable --now setup-network-tuning.service 2>/dev/null || true
+  restore_original /etc/systemd/system/setup-network-tuning.service setup-network-tuning.service
   systemctl daemon-reload || true
-  restore_original /etc/systemd/resolved.conf.d resolved.conf.d
+  restore_original /etc/systemd/resolved.conf.d/dns_servers.conf dns_servers.conf
   if [[ -f /etc/sysctl.conf ]]; then
     sysctl -e -p /etc/sysctl.conf || true
   fi
@@ -4572,6 +4870,9 @@ run_service() {
   set -e
   end=$(date +%s)
   SVC_SECONDS[$name]=$(( end - start ))
+  if [[ $name == php && -s "${STATE_DIR}/php-selected-version" ]]; then
+    OPT[php.ver]=$(<"${STATE_DIR}/php-selected-version")
+  fi
   if (( rc == 0 )); then
     SVC_STATUS[$name]="OK"
     ok "${name} completed in $(format_duration "${SVC_SECONDS[$name]}")"
@@ -4682,7 +4983,8 @@ opt_report() { OPT_REPORT+=("$*"); }
 
 opt_backup() {
   local path=$1 name=$2
-  [[ -n $OPT_BACKUP_DIR ]] || OPT_BACKUP_DIR="${TMP_ROOT}/setup-optimize-$(date +%Y%m%d-%H%M%S)"
+  [[ -n $OPT_BACKUP_DIR ]] || OPT_BACKUP_DIR=$(tmp_dir setup-optimize.XXXXXX)
+  [[ -n $OPT_BACKUP_DIR ]] || die "Could not create an optimize backup directory"
   # Copies include /etc/angie/ssl/*/privkey.pem and /etc/mysql/debian.cnf.
   # 0700 keeps the rollback tree (and its filenames) private to root.
   install -d -m 700 "$OPT_BACKUP_DIR"
@@ -4696,7 +4998,8 @@ opt_backup() {
 }
 
 opt_restore() {
-  local path=$1 name=$2 src="${OPT_BACKUP_DIR}/${name}" moved
+  local path=$1 name=$2
+  local src="${OPT_BACKUP_DIR}/${name}" moved
   [[ -n $OPT_BACKUP_DIR ]] || return 1
   if [[ -e $src ]]; then
     # Overwrite in place; never unlink the live path before restoring it.
@@ -4729,7 +5032,12 @@ detect_installed_services() {
     [[ -d /etc/mysql ]] && OPT_DETECTED+=(mariadb)
   fi
   [[ -f /etc/valkey/valkey.conf ]] && OPT_DETECTED+=(valkey)
-  [[ -f /etc/redis/redis.conf ]] && OPT_DETECTED+=(redis)
+  # Valkey takes precedence.  Tuning both would apply the same shared cache
+  # budget twice and could overcommit RAM; Redis-only hosts still get the
+  # complete Valkey tuning profile.
+  if [[ ! -f /etc/valkey/valkey.conf && -f /etc/redis/redis.conf ]]; then
+    OPT_DETECTED+=(redis)
+  fi
   [[ -f /etc/elasticsearch/elasticsearch.yml ]] && OPT_DETECTED+=(elastic)
   return 0
 }
@@ -4783,14 +5091,16 @@ mariadb_current_pool_mb() {
 
 # Allocated index store size (primary + replicas) in whole MB.
 elasticsearch_data_size_mb() {
-  local bytes
+  local bytes resp
   command -v curl >/dev/null 2>&1 || return 0
-  bytes=$(curl -fsS --max-time 3 \
+  resp=$(curl -fsS --max-time 3 \
     'http://127.0.0.1:9200/_cluster/stats?filter_path=indices.store.size_in_bytes' \
-    2>/dev/null \
+    2>/dev/null || true)
+  [[ -n $resp ]] || return 0
+  bytes=$(printf '%s\n' "$resp" \
     | sed -n 's/.*"size_in_bytes"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
-    | head -n1)
-  [[ $bytes =~ ^[0-9]+$ ]] || return 0
+    | head -n1 || true)
+  [[ $bytes =~ ^[0-9]+$ ]] || bytes=0
   printf '%s' $(( bytes / 1024 / 1024 ))
 }
 
@@ -4803,7 +5113,7 @@ elasticsearch_current_heap_mb() {
       'http://127.0.0.1:9200/_nodes/stats/jvm?filter_path=nodes.*.jvm.mem.heap_max_in_bytes' \
       2>/dev/null \
       | sed -n 's/.*"heap_max_in_bytes"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
-      | sort -n | tail -n1)
+      | sort -n | tail -n1 || true)
     if [[ $bytes =~ ^[0-9]+$ ]]; then
       printf '%s' $(( bytes / 1024 / 1024 ))
       return 0
@@ -4827,8 +5137,8 @@ elasticsearch_current_heap_mb() {
 plan_memory_budget() {
   local total usable has_php=0 has_angie=0 has_maria=0 has_cache=0 has_es=0
   local fixed_available children php_cap
-  local es_base_cap=31744 es_hard_cap=31744 es_size_mb=0 es_base=0
-  local es_cap=0 current_heap=0 current_pool=0
+  local es_base_cap=31744 es_hard_cap=31744 es_size_mb=0 es_base=0 es_measured=0
+  local es_cap=0 current_heap=0 current_pool=0 db_measured=0
   total=$(mem_total_mb)
   (( total > 0 )) || total=1024
   OPT_MEM_TOTAL_MB=$total
@@ -4895,10 +5205,20 @@ plan_memory_budget() {
   OPT_ES_SIZE_MB=0
   if [[ " ${OPT_DETECTED[*]} " == *" elastic "* ]]; then
     es_size_mb=$(elasticsearch_data_size_mb)
-    [[ $es_size_mb =~ ^[0-9]+$ ]] || es_size_mb=0
+    if [[ -n $es_size_mb ]]; then
+      es_measured=1
+    else
+      es_size_mb=0
+    fi
     OPT_ES_SIZE_MB=$es_size_mb
-    if (( es_size_mb > 0 )); then
-      es_base=$(( es_size_mb * 105 / 100 ))
+    if (( es_measured )); then
+      # A measured empty index is not a missing measurement: give the JVM the
+      # 512 MB floor, not 25% of RAM.
+      if (( es_size_mb > 0 )); then
+        es_base=$(( es_size_mb * 105 / 100 ))
+      else
+        es_base=512
+      fi
     else
       local es_fallback_pct=25
       if (( !has_angie && !has_php && !has_maria && !has_cache )); then
@@ -4917,7 +5237,11 @@ plan_memory_budget() {
     # Prefer a buffer pool that holds the live data+index working set.  The
     # 5% headroom covers InnoDB metadata and adaptive hash structures.
     db_size_mb=$(mariadb_data_size_mb)
-    [[ $db_size_mb =~ ^[0-9]+$ ]] || db_size_mb=0
+    if [[ -n $db_size_mb ]]; then
+      db_measured=1
+    else
+      db_size_mb=0
+    fi
     OPT_DB_SIZE_MB=$db_size_mb
 
     # Reserve the full cache and search budgets before sizing MariaDB, so a
@@ -4936,8 +5260,13 @@ plan_memory_budget() {
     (( db_floor > 8192 )) && db_floor=8192
     (( db_floor < 256 )) && db_floor=256
     (( db_floor > db_cap )) && db_floor=$db_cap
-    if (( db_size_mb > 0 )); then
-      OPT_MARIADB_BUDGET_MB=$(( db_size_mb * 105 / 100 ))
+    if (( db_measured )); then
+      if (( db_size_mb > 0 )); then
+        OPT_MARIADB_BUDGET_MB=$(( db_size_mb * 105 / 100 ))
+      else
+        # A measured empty database keeps the hardware-scaled floor.
+        OPT_MARIADB_BUDGET_MB=$db_floor
+      fi
       (( OPT_MARIADB_BUDGET_MB < db_floor )) && OPT_MARIADB_BUDGET_MB=$db_floor
     else
       local db_fallback_pct=40
@@ -5336,9 +5665,13 @@ migrate_php_pool_to_socket() {
   local pool="/etc/php/${ver}/fpm/pool.d/www.conf"
   local angie_conf=/etc/angie/angie.conf
   local socket=/run/php/php-fpm.sock
-  local bak="${OPT_BACKUP_DIR:-${TMP_ROOT}/setup-php-socket-$(date +%Y%m%d-%H%M%S)}/php-socket"
+  local bakdir bak="${OPT_BACKUP_DIR:-}/php-socket"
   local fpm_bin="" tcp_re port i ok=0
   MIGRATE_REASON=""
+  if [[ -z ${OPT_BACKUP_DIR:-} ]]; then
+    bakdir=$(tmp_dir setup-php-socket.XXXXXX) || { MIGRATE_REASON="could not create a backup directory"; return 1; }
+    bak="${bakdir}/php-socket"
+  fi
 
   [[ -f $pool && -f $angie_conf ]] || { MIGRATE_REASON="pool or angie.conf is missing"; return 1; }
   systemctl is-active --quiet angie || { MIGRATE_REASON="Angie is not active"; return 1; }
@@ -5672,6 +6005,10 @@ EOF
   cnf_after=$(md5sum "$cnf" | awk '{print $1}')
   opt_report "- Wrote \`${cnf}\` (buffer=${buffer}, max_connections=${max_conn}, back_log=${backlog})"
   opt_report "- innodb_io_capacity=${io_read}/${io_write}, thread_pool_size=${threads}"
+  # One owner for the performance values: remove the installer-managed block
+  # from 50-server.cnf now that the 99- drop-in is authoritative.
+  mariadb_strip_install_block "$size_mb" "$max_conn" \
+    || warn "Could not remove old performance keys from 50-server.cnf"
 
   # A running server can resize the buffer pool online.  Restarting a busy
   # database just to grow it by a few percent empties every application cache
@@ -5805,8 +6142,16 @@ optimize_valkey() {
     [[ $used_mb =~ ^[0-9]+$ ]] || used_mb=0
     needed_mb=$(( used_mb * 110 / 100 ))
     if (( needed_mb > max_mb )); then
-      opt_report "- maxmemory raised to ${needed_mb}mb (in use=${used_mb}mb; refusing to evict live data)"
-      max_mb=$needed_mb
+      local hard_cap
+      hard_cap=$(( ${OPT_MEM_TOTAL_MB:-$(mem_total_mb)} * 80 / 100 ))
+      (( hard_cap < 256 )) && hard_cap=256
+      if (( needed_mb > hard_cap )); then
+        opt_report "- maxmemory capped at ${hard_cap}mb (live data needs ${needed_mb}mb; add RAM or reduce the working set)"
+        max_mb=$hard_cap
+      else
+        opt_report "- maxmemory raised to ${needed_mb}mb (in use=${used_mb}mb; refusing to evict live data)"
+        max_mb=$needed_mb
+      fi
     fi
   fi
   policy=$(awk '/^[[:space:]]*maxmemory-policy[[:space:]]/{print $2; exit}' "$conf")
@@ -5838,7 +6183,7 @@ optimize_valkey() {
   # Keep this in a dedicated drop-in so a package/admin file is never edited.
   dropin="/etc/systemd/system/${unit}.service.d/zz-setup-optimize.conf"
   fd_limit=$(systemctl show -p LimitNOFILE --value "$unit" 2>/dev/null || true)
-  if [[ $fd_limit =~ ^[0-9]+$ ]] && (( fd_limit < 32768 )); then
+  if [[ $fd_limit =~ ^[0-9]+$ ]] && (( fd_limit < 524288 )); then
     opt_backup "$(dirname "$dropin")" "${kind}-systemd"
     mkdir -p "$(dirname "$dropin")"
     printf '[Service]\nLimitNOFILE=524288\nLimitCORE=0\n' > "$dropin"
@@ -6358,7 +6703,7 @@ optimize_plan() {
   detect_installed_services
   plan_memory_budget
   cpu_performance_governor_available || governor_desc="skipped (no performance governor)"
-  disk_free_mb=$(df -Pm /var/www 2>/dev/null | awk 'NR==2{print $4}')
+  disk_free_mb=$(df -Pm /var/www 2>/dev/null | awk 'NR==2{print $4}' || true)
   [[ $disk_free_mb =~ ^[0-9]+$ ]] || disk_free_mb=$(df -Pm / 2>/dev/null | awk 'NR==2{print $4}')
   [[ $disk_free_mb =~ ^[0-9]+$ ]] || disk_free_mb=10240
   cache_mb=$(angie_cache_budget_mb "$ram_mb" "$disk_free_mb")
@@ -6435,6 +6780,273 @@ optimize_plan() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# Diagnostics: one read-only report for an OpenCode/analysis session
+# ---------------------------------------------------------------------------
+DIAG_FILE=""
+
+diag_section() {
+  printf '\n\n===== %s =====\n' "$*" >> "$DIAG_FILE"
+}
+
+# Run a command (or builtin) and append one titled section.  Every failure is
+# recorded in the report instead of aborting the diagnostics run.
+diag() {
+  local title=$1
+  shift
+  diag_section "$title"
+  "$@" >> "$DIAG_FILE" 2>&1 || true
+}
+
+# Same as diag(), for compound commands and pipelines.
+diag_sh() {
+  local title=$1 cmd=$2
+  diag_section "$title"
+  bash -c "$cmd" >> "$DIAG_FILE" 2>&1 || true
+}
+
+diag_tail_file() {
+  local logfile=$1 nlines=${2:-300}
+  [[ -f $logfile ]] || return 0
+  diag_section "tail ${nlines}: ${logfile}"
+  tail -n "$nlines" -- "$logfile" >> "$DIAG_FILE" 2>&1 || true
+}
+
+# Diagnostics read journald, sudo records and service logs.  Redact common
+# credential forms before the file is handed to an analysis agent.
+redact_diagnostics() {
+  local file=$1
+  [[ -f $file ]] || return 0
+  sed_in_place -E \
+    -e 's/([A-Za-z_]*(pass|PASS|Pass|password|PASSWORD|Password)=)[^[:space:];]+/\1***/g' \
+    -e 's/(MYSQL_PWD=)[^[:space:];]+/\1***/g' \
+    -e 's/(REDISCLI_AUTH=)[^[:space:];]+/\1***/g' \
+    -e "s/(IDENTIFIED BY ')[^']*(')/\1***\2/g" \
+    -e 's/(IDENTIFIED BY ")[^"]*(")/\1***\2/g' \
+    "$file" || true
+}
+
+run_diagnostics() {
+  local out="${SCRIPT_DIR}/diagnostics.log"
+  local u ver fpm_bin f
+  local -a units=(angie mariadb valkey-server redis-server elasticsearch)
+
+  umask 077
+  if ! : > "$out" 2>/dev/null; then
+    die "Could not write ${out}; run diagnostics from a writable checkout"
+  fi
+  chmod 600 "$out"
+  DIAG_FILE=$out
+
+  {
+    printf '================================================================\n'
+    printf ' setup.sh diagnostics\n'
+    printf ' Script: %s %s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
+    printf ' Host  : %s\n' "$(hostname 2>/dev/null || printf unknown)"
+    printf ' Date  : %s\n' "$(date -Is 2>/dev/null || date)"
+    printf '================================================================\n'
+  } >> "$DIAG_FILE"
+
+  # ---------------------------------------------------------------------------
+  # Host, hardware and OS
+  # ---------------------------------------------------------------------------
+  diag "date" date -Is
+  diag "hostname" hostname -f
+  diag "uname" uname -a
+  diag "uptime" uptime
+  diag "os-release" cat /etc/os-release
+  diag "virtualization" systemd-detect-virt
+  diag "cpu" lscpu
+  diag_sh "cpu model and flags" 'grep -m1 -E "^(model name|flags)" /proc/cpuinfo; grep -m1 "cpu cores" /proc/cpuinfo'
+  diag "memory" free -m
+  diag "meminfo" cat /proc/meminfo
+  diag "block devices" lsblk -o NAME,SIZE,TYPE,ROTA,MODEL,MOUNTPOINT
+  diag "filesystems" df -hT
+  diag "inodes" df -i
+  diag "swap" swapon --show
+  diag "mounts" mount
+  diag "ulimits" bash -c 'ulimit -a'
+  diag "boot parameters" cat /proc/cmdline
+  diag "kernel modules" lsmod
+  diag "thermal" bash -c 'command -v sensors >/dev/null && sensors || true'
+  diag "load" cat /proc/loadavg
+  diag "vmstat" vmstat 1 5
+  diag_sh "I/O statistics" 'if command -v iostat >/dev/null; then iostat -xz 1 3; else echo "iostat not installed"; fi'
+  diag_sh "per-CPU statistics" 'if command -v mpstat >/dev/null; then mpstat -P ALL 1 3; else echo "mpstat not installed"; fi'
+  diag_sh "process I/O" 'if command -v pidstat >/dev/null; then pidstat -u -r -d 1 3; else echo "pidstat not installed"; fi'
+  diag "top by CPU" bash -c 'ps -eo pid,ppid,user,%cpu,%mem,rss,etime,cmd --sort=-%cpu | head -40'
+  diag "top by memory" bash -c 'ps -eo pid,ppid,user,%cpu,%mem,rss,etime,cmd --sort=-%mem | head -40'
+  diag "top snapshot" bash -c 'top -b -n1 | head -60'
+
+  # ---------------------------------------------------------------------------
+  # Network and kernel tuning
+  # ---------------------------------------------------------------------------
+  diag "addresses" ip -br address
+  diag "routes" ip route show table all
+  diag "link statistics" ip -s link
+  diag "socket summary" ss -s
+  diag "listeners" ss -lntup
+  diag "unix sockets" ss -lxnp
+  diag "DNS" resolvectl status
+  diag "qdisc" tc qdisc show
+  diag_sh "ethtool statistics" 'for i in $(ls /sys/class/net); do [ "$i" = lo ] && continue; echo "--- $i"; ethtool -S "$i" 2>/dev/null | head -40; done'
+  diag "sysctl all" sysctl -a
+  diag "sysctl.conf" cat /etc/sysctl.conf
+  diag_sh "sysctl drop-ins" 'find /etc/sysctl.d -maxdepth 1 -type f -print -exec sh -c "echo --- \$1; sed -n \"1,300p\" \"\$1\"" _ {} \;'
+  diag "PAM limits" cat /etc/security/limits.conf
+  diag_sh "PAM limit drop-ins" 'find /etc/security/limits.d -maxdepth 1 -type f -print -exec sh -c "echo --- \$1; cat \"\$1\"" _ {} \;'
+  diag "modules-load" bash -c 'find /etc/modules-load.d -maxdepth 1 -type f -print -exec cat {} \;'
+
+  # ---------------------------------------------------------------------------
+  # Services, units and versions
+  # ---------------------------------------------------------------------------
+  diag "failed units" systemctl --failed --no-pager -l
+  diag "all units" systemctl list-units --all --no-pager
+  diag "unit files" systemctl list-unit-files --no-pager
+  diag "timers" systemctl list-timers --all --no-pager
+  diag "systemd blame" bash -c 'systemd-analyze blame | head -40'
+  diag "systemd critical chain" systemd-analyze critical-chain
+
+  while IFS= read -r u; do
+    [[ -n $u ]] || continue
+    units+=("$u")
+  done < <(systemctl list-units --all --no-legend --no-pager 'php*-fpm.service' 2>/dev/null \
+             | awk '{print $1}' | grep -E '^php.*-fpm\.service$' || true)
+
+  for u in "${units[@]}"; do
+    diag "systemctl status ${u}" systemctl status "$u" --no-pager -l
+    diag "systemctl show ${u}" systemctl show "$u" \
+      -p Id,Description,LoadState,ActiveState,SubState,MainPID,ExecMainPID,MemoryCurrent,CPUUsageNSec,TasksCurrent,TasksMax,LimitNOFILE,LimitMEMLOCK,LimitNPROC,Restart,RestartUSec
+    diag "systemctl cat ${u}" systemctl cat "$u"
+  done
+
+  diag "Angie version" /usr/sbin/angie -V
+  diag "Angie config test" /usr/sbin/angie -t
+  diag_sh "Angie loaded configuration" '/usr/sbin/angie -T 2>&1 | head -n 3000'
+  diag_sh "Angie vhosts" 'find /etc/angie/conf.d -maxdepth 1 -type f -name "*.conf" -printf "%f\n" 2>/dev/null | sort'
+  diag_sh "Angie certificates" 'for f in /etc/angie/ssl/*/fullchain.pem; do [ -f "$f" ] || continue; echo "--- $f"; openssl x509 -in "$f" -noout -subject -issuer -dates 2>&1; done'
+  diag_sh "Angie error/access log sizes" 'du -sh /var/www/logs/angie /var/log/angie 2>/dev/null || true'
+
+  diag "PHP CLI version" php -v
+  diag "PHP CLI modules" php -m
+  diag "PHP CLI ini" php --ini
+  diag_sh "PHP-FPM versions" 'for d in /etc/php/*/fpm; do [ -d "$d" ] || continue; v=${d%/fpm}; v=${v##*/}; echo "--- PHP $v"; command -v "php-fpm$v" >/dev/null && "php-fpm$v" -v || /usr/sbin/php-fpm"$v" -v 2>&1; done'
+  while IFS= read -r ver; do
+    [[ -n $ver ]] || continue
+    if command -v "php-fpm${ver}" >/dev/null 2>&1; then
+      fpm_bin=$(command -v "php-fpm${ver}")
+    else
+      fpm_bin="/usr/sbin/php-fpm${ver}"
+    fi
+    diag "PHP ${ver} FPM version" "$fpm_bin" -v
+    diag "PHP ${ver} FPM test" "$fpm_bin" -t
+    diag "PHP ${ver} pool" cat "/etc/php/${ver}/fpm/pool.d/www.conf"
+    diag "PHP ${ver} global config" cat "/etc/php/${ver}/fpm/php-fpm.conf"
+    diag_sh "PHP ${ver} conf.d" "find /etc/php/${ver}/fpm/conf.d -maxdepth 1 -type f -print -exec sh -c 'echo --- \$1; cat \"\$1\"' _ {} \\;"
+    diag_sh "PHP ${ver} processes" "ps -eo pid,ppid,user,%cpu,%mem,rss,etime,cmd | grep -E '[p]hp-fpm${ver}' | head -60"
+    diag_sh "PHP ${ver} listeners" "ss -lxp | grep -E 'php${ver}|php-fpm' || true"
+    diag_sh "PHP ${ver} status" "if [ -S /run/php/php-fpm.sock ]; then curl -fsS --max-time 3 --unix-socket /run/php/php-fpm.sock http://localhost/fpm-status 2>&1 || true; fi"
+  done < <(php_fpm_versions)
+
+  diag "MariaDB version" mariadb --version
+  diag "MariaDB server version" mariadbd --version
+  diag "MariaDB ping" mariadb-admin ping
+  diag "MariaDB variables" mariadb -N -B -e 'SHOW GLOBAL VARIABLES'
+  diag "MariaDB status" mariadb -N -B -e 'SHOW GLOBAL STATUS'
+  diag "MariaDB processlist" mariadb -e 'SHOW FULL PROCESSLIST'
+  diag "MariaDB InnoDB status" mariadb -e 'SHOW ENGINE INNODB STATUS\G'
+  diag_sh "MariaDB database sizes" "mariadb -N -B -e \"SELECT table_schema, ROUND(SUM(data_length+index_length)/1024/1024,1) AS mb, COUNT(*) AS tables FROM information_schema.tables WHERE table_schema NOT IN ('mysql','information_schema','performance_schema','sys') GROUP BY table_schema ORDER BY mb DESC;\""
+  diag_sh "MariaDB replication" "mariadb -e 'SHOW REPLICA STATUS\\G' 2>&1 || mariadb -e 'SHOW SLAVE STATUS\\G' 2>&1 || true"
+  diag_sh "MariaDB extended status" 'mariadb-admin ext 2>&1 | head -300'
+  diag_sh "MariaDB error log size" 'du -sh /var/www/logs/mariadb /var/log/mysql 2>/dev/null || true'
+
+  if command -v valkey-cli >/dev/null 2>&1; then
+    diag "Valkey info" valkey-cli INFO all
+    diag "Valkey config" valkey-cli CONFIG GET maxmemory
+    diag "Valkey clients" valkey-cli CLIENT LIST
+    diag "Valkey slowlog" valkey-cli SLOWLOG GET 100
+    diag "Valkey memory stats" valkey-cli MEMORY STATS
+    diag "Valkey latency" valkey-cli LATENCY LATEST
+  fi
+  if command -v redis-cli >/dev/null 2>&1; then
+    diag "Redis info" redis-cli INFO all
+    diag "Redis config" redis-cli CONFIG GET maxmemory
+    diag "Redis clients" redis-cli CLIENT LIST
+    diag "Redis slowlog" redis-cli SLOWLOG GET 100
+    diag "Redis memory stats" redis-cli MEMORY STATS
+    diag "Redis latency" redis-cli LATENCY LATEST
+  fi
+
+  diag "Elasticsearch root" curl -fsS --max-time 5 http://127.0.0.1:9200
+  diag "Elasticsearch health" curl -fsS --max-time 5 'http://127.0.0.1:9200/_cluster/health?pretty'
+  diag "Elasticsearch nodes" curl -fsS --max-time 5 'http://127.0.0.1:9200/_cat/nodes?v'
+  diag "Elasticsearch indices" curl -fsS --max-time 5 'http://127.0.0.1:9200/_cat/indices?v&s=store.size:desc'
+  diag_sh "Elasticsearch node stats" 'curl -fsS --max-time 10 "http://127.0.0.1:9200/_nodes/stats/jvm,os,indices,thread_pool?pretty" | head -n 500'
+  diag_sh "Elasticsearch allocation" 'curl -fsS --max-time 5 "http://127.0.0.1:9200/_cluster/allocation/explain?pretty" | head -n 200'
+  diag "Elasticsearch YAML" cat /etc/elasticsearch/elasticsearch.yml
+  diag_sh "Elasticsearch JVM options" 'find /etc/elasticsearch/jvm.options.d -maxdepth 1 -type f -print -exec sh -c "echo --- \$1; cat \"\$1\"" _ {} \;'
+  diag "Elasticsearch systemd limits" cat /etc/systemd/system/elasticsearch.service.d/limits.conf
+  diag_sh "Elasticsearch log size" 'du -sh /var/www/logs/elasticsearch /var/log/elasticsearch 2>/dev/null || true'
+
+  diag "Node version" node -v
+  diag "npm version" npm -v
+  diag_sh "Node processes" 'ps -eo pid,ppid,user,%cpu,%mem,rss,etime,cmd | grep -E "[n]ode" | head -60'
+  diag_sh "Node listeners" 'ss -lntp | grep -i node || true'
+  diag_sh "Node service units" 'systemctl list-units --all --no-legend --no-pager "*node*.service" 2>/dev/null || true'
+
+  # ---------------------------------------------------------------------------
+  # Logs, slow logs and failed requests
+  # ---------------------------------------------------------------------------
+  diag "journal disk usage" journalctl --disk-usage
+  diag_sh "recent journal warnings" 'journalctl --since "24 hours ago" -p warning --no-pager | tail -n 1200'
+  for u in "${units[@]}"; do
+    diag_sh "journal ${u} (24h)" "journalctl -u '${u}' --since '24 hours ago' -n 600 --no-pager 2>&1"
+  done
+  diag_sh "kernel OOM/hung tasks" 'journalctl -k --since "7 days ago" --no-pager 2>&1 | grep -iE "out of memory|oom|killed process|hung task|blocked for more|call trace" | tail -n 300'
+  diag "dmesg" dmesg -T
+  diag "syslog" tail -n 800 /var/log/syslog
+  diag "kern.log" tail -n 500 /var/log/kern.log
+  diag "auth.log" tail -n 300 /var/log/auth.log
+
+  # Slow logs first: these matter most for application tuning.
+  diag_tail_file /var/www/logs/php/php-fpm-slow.log 800
+  diag_tail_file /var/www/logs/mariadb/slow.log 800
+  diag_tail_file /var/www/logs/angie/error.log 500
+  diag_tail_file /var/www/logs/valkey/valkey.log 500
+  diag_tail_file /var/www/logs/elasticsearch/essearch.log 500
+  diag_tail_file /var/www/logs/nodejs/nodejs.log 500
+  diag_tail_file /var/www/logs/gifsicle/gifsicle.log 200
+
+  while IFS= read -r f; do
+    [[ -n $f ]] || continue
+    diag_tail_file "$f" 200
+  done < <(find /var/www/logs -type f \( -name '*.log' -o -name '*.json' \) 2>/dev/null | sort | head -n 120)
+
+  diag_sh "log sizes" 'du -sh /var/www/logs/* /var/log/angie /var/log/php* /var/log/mysql /var/log/redis* 2>/dev/null | sort -h || true'
+  diag "logrotate debug" logrotate -d /etc/logrotate.d/setup-logs
+  diag "cron" crontab -l
+  diag "UFW status" ufw status verbose
+  diag "UFW added rules" ufw show added
+  diag "SSH effective config" sshd -T
+  diag "last logins" last -n 30
+  diag "who" who
+  diag "apt upgradable" bash -c 'apt list --upgradable 2>/dev/null | head -100'
+  diag_sh "installed service packages" 'dpkg -l | awk "\$1==\"ii\" && (\$2 ~ /^(angie|php|mariadb|valkey|redis|elasticsearch|nodejs|nginx)/){print \$2, \$3}"'
+  diag_sh "setup state" 'find /var/lib/setup.sh -maxdepth 2 -type f -printf "%p %s bytes\n" 2>/dev/null | sort'
+  diag_sh "cache and data sizes" 'du -sh /var/lib/mysql /var/lib/elasticsearch /var/cache/angie /home/nginx_cache* /var/cache/php/opcache 2>/dev/null | sort -h || true'
+
+  redact_diagnostics "$DIAG_FILE"
+
+  {
+    printf '\n\n===== diagnostics complete =====\n'
+    printf 'Finished: %s\n' "$(date -Is 2>/dev/null || date)"
+    printf 'Size: %s\n' "$(du -h "$DIAG_FILE" 2>/dev/null | awk '{print $1}')"
+  } >> "$DIAG_FILE"
+
+  chmod 600 "$DIAG_FILE"
+  printf '%s\n' "$DIAG_FILE"
+}
+
 run_os_tuning() {
   step "OS auto-tuning (CPU, memory, networking)"
   ensure_state
@@ -6442,10 +7054,10 @@ run_os_tuning() {
   # same hardware-aware profile as a fresh build.  Each tuner is idempotent
   # and records the original files for a later --purge.
   configure_cpu_governor
-  # The installer targets 50% of RAM as swap (and does nothing when the host
-  # already has enough).  Apply the same policy during --optimize so a live
-  # host has the same memory-pressure headroom.
-  configure_swap_auto
+  # Swap is deliberately not touched by --optimize.  Resizing a live swap
+  # file can swapoff/rewrite under memory pressure, and creating a 50%-of-RAM
+  # file on a large host is a destructive disk change rather than tuning.
+  # Use --basic swap=SIZE (or manage swap separately) when a host needs it.
   # Raise fs.nr_open/file-max before writing the 1M-nofile PAM limits: a
   # limits value above the kernel's fs.nr_open makes PAM fail to raise the
   # hard limit for the next login.
@@ -6458,13 +7070,17 @@ run_optimize() {
   OPT_REPORT_STARTED=1
   OPT_START_TS=$(date -Is)
   OPT_START_EPOCH=$(date +%s)
-  OPT_BACKUP_DIR="${TMP_ROOT}/setup-optimize-$(date +%Y%m%d-%H%M%S)"
+  OPT_BACKUP_DIR=""
   # The directory is created lazily by opt_backup() so a host with no
   # supported services (OS tuning only) does not leave an empty backup tree.
   # Rollback copies live under /tmp and are allowed to expire there; older
   # releases pruned them, which permanently deleted operator-recoverable data.
   OPT_REPORT=()
   detect_installed_services
+  if (( ${#OPT_DETECTED[@]} > 0 )); then
+    OPT_BACKUP_DIR=$(tmp_dir setup-optimize.XXXXXX) \
+      || die "Could not create an optimize backup directory"
+  fi
   plan_memory_budget
   run_os_tuning
   # A service restart fails when its log directory is owned by another
@@ -6563,6 +7179,11 @@ main() {
   # in the invocation directory before anything can fail or print output.
   start_run_log "$@"
   trap on_exit EXIT
+  # A Ctrl-C or service-manager stop must unwind through on_exit so the run
+  # log is closed and the optimize report is written.  Without these traps a
+  # signal can leave the terminal/log in an inconsistent state.
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
 
   # --help/--version are safe without root.
   local a
@@ -6580,6 +7201,10 @@ main() {
   log_selection
 
   if (( DRY_RUN )); then
+    if (( DIAGNOSTICS )); then
+      printf 'DRY RUN - would write diagnostics to %s\n' "${SCRIPT_DIR}/diagnostics.log"
+      exit 0
+    fi
     if (( OPTIMIZE )); then
       optimize_plan
       exit 0
@@ -6590,6 +7215,12 @@ main() {
   fi
 
   [[ ${EUID} -eq 0 ]] || die "This script must be run as root (use: sudo bash ${SCRIPT_NAME} ...)"
+
+  if (( DIAGNOSTICS )); then
+    run_diagnostics
+    exit 0
+  fi
+
   acquire_run_lock
 
   [[ -r /etc/os-release ]] || die "Cannot read /etc/os-release"
@@ -6641,6 +7272,18 @@ main() {
 
   if [[ ${ENABLED[basic]:-0} -eq 1 ]];   then run_service basic   install_basic; fi
 
+  # Add all selected third-party repositories first, then update APT once.
+  # Service installers only install packages; this avoids one apt-get update
+  # (and its lock/retry overhead) per service.
+  local need_repos=0 item
+  (( ${ENABLED[angie]:-0} || ${ENABLED[php]:-0} || ${ENABLED[elastic]:-0} )) && need_repos=1
+  for item in "${OTHERS[@]}"; do
+    [[ $item == nodejs ]] && need_repos=1
+  done
+  if (( need_repos )); then
+    prepare_repositories
+  fi
+
   # The external repository now owns Angie config only. PHP-FPM templates are
   # local to this repository (configs/php), so a PHP-only install needs no
   # network fetch.
@@ -6675,58 +7318,58 @@ main() {
 
 blob_sysctl() {
   base64 -d <<'B64' | gzip -dc
-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
-wvF2xb9R/B/i0SKoHh0AAA==
+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
+FXz7sZkSDjcq/nXi/z3CegAYHQAA
 B64
 }
 

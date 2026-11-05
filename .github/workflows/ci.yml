@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Bash syntax
+        run: |
+          bash -n setup.sh
+          bash -n tests/test-dry-run-matrix.sh
+          bash -n tests/test-tuning.sh
+          bash -n tests/stress-site/setup-stress-site.sh
+          bash -n tests/stress-site/run-stress.sh
+          bash -n tools/diff_configs.sh
+
+      - name: ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          shellcheck -S warning setup.sh tests/test-dry-run-matrix.sh tests/test-tuning.sh tools/diff_configs.sh
+
+      - name: Dry-run matrix
+        run: bash tests/test-dry-run-matrix.sh
+
+      - name: Tuning tests
+        run: bash tests/test-tuning.sh

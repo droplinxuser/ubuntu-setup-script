@@ -2,3 +2,4 @@
 .DS_Store
 *.swp
 setup_*.log
+diagnostics.log

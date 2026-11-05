@@ -15,10 +15,12 @@ other service configs live here.
 | `mariadb/limit_nofile.conf` | MariaDB systemd `LimitNOFILE` drop-in |
 | `php/` | PHP-FPM pool templates, `custom_dan.ini`, systemd limits |
 
-`setup.sh` embeds equivalent fallbacks so it still works as a single file, but
-when it is run from this checkout it prefers the files in this directory. The
-MariaDB profile is a reference; `setup.sh` generates a hardware-aware variant
-(buffer pool size, thread pool, I/O capacity, slow log, etc.).
+`setup.sh` embeds fallbacks for the system and MariaDB profiles so a
+single-file run can still provision those services, but the PHP-FPM pool and
+`php.ini` templates are intentionally **not** embedded: run an install from a
+repository checkout (or package `configs/php/` alongside `setup.sh`) when
+installing PHP. When the checkout is present, `setup.sh` prefers the files in
+this directory.
 
 Related items:
 

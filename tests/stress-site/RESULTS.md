@@ -1,6 +1,57 @@
 # Full-stack stress test reports
 
+## setup.sh 1.8.36 - 8 vCPU / 15 GiB validation (2026-11-05)
+
+Host: `stress-vps`, 8 vCPU, 15.1 GiB RAM, Ubuntu 26.04.1, Angie 1.12.4,
+PHP 8.5.12 FPM (80 static workers), MariaDB 11.8.6, Valkey 9.0.4,
+Elasticsearch 9.5.6, Node.js 26.13.0, Gifsicle 1.96.
+
+The host was installed with `--basic ... --angie --php --mariadb --valkey
+--elastic --others all`, then optimized with `--optimize`. The standard suite
+was run on the VPS itself so the load generator did not hide CPU saturation;
+the local macOS desktop also ran `oha` over HTTPS for an external view.
+
+| Scenario | Requests/sec | p50 | p90 | p99 |
+|---|---:|---:|---:|---:|
+| static | 156,990 | 482us | 1.19ms | 2.11ms |
+| php-hello | 68,619 | 1.20ms | 66.83ms | 464.70ms |
+| mariadb-json | 13,300 | 6.06ms | 281.86ms | 1.34s |
+| valkey-json | 18,959 | 3.90ms | 599.90ms | 1.49s |
+| elasticsearch | 7,697 | 5.77ms | 8.94ms | 17.80ms |
+| node-proxy (simple) | 19,701 | 4.93ms | 6.22ms | 7.88ms |
+| full-uncached-200 | 3,618 | 21.84ms | 31.15ms | 41.07ms |
+| full-cached-200 | 93,116 | 1.94ms | 3.28ms | 5.20ms |
+| slow-1s-200 | 71.8 | 1.00s | 1.01s | 1.04s |
+
+Additional full-stack probes:
+
+| Workload | Requests/sec | CPU |
+|---|---:|---:|
+| WordPress guest page (FastCGI cache) | 9,028 | 100% |
+| Node.js all-services app (`mysql2` + `ioredis` + ES) | 4,250 | 99.7% |
+| Mixed stress + WordPress + Node, 20s | 768 + 3,732 + 1,128 | 100% (0% idle) |
+| Valkey direct Unix-socket benchmark | ~195k SET / ~195k GET ops/s | 38% total CPU; client/loopback bound |
+
+Per-service CPU observations at high concurrency:
+
+- Angie static: 100% CPU, 154k req/s.
+- PHP hello: 94% CPU, 60k req/s.
+- MariaDB through PHP: 96.5% CPU, 13.4k req/s.
+- Elasticsearch through PHP: 91.8% CPU, 8.1k req/s.
+- Node all-services: 99.7% CPU, 4.25k req/s.
+- Full stack: 97% CPU at 3.7k req/s; the uncached path is CPU-limited,
+  not blocked on a single service.
+
+The external macOS `oha` run was limited by the ~70 ms RTT and local uplink
+(~1.6k req/s at 500-800 connections, server 34-66% idle), so it is not used
+for CPU-ceiling conclusions. The loopback runs above are the ceiling tests.
+
+Optimization notes applied: MariaDB buffer pool 966 MB, PHP 80 workers,
+Valkey 1.5 GB, Elasticsearch 512 MB, BBR/fq, 1M nofile, 32k backlog, 80% RAM
+budget, WordPress guest cache and single-node ES replica fix.
+
 ## Remote stress test - live origin host (2026-11-04)
+
 
 Origin-direct load test from a separate 48 vCPU dev server
 (`198.51.100.20`, Ubuntu 26.04.1, `wrk` 4.1.0). Public DNS for the site is
