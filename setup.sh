@@ -34,7 +34,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.32"
+readonly SCRIPT_VERSION="1.8.33"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -127,7 +127,7 @@ log_safe_args() {
 }
 
 log_environment() {
-  local os_name="" os_ver="" virt="" ips="" failed="" mem="" disk="" enabled_keys=""
+  local os_name="" os_ver="" virt="" ips="" failed="" mem="" disk=""
   if [[ -r /etc/os-release ]]; then
     # shellcheck disable=SC1091
     os_name=$( . /etc/os-release; printf '%s' "${PRETTY_NAME:-${ID:-unknown}}" )
@@ -161,11 +161,38 @@ log_environment() {
   printf 'Addresses    : %s\n' "${ips:-unknown}"
   printf 'Failed units : %s\n' "${failed:-none}"
   printf 'TMPDIR       : %s\n' "${TMPDIR:-unset}"
+  printf 'Log file     : %s\n' "$RUN_LOG_FILE"
+  printf '%s\n' '--------------------'
+  printf '\n'
+}
+
+# Printed after argument parsing so the log reports what the script will
+# actually do, not the empty arrays that exist while the header is written.
+log_selection() {
+  local services="none" domains="none"
+  (( ${#ENABLED[@]} > 0 )) && services="${!ENABLED[*]}"
+  (( ${#DOMAINS[@]} > 0 )) && domains="${DOMAINS[*]}"
+  printf '\n--- selection ---\n'
   printf 'Modes        : dry_run=%s optimize=%s purge=%s\n' \
     "${DRY_RUN:-0}" "${OPTIMIZE:-0}" "${PURGE:-0}"
-  enabled_keys="${!ENABLED[*]}"
-  printf 'Enabled      : %s\n' "${enabled_keys:-none}"
-  printf 'Log file     : %s\n' "$RUN_LOG_FILE"
+  printf 'Services     : %s\n' "$services"
+  printf 'Domains      : %s\n' "$domains"
+  if [[ ${ENABLED[mariadb]:-0} -eq 1 ]]; then
+    printf 'MariaDB      : user=%s size=%s bind=%s\n' \
+      "${OPT[mariadb.user]:-}" "${OPT[mariadb.size]:-}" "${OPT[mariadb.bind]:-}"
+  fi
+  if [[ ${ENABLED[php]:-0} -eq 1 ]]; then
+    printf 'PHP          : version=%s children=%s max_requests=%s\n' \
+      "${OPT[php.ver]:-auto}" "${OPT[php.children]:-auto}" "${OPT[php.max_requests]:-auto}"
+  fi
+  if [[ ${ENABLED[valkey]:-0} -eq 1 ]]; then
+    printf 'Valkey       : ram=%s policy=%s io_threads=%s\n' \
+      "${OPT[valkey.ram]:-auto}" "${OPT[valkey.policy]:-allkeys-lru}" "${OPT[valkey.io_threads]:-1}"
+  fi
+  if [[ ${ENABLED[elastic]:-0} -eq 1 ]]; then
+    printf 'Elasticsearch: host=%s ram=%s\n' \
+      "${OPT[elastic.host]:-localhost}" "${OPT[elastic.ram]:-auto}"
+  fi
   printf '%s\n' '--------------------'
   printf '\n'
 }
@@ -6627,6 +6654,7 @@ main() {
   # normal user and invalid arguments get an accurate error message.
   parse_args "$@"
   validate_all
+  log_selection
 
   if (( DRY_RUN )); then
     if (( OPTIMIZE )); then
