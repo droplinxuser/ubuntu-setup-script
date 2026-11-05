@@ -33,6 +33,20 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.35
+
+- **The optional package list is smaller.** `--others` now installs only
+  `smartmon`, `nvme`, `gif`, `nodejs` and `sysstat`. `fail2ban`,
+  `unattended-upgrades`, Composer and the `security` shorthand were removed,
+  so `--others all` no longer pulls them in.
+- **SSH is rate-limited in UFW.** `--basic` now writes `ufw limit <port>/tcp`
+  for every effective `sshd` port instead of a plain `allow` rule, and replaces
+  an older plain ALLOW rule so the limit actually takes effect. A client that
+  opens more than six SSH connections in 30 seconds is blocked temporarily.
+- **Composer, fail2ban and unattended-upgrades are no longer managed by this
+  script.** Install them manually if a host needs them. Existing installations
+  keep anything already present; `--purge` still never removes packages.
+
 ## What's new in 1.8.34
 
 - **The nightly ownership job no longer breaks service logs.** The managed
@@ -1051,7 +1065,7 @@ Basic performs:
 9. Installs/enables cron and writes a managed crontab block containing only the entries for the selected services:
    - Angie: daily ownership repair of `/var/www` that skips the shared log tree (`/var/www/logs`, owned per service), daily `chmod +x` and execution of `/etc/angie/scripts/cloudflare.sh`.
    - MariaDB: daily 03:03 mysql backup and monthly `mariadb-check`.
-10. Configures UFW: deny incoming, allow outgoing, limit 22, allow 80 and 443, enable the firewall. The original active state, added rules and default policies are recorded so `--purge basic` can restore them.
+10. Configures UFW: deny incoming, allow outgoing, rate-limit every effective SSH port with `ufw limit`, allow 80 and 443, enable the firewall. The original active state, added rules and default policies are recorded so `--purge basic` can restore them.
 
 Before changing basic settings, the script records the originals under `/var/lib/setup.sh/backup`. `--purge basic` restores them by overwriting the live files. `/swapfile` and its `/etc/fstab` entry are left enabled (`/var/lib/setup.sh/swapfile-managed`).
 
@@ -1194,7 +1208,7 @@ With security disabled, keep `host=localhost` unless you really intend to expose
 
 ### Other packages (`--others ...`)
 
-Available names: `smartmon`, `nvme`, `gif`, `nodejs`, `fail2ban`, `unattended`, `sysstat`, `composer`, `security`, or `all`.
+Available names: `smartmon`, `nvme`, `gif`, `nodejs`, `sysstat`, or `all`.
 
 | Name | Installs |
 |---|---|
@@ -1202,11 +1216,9 @@ Available names: `smartmon`, `nvme`, `gif`, `nodejs`, `fail2ban`, `unattended`, 
 | `nvme` | `nvme-cli` — **only when the server is dedicated and the storage is actually NVMe**; otherwise skipped |
 | `gif` | `gifsicle` |
 | `nodejs` | NodeSource 26.x repository/key (embedded) and `nodejs` |
-| `fail2ban` | `fail2ban` + `python3-systemd`, an SSH jail using the UFW ban action |
-| `unattended` | `unattended-upgrades` plus a managed `/etc/apt/apt.conf.d/52setup-unattended` policy |
 | `sysstat` | `sysstat` and its collect/summary timers (`sar`, `iostat`, `pidstat`) |
-| `composer` | Composer 2 from the Ubuntu repository |
-| `security` | shorthand for `fail2ban unattended` |
+
+`--others all` expands to `smartmon nvme gif nodejs sysstat` (subject to the NVMe gate).
 
 The `nvme` item is gated: it installs only when `server=dedi` (or auto-detection says dedicated) **and** an NVMe block device is present (`/sys/block/nvme*` or `lsblk` transport `nvme`). On a VPS/container or non-NVMe server it logs a skip and continues.
 
@@ -1374,10 +1386,10 @@ sudo bash setup.sh --purge
 ```
 
 - `--purge --php ver=8.5` stops one version; `--purge php` discovers and stops every installed PHP-FPM version (not just 8.x).
-- **Nothing is uninstalled or deleted.** Package purge/autoremove/clean calls were removed. `--purge` stops/disables the selected services, removes the managed cron entries, restores recorded basic settings where the original existed, and leaves packages, repositories, keys, Composer, configuration, certificates, databases, caches and logs on disk.
+- **Nothing is uninstalled or deleted.** Package purge/autoremove/clean calls were removed. `--purge` stops/disables the selected services, removes the managed cron entries, restores recorded basic settings where the original existed, and leaves packages, repositories, keys, configuration, certificates, databases, caches and logs on disk.
 - `--purge all` runs every stop/restore step in a safe order.
 - Bare targets and service flags are combined, so `--purge basic --php` stops both.
-- `--purge others` only disables the managed cron/setup entries it knows about; optional packages, Node.js, repository files and Composer are left installed.
+- `--purge others` only disables the managed cron/setup entries it knows about; optional packages, Node.js and repository files are left installed. Composer, fail2ban and unattended-upgrades are no longer installed by this script; if present from an older release, remove them manually.
 - `--purge angie` stops Angie and leaves `/etc/angie` (including domain vhosts and certificates), cache directories under `/home` and logs intact.
 - `--purge valkey` stops Valkey and leaves the Unix socket, systemd drop-in, group membership, configuration and data intact.
 - `--purge basic` restores files recorded in `/var/lib/setup.sh/backup` by overwriting them (never by unlinking the live path), leaves `/swapfile` and its `/etc/fstab` line enabled, removes only the managed cron block, restores the original UFW default policies, and disables UFW again if it was originally inactive. UFW rules that setup.sh added are still removed, except SSH rules.
@@ -1481,10 +1493,10 @@ Also checked at CLI level (all using `--dry-run`, no system changes):
   domain app type, per-domain and trailing group `app=` forms, every purge
   mode, `--optimize` and representative invalid inputs.
 
-- `tests/test-tuning.sh` covers 29 cases: Angie directive rewriting, the
+- `tests/test-tuning.sh` covers 165 checks: Angie directive rewriting, the
   multi-line `proxy_cache_path` fix, insertion anchors, miss reporting,
-  PHP pool editing/deduplication, the shared memory budget and a second-run
-  no-op check.
+  PHP pool editing/deduplication, the shared memory budget, UFW SSH
+  rate-limiting, and a second-run no-op check.
 
 - All 64 combinations of the six install service flags (`angie`, `php`, `mariadb`, `valkey`, `elastic`, `others`) plus `--basic` parse and validate.
 - All 128 bare purge target subsets (including empty/implicit/explicit `all`) parse and validate.
@@ -1564,9 +1576,9 @@ The script produces a working, internet-facing baseline. For a large or security
 - Back up with snapshots to an external repository; Elasticsearch data is not covered by the MariaDB backup.
 
 **Host / operations**
-- Use SSH keys only, disable password login, keep UFW limited to 22/80/443, and add fail2ban or equivalent for SSH and web auth endpoints. `--others fail2ban` installs an SSH jail with the UFW ban action; `--others unattended` enables automatic security updates.
+- Use SSH keys only, disable password login, keep UFW limited to 22/80/443, and use a brute-force tool of your choice for SSH and web auth endpoints. `--basic` rate-limits every effective SSH port with `ufw limit`; `fail2ban` is not installed by this script.
 - Remove the mDNS (`5353/udp`) and WS-Discovery (`3702/udp`) UFW rules if you do not need them; they were pre-existing on this host, not added by the script.
-- Enable `unattended-upgrades` for security patches and monitor reboot-required. Keep the kernel/firmware updated. `libgd3` is currently held back by the apt phasing/upgrade policy; review it before the next PHP/GD upgrade.
+- Enable `unattended-upgrades` manually if you want automatic security patches, and monitor reboot-required. Keep the kernel/firmware updated. `libgd3` is currently held back by the apt phasing/upgrade policy; review it before the next PHP/GD upgrade.
 - Ship Angie access/error logs, PHP-FPM slow log, MariaDB slow query log, Elasticsearch and Valkey metrics to a central monitor; alert on 5xx rate, p99 latency, disk, memory and queue depth. `--others sysstat` provides `sar`/`iostat`/`pidstat` history.
 - Load-test after every application or config change. The local `tests/stress-site/` harness is a starting point; tune `pm.max_children`, MariaDB buffers and Elasticsearch heap from measured RSS/CPU, not guesswork.
 - For very large traffic, scale horizontally: CDN for static, multiple Angie/PHP nodes behind a load balancer, MariaDB read replicas, and a separate Elasticsearch cluster. A single 16-core host tops out around the measured full-stack numbers above.
@@ -1601,11 +1613,11 @@ The package is installed, but `smartd` may refuse to start on machines with no S
 
 ### `--purge others` and pre-existing packages
 
-`--purge others` no longer removes any package, repository, key or Composer file. It only stops the managed optional services and leaves Node.js, `smartmontools`, `nvme-cli`, `gifsicle`, `fail2ban`, `unattended-upgrades`, `sysstat` and `composer` installed. Remove them manually with APT only after confirming nothing needs them.
+`--purge others` no longer removes any package, repository or key. It only stops the managed optional services and leaves Node.js, `smartmontools`, `nvme-cli`, `gifsicle` and `sysstat` installed. Remove them manually with APT only after confirming nothing needs them. If a host still has fail2ban, unattended-upgrades or Composer from an older release, remove them manually; this script no longer manages them.
 
-### `--purge --php` and Composer
+### `--purge --php`
 
-PHP purge stops the selected PHP-FPM versions and leaves Composer, its `php-*` library packages and all PHP configuration in place. Re-running `--php` reuses that installation; if you truly want Composer removed, do it manually after the purge.
+PHP purge stops the selected PHP-FPM versions and leaves their packages and configuration in place. Re-running `--php` reuses that installation. If Composer was installed manually or by an older release, it is left in place too; remove it manually if it is no longer needed.
 
 ### Rate limiting returns 429 on a site behind Cloudflare / a proxy
 
@@ -1656,8 +1668,6 @@ By default `--elastic host=localhost` binds to loopback and security is disabled
 | `/etc/systemd/system/valkey-server.service.d/limits.conf` | Valkey nofile drop-in |
 | `/etc/elasticsearch/` | Elasticsearch configuration, JVM options and scripts |
 | `/etc/systemd/system/elasticsearch.service.d/limits.conf` | Elasticsearch memlock/nofile drop-in |
-| `/etc/fail2ban/jail.d/setup-ssh.local` | Fail2ban SSH jail (when `--others fail2ban`) |
-| `/etc/apt/apt.conf.d/52setup-unattended` | Unattended security-update policy (when `--others unattended`) |
 | `/root/mysqltuner.pl` | Embedded MySQL Tuner |
 | `/root/tools/mysqlbackup-master/` | Embedded mysqlbackup utility |
 | `/usr/local/bin/mysqlbkup.sh` | Installed backup script |
