@@ -16,6 +16,8 @@
 #     Other vendor payloads that must be reproducible offline are embedded in
 #     the "EMBEDDED PAYLOADS" section at the bottom.
 #   * Each service is timed; a summary is printed at the end.
+#   * Every run mirrors its complete output to setup_<timestamp>.log in the
+#     invocation directory so the log can be handed to a debugging agent.
 #   * `--purge` stops/disables selected services and restores recorded basic
 #     settings; it never removes packages, data, configuration or log files.
 # =============================================================================
@@ -32,7 +34,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.30"
+readonly SCRIPT_VERSION="1.8.31"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -97,6 +99,125 @@ ok()   { printf '%s %s[ OK ]%s %s\n' "$(_timestamp)" "$C_GREEN" "$C_RESET" "$*";
 warn() { printf '%s %s[WARN]%s %s\n' "$(_timestamp)" "$C_YELLOW" "$C_RESET" "$*" >&2; }
 die()  { trap - ERR; printf '%s %s[FAIL]%s %s\n' "$(_timestamp)" "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 step() { printf '\n%s%s==> %s%s\n' "$C_BOLD" "$C_BLUE" "$*" "$C_RESET"; }
+
+# ---------------------------------------------------------------------------
+# Full run log
+# ---------------------------------------------------------------------------
+# Every run mirrors its complete stdout/stderr into setup_<timestamp>.log in
+# the directory the script was started from.  That log is the one deliberate
+# output written outside /tmp: it is meant to be copied to a debugging agent,
+# so it is neither temporary nor auto-expired.  Everything else stays in /tmp.
+RUN_LOG_FILE=""
+RUN_LOG_TEE_PID=""
+RUN_LOG_STARTED=0
+RUN_LOG_START_EPOCH=0
+
+# Never write a password into the log header.  --mariadb pass=... is the only
+# secret accepted on the command line today; keep the pattern broad enough to
+# cover future password= options too.
+log_safe_args() {
+  local arg out=()
+  for arg in "$@"; do
+    case "$arg" in
+      pass=*|password=*|*[Pp]assword=*) arg="${arg%%=*}=***" ;;
+    esac
+    out+=("$arg")
+  done
+  printf '%s' "${out[*]}"
+}
+
+log_environment() {
+  local os_name="" os_ver="" virt="" ips="" failed="" mem="" disk="" enabled_keys=""
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    os_name=$( . /etc/os-release; printf '%s' "${PRETTY_NAME:-${ID:-unknown}}" )
+    os_ver=$( . /etc/os-release; printf '%s' "${VERSION_ID:-unknown}" )
+  fi
+  command -v systemd-detect-virt >/dev/null 2>&1 \
+    && virt=$(systemd-detect-virt 2>/dev/null || true)
+  command -v hostname >/dev/null 2>&1 \
+    && ips=$(hostname -I 2>/dev/null || true)
+  command -v systemctl >/dev/null 2>&1 \
+    && failed=$(systemctl --failed --no-legend --no-pager 2>/dev/null | awk '{print $1}' | paste -sd, - || true)
+  command -v free >/dev/null 2>&1 && mem=$(free -m 2>/dev/null | awk '/^Mem:/{printf "%sMB total, %sMB available", $2, $7}')
+  command -v df >/dev/null 2>&1 && disk=$(df -Ph / 2>/dev/null | awk 'NR==2{printf "%s total, %s free on %s", $2, $4, $6}')
+
+  printf '\n--- environment ---\n'
+  printf 'Command      : %s %s\n' "$SCRIPT_NAME" "$(log_safe_args "$@")"
+  printf 'Invocation   : %s\n' "${BASH_SOURCE[0]}"
+  printf 'Directory    : %s\n' "$PWD"
+  printf 'Script dir   : %s\n' "$SCRIPT_DIR"
+  printf 'PID / PPID   : %s / %s\n' "$$" "${PPID:-unknown}"
+  printf 'User / EUID  : %s / %s\n' "$(id -un 2>/dev/null || printf unknown)" "${EUID:-unknown}"
+  printf 'Umask        : %s\n' "$(umask)"
+  printf 'Shell        : %s (bash %s)\n' "${SHELL:-unknown}" "$BASH_VERSION"
+  printf 'OS           : %s (%s)\n' "$os_name" "$os_ver"
+  printf 'Kernel       : %s\n' "$(uname -srmo 2>/dev/null || uname -a 2>/dev/null || printf unknown)"
+  printf 'Architecture : %s\n' "$(dpkg --print-architecture 2>/dev/null || uname -m 2>/dev/null || printf unknown)"
+  printf 'Virtualization: %s\n' "${virt:-none/unknown}"
+  printf 'CPU          : %s logical CPUs\n' "$(nproc 2>/dev/null || printf unknown)"
+  printf 'Memory       : %s\n' "${mem:-unknown}"
+  printf 'Disk         : %s\n' "${disk:-unknown}"
+  printf 'Addresses    : %s\n' "${ips:-unknown}"
+  printf 'Failed units : %s\n' "${failed:-none}"
+  printf 'TMPDIR       : %s\n' "${TMPDIR:-unset}"
+  printf 'Modes        : dry_run=%s optimize=%s purge=%s\n' \
+    "${DRY_RUN:-0}" "${OPTIMIZE:-0}" "${PURGE:-0}"
+  enabled_keys="${!ENABLED[*]}"
+  printf 'Enabled      : %s\n' "${enabled_keys:-none}"
+  printf 'Log file     : %s\n' "$RUN_LOG_FILE"
+  printf '%s\n' '--------------------'
+  printf '\n'
+}
+
+start_run_log() {
+  local stamp
+  stamp=$(date +%Y%m%d-%H%M%S)
+  RUN_LOG_FILE="${PWD}/setup_${stamp}.log"
+
+  # Refuse to abort a real run just because the invocation directory is not
+  # writable; the console output and normal diagnostics still work.
+  if ! ( umask 077; : >> "$RUN_LOG_FILE" ) 2>/dev/null; then
+    RUN_LOG_FILE=""
+    warn "Could not create a run log in ${PWD}; continuing without a file log"
+    return 0
+  fi
+  chmod 600 "$RUN_LOG_FILE" 2>/dev/null || true
+
+  # tee mirrors every line to the terminal and the file.  The PID is saved so
+  # finish_run_log() can wait for the final line to reach disk before exit.
+  exec > >(tee -a "$RUN_LOG_FILE") 2>&1
+  RUN_LOG_TEE_PID=$!
+  RUN_LOG_STARTED=1
+  RUN_LOG_START_EPOCH=$(date +%s)
+
+  printf '================================================================\n'
+  printf ' setup.sh run log\n'
+  printf ' Started: %s\n' "$(_timestamp)"
+  printf ' Script : %s %s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"
+  printf ' Log    : %s\n' "$RUN_LOG_FILE"
+  printf '================================================================\n'
+  log_environment "$@"
+}
+
+finish_run_log() {
+  local rc=${1:-0} end duration
+  (( RUN_LOG_STARTED )) || return 0
+  end=$(date +%s)
+  duration=$(( end - RUN_LOG_START_EPOCH ))
+  printf '\n--- run finished ---\n'
+  printf 'Result    : %s (exit %s)\n' "$([[ $rc -eq 0 ]] && printf SUCCESS || printf FAILURE)" "$rc"
+  printf 'Finished  : %s\n' "$(_timestamp)"
+  printf 'Duration  : %s\n' "$(format_duration "$duration")"
+  printf 'Full log  : %s\n' "$RUN_LOG_FILE"
+  printf '%s\n' '--------------------'
+  sync 2>/dev/null || true
+  # Closing stdout lets tee see EOF.  Wait for it so a wrapper that reads the
+  # log immediately after the process exits never sees a truncated file.
+  exec 1>&- 2>&-
+  [[ -n $RUN_LOG_TEE_PID ]] && wait "$RUN_LOG_TEE_PID" 2>/dev/null || true
+  RUN_LOG_STARTED=0
+}
 
 # Every transient file and directory must live below /tmp.  These wrappers also
 # ignore a caller's TMPDIR so an environment variable cannot move scratch data
@@ -344,6 +465,9 @@ Testing:
                                         a normal user and with --purge)
 
 Notes:
+  * Every run mirrors its full output to setup_<timestamp>.log in the
+    directory where setup.sh was started.  Copy that file when reporting an
+    issue; it includes the host facts and the exit status.
   * Only one PHP-FPM version can own the shared Unix socket at a time.
     Switch versions by purging the old one first:
       --purge --php ver=8.4   then   --basic ... --php ver=8.5
@@ -3195,24 +3319,29 @@ mariadb_io_capacity() {
   esac
 }
 
-configure_mariadb() {
-  local size_mb=$1 bind=$2
-  local cnf=/etc/mysql/mariadb.conf.d/50-server.cnf
-  local buffer logsize threads max_conn open_cache aria_mb
-  local io_read io_write tmp backlog
-  [[ -f $cnf ]] || die "MariaDB config ${cnf} not found"
+# One hardware profile for both a fresh install and --optimize.  Keeping the
+# arithmetic here means the two paths cannot drift apart again (for example
+# one writing a larger log file or a different connection ceiling).
+MARIADB_PROFILE_BUFFER=""
+MARIADB_PROFILE_LOG_SIZE=""
+MARIADB_PROFILE_OPEN_CACHE=""
+MARIADB_PROFILE_ARIA_MB=""
+MARIADB_PROFILE_THREADS=""
+MARIADB_PROFILE_MAX_CONN=""
+MARIADB_PROFILE_IO_READ=""
+MARIADB_PROFILE_IO_WRITE=""
+MARIADB_PROFILE_BACKLOG=""
 
+mariadb_compute_profile() {
+  local size_mb=$1 logsize open_cache aria_mb threads max_conn current_max=""
   logsize=$(( size_mb / 4 ))
   (( logsize < 64 )) && logsize=64
   (( logsize > 2048 )) && logsize=2048
-  buffer=$(mb_to_config "$size_mb")
-  logsize=$(mb_to_config "$logsize")
   open_cache=4000
   (( size_mb >= 4096 )) && open_cache=8000
   aria_mb=$(( size_mb / 16 ))
   (( aria_mb < 16 )) && aria_mb=16
   (( aria_mb > 256 )) && aria_mb=256
-  read -r io_read io_write <<< "$(mariadb_io_capacity)"
   threads=$(nproc)
   (( threads > 64 )) && threads=64
   # PHP-FPM opens one MariaDB connection per active request.  A 500-connection
@@ -3220,9 +3349,111 @@ configure_mariadb() {
   # / HTTP 503 during the aggressive run).  Size the server above the FPM pool
   # plus admin/backup headroom; the thread pool makes extra sessions cheap.
   max_conn=$(( threads * 32 ))
+  # Never lower an existing, larger ceiling: a busy application may already
+  # allow more than threads*32 connections, and a tune must not turn into
+  # "Too many connections" during a traffic peak.
+  if command -v mariadb >/dev/null 2>&1 \
+     && systemctl is-active --quiet mariadb 2>/dev/null; then
+    current_max=$(mariadb -N -B -e 'SELECT @@max_connections' 2>/dev/null || true)
+  fi
+  if [[ $current_max =~ ^[0-9]+$ ]] && (( current_max > max_conn )); then
+    max_conn=$current_max
+  fi
   (( max_conn > 2000 )) && max_conn=2000
   (( max_conn < 200 )) && max_conn=200
-  backlog=$(effective_backlog)
+
+  MARIADB_PROFILE_BUFFER=$(mb_to_config "$size_mb")
+  MARIADB_PROFILE_LOG_SIZE=$(mb_to_config "$logsize")
+  MARIADB_PROFILE_OPEN_CACHE=$open_cache
+  MARIADB_PROFILE_ARIA_MB=$aria_mb
+  MARIADB_PROFILE_THREADS=$threads
+  MARIADB_PROFILE_MAX_CONN=$max_conn
+  read -r MARIADB_PROFILE_IO_READ MARIADB_PROFILE_IO_WRITE <<< "$(mariadb_io_capacity)"
+  MARIADB_PROFILE_BACKLOG=$(effective_backlog)
+}
+
+# Print the performance directives shared by the install-time 50-server.cnf
+# block and the --optimize 99-setup-optimize.cnf drop-in.
+mariadb_performance_settings() {
+  local size_mb=$1 max_conn=${2:-}
+  local ver major minor
+  mariadb_compute_profile "$size_mb"
+  [[ -n $max_conn ]] || max_conn=$MARIADB_PROFILE_MAX_CONN
+  ver=$(mariadb_server_version 2>/dev/null || true)
+  major=${ver%%.*}
+  minor=${ver#*.}; minor=${minor%%.*}
+  if ! [[ $major =~ ^[0-9]+$ ]]; then
+    # Fresh install before the server has started: the install target is
+    # Ubuntu 26.04 with MariaDB 11.8, which uses the per-file buffering knobs.
+    major=11; minor=8
+  fi
+  [[ $minor =~ ^[0-9]+$ ]] || minor=0
+
+  cat <<EOF
+max_connections = ${max_conn}
+max_connect_errors = 524288
+back_log = ${MARIADB_PROFILE_BACKLOG}
+thread_cache_size = 64
+thread_handling = pool-of-threads
+thread_pool_size = ${MARIADB_PROFILE_THREADS}
+max_allowed_packet = 64M
+wait_timeout = 600
+interactive_timeout = 600
+net_read_timeout = 120
+net_write_timeout = 120
+
+innodb_log_buffer_size = 64M
+innodb_log_file_size = ${MARIADB_PROFILE_LOG_SIZE}
+innodb_buffer_pool_size = ${MARIADB_PROFILE_BUFFER}
+innodb_buffer_pool_dump_at_shutdown = ON
+innodb_buffer_pool_load_at_startup = ON
+innodb_buffer_pool_dump_pct = 25
+innodb_stats_on_metadata = OFF
+innodb_lock_wait_timeout = 100
+innodb_flush_neighbors = 0
+innodb_stats_persistent = ON
+innodb_stats_auto_recalc = ON
+innodb_lru_scan_depth = 2048
+innodb_io_capacity = ${MARIADB_PROFILE_IO_READ}
+innodb_io_capacity_max = ${MARIADB_PROFILE_IO_WRITE}
+innodb_read_io_threads = ${MARIADB_PROFILE_THREADS}
+innodb_write_io_threads = ${MARIADB_PROFILE_THREADS}
+innodb_flush_log_at_trx_commit = 2
+EOF
+  if (( major > 11 || (major == 11 && minor >= 8) )); then
+    cat <<'EOF'
+# MariaDB 11.8+ per-file buffering knobs (OFF = O_DIRECT).
+innodb_data_file_buffering = OFF
+innodb_data_file_write_through = OFF
+innodb_log_file_buffering = OFF
+innodb_log_file_write_through = OFF
+EOF
+  else
+    cat <<'EOF'
+# MariaDB <= 11.7 uses the legacy flush method.
+innodb_flush_method = O_DIRECT
+EOF
+  fi
+  cat <<EOF
+join_buffer_size = 512K
+read_buffer_size = 512K
+read_rnd_buffer_size = 512K
+sort_buffer_size = 1M
+tmp_table_size = 64M
+max_heap_table_size = 64M
+table_open_cache = ${MARIADB_PROFILE_OPEN_CACHE}
+table_definition_cache = ${MARIADB_PROFILE_OPEN_CACHE}
+innodb_open_files = ${MARIADB_PROFILE_OPEN_CACHE}
+key_buffer_size = 32M
+aria_pagecache_buffer_size = ${MARIADB_PROFILE_ARIA_MB}M
+EOF
+}
+
+configure_mariadb() {
+  local size_mb=$1 bind=$2
+  local cnf=/etc/mysql/mariadb.conf.d/50-server.cnf
+  local tmp
+  [[ -f $cnf ]] || die "MariaDB config ${cnf} not found"
 
   # Comment out expire_logs_days if it is active.
   sed_in_place -E 's|^([[:space:]]*)expire_logs_days([[:space:]]*=)|\1#expire_logs_days\2|' "$cnf"
@@ -3254,67 +3485,11 @@ query_cache_type = 0
 open_files_limit = 524288
 secure_file_priv = /var/lib/mysql-files
 local_infile = 0
-
-max_connections = ${max_conn}
-max_connect_errors = 524288
-# PHP opens a short-lived connection per request.  The default listen backlog
-# (357 on this build) overflows under a few hundred concurrent requests and
-# PDO reports "Resource temporarily unavailable" (SQLSTATE 2002).
-back_log = ${backlog}
-thread_cache_size = 64
-# PHP opens a fresh, short-lived connection for most requests.  The thread
-# pool removes the connection/thread-creation tail latency that otherwise
-# shows up as multi-hundred-ms p99 spikes in web workloads.
-thread_handling = pool-of-threads
-thread_pool_size = ${threads}
-max_allowed_packet = 64M
-wait_timeout = 600
-interactive_timeout = 600
-net_read_timeout = 120
-net_write_timeout = 120
-
-innodb_log_buffer_size = 64M
-innodb_log_file_size = ${logsize}
-innodb_buffer_pool_size = ${buffer}
-
-innodb_flush_log_at_trx_commit = 2
-# MariaDB 11.8 replaced innodb_flush_method with per-file buffering knobs.
-# OFF = O_DIRECT for data/log files, which avoids double buffering on NVMe.
-innodb_data_file_buffering = OFF
-innodb_data_file_write_through = OFF
-innodb_log_file_buffering = OFF
-innodb_log_file_write_through = OFF
-innodb_buffer_pool_dump_at_shutdown = ON
-innodb_buffer_pool_load_at_startup = ON
-innodb_buffer_pool_dump_pct = 25
-innodb_stats_on_metadata = OFF
 innodb_read_only_compressed = OFF
-innodb_lock_wait_timeout = 100
-innodb_flush_neighbors = 0
-innodb_stats_persistent = ON
-innodb_stats_auto_recalc = ON
-innodb_lru_scan_depth = 2048
 
-innodb_io_capacity = ${io_read}
-innodb_io_capacity_max = ${io_write}
-
-innodb_read_io_threads = ${threads}
-innodb_write_io_threads = ${threads}
-
-join_buffer_size = 512K
-read_buffer_size = 512K
-read_rnd_buffer_size = 512K
-sort_buffer_size = 1M
-
-tmp_table_size = 64M
-max_heap_table_size = 64M
-
-table_open_cache = ${open_cache}
-table_definition_cache = ${open_cache}
-innodb_open_files = ${open_cache}
-key_buffer_size = 32M
-
-aria_pagecache_buffer_size = ${aria_mb}M
+EOF
+  mariadb_performance_settings "$size_mb" >> "$cnf"
+  cat >> "$cnf" <<EOF
 
 slow_query_log = 1
 slow_query_log_file = /var/www/logs/mariadb/slow.log
@@ -3471,6 +3646,29 @@ EOF
 # ---------------------------------------------------------------------------
 # Valkey
 # ---------------------------------------------------------------------------
+# The live-tuning keys are shared so a fresh install and --optimize cannot
+# disagree about maxmemory, backlog, lazy-free or I/O settings.
+valkey_tuning_lines() {
+  local max_mb=$1 policy=$2 io_threads=$3
+  cat <<EOF
+maxmemory ${max_mb}mb
+maxmemory-policy ${policy}
+maxmemory-samples 10
+maxclients 20000
+tcp-backlog $(effective_backlog)
+timeout 0
+tcp-keepalive 300
+hz 10
+io-threads ${io_threads}
+io-threads-do-reads yes
+lazyfree-lazy-eviction yes
+lazyfree-lazy-expire yes
+lazyfree-lazy-server-del yes
+lazyfree-lazy-user-del yes
+lazyfree-lazy-user-flush yes
+EOF
+}
+
 install_valkey() {
   step "Valkey"
   if pkg_ok redis-server; then
@@ -3511,29 +3709,15 @@ install_valkey() {
     "logfile ${LOG_ROOT}/valkey/valkey.log"
     'save ""'
     'appendonly no'
-    "maxmemory ${valkey_mb}mb"
-    "maxmemory-policy ${policy}"
-    'maxmemory-samples 10'
     'bind 127.0.0.1 -::1'
     'protected-mode yes'
     'unixsocket /run/valkey/valkey.sock'
     'unixsocketperm 770'
-    "tcp-backlog $(effective_backlog)"
-    'timeout 0'
-    'tcp-keepalive 300'
-    'maxclients 20000'
-    'hz 10'
-    "io-threads ${io_threads}"
-    'io-threads-do-reads yes'
-    'lazyfree-lazy-eviction yes'
-    'lazyfree-lazy-expire yes'
-    'lazyfree-lazy-server-del yes'
-    'lazyfree-lazy-user-del yes'
-    'lazyfree-lazy-user-flush yes'
   )
   for line in "${vlines[@]}"; do
     printf '%s\n' "$line" >> "$conf"
   done
+  valkey_tuning_lines "$valkey_mb" "$policy" "$io_threads" >> "$conf"
   info "Valkey maxmemory: ${valkey_mb} MB ($(printf '%s' "$policy"); ~10% of RAM by default)"
   tail -20 "$conf"
 
@@ -3579,11 +3763,70 @@ EOF
 # ---------------------------------------------------------------------------
 # Elasticsearch
 # ---------------------------------------------------------------------------
+# Install and --optimize share one copy of the managed YAML block and one
+# systemd drop-in.  Previously each path wrote its own file name and key list,
+# so an optimize after install left two competing definitions.
+elasticsearch_strip_managed() {
+  local file=$1 include_base=${2:-0} tmp
+  [[ -f $file ]] || return 0
+  tmp=$(tmp_file)
+  awk -v b="$ES_BEGIN" -v e="$ES_END" -v ib="$include_base" '
+    $0 == "# BEGIN setup.sh optimize" { skip = 1; next }
+    $0 == "# END setup.sh optimize" { skip = 0; next }
+    $0 == b && ib == 1 { skip = 1; next }
+    $0 == e && ib == 1 { skip = 0; next }
+    !skip { print }
+  ' "$file" > "$tmp"
+  cat "$tmp" > "$file"
+}
+
+elasticsearch_comment_keys() {
+  local file=$1 key
+  shift
+  for key in "$@"; do
+    sed_in_place -E "s|^[[:space:]]*${key//./\\.}[[:space:]]*:.*|#&|" "$file"
+  done
+}
+
+elasticsearch_write_performance_block() {
+  local file=$1
+  elasticsearch_comment_keys "$file" \
+    bootstrap.memory_lock indices.query.bool.max_clause_count \
+    indices.memory.index_buffer_size indices.fielddata.cache.size \
+    search.max_buckets action.destructive_requires_name \
+    http.compression http.max_content_length
+  cat >> "$file" <<'EOF'
+# BEGIN setup.sh optimize
+bootstrap.memory_lock: true
+indices.query.bool.max_clause_count: 4096
+indices.memory.index_buffer_size: 20%
+indices.fielddata.cache.size: 20%
+search.max_buckets: 65536
+action.destructive_requires_name: true
+http.compression: true
+http.max_content_length: 200mb
+# END setup.sh optimize
+EOF
+  chmod 644 "$file"
+}
+
+elasticsearch_write_systemd_limits() {
+  local dir=/etc/systemd/system/elasticsearch.service.d
+  mkdir -p "$dir"
+  cat > "${dir}/limits.conf" <<'EOF'
+[Service]
+LimitMEMLOCK=infinity
+LimitNOFILE=1048576
+LimitNPROC=4096
+EOF
+  chmod 644 "${dir}/limits.conf"
+}
+
 install_elastic() {
   local host=${OPT[elastic.host]:-localhost}
   local ram=${OPT[elastic.ram]:-auto}
   local ram_lc=${ram,,}
-  local ram_mb ram_total_mb tmp
+  local ram_mb ram_total_mb
   step "Elasticsearch"
 
   ram_total_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
@@ -3649,29 +3892,18 @@ install_elastic() {
     es_url="http://${host}:9200"
   fi
 
-  # Drop previous managed block, including the one written by
-  # `setup.sh --optimize`; otherwise a reinstall leaves two copies of
-  # bootstrap.memory_lock and Elasticsearch refuses to start.
-  tmp=$(tmp_file)
-  awk -v b="$ES_BEGIN" -v e="$ES_END" '
-    $0 == b || $0 == "# BEGIN setup.sh optimize" { skip = 1; next }
-    $0 == e || $0 == "# END setup.sh optimize" { skip = 0; next }
-    !skip { print }
-  ' "$yml" > "$tmp"
-  cat "$tmp" > "$yml"
+  # Drop previous managed blocks, including the one written by
+  # `setup.sh --optimize`; otherwise a reinstall leaves duplicate keys and
+  # Elasticsearch refuses to start.
+  elasticsearch_strip_managed "$yml" 1
 
-  # Comment out keys that we are about to set (keeps YAML free of duplicates).
-  local key
-  for key in cluster.name network.host http.host transport.host http.port \
-             path.logs path.data bootstrap.memory_lock \
-             indices.query.bool.max_clause_count discovery.type \
-             xpack.security.enabled xpack.security.enrollment.enabled \
-             cluster.initial_master_nodes indices.memory.index_buffer_size \
-             indices.fielddata.cache.size search.max_buckets \
-             action.destructive_requires_name http.compression \
-             http.max_content_length; do
-    sed_in_place -E "s|^[[:space:]]*${key}[[:space:]]*:.*|#&|" "$yml"
-  done
+  # Comment out base keys that we are about to set (keeps YAML free of
+  # duplicates).  Performance keys are handled by the shared block helper.
+  elasticsearch_comment_keys "$yml" \
+    cluster.name network.host http.host transport.host http.port \
+    path.logs path.data discovery.type \
+    xpack.security.enabled xpack.security.enrollment.enabled \
+    cluster.initial_master_nodes
 
   cat >> "$yml" <<EOF
 ${ES_BEGIN}
@@ -3680,28 +3912,15 @@ network.host: "${host}"
 http.port: 9200
 path.data: /var/lib/elasticsearch
 path.logs: ${LOG_ROOT}/elasticsearch
-bootstrap.memory_lock: true
-indices.query.bool.max_clause_count: 4096
-indices.memory.index_buffer_size: 20%
-indices.fielddata.cache.size: 20%
-search.max_buckets: 65536
-action.destructive_requires_name: true
-http.compression: true
-http.max_content_length: 200mb
 discovery.type: single-node
 xpack.security.enabled: false
 xpack.security.enrollment.enabled: false
 #cluster.initial_master_nodes: [""]
 ${ES_END}
 EOF
+  elasticsearch_write_performance_block "$yml"
 
-  mkdir -p /etc/systemd/system/elasticsearch.service.d
-  cat > /etc/systemd/system/elasticsearch.service.d/limits.conf <<'EOF'
-[Service]
-LimitMEMLOCK=infinity
-LimitNOFILE=1048576
-LimitNPROC=4096
-EOF
+  elasticsearch_write_systemd_limits
 
   mkdir -p /etc/elasticsearch/jvm.options.d
   write_es_jvm_options "$ram_mb"
@@ -5417,9 +5636,9 @@ cnf_only_pool_changed() {
 }
 
 optimize_mariadb() {
-  local active=0 ver major minor size_mb buffer logsize open_cache aria_mb
+  local active=0 ver size_mb buffer logsize open_cache aria_mb
   local threads max_conn io_read io_write cnf_dir cnf backlog cnf_before cnf_after
-  local current_max="" unit_changed=0 limit_before=""
+  local unit_changed=0 limit_before=""
   systemctl is-active --quiet mariadb 2>/dev/null && active=1
   ver=$(mariadb_server_version)
   opt_report "## MariaDB"
@@ -5446,32 +5665,16 @@ optimize_mariadb() {
       opt_report "- Database data+index=${OPT_DB_SIZE_MB}MB; buffer pool=${size_mb}MB (does not fully fit; largest feasible pool)"
     fi
   fi
-  backlog=$(effective_backlog)
-  logsize=$(( size_mb / 4 ))
-  (( logsize < 64 )) && logsize=64
-  (( logsize > 2048 )) && logsize=2048
-  buffer=$(mb_to_config "$size_mb")
-  logsize=$(mb_to_config "$logsize")
-  open_cache=4000
-  (( size_mb >= 4096 )) && open_cache=8000
-  aria_mb=$(( size_mb / 16 ))
-  (( aria_mb < 16 )) && aria_mb=16
-  (( aria_mb > 256 )) && aria_mb=256
-  read -r io_read io_write <<< "$(mariadb_io_capacity)"
-  threads=$(nproc)
-  (( threads > 64 )) && threads=64
-  max_conn=$(( threads * 32 ))
-  # Keep an existing, larger connection ceiling.  A busy application may
-  # already allow more than threads*32 connections; silently lowering it can
-  # turn a performance tune into "Too many connections" during a traffic peak.
-  if (( active )); then
-    current_max=$(mariadb -N -B -e 'SELECT @@max_connections' 2>/dev/null || true)
-  fi
-  if [[ $current_max =~ ^[0-9]+$ ]] && (( current_max > max_conn )); then
-    max_conn=$current_max
-  fi
-  (( max_conn > 2000 )) && max_conn=2000
-  (( max_conn < 200 )) && max_conn=200
+  mariadb_compute_profile "$size_mb"
+  buffer=$MARIADB_PROFILE_BUFFER
+  logsize=$MARIADB_PROFILE_LOG_SIZE
+  open_cache=$MARIADB_PROFILE_OPEN_CACHE
+  aria_mb=$MARIADB_PROFILE_ARIA_MB
+  threads=$MARIADB_PROFILE_THREADS
+  max_conn=$MARIADB_PROFILE_MAX_CONN
+  io_read=$MARIADB_PROFILE_IO_READ
+  io_write=$MARIADB_PROFILE_IO_WRITE
+  backlog=$MARIADB_PROFILE_BACKLOG
 
   cnf_dir=/etc/mysql/mariadb.conf.d
   mkdir -p "$cnf_dir"
@@ -5496,10 +5699,6 @@ optimize_mariadb() {
     opt_report "- systemd LimitNOFILE=1048576"
   fi
   cnf="${cnf_dir}/99-setup-optimize.cnf"
-  major=${ver%%.*}
-  minor=${ver#*.}; minor=${minor%%.*}
-  [[ $major =~ ^[0-9]+$ ]] || major=0
-  [[ $minor =~ ^[0-9]+$ ]] || minor=0
 
   cnf_before=""
   [[ -f $cnf ]] && cnf_before=$(md5sum "$cnf" | awk '{print $1}')
@@ -5509,69 +5708,16 @@ optimize_mariadb() {
     cp -a "$cnf" "$cnf_old"
   fi
 
-  cat > "$cnf" <<EOF
+  {
+    cat <<'EOF'
 # BEGIN setup.sh optimize
 # Hardware-aware MariaDB tuning; generated by setup.sh --optimize.
 # [mysqld] is understood by MariaDB 10.11 (Ubuntu 24.04) and 11.8 (26.04).
 [mysqld]
-max_connections = ${max_conn}
-max_connect_errors = 524288
-back_log = ${backlog}
-thread_cache_size = 64
-thread_handling = pool-of-threads
-thread_pool_size = ${threads}
-max_allowed_packet = 64M
-wait_timeout = 600
-interactive_timeout = 600
-net_read_timeout = 120
-net_write_timeout = 120
-
-innodb_log_buffer_size = 64M
-innodb_log_file_size = ${logsize}
-innodb_buffer_pool_size = ${buffer}
-innodb_buffer_pool_dump_at_shutdown = ON
-innodb_buffer_pool_load_at_startup = ON
-innodb_buffer_pool_dump_pct = 25
-innodb_stats_on_metadata = OFF
-innodb_lock_wait_timeout = 100
-innodb_flush_neighbors = 0
-innodb_stats_persistent = ON
-innodb_stats_auto_recalc = ON
-innodb_lru_scan_depth = 2048
-innodb_io_capacity = ${io_read}
-innodb_io_capacity_max = ${io_write}
-innodb_read_io_threads = ${threads}
-innodb_write_io_threads = ${threads}
-innodb_flush_log_at_trx_commit = 2
 EOF
-  if (( major > 11 || (major == 11 && minor >= 8) )); then
-    cat >> "$cnf" <<'EOF'
-# MariaDB 11.8+ per-file buffering knobs (OFF = O_DIRECT).
-innodb_data_file_buffering = OFF
-innodb_data_file_write_through = OFF
-innodb_log_file_buffering = OFF
-innodb_log_file_write_through = OFF
-EOF
-  else
-    cat >> "$cnf" <<'EOF'
-# MariaDB <= 11.7 uses the legacy flush method.
-innodb_flush_method = O_DIRECT
-EOF
-  fi
-  cat >> "$cnf" <<EOF
-join_buffer_size = 512K
-read_buffer_size = 512K
-read_rnd_buffer_size = 512K
-sort_buffer_size = 1M
-tmp_table_size = 64M
-max_heap_table_size = 64M
-table_open_cache = ${open_cache}
-table_definition_cache = ${open_cache}
-innodb_open_files = ${open_cache}
-key_buffer_size = 32M
-aria_pagecache_buffer_size = ${aria_mb}M
-# END setup.sh optimize
-EOF
+    mariadb_performance_settings "$size_mb" "$max_conn"
+    printf '%s\n' '# END setup.sh optimize'
+  } > "$cnf"
   chmod 644 "$cnf"
   cnf_after=$(md5sum "$cnf" | awk '{print $1}')
   opt_report "- Wrote \`${cnf}\` (buffer=${buffer}, max_connections=${max_conn}, back_log=${backlog})"
@@ -5731,21 +5877,10 @@ optimize_valkey() {
       printf '%s %s\n' "$key" "$value" >> "$conf"
     fi
   }
-  conf_set maxmemory "${max_mb}mb"
-  conf_set maxmemory-policy "$policy"
-  conf_set maxmemory-samples 10
-  conf_set maxclients 20000
-  conf_set tcp-backlog "$backlog"
-  conf_set timeout 0
-  conf_set tcp-keepalive 300
-  conf_set hz 10
-  conf_set io-threads "$io_threads"
-  conf_set io-threads-do-reads yes
-  conf_set lazyfree-lazy-eviction yes
-  conf_set lazyfree-lazy-expire yes
-  conf_set lazyfree-lazy-server-del yes
-  conf_set lazyfree-lazy-user-del yes
-  conf_set lazyfree-lazy-user-flush yes
+  while read -r key value; do
+    [[ -n $key ]] || continue
+    conf_set "$key" "$value"
+  done < <(valkey_tuning_lines "$max_mb" "$policy" "$io_threads")
   conf_after=$(md5sum "$conf" | awk '{print $1}')
   opt_report "- maxmemory=${max_mb}mb, policy=${policy}, maxclients=20000, tcp-backlog=${backlog}"
 
@@ -5997,8 +6132,8 @@ optimize_elastic() {
   local active=0 yml=/etc/elasticsearch/elasticsearch.yml ram_mb heap_mb
   local jvm=$ES_JVM_OPTIONS
   local legacy=/etc/elasticsearch/jvm.options.d/jvm.options
-  local unit=/etc/systemd/system/elasticsearch.service.d/optimize.conf
-  local es_before jvm_before legacy_before unit_before es_after jvm_after unit_after changed=0 tmp
+  local unit=/etc/systemd/system/elasticsearch.service.d/limits.conf
+  local es_before jvm_before legacy_before unit_before es_after jvm_after unit_after changed=0
   systemctl is-active --quiet elasticsearch 2>/dev/null && active=1
   opt_report "## Elasticsearch"
   opt_report "- Active: ${active}; config: \`${yml}\`"
@@ -6046,44 +6181,13 @@ optimize_elastic() {
 
   write_es_jvm_options "$heap_mb"
 
-  # Drop a previous optimize block so repeated runs stay idempotent.
-  tmp=$(tmp_file)
-  awk -v b='# BEGIN setup.sh optimize' -v e='# END setup.sh optimize' '
-    $0 == b { skip=1; next }
-    $0 == e { skip=0; next }
-    !skip { print }
-  ' "$yml" > "$tmp"
-  cat "$tmp" > "$yml"
+  # Drop a previous managed block so repeated runs stay idempotent, then let
+  # the shared helper append the exact same performance block the installer
+  # writes.
+  elasticsearch_strip_managed "$yml"
+  elasticsearch_write_performance_block "$yml"
 
-  local key
-  for key in bootstrap.memory_lock indices.query.bool.max_clause_count \
-             indices.memory.index_buffer_size indices.fielddata.cache.size \
-             search.max_buckets action.destructive_requires_name \
-             http.compression http.max_content_length; do
-    sed_in_place -E "s|^[[:space:]]*${key//./\\.}[[:space:]]*:.*|#&|" "$yml"
-  done
-  cat >> "$yml" <<'EOF'
-# BEGIN setup.sh optimize
-bootstrap.memory_lock: true
-indices.query.bool.max_clause_count: 4096
-indices.memory.index_buffer_size: 20%
-indices.fielddata.cache.size: 20%
-search.max_buckets: 65536
-action.destructive_requires_name: true
-http.compression: true
-http.max_content_length: 200mb
-# END setup.sh optimize
-EOF
-  chmod 644 "$yml"
-
-  mkdir -p /etc/systemd/system/elasticsearch.service.d
-  cat > "$unit" <<'EOF'
-[Service]
-LimitMEMLOCK=infinity
-LimitNOFILE=1048576
-LimitNPROC=4096
-EOF
-  chmod 644 "$unit"
+  elasticsearch_write_systemd_limits
   systemctl daemon-reload || true
 
   es_after=$([[ -f $yml ]] && md5sum "$yml" | awk '{print $1}' || echo absent)
@@ -6296,7 +6400,7 @@ write_optimize_report() {
 }
 
 optimize_plan() {
-  local nproc ram_mb size_mb max_children max_mb heap_mb backlog max_conn current_max db_fit db_size_mb es_fit es_size_mb
+  local nproc ram_mb size_mb max_children max_mb heap_mb backlog max_conn db_fit db_size_mb es_fit es_size_mb
   local governor_desc=performance disk_free_mb cache_mb
   nproc=$(nproc)
   ram_mb=$(mem_total_mb)
@@ -6342,12 +6446,8 @@ optimize_plan() {
   fi
   if [[ " ${OPT_DETECTED[*]} " == *" mariadb "* ]]; then
     size_mb=$OPT_MARIADB_BUDGET_MB
-    max_conn=$(tune_clamp $(( nproc * 32 )) 200 2000)
-    current_max=$(mariadb -N -B -e 'SELECT @@max_connections' 2>/dev/null || true)
-    if [[ $current_max =~ ^[0-9]+$ ]] && (( current_max > max_conn )); then
-      max_conn=$current_max
-    fi
-    (( max_conn > 2000 )) && max_conn=2000
+    mariadb_compute_profile "$size_mb"
+    max_conn=$MARIADB_PROFILE_MAX_CONN
     db_size_mb=${OPT_DB_SIZE_MB:-0}
     db_fit=""
     if (( db_size_mb > 0 )); then
@@ -6501,12 +6601,18 @@ on_exit() {
   fi
   cleanup_configs
   release_run_lock
+  finish_run_log "$rc"
   return "$rc"
 }
 
 main() {
   normalize_cli_args "$@"
   set -- "${NORMALIZED_ARGS[@]}"
+
+  # Mirror every run (including --help, --dry-run and failures) to a full log
+  # in the invocation directory before anything can fail or print output.
+  start_run_log "$@"
+  trap on_exit EXIT
 
   # --help/--version are safe without root.
   local a
@@ -6531,8 +6637,6 @@ main() {
     print_plan
     exit 0
   fi
-
-  trap on_exit EXIT
 
   [[ ${EUID} -eq 0 ]] || die "This script must be run as root (use: sudo bash ${SCRIPT_NAME} ...)"
   acquire_run_lock

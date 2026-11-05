@@ -4,7 +4,11 @@
 set -u
 
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-cd "$SCRIPT_DIR" || exit 1
+# Run each invocation from /tmp so the mandatory setup_<timestamp>.log does
+# not accumulate in the repository.  The test itself never deletes the files;
+# /tmp expires them.
+TMP=$(mktemp -d /tmp/setup-test-matrix.XXXXXX)
+cd "$TMP" || exit 1
 
 PASS=0
 FAIL=0
@@ -13,7 +17,7 @@ run() {
   local expect=$1
   shift
   local out rc
-  out=$(bash setup.sh "$@" 2>&1)
+  out=$(bash "$SCRIPT_DIR/setup.sh" "$@" 2>&1)
   rc=$?
   if [[ $expect == ok && $rc -eq 0 ]] || [[ $expect == fail && $rc -ne 0 ]]; then
     PASS=$((PASS + 1))
@@ -106,13 +110,43 @@ run fail --dry-run --angie
 run fail --dry-run --bogus
 
 # The single optimize command must include the OS layer.
-out=$(bash setup.sh --dry-run --optimize 2>&1)
+out=$(bash "$SCRIPT_DIR/setup.sh" --dry-run --optimize 2>&1)
 if [[ $out == *"OS: governor="* && $out == *"limits=1M-nofile"* ]]; then
   PASS=$((PASS + 1))
   printf 'PASS  --optimize includes the OS tuning plan\n'
 else
   FAIL=$((FAIL + 1))
   printf 'FAIL  --optimize does not include the OS tuning plan\n'
+fi
+
+# Every run must leave a complete log in the invocation directory.
+LOGDIR="$TMP/log-check"
+mkdir -p "$LOGDIR"
+( cd "$LOGDIR" && bash "$SCRIPT_DIR/setup.sh" --dry-run --basic >/dev/null 2>&1 )
+log=$(find "$LOGDIR" -maxdepth 1 -name 'setup_*.log' -type f | head -n1)
+if [[ -n $log && -s $log ]] \
+   && grep -q 'setup.sh run log' "$log" \
+   && grep -q 'Command' "$log" \
+   && grep -q 'run finished' "$log"; then
+  PASS=$((PASS + 1))
+  printf 'PASS  every run writes a complete setup_<timestamp>.log\n'
+else
+  FAIL=$((FAIL + 1))
+  printf 'FAIL  run log is missing or incomplete\n'
+fi
+
+# The run log must never record a password argument.
+REDACTDIR="$TMP/log-redact"
+mkdir -p "$REDACTDIR"
+( cd "$REDACTDIR" && bash "$SCRIPT_DIR/setup.sh" --dry-run --basic \
+    --mariadb user=demo pass=topsecret size=4gb >/dev/null 2>&1 )
+log=$(find "$REDACTDIR" -maxdepth 1 -name 'setup_*.log' -type f | head -n1)
+if [[ -n $log ]] && grep -q 'pass=\*\*\*' "$log" && ! grep -q 'topsecret' "$log"; then
+  PASS=$((PASS + 1))
+  printf 'PASS  run log redacts pass= arguments\n'
+else
+  FAIL=$((FAIL + 1))
+  printf 'FAIL  run log leaks or omits a password argument\n'
 fi
 
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
