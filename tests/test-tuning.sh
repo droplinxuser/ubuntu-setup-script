@@ -871,5 +871,30 @@ limits_line=$(printf '%s\n' "$tuning_body" | grep -n 'configure_limits' | head -
 check "OS tuning applies sysctl before the PAM nofile limits" \
   test -n "$sysctl_line" -a -n "$limits_line" -a "$sysctl_line" -lt "$limits_line"
 
+# ---------------------------------------------------------------------------
+# Shared install/--optimize tuning helpers
+# ---------------------------------------------------------------------------
+mariadb_compute_profile 2048
+check "MariaDB shared profile sizes a 2G buffer pool" \
+  test "$MARIADB_PROFILE_BUFFER" = 2G
+check "MariaDB shared profile caps the log at 512M" \
+  test "$MARIADB_PROFILE_LOG_SIZE" = 512M
+check "MariaDB shared profile keeps a usable connection ceiling" \
+  bash -c "(( $MARIADB_PROFILE_MAX_CONN >= 200 && $MARIADB_PROFILE_MAX_CONN <= 2000 ))"
+
+valkey_lines=$(valkey_tuning_lines 512 allkeys-lru 2)
+check "Valkey shared lines keep maxmemory and policy" \
+  grep -qx 'maxmemory 512mb' <<<"$valkey_lines"
+check "Valkey shared lines keep the io-threads override" \
+  grep -qx 'io-threads 2' <<<"$valkey_lines"
+
+printf '# BEGIN setup.sh optimize\nbootstrap.memory_lock: true\n# END setup.sh optimize\ncluster.name: keep\n' \
+  > "$TMP/es-strip.yml"
+elasticsearch_strip_managed "$TMP/es-strip.yml"
+check "Elasticsearch strip removes only the optimize block" \
+  grep -qx 'cluster.name: keep' "$TMP/es-strip.yml"
+check "Elasticsearch strip removes the old performance key" \
+  bash -c "! grep -q '^bootstrap.memory_lock' '$TMP/es-strip.yml'"
+
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

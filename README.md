@@ -2,7 +2,7 @@
 
 A single, idempotent Bash provisioning script for **Ubuntu 26.04 LTS** (and newer LTS releases such as 28.04). It installs and configures a complete web/database stack from one command. `--purge` stops and disables selected services and restores recorded basic settings, but it deliberately leaves packages, configuration, databases and logs on disk.
 
-**File-safety policy:** every transient file is created under `/tmp`, and the script never unlinks, purges or otherwise permanently removes files or directories on the server. Anything left in `/tmp` is allowed to expire through the system's normal `/tmp` cleanup. `--purge` is therefore a stop/disable operation, not a destructive uninstall; remove data manually only after you have verified it is no longer needed.
+**File-safety policy:** every transient file is created under `/tmp`, and the script never unlinks, purges or otherwise permanently removes files or directories on the server. Anything left in `/tmp` is allowed to expire through the system's normal `/tmp` cleanup. The one intentional file written outside `/tmp` is the requested run log: every invocation creates `setup_<timestamp>.log` in the directory it was started from, so it can be pulled for debugging. `--purge` is therefore a stop/disable operation, not a destructive uninstall; remove data manually only after you have verified it is no longer needed.
 
 Angie configuration is **not** hard-coded in this script. It is downloaded at install time from [`droplinxuser/server-configs-nginx`](https://github.com/droplinxuser/server-configs-nginx), which is the single source of truth for Angie/Nginx configs. PHP-FPM pool and `php.ini` templates are **non-Angie** configuration and live locally under `configs/php/` in this repository.
 
@@ -32,6 +32,29 @@ checkout. System/MariaDB/systemd blobs still have embedded fallbacks, but the
 PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
+
+## What's new in 1.8.31
+
+- **Every run writes a full diagnostic log.** `setup.sh` now mirrors its
+  complete stdout/stderr into `setup_<YYYYmmdd-HHMMSS>.log` in the directory
+  where it was invoked. The header records the redacted command line, user,
+  working directory, OS/kernel/architecture, virtualization, CPU, memory,
+  disk, addresses, failed units and enabled modes; the footer records the exit
+  status, duration and log path. `--help`, `--dry-run`, install, `--optimize`
+  and failed runs all write one. Password arguments are redacted.
+- **Duplicate tuning blocks merged.** MariaDB now has one
+  `mariadb_compute_profile` / `mariadb_performance_settings` pair used by both
+  the installer and `--optimize`; Elasticsearch shares one managed performance
+  block and one systemd limits file; Valkey shares one list of tuning
+  directives. This removes drift between fresh installs and later tunes while
+  preserving the existing zero-downtime/rollback behavior.
+- **Only the log is outside `/tmp`.** All scratch/config-test/backup paths
+  remain under `/tmp` and are left for the OS to expire; no permanent deletion
+  code was added. The test matrix now runs each invocation from `/tmp` so its
+  logs do not accumulate in the checkout.
+- **Install and `--optimize` parity maintained.** Both paths still call the
+  same OS profile and the same 80%-of-RAM plan, and the merged service helpers
+  keep the install-time and optimize-time values identical.
 
 ## What's new in 1.8.30
 
