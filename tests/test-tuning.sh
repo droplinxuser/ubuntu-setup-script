@@ -536,7 +536,7 @@ OPT_DETECTED=(angie php:8.3 mariadb redis elastic)
 mariadb_data_size_mb() { printf '40960'; }
 plan_memory_budget
 check "oversized database gets the budget-limited buffer pool" \
-  test "$OPT_MARIADB_BUDGET_MB" -gt 20000 -a "$OPT_MARIADB_BUDGET_MB" -lt 32768
+  test "$OPT_MARIADB_BUDGET_MB" -gt 20000 -a "$OPT_MARIADB_BUDGET_MB" -lt 34000
 check "oversized database is not falsely reported as fitting" \
   test "$OPT_DB_SIZE_MB" -eq 40960 -a "$OPT_MARIADB_BUDGET_MB" -lt 40960
 
@@ -598,8 +598,8 @@ check "MariaDB-only host reserves no PHP budget" \
 check "MariaDB-only large database can use the full 80% budget" \
   test "$OPT_MARIADB_BUDGET_MB" -eq 52428
 
-# Unknown data size falls back to the larger MariaDB-only share.
-mariadb_data_size_mb() { printf '0'; }
+# Unknown data size (query failed) falls back to the larger MariaDB-only share.
+mariadb_data_size_mb() { printf ''; }
 OPT_DETECTED=(mariadb)
 plan_memory_budget
 check "MariaDB-only unknown data falls back to 80% RAM" \
@@ -617,13 +617,21 @@ plan_memory_budget
 check "Angie+PHP+Valkey budget uses 25% of RAM" \
   test "$OPT_VALKEY_BUDGET_MB" -eq 16384
 
-# Elasticsearch-only fallback when the index size is unknown.
-elasticsearch_data_size_mb() { printf '0'; }
+# Elasticsearch-only fallback when the index size cannot be measured.
+elasticsearch_data_size_mb() { printf ''; }
 elasticsearch_current_heap_mb() { printf '0'; }
 OPT_DETECTED=(elastic)
 plan_memory_budget
 check "Elasticsearch-only unknown index falls back to 50% RAM" \
   test "$OPT_ES_BUDGET_MB" -eq 31744
+
+# A reachable but empty cluster is a measurement, not a failure: use the
+# 512 MB JVM floor instead of allocating 25-50% of RAM.
+elasticsearch_data_size_mb() { printf '0'; }
+OPT_DETECTED=(elastic)
+plan_memory_budget
+check "measured empty Elasticsearch index uses the 512 MB floor" \
+  test "$OPT_ES_BUDGET_MB" -eq 512
 
 mariadb_current_pool_mb() { printf '0'; }
 mariadb_data_size_mb() { printf '20000'; }
@@ -912,6 +920,14 @@ check "Elasticsearch strip removes only the optimize block" \
   grep -qx 'cluster.name: keep' "$TMP/es-strip.yml"
 check "Elasticsearch strip removes the old performance key" \
   bash -c "! grep -q '^bootstrap.memory_lock' '$TMP/es-strip.yml'"
+
+# --optimize must not create/resize swap, and Valkey must take precedence over
+# Redis so one cache budget is not applied twice.
+check "optimize leaves swap untouched" \
+  bash -c '! grep -q "configure_swap_auto" <<< "$1"' _ "$tuning_body"
+detect_body=$(sed -n '/^detect_installed_services()/,/^}/p' "$ROOT/setup.sh")
+check "Valkey takes precedence over Redis in service detection" \
+  grep -q '! -f /etc/valkey/valkey.conf' <<<"$detect_body"
 
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

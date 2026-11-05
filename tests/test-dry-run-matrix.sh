@@ -77,6 +77,10 @@ run ok   --dry-run --domain a.example.com app=lychee
 run ok   --dry-run --optimize
 run ok   $'—optimize' --dry-run
 run ok   $'–optimize' --dry-run
+run ok   --dry-run --diagnostics
+run fail --dry-run --diagnostics --basic
+run fail --dry-run --diagnostics --optimize
+run fail --dry-run --diagnostics --purge
 run fail --dry-run --optimize --basic
 run fail --dry-run --optimize --angie
 run fail --dry-run --optimize --purge
