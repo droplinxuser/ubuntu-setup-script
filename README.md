@@ -1,6 +1,8 @@
 # Ubuntu Setup Script
 
-A single, idempotent Bash provisioning script for **Ubuntu 26.04 LTS** (and newer LTS releases such as 28.04). It installs and configures a complete web/database stack from one command and can uninstall everything again with a `--purge` mode.
+A single, idempotent Bash provisioning script for **Ubuntu 26.04 LTS** (and newer LTS releases such as 28.04). It installs and configures a complete web/database stack from one command. `--purge` stops and disables selected services and restores recorded basic settings, but it deliberately leaves packages, configuration, databases and logs on disk.
+
+**File-safety policy:** every transient file is created under `/tmp`, and the script never unlinks, purges or otherwise permanently removes files or directories on the server. Anything left in `/tmp` is allowed to expire through the system's normal `/tmp` cleanup. `--purge` is therefore a stop/disable operation, not a destructive uninstall; remove data manually only after you have verified it is no longer needed.
 
 Angie configuration is **not** hard-coded in this script. It is downloaded at install time from [`droplinxuser/server-configs-nginx`](https://github.com/droplinxuser/server-configs-nginx), which is the single source of truth for Angie/Nginx configs. PHP-FPM pool and `php.ini` templates are **non-Angie** configuration and live locally under `configs/php/` in this repository.
 
@@ -31,6 +33,32 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
+## What's new in 1.8.29
+
+- **No permanent deletions anywhere.** Package purge/autoremove/clean calls,
+  `rm`/`rmdir`/`find -delete`, crontab removal and old-backup pruning were
+  removed. `--purge` now stops/disables services and restores recorded originals,
+  then leaves packages, databases, configuration, certificates, caches and logs
+  in place. A rejected vhost or a legacy generated JVM options file is moved to
+  `/tmp`, not deleted.
+- **All scratch data lives under `/tmp`.** `mktemp` wrappers force `TMPDIR=/tmp`,
+  the run lock moved from `/run` to `/tmp`, and temporary config rewrites no
+  longer create `*.new` files beside `/etc` files. Optimize rollback copies now
+  live under `/tmp` and expire there instead of being pruned.
+- **Install and `--optimize` share one hardware plan.** A fresh install now sizes
+  PHP-FPM, MariaDB, Valkey and Elasticsearch from the same 80%-of-RAM budget
+  used by `--optimize`, instead of each service claiming its own percentage.
+  Both paths call the same CPU governor, swap, sysctl/PAM, Angie, PHP-FPM and
+  service tuning helpers.
+- **Angie and PHP tuning parity.** The installer now applies the WordPress
+  FastCGI guest cache and the same cache/error-policy tuning as `--optimize`.
+- **Duplicate helper merged.** `opt_clamp` was merged into the shared
+  `tune_clamp`, and the Angie systemd limit logic is one helper used by install
+  and optimize.
+- **PHP `redis-server` conflict is reported, not fixed by purging.** If Redis is
+  already installed, Valkey installation stops with a warning instead of
+  removing Redis and its files.
+
 ## What's new in 1.8.28
 
 - **Live tuning no longer restarts a cache just to add defaults.** Valkey and
@@ -55,10 +83,10 @@ alongside `setup.sh`).
   `/etc/php/<ver>/fpm` with no pool config made `--optimize` create systemd
   drop-ins and per-version reports for a service that was not installed.
   Only versions with a real pool and binary are detected now.
-- **An idempotent run no longer deletes healthy cache entries.** The
-  post-run cache purge now runs only when a service actually reloaded or
-  restarted; a repeat run with unchanged files reports
-  `Cache: left intact` instead of deleting objects written by live traffic.
+- **An idempotent run never deletes healthy cache entries.** Older releases
+  purged the cache after a cutover; since 1.8.29 the run only counts and
+  reports objects written during the run. A repeat run with unchanged files
+  reports `Cache: left intact`.
 - **The pool-level `process_control_timeout` is normalised too.** Older
   `pool.d/www.conf` templates carried a `[global]` block with 60s; because
   pool files are included last, that value overrode the 10s global setting.
@@ -115,8 +143,8 @@ alongside `setup.sh`).
   seconds and rolled back to TCP. The migration now gives Angie the socket as
   primary plus the existing TCP listener as backup, moves the existing pool
   on reload, and removes the backup once the socket is live. A request that
-  lands exactly in the cutover can fail over to the backup; the cache purge
-  covers any blank page. Failures now report the exact stage instead of only
+  lands exactly in the cutover can fail over to the backup; the post-run cache
+  report lists any blank page written in that window (files are not deleted). Failures now report the exact stage instead of only
   "socket migration failed".
 
 ## What's new in 1.8.23
@@ -125,10 +153,11 @@ alongside `setup.sh`).
   backend is restarting (MariaDB, PHP-FPM), XenForo/WordPress can emit an
   empty `200` that Angie's FastCGI guest cache stores for its 5-minute 200
   validity. During the live validation on a XenForo host the cutover produced
-  exactly that and every guest received a blank homepage. `--optimize` now
-  discovers the included `fastcgi_cache_path`/`proxy_cache_path` directories
-  and deletes only the objects written during the run, so the next request
-  refills them from a healthy backend. The report lists the count removed.
+  exactly that and every guest received a blank homepage. Newer releases
+  discover the included `fastcgi_cache_path`/`proxy_cache_path` directories
+  and report how many objects were written during the run. Since 1.8.29 they
+  are left in place instead of being deleted; invalidate them manually if a
+  blank response really was cached.
 - **MariaDB is not restarted just to apply a larger fd limit.** When the only
   change is the systemd `LimitNOFILE` drop-in and the running limit is already
   at least 65536 (far above what `max_connections` needs), the drop-in is
@@ -149,8 +178,8 @@ alongside `setup.sh`).
   `jvm.options.d/zz-setup-optimize.options`, so a host that had both passed
   two conflicting `-Xms/-Xmx` pairs to the JVM (the last one silently won).
   Both paths now own `zz-setup-optimize.options`; the old generated file is
-  removed when it matches the exact script-generated shape, and an operator's
-  own `jvm.options` is preserved.
+  moved to `/tmp` when it matches the exact script-generated shape, and an
+  operator's own `jvm.options` is preserved.
 - **`/etc/sysctl.conf` no longer contains duplicate keys.** The base profile
   and the hardware-aware block set some of the same tunables
   (`somaxconn`, `tcp_max_syn_backlog`, `file-max`, ...), with the last line
@@ -165,7 +194,7 @@ alongside `setup.sh`).
 - **Small hosts keep usable service floors.** Proportional scaling could hand
   a 1 GB host a 17 MB Valkey budget; Valkey and Elasticsearch now keep their
   256 MB / 512 MB minimums.
-- **Rollback backups are root-only.** `/var/backups/setup-optimize-*` is
+- **Rollback backups are root-only.** `/tmp/setup-optimize-*` is
   created with mode 0700 because it contains copies of
   `/etc/angie/ssl/*/privkey.pem` and `/etc/mysql/debian.cnf`.
 - **Legacy Angie files are reported, not silently ignored.** When `http.d`
@@ -198,8 +227,8 @@ alongside `setup.sh`).
   Elasticsearch cannot rotate its logs (`Null object returned for RollingFile`
   / `Exec failed, error: 13`). The ownership fix is recursive so rotated
   `.log.1`, `.gz` and audit files are included.
-- **Temporary config checkouts are cleaned on every exit path**, not only
-  after a successful install.
+- Temporary config checkouts live under `/tmp` and are left for the operating
+  system to expire; older releases removed them on exit.
 - **APT downloads retry automatically** (`Acquire::Retries=3`, 30 s HTTP
   timeout) in addition to the existing dpkg lock wait.
 - A PHP version directory without `pool.d/www.conf` is reported as a miss
@@ -525,8 +554,8 @@ alongside `setup.sh`).
 - Typographic em/en dashes are normalized, so pasted commands such as
   `setup.sh —optimize` work. Bash 4.0+ is checked explicitly, and APT waits
   up to 300 s for a concurrent dpkg lock instead of failing.
-- Rollback backups under `/var/backups/setup-optimize-*` are pruned to the ten
-  newest runs.
+- Rollback backups live under `/tmp/setup-optimize-*`; since 1.8.29 they are
+  left for the operating system to expire instead of being pruned.
 
 ## What's new in 1.6.12
 
@@ -567,7 +596,7 @@ alongside `setup.sh`).
   found. The shared socket is used only when Angie is installed; other PHP
   versions keep their existing listener.
 - `--optimize` backs up every touched configuration directory under
-  `/var/backups/setup-optimize-*`, validates each config, restarts only active
+  `/tmp/setup-optimize-*`, validates each config, restarts only active
   services, rolls back automatically on failure, and writes a Markdown report
   to `/var/log/setup-optimize-*.md` (latest at
   `/var/log/setup-optimize-latest.md`).
@@ -929,7 +958,7 @@ If a service flag is omitted, that service is **not** installed. `--basic` value
 Basic performs:
 
 1. Writes its own `/etc/systemd/resolved.conf.d/dns_servers.conf` (`8.8.8.8`, `1.1.1.1`) and restarts `systemd-resolved`. Other resolver drop-ins are left untouched.
-2. Purges snapd (if present), updates Ubuntu, upgrades packages, autoremoves and cleans.
+2. Updates Ubuntu and upgrades packages. Snapd and package caches are left alone.
 3. On a dedicated server: installs `cpufrequtils`, writes `/etc/default/cpufrequtils`, enables the service, and sets the `performance` governor. On a VPS this is skipped.
 4. Installs basic tools: `wget unzip nano zip software-properties-common rsync ca-certificates curl gnupg dmidecode`.
 5. Generates a hostname if one was not supplied, then sets the hostname and timezone.
@@ -943,7 +972,7 @@ Basic performs:
    - MariaDB: daily 03:03 mysql backup and monthly `mariadb-check`.
 10. Configures UFW: deny incoming, allow outgoing, limit 22, allow 80 and 443, enable the firewall. The original active state, added rules and default policies are recorded so `--purge basic` can restore them.
 
-Before changing basic settings, the script records the originals under `/var/lib/setup.sh/backup`. `--purge basic` restores them. A swap file is only removed by purge if the script actually created or resized it (`/var/lib/setup.sh/swapfile-managed`).
+Before changing basic settings, the script records the originals under `/var/lib/setup.sh/backup`. `--purge basic` restores them by overwriting the live files. `/swapfile` and its `/etc/fstab` entry are left enabled (`/var/lib/setup.sh/swapfile-managed`).
 
 ---
 
@@ -1041,7 +1070,7 @@ The MariaDB backup cron entry is added only when MariaDB is selected.
 
 ### Valkey (`--valkey [ram=2g] [policy=allkeys-lru] [io_threads=1]`)
 
-- Purges any existing `redis-server` (with a warning), cleans apt, installs `valkey-server`.
+- If an existing `redis-server` is present, stops with a warning instead of purging it, because setup.sh never removes packages. Remove Redis manually first if you want Valkey; otherwise `valkey-server` is installed.
 - Replaces the managed directives in `/etc/valkey/valkey.conf` (no duplicates):
   - `supervised systemd`
   - `save ""` (cache-only; enable AOF/RDB if you store sessions or queues)
@@ -1130,7 +1159,7 @@ sudo bash setup.sh --domain node.example.com app=node
 `app=TYPE` applies to every domain in that `--domain` group; use separate `--domain ... app=...` groups for different apps. Supported values: `blank` (default), `xf`, `wordpress`, `pingvin`, `chevereto`, `polr`, `lychee`, `php`, `node`.
 
 - `xf`, `wordpress`, `pingvin`, `chevereto` and `polr` use the templates from `server-configs-nginx` (the repo is the single source of truth). `lychee` and `php` use a Laravel/front-controller vhost. `node` proxies to `127.0.0.1:3000` and adds a WebSocket location.
-- The vhost is tested with `angie -t` before it is kept; a broken generated config is removed and the script fails loudly.
+- The vhost is tested with `angie -t` before it is kept; a broken generated config is moved to `/tmp` (never deleted) and the script fails loudly.
 - The certificate is self-signed and valid for the domain and `www.` name. Replace it with ACME/Let's Encrypt (Angie has `http_acme` built in) for production.
 - App code is **not** downloaded. The script provisions the vhost, certificate, document root and database; install the application itself (Composer, WP-CLI, Node, etc.) on top.
 - Domain names are lowercased and validated as hostnames. A trailing dot is removed.
@@ -1199,7 +1228,7 @@ reserved first, so MariaDB + PHP + cache + Elasticsearch cannot collectively
 exhaust memory. Each configuration is
 validated and active services are restarted only when their generated files
 actually changed; a failure rolls back the affected service from
-`/var/backups/setup-optimize-*`. The final verification checks each service's
+`/tmp/setup-optimize-*`. The final verification checks each service's
 real listener (Angie via `ss`, PHP socket/TCP) plus SQL/PING/HTTP probes and
 lists recent error-level journal entries. The Markdown report is written to
 `/var/log/setup-optimize-<timestamp>.md` and copied to
@@ -1231,7 +1260,7 @@ The script is safe to re-run:
 - Auto swap is a no-op once total swap is at least 50% of RAM.
 - Managed blocks in `crontab`, `50-server.cnf`, `elasticsearch.yml` and `valkey.conf` are replaced, not duplicated.
 - A `--basic`-only re-run keeps the managed cron entries of services that are still installed; stale entries for removed services are dropped.
-- Package-origin markers prevent `--purge others` from removing packages that existed before setup.sh, even after a previous purge removed the state directory.
+- Package-origin markers are retained for diagnostics, but `--purge` no longer removes any package regardless of origin.
 - Package repositories and keys are re-written only when missing.
 - Domain directories and databases use idempotent creation; existing Angie domain configs are preserved.
 - PHP, MariaDB, Angie, Valkey and Elasticsearch services are restarted after configuration changes so changed parameters take effect. Angie and PHP-FPM use a graceful `reload` when possible, Valkey applies runtime values with `CONFIG SET`, and startup-only changes are deferred; a repeat `--optimize` run with unchanged files restarts nothing.
@@ -1240,7 +1269,7 @@ A second run is normally much faster than the first (typically under a minute fo
 
 ---
 
-## Purge / uninstall
+## Purge / stop
 
 ```bash
 # Everything this script installed (packages that pre-existed are kept)
@@ -1263,16 +1292,16 @@ sudo bash setup.sh --purge basic
 sudo bash setup.sh --purge
 ```
 
-- `--purge --php ver=8.5` purges one version; `--purge php` discovers and purges every installed PHP-FPM version (not just 8.x).
-- PHP purge first removes a setup-installed Composer and its `php-*` library dependencies. Without that, APT can “satisfy” Composer's virtual `php-cli`/`php-intl` dependencies by installing an old alternative PHP/Apache stack during the purge. If Composer existed before setup.sh, the purge refuses instead of removing it silently.
-- `--purge all` removes `others` (including Composer) before PHP for the same reason.
-- Bare targets and service flags are combined, so `--purge basic --php` purges both.
-- `--purge others` removes `smartmontools`, `nvme-cli`, `gifsicle`, Node.js, `fail2ban`, `unattended-upgrades`, `sysstat` and `composer` **only when setup.sh installed them**. Packages and the NodeSource repository/key that already existed are preserved, using `/var/lib/setup.sh/setup-installed-pkg-*` and `preexisting-pkg-*` markers. This makes repeated purges safe even after `--purge basic` removed the rest of the state directory.
-- `--purge angie` also removes the FastCGI/proxy cache directories under `/home` and the per-domain certificates under `/etc/angie/ssl` (part of `/etc/angie`).
-- `--purge valkey` removes the Unix socket, systemd drop-in and group membership created for local PHP.
-- `--purge basic` restores the files recorded in `/var/lib/setup.sh/backup`, removes a `/swapfile` that the script created/resized (and its `/etc/fstab` line), removes the managed cron block while keeping operator-owned cron lines, deletes the UFW rules it added, restores the original UFW default policies, and disables UFW again if it was originally inactive. Pre-existing swap is left untouched if the script did not manage it.
-- Service purge removes packages, service units, configuration directories and runtime data created by the service. **MariaDB purge removes `/var/lib/mariadb` (the database data).** Back up your databases first.
-- There is no `--purge domain` target. `--purge angie` removes `/etc/angie/` (including domain vhosts), `--purge mariadb` removes the databases, and `/var/www/<domain>/` is left in place. Remove those manually if needed.
+- `--purge --php ver=8.5` stops one version; `--purge php` discovers and stops every installed PHP-FPM version (not just 8.x).
+- **Nothing is uninstalled or deleted.** Package purge/autoremove/clean calls were removed. `--purge` stops/disables the selected services, removes the managed cron entries, restores recorded basic settings where the original existed, and leaves packages, repositories, keys, Composer, configuration, certificates, databases, caches and logs on disk.
+- `--purge all` runs every stop/restore step in a safe order.
+- Bare targets and service flags are combined, so `--purge basic --php` stops both.
+- `--purge others` only disables the managed cron/setup entries it knows about; optional packages, Node.js, repository files and Composer are left installed.
+- `--purge angie` stops Angie and leaves `/etc/angie` (including domain vhosts and certificates), cache directories under `/home` and logs intact.
+- `--purge valkey` stops Valkey and leaves the Unix socket, systemd drop-in, group membership, configuration and data intact.
+- `--purge basic` restores files recorded in `/var/lib/setup.sh/backup` by overwriting them (never by unlinking the live path), leaves `/swapfile` and its `/etc/fstab` line enabled, removes only the managed cron block, restores the original UFW default policies, and disables UFW again if it was originally inactive. UFW rules that setup.sh added are still removed, except SSH rules.
+- **MariaDB data is never removed.** Database files under `/var/lib/mysql` and `/var/lib/mariadb`, configuration and backups stay in place after `--purge mariadb`.
+- There is no `--purge domain` target. Domain vhosts, certificates, `/var/www/<domain>/` and databases stay in place under this policy; remove them manually only after verifying they are unused.
 
 ---
 
@@ -1491,11 +1520,11 @@ The package is installed, but `smartd` may refuse to start on machines with no S
 
 ### `--purge others` and pre-existing packages
 
-`--purge others` removes Node.js, `smartmontools`, `nvme-cli` and `gifsicle` only if setup.sh installed them. If they already existed, setup.sh writes a `preexisting-pkg-*` marker and purge leaves them (and the NodeSource repository/key) alone. If the state directory was deleted by an older version, the safe default is also to keep them; remove them manually with APT if desired.
+`--purge others` no longer removes any package, repository, key or Composer file. It only stops the managed optional services and leaves Node.js, `smartmontools`, `nvme-cli`, `gifsicle`, `fail2ban`, `unattended-upgrades`, `sysstat` and `composer` installed. Remove them manually with APT only after confirming nothing needs them.
 
-### `--purge --php` removed Composer
+### `--purge --php` and Composer
 
-When setup.sh installed Composer (`--others composer`), PHP purge removes Composer and its `php-*` library dependencies first. Otherwise APT can install an old PHP/Apache provider stack to satisfy Composer's virtual PHP dependencies. This is intentional; re-run `--others composer` after installing PHP again if you still need it. If Composer existed before setup.sh, purge refuses rather than removing it.
+PHP purge stops the selected PHP-FPM versions and leaves Composer, its `php-*` library packages and all PHP configuration in place. Re-running `--php` reuses that installation; if you truly want Composer removed, do it manually after the purge.
 
 ### Rate limiting returns 429 on a site behind Cloudflare / a proxy
 
@@ -1561,9 +1590,9 @@ By default `--elastic host=localhost` binds to loopback and security is disabled
 - An auto-generated hostname uses logical CPU threads, nominal installed RAM (DMI when available) and the sum of physical disks: `8c-32g-1T` = 8 threads, 32 GB RAM, 1 TB. Supply `host=` to override it.
 - Auto swap only acts when the current total swap is zero or below 50% of RAM; it sizes `/swapfile` so the total reaches 50% of RAM. Supply `swap=` for an exact size.
 - `--domain` creates the directory, Angie vhost (blank or `app=TYPE`), certificate and database. It does not install the application code, Angie or MariaDB, and does not purge them.
-- `--purge basic` restores the recorded originals, but a reboot is the cleanest way to reset all runtime kernel tunables.
+- `--purge basic` restores the recorded originals by overwriting them, but a reboot is the cleanest way to reset all runtime kernel tunables. No file is deleted.
 - The script never stores credentials in the repository. MariaDB credentials are written only to `/etc/mysqlbkup.cnf` on the target server (mode 600).
 - `--dry-run` / `--check` is safe as a normal user and makes no changes; use it to validate a command before running it.
-- Package-origin markers in `/var/lib/setup.sh` let purge avoid removing software that existed before setup.sh. Do not delete that directory if you intend to purge later.
+- Package-origin markers in `/var/lib/setup.sh` are kept for diagnostics. Purge no longer removes software regardless of origin, so deleting that directory does not change file-safety behavior.
 - Package versions follow the upstream repositories at install time. Angie/PHP configuration follows the current `server-configs-nginx` branch at install time; other embedded payloads are fixed snapshots.
 - Set `CONFIG_SOURCE_DIR=/path/to/server-configs-nginx` to use a local checkout (for testing or offline installs), `CONFIG_REPO_REF=<branch|tag>` to choose a branch/tag, or `CONFIG_REPO_URL=<url>` for a fork.

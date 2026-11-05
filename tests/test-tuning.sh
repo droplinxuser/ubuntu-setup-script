@@ -9,8 +9,9 @@ FIXTURES="$ROOT/tests/fixtures/angie"
 
 PASS=0
 FAIL=0
-TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+TMP=$(TMPDIR=/tmp mktemp -d)
+# Scratch data stays under /tmp and is allowed to expire there; the tests do
+# not remove it, so a failed run remains inspectable.
 
 # Load the helpers without running main().  Source first: setup.sh defines its
 # own ok()/warn() logging helpers, so test helpers must be defined afterwards.
@@ -216,7 +217,7 @@ check "tune_replace records a missing file as a miss" \
 check "tune_first_file prefers the current file name" \
   test "$(mkdir -p "$TMP/pick" && : > "$TMP/pick/fastcgi_cache.conf" && : > "$TMP/pick/fastcgi_cache_conf" && tune_first_file "$TMP/pick" fastcgi_cache.conf fastcgi_cache_conf)" = \
        "$TMP/pick/fastcgi_cache.conf"
-rm -f "$TMP/pick/fastcgi_cache.conf"
+mv "$TMP/pick/fastcgi_cache.conf" "$TMP/pick/fastcgi_cache.conf.hidden"
 check "tune_first_file falls back to the legacy _conf layout" \
   test "$(tune_first_file "$TMP/pick" fastcgi_cache.conf fastcgi_cache_conf)" = \
        "$TMP/pick/fastcgi_cache_conf"
@@ -385,12 +386,12 @@ cache_disk_mb=$(df -Pm /var/www 2>/dev/null | awk 'NR==2{print $4}' || true)
 expected_cache_angie=$(tune_cache_total_mb "$cache_mem_mb" "$cache_disk_mb" 50 10)
 expected_cache_php=$(tune_cache_total_mb "$cache_mem_mb" "$cache_disk_mb" 30 5)
 
-mkdir -p "$TMP/xfonly"
+mkdir -p "$TMP/xfonly/disabled"
 cp -a "$FIXTURES/." "$TMP/xfonly/"
-rm -f "$TMP/xfonly/http.d/fastcgi_cache.conf" \
-      "$TMP/xfonly/http.d/fastcgi_cache_chev.conf" \
-      "$TMP/xfonly/http.d/proxy_cache.conf" \
-      "$TMP/xfonly/http.d/limit_req.conf"
+mv "$TMP/xfonly/http.d/fastcgi_cache.conf" \
+   "$TMP/xfonly/http.d/fastcgi_cache_chev.conf" \
+   "$TMP/xfonly/http.d/proxy_cache.conf" \
+   "$TMP/xfonly/http.d/limit_req.conf" "$TMP/xfonly/disabled/"
 OPT_PHP_SOCKET=""
 OPT_DETECTED=(angie)
 tune_reset_changes
@@ -399,12 +400,12 @@ check "proxy-only host gives the whole Angie-only budget to xfproxycache" \
   grep -q "max_size=$(tune_size_value "$expected_cache_angie")" \
   "$TMP/xfonly/http.d/xf_proxy_cache.conf"
 
-mkdir -p "$TMP/fcgionly"
+mkdir -p "$TMP/fcgionly/disabled"
 cp -a "$FIXTURES/." "$TMP/fcgionly/"
-rm -f "$TMP/fcgionly/http.d/fastcgi_cache_chev.conf" \
-      "$TMP/fcgionly/http.d/proxy_cache.conf" \
-      "$TMP/fcgionly/http.d/xf_proxy_cache.conf" \
-      "$TMP/fcgionly/http.d/limit_req.conf"
+mv "$TMP/fcgionly/http.d/fastcgi_cache_chev.conf" \
+   "$TMP/fcgionly/http.d/proxy_cache.conf" \
+   "$TMP/fcgionly/http.d/xf_proxy_cache.conf" \
+   "$TMP/fcgionly/http.d/limit_req.conf" "$TMP/fcgionly/disabled/"
 OPT_PHP_SOCKET=""
 OPT_DETECTED=(angie php:8.3)
 tune_reset_changes
@@ -706,7 +707,8 @@ printf 'server {\n  root %s;\n  include h5bp/php_wp.conf;\n}\n' \
   "$TMP/wpangie/www/site/public" > "$TMP/wpangie/conf.d/site.conf"
 check "WordPress vhost detection finds a real installation" \
   test "$(angie_wordpress_vhosts "$TMP/wpangie")" = "$TMP/wpangie/conf.d/site.conf"
-rm -f "$TMP/wpangie/www/site/public/wp-config.php"
+mv "$TMP/wpangie/www/site/public/wp-config.php" \
+   "$TMP/wpangie/www/site/public/wp-config.php.hidden"
 check "WordPress vhost detection ignores a missing wp-config" \
   test -z "$(angie_wordpress_vhosts "$TMP/wpangie")"
 
@@ -736,7 +738,7 @@ cp "$TMP/es-managed.options" "$TMP/esopt/jvm.options"
 write_es_jvm_options 2048 "$TMP/esopt"
 check "write_es_jvm_options writes the managed heap file" \
   grep -qx -- '-Xmx2048m' "$TMP/esopt/zz-setup-optimize.options"
-check "write_es_jvm_options removes the legacy managed heap file" \
+check "write_es_jvm_options moves the legacy managed heap file out of the config directory" \
   test ! -e "$TMP/esopt/jvm.options"
 printf -- '-Xms1g\n-Xmx1g\n' > "$TMP/esopt/jvm.options"
 write_es_jvm_options 2048 "$TMP/esopt"
@@ -799,10 +801,10 @@ touch -d '1 hour ago' "$TMP/cache/old"
 now=$(date +%s)
 sleep 1
 : > "$TMP/cache/sub/new"
-removed=$(purge_optimize_cache_entries "$now" "$TMP/cachetree")
-check "cache purge removes objects written during the run" test "$removed" -eq 1
-check "cache purge removes the new object" test ! -e "$TMP/cache/sub/new"
-check "cache purge keeps older objects" test -f "$TMP/cache/old"
+removed=$(count_optimize_cache_entries "$now" "$TMP/cachetree")
+check "cache report counts objects written during the run" test "$removed" -eq 1
+check "cache report leaves the new object in place" test -f "$TMP/cache/sub/new"
+check "cache report keeps older objects" test -f "$TMP/cache/old"
 
 # ---------------------------------------------------------------------------
 # Live disk-cache safety: never shrink max_size below current usage

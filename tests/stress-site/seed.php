@@ -137,6 +137,5 @@ if ($status !== 0 || !is_file($out)) {
 } else {
     echo 'GifSicle: wrote ' . $out . ' (' . filesize($out) . " bytes)\n";
 }
-foreach ($frameFiles as $file) {
-    @unlink($file);
-}
+// The temporary frames under /tmp are intentionally left for the operating
+// system to expire; the seed script never deletes files.

@@ -8,8 +8,7 @@ command -v wrk >/dev/null || { echo "wrk is required (apt install wrk)" >&2; exi
 
 DOMAIN=${DOMAIN:-stress.invalid}
 REPORT=${1:-/tmp/stress-report.md}
-TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+TMP=$(TMPDIR=/tmp mktemp -d)
 
 curl_nginx() { curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}$1"; }
 sql() { mariadb -N -B -e "$1"; }
