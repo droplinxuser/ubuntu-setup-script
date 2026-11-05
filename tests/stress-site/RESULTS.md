@@ -30,7 +30,7 @@ Additional full-stack probes:
 | WordPress guest page (FastCGI cache) | 9,028 | 100% |
 | Node.js all-services app (`mysql2` + `ioredis` + ES) | 4,250 | 99.7% |
 | Mixed stress + WordPress + Node, 20s | 768 + 3,732 + 1,128 | 100% (0% idle) |
-| Valkey direct Unix-socket benchmark | ~195k SET / ~195k GET ops/s | 38% total CPU; client/loopback bound |
+| Valkey direct Unix-socket benchmark | ~195k SET / ~200k GET ops/s | valkey-server 98-100% of one core; single-thread ceiling |
 
 Per-service CPU observations at high concurrency:
 
