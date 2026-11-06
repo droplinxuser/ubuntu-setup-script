@@ -2,6 +2,46 @@
 
 Historical release notes for ubuntu-setup-script. Current behavior is documented in README.md.
 
+## What's new in 1.8.41
+
+- **PHP session/cgi hardening is opt-in again.** 1.8.39 wrote global
+  `session.use_strict_mode`, `use_only_cookies`, `cookie_httponly`,
+  `cookie_secure=1`, `cookie_samesite=Lax`, 48-character session IDs and a
+  bounded `gc_maxlifetime` into `zz-setup-optimize.ini`. On this mixed
+  Joomla/WordPress/Polr host that made applications answer **"Access
+  denied."** after `--optimize`. `--optimize` now writes only the
+  performance block (limits, OPcache/JIT, realpath cache, MySQL socket
+  defaults). Enable the hardening deliberately with:
+
+  ```bash
+  sudo SETUP_PHP_SESSION_HARDENING=1 ./setup.sh --optimize
+  ```
+
+  `configs/php/custom_dan.ini` no longer carries `session.*` overrides
+  either, so a fresh install keeps PHP's session defaults.
+- The central PHP `error_log` and `cgi.fix_pathinfo=0`/`expose_php=Off`/
+  `display_errors=Off` settings moved into the same opt-in block, matching
+  the recovery configuration that restored the sites. When enabling the flag,
+  `setup.sh` still creates `/var/www/logs/php/php-error.log` and sets its
+  ownership.
+
+## What's new in 1.8.40
+
+- **Pretty URLs no longer fail with PHP-FPM "Access denied".** The shared
+  `snippets/fastcgi-php.conf` used
+  `fastcgi_split_path_info ^(.+?\.php)(/.*)$;`, which requires a trailing
+  `/...` and can leave `$fastcgi_script_name` empty for a bare `/index.php`.
+  `try_files` then passed the document root to PHP-FPM, and
+  `security.limit_extensions` returned 403 "Access denied" for every SEF URL.
+  `--optimize` (and a fresh Angie deploy) now makes the PATH_INFO capture
+  optional while keeping the existing `try_files`/`SCRIPT_FILENAME` behavior
+  so PATH_INFO applications continue to work.
+- **WordPress and Polr includes gain a server-level index.** Older vhosts
+  using `location / { try_files ...; }` without an `index` directive resolved
+  `/` to the directory instead of `index.php`. The optimizer now prepends
+  `index index.php index.html;` to `h5bp/wordpress.conf` and
+  `h5bp/php_polr.conf` when it is missing.
+
 ## What's new in 1.8.39
 
 - **`--optimize` probes the Elasticsearch endpoint it actually configured.**

@@ -204,8 +204,10 @@ Already good:
 - 108 static workers, `max_requests=16384`, `request_terminate_timeout=100s`,
   slow-request log at 5 s, `catch_workers_output=yes`.
 - `expose_php=Off`, `allow_url_fopen=Off`, `cgi.fix_pathinfo=0`.
-- Session hardening: strict mode, cookies only, HttpOnly, SameSite=Lax,
-  48-character IDs.
+- Session hardening is off by default. `sudo SETUP_PHP_SESSION_HARDENING=1
+  ./setup.sh --optimize` adds
+  strict mode, cookies only, HttpOnly, SameSite=Lax and 48-character IDs; it
+  broke Joomla/Polr logins on this mixed host, so test before enabling.
 - MariaDB Unix-socket defaults and `mysqlnd` statistics disabled.
 
 Recommended changes:
@@ -217,7 +219,9 @@ Recommended changes:
 - Add `exec,shell_exec,proc_open,popen,pcntl_exec` to `disable_functions` where
   the app does not need them. Chevereto video processing and some WordPress
   plugins may need `exec`/`shell_exec`; test per app.
-- Set `session.cookie_secure=1` once every vhost is HTTPS-only.
+- Set `session.cookie_secure=1` only with `SETUP_PHP_SESSION_HARDENING=1`,
+  once every vhost is HTTPS-only and every application accepts the stricter
+  session identifiers.
 - For production, set `opcache.validate_timestamps=0` and reload PHP-FPM on
   deploy. Keep `revalidate_freq=60` if you prefer not to restart.
 - Tune `children=` from measured RSS (`ps -o rss= -C php-fpm8.5`). On this host
