@@ -433,6 +433,46 @@ check "error policy keeps a single 5xx rule" \
   test "$(grep -c 'fastcgi_cache_valid 500' "$TMP/cache-policy.conf")" -eq 1
 
 # ---------------------------------------------------------------------------
+# FastCGI snippet and server-level index repair (pretty URLs)
+# ---------------------------------------------------------------------------
+mkdir -p "$TMP/fcgi-repair"
+cat > "$TMP/fcgi-repair/fastcgi-php.conf" <<'EOF'
+fastcgi_split_path_info ^(.+?\.php)(/.*)$;
+try_files $fastcgi_script_name =404;
+EOF
+tune_reset_changes
+tune_fastcgi_snippet "$TMP/fcgi-repair/fastcgi-php.conf"
+check "FastCGI snippet makes PATH_INFO optional" \
+  grep -qF 'fastcgi_split_path_info ^(.+?\.php)(/.*)?$;' "$TMP/fcgi-repair/fastcgi-php.conf"
+check "FastCGI snippet keeps the try_files test" \
+  grep -qF 'try_files $fastcgi_script_name =404;' "$TMP/fcgi-repair/fastcgi-php.conf"
+check "FastCGI snippet repair marks configuration dirty" \
+  test "$TUNE_DIRTY" -eq 1
+tune_reset_changes
+tune_fastcgi_snippet "$TMP/fcgi-repair/fastcgi-php.conf"
+check "FastCGI snippet repair is idempotent" test "$TUNE_DIRTY" -eq 0
+
+mkdir -p "$TMP/index-repair"
+cat > "$TMP/index-repair/wordpress.conf" <<'EOF'
+location / {
+  try_files $uri $uri/ /index.php?$args;
+}
+EOF
+tune_reset_changes
+tune_ensure_index "$TMP/index-repair/wordpress.conf"
+check "WordPress include gains a server-level index" \
+  test "$(head -n1 "$TMP/index-repair/wordpress.conf")" = 'index index.php index.html;'
+check "index repair marks configuration dirty" test "$TUNE_DIRTY" -eq 1
+tune_reset_changes
+tune_ensure_index "$TMP/index-repair/wordpress.conf"
+check "index repair is idempotent" test "$TUNE_DIRTY" -eq 0
+
+printf 'index index.php index.html;\nlocation / {}\n' > "$TMP/index-repair/polr.conf"
+tune_reset_changes
+tune_ensure_index "$TMP/index-repair/polr.conf"
+check "existing index is left untouched" test "$TUNE_DIRTY" -eq 0
+
+# ---------------------------------------------------------------------------
 # Angie tuning against the repository fixture
 # ---------------------------------------------------------------------------
 mkdir -p "$TMP/angie"
@@ -607,37 +647,52 @@ check "tune_pool_dedupe keeps one pm.max_children" \
 check "tune_pool_dedupe keeps the value set by tune_pool_set" \
   grep -qx 'pm.max_children = 64' "$TMP/www.conf"
 
-# --optimize must add session/cgi/error-log hardening for old hosts whose
-# custom_dan.ini predates the current template.  The managed ini sorts last.
+# --optimize must keep the managed ini performance-only by default.  The
+# 1.8.39 global session hardening broke Joomla/Polr logins, so session and
+# cgi hardening is behind an explicit opt-in flag.
 php_tune_body=$(sed -n '/^tune_php_fpm_version()/,/^}/p' "$ROOT/setup.sh")
-check "PHP optimize disables cgi.fix_pathinfo" \
-  grep -q '^cgi.fix_pathinfo = 0$' <<<"$php_tune_body"
-check "PHP optimize disables expose_php" \
-  grep -q '^expose_php = Off$' <<<"$php_tune_body"
-check "PHP optimize disables display_errors" \
-  grep -q '^display_errors = Off$' <<<"$php_tune_body"
-check "PHP optimize enables error logging" \
-  grep -q '^log_errors = On$' <<<"$php_tune_body"
-check "PHP optimize points error_log at the central tree" \
-  grep -qF 'error_log = ${php_error_log}' <<<"$php_tune_body"
-check "PHP optimize enables strict sessions" \
-  grep -q '^session.use_strict_mode = 1$' <<<"$php_tune_body"
-check "PHP optimize restricts sessions to cookies" \
-  grep -q '^session.use_only_cookies = 1$' <<<"$php_tune_body"
-check "PHP optimize marks cookies HttpOnly" \
-  grep -q '^session.cookie_httponly = 1$' <<<"$php_tune_body"
-check "PHP optimize marks cookies Secure" \
-  grep -q '^session.cookie_secure = 1$' <<<"$php_tune_body"
-check "PHP optimize sets SameSite=Lax" \
-  grep -q '^session.cookie_samesite = Lax$' <<<"$php_tune_body"
-check "PHP optimize sets a bounded session lifetime" \
-  grep -q '^session.gc_maxlifetime = 14400$' <<<"$php_tune_body"
-check "PHP optimize lengthens session IDs" \
-  grep -q '^session.sid_length = 48$' <<<"$php_tune_body"
-check "PHP optimize uses six bits per session character" \
-  grep -q '^session.sid_bits_per_character = 6$' <<<"$php_tune_body"
-check "PHP optimize creates the central PHP error log" \
-  grep -qF 'ensure_fpm_log_path "$php_error_log"' <<<"$php_tune_body"
+php_tune_default=$(awk '/SETUP_PHP_SESSION_HARDENING:-0} == 1/{exit} {print}' <<<"$php_tune_body")
+php_tune_hardening=$(awk '/SETUP_PHP_SESSION_HARDENING:-0} == 1/{f=1} f' <<<"$php_tune_body")
+
+check "PHP optimize keeps the performance block" \
+  grep -q '^memory_limit = ${memory_mb}M$' <<<"$php_tune_body"
+check "default PHP tuning writes no session overrides" \
+  test -z "$(grep '^session\.' <<<"$php_tune_default")"
+check "default PHP tuning writes no cgi/expose hardening" \
+  test -z "$(grep -E '^(cgi\.fix_pathinfo|expose_php|display_errors|log_errors) ' <<<"$php_tune_default")"
+check "session hardening is gated behind the opt-in flag" \
+  grep -qF 'SETUP_PHP_SESSION_HARDENING:-0} == 1' <<<"$php_tune_body"
+check "the shipped PHP template has no global session overrides" \
+  test -z "$(grep '^session\.' "$ROOT/configs/php/custom_dan.ini")"
+
+check "opt-in hardening disables cgi.fix_pathinfo" \
+  grep -q '^cgi.fix_pathinfo = 0$' <<<"$php_tune_hardening"
+check "opt-in hardening disables expose_php" \
+  grep -q '^expose_php = Off$' <<<"$php_tune_hardening"
+check "opt-in hardening disables display_errors" \
+  grep -q '^display_errors = Off$' <<<"$php_tune_hardening"
+check "opt-in hardening enables error logging" \
+  grep -q '^log_errors = On$' <<<"$php_tune_hardening"
+check "opt-in hardening points error_log at the central tree" \
+  grep -qF 'error_log = ${php_error_log}' <<<"$php_tune_hardening"
+check "opt-in hardening enables strict sessions" \
+  grep -q '^session.use_strict_mode = 1$' <<<"$php_tune_hardening"
+check "opt-in hardening restricts sessions to cookies" \
+  grep -q '^session.use_only_cookies = 1$' <<<"$php_tune_hardening"
+check "opt-in hardening marks cookies HttpOnly" \
+  grep -q '^session.cookie_httponly = 1$' <<<"$php_tune_hardening"
+check "opt-in hardening marks cookies Secure" \
+  grep -q '^session.cookie_secure = 1$' <<<"$php_tune_hardening"
+check "opt-in hardening sets SameSite=Lax" \
+  grep -q '^session.cookie_samesite = Lax$' <<<"$php_tune_hardening"
+check "opt-in hardening sets a bounded session lifetime" \
+  grep -q '^session.gc_maxlifetime = 14400$' <<<"$php_tune_hardening"
+check "opt-in hardening lengthens session IDs" \
+  grep -q '^session.sid_length = 48$' <<<"$php_tune_hardening"
+check "opt-in hardening uses six bits per session character" \
+  grep -q '^session.sid_bits_per_character = 6$' <<<"$php_tune_hardening"
+check "opt-in hardening creates the central PHP error log" \
+  grep -qF 'ensure_fpm_log_path "$php_error_log"' <<<"$php_tune_hardening"
 
 # ---------------------------------------------------------------------------
 # Shared memory budget
