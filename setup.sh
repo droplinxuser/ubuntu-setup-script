@@ -34,7 +34,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.43"
+readonly SCRIPT_VERSION="1.8.44"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -7653,10 +7653,18 @@ diag_redis_cli() {
   return 1
 }
 
+# Elasticsearch is optional.  Detect the package/unit before probing HTTP so a
+# host without it reports "not installed" instead of five curl failures.
+diag_elasticsearch_installed() {
+  systemctl cat elasticsearch.service >/dev/null 2>&1 && return 0
+  command -v elasticsearch >/dev/null 2>&1 && return 0
+  [[ -x /usr/share/elasticsearch/bin/elasticsearch ]] && return 0
+  return 1
+}
+
 # `_cluster/allocation/explain` returns HTTP 400 when every shard is already
 # assigned.  Treat that as healthy instead of reporting a diagnostic error.
-diag_elasticsearch_allocation() {
-  local es_url=$1 health status unassigned
+diag_elasticsearch_allocation() {  local es_url=$1 health status unassigned
   health=$(curl -fsS --max-time 5 "${es_url}/_cluster/health" 2>/dev/null) || {
     printf 'Could not query %s/_cluster/health\n' "$es_url"
     return 0
@@ -7867,18 +7875,27 @@ run_diagnostics() {
   fi
   diag "Valkey/Redis resolved log files" diag_redis_log_files
 
-  es_url=$(elasticsearch_http_url)
-  diag "Elasticsearch root" curl -fsS --max-time 5 "$es_url"
-  diag "Elasticsearch health" curl -fsS --max-time 5 "${es_url}/_cluster/health?pretty"
-  diag "Elasticsearch nodes" curl -fsS --max-time 5 "${es_url}/_cat/nodes?v"
-  diag "Elasticsearch indices" curl -fsS --max-time 5 "${es_url}/_cat/indices?v&s=store.size:desc"
-  diag_sh "Elasticsearch node stats" "curl -fsS --max-time 10 '${es_url}/_nodes/stats/jvm,os,indices,thread_pool?pretty' | head -n 500"
-  diag "Elasticsearch allocation" diag_elasticsearch_allocation "$es_url"
-  diag_sh "Elasticsearch YAML" 'if [ -f /etc/elasticsearch/elasticsearch.yml ]; then cat /etc/elasticsearch/elasticsearch.yml; else echo "Elasticsearch is not installed"; fi'
-  diag_sh "Elasticsearch JVM options" 'find /etc/elasticsearch/jvm.options.d -maxdepth 1 -type f -print -exec sh -c "echo --- \$1; cat \"\$1\"" _ {} \; 2>/dev/null || true'
-  diag_sh "Elasticsearch systemd limits" 'if [ -f /etc/systemd/system/elasticsearch.service.d/limits.conf ]; then cat /etc/systemd/system/elasticsearch.service.d/limits.conf; else echo "systemd drop-in is not installed"; fi'
-  diag_sh "Elasticsearch log size" 'du -sh /var/www/logs/elasticsearch /var/log/elasticsearch 2>/dev/null || true'
-  diag "Elasticsearch resolved log files" diag_es_log_files
+  if ! diag_elasticsearch_installed; then
+    diag_sh "Elasticsearch" 'printf "%s\n" "Elasticsearch is not installed."'
+  else
+    es_url=$(elasticsearch_http_url)
+    if systemctl is-active --quiet elasticsearch 2>/dev/null; then
+      diag "Elasticsearch root" curl -fsS --max-time 5 "$es_url"
+      diag "Elasticsearch health" curl -fsS --max-time 5 "${es_url}/_cluster/health?pretty"
+      diag "Elasticsearch nodes" curl -fsS --max-time 5 "${es_url}/_cat/nodes?v"
+      diag "Elasticsearch indices" curl -fsS --max-time 5 "${es_url}/_cat/indices?v&s=store.size:desc"
+      diag_sh "Elasticsearch node stats" "curl -fsS --max-time 10 '${es_url}/_nodes/stats/jvm,os,indices,thread_pool?pretty' | head -n 500"
+      diag "Elasticsearch allocation" diag_elasticsearch_allocation "$es_url"
+    else
+      diag "Elasticsearch status" systemctl status elasticsearch --no-pager -l
+      diag_sh "Elasticsearch" 'printf "%s\n" "Elasticsearch is installed but not running; live probes skipped."'
+    fi
+    diag_sh "Elasticsearch YAML" 'if [ -f /etc/elasticsearch/elasticsearch.yml ]; then cat /etc/elasticsearch/elasticsearch.yml; else echo "Elasticsearch is not installed"; fi'
+    diag_sh "Elasticsearch JVM options" 'find /etc/elasticsearch/jvm.options.d -maxdepth 1 -type f -print -exec sh -c "echo --- \$1; cat \"\$1\"" _ {} \; 2>/dev/null || true'
+    diag_sh "Elasticsearch systemd limits" 'if [ -f /etc/systemd/system/elasticsearch.service.d/limits.conf ]; then cat /etc/systemd/system/elasticsearch.service.d/limits.conf; else echo "systemd drop-in is not installed"; fi'
+    diag_sh "Elasticsearch log size" 'du -sh /var/www/logs/elasticsearch /var/log/elasticsearch 2>/dev/null || true'
+    diag "Elasticsearch resolved log files" diag_es_log_files
+  fi
 
   diag_sh "Node version" 'if command -v node >/dev/null 2>&1; then node -v; else echo "Node.js is not installed"; fi'
   diag_sh "npm version" 'if command -v npm >/dev/null 2>&1; then npm -v; else echo "npm is not installed"; fi'
