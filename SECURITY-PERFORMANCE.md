@@ -175,9 +175,14 @@ Recommended changes / additions:
   applied globally on purpose.
 - Consider HTTP/3: add `listen 443 quic reuseport;`, an `Alt-Svc` header, and
   `ufw allow 443/udp`. Test clients first.
-- Brotli/zstd are not compiled into the distro Angie package. Use
-  `gzip_static on` (already enabled), precompress assets, or install an Angie
-  build with those modules.
+- Brotli is not compiled into the distro Angie package, but the official
+  `angie-module-brotli` package is installed and enabled by `--angie` and
+  `--optimize` (level 5, gzip fallback). On a 149 KB XenForo thread page,
+  Brotli 5 produced 10.9 KB versus 13.7 KB for gzip. Static assets are left to
+  the CDN; precompressing them only helps the first origin miss.
+- Zstandard was tested but not selected: it was faster to produce, yet 9-10%
+  larger than Brotli on the same pages, and dynamic PHP (not compression) is
+  the bottleneck on uncached logged-in requests.
 - Add a WAF at the edge (Cloudflare, Coraza/ModSecurity in front of Angie, or a
   separate reverse proxy). The embedded Naxsi/ngx_waf configs cannot be enabled
   on this Angie build.

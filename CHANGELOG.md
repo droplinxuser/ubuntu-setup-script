@@ -2,6 +2,41 @@
 
 Historical release notes for ubuntu-setup-script. Current behavior is documented in README.md.
 
+## What's new in 1.8.46
+
+- **Dynamic Brotli compression is installed and enabled by both `--angie` and
+  `--optimize`.** Angie does not bundle Brotli; setup.sh installs the official
+  `angie-module-brotli` package, loads it from
+  `/etc/angie/modules-enabled/50-brotli.conf`, deploys
+  `/etc/angie/http.d/brotli.conf` from the repository template, and pins level
+  5 with gzip as the fallback. `--optimize` previously only tuned the existing
+  tree, so an already-installed host kept gzip-only; it now reaches the same
+  profile as a fresh install.
+  - Measured on a 16-thread Ubuntu 26.04 host with XenForo 2.3.13: a 149 KB
+    logged-in thread page compressed to **10.9 KB with Brotli 5** versus
+    **13.7 KB with gzip 5** (-20%), and a 41 KB guest index compressed to
+    **8.8 KB versus 9.7 KB** (-9%). Brotli 10/11 reduced size a little further
+    but collapsed throughput from ~16k to ~1k/~0.4k responses/s, so level 5 is
+    the default; `SETUP_BROTLI_LEVEL` overrides it.
+  - Zstandard was evaluated and intentionally not enabled: it was 9-10% larger
+    than Brotli on the same pages. Only one extra module is loaded.
+  - Static assets are not precompressed. A CDN caches them, so the only origin
+    hit is the first one; the meaningful work is per-request dynamic HTML.
+- **`--optimize` keeps install/optimize parity for compression.** The two
+  small package exceptions are documented: `cpufrequtils` and
+  `angie-module-brotli`.
+- **Disk-class detection ignores DVDs/loop devices and recognises virtio.**
+  `storage_class` used to inspect every block device, so a QEMU DVD-ROM
+  (`sr0`, `ROTA=0`) made a spinning disk look like an SSD and loop devices
+  could do the same. It now considers whole `disk` devices only and treats
+  virtio/pv block devices as SSD, preserving the 2000/4000 InnoDB IOPS profile
+  on cloud VMs while keeping real HDDs at 400/800.
+- **XenForo Redis cache caution in the optimizer report.** On a single host
+  with local MariaDB, XF's Redis registry/session cache measured 0.97k req/s
+  versus 1.33k req/s with MariaDB-backed sessions (+37%). The report now tells
+  operators to benchmark it and reserve Redis for multi-node or remote-DB
+  deployments.
+
 ## What's new in 1.8.45
 
 - **`--optimize` repairs `PATH_TRANSLATED` in every PHP location include.**
