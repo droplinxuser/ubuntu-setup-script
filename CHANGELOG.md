@@ -2,6 +2,15 @@
 
 Historical release notes for ubuntu-setup-script. Current behavior is documented in README.md.
 
+## What's new in 1.8.45
+
+- **`--optimize` repairs `PATH_TRANSLATED` in every PHP location include.**
+  1.8.43 covered `php_wp.conf`, `php_polr.conf` and `php.conf`, but hosts
+  using the XenForo includes (`php_xf.conf`, `php_xf_proxy.conf`) still kept
+  `$document_root$fastcgi_path_info`. The optimizer now processes `php.conf`
+  plus all `h5bp/php_*.conf`, so any current or future PHP include is
+  normalised to `$document_root$fastcgi_script_name`.
+
 ## What's new in 1.8.44
 
 - **Diagnostics report an absent Elasticsearch as “not installed” and skip

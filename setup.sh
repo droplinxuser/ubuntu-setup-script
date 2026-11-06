@@ -34,7 +34,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.44"
+readonly SCRIPT_VERSION="1.8.45"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -2723,6 +2723,19 @@ tune_fastcgi_path_translated() {
   return 0
 }
 
+# Apply the PATH_TRANSLATED repair to every deployed PHP location include:
+# php.conf plus all php_*.conf (php_xf.conf, php_xf_proxy.conf, php_wp.conf,
+# php_polr.conf, and any future variant).
+tune_fastcgi_path_translated_all() {
+  local target=$1 file
+  tune_fastcgi_path_translated "${target}/h5bp/php.conf"
+  for file in "${target}"/h5bp/php_*.conf; do
+    [[ -f $file ]] || continue
+    tune_fastcgi_path_translated "$file"
+  done
+  return 0
+}
+
 # A bare `location / { try_files ... }` with no index directive resolves "/"
 # to the directory instead of index.php on older vhosts.  Add a server-level
 # index to the shared WordPress and Polr includes when they lack one.
@@ -2751,14 +2764,13 @@ tune_angie_configs() {
   [[ -f $nginx_conf ]] || return 1
 
   # Repair the shared PHP include and the two server-level includes that old
-  # deployments left without an index.  Also normalise PATH_TRANSLATED so
-  # cgi.fix_pathinfo=0 cannot make PHP-FPM execute the document root.
+  # deployments left without an index.  Also normalise PATH_TRANSLATED in
+  # every PHP location include so cgi.fix_pathinfo=0 cannot make PHP-FPM
+  # execute the document root.
   tune_fastcgi_snippet "${target}/snippets/fastcgi-php.conf"
   tune_ensure_index "${target}/h5bp/wordpress.conf"
   tune_ensure_index "${target}/h5bp/php_polr.conf"
-  tune_fastcgi_path_translated "${target}/h5bp/php_wp.conf"
-  tune_fastcgi_path_translated "${target}/h5bp/php_polr.conf"
-  tune_fastcgi_path_translated "${target}/h5bp/php.conf"
+  tune_fastcgi_path_translated_all "$target"
 
   local nproc mem_mb disk_free_mb disk_class
   local worker_rlimit worker_connections php_keepalive open_files
