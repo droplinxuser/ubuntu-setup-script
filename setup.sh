@@ -4978,6 +4978,11 @@ OPT_REPORT_WRITTEN=0
 # objects written during a cutover window are only counted and reported; they
 # are never deleted, and an idempotent run does not touch the live cache.
 OPT_CUTOVER=0
+# Web frontends paused while MariaDB restarts.  Stopping Angie and PHP-FPM
+# first prevents a thundering herd of reconnects while InnoDB preloads a new
+# buffer pool.
+OPT_WEB_PAUSED_ANGIE=0
+OPT_WEB_PAUSED_PHP=()
 
 opt_report() { OPT_REPORT+=("$*"); }
 
@@ -5918,15 +5923,66 @@ cnf_only_pool_changed() {
     >/dev/null 2>&1
 }
 
+# Stop the request-serving tiers before a MariaDB restart, then bring them
+# back in dependency order (PHP first, Angie last).  Only services that were
+# active are touched; an OS-only or DB-only host is unaffected.
+opt_pause_web_frontends() {
+  OPT_WEB_PAUSED_ANGIE=0
+  OPT_WEB_PAUSED_PHP=()
+  local unit
+  if systemctl is-active --quiet angie 2>/dev/null; then
+    if systemctl stop angie 2>/dev/null; then
+      OPT_WEB_PAUSED_ANGIE=1
+      info "Paused Angie before the MariaDB restart"
+    else
+      warn "Could not stop Angie before the MariaDB restart"
+    fi
+  fi
+  while IFS= read -r unit; do
+    [[ -n $unit ]] || continue
+    systemctl is-active --quiet "$unit" 2>/dev/null || continue
+    if systemctl stop "$unit" 2>/dev/null; then
+      OPT_WEB_PAUSED_PHP+=("$unit")
+      info "Paused ${unit} before the MariaDB restart"
+    else
+      warn "Could not stop ${unit} before the MariaDB restart"
+    fi
+  done < <(systemctl list-units --type=service --state=active --no-legend --no-pager \
+             'php*-fpm.service' 2>/dev/null | awk '{print $1}')
+}
+
+opt_resume_web_frontends() {
+  local unit rc=0
+  for unit in "${OPT_WEB_PAUSED_PHP[@]}"; do
+    if ! systemctl start "$unit" 2>/dev/null; then
+      warn "Could not start ${unit} after the MariaDB restart"
+      rc=1
+    fi
+  done
+  if (( OPT_WEB_PAUSED_ANGIE )); then
+    if ! systemctl start angie 2>/dev/null; then
+      warn "Could not start Angie after the MariaDB restart"
+      rc=1
+    fi
+  fi
+  if (( ${#OPT_WEB_PAUSED_PHP[@]} > 0 || OPT_WEB_PAUSED_ANGIE )); then
+    info "Resumed web frontends after the MariaDB restart"
+  fi
+  OPT_WEB_PAUSED_ANGIE=0
+  OPT_WEB_PAUSED_PHP=()
+  return "$rc"
+}
+
 optimize_mariadb() {
   local active=0 ver size_mb buffer logsize open_cache aria_mb
   local threads max_conn io_read io_write cnf_dir cnf backlog cnf_before cnf_after
-  local unit_changed=0 limit_before=""
+  local unit_changed=0 limit_before="" i
   systemctl is-active --quiet mariadb 2>/dev/null && active=1
   ver=$(mariadb_server_version)
   opt_report "## MariaDB"
   opt_report "- Version: \`${ver:-unknown}\`; active: ${active}"
   opt_backup /etc/mysql mysql
+  opt_backup /etc/systemd/system/mariadb.service.d mariadb-systemd
 
   if [[ ${OPT_MARIADB_BUDGET_MB:-0} -gt 0 ]]; then
     size_mb=$OPT_MARIADB_BUDGET_MB
@@ -6053,14 +6109,24 @@ EOF
     if ! mariadbd --defaults-file=/etc/mysql/my.cnf --help --verbose >/dev/null 2>&1; then
       opt_report "- **FAILED** MariaDB rejected the generated configuration; rolled back"
       opt_restore /etc/mysql mysql
+      opt_restore /etc/systemd/system/mariadb.service.d mariadb-systemd
+      systemctl daemon-reload || true
       return 1
     fi
   fi
 
   if (( active )); then
+    # Apply any service-unit drop-in before restarting, then stop the request
+    # tiers.  A busy PHP pool reconnecting while InnoDB preloads can otherwise
+    # overwhelm a freshly started database.
+    systemctl daemon-reload || true
+    opt_pause_web_frontends
+    if (( OPT_WEB_PAUSED_ANGIE || ${#OPT_WEB_PAUSED_PHP[@]} > 0 )); then
+      opt_report "- Paused web frontends before the MariaDB restart (PHP, then Angie)"
+    fi
+
     if systemctl restart mariadb 2>/dev/null; then
       OPT_CUTOVER=1
-      local i
       # A large buffer pool may need to preload at startup; allow up to five
       # minutes before declaring the restart failed.
       for i in {1..300}; do
@@ -6069,16 +6135,35 @@ EOF
       done
       if mariadb -e 'SELECT 1' >/dev/null 2>&1; then
         opt_report "- Restart: **OK**"
+        if ! opt_resume_web_frontends; then
+          opt_report "- Web frontends: **FAILED** to resume; check Angie/PHP-FPM"
+          return 1
+        fi
+        opt_report "- Web frontends resumed after the MariaDB restart"
       else
         opt_report "- Restart: **FAILED** (SQL probe); rolling back"
         opt_restore /etc/mysql mysql
+        opt_restore /etc/systemd/system/mariadb.service.d mariadb-systemd
+        systemctl daemon-reload || true
         systemctl restart mariadb 2>/dev/null || true
+        for i in {1..30}; do
+          mariadb -e 'SELECT 1' >/dev/null 2>&1 && break
+          sleep 1
+        done
+        opt_resume_web_frontends || true
         return 1
       fi
     else
       opt_report "- Restart: **FAILED**; rolling back"
       opt_restore /etc/mysql mysql
+      opt_restore /etc/systemd/system/mariadb.service.d mariadb-systemd
+      systemctl daemon-reload || true
       systemctl restart mariadb 2>/dev/null || true
+      for i in {1..30}; do
+        mariadb -e 'SELECT 1' >/dev/null 2>&1 && break
+        sleep 1
+      done
+      opt_resume_web_frontends || true
       return 1
     fi
   else
@@ -6111,7 +6196,7 @@ optimize_valkey() {
     label=Redis conf=/etc/redis/redis.conf conf_dir=/etc/redis
     unit=redis-server cli=redis-cli
   fi
-  local active=0 ram_mb max_mb policy backlog io_threads
+  local active=0 ram_mb max_mb policy backlog io_threads i
   local conf_before conf_after fd_limit dropin unit_changed=0
   local online_ok=0 live_io="" live_backlog="" setting k v
   [[ -f $conf ]] || return 0
@@ -6251,7 +6336,6 @@ optimize_valkey() {
   if (( active )); then
     if systemctl restart "$unit" 2>/dev/null; then
       OPT_CUTOVER=1
-      local i
       for i in {1..20}; do
         "$cli" ping 2>/dev/null | grep -q PONG && break
         sleep 1
@@ -6428,7 +6512,7 @@ optimize_elastic() {
   local jvm=$ES_JVM_OPTIONS
   local legacy=/etc/elasticsearch/jvm.options.d/jvm.options
   local unit=/etc/systemd/system/elasticsearch.service.d/limits.conf
-  local es_before jvm_before legacy_before unit_before es_after jvm_after unit_after changed=0
+  local es_before jvm_before legacy_before unit_before es_after jvm_after unit_after changed=0 i
   systemctl is-active --quiet elasticsearch 2>/dev/null && active=1
   opt_report "## Elasticsearch"
   opt_report "- Active: ${active}; config: \`${yml}\`"
@@ -6510,7 +6594,6 @@ optimize_elastic() {
     fi
     if systemctl restart elasticsearch 2>/dev/null; then
       OPT_CUTOVER=1
-      local i
       # Large heaps and many shards take time to become ready.
       for i in {1..300}; do
         curl -fsS http://127.0.0.1:9200 >/dev/null 2>&1 && break

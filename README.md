@@ -55,6 +55,11 @@ alongside `setup.sh`).
   backups use `mktemp`, removing symlink/pre-creation risks.
 - **`--optimize` never touches swap.** Swap creation/resizing remains a
   `--basic` operation only.
+- **MariaDB restarts now pause Angie and PHP-FPM.** The optimize path reloads
+  systemd units, stops Angie and every active PHP-FPM version in that order,
+  restarts MariaDB, waits for SQL, then starts PHP-FPM and Angie again. This
+  prevents a reconnect storm while InnoDB preloads a larger buffer pool; the
+  pause is skipped for online resizes and deferred restarts.
 - **APT and key handling are consolidated.** All selected repositories are
   added before one `apt-get update`, embedded signing keys are verified and
   refreshed, and the basic tool set no longer installs `jq`, `htop`, `iotop`,
@@ -538,7 +543,12 @@ reserved first, so MariaDB + PHP + cache + Elasticsearch cannot collectively
 exhaust memory. Each configuration is
 validated and active services are restarted only when their generated files
 actually changed; a failure rolls back the affected service from
-`/tmp/setup-optimize.*`. The final verification checks each service's
+`/tmp/setup-optimize.*`. Before a MariaDB restart, `--optimize` stops Angie
+and every active PHP-FPM version, runs `systemctl daemon-reload`, restarts
+MariaDB, waits for `SELECT 1`, then starts PHP-FPM first and Angie last. This
+prevents a reconnect storm while InnoDB preloads a larger buffer pool. The
+pause/resume is skipped when the buffer pool is resized online or the restart
+is deferred. The final verification checks each service's
 real listener (Angie via `ss`, PHP socket/TCP) plus SQL/PING/HTTP probes and
 lists recent error-level journal entries. The Markdown report is written to
 `/var/log/setup-optimize-<timestamp>.md` and copied to
@@ -745,7 +755,7 @@ Also checked at CLI level (all using `--dry-run`, no system changes):
   domain app type, per-domain and trailing group `app=` forms, every purge
   mode, `--optimize` and representative invalid inputs.
 
-- `tests/test-tuning.sh` covers 168 checks: Angie directive rewriting, the
+- `tests/test-tuning.sh` covers 171 checks: Angie directive rewriting, the
   multi-line `proxy_cache_path` fix, insertion anchors, miss reporting,
   PHP pool editing/deduplication, the shared memory budget, UFW SSH
   rate-limiting, and a second-run no-op check.
