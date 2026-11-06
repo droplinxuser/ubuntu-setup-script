@@ -268,6 +268,7 @@ Before changing basic settings, the script records the originals under `/var/lib
 - Sizes OPcache, JIT and `memory_limit` from RAM instead of fixed 512 MB values:
   - OPcache 128–512 MB, JIT 32–128 MB, `memory_limit` 256–512 MB, realpath cache 4–16 MB.
 - The repo templates provide OPcache file cache under `/var/cache/php/opcache`, `request_slowlog_timeout=10s`, `catch_workers_output=yes`, session hardening, `cgi.fix_pathinfo=0`, MariaDB Unix-socket defaults and `mysqlnd` statistics disabled.
+- `--optimize` writes the same session/cgi/error-log hardening into `/etc/php/<ver>/fpm/conf.d/zz-setup-optimize.ini` (strict mode, cookies-only, `HttpOnly`, `Secure`, `SameSite=Lax`, `cgi.fix_pathinfo=0`, `display_errors=Off`, `log_errors=On`, central `error_log`). The managed file sorts last, so an old `custom_dan.ini` no longer leaves unsafe defaults in place. An operator can override it in a later ini file or per vhost; set `session.cookie_secure=0` only for an HTTP-only test vhost.
 - `setup.sh` creates the log/cache directories and the systemd `LimitNOFILE=524288`, `UMask=0027` drop-in. PHP-FPM and Angie use the Unix socket `/run/php/php-fpm.sock`.
 - Sets the PHP timezone from `--basic time=`.
 - Enables and restarts `php<ver>-fpm` and prints `php<ver> -v`. If the template/tuning/start fails, the previous PHP configuration is restored from `/tmp`.
@@ -291,7 +292,7 @@ Before changing basic settings, the script records the originals under `/var/lib
   - `secure_file_priv=/var/lib/mysql-files`, `local_infile=0`, `wait_timeout=600`, `max_allowed_packet=64M`
   - Slow query log at `/var/www/logs/mariadb/slow.log` (`long_query_time=1`, `min_examined_row_limit=100`, query plan + explain)
   - `bind-address` from `bind=` (default `127.0.0.1`)
-- `--optimize` writes performance settings to `/etc/mysql/mariadb.conf.d/99-setup-optimize.cnf` and removes only the performance keys from the installer block in `50-server.cnf`, so one file owns the tuning while base settings (charset, slow log, bind address) remain in 50.
+- `--optimize` writes performance settings to `/etc/mysql/mariadb.conf.d/99-setup-optimize.cnf` and removes the performance/logging keys from `50-server.cnf`, not only from the marker block: older releases wrote these keys bare, so this is what makes the 99- drop-in the single owner. Base settings (charset, `skip_name_resolve`, `open_files_limit`, `secure_file_priv`, `bind-address`) remain in 50. The optimizer leaves a `/tmp` copy and does not delete the file.
 - Comments out `expire_logs_days`.
 - Creates the requested admin user with `GRANT ALL ... WITH GRANT OPTION` for `localhost`, `127.0.0.1` and `::1` (idempotent `CREATE USER IF NOT EXISTS` + `ALTER USER`). The extra loopback hosts are required because `skip_name_resolve=1` means a TCP connection to `127.0.0.1` does **not** match `'user'@'localhost'`.
 - Creates `/var/www/logs/mariadb`, sets ownership, reloads systemd and restarts MariaDB.
@@ -368,8 +369,9 @@ For local PHP, prefer the Unix socket (`/run/valkey/valkey.sock`) over TCP. In t
 - Writes `/etc/elasticsearch/scripts/xf-date-weighted.groovy`.
 - Sets `vm.max_map_count=1048576` (persisted in `/etc/sysctl.d/99-elasticsearch.conf`, rewritten on every install/optimize so an older lower value cannot survive a reboot).
 - Enables/restarts Elasticsearch and waits for the HTTP endpoint to become ready.
+- `--optimize` resolves the effective HTTP endpoint from `http.host` (when set) or `network.host`, honours a custom `http.port`, and uses it for the index/heap/readiness/replica calls. A node intentionally bound to a local IPv4 for a remote XenForo client is therefore probed on that address instead of `127.0.0.1`; if the host itself cannot reach the endpoint (firewall/NAT), the active unit plus the exact listener is reported instead of rolling back a healthy tune.
 
-With security disabled, keep `host=localhost` unless you really intend to expose port 9200. The script warns when a non-loopback `host=` is used; enable X-Pack security/TLS and a firewall before exposing it. The heap is also checked against 50% of RAM and a warning is printed if it is too large.
+With security disabled, keep `host=localhost` unless you really intend to expose port 9200. The script warns when a non-loopback `host=` is used; enable X-Pack security/TLS and a firewall before exposing it. For a remote Elasticsearch client, allow TCP 9200 only from the XenForo server and prefer a private network or X-Pack security/TLS. The heap is also checked against 50% of RAM and a warning is printed if it is too large.
 
 ### Other packages (`--others ...`)
 
@@ -458,7 +460,11 @@ It also reconciles the logging and connection profile on old hosts:
   drop-in changes).
 - Elasticsearch’s `http.host`/`transport.host` are commented so `network.host`
   controls the bind, and a non-loopback bind with X-Pack security disabled is
-  reported.
+  reported. The endpoint used for data/heap/readiness/replica probes follows
+  the effective `http.host`/`network.host` and `http.port`, so a public IPv4
+  intentionally used by a remote client is supported. If only that remote
+  address is reachable (the host itself is blocked by firewall/NAT), the
+  active unit and listener are reported instead of a false rollback.
 - Redis and Valkey get a local Unix socket (`/run/redis/redis.sock` or
   `/run/valkey/valkey.sock`), `unixsocketperm 770`, `www-data` in the service
   group, and printed XenForo/WordPress/Laravel snippets. Application config is

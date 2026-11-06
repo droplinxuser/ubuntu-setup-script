@@ -34,7 +34,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.38"
+readonly SCRIPT_VERSION="1.8.39"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -3179,6 +3179,7 @@ tune_php_fpm_version() {
   # directory that no longer exists (seen on Ubuntu 24.04); php-fpm -t then
   # fails as soon as request_slowlog_timeout is set.
   local fpm_user fpm_group slowlog accesslog poollog
+  local php_error_log=/var/www/logs/php/php-error.log
   fpm_user=$(awk -F= '/^[[:space:]]*user[[:space:]]*=/{v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/,"",v); print v; exit}' "$pool")
   fpm_group=$(awk -F= '/^[[:space:]]*group[[:space:]]*=/{v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/,"",v); print v; exit}' "$pool")
   slowlog=$(awk -F= '/^[[:space:]]*slowlog[[:space:]]*=/{v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/,"",v); print v; exit}' "$pool")
@@ -3191,6 +3192,7 @@ tune_php_fpm_version() {
   ensure_fpm_log_path "$slowlog" "${fpm_user:-www-data}" "${fpm_group:-www-data}"
   ensure_fpm_log_path "$accesslog" "${fpm_user:-www-data}" "${fpm_group:-www-data}"
   ensure_fpm_log_path "$poollog" "${fpm_user:-www-data}" "${fpm_group:-www-data}"
+  ensure_fpm_log_path "$php_error_log" "${fpm_user:-www-data}" "${fpm_group:-www-data}"
   tune_pool_set "$pool" request_terminate_timeout 300s "PHP ${ver}: request_terminate_timeout=300s"
   tune_pool_set "$pool" request_slowlog_timeout 10s "PHP ${ver}: request_slowlog_timeout=10s"
   tune_pool_set "$pool" catch_workers_output yes "PHP ${ver}: catch_workers_output=yes"
@@ -3247,12 +3249,31 @@ opcache.file_cache_only = 0
 mysqlnd.net_cmd_buffer_size = 524288
 mysqli.default_socket = /run/mysqld/mysqld.sock
 pdo_mysql.default_socket = /run/mysqld/mysqld.sock
+
+; Security and session hardening.  zz-setup-optimize.ini sorts last in
+; conf.d, so an older custom_dan.ini cannot keep an unsafe default.  For an
+; HTTP-only test vhost, set session.cookie_secure=0 in a later per-host ini.
+cgi.fix_pathinfo = 0
+expose_php = Off
+display_errors = Off
+log_errors = On
+error_log = ${php_error_log}
+session.use_strict_mode = 1
+session.use_only_cookies = 1
+session.cookie_httponly = 1
+session.cookie_secure = 1
+session.cookie_samesite = Lax
+session.gc_maxlifetime = 14400
+session.sid_length = 48
+session.sid_bits_per_character = 6
 EOF
   chmod 644 "$ini"
   local ini_after
   ini_after=$(md5sum "$ini" | awk '{print $1}')
-  [[ $ini_before != "$ini_after" ]] \
-    && tune_note "PHP ${ver}: memory_limit=${memory_mb}M opcache=${opcache_mb}M jit=${jit_mb}M"
+  if [[ $ini_before != "$ini_after" ]]; then
+    tune_note "PHP ${ver}: memory_limit=${memory_mb}M opcache=${opcache_mb}M jit=${jit_mb}M"
+    tune_note "PHP ${ver}: session/cgi/error-log hardening"
+  fi
 
   local fpm_bin="" fpm_test
   if command -v "php-fpm${ver}" >/dev/null 2>&1; then
@@ -3729,27 +3750,32 @@ MARIADB_PROFILE_IO_READ=""
 MARIADB_PROFILE_IO_WRITE=""
 MARIADB_PROFILE_BACKLOG=""
 
-# Remove only the performance directives from the installer-managed block in
-# 50-server.cnf once the optimize drop-in exists.  Base settings (charset,
-# secure_file_priv, slow log, bind-address, ...) stay in 50; the 99- drop-in is
-# the single owner of the tuning keys.
+# Remove the performance/logging directives from 50-server.cnf once the
+# optimize drop-in exists.  Older releases wrote these keys bare (without the
+# managed markers), so strip them wherever they appear, not only inside the
+# marker block; otherwise 50- and 99- carry two competing definitions and the
+# old 2 GB/5 GB values return if the drop-in is ever removed.  Base settings
+# (charset, bind-address, skip_name_resolve, secure_file_priv, ...) stay in 50.
+# The optional third argument is for tests; production uses the live path.
 mariadb_strip_install_block() {
   local size_mb=$1 max_conn=$2
-  local cnf=/etc/mysql/mariadb.conf.d/50-server.cnf tmp keys
+  local cnf=${3:-/etc/mysql/mariadb.conf.d/50-server.cnf}
+  local tmp keys
   [[ -f $cnf ]] || return 0
   keys=$( { mariadb_performance_settings "$size_mb" "$max_conn"; mariadb_logging_settings; } 2>/dev/null \
     | sed -n 's/^\([a-z0-9_]*\)[[:space:]]*=.*/\1/p' | paste -sd'|' -)
   [[ -n $keys ]] || return 0
   tmp=$(tmp_file) || return 1
   awk -v b="$MARIADB_BEGIN" -v e="$MARIADB_END" -v keys="$keys" '
-    $0 == b { inblock = 1; print; next }
-    $0 == e { inblock = 0; print; next }
-    inblock && $0 ~ ("^[[:space:]]*(" keys ")[[:space:]]*=") { next }
+    $0 == b { print; next }
+    $0 == e { print; next }
+    $0 ~ ("^[[:space:]]*(" keys ")[[:space:]]*=") { next }
     { print }
   ' "$cnf" > "$tmp"
   if ! cmp -s "$cnf" "$tmp"; then
     cat "$tmp" > "$cnf"
-    info "Consolidated MariaDB performance settings into 99-setup-optimize.cnf"
+    info "Removed duplicate MariaDB performance keys from ${cnf}; 99-setup-optimize.cnf owns them"
+    opt_report "- Removed duplicate performance keys from \`${cnf}\`; \`99-setup-optimize.cnf\` owns them"
   fi
   return 0
 }
@@ -5189,13 +5215,76 @@ mariadb_current_pool_mb() {
   printf '%s' $(( bytes / 1024 / 1024 ))
 }
 
+# Elasticsearch may intentionally listen on a non-loopback address (for
+# example an IPv4 address used by a XenForo instance on another host).
+# Resolve the endpoint the node is configured to use instead of assuming
+# 127.0.0.1:9200.  http.host wins over network.host, matching Elasticsearch.
+elasticsearch_http_url() {
+  local yml=${1:-/etc/elasticsearch/elasticsearch.yml}
+  local raw host="" port=""
+
+  if [[ -r $yml ]]; then
+    raw=$(sed -nE 's/^[[:space:]]*http\.host[[:space:]]*:[[:space:]]*//p' "$yml" 2>/dev/null | head -n1)
+    host=$(printf '%s' "$raw" | sed -E 's/[[:space:]]+#.*$//; s/^[[:space:]]+//; s/[[:space:]]+$//')
+    host=$(printf '%s' "$host" | sed -E "s/^['\"]//; s/['\"]$//")
+    host=${host%%,*}
+    if [[ -z $host ]]; then
+      raw=$(sed -nE 's/^[[:space:]]*network\.host[[:space:]]*:[[:space:]]*//p' "$yml" 2>/dev/null | head -n1)
+      host=$(printf '%s' "$raw" | sed -E 's/[[:space:]]+#.*$//; s/^[[:space:]]+//; s/[[:space:]]+$//')
+      host=$(printf '%s' "$host" | sed -E "s/^['\"]//; s/['\"]$//")
+      host=${host%%,*}
+    fi
+    raw=$(sed -nE 's/^[[:space:]]*http\.port[[:space:]]*:[[:space:]]*//p' "$yml" 2>/dev/null | head -n1)
+    port=$(printf '%s' "$raw" | tr -dc '0-9')
+  fi
+
+  if [[ ! $port =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+    port=9200
+  fi
+
+  case $host in
+    ""|0.0.0.0|localhost|127.0.0.1) host=127.0.0.1 ;;
+    "::"|"[::]"|"::1"|"[::1]") host="[::1]" ;;
+    _local_) host=127.0.0.1 ;;
+    _site_|_global_)
+      host=$(detect_local_ipv4 2>/dev/null || true)
+      [[ -n $host ]] || host=127.0.0.1
+      ;;
+  esac
+
+  host=${host#\[}
+  host=${host%\]}
+  [[ $host == *:* ]] && host="[${host}]"
+  printf 'http://%s:%s' "$host" "$port"
+}
+
+# True when the exact HTTP endpoint appears in the kernel listener table.
+# Used as a fallback when a firewall or NAT prevents the host from probing
+# its own non-loopback address, so a healthy restart is not rolled back.
+elasticsearch_listener_on() {
+  local url=$1 hostport port
+  hostport=${url#*://}
+  port=${hostport##*:}
+  command -v ss >/dev/null 2>&1 || return 0
+  if ss -H -ltn 2>/dev/null | awk '{print $4}' | grep -qxF -- "$hostport"; then
+    return 0
+  fi
+  # A wildcard bind is reachable on every local address, including a specific
+  # non-loopback address; ss prints it as 0.0.0.0, [::] or *.
+  ss -H -ltn 2>/dev/null | awk '{print $4}' \
+    | grep -qE "^(0\\.0\\.0\\.0|\\[::\\]|\\*):${port}$"
+}
+
 # Allocated index store size (primary + replicas) in whole MB.
 elasticsearch_data_size_mb() {
-  local bytes resp
+  local bytes resp url
   command -v curl >/dev/null 2>&1 || return 0
-  resp=$(curl -fsS --max-time 3 \
-    'http://127.0.0.1:9200/_cluster/stats?filter_path=indices.store.size_in_bytes' \
-    2>/dev/null || true)
+  for url in "$(elasticsearch_http_url)" "http://127.0.0.1:9200"; do
+    resp=$(curl -fsS --max-time 3 \
+      "${url}/_cluster/stats?filter_path=indices.store.size_in_bytes" \
+      2>/dev/null || true)
+    [[ -n $resp ]] && break
+  done
   [[ -n $resp ]] || return 0
   bytes=$(printf '%s\n' "$resp" \
     | sed -n 's/.*"size_in_bytes"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
@@ -5207,17 +5296,19 @@ elasticsearch_data_size_mb() {
 # Current JVM heap in MB.  Prefer the live node stats, then the -Xmx value
 # from jvm.options.d, so an operator-sized heap is not shrunk.
 elasticsearch_current_heap_mb() {
-  local bytes val file mb
+  local bytes val file mb url
   if command -v curl >/dev/null 2>&1; then
-    bytes=$(curl -fsS --max-time 3 \
-      'http://127.0.0.1:9200/_nodes/stats/jvm?filter_path=nodes.*.jvm.mem.heap_max_in_bytes' \
-      2>/dev/null \
-      | sed -n 's/.*"heap_max_in_bytes"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
-      | sort -n | tail -n1 || true)
-    if [[ $bytes =~ ^[0-9]+$ ]]; then
-      printf '%s' $(( bytes / 1024 / 1024 ))
-      return 0
-    fi
+    for url in "$(elasticsearch_http_url)" "http://127.0.0.1:9200"; do
+      bytes=$(curl -fsS --max-time 3 \
+        "${url}/_nodes/stats/jvm?filter_path=nodes.*.jvm.mem.heap_max_in_bytes" \
+        2>/dev/null \
+        | sed -n 's/.*"heap_max_in_bytes"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+        | sort -n | tail -n1 || true)
+      if [[ $bytes =~ ^[0-9]+$ ]]; then
+        printf '%s' $(( bytes / 1024 / 1024 ))
+        return 0
+      fi
+    done
   fi
   for file in /etc/elasticsearch/jvm.options /etc/elasticsearch/jvm.options.d/*.options; do
     [[ -f $file ]] || continue
@@ -6652,9 +6743,10 @@ elasticsearch_single_node_replica_issue() {
 }
 
 elasticsearch_ensure_single_node_template() {
-  local resp
+  local resp es_url
+  es_url=$(elasticsearch_http_url)
   resp=$(curl -fsS --max-time 15 -X PUT -H 'Content-Type: application/json' \
-    http://127.0.0.1:9200/_index_template/setup-single-node-zero-replicas \
+    "${es_url}/_index_template/setup-single-node-zero-replicas" \
     -d '{"index_patterns":["*"],"priority":1,"template":{"settings":{"number_of_replicas":0}}}' \
     2>/dev/null) || resp=""
   if [[ $resp == *'"acknowledged":true'* ]]; then
@@ -6669,9 +6761,15 @@ elasticsearch_ensure_single_node_template() {
 # cluster can be red for a few seconds while shards recover; deciding before
 # then skips the single-node replica fix.
 elasticsearch_wait_primaries() {
-  local i health status primary
+  local i health status primary es_url code
+  es_url=$(elasticsearch_http_url)
+  # Return quickly when the endpoint is unreachable from this host (a remote
+  # bind + restrictive firewall).  A 503 is still a reachable node and should
+  # be waited on.
+  code=$(curl -sS --max-time 3 -o /dev/null -w '%{http_code}' "$es_url" 2>/dev/null || true)
+  [[ $code == 000 || -z $code ]] && return 1
   for i in {1..120}; do
-    health=$(curl -fsS --max-time 5 http://127.0.0.1:9200/_cluster/health 2>/dev/null) || true
+    health=$(curl -sS --max-time 5 "${es_url}/_cluster/health" 2>/dev/null) || true
     status=$(printf '%s' "$health" | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([a-z]*\)".*/\1/p' | head -n1)
     primary=$(printf '%s' "$health" | sed -n 's/.*"unassigned_primary_shards"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -n1)
     [[ $status == green ]] && return 0
@@ -6687,10 +6785,11 @@ elasticsearch_wait_primaries() {
 # unassigned replicas is expected there; set replicas=0 on existing indices
 # and keep a low-priority template for future indices.
 elasticsearch_fix_single_node_replicas() {
-  local health status nodes unassigned primary resp i
+  local health status nodes unassigned primary resp i es_url
   command -v curl >/dev/null 2>&1 || return 0
+  es_url=$(elasticsearch_http_url)
   elasticsearch_wait_primaries || true
-  health=$(curl -fsS --max-time 5 http://127.0.0.1:9200/_cluster/health 2>/dev/null) || return 0
+  health=$(curl -fsS --max-time 5 "${es_url}/_cluster/health" 2>/dev/null) || return 0
   nodes=$(printf '%s' "$health" | sed -n 's/.*"number_of_nodes"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -n1)
   status=$(printf '%s' "$health" | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([a-z]*\)".*/\1/p' | head -n1)
   unassigned=$(printf '%s' "$health" | sed -n 's/.*"unassigned_shards"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -n1)
@@ -6711,7 +6810,7 @@ elasticsearch_fix_single_node_replicas() {
   fi
 
   resp=$(curl -fsS --max-time 30 -X PUT -H 'Content-Type: application/json' \
-    http://127.0.0.1:9200/_all/_settings \
+    "${es_url}/_all/_settings" \
     -d '{"index":{"number_of_replicas":0}}' 2>/dev/null) || resp=""
   if [[ $resp != *'"acknowledged":true'* ]]; then
     opt_report "- Single-node cluster: **FAILED** to set number_of_replicas=0"
@@ -6721,7 +6820,7 @@ elasticsearch_fix_single_node_replicas() {
   elasticsearch_ensure_single_node_template || true
 
   for i in {1..30}; do
-    health=$(curl -fsS --max-time 5 http://127.0.0.1:9200/_cluster/health 2>/dev/null) || true
+    health=$(curl -fsS --max-time 5 "${es_url}/_cluster/health" 2>/dev/null) || true
     status=$(printf '%s' "$health" | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([a-z]*\)".*/\1/p' | head -n1)
     [[ $status == green ]] && break
     sleep 1
@@ -6734,12 +6833,35 @@ elasticsearch_fix_single_node_replicas() {
   return 1
 }
 
+# Restore the pre-run Elasticsearch tree after a failed restart.  opt_restore
+# copies the backup over the live tree but does not remove files the failed
+# run created; move the managed JVM file out of the live directory when it was
+# not in the backup, so the restored heap file is the only owner.  Nothing is
+# deleted.
+elasticsearch_rollback() {
+  local moved
+  opt_restore /etc/elasticsearch elasticsearch
+  opt_restore /etc/systemd/system/elasticsearch.service.d elasticsearch-systemd
+  if [[ -n ${OPT_BACKUP_DIR:-} \
+        && ! -e "${OPT_BACKUP_DIR}/elasticsearch/jvm.options.d/zz-setup-optimize.options" \
+        && -e $ES_JVM_OPTIONS ]]; then
+    moved=$(preserve_to_tmp "$ES_JVM_OPTIONS" 2>/dev/null || true)
+    if [[ -n $moved ]]; then
+      opt_report "- ROLLBACK: moved \`${ES_JVM_OPTIONS}\` to \`${moved}\` (not deleted)"
+    fi
+  fi
+  systemctl daemon-reload || true
+  systemctl restart elasticsearch 2>/dev/null || true
+  return 0
+}
+
 optimize_elastic() {
   local active=0 yml=/etc/elasticsearch/elasticsearch.yml ram_mb heap_mb
   local jvm=$ES_JVM_OPTIONS
   local legacy=/etc/elasticsearch/jvm.options.d/jvm.options
   local unit=/etc/systemd/system/elasticsearch.service.d/limits.conf
   local es_before jvm_before legacy_before unit_before es_after jvm_after unit_after changed=0 i
+  local es_url="" last_code="" code=""
   systemctl is-active --quiet elasticsearch 2>/dev/null && active=1
   opt_report "## Elasticsearch"
   opt_report "- Active: ${active}; config: \`${yml}\`"
@@ -6801,13 +6923,19 @@ optimize_elastic() {
   # writes.
   elasticsearch_strip_managed "$yml"
   elasticsearch_write_performance_block "$yml"
+  # The managed block comments http.host/transport.host, so the effective
+  # endpoint is derived after it is written.  A node intentionally bound to a
+  # public IPv4 for a remote XenForo client must be probed there, not on
+  # 127.0.0.1.
+  es_url=$(elasticsearch_http_url "$yml")
+  opt_report "- HTTP endpoint: \`${es_url}\`"
   if (( active_bind )); then
     opt_report "- Commented active http.host/transport.host; network.host controls the bind"
   fi
   if [[ -n $net_host && $net_host != localhost && $net_host != 127.0.0.1 \
         && $net_host != "::1" && $net_host != "[::1]" ]] \
      && grep -qE '^[[:space:]]*xpack\.security\.enabled[[:space:]]*:[[:space:]]*false' "$yml" 2>/dev/null; then
-    opt_report "- **WARNING**: Elasticsearch network.host=${net_host} with X-Pack security disabled"
+    opt_report "- **WARNING**: Elasticsearch network.host=${net_host} with X-Pack security disabled; restrict TCP 9200/9300 to the remote client(s) or enable X-Pack security/TLS"
   fi
 
   elasticsearch_write_systemd_limits
@@ -6838,16 +6966,43 @@ optimize_elastic() {
     fi
     if systemctl restart elasticsearch 2>/dev/null; then
       OPT_CUTOVER=1
-      # Large heaps and many shards take time to become ready.
+      # Large heaps and many shards take time to become ready.  Probe the
+      # endpoint the node was configured with; a remote-bound node will not
+      # answer on loopback.
+      local ready=0
       for i in {1..300}; do
-        curl -fsS http://127.0.0.1:9200 >/dev/null 2>&1 && break
+        code=$(curl -sS --max-time 3 -o /dev/null -w '%{http_code}' "$es_url" 2>/dev/null || true)
+        if [[ $code == 200 ]]; then
+          ready=1
+          break
+        fi
+        last_code=$code
+        # Stop waiting early when the unit is gone, or when it is listening
+        # on the configured address but this host cannot reach it (firewall
+        # or NAT).  The latter is reported below, not rolled back.
+        if ! systemctl is-active --quiet elasticsearch; then
+          last_code="unit-inactive"
+          break
+        fi
+        if [[ $code == 000 || -z $code ]] \
+           && elasticsearch_listener_on "$es_url"; then
+          break
+        fi
         sleep 1
       done
-      if curl -fsS http://127.0.0.1:9200 >/dev/null 2>&1; then
+      if (( ready )); then
         opt_report "- Restart: **OK**"
         elasticsearch_fix_single_node_replicas || return 1
+      elif [[ $last_code == 000 || -z $last_code ]] \
+           && systemctl is-active --quiet elasticsearch \
+           && elasticsearch_listener_on "$es_url"; then
+        # The unit restarted and owns the configured listener, but this host
+        # cannot reach that address (firewall/NAT or a client-only allow
+        # rule).  Do not roll back a healthy tune; report it instead.
+        opt_report "- Restart: **OK** (unit active and listening on \`${es_url#*://}\`; HTTP probe from this host was unavailable — verify from the XenForo client)"
+        opt_report "- Single-node replica check skipped: the HTTP endpoint was not reachable from this host"
       else
-        opt_report "- Restart: **FAILED** (HTTP probe); rolling back"
+        opt_report "- Restart: **FAILED** (HTTP probe to \`${es_url}\` returned ${last_code:-no response}); rolling back"
         opt_restore /etc/elasticsearch elasticsearch
         opt_restore /etc/systemd/system/elasticsearch.service.d elasticsearch-systemd
         systemctl daemon-reload || true
@@ -6913,7 +7068,7 @@ opt_log_errors() {
 }
 
 verify_optimized_services() {
-  local rc=0 ver sock
+  local rc=0 ver sock es_url code
   opt_report "## Verification"
 
   if [[ -x /usr/sbin/angie ]] && systemctl is-active --quiet angie; then
@@ -6979,10 +7134,14 @@ verify_optimized_services() {
     opt_log_errors redis-server Redis
   fi
   if [[ " ${OPT_DETECTED[*]} " == *" elastic "* ]] && systemctl is-active --quiet elasticsearch; then
-    if curl -fsS http://127.0.0.1:9200 >/dev/null 2>&1; then
-      opt_report "- Elasticsearch: active and answering HTTP"
+    es_url=$(elasticsearch_http_url)
+    code=$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' "$es_url" 2>/dev/null || true)
+    if [[ $code == 200 ]]; then
+      opt_report "- Elasticsearch: active and answering HTTP on \`${es_url}\`"
+    elif [[ $code == 000 || -z $code ]] && elasticsearch_listener_on "$es_url"; then
+      opt_report "- Elasticsearch: active and listening on \`${es_url#*://}\` (HTTP probe from this host unavailable; verify from the client)"
     else
-      opt_report "- Elasticsearch: **FAILED** active but HTTP probe failed"
+      opt_report "- Elasticsearch: **FAILED** active but HTTP probe to \`${es_url}\` returned ${code:-no response}"
       rc=1
     fi
     opt_log_errors elasticsearch Elasticsearch
@@ -7338,7 +7497,7 @@ redact_diagnostics() {
 
 run_diagnostics() {
   local out="${SCRIPT_DIR}/diagnostics.log"
-  local u ver fpm_bin f
+  local u ver fpm_bin f es_url
   local -a units=(angie mariadb valkey-server redis-server elasticsearch)
 
   umask 077
@@ -7493,12 +7652,13 @@ run_diagnostics() {
   fi
   diag "Valkey/Redis resolved log files" diag_redis_log_files
 
-  diag "Elasticsearch root" curl -fsS --max-time 5 http://127.0.0.1:9200
-  diag "Elasticsearch health" curl -fsS --max-time 5 'http://127.0.0.1:9200/_cluster/health?pretty'
-  diag "Elasticsearch nodes" curl -fsS --max-time 5 'http://127.0.0.1:9200/_cat/nodes?v'
-  diag "Elasticsearch indices" curl -fsS --max-time 5 'http://127.0.0.1:9200/_cat/indices?v&s=store.size:desc'
-  diag_sh "Elasticsearch node stats" 'curl -fsS --max-time 10 "http://127.0.0.1:9200/_nodes/stats/jvm,os,indices,thread_pool?pretty" | head -n 500'
-  diag_sh "Elasticsearch allocation" 'curl -sS --max-time 5 -w "\nHTTP %{http_code}\n" "http://127.0.0.1:9200/_cluster/allocation/explain?pretty" | head -n 200'
+  es_url=$(elasticsearch_http_url)
+  diag "Elasticsearch root" curl -fsS --max-time 5 "$es_url"
+  diag "Elasticsearch health" curl -fsS --max-time 5 "${es_url}/_cluster/health?pretty"
+  diag "Elasticsearch nodes" curl -fsS --max-time 5 "${es_url}/_cat/nodes?v"
+  diag "Elasticsearch indices" curl -fsS --max-time 5 "${es_url}/_cat/indices?v&s=store.size:desc"
+  diag_sh "Elasticsearch node stats" "curl -fsS --max-time 10 '${es_url}/_nodes/stats/jvm,os,indices,thread_pool?pretty' | head -n 500"
+  diag_sh "Elasticsearch allocation" "curl -sS --max-time 5 -w '\\nHTTP %{http_code}\\n' '${es_url}/_cluster/allocation/explain?pretty' | head -n 200"
   diag_sh "Elasticsearch YAML" 'if [ -f /etc/elasticsearch/elasticsearch.yml ]; then cat /etc/elasticsearch/elasticsearch.yml; else echo "Elasticsearch is not installed"; fi'
   diag_sh "Elasticsearch JVM options" 'find /etc/elasticsearch/jvm.options.d -maxdepth 1 -type f -print -exec sh -c "echo --- \$1; cat \"\$1\"" _ {} \; 2>/dev/null || true'
   diag_sh "Elasticsearch systemd limits" 'if [ -f /etc/systemd/system/elasticsearch.service.d/limits.conf ]; then cat /etc/systemd/system/elasticsearch.service.d/limits.conf; else echo "systemd drop-in is not installed"; fi'
