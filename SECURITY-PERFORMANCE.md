@@ -203,7 +203,9 @@ Already good:
   `/var/cache/php/opcache`.
 - 108 static workers, `max_requests=16384`, `request_terminate_timeout=100s`,
   slow-request log at 5 s, `catch_workers_output=yes`.
-- `expose_php=Off`, `allow_url_fopen=Off`, `cgi.fix_pathinfo=0`.
+- `expose_php=Off`, `allow_url_fopen=Off`; `cgi.fix_pathinfo` keeps PHP's
+  runtime default. The opt-in session/cgi hardening sets it to 0 after
+  `PATH_TRANSLATED` is repaired.
 - Session hardening is off by default. `sudo SETUP_PHP_SESSION_HARDENING=1
   ./setup.sh --optimize` adds
   strict mode, cookies only, HttpOnly, SameSite=Lax and 48-character IDs; it
