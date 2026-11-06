@@ -268,7 +268,7 @@ Before changing basic settings, the script records the originals under `/var/lib
 - Sizes OPcache, JIT and `memory_limit` from RAM instead of fixed 512 MB values:
   - OPcache 128–512 MB, JIT 32–128 MB, `memory_limit` 256–512 MB, realpath cache 4–16 MB.
 - The repo templates provide OPcache file cache under `/var/cache/php/opcache`, `request_slowlog_timeout=10s`, `catch_workers_output=yes`, `cgi.fix_pathinfo=0`, MariaDB Unix-socket defaults and `mysqlnd` statistics disabled. PHP session settings are left at their defaults.
-- `--optimize` writes the performance tuning into `/etc/php/<ver>/fpm/conf.d/zz-setup-optimize.ini` and leaves PHP sessions alone. Global session overrides broke Joomla/Polr logins, so `session.*` hardening (strict mode, cookies-only, `HttpOnly`, `Secure`, `SameSite=Lax`, long IDs), `cgi.fix_pathinfo=0`, `display_errors=Off` and the central `error_log` are **opt-in**: run `sudo SETUP_PHP_SESSION_HARDENING=1 ./setup.sh --optimize`. Test every application before enabling it.
+- `--optimize` writes the performance tuning into `/etc/php/<ver>/fpm/conf.d/zz-setup-optimize.ini` and leaves PHP sessions alone. It also refreshes a stale `conf.d/custom_dan.ini` from `configs/php/custom_dan.ini`, preserving the host's existing `date.timezone`; this removes old 2 GB `memory_limit`, JIT-off and `curl_exec`/`exec` `disable_functions` values. Global session overrides broke Joomla/Polr logins, so `session.*` hardening (strict mode, cookies-only, `HttpOnly`, `Secure`, `SameSite=Lax`, long IDs), `cgi.fix_pathinfo=0`, `display_errors=Off` and the central `error_log` are **opt-in**: run `sudo SETUP_PHP_SESSION_HARDENING=1 ./setup.sh --optimize`. Test every application before enabling it.
 - `setup.sh` creates the log/cache directories and the systemd `LimitNOFILE=524288`, `UMask=0027` drop-in. PHP-FPM and Angie use the Unix socket `/run/php/php-fpm.sock`.
 - Sets the PHP timezone from `--basic time=`.
 - Enables and restarts `php<ver>-fpm` and prints `php<ver> -v`. If the template/tuning/start fails, the previous PHP configuration is restored from `/tmp`.
@@ -578,9 +578,10 @@ file is written. It covers:
 - MariaDB variables/status/processlist/InnoDB status/database sizes, resolved
   `log_error`/slow-log paths, and `mariadb.conf.d` files
 - Valkey and Redis INFO/CONFIG/CLIENT LIST/SLOWLOG/MEMORY/LATENCY, selected
-  persistence/socket/bind settings, and the configured logfile
+  persistence/socket/bind settings, and the configured logfile; a host with
+  neither service reports “not installed” instead of connection errors
 - Elasticsearch health, nodes, indices, JVM/OS/thread-pool stats, allocation
-  and resolved log files
+  explain (only when shards are unassigned) and resolved log files
 - Node.js version, processes, listeners and units
 - journal warnings, per-service logs, kernel OOM/hung-task reports, dmesg
 - PHP-FPM slow log, MariaDB slow log, Angie/PHP/Valkey/ES/Node logs, including

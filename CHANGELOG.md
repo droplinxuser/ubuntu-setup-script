@@ -2,6 +2,28 @@
 
 Historical release notes for ubuntu-setup-script. Current behavior is documented in README.md.
 
+## What's new in 1.8.42
+
+- **`--optimize` refreshes a stale `custom_dan.ini`.** Old hosts still carry
+  `memory_limit = 2048M`, `opcache.jit = off` and a WordPress
+  `disable_functions` list containing `curl_exec`, `exec` and
+  `shell_exec`. The managed `zz-setup-optimize.ini` overrides the limits but
+  not `allow_url_fopen`/`disable_functions`, and removing the managed file
+  would expose the stale 2 GB limit. Optimize now installs the current
+  `configs/php/custom_dan.ini` over the old copy, preserving the host's
+  existing `date.timezone`. The whole `/etc/php/<ver>` tree is backed up to
+  `/tmp/setup-optimize.*` first, and the refresh is listed in the report.
+- **Diagnostics no longer report absent Valkey/Redis as connection
+  failures.** When neither `valkey-server` nor `redis-server` has a service
+  unit, the diagnostic prints “Valkey/Redis is not installed”. If the service
+  exists but is stopped, or no client can reach it, that state is reported
+  once instead of six times.
+- **`Elasticsearch allocation` is healthy when nothing is unassigned.**
+  `_cluster/allocation/explain` returns HTTP 400 when all shards are assigned.
+  The diagnostic now reads `unassigned_shards` first and prints “No
+  unassigned shards; allocation explain is not needed” instead of a
+  misleading error.
+
 ## What's new in 1.8.41
 
 - **PHP session/cgi hardening is opt-in again.** 1.8.39 wrote global

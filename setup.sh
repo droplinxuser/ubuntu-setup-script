@@ -34,7 +34,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.41"
+readonly SCRIPT_VERSION="1.8.42"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -3174,6 +3174,55 @@ process_control_timeout = 10s' "$conf"
   return 0
 }
 
+# Old hosts can still carry a pre-1.8.41 custom_dan.ini (2 GB memory_limit,
+# OPcache JIT off, curl_exec/exec disabled).  The managed
+# zz-setup-optimize.ini overrides some values, but not allow_url_fopen or
+# disable_functions, and removing the managed file would expose the stale
+# limits.  --optimize refreshes the managed template while keeping the
+# host's existing date.timezone.
+sync_php_ini_template() {
+  local ver=$1 target=${2:-} template=${3:-}
+  if [[ -z $target ]]; then
+    [[ -d /etc/php/${ver}/fpm ]] || return 0
+    target="/etc/php/${ver}/fpm/conf.d/custom_dan.ini"
+  fi
+  [[ -n $template ]] || template="${SCRIPT_DIR}/configs/php/custom_dan.ini"
+  [[ -f $template ]] || { tune_miss "PHP ${ver}: custom_dan.ini template not found"; return 0; }
+
+  local tz=""
+  if [[ -f $target ]]; then
+    tz=$(awk -F= '/^[[:space:]]*date\.timezone[[:space:]]*=/{v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", v); print v; exit}' "$target")
+  fi
+  if [[ -z $tz && -r /etc/timezone ]]; then
+    tz=$(head -n1 /etc/timezone | tr -d '[:space:]')
+  fi
+
+  local tmp
+  tmp=$(tmp_file) || return 1
+  if [[ -n $tz ]]; then
+    awk -v tz="$tz" '
+      /^[[:space:]]*date\.timezone[[:space:]]*=/ {
+        print "date.timezone = " tz
+        done = 1
+        next
+      }
+      { print }
+      END { if (!done) print "date.timezone = " tz }
+    ' "$template" > "$tmp"
+  else
+    cat "$template" > "$tmp"
+  fi
+
+  if [[ -f $target ]] && cmp -s "$tmp" "$target"; then
+    return 0
+  fi
+  mkdir -p "$(dirname "$target")"
+  cat "$tmp" > "$target"
+  chmod 644 "$target"
+  tune_note "PHP ${ver}: custom_dan.ini refreshed from template"
+  return 0
+}
+
 tune_php_fpm_version() {
   local ver=$1
   local socket=${2:-}
@@ -6041,6 +6090,9 @@ optimize_php_services() {
     opt_report "- Active: ${active}; listen kept: \`${listen_path:-unknown}\`"
     opt_backup "/etc/php/${ver}" "php-${ver}"
     tune_reset_changes
+    # Replace a stale managed php.ini copy before tuning.  Keep the live
+    # timezone; everything else follows configs/php/custom_dan.ini.
+    sync_php_ini_template "$ver"
     # Keep the systemd fd/core limits in sync with the installer; an old
     # server may still be capped at the package default (1024 fds) while the
     # pool asks for 524288.
@@ -7525,6 +7577,60 @@ diag_redis_config() {
   done
 }
 
+# Return the installed Valkey/Redis service unit, if any.  A host can have the
+# client package without a server, so the unit file is the authoritative
+# "installed" signal for the diagnostics.
+diag_redis_unit() {
+  local u
+  for u in valkey-server.service redis-server.service; do
+    if systemctl cat "$u" >/dev/null 2>&1; then
+      printf '%s' "$u"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Return the server binary when a package is installed without a unit file.
+diag_redis_server_bin() {
+  local bin
+  for bin in valkey-server redis-server; do
+    command -v "$bin" >/dev/null 2>&1 && { printf '%s' "$bin"; return 0; }
+  done
+  return 1
+}
+
+# Return a client that can actually reach the running cache.  This avoids
+# printing a connection-refused error for every Valkey/Redis section when the
+# service is installed but stopped or protected by authentication.
+diag_redis_cli() {
+  local cli
+  for cli in valkey-cli redis-cli; do
+    command -v "$cli" >/dev/null 2>&1 || continue
+    "$cli" ping >/dev/null 2>&1 && { printf '%s' "$cli"; return 0; }
+  done
+  return 1
+}
+
+# `_cluster/allocation/explain` returns HTTP 400 when every shard is already
+# assigned.  Treat that as healthy instead of reporting a diagnostic error.
+diag_elasticsearch_allocation() {
+  local es_url=$1 health status unassigned
+  health=$(curl -fsS --max-time 5 "${es_url}/_cluster/health" 2>/dev/null) || {
+    printf 'Could not query %s/_cluster/health\n' "$es_url"
+    return 0
+  }
+  status=$(printf '%s' "$health" | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([a-z]*\)".*/\1/p' | head -n1)
+  unassigned=$(printf '%s' "$health" | sed -n 's/.*"unassigned_shards"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -n1)
+  if [[ ${unassigned:-0} =~ ^[0-9]+$ ]] && (( unassigned == 0 )); then
+    printf 'Cluster status: %s\n' "${status:-unknown}"
+    printf 'No unassigned shards; allocation explain is not needed.\n'
+    return 0
+  fi
+  curl -sS --max-time 5 -w '\nHTTP %{http_code}\n' \
+    "${es_url}/_cluster/allocation/explain?pretty" | head -n 200
+}
+
 diag_angie_include_status() {
   local included f
   if [[ ! -x /usr/sbin/angie ]]; then
@@ -7559,7 +7665,7 @@ redact_diagnostics() {
 
 run_diagnostics() {
   local out="${SCRIPT_DIR}/diagnostics.log"
-  local u ver fpm_bin f es_url
+  local u ver fpm_bin f es_url redis_unit redis_bin redis_cli redis_label
   local -a units=(angie mariadb valkey-server redis-server elasticsearch)
 
   umask 077
@@ -7694,23 +7800,29 @@ run_diagnostics() {
   diag "MariaDB resolved log files" diag_mariadb_log_files
   diag_sh "MariaDB config files" 'find /etc/mysql -maxdepth 3 -type f ! -name "debian.cnf" ! -name "*.pem" ! -name "*.key" ! -name "*.crt" -print -exec sh -c "echo --- \$1; sed -n \"1,200p\" \"\$1\"" _ {} \; 2>/dev/null | head -n 800'
 
-  if command -v valkey-cli >/dev/null 2>&1; then
-    diag "Valkey info" valkey-cli INFO all
-    diag "Valkey config" valkey-cli CONFIG GET maxmemory
-    diag "Valkey selected config" diag_redis_config valkey-cli
-    diag "Valkey clients" valkey-cli CLIENT LIST
-    diag "Valkey slowlog" valkey-cli SLOWLOG GET 100
-    diag "Valkey memory stats" valkey-cli MEMORY STATS
-    diag "Valkey latency" valkey-cli LATENCY LATEST
-  fi
-  if command -v redis-cli >/dev/null 2>&1; then
-    diag "Redis info" redis-cli INFO all
-    diag "Redis config" redis-cli CONFIG GET maxmemory
-    diag "Redis selected config" diag_redis_config redis-cli
-    diag "Redis clients" redis-cli CLIENT LIST
-    diag "Redis slowlog" redis-cli SLOWLOG GET 100
-    diag "Redis memory stats" redis-cli MEMORY STATS
-    diag "Redis latency" redis-cli LATENCY LATEST
+  redis_unit=$(diag_redis_unit || true)
+  redis_bin=$(diag_redis_server_bin || true)
+  redis_cli=$(diag_redis_cli || true)
+  if [[ -z $redis_unit && -z $redis_bin ]]; then
+    diag_sh "Valkey/Redis" 'printf "%s\n" "Valkey/Redis is not installed (no valkey-server or redis-server service unit)."'
+  elif [[ -z $redis_unit ]]; then
+    diag_sh "Valkey/Redis" "printf 'Valkey/Redis is installed (%s) but has no systemd service unit.\\n' '${redis_bin}'"
+  elif ! systemctl is-active --quiet "$redis_unit"; then
+    diag "Valkey/Redis status" systemctl status "$redis_unit" --no-pager -l
+    diag_sh "Valkey/Redis" "printf 'Valkey/Redis is installed (%s) but not running.\\n' '${redis_unit}'"
+  elif [[ -z $redis_cli ]]; then
+    diag "Valkey/Redis status" systemctl status "$redis_unit" --no-pager -l
+    diag_sh "Valkey/Redis" "printf 'Valkey/Redis is running (%s) but no client can reach it.\\n' '${redis_unit}'"
+  else
+    redis_label=Valkey
+    [[ $redis_cli == redis-cli ]] && redis_label=Redis
+    diag "${redis_label} info" "$redis_cli" INFO all
+    diag "${redis_label} config" "$redis_cli" CONFIG GET maxmemory
+    diag "${redis_label} selected config" diag_redis_config "$redis_cli"
+    diag "${redis_label} clients" "$redis_cli" CLIENT LIST
+    diag "${redis_label} slowlog" "$redis_cli" SLOWLOG GET 100
+    diag "${redis_label} memory stats" "$redis_cli" MEMORY STATS
+    diag "${redis_label} latency" "$redis_cli" LATENCY LATEST
   fi
   diag "Valkey/Redis resolved log files" diag_redis_log_files
 
@@ -7720,7 +7832,7 @@ run_diagnostics() {
   diag "Elasticsearch nodes" curl -fsS --max-time 5 "${es_url}/_cat/nodes?v"
   diag "Elasticsearch indices" curl -fsS --max-time 5 "${es_url}/_cat/indices?v&s=store.size:desc"
   diag_sh "Elasticsearch node stats" "curl -fsS --max-time 10 '${es_url}/_nodes/stats/jvm,os,indices,thread_pool?pretty' | head -n 500"
-  diag_sh "Elasticsearch allocation" "curl -sS --max-time 5 -w '\\nHTTP %{http_code}\\n' '${es_url}/_cluster/allocation/explain?pretty' | head -n 200"
+  diag "Elasticsearch allocation" diag_elasticsearch_allocation "$es_url"
   diag_sh "Elasticsearch YAML" 'if [ -f /etc/elasticsearch/elasticsearch.yml ]; then cat /etc/elasticsearch/elasticsearch.yml; else echo "Elasticsearch is not installed"; fi'
   diag_sh "Elasticsearch JVM options" 'find /etc/elasticsearch/jvm.options.d -maxdepth 1 -type f -print -exec sh -c "echo --- \$1; cat \"\$1\"" _ {} \; 2>/dev/null || true'
   diag_sh "Elasticsearch systemd limits" 'if [ -f /etc/systemd/system/elasticsearch.service.d/limits.conf ]; then cat /etc/systemd/system/elasticsearch.service.d/limits.conf; else echo "systemd drop-in is not installed"; fi'
