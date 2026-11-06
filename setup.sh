@@ -34,7 +34,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.46"
+readonly SCRIPT_VERSION="1.8.47"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -133,6 +133,14 @@ log_safe_args() {
   printf '%s' "${out[*]}"
 }
 
+# systemd marks a failed unit with a leading bullet in --no-legend output
+# ("● logrotate.service loaded failed failed ..."), so $1 is the bullet on
+# current releases and the unit name on older ones.  Keep the log header
+# useful instead of printing "●,●,●".
+failed_unit_names() {
+  awk '{ gsub(/\033\[[0-9;]*m/, ""); if ($1 == "●" || $1 == "*") print $2; else print $1 }' | paste -sd, -
+}
+
 log_environment() {
   local os_name="" os_ver="" virt="" ips="" failed="" mem="" disk=""
   if [[ -r /etc/os-release ]]; then
@@ -145,7 +153,7 @@ log_environment() {
   command -v hostname >/dev/null 2>&1 \
     && ips=$(hostname -I 2>/dev/null || true)
   command -v systemctl >/dev/null 2>&1 \
-    && failed=$(systemctl --failed --no-legend --no-pager 2>/dev/null | awk '{print $1}' | paste -sd, - || true)
+    && failed=$(systemctl --failed --no-legend --no-pager 2>/dev/null | failed_unit_names || true)
   command -v free >/dev/null 2>&1 && mem=$(free -m 2>/dev/null | awk '/^Mem:/{printf "%sMB total, %sMB available", $2, $7}')
   command -v df >/dev/null 2>&1 && disk=$(df -Ph / 2>/dev/null | awk 'NR==2{printf "%s total, %s free on %s", $2, $4, $6}')
 
@@ -507,7 +515,9 @@ Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
       restart.  Existing PHP-FPM listeners are kept;
       when a pool already listens on a Unix socket, Angie's fastcgi_pass is
       repointed to it.  TCP pools stay on TCP so a live site is never left
-      pointing at a missing socket.
+      pointing at a missing socket.  Set
+      SETUP_OPTIMIZE_MIGRATE_PHP_SOCKET=1 to attempt the in-place TCP-to-Unix
+      move; some PHP-FPM builds do not open the new listener on reload.
       Hosts built before 1.8.34 also get the legacy nightly
       `chown -R /var/www/` crontab entry migrated to the log-safe find form,
       and /var/www/logs ownership repaired before any service is restarted.
@@ -819,12 +829,17 @@ is_local_ipv4() {
 sshd_listen_ports() {
   local ports=""
   if command -v sshd >/dev/null 2>&1; then
-    ports=$(sshd -T 2>/dev/null | awk 'tolower($1) == "port" {print $2}')
+    # sshd -T fails as a normal user on some hosts; `|| true` keeps pipefail
+    # from aborting the function before the port-22 fallback.
+    ports=$(sshd -T 2>/dev/null | awk 'tolower($1) == "port" {print $2}' || true)
   fi
   if [[ -z $ports && -r /etc/ssh/sshd_config ]]; then
-    ports=$(awk 'tolower($1) == "port" {print $2}' /etc/ssh/sshd_config)
+    ports=$(awk 'tolower($1) == "port" {print $2}' /etc/ssh/sshd_config || true)
   fi
-  ports=$(printf '%s\n' "$ports" | grep -E '^[0-9]+$' | sort -nu)
+  # An empty sshd output is normal in a container/CI runner: grep exits 1.
+  # Without `|| true`, pipefail + set -e would abort the process substitution
+  # before the port-22 fallback and the caller would see no ports at all.
+  ports=$(printf '%s\n' "$ports" | grep -E '^[0-9]+$' | sort -nu || true)
   [[ -n $ports ]] || ports=22
   printf '%s\n' "$ports"
 }
@@ -2042,6 +2057,15 @@ sysctl_dedupe_keys() {
   return 0
 }
 
+# The kernel rejects ipfrag_high_thresh when the new value is below the
+# current low threshold (EINVAL).  Writing the low mark first keeps a lower
+# high mark valid; only low <= high is required.
+ipfrag_sysctl_lines() {
+  local high=$1 low=$2
+  printf 'net.ipv4.ipfrag_low_thresh = %s\n' "$low"
+  printf 'net.ipv4.ipfrag_high_thresh = %s\n' "$high"
+}
+
 configure_sysctl() {
   step "sysctl tweaks"
   record_sysctl_values
@@ -2104,10 +2128,9 @@ net.ipv4.tcp_keepalive_time = 120
 net.ipv4.neigh.default.gc_thresh1 = 32
 net.ipv4.neigh.default.gc_thresh2 = ${arp_thresh2}
 net.ipv4.neigh.default.gc_thresh3 = ${arp_thresh3}
-# ipfrag_low_thresh must not exceed the current high threshold, so set the
-# high water mark first and the low mark second.
-net.ipv4.ipfrag_high_thresh = ${ipfrag_high}
-net.ipv4.ipfrag_low_thresh = ${ipfrag_low}
+# Keep low <= high.  A lower high mark is rejected while the old low mark is
+# still above it, so write the low mark first and the high mark second.
+$(ipfrag_sysctl_lines "$ipfrag_high" "$ipfrag_low")
 net.netfilter.nf_conntrack_max = ${conntrack_max}
 fs.file-max = ${file_max}
 fs.nr_open = ${file_max}
@@ -2175,6 +2198,19 @@ EOF
   chmod 644 /etc/sysctl.d/90-setup-network.conf
   sysctl -w "net.core.default_qdisc=${QDISC}" >/dev/null 2>&1 \
     || warn "Could not set net.core.default_qdisc=${QDISC}"
+
+  # A live kernel can still have the old low mark above the new high mark.
+  # Make room before the file is applied; the file itself writes low first.
+  if [[ -r /proc/sys/net/ipv4/ipfrag_low_thresh && -r /proc/sys/net/ipv4/ipfrag_high_thresh ]]; then
+    local cur_low cur_high
+    cur_low=$(< /proc/sys/net/ipv4/ipfrag_low_thresh)
+    cur_high=$(< /proc/sys/net/ipv4/ipfrag_high_thresh)
+    if [[ $cur_low =~ ^[0-9]+$ ]] && (( cur_low > ipfrag_high )); then
+      sysctl -w "net.ipv4.ipfrag_low_thresh=${ipfrag_low}" >/dev/null 2>&1 || true
+    elif [[ $cur_high =~ ^[0-9]+$ ]] && (( cur_high < ipfrag_low )); then
+      sysctl -w "net.ipv4.ipfrag_high_thresh=${ipfrag_high}" >/dev/null 2>&1 || true
+    fi
+  fi
 
   sysctl -e -p /etc/sysctl.conf || warn "One or more sysctl values could not be applied"
 
@@ -4092,7 +4128,11 @@ mariadb_strip_install_block() {
   local cnf=${3:-/etc/mysql/mariadb.conf.d/50-server.cnf}
   local tmp keys
   [[ -f $cnf ]] || return 0
-  keys=$( { mariadb_performance_settings "$size_mb" "$max_conn"; mariadb_logging_settings; } 2>/dev/null \
+  # log_slow_admin_statements is a deprecated MariaDB 11.8 alias
+  # (--log-slow-filter owns it now).  It is no longer generated, but old
+  # managed blocks still carry it, so strip it as a legacy key.
+  keys=$( { mariadb_performance_settings "$size_mb" "$max_conn"; mariadb_logging_settings; \
+            printf 'log_slow_admin_statements = 1\n'; } 2>/dev/null \
     | sed -n 's/^\([a-z0-9_]*\)[[:space:]]*=.*/\1/p' | paste -sd'|' -)
   [[ -n $keys ]] || return 0
   tmp=$(tmp_file) || return 1
@@ -4162,7 +4202,6 @@ slow_query_log_file = /var/www/logs/mariadb/slow.log
 long_query_time = 1
 min_examined_row_limit = 100
 log_slow_verbosity = query_plan,explain
-log_slow_admin_statements = 1
 log_error = /var/www/logs/mariadb/error.log
 EOF
 }
@@ -6169,6 +6208,15 @@ optimize_angie() {
   return 0
 }
 
+# Live TCP-to-Unix migration is opt-in.  Some PHP-FPM builds (PHP 8.5 was
+# observed) close the old TCP listener on SIGUSR2 without opening the new
+# socket, so neither the primary nor the backup can serve during the cutover.
+# The default therefore preserves a working TCP listener, matching the
+# installer and the README.
+php_socket_migration_enabled() {
+  [[ ${SETUP_OPTIMIZE_MIGRATE_PHP_SOCKET:-0} == 1 ]]
+}
+
 # True when active PHP vhosts use the shared local_php upstream, so the
 # temporary socket-primary/TCP-backup cutover is safe.  A direct fastcgi_pass
 # or fastcgi_next_upstream off cannot fall back to the TCP listener.
@@ -6242,10 +6290,12 @@ migrate_php_pool_to_socket() {
   # 1. Angie: socket primary, current TCP listener as backup.  angie -t
   #    accepts a unix: server whose socket does not exist yet; the connect
   #    fails fast and the backup serves traffic until PHP creates the socket.
+  #    max_fails=0 would disable failure accounting and keep the backup
+  #    unused, so use a short fail_timeout that retries the socket quickly.
   sed_in_place -E \
-    "s|^([[:space:]]*)server[[:space:]]+${tcp_re};|\1server unix:${socket} max_fails=0;\n\1server ${tcp} backup;|" \
+    "s|^([[:space:]]*)server[[:space:]]+${tcp_re};|\1server unix:${socket} max_fails=1 fail_timeout=2s;\n\1server ${tcp} backup;|" \
     "$angie_conf"
-  if ! grep -qF "server unix:${socket} max_fails=0;" "$angie_conf" \
+  if ! grep -qF "server unix:${socket} max_fails=1 fail_timeout=2s;" "$angie_conf" \
      || ! /usr/sbin/angie -t >/dev/null 2>&1 \
      || ! systemctl reload angie 2>/dev/null; then
     cp -a "$bak/angie.conf" "$angie_conf"
@@ -6285,16 +6335,16 @@ migrate_php_pool_to_socket() {
     "$fpm_bin" -t >/dev/null 2>&1 && systemctl reload "php${ver}-fpm" 2>/dev/null || true
     /usr/sbin/angie -t >/dev/null 2>&1 && systemctl reload angie 2>/dev/null || true
     # Not every PHP-FPM build applies a listener change on SIGUSR2 (PHP 8.4
-    # kept the old TCP listener in validation).  Forcing a restart here would
-    # cut a live site for a marginal gain, so leave the working TCP pool and
-    # let an operator complete the move during a maintenance restart.
-    MIGRATE_REASON="this PHP-FPM build did not open the socket on reload; kept TCP (a PHP-FPM restart applies it)"
+    # kept the old listener; 8.5 closed it without opening the socket).
+    # Both configs were restored, so no restart is pending; forcing one would
+    # cut a live site for a marginal gain.  Report the rollback accurately.
+    MIGRATE_REASON="this PHP-FPM build did not open the socket on reload; restored the TCP listener"
     return 2
   fi
 
   # 3. Drop the TCP backup; the socket is proven live.
   sed_in_place -E "/^[[:space:]]*server[[:space:]]+${tcp_re}[[:space:]]+backup;/d" "$angie_conf"
-  sed_in_place -E "s|server unix:${socket} max_fails=0;|server unix:${socket};|" "$angie_conf"
+  sed_in_place -E "s|server unix:${socket} max_fails=1 fail_timeout=2s;|server unix:${socket};|" "$angie_conf"
   if ! /usr/sbin/angie -t >/dev/null 2>&1 \
      || ! systemctl reload angie 2>/dev/null; then
     # Keep the working socket+backup config rather than risking the site.
@@ -6362,7 +6412,12 @@ optimize_php_services() {
     local migrated=0 migration_failed=0 migration_rc=0
     if (( active )) && [[ $ver == "$primary" ]] \
        && [[ $listen_path =~ ^(127\.0\.0\.1|localhost):[0-9]+$ ]]; then
-      if systemctl is-active --quiet angie \
+      if ! php_socket_migration_enabled; then
+        # A live TCP pool is a working listener.  PHP-FPM 8.5 can close it on
+        # SIGUSR2 without opening the new socket, leaving Angie with no live
+        # upstream; keep TCP unless the operator explicitly opts in.
+        opt_report "- Socket migration skipped: live TCP listener preserved (set SETUP_OPTIMIZE_MIGRATE_PHP_SOCKET=1 to opt in)"
+      elif systemctl is-active --quiet angie \
          && angie_uses_local_php_upstream /etc/angie; then
         if migrate_php_pool_to_socket "$ver" "$listen_path"; then
           OPT_PHP_SOCKET=/run/php/php-fpm.sock
@@ -6759,7 +6814,7 @@ optimize_valkey() {
   local active=0 ram_mb max_mb policy backlog io_threads i
   local conf_before conf_after fd_limit dropin unit_changed=0
   local online_ok=0 live_io="" live_backlog="" setting k v
-  local socket_path group socket_before socket_after perm_before perm_after socket_changed=0 group_changed=0
+  local socket_path group socket_before perm_before perm_after socket_changed=0 group_changed=0
   [[ -f $conf ]] || return 0
   systemctl is-active --quiet "$unit" 2>/dev/null && active=1
   opt_report "## ${label}"
@@ -6842,7 +6897,6 @@ optimize_valkey() {
   fi
   conf_set unixsocket "$socket_path"
   conf_set unixsocketperm 770
-  socket_after=$(awk '/^[[:space:]]*unixsocket[[:space:]]/{print $2; exit}' "$conf")
   perm_after=$(awk '/^[[:space:]]*unixsocketperm[[:space:]]/{print $2; exit}' "$conf")
   if [[ $socket_before != "$socket_path" || $perm_before != "$perm_after" || $perm_after != 770 ]]; then
     socket_changed=1
@@ -6968,7 +7022,11 @@ optimize_valkey() {
       done
       if "$cli" ping 2>/dev/null | grep -q PONG; then
         opt_report "- Restart: **OK**"
-        if (( group_changed || socket_changed )); then
+        # A socket path change does not alter the supplementary groups the
+        # PHP workers already have.  Restarting PHP just because the cache
+        # moved to a Unix socket briefly removes /run/php/php-fpm.sock and
+        # makes Angie return 502s; only a real group change needs it.
+        if (( group_changed )); then
           restart_php_workers_for_group "$group"
           opt_report "- PHP-FPM restarted to inherit the ${group} group"
         fi
@@ -6990,7 +7048,7 @@ optimize_valkey() {
     fi
   else
     opt_report "- Restart: skipped (service was not active)"
-    if (( group_changed || socket_changed )); then
+    if (( group_changed )); then
       restart_php_workers_for_group "$group"
       opt_report "- PHP-FPM restarted to inherit the ${group} group (socket applies at next start)"
     fi
@@ -7758,6 +7816,15 @@ diag_php_log_files() {
   ' | sort -u
 }
 
+# MariaDB is optional.  Detect the server before live probes so a host
+# without it reports "not installed" instead of "command not found".
+diag_mariadb_installed() {
+  command -v mariadbd >/dev/null 2>&1 && return 0
+  systemctl cat mariadb.service >/dev/null 2>&1 && return 0
+  [[ -x /usr/sbin/mariadbd ]] && return 0
+  return 1
+}
+
 diag_mariadb_log_files() {
   local logerr="" slow="" datadir=""
   if command -v mariadb >/dev/null 2>&1; then
@@ -8018,7 +8085,7 @@ run_diagnostics() {
   diag_sh "PHP CLI version" 'if command -v php >/dev/null 2>&1; then php -v; else echo "php CLI is not installed"; fi'
   diag_sh "PHP CLI modules" 'if command -v php >/dev/null 2>&1; then php -m; else echo "php CLI is not installed"; fi'
   diag_sh "PHP CLI ini" 'if command -v php >/dev/null 2>&1; then php --ini; else echo "php CLI is not installed"; fi'
-  diag_sh "PHP-FPM versions" 'for d in /etc/php/*/fpm; do [ -d "$d" ] || continue; v=${d%/fpm}; v=${v##*/}; echo "--- PHP $v"; command -v "php-fpm$v" >/dev/null && "php-fpm$v" -v || /usr/sbin/php-fpm"$v" -v 2>&1; done'
+  diag_sh "PHP-FPM versions" 'for d in /etc/php/*/fpm; do [ -d "$d" ] || continue; v=${d%/fpm}; v=${v##*/}; echo "--- PHP $v"; if command -v "php-fpm$v" >/dev/null 2>&1; then "php-fpm$v" -v; elif [ -x "/usr/sbin/php-fpm$v" ]; then "/usr/sbin/php-fpm$v" -v 2>&1; else echo "no php-fpm${v} binary (stale configuration directory)"; fi; done'
   while IFS= read -r ver; do
     [[ -n $ver ]] || continue
     if command -v "php-fpm${ver}" >/dev/null 2>&1; then
@@ -8036,18 +8103,26 @@ run_diagnostics() {
     diag "PHP ${ver} status" diag_php_fpm_status "$ver"
   done < <(php_fpm_versions)
 
-  diag "MariaDB version" mariadb --version
-  diag "MariaDB server version" mariadbd --version
-  diag "MariaDB ping" mariadb-admin ping
-  diag "MariaDB variables" mariadb -N -B -e 'SHOW GLOBAL VARIABLES'
-  diag "MariaDB status" mariadb -N -B -e 'SHOW GLOBAL STATUS'
-  diag "MariaDB processlist" mariadb -e 'SHOW FULL PROCESSLIST'
-  diag "MariaDB InnoDB status" mariadb -e 'SHOW ENGINE INNODB STATUS\G'
-  diag_sh "MariaDB database sizes" "mariadb -N -B -e \"SELECT table_schema, ROUND(SUM(data_length+index_length)/1024/1024,1) AS mb, COUNT(*) AS tables FROM information_schema.tables WHERE table_schema NOT IN ('mysql','information_schema','performance_schema','sys') GROUP BY table_schema ORDER BY mb DESC;\""
-  diag_sh "MariaDB replication" "mariadb -e 'SHOW REPLICA STATUS\\G' 2>&1 || mariadb -e 'SHOW SLAVE STATUS\\G' 2>&1 || true"
-  diag_sh "MariaDB extended status" 'mariadb-admin ext 2>&1 | head -300'
-  diag_sh "MariaDB error log size" 'du -sh /var/www/logs/mariadb /var/log/mysql 2>/dev/null || true'
-  diag "MariaDB resolved log files" diag_mariadb_log_files
+  if diag_mariadb_installed; then
+    diag "MariaDB version" mariadb --version
+    diag "MariaDB server version" mariadbd --version
+    diag "MariaDB ping" mariadb-admin ping
+    diag "MariaDB variables" mariadb -N -B -e 'SHOW GLOBAL VARIABLES'
+    diag "MariaDB status" mariadb -N -B -e 'SHOW GLOBAL STATUS'
+    diag "MariaDB processlist" mariadb -e 'SHOW FULL PROCESSLIST'
+    diag "MariaDB InnoDB status" mariadb -e 'SHOW ENGINE INNODB STATUS\G'
+    diag_sh "MariaDB database sizes" "mariadb -N -B -e \"SELECT table_schema, ROUND(SUM(data_length+index_length)/1024/1024,1) AS mb, COUNT(*) AS tables FROM information_schema.tables WHERE table_schema NOT IN ('mysql','information_schema','performance_schema','sys') GROUP BY table_schema ORDER BY mb DESC;\""
+    diag_sh "MariaDB replication" "mariadb -e 'SHOW REPLICA STATUS\\G' 2>&1 || mariadb -e 'SHOW SLAVE STATUS\\G' 2>&1 || true"
+    diag_sh "MariaDB extended status" 'mariadb-admin ext 2>&1 | head -300'
+    diag_sh "MariaDB error log size" 'du -sh /var/www/logs/mariadb /var/log/mysql 2>/dev/null || true'
+    diag "MariaDB resolved log files" diag_mariadb_log_files
+  elif command -v mariadb >/dev/null 2>&1; then
+    diag "MariaDB client version" mariadb --version
+    diag_sh "MariaDB" 'printf "%s\n" "MariaDB server is not installed (client only)."'
+    diag "MariaDB resolved log files" diag_mariadb_log_files
+  else
+    diag_sh "MariaDB" 'printf "%s\n" "MariaDB is not installed."'
+  fi
   diag_sh "MariaDB config files" 'find /etc/mysql -maxdepth 3 -type f ! -name "debian.cnf" ! -name "*.pem" ! -name "*.key" ! -name "*.crt" -print -exec sh -c "echo --- \$1; sed -n \"1,200p\" \"\$1\"" _ {} \; 2>/dev/null | head -n 800'
 
   redis_unit=$(diag_redis_unit || true)
@@ -8198,6 +8273,7 @@ restart_all_plan() {
   printf '  stop active php*-fpm.service\n'
   printf '  restart active Valkey/Redis service\n'
   printf '  restart active Elasticsearch\n'
+  printf '  wait for the Elasticsearch HTTP endpoint (up to 300s)\n'
   printf '  restart active MariaDB\n'
   printf '  wait for SELECT 1 (up to 300s)\n'
   printf '  start the PHP-FPM versions that were stopped\n'
@@ -8210,7 +8286,7 @@ restart_all_plan() {
 run_restart_all() {
   local unit rc=0
   local angie_active=0 angie_stopped=0 mariadb_active=0 mariadb_ok=0
-  local elastic_active=0
+  local elastic_active=0 es_url="" es_ok=0
   local -a php_units=() stopped_php=() cache_units=() failures=()
   local i
 
@@ -8284,6 +8360,31 @@ run_restart_all() {
   if (( elastic_active )); then
     if systemctl restart elasticsearch 2>/dev/null; then
       info "Restarted elasticsearch"
+      # Type=simple returns before the node is ready.  Wait for the HTTP
+      # endpoint before the PHP/Angie tiers are started so the first search
+      # requests do not hit a recovering cluster.
+      es_url=$(elasticsearch_http_url 2>/dev/null || true)
+      if [[ -n $es_url ]] && command -v curl >/dev/null 2>&1; then
+        for i in {1..300}; do
+          curl -fsS --max-time 2 "$es_url" >/dev/null 2>&1 && { es_ok=1; break; }
+          sleep 1
+        done
+        # A remote-bound node can be healthy while the host cannot reach its
+        # own public address through firewall/NAT; the listener is enough.
+        if (( ! es_ok )) && elasticsearch_listener_on "$es_url"; then
+          es_ok=1
+          info "Elasticsearch is listening on the configured endpoint"
+        fi
+        if (( es_ok )); then
+          info "Elasticsearch is answering HTTP"
+        else
+          warn "Elasticsearch did not answer HTTP within 300s"
+          failures+=("elasticsearch HTTP probe")
+          rc=1
+        fi
+      else
+        info "Elasticsearch HTTP endpoint or curl is unavailable; skipping readiness probe"
+      fi
     else
       warn "Could not restart elasticsearch"
       failures+=("restart elasticsearch")
