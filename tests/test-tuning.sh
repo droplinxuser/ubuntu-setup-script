@@ -89,6 +89,41 @@ check "MariaDB logging helper sets the central slow log" \
 check "MariaDB logging helper sets log_error" \
   test "$(mariadb_logging_settings | grep -c '^log_error = /var/www/logs/mariadb/error.log$')" -eq 1
 
+# Older releases wrote performance directives bare in 50-server.cnf, without
+# the managed markers.  Once the 99- drop-in exists, all of them must leave
+# 50-server.cnf while base settings remain.
+cat > "$TMP/50-server.cnf" <<'EOF'
+[mysqld]
+max_connections = 1500
+innodb_log_buffer_size = 2047M
+innodb_log_file_size = 5120M
+innodb_buffer_pool_size = 20480M
+tmp_table_size = 256M
+skip_name_resolve = 1
+# BEGIN setup.sh managed mariadb
+[mariadbd]
+innodb_io_capacity = 3000
+bind-address = 127.0.0.1
+# END setup.sh managed mariadb
+EOF
+mariadb_strip_install_block 16351 1500 "$TMP/50-server.cnf" >/dev/null 2>&1
+check "legacy bare max_connections is removed from 50-server" \
+  bash -c "! grep -q '^max_connections[[:space:]]*=' '$TMP/50-server.cnf'"
+check "legacy bare InnoDB sizes are removed from 50-server" \
+  bash -c "! grep -qE '^(innodb_log_buffer_size|innodb_log_file_size|innodb_buffer_pool_size|innodb_io_capacity)[[:space:]]*=' '$TMP/50-server.cnf'"
+check "legacy bare tmp_table_size is removed from 50-server" \
+  bash -c "! grep -q '^tmp_table_size[[:space:]]*=' '$TMP/50-server.cnf'"
+check "base MariaDB settings stay in 50-server" \
+  grep -qx 'skip_name_resolve = 1' "$TMP/50-server.cnf"
+check "managed base MariaDB settings stay in 50-server" \
+  grep -qx 'bind-address = 127.0.0.1' "$TMP/50-server.cnf"
+check "managed MariaDB markers are preserved" \
+  grep -qx '# BEGIN setup.sh managed mariadb' "$TMP/50-server.cnf"
+mariadb_hash=$(md5sum "$TMP/50-server.cnf" | awk '{print $1}')
+mariadb_strip_install_block 16351 1500 "$TMP/50-server.cnf" >/dev/null 2>&1
+check "MariaDB legacy-key cleanup is idempotent" \
+  test "$mariadb_hash" = "$(md5sum "$TMP/50-server.cnf" | awk '{print $1}')"
+
 # A heap-only operator JVM file is safe to replace with the managed file; a
 # richer file must be preserved (with a warning from write_es_jvm_options).
 printf -- '-Xms4g\n-Xmx4g\n' > "$TMP/heap-only.options"
@@ -572,6 +607,38 @@ check "tune_pool_dedupe keeps one pm.max_children" \
 check "tune_pool_dedupe keeps the value set by tune_pool_set" \
   grep -qx 'pm.max_children = 64' "$TMP/www.conf"
 
+# --optimize must add session/cgi/error-log hardening for old hosts whose
+# custom_dan.ini predates the current template.  The managed ini sorts last.
+php_tune_body=$(sed -n '/^tune_php_fpm_version()/,/^}/p' "$ROOT/setup.sh")
+check "PHP optimize disables cgi.fix_pathinfo" \
+  grep -q '^cgi.fix_pathinfo = 0$' <<<"$php_tune_body"
+check "PHP optimize disables expose_php" \
+  grep -q '^expose_php = Off$' <<<"$php_tune_body"
+check "PHP optimize disables display_errors" \
+  grep -q '^display_errors = Off$' <<<"$php_tune_body"
+check "PHP optimize enables error logging" \
+  grep -q '^log_errors = On$' <<<"$php_tune_body"
+check "PHP optimize points error_log at the central tree" \
+  grep -qF 'error_log = ${php_error_log}' <<<"$php_tune_body"
+check "PHP optimize enables strict sessions" \
+  grep -q '^session.use_strict_mode = 1$' <<<"$php_tune_body"
+check "PHP optimize restricts sessions to cookies" \
+  grep -q '^session.use_only_cookies = 1$' <<<"$php_tune_body"
+check "PHP optimize marks cookies HttpOnly" \
+  grep -q '^session.cookie_httponly = 1$' <<<"$php_tune_body"
+check "PHP optimize marks cookies Secure" \
+  grep -q '^session.cookie_secure = 1$' <<<"$php_tune_body"
+check "PHP optimize sets SameSite=Lax" \
+  grep -q '^session.cookie_samesite = Lax$' <<<"$php_tune_body"
+check "PHP optimize sets a bounded session lifetime" \
+  grep -q '^session.gc_maxlifetime = 14400$' <<<"$php_tune_body"
+check "PHP optimize lengthens session IDs" \
+  grep -q '^session.sid_length = 48$' <<<"$php_tune_body"
+check "PHP optimize uses six bits per session character" \
+  grep -q '^session.sid_bits_per_character = 6$' <<<"$php_tune_body"
+check "PHP optimize creates the central PHP error log" \
+  grep -qF 'ensure_fpm_log_path "$php_error_log"' <<<"$php_tune_body"
+
 # ---------------------------------------------------------------------------
 # Shared memory budget
 # ---------------------------------------------------------------------------
@@ -844,6 +911,52 @@ if elasticsearch_single_node_replica_issue \
 else
   t_pass "unassigned primary shard is not treated as a replica issue"
 fi
+
+# ---------------------------------------------------------------------------
+# Elasticsearch HTTP endpoint resolution
+# ---------------------------------------------------------------------------
+# A node intentionally bound to a public IPv4 for a remote XenForo client must
+# be probed on that address, not 127.0.0.1.
+cat > "$TMP/es-http-public.yml" <<'EOF'
+network.host: 188.40.128.83
+http.port: 9200
+EOF
+check "Elasticsearch HTTP URL uses a public IPv4 network.host" \
+  test "$(elasticsearch_http_url "$TMP/es-http-public.yml")" = "http://188.40.128.83:9200"
+
+cat > "$TMP/es-http-quoted.yml" <<'EOF'
+network.host: "188.40.128.83" # remote client
+http.port: "9201"
+EOF
+check "Elasticsearch HTTP URL strips quotes, comments and honours http.port" \
+  test "$(elasticsearch_http_url "$TMP/es-http-quoted.yml")" = "http://188.40.128.83:9201"
+
+cat > "$TMP/es-http-explicit.yml" <<'EOF'
+http.host: 127.0.0.1
+network.host: 188.40.128.83
+EOF
+check "Elasticsearch HTTP URL prefers an explicit http.host" \
+  test "$(elasticsearch_http_url "$TMP/es-http-explicit.yml")" = "http://127.0.0.1:9200"
+
+cat > "$TMP/es-http-commented.yml" <<'EOF'
+# http.host: 127.0.0.1
+network.host: 188.40.128.83
+EOF
+check "Elasticsearch HTTP URL ignores a commented http.host" \
+  test "$(elasticsearch_http_url "$TMP/es-http-commented.yml")" = "http://188.40.128.83:9200"
+
+cat > "$TMP/es-http-wildcard.yml" <<'EOF'
+http.host: 0.0.0.0
+network.host: 188.40.128.83
+EOF
+check "Elasticsearch wildcard HTTP bind probes loopback" \
+  test "$(elasticsearch_http_url "$TMP/es-http-wildcard.yml")" = "http://127.0.0.1:9200"
+
+cat > "$TMP/es-http-ipv6.yml" <<'EOF'
+network.host: 2a01:4f8:221:1be1::2
+EOF
+check "Elasticsearch HTTP URL brackets an IPv6 host" \
+  test "$(elasticsearch_http_url "$TMP/es-http-ipv6.yml")" = "http://[2a01:4f8:221:1be1::2]:9200"
 
 # ---------------------------------------------------------------------------
 # WordPress vhost detection

@@ -2,6 +2,37 @@
 
 Historical release notes for ubuntu-setup-script. Current behavior is documented in README.md.
 
+## What's new in 1.8.39
+
+- **`--optimize` probes the Elasticsearch endpoint it actually configured.**
+  It now resolves the effective HTTP address from `http.host` (when active) or
+  `network.host`, honours a custom `http.port`, brackets IPv6 addresses, and
+  uses that endpoint for the index-store query, live-heap query, readiness
+  probe, verification and single-node replica calls. A node intentionally
+  bound to a public IPv4 for a remote XenForo client no longer fails a
+  hard-coded `127.0.0.1:9200` probe and rolls back. If the host cannot reach
+  its own non-loopback address because of a firewall/NAT, the active unit plus
+  the exact listener is reported instead of a false failure; the single-node
+  replica check is skipped in that case.
+- **`--diagnostics` follows the same endpoint**, so a remote-bound
+  Elasticsearch is queried on its configured address instead of loopback.
+- **`--optimize` upgrades PHP session/cgi hardening on old hosts.** The
+  managed `zz-setup-optimize.ini` now sets strict session mode, cookies-only,
+  `HttpOnly`, `Secure`, `SameSite=Lax`, `cgi.fix_pathinfo=0`,
+  `display_errors=Off`, `log_errors=On` and the central
+  `/var/www/logs/php/php-error.log`. Because the file sorts last, an older
+  `custom_dan.ini` can no longer leave unsafe defaults in place; the file is
+  created and owned before PHP-FPM is reloaded.
+- **`--optimize` removes bare legacy MariaDB performance keys.** Older
+  releases wrote optimizer-generated directives (for example
+  `innodb_buffer_pool_size`, `innodb_log_file_size`, `tmp_table_size` and
+  `max_connections`) directly into `50-server.cnf` without the managed
+  markers. The optimizer now strips every optimizer-managed performance and
+  logging key from that file (inside or outside the marker block) while
+  preserving base settings such as `skip_name_resolve`, `open_files_limit`,
+  `secure_file_priv` and `bind-address`, so `99-setup-optimize.cnf` is the
+  single owner.
+
 ## What's new in 1.8.38
 
 - **`--optimize` no longer aborts on a host with an empty root crontab.** The
