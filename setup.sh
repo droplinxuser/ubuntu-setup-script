@@ -34,7 +34,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.39"
+readonly SCRIPT_VERSION="1.8.41"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -2668,6 +2668,55 @@ tune_cache_error_policy() {
   return 0
 }
 
+# The shared FastCGI snippet historically captured PATH_INFO with
+# ^(.+?\.php)(/.*)$; that requires a trailing "/..." and can leave
+# $fastcgi_script_name empty for a bare /index.php.  try_files then sees the
+# document root, passes it to PHP-FPM, and security.limit_extensions returns
+# "Access denied" for every pretty URL.  Make PATH_INFO optional; the
+# try_files test and SCRIPT_FILENAME stay unchanged so PATH_INFO apps keep
+# working.
+tune_fastcgi_snippet() {
+  local file=$1 tmp
+  [[ -f $file ]] || { tune_miss "FastCGI snippet missing: ${file}"; return 0; }
+  grep -qE '^[[:space:]]*fastcgi_split_path_info[[:space:]]+' "$file" || {
+    tune_miss "FastCGI snippet has no fastcgi_split_path_info: ${file}"
+    return 0
+  }
+  tmp=$(tmp_file) || return 1
+  awk '
+    function lead(s) { match(s, /^[[:space:]]*/); return substr(s, 1, RLENGTH) }
+    /^[[:space:]]*fastcgi_split_path_info[[:space:]]+/ {
+      print lead($0) "fastcgi_split_path_info ^(.+?\\.php)(/.*)?$;"
+      next
+    }
+    { print }
+  ' "$file" > "$tmp"
+  if ! cmp -s "$file" "$tmp"; then
+    cat "$tmp" > "$file"
+    tune_note "snippets/fastcgi-php.conf: PATH_INFO capture is optional"
+  fi
+  return 0
+}
+
+# A bare `location / { try_files ... }` with no index directive resolves "/"
+# to the directory instead of index.php on older vhosts.  Add a server-level
+# index to the shared WordPress and Polr includes when they lack one.
+tune_ensure_index() {
+  local file=$1 tmp
+  [[ -f $file ]] || return 0
+  if grep -qE '^[[:space:]]*index[[:space:]]' "$file"; then
+    return 0
+  fi
+  tmp=$(tmp_file) || return 1
+  {
+    printf 'index index.php index.html;\n'
+    cat "$file"
+  } > "$tmp"
+  cat "$tmp" > "$file"
+  tune_note "${file##*/}: index index.php index.html"
+  return 0
+}
+
 # ---------------------------------------------------------------------------
 # Angie
 # ---------------------------------------------------------------------------
@@ -2675,6 +2724,13 @@ tune_angie_configs() {
   local target=${1:-/etc/angie}
   local nginx_conf="${target}/angie.conf"
   [[ -f $nginx_conf ]] || return 1
+
+  # Repair the shared PHP include and the two server-level includes that old
+  # deployments left without an index.  These are targeted repairs, not a
+  # deployment of the Angie repository.
+  tune_fastcgi_snippet "${target}/snippets/fastcgi-php.conf"
+  tune_ensure_index "${target}/h5bp/wordpress.conf"
+  tune_ensure_index "${target}/h5bp/php_polr.conf"
 
   local nproc mem_mb disk_free_mb disk_class
   local worker_rlimit worker_connections php_keepalive open_files
@@ -3179,7 +3235,6 @@ tune_php_fpm_version() {
   # directory that no longer exists (seen on Ubuntu 24.04); php-fpm -t then
   # fails as soon as request_slowlog_timeout is set.
   local fpm_user fpm_group slowlog accesslog poollog
-  local php_error_log=/var/www/logs/php/php-error.log
   fpm_user=$(awk -F= '/^[[:space:]]*user[[:space:]]*=/{v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/,"",v); print v; exit}' "$pool")
   fpm_group=$(awk -F= '/^[[:space:]]*group[[:space:]]*=/{v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/,"",v); print v; exit}' "$pool")
   slowlog=$(awk -F= '/^[[:space:]]*slowlog[[:space:]]*=/{v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/,"",v); print v; exit}' "$pool")
@@ -3192,7 +3247,6 @@ tune_php_fpm_version() {
   ensure_fpm_log_path "$slowlog" "${fpm_user:-www-data}" "${fpm_group:-www-data}"
   ensure_fpm_log_path "$accesslog" "${fpm_user:-www-data}" "${fpm_group:-www-data}"
   ensure_fpm_log_path "$poollog" "${fpm_user:-www-data}" "${fpm_group:-www-data}"
-  ensure_fpm_log_path "$php_error_log" "${fpm_user:-www-data}" "${fpm_group:-www-data}"
   tune_pool_set "$pool" request_terminate_timeout 300s "PHP ${ver}: request_terminate_timeout=300s"
   tune_pool_set "$pool" request_slowlog_timeout 10s "PHP ${ver}: request_slowlog_timeout=10s"
   tune_pool_set "$pool" catch_workers_output yes "PHP ${ver}: catch_workers_output=yes"
@@ -3249,10 +3303,15 @@ opcache.file_cache_only = 0
 mysqlnd.net_cmd_buffer_size = 524288
 mysqli.default_socket = /run/mysqld/mysqld.sock
 pdo_mysql.default_socket = /run/mysqld/mysqld.sock
+EOF
+  if [[ ${SETUP_PHP_SESSION_HARDENING:-0} == 1 ]]; then
+    local php_error_log=/var/www/logs/php/php-error.log
+    ensure_fpm_log_path "$php_error_log" "${fpm_user:-www-data}" "${fpm_group:-www-data}"
+    cat >> "$ini" <<EOF
 
-; Security and session hardening.  zz-setup-optimize.ini sorts last in
-; conf.d, so an older custom_dan.ini cannot keep an unsafe default.  For an
-; HTTP-only test vhost, set session.cookie_secure=0 in a later per-host ini.
+; Optional session/cgi hardening, enabled with SETUP_PHP_SESSION_HARDENING=1.
+; Not written by default: strict session IDs and Secure cookies can break
+; Joomla/Polr sites and applications that validate PHP session identifiers.
 cgi.fix_pathinfo = 0
 expose_php = Off
 display_errors = Off
@@ -3267,12 +3326,15 @@ session.gc_maxlifetime = 14400
 session.sid_length = 48
 session.sid_bits_per_character = 6
 EOF
+  fi
   chmod 644 "$ini"
   local ini_after
   ini_after=$(md5sum "$ini" | awk '{print $1}')
   if [[ $ini_before != "$ini_after" ]]; then
     tune_note "PHP ${ver}: memory_limit=${memory_mb}M opcache=${opcache_mb}M jit=${jit_mb}M"
-    tune_note "PHP ${ver}: session/cgi/error-log hardening"
+    if [[ ${SETUP_PHP_SESSION_HARDENING:-0} == 1 ]]; then
+      tune_note "PHP ${ver}: optional session/cgi hardening"
+    fi
   fi
 
   local fpm_bin="" fpm_test

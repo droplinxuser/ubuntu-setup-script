@@ -267,8 +267,8 @@ Before changing basic settings, the script records the originals under `/var/lib
   - override either with `children=` / `max_requests=`
 - Sizes OPcache, JIT and `memory_limit` from RAM instead of fixed 512 MB values:
   - OPcache 128–512 MB, JIT 32–128 MB, `memory_limit` 256–512 MB, realpath cache 4–16 MB.
-- The repo templates provide OPcache file cache under `/var/cache/php/opcache`, `request_slowlog_timeout=10s`, `catch_workers_output=yes`, session hardening, `cgi.fix_pathinfo=0`, MariaDB Unix-socket defaults and `mysqlnd` statistics disabled.
-- `--optimize` writes the same session/cgi/error-log hardening into `/etc/php/<ver>/fpm/conf.d/zz-setup-optimize.ini` (strict mode, cookies-only, `HttpOnly`, `Secure`, `SameSite=Lax`, `cgi.fix_pathinfo=0`, `display_errors=Off`, `log_errors=On`, central `error_log`). The managed file sorts last, so an old `custom_dan.ini` no longer leaves unsafe defaults in place. An operator can override it in a later ini file or per vhost; set `session.cookie_secure=0` only for an HTTP-only test vhost.
+- The repo templates provide OPcache file cache under `/var/cache/php/opcache`, `request_slowlog_timeout=10s`, `catch_workers_output=yes`, `cgi.fix_pathinfo=0`, MariaDB Unix-socket defaults and `mysqlnd` statistics disabled. PHP session settings are left at their defaults.
+- `--optimize` writes the performance tuning into `/etc/php/<ver>/fpm/conf.d/zz-setup-optimize.ini` and leaves PHP sessions alone. Global session overrides broke Joomla/Polr logins, so `session.*` hardening (strict mode, cookies-only, `HttpOnly`, `Secure`, `SameSite=Lax`, long IDs), `cgi.fix_pathinfo=0`, `display_errors=Off` and the central `error_log` are **opt-in**: run `sudo SETUP_PHP_SESSION_HARDENING=1 ./setup.sh --optimize`. Test every application before enabling it.
 - `setup.sh` creates the log/cache directories and the systemd `LimitNOFILE=524288`, `UMask=0027` drop-in. PHP-FPM and Angie use the Unix socket `/run/php/php-fpm.sock`.
 - Sets the PHP timezone from `--basic time=`.
 - Enables and restarts `php<ver>-fpm` and prints `php<ver> -v`. If the template/tuning/start fails, the previous PHP configuration is restored from `/tmp`.
@@ -465,6 +465,12 @@ It also reconciles the logging and connection profile on old hosts:
   intentionally used by a remote client is supported. If only that remote
   address is reachable (the host itself is blocked by firewall/NAT), the
   active unit and listener are reported instead of a false rollback.
+- The shared `snippets/fastcgi-php.conf` is repaired so PATH_INFO capture is
+  optional. Without that, a bare `/index.php` can leave
+  `$fastcgi_script_name` empty, pass the document root to PHP-FPM, and make
+  every pretty URL return PHP-FPM’s “Access denied” (403). The WordPress and
+  Polr includes also gain `index index.php index.html;` when an old vhost
+  lacked it.
 - Redis and Valkey get a local Unix socket (`/run/redis/redis.sock` or
   `/run/valkey/valkey.sock`), `unixsocketperm 770`, `www-data` in the service
   group, and printed XenForo/WordPress/Laravel snippets. Application config is
@@ -826,7 +832,7 @@ The script produces a working, internet-facing baseline. For a large or security
 **PHP**
 - `disable_functions` blocks `show_source,phpinfo` by default. For applications that do not need process execution, add `system,passthru,exec,shell_exec,proc_open,popen,pcntl_exec`. Chevereto video processing and some WordPress plugins may need `exec`/`shell_exec`, so test per application.
 - Use `open_basedir` per vhost/pool, especially for multi-tenant hosting. The default pool is shared by every domain.
-- Session hardening is enabled (`use_strict_mode`, cookies only, `HttpOnly`, `SameSite=Lax`, and `cookie_secure=1` by default). Set `session.cookie_secure=0` only for an HTTP-only test vhost.
+- Session hardening is opt-in (`sudo SETUP_PHP_SESSION_HARDENING=1 ./setup.sh --optimize`) and off by default. The global overrides (`use_strict_mode`, cookies only, `HttpOnly`, `SameSite=Lax`, `cookie_secure=1`, 48-character IDs) broke Joomla/Polr logins on mixed hosts. Enable it only after testing every application, and set `session.cookie_secure=0` for an HTTP-only test vhost.
 - For production, set `opcache.validate_timestamps=0` and reload PHP-FPM on deploy to avoid per-request stat calls. Keep `expose_php=Off`.
 - `memory_limit` is auto-sized to 256–512 MB. Lower it per application where possible; the worker count assumes ~96 MB average, and worst-case memory must still fit in RAM.
 - Do not run untrusted PHP code as the same `www-data` user across unrelated sites; use separate pools/users per tenant.
