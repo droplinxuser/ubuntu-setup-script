@@ -887,6 +887,20 @@ limits_line=$(printf '%s\n' "$tuning_body" | grep -n 'configure_limits' | head -
 check "OS tuning applies sysctl before the PAM nofile limits" \
   test -n "$sysctl_line" -a -n "$limits_line" -a "$sysctl_line" -lt "$limits_line"
 
+# MariaDB restart must pause the request tiers first, and apply unit changes
+# before stopping them.
+mariadb_body=$(sed -n '/^optimize_mariadb()/,/^}/p' "$ROOT/setup.sh")
+pause_line=$(printf '%s\n' "$mariadb_body" | grep -n 'opt_pause_web_frontends' | head -n1 | cut -d: -f1)
+resume_line=$(printf '%s\n' "$mariadb_body" | grep -n 'opt_resume_web_frontends' | head -n1 | cut -d: -f1)
+restart_line=$(printf '%s\n' "$mariadb_body" | grep -n 'systemctl restart mariadb' | head -n1 | cut -d: -f1)
+daemon_line=$(printf '%s\n' "$mariadb_body" | grep -n 'systemctl daemon-reload' | head -n1 | cut -d: -f1)
+check "MariaDB restart pauses web frontends first" \
+  test -n "$pause_line" -a -n "$restart_line" -a "$pause_line" -lt "$restart_line"
+check "MariaDB restart resumes web frontends afterwards" \
+  test -n "$resume_line" -a -n "$restart_line" -a "$restart_line" -lt "$resume_line"
+check "MariaDB restart reloads systemd units before pausing web" \
+  test -n "$daemon_line" -a -n "$pause_line" -a "$daemon_line" -lt "$pause_line"
+
 # ---------------------------------------------------------------------------
 # Embedded payload integrity
 # ---------------------------------------------------------------------------
