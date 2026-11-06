@@ -2,6 +2,16 @@
 
 Historical release notes for ubuntu-setup-script. Current behavior is documented in README.md.
 
+## What's new in 1.8.44
+
+- **Diagnostics report an absent Elasticsearch as “not installed” and skip
+  its live probes.** A host without the Elasticsearch package/unit no longer
+  prints five `curl: (7) Failed to connect to 127.0.0.1 port 9200` errors.
+  The diagnostic checks for an `elasticsearch.service` unit, the CLI binary or
+  `/usr/share/elasticsearch/bin/elasticsearch` first. When installed but
+  stopped, it shows the unit status and skips the HTTP probes while still
+  printing the YAML/JVM/limits/log configuration.
+
 ## What's new in 1.8.43
 
 - **Removed the default `cgi.fix_pathinfo=0` that brought “Access denied”

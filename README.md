@@ -581,7 +581,8 @@ file is written. It covers:
   persistence/socket/bind settings, and the configured logfile; a host with
   neither service reports “not installed” instead of connection errors
 - Elasticsearch health, nodes, indices, JVM/OS/thread-pool stats, allocation
-  explain (only when shards are unassigned) and resolved log files
+  explain (only when shards are unassigned) and resolved log files; a host
+  without Elasticsearch reports “not installed” and skips the live probes
 - Node.js version, processes, listeners and units
 - journal warnings, per-service logs, kernel OOM/hung-task reports, dmesg
 - PHP-FPM slow log, MariaDB slow log, Angie/PHP/Valkey/ES/Node logs, including
