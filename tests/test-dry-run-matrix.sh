@@ -81,6 +81,13 @@ run ok   --dry-run --diagnostics
 run fail --dry-run --diagnostics --basic
 run fail --dry-run --diagnostics --optimize
 run fail --dry-run --diagnostics --purge
+run ok   --dry-run --restart-all
+run fail --dry-run --restart-all --basic
+run fail --dry-run --restart-all --purge
+run fail --dry-run --restart-all --optimize
+run fail --dry-run --restart-all --diagnostics
+run fail --dry-run --restart-all --domain example.com
+run fail --dry-run --restart-all --angie
 run fail --dry-run --optimize --basic
 run fail --dry-run --optimize --angie
 run fail --dry-run --optimize --purge

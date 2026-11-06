@@ -901,6 +901,31 @@ check "MariaDB restart resumes web frontends afterwards" \
 check "MariaDB restart reloads systemd units before pausing web" \
   test -n "$daemon_line" -a -n "$pause_line" -a "$daemon_line" -lt "$pause_line"
 
+# --restart-all must preserve the dependency order: stop Angie/PHP, restart
+# cache/search, restart MariaDB, wait for SQL, then start PHP and Angie.
+restart_body=$(sed -n '/^run_restart_all()/,/^}/p' "$ROOT/setup.sh")
+ra_daemon=$(printf '%s\n' "$restart_body" | grep -n 'systemctl daemon-reload' | head -n1 | cut -d: -f1)
+ra_stop_angie=$(printf '%s\n' "$restart_body" | grep -n 'systemctl stop angie' | head -n1 | cut -d: -f1)
+ra_stop_php=$(printf '%s\n' "$restart_body" | grep -n 'systemctl stop "\$unit"' | head -n1 | cut -d: -f1)
+ra_restart_cache=$(printf '%s\n' "$restart_body" | grep -n 'systemctl restart "\$unit"' | head -n1 | cut -d: -f1)
+ra_restart_es=$(printf '%s\n' "$restart_body" | grep -n 'systemctl restart elasticsearch' | head -n1 | cut -d: -f1)
+ra_restart_db=$(printf '%s\n' "$restart_body" | grep -n 'systemctl restart mariadb' | head -n1 | cut -d: -f1)
+ra_wait_db=$(printf '%s\n' "$restart_body" | grep -n "mariadb -e 'SELECT 1'" | head -n1 | cut -d: -f1)
+ra_start_php=$(printf '%s\n' "$restart_body" | grep -n 'systemctl start "\$unit"' | head -n1 | cut -d: -f1)
+ra_start_angie=$(printf '%s\n' "$restart_body" | grep -n 'systemctl start angie' | head -n1 | cut -d: -f1)
+check "restart-all reloads systemd before stopping Angie" \
+  test -n "$ra_daemon" -a -n "$ra_stop_angie" -a "$ra_daemon" -lt "$ra_stop_angie"
+check "restart-all stops Angie before PHP-FPM" \
+  test -n "$ra_stop_angie" -a -n "$ra_stop_php" -a "$ra_stop_angie" -lt "$ra_stop_php"
+check "restart-all restarts cache/search before MariaDB" \
+  test -n "$ra_restart_cache" -a -n "$ra_restart_es" -a -n "$ra_restart_db" \
+       -a "$ra_restart_cache" -lt "$ra_restart_db" -a "$ra_restart_es" -lt "$ra_restart_db"
+check "restart-all waits for MariaDB before starting PHP" \
+  test -n "$ra_restart_db" -a -n "$ra_wait_db" -a -n "$ra_start_php" \
+       -a "$ra_restart_db" -lt "$ra_wait_db" -a "$ra_wait_db" -lt "$ra_start_php"
+check "restart-all starts PHP before Angie" \
+  test -n "$ra_start_php" -a -n "$ra_start_angie" -a "$ra_start_php" -lt "$ra_start_angie"
+
 # ---------------------------------------------------------------------------
 # Embedded payload integrity
 # ---------------------------------------------------------------------------

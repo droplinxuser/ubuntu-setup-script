@@ -180,8 +180,8 @@ log_selection() {
   (( ${#ENABLED[@]} > 0 )) && services="${!ENABLED[*]}"
   (( ${#DOMAINS[@]} > 0 )) && domains="${DOMAINS[*]}"
   printf '\n--- selection ---\n'
-  printf 'Modes        : dry_run=%s optimize=%s purge=%s diagnostics=%s\n' \
-    "${DRY_RUN:-0}" "${OPTIMIZE:-0}" "${PURGE:-0}" "${DIAGNOSTICS:-0}"
+  printf 'Modes        : dry_run=%s optimize=%s purge=%s diagnostics=%s restart_all=%s\n' \
+    "${DRY_RUN:-0}" "${OPTIMIZE:-0}" "${PURGE:-0}" "${DIAGNOSTICS:-0}" "${RESTART_ALL:-0}"
   printf 'Services     : %s\n' "$services"
   printf 'Domains      : %s\n' "$domains"
   if [[ ${ENABLED[mariadb]:-0} -eq 1 ]]; then
@@ -421,6 +421,7 @@ DOMAINS=()
 PURGE=0
 OPTIMIZE=0
 DIAGNOSTICS=0
+RESTART_ALL=0
 DRY_RUN=0
 PURGE_TARGETS=()
 PURGE_ORDER=()
@@ -542,6 +543,14 @@ Diagnostics:
       slow-query and slow-request logs, service error logs and kernel/OOM
       reports into diagnostics.log beside setup.sh.  Run as root; this mode
       only reads state and writes that one file.
+
+Restart all:
+  --restart-all
+      Detects installed/running services, reloads systemd, stops Angie and
+      every active PHP-FPM version, restarts active Valkey/Redis,
+      Elasticsearch and MariaDB, waits for MariaDB SELECT 1, then starts
+      PHP-FPM followed by Angie.  Only services that were active are stopped
+      and started again.  Use --dry-run to print the detected plan.
 
 Notes:
   * Every run mirrors its full output to setup_<timestamp>.log in the
@@ -697,6 +706,8 @@ parse_args() {
         OPTIMIZE=1; shift ;;
       --diagnostics)
         DIAGNOSTICS=1; shift ;;
+      --restart-all)
+        RESTART_ALL=1; shift ;;
       --purge)
         PURGE=1; shift
         while (( $# )) && [[ $1 != --* ]]; do
@@ -1087,6 +1098,7 @@ validate_all() {
 
   if (( OPTIMIZE )); then
     (( DIAGNOSTICS )) && die "--optimize cannot be combined with --diagnostics"
+    (( RESTART_ALL )) && die "--optimize cannot be combined with --restart-all"
     (( PURGE )) && die "--optimize cannot be combined with --purge"
     [[ ${#DOMAINS[@]} -eq 0 ]] || die "--optimize cannot be combined with --domain"
     [[ ${#ENABLED[@]} -eq 0 ]] || die "--optimize scans installed services and cannot be combined with install flags"
@@ -1095,8 +1107,18 @@ validate_all() {
 
   if (( DIAGNOSTICS )); then
     (( PURGE )) && die "--diagnostics cannot be combined with --purge"
+    (( RESTART_ALL )) && die "--diagnostics cannot be combined with --restart-all"
     [[ ${#DOMAINS[@]} -eq 0 ]] || die "--diagnostics cannot be combined with --domain"
     [[ ${#ENABLED[@]} -eq 0 ]] || die "--diagnostics only reads the host and cannot be combined with install flags"
+    return 0
+  fi
+
+  if (( RESTART_ALL )); then
+    (( PURGE )) && die "--restart-all cannot be combined with --purge"
+    (( OPTIMIZE )) && die "--restart-all cannot be combined with --optimize"
+    (( DIAGNOSTICS )) && die "--restart-all cannot be combined with --diagnostics"
+    [[ ${#DOMAINS[@]} -eq 0 ]] || die "--restart-all cannot be combined with --domain"
+    [[ ${#ENABLED[@]} -eq 0 ]] || die "--restart-all only restarts installed services and cannot be combined with install flags"
     return 0
   fi
 
@@ -7130,6 +7152,178 @@ run_diagnostics() {
   printf '%s\n' "$DIAG_FILE"
 }
 
+# ---------------------------------------------------------------------------
+# --restart-all: restart the whole installed stack in dependency order
+# ---------------------------------------------------------------------------
+list_active_php_units() {
+  systemctl list-units --type=service --state=active --no-legend --no-pager \
+    'php*-fpm.service' 2>/dev/null \
+    | awk '{print $1}' | grep -E '^php.*-fpm\.service$' || true
+}
+
+restart_all_plan() {
+  local unit
+  local -a active=() php_units=()
+  detect_installed_services
+  mapfile -t php_units < <(list_active_php_units)
+  for unit in angie mariadb valkey-server valkey redis-server elasticsearch; do
+    systemctl is-active --quiet "$unit" 2>/dev/null && active+=("$unit")
+  done
+  active+=("${php_units[@]}")
+  printf '\n%sDRY RUN%s - restart-all scan only, no changes will be made.\n' "$C_BOLD" "$C_RESET"
+  printf 'Detected installed: %s\n' "${OPT_DETECTED[*]:-none}"
+  printf 'Active services:     %s\n' "${active[*]:-none}"
+  printf 'Order:\n'
+  printf '  daemon-reload\n'
+  printf '  stop angie (if active)\n'
+  printf '  stop active php*-fpm.service\n'
+  printf '  restart active Valkey/Redis service\n'
+  printf '  restart active Elasticsearch\n'
+  printf '  restart active MariaDB\n'
+  printf '  wait for SELECT 1 (up to 300s)\n'
+  printf '  start the PHP-FPM versions that were stopped\n'
+  printf '  start angie if it was stopped\n'
+  if (( ${#active[@]} == 0 )); then
+    printf 'No active supported services detected.\n'
+  fi
+}
+
+run_restart_all() {
+  local unit rc=0
+  local angie_active=0 angie_stopped=0 mariadb_active=0 mariadb_ok=0
+  local elastic_active=0
+  local -a php_units=() stopped_php=() cache_units=() failures=()
+  local i
+
+  step "Restarting all detected services"
+  detect_installed_services
+  if (( ${#OPT_DETECTED[@]} > 0 )); then
+    info "Detected installed services: ${OPT_DETECTED[*]}"
+  else
+    warn "No supported installed services were detected from configuration paths"
+  fi
+
+  systemctl daemon-reload || warn "systemctl daemon-reload failed"
+  systemctl is-active --quiet angie 2>/dev/null && angie_active=1
+  mapfile -t php_units < <(list_active_php_units)
+  for unit in valkey-server valkey redis-server; do
+    if systemctl is-active --quiet "$unit" 2>/dev/null; then
+      cache_units+=("$unit")
+      break
+    fi
+  done
+  systemctl is-active --quiet elasticsearch 2>/dev/null && elastic_active=1
+  systemctl is-active --quiet mariadb 2>/dev/null && mariadb_active=1
+
+  # Report installed-but-inactive units without starting them.
+  for unit in angie mariadb valkey-server redis-server elasticsearch; do
+    if ! systemctl is-active --quiet "$unit" 2>/dev/null \
+       && systemctl cat "$unit" >/dev/null 2>&1; then
+      info "Skipping ${unit}: installed but inactive"
+    fi
+  done
+
+  # 1. Stop the request tiers, Angie first, then all active PHP versions.
+  if (( angie_active )); then
+    if systemctl stop angie 2>/dev/null; then
+      angie_stopped=1
+      info "Stopped Angie"
+    else
+      warn "Could not stop Angie"
+      failures+=("stop angie")
+      rc=1
+    fi
+  fi
+  for unit in "${php_units[@]}"; do
+    if systemctl stop "$unit" 2>/dev/null; then
+      stopped_php+=("$unit")
+      info "Stopped ${unit}"
+    else
+      warn "Could not stop ${unit}"
+      failures+=("stop ${unit}")
+      rc=1
+    fi
+  done
+
+  # 2. Restart cache/search before MariaDB.
+  for unit in "${cache_units[@]}"; do
+    if systemctl restart "$unit" 2>/dev/null; then
+      info "Restarted ${unit}"
+    else
+      warn "Could not restart ${unit}"
+      failures+=("restart ${unit}")
+      rc=1
+    fi
+  done
+  if (( elastic_active )); then
+    if systemctl restart elasticsearch 2>/dev/null; then
+      info "Restarted elasticsearch"
+    else
+      warn "Could not restart elasticsearch"
+      failures+=("restart elasticsearch")
+      rc=1
+    fi
+  fi
+
+  # 3. Restart MariaDB and wait for SQL before letting web traffic back in.
+  if (( mariadb_active )); then
+    if systemctl restart mariadb 2>/dev/null; then
+      info "Restarted mariadb; waiting for SELECT 1"
+      if command -v mariadb >/dev/null 2>&1; then
+        for i in {1..300}; do
+          mariadb -e 'SELECT 1' >/dev/null 2>&1 && { mariadb_ok=1; break; }
+          sleep 1
+        done
+      else
+        warn "mariadb client not found; cannot verify SELECT 1"
+      fi
+      if (( mariadb_ok )); then
+        info "MariaDB is accepting SQL"
+      else
+        if command -v mariadb >/dev/null 2>&1; then
+          warn "MariaDB did not answer SELECT 1 within 300s"
+        else
+          warn "MariaDB was restarted but could not be probed (client missing)"
+        fi
+        failures+=("mariadb SQL probe")
+        rc=1
+      fi
+    else
+      warn "Could not restart mariadb"
+      failures+=("restart mariadb")
+      rc=1
+    fi
+  fi
+
+  # 4. Start PHP-FPM first, then Angie, regardless of a MariaDB probe failure:
+  #    restore the services that were active before the restart and report it.
+  for unit in "${stopped_php[@]}"; do
+    if systemctl start "$unit" 2>/dev/null; then
+      info "Started ${unit}"
+    else
+      warn "Could not start ${unit}"
+      failures+=("start ${unit}")
+      rc=1
+    fi
+  done
+  if (( angie_stopped )); then
+    if systemctl start angie 2>/dev/null; then
+      info "Started Angie"
+    else
+      warn "Could not start Angie"
+      failures+=("start angie")
+      rc=1
+    fi
+  fi
+
+  if (( rc == 0 )); then
+    ok "All detected services restarted successfully"
+  else
+    warn "Restart completed with failures: ${failures[*]}"
+  fi
+  return "$rc"
+}
+
 run_os_tuning() {
   step "OS auto-tuning (CPU, memory, networking)"
   ensure_state
@@ -7288,6 +7482,10 @@ main() {
       printf 'DRY RUN - would write diagnostics to %s\n' "${SCRIPT_DIR}/diagnostics.log"
       exit 0
     fi
+    if (( RESTART_ALL )); then
+      restart_all_plan
+      exit 0
+    fi
     if (( OPTIMIZE )); then
       optimize_plan
       exit 0
@@ -7310,9 +7508,9 @@ main() {
   # shellcheck disable=SC1091
   . /etc/os-release
   [[ ${ID:-} == ubuntu ]] || die "This script only supports Ubuntu (found: ${ID:-unknown})"
-  if (( OPTIMIZE )); then
+  if (( OPTIMIZE || RESTART_ALL )); then
     if ! optimize_os_supported "${VERSION_ID:-}"; then
-      die "--optimize supports Ubuntu 22.04, 24.04 or 26.04 (found ${VERSION_ID:-unknown})"
+      die "--optimize/--restart-all supports Ubuntu 22.04, 24.04 or 26.04 (found ${VERSION_ID:-unknown})"
     fi
   elif (( ${VERSION_ID%%.*} < 26 )); then
     die "This script requires Ubuntu 26.04 or newer (found ${VERSION_ID})"
@@ -7320,8 +7518,17 @@ main() {
 
   # Size every service against one shared RAM budget on a fresh install, just
   # as --optimize does on an existing host.
-  if (( ! OPTIMIZE && ! PURGE )); then
+  if (( ! OPTIMIZE && ! PURGE && ! RESTART_ALL )); then
     plan_install_budget
+  fi
+
+  if (( RESTART_ALL )); then
+    printf '%s%sUbuntu %s service restart%s\n' "$C_BOLD" "$C_BLUE" "${VERSION_ID}" "$C_RESET"
+    if ! run_restart_all; then
+      trap - ERR
+      exit 1
+    fi
+    exit 0
   fi
 
   if (( OPTIMIZE )); then
