@@ -1340,6 +1340,10 @@ check "diagnostics does not call the Redis client when none is reachable" \
   grep -q 'diag_redis_cli' <<<"$diag_body"
 check "diagnostics skips allocation explain when no shards are unassigned" \
   grep -q 'No unassigned shards; allocation explain is not needed' "$ROOT/setup.sh"
+check "diagnostics reports absent Elasticsearch as not installed" \
+  grep -q 'Elasticsearch is not installed' <<<"$diag_body"
+check "diagnostics gates Elasticsearch probes on installation" \
+  grep -q 'diag_elasticsearch_installed' <<<"$diag_body"
 
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
