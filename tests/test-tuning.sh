@@ -24,7 +24,13 @@ source "$ROOT/setup.sh"
 trap - ERR
 
 t_pass() { PASS=$((PASS + 1)); printf 'PASS  %s\n' "$*"; }
-t_fail() { FAIL=$((FAIL + 1)); printf 'FAIL  %s\n' "$*"; }
+t_fail() {
+  FAIL=$((FAIL + 1))
+  printf 'FAIL  %s\n' "$*"
+  # GitHub Actions turns this into a check annotation, so a CI-only failure
+  # names the broken check without requiring the job log.
+  printf '::error file=tests/test-tuning.sh,title=Tuning test failed::%s\n' "$*"
+}
 check() {
   local desc=$1
   shift
@@ -62,6 +68,30 @@ check "Valkey size parser handles GB" test "$(valkey_mb_from_config 8gb)" = 8192
 check "Valkey size parser handles raw bytes" test "$(valkey_mb_from_config 1048576)" = 1
 check "Valkey size parser rejects an unknown unit" test "$(valkey_mb_from_config 1xb)" = 0
 
+# systemd prints "● unit.service ..." in --failed output; the run-log header
+# must contain the unit names, not a list of bullets.
+check "failed unit parser strips the systemd bullet" \
+  test "$(printf '● logrotate.service loaded failed failed Rotate log files\n' | failed_unit_names)" = "logrotate.service"
+check "failed unit parser keeps older output without a bullet" \
+  test "$(printf 'nginx.service loaded failed failed A high performance web server\n' | failed_unit_names)" = "nginx.service"
+check "failed unit parser strips ANSI colour" \
+  test "$(printf '\033[1;31m●\033[0m logrotate.service loaded failed failed Rotate log files\n' | failed_unit_names)" = "logrotate.service"
+
+# A lower ipfrag high mark is rejected while the old low mark is above it.
+# The generated block must write the low mark first.
+ipfrag_block=$(ipfrag_sysctl_lines 2047616 1535712)
+check "ipfrag tuning writes the low mark first" \
+  test "$(printf '%s\n' "$ipfrag_block" | head -n1)" = "net.ipv4.ipfrag_low_thresh = 1535712"
+check "ipfrag tuning writes the high mark second" \
+  test "$(printf '%s\n' "$ipfrag_block" | tail -n1)" = "net.ipv4.ipfrag_high_thresh = 2047616"
+
+# The live TCP pool is preserved unless the operator opts in.
+unset SETUP_OPTIMIZE_MIGRATE_PHP_SOCKET
+migration_disabled() { ! php_socket_migration_enabled; }
+migration_enabled() { SETUP_OPTIMIZE_MIGRATE_PHP_SOCKET=1 php_socket_migration_enabled; }
+check "PHP socket migration is off by default" migration_disabled
+check "PHP socket migration opts in with the environment" migration_enabled
+
 # Cron ownership repair.  Releases before 1.8.34 wrote a nightly
 # `chown -R /var/www/` that also flattened the shared log tree; the managed
 # block must replace it without touching unrelated operator entries.
@@ -88,6 +118,9 @@ check "MariaDB logging helper sets the central slow log" \
   test "$(mariadb_logging_settings | grep -c '^slow_query_log_file = /var/www/logs/mariadb/slow.log$')" -eq 1
 check "MariaDB logging helper sets log_error" \
   test "$(mariadb_logging_settings | grep -c '^log_error = /var/www/logs/mariadb/error.log$')" -eq 1
+no_slow_admin_alias() { ! mariadb_logging_settings | grep -q '^log_slow_admin_statements[[:space:]]*='; }
+check "MariaDB logging helper omits the deprecated slow-admin alias" \
+  no_slow_admin_alias
 
 # Older releases wrote performance directives bare in 50-server.cnf, without
 # the managed markers.  Once the 99- drop-in exists, all of them must leave
@@ -103,6 +136,7 @@ skip_name_resolve = 1
 # BEGIN setup.sh managed mariadb
 [mariadbd]
 innodb_io_capacity = 3000
+log_slow_admin_statements = 1
 bind-address = 127.0.0.1
 # END setup.sh managed mariadb
 EOF
@@ -113,6 +147,8 @@ check "legacy bare InnoDB sizes are removed from 50-server" \
   bash -c "! grep -qE '^(innodb_log_buffer_size|innodb_log_file_size|innodb_buffer_pool_size|innodb_io_capacity)[[:space:]]*=' '$TMP/50-server.cnf'"
 check "legacy bare tmp_table_size is removed from 50-server" \
   bash -c "! grep -q '^tmp_table_size[[:space:]]*=' '$TMP/50-server.cnf'"
+check "deprecated log_slow_admin_statements is removed from 50-server" \
+  bash -c "! grep -q '^log_slow_admin_statements[[:space:]]*=' '$TMP/50-server.cnf'"
 check "base MariaDB settings stay in 50-server" \
   grep -qx 'skip_name_resolve = 1' "$TMP/50-server.cnf"
 check "managed base MariaDB settings stay in 50-server" \
@@ -1299,6 +1335,7 @@ ra_restart_db=$(printf '%s\n' "$restart_body" | grep -n 'systemctl restart maria
 ra_wait_db=$(printf '%s\n' "$restart_body" | grep -n "mariadb -e 'SELECT 1'" | head -n1 | cut -d: -f1)
 ra_start_php=$(printf '%s\n' "$restart_body" | grep -n 'systemctl start "\$unit"' | head -n1 | cut -d: -f1)
 ra_start_angie=$(printf '%s\n' "$restart_body" | grep -n 'systemctl start angie' | head -n1 | cut -d: -f1)
+ra_wait_es=$(printf '%s\n' "$restart_body" | grep -n 'Elasticsearch did not answer HTTP' | head -n1 | cut -d: -f1)
 check "restart-all reloads systemd before stopping Angie" \
   test -n "$ra_daemon" -a -n "$ra_stop_angie" -a "$ra_daemon" -lt "$ra_stop_angie"
 check "restart-all stops Angie before PHP-FPM" \
@@ -1306,6 +1343,9 @@ check "restart-all stops Angie before PHP-FPM" \
 check "restart-all restarts cache/search before MariaDB" \
   test -n "$ra_restart_cache" -a -n "$ra_restart_es" -a -n "$ra_restart_db" \
        -a "$ra_restart_cache" -lt "$ra_restart_db" -a "$ra_restart_es" -lt "$ra_restart_db"
+check "restart-all waits for Elasticsearch before MariaDB" \
+  test -n "$ra_restart_es" -a -n "$ra_wait_es" -a -n "$ra_restart_db" \
+       -a "$ra_restart_es" -lt "$ra_wait_es" -a "$ra_wait_es" -lt "$ra_restart_db"
 check "restart-all waits for MariaDB before starting PHP" \
   test -n "$ra_restart_db" -a -n "$ra_wait_db" -a -n "$ra_start_php" \
        -a "$ra_restart_db" -lt "$ra_wait_db" -a "$ra_wait_db" -lt "$ra_start_php"
@@ -1366,6 +1406,10 @@ check "diagnostics reports absent Elasticsearch as not installed" \
   grep -q 'Elasticsearch is not installed' <<<"$diag_body"
 check "diagnostics gates Elasticsearch probes on installation" \
   grep -q 'diag_elasticsearch_installed' <<<"$diag_body"
+check "diagnostics gates MariaDB probes on installation" \
+  grep -q 'diag_mariadb_installed' <<<"$diag_body"
+check "diagnostics reports absent MariaDB as not installed" \
+  grep -q 'MariaDB is not installed' <<<"$diag_body"
 
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

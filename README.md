@@ -567,7 +567,10 @@ allocations are reduced to the data-sized target. Elasticsearch keeps its
 31 GB compressed-oops ceiling. PHP listeners are preserved: Angie is
 repointed only when the pool
 already owns a Unix socket, so a live TCP pool is never broken by a
-configuration change. Service allocations
+configuration change. The in-place TCP-to-Unix migration is opt-in with
+`SETUP_OPTIMIZE_MIGRATE_PHP_SOCKET=1`; the default is off because some
+PHP-FPM builds (PHP 8.5 was observed) do not open the new listener on reload
+and can leave Angie without a live upstream during the cutover. Service allocations
 are planned together from one 80%-of-RAM budget, with PHP worker capacity
 reserved first, so MariaDB + PHP + cache + Elasticsearch cannot collectively
 exhaust memory. Each configuration is
@@ -658,7 +661,7 @@ ownership first (so a service cannot fail to reopen its logs), then:
 2. stop Angie if active
 3. stop every active `php*-fpm.service`
 4. restart active Valkey/Redis (`valkey-server`, `valkey` or `redis-server`)
-5. restart active Elasticsearch
+5. restart active Elasticsearch and wait for its HTTP endpoint, up to 300 seconds
 6. restart active MariaDB
 7. wait for `SELECT 1`, up to 300 seconds
 8. start the PHP-FPM versions that were stopped

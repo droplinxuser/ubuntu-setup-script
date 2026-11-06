@@ -2,6 +2,46 @@
 
 Historical release notes for ubuntu-setup-script. Current behavior is documented in README.md.
 
+## What's new in 1.8.47
+
+- **`sysctl` no longer logs `net.ipv4.ipfrag_high_thresh: Invalid argument`.**
+  The kernel rejects a new high threshold while the current low threshold is
+  still above it. The tuning block writes the low mark first (with a runtime
+  pre-adjustment when the live pair is inverted), so 64 GB hosts no longer
+  fail that key or print the generic "One or more sysctl values could not be
+  applied" warning.
+- **MariaDB 11.8 no longer warns about `--log-slow-admin-statements`.** The
+  deprecated alias is no longer written; MariaDB's default `log_slow_filter`
+  already includes `admin`, so admin statements stay in the slow log.
+  `--optimize` also strips the legacy key from an existing `50-server.cnf`.
+- **The TCP-to-Unix PHP-FPM migration is opt-in.** Some PHP-FPM builds (PHP
+  8.5 was observed) close the old TCP listener on SIGUSR2 without opening the
+  new socket, leaving Angie with no live upstream for the ten-second cutover
+  window. `--optimize` now preserves a working TCP listener by default; set
+  `SETUP_OPTIMIZE_MIGRATE_PHP_SOCKET=1` to attempt the move. When opted in,
+  the socket primary uses `max_fails=1 fail_timeout=2s` so Angie can actually
+  use the TCP backup (with `max_fails=0` the backup was never selected).
+- **Changing the Valkey/Redis socket no longer restarts PHP-FPM.** Workers
+  only need a restart when `www-data` was just added to the service group;
+  the socket path itself does not change their supplementary groups. This
+  removes a brief `/run/php/php-fpm.sock` gap (502s) during `--optimize`.
+- **Run-log headers show failed-unit names.** systemd prefixes each failed
+  unit with `●`; the header now prints `logrotate.service` instead of `●`.
+- **Diagnostics report an absent MariaDB as "not installed".** A host with no
+  MariaDB server no longer writes `mariadb: command not found` for every live
+  probe; a client-only host reports its client version and that the server is
+  missing. A stale `/etc/php/<ver>/fpm` directory without a binary is reported
+  as such instead of running a missing `/usr/sbin/php-fpm<ver>`.
+- **`--restart-all` waits for Elasticsearch's HTTP endpoint.** The unit's
+  `Type=simple` start returns before the node is ready; the web tiers are now
+  started only after the endpoint answers (up to 300 seconds), so the first
+  searches do not hit a recovering cluster.
+- **SSH port discovery keeps the port-22 fallback on hosts without an
+  `sshd_config`.** `sshd -T` can fail as a non-root user and the empty `grep`
+  pipeline exited non-zero under `pipefail`/`set -e`, aborting the process
+  substitution before the fallback; UFW could then miss the SSH rule in a
+  container or CI environment.
+
 ## What's new in 1.8.46
 
 - **Dynamic Brotli compression is installed and enabled by both `--angie` and
