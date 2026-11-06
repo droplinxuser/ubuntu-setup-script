@@ -739,8 +739,30 @@ tune_fastcgi_path_translated "$TMP/path-translated/php_wp.conf"
 check "PATH_TRANSLATED repair is idempotent" test "$TUNE_DIRTY" -eq 0
 
 check "--optimize repairs PATH_TRANSLATED in the PHP includes" \
-  grep -q 'tune_fastcgi_path_translated "${target}/h5bp/php_wp.conf"' \
+  grep -q 'tune_fastcgi_path_translated_all "$target"' \
   <<<"$(sed -n '/^tune_angie_configs()/,/^}/p' "$ROOT/setup.sh")"
+
+# Every php*.conf include is covered, including XenForo and future variants.
+mkdir -p "$TMP/path-translated-all/h5bp"
+for f in php.conf php_xf.conf php_xf_proxy.conf php_wp.conf php_future.conf; do
+  printf 'fastcgi_param PATH_TRANSLATED $document_root$fastcgi_path_info;\n' \
+    > "$TMP/path-translated-all/h5bp/$f"
+done
+printf '# no PHP location here\n' > "$TMP/path-translated-all/h5bp/notes.conf"
+tune_reset_changes
+tune_fastcgi_path_translated_all "$TMP/path-translated-all"
+for f in php.conf php_xf.conf php_xf_proxy.conf php_wp.conf php_future.conf; do
+  check "PATH_TRANSLATED repaired in ${f}" \
+    grep -qF 'fastcgi_param PATH_TRANSLATED $document_root$fastcgi_script_name;' \
+    "$TMP/path-translated-all/h5bp/$f"
+done
+check "PATH_TRANSLATED repair ignores unrelated includes" \
+  grep -qF '# no PHP location here' "$TMP/path-translated-all/h5bp/notes.conf"
+check "PATH_TRANSLATED repair covers all PHP includes" \
+  test "${#TUNE_CHANGES[@]}" -eq 5
+tune_reset_changes
+tune_fastcgi_path_translated_all "$TMP/path-translated-all"
+check "all-include PATH_TRANSLATED repair is idempotent" test "$TUNE_DIRTY" -eq 0
 
 check "opt-in hardening disables cgi.fix_pathinfo" \
   grep -q '^cgi.fix_pathinfo = 0$' <<<"$php_tune_hardening"
