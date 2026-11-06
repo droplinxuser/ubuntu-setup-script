@@ -163,6 +163,22 @@ check "stale Angie cron entry is dropped" \
 check "MariaDB cron entry is kept" \
   cron_contains "$(cat "$CRON_OUT")" 'mysqlbkup'
 
+# A host with no root crontab at all is the common fresh-install case.  The
+# legacy-cron repair must not read an unset `backup` under `set -u`; that
+# aborted --optimize before any service was tuned.
+: > "$CRON_IN"
+empty_cron_repair_ok() {
+  (
+    cron_angie_configured() { return 0; }
+    cron_mariadb_configured() { return 1; }
+    crontab() { fake_crontab "$@"; }
+    repair_optimize_legacy_cron
+  ) >/dev/null 2>&1
+}
+check "optimize cron repair handles an empty crontab" empty_cron_repair_ok
+check "empty-crontab repair still writes the managed block" \
+  grep -qF "$CRON_BEGIN" "$CRON_OUT"
+
 # Network profile selection (BBR can regress some proxy hosts).
 check "network profile honours SETUP_TCP_CC/SETUP_QDISC" \
   test "$(SETUP_TCP_CC=cubic SETUP_QDISC=fq_codel bash -c 'source "$1"; printf "%s/%s" "$TCP_CC" "$QDISC"' _ "$ROOT/setup.sh")" = "cubic/fq_codel"

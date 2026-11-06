@@ -2,6 +2,15 @@
 
 Historical release notes for ubuntu-setup-script. Current behavior is documented in README.md.
 
+## What's new in 1.8.38
+
+- **`--optimize` no longer aborts on a host with an empty root crontab.** The
+  legacy-cron repair declared `backup` without initialising it, so the
+  `[[ -n $backup ]]` report line failed under `set -u` with
+  `backup: unbound variable` immediately after the managed crontab was
+  written. `backup` is now initialised and a regression test covers the
+  empty-crontab case.
+
 ## What's new in 1.8.37
 
 - **`--optimize` repairs legacy log ownership and cron on old hosts.** It

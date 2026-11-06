@@ -34,7 +34,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.37"
+readonly SCRIPT_VERSION="1.8.38"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -7781,7 +7781,7 @@ run_os_tuning() {
 # log tree or the database backup directory, and the old nginx/mysqlcheck
 # paths are replaced by the managed block.
 repair_optimize_legacy_cron() {
-  local cur backup had_legacy=0 had_cloudflare=0 had_mysqlcheck=0
+  local cur backup="" had_legacy=0 had_cloudflare=0 had_mysqlcheck=0
   if ! command -v crontab >/dev/null 2>&1; then
     opt_report "- Cron: skipped (crontab is not installed)"
     return 0
