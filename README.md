@@ -33,64 +33,6 @@ PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
 run the install from a repository checkout (or package that directory
 alongside `setup.sh`).
 
-## What's new in 1.8.36
-
-- **New `--diagnostics` command.** It collects host/hardware data, network and
-  kernel tuning, every managed service status, Angie/PHP/MariaDB/Valkey/Redis/
-  Elasticsearch runtime statistics, slow-query and slow-request logs, service
-  error logs and kernel/OOM reports into `diagnostics.log` beside `setup.sh`.
-- **New `--restart-all` command.** It detects installed/active services and
-  restarts them in dependency order: stop Angie/PHP, restart Valkey/Redis and
-  Elasticsearch, restart MariaDB, wait for SQL, then start PHP and Angie.
-  Only active services are touched, and `--dry-run` shows the plan.
-- **Redis-only hosts are optimized with the Valkey profile.** `--optimize`
-  detects Redis when Valkey is absent, applies the same cache tuning and
-  systemd fd limits, and uses `CONFIG SET` before a restart. If both exist,
-  Valkey wins and only one cache budget is applied.
-- **Installation safety fixes.** PHP installs purge previous PHP packages for a
-  clean single-version installation; Angie/PHP configuration changes have an
-  install-time rollback; embedded keys are verified and refreshed; MariaDB
-  performance settings are consolidated into one drop-in.
-- **`--purge basic` now moves generated drop-ins to `/tmp`** (DNS, PAM limits,
-  sysctl, modules-load, logrotate and the network oneshot) instead of leaving
-  them active. Pre-existing SSH allow rules replaced by the UFW limit are
-  restored on purge.
-- **Predictable `/tmp` paths fixed.** The run lock moved to `/run` and optimize
-  backups use `mktemp`, removing symlink/pre-creation risks.
-- **`--optimize` never touches swap.** Swap creation/resizing remains a
-  `--basic` operation only.
-- **MariaDB restarts now pause Angie and PHP-FPM.** The optimize path reloads
-  systemd units, stops Angie and every active PHP-FPM version in that order,
-  restarts MariaDB, waits for SQL, then starts PHP-FPM and Angie again. This
-  prevents a reconnect storm while InnoDB preloads a larger buffer pool; the
-  pause is skipped for online resizes and deferred restarts.
-- **APT and key handling are consolidated.** All selected repositories are
-  added before one `apt-get update`, embedded signing keys are verified and
-  refreshed, and the basic tool set no longer installs `jq`, `htop`, `iotop`,
-  `openssl` or `logrotate` by default.
-- **Repository hygiene.** Historical release notes are in `CHANGELOG.md`, an
-  MIT `LICENSE` and a GitHub Actions workflow run syntax checks, ShellCheck and
-  the dry-run/tuning suites, and `--diagnostics` redacts common credential
-  forms before writing its report.
-
-## What's new in 1.8.35
-
-- **The optional package list is smaller.** `--others` now installs only
-  `smartmon`, `nvme`, `gif`, `nodejs` and `sysstat`. `fail2ban`,
-  `unattended-upgrades`, Composer and the `security` shorthand were removed,
-  so `--others all` no longer pulls them in.
-- **SSH is rate-limited in UFW.** `--basic` now writes `ufw limit <port>/tcp`
-  for every effective `sshd` port instead of a plain `allow` rule, and replaces
-  an older plain ALLOW rule so the limit actually takes effect. A client that
-  opens more than six SSH connections in 30 seconds is blocked temporarily.
-- **Composer, fail2ban and unattended-upgrades are no longer managed by this
-  script.** Install them manually if a host needs them. Existing installations
-  keep anything already present; `--purge` still never removes packages.
-
-Historical release notes are in [CHANGELOG.md](CHANGELOG.md).
-
----
-
 ---
 
 ## Requirements
@@ -288,9 +230,9 @@ Basic performs:
    - With `swap=SIZE`: creates/reuses `/swapfile` at exactly that size.
    - Without `swap`: computes current swap and RAM. If current swap is 0 or below 50% of RAM, it creates/resizes `/swapfile` so the **total** swap becomes 50% of RAM. If current swap is already at least 50%, it leaves the existing configuration untouched.
 7. Replaces `/etc/sysctl.conf` with the tuned profile and applies it (`/etc/sysctl.d/99-sysctl.conf` symlink is added when needed).
-8. Replaces `/etc/security/limits.conf` with the high `nofile` limits.
-9. Installs/enables cron and writes a managed crontab block containing only the entries for the selected services:
-   - Angie: daily ownership repair of `/var/www` that skips the shared log tree (`/var/www/logs`, owned per service), daily `chmod +x` and execution of `/etc/angie/scripts/cloudflare.sh`.
+8. Writes the high `nofile` limits to `/etc/security/limits.d/99-setup.conf`; a distribution `/etc/security/limits.conf` is restored if an older release replaced it.
+9. Installs/enables cron and writes a managed crontab block for the selected services and for services already installed and configured by this script:
+   - Angie: daily ownership repair of `/var/www` that skips the shared log tree (`/var/www/logs`, owned per service), `/var/www/mysql_database` and `*.log` files, daily `chmod +x` and execution of `/etc/angie/scripts/cloudflare.sh`.
    - MariaDB: daily 03:03 mysql backup and monthly `mariadb-check`.
 10. Configures UFW: deny incoming, allow outgoing, rate-limit every effective SSH port with `ufw limit`, allow 80 and 443, enable the firewall. The original active state, added rules and default policies are recorded so `--purge basic` can restore them.
 
@@ -499,8 +441,33 @@ bash setup.sh --optimize --dry-run
 
 `--optimize` never installs, purges or starts a managed service, and it never
 creates, resizes or disables swap. The only package it may add is the small
-`cpufrequtils` helper when the CPU exposes frequency scaling. It applies the
-OS profile first (CPU governor, PAM limits, hardware-scaled
+`cpufrequtils` helper when the CPU exposes frequency scaling. On hosts built
+by releases before 1.8.34 it also repairs the legacy log permissions and cron
+paths: the nightly blanket `chown -R /var/www/`, the old
+`/etc/nginx/scripts/cloudflare.sh` path and the old `/usr/bin/mysqlcheck`
+entry are replaced by the managed, log-safe block, and `/var/www/logs` is
+restored to `root:root 755` with per-service ownership. `/var/www` and
+`/var/www/mysql_database` are reset to root ownership when the legacy cron
+left them web-owned.
+
+It also reconciles the logging and connection profile on old hosts:
+
+- MariaDB gets `slow_query_log=1`, `long_query_time=1`,
+  `min_examined_row_limit=100`, `log_slow_verbosity=query_plan,explain` and a
+  managed `log_error` under `/var/www/logs/mariadb/` (with a restart when the
+  drop-in changes).
+- Elasticsearch’s `http.host`/`transport.host` are commented so `network.host`
+  controls the bind, and a non-loopback bind with X-Pack security disabled is
+  reported.
+- Redis and Valkey get a local Unix socket (`/run/redis/redis.sock` or
+  `/run/valkey/valkey.sock`), `unixsocketperm 770`, `www-data` in the service
+  group, and printed XenForo/WordPress/Laravel snippets. Application config is
+  not edited.
+- A heap-only operator `jvm.options` is moved to `/tmp` so the managed
+  `zz-setup-optimize.options` owns the heap; a richer operator file is kept and
+  the override is reported.
+
+It applies the OS profile first (CPU governor, PAM limits, hardware-scaled
 kernel/network/memory sysctls) and then looks for:
 
 - `angie` + `/etc/angie/angie.conf`
@@ -591,14 +558,23 @@ file is written. It covers:
 - network addresses, routes, sockets, DNS, qdisc and `ethtool` statistics
 - kernel sysctls, sysctl/limits/modules-load drop-ins
 - systemd units, failed units, timers, unit files and service limits
-- Angie version/config test/loaded config/vhosts/certificate dates
-- every PHP-FPM version, pool/ini files, processes and listeners
-- MariaDB variables/status/processlist/InnoDB status/database sizes
-- Valkey and Redis INFO/CONFIG/CLIENT LIST/SLOWLOG/MEMORY/LATENCY
+- Angie version/config test/loaded config/vhosts/certificate dates, including
+  vhost certificates outside `/etc/angie/ssl`, and `http.d` ACTIVE/INACTIVE
+  include status
+- every PHP-FPM version, pool/ini files, processes and listeners, and the
+  slow/error log paths actually configured in the pool
+- MariaDB variables/status/processlist/InnoDB status/database sizes, resolved
+  `log_error`/slow-log paths, and `mariadb.conf.d` files
+- Valkey and Redis INFO/CONFIG/CLIENT LIST/SLOWLOG/MEMORY/LATENCY, selected
+  persistence/socket/bind settings, and the configured logfile
 - Elasticsearch health, nodes, indices, JVM/OS/thread-pool stats, allocation
+  and resolved log files
 - Node.js version, processes, listeners and units
 - journal warnings, per-service logs, kernel OOM/hung-task reports, dmesg
-- PHP-FPM slow log, MariaDB slow log, Angie/PHP/Valkey/ES/Node logs
+- PHP-FPM slow log, MariaDB slow log, Angie/PHP/Valkey/ES/Node logs, including
+  paths outside `/var/www/logs`
+- `/var/www`, `/var/www/logs`, `/var/www/logs/*` and
+  `/var/www/mysql_database` ownership and permissions
 - UFW, SSH effective config, cron, upgradable packages and setup state
 
 Use `--diagnostics --dry-run` to print the destination without writing.
@@ -614,7 +590,8 @@ sudo bash setup.sh --restart-all --dry-run
 
 This is a controlled whole-stack restart, not a configuration change. It
 detects installed services from their configuration paths and active units,
-then:
+repairs legacy `/var/www/logs`, `/var/www` and `/var/www/mysql_database`
+ownership first (so a service cannot fail to reopen its logs), then:
 
 1. `systemctl daemon-reload`
 2. stop Angie if active
@@ -642,7 +619,7 @@ The script is safe to re-run:
 - `/swapfile` is reused if it already has the requested size.
 - Auto swap is a no-op once total swap is at least 50% of RAM.
 - Managed blocks in `crontab`, `50-server.cnf`, `elasticsearch.yml` and `valkey.conf` are replaced, not duplicated.
-- A `--basic`-only re-run keeps the managed cron entries of services that are still installed; stale entries for removed services are dropped.
+- A `--basic`-only re-run regenerates the managed cron entries for services that are still installed and configured by this script, even when the managed block was removed (for example by `--purge basic`); stale entries for removed services are dropped.
 - Package-origin markers are retained for diagnostics, but `--purge` no longer removes any package regardless of origin.
 - Package repositories and embedded keys are verified against their payloads and refreshed when they differ.
 - Domain directories and databases use idempotent creation; existing Angie domain configs are preserved.
@@ -677,13 +654,13 @@ sudo bash setup.sh --purge
 ```
 
 - `--purge --php ver=8.5` stops one version; `--purge php` discovers and stops every installed PHP-FPM version (not just 8.x).
-- **Nothing is uninstalled or deleted.** Package purge/autoremove/clean calls were removed. `--purge` stops/disables the selected services, removes the managed cron entries, restores recorded basic settings where the original existed, and leaves packages, repositories, keys, configuration, certificates, databases, caches and logs on disk.
+- **Nothing is uninstalled or deleted.** Package purge/autoremove/clean calls were removed. `--purge` stops/disables the selected services, removes the managed and legacy cron entries, restores recorded basic settings where the original existed, and leaves packages, repositories, keys, configuration, certificates, databases, caches and logs on disk.
 - `--purge all` runs every stop/restore step in a safe order.
 - Bare targets and service flags are combined, so `--purge basic --php` stops both.
 - `--purge others` only disables the managed cron/setup entries it knows about; optional packages, Node.js and repository files are left installed. Composer, fail2ban and unattended-upgrades are no longer installed by this script; if present from an older release, remove them manually.
 - `--purge angie` stops Angie and leaves `/etc/angie` (including domain vhosts and certificates), cache directories under `/home` and logs intact.
 - `--purge valkey` stops Valkey and leaves the Unix socket, systemd drop-in, group membership, configuration and data intact.
-- `--purge basic` restores files recorded in `/var/lib/setup.sh/backup` by overwriting them (never by unlinking the live path), moves generated drop-ins that did not exist before to `/tmp` (DNS, PAM limits, sysctl, modules-load, logrotate, network oneshot), leaves `/swapfile` and its `/etc/fstab` line enabled, removes only the managed cron block, restores the original UFW default policies and pre-existing SSH allow rules, and disables UFW again if it was originally inactive. If no original SSH rule existed, the limit rule is kept as a lockout guard.
+- `--purge basic` restores files recorded in `/var/lib/setup.sh/backup` by overwriting them (never by unlinking the live path), moves generated drop-ins that did not exist before to `/tmp` (DNS, PAM limits, sysctl, modules-load, logrotate, network oneshot), leaves `/swapfile` and its `/etc/fstab` line enabled, removes the managed and legacy cron entries, restores the original UFW default policies and pre-existing SSH allow rules, and disables UFW again if it was originally inactive. If no original SSH rule existed, the limit rule is kept as a lockout guard.
 - **MariaDB data is never removed.** Database files under `/var/lib/mysql` and `/var/lib/mariadb`, configuration and backups stay in place after `--purge mariadb`.
 - There is no `--purge domain` target. Domain vhosts, certificates, `/var/www/<domain>/` and databases stay in place under this policy; remove them manually only after verifying they are unused.
 
@@ -920,7 +897,11 @@ The per-IP limiter keys on the direct client address. If all traffic arrives thr
 
 ### PHP-FPM slow log fills with queued requests
 
-`request_slowlog_timeout=10s` measures from accept, so a full listen queue can log requests that are simply waiting for a worker. Check `/fpm-status` (if enabled) for `listen queue`/`max listen queue` and add workers, cache the endpoint, or reduce upstream latency. A slow log entry is not automatically a bug in that script.
+`request_slowlog_timeout=10s` measures from accept, so a full listen queue can log requests that are simply waiting for a worker. Check `/fpm-status.php` (if enabled) for `listen queue`/`max listen queue` and add workers, cache the endpoint, or reduce upstream latency. A slow log entry is not automatically a bug in that script. The status path must end in `.php` when the pool sets `security.limit_extensions = .php`.
+
+### Angie logs “upstream prematurely closed connection” during a load test
+
+PHP-FPM worker recycling at `pm.max_requests` closes FastCGI keepalive connections, and Angie logs this when a worker exits between requests. A PHP-FPM reload or restart during traffic produces a burst of the same message. For a benchmark, set `pm.max_requests = 0` (or a much higher value) and reload FPM; for production, keep a finite limit and treat occasional entries as expected. The stress harness sets `pm.max_requests = 0` automatically.
 
 ### `--domain` says Angie or MariaDB is missing
 

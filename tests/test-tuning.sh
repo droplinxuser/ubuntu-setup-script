@@ -30,6 +30,8 @@ check() {
   shift
   if "$@"; then t_pass "$desc"; else t_fail "$desc"; fi
 }
+cron_contains()     { [[ $1 == *"$2"* ]]; }
+cron_not_contains() { [[ $1 != *"$2"* ]]; }
 
 # Scratch helpers must never place data outside /tmp, and sed_in_place must not
 # leave a sibling scratch file next to the live target.
@@ -59,6 +61,107 @@ check "Valkey size parser handles MB" test "$(valkey_mb_from_config 8192mb)" = 8
 check "Valkey size parser handles GB" test "$(valkey_mb_from_config 8gb)" = 8192
 check "Valkey size parser handles raw bytes" test "$(valkey_mb_from_config 1048576)" = 1
 check "Valkey size parser rejects an unknown unit" test "$(valkey_mb_from_config 1xb)" = 0
+
+# Cron ownership repair.  Releases before 1.8.34 wrote a nightly
+# `chown -R /var/www/` that also flattened the shared log tree; the managed
+# block must replace it without touching unrelated operator entries.
+check "safe cron chown excludes backups and log files" \
+  cron_contains "$CRON_WWW_CHOWN" '/var/www/mysql_database'
+check "safe cron chown excludes log files" \
+  cron_contains "$CRON_WWW_CHOWN" '*.log'
+stripped_cron=$(printf '%s\n' \
+  '0 0 * * * /usr/bin/mysqlcheck -Aos --auto-repair' \
+  '1 1 * * * /etc/nginx/scripts/cloudflare.sh' \
+  '2 2 * * * /bin/true' | cron_strip_legacy_jobs)
+check "legacy mysqlcheck cron is stripped" \
+  cron_not_contains "$stripped_cron" '/usr/bin/mysqlcheck'
+check "legacy nginx cloudflare cron is stripped" \
+  cron_not_contains "$stripped_cron" '/etc/nginx/scripts/cloudflare.sh'
+check "cron strip preserves unrelated entries" \
+  cron_contains "$stripped_cron" '/bin/true'
+
+# MariaDB logging must be part of both the installer block and the optimize
+# drop-in, otherwise old hosts keep slow logging off forever.
+check "MariaDB logging helper enables the slow log" \
+  test "$(mariadb_logging_settings | grep -c '^slow_query_log = 1$')" -eq 1
+check "MariaDB logging helper sets the central slow log" \
+  test "$(mariadb_logging_settings | grep -c '^slow_query_log_file = /var/www/logs/mariadb/slow.log$')" -eq 1
+check "MariaDB logging helper sets log_error" \
+  test "$(mariadb_logging_settings | grep -c '^log_error = /var/www/logs/mariadb/error.log$')" -eq 1
+
+# A heap-only operator JVM file is safe to replace with the managed file; a
+# richer file must be preserved (with a warning from write_es_jvm_options).
+printf -- '-Xms4g\n-Xmx4g\n' > "$TMP/heap-only.options"
+printf -- '-Xms4g\n-Xmx4g\n-XX:MaxDirectMemorySize=1g\n' > "$TMP/custom.options"
+check "heap-only JVM options are detected" \
+  es_jvm_options_is_heap_only "$TMP/heap-only.options"
+not_heap_only() { ! es_jvm_options_is_heap_only "$1"; }
+check "custom JVM options are not treated as heap-only" \
+  not_heap_only "$TMP/custom.options"
+
+# A --basic-only run must regenerate installed service entries even when the
+# managed block is gone (for example after --purge basic).  Fake crontab and
+# package checks keep the test off the real host state.
+CRON_IN="$TMP/cron-in"
+CRON_OUT="$TMP/cron-out"
+fake_crontab() {
+  if [[ ${1:-} == -l ]]; then
+    cat "$CRON_IN" 2>/dev/null || true
+  else
+    cat "$1" > "$CRON_OUT"
+  fi
+}
+: > "$CRON_IN"
+(
+  cron_angie_configured() { return 0; }
+  cron_mariadb_configured() { return 0; }
+  crontab() { fake_crontab "$@"; }
+  write_cron
+) >/dev/null 2>&1
+check "basic-only cron run restores installed service entries" \
+  grep -q 'mysqlbkup' "$CRON_OUT"
+check "basic-only cron run restores the log-safe chown" \
+  grep -qF -- "$CRON_WWW_CHOWN" "$CRON_OUT"
+
+cat > "$CRON_IN" <<'EOF'
+0 0 * * * /usr/bin/chown www-data:www-data -R /var/www/ >/dev/null 2>&1
+1 1 * * * /etc/nginx/scripts/cloudflare.sh
+4 4 4 * * /usr/bin/mysqlcheck -Aos --auto-repair
+1 1 * * * /bin/true
+EOF
+(
+  cron_angie_configured() { return 0; }
+  cron_mariadb_configured() { return 1; }
+  crontab() { fake_crontab "$@"; }
+  write_cron
+) >/dev/null 2>&1
+check "bare legacy chown is removed" \
+  cron_not_contains "$(cat "$CRON_OUT")" 'chown www-data:www-data -R /var/www'
+check "bare legacy cloudflare path is removed" \
+  cron_not_contains "$(cat "$CRON_OUT")" '/etc/nginx/scripts/cloudflare.sh'
+check "bare legacy mysqlcheck path is removed" \
+  cron_not_contains "$(cat "$CRON_OUT")" '/usr/bin/mysqlcheck'
+check "bare legacy chown is replaced by the safe managed line" \
+  cron_contains "$(cat "$CRON_OUT")" "$CRON_WWW_CHOWN"
+check "unrelated cron entry is preserved" \
+  cron_contains "$(cat "$CRON_OUT")" '/bin/true'
+
+cat > "$CRON_IN" <<'EOF'
+# BEGIN setup.sh managed cron
+0 0 * * * /etc/angie/scripts/cloudflare.sh
+3 3 * * * /usr/local/bin/mysqlbkup.sh
+# END setup.sh managed cron
+EOF
+(
+  cron_angie_configured() { return 1; }
+  cron_mariadb_configured() { return 0; }
+  crontab() { fake_crontab "$@"; }
+  write_cron
+) >/dev/null 2>&1
+check "stale Angie cron entry is dropped" \
+  cron_not_contains "$(cat "$CRON_OUT")" '/etc/angie/'
+check "MariaDB cron entry is kept" \
+  cron_contains "$(cat "$CRON_OUT")" 'mysqlbkup'
 
 # Network profile selection (BBR can regress some proxy hosts).
 check "network profile honours SETUP_TCP_CC/SETUP_QDISC" \

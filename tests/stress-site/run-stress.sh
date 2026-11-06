@@ -4,11 +4,41 @@
 set -Eeuo pipefail
 
 [[ ${EUID} -eq 0 ]] || { echo "run as root" >&2; exit 1; }
-command -v wrk >/dev/null || { echo "wrk is required (apt install wrk)" >&2; exit 1; }
 
 DOMAIN=${DOMAIN:-stress.invalid}
 REPORT=${1:-/tmp/stress-report.md}
 TMP=$(mktemp -d /tmp/stress-run.XXXXXX)
+STRESS_STATE=${STRESS_FPM_STATE:-/var/lib/stress-site/fpm-max-requests}
+
+# setup-stress-site.sh disables pm.max_requests so worker recycling does not
+# close FastCGI keepalive connections during the high-rate PHP runs.  Restore
+# the saved production value on exit, including on a failed or interrupted
+# suite.
+restore_fpm_max_requests() {
+  [[ -r $STRESS_STATE ]] || return 0
+  local pool svc value
+  pool=$(sed -n 's/^POOL=//p' "$STRESS_STATE" | head -n1)
+  svc=$(sed -n 's/^FPM_SVC=//p' "$STRESS_STATE" | head -n1)
+  value=$(sed -n 's/^ORIGINAL_MAX_REQUESTS=//p' "$STRESS_STATE" | head -n1)
+  [[ -n $pool && -f $pool ]] || return 0
+  if [[ $value == NONE || -z $value ]]; then
+    sed -i -E '/^[[:space:]]*pm\.max_requests[[:space:]]*=/d' "$pool"
+  elif grep -qE '^[[:space:]]*pm\.max_requests[[:space:]]*=' "$pool"; then
+    sed -i -E "s|^[[:space:]]*pm\.max_requests[[:space:]]*=.*|pm.max_requests = ${value}|" "$pool"
+  else
+    printf '\npm.max_requests = %s\n' "$value" >> "$pool"
+  fi
+  if [[ -n $svc ]]; then
+    systemctl reload "$svc" 2>/dev/null || systemctl restart "$svc" 2>/dev/null || true
+  fi
+  echo "Restored pm.max_requests=${value:-NONE} on ${pool}" >&2
+  return 0
+}
+trap restore_fpm_max_requests EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+command -v wrk >/dev/null || { echo "wrk is required (apt install wrk)" >&2; exit 1; }
 
 curl_nginx() { curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}$1"; }
 sql() { mariadb -N -B -e "$1"; }
@@ -34,7 +64,7 @@ curl_nginx /cached.php >/dev/null
 echo "Collecting pre-test state..." >&2
 FREE_BEFORE=$(free -m | awk '/^Mem:/{printf "%s/%s MB used", $3, $2}')
 LOAD_BEFORE=$(awk '{print $1}' /proc/loadavg)
-FPM_BEFORE=$(curl_nginx /fpm-status | tr '\n' ';')
+FPM_BEFORE=$(curl_nginx /fpm-status.php | tr '\n' ';')
 VK_BEFORE=$(valkey-cli INFO stats | grep -E 'instantaneous_ops_per_sec|total_commands_processed|evicted_keys|rejected_connections' | tr '\n' ';')
 DB_BEFORE=$(sql "SHOW GLOBAL STATUS WHERE Variable_name IN ('Questions','Threads_connected','Threads_running','Max_used_connections','Slow_queries','Aborted_connects')" | tr '\n' ';')
 ES_BEFORE=$(curl -fsS 'http://127.0.0.1:9200/_nodes/stats/jvm,indices?filter_path=nodes.*.jvm.mem.heap_used_in_bytes,nodes.*.jvm.gc.collectors.young.collection_count,nodes.*.indices.search.query_total' | jq -c .)
@@ -76,7 +106,7 @@ cat "$TMP/table.md" >>"$REPORT"
 
 FREE_AFTER=$(free -m | awk '/^Mem:/{printf "%s/%s MB used", $3, $2}')
 LOAD_AFTER=$(awk '{print $1}' /proc/loadavg)
-FPM_AFTER=$(curl_nginx /fpm-status | tr '\n' ';')
+FPM_AFTER=$(curl_nginx /fpm-status.php | tr '\n' ';')
 VK_AFTER=$(valkey-cli INFO stats | grep -E 'instantaneous_ops_per_sec|total_commands_processed|evicted_keys|rejected_connections' | tr '\n' ';')
 DB_AFTER=$(sql "SHOW GLOBAL STATUS WHERE Variable_name IN ('Questions','Threads_connected','Threads_running','Max_used_connections','Slow_queries','Aborted_connects')" | tr '\n' ';')
 ES_AFTER=$(curl -fsS 'http://127.0.0.1:9200/_nodes/stats/jvm,indices?filter_path=nodes.*.jvm.mem.heap_used_in_bytes,nodes.*.jvm.gc.collectors.young.collection_count,nodes.*.indices.search.query_total' | jq -c .)
