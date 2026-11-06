@@ -665,6 +665,37 @@ check "session hardening is gated behind the opt-in flag" \
 check "the shipped PHP template has no global session overrides" \
   test -z "$(grep '^session\.' "$ROOT/configs/php/custom_dan.ini")"
 
+# --optimize refreshes a stale managed php.ini from the repo template while
+# keeping the host's existing timezone.
+mkdir -p "$TMP/php-ini"
+cat > "$TMP/php-ini/template.ini" <<'EOF'
+memory_limit = 512M
+allow_url_fopen = Off
+date.timezone = Asia/Manila
+EOF
+cat > "$TMP/php-ini/custom_dan.ini" <<'EOF'
+memory_limit = 2048M
+allow_url_fopen = Off
+disable_functions = php_uname,curl_exec
+date.timezone = Africa/Dar_es_Salaam
+EOF
+tune_reset_changes
+sync_php_ini_template 8.3 "$TMP/php-ini/custom_dan.ini" "$TMP/php-ini/template.ini"
+check "PHP optimize refreshes a stale custom_dan.ini" \
+  grep -q '^memory_limit = 512M$' "$TMP/php-ini/custom_dan.ini"
+check "PHP optimize removes stale disable_functions" \
+  test -z "$(grep '^disable_functions' "$TMP/php-ini/custom_dan.ini")"
+check "PHP optimize preserves the host timezone" \
+  grep -qx 'date.timezone = Africa/Dar_es_Salaam' "$TMP/php-ini/custom_dan.ini"
+check "custom_dan refresh marks configuration dirty" test "$TUNE_DIRTY" -eq 1
+tune_reset_changes
+sync_php_ini_template 8.3 "$TMP/php-ini/custom_dan.ini" "$TMP/php-ini/template.ini"
+check "custom_dan refresh is idempotent" test "$TUNE_DIRTY" -eq 0
+
+check "--optimize calls the custom_dan refresh" \
+  grep -q 'sync_php_ini_template "$ver"' \
+  <<<"$(sed -n '/^optimize_php_services()/,/^}/p' "$ROOT/setup.sh")"
+
 check "opt-in hardening disables cgi.fix_pathinfo" \
   grep -q '^cgi.fix_pathinfo = 0$' <<<"$php_tune_hardening"
 check "opt-in hardening disables expose_php" \
@@ -1254,6 +1285,15 @@ check "optimize leaves swap untouched" \
 detect_body=$(sed -n '/^detect_installed_services()/,/^}/p' "$ROOT/setup.sh")
 check "Valkey takes precedence over Redis in service detection" \
   grep -q '! -f /etc/valkey/valkey.conf' <<<"$detect_body"
+
+# Diagnostics must not present absent services as connection failures.
+diag_body=$(sed -n '/^run_diagnostics()/,/^}/p' "$ROOT/setup.sh")
+check "diagnostics reports absent Valkey/Redis as not installed" \
+  grep -q 'Valkey/Redis is not installed' <<<"$diag_body"
+check "diagnostics does not call the Redis client when none is reachable" \
+  grep -q 'diag_redis_cli' <<<"$diag_body"
+check "diagnostics skips allocation explain when no shards are unassigned" \
+  grep -q 'No unassigned shards; allocation explain is not needed' "$ROOT/setup.sh"
 
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
