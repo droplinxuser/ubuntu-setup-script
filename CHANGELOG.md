@@ -2,6 +2,55 @@
 
 Historical release notes for ubuntu-setup-script. Current behavior is documented in README.md.
 
+## What's new in 1.8.37
+
+- **`--optimize` repairs legacy log ownership and cron on old hosts.** It
+  replaces the pre-1.8.34 nightly `chown -R www-data:www-data /var/www/`
+  entry with the log-safe `find` form that prunes `/var/www/logs`,
+  `/var/www/mysql_database` and `*.log`, resets `/var/www/logs` to
+  `root:root 755`, restores per-service log ownership (`mysql`,
+  `elasticsearch`, `valkey`/`redis`, `www-data`), and resets `/var/www` and
+  `/var/www/mysql_database` to root ownership when the old cron left them
+  web-owned.
+- **`--restart-all` repairs log ownership first.** It runs the same
+  `/var/www/logs`, `/var/www` and backup-directory repair before stopping
+  services, so a restart cannot fail because a log directory is still owned
+  by www-data.
+- **MariaDB logging is reconciled by `--optimize`.** The generated
+  `99-setup-optimize.cnf` now carries `slow_query_log`, `log_error`,
+  `long_query_time=1`, `min_examined_row_limit=100` and
+  `log_slow_verbosity=query_plan,explain`; the AppArmor log override is
+  refreshed before the restart.
+- **Elasticsearch bind and JVM handling are fixed.** Active
+  `http.host`/`transport.host` keys are commented so `network.host` controls
+  the bind, a non-loopback bind with X-Pack security disabled is reported,
+  and a heap-only operator `jvm.options` is moved to `/tmp` so the managed
+  `zz-setup-optimize.options` owns the heap. A richer operator file is kept
+  and the override is reported.
+- **Redis and Valkey get a local Unix socket.** `--optimize` writes
+  `unixsocket`/`unixsocketperm 770`, adds `www-data` to the service group,
+  restarts PHP-FPM so workers inherit it, and prints XenForo, WordPress and
+  Laravel snippets. Application config is never edited.
+- **A `--basic`-only run regenerates managed cron entries for installed
+  services.** This restores Angie maintenance, MariaDB backups and the
+  `mariadb-check` job after `--purge basic` (or after the managed block was
+  removed), instead of leaving the host with no scheduled jobs.
+- **The stress harness uses a working FPM status path and restores worker
+  recycling.** It sets `pm.status_path = /fpm-status.php`, points the vhost
+  and harness at that path, saves the original `pm.max_requests` to
+  `/var/lib/stress-site/fpm-max-requests`, sets it to `0` for the test, and
+  restores it from an EXIT trap in `run-stress.sh`.
+- **`--diagnostics` resolves live paths and reports ownership.** It tails
+  PHP/Angie/MariaDB/Redis/Elasticsearch logs from their configured paths
+  (including vhost certificates and `/var/log/...`), lists Angie `http.d`
+  ACTIVE/INACTIVE files, includes MariaDB config files and Redis persistence/
+  socket settings, and reports `/var/www`/log/backup ownership. `last`,
+  `node`, `npm`, the logrotate drop-in and the Elasticsearch allocation probe
+  are guarded.
+- **Cron removals report write failures.** `cron_remove_line` and
+  `--purge basic` now warn when `crontab` cannot be written instead of
+  silently reporting success.
+
 ## What's new in 1.8.35
 
 - Removed `fail2ban`, `unattended-upgrades`, Composer and the `security`

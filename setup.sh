@@ -34,7 +34,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.36"
+readonly SCRIPT_VERSION="1.8.37"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -73,7 +73,7 @@ readonly CRON_END="# END setup.sh managed cron"
 # MariaDB, Valkey and Elasticsearch own subdirectories below /var/www/logs; a
 # blanket recursive chown changes their owner to www-data and their next start
 # or restart fails to open/rotate logs ("Permission denied", errno 13).
-readonly CRON_WWW_CHOWN='/usr/bin/find /var/www -mindepth 1 -path /var/www/logs -prune -o -exec /usr/bin/chown -h www-data:www-data {} +'
+readonly CRON_WWW_CHOWN='/usr/bin/find /var/www -mindepth 1 \( -path /var/www/logs -o -path /var/www/mysql_database -o -name "*.log" \) -prune -o -exec /usr/bin/chown -h www-data:www-data {} +'
 # The form written by releases up to 1.8.33, kept so a re-run upgrades it.
 readonly CRON_WWW_CHOWN_LEGACY='/usr/bin/chown www-data:www-data -R /var/www/'
 readonly MARIADB_BEGIN="# BEGIN setup.sh managed mariadb"
@@ -506,6 +506,9 @@ Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
       when a pool already listens on a Unix socket, Angie's fastcgi_pass is
       repointed to it.  TCP pools stay on TCP so a live site is never left
       pointing at a missing socket.
+      Hosts built before 1.8.34 also get the legacy nightly
+      `chown -R /var/www/` crontab entry migrated to the log-safe find form,
+      and /var/www/logs ownership repaired before any service is restarted.
       Configuration files are backed up under /tmp/setup-optimize-*
       and a Markdown report is written to /var/log/setup-optimize-*.md.
       Existing application vhosts and credentials are preserved.
@@ -1348,15 +1351,22 @@ ensure_log_dirs() {
 }
 
 configure_logrotate() {
+  local install_pkg=${1:-1}
   step "Log rotation (/var/www/logs)"
-  apt_install logrotate
+  if (( install_pkg )); then
+    apt_install logrotate
+  fi
+  if ! command -v logrotate >/dev/null 2>&1; then
+    warn "logrotate is not installed; /var/www/logs will not be rotated"
+    return 0
+  fi
   record_original /etc/logrotate.d/setup-logs logrotate-setup-logs
   cat > /etc/logrotate.d/setup-logs <<'EOF'
-# Managed by setup.sh: keep all service logs under /var/www/logs.
+# Managed by setup.sh: central service logs and vhost error/access logs.
 # copytruncate is used so services do not need a reopen signal. Rotation runs
 # as root; per-service `su` lines would fail on a basic-only install where the
 # valkey/elasticsearch users do not exist yet.
-/var/www/logs/*/*.log /var/www/logs/elasticsearch/*.json {
+/var/www/logs/*/*.log /var/www/logs/elasticsearch/*.json /var/www/*/error.log /var/www/*/access.log {
     daily
     maxsize 1G
     rotate 14
@@ -1584,16 +1594,54 @@ cron_compact_managed() {
   '
 }
 
+# Drop bare ownership/maintenance jobs that no longer belong outside the
+# managed block: the pre-1.8.34 blanket chown, an earlier log-safe find, and
+# the old nginx/mysqlcheck paths.  write_cron() and purge_basic() both use
+# this so a host cannot keep two competing jobs (one of them broken).
+cron_strip_legacy_jobs() {
+  awk '
+    /chown[[:space:]]+www-data:www-data[[:space:]]+(-R|--recursive)[[:space:]]+\/var\/www([[:space:]]|\/|$)/ { next }
+    /chown[[:space:]]+(-R|--recursive)[[:space:]]+www-data:www-data[[:space:]]+\/var\/www([[:space:]]|\/|$)/ { next }
+    /\/usr\/bin\/find[[:space:]]+\/var\/www([[:space:]]|\/|$)/ && /chown/ { next }
+    /\/etc\/nginx\/scripts\/cloudflare\.sh/ { next }
+    /\/etc\/angie\/scripts\/cloudflare\.sh/ { next }
+    /\/usr\/bin\/mysqlcheck/ { next }
+    /\/usr\/bin\/mariadb-check/ { next }
+    /\/usr\/local\/bin\/mysqlbkup\.sh/ { next }
+    { print }
+  '
+}
+
+cron_angie_configured() {
+  pkg_ok angie && [[ -f /etc/angie/angie.conf ]]
+}
+
+cron_mariadb_configured() {
+  pkg_ok mariadb-server && [[ -x /usr/local/bin/mysqlbkup.sh ]] \
+    && { [[ -f /etc/mysqlbkup.cnf ]] || [[ -f /etc/mysqlbkup.config ]]; }
+}
+
 write_cron() {
   local cur tmp line group seen=" "
+  local angie_cron=0 mariadb_cron=0
   local -a lines=() existing=() preserved=()
 
-  if [[ ${ENABLED[angie]:-0} -eq 1 ]]; then
+  # Regenerate entries for installed services even when this run only selected
+  # --basic.  This is what restores the managed block after --purge basic (or
+  # after an operator removed it) instead of leaving the host with no backups
+  # and no log-ownership repair.  Require the installer's own files as well as
+  # the package, so a provider-installed Angie/MariaDB without the managed
+  # configuration does not get a cron job that cannot run.
+  if [[ ${ENABLED[angie]:-0} -eq 1 ]] || cron_angie_configured; then
+    angie_cron=1
     lines+=("0 0 * * * ${CRON_WWW_CHOWN} >/dev/null 2>&1")
-    lines+=('1 1 * * * /usr/bin/chmod +x /etc/angie/scripts/cloudflare.sh >/dev/null 2>&1')
-    lines+=('2 1 * * * /etc/angie/scripts/cloudflare.sh >/dev/null 2>&1')
+    if [[ ${ENABLED[angie]:-0} -eq 1 ]] || [[ -x /etc/angie/scripts/cloudflare.sh ]]; then
+      lines+=('1 1 * * * /usr/bin/chmod +x /etc/angie/scripts/cloudflare.sh >/dev/null 2>&1')
+      lines+=('2 1 * * * /etc/angie/scripts/cloudflare.sh >/dev/null 2>&1')
+    fi
   fi
-  if [[ ${ENABLED[mariadb]:-0} -eq 1 ]]; then
+  if [[ ${ENABLED[mariadb]:-0} -eq 1 ]] || cron_mariadb_configured; then
+    mariadb_cron=1
     lines+=("3 3 * * * /usr/local/bin/mysqlbkup.sh 1>> ${LOG_ROOT}/mariadb/backup.log 2>> ${LOG_ROOT}/mariadb/backup-err.log")
     lines+=('4 4 4 * * /usr/bin/mariadb-check -Aos --auto-repair > /dev/null 2>&1')
   fi
@@ -1611,25 +1659,28 @@ write_cron() {
     [[ -n $line ]] || continue
     if [[ $line == *mysqlbkup* || $line == *mariadb-check* ]]; then
       group=mariadb
-    elif [[ $line == *'/etc/angie/'* || $line == *"${CRON_WWW_CHOWN_LEGACY}"* || $line == *"${CRON_WWW_CHOWN}"* ]]; then
+    elif [[ $line == *'/etc/angie/'* || $line == *'/usr/bin/find /var/www'* || $line == *"${CRON_WWW_CHOWN_LEGACY}"* ]]; then
       group=angie
     else
       group=unknown
     fi
     case "$group" in
       angie)
-        [[ ${ENABLED[angie]:-0} -eq 1 ]] && continue
-        pkg_ok angie || continue
+        (( angie_cron )) && continue
+        cron_angie_configured || continue
         ;;
       mariadb)
-        [[ ${ENABLED[mariadb]:-0} -eq 1 ]] && continue
-        pkg_ok mariadb-server || continue
+        (( mariadb_cron )) && continue
+        cron_mariadb_configured || continue
         ;;
     esac
     # A preserved entry from an older release is rewritten in place so the
     # destructive blanket chown cannot survive a --basic run that does not
-    # select --angie again.
+    # select --angie again.  The earlier log-safe find (which did not exclude
+    # the backup directory or *.log files) is upgraded to the current form.
     if [[ $line == *"${CRON_WWW_CHOWN_LEGACY}"* ]]; then
+      line="0 0 * * * ${CRON_WWW_CHOWN} >/dev/null 2>&1"
+    elif [[ $line == *'/usr/bin/find /var/www'* ]] && [[ $line != *"${CRON_WWW_CHOWN}"* ]]; then
       line="0 0 * * * ${CRON_WWW_CHOWN} >/dev/null 2>&1"
     fi
     [[ $seen == *" ${line} "* ]] && continue
@@ -1641,7 +1692,7 @@ write_cron() {
   tmp=$(tmp_file)
   {
     if [[ -n $cur ]]; then
-      printf '%s\n' "$cur" | cron_strip_managed
+      printf '%s\n' "$cur" | cron_strip_managed | cron_strip_legacy_jobs || true
     fi
     if (( ${#lines[@]} > 0 )); then
       printf '%s\n' "$CRON_BEGIN"
@@ -1652,7 +1703,10 @@ write_cron() {
 
   # Install the file even when it is empty instead of deleting the user's
   # crontab; writing an empty crontab keeps the file in place.
-  crontab "$tmp"
+  if ! crontab "$tmp"; then
+    warn "Could not install the managed crontab"
+    return 1
+  fi
   info "Managed crontab entries updated"
 }
 
@@ -1662,7 +1716,11 @@ cron_remove_line() {
   [[ -n $cur ]] || return 0
   tmp=$(tmp_file)
   printf '%s\n' "$cur" | grep -vF -- "$needle" | cron_compact_managed > "$tmp" || true
-  crontab "$tmp"
+  if ! crontab "$tmp"; then
+    warn "Could not update crontab after removing ${needle}"
+    return 1
+  fi
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -3679,7 +3737,7 @@ mariadb_strip_install_block() {
   local size_mb=$1 max_conn=$2
   local cnf=/etc/mysql/mariadb.conf.d/50-server.cnf tmp keys
   [[ -f $cnf ]] || return 0
-  keys=$(mariadb_performance_settings "$size_mb" "$max_conn" 2>/dev/null \
+  keys=$( { mariadb_performance_settings "$size_mb" "$max_conn"; mariadb_logging_settings; } 2>/dev/null \
     | sed -n 's/^\([a-z0-9_]*\)[[:space:]]*=.*/\1/p' | paste -sd'|' -)
   [[ -n $keys ]] || return 0
   tmp=$(tmp_file) || return 1
@@ -3738,6 +3796,21 @@ mariadb_compute_profile() {
 
 # Print the performance directives shared by the install-time 50-server.cnf
 # block and the --optimize 99-setup-optimize.cnf drop-in.
+# Logging keys are shared by the installer block and the --optimize drop-in.
+# Keeping them in one helper prevents an old host from keeping slow logging
+# off (or log_error empty) after --optimize.
+mariadb_logging_settings() {
+  cat <<'EOF'
+slow_query_log = 1
+slow_query_log_file = /var/www/logs/mariadb/slow.log
+long_query_time = 1
+min_examined_row_limit = 100
+log_slow_verbosity = query_plan,explain
+log_slow_admin_statements = 1
+log_error = /var/www/logs/mariadb/error.log
+EOF
+}
+
 mariadb_performance_settings() {
   local size_mb=$1 max_conn=${2:-}
   local ver major minor
@@ -3864,15 +3937,9 @@ innodb_read_only_compressed = OFF
 
 EOF
   mariadb_performance_settings "$size_mb" >> "$cnf"
+  mariadb_logging_settings >> "$cnf"
   cat >> "$cnf" <<EOF
 
-slow_query_log = 1
-slow_query_log_file = /var/www/logs/mariadb/slow.log
-long_query_time = 1
-min_examined_row_limit = 100
-log_slow_verbosity = query_plan,explain
-
-log_error = /var/www/logs/mariadb/error.log
 bind-address = ${bind}
 ${MARIADB_END}
 EOF
@@ -4171,7 +4238,7 @@ elasticsearch_write_performance_block() {
     bootstrap.memory_lock indices.query.bool.max_clause_count \
     indices.memory.index_buffer_size indices.fielddata.cache.size \
     search.max_buckets action.destructive_requires_name \
-    http.compression http.max_content_length
+    http.compression http.max_content_length http.host transport.host
   cat >> "$file" <<'EOF'
 # BEGIN setup.sh optimize
 bootstrap.memory_lock: true
@@ -4588,13 +4655,17 @@ purge_basic() {
     info "Leaving pre-existing swap configuration unchanged"
   fi
 
-  local cur tmp
+  local cur tmp rc=0
   cur=$(crontab -l 2>/dev/null || true)
   if [[ -n $cur ]]; then
     tmp=$(tmp_file)
-    printf '%s\n' "$cur" | cron_strip_managed > "$tmp"
-    crontab "$tmp"
-    info "Removed managed cron entries"
+    printf '%s\n' "$cur" | cron_strip_managed | cron_strip_legacy_jobs > "$tmp" || true
+    if crontab "$tmp"; then
+      info "Removed managed and legacy cron entries"
+    else
+      warn "Could not remove managed/legacy cron entries"
+      rc=1
+    fi
   fi
 
   # Last-resort lockout guard: if UFW is active but an SSH rule is missing,
@@ -4718,6 +4789,7 @@ purge_basic() {
   systemctl restart systemd-resolved 2>/dev/null || true
   info "Leaving setup state in ${STATE_DIR} for a future reinstall or rollback"
   ok "Basic setup purged"
+  return "$rc"
 }
 
 purge_angie() {
@@ -4728,9 +4800,10 @@ purge_angie() {
   # then restores the exact site instead of starting from an empty tree.
   info "Leaving Angie files under /etc/angie, /var/lib/angie, /var/log/angie, /var/cache/angie and ${LOG_ROOT}/angie"
   info "Leaving cache directories and /root installer files in place"
-  cron_remove_line '/etc/angie/scripts/cloudflare.sh'
-  cron_remove_line "$CRON_WWW_CHOWN_LEGACY"
-  cron_remove_line "$CRON_WWW_CHOWN"
+  cron_remove_line '/etc/angie/scripts/cloudflare.sh' || true
+  cron_remove_line '/usr/bin/find /var/www' || true
+  cron_remove_line "$CRON_WWW_CHOWN_LEGACY" || true
+  cron_remove_line "$CRON_WWW_CHOWN" || true
   systemctl daemon-reload || true
   ok "Angie purged (files preserved)"
 }
@@ -4789,8 +4862,8 @@ purge_mariadb() {
   if [[ -f "${STATE_DIR}/lz4-installed" ]]; then
     apt_purge_pkgs lz4
   fi
-  cron_remove_line '/usr/local/bin/mysqlbkup.sh'
-  cron_remove_line '/usr/bin/mariadb-check'
+  cron_remove_line '/usr/local/bin/mysqlbkup.sh' || true
+  cron_remove_line '/usr/bin/mariadb-check' || true
   systemctl daemon-reload || true
   ok "MariaDB purged (files preserved)"
 }
@@ -5998,7 +6071,7 @@ opt_resume_web_frontends() {
 optimize_mariadb() {
   local active=0 ver size_mb buffer logsize open_cache aria_mb
   local threads max_conn io_read io_write cnf_dir cnf backlog cnf_before cnf_after
-  local unit_changed=0 limit_before="" i
+  local unit_changed=0 limit_before="" i live_slow="" live_err=""
   systemctl is-active --quiet mariadb 2>/dev/null && active=1
   ver=$(mariadb_server_version)
   opt_report "## MariaDB"
@@ -6039,6 +6112,10 @@ optimize_mariadb() {
 
   cnf_dir=/etc/mysql/mariadb.conf.d
   mkdir -p "$cnf_dir"
+  # Enabling slow/error logging under /var/www/logs needs the AppArmor override
+  # on Ubuntu 24.04/26.04 as well; the installer already writes it, but an old
+  # host tuned in place may not have it.
+  configure_mariadb_apparmor
 
   # An existing server may still carry the package's default 1024-fd limit.
   # Keep the same systemd drop-in the installer uses.
@@ -6077,11 +6154,13 @@ optimize_mariadb() {
 [mysqld]
 EOF
     mariadb_performance_settings "$size_mb" "$max_conn"
+    mariadb_logging_settings
     printf '%s\n' '# END setup.sh optimize'
   } > "$cnf"
   chmod 644 "$cnf"
   cnf_after=$(md5sum "$cnf" | awk '{print $1}')
   opt_report "- Wrote \`${cnf}\` (buffer=${buffer}, max_connections=${max_conn}, back_log=${backlog})"
+  opt_report "- Slow/error logging: /var/www/logs/mariadb/slow.log and error.log"
   opt_report "- innodb_io_capacity=${io_read}/${io_write}, thread_pool_size=${threads}"
   # One owner for the performance values: remove the installer-managed block
   # from 50-server.cnf now that the 99- drop-in is authoritative.
@@ -6157,6 +6236,12 @@ EOF
       done
       if mariadb -e 'SELECT 1' >/dev/null 2>&1; then
         opt_report "- Restart: **OK**"
+        live_slow=$(mariadb -N -B -e 'SELECT @@slow_query_log' 2>/dev/null || true)
+        live_err=$(mariadb -N -B -e 'SELECT @@log_error' 2>/dev/null || true)
+        opt_report "- Live slow_query_log=${live_slow:-unknown}, log_error=${live_err:-unknown}"
+        if [[ $live_slow != 1 ]]; then
+          opt_report "- **WARNING**: slow_query_log is ${live_slow:-unknown} after restart; check AppArmor/log permissions"
+        fi
         if ! opt_resume_web_frontends; then
           opt_report "- Web frontends: **FAILED** to resume; check Angie/PHP-FPM"
           return 1
@@ -6210,6 +6295,16 @@ valkey_mb_from_config() {
   esac
 }
 
+restart_php_workers_for_group() {
+  local group=$1 unit
+  while IFS= read -r unit; do
+    [[ -n $unit ]] || continue
+    if ! systemctl restart "$unit" 2>/dev/null; then
+      warn "Could not restart ${unit} to inherit the ${group} group"
+    fi
+  done < <(list_active_php_units)
+}
+
 optimize_valkey() {
   local kind=${1:-valkey}
   local label=Valkey conf=/etc/valkey/valkey.conf conf_dir=/etc/valkey
@@ -6221,6 +6316,7 @@ optimize_valkey() {
   local active=0 ram_mb max_mb policy backlog io_threads i
   local conf_before conf_after fd_limit dropin unit_changed=0
   local online_ok=0 live_io="" live_backlog="" setting k v
+  local socket_path group socket_before socket_after perm_before perm_after socket_changed=0 group_changed=0
   [[ -f $conf ]] || return 0
   systemctl is-active --quiet "$unit" 2>/dev/null && active=1
   opt_report "## ${label}"
@@ -6283,6 +6379,56 @@ optimize_valkey() {
     [[ -n $key ]] || continue
     conf_set "$key" "$value"
   done < <(valkey_tuning_lines "$max_mb" "$policy" "$io_threads")
+
+  # Local PHP should use the Unix socket: it avoids ephemeral-port/TIME_WAIT
+  # pressure and was measurably faster for small cache commands.  This is
+  # startup-only, so it is applied here and the cache is restarted below.
+  if [[ $kind == redis ]]; then
+    socket_path=/run/redis/redis.sock
+    group=redis
+  else
+    socket_path=/run/valkey/valkey.sock
+    group=valkey
+  fi
+  socket_before=$(awk '/^[[:space:]]*unixsocket[[:space:]]/{print $2; exit}' "$conf")
+  perm_before=$(awk '/^[[:space:]]*unixsocketperm[[:space:]]/{print $2; exit}' "$conf")
+  # Keep an operator's existing custom socket path; only add the default when
+  # the service has no socket configured.
+  if [[ -n $socket_before && $socket_before == /* ]]; then
+    socket_path=$socket_before
+  fi
+  conf_set unixsocket "$socket_path"
+  conf_set unixsocketperm 770
+  socket_after=$(awk '/^[[:space:]]*unixsocket[[:space:]]/{print $2; exit}' "$conf")
+  perm_after=$(awk '/^[[:space:]]*unixsocketperm[[:space:]]/{print $2; exit}' "$conf")
+  if [[ $socket_before != "$socket_path" || $perm_before != "$perm_after" || $perm_after != 770 ]]; then
+    socket_changed=1
+  fi
+  # A configured socket that is not live (or still has the old permissions)
+  # needs a restart.
+  if [[ -S $socket_path ]]; then
+    [[ $(stat -c '%a' "$socket_path" 2>/dev/null || true) == 770 ]] || socket_changed=1
+  else
+    socket_changed=1
+  fi
+  if getent group "$group" >/dev/null 2>&1; then
+    if ! id -nG www-data 2>/dev/null | grep -qw "$group"; then
+      if usermod -aG "$group" www-data 2>/dev/null; then
+        group_changed=1
+      else
+        warn "Could not add www-data to the ${group} group"
+      fi
+    fi
+  else
+    warn "Service group ${group} does not exist; ${socket_path} will not be accessible to www-data"
+  fi
+  opt_report "- Local socket: \`${socket_path}\` (unixsocketperm 770)"
+  opt_report "- Application config (not edited automatically):"
+  opt_report "  XenForo: \`\$config['cache']['config']['host'] = '${socket_path}'; \$config['cache']['config']['port'] = 0;\`"
+  opt_report "  WordPress: \`define('WP_REDIS_PATH', '${socket_path}');\`"
+  opt_report "  Laravel/phpredis: \`'host' => '${socket_path}', 'port' => 0\`"
+  opt_report "  Test: \`${cli} -s ${socket_path} ping\`"
+
   conf_after=$(md5sum "$conf" | awk '{print $1}')
   opt_report "- maxmemory=${max_mb}mb, policy=${policy}, maxclients=20000, tcp-backlog=${backlog}"
 
@@ -6301,7 +6447,12 @@ optimize_valkey() {
   fi
 
   if (( active )) && (( TUNE_DIRTY == 0 )) \
-     && [[ $conf_before == "$conf_after" ]] && (( unit_changed == 0 )); then
+     && [[ $conf_before == "$conf_after" ]] && (( unit_changed == 0 )) \
+     && (( socket_changed == 0 )); then
+    if (( group_changed )); then
+      restart_php_workers_for_group "$group"
+      opt_report "- PHP-FPM restarted to inherit the ${group} group"
+    fi
     opt_report "- Restart: skipped (configuration already optimized)"
     return 0
   fi
@@ -6345,11 +6496,19 @@ optimize_valkey() {
     if (( unit_changed )); then
       online_ok=0
     fi
+    if (( socket_changed )); then
+      online_ok=0
+      opt_report "- Unix socket change applies on restart (cache may be cold)"
+    fi
   fi
   if (( active )) && (( online_ok )); then
     live_backlog=$("$cli" CONFIG GET tcp-backlog 2>/dev/null | tail -n1 || true)
     if [[ $live_backlog =~ ^[0-9]+$ ]] && [[ $live_backlog != "$backlog" ]]; then
       opt_report "- tcp-backlog=${backlog} applies at startup (live ${live_backlog}); restart deferred"
+    fi
+    if (( group_changed )); then
+      restart_php_workers_for_group "$group"
+      opt_report "- PHP-FPM restarted to inherit the ${group} group"
     fi
     opt_report "- Applied online via CONFIG SET (no restart; cache retained)"
     return 0
@@ -6364,6 +6523,10 @@ optimize_valkey() {
       done
       if "$cli" ping 2>/dev/null | grep -q PONG; then
         opt_report "- Restart: **OK**"
+        if (( group_changed || socket_changed )); then
+          restart_php_workers_for_group "$group"
+          opt_report "- PHP-FPM restarted to inherit the ${group} group"
+        fi
       else
         opt_report "- Restart: **FAILED** (PING); rolling back"
         opt_restore "$conf_dir" "$kind"
@@ -6382,6 +6545,10 @@ optimize_valkey() {
     fi
   else
     opt_report "- Restart: skipped (service was not active)"
+    if (( group_changed || socket_changed )); then
+      restart_php_workers_for_group "$group"
+      opt_report "- PHP-FPM restarted to inherit the ${group} group (socket applies at next start)"
+    fi
   fi
   return 0
 }
@@ -6401,7 +6568,7 @@ es_jvm_options_is_managed() {
     [[ -n $line ]] || continue
     count=$(( count + 1 ))
     case $line in
-      -Xms*m|-Xmx*m)
+      -Xms*|-Xmx*)
         [[ $line == -Xms* ]] && xs=$(( xs + 1 )) || xx=$(( xx + 1 ))
         ;;
       -XX:+UseG1GC|-XX:MaxGCPauseMillis=200|-XX:+HeapDumpOnOutOfMemoryError|-Dlog4j2.formatMsgNoLookups=true) ;;
@@ -6411,9 +6578,29 @@ es_jvm_options_is_managed() {
   (( other == 0 && xs == 1 && xx == 1 && count >= 4 && count <= 6 ))
 }
 
+es_jvm_options_is_heap_only() {
+  local file=$1 line count=0 xs=0 xx=0 other=0
+  [[ -f $file ]] || return 1
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    if [[ $line =~ ^[[:space:]]*# ]]; then
+      continue
+    fi
+    count=$(( count + 1 ))
+    case $line in
+      -Xms*) xs=$(( xs + 1 )) ;;
+      -Xmx*) xx=$(( xx + 1 )) ;;
+      -XX:+UseG1GC|-XX:MaxGCPauseMillis=200|-XX:+HeapDumpOnOutOfMemoryError|-Dlog4j2.formatMsgNoLookups=true) ;;
+      *) other=$(( other + 1 )) ;;
+    esac
+  done < "$file"
+  (( other == 0 && xs == 1 && xx == 1 && count >= 2 ))
+}
+
 write_es_jvm_options() {
   local heap_mb=$1 dir=${2:-/etc/elasticsearch/jvm.options.d}
   local jvm="${dir}/zz-setup-optimize.options"
+  local legacy="${dir}/jvm.options"
   cat > "$jvm" <<EOF
 -Xms${heap_mb}m
 -Xmx${heap_mb}m
@@ -6424,11 +6611,29 @@ write_es_jvm_options() {
 EOF
   chmod 644 "$jvm"
   chown root:elasticsearch "$jvm" 2>/dev/null || true
-  # Never delete an operator's own jvm.options; only move the exact shape
-  # written by install_elastic() before 1.8.20 to /tmp.  It stays recoverable
-  # and /tmp expires it automatically.
-  if es_jvm_options_is_managed "${dir}/jvm.options"; then
-    preserve_to_tmp "${dir}/jvm.options" >/dev/null || true
+  # Never delete an operator's own jvm.options.  A simple heap-only file (the
+  # common 4g/4g leftover) is moved to /tmp so zz-setup-optimize.options is the
+  # single source of truth.  A richer operator file is preserved, but the
+  # silent-override risk is reported explicitly.
+  if [[ -f $legacy ]]; then
+    if es_jvm_options_is_managed "$legacy" || es_jvm_options_is_heap_only "$legacy"; then
+      if preserve_to_tmp "$legacy" >/dev/null; then
+        info "Moved heap-only ${legacy} to /tmp; ${jvm} owns the heap"
+        if (( ${OPTIMIZE:-0} )); then
+          opt_report "- Moved heap-only \`${legacy}\` to /tmp; \`${jvm}\` owns the heap"
+        fi
+      else
+        warn "Could not move ${legacy}; ${jvm} still takes precedence"
+        if (( ${OPTIMIZE:-0} )); then
+          opt_report "- **WARNING**: could not move \`${legacy}\`; \`${jvm}\` still takes precedence"
+        fi
+      fi
+    elif grep -qE '^[[:space:]]*-Xm[sx]' "$legacy"; then
+      warn "Operator ${legacy} also sets -Xms/-Xmx; ${jvm} takes precedence"
+      if (( ${OPTIMIZE:-0} )); then
+        opt_report "- Warning: operator \`${legacy}\` also sets -Xms/-Xmx; \`${jvm}\` takes precedence"
+      fi
+    fi
   fi
   return 0
 }
@@ -6582,11 +6787,28 @@ optimize_elastic() {
 
   write_es_jvm_options "$heap_mb"
 
+  # The installer comments http.host/transport.host so network.host controls
+  # the bind; --optimize must do the same or an old 0.0.0.0 value survives.
+  local active_bind=0 net_host=""
+  if grep -qE '^[[:space:]]*(http\.host|transport\.host)[[:space:]]*:' "$yml"; then
+    active_bind=1
+  fi
+  net_host=$(sed -nE 's/^[[:space:]]*network\.host[[:space:]]*:[[:space:]]*//p' "$yml" 2>/dev/null | head -n1 \
+    | sed -e 's/[[:space:]]*$//' -e 's/^"//' -e 's/"$//')
+
   # Drop a previous managed block so repeated runs stay idempotent, then let
   # the shared helper append the exact same performance block the installer
   # writes.
   elasticsearch_strip_managed "$yml"
   elasticsearch_write_performance_block "$yml"
+  if (( active_bind )); then
+    opt_report "- Commented active http.host/transport.host; network.host controls the bind"
+  fi
+  if [[ -n $net_host && $net_host != localhost && $net_host != 127.0.0.1 \
+        && $net_host != "::1" && $net_host != "[::1]" ]] \
+     && grep -qE '^[[:space:]]*xpack\.security\.enabled[[:space:]]*:[[:space:]]*false' "$yml" 2>/dev/null; then
+    opt_report "- **WARNING**: Elasticsearch network.host=${net_host} with X-Pack security disabled"
+  fi
 
   elasticsearch_write_systemd_limits
   systemctl daemon-reload || true
@@ -6817,6 +7039,7 @@ optimize_plan() {
     "$nproc" "$ram_mb" "$(df -h / | awk 'NR==2{print $4 " free"}')"
   printf '  OS: governor=%s limits=1M-nofile sysctl=hardware-scaled (%s CPUs / %sMB RAM)\n' \
     "$governor_desc" "$nproc" "$ram_mb"
+  printf '  Legacy repair: nightly cron chown and /var/www/logs ownership\n'
   if (( ${#OPT_DETECTED[@]} == 0 )); then
     printf 'No supported installed services detected.\n'
     return 0
@@ -6917,6 +7140,187 @@ diag_tail_file() {
   tail -n "$nlines" -- "$logfile" >> "$DIAG_FILE" 2>&1 || true
 }
 
+# Query PHP-FPM's pm.status_path over the FastCGI socket.  curl cannot speak
+# FastCGI; the old probe sent HTTP to the socket and always ended with
+# "Recv failure: Connection reset by peer".  cgi-fcgi is used when available,
+# and a status path without .php is reported instead of being rejected by
+# security.limit_extensions.
+diag_php_fpm_status() {
+  local pool="/etc/php/${1}/fpm/pool.d/www.conf" status=""
+  if [[ ! -S /run/php/php-fpm.sock ]]; then
+    printf 'FPM socket /run/php/php-fpm.sock is missing\n'
+    return 0
+  fi
+  if ! command -v cgi-fcgi >/dev/null 2>&1; then
+    printf 'cgi-fcgi is not installed; cannot query pm.status_path\n'
+    return 0
+  fi
+  if [[ -r $pool ]]; then
+    status=$(awk -F= '/^[[:space:]]*pm\.status_path[[:space:]]*=/{gsub(/[[:space:]]/, "", $2); print $2; exit}' "$pool")
+  fi
+  if [[ -z $status ]]; then
+    printf 'pm.status_path is not configured in %s\n' "$pool"
+    return 0
+  fi
+  if [[ $status != *.php ]] \
+     && grep -qE '^[[:space:]]*security\.limit_extensions[[:space:]]*=[[:space:]]*\.php([[:space:]]|$)' "$pool" 2>/dev/null; then
+    printf 'pm.status_path %s has no .php extension and security.limit_extensions=.php rejects it\n' "$status"
+    return 0
+  fi
+  SCRIPT_FILENAME="$status" SCRIPT_NAME="$status" REQUEST_METHOD=GET \
+    cgi-fcgi -bind -connect /run/php/php-fpm.sock 2>&1 || true
+}
+
+diag_tail_files() {
+  local nlines=$1 f
+  shift
+  for f in "$@"; do
+    diag_tail_file "$f" "$nlines"
+  done
+}
+
+diag_angie_log_files() {
+  {
+    if [[ -x /usr/sbin/angie ]]; then
+      /usr/sbin/angie -T 2>/dev/null | awk '
+        $1 == "error_log" || $1 == "access_log" {
+          path = $2
+          sub(/;$/, "", path)
+          if (path != "off" && path != "stderr") print path
+        }
+      ' || true
+    fi
+    printf '%s\n' /var/log/angie/error.log /var/log/angie/access.log
+  } | awk '{ if ($0 !~ /^\//) $0 = "/etc/angie/" $0; print }' | sort -u
+}
+
+diag_angie_certificates() {
+  local f
+  {
+    if [[ -x /usr/sbin/angie ]]; then
+      /usr/sbin/angie -T 2>/dev/null | awk '
+        $1 == "ssl_certificate" {
+          path = $2
+          sub(/;$/, "", path)
+          print path
+        }
+      ' || true
+    fi
+    find /etc/angie/ssl -type f -name 'fullchain.pem' 2>/dev/null || true
+  } | awk '{ if ($0 !~ /^\//) $0 = "/etc/angie/" $0; print }' | sort -u | while IFS= read -r f; do
+    [[ -f $f ]] || continue
+    printf -- '--- %s\n' "$f"
+    if command -v openssl >/dev/null 2>&1; then
+      openssl x509 -in "$f" -noout -subject -issuer -dates 2>&1
+    else
+      printf 'openssl is not installed\n'
+    fi
+  done
+}
+
+diag_php_log_files() {
+  local ver=$1 pool="/etc/php/${1}/fpm/pool.d/www.conf" global="/etc/php/${1}/fpm/php-fpm.conf" f
+  {
+    for f in "$pool" "$global"; do
+      [[ -r $f ]] || continue
+      awk -F= '
+        /^[[:space:]]*(slowlog|error_log|access\.log)[[:space:]]*=/ {
+          value = $2
+          gsub(/^[[:space:]]+|[[:space:]]+$/, "", value)
+          sub(/[[:space:]]*;.*/, "", value)
+          if (value != "" && value != "off" && value != "stderr") print value
+        }
+      ' "$f"
+    done
+    printf '%s\n' \
+      /var/www/logs/php/php-fpm.log \
+      /var/www/logs/php/php-fpm-slow.log \
+      /var/www/logs/php/php-error.log \
+      /var/log/php-fpm/www-slow.log \
+      "/var/log/php${ver}-fpm.log"
+  } | awk -v prefix="/etc/php/${ver}/fpm/" '
+    { if ($0 !~ /^\//) $0 = prefix $0; print }
+  ' | sort -u
+}
+
+diag_mariadb_log_files() {
+  local logerr="" slow="" datadir=""
+  if command -v mariadb >/dev/null 2>&1; then
+    logerr=$(mariadb -N -B -e 'SELECT @@log_error' 2>/dev/null || true)
+    slow=$(mariadb -N -B -e 'SELECT @@slow_query_log_file' 2>/dev/null || true)
+    datadir=$(mariadb -N -B -e 'SELECT @@datadir' 2>/dev/null || true)
+  fi
+  {
+    if [[ -n $logerr ]]; then
+      if [[ $logerr == /* ]]; then
+        printf '%s\n' "$logerr"
+      else
+        printf '%s\n' "${datadir%/}/$logerr"
+      fi
+    fi
+    if [[ -n $slow ]]; then
+      if [[ $slow == /* ]]; then
+        printf '%s\n' "$slow"
+      else
+        printf '%s\n' "${datadir%/}/$slow"
+      fi
+    fi
+    printf '%s\n' \
+      /var/www/logs/mariadb/error.log \
+      /var/www/logs/mariadb/slow.log \
+      /var/log/mysql/error.log
+  } | sort -u
+}
+
+diag_redis_log_files() {
+  local cli value
+  {
+    for cli in valkey-cli redis-cli; do
+      command -v "$cli" >/dev/null 2>&1 || continue
+      value=$("$cli" CONFIG GET logfile 2>/dev/null | tail -n1 || true)
+      if [[ -n $value ]]; then
+        printf '%s\n' "$value"
+      fi
+    done
+    printf '%s\n' /var/www/logs/valkey/valkey.log /var/log/redis/redis-server.log
+  } | sort -u
+}
+
+diag_es_log_files() {
+  find /var/log/elasticsearch /var/www/logs/elasticsearch \
+    -maxdepth 1 -type f \( -name '*.log' -o -name '*.json' \) 2>/dev/null | sort -u || true
+}
+
+diag_redis_config() {
+  local cli=$1 key
+  command -v "$cli" >/dev/null 2>&1 || return 0
+  if ! "$cli" ping >/dev/null 2>&1; then
+    printf '%s is not responding\n' "$cli"
+    return 0
+  fi
+  for key in save appendonly unixsocket unixsocketperm bind protected-mode maxmemory maxmemory-policy logfile dir; do
+    printf -- '--- %s\n' "$key"
+    "$cli" CONFIG GET "$key" 2>/dev/null || true
+  done
+}
+
+diag_angie_include_status() {
+  local included f
+  if [[ ! -x /usr/sbin/angie ]]; then
+    printf 'Angie is not installed\n'
+    return 0
+  fi
+  included=$(/usr/sbin/angie -T 2>/dev/null \
+    | sed -n 's|^# configuration file /etc/angie/http\.d/\(.*\):$|\1|p' | sort -u)
+  find /etc/angie/http.d -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | sort | while IFS= read -r f; do
+    if printf '%s\n' "$included" | grep -qxF -- "$f"; then
+      printf 'ACTIVE   %s\n' "$f"
+    else
+      printf 'INACTIVE %s\n' "$f"
+    fi
+  done || true
+}
+
 # Diagnostics read journald, sudo records and service logs.  Redact common
 # credential forms before the file is handed to an analysis agent.
 redact_diagnostics() {
@@ -6924,6 +7328,7 @@ redact_diagnostics() {
   [[ -f $file ]] || return 0
   sed_in_place -E \
     -e 's/([A-Za-z_]*(pass|PASS|Pass|password|PASSWORD|Password)=)[^[:space:];]+/\1***/g' \
+    -e 's/([Pp][Aa][Ss][Ss][Ww][Oo][Rr][Dd]|passwd|pwd)([[:space:]]*=[[:space:]]*)[^[:space:];]+/\1\2***/g' \
     -e 's/(MYSQL_PWD=)[^[:space:];]+/\1***/g' \
     -e 's/(REDISCLI_AUTH=)[^[:space:];]+/\1***/g' \
     -e "s/(IDENTIFIED BY ')[^']*(')/\1***\2/g" \
@@ -7025,16 +7430,17 @@ run_diagnostics() {
     diag "systemctl cat ${u}" systemctl cat "$u"
   done
 
-  diag "Angie version" /usr/sbin/angie -V
-  diag "Angie config test" /usr/sbin/angie -t
-  diag_sh "Angie loaded configuration" '/usr/sbin/angie -T 2>&1 | head -n 3000'
+  diag_sh "Angie version" 'if [ -x /usr/sbin/angie ]; then /usr/sbin/angie -V; else echo "Angie is not installed"; fi'
+  diag_sh "Angie config test" 'if [ -x /usr/sbin/angie ]; then /usr/sbin/angie -t; else echo "Angie is not installed"; fi'
+  diag_sh "Angie loaded configuration" 'if [ -x /usr/sbin/angie ]; then /usr/sbin/angie -T 2>&1 | head -n 3000; else echo "Angie is not installed"; fi'
   diag_sh "Angie vhosts" 'find /etc/angie/conf.d -maxdepth 1 -type f -name "*.conf" -printf "%f\n" 2>/dev/null | sort'
-  diag_sh "Angie certificates" 'for f in /etc/angie/ssl/*/fullchain.pem; do [ -f "$f" ] || continue; echo "--- $f"; openssl x509 -in "$f" -noout -subject -issuer -dates 2>&1; done'
+  diag "Angie certificates" diag_angie_certificates
+  diag "Angie http.d include status" diag_angie_include_status
   diag_sh "Angie error/access log sizes" 'du -sh /var/www/logs/angie /var/log/angie 2>/dev/null || true'
 
-  diag "PHP CLI version" php -v
-  diag "PHP CLI modules" php -m
-  diag "PHP CLI ini" php --ini
+  diag_sh "PHP CLI version" 'if command -v php >/dev/null 2>&1; then php -v; else echo "php CLI is not installed"; fi'
+  diag_sh "PHP CLI modules" 'if command -v php >/dev/null 2>&1; then php -m; else echo "php CLI is not installed"; fi'
+  diag_sh "PHP CLI ini" 'if command -v php >/dev/null 2>&1; then php --ini; else echo "php CLI is not installed"; fi'
   diag_sh "PHP-FPM versions" 'for d in /etc/php/*/fpm; do [ -d "$d" ] || continue; v=${d%/fpm}; v=${v##*/}; echo "--- PHP $v"; command -v "php-fpm$v" >/dev/null && "php-fpm$v" -v || /usr/sbin/php-fpm"$v" -v 2>&1; done'
   while IFS= read -r ver; do
     [[ -n $ver ]] || continue
@@ -7048,9 +7454,9 @@ run_diagnostics() {
     diag "PHP ${ver} pool" cat "/etc/php/${ver}/fpm/pool.d/www.conf"
     diag "PHP ${ver} global config" cat "/etc/php/${ver}/fpm/php-fpm.conf"
     diag_sh "PHP ${ver} conf.d" "find /etc/php/${ver}/fpm/conf.d -maxdepth 1 -type f -print -exec sh -c 'echo --- \$1; cat \"\$1\"' _ {} \\;"
-    diag_sh "PHP ${ver} processes" "ps -eo pid,ppid,user,%cpu,%mem,rss,etime,cmd | grep -E '[p]hp-fpm${ver}' | head -60"
+    diag_sh "PHP ${ver} processes" "ps -eo pid,ppid,user,%cpu,%mem,rss,etime,cmd | grep -E '[p]hp-fpm' | head -60"
     diag_sh "PHP ${ver} listeners" "ss -lxp | grep -E 'php${ver}|php-fpm' || true"
-    diag_sh "PHP ${ver} status" "if [ -S /run/php/php-fpm.sock ]; then curl -fsS --max-time 3 --unix-socket /run/php/php-fpm.sock http://localhost/fpm-status 2>&1 || true; fi"
+    diag "PHP ${ver} status" diag_php_fpm_status "$ver"
   done < <(php_fpm_versions)
 
   diag "MariaDB version" mariadb --version
@@ -7064,10 +7470,13 @@ run_diagnostics() {
   diag_sh "MariaDB replication" "mariadb -e 'SHOW REPLICA STATUS\\G' 2>&1 || mariadb -e 'SHOW SLAVE STATUS\\G' 2>&1 || true"
   diag_sh "MariaDB extended status" 'mariadb-admin ext 2>&1 | head -300'
   diag_sh "MariaDB error log size" 'du -sh /var/www/logs/mariadb /var/log/mysql 2>/dev/null || true'
+  diag "MariaDB resolved log files" diag_mariadb_log_files
+  diag_sh "MariaDB config files" 'find /etc/mysql -maxdepth 3 -type f ! -name "debian.cnf" ! -name "*.pem" ! -name "*.key" ! -name "*.crt" -print -exec sh -c "echo --- \$1; sed -n \"1,200p\" \"\$1\"" _ {} \; 2>/dev/null | head -n 800'
 
   if command -v valkey-cli >/dev/null 2>&1; then
     diag "Valkey info" valkey-cli INFO all
     diag "Valkey config" valkey-cli CONFIG GET maxmemory
+    diag "Valkey selected config" diag_redis_config valkey-cli
     diag "Valkey clients" valkey-cli CLIENT LIST
     diag "Valkey slowlog" valkey-cli SLOWLOG GET 100
     diag "Valkey memory stats" valkey-cli MEMORY STATS
@@ -7076,25 +7485,28 @@ run_diagnostics() {
   if command -v redis-cli >/dev/null 2>&1; then
     diag "Redis info" redis-cli INFO all
     diag "Redis config" redis-cli CONFIG GET maxmemory
+    diag "Redis selected config" diag_redis_config redis-cli
     diag "Redis clients" redis-cli CLIENT LIST
     diag "Redis slowlog" redis-cli SLOWLOG GET 100
     diag "Redis memory stats" redis-cli MEMORY STATS
     diag "Redis latency" redis-cli LATENCY LATEST
   fi
+  diag "Valkey/Redis resolved log files" diag_redis_log_files
 
   diag "Elasticsearch root" curl -fsS --max-time 5 http://127.0.0.1:9200
   diag "Elasticsearch health" curl -fsS --max-time 5 'http://127.0.0.1:9200/_cluster/health?pretty'
   diag "Elasticsearch nodes" curl -fsS --max-time 5 'http://127.0.0.1:9200/_cat/nodes?v'
   diag "Elasticsearch indices" curl -fsS --max-time 5 'http://127.0.0.1:9200/_cat/indices?v&s=store.size:desc'
   diag_sh "Elasticsearch node stats" 'curl -fsS --max-time 10 "http://127.0.0.1:9200/_nodes/stats/jvm,os,indices,thread_pool?pretty" | head -n 500'
-  diag_sh "Elasticsearch allocation" 'curl -fsS --max-time 5 "http://127.0.0.1:9200/_cluster/allocation/explain?pretty" | head -n 200'
-  diag "Elasticsearch YAML" cat /etc/elasticsearch/elasticsearch.yml
-  diag_sh "Elasticsearch JVM options" 'find /etc/elasticsearch/jvm.options.d -maxdepth 1 -type f -print -exec sh -c "echo --- \$1; cat \"\$1\"" _ {} \;'
-  diag "Elasticsearch systemd limits" cat /etc/systemd/system/elasticsearch.service.d/limits.conf
+  diag_sh "Elasticsearch allocation" 'curl -sS --max-time 5 -w "\nHTTP %{http_code}\n" "http://127.0.0.1:9200/_cluster/allocation/explain?pretty" | head -n 200'
+  diag_sh "Elasticsearch YAML" 'if [ -f /etc/elasticsearch/elasticsearch.yml ]; then cat /etc/elasticsearch/elasticsearch.yml; else echo "Elasticsearch is not installed"; fi'
+  diag_sh "Elasticsearch JVM options" 'find /etc/elasticsearch/jvm.options.d -maxdepth 1 -type f -print -exec sh -c "echo --- \$1; cat \"\$1\"" _ {} \; 2>/dev/null || true'
+  diag_sh "Elasticsearch systemd limits" 'if [ -f /etc/systemd/system/elasticsearch.service.d/limits.conf ]; then cat /etc/systemd/system/elasticsearch.service.d/limits.conf; else echo "systemd drop-in is not installed"; fi'
   diag_sh "Elasticsearch log size" 'du -sh /var/www/logs/elasticsearch /var/log/elasticsearch 2>/dev/null || true'
+  diag "Elasticsearch resolved log files" diag_es_log_files
 
-  diag "Node version" node -v
-  diag "npm version" npm -v
+  diag_sh "Node version" 'if command -v node >/dev/null 2>&1; then node -v; else echo "Node.js is not installed"; fi'
+  diag_sh "npm version" 'if command -v npm >/dev/null 2>&1; then npm -v; else echo "npm is not installed"; fi'
   diag_sh "Node processes" 'ps -eo pid,ppid,user,%cpu,%mem,rss,etime,cmd | grep -E "[n]ode" | head -60'
   diag_sh "Node listeners" 'ss -lntp | grep -i node || true'
   diag_sh "Node service units" 'systemctl list-units --all --no-legend --no-pager "*node*.service" 2>/dev/null || true'
@@ -7113,12 +7525,24 @@ run_diagnostics() {
   diag "kern.log" tail -n 500 /var/log/kern.log
   diag "auth.log" tail -n 300 /var/log/auth.log
 
-  # Slow logs first: these matter most for application tuning.
-  diag_tail_file /var/www/logs/php/php-fpm-slow.log 800
-  diag_tail_file /var/www/logs/mariadb/slow.log 800
-  diag_tail_file /var/www/logs/angie/error.log 500
-  diag_tail_file /var/www/logs/valkey/valkey.log 500
-  diag_tail_file /var/www/logs/elasticsearch/essearch.log 500
+  # Slow logs first: these matter most for application tuning.  Resolve the
+  # live paths instead of assuming the /var/www/logs layout: old hosts still
+  # write PHP-FPM to /var/log/php-fpm, Angie vhosts to their document root,
+  # MariaDB to its datadir, and Elasticsearch to /var/log/elasticsearch.
+  local -a log_files=()
+  while IFS= read -r ver; do
+    [[ -n $ver ]] || continue
+    mapfile -t log_files < <(diag_php_log_files "$ver")
+    diag_tail_files 800 "${log_files[@]}"
+  done < <(php_fpm_versions)
+  mapfile -t log_files < <(diag_mariadb_log_files)
+  diag_tail_files 800 "${log_files[@]}"
+  mapfile -t log_files < <(diag_angie_log_files)
+  diag_tail_files 500 "${log_files[@]}"
+  mapfile -t log_files < <(diag_redis_log_files)
+  diag_tail_files 500 "${log_files[@]}"
+  mapfile -t log_files < <(diag_es_log_files)
+  diag_tail_files 500 "${log_files[@]}"
   diag_tail_file /var/www/logs/nodejs/nodejs.log 500
   diag_tail_file /var/www/logs/gifsicle/gifsicle.log 200
 
@@ -7127,13 +7551,15 @@ run_diagnostics() {
     diag_tail_file "$f" 200
   done < <(find /var/www/logs -type f \( -name '*.log' -o -name '*.json' \) 2>/dev/null | sort | head -n 120)
 
-  diag_sh "log sizes" 'du -sh /var/www/logs/* /var/log/angie /var/log/php* /var/log/mysql /var/log/redis* 2>/dev/null | sort -h || true'
-  diag "logrotate debug" logrotate -d /etc/logrotate.d/setup-logs
+  diag_sh "log sizes" 'du -sh /var/www/logs/* /var/log/angie /var/log/php* /var/log/mysql /var/log/redis* /var/www/*/error.log /var/www/*/access.log 2>/dev/null | sort -h || true'
+  diag_sh "web root ownership" 'ls -ld /var/www /var/www/logs /var/www/logs/* /var/www/mysql_database 2>/dev/null || true'
+  diag_sh "log tree ownership" 'find /var/www/logs -maxdepth 2 -printf "%M %u:%g %p\n" 2>/dev/null | sort || true'
+  diag_sh "logrotate debug" 'if command -v logrotate >/dev/null 2>&1 && [ -f /etc/logrotate.d/setup-logs ]; then logrotate -d /etc/logrotate.d/setup-logs; else echo "logrotate or /etc/logrotate.d/setup-logs is not installed"; fi'
   diag "cron" crontab -l
   diag "UFW status" ufw status verbose
   diag "UFW added rules" ufw show added
   diag "SSH effective config" sshd -T
-  diag "last logins" last -n 30
+  diag_sh "last logins" 'if command -v last >/dev/null 2>&1; then last -n 30; else echo "last is not installed"; fi'
   diag "who" who
   diag "apt upgradable" bash -c 'apt list --upgradable 2>/dev/null | head -100'
   diag_sh "installed service packages" 'dpkg -l | awk "\$1==\"ii\" && (\$2 ~ /^(angie|php|mariadb|valkey|redis|elasticsearch|nodejs|nginx)/){print \$2, \$3}"'
@@ -7201,6 +7627,13 @@ run_restart_all() {
     info "Detected installed services: ${OPT_DETECTED[*]}"
   else
     warn "No supported installed services were detected from configuration paths"
+  fi
+
+  # Repair old /var/www/logs ownership before touching any service.  A
+  # MariaDB/Valkey/Elasticsearch restart can otherwise fail when the previous
+  # release left its log directory owned by www-data.
+  if (( ${#OPT_DETECTED[@]} > 0 )); then
+    repair_log_ownership 1 || warn "Log ownership repair reported failures"
   fi
 
   systemctl daemon-reload || warn "systemctl daemon-reload failed"
@@ -7342,6 +7775,136 @@ run_os_tuning() {
   configure_limits
 }
 
+# Repair legacy cron jobs written by older releases.  It is deliberately a
+# text migration, not a purge: the ownership job's intent (keep web content
+# owned by www-data) is preserved, but it no longer touches the per-service
+# log tree or the database backup directory, and the old nginx/mysqlcheck
+# paths are replaced by the managed block.
+repair_optimize_legacy_cron() {
+  local cur backup had_legacy=0 had_cloudflare=0 had_mysqlcheck=0
+  if ! command -v crontab >/dev/null 2>&1; then
+    opt_report "- Cron: skipped (crontab is not installed)"
+    return 0
+  fi
+  cur=$(crontab -l 2>/dev/null || true)
+  if [[ -n $cur ]] \
+     && printf '%s\n' "$cur" | grep -qE 'chown[[:space:]]+www-data:www-data[[:space:]]+(-R|--recursive)[[:space:]]+/var/www|chown[[:space:]]+(-R|--recursive)[[:space:]]+www-data:www-data[[:space:]]+/var/www'; then
+    had_legacy=1
+  fi
+  if printf '%s\n' "$cur" | grep -qF -- '/etc/nginx/scripts/cloudflare.sh'; then
+    had_cloudflare=1
+  fi
+  if printf '%s\n' "$cur" | grep -qF -- '/usr/bin/mysqlcheck'; then
+    had_mysqlcheck=1
+  fi
+  if [[ -n $cur ]]; then
+    backup=$(tmp_file)
+    printf '%s\n' "$cur" > "$backup"
+  fi
+  # Let write_cron own the managed block.  It strips bare legacy/safe chown
+  # lines and the old nginx/mysqlcheck paths, then regenerates entries for
+  # installed services, so a host whose block was removed by --purge basic
+  # also gets its backups and log-owner repair back.
+  if write_cron; then
+    if (( had_legacy )); then
+      opt_report "- Cron: migrated the legacy 'chown -R /var/www' entry"
+    fi
+    if (( had_cloudflare )); then
+      opt_report "- Cron: removed the legacy /etc/nginx/scripts/cloudflare.sh path"
+    fi
+    if (( had_mysqlcheck )); then
+      opt_report "- Cron: removed the legacy /usr/bin/mysqlcheck path"
+    fi
+    if (( had_legacy == 0 && had_cloudflare == 0 && had_mysqlcheck == 0 )); then
+      opt_report "- Cron: managed block ensured for installed services"
+    fi
+    if [[ -n $backup ]]; then
+      opt_report "- Cron: previous crontab saved to \`${backup}\`"
+    fi
+    return 0
+  fi
+  opt_report "- Cron: **FAILED** to update the crontab"
+  return 1
+}
+
+# Older releases created every /var/www/logs/<service> directory as www-data.
+# A service that writes its own log (MariaDB, Redis/Valkey, Elasticsearch) then
+# fails to reopen or rotate it, sometimes only after the next restart.  Fix the
+# ownership that this run can prove is wrong, and repair the two paths the old
+# blanket cron also flattened (/var/www and /var/www/mysql_database).  The
+# quiet mode uses info() (for --restart-all); the default writes the optimize
+# report.
+repair_log_ownership() {
+  local quiet=${1:-0} svc owner grp dir rc=0
+  ensure_log_dirs
+  repair_note() {
+    if (( quiet )); then info "$*"; else opt_report "$*"; fi
+  }
+  if ! chown root:root /var/www/logs 2>/dev/null; then
+    warn "Could not set /var/www/logs owner to root:root"
+    repair_note "- Logs: **FAILED** to reset /var/www/logs to root:root"
+    rc=1
+  else
+    chmod 755 /var/www/logs 2>/dev/null || true
+    repair_note "- Logs: /var/www/logs -> root:root (755)"
+  fi
+  while read -r svc owner grp; do
+    [[ -n $svc ]] || continue
+    dir="/var/www/logs/$svc"
+    [[ -d $dir ]] || continue
+    if ! getent passwd "$owner" >/dev/null 2>&1; then
+      repair_note "- Logs: skipped ${dir} (user ${owner} not found)"
+      continue
+    fi
+    if chown -R "$owner:$grp" "$dir" 2>/dev/null \
+       && chmod 750 "$dir" 2>/dev/null; then
+      find "$dir" -type f -exec chmod 640 {} + 2>/dev/null || true
+      repair_note "- Logs: ${dir} -> ${owner}:${grp} (750/640)"
+    else
+      warn "Could not repair ${dir} ownership"
+      repair_note "- Logs: **FAILED** to repair ${dir} -> ${owner}:${grp}"
+      rc=1
+    fi
+  done <<'EOF'
+angie www-data www-data
+php www-data www-data
+nodejs www-data www-data
+gifsicle www-data www-data
+mariadb mysql mysql
+elasticsearch elasticsearch elasticsearch
+valkey valkey valkey
+redis redis redis
+EOF
+
+  # The legacy cron also flattened the web root and the database backup
+  # directory to www-data.  Both are security-sensitive: /var/www should be
+  # root-owned, and dumps must not be readable by the web user.  Change them
+  # only when the owner is still www-data, so an operator's deliberate layout
+  # is left alone.
+  if [[ -d /var/www ]] \
+     && [[ $(stat -c '%U' /var/www 2>/dev/null || true) == www-data ]]; then
+    if chown root:root /var/www 2>/dev/null && chmod 755 /var/www 2>/dev/null; then
+      repair_note "- Web root: /var/www -> root:root (755)"
+    else
+      warn "Could not reset /var/www ownership"
+      repair_note "- Web root: **FAILED** to reset /var/www"
+      rc=1
+    fi
+  fi
+  if [[ -d /var/www/mysql_database ]] \
+     && [[ $(stat -c '%U' /var/www/mysql_database 2>/dev/null || true) == www-data ]]; then
+    if chown -R root:root /var/www/mysql_database 2>/dev/null \
+       && chmod 700 /var/www/mysql_database 2>/dev/null; then
+      repair_note "- Backups: /var/www/mysql_database -> root:root (700)"
+    else
+      warn "Could not reset /var/www/mysql_database ownership"
+      repair_note "- Backups: **FAILED** to reset /var/www/mysql_database"
+      rc=1
+    fi
+  fi
+  return "$rc"
+}
+
 run_optimize() {
   local rc=0 service
   OPT_REPORT_STARTED=1
@@ -7360,12 +7923,19 @@ run_optimize() {
   fi
   plan_memory_budget
   run_os_tuning
-  # A service restart fails when its log directory is owned by another
-  # account (seen on hosts upgraded from an older setup.sh that created every
-  # log directory as www-data): Valkey cannot open its logfile and
-  # Elasticsearch cannot use path.logs as its working directory.  Repair the
-  # ownership before any service is restarted.
-  ensure_log_dirs
+  # Old hosts can still carry the pre-1.8.34 nightly chown that flattened the
+  # log tree to www-data.  Migrate that cron entry and repair the resulting
+  # ownership before any service is restarted; otherwise MariaDB/Valkey/
+  # Elasticsearch may fail to reopen or rotate their logs later.
+  opt_report "## Legacy host repair"
+  repair_optimize_legacy_cron || rc=1
+  repair_log_ownership 0 || rc=1
+  if command -v logrotate >/dev/null 2>&1; then
+    configure_logrotate 0
+    opt_report "- Log rotation: \`/etc/logrotate.d/setup-logs\` ensured"
+  else
+    opt_report "- Log rotation: logrotate is not installed; central logs may grow"
+  fi
   opt_report "## Operating system"
   opt_report "- CPU governor, PAM limits and kernel/network/memory sysctls tuned for ${OPT_MEM_TOTAL_MB}MB RAM / $(nproc) CPUs"
   step "Optimizing installed services"
@@ -7381,7 +7951,12 @@ run_optimize() {
     # EXIT trap does not write a duplicate partial report.
     OPT_REPORT_WRITTEN=1
     info "Report: ${report}"
-    return 0
+    if (( rc == 0 )); then
+      ok "OS tuning and legacy repair completed"
+    else
+      warn "OS tuning or legacy repair reported failures; check the report"
+    fi
+    return "$rc"
   fi
   info "Detected: ${OPT_DETECTED[*]}"
   info "Backups: ${OPT_BACKUP_DIR}"

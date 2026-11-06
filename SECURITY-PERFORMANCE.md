@@ -354,9 +354,10 @@ Recommended changes:
 
 Already good:
 
-- UFW default deny incoming, allow outgoing; every effective SSH port plus
-  80/443 allowed (no rate limit on SSH, so automation is not banned).
-- fail2ban SSH jail using UFW; unattended security updates; sysstat history.
+- UFW default deny incoming, allow outgoing; every effective SSH port is
+  rate-limited with `ufw limit`, and 80/443 are allowed.
+- `sysstat` history is optional (`--others sysstat`); fail2ban and
+  unattended-upgrades are not installed by this script.
 - BBR/fq, large connection backlogs, file-max/nr_open, security sysctls,
   protected links/symlinks/fifos/regular files. A sysctl.d drop-in keeps fq
   as the default qdisc when a package upgrade restarts systemd-sysctl.
@@ -430,4 +431,4 @@ sudo bash tests/stress-site/run-stress.sh /tmp/stress-report.md
 
 The test site is available at `https://stress.invalid/` (self-signed certificate),
 with `/cached.php` for the FastCGI-cache comparison and `/nginx-status` /
-`/fpm-status` restricted to localhost. Remove it from production.
+`/fpm-status.php` restricted to localhost. Remove it from production.

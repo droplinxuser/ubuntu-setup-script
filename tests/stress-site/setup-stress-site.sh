@@ -132,12 +132,54 @@ systemctl enable --now stress-node.service
 systemctl restart stress-node.service
 
 # ---------------------------------------------------------------------------
-# PHP-FPM status endpoint (localhost only, used by the stress harness)
+# PHP-FPM settings used by the stress harness
 # ---------------------------------------------------------------------------
 POOL="/etc/php/${PHP_VER}/fpm/pool.d/www.conf"
-if [[ -f $POOL ]] && ! grep -q '^pm\.status_path' "$POOL"; then
-  printf '\npm.status_path = /fpm-status\n' >> "$POOL"
-  systemctl restart "$FPM_SVC"
+FPM_CHANGED=0
+STRESS_STATE_DIR=/var/lib/stress-site
+FPM_STATE="${STRESS_FPM_STATE:-${STRESS_STATE_DIR}/fpm-max-requests}"
+if [[ -f $POOL ]]; then
+  mkdir -p "$STRESS_STATE_DIR"
+  # Save the production value once.  run-stress.sh restores it in an EXIT
+  # trap, so an interrupted or completed suite does not leave the live pool
+  # with worker recycling disabled.
+  if [[ ! -f $FPM_STATE ]]; then
+    original_max=$(awk -F= '/^[[:space:]]*pm\.max_requests[[:space:]]*=/{gsub(/[[:space:]]/, "", $2); print $2; exit}' "$POOL")
+    [[ -n $original_max ]] || original_max=NONE
+    {
+      printf 'POOL=%s\n' "$POOL"
+      printf 'FPM_SVC=%s\n' "$FPM_SVC"
+      printf 'ORIGINAL_MAX_REQUESTS=%s\n' "$original_max"
+    } > "$FPM_STATE"
+    chmod 600 "$FPM_STATE"
+    echo "Saved original pm.max_requests=${original_max} to ${FPM_STATE}" >&2
+  fi
+  # The status path needs a .php extension: the pool sets
+  # security.limit_extensions = .php, which rejects a bare /fpm-status.
+  if ! grep -qx 'pm.status_path = /fpm-status.php' "$POOL"; then
+    if grep -qE '^[[:space:]]*pm\.status_path[[:space:]]*=' "$POOL"; then
+      sed -i -E 's|^[[:space:]]*pm\.status_path[[:space:]]*=.*|pm.status_path = /fpm-status.php|' "$POOL"
+    else
+      printf '\npm.status_path = /fpm-status.php\n' >> "$POOL"
+    fi
+    FPM_CHANGED=1
+  fi
+  # Worker recycling closes FastCGI keepalive connections and shows up as
+  # "upstream prematurely closed connection" in the Angie log during the
+  # high-request-rate PHP tests.  The stress pages are allocation-light, so
+  # disable recycling for this test host.  This is test-only; keep a finite
+  # pm.max_requests in production.
+  if ! grep -qx 'pm.max_requests = 0' "$POOL"; then
+    if grep -qE '^[[:space:]]*pm\.max_requests[[:space:]]*=' "$POOL"; then
+      sed -i -E 's|^[[:space:]]*pm\.max_requests[[:space:]]*=.*|pm.max_requests = 0|' "$POOL"
+    else
+      printf '\npm.max_requests = 0\n' >> "$POOL"
+    fi
+    FPM_CHANGED=1
+  fi
+  if (( FPM_CHANGED )); then
+    systemctl restart "$FPM_SVC"
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -210,12 +252,12 @@ server {
         deny all;
     }
 
-    location = /fpm-status {
+    location = /fpm-status.php {
         allow 127.0.0.1;
         deny all;
         include fastcgi_params;
-        fastcgi_param SCRIPT_NAME /fpm-status;
-        fastcgi_param SCRIPT_FILENAME /fpm-status;
+        fastcgi_param SCRIPT_NAME /fpm-status.php;
+        fastcgi_param SCRIPT_FILENAME /fpm-status.php;
         fastcgi_pass local_php;
     }
 
@@ -254,7 +296,7 @@ echo "  https://${DOMAIN}/db.php      (MariaDB)"
 echo "  https://${DOMAIN}/cache.php   (Valkey)"
 echo "  https://${DOMAIN}/search.php  (Elasticsearch)"
 echo "  https://${DOMAIN}/node/       (Node.js proxy)"
-echo "  https://${DOMAIN}/nginx-status, /fpm-status (localhost only)"
+echo "  https://${DOMAIN}/nginx-status, /fpm-status.php (localhost only)"
 echo
 curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/hello.php"
 curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/" | grep -Eo 'Total render: [0-9.]+ ms' | head -1 || true
