@@ -34,7 +34,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.42"
+readonly SCRIPT_VERSION="1.8.43"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -2698,6 +2698,31 @@ tune_fastcgi_snippet() {
   return 0
 }
 
+# PHP-FPM uses PATH_TRANSLATED instead of SCRIPT_FILENAME when
+# cgi.fix_pathinfo=0. The shared WordPress/Polr includes used to set it to
+# $document_root$fastcgi_path_info, which is the document root for a normal
+# /index.php request. Point it at the script so enabling fix_pathinfo later
+# cannot turn the document root into an attempted PHP script.
+tune_fastcgi_path_translated() {
+  local file=$1 tmp
+  [[ -f $file ]] || return 0
+  grep -qE '^[[:space:]]*fastcgi_param[[:space:]]+PATH_TRANSLATED[[:space:]]+\$document_root\$fastcgi_path_info[[:space:]]*;' "$file" || return 0
+  tmp=$(tmp_file) || return 1
+  awk '
+    function lead(s) { match(s, /^[[:space:]]*/); return substr(s, 1, RLENGTH) }
+    /^[[:space:]]*fastcgi_param[[:space:]]+PATH_TRANSLATED[[:space:]]+\$document_root\$fastcgi_path_info[[:space:]]*;/ {
+      print lead($0) "fastcgi_param PATH_TRANSLATED $document_root$fastcgi_script_name;"
+      next
+    }
+    { print }
+  ' "$file" > "$tmp"
+  if ! cmp -s "$file" "$tmp"; then
+    cat "$tmp" > "$file"
+    tune_note "${file##*/}: PATH_TRANSLATED uses the PHP script"
+  fi
+  return 0
+}
+
 # A bare `location / { try_files ... }` with no index directive resolves "/"
 # to the directory instead of index.php on older vhosts.  Add a server-level
 # index to the shared WordPress and Polr includes when they lack one.
@@ -2726,11 +2751,14 @@ tune_angie_configs() {
   [[ -f $nginx_conf ]] || return 1
 
   # Repair the shared PHP include and the two server-level includes that old
-  # deployments left without an index.  These are targeted repairs, not a
-  # deployment of the Angie repository.
+  # deployments left without an index.  Also normalise PATH_TRANSLATED so
+  # cgi.fix_pathinfo=0 cannot make PHP-FPM execute the document root.
   tune_fastcgi_snippet "${target}/snippets/fastcgi-php.conf"
   tune_ensure_index "${target}/h5bp/wordpress.conf"
   tune_ensure_index "${target}/h5bp/php_polr.conf"
+  tune_fastcgi_path_translated "${target}/h5bp/php_wp.conf"
+  tune_fastcgi_path_translated "${target}/h5bp/php_polr.conf"
+  tune_fastcgi_path_translated "${target}/h5bp/php.conf"
 
   local nproc mem_mb disk_free_mb disk_class
   local worker_rlimit worker_connections php_keepalive open_files
@@ -3211,6 +3239,19 @@ sync_php_ini_template() {
     ' "$template" > "$tmp"
   else
     cat "$template" > "$tmp"
+  fi
+
+  # Never leave a global cgi.fix_pathinfo override in the default template.
+  # With fix_pathinfo=0 PHP-FPM prefers PATH_TRANSLATED; the deployed PHP
+  # includes used to map that to the document root, so every pretty URL was
+  # denied.  The opt-in hardening block writes the value deliberately after
+  # PATH_TRANSLATED is repaired.
+  if [[ ${SETUP_PHP_SESSION_HARDENING:-0} != 1 ]] \
+     && grep -qE '^[[:space:]]*cgi\.fix_pathinfo[[:space:]]*=' "$tmp"; then
+    local cleaned
+    cleaned=$(tmp_file) || return 1
+    grep -vE '^[[:space:]]*cgi\.fix_pathinfo[[:space:]]*=' "$tmp" > "$cleaned" || true
+    cat "$cleaned" > "$tmp"
   fi
 
   if [[ -f $target ]] && cmp -s "$tmp" "$target"; then

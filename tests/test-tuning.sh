@@ -692,9 +692,55 @@ tune_reset_changes
 sync_php_ini_template 8.3 "$TMP/php-ini/custom_dan.ini" "$TMP/php-ini/template.ini"
 check "custom_dan refresh is idempotent" test "$TUNE_DIRTY" -eq 0
 
+# An old template that still carries cgi.fix_pathinfo=0 must not be installed
+# when the opt-in hardening is disabled.
+cat > "$TMP/php-ini/cgi-template.ini" <<'EOF'
+memory_limit = 512M
+cgi.fix_pathinfo = 0
+date.timezone = Asia/Manila
+EOF
+cat > "$TMP/php-ini/cgi-custom.ini" <<'EOF'
+memory_limit = 2048M
+cgi.fix_pathinfo = 0
+date.timezone = Africa/Dar_es_Salaam
+EOF
+tune_reset_changes
+sync_php_ini_template 8.3 "$TMP/php-ini/cgi-custom.ini" "$TMP/php-ini/cgi-template.ini"
+check "custom_dan refresh drops global cgi.fix_pathinfo" \
+  test -z "$(grep '^cgi\.fix_pathinfo' "$TMP/php-ini/cgi-custom.ini")"
+check "custom_dan refresh keeps the performance block" \
+  grep -qx 'memory_limit = 512M' "$TMP/php-ini/cgi-custom.ini"
+
 check "--optimize calls the custom_dan refresh" \
   grep -q 'sync_php_ini_template "$ver"' \
   <<<"$(sed -n '/^optimize_php_services()/,/^}/p' "$ROOT/setup.sh")"
+
+check "default PHP template leaves cgi.fix_pathinfo unset" \
+  test -z "$(grep '^cgi\.fix_pathinfo' "$ROOT/configs/php/custom_dan.ini")"
+
+# cgi.fix_pathinfo=0 makes PHP-FPM prefer PATH_TRANSLATED.  The deployed
+# includes must point it at the script, not at the empty path_info.
+mkdir -p "$TMP/path-translated"
+cat > "$TMP/path-translated/php_wp.conf" <<'EOF'
+location ~ [^/]\.php(/|$) {
+fastcgi_param HTTP_PROXY "";
+fastcgi_param PATH_TRANSLATED $document_root$fastcgi_path_info;
+}
+EOF
+tune_reset_changes
+tune_fastcgi_path_translated "$TMP/path-translated/php_wp.conf"
+check "PATH_TRANSLATED points at the PHP script" \
+  grep -qF 'fastcgi_param PATH_TRANSLATED $document_root$fastcgi_script_name;' \
+  "$TMP/path-translated/php_wp.conf"
+check "PATH_TRANSLATED repair marks configuration dirty" \
+  test "$TUNE_DIRTY" -eq 1
+tune_reset_changes
+tune_fastcgi_path_translated "$TMP/path-translated/php_wp.conf"
+check "PATH_TRANSLATED repair is idempotent" test "$TUNE_DIRTY" -eq 0
+
+check "--optimize repairs PATH_TRANSLATED in the PHP includes" \
+  grep -q 'tune_fastcgi_path_translated "${target}/h5bp/php_wp.conf"' \
+  <<<"$(sed -n '/^tune_angie_configs()/,/^}/p' "$ROOT/setup.sh")"
 
 check "opt-in hardening disables cgi.fix_pathinfo" \
   grep -q '^cgi.fix_pathinfo = 0$' <<<"$php_tune_hardening"

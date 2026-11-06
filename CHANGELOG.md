@@ -2,6 +2,30 @@
 
 Historical release notes for ubuntu-setup-script. Current behavior is documented in README.md.
 
+## What's new in 1.8.43
+
+- **Removed the default `cgi.fix_pathinfo=0` that brought “Access denied”
+  back.** 1.8.42 refreshed `custom_dan.ini` from the template, which still
+  contained `cgi.fix_pathinfo = 0`. With that value PHP-FPM uses
+  `PATH_TRANSLATED` instead of `SCRIPT_FILENAME` (PHP bug #68053). The
+  deployed WordPress/Polr includes set
+  `fastcgi_param PATH_TRANSLATED $document_root$fastcgi_path_info;`, so a
+  normal `/index.php` request translated to the document root and PHP-FPM
+  rejected it:
+  `Access to the script '/var/www/<site>/public' has been denied`.
+  `configs/php/custom_dan.ini` no longer sets `cgi.fix_pathinfo`; the opt-in
+  hardening block still does, deliberately.
+- **`--optimize` repairs `PATH_TRANSLATED` in the deployed PHP includes.**
+  `h5bp/php_wp.conf`, `h5bp/php_polr.conf` and `h5bp/php.conf` are changed
+  from `$document_root$fastcgi_path_info` to
+  `$document_root$fastcgi_script_name`, matching the repository’s PHP
+  location. This makes the mapping correct even if an operator later enables
+  `cgi.fix_pathinfo=0`, without widening `security.limit_extensions`.
+- **Upgrade action:** run `sudo ./setup.sh --optimize`. It refreshes
+  `custom_dan.ini` (removing `cgi.fix_pathinfo=0`) and rewrites the
+  `PATH_TRANSLATED` line in the deployed includes. No manual PHP edit is
+  required.
+
 ## What's new in 1.8.42
 
 - **`--optimize` refreshes a stale `custom_dan.ini`.** Old hosts still carry
