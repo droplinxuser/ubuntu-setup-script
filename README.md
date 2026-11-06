@@ -39,6 +39,10 @@ alongside `setup.sh`).
   kernel tuning, every managed service status, Angie/PHP/MariaDB/Valkey/Redis/
   Elasticsearch runtime statistics, slow-query and slow-request logs, service
   error logs and kernel/OOM reports into `diagnostics.log` beside `setup.sh`.
+- **New `--restart-all` command.** It detects installed/active services and
+  restarts them in dependency order: stop Angie/PHP, restart Valkey/Redis and
+  Elasticsearch, restart MariaDB, wait for SQL, then start PHP and Angie.
+  Only active services are touched, and `--dry-run` shows the plan.
 - **Redis-only hosts are optimized with the Valkey profile.** `--optimize`
   detects Redis when Valkey is absent, applies the same cache tuning and
   systemd fd limits, and uses `CONFIG SET` before a restart. If both exist,
@@ -601,6 +605,35 @@ Use `--diagnostics --dry-run` to print the destination without writing.
 
 ---
 
+## Restart all (`--restart-all`)
+
+```bash
+sudo bash setup.sh --restart-all
+sudo bash setup.sh --restart-all --dry-run
+```
+
+This is a controlled whole-stack restart, not a configuration change. It
+detects installed services from their configuration paths and active units,
+then:
+
+1. `systemctl daemon-reload`
+2. stop Angie if active
+3. stop every active `php*-fpm.service`
+4. restart active Valkey/Redis (`valkey-server`, `valkey` or `redis-server`)
+5. restart active Elasticsearch
+6. restart active MariaDB
+7. wait for `SELECT 1`, up to 300 seconds
+8. start the PHP-FPM versions that were stopped
+9. start Angie again if it was stopped
+
+Only services that were **active** are stopped and restarted. Installed but
+inactive units are reported and skipped. If MariaDB or a dependency fails, the
+script still restores the previously active web tiers where possible and exits
+non-zero with the failure list. `--dry-run` prints the detected/active units
+and the planned order without changing anything.
+
+---
+
 ## Idempotency
 
 The script is safe to re-run:
@@ -751,11 +784,11 @@ The script was tested on Ubuntu 26.04.1 LTS (16 CPU threads, 32 GB installed RAM
 
 Also checked at CLI level (all using `--dry-run`, no system changes):
 
-- `tests/test-dry-run-matrix.sh` covers 74 cases: every service flag, every
+- `tests/test-dry-run-matrix.sh` covers 81 cases: every service flag, every
   domain app type, per-domain and trailing group `app=` forms, every purge
   mode, `--optimize` and representative invalid inputs.
 
-- `tests/test-tuning.sh` covers 171 checks: Angie directive rewriting, the
+- `tests/test-tuning.sh` covers 176 checks: Angie directive rewriting, the
   multi-line `proxy_cache_path` fix, insertion anchors, miss reporting,
   PHP pool editing/deduplication, the shared memory budget, UFW SSH
   rate-limiting, and a second-run no-op check.
