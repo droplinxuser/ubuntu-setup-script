@@ -34,7 +34,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.45"
+readonly SCRIPT_VERSION="1.8.46"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -496,9 +496,11 @@ Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
       profile (CPU governor, swap headroom, PAM security limits, and
       kernel/network/memory sysctls) and then tunes every installed service (Angie, PHP-FPM,
       MariaDB, Valkey or Redis, Elasticsearch) for the current CPU/RAM/disk.
-      It never installs, purges or starts a managed service; the only package
-      it may add is the small cpufrequtils helper when the CPU exposes
-      frequency scaling.  Allocations are planned together from one
+      It never installs, purges or starts a managed service; the only packages
+      it may add are the small cpufrequtils helper when the CPU exposes
+      frequency scaling and angie-module-brotli when Angie is installed, so
+      install and optimize share the same compression profile.  Allocations
+      are planned together from one
       80%-of-RAM budget, and a service is reloaded (Angie, PHP-FPM) or tuned
       online (Valkey/Redis) only when its generated configuration actually
       changed.  Startup-only settings are reported and apply on the next full
@@ -1066,12 +1068,25 @@ is_nvme_storage() {
 
 # Storage class shared by the MariaDB I/O-capacity and Angie cache tuners so
 # install and --optimize classify the same disk the same way.
+#
+# Only whole disks count.  The old check read every block device, so a QEMU
+# DVD-ROM (sr0, ROTA=0) or a loop device could make a spinning disk look like
+# an SSD.  Virtio/pv block devices are treated as SSD: cloud providers back
+# them with SSD/NVMe even though Linux reports ROTA=1, and the conservative
+# 400/800 IOPS profile otherwise leaves a fast database waiting on disk.
 storage_class() {
   if is_nvme_storage; then
     printf 'nvme'
-  elif command -v lsblk >/dev/null 2>&1 \
-       && lsblk -d -n -o ROTA 2>/dev/null | grep -q '^0'; then
-    printf 'ssd'
+  elif command -v lsblk >/dev/null 2>&1; then
+    if lsblk -d -n -o TYPE,ROTA 2>/dev/null \
+         | awk '$1 == "disk" && $2 == "0" { found = 1 } END { exit !found }'; then
+      printf 'ssd'
+    elif lsblk -d -n -o TYPE,TRAN 2>/dev/null \
+         | awk '$1 == "disk" && ($2 == "virtio" || $2 == "pv") { found = 1 } END { exit !found }'; then
+      printf 'ssd'
+    else
+      printf 'hdd'
+    fi
   else
     printf 'hdd'
   fi
@@ -1973,7 +1988,17 @@ record_sysctl_values() {
 
 restore_sysctl_values() {
   local key file value
+  # ipfrag_low_thresh must be written after ipfrag_high_thresh; otherwise the
+  # kernel rejects a low value that is above the currently live high mark and
+  # --purge basic logs a spurious failure.  Restore every other key first,
+  # then the low threshold.
+  local -a ordered=()
   for key in "${SYSCTL_MANAGED_KEYS[@]}"; do
+    [[ $key == net.ipv4.ipfrag_low_thresh ]] && continue
+    ordered+=("$key")
+  done
+  ordered+=(net.ipv4.ipfrag_low_thresh)
+  for key in "${ordered[@]}"; do
     file="${STATE_DIR}/sysctl-orig-${key//\//_}"
     [[ -s $file ]] || continue
     value=$(<"$file")
@@ -3456,6 +3481,137 @@ EOF
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# Angie dynamic compression (Brotli only)
+# ---------------------------------------------------------------------------
+# Brotli was chosen over Zstandard after live measurements on a 16-thread
+# host.  At level 5 on a 149 KB XenForo thread page, Brotli produced 10.9 KB
+# vs 13.7 KB for gzip (-20%) and 11.9 KB for Zstandard.  Zstandard was faster
+# to produce (29k vs 16k compressed responses/s on a 34 KB page), but dynamic
+# PHP is the bottleneck on uncached pages (~1k req/s logged-in), so Brotli's
+# smaller payload wins page load time.  Gzip remains the compatibility
+# fallback.  Brotli is the only extra module loaded.
+#
+# Static assets are intentionally not precompressed.  A CDN normally caches
+# them and only the first request reaches the origin; the expensive work here
+# is compressing per-user dynamic HTML on every uncached request.
+ANGIE_COMPRESSION_CHANGED=0
+ANGIE_COMPRESSION_SKIPPED=0
+ANGIE_BROTLI_OK=0
+ANGIE_BROTLI_LEVEL=5
+
+ensure_angie_compression() {
+  local target=${1:-/etc/angie}
+  local conf="${target}/angie.conf"
+  [[ -f $conf ]] || return 0
+  ANGIE_COMPRESSION_CHANGED=0
+  ANGIE_COMPRESSION_SKIPPED=0
+  ANGIE_BROTLI_OK=0
+
+  if [[ ${SETUP_ANGIE_COMPRESSION:-1} == 0 ]]; then
+    ANGIE_COMPRESSION_SKIPPED=1
+    info "Angie dynamic Brotli disabled by SETUP_ANGIE_COMPRESSION=0"
+    return 0
+  fi
+
+  local brotli_level=${SETUP_BROTLI_LEVEL:-5}
+  [[ $brotli_level =~ ^([1-9]|1[01])$ ]] || brotli_level=5
+  ANGIE_BROTLI_LEVEL=$brotli_level
+
+  local enabled="${target}/modules-enabled"
+  local changed=0
+  if ! pkg_ok angie-module-brotli; then
+    # --optimize is normally install-free (except cpufrequtils).  This one
+    # small module is part of the same compression profile as a fresh --angie
+    # install, so installing it here keeps both paths identical.  If the
+    # repository or package is unavailable, fall back to gzip.
+    if ! apt-cache show angie-module-brotli >/dev/null 2>&1; then
+      apt_update || true
+    fi
+    apt_install angie-module-brotli \
+      || warn "Could not install angie-module-brotli; gzip remains active"
+  fi
+  pkg_ok angie-module-brotli && ANGIE_BROTLI_OK=1
+
+  mkdir -p "$enabled" "${target}/http.d"
+  local tmp moved f
+  # Remove a managed Zstandard stanza left by an earlier test/release so only
+  # one optional compression module is active.
+  for f in "${enabled}/40-zstd.conf" "${target}/http.d/zstd.conf"; do
+    [[ -e $f ]] || continue
+    grep -q '^# Managed by setup.sh' "$f" 2>/dev/null || continue
+    moved=$(preserve_to_tmp "$f" 2>/dev/null || true)
+    [[ -n $moved ]] && info "Moved superseded Zstandard file to ${moved}"
+    changed=1
+  done
+
+  if (( ANGIE_BROTLI_OK )); then
+    if ! grep -Rqs 'ngx_http_brotli_filter_module' "$enabled" 2>/dev/null; then
+      tmp=$(tmp_file)
+      cat > "$tmp" <<'EOF'
+# Managed by setup.sh: dynamic Brotli compression.
+load_module modules/ngx_http_brotli_filter_module.so;
+load_module modules/ngx_http_brotli_static_module.so;
+EOF
+      cat "$tmp" > "${enabled}/50-brotli.conf"
+      chmod 644 "${enabled}/50-brotli.conf"
+      changed=1
+    fi
+    tmp=$(tmp_file)
+    if [[ -f "${target}/http.d/brotli_conf" ]]; then
+      {
+        printf '# Managed by setup.sh: dynamic Brotli from http.d/brotli_conf.\n'
+        printf '# Static assets are left to the CDN; dynamic PHP/HTML is compressed here.\n'
+        cat "${target}/http.d/brotli_conf"
+      } > "$tmp"
+      sed_in_place -E "s/^brotli_comp_level [0-9]+;/brotli_comp_level ${brotli_level};/" "$tmp"
+      sed_in_place -E 's/^brotli_static on;/brotli_static off;/' "$tmp"
+    else
+      cat > "$tmp" <<EOF
+# Managed by setup.sh: dynamic Brotli (template was missing).
+brotli on;
+brotli_static off;
+brotli_comp_level ${brotli_level};
+brotli_min_length 50;
+brotli_types text/plain text/css text/xml application/json application/javascript application/xml image/svg+xml font/ttf font/otf;
+EOF
+    fi
+    if ! cmp -s "$tmp" "${target}/http.d/brotli.conf"; then
+      cat "$tmp" > "${target}/http.d/brotli.conf"
+      chmod 644 "${target}/http.d/brotli.conf"
+      changed=1
+    fi
+  elif [[ -f "${enabled}/50-brotli.conf" ]]; then
+    warn "Angie Brotli module is not installed; keeping the existing module stanza"
+  fi
+
+  # Never leave the service unable to start because an optional module failed
+  # to load.  Move the managed files to /tmp (the script never deletes) and
+  # keep the gzip fallback.
+  local testlog
+  testlog=$(tmp_file)
+  if ! /usr/sbin/angie -t >"$testlog" 2>&1; then
+    warn "Angie rejected the dynamic compression configuration; disabling Brotli"
+    sed 's/^/  /' "$testlog" >&2 || true
+    for f in "${enabled}/50-brotli.conf" "${target}/http.d/brotli.conf"; do
+      [[ -e $f ]] || continue
+      moved=$(preserve_to_tmp "$f" 2>/dev/null || true)
+      [[ -n $moved ]] && info "Moved rejected compression file to ${moved}"
+    done
+    ANGIE_BROTLI_OK=0
+    changed=1
+    if ! /usr/sbin/angie -t >/dev/null 2>&1; then
+      warn "Angie still rejects the configuration after removing compression files"
+    fi
+  fi
+
+  ANGIE_COMPRESSION_CHANGED=$changed
+  if (( changed )); then
+    TUNE_DIRTY=1
+  fi
+  return 0
+}
+
 deploy_angie_configs() {
   step "Angie configuration (server-configs-nginx)"
   fetch_server_configs
@@ -3484,6 +3640,16 @@ deploy_angie_configs() {
   if ! tune_angie_configs /etc/angie; then
     warn "Angie tuning failed"
     return 1
+  fi
+  # Dynamic Brotli compression.  The module is optional, so a failure here
+  # must not stop the Angie install; gzip remains active.
+  ensure_angie_compression /etc/angie || warn "Angie compression setup was skipped"
+  if (( ANGIE_COMPRESSION_SKIPPED )); then
+    info "Compression: unchanged (SETUP_ANGIE_COMPRESSION=0)"
+  elif (( ANGIE_BROTLI_OK )); then
+    info "Compression: Brotli level ${ANGIE_BROTLI_LEVEL} (gzip fallback)"
+  else
+    info "Compression: gzip only (Brotli module unavailable)"
   fi
   # Enable the same WordPress FastCGI guest cache that --optimize installs.
   optimize_wordpress_cache /etc/angie || warn "WordPress cache setup was skipped"
@@ -4814,6 +4980,10 @@ create_domains() {
     systemctl reload angie 2>/dev/null || systemctl restart angie 2>/dev/null \
       || warn "Could not reload Angie after creating vhosts"
   fi
+  for d in "${DOMAINS[@]}"; do
+    [[ ${DOMAIN_APP[$d]:-blank} == xf ]] || continue
+    info "XenForo ${d}: dynamic Brotli is enabled; keep XF's Redis cache off on a single local-MariaDB host (measured slower), and disable the Members online / Trending / Featured widgets if you do not need them (measured +39% authenticated throughput)."
+  done
   ok "Domain setup complete"
 }
 
@@ -5936,6 +6106,21 @@ optimize_angie() {
     opt_report "- **FAILED** tuning returned an error; configuration rolled back"
     return 1
   fi
+  # Dynamic Brotli is part of the same profile on a fresh install.  The
+  # function installs the small Angie module when it is missing, then validates
+  # the tree; a failure moves the optional files to /tmp and leaves gzip
+  # active.
+  ensure_angie_compression /etc/angie || true
+  if (( ANGIE_COMPRESSION_CHANGED )); then
+    TUNE_DIRTY=1
+  fi
+  if (( ANGIE_COMPRESSION_SKIPPED )); then
+    opt_report "- Compression: unchanged (SETUP_ANGIE_COMPRESSION=0)"
+  elif (( ANGIE_BROTLI_OK )); then
+    opt_report "- Compression: Brotli level ${ANGIE_BROTLI_LEVEL} (gzip fallback)"
+  else
+    opt_report "- Compression: gzip only (Brotli module unavailable)"
+  fi
   local angie_test_log
   angie_test_log=$(tmp_file)
   if ! /usr/sbin/angie -t >"$angie_test_log" 2>&1; then
@@ -6683,6 +6868,8 @@ optimize_valkey() {
   opt_report "- Local socket: \`${socket_path}\` (unixsocketperm 770)"
   opt_report "- Application config (not edited automatically):"
   opt_report "  XenForo: \`\$config['cache']['config']['host'] = '${socket_path}'; \$config['cache']['config']['port'] = 0;\`"
+  opt_report "  XenForo note: on a single host with local MariaDB, XF's Redis registry/session cache measured slower than MariaDB (1.33k vs 0.97k req/s in testing). Use it for multi-node or remote-DB setups, not by default."
+  opt_report "  XenForo widgets: disabling Members online, Trending content and Featured content on the forum list measured +39% authenticated throughput and 13% smaller HTML; disable them in ACP > Widgets if they are not required."
   opt_report "  WordPress: \`define('WP_REDIS_PATH', '${socket_path}');\`"
   opt_report "  Laravel/phpredis: \`'host' => '${socket_path}', 'port' => 0\`"
   opt_report "  Test: \`${cli} -s ${socket_path} ping\`"
@@ -6869,16 +7056,16 @@ write_es_jvm_options() {
 EOF
   chmod 644 "$jvm"
   chown root:elasticsearch "$jvm" 2>/dev/null || true
-  # Never delete an operator's own jvm.options.  A simple heap-only file (the
-  # common 4g/4g leftover) is moved to /tmp so zz-setup-optimize.options is the
-  # single source of truth.  A richer operator file is preserved, but the
-  # silent-override risk is reported explicitly.
+  # Never delete or move an operator's own jvm.options.  Only the recognisable
+  # file this script generated is moved to /tmp.  A minimal operator heap file
+  # is preserved; zz-setup-optimize.options sorts last and owns the effective
+  # heap, and the override is reported explicitly.
   if [[ -f $legacy ]]; then
-    if es_jvm_options_is_managed "$legacy" || es_jvm_options_is_heap_only "$legacy"; then
+    if es_jvm_options_is_managed "$legacy"; then
       if preserve_to_tmp "$legacy" >/dev/null; then
-        info "Moved heap-only ${legacy} to /tmp; ${jvm} owns the heap"
+        info "Moved legacy managed ${legacy} to /tmp; ${jvm} owns the heap"
         if (( ${OPTIMIZE:-0} )); then
-          opt_report "- Moved heap-only \`${legacy}\` to /tmp; \`${jvm}\` owns the heap"
+          opt_report "- Moved legacy managed \`${legacy}\` to /tmp; \`${jvm}\` owns the heap"
         fi
       else
         warn "Could not move ${legacy}; ${jvm} still takes precedence"
@@ -7380,6 +7567,8 @@ optimize_plan() {
       "$(tune_clamp $(( nproc * 8192 )) 65536 524288)" \
       "$(tune_clamp $(( nproc * 2 )) 16 128)" \
       "$cache_mb"
+    printf '  Angie compression: Brotli level %s dynamic, gzip fallback (module installed on apply)\n' \
+      "${SETUP_BROTLI_LEVEL:-5}"
   fi
   if [[ ${OPT_DETECTED[*]} == *php:* ]]; then
     if (( OPT_PHP_BUDGET_MB > 0 )); then

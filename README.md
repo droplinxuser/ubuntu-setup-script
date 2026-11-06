@@ -246,6 +246,7 @@ Before changing basic settings, the script records the originals under `/var/lib
 
 - Installs the Angie signing key and APT repository.
 - Installs `angie`.
+- Installs the official `angie-module-brotli` dynamic module and enables dynamic Brotli at level 5 with gzip as the compatibility fallback. On a 149 KB XenForo thread page this produced 10.9 KB on the wire versus 13.7 KB for gzip (20% smaller); guest pages were 79-93% smaller than identity. `--optimize` installs and enables the same module, so both paths stay in parity. Static assets are deliberately left to the CDN (`brotli_static off`): precompressing thousands of files only helps the first origin miss and adds deployment churn. Set `SETUP_BROTLI_LEVEL=1..11` to override the level or `SETUP_ANGIE_COMPRESSION=0` to disable it.
 - Downloads [`droplinxuser/server-configs-nginx`](https://github.com/droplinxuser/server-configs-nginx) once per run and delegates deployment to its `scripts/nginx_conf.sh`.
 - The repository (not `setup.sh`) owns `angie.conf`, `h5bp/`, `conf.d/`, `http.d/`, `snippets/`, the cache/rate-limit settings, template repairs and the Cloudflare helper.
 - Uses the repo's `scripts/limit_nofile.conf` and `scripts/etc_default_nginx` for the systemd `LimitNOFILE` drop-in and `/etc/default/angie`.
@@ -274,6 +275,42 @@ Before changing basic settings, the script records the originals under `/var/lib
 - Enables and restarts `php<ver>-fpm` and prints `php<ver> -v`. If the template/tuning/start fails, the previous PHP configuration is restored from `/tmp`.
 
 **PHP version policy:** the pool listens on `/run/php/php-fpm.sock`, and the Angie `local_php` upstream points to the same socket. Therefore **only one PHP-FPM version can be active at a time**. A new `--php` run purges all existing PHP packages first and performs a clean installation of the requested version.
+
+### XenForo tuning (`--domain ... app=xf`)
+
+The generated `app=xf` vhost serves guest pages from Angie's FastCGI cache
+for 5 minutes and bypasses it for `xf_session`, `xf_user`, admin and login
+cookies. The stack-level defaults (PHP-FPM static workers, Unix sockets,
+MariaDB thread pool, Brotli, HTTP/2 keepalive) are tuned for XenForo. Measured
+on the 16-thread test host (Ubuntu 26.04, XenForo 2.3.13, 50 authenticated
+users):
+
+| Change | Authenticated index | Notes |
+|---|---:|---|
+| Default stack + Brotli 5 | ~1.0k req/s | 51 KB HTML -> 9.8 KB Brotli |
+| Disable "Members online" widget | ~1.2k req/s | 13% smaller HTML |
+| Disable members-online + trending + featured widgets | **~1.43k req/s** | +39%, ACP > Widgets |
+| XenForo Redis registry/session cache | ~0.97k req/s | slower than local MariaDB on one host |
+| MariaDB-backed registry/sessions (no XF cache) | **~1.33k req/s** | recommended for a single host |
+
+Recommended application settings:
+
+- Keep `xf_session_activity` optimization enabled (XenForo default); it skips
+  repeat activity writes within one second.
+- Do **not** enable XF's Redis cache on a single host with local MariaDB just
+  because Valkey is installed. It measured 27% slower than MariaDB sessions.
+  Use it for multi-node installations or a remote/slow database.
+- If you use persistent DB connections, set `$config['db']['host'] =
+  'p:localhost'` and keep the socket path. The synthetic DB endpoint improved
+  from 23k to 38k req/s (+62%); XF itself is mostly CPU-bound.
+- Disable the "Members online", "Trending content" and "Featured content"
+  forum-list widgets when they are not required; they issue several queries
+  and add 13% HTML per authenticated page.
+- Set `opcache.validate_timestamps=0` and reload PHP-FPM on deploy if the
+  application files are stable; it removes per-request stat calls. Measure
+  first: the template-heavy XF workload showed little difference on this host.
+- Guest traffic stays on Angie's FastCGI cache. Do not cache authenticated
+  pages; the vhost's cookie bypass is intentional.
 
 ### MariaDB (`--mariadb user=... pass=... size=4gb|auto [bind=...]`)
 
@@ -346,6 +383,14 @@ If both Valkey and Redis are installed, `--optimize` tunes Valkey only, because 
 Benchmarks on this host showed that extra I/O threads are counterproductive for small web-cache commands: full-page throughput was 6.5k req/s with `io_threads=1` vs 5.1k with `io_threads=8`, while Valkey CPU rose from 64% to 430%. Raise `io_threads=` only after `valkey-benchmark` shows the main thread saturated.
 
 For local PHP, prefer the Unix socket (`/run/valkey/valkey.sock`) over TCP. In the stress test it raised Valkey endpoint throughput from ~15k to ~29k req/s and removed most of the p99 tail caused by ephemeral-port/TIME_WAIT pressure.
+
+**XenForo caution:** a local Redis/Valkey cache is not automatically faster
+than a local MariaDB. On a single 16-thread host, XenForo's registry/session
+cache over the Unix socket measured **0.97k req/s** on authenticated pages,
+while MariaDB-backed sessions/registry measured **1.33k req/s** (+37%). Enable
+XF's Redis cache for multi-node installations, a remote/slow database, or a
+large shared registry; benchmark it first on a single host. `--optimize` prints
+this warning next to the XenForo snippet.
 
 ### Elasticsearch (`--elastic [host=localhost] ram=4g`)
 
@@ -442,8 +487,10 @@ bash setup.sh --optimize --dry-run
 ```
 
 `--optimize` never installs, purges or starts a managed service, and it never
-creates, resizes or disables swap. The only package it may add is the small
-`cpufrequtils` helper when the CPU exposes frequency scaling. On hosts built
+creates, resizes or disables swap. The only packages it may add are the small
+`cpufrequtils` helper when the CPU exposes frequency scaling and
+`angie-module-brotli` when Angie is installed, so the compression profile
+matches a fresh `--angie` install. On hosts built
 by releases before 1.8.34 it also repairs the legacy log permissions and cron
 paths: the nightly blanket `chown -R /var/www/`, the old
 `/etc/nginx/scripts/cloudflare.sh` path and the old `/usr/bin/mysqlcheck`
@@ -773,13 +820,28 @@ The script was tested on Ubuntu 26.04.1 LTS (16 CPU threads, 32 GB installed RAM
 | Valkey hardening | loopback bind, `protected-mode yes`, no duplicate managed directives | PASS |
 | Elasticsearch hardening | `bootstrap.memory_lock: true`, `LimitMEMLOCK=infinity`, heap ≤ 50% RAM warning | PASS |
 
+### Brotli results (XenForo 2.3.13, 16-thread host)
+
+| Page | Identity | gzip 5 | Brotli 5 | Brotli vs gzip |
+|---|---:|---:|---:|---:|
+| Guest forum index | 41,657 B | 9,658 B | **8,768 B** | -9.2% |
+| Logged-in index | 51,463 B | 10,589 B | **9,787 B** | -7.6% |
+| Logged-in thread (20 posts) | 210,507 B | 18,825 B | **15,911 B** | -15.5% |
+
+On a fixed 34 KB page, Brotli level 4 served 19.4k responses/s (8.49 KiB),
+level 5 16.4k/s (7.81 KiB), level 9 13.4k/s (7.73 KiB), and levels 10/11
+collapsed to ~1k/~0.4k responses/s. Level 5 is the default: the logged-in
+origin is PHP-bound (~1k req/s), so the smaller payload is worth more than the
+compression CPU. Static asset precompression is intentionally omitted because
+a CDN serves those after the first origin request.
+
 Also checked at CLI level (all using `--dry-run`, no system changes):
 
-- `tests/test-dry-run-matrix.sh` covers 81 cases: every service flag, every
+- `tests/test-dry-run-matrix.sh` covers 85 cases: every service flag, every
   domain app type, per-domain and trailing group `app=` forms, every purge
   mode, `--optimize` and representative invalid inputs.
 
-- `tests/test-tuning.sh` covers 176 checks: Angie directive rewriting, the
+- `tests/test-tuning.sh` covers 276 checks: Angie directive rewriting, the
   multi-line `proxy_cache_path` fix, insertion anchors, miss reporting,
   PHP pool editing/deduplication, the shared memory budget, UFW SSH
   rate-limiting, and a second-run no-op check.
@@ -828,7 +890,7 @@ The script produces a working, internet-facing baseline. For a large or security
 - Replace the self-signed per-domain certificates under `/etc/angie/ssl/<domain>/` (or the embedded default certificate) with real certificates (Angie ACME/Let's Encrypt or your CA). The default TLS policy is balanced TLS 1.2/1.3; use a stricter policy if your clients allow it.
 - `access_log off` is set globally and no vhost writes access logs by default. If you need forensics, rate-limit tuning or fail2ban web jails, add a buffered per-vhost log (`access_log ... buffer=64k flush=5s;`); use logrotate/shipping so it cannot fill the disk.
 - Rate limiting and FastCGI cache zones are now enabled, with loopback exempt. For a site behind Cloudflare or another proxy, configure `real_ip` (`/etc/angie/scripts/cloudflare.sh`) first, otherwise every visitor shares the proxy IP and the per-IP limiter will throttle them.
-- Add HTTP/3 (QUIC) if clients support it (`listen 443 quic`, `Alt-Svc`, and `ufw allow 443/udp`). The distro Angie build lacks Brotli/zstd modules, so use precompressed gzip (`gzip_static on` is enabled) or install a build with those modules.
+- Add HTTP/3 (QUIC) if clients support it (`listen 443 quic`, `Alt-Svc`, and `ufw allow 443/udp`). Dynamic Brotli is installed and enabled by `--angie`/`--optimize`; gzip remains the fallback. Static assets are best cached at the CDN rather than precompressed on the origin.
 - Keep `client_max_body_size` and PHP upload limits aligned (both 100 MB now). Put Cloudflare or another CDN in front of static traffic and keep the daily Cloudflare real-IP refresh enabled.
 
 **PHP**
