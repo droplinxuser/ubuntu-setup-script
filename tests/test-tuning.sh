@@ -1511,6 +1511,7 @@ check "diagnostics reports absent MariaDB as not installed" \
 # planner must use the same empty-data floors as --optimize, otherwise
 # Elasticsearch reserves 25% of RAM and MariaDB is left on its 256 MB floor.
 mem_total_mb() { printf '27812'; }
+nproc() { printf '16'; }
 php_pool_max_children() { printf '144'; }
 mariadb_data_size_mb() { return 0; }
 mariadb_current_pool_mb() { return 0; }
