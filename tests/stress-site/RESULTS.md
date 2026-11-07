@@ -389,3 +389,60 @@ Notes on the numbers:
   listen queue is full; add workers or cache the endpoint.
 - Check /var/log/angie/stress.invalid.error.log and
   /var/log/php-fpm/www-slow.log for server-side warnings.
+
+## setup.sh 1.8.50 - dev-host (16 threads / 27.2 GiB / NVMe) validation
+
+Host: `devhost.test` (Beelink dev-host, AMD Ryzen 7-class, 16 threads, 27.2 GiB
+usable RAM, NVMe), Ubuntu 26.04.1, Angie 1.12.4, PHP 8.5.12 FPM,
+MariaDB 11.8.6, Valkey 9.0.4, Elasticsearch 9.5.6, Node.js 26.13.0.
+Installed with `--basic server=dedi --angie --php ver=8.5 --mariadb
+user=demo pass=temp size=auto --valkey --elastic --others all`, then
+`--optimize`, then `tests/stress-site/setup-stress-site.sh`.
+
+Memory plan after the 1.8.50 changes: usable budget 22,249 MB of 27,812
+(PHP 9,216 / MariaDB 1,738 / Valkey 2,781 / Elasticsearch 3,476). PHP-FPM
+keeps 144 static workers; the measured allowance dropped the reservation from
+96 MB to 64 MB per worker (idle average 42 MB), and the empty-index
+Elasticsearch heap moved from 512 MB to 3,072 MB.
+
+| Scenario | Requests/sec | p50 | p90 | p99 | Client socket errors |
+|---|---:|---:|---:|---:|---|
+| static | 273,123 | 214us | 1.26ms | 3.22ms | none |
+| php-hello | 154,058 | 464us | 2.77ms | 10.83ms | none |
+| mariadb-json | 30,385 | 3.20ms | 4.49ms | 6.23ms | none |
+| valkey-json | 32,533 | 3.05ms | 3.23ms | 3.51ms | none |
+| elasticsearch | 7,121 | 6.07ms | 13.47ms | 27.33ms | none |
+| node-proxy | 31,780 | 2.65ms | 7.23ms | 38.18ms | none |
+| full-uncached-200 | 7,686 | 18.10ms | 22.71ms | 33.71ms | timeout 38 |
+| full-cached-200 | 197,738 | 0.88ms | 1.66ms | 2.55ms | none |
+| slow-1s-200 | 128 | 1.00s | 1.00s | 1.00s | timeout 1 |
+
+Standalone probes: Elasticsearch search alone warmed to ~15.6k req/s
+(p50 2.8 ms, p99 7.5 ms); the lower suite figure follows the PHP/DB/cache
+runs and a cold JVM. `php-hello` improved from ~116k (v1.5.0 notes) to 154k
+with the same 16 threads.
+
+### XenForo 2.3.13 guest and logged-in paths
+
+XenForo was installed with `php cmd.php xf:install` on `forum.test`, seeded
+with 41 threads / 61 posts, and benchmarked over HTTPS on loopback:
+
+| Scenario | Cache status | Requests/sec | p50 | p99 |
+|---|---|---:|---:|---:|
+| Guest forum index | HIT | 41,892 | 2.02ms | 6.38ms |
+| Guest thread (20 replies) | HIT | 34,978 | 2.39ms | 6.94ms |
+| Logged-in index | BYPASS | 983 | 93.78ms | 145.44ms |
+| Logged-in thread | BYPASS | 936 | 98.36ms | 139.84ms |
+| Logged-in thread, 400 conns | BYPASS | 926 | 98.92ms | 142.73ms |
+
+The guest path is Angie's FastCGI cache (5 min TTL, background refresh);
+logged-in requests correctly bypass it. The authenticated ceiling is
+XenForo's job queue: the dominant slow query is the per-request
+`INSERT INTO xf_job ... ON DUPLICATE KEY UPDATE` for trending/icon jobs
+(~2.2k inserts/s at 1k req/s), serialized on the unique key. This is
+application work, not a server misconfiguration. Persistent MariaDB
+connections (`p:127.0.0.1`), READ COMMITTED and
+`thread_pool_oversubscribe=10` did not move the shared-session benchmark
+(±2%, and the test shares one session across all connections). Disabling the
+members-online, trending and featured widgets remains the largest
+authenticated win (see the README table).

@@ -3427,9 +3427,19 @@ tune_php_fpm_version() {
   # pool is derived from the budget at the standard 96 MB divisor.  The 50%
   # of RAM ceiling still prevents a small host from overcommitting.
   current_children=$(php_pool_max_children)
-  if (( current_children > 0 )); then
+  # install_php() sets PHP_FRESH_INSTALL: the package may have auto-started
+  # its stock 64-worker pool, and that placeholder must not override the
+  # hardware-sized pool.
+  [[ ${PHP_FRESH_INSTALL:-0} == 1 ]] && current_children=0
+  if (( current_children > 0 )) \
+     && systemctl is-active --quiet "php${ver}-fpm" 2>/dev/null; then
+    # A live pool keeps its worker count: the reservation is a memory
+    # estimate, not a worker quota.
     max_children=$current_children
   elif (( php_budget > 0 )); then
+    # First install (the pool template is on disk but the service has not
+    # started yet): size the pool from the shared budget, not the template's
+    # placeholder value.
     max_children=$(( php_budget / 96 ))
   else
     max_children=$(( ram_mb * 50 / 100 / 96 ))
@@ -4074,10 +4084,13 @@ install_php() {
   # the --optimize command.  It writes the socket listener and the final
   # performance values in conf.d/zz-setup-optimize.ini.
   tune_reset_changes
+  PHP_FRESH_INSTALL=1
   if ! tune_php_fpm_version "$ver"; then
+    PHP_FRESH_INSTALL=0
     rollback_php_tree "$php_backup" "$ver"
     return 1
   fi
+  PHP_FRESH_INSTALL=0
   if [[ -n ${OPT[php.children]:-} && ${OPT[php.children]} != auto ]]; then
     tune_pool_set "/etc/php/${ver}/fpm/pool.d/www.conf" pm.max_children \
       "${OPT[php.children]}" "PHP ${ver}: max_children override=${OPT[php.children]}"
@@ -5815,13 +5828,20 @@ plan_memory_budget() {
   # max_children when available and the measured per-worker allowance (96 MB
   # only when no live pool exists), capped at 50% of RAM.
   if (( has_php )); then
-    children=$(php_pool_max_children)
-    (( children > 0 )) || children=$(( $(nproc) * 16 ))
+    if (( OPT_INSTALL_PLAN )); then
+      # A fresh install replaces PHP and its pool; an existing (or purged)
+      # pool template must not define the new worker count or allowance.
+      children=$(( $(nproc) * 16 ))
+      php_allowance=96
+    else
+      children=$(php_pool_max_children)
+      (( children > 0 )) || children=$(( $(nproc) * 16 ))
+      php_ver=$(php_primary_version 2>/dev/null || true)
+      php_allowance=$(php_worker_allowance_mb "$php_ver")
+    fi
     # tune_php_fpm_version() never goes below 8 workers; use the same floor
     # here so a first run and a second run calculate the same PHP budget.
     (( children < 8 )) && children=8
-    php_ver=$(php_primary_version 2>/dev/null || true)
-    php_allowance=$(php_worker_allowance_mb "$php_ver")
     [[ $php_allowance =~ ^[0-9]+$ ]] || php_allowance=96
     OPT_PHP_ALLOWANCE_MB=$php_allowance
     OPT_PHP_BUDGET_MB=$(( children * php_allowance ))
