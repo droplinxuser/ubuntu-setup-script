@@ -34,7 +34,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.49"
+readonly SCRIPT_VERSION="1.8.50"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -2839,6 +2839,41 @@ tune_ensure_index() {
 # ---------------------------------------------------------------------------
 # Angie
 # ---------------------------------------------------------------------------
+# XenForo's own page cache varies on style_id and language_id (see
+# src/XF/PageCache.php).  The deployed Angie vhost only keyed on the style
+# variation, so a guest who picked a non-default style or language could
+# receive another guest's cached HTML.  Add both cookies to the key and enable
+# a background refresh so an expiring entry does not make one visitor wait on
+# PHP while cache_lock serializes the stampede.
+tune_xf_cache_vary() {
+  local file=$1
+  [[ -f $file ]] || return 0
+  local before tmp
+  before=$(md5sum "$file" | awk '{print $1}')
+  if grep -qE '^[[:space:]]*fastcgi_cache_key[[:space:]]' "$file"; then
+    tmp=$(tmp_file)
+    awk '
+      /^[[:space:]]*fastcgi_cache_key[[:space:]]/ {
+        if (index($0, "$cookie_xf_language_id") == 0) {
+          sub(/";[[:space:]]*$/, "$cookie_xf_style_id$cookie_xf_language_id\";")
+        }
+      }
+      { print }
+    ' "$file" > "$tmp"
+    cat "$tmp" > "$file"
+  fi
+  if grep -qE '^[[:space:]]*fastcgi_cache_lock[[:space:]]+on;' "$file" \
+     && ! grep -qE '^[[:space:]]*fastcgi_cache_background_update' "$file"; then
+    tune_insert_after "$file" '^[[:space:]]*fastcgi_cache_lock[[:space:]]+on;' \
+      'fastcgi_cache_background_update on;' \
+      "$(basename "$file"): background cache update"
+  fi
+  if [[ $(md5sum "$file" | awk '{print $1}') != "$before" ]]; then
+    tune_note "$(basename "$file"): cache key varies on style/language"
+  fi
+  return 0
+}
+
 tune_angie_configs() {
   local target=${1:-/etc/angie}
   local nginx_conf="${target}/angie.conf"
@@ -3172,6 +3207,8 @@ tune_angie_configs() {
   tune_cache_error_policy "$target/h5bp/php_xf_proxy.conf" "h5bp/php_xf_proxy.conf"
   tune_cache_error_policy "$target/h5bp/php_chev.conf" "h5bp/php_chev.conf"
   tune_cache_error_policy "$target/h5bp/php_flarum.conf" "h5bp/php_flarum.conf"
+  tune_xf_cache_vary "$target/h5bp/php_xf.conf"
+  tune_xf_cache_vary "$target/h5bp/php_xf_proxy.conf"
 
   tune_summary "angie summary: ${nproc} CPU / ${mem_mb}MB RAM / ${disk_class} / cache_budget=${cache_total_mb}MB"
   return 0
@@ -3372,19 +3409,33 @@ tune_php_fpm_version() {
   fi
 
   local nproc ram_mb max_children max_requests max_by_cpu php_budget backlog
-  local opcache_mb jit_mb memory_mb realpath_kb
+  local opcache_mb jit_mb memory_mb realpath_kb php_allowance
+  local current_children max_by_ram
   nproc=$(nproc)
   (( nproc > 0 )) || nproc=1
   ram_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
   backlog=$(effective_backlog)
 
+  php_allowance=${OPT_PHP_ALLOWANCE_MB:-0}
+  if ! [[ $php_allowance =~ ^[0-9]+$ ]] || (( php_allowance <= 0 )); then
+    php_allowance=$(php_worker_allowance_mb "$ver")
+    [[ $php_allowance =~ ^[0-9]+$ ]] || php_allowance=96
+  fi
   php_budget=${OPT_PHP_BUDGET_MB:-0}
-  if (( php_budget > 0 )); then
-    # Shared --optimize budget, already sized against MariaDB/Valkey/ES.
+  # Capacity and reservation are different numbers.  A live pool keeps its
+  # worker count even when the measured per-worker allowance rises; a fresh
+  # pool is derived from the budget at the standard 96 MB divisor.  The 50%
+  # of RAM ceiling still prevents a small host from overcommitting.
+  current_children=$(php_pool_max_children)
+  if (( current_children > 0 )); then
+    max_children=$current_children
+  elif (( php_budget > 0 )); then
     max_children=$(( php_budget / 96 ))
   else
     max_children=$(( ram_mb * 50 / 100 / 96 ))
   fi
+  max_by_ram=$(( ram_mb * 50 / 100 / 96 ))
+  (( max_children > max_by_ram )) && max_children=$max_by_ram
   max_by_cpu=$(( nproc * 16 ))
   (( max_children > max_by_cpu )) && max_children=$max_by_cpu
   (( max_children > 512 )) && max_children=512
@@ -5736,7 +5787,7 @@ elasticsearch_current_heap_mb() {
 
 plan_memory_budget() {
   local total usable has_php=0 has_angie=0 has_maria=0 has_cache=0 has_es=0
-  local fixed_available children php_cap
+  local fixed_available children php_cap php_allowance php_ver
   local es_base_cap=31744 es_hard_cap=31744 es_size_mb=0 es_base=0 es_measured=0
   local es_cap=0 current_heap=0 current_pool=0 db_measured=0
   total=$(mem_total_mb)
@@ -5745,6 +5796,7 @@ plan_memory_budget() {
   usable=$(( total * 80 / 100 ))
   OPT_MEM_BUDGET_MB=$usable
   OPT_PHP_BUDGET_MB=0
+  OPT_PHP_ALLOWANCE_MB=0
   OPT_MARIADB_BUDGET_MB=0
   OPT_MARIADB_KEPT_MB=0
   OPT_VALKEY_BUDGET_MB=0
@@ -5760,15 +5812,19 @@ plan_memory_budget() {
   # Reserve PHP workers before sizing the data services.  PHP is the
   # request-serving tier: starving it to give Elasticsearch a larger heap
   # turns a memory win into a throughput regression.  Use the pool's current
-  # max_children when available, with a 96 MB/worker allowance (the same
-  # divisor tune_php_fpm_version uses), capped at 50% of RAM.
+  # max_children when available and the measured per-worker allowance (96 MB
+  # only when no live pool exists), capped at 50% of RAM.
   if (( has_php )); then
     children=$(php_pool_max_children)
     (( children > 0 )) || children=$(( $(nproc) * 16 ))
     # tune_php_fpm_version() never goes below 8 workers; use the same floor
     # here so a first run and a second run calculate the same PHP budget.
     (( children < 8 )) && children=8
-    OPT_PHP_BUDGET_MB=$(( children * 96 ))
+    php_ver=$(php_primary_version 2>/dev/null || true)
+    php_allowance=$(php_worker_allowance_mb "$php_ver")
+    [[ $php_allowance =~ ^[0-9]+$ ]] || php_allowance=96
+    OPT_PHP_ALLOWANCE_MB=$php_allowance
+    OPT_PHP_BUDGET_MB=$(( children * php_allowance ))
     (( OPT_PHP_BUDGET_MB < 512 )) && OPT_PHP_BUDGET_MB=512
     php_cap=$(( total * 50 / 100 ))
     (( OPT_PHP_BUDGET_MB > php_cap )) && OPT_PHP_BUDGET_MB=$php_cap
@@ -5819,12 +5875,14 @@ plan_memory_budget() {
     fi
     OPT_ES_SIZE_MB=$es_size_mb
     if (( es_measured )); then
-      # A measured empty index is not a missing measurement: give the JVM the
-      # 512 MB floor, not 25% of RAM.
+      # A measured empty index is not a missing measurement: size it from the
+      # host instead of the 25%-of-RAM fallback, but do not pin a 32 GB host
+      # to a 512 MB heap.  RAM/16 (512 MB..4 GB) gives a new index room to
+      # grow without starving the database and PHP workers.
       if (( es_size_mb > 0 )); then
         es_base=$(( es_size_mb * 105 / 100 ))
       else
-        es_base=512
+        es_base=$(tune_clamp $(( total / 16 )) 512 4096)
       fi
     else
       local es_fallback_pct=25
@@ -5944,6 +6002,39 @@ plan_memory_budget() {
   if (( has_es )); then
     (( OPT_ES_BUDGET_MB < 512 )) && OPT_ES_BUDGET_MB=512
   fi
+
+  # Spend the remaining shared budget instead of leaving it idle.  A fresh
+  # (empty) database and search index both grow into spare RAM; give it to
+  # Elasticsearch first (up to RAM/8), then MariaDB (up to RAM/4).  Populated
+  # stores keep their data-sized targets, so their spare stays with the OS
+  # page cache instead of inflating a buffer pool that already fits.
+  local allocated leftover room add
+  allocated=$(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB ))
+  leftover=$(( usable - allocated ))
+  if (( leftover > 0 && has_es && OPT_ES_SIZE_MB == 0 && es_cap > OPT_ES_BUDGET_MB )); then
+    if (( has_php || has_maria || has_cache )); then
+      room=$(( total / 8 ))
+    else
+      # Elasticsearch is the only consumer: keep the standard 50% heap.
+      room=$(( total / 2 ))
+    fi
+    (( room > es_hard_cap )) && room=$es_hard_cap
+    (( room > es_cap )) && room=$es_cap
+    add=$(( room - OPT_ES_BUDGET_MB ))
+    (( add > leftover )) && add=$leftover
+    (( add > 0 )) && OPT_ES_BUDGET_MB=$(( OPT_ES_BUDGET_MB + add ))
+  fi
+  leftover=$(( usable - OPT_PHP_BUDGET_MB - OPT_MARIADB_BUDGET_MB - OPT_VALKEY_BUDGET_MB - OPT_ES_BUDGET_MB ))
+  if (( leftover > 0 && has_maria && OPT_DB_SIZE_MB == 0 && db_cap > OPT_MARIADB_BUDGET_MB )); then
+    if (( has_php || has_es || has_cache )); then
+      room=$(( total / 4 ))
+    else
+      room=$(( total / 2 ))
+    fi
+    add=$(( room - OPT_MARIADB_BUDGET_MB ))
+    (( add > leftover )) && add=$leftover
+    (( add > 0 )) && OPT_MARIADB_BUDGET_MB=$(( OPT_MARIADB_BUDGET_MB + add ))
+  fi
   return 0
 }
 
@@ -5997,6 +6088,38 @@ php_pool_max_children() {
     (( cur > max )) && max=$cur
   done < <(php_fpm_versions)
   printf '%s' "$max"
+}
+
+# Per-worker memory allowance used to size the PHP-FPM pool and to reserve
+# RAM for it in the shared plan.  A fixed 96 MB is safe for an unknown
+# application, but real workers are commonly 20-50 MB; reserving 96 MB each
+# leaves several GB that MariaDB and Elasticsearch could use.  When a pool is
+# already running, measure it and add headroom to the largest worker (and 3x
+# the average), clamped to a conservative 64-192 MB range.  A fresh install
+# has no pool to measure and keeps the 96 MB default.
+php_worker_allowance_mb() {
+  local ver=${1:-} out avg=0 n=0 allowance=96
+  if [[ -n $ver ]]; then
+    out=$(ps -o rss= -C "php-fpm${ver}" 2>/dev/null || true)
+  fi
+  [[ -n ${out:-} ]] || out=$(ps -o rss= -C php-fpm 2>/dev/null || true)
+  if [[ -n ${out:-} ]]; then
+    read -r avg n < <(printf '%s\n' "$out" | awk '
+      { sum += $1; n++ }
+      END { if (n) printf "%d %d\n", int(sum / n / 1024), n }
+    ') || true
+  fi
+  # One process is just the master; it says nothing about worker memory.
+  if [[ ${n:-0} =~ ^[0-9]+$ ]] && (( n >= 2 && avg > 0 )); then
+    # Average RSS already includes shared pages (OPcache, libraries) that are
+    # counted once per worker in a naive sum.  1.5x the average leaves room
+    # for a heavier request without turning a transient peak into a permanent
+    # multi-GB reservation.
+    allowance=$(( avg * 3 / 2 ))
+    (( allowance < 64 )) && allowance=64
+    (( allowance > 192 )) && allowance=192
+  fi
+  printf '%s\n' "$allowance"
 }
 
 php_primary_version() {

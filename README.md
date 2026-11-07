@@ -263,7 +263,7 @@ Before changing basic settings, the script records the originals under `/var/lib
   - OPcache/JIT settings in `custom_dan.ini` are active because `php<ver>-opcache` is installed. Add `php<ver>-intl` only if an add-on needs it.
 - Deploys `www.conf` from `configs/php/www_<ver>.conf` and `custom_dan.ini` from `configs/php/custom_dan.ini`. Add a new `configs/php/www_<ver>.conf` to support a new PHP version. These are local non-Angie configs; no Angie repo fetch is needed for a PHP-only install.
 - Fills in the dynamic values from `setup.sh`:
-  - `pm.max_children = RAM_budget / 96 MB` (the shared 80%-of-RAM plan; capped at `CPU threads × 16`, 512, and at least 8)
+  - `pm.max_children = RAM_budget / 96 MB` on a fresh install (the shared 80%-of-RAM plan; capped at `CPU threads × 16`, 512, and at least 8). On `--optimize` a live pool keeps its worker count and the planner reserves `max_children × measured allowance` instead: it samples the running workers, adds 50% headroom to the average RSS, clamps the allowance to 64–192 MB, and leaves the freed RAM for MariaDB/Elasticsearch. A measured 28 MB XenForo worker on the 27.8 GB test host therefore reserves 42 MB instead of 96 MB.
   - `pm.max_requests = CPU threads × 1024`
   - override either with `children=` / `max_requests=`
 - Sizes OPcache, JIT and `memory_limit` from RAM instead of fixed 512 MB values:
@@ -280,10 +280,15 @@ Before changing basic settings, the script records the originals under `/var/lib
 
 The generated `app=xf` vhost serves guest pages from Angie's FastCGI cache
 for 5 minutes and bypasses it for `xf_session`, `xf_user`, admin and login
-cookies. The stack-level defaults (PHP-FPM static workers, Unix sockets,
-MariaDB thread pool, Brotli, HTTP/2 keepalive) are tuned for XenForo. Measured
-on the 16-thread test host (Ubuntu 26.04, XenForo 2.3.13, 50 authenticated
-users):
+cookies. The cache key varies on the XenForo style variant (`xf_style_id`,
+`xf_style_variation`) and language (`xf_language_id`), matching
+`src/XF/PageCache.php`; without the last two a guest with a non-default style
+or language could receive another guest's cached HTML. Expired entries are
+refreshed in the background (`fastcgi_cache_background_update`) while
+`cache_lock` collapses a stampede. The stack-level defaults (PHP-FPM static
+workers, Unix sockets, MariaDB thread pool, Brotli, HTTP/2 keepalive) are
+tuned for XenForo. Measured on the 16-thread test host (Ubuntu 26.04,
+XenForo 2.3.13, 50 authenticated users):
 
 | Change | Authenticated index | Notes |
 |---|---:|---|
@@ -408,7 +413,7 @@ this warning next to the XenForo snippet.
   - disables `xpack.security.enabled` and `xpack.security.enrollment.enabled`
   - comments out `cluster.initial_master_nodes`
   - comments out the package’s `http.host`/`transport.host` so `network.host` actually controls the bind address
-- Writes `/etc/elasticsearch/jvm.options.d/zz-setup-optimize.options` with `-Xms<ram>`, `-Xmx<ram>`, G1GC, a 200 ms pause target and heap-dump-on-OOM. An operator-owned `jvm.options` is preserved; only the legacy script-generated file is moved to `/tmp`.
+- Writes `/etc/elasticsearch/jvm.options.d/zz-setup-optimize.options` with `-Xms<ram>`, `-Xmx<ram>`, G1GC, a 200 ms pause target and heap-dump-on-OOM. An operator-owned `jvm.options` is preserved; only the legacy script-generated file is moved to `/tmp`. `ram=auto` on a fresh install starts from `RAM/16` (512 MB–4 GB) and then spends any spare shared budget on the search heap (up to `RAM/8` on a shared host; the standard 50% heap when Elasticsearch is the only service). On the 27.8 GB test host this moved the empty-index heap from 512 MB to 3 GB.
 - Writes `/etc/systemd/system/elasticsearch.service.d/limits.conf` with `LimitMEMLOCK=infinity`, `LimitNOFILE=1048576` and `LimitNPROC=4096`.
 - Handles IPv6 hosts correctly when probing `http://[::1]:9200`.
 - Writes `/etc/elasticsearch/scripts/xf-date-weighted.groovy`.
@@ -858,10 +863,12 @@ Also checked at CLI level (all using `--dry-run`, no system changes):
   domain app type, per-domain and trailing group `app=` forms, every purge
   mode, `--optimize` and representative invalid inputs.
 
-- `tests/test-tuning.sh` covers 276 checks: Angie directive rewriting, the
-  multi-line `proxy_cache_path` fix, insertion anchors, miss reporting,
-  PHP pool editing/deduplication, the shared memory budget, UFW SSH
-  rate-limiting, and a second-run no-op check.
+- `tests/test-tuning.sh` covers 319 checks: Angie directive rewriting, the
+  XenForo guest-cache key (style/language), the multi-line `proxy_cache_path`
+  fix, insertion anchors, miss reporting, PHP pool editing/deduplication, the
+  shared memory budget (including the measured PHP worker allowance and the
+  Elasticsearch empty-index floor), UFW SSH rate-limiting, and a second-run
+  no-op check.
 
 - All 64 combinations of the six install service flags (`angie`, `php`, `mariadb`, `valkey`, `elastic`, `others`) plus `--basic` parse and validate.
 - All 128 bare purge target subsets (including empty/implicit/explicit `all`) parse and validate.

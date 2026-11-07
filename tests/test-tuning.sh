@@ -474,6 +474,31 @@ check "error policy keeps a single 5xx rule" \
   test "$(grep -c 'fastcgi_cache_valid 500' "$TMP/cache-policy.conf")" -eq 1
 
 # ---------------------------------------------------------------------------
+# XenForo guest-cache key (style and language variation)
+# ---------------------------------------------------------------------------
+cat > "$TMP/xf-cache.conf" <<'EOF'
+fastcgi_cache_key       "$request_method$scheme$host$request_uri$cookie_xf_style_variation";
+fastcgi_cache_lock      on;
+fastcgi_cache_use_stale error timeout invalid_header updating http_503;
+EOF
+tune_reset_changes
+tune_xf_cache_vary "$TMP/xf-cache.conf"
+check "XF cache key includes the style id" \
+  grep -q '\$cookie_xf_style_id' "$TMP/xf-cache.conf"
+check "XF cache key includes the language id" \
+  grep -q '\$cookie_xf_language_id' "$TMP/xf-cache.conf"
+check "XF cache key keeps the style variation" \
+  grep -q '\$cookie_xf_style_variation' "$TMP/xf-cache.conf"
+check "XF cache refreshes in the background" \
+  grep -qx 'fastcgi_cache_background_update on;' "$TMP/xf-cache.conf"
+check "XF cache repair is idempotent" \
+  test "$(grep -c 'fastcgi_cache_key' "$TMP/xf-cache.conf")" -eq 1
+
+tune_reset_changes
+tune_xf_cache_vary "$TMP/xf-cache.conf"
+check "XF cache repair records no second change" test "${#TUNE_CHANGES[@]}" -eq 0
+
+# ---------------------------------------------------------------------------
 # FastCGI snippet and server-level index repair (pretty URLs)
 # ---------------------------------------------------------------------------
 mkdir -p "$TMP/fcgi-repair"
@@ -837,6 +862,11 @@ check "opt-in hardening creates the central PHP error log" \
 # ---------------------------------------------------------------------------
 # Shared memory budget
 # ---------------------------------------------------------------------------
+# Keep these tests independent of any PHP-FPM pool that happens to run on the
+# machine executing the suite; the real helper measures the live pool and the
+# 96 MB default is the fresh-install path asserted below.
+php_primary_version() { printf '8.4'; }
+php_worker_allowance_mb() { printf '96'; }
 mem_total_mb() { printf '131072'; }
 mariadb_data_size_mb() { printf '0'; }
 mariadb_current_pool_mb() { printf '0'; }
@@ -1006,13 +1036,14 @@ plan_memory_budget
 check "Elasticsearch-only unknown index falls back to 50% RAM" \
   test "$OPT_ES_BUDGET_MB" -eq 31744
 
-# A reachable but empty cluster is a measurement, not a failure: use the
-# 512 MB JVM floor instead of allocating 25-50% of RAM.
+# A reachable but empty cluster is a measurement, not a failure: start from a
+# RAM-scaled floor (total/16, 512 MB..4 GB) and give the spare budget to the
+# only consumer.  This host is 64 GB, so the 50% heap cap applies.
 elasticsearch_data_size_mb() { printf '0'; }
 OPT_DETECTED=(elastic)
 plan_memory_budget
-check "measured empty Elasticsearch index uses the 512 MB floor" \
-  test "$OPT_ES_BUDGET_MB" -eq 512
+check "measured empty Elasticsearch-only host keeps the 50% heap" \
+  test "$OPT_ES_BUDGET_MB" -eq 31744
 
 mariadb_current_pool_mb() { printf '0'; }
 mariadb_data_size_mb() { printf '20000'; }
@@ -1491,8 +1522,10 @@ plan_memory_budget
 OPT_INSTALL_PLAN=0
 check "fresh install keeps MariaDB above the 256 MB floor" \
   test "$OPT_MARIADB_BUDGET_MB" -ge 1738
-check "fresh install uses the 512 MB empty-index ES floor" \
-  test "$OPT_ES_BUDGET_MB" -eq 512
+check "fresh install uses the RAM-scaled empty-index ES floor plus spare" \
+  test "$OPT_ES_BUDGET_MB" -eq 3476
+check "fresh install spends spare RAM on the empty database" \
+  test "$OPT_MARIADB_BUDGET_MB" -gt 1738
 check "fresh install full-stack plan stays inside the 80% budget" \
   test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
        -le $(( 27812 * 80 / 100 ))

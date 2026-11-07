@@ -2,6 +2,39 @@
 
 Historical release notes for ubuntu-setup-script. Current behavior is documented in README.md.
 
+## What's new in 1.8.50
+
+- **PHP worker memory is measured instead of assumed.** The shared planner
+  reserved a fixed 96 MB for every PHP-FPM worker. On the 16-thread / 27.8 GB
+  test host the live XenForo pool averaged 28 MB per worker (peak 51 MB), so
+  `--optimize` reserved 13.9 GB for a pool that used 4 GB at full load. The
+  planner now samples the running pool, adds 50% headroom to the average
+  worker RSS, clamps the allowance to 64-192 MB and reserves
+  `max_children × allowance`. A fresh install with no pool still uses 96 MB.
+  Worker *capacity* is unchanged: `--optimize` keeps a live pool's
+  `max_children` instead of deriving it from the reservation, so a heavier
+  measurement cannot shrink the pool.
+- **A fresh Elasticsearch index is no longer pinned to a 512 MB heap.** The
+  512 MB empty-index floor was correct for a tiny VPS but under-provisioned a
+  27.8 GB host that also runs MariaDB and PHP. An empty index now starts from
+  `RAM/16` clamped to 512 MB-4 GB, and the spare shared budget is spent on
+  Elasticsearch (up to RAM/8 on a shared host, the standard 50% heap when it
+  is the only service) before MariaDB (up to RAM/4, or 50% on a DB-only host).
+  Populated stores keep their data-sized targets, so the spare stays with the
+  application/page cache instead of inflating a pool that already fits. On
+  the 27.8 GB host the search heap moved from 512 MB to 3 GB.
+- **XenForo's guest cache varies on style and language.** XenForo's own page
+  cache keys on `style_id`, `style_variation`, `language_id` and cookie
+  consent (`src/XF/PageCache.php`). The deployed Angie vhost keyed only on
+  the style variation, so a guest who picked a non-default style or language
+  could receive another guest's cached HTML. `--angie` and `--optimize` now
+  add `$cookie_xf_style_id` and `$cookie_xf_language_id` to the FastCGI cache
+  key and enable `fastcgi_cache_background_update`, so an expiring entry is
+  refreshed in the background while `cache_lock` still collapses the
+  stampede. The repair is idempotent and also covers `php_xf_proxy.conf`.
+- The tuning suite grew to 319 checks, including the XenForo cache key and
+  the new memory-plan floors.
+
 ## What's new in 1.8.49
 
 - **Fresh installs no longer starve MariaDB to give Elasticsearch a
