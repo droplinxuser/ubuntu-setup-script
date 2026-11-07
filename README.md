@@ -490,7 +490,21 @@ bash setup.sh --optimize --dry-run
 creates, resizes or disables swap. The only packages it may add are the small
 `cpufrequtils` helper when the CPU exposes frequency scaling and
 `angie-module-brotli` when Angie is installed, so the compression profile
-matches a fresh `--angie` install. On hosts built
+matches a fresh `--angie` install. Before tuning Angie, it synchronizes
+`/etc/angie` with the canonical
+[`server-configs-nginx`](https://github.com/droplinxuser/server-configs-nginx)
+repository (or `CONFIG_SOURCE_DIR`) and runs the repository's deployer; the
+hardware-aware Angie profile is then applied to the deployed tree. If the
+download or deployment fails, the previous `/etc/angie` tree is restored and
+the synchronization is reported as a failed step.
+
+`--optimize` also audits WordPress (`wp-config.php`) and XenForo
+(`src/config.php`) installations under `/var/www`. The report lists the config
+file, whether MariaDB uses a persistent `p:` host, and whether Valkey/Redis
+uses the local Unix socket with persistent connections. The recommended
+`DB_HOST`, `WP_REDIS_PATH`, `WP_REDIS_PERSISTENT` and XenForo
+`$config['db']['host']` / `$config['cache']['config']` values are printed for
+the admin to apply; application files are never edited. On hosts built
 by releases before 1.8.34 it also repairs the legacy log permissions and cron
 paths: the nightly blanket `chown -R /var/www/`, the old
 `/etc/nginx/scripts/cloudflare.sh` path and the old `/usr/bin/mysqlcheck`
