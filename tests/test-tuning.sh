@@ -1473,5 +1473,65 @@ check "diagnostics gates MariaDB probes on installation" \
 check "diagnostics reports absent MariaDB as not installed" \
   grep -q 'MariaDB is not installed' <<<"$diag_body"
 
+# ---------------------------------------------------------------------------
+# Fresh-install memory plan
+# ---------------------------------------------------------------------------
+# A fresh full-stack install cannot measure an empty database or index.  The
+# planner must use the same empty-data floors as --optimize, otherwise
+# Elasticsearch reserves 25% of RAM and MariaDB is left on its 256 MB floor.
+mem_total_mb() { printf '27812'; }
+php_pool_max_children() { printf '144'; }
+mariadb_data_size_mb() { return 0; }
+mariadb_current_pool_mb() { return 0; }
+elasticsearch_data_size_mb() { return 0; }
+elasticsearch_current_heap_mb() { return 0; }
+OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
+OPT_INSTALL_PLAN=1
+plan_memory_budget
+OPT_INSTALL_PLAN=0
+check "fresh install keeps MariaDB above the 256 MB floor" \
+  test "$OPT_MARIADB_BUDGET_MB" -ge 1738
+check "fresh install uses the 512 MB empty-index ES floor" \
+  test "$OPT_ES_BUDGET_MB" -eq 512
+check "fresh install full-stack plan stays inside the 80% budget" \
+  test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
+       -le $(( 27812 * 80 / 100 ))
+
+# A database-only host has no competing service, so it must keep the larger
+# 80%-of-usable fallback instead of the shared-host floor.
+OPT_DETECTED=(mariadb)
+OPT_INSTALL_PLAN=1
+plan_memory_budget
+OPT_INSTALL_PLAN=0
+check "database-only fresh install keeps the large fallback" \
+  test "$OPT_MARIADB_BUDGET_MB" -gt 20000
+
+# ---------------------------------------------------------------------------
+# --restart-all plan de-duplicates the Valkey unit alias
+# ---------------------------------------------------------------------------
+systemctl() {
+  case "$1 $2 $3" in
+    "is-active --quiet valkey-server") return 0 ;;
+    "is-active --quiet valkey") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+detect_installed_services() { OPT_DETECTED=(angie mariadb valkey); }
+list_active_php_units() { return 0; }
+plan_out=$(restart_all_plan 2>&1)
+active_line=$(sed -n 's/^Active services: *//p' <<<"$plan_out")
+check "restart-all plan lists the Valkey alias only once" \
+  test "$(grep -o 'valkey' <<<"$active_line" | wc -l | tr -d ' ')" -eq 1
+
+# ---------------------------------------------------------------------------
+# Run-log robustness
+# ---------------------------------------------------------------------------
+run_log_body=$(sed -n '/^start_run_log()/,/^}/p' "$ROOT/setup.sh")
+check "run log name is unique per process" \
+  grep -Fq 'setup_${stamp}-$$.log' <<<"$run_log_body"
+on_error_body=$(sed -n '/^on_error()/,/^}/p' "$ROOT/setup.sh")
+check "on_error ignores SIGPIPE from a closed pipe" \
+  grep -q 'rc == 141' <<<"$on_error_body"
+
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

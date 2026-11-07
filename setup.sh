@@ -34,7 +34,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.48"
+readonly SCRIPT_VERSION="1.8.49"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -215,7 +215,10 @@ log_selection() {
 start_run_log() {
   local stamp
   stamp=$(date +%Y%m%d-%H%M%S)
-  RUN_LOG_FILE="${PWD}/setup_${stamp}.log"
+  # Include the PID so two invocations started in the same second (a common
+  # occurrence for --help/--version probes and CI dry-runs) never append to
+  # the same file and interleave their environment headers.
+  RUN_LOG_FILE="${PWD}/setup_${stamp}-$$.log"
 
   # Refuse to abort a real run just because the invocation directory is not
   # writable; the console output and normal diagnostics still work.
@@ -344,6 +347,12 @@ rollback_php_tree() {
 
 on_error() {
   local rc=$? line=${1:-?} cmd=${BASH_COMMAND:-unknown}
+  # A downstream consumer closing the pipe (for example `setup.sh --help |
+  # head`) makes tee exit with SIGPIPE (128+13).  That is not a script
+  # failure; suppress it so the run log stays free of false [ERR] lines.
+  if (( rc == 141 )); then
+    return 0
+  fi
   # Keep the failing command on one line and bounded, so a large heredoc or a
   # generated SQL statement does not flood the operator's terminal/log.
   cmd=$(printf '%s' "$cmd" | tr '\n' ' ' | cut -c1-200)
@@ -5582,6 +5591,10 @@ OPT_MARIADB_KEPT_MB=0
 OPT_VALKEY_BUDGET_MB=0
 OPT_ES_BUDGET_MB=0
 OPT_ES_KEPT_MB=0
+# Set while plan_install_budget() runs.  A fresh install has no live database
+# or index to measure, so the planner must use the same empty-data floors that
+# --optimize applies instead of the larger "unmeasured" fallbacks.
+OPT_INSTALL_PLAN=0
 
 mem_total_mb() {
   awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || printf '1024'
@@ -5794,6 +5807,13 @@ plan_memory_budget() {
     es_size_mb=$(elasticsearch_data_size_mb)
     if [[ -n $es_size_mb ]]; then
       es_measured=1
+    elif (( OPT_INSTALL_PLAN )) && (( has_maria )); then
+      # Fresh full-stack install: Elasticsearch is not installed yet and has
+      # no index.  Treat it as a measured empty cluster (512 MB floor) so it
+      # cannot reserve 25% of RAM and starve the MariaDB buffer pool that is
+      # installed later in the same run.  --optimize makes the same choice.
+      es_size_mb=0
+      es_measured=1
     else
       es_size_mb=0
     fi
@@ -5825,6 +5845,15 @@ plan_memory_budget() {
     # 5% headroom covers InnoDB metadata and adaptive hash structures.
     db_size_mb=$(mariadb_data_size_mb)
     if [[ -n $db_size_mb ]]; then
+      db_measured=1
+    elif (( OPT_INSTALL_PLAN )) && (( has_php || has_es )); then
+      # Fresh full-stack install: the database is empty and shares RAM with
+      # the PHP worker pool and/or the search heap.  Use the same 1/16-RAM
+      # empty-database floor that --optimize uses instead of the 40%-of-RAM
+      # unmeasured fallback, which would over-reserve memory that the other
+      # services need.  A database-only (or database+cache) host keeps the
+      # larger fallback because the database is its primary consumer.
+      db_size_mb=0
       db_measured=1
     else
       db_size_mb=0
@@ -5929,7 +5958,12 @@ plan_install_budget() {
   [[ ${ENABLED[mariadb]:-0} -eq 1 ]] && OPT_DETECTED+=(mariadb)
   [[ ${ENABLED[valkey]:-0} -eq 1 ]]  && OPT_DETECTED+=(valkey)
   [[ ${ENABLED[elastic]:-0} -eq 1 ]] && OPT_DETECTED+=(elastic)
+  # The services do not exist yet, so their size probes cannot return data.
+  # Let the planner use the empty-data floors instead of the unmeasured
+  # fallbacks; a re-run on an installed host still uses the measured values.
+  OPT_INSTALL_PLAN=1
   plan_memory_budget
+  OPT_INSTALL_PLAN=0
   info "Memory plan: ${OPT_MEM_BUDGET_MB}MB usable of ${OPT_MEM_TOTAL_MB}MB (PHP=${OPT_PHP_BUDGET_MB}MB MariaDB=${OPT_MARIADB_BUDGET_MB}MB Cache=${OPT_VALKEY_BUDGET_MB}MB Elasticsearch=${OPT_ES_BUDGET_MB}MB)"
 }
 
@@ -8459,13 +8493,22 @@ list_active_php_units() {
 }
 
 restart_all_plan() {
-  local unit
+  local unit cache_unit=""
   local -a active=() php_units=()
   detect_installed_services
   mapfile -t php_units < <(list_active_php_units)
-  for unit in angie mariadb valkey-server valkey redis-server elasticsearch; do
-    systemctl is-active --quiet "$unit" 2>/dev/null && active+=("$unit")
+  systemctl is-active --quiet angie 2>/dev/null && active+=(angie)
+  systemctl is-active --quiet mariadb 2>/dev/null && active+=(mariadb)
+  # valkey and valkey-server are aliases for the same unit; report only the
+  # first active name so the plan does not list the cache service twice.
+  for unit in valkey-server valkey redis-server; do
+    if systemctl is-active --quiet "$unit" 2>/dev/null; then
+      cache_unit=$unit
+      break
+    fi
   done
+  [[ -n $cache_unit ]] && active+=("$cache_unit")
+  systemctl is-active --quiet elasticsearch 2>/dev/null && active+=(elasticsearch)
   active+=("${php_units[@]}")
   printf '\n%sDRY RUN%s - restart-all scan only, no changes will be made.\n' "$C_BOLD" "$C_RESET"
   printf 'Detected installed: %s\n' "${OPT_DETECTED[*]:-none}"
