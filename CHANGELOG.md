@@ -14,13 +14,14 @@ Historical release notes for ubuntu-setup-script. Current behavior is documented
   deprecated alias is no longer written; MariaDB's default `log_slow_filter`
   already includes `admin`, so admin statements stay in the slow log.
   `--optimize` also strips the legacy key from an existing `50-server.cnf`.
-- **The TCP-to-Unix PHP-FPM migration is opt-in.** Some PHP-FPM builds (PHP
-  8.5 was observed) close the old TCP listener on SIGUSR2 without opening the
-  new socket, leaving Angie with no live upstream for the ten-second cutover
-  window. `--optimize` now preserves a working TCP listener by default; set
-  `SETUP_OPTIMIZE_MIGRATE_PHP_SOCKET=1` to attempt the move. When opted in,
-  the socket primary uses `max_fails=1 fail_timeout=2s` so Angie can actually
-  use the TCP backup (with `max_fails=0` the backup was never selected).
+- **The TCP-to-Unix PHP-FPM migration is mandatory.** `--optimize` always
+  migrates a live TCP pool used through the shared `local_php` upstream and
+  repoints Angie to the socket. The graceful reload is tried first; if the
+  build does not open the new listener on SIGUSR2 (PHP 8.5 was observed),
+  PHP-FPM is restarted to complete the cutover. The socket primary keeps `max_fails=1 fail_timeout=2s` so Angie
+  can use the TCP backup during the reload attempt (with `max_fails=0` the
+  backup was never selected). A failed migration is reported as a failed
+  optimize step instead of silently leaving TCP in place.
 - **Changing the Valkey/Redis socket no longer restarts PHP-FPM.** Workers
   only need a restart when `www-data` was just added to the service group;
   the socket path itself does not change their supplementary groups. This
