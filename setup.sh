@@ -34,7 +34,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.47"
+readonly SCRIPT_VERSION="1.8.48"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -517,6 +517,11 @@ Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
       The graceful reload is tried first; if the build does not open the new
       listener on SIGUSR2, PHP-FPM is restarted to complete the migration
       (a short, explicit cutover).
+      Angie's /etc/angie tree is synchronized from server-configs-nginx (or
+      CONFIG_SOURCE_DIR) before the hardware profile is applied; a failed
+      sync restores the previous tree and is reported.  WordPress/XenForo
+      configs under /var/www are audited, and the report lists persistent
+      MariaDB and local Valkey socket settings the admin still needs to apply.
       Hosts built before 1.8.34 also get the legacy nightly
       `chown -R /var/www/` crontab entry migrated to the log-safe find form,
       and /var/www/logs ownership repaired before any service is restarted.
@@ -1534,24 +1539,31 @@ fetch_server_configs() {
 
   info "Downloading server configs: ${url}"
   if retry 3 5 curl -fsSL --proto '=https' --tlsv1.2 "$url" -o "$archive" 2>/dev/null; then
-    tar -xzf "$archive" -C "$CONFIG_TEMP_DIR" \
-      || die "Could not extract server configs from ${url}"
+    if ! tar -xzf "$archive" -C "$CONFIG_TEMP_DIR"; then
+      warn "Could not extract server configs from ${url}"
+      CONFIG_TEMP_DIR=""
+      return 1
+    fi
   elif command -v git >/dev/null 2>&1 \
        && retry 3 5 git clone --depth 1 --branch "$CONFIG_REPO_REF" \
             "${CONFIG_REPO_URL}.git" "${CONFIG_TEMP_DIR}/repo" 2>/dev/null; then
     src="${CONFIG_TEMP_DIR}/repo"
   else
     # Keep the failed download under /tmp for inspection; it expires on its own.
+    warn "Could not download server configs from ${CONFIG_REPO_URL} (${CONFIG_REPO_REF})"
     CONFIG_TEMP_DIR=""
-    die "Could not download server configs from ${CONFIG_REPO_URL} (${CONFIG_REPO_REF})"
+    return 1
   fi
 
   if [[ -z $src ]]; then
     src=$(find "$CONFIG_TEMP_DIR" -mindepth 1 -maxdepth 1 -type d \
-      -name 'server-configs-nginx-*' 2>/dev/null | head -n1)
+      -name 'server-configs-nginx-*' 2>/dev/null | head -n1 || true)
   fi
-  [[ -n $src && -f "${src}/scripts/nginx_conf.sh" ]] \
-    || die "Downloaded server configs are missing scripts/nginx_conf.sh"
+  if [[ -z $src || ! -f "${src}/scripts/nginx_conf.sh" ]]; then
+    warn "Downloaded server configs are missing scripts/nginx_conf.sh"
+    CONFIG_TEMP_DIR=""
+    return 1
+  fi
   CONFIG_SOURCE_DIR=$src
   info "Server configs ready: ${CONFIG_SOURCE_DIR}"
 }
@@ -3647,15 +3659,21 @@ EOF
   return 0
 }
 
-deploy_angie_configs() {
-  step "Angie configuration (server-configs-nginx)"
-  fetch_server_configs
-
+# Fetch the canonical Angie tree and run the repository's deployer.  Kept
+# separate from the tuning pass so --optimize can synchronize /etc/angie and
+# then apply the hardware-aware profile to the freshly deployed files.
+sync_angie_repo_configs() {
+  fetch_server_configs || return 1
+  local limit_src="${CONFIG_SOURCE_DIR}/scripts/limit_nofile.conf"
+  local default_src="${CONFIG_SOURCE_DIR}/scripts/etc_default_nginx"
+  [[ -f $limit_src && -f $default_src ]] || {
+    warn "Downloaded server configs lack the systemd/default Angie files"
+    return 1
+  }
   mkdir -p /etc/systemd/system/angie.service.d
-  install -m 644 "${CONFIG_SOURCE_DIR}/scripts/limit_nofile.conf" \
-    /etc/systemd/system/angie.service.d/limits.conf
-  install -m 644 "${CONFIG_SOURCE_DIR}/scripts/etc_default_nginx" \
-    /etc/default/angie
+  install -m 644 "$limit_src" /etc/systemd/system/angie.service.d/limits.conf \
+    || return 1
+  install -m 644 "$default_src" /etc/default/angie || return 1
 
   # Load the new drop-in before nginx_conf.sh reloads the unit; otherwise
   # systemctl prints "unit file changed on disk" and may use stale limits.
@@ -3664,7 +3682,13 @@ deploy_angie_configs() {
   # The repository owns the config tree, cache-directory creation, removal of
   # old setup.sh overrides, the angie -t check and the reload.
   export CONFIG_SOURCE_DIR
-  if ! bash "${CONFIG_SOURCE_DIR}/scripts/nginx_conf.sh"; then
+  bash "${CONFIG_SOURCE_DIR}/scripts/nginx_conf.sh" || return 1
+  return 0
+}
+
+deploy_angie_configs() {
+  step "Angie configuration (server-configs-nginx)"
+  if ! sync_angie_repo_configs; then
     warn "Angie config deployment failed"
     return 1
   fi
@@ -6102,6 +6126,155 @@ optimize_wordpress_cache() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# WordPress / XenForo connection audit
+# ---------------------------------------------------------------------------
+# --optimize reports, but never edits, application config.  The admin owns
+# wp-config.php and XenForo's src/config.php, so the report gives the exact
+# settings needed for persistent MariaDB connections and the local Valkey
+# socket.
+app_cache_socket_hint() {
+  if [[ -f /etc/valkey/valkey.conf || -S /run/valkey/valkey.sock ]]; then
+    printf '/run/valkey/valkey.sock'
+  elif [[ -f /etc/redis/redis.conf || -S /run/redis/redis.sock ]]; then
+    printf '/run/redis/redis.sock'
+  else
+    printf '/run/valkey/valkey.sock'
+  fi
+}
+
+app_is_socket_path() {
+  case "$1" in
+    */valkey.sock|*/redis.sock|unix://*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+wp_db_host_from_config() {
+  sed -nE "s/^[[:space:]]*define[[:space:]]*\([[:space:]]*['\"]DB_HOST['\"][[:space:]]*,[[:space:]]*['\"]([^'\"]*)['\"].*/\1/p" "$1" 2>/dev/null | head -n1 || true
+}
+
+wp_redis_path_from_config() {
+  sed -nE "s/^[[:space:]]*define[[:space:]]*\([[:space:]]*['\"]WP_REDIS_PATH['\"][[:space:]]*,[[:space:]]*['\"]([^'\"]*)['\"].*/\1/p" "$1" 2>/dev/null | head -n1 || true
+}
+
+wp_redis_host_from_config() {
+  sed -nE "s/^[[:space:]]*define[[:space:]]*\([[:space:]]*['\"]WP_REDIS_HOST['\"][[:space:]]*,[[:space:]]*['\"]([^'\"]*)['\"].*/\1/p" "$1" 2>/dev/null | head -n1 || true
+}
+
+wp_redis_persistent_from_config() {
+  grep -qE "^[[:space:]]*define[[:space:]]*\([[:space:]]*['\"]WP_REDIS_PERSISTENT['\"][[:space:]]*,[[:space:]]*(true|TRUE|True|1)[[:space:]]*\)" "$1" 2>/dev/null
+}
+
+xf_db_host_from_config() {
+  sed -nE "s/^[[:space:]]*\\\$config\[['\"]db['\"]\]\[['\"]host['\"]\][[:space:]]*=[[:space:]]*['\"]([^'\"]*)['\"].*/\1/p" "$1" 2>/dev/null | head -n1 || true
+}
+
+xf_cache_host_from_config() {
+  sed -nE "s/^[[:space:]]*\\\$config\[['\"]cache['\"]\]\[['\"]config['\"]\]\[['\"]host['\"]\][[:space:]]*=[[:space:]]*['\"]([^'\"]*)['\"].*/\1/p" "$1" 2>/dev/null | head -n1 || true
+}
+
+xf_cache_port_from_config() {
+  sed -nE "s/^[[:space:]]*\\\$config\[['\"]cache['\"]\]\[['\"]config['\"]\]\[['\"]port['\"]\][[:space:]]*=[[:space:]]*([0-9]+).*/\1/p" "$1" 2>/dev/null | head -n1 || true
+}
+
+app_find_wordpress_configs() {
+  find /var/www -maxdepth 5 -type f -name wp-config.php 2>/dev/null | sort -u || true
+}
+
+app_find_xenforo_configs() {
+  local conf
+  while IFS= read -r conf; do
+    if [[ -f "${conf%/config.php}/XF.php" ]]; then
+      printf '%s\n' "$conf"
+    fi
+  done < <(find /var/www -maxdepth 6 -type f -path '*/src/config.php' 2>/dev/null | sort -u || true)
+}
+
+audit_app_persistent_connections() {
+  local socket_hint conf dbhost redis_path redis_host redis_value
+  local xf_dbhost xf_cache_host xf_cache_port found=0 issues=0
+  local redis_persistent=0
+  APP_CONNECTION_ISSUES=0
+  socket_hint=$(app_cache_socket_hint)
+  opt_report "## Application connection notices"
+
+  while IFS= read -r conf; do
+    [[ -n $conf ]] || continue
+    case "$conf" in
+      */backup/*|*/mysql_database/*|*/logs/*) continue ;;
+    esac
+    found=1
+    dbhost=$(wp_db_host_from_config "$conf")
+    redis_path=$(wp_redis_path_from_config "$conf")
+    redis_host=$(wp_redis_host_from_config "$conf")
+    redis_persistent=0
+    if wp_redis_persistent_from_config "$conf"; then
+      redis_persistent=1
+    fi
+    redis_value=${redis_path:-$redis_host}
+
+    opt_report "- WordPress \`${conf}\`"
+    if [[ -z $dbhost ]]; then
+      opt_report "  - DB_HOST was not found; verify the MariaDB connection manually."
+      issues=$((issues + 1))
+    elif [[ $dbhost == p:* ]]; then
+      opt_report "  - MariaDB host is persistent (\`${dbhost}\`)."
+    else
+      opt_report "  - MariaDB host \`${dbhost}\` is not persistent; set \`define('DB_HOST', 'p:localhost');\`"
+      issues=$((issues + 1))
+    fi
+    if [[ -z $redis_value ]]; then
+      opt_report "  - No Valkey/Redis cache is configured (optional)."
+    elif app_is_socket_path "$redis_value"; then
+      if (( redis_persistent )); then
+        opt_report "  - Valkey uses \`${redis_value}\` with persistent connections."
+      else
+        opt_report "  - Valkey uses \`${redis_value}\`; add \`define('WP_REDIS_PERSISTENT', true);\`"
+        issues=$((issues + 1))
+      fi
+    else
+      opt_report "  - Valkey/Redis endpoint \`${redis_value}\` is not the local socket; set \`define('WP_REDIS_PATH', '${socket_hint}');\` and \`define('WP_REDIS_PERSISTENT', true);\`"
+      issues=$((issues + 1))
+    fi
+  done < <(app_find_wordpress_configs)
+
+  while IFS= read -r conf; do
+    [[ -n $conf ]] || continue
+    case "$conf" in
+      */backup/*|*/mysql_database/*|*/logs/*) continue ;;
+    esac
+    found=1
+    xf_dbhost=$(xf_db_host_from_config "$conf")
+    xf_cache_host=$(xf_cache_host_from_config "$conf")
+    xf_cache_port=$(xf_cache_port_from_config "$conf")
+    opt_report "- XenForo \`${conf}\`"
+    if [[ -z $xf_dbhost ]]; then
+      opt_report "  - Database host was not found; verify the MariaDB connection manually."
+      issues=$((issues + 1))
+    elif [[ $xf_dbhost == p:* ]]; then
+      opt_report "  - MariaDB host is persistent (\`${xf_dbhost}\`)."
+    else
+      opt_report "  - MariaDB host \`${xf_dbhost}\` is not persistent; set \`\$config['db']['host'] = 'p:localhost';\`"
+      issues=$((issues + 1))
+    fi
+    if [[ -z $xf_cache_host ]]; then
+      opt_report "  - No Valkey/Redis cache backend is configured (optional)."
+    elif app_is_socket_path "$xf_cache_host" && [[ ${xf_cache_port:-0} == 0 ]]; then
+      opt_report "  - Valkey uses the local Unix socket \`${xf_cache_host}\` (port 0)."
+    else
+      opt_report "  - Valkey is not using the local socket; set \`\$config['cache']['config']['host'] = '${socket_hint}';\` and \`\$config['cache']['config']['port'] = 0;\`"
+      issues=$((issues + 1))
+    fi
+  done < <(app_find_xenforo_configs)
+
+  if (( found == 0 )); then
+    opt_report "- No WordPress or XenForo configuration was found under /var/www."
+  fi
+  APP_CONNECTION_ISSUES=$issues
+  return 0
+}
+
 # Match the installer's systemd fd limit on an existing server too.  Only the
 # fd limit is checked: Angie daemonises with umask(0), so a UMask= drop-in
 # does not change the modes of the files its workers create.  Rewriting an
@@ -6129,15 +6302,40 @@ ensure_angie_limits() {
 }
 
 optimize_angie() {
-  local active=0 change version
+  local active=0 change version rc=0 unit_changed=0
+  local limit_file=/etc/systemd/system/angie.service.d/limits.conf
+  local default_file=/etc/default/angie
+  local limit_before="" limit_after="" default_before="" default_after=""
   systemctl is-active --quiet angie 2>/dev/null && active=1
   version=$(/usr/sbin/angie -v 2>&1 | head -n1 || true)
   opt_report "## Angie"
   opt_report "- Version: \`${version:-unknown}\`; active: ${active}"
   opt_backup /etc/angie angie
   tune_reset_changes
-  ensure_angie_limits || true
-  local unit_changed=$ANGIE_UNIT_CHANGED
+  [[ -f $limit_file ]] && limit_before=$(md5sum "$limit_file" | awk '{print $1}')
+  [[ -f $default_file ]] && default_before=$(md5sum "$default_file" | awk '{print $1}')
+
+  # Keep /etc/angie byte-for-byte aligned with the canonical repository before
+  # applying the hardware-aware profile.  The repository deployer owns the
+  # tree layout and validates/reloads Angie; setup.sh owns the tuning below.
+  if sync_angie_repo_configs; then
+    opt_report "- Repository: synchronized from ${CONFIG_REPO_URL} (${CONFIG_REPO_REF})"
+    [[ -f $limit_file ]] && limit_after=$(md5sum "$limit_file" | awk '{print $1}')
+    [[ -f $default_file ]] && default_after=$(md5sum "$default_file" | awk '{print $1}')
+    if [[ $limit_before != "$limit_after" || $default_before != "$default_after" ]]; then
+      unit_changed=1
+      opt_report "- Repository: systemd limit/default files refreshed"
+    fi
+  else
+    rc=1
+    opt_report "- **FAILED** Angie repository synchronization; restored the existing /etc/angie tree"
+    opt_restore /etc/angie angie
+    /usr/sbin/angie -t >/dev/null 2>&1 \
+      && { systemctl reload angie 2>/dev/null || systemctl restart angie 2>/dev/null; } || true
+    # No repository deployer ran, so keep the standalone limit tuning.
+    ensure_angie_limits || true
+    unit_changed=$ANGIE_UNIT_CHANGED
+  fi
   optimize_wordpress_cache /etc/angie || true
   if ! tune_angie_configs /etc/angie; then
     opt_restore /etc/angie angie
@@ -6182,7 +6380,7 @@ optimize_angie() {
   if (( active )); then
     if (( TUNE_DIRTY == 0 )); then
       if (( unit_changed )); then
-        opt_report "- Restart: deferred (systemd LimitNOFILE drop-in applies on the next restart)"
+        opt_report "- Restart: deferred (systemd/default Angie files apply on the next restart)"
       else
         opt_report "- Restart: skipped (configuration already optimized)"
       fi
@@ -6190,7 +6388,7 @@ optimize_angie() {
       OPT_CUTOVER=1
       opt_report "- Reload: **OK** (graceful; in-flight requests keep running)"
       if (( unit_changed )); then
-        opt_report "- Note: systemd LimitNOFILE drop-in applies on the next full restart"
+        opt_report "- Note: systemd/default Angie files apply on the next full restart"
       fi
     elif systemctl restart angie 2>/dev/null && systemctl is-active --quiet angie; then
       OPT_CUTOVER=1
@@ -6204,7 +6402,7 @@ optimize_angie() {
   else
     opt_report "- Restart: skipped (service was not active)"
   fi
-  return 0
+  return "$rc"
 }
 
 # True when active PHP vhosts use the shared local_php upstream, so the
@@ -7629,7 +7827,10 @@ optimize_plan() {
       "$cache_mb"
     printf '  Angie compression: Brotli level %s dynamic, gzip fallback (module installed on apply)\n' \
       "${SETUP_BROTLI_LEVEL:-5}"
+    printf '  Angie repository: sync %s (%s), then apply the hardware profile\n' \
+      "${CONFIG_REPO_URL}" "${CONFIG_REPO_REF}"
   fi
+  printf '  Applications: audit WordPress/XenForo persistent MariaDB and Valkey socket settings\n'
   if [[ ${OPT_DETECTED[*]} == *php:* ]]; then
     if (( OPT_PHP_BUDGET_MB > 0 )); then
       max_children=$(( OPT_PHP_BUDGET_MB / 96 ))
@@ -8678,6 +8879,12 @@ run_optimize() {
   done
 
   verify_optimized_services || rc=1
+  # Detect WordPress/XenForo configs under /var/www and report the exact
+  # persistent MariaDB/Valkey settings the admin still needs to apply.
+  audit_app_persistent_connections
+  if (( ${APP_CONNECTION_ISSUES:-0} > 0 )); then
+    warn "Application connection notices: ${APP_CONNECTION_ISSUES} item(s) need attention (see the report)"
+  fi
 
   if (( OPT_CUTOVER )); then
     local cached
@@ -8849,7 +9056,7 @@ main() {
   # local to this repository (configs/php), so a PHP-only install needs no
   # network fetch.
   if [[ ${ENABLED[angie]:-0} -eq 1 ]]; then
-    fetch_server_configs
+    fetch_server_configs || die "Could not prepare the Angie configuration repository"
   fi
 
   if [[ ${ENABLED[angie]:-0} -eq 1 ]];   then run_service angie   install_angie; fi
