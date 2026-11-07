@@ -2,6 +2,24 @@
 
 Historical release notes for ubuntu-setup-script. Current behavior is documented in README.md.
 
+## What's new in 1.8.48
+
+- **`--optimize` synchronizes `/etc/angie` with `server-configs-nginx` before
+  tuning it.** The canonical tree is fetched from
+  `https://github.com/droplinxuser/server-configs-nginx` (or
+  `CONFIG_SOURCE_DIR`) and deployed with the repository's `nginx_conf.sh`.
+  The hardware-aware Angie profile then runs against the freshly deployed
+  files. A failed download/validation restores the previous `/etc/angie`
+  tree and reports the synchronization as a failed optimize step.
+- **WordPress and XenForo configs under `/var/www` are audited for persistent
+  connections.** `--optimize` locates `wp-config.php` and XenForo's
+  `src/config.php`, then reports whether the MariaDB host uses a persistent
+  `p:` connection and whether Valkey/Redis uses the local Unix socket.
+  Recommended `DB_HOST`/`WP_REDIS_PATH`/`WP_REDIS_PERSISTENT` and XenForo
+  `$config['db']['host']`/`$config['cache']['config']` values are printed in
+  the optimization report. The audit is read-only; the admin applies the
+  changes.
+
 ## What's new in 1.8.47
 
 - **`sysctl` no longer logs `net.ipv4.ipfrag_high_thresh: Invalid argument`.**

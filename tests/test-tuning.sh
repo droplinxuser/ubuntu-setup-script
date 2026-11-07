@@ -1168,6 +1168,63 @@ check "WordPress vhost detection ignores a missing wp-config" \
   test -z "$(angie_wordpress_vhosts "$TMP/wpangie")"
 
 # ---------------------------------------------------------------------------
+# WordPress / XenForo persistent-connection audit
+# ---------------------------------------------------------------------------
+cat > "$TMP/wp-config.php" <<'EOF'
+<?php
+define( 'DB_HOST', 'localhost' );
+define( 'WP_REDIS_PATH', '/run/valkey/valkey.sock' );
+define( 'WP_REDIS_PERSISTENT', true );
+EOF
+cat > "$TMP/xf-config.php" <<'EOF'
+<?php
+$config['db']['host'] = 'p:localhost';
+$config['cache']['config']['host'] = '/run/valkey/valkey.sock';
+$config['cache']['config']['port'] = 0;
+EOF
+check "WordPress DB host parser" \
+  test "$(wp_db_host_from_config "$TMP/wp-config.php")" = localhost
+check "WordPress Valkey path parser" \
+  test "$(wp_redis_path_from_config "$TMP/wp-config.php")" = /run/valkey/valkey.sock
+check "WordPress persistent flag parser" wp_redis_persistent_from_config "$TMP/wp-config.php"
+check "XenForo DB host parser" \
+  test "$(xf_db_host_from_config "$TMP/xf-config.php")" = p:localhost
+check "XenForo cache host parser" \
+  test "$(xf_cache_host_from_config "$TMP/xf-config.php")" = /run/valkey/valkey.sock
+check "XenForo cache port parser" \
+  test "$(xf_cache_port_from_config "$TMP/xf-config.php")" = 0
+check "Unix socket detector accepts a Valkey socket" \
+  app_is_socket_path /run/valkey/valkey.sock
+tcp_not_socket() { ! app_is_socket_path 127.0.0.1; }
+check "Unix socket detector rejects TCP" tcp_not_socket
+
+app_find_wordpress_configs() { printf '%s\n' "$TMP/wp-config.php"; }
+app_find_xenforo_configs() { :; }
+app_cache_socket_hint() { printf '/run/valkey/valkey.sock'; }
+OPT_REPORT=()
+audit_app_persistent_connections
+check "audit reports a non-persistent MariaDB host" \
+  grep -q 'is not persistent' <<<"${OPT_REPORT[*]}"
+check "audit recognizes a persistent Valkey socket" \
+  grep -q 'with persistent connections' <<<"${OPT_REPORT[*]}"
+check "audit counts the MariaDB notice" \
+  test "$APP_CONNECTION_ISSUES" -eq 1
+
+opt_body=$(sed -n '/^optimize_angie()/,/^}/p' "$ROOT/setup.sh")
+check "optimize_angie synchronizes the Angie repository" \
+  grep -q 'sync_angie_repo_configs' <<<"$opt_body"
+sync_body=$(sed -n '/^sync_angie_repo_configs()/,/^}/p' "$ROOT/setup.sh")
+check "Angie sync runs the repository deployer" \
+  grep -q 'nginx_conf.sh' <<<"$sync_body"
+run_body=$(sed -n '/^run_optimize()/,/^}/p' "$ROOT/setup.sh")
+check "run_optimize calls the application connection audit" \
+  grep -q 'audit_app_persistent_connections' <<<"$run_body"
+audit_line=$(printf '%s\n' "$run_body" | grep -n 'audit_app_persistent_connections' | head -n1 | cut -d: -f1)
+report_line=$(printf '%s\n' "$run_body" | grep -n 'write_optimize_report' | tail -n1 | cut -d: -f1)
+check "application notices are added before the report is written" \
+  test -n "$audit_line" -a -n "$report_line" -a "$audit_line" -lt "$report_line"
+
+# ---------------------------------------------------------------------------
 # Managed Elasticsearch heap file
 # ---------------------------------------------------------------------------
 cat > "$TMP/es-managed.options" <<'EOF'
