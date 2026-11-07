@@ -564,13 +564,13 @@ so a freshly installed database cannot collapse a large host to a 256 MB
 pool. A 40%-of-RAM (MariaDB) or 25%-of-RAM (Elasticsearch)
 fallback is used only when the data size cannot be measured. Oversized live
 allocations are reduced to the data-sized target. Elasticsearch keeps its
-31 GB compressed-oops ceiling. PHP listeners are preserved: Angie is
-repointed only when the pool
-already owns a Unix socket, so a live TCP pool is never broken by a
-configuration change. The in-place TCP-to-Unix migration is opt-in with
-`SETUP_OPTIMIZE_MIGRATE_PHP_SOCKET=1`; the default is off because some
-PHP-FPM builds (PHP 8.5 was observed) do not open the new listener on reload
-and can leave Angie without a live upstream during the cutover. Service allocations
+31 GB compressed-oops ceiling. A live TCP PHP-FPM pool used through the
+shared `local_php` upstream is migrated to the Unix socket and Angie is
+repointed to it. The graceful reload is tried first; when a build does not
+open the new listener on SIGUSR2 (PHP 8.5 was observed), `--optimize`
+restarts PHP-FPM to complete the migration. That cutover is short and
+explicit, and the migration is mandatory rather than an optional setting.
+Service allocations
 are planned together from one 80%-of-RAM budget, with PHP worker capacity
 reserved first, so MariaDB + PHP + cache + Elasticsearch cannot collectively
 exhaust memory. Each configuration is

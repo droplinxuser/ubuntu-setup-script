@@ -85,12 +85,17 @@ check "ipfrag tuning writes the low mark first" \
 check "ipfrag tuning writes the high mark second" \
   test "$(printf '%s\n' "$ipfrag_block" | tail -n1)" = "net.ipv4.ipfrag_high_thresh = 2047616"
 
-# The live TCP pool is preserved unless the operator opts in.
-unset SETUP_OPTIMIZE_MIGRATE_PHP_SOCKET
-migration_disabled() { ! php_socket_migration_enabled; }
-migration_enabled() { SETUP_OPTIMIZE_MIGRATE_PHP_SOCKET=1 php_socket_migration_enabled; }
-check "PHP socket migration is off by default" migration_disabled
-check "PHP socket migration opts in with the environment" migration_enabled
+# The live TCP pool is always migrated; there is no opt-out switch.
+php_body=$(sed -n '/^optimize_php_services()/,/^}/p' "$ROOT/setup.sh")
+check "optimize always calls the PHP socket migration" \
+  grep -qF 'migrate_php_pool_to_socket "$ver" "$listen_path"' <<<"$php_body"
+check "PHP socket migration has no opt-out environment guard" \
+  bash -c '! grep -q "SETUP_OPTIMIZE_MIGRATE_PHP_SOCKET" "$1"' _ "$ROOT/setup.sh"
+migrate_body=$(sed -n '/^migrate_php_pool_to_socket()/,/^}/p' "$ROOT/setup.sh")
+check "socket migration restarts PHP when reload cannot apply it" \
+  grep -qF 'systemctl restart "php${ver}-fpm"' <<<"$migrate_body"
+check "failed socket migration is not silently downgraded" \
+  bash -c '! grep -q "return 2" <<< "$1"' _ "$migrate_body"
 
 # Cron ownership repair.  Releases before 1.8.34 wrote a nightly
 # `chown -R /var/www/` that also flattened the shared log tree; the managed

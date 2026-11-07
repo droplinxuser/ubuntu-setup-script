@@ -512,12 +512,11 @@ Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
       80%-of-RAM budget, and a service is reloaded (Angie, PHP-FPM) or tuned
       online (Valkey/Redis) only when its generated configuration actually
       changed.  Startup-only settings are reported and apply on the next full
-      restart.  Existing PHP-FPM listeners are kept;
-      when a pool already listens on a Unix socket, Angie's fastcgi_pass is
-      repointed to it.  TCP pools stay on TCP so a live site is never left
-      pointing at a missing socket.  Set
-      SETUP_OPTIMIZE_MIGRATE_PHP_SOCKET=1 to attempt the in-place TCP-to-Unix
-      move; some PHP-FPM builds do not open the new listener on reload.
+      restart.  A live TCP PHP-FPM pool used through the shared local_php
+      upstream is migrated to the Unix socket, and Angie is repointed to it.
+      The graceful reload is tried first; if the build does not open the new
+      listener on SIGUSR2, PHP-FPM is restarted to complete the migration
+      (a short, explicit cutover).
       Hosts built before 1.8.34 also get the legacy nightly
       `chown -R /var/www/` crontab entry migrated to the log-safe find form,
       and /var/www/logs ownership repaired before any service is restarted.
@@ -6208,15 +6207,6 @@ optimize_angie() {
   return 0
 }
 
-# Live TCP-to-Unix migration is opt-in.  Some PHP-FPM builds (PHP 8.5 was
-# observed) close the old TCP listener on SIGUSR2 without opening the new
-# socket, so neither the primary nor the backup can serve during the cutover.
-# The default therefore preserves a working TCP listener, matching the
-# installer and the README.
-php_socket_migration_enabled() {
-  [[ ${SETUP_OPTIMIZE_MIGRATE_PHP_SOCKET:-0} == 1 ]]
-}
-
 # True when active PHP vhosts use the shared local_php upstream, so the
 # temporary socket-primary/TCP-backup cutover is safe.  A direct fastcgi_pass
 # or fastcgi_next_upstream off cannot fall back to the TCP listener.
@@ -6312,16 +6302,30 @@ migrate_php_pool_to_socket() {
   tune_pool_set "$pool" listen.owner www-data "PHP ${ver}: listen.owner=www-data"
   tune_pool_set "$pool" listen.group www-data "PHP ${ver}: listen.group=www-data"
   tune_pool_set "$pool" listen.mode 0660 "PHP ${ver}: listen.mode=0660"
-  if ! "$fpm_bin" -t >/dev/null 2>&1 \
-     || ! systemctl reload "php${ver}-fpm" 2>/dev/null; then
+  if ! "$fpm_bin" -t >/dev/null 2>&1; then
     cp -a "$bak/www.conf" "$pool"
-    "$fpm_bin" -t >/dev/null 2>&1 && systemctl reload "php${ver}-fpm" 2>/dev/null || true
     cp -a "$bak/angie.conf" "$angie_conf"
     /usr/sbin/angie -t >/dev/null 2>&1 && systemctl reload angie 2>/dev/null || true
-    MIGRATE_REASON="PHP rejected the socket pool or the reload failed"
+    MIGRATE_REASON="PHP rejected the socket pool"
     return 1
   fi
-  for i in {1..50}; do
+  # Try the graceful reload first.  If it fails, a restart is still required:
+  # the migration is mandatory, not an optional optimization.
+  if ! systemctl reload "php${ver}-fpm" 2>/dev/null; then
+    opt_report "- PHP-FPM reload failed; restarting to apply the socket listener"
+    if ! systemctl restart "php${ver}-fpm" 2>/dev/null; then
+      cp -a "$bak/www.conf" "$pool"
+      cp -a "$bak/angie.conf" "$angie_conf"
+      "$fpm_bin" -t >/dev/null 2>&1 && systemctl restart "php${ver}-fpm" 2>/dev/null || true
+      /usr/sbin/angie -t >/dev/null 2>&1 && systemctl reload angie 2>/dev/null || true
+      MIGRATE_REASON="PHP-FPM reload and restart failed"
+      return 1
+    fi
+  fi
+  # Give the master a short window to open the socket.  Some builds do not
+  # apply a listener change on SIGUSR2 at all (PHP 8.5 closed the old TCP
+  # listener without opening the socket); for those, restart PHP-FPM now.
+  for i in {1..15}; do
     if systemctl is-active --quiet "php${ver}-fpm" \
        && ss -lx 2>/dev/null | grep -qF "$socket"; then
       ok=1
@@ -6330,16 +6334,26 @@ migrate_php_pool_to_socket() {
     sleep 0.2
   done
   if (( ok == 0 )); then
-    cp -a "$bak/www.conf" "$pool"
-    cp -a "$bak/angie.conf" "$angie_conf"
-    "$fpm_bin" -t >/dev/null 2>&1 && systemctl reload "php${ver}-fpm" 2>/dev/null || true
-    /usr/sbin/angie -t >/dev/null 2>&1 && systemctl reload angie 2>/dev/null || true
-    # Not every PHP-FPM build applies a listener change on SIGUSR2 (PHP 8.4
-    # kept the old listener; 8.5 closed it without opening the socket).
-    # Both configs were restored, so no restart is pending; forcing one would
-    # cut a live site for a marginal gain.  Report the rollback accurately.
-    MIGRATE_REASON="this PHP-FPM build did not open the socket on reload; restored the TCP listener"
-    return 2
+    opt_report "- PHP-FPM did not apply the socket on reload; restarting to complete the migration"
+    if systemctl restart "php${ver}-fpm" 2>/dev/null; then
+      for i in {1..50}; do
+        if systemctl is-active --quiet "php${ver}-fpm" \
+           && ss -lx 2>/dev/null | grep -qF "$socket"; then
+          ok=1
+          break
+        fi
+        sleep 0.2
+      done
+    fi
+    if (( ok == 0 )); then
+      cp -a "$bak/www.conf" "$pool"
+      cp -a "$bak/angie.conf" "$angie_conf"
+      "$fpm_bin" -t >/dev/null 2>&1 && systemctl restart "php${ver}-fpm" 2>/dev/null || true
+      /usr/sbin/angie -t >/dev/null 2>&1 && systemctl reload angie 2>/dev/null || true
+      MIGRATE_REASON="PHP-FPM did not open ${socket} after reload or restart; restored the TCP listener"
+      return 1
+    fi
+    opt_report "- PHP-FPM restart applied the socket listener"
   fi
 
   # 3. Drop the TCP backup; the socket is proven live.
@@ -6409,15 +6423,10 @@ optimize_php_services() {
     local change
     for change in "${TUNE_CHANGES[@]}"; do opt_report "- ${change}"; done
     for change in "${TUNE_MISSES[@]}"; do opt_report "- Not applied: ${change}"; done
-    local migrated=0 migration_failed=0 migration_rc=0
+    local migrated=0 migration_failed=0
     if (( active )) && [[ $ver == "$primary" ]] \
        && [[ $listen_path =~ ^(127\.0\.0\.1|localhost):[0-9]+$ ]]; then
-      if ! php_socket_migration_enabled; then
-        # A live TCP pool is a working listener.  PHP-FPM 8.5 can close it on
-        # SIGUSR2 without opening the new socket, leaving Angie with no live
-        # upstream; keep TCP unless the operator explicitly opts in.
-        opt_report "- Socket migration skipped: live TCP listener preserved (set SETUP_OPTIMIZE_MIGRATE_PHP_SOCKET=1 to opt in)"
-      elif systemctl is-active --quiet angie \
+      if systemctl is-active --quiet angie \
          && angie_uses_local_php_upstream /etc/angie; then
         if migrate_php_pool_to_socket "$ver" "$listen_path"; then
           OPT_PHP_SOCKET=/run/php/php-fpm.sock
@@ -6425,17 +6434,10 @@ optimize_php_services() {
           migrated=1
           opt_report "- Migrated listener: ${listen_path} -> unix:${OPT_PHP_SOCKET}"
         else
-          migration_rc=$?
-          if (( migration_rc == 2 )); then
-            # The pool is healthy on TCP; only the optional socket move was
-            # skipped.  Do not fail the whole optimize run for that.
-            opt_report "- Socket migration skipped: ${MIGRATE_REASON:-the listener did not move}"
-          else
-            opt_report "- **FAILED** socket migration; kept ${listen_path} (${MIGRATE_REASON:-no reason recorded})"
-            rc=1
-            OPT_PHP_OK=0
-            migration_failed=1
-          fi
+          opt_report "- **FAILED** socket migration; kept ${listen_path} (${MIGRATE_REASON:-no reason recorded})"
+          rc=1
+          OPT_PHP_OK=0
+          migration_failed=1
         fi
       else
         opt_report "- Socket migration skipped: Angie inactive or vhosts use a direct fastcgi_pass/next_upstream off"
