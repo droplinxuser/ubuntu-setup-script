@@ -2,6 +2,32 @@
 
 Historical release notes for ubuntu-setup-script. Current behavior is documented in README.md.
 
+## What's new in 1.8.49
+
+- **Fresh installs no longer starve MariaDB to give Elasticsearch a
+  speculative 25% of RAM.** When Elasticsearch is installed in the same run
+  as MariaDB, the shared planner now treats the not-yet-created empty index as
+  measured-empty (512 MB floor) instead of using the 25%-of-RAM fallback. On a
+  fresh MariaDB+PHP/cache/search host, MariaDB also starts from the same
+  1/16-RAM empty-database floor that `--optimize` uses, instead of the
+  40%-of-RAM unmeasured fallback. A measured 27.8 GB host that previously
+  planned `PHP=13906 / MariaDB=256 / Cache=2781 / Elasticsearch=5306 MB` now
+  plans `PHP=13906 / MariaDB=1738 / Cache=2781 / Elasticsearch=512 MB`, so the
+  first install and a later `--optimize` agree. Database-only (and
+  database+cache) hosts keep the larger fallback because the database is the
+  primary consumer.
+- **Run logs are unique per process.** `setup_<timestamp>.log` now includes the
+  PID. Two invocations started in the same second (`--version`, `--help`, a CI
+  dry-run) no longer append to one file and interleave their headers.
+- **A closed output pipe no longer writes a false `[ERR]` line.** `setup.sh
+  --help | head` makes `tee` exit with SIGPIPE (141); the ERR trap now ignores
+  that status instead of logging `command failed (exit 141)`.
+- **`--restart-all --dry-run` lists the cache service once.** `valkey` is an
+  alias of `valkey-server`; the plan now reports only the first active name
+  instead of both.
+- Tests cover the fresh-install memory floors, the database-only fallback, the
+  Valkey alias de-duplication, the PID-suffixed run log and the SIGPIPE guard.
+
 ## What's new in 1.8.48
 
 - **`--optimize` synchronizes `/etc/angie` with `server-configs-nginx` before
