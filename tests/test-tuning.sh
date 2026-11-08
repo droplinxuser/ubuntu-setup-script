@@ -895,6 +895,7 @@ mariadb_data_size_mb() { printf '0'; }
 mariadb_current_pool_mb() { printf '0'; }
 elasticsearch_data_size_mb() { printf '0'; }
 elasticsearch_current_heap_mb() { printf '0'; }
+valkey_live_used_mb() { return 0; }
 OPT_DETECTED=(angie php:8.4 mariadb valkey elastic)
 plan_memory_budget
 check "PHP budget is at most 50% of RAM" \
@@ -956,9 +957,9 @@ elasticsearch_data_size_mb() { printf '0'; }
 php_pool_max_children() { printf '128'; }
 OPT_DETECTED=(angie php:8.4 mariadb valkey elastic)
 plan_memory_budget
-check "tiny fresh database keeps the hardware-scaled floor" \
-  test "$OPT_MARIADB_BUDGET_MB" -ge 8192
-check "tiny fresh database may use spare budget up to RAM/4" \
+check "tiny live database keeps the hardware-scaled floor" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 8192
+check "tiny live database stays far below RAM/4" \
   test "$OPT_MARIADB_BUDGET_MB" -le $(( 262144 / 4 ))
 check "tiny database floor stays inside the 80% budget" \
   test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
@@ -973,10 +974,10 @@ OPT_DETECTED=(angie php:8.3 mariadb redis elastic)
 # A database larger than the remaining budget gets the largest feasible pool.
 mariadb_data_size_mb() { printf '40960'; }
 plan_memory_budget
-check "oversized database gets the budget-limited buffer pool" \
-  test "$OPT_MARIADB_BUDGET_MB" -gt 20000 -a "$OPT_MARIADB_BUDGET_MB" -lt 34000
-check "oversized database is not falsely reported as fitting" \
-  test "$OPT_DB_SIZE_MB" -eq 40960 -a "$OPT_MARIADB_BUDGET_MB" -lt 40960
+check "oversized database gets a pool that covers the data" \
+  test "$OPT_MARIADB_BUDGET_MB" -ge 40960 -a "$OPT_MARIADB_BUDGET_MB" -le 43008
+check "oversized database keeps the data target but not the full +5%" \
+  test "$OPT_DB_SIZE_MB" -eq 40960 -a "$OPT_MARIADB_BUDGET_MB" -ge 40960 -a "$OPT_MARIADB_BUDGET_MB" -lt 43008
 
 # On a large host the pool follows the live working set plus 5% headroom.
 mem_total_mb() { printf '262144'; }
@@ -1003,10 +1004,10 @@ check "small statistics drift keeps the live pool" \
 # shrinking would force a restart and a cold buffer pool for no RAM benefit.
 mariadb_current_pool_mb() { printf '120000'; }
 plan_memory_budget
-check "oversized live pool is kept while it fits the budget" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 120000
-check "kept oversized pool is marked as preserved" \
-  test "$OPT_MARIADB_KEPT_MB" -eq 120000
+check "oversized live pool is reduced to data+5%" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 77278
+check "shrunk pool is not marked as preserved" \
+  test "$OPT_MARIADB_KEPT_MB" -eq 0
 
 # A pool that would exceed the shared budget is capped.
 mariadb_current_pool_mb() { printf '200000'; }
@@ -1019,7 +1020,7 @@ mariadb_current_pool_mb() { printf '0'; }
 mariadb_data_size_mb() { printf '300000'; }
 plan_memory_budget
 check "database larger than the shared budget is capped" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 189235
+  test "$OPT_MARIADB_BUDGET_MB" -gt 200000 -a "$OPT_MARIADB_BUDGET_MB" -lt 209715
 check "capped data-sized plan still fits the 80% budget" \
   test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
        -le $(( 262144 * 80 / 100 ))
@@ -1070,8 +1071,8 @@ check "Elasticsearch-only unknown index falls back to 50% RAM" \
 elasticsearch_data_size_mb() { printf '0'; }
 OPT_DETECTED=(elastic)
 plan_memory_budget
-check "measured empty Elasticsearch-only host keeps the 50% heap" \
-  test "$OPT_ES_BUDGET_MB" -eq 31744
+check "measured empty Elasticsearch-only host uses the small floor" \
+  test "$OPT_ES_BUDGET_MB" -eq 4096
 
 mariadb_current_pool_mb() { printf '0'; }
 mariadb_data_size_mb() { printf '20000'; }
@@ -1116,10 +1117,10 @@ mariadb_data_size_mb() { printf '20000'; }
 elasticsearch_data_size_mb() { printf '13000'; }
 elasticsearch_current_heap_mb() { printf '20000'; }
 plan_memory_budget
-check "oversized Elasticsearch heap is kept while it fits the budget" \
-  test "$OPT_ES_BUDGET_MB" -eq 20000
-check "kept Elasticsearch heap is marked as preserved" \
-  test "$OPT_ES_KEPT_MB" -eq 20000
+check "oversized Elasticsearch heap is reduced to index+5%" \
+  test "$OPT_ES_BUDGET_MB" -eq 13824
+check "shrunk Elasticsearch heap is not marked as preserved" \
+  test "$OPT_ES_KEPT_MB" -eq 0
 
 # Small statistics drift must not change the heap on every run.
 elasticsearch_current_heap_mb() { printf '14000'; }
@@ -1135,7 +1136,7 @@ elasticsearch_data_size_mb() { printf '4096'; }
 elasticsearch_current_heap_mb() { printf '30000'; }
 plan_memory_budget
 check "Elasticsearch heap above the shared budget is capped" \
-  test "$OPT_ES_BUDGET_MB" -eq 4608
+  test "$OPT_ES_BUDGET_MB" -eq 4096
 
 elasticsearch_current_heap_mb() { printf '0'; }
 elasticsearch_data_size_mb() { printf '0'; }
@@ -1650,10 +1651,10 @@ plan_memory_budget
 OPT_INSTALL_PLAN=0
 check "fresh install keeps MariaDB above the 256 MB floor" \
   test "$OPT_MARIADB_BUDGET_MB" -ge 1738
-check "fresh install uses the RAM-scaled empty-index ES floor plus spare" \
-  test "$OPT_ES_BUDGET_MB" -eq 3072
-check "fresh install spends spare RAM on the empty database" \
-  test "$OPT_MARIADB_BUDGET_MB" -gt 1738
+check "fresh install uses the RAM-scaled empty-index ES floor" \
+  test "$OPT_ES_BUDGET_MB" -eq 2048
+check "fresh install keeps the empty-database floor" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 1738
 check "fresh install full-stack plan stays inside the 80% budget" \
   test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
        -le $(( 27812 * 80 / 100 ))
@@ -1665,15 +1666,15 @@ mariadb_data_size_mb() { printf '4'; }
 OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
 OPT_INSTALL_PLAN=0
 plan_memory_budget
-check "measured-empty database keeps the spare-RAM growth budget" \
-  test "$OPT_MARIADB_BUDGET_MB" -gt 1738
+check "measured-empty live database keeps the hardware floor" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 1738
 
 # ---------------------------------------------------------------------------
 # Live-data protection
 # ---------------------------------------------------------------------------
-# A larger live buffer pool/heap that still fits the RAM budget is kept
-# (shrinking would force a restart and a cold cache), and the live Valkey
-# working set becomes a floor for its budget.
+# Live stores are sized to data+5%.  A pool/heap that is grossly above that
+# target is reduced so the freed RAM can go to the other services; a value
+# within statistics noise is kept to avoid restart churn.
 valkey_live_used_mb() { return 0; }
 mariadb_data_size_mb() { printf '2048'; }
 mariadb_current_pool_mb() { printf '4096'; }
@@ -1682,10 +1683,10 @@ elasticsearch_current_heap_mb() { printf '4096'; }
 OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
 OPT_INSTALL_PLAN=0
 plan_memory_budget
-check "live MariaDB pool above the data target is kept" \
-  test "$OPT_MARIADB_KEPT_MB" -eq 4096 -a "$OPT_MARIADB_BUDGET_MB" -eq 4096
-check "live Elasticsearch heap above the index target is kept" \
-  test "$OPT_ES_KEPT_MB" -eq 4096 -a "$OPT_ES_BUDGET_MB" -eq 4096
+check "live MariaDB pool is reduced to data+5%" \
+  test "$OPT_MARIADB_KEPT_MB" -eq 0 -a "$OPT_MARIADB_BUDGET_MB" -eq 2150
+check "live Elasticsearch heap is reduced to index+5%" \
+  test "$OPT_ES_KEPT_MB" -eq 0 -a "$OPT_ES_BUDGET_MB" -eq 1024
 
 valkey_live_used_mb() { printf '5000'; }
 mariadb_current_pool_mb() { printf '0'; }
@@ -1694,6 +1695,42 @@ OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
 plan_memory_budget
 check "live Valkey working set raises the cache budget with headroom" \
   test "$OPT_VALKEY_LIVE_MB" -eq 5000 -a "$OPT_VALKEY_BUDGET_MB" -ge 5500
+valkey_live_used_mb() { return 0; }
+
+# Priority allocation adapts to the installed set: MariaDB+Valkey only has no
+# PHP or Elasticsearch reservation, and the live targets still fit.
+mem_total_mb() { printf '27812'; }
+mariadb_data_size_mb() { printf '5000'; }
+mariadb_current_pool_mb() { printf '0'; }
+elasticsearch_data_size_mb() { return 0; }
+elasticsearch_current_heap_mb() { return 0; }
+valkey_live_used_mb() { printf '500'; }
+OPT_DETECTED=(mariadb valkey)
+OPT_INSTALL_PLAN=0
+plan_memory_budget
+check "MariaDB+Valkey host reserves no PHP or Elasticsearch budget" \
+  test "$OPT_PHP_BUDGET_MB" -eq 0 -a "$OPT_ES_BUDGET_MB" -eq 0
+check "MariaDB+Valkey host fits the live database target" \
+  test "$OPT_MARIADB_BUDGET_MB" -ge 5000
+check "MariaDB+Valkey plan stays inside the 80% budget" \
+  test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
+       -le $(( 27812 * 80 / 100 ))
+
+# Full stack: the data targets are reserved and PHP receives the remainder.
+mariadb_data_size_mb() { printf '8000'; }
+elasticsearch_data_size_mb() { printf '1000'; }
+valkey_live_used_mb() { printf '1000'; }
+OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
+plan_memory_budget
+check "full stack reserves MariaDB, Valkey and Elasticsearch first" \
+  test "$OPT_MARIADB_BUDGET_MB" -ge 8000 \
+       -a "$OPT_VALKEY_BUDGET_MB" -ge 1100 \
+       -a "$OPT_ES_BUDGET_MB" -ge 1024
+check "full stack still gets a viable PHP pool" \
+  test "$OPT_PHP_BUDGET_MB" -ge 512 -a "$OPT_PHP_CHILDREN" -ge 8
+check "full stack priority plan stays inside the 80% budget" \
+  test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
+       -le $(( 27812 * 80 / 100 ))
 valkey_live_used_mb() { return 0; }
 
 # An existing server may already allow more than the computed thread*32

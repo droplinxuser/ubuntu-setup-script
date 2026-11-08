@@ -2,6 +2,37 @@
 
 Historical release notes for ubuntu-setup-script. Current behavior is documented in README.md.
 
+## What's new in 1.8.56
+
+- **Live data services are funded first, then the remainder goes to the
+  request tier and the OS.** `plan_memory_budget()` now builds targets in this
+  order and scales them together when they cannot all fit:
+  1. MariaDB: live `information_schema` data+index +5%, with the existing
+     hardware floor for an empty/tiny database;
+  2. Valkey/Redis: live `used_memory` +10% (or the growth percentage when the
+     cache is empty);
+  3. Elasticsearch: live `_cluster/stats` index store +5%, with a small floor
+     for an empty index.
+  PHP-FPM is sized **after** those targets from what remains (CPU-capped,
+  8-worker floor), and any unallocated memory is left to the OS page cache.
+  If the three targets exceed the budget, they are scaled proportionally and
+  trimmed Elasticsearch first, then Valkey, then MariaDB; the report states
+  when a store does not fully fit. This replaces the 1.8.55 "keep an oversized
+  live pool/heap" rule: a pool/heap grossly above data+5% is reduced so the
+  freed RAM can serve PHP/OS, while a value within 2% of the target is kept to
+  avoid restart churn.
+- The planner adapts to the installed set: MariaDB-only, MariaDB+Valkey,
+  MariaDB+Elasticsearch, cache-only, search-only and full-stack hosts each
+  reserve only the services that exist. Fresh install and `--optimize` use
+  the same target rules, so parity is preserved.
+- On the 16-thread / 27.8 GB host this produces
+  `PHP=9216 MariaDB=1738 Cache=2781 Elasticsearch=2048 MB` from the live
+  54 MB database, 1 MB cache and empty index; all services remain active and
+  the forum keeps serving 200s.
+- Tests: 358 tuning checks (priority allocation, proportional caps, floors,
+  live targets, MariaDB+Valkey-only and full-stack cases) and 86 dry-run
+  cases.
+
 ## What's new in 1.8.55
 
 - **Live working sets are budgeted and never shrunk unnecessarily.**
