@@ -34,7 +34,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.50"
+readonly SCRIPT_VERSION="1.8.51"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -188,8 +188,8 @@ log_selection() {
   (( ${#ENABLED[@]} > 0 )) && services="${!ENABLED[*]}"
   (( ${#DOMAINS[@]} > 0 )) && domains="${DOMAINS[*]}"
   printf '\n--- selection ---\n'
-  printf 'Modes        : dry_run=%s optimize=%s purge=%s diagnostics=%s restart_all=%s\n' \
-    "${DRY_RUN:-0}" "${OPTIMIZE:-0}" "${PURGE:-0}" "${DIAGNOSTICS:-0}" "${RESTART_ALL:-0}"
+  printf 'Modes        : dry_run=%s optimize=%s sync_angie=%s purge=%s diagnostics=%s restart_all=%s\n' \
+    "${DRY_RUN:-0}" "${OPTIMIZE:-0}" "${SYNC_ANGIE:-0}" "${PURGE:-0}" "${DIAGNOSTICS:-0}" "${RESTART_ALL:-0}"
   printf 'Services     : %s\n' "$services"
   printf 'Domains      : %s\n' "$domains"
   if [[ ${ENABLED[mariadb]:-0} -eq 1 ]]; then
@@ -437,6 +437,7 @@ OTHERS=()
 DOMAINS=()
 PURGE=0
 OPTIMIZE=0
+SYNC_ANGIE=0
 DIAGNOSTICS=0
 RESTART_ALL=0
 DRY_RUN=0
@@ -538,6 +539,18 @@ Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
       and a Markdown report is written to /var/log/setup-optimize-*.md.
       Existing application vhosts and credentials are preserved.
       --dry-run only prints the planned OS and service values.
+
+Angie sync mode (Ubuntu 22.04, 24.04 or 26.04):
+  --sync-angie [--dry-run]
+      Synchronizes /etc/angie from server-configs-nginx and immediately
+      applies the same hardware-aware Angie profile that --optimize applies
+      (worker limits, FastCGI/Cache sizing, Brotli, PHP upstream keepalive,
+      systemd limits), together with the shared OS tuning.  It is the
+      upgrade path for an existing host whose Angie tree is out of date and
+      it intentionally shares one code path with --optimize, so a fresh
+      install, `--optimize` and `--sync-angie` always produce the same
+      configuration for the same hardware.  The service must already be
+      installed; nothing is installed by this mode.
 
 Purge (stop/restore) mode:
   --purge [all|basic|angie|php|mariadb|valkey|elastic|others]
@@ -732,6 +745,11 @@ parse_args() {
         ;;
       --optimize)
         OPTIMIZE=1; shift ;;
+      --sync-angie)
+        # Sync the Angie tree from server-configs-nginx and apply the same
+        # hardware-aware profile --optimize uses.  Both modes share one code
+        # path (run_optimize -> optimize_angie -> sync_angie_repo_configs).
+        SYNC_ANGIE=1; OPTIMIZE=1; shift ;;
       --diagnostics)
         DIAGNOSTICS=1; shift ;;
       --restart-all)
@@ -1568,8 +1586,8 @@ fetch_server_configs() {
     src=$(find "$CONFIG_TEMP_DIR" -mindepth 1 -maxdepth 1 -type d \
       -name 'server-configs-nginx-*' 2>/dev/null | head -n1 || true)
   fi
-  if [[ -z $src || ! -f "${src}/scripts/nginx_conf.sh" ]]; then
-    warn "Downloaded server configs are missing scripts/nginx_conf.sh"
+  if [[ -z $src || ! -f "${src}/angie.conf" ]]; then
+    warn "Downloaded server configs are missing angie.conf"
     CONFIG_TEMP_DIR=""
     return 1
   fi
@@ -3436,10 +3454,12 @@ tune_php_fpm_version() {
     # A live pool keeps its worker count: the reservation is a memory
     # estimate, not a worker quota.
     max_children=$current_children
+  elif (( ${OPT_PHP_CHILDREN:-0} > 0 )); then
+    # The shared planner already derived the count with the same CPU/RAM
+    # ceilings used here, so a fresh install and --optimize agree.
+    max_children=$OPT_PHP_CHILDREN
   elif (( php_budget > 0 )); then
-    # First install (the pool template is on disk but the service has not
-    # started yet): size the pool from the shared budget, not the template's
-    # placeholder value.
+    # Standalone call (no plan): fall back to the reservation divisor.
     max_children=$(( php_budget / 96 ))
   else
     max_children=$(( ram_mb * 50 / 100 / 96 ))
@@ -3732,6 +3752,131 @@ EOF
 # Fetch the canonical Angie tree and run the repository's deployer.  Kept
 # separate from the tuning pass so --optimize can synchronize /etc/angie and
 # then apply the hardware-aware profile to the freshly deployed files.
+# ---------------------------------------------------------------------------
+# Angie config tree
+# ---------------------------------------------------------------------------
+# This deployer used to live in the server-configs-nginx repository as a
+# separate script.  It now lives here so a fresh install, `--optimize` and
+# `--sync-angie` share exactly one implementation: fetch -> sync tree ->
+# hardware profile.
+ANGIE_CACHE_DIRS=(/home/nginx_cache /home/nginx_cache_chev /home/xf_proxy_cache
+                  /home/proxy_cache /home/proxy_cdn)
+
+# Sync CONFIG_SOURCE_DIR into /etc/angie and normalise what a checkout can
+# carry (ownership, modes, macOS AppleDouble files, sample keys).  The caller
+# has already run fetch_server_configs.
+deploy_angie_tree() {
+  local target=/etc/angie
+  local log_dir="${LOG_ROOT}/angie"
+  local src=${CONFIG_SOURCE_DIR:-}
+  [[ -n $src && -d $src ]] || { warn "No Angie config source directory available"; return 1; }
+
+  # --no-owner/--no-group + --chmod prevents a checkout owned by uid 1000 from
+  # leaving writable files in /etc/angie. Never copy the sample private key.
+  rsync -a --no-owner --no-group --chmod=D755,F644 \
+    --exclude='*.md' --exclude='*.txt' --exclude='.git*' \
+    --exclude='.github/' --exclude='test/' --exclude='.editorconfig' \
+    --exclude='h5bp/tls/private.key' --exclude='h5bp/tls/certificate.pem' \
+    "$src"/ "$target"/ || return 1
+  mkdir -p "$target/snippets" "$target/custom.d"
+  # Remove macOS AppleDouble files that appear when a local checkout is used
+  # via CONFIG_SOURCE_DIR.
+  find "$target" -name '._*' -delete 2>/dev/null || true
+
+  # Remove legacy demo/error pages, sample keys and superseded sample
+  # templates that older deployments may still carry.
+  rm -rf "$target/test"
+  rm -f "$target"/v3.html "$target"/ua.html "$target"/503.html \
+        "$target"/ssl/default/certificate.pem "$target"/ssl/default/private.key
+  rm -f "$target"/conf.d/templates/sample_basic_php.conf \
+        "$target"/conf.d/templates/sample_psi.conf \
+        "$target"/conf.d/templates/sample_pingvin_proxy.conf \
+        "$target"/conf.d/templates/sample_proxy_pass.conf
+  # Old setup.sh-managed overrides duplicated the cache zones, log_format and
+  # limiter variables now provided by the repository tree.  PHP-FPM templates
+  # were also copied here by old releases; they live in configs/php now.
+  rm -f "$target"/scripts/www_*.conf \
+        "$target/scripts/custom_dan.ini" \
+        "$target/scripts/php-fpm-limits.conf" \
+        "$target/scripts/auto_tune.sh" \
+        "$target/http.d/98_setup_cache.conf" \
+        "$target/http.d/99_setup_overrides.conf" \
+        "$target/http.d/limit_req_whitelist.conf" \
+        "$target/http.d/fastcgi_cache_conf" \
+        "$target/http.d/fastcgi_cache_chev_conf" \
+        "$target/http.d/xf_proxy_cache_conf" \
+        "$target/http.d/xf_websocket_conf" \
+        "$target/http.d/limit_req_conf" \
+        "$target/http.d/proxy_cache_conf" \
+        "$target/http.d/referer_map_conf" \
+        "$target/h5bp/limit_req/_high_conf" \
+        "$target/h5bp/limit_req/_medium_conf" \
+        "$target/h5bp/tls/private.key" \
+        "$target/h5bp/tls/certificate.pem"
+
+  # Normalise ownership/modes for everything except operator certificates and
+  # stream configs.  scripts/*.sh stay executable for the Cloudflare cron job.
+  find "$target" -path "$target/ssl" -prune -o \
+       -path "$target/stream.d" -prune -o \
+       -exec chown root:root {} + 2>/dev/null || true
+  find "$target" -path "$target/ssl" -prune -o \
+       -path "$target/stream.d" -prune -o \
+       -type d -exec chmod 755 {} + 2>/dev/null || true
+  find "$target" -path "$target/ssl" -prune -o \
+       -path "$target/stream.d" -prune -o \
+       -type f -exec chmod 644 {} + 2>/dev/null || true
+  chmod 755 "$target"/scripts/*.sh 2>/dev/null || true
+
+  # The catch-all 443 server needs a unique local certificate.  The repository
+  # ships no private key; generate one per host instead.
+  if [[ ! -s "$target/ssl/default/fullchain.pem" \
+        || ! -s "$target/ssl/default/privkey.pem" ]]; then
+    local hostname_fqdn
+    hostname_fqdn=$(hostname -f 2>/dev/null || hostname)
+    install -d -m 700 "$target/ssl/default"
+    openssl req -x509 -nodes -newkey rsa:2048 -days 397 \
+        -subj "/CN=${hostname_fqdn}" \
+        -addext "subjectAltName=DNS:${hostname_fqdn}" \
+        -keyout "$target/ssl/default/privkey.pem" \
+        -out "$target/ssl/default/fullchain.pem" >/dev/null 2>&1
+    chmod 600 "$target/ssl/default/privkey.pem"
+    chmod 644 "$target/ssl/default/fullchain.pem"
+  fi
+
+  # Central log and cache directories.  All service logs live under
+  # /var/www/logs so they can be collected as one tree.
+  install -d -m 750 -o www-data -g www-data "$log_dir"
+  [[ -e "$log_dir/error.log" ]] || : > "$log_dir/error.log"
+  chown www-data:www-data "$log_dir/error.log" 2>/dev/null || true
+  chmod 640 "$log_dir/error.log"
+
+  local cache_dir
+  for cache_dir in "${ANGIE_CACHE_DIRS[@]}"; do
+    mkdir -p "$cache_dir"
+    chown www-data:www-data "$cache_dir" 2>/dev/null || true
+    chmod 750 "$cache_dir"
+  done
+
+  # Validate before anything reloads.  A stopped service is valid (the tree is
+  # applied at the next start); reload only when the unit is active.
+  if ! /usr/sbin/angie -t; then
+    warn "Angie configuration test failed; live service left untouched"
+    return 1
+  fi
+  if systemctl is-active --quiet angie 2>/dev/null; then
+    systemctl daemon-reload || true
+    if systemctl reload angie.service 2>/dev/null; then
+      info "Angie configuration reloaded"
+    else
+      warn "Angie configuration is valid but the reload failed"
+    fi
+  fi
+  # Angie's master opens log files as root.  Normalise pre-existing logs for
+  # the UMask=0027 drop-in; new files are already 0640.
+  find "$log_dir" -type f -name '*.log' -exec chmod 640 {} + 2>/dev/null || true
+  return 0
+}
+
 sync_angie_repo_configs() {
   fetch_server_configs || return 1
   local limit_src="${CONFIG_SOURCE_DIR}/scripts/limit_nofile.conf"
@@ -3745,14 +3890,11 @@ sync_angie_repo_configs() {
     || return 1
   install -m 644 "$default_src" /etc/default/angie || return 1
 
-  # Load the new drop-in before nginx_conf.sh reloads the unit; otherwise
+  # Load the new drop-in before the tree deployer reloads the unit; otherwise
   # systemctl prints "unit file changed on disk" and may use stale limits.
   systemctl daemon-reload || true
 
-  # The repository owns the config tree, cache-directory creation, removal of
-  # old setup.sh overrides, the angie -t check and the reload.
-  export CONFIG_SOURCE_DIR
-  bash "${CONFIG_SOURCE_DIR}/scripts/nginx_conf.sh" || return 1
+  deploy_angie_tree || return 1
   return 0
 }
 
@@ -5650,6 +5792,7 @@ OPT_DB_SIZE_MB=0
 OPT_ES_SIZE_MB=0
 OPT_MEM_BUDGET_MB=0
 OPT_PHP_BUDGET_MB=0
+OPT_PHP_CHILDREN=0
 OPT_MARIADB_BUDGET_MB=0
 OPT_MARIADB_KEPT_MB=0
 OPT_VALKEY_BUDGET_MB=0
@@ -5809,6 +5952,7 @@ plan_memory_budget() {
   usable=$(( total * 80 / 100 ))
   OPT_MEM_BUDGET_MB=$usable
   OPT_PHP_BUDGET_MB=0
+  OPT_PHP_CHILDREN=0
   OPT_PHP_ALLOWANCE_MB=0
   OPT_MARIADB_BUDGET_MB=0
   OPT_MARIADB_KEPT_MB=0
@@ -5831,8 +5975,18 @@ plan_memory_budget() {
     if (( OPT_INSTALL_PLAN )); then
       # A fresh install replaces PHP and its pool; an existing (or purged)
       # pool template must not define the new worker count or allowance.
+      # Derive the count exactly like tune_php_fpm_version() (CPU x16, the
+      # 50%-of-RAM ceiling and the 512 cap) and reserve the measured-worker
+      # floor (64 MB), not the 96 MB placeholder.  --optimize then measures
+      # the running workers and lands on the same budget instead of freeing
+      # memory the install had already promised to MariaDB/Elasticsearch.
       children=$(( $(nproc) * 16 ))
-      php_allowance=96
+      local install_max_by_ram
+      install_max_by_ram=$(( total * 50 / 100 / 96 ))
+      (( install_max_by_ram > 0 && children > install_max_by_ram )) && children=$install_max_by_ram
+      (( children > 512 )) && children=512
+      (( children < 8 )) && children=8
+      php_allowance=64
     else
       children=$(php_pool_max_children)
       (( children > 0 )) || children=$(( $(nproc) * 16 ))
@@ -5843,6 +5997,7 @@ plan_memory_budget() {
     # here so a first run and a second run calculate the same PHP budget.
     (( children < 8 )) && children=8
     [[ $php_allowance =~ ^[0-9]+$ ]] || php_allowance=96
+    OPT_PHP_CHILDREN=$children
     OPT_PHP_ALLOWANCE_MB=$php_allowance
     OPT_PHP_BUDGET_MB=$(( children * php_allowance ))
     (( OPT_PHP_BUDGET_MB < 512 )) && OPT_PHP_BUDGET_MB=512
@@ -6054,6 +6209,12 @@ plan_memory_budget() {
     add=$(( room - OPT_MARIADB_BUDGET_MB ))
     (( add > leftover )) && add=$leftover
     (( add > 0 )) && OPT_MARIADB_BUDGET_MB=$(( OPT_MARIADB_BUDGET_MB + add ))
+  fi
+  # Normalise the search heap to the 512 MB boundary here, once, so an install
+  # and --optimize cannot write different -Xmx values for the same budget.
+  if (( has_es && OPT_ES_BUDGET_MB > 0 && OPT_ES_KEPT_MB == 0 )); then
+    OPT_ES_BUDGET_MB=$(( OPT_ES_BUDGET_MB / 512 * 512 ))
+    (( OPT_ES_BUDGET_MB < 512 )) && OPT_ES_BUDGET_MB=512
   fi
   return 0
 }
@@ -6552,7 +6713,7 @@ optimize_angie() {
     local inert_file
     opt_report "- Warning: ${#inert[@]} cache/limit file(s) under http.d are not included by angie.conf:"
     for inert_file in "${inert[@]}"; do opt_report "  \`${inert_file}\`"; done
-    opt_report "  Re-run the Angie config deployment (install or scripts/nginx_conf.sh) to activate the current file names."
+    opt_report "  Re-run the Angie config deployment (install or setup.sh --sync-angie) to activate the current file names."
   fi
   if (( active )); then
     if (( TUNE_DIRTY == 0 )); then
@@ -8009,7 +8170,9 @@ optimize_plan() {
   fi
   printf '  Applications: audit WordPress/XenForo persistent MariaDB and Valkey socket settings\n'
   if [[ ${OPT_DETECTED[*]} == *php:* ]]; then
-    if (( OPT_PHP_BUDGET_MB > 0 )); then
+    if (( ${OPT_PHP_CHILDREN:-0} > 0 )); then
+      max_children=$OPT_PHP_CHILDREN
+    elif (( OPT_PHP_BUDGET_MB > 0 )); then
       max_children=$(( OPT_PHP_BUDGET_MB / 96 ))
     else
       max_children=$(( ram_mb * 50 / 100 / 96 ))
@@ -9196,7 +9359,12 @@ main() {
   fi
 
   if (( OPTIMIZE )); then
-    printf '%s%sUbuntu %s optimization%s\n' "$C_BOLD" "$C_BLUE" "${VERSION_ID}" "$C_RESET"
+    if (( SYNC_ANGIE )); then
+      pkg_ok angie || die "--sync-angie requires Angie to be installed (install it with --basic --angie first)"
+      printf '%s%sUbuntu %s Angie config sync + optimization%s\n' "$C_BOLD" "$C_BLUE" "${VERSION_ID}" "$C_RESET"
+    else
+      printf '%s%sUbuntu %s optimization%s\n' "$C_BOLD" "$C_BLUE" "${VERSION_ID}" "$C_RESET"
+    fi
     if ! run_optimize; then
       # The report already explains the failure; suppress a duplicate ERR
       # trap message from this intentional non-zero exit.

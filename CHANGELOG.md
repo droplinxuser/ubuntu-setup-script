@@ -2,6 +2,39 @@
 
 Historical release notes for ubuntu-setup-script. Current behavior is documented in README.md.
 
+## What's new in 1.8.51
+
+- **The Angie tree deployer is part of setup.sh and `--sync-angie` is a
+  sub-command.** Sync, legacy-file cleanup, permissions, the per-host default
+  certificate, `angie -t` and the reload now live in `deploy_angie_tree()`
+  instead of `server-configs-nginx/scripts/nginx_conf.sh`, so a fresh install,
+  `--optimize` and the new `--sync-angie` share one implementation. The
+  configuration repository no longer ships an executable deployer.
+- **Install and `--optimize` now reserve the same PHP budget.** A fresh
+  install used to reserve 96 MB per worker and cap the pool at `threads × 16`,
+  while `--optimize` measured the running workers and reserved the 64 MB
+  floor. On the 16-thread / 27.8 GB test host that was 13906 MB versus
+  9216 MB, so MariaDB and Elasticsearch were sized from different numbers the
+  first time `--optimize` ran. The install planner now derives the worker
+  count exactly like the tuner (CPU×16, 50%-of-RAM ceiling, 512 cap) and
+  reserves the 64 MB measured floor; `tune_php_fpm_version()` uses that count
+  directly instead of re-dividing the budget by 96. The dry-run plan reports
+  the same count.
+- **The search heap is rounded once, in the planner.** `--optimize` rounded
+  `-Xmx` down to a 512 MB boundary but the installer did not, so the same
+  budget produced 3476 MB and 3072 MB on the two paths. A kept live heap is
+  still left untouched, so no restart is forced just to align it.
+- **Measured on the 16-thread / 27.8 GB dev-host host** (XenForo 2.3.13 with 40
+  threads and 360 replies): PHP JIT `tracing` versus `off` changed
+  authenticated throughput by less than run-to-run noise (~910 vs ~900 req/s),
+  MariaDB `thread_pool_size` 8/16/32/64 stayed within 3%, and
+  `innodb_io_capacity` 4000 → 10000 made no difference for the read-heavy
+  authenticated page. Angie's cache-hit path served ~103k req/s on loopback
+  with the current 32k `worker_connections`, `ssl_buffer_size 1400` and
+  Brotli level 5, and Valkey did ~118k SET/s and ~117k GET/s with
+  `io-threads 1`. The existing defaults were kept because each alternative was
+  equal or worse.
+
 ## What's new in 1.8.50
 
 - **PHP worker memory is measured instead of assumed.** The shared planner
