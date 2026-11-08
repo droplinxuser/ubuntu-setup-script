@@ -285,10 +285,12 @@ cookies. The cache key varies on the XenForo style variant (`xf_style_id`,
 `src/XF/PageCache.php`; without the last two a guest with a non-default style
 or language could receive another guest's cached HTML. Expired entries are
 refreshed in the background (`fastcgi_cache_background_update`) while
-`cache_lock` collapses a stampede. The stack-level defaults (PHP-FPM static
-workers, Unix sockets, MariaDB thread pool, Brotli, HTTP/2 keepalive) are
-tuned for XenForo. Measured on the 16-thread test host (Ubuntu 26.04,
-XenForo 2.3.13, 50 authenticated users):
+`cache_lock` collapses a stampede. XenForo's own `/js`, `/styles` and `/data`
+assets get one managed `Cache-Control: public, immutable` location with a
+30-day expiry, re-applied after every Angie repository sync. The stack-level
+defaults (PHP-FPM static workers, Unix sockets, MariaDB thread pool, Brotli,
+HTTP/2 keepalive) are tuned for XenForo. Measured on the 16-thread test host
+(Ubuntu 26.04, XenForo 2.3.13, 50 authenticated users):
 
 | Change | Authenticated index | Notes |
 |---|---:|---|
@@ -724,6 +726,8 @@ The script is safe to re-run:
 - Package repositories and embedded keys are verified against their payloads and refreshed when they differ.
 - Domain directories and databases use idempotent creation; existing Angie domain configs are preserved.
 - PHP, MariaDB, Angie, Valkey and Elasticsearch services are restarted after configuration changes so changed parameters take effect. Angie and PHP-FPM use a graceful `reload` when possible, Valkey applies runtime values with `CONFIG SET`, and startup-only changes are deferred; a repeat `--optimize` run with unchanged files restarts nothing.
+- A fresh install and `--optimize` write the same managed configuration for the same hardware: MariaDB tuning lives only in `99-setup-optimize.cnf`, Elasticsearch's base and performance blocks come from one helper, and a full-stack install followed by `--optimize` was verified to produce a zero-byte diff.
+- Explicit values from `--php children=`, `--php max_requests=`, `--mariadb size=`, `--valkey ram=` and `--elastic ram=` are recorded in `/var/lib/setup.sh/explicit-options.conf` and are not replaced by later `--optimize` runs.
 
 A second run is normally much faster than the first (typically under a minute for the full stack).
 
