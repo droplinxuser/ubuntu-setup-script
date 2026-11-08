@@ -247,10 +247,10 @@ Before changing basic settings, the script records the originals under `/var/lib
 - Installs the Angie signing key and APT repository.
 - Installs `angie`.
 - Installs the official `angie-module-brotli` dynamic module and enables dynamic Brotli at level 5 with gzip as the compatibility fallback. On a 149 KB XenForo thread page this produced 10.9 KB on the wire versus 13.7 KB for gzip (20% smaller); guest pages were 79-93% smaller than identity. `--optimize` installs and enables the same module, so both paths stay in parity. Static assets are deliberately left to the CDN (`brotli_static off`): precompressing thousands of files only helps the first origin miss and adds deployment churn. Set `SETUP_BROTLI_LEVEL=1..11` to override the level or `SETUP_ANGIE_COMPRESSION=0` to disable it.
-- Downloads [`droplinxuser/server-configs-nginx`](https://github.com/droplinxuser/server-configs-nginx) once per run and deploys it with the built-in deployer (`deploy_angie_tree`), the same code used by `--optimize` and `--sync-angie`.
+- Downloads [`droplinxuser/server-configs-nginx`](https://github.com/droplinxuser/server-configs-nginx) once per run and deploys it with the built-in deployer (`deploy_angie_tree`), the same code used by `--optimize`.
 - The repository (not `setup.sh`) owns `angie.conf`, `h5bp/`, `conf.d/`, `http.d/`, `snippets/`, the cache/rate-limit settings, template repairs and the Cloudflare helper.
 - Uses the repo's `scripts/limit_nofile.conf` and `scripts/etc_default_nginx` for the systemd `LimitNOFILE` drop-in and `/etc/default/angie`.
-- The repository deployer creates cache directories, removes obsolete setup.sh/pre-refactor config filenames, runs `angie -t`, and reloads Angie. `--sync-angie` re-runs exactly that deployer plus the hardware profile.
+- The repository deployer creates cache directories, removes obsolete setup.sh/pre-refactor config filenames, runs `angie -t`, and reloads Angie. `--optimize` re-runs exactly that deployer plus the hardware and guest-cache profile.
 - Configuration source overrides: `CONFIG_SOURCE_DIR=/path` (local checkout/testing), `CONFIG_REPO_URL=...`, `CONFIG_REPO_REF=main`.
 - Generates `/etc/angie/http.d/cloudflare.conf` via the repo's `scripts/cloudflare.sh` and reloads Angie.
 
@@ -280,15 +280,21 @@ Before changing basic settings, the script records the originals under `/var/lib
 
 The generated `app=xf` vhost serves guest pages from Angie's FastCGI cache
 for 5 minutes and bypasses it for `xf_session`, `xf_user`, admin and login
-cookies. The cache key varies on the XenForo style variant (`xf_style_id`,
+cookies. The cookie decision is a managed
+`map $http_cookie $setup_xf_guest_bypass` file (no `if` inside location
+blocks), consumed by `fastcgi_no_cache`/`fastcgi_cache_bypass`. The cache key
+varies on the XenForo style variant (`xf_style_id`,
 `xf_style_variation`) and language (`xf_language_id`), matching
 `src/XF/PageCache.php`; without the last two a guest with a non-default style
 or language could receive another guest's cached HTML. Expired entries are
 refreshed in the background (`fastcgi_cache_background_update`) while
 `cache_lock` collapses a stampede. XenForo's own `/js`, `/styles` and `/data`
 assets get one managed `Cache-Control: public, immutable` location with a
-30-day expiry, re-applied after every Angie repository sync. The stack-level
-defaults (PHP-FPM static workers, Unix sockets, MariaDB thread pool, Brotli,
+30-day expiry, re-applied after every Angie repository sync. `--optimize`
+repairs or completes this cache block on older hosts (including the shared
+`fastcgicache` zone and `$nocacheuri` map), so an existing XenForo vhost gets
+the same guest cache as a fresh `app=xf` install. The stack-level defaults
+(PHP-FPM static workers, Unix sockets, MariaDB thread pool, Brotli,
 HTTP/2 keepalive) are tuned for XenForo. Measured on the 16-thread test host
 (Ubuntu 26.04, XenForo 2.3.13, 50 authenticated users):
 
@@ -483,22 +489,23 @@ sudo bash setup.sh --domain node.example.com app=node
 
 ---
 
-## Sync Angie configs (`--sync-angie`)
+## Angie synchronization (`--optimize`, alias `--sync-angie`)
 
 ```bash
-# Re-download server-configs-nginx, then apply the same hardware profile
-sudo bash setup.sh --sync-angie
+# --optimize synchronizes /etc/angie and applies the hardware profile
+sudo bash setup.sh --optimize
 
-# Print what the sync would change
-bash setup.sh --sync-angie --dry-run
+# Deprecated alias; identical behavior
+sudo bash setup.sh --sync-angie
 ```
 
-`--sync-angie` is the upgrade path for an existing host whose `/etc/angie`
-tree is out of date. It runs the built-in deployer (`deploy_angie_tree`: sync,
+`--optimize` is the upgrade path for an existing host whose `/etc/angie` tree
+is out of date. It runs the built-in deployer (`deploy_angie_tree`: sync,
 legacy-file cleanup, permissions, self-signed default certificate, `angie -t`,
-reload) and then the shared `run_optimize` pipeline, so the resulting Angie
-configuration is identical to a fresh `--angie` install and to `--optimize` on
-the same hardware. It installs nothing; Angie must already be installed.
+reload) and then the shared optimization pipeline, so the resulting Angie
+configuration is identical to a fresh `--angie` install and to a repeat
+`--optimize` on the same hardware. It installs nothing; Angie must already be
+installed. `--sync-angie` is kept only as a deprecated alias.
 
 ## Optimize an existing server (Ubuntu 22.04, 24.04 or 26.04)
 
@@ -517,12 +524,23 @@ creates, resizes or disables swap. The only packages it may add are the small
 matches a fresh `--angie` install. Before tuning Angie, it synchronizes
 `/etc/angie` with the canonical
 [`server-configs-nginx`](https://github.com/droplinxuser/server-configs-nginx)
-repository (or `CONFIG_SOURCE_DIR`) and runs the repository's deployer; the
+repository (or `CONFIG_SOURCE_DIR`) and runs the built-in deployer; the
 hardware-aware Angie profile is then applied to the deployed tree. If the
 download or deployment fails, the previous `/etc/angie` tree is restored and
-the synchronization is reported as a failed step.
+the synchronization is reported as a failed step. `--sync-angie` remains as a
+deprecated alias because synchronization is always part of `--optimize`.
 
-`--optimize` also audits WordPress (`wp-config.php`) and XenForo
+`--optimize` also enables FastCGI guest caching for every detected WordPress
+and XenForo vhost. It installs the shared `fastcgicache` zone and its
+`$nocacheuri` map when no active `http.d` file defines them, adds the
+WordPress cache include, and repairs or completes XenForo's
+`h5bp/php_xf.conf` cache block (style/language cache key, map-based
+session-cookie bypass, lock/background update, error-response policy and
+TTLs). The repair is idempotent and runs both on install and on `--optimize`,
+so an older host gets the same guest cache as a fresh `app=xf` or
+`app=wordpress` vhost.
+
+`--optimize` audits WordPress (`wp-config.php`) and XenForo
 (`src/config.php`) installations under `/var/www`. The report lists the config
 file, whether MariaDB uses a persistent `p:` host, and whether Valkey/Redis
 uses the local Unix socket with persistent connections. The recommended

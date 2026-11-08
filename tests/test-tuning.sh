@@ -1317,6 +1317,63 @@ check "setup.sh no longer shells out to the repository nginx_conf.sh" \
   bash -c '! grep -q "nginx_conf.sh" "$1"' _ "$ROOT/setup.sh"
 check "--sync-angie runs the same optimize pipeline as --optimize" \
   bash -c 'sed -n "/--sync-angie)/,/;;/p" "$1" | grep -q "OPTIMIZE=1"' _ "$ROOT/setup.sh"
+check "--sync-angie is a deprecated alias for --optimize" \
+  bash -c 'grep -q "deprecated alias for --optimize" "$1" && ! grep -q "requires Angie to be installed" "$1"' _ "$ROOT/setup.sh"
+check "optimize_angie enables the XenForo guest cache" \
+  grep -q 'ensure_xf_guest_cache' <<<"$opt_body"
+deploy_body=$(sed -n '/^deploy_angie_configs()/,/^}/p' "$ROOT/setup.sh")
+check "the installer enables the same XenForo guest cache" \
+  grep -q 'ensure_xf_guest_cache' <<<"$deploy_body"
+check "WordPress and XenForo share one FastCGI cache zone helper" \
+  bash -c 'grep -q "ensure_fastcgi_cache_zone" "$1" && grep -q "ensure_fastcgi_cache_zone" <<<"$(sed -n "/^optimize_wordpress_cache()/,/^}/p" "$1")"' _ "$ROOT/setup.sh"
+
+# A legacy XenForo include without any cache block must be completed by
+# --optimize, and the second run must be a no-op.
+mkdir -p "$TMP/xfguest/conf.d" "$TMP/xfguest/h5bp" "$TMP/xfguest/http.d" \
+         "$TMP/xfroot/src"
+printf 'include http.d/*.conf;\n' > "$TMP/xfguest/angie.conf"
+printf 'fastcgi_cache_path /home/nginx_cache levels=1:2 keys_zone=fastcgicache:512m max_size=1g inactive=1h use_temp_path=off;\nmap $request_uri $nocacheuri { default 0; }\n' \
+  > "$TMP/xfguest/http.d/cache.conf"
+printf 'server {\n    root %s;\n    include h5bp/php_xf.conf;\n}\n' "$TMP/xfroot" \
+  > "$TMP/xfguest/conf.d/forum.test.conf"
+printf '<?php\n' > "$TMP/xfroot/src/XF.php"
+printf 'fastcgi_pass local_php;\n' > "$TMP/xfguest/h5bp/php_xf.conf"
+tune_reset_changes
+OPT_REPORT=()
+ensure_xf_guest_cache "$TMP/xfguest"
+check "XenForo guest cache block is injected when missing" \
+  grep -q '^fastcgi_cache fastcgicache;' "$TMP/xfguest/h5bp/php_xf.conf"
+check "XenForo guest cache key varies on style and language" \
+  bash -c 'grep -q "cookie_xf_style_id" "$1" && grep -q "cookie_xf_language_id" "$1"' _ "$TMP/xfguest/h5bp/php_xf.conf"
+check "XenForo guest cache bypasses session cookies" \
+  grep -q 'fastcgi_cache_bypass.*setup_xf_guest_bypass' "$TMP/xfguest/h5bp/php_xf.conf"
+check "XenForo cookie bypass is a map, not an if" \
+  bash -c 'grep -q "map \$http_cookie \$setup_xf_guest_bypass" "$1" && ! grep -qE "^[[:space:]]*if[[:space:]]*\(" "$2"' _ "$TMP/xfguest/http.d/zz-setup-fastcgi-cache-map.conf" "$TMP/xfguest/h5bp/php_xf.conf"
+check "XenForo map excludes every session cookie" \
+  bash -c 'for c in xf_session xf_user xf_session_admin xf_tfa_trust; do grep -q "$c" "$1" || exit 1; done' _ "$TMP/xfguest/http.d/zz-setup-fastcgi-cache-map.conf"
+check "XenForo guest cache bounds the 200 TTL" \
+  grep -q '^fastcgi_cache_valid 200 5m;' "$TMP/xfguest/h5bp/php_xf.conf"
+check "XenForo guest cache repair reports a change" \
+  test "${#TUNE_CHANGES[@]}" -gt 0
+tune_reset_changes
+OPT_REPORT=()
+ensure_xf_guest_cache "$TMP/xfguest"
+check "XenForo guest cache repair is idempotent" \
+  test "${#TUNE_CHANGES[@]}" -eq 0
+check "XenForo guest cache repair reports already enabled" \
+  grep -q 'already enabled' <<<"${OPT_REPORT[*]}"
+
+# A legacy include with direct cookie variables must be converted to the map.
+printf 'fastcgi_cache fastcgicache;\nfastcgi_no_cache $cookie_xf_session $cookie_xf_user $nocacheuri;\nfastcgi_cache_bypass $cookie_xf_session $cookie_xf_user $nocacheuri;\n' \
+  > "$TMP/xfguest/h5bp/php_xf.conf"
+tune_reset_changes
+ensure_xf_guest_cache "$TMP/xfguest"
+check "legacy direct-cookie bypass is replaced by the map variable" \
+  bash -c '! grep -q "fastcgi_no_cache.*cookie_xf_session" "$1" && grep -q "fastcgi_no_cache \$setup_xf_guest_bypass \$nocacheuri;" "$1"' _ "$TMP/xfguest/h5bp/php_xf.conf"
+tune_reset_changes
+ensure_xf_guest_cache "$TMP/xfguest"
+check "second XenForo conversion records no change" \
+  test "${#TUNE_CHANGES[@]}" -eq 0
 run_body=$(sed -n '/^run_optimize()/,/^}/p' "$ROOT/setup.sh")
 check "run_optimize calls the application connection audit" \
   grep -q 'audit_app_persistent_connections' <<<"$run_body"

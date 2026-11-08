@@ -34,7 +34,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.52"
+readonly SCRIPT_VERSION="1.8.53"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -510,10 +510,14 @@ Domain setup (standalone; Angie + MariaDB must already be installed/running):
 
 Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
   --optimize [--dry-run]
-      One command for the whole host.  It applies the hardware-aware OS
-      profile (CPU governor, swap headroom, PAM security limits, and
-      kernel/network/memory sysctls) and then tunes every installed service (Angie, PHP-FPM,
-      MariaDB, Valkey or Redis, Elasticsearch) for the current CPU/RAM/disk.
+      One command for the whole host.  It synchronizes Angie's /etc/angie
+      tree from server-configs-nginx (or CONFIG_SOURCE_DIR), applies the
+      hardware-aware OS profile (CPU governor, PAM security limits, and
+      kernel/network/memory sysctls) and then tunes every installed service
+      (Angie, PHP-FPM, MariaDB, Valkey or Redis, Elasticsearch) for the
+      current CPU/RAM/disk.  It also enables FastCGI guest caching for
+      detected WordPress and XenForo vhosts, including the shared cache
+      zone, style/language cache keys and session-cookie bypass.
       It never installs, purges or starts a managed service; the only packages
       it may add are the small cpufrequtils helper when the CPU exposes
       frequency scaling and angie-module-brotli when Angie is installed, so
@@ -527,11 +531,10 @@ Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
       The graceful reload is tried first; if the build does not open the new
       listener on SIGUSR2, PHP-FPM is restarted to complete the migration
       (a short, explicit cutover).
-      Angie's /etc/angie tree is synchronized from server-configs-nginx (or
-      CONFIG_SOURCE_DIR) before the hardware profile is applied; a failed
-      sync restores the previous tree and is reported.  WordPress/XenForo
-      configs under /var/www are audited, and the report lists persistent
-      MariaDB and local Valkey socket settings the admin still needs to apply.
+      A failed Angie sync restores the previous tree and is reported.
+      WordPress/XenForo configs under /var/www are audited, and the report
+      lists persistent MariaDB and local Valkey socket settings the admin
+      still needs to apply.
       Hosts built before 1.8.34 also get the legacy nightly
       `chown -R /var/www/` crontab entry migrated to the log-safe find form,
       and /var/www/logs ownership repaired before any service is restarted.
@@ -540,17 +543,8 @@ Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
       Existing application vhosts and credentials are preserved.
       --dry-run only prints the planned OS and service values.
 
-Angie sync mode (Ubuntu 22.04, 24.04 or 26.04):
-  --sync-angie [--dry-run]
-      Synchronizes /etc/angie from server-configs-nginx and immediately
-      applies the same hardware-aware Angie profile that --optimize applies
-      (worker limits, FastCGI/Cache sizing, Brotli, PHP upstream keepalive,
-      systemd limits), together with the shared OS tuning.  It is the
-      upgrade path for an existing host whose Angie tree is out of date and
-      it intentionally shares one code path with --optimize, so a fresh
-      install, `--optimize` and `--sync-angie` always produce the same
-      configuration for the same hardware.  The service must already be
-      installed; nothing is installed by this mode.
+  --sync-angie is accepted as a deprecated alias for --optimize (Angie
+  synchronization is now always part of --optimize).
 
 Purge (stop/restore) mode:
   --purge [all|basic|angie|php|mariadb|valkey|elastic|others]
@@ -746,9 +740,8 @@ parse_args() {
       --optimize)
         OPTIMIZE=1; shift ;;
       --sync-angie)
-        # Sync the Angie tree from server-configs-nginx and apply the same
-        # hardware-aware profile --optimize uses.  Both modes share one code
-        # path (run_optimize -> optimize_angie -> sync_angie_repo_configs).
+        # Deprecated alias: --optimize has always synchronized the Angie
+        # tree (run_optimize -> optimize_angie -> sync_angie_repo_configs).
         SYNC_ANGIE=1; OPTIMIZE=1; shift ;;
       --diagnostics)
         DIAGNOSTICS=1; shift ;;
@@ -2672,10 +2665,23 @@ angie_active_http_files() {
   done < <(grep -hE '^[[:space:]]*include[[:space:]]+' "$conf" 2>/dev/null || true)
 }
 
+# The repository ships both .conf and legacy *_conf http.d filenames.  New
+# managed files must use the same suffix as the files angie.conf includes,
+# otherwise they are inert (and a duplicate cache zone is never loaded).
+angie_http_suffix() {
+  local target=$1 file
+  while IFS= read -r file; do
+    [[ -n $file ]] || continue
+    case "$file" in
+      *_conf) printf '_conf'; return 0 ;;
+    esac
+  done < <(angie_active_http_files "$target")
+  printf '.conf'
+}
+
 tune_active_file() {
   local pattern=$1 file
-  for file in "${TUNE_ACTIVE_HTTP[@]}"; do
-    [[ -f $file ]] || continue
+  for file in "${TUNE_ACTIVE_HTTP[@]}"; do    [[ -f $file ]] || continue
     grep -qE "$pattern" "$file" && { printf '%s' "$file"; return 0; }
   done
   return 1
@@ -2827,6 +2833,18 @@ tune_insert_after() {
     cat "$tmp" > "$file"
     tune_note "$desc"
   fi
+}
+
+# Append a directive only when the file has no active copy.  Used by the
+# guest-cache repair so an older include that is missing one line (for
+# example fastcgi_no_cache) is completed without duplicating the rest.
+tune_ensure_line() {
+  local file=$1 pattern=$2 line=$3 desc=$4
+  [[ -f $file ]] || { tune_miss "file not found for ${desc}: ${file}"; return 0; }
+  grep -qE "$pattern" "$file" && return 0
+  printf '%s\n' "$line" >> "$file"
+  tune_note "$desc"
+  return 0
 }
 
 # A cached 500 (or a stale 500 served by fastcgi_cache_use_stale) hides a
@@ -4055,6 +4073,7 @@ deploy_angie_configs() {
   # tuner adjusts them; --optimize uses this order, and the reverse order let
   # the repo template overwrite tuned cache values on the next run.
   optimize_wordpress_cache /etc/angie || warn "WordPress cache setup was skipped"
+  ensure_xf_guest_cache /etc/angie || warn "XenForo cache setup was skipped"
   if ! tune_angie_configs /etc/angie; then
     warn "Angie tuning failed"
     return 1
@@ -6596,6 +6615,20 @@ angie_wordpress_vhosts() {
   done
 }
 
+# A XenForo vhost includes h5bp/php_xf.conf (the PHP/cache snippet) or the
+# xf2.conf location set, and its document root contains src/XF.php.
+angie_xenforo_vhosts() {
+  local target=$1 file root
+  for file in "$target"/conf.d/*.conf; do
+    [[ -f $file ]] || continue
+    grep -qE '^[[:space:]]*include[[:space:]]+h5bp/(php_xf|xf2)\.conf;' "$file" || continue
+    root=$(grep -m1 -E '^[[:space:]]*root[[:space:]]+' "$file" 2>/dev/null \
+      | sed -E 's/^[[:space:]]*root[[:space:]]+//; s/;.*//; s/^[[:space:]]+//; s/[[:space:]]+$//')
+    root=${root%\"}; root=${root#\"}
+    [[ -n $root && -f "${root%/}/src/XF.php" ]] && printf '%s\n' "$file"
+  done
+}
+
 # Download the cache templates from the Angie config repository.  Kept
 # separate from the installer fetch path so a failed download is a reported
 # miss instead of aborting --optimize.
@@ -6620,6 +6653,37 @@ wordpress_cache_templates() {
     fi
   done
   printf '%s' "$temp"
+}
+
+# Install the shared FastCGI cache zone (and its $nocacheuri map) when no
+# active http.d file defines fastcgicache.  WordPress and XenForo both use
+# it; a single owner avoids a second, inert cache_path.
+ensure_fastcgi_cache_zone() {
+  local target=${1:-/etc/angie} suffix file active_zone=0 src="" temp=""
+  suffix=$(angie_http_suffix "$target")
+  while IFS= read -r file; do
+    [[ -n $file ]] || continue
+    grep -qE 'fastcgi_cache_path.*keys_zone=fastcgicache:' "$file" && active_zone=1
+  done < <(angie_active_http_files "$target")
+  (( active_zone )) && return 0
+
+  install -d -m 700 /home/nginx_cache 2>/dev/null || mkdir -p /home/nginx_cache
+  chown www-data:www-data /home/nginx_cache 2>/dev/null || true
+
+  if [[ -n ${CONFIG_SOURCE_DIR:-} \
+        && -f ${CONFIG_SOURCE_DIR}/http.d/fastcgi_cache.conf ]]; then
+    src=$CONFIG_SOURCE_DIR
+  else
+    temp=$(wordpress_cache_templates) || {
+      tune_miss "FastCGI cache: no local template and the repository download failed"
+      return 1
+    }
+    src=$temp
+  fi
+  install -m 644 "${src}/http.d/fastcgi_cache.conf" \
+    "${target}/http.d/zz-setup-fastcgi-cache${suffix}" || return 1
+  tune_note "FastCGI cache: zone and no-cache map installed"
+  return 0
 }
 
 optimize_wordpress_cache() {
@@ -6680,11 +6744,11 @@ optimize_wordpress_cache() {
     src=$temp
   fi
 
-  local cache_file="${target}/http.d/zz-setup-wordpress-cache${suffix}"
   local map_file="${target}/http.d/zz-setup-wordpress-cache-map${suffix}"
   if (( active_zone == 0 )); then
-    install -m 644 "${src}/http.d/fastcgi_cache.conf" "$cache_file"
-    changed=1
+    if ensure_fastcgi_cache_zone "$target"; then
+      changed=1
+    fi
   fi
   if (( active_map == 0 )); then
     install -m 644 "${src}/http.d/wordpress_cache_map.conf" "$map_file"
@@ -6703,15 +6767,152 @@ optimize_wordpress_cache() {
       >> "${target}/h5bp/php_wp.conf"
     changed=1
   fi
-  if (( active_zone == 0 )); then
-    install -d -m 700 /home/nginx_cache 2>/dev/null || mkdir -p /home/nginx_cache
-    chown www-data:www-data /home/nginx_cache 2>/dev/null || true
-  fi
 
   if (( changed )); then
     tune_note "WordPress: FastCGI guest cache enabled for ${#wp_vhosts[@]} vhost(s)"
   else
     opt_report "- WordPress: FastCGI guest cache already enabled for ${#wp_vhosts[@]} vhost(s)"
+  fi
+  return 0
+}
+
+# XenForo guest cache cookie bypass is decided in a map, never with `if`.
+# `map` lives in the http context; the result is consumed by
+# fastcgi_no_cache/fastcgi_cache_bypass.  Keeping it in its own managed file
+# lets --optimize repair old hosts without editing the repository template.
+ensure_xf_cookie_bypass_map() {
+  local target=${1:-/etc/angie} suffix file
+  suffix=$(angie_http_suffix "$target")
+  file="${target}/http.d/zz-setup-fastcgi-cache-map${suffix}"
+  if [[ ! -f $file ]] || ! grep -qE 'map[[:space:]]+\$http_cookie[[:space:]]+\$setup_xf_guest_bypass' "$file"; then
+    cat > "$file" <<'EOF'
+# BEGIN setup.sh XenForo cookie bypass map
+# Authenticated/session cookies bypass the guest cache.  This is a map (http
+# context) so no `if` is needed inside a location block in Angie.
+map $http_cookie $setup_xf_guest_bypass {
+    default 0;
+    ~*xf_session=       1;
+    ~*xf_session_admin= 1;
+    ~*xf_user=          1;
+    ~*xf_tfa_trust=     1;
+}
+# END setup.sh XenForo cookie bypass map
+EOF
+    chmod 644 "$file"
+    tune_note "XenForo: cookie bypass map installed (${file##*/})"
+  fi
+  if ! angie_active_http_files "$target" | grep -qx "$file"; then
+    tune_miss "XenForo cache: ${file} is not included by angie.conf"
+    return 1
+  fi
+  return 0
+}
+
+# Replace the old direct-cookie bypass with the map variable.  The URI map
+# ($nocacheuri) remains from the shared fastcgi_cache.conf.
+tune_xf_cache_bypass_var() {
+  local file=$1 tmp before
+  [[ -f $file ]] || return 0
+  before=$(md5sum "$file" | awk '{print $1}')
+  tmp=$(tmp_file) || return 1
+  awk '
+    /^[[:space:]]*fastcgi_no_cache[[:space:]]/ {
+      print "fastcgi_no_cache $setup_xf_guest_bypass $nocacheuri;"
+      next
+    }
+    /^[[:space:]]*fastcgi_cache_bypass[[:space:]]/ {
+      print "fastcgi_cache_bypass $setup_xf_guest_bypass $nocacheuri;"
+      next
+    }
+    { print }
+  ' "$file" > "$tmp"
+  if ! cmp -s "$file" "$tmp"; then
+    cat "$tmp" > "$file"
+    tune_note "XenForo: cookie bypass moved to a map"
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# XenForo guest cache
+# ---------------------------------------------------------------------------
+# Fresh app=xf vhosts include h5bp/php_xf.conf, which ships the FastCGI cache
+# block.  Older or hand-written hosts may lack the block or one of its
+# directives, so --optimize repairs the include in place: zone/map, cache key
+# varied on style and language, session-cookie bypass, lock/background update,
+# error-response policy and the 5-minute TTL.  Idempotent; a file that already
+# has the full block only receives the key/background-update repairs.
+ensure_xf_guest_cache() {
+  local target=${1:-/etc/angie}
+  local -a xf_vhosts=()
+  mapfile -t xf_vhosts < <(angie_xenforo_vhosts "$target")
+  (( ${#xf_vhosts[@]} > 0 )) || return 0
+
+  local file="${target}/h5bp/php_xf.conf"
+  if [[ ! -f $file ]]; then
+    tune_miss "XenForo cache: h5bp/php_xf.conf is missing (${#xf_vhosts[@]} vhost(s) cannot be cached)"
+    return 0
+  fi
+  if ! ensure_xf_cookie_bypass_map "$target"; then
+    tune_miss "XenForo cache: cookie bypass map unavailable; leaving the include unchanged"
+    return 0
+  fi
+  ensure_fastcgi_cache_zone "$target" || true
+  local changes_before=${#TUNE_CHANGES[@]}
+
+  local lock='$setup_xf_guest_bypass $nocacheuri'
+  if ! grep -qE '^[[:space:]]*fastcgi_cache[[:space:]]+fastcgicache;' "$file"; then
+    cat >> "$file" <<EOF
+
+# BEGIN setup.sh XenForo guest cache
+fastcgi_cache_methods GET HEAD;
+fastcgi_cache_key "\$request_method\$scheme\$host\$request_uri\$cookie_xf_style_variation\$cookie_xf_style_id\$cookie_xf_language_id";
+fastcgi_cache_lock on;
+fastcgi_cache_background_update on;
+fastcgi_cache_use_stale error timeout invalid_header updating http_503;
+fastcgi_ignore_headers Cache-Control Expires Set-Cookie;
+fastcgi_cache fastcgicache;
+fastcgi_no_cache ${lock};
+fastcgi_cache_bypass ${lock};
+fastcgi_cache_valid 200 5m;
+fastcgi_cache_valid 302 1h;
+fastcgi_cache_valid 301 404 24h;
+fastcgi_cache_valid any 5s;
+fastcgi_cache_valid 500 502 503 504 0s;
+add_header X-5m-Cache \$upstream_cache_status always;
+# END setup.sh XenForo guest cache
+EOF
+    tune_note "XenForo: FastCGI guest cache enabled for ${#xf_vhosts[@]} vhost(s)"
+    return 0
+  fi
+
+  tune_ensure_line "$file" '^[[:space:]]*fastcgi_cache_methods[[:space:]]' \
+    'fastcgi_cache_methods GET HEAD;' "XenForo: cache methods added"
+  tune_ensure_line "$file" '^[[:space:]]*fastcgi_cache_key[[:space:]]' \
+    'fastcgi_cache_key "$request_method$scheme$host$request_uri$cookie_xf_style_variation";' \
+    "XenForo: cache key added"
+  tune_ensure_line "$file" '^[[:space:]]*fastcgi_cache_lock[[:space:]]+on;' \
+    'fastcgi_cache_lock on;' "XenForo: cache stampede lock added"
+  tune_ensure_line "$file" '^[[:space:]]*fastcgi_cache_use_stale[[:space:]]' \
+    'fastcgi_cache_use_stale error timeout invalid_header updating http_503;' \
+    "XenForo: stale-on-error policy added"
+  tune_ensure_line "$file" '^[[:space:]]*fastcgi_ignore_headers[[:space:]]' \
+    'fastcgi_ignore_headers Cache-Control Expires Set-Cookie;' \
+    "XenForo: Set-Cookie/Cache-Control ignored for guest cache"
+  tune_ensure_line "$file" '^[[:space:]]*fastcgi_no_cache[[:space:]]' \
+    "fastcgi_no_cache ${lock};" "XenForo: session cookie bypass added"
+  tune_ensure_line "$file" '^[[:space:]]*fastcgi_cache_bypass[[:space:]]' \
+    "fastcgi_cache_bypass ${lock};" "XenForo: session cookie bypass added"
+  tune_xf_cache_bypass_var "$file"
+  tune_ensure_line "$file" '^[[:space:]]*fastcgi_cache_valid[[:space:]]+200[[:space:]]' \
+    'fastcgi_cache_valid 200 5m;' "XenForo: guest cache TTL guaranteed"
+  tune_ensure_line "$file" '^[[:space:]]*fastcgi_cache_valid[[:space:]]+500([[:space:]]+[0-9]+)+[[:space:]]+0s;' \
+    'fastcgi_cache_valid 500 502 503 504 0s;' "XenForo: error responses never cached"
+  # Run the key/background repair last: it needs the lock line above to exist
+  # before it can decide whether background_update is missing.
+  tune_xf_cache_vary "$file"
+  if (( ${#TUNE_CHANGES[@]} == changes_before )); then
+    opt_report "- XenForo: FastCGI guest cache already enabled for ${#xf_vhosts[@]} vhost(s)"
   fi
   return 0
 }
@@ -6927,6 +7128,7 @@ optimize_angie() {
     unit_changed=$ANGIE_UNIT_CHANGED
   fi
   optimize_wordpress_cache /etc/angie || true
+  ensure_xf_guest_cache /etc/angie || true
   if ! tune_angie_configs /etc/angie; then
     opt_restore /etc/angie angie
     opt_report "- **FAILED** tuning returned an error; configuration rolled back"
@@ -9626,11 +9828,9 @@ main() {
 
   if (( OPTIMIZE )); then
     if (( SYNC_ANGIE )); then
-      pkg_ok angie || die "--sync-angie requires Angie to be installed (install it with --basic --angie first)"
-      printf '%s%sUbuntu %s Angie config sync + optimization%s\n' "$C_BOLD" "$C_BLUE" "${VERSION_ID}" "$C_RESET"
-    else
-      printf '%s%sUbuntu %s optimization%s\n' "$C_BOLD" "$C_BLUE" "${VERSION_ID}" "$C_RESET"
+      warn "--sync-angie is deprecated; --optimize always synchronizes the Angie tree"
     fi
+    printf '%s%sUbuntu %s optimization (Angie sync + hardware profile)%s\n' "$C_BOLD" "$C_BLUE" "${VERSION_ID}" "$C_RESET"
     if ! run_optimize; then
       # The report already explains the failure; suppress a duplicate ERR
       # trap message from this intentional non-zero exit.
