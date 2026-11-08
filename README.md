@@ -523,14 +523,18 @@ TTLs). The repair is idempotent and runs both on install and on `--optimize`,
 so an older host gets the same guest cache as a fresh `app=xf` or
 `app=wordpress` vhost.
 
-Live data is part of the RAM plan. MariaDB's buffer-pool target is the live
-`information_schema` data+index size plus 5% (capped by its share of the 80%
-budget); Elasticsearch's heap target is the live index store plus 5%;
-Valkey's live `used_memory` plus 10% becomes a floor before MariaDB and
-Elasticsearch are sized. An existing pool/heap that already covers the target
-and still fits the budget is kept instead of being resized, avoiding a restart
-and a cold cache. If the data genuinely does not fit in RAM, the service is
-capped at its budget share and the report states that it does not fully fit.
+Live data is funded first. MariaDB gets its live `information_schema`
+data+index size plus 5% (with the hardware floor for an empty/tiny database);
+Valkey gets live `used_memory` plus 10% (or the growth percentage when the
+cache is empty); Elasticsearch gets the live index store plus 5% (with a small
+floor for an empty index). PHP-FPM is sized after those targets from what
+remains (CPU-capped, 8-worker floor), and unallocated memory stays with the OS
+page cache. If all live targets cannot fit, they are scaled proportionally and
+trimmed Elasticsearch first, then Valkey, then MariaDB; the report says when a
+store does not fully fit. The rules adapt to the installed set (MariaDB-only,
+MariaDB+Valkey, MariaDB+Elasticsearch, cache-only, search-only, full stack).
+A pool/heap grossly above its target is reduced so the freed RAM can serve the
+request tier; a value within 2% of the target is kept to avoid restart churn.
 
 `--optimize` audits WordPress (`wp-config.php`) and XenForo
 (`src/config.php`) installations under `/var/www`. The report lists the config

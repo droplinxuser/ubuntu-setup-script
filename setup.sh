@@ -34,7 +34,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.54"
+readonly SCRIPT_VERSION="1.8.56"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -6176,10 +6176,17 @@ elasticsearch_current_heap_mb() {
 }
 
 plan_memory_budget() {
-  local total usable has_php=0 has_angie=0 has_maria=0 has_cache=0 has_es=0
-  local fixed_available children php_cap php_allowance php_ver
-  local es_base_cap=31744 es_hard_cap=31744 es_size_mb=0 es_base=0 es_measured=0
-  local es_cap=0 current_heap=0 current_pool=0 db_measured=0 db_spare_ok=0
+  local total usable
+  local has_php=0 has_angie=0 has_maria=0 has_cache=0 has_es=0
+  local cpu=1 allowance=64 php_capacity=0 php_floor=0 php_budget=0 children=0
+  local maria_target=0 valkey_target=0 es_target=0
+  local maria_alloc=0 valkey_alloc=0 es_alloc=0
+  local data="" db_floor=0 current_pool=0 kept_pool=0
+  local cache_used=""
+  local es_store="" es_kept=0 current_heap=0
+  local remaining data_pool targets_sum alloc_total excess dec
+  local explicit="" room_pct
+
   total=$(mem_total_mb)
   (( total > 0 )) || total=1024
   OPT_MEM_TOTAL_MB=$total
@@ -6194,318 +6201,248 @@ plan_memory_budget() {
   OPT_VALKEY_LIVE_MB=0
   OPT_ES_BUDGET_MB=0
   OPT_ES_KEPT_MB=0
+  OPT_DB_SIZE_MB=0
+  OPT_ES_SIZE_MB=0
 
   [[ " ${OPT_DETECTED[*]} " == *" php:"* ]] && has_php=1
   [[ " ${OPT_DETECTED[*]} " == *" angie "* ]] && has_angie=1
   [[ " ${OPT_DETECTED[*]} " == *" mariadb "* ]] && has_maria=1
   [[ " ${OPT_DETECTED[*]} " == *" valkey "* || " ${OPT_DETECTED[*]} " == *" redis "* ]] && has_cache=1
   [[ " ${OPT_DETECTED[*]} " == *" elastic "* ]] && has_es=1
+  cpu=$(effective_cpus)
+  (( cpu > 0 )) || cpu=1
 
-  # Reserve PHP workers before sizing the data services.  PHP is the
-  # request-serving tier: starving it to give Elasticsearch a larger heap
-  # turns a memory win into a throughput regression.  Use the pool's current
-  # max_children when available and the measured per-worker allowance (96 MB
-  # only when no live pool exists), capped at 50% of RAM.
+  # PHP is sized last, but keep a small floor so a database-heavy host still
+  # serves requests.  A live pool's measured worker RSS sets the allowance.
   if (( has_php )); then
-    if (( OPT_INSTALL_PLAN )); then
-      # A fresh install replaces PHP and its pool; an existing (or purged)
-      # pool template must not define the new worker count or allowance.
-      # Derive the count exactly like tune_php_fpm_version() (CPU x16, the
-      # 50%-of-RAM ceiling and the 512 cap) and reserve the measured-worker
-      # floor (64 MB), not the 96 MB placeholder.  --optimize then measures
-      # the running workers and lands on the same budget instead of freeing
-      # memory the install had already promised to MariaDB/Elasticsearch.
-      local explicit_children=${OPT[php.children]:-auto}
-      if [[ $explicit_children =~ ^[0-9]+$ ]] && (( explicit_children > 0 )); then
-        children=$explicit_children
-      else
-        children=$(( $(effective_cpus) * 16 ))
-        local install_max_by_ram
-        install_max_by_ram=$(( total * 50 / 100 / 96 ))
-        (( install_max_by_ram > 0 && children > install_max_by_ram )) && children=$install_max_by_ram
-      fi
-      (( children > 512 )) && children=512
-      (( children < 8 )) && children=8
-      php_allowance=64
-    else
-      children=$(php_pool_max_children)
-      (( children > 0 )) || children=$(( $(effective_cpus) * 16 ))
-      php_ver=$(php_primary_version 2>/dev/null || true)
-      php_allowance=$(php_worker_allowance_mb "$php_ver")
-    fi
-    # tune_php_fpm_version() never goes below 8 workers; use the same floor
-    # here so a first run and a second run calculate the same PHP budget.
-    (( children < 8 )) && children=8
-    [[ $php_allowance =~ ^[0-9]+$ ]] || php_allowance=96
-    OPT_PHP_CHILDREN=$children
-    OPT_PHP_ALLOWANCE_MB=$php_allowance
-    OPT_PHP_BUDGET_MB=$(( children * php_allowance ))
-    (( OPT_PHP_BUDGET_MB < 512 )) && OPT_PHP_BUDGET_MB=512
-    php_cap=$(( total * 50 / 100 ))
-    (( OPT_PHP_BUDGET_MB > php_cap )) && OPT_PHP_BUDGET_MB=$php_cap
-    fixed_available=$(( usable - OPT_PHP_BUDGET_MB ))
-    (( fixed_available < 0 )) && fixed_available=0
-  else
-    fixed_available=$usable
-  fi
-
-  if (( has_cache )); then
-    local cache_pct=10 cache_cap=8192
-    if (( !has_maria && !has_es )); then
-      if (( has_angie || has_php )); then
-        # Web/cache-only host: give the in-memory cache a larger share.
-        cache_pct=25
-        cache_cap=32768
-      else
-        # Cache-only host.
-        cache_pct=50
-        cache_cap=65536
-      fi
-    fi
-    OPT_VALKEY_BUDGET_MB=$(tune_clamp $(( total * cache_pct / 100 )) 256 "$cache_cap")
-
-    # A live cache may already hold more than the percentage plan.  Reserve it
-    # (plus 10% headroom) here, before MariaDB/Elasticsearch are sized, so the
-    # protection in optimize_valkey() cannot overcommit the shared budget.
     if (( ! OPT_INSTALL_PLAN )); then
-      local live_cache live_floor live_cap
-      live_cache=$(valkey_live_used_mb 2>/dev/null || true)
-      if [[ $live_cache =~ ^[0-9]+$ ]] && (( live_cache > 0 )); then
-        OPT_VALKEY_LIVE_MB=$live_cache
-        live_floor=$(( live_cache * 110 / 100 ))
-        (( live_floor < 256 )) && live_floor=256
-        live_cap=$(( total * 80 / 100 ))
-        (( live_floor > live_cap )) && live_floor=$live_cap
-        (( live_floor > OPT_VALKEY_BUDGET_MB )) && OPT_VALKEY_BUDGET_MB=$live_floor
+      local ver php_allowance
+      ver=$(php_primary_version 2>/dev/null || true)
+      if [[ -n $ver ]]; then
+        php_allowance=$(php_worker_allowance_mb "$ver" 2>/dev/null || true)
+        [[ $php_allowance =~ ^[0-9]+$ ]] && allowance=$php_allowance
       fi
     fi
+    php_capacity=$(( cpu * 16 ))
+    local by_ram=$(( total * 50 / 100 / 96 ))
+    (( by_ram > 0 && php_capacity > by_ram )) && php_capacity=$by_ram
+    (( php_capacity > 512 )) && php_capacity=512
+    (( php_capacity < 8 )) && php_capacity=8
+    if (( ! OPT_INSTALL_PLAN )); then
+      local live_children
+      live_children=$(php_pool_max_children)
+      if [[ $live_children =~ ^[0-9]+$ ]] && (( live_children > 0 )); then
+        php_capacity=$live_children
+      fi
+    fi
+    explicit=$(explicit_option php_children 2>/dev/null || true)
+    if [[ $explicit =~ ^[0-9]+$ ]] && (( explicit > 0 )); then
+      php_capacity=$explicit
+    fi
+    (( php_capacity > 512 )) && php_capacity=512
+    (( php_capacity < 8 )) && php_capacity=8
+    php_floor=$(( 8 * allowance ))
+    (( php_floor < 512 )) && php_floor=512
+    (( php_floor > usable / 2 )) && php_floor=$(( usable / 2 ))
   fi
 
-  # The heap follows the live index store (+5%) up to the 31 GB
-  # compressed-oops ceiling; 25%-of-RAM (8 GB on shared hosts) is used only
-  # when the store size cannot be measured.  The shared budget caps it below
-  # so the other services keep their memory.
-  if [[ " ${OPT_DETECTED[*]} " == *" php:"* || " ${OPT_DETECTED[*]} " == *" mariadb "* ]]; then
-    es_base_cap=8192
-  fi
-  es_hard_cap=31744
-  OPT_ES_SIZE_MB=0
-  if [[ " ${OPT_DETECTED[*]} " == *" elastic "* ]]; then
-    es_size_mb=$(elasticsearch_data_size_mb)
-    if [[ -n $es_size_mb ]]; then
-      es_measured=1
-    elif (( OPT_INSTALL_PLAN )) && (( has_maria )); then
-      # Fresh full-stack install: Elasticsearch is not installed yet and has
-      # no index.  Treat it as a measured empty cluster (512 MB floor) so it
-      # cannot reserve 25% of RAM and starve the MariaDB buffer pool that is
-      # installed later in the same run.  --optimize makes the same choice.
-      es_size_mb=0
-      es_measured=1
+  # MariaDB target: live data+index +5%, or a stability floor when the
+  # database is empty (fresh install).  A live pool is only kept when it is
+  # already within 2% of that target; a grossly oversized pool is reduced so
+  # the freed RAM can go to the other services.
+  db_floor=$(( total / 16 ))
+  (( db_floor > 8192 )) && db_floor=8192
+  (( db_floor < 256 )) && db_floor=256
+  if (( has_maria )); then
+    explicit=$(explicit_option mariadb_size_mb 2>/dev/null || true)
+    if [[ $explicit =~ ^[0-9]+$ ]] && (( explicit >= 256 )); then
+      maria_target=$explicit
     else
-      es_size_mb=0
-    fi
-    OPT_ES_SIZE_MB=$es_size_mb
-    if (( es_measured )); then
-      # A measured empty index is not a missing measurement: size it from the
-      # host instead of the 25%-of-RAM fallback, but do not pin a 32 GB host
-      # to a 512 MB heap.  RAM/16 (512 MB..4 GB) gives a new index room to
-      # grow without starving the database and PHP workers.
-      if (( es_size_mb > 0 )); then
-        es_base=$(( es_size_mb * 105 / 100 ))
+      data=$(mariadb_data_size_mb)
+      if [[ $data =~ ^[0-9]+$ ]]; then
+        OPT_DB_SIZE_MB=$data
+        if (( data > 0 )); then
+          maria_target=$(( data * 105 / 100 ))
+          (( maria_target < db_floor )) && maria_target=$db_floor
+        else
+          maria_target=$db_floor
+        fi
+      elif (( OPT_INSTALL_PLAN )); then
+        if (( has_php || has_es )); then
+          maria_target=$db_floor
+        else
+          maria_target=$(( total * 80 / 100 ))
+        fi
       else
-        es_base=$(tune_clamp $(( total / 16 )) 512 4096)
+        if (( !has_php && !has_cache && !has_es )); then
+          maria_target=$(( total * 80 / 100 ))
+        else
+          maria_target=$(( total * 40 / 100 ))
+        fi
       fi
-    else
-      local es_fallback_pct=25
-      if (( !has_angie && !has_php && !has_maria && !has_cache )); then
-        es_fallback_pct=50
-      fi
-      es_base=$(tune_clamp $(( total * es_fallback_pct / 100 )) 512 "$es_base_cap")
     fi
-    (( es_base < 512 )) && es_base=512
-    (( es_base > es_hard_cap )) && es_base=$es_hard_cap
-    es_base=$(( (es_base + 511) / 512 * 512 ))
-    OPT_ES_BUDGET_MB=$es_base
-  fi
-  local db_size_mb=0 db_cap=0 remaining=0 others=0
-  OPT_DB_SIZE_MB=0
-  if [[ " ${OPT_DETECTED[*]} " == *" mariadb "* ]]; then
-    # Prefer a buffer pool that holds the live data+index working set.  The
-    # 5% headroom covers InnoDB metadata and adaptive hash structures.
-    db_size_mb=$(mariadb_data_size_mb)
-    if [[ -n $db_size_mb ]]; then
-      db_measured=1
-    elif (( OPT_INSTALL_PLAN )) && (( has_php || has_es )); then
-      # Fresh full-stack install: the database is empty and shares RAM with
-      # the PHP worker pool and/or the search heap.  Use the same 1/16-RAM
-      # empty-database floor that --optimize uses instead of the 40%-of-RAM
-      # unmeasured fallback, which would over-reserve memory that the other
-      # services need.  A database-only (or database+cache) host keeps the
-      # larger fallback because the database is its primary consumer.
-      db_size_mb=0
-      db_measured=1
-    else
-      db_size_mb=0
-    fi
-    OPT_DB_SIZE_MB=$db_size_mb
-
-    # Reserve the full cache and search budgets before sizing MariaDB, so a
-    # large database cannot crowd them out.
-    db_cap=$(( fixed_available - OPT_VALKEY_BUDGET_MB - OPT_ES_BUDGET_MB ))
-    (( db_cap < 256 )) && db_cap=256
-
-    # Size to the live working set plus 5% headroom.  Fall back to 40% of
-    # RAM only when the data size cannot be measured (for example a stopped
-    # server).  Keep a hardware-scaled floor as well: a freshly installed
-    # database can be only a few MB, but collapsing a 128 GB host to a 256 MB
-    # buffer pool makes the next traffic spike hit disk for every page.  The
-    # floor is 1/16 of RAM, capped at 8 GB, so small hosts stay conservative.
-    local db_floor
-    db_floor=$(( total / 16 ))
-    (( db_floor > 8192 )) && db_floor=8192
-    (( db_floor < 256 )) && db_floor=256
-    (( db_floor > db_cap )) && db_floor=$db_cap
-    if (( db_measured )); then
-      if (( db_size_mb > 0 )); then
-        OPT_MARIADB_BUDGET_MB=$(( db_size_mb * 105 / 100 ))
-      else
-        # A measured empty database keeps the hardware-scaled floor.
-        OPT_MARIADB_BUDGET_MB=$db_floor
-      fi
-      (( OPT_MARIADB_BUDGET_MB < db_floor )) && OPT_MARIADB_BUDGET_MB=$db_floor
-      # A database whose whole working set already fits in the hardware floor
-      # is effectively empty for planning purposes: it must be allowed to grow
-      # into spare RAM.  Without this, a freshly installed MariaDB (whose
-      # system tables report a few MB) was shrunk from the installer's 6776MB
-      # buffer pool to 1738MB by the very first --optimize on a 27.8GB host.
-      (( OPT_MARIADB_BUDGET_MB <= db_floor )) && db_spare_ok=1
-    else
-      local db_fallback_pct=40
-      if (( !has_php && !has_cache && !has_es )); then
-        db_fallback_pct=80
-      fi
-      OPT_MARIADB_BUDGET_MB=$(tune_clamp $(( total * db_fallback_pct / 100 )) 256 "$db_cap")
-    fi
-    (( OPT_MARIADB_BUDGET_MB < 256 )) && OPT_MARIADB_BUDGET_MB=256
-    (( OPT_MARIADB_BUDGET_MB > db_cap )) && OPT_MARIADB_BUDGET_MB=$db_cap
-
-    # Never shrink a live pool that already covers the working-set target and
-    # still fits MariaDB's own share of the budget: resizing forces a restart,
-    # a cold buffer pool and a slow first traffic burst for no RAM benefit.
-    # A pool within 2% of the target is also kept to absorb statistics drift.
+    (( maria_target < 256 )) && maria_target=256
     current_pool=$(mariadb_current_pool_mb)
-    if [[ $current_pool =~ ^[0-9]+$ ]] && (( current_pool > 0 && current_pool <= db_cap )); then
-      if (( current_pool >= OPT_MARIADB_BUDGET_MB )); then
-        OPT_MARIADB_BUDGET_MB=$current_pool
-        OPT_MARIADB_KEPT_MB=$current_pool
-      elif (( current_pool * 100 >= OPT_MARIADB_BUDGET_MB * 98 \
-              && current_pool * 100 <= OPT_MARIADB_BUDGET_MB * 102 )); then
-        OPT_MARIADB_BUDGET_MB=$current_pool
-        OPT_MARIADB_KEPT_MB=$current_pool
+    if [[ $current_pool =~ ^[0-9]+$ ]] && (( current_pool > 0 )); then
+      if (( current_pool * 100 <= maria_target * 102 \
+            && current_pool * 100 >= maria_target * 98 )); then
+        maria_target=$current_pool
+        kept_pool=$current_pool
       fi
     fi
   fi
 
-  # Elasticsearch gets what remains after MariaDB and the cache tier, so a
-  # larger heap cannot crowd the database out.  Keep a live heap within 2%
-  # of the target (or larger, if it still fits) to avoid restart churn.
-  if [[ " ${OPT_DETECTED[*]} " == *" elastic "* ]]; then
-    es_cap=$(( fixed_available - OPT_MARIADB_BUDGET_MB - OPT_VALKEY_BUDGET_MB ))
-    (( es_cap < 512 )) && es_cap=512
-    (( OPT_ES_BUDGET_MB > es_cap )) && OPT_ES_BUDGET_MB=$es_cap
-    # Keep a live heap that already covers the index target and still fits the
-    # search share of the budget; shrinking would force a JVM restart and cold
-    # caches for no RAM benefit.  A heap within 2% is kept for statistics drift.
-    current_heap=$(elasticsearch_current_heap_mb)
-    if [[ $current_heap =~ ^[0-9]+$ ]] && (( current_heap > 0 && current_heap <= es_cap )); then
-      if (( current_heap >= OPT_ES_BUDGET_MB )); then
-        OPT_ES_BUDGET_MB=$current_heap
-        OPT_ES_KEPT_MB=$current_heap
-      elif (( current_heap * 100 >= OPT_ES_BUDGET_MB * 98 \
-              && current_heap * 100 <= OPT_ES_BUDGET_MB * 102 )); then
-        OPT_ES_BUDGET_MB=$current_heap
-        OPT_ES_KEPT_MB=$current_heap
-      fi
-    fi
-  fi
-
-  # Scale the remaining data services into what MariaDB did not consume.
-  remaining=$(( fixed_available - OPT_MARIADB_BUDGET_MB ))
-  (( remaining < 0 )) && remaining=0
-  others=$(( OPT_ES_BUDGET_MB + OPT_VALKEY_BUDGET_MB ))
-  if (( others > remaining )); then
-    if (( others > 0 )); then
-      OPT_ES_BUDGET_MB=$(( OPT_ES_BUDGET_MB * remaining / others ))
-      OPT_VALKEY_BUDGET_MB=$(( OPT_VALKEY_BUDGET_MB * remaining / others ))
-    fi
-  fi
-  # Proportional scaling must not hand a small host an unusable slice (a
-  # 1 GB host used to end up with a 17 MB cache).  Apply the same floors the
-  # per-service tuners use; the small overcommit is bounded and safer than a
-  # cache that evicts everything immediately.
+  # Valkey target: live used_memory +10% headroom when the cache already has
+  # data; an empty cache keeps the growth-oriented percentage plan.
   if (( has_cache )); then
-    (( OPT_VALKEY_BUDGET_MB < 256 )) && OPT_VALKEY_BUDGET_MB=256
+    explicit=$(explicit_option valkey_mb 2>/dev/null || true)
+    if [[ $explicit =~ ^[0-9]+$ ]] && (( explicit >= 1 )); then
+      valkey_target=$explicit
+    else
+      if (( ! OPT_INSTALL_PLAN )); then
+        cache_used=$(valkey_live_used_mb 2>/dev/null || true)
+      fi
+      room_pct=10
+      local cache_cap=8192
+      if (( !has_maria && !has_es )); then
+        if (( has_angie || has_php )); then
+          room_pct=25
+          cache_cap=32768
+        else
+          room_pct=50
+          cache_cap=65536
+        fi
+      fi
+      valkey_target=$(( total * room_pct / 100 ))
+      (( valkey_target > cache_cap )) && valkey_target=$cache_cap
+      if [[ $cache_used =~ ^[0-9]+$ ]] && (( cache_used > 0 )); then
+        OPT_VALKEY_LIVE_MB=$cache_used
+        local cache_floor=$(( cache_used * 110 / 100 ))
+        (( cache_floor < 256 )) && cache_floor=256
+        (( cache_floor > valkey_target )) && valkey_target=$cache_floor
+      fi
+    fi
+    (( valkey_target < 256 )) && valkey_target=256
   fi
+
+  # Elasticsearch target: live index store +5% when the store is populated,
+  # a small hardware-scaled floor for an empty/new index, and the standard
+  # percentage only when the store cannot be measured at all.
   if (( has_es )); then
-    (( OPT_ES_BUDGET_MB < 512 )) && OPT_ES_BUDGET_MB=512
+    explicit=$(explicit_option elastic_mb 2>/dev/null || true)
+    if [[ $explicit =~ ^[0-9]+$ ]] && (( explicit >= 1 )); then
+      es_target=$explicit
+    else
+      es_store=$(elasticsearch_data_size_mb)
+      if [[ $es_store =~ ^[0-9]+$ ]]; then
+        OPT_ES_SIZE_MB=$es_store
+        if (( es_store > 0 )); then
+          es_target=$(( es_store * 105 / 100 ))
+        else
+          es_target=$(( total / 16 ))
+          (( es_target < 512 )) && es_target=512
+          (( es_target > 4096 )) && es_target=4096
+        fi
+      elif (( OPT_INSTALL_PLAN )) && (( has_maria )); then
+        es_target=$(( total / 16 ))
+        (( es_target < 512 )) && es_target=512
+        (( es_target > 4096 )) && es_target=4096
+      else
+        local es_cap=31744
+        if (( has_php || has_maria )); then es_cap=8192; fi
+        if (( !has_angie && !has_php && !has_maria && !has_cache )); then
+          es_target=$(( total * 50 / 100 ))
+        else
+          es_target=$(( total * 25 / 100 ))
+        fi
+        (( es_target > es_cap )) && es_target=$es_cap
+        (( es_target < 512 )) && es_target=512
+      fi
+    fi
+    (( es_target < 512 )) && es_target=512
+    (( es_target > 31744 )) && es_target=31744
+    # Round the target up once, before the live-heap comparison, so the 2%
+    # drift window is measured against the value that will be written.
+    es_target=$(( (es_target + 511) / 512 * 512 ))
+    (( es_target > 31744 )) && es_target=31744
+    current_heap=$(elasticsearch_current_heap_mb)
+    if [[ $current_heap =~ ^[0-9]+$ ]] && (( current_heap > 0 )); then
+      if (( current_heap * 100 <= es_target * 102 \
+            && current_heap * 100 >= es_target * 98 )); then
+        es_target=$current_heap
+        es_kept=$current_heap
+      fi
+    fi
   fi
 
-  # Spend the remaining shared budget instead of leaving it idle.  A fresh
-  # (empty) database and search index both grow into spare RAM; give it to
-  # Elasticsearch first (up to RAM/8), then MariaDB (up to RAM/4).  Populated
-  # stores keep their data-sized targets, so their spare stays with the OS
-  # page cache instead of inflating a buffer pool that already fits.
-  local allocated leftover room add
-  allocated=$(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB ))
-  leftover=$(( usable - allocated ))
-  if (( leftover > 0 && has_es && OPT_ES_SIZE_MB == 0 && OPT_ES_KEPT_MB == 0 && es_cap > OPT_ES_BUDGET_MB )); then
-    if (( has_php || has_maria || has_cache )); then
-      room=$(( total / 8 ))
-    else
-      # Elasticsearch is the only consumer: keep the standard 50% heap.
-      room=$(( total / 2 ))
-    fi
-    (( room > es_hard_cap )) && room=$es_hard_cap
-    (( room > es_cap )) && room=$es_cap
-    add=$(( room - OPT_ES_BUDGET_MB ))
-    (( add > leftover )) && add=$leftover
-    (( add > 0 )) && OPT_ES_BUDGET_MB=$(( OPT_ES_BUDGET_MB + add ))
-  fi
-  leftover=$(( usable - OPT_PHP_BUDGET_MB - OPT_MARIADB_BUDGET_MB - OPT_VALKEY_BUDGET_MB - OPT_ES_BUDGET_MB ))
-  if (( leftover > 0 && has_maria && db_spare_ok && OPT_MARIADB_KEPT_MB == 0 && db_cap > OPT_MARIADB_BUDGET_MB )); then
-    if (( has_php || has_es || has_cache )); then
-      room=$(( total / 4 ))
-    else
-      room=$(( total / 2 ))
-    fi
-    add=$(( room - OPT_MARIADB_BUDGET_MB ))
-    (( add > leftover )) && add=$leftover
-    (( add > 0 )) && OPT_MARIADB_BUDGET_MB=$(( OPT_MARIADB_BUDGET_MB + add ))
-  fi
-  # Normalise the search heap to the 512 MB boundary here, once, so an install
-  # and --optimize cannot write different -Xmx values for the same budget.
-  if (( has_es && OPT_ES_BUDGET_MB > 0 && OPT_ES_KEPT_MB == 0 )); then
-    OPT_ES_BUDGET_MB=$(( OPT_ES_BUDGET_MB / 512 * 512 ))
-    (( OPT_ES_BUDGET_MB < 512 )) && OPT_ES_BUDGET_MB=512
+  # Reserve the live data services first.  PHP keeps only its 8-worker floor
+  # during this pass so the data tier can fit; the remainder goes to PHP and
+  # finally to the OS page cache.  If all targets cannot fit, scale them
+  # proportionally and trim Elasticsearch first, then Valkey, then MariaDB.
+  data_pool=$(( usable - php_floor ))
+  (( data_pool < 0 )) && data_pool=0
+  targets_sum=$(( maria_target + valkey_target + es_target ))
+  if (( targets_sum <= data_pool )); then
+    maria_alloc=$maria_target
+    valkey_alloc=$valkey_target
+    es_alloc=$es_target
+  elif (( targets_sum > 0 )); then
+    maria_alloc=$(( maria_target * data_pool / targets_sum ))
+    valkey_alloc=$(( valkey_target * data_pool / targets_sum ))
+    es_alloc=$(( es_target * data_pool / targets_sum ))
+    (( has_maria && maria_alloc < 256 )) && maria_alloc=256
+    (( has_cache && valkey_alloc < 256 )) && valkey_alloc=256
+    (( has_es && es_alloc < 512 )) && es_alloc=512
+    alloc_total=$(( maria_alloc + valkey_alloc + es_alloc ))
+    excess=$(( alloc_total - data_pool ))
+    while (( excess > 0 )); do
+      if (( has_es && es_alloc > 512 )); then
+        dec=$(( es_alloc - 512 )); (( dec > excess )) && dec=$excess
+        es_alloc=$(( es_alloc - dec )); excess=$(( excess - dec ))
+      elif (( has_cache && valkey_alloc > 256 )); then
+        dec=$(( valkey_alloc - 256 )); (( dec > excess )) && dec=$excess
+        valkey_alloc=$(( valkey_alloc - dec )); excess=$(( excess - dec ))
+      elif (( has_maria && maria_alloc > 256 )); then
+        dec=$(( maria_alloc - 256 )); (( dec > excess )) && dec=$excess
+        maria_alloc=$(( maria_alloc - dec )); excess=$(( excess - dec ))
+      else
+        break
+      fi
+    done
   fi
 
-  # Explicit operator sizes recorded at install time (--mariadb size=,
-  # --valkey ram=, --elastic ram=) override the hardware plan on every
-  # --optimize run.  Without this, the first tune silently replaced the
-  # requested 2 GB Valkey with 2.7 GB and a requested 4 GB database with the
-  # planner's floor.
-  local ov
-  if (( ! OPT_INSTALL_PLAN )); then
-    if ov=$(explicit_option mariadb_size_mb); then
-      [[ $ov =~ ^[0-9]+$ ]] && (( ov >= 256 )) && OPT_MARIADB_BUDGET_MB=$ov && db_spare_ok=0
-    fi
-    if ov=$(explicit_option valkey_mb); then
-      [[ $ov =~ ^[0-9]+$ ]] && (( ov >= 1 )) && OPT_VALKEY_BUDGET_MB=$ov
-    fi
-    if ov=$(explicit_option elastic_mb); then
-      [[ $ov =~ ^[0-9]+$ ]] && (( ov >= 1 )) && OPT_ES_BUDGET_MB=$ov
+  # PHP gets what the data tier did not need, bounded by CPU and the 50%-RAM
+  # ceiling.  Eight workers are always kept when PHP is installed.
+  remaining=$(( usable - maria_alloc - valkey_alloc - es_alloc ))
+  (( remaining < 0 )) && remaining=0
+  if (( has_php )); then
+    children=$(( remaining / allowance ))
+    (( children > php_capacity )) && children=$php_capacity
+    (( children < 8 )) && children=8
+    (( children > 512 )) && children=512
+    php_budget=$(( children * allowance ))
+    if (( php_budget > remaining && children > 8 )); then
+      children=$(( remaining / allowance ))
+      (( children < 8 )) && children=8
+      php_budget=$(( children * allowance ))
     fi
   fi
+
+  # Normalise the search heap to a 512 MB boundary unless it is a preserved
+  # live value.
+  if (( has_es && es_alloc > 0 && es_kept == 0 )); then
+    es_alloc=$(( es_alloc / 512 * 512 ))
+    (( es_alloc < 512 )) && es_alloc=512
+  fi
+
+  OPT_MARIADB_BUDGET_MB=$maria_alloc
+  OPT_MARIADB_KEPT_MB=$kept_pool
+  OPT_VALKEY_BUDGET_MB=$valkey_alloc
+  OPT_ES_BUDGET_MB=$es_alloc
+  OPT_ES_KEPT_MB=$es_kept
+  OPT_PHP_ALLOWANCE_MB=$allowance
+  OPT_PHP_CHILDREN=$children
+  OPT_PHP_BUDGET_MB=$php_budget
   return 0
 }
 
