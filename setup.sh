@@ -34,7 +34,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.53"
+readonly SCRIPT_VERSION="1.8.54"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -188,8 +188,8 @@ log_selection() {
   (( ${#ENABLED[@]} > 0 )) && services="${!ENABLED[*]}"
   (( ${#DOMAINS[@]} > 0 )) && domains="${DOMAINS[*]}"
   printf '\n--- selection ---\n'
-  printf 'Modes        : dry_run=%s optimize=%s sync_angie=%s purge=%s diagnostics=%s restart_all=%s\n' \
-    "${DRY_RUN:-0}" "${OPTIMIZE:-0}" "${SYNC_ANGIE:-0}" "${PURGE:-0}" "${DIAGNOSTICS:-0}" "${RESTART_ALL:-0}"
+  printf 'Modes        : dry_run=%s optimize=%s purge=%s diagnostics=%s restart_all=%s\n' \
+    "${DRY_RUN:-0}" "${OPTIMIZE:-0}" "${PURGE:-0}" "${DIAGNOSTICS:-0}" "${RESTART_ALL:-0}"
   printf 'Services     : %s\n' "$services"
   printf 'Domains      : %s\n' "$domains"
   if [[ ${ENABLED[mariadb]:-0} -eq 1 ]]; then
@@ -437,7 +437,6 @@ OTHERS=()
 DOMAINS=()
 PURGE=0
 OPTIMIZE=0
-SYNC_ANGIE=0
 DIAGNOSTICS=0
 RESTART_ALL=0
 DRY_RUN=0
@@ -542,9 +541,6 @@ Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
       and a Markdown report is written to /var/log/setup-optimize-*.md.
       Existing application vhosts and credentials are preserved.
       --dry-run only prints the planned OS and service values.
-
-  --sync-angie is accepted as a deprecated alias for --optimize (Angie
-  synchronization is now always part of --optimize).
 
 Purge (stop/restore) mode:
   --purge [all|basic|angie|php|mariadb|valkey|elastic|others]
@@ -739,10 +735,6 @@ parse_args() {
         ;;
       --optimize)
         OPTIMIZE=1; shift ;;
-      --sync-angie)
-        # Deprecated alias: --optimize has always synchronized the Angie
-        # tree (run_optimize -> optimize_angie -> sync_angie_repo_configs).
-        SYNC_ANGIE=1; OPTIMIZE=1; shift ;;
       --diagnostics)
         DIAGNOSTICS=1; shift ;;
       --restart-all)
@@ -3917,9 +3909,8 @@ EOF
 # Angie config tree
 # ---------------------------------------------------------------------------
 # This deployer used to live in the server-configs-nginx repository as a
-# separate script.  It now lives here so a fresh install, `--optimize` and
-# `--sync-angie` share exactly one implementation: fetch -> sync tree ->
-# hardware profile.
+# separate script.  It now lives here so a fresh install and `--optimize`
+# share exactly one implementation: fetch -> sync tree -> hardware profile.
 ANGIE_CACHE_DIRS=(/home/nginx_cache /home/nginx_cache_chev /home/xf_proxy_cache
                   /home/proxy_cache /home/proxy_cdn)
 
@@ -7167,7 +7158,7 @@ optimize_angie() {
     local inert_file
     opt_report "- Warning: ${#inert[@]} cache/limit file(s) under http.d are not included by angie.conf:"
     for inert_file in "${inert[@]}"; do opt_report "  \`${inert_file}\`"; done
-    opt_report "  Re-run the Angie config deployment (install or setup.sh --sync-angie) to activate the current file names."
+    opt_report "  Re-run the Angie config deployment (install or --optimize) to activate the current file names."
   fi
   if (( active )); then
     if (( TUNE_DIRTY == 0 )); then
@@ -9827,9 +9818,6 @@ main() {
   fi
 
   if (( OPTIMIZE )); then
-    if (( SYNC_ANGIE )); then
-      warn "--sync-angie is deprecated; --optimize always synchronizes the Angie tree"
-    fi
     printf '%s%sUbuntu %s optimization (Angie sync + hardware profile)%s\n' "$C_BOLD" "$C_BLUE" "${VERSION_ID}" "$C_RESET"
     if ! run_optimize; then
       # The report already explains the failure; suppress a duplicate ERR

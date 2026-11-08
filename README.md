@@ -489,24 +489,6 @@ sudo bash setup.sh --domain node.example.com app=node
 
 ---
 
-## Angie synchronization (`--optimize`, alias `--sync-angie`)
-
-```bash
-# --optimize synchronizes /etc/angie and applies the hardware profile
-sudo bash setup.sh --optimize
-
-# Deprecated alias; identical behavior
-sudo bash setup.sh --sync-angie
-```
-
-`--optimize` is the upgrade path for an existing host whose `/etc/angie` tree
-is out of date. It runs the built-in deployer (`deploy_angie_tree`: sync,
-legacy-file cleanup, permissions, self-signed default certificate, `angie -t`,
-reload) and then the shared optimization pipeline, so the resulting Angie
-configuration is identical to a fresh `--angie` install and to a repeat
-`--optimize` on the same hardware. It installs nothing; Angie must already be
-installed. `--sync-angie` is kept only as a deprecated alias.
-
 ## Optimize an existing server (Ubuntu 22.04, 24.04 or 26.04)
 
 ```bash
@@ -527,8 +509,9 @@ matches a fresh `--angie` install. Before tuning Angie, it synchronizes
 repository (or `CONFIG_SOURCE_DIR`) and runs the built-in deployer; the
 hardware-aware Angie profile is then applied to the deployed tree. If the
 download or deployment fails, the previous `/etc/angie` tree is restored and
-the synchronization is reported as a failed step. `--sync-angie` remains as a
-deprecated alias because synchronization is always part of `--optimize`.
+the synchronization is reported as a failed step. Synchronization is always
+part of `--optimize`; it is the upgrade path for an existing host whose
+`/etc/angie` tree is out of date.
 
 `--optimize` also enables FastCGI guest caching for every detected WordPress
 and XenForo vhost. It installs the shared `fastcgicache` zone and its
