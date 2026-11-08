@@ -46,7 +46,6 @@ declare -A config_files=(
     ["mariadb_service_limits"]="${SETUP_REPO}/configs/mariadb/limit_nofile.conf /etc/systemd/system/mariadb.service.d/limits.conf"
     ["mariadb_server"]="${SETUP_REPO}/configs/mariadb/mariadb_server.cnf /etc/mysql/mariadb.conf.d/50-server.cnf"
     ["angie_conf"]="${CONFIG_REPO}/angie.conf /etc/angie/angie.conf"
-    ["angie_conf_deployer"]="${CONFIG_REPO}/scripts/nginx_conf.sh /etc/angie/scripts/nginx_conf.sh"
     ["angie_service_limits"]="${CONFIG_REPO}/scripts/limit_nofile.conf /etc/systemd/system/angie.service.d/limits.conf"
     ["angie_default"]="${CONFIG_REPO}/scripts/etc_default_nginx /etc/default/angie"
     ["angie_additional"]="${CONFIG_REPO}/http.d/ppa_eilander_conf /etc/angie/http.d/ppa_eilander.conf"

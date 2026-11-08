@@ -247,10 +247,10 @@ Before changing basic settings, the script records the originals under `/var/lib
 - Installs the Angie signing key and APT repository.
 - Installs `angie`.
 - Installs the official `angie-module-brotli` dynamic module and enables dynamic Brotli at level 5 with gzip as the compatibility fallback. On a 149 KB XenForo thread page this produced 10.9 KB on the wire versus 13.7 KB for gzip (20% smaller); guest pages were 79-93% smaller than identity. `--optimize` installs and enables the same module, so both paths stay in parity. Static assets are deliberately left to the CDN (`brotli_static off`): precompressing thousands of files only helps the first origin miss and adds deployment churn. Set `SETUP_BROTLI_LEVEL=1..11` to override the level or `SETUP_ANGIE_COMPRESSION=0` to disable it.
-- Downloads [`droplinxuser/server-configs-nginx`](https://github.com/droplinxuser/server-configs-nginx) once per run and delegates deployment to its `scripts/nginx_conf.sh`.
+- Downloads [`droplinxuser/server-configs-nginx`](https://github.com/droplinxuser/server-configs-nginx) once per run and deploys it with the built-in deployer (`deploy_angie_tree`), the same code used by `--optimize` and `--sync-angie`.
 - The repository (not `setup.sh`) owns `angie.conf`, `h5bp/`, `conf.d/`, `http.d/`, `snippets/`, the cache/rate-limit settings, template repairs and the Cloudflare helper.
 - Uses the repo's `scripts/limit_nofile.conf` and `scripts/etc_default_nginx` for the systemd `LimitNOFILE` drop-in and `/etc/default/angie`.
-- The repo deployer creates cache directories, removes obsolete setup.sh/pre-refactor config filenames, runs `angie -t`, and reloads Angie.
+- The repository deployer creates cache directories, removes obsolete setup.sh/pre-refactor config filenames, runs `angie -t`, and reloads Angie. `--sync-angie` re-runs exactly that deployer plus the hardware profile.
 - Configuration source overrides: `CONFIG_SOURCE_DIR=/path` (local checkout/testing), `CONFIG_REPO_URL=...`, `CONFIG_REPO_REF=main`.
 - Generates `/etc/angie/http.d/cloudflare.conf` via the repo's `scripts/cloudflare.sh` and reloads Angie.
 
@@ -263,7 +263,7 @@ Before changing basic settings, the script records the originals under `/var/lib
   - OPcache/JIT settings in `custom_dan.ini` are active because `php<ver>-opcache` is installed. Add `php<ver>-intl` only if an add-on needs it.
 - Deploys `www.conf` from `configs/php/www_<ver>.conf` and `custom_dan.ini` from `configs/php/custom_dan.ini`. Add a new `configs/php/www_<ver>.conf` to support a new PHP version. These are local non-Angie configs; no Angie repo fetch is needed for a PHP-only install.
 - Fills in the dynamic values from `setup.sh`:
-  - `pm.max_children = RAM_budget / 96 MB` on a fresh install (the shared 80%-of-RAM plan; capped at `CPU threads × 16`, 512, and at least 8). On `--optimize` a live pool keeps its worker count and the planner reserves `max_children × measured allowance` instead: it samples the running workers, adds 50% headroom to the average RSS, clamps the allowance to 64–192 MB, and leaves the freed RAM for MariaDB/Elasticsearch. A measured 28 MB XenForo worker on the 27.8 GB test host therefore reserves 42 MB instead of 96 MB.
+  - `pm.max_children` on a fresh install comes from the shared plan: `CPU threads × 16`, capped by `50% of RAM / 96 MB`, 512 and at least 8, and the plan reserves 64 MB per worker (the measured XF floor) so a first `--optimize` does not have to shrink the budget. On `--optimize` a live pool keeps its worker count and the planner reserves `max_children × measured allowance` instead: it samples the running workers, adds 50% headroom to the average RSS, clamps the allowance to 64–192 MB, and leaves the freed RAM for MariaDB/Elasticsearch. A measured 28 MB XenForo worker on the 27.8 GB test host therefore reserves 64 MB (the floor), and the count stays 144.
   - `pm.max_requests = CPU threads × 1024`
   - override either with `children=` / `max_requests=`
 - Sizes OPcache, JIT and `memory_limit` from RAM instead of fixed 512 MB values:
@@ -480,6 +480,23 @@ sudo bash setup.sh --domain node.example.com app=node
 - There is no domain purge target. Remove the directory, Angie config/certificate and database manually if needed.
 
 ---
+
+## Sync Angie configs (`--sync-angie`)
+
+```bash
+# Re-download server-configs-nginx, then apply the same hardware profile
+sudo bash setup.sh --sync-angie
+
+# Print what the sync would change
+bash setup.sh --sync-angie --dry-run
+```
+
+`--sync-angie` is the upgrade path for an existing host whose `/etc/angie`
+tree is out of date. It runs the built-in deployer (`deploy_angie_tree`: sync,
+legacy-file cleanup, permissions, self-signed default certificate, `angie -t`,
+reload) and then the shared `run_optimize` pipeline, so the resulting Angie
+configuration is identical to a fresh `--angie` install and to `--optimize` on
+the same hardware. It installs nothing; Angie must already be installed.
 
 ## Optimize an existing server (Ubuntu 22.04, 24.04 or 26.04)
 
@@ -792,7 +809,7 @@ under `payloads/` without changing the runtime interface.
 
 Downloaded at install time (single source of truth):
 
-- Angie configuration from [`droplinxuser/server-configs-nginx`](https://github.com/droplinxuser/server-configs-nginx): `angie.conf`, `h5bp/`, `conf.d/`, `http.d/`, `snippets/`, `scripts/cloudflare.sh`, `scripts/limit_nofile.conf`, `scripts/etc_default_nginx`, and `scripts/nginx_conf.sh`.
+- Angie configuration from [`droplinxuser/server-configs-nginx`](https://github.com/droplinxuser/server-configs-nginx): `angie.conf`, `h5bp/`, `conf.d/`, `http.d/`, `snippets/`, `scripts/cloudflare.sh`, `scripts/limit_nofile.conf` and `scripts/etc_default_nginx`. The deployer itself lives in `setup.sh`.
 - Cloudflare IP ranges from Cloudflare.
 - Package repositories via APT.
 

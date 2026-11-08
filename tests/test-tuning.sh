@@ -1114,6 +1114,45 @@ mariadb_data_size_mb() { printf '20000'; }
 OPT_DETECTED=(angie php:8.3 mariadb redis elastic)
 
 # ---------------------------------------------------------------------------
+# Install / --optimize parity
+# ---------------------------------------------------------------------------
+# A fresh install must reserve the same PHP budget as --optimize does on the
+# host it just built; otherwise the database/search tiers are sized from two
+# different numbers (and the heap changes on the first --optimize run).
+nproc() { printf '16'; }
+mem_total_mb() { printf '27812'; }
+php_pool_max_children() { printf '144'; }
+php_worker_allowance_mb() { printf '64'; }
+php_primary_version() { printf '8.5'; }
+mariadb_data_size_mb() { printf '0'; }
+mariadb_current_pool_mb() { printf '0'; }
+elasticsearch_data_size_mb() { printf '0'; }
+elasticsearch_current_heap_mb() { printf '0'; }
+
+ENABLED=([angie]=1 [php]=1 [mariadb]=1 [valkey]=1 [elastic]=1)
+plan_install_budget
+install_php_budget=$OPT_PHP_BUDGET_MB
+install_children=$OPT_PHP_CHILDREN
+install_es_budget=$OPT_ES_BUDGET_MB
+check "install plan derives the same worker count as the tuner" \
+  test "$install_children" -eq 144
+check "install plan reserves 64 MB per fresh worker, not 96 MB" \
+  test "$install_php_budget" -eq $(( 144 * 64 ))
+
+# The same host, now sized by --optimize after the install ran (live pool of
+# 144 workers measured at the 64 MB floor).
+OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
+plan_memory_budget
+check "install and --optimize reserve the same PHP budget" \
+  test "$OPT_PHP_BUDGET_MB" -eq "$install_php_budget"
+check "install and --optimize use the same worker count" \
+  test "$OPT_PHP_CHILDREN" -eq "$install_children"
+check "install and --optimize round the heap the same way" \
+  test "$OPT_ES_BUDGET_MB" -eq "$install_es_budget"
+check "Elasticsearch heap is a 512 MB multiple" \
+  test $(( install_es_budget % 512 )) -eq 0
+
+# ---------------------------------------------------------------------------
 # Single-node Elasticsearch replica detection
 # ---------------------------------------------------------------------------
 check "single-node yellow replica issue is detected" \
@@ -1245,8 +1284,12 @@ opt_body=$(sed -n '/^optimize_angie()/,/^}/p' "$ROOT/setup.sh")
 check "optimize_angie synchronizes the Angie repository" \
   grep -q 'sync_angie_repo_configs' <<<"$opt_body"
 sync_body=$(sed -n '/^sync_angie_repo_configs()/,/^}/p' "$ROOT/setup.sh")
-check "Angie sync runs the repository deployer" \
-  grep -q 'nginx_conf.sh' <<<"$sync_body"
+check "Angie sync deploys the tree itself (deployer merged into setup.sh)" \
+  grep -q 'deploy_angie_tree' <<<"$sync_body"
+check "setup.sh no longer shells out to the repository nginx_conf.sh" \
+  bash -c '! grep -q "nginx_conf.sh" "$1"' _ "$ROOT/setup.sh"
+check "--sync-angie runs the same optimize pipeline as --optimize" \
+  bash -c 'sed -n "/--sync-angie)/,/;;/p" "$1" | grep -q "OPTIMIZE=1"' _ "$ROOT/setup.sh"
 run_body=$(sed -n '/^run_optimize()/,/^}/p' "$ROOT/setup.sh")
 check "run_optimize calls the application connection audit" \
   grep -q 'audit_app_persistent_connections' <<<"$run_body"
@@ -1524,7 +1567,7 @@ OPT_INSTALL_PLAN=0
 check "fresh install keeps MariaDB above the 256 MB floor" \
   test "$OPT_MARIADB_BUDGET_MB" -ge 1738
 check "fresh install uses the RAM-scaled empty-index ES floor plus spare" \
-  test "$OPT_ES_BUDGET_MB" -eq 3476
+  test "$OPT_ES_BUDGET_MB" -eq 3072
 check "fresh install spends spare RAM on the empty database" \
   test "$OPT_MARIADB_BUDGET_MB" -gt 1738
 check "fresh install full-stack plan stays inside the 80% budget" \
