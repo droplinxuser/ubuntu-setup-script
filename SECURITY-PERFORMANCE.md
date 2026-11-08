@@ -8,10 +8,12 @@ The script now produces a solid single-host baseline. The remaining work is
 mostly about identity/secrets, certificates, per-tenant isolation, backups,
 monitoring and scaling beyond one 16-core machine.
 
-> **Note:** this audit describes a host built with `setup.sh` 1.6.7. Current
-> releases no longer install `fail2ban`, `unattended-upgrades` or Composer;
-> where this document mentions them, treat the item as an operator-managed
-> recommendation rather than something the script provides.
+> **Note:** this audit describes a host built with `setup.sh` 1.6.7. Since
+> 1.8.58, `--basic` installs and enables `unattended-upgrades` and a fail2ban
+> `sshd` jail again (and `--optimize` configures them when they are already
+> installed); from 1.8.59 the jail's `ignoreip` includes the SSH client that
+> runs the deploy. Composer is still not installed; where this document
+> mentions it, treat the item as an operator-managed recommendation.
 
 ---
 

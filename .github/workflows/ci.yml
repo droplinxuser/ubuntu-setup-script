@@ -24,7 +24,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y shellcheck
-          shellcheck -S warning setup.sh tests/test-dry-run-matrix.sh tests/test-tuning.sh tools/diff_configs.sh
+          shellcheck -S warning setup.sh tests/test-dry-run-matrix.sh tests/test-tuning.sh \
+            tests/stress-site/setup-stress-site.sh tests/stress-site/run-stress.sh tools/diff_configs.sh
 
       - name: Dry-run matrix
         run: bash tests/test-dry-run-matrix.sh

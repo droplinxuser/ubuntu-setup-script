@@ -85,6 +85,83 @@ check "ipfrag tuning writes the low mark first" \
 check "ipfrag tuning writes the high mark second" \
   test "$(printf '%s\n' "$ipfrag_block" | tail -n1)" = "net.ipv4.ipfrag_high_thresh = 2047616"
 
+# --cloudflare-only must keep the prefix length of every range; a bare
+# network address would allow one host per range and block every other edge.
+cat > "$TMP/cloudflare.conf" <<'EOF'
+set_real_ip_from 173.245.48.0/20;
+set_real_ip_from   2400:cb00::/32;
+set_real_ip_from 10.0.0.1;
+# set_real_ip_from 192.0.2.0/24;
+real_ip_header CF-Connecting-IP;
+EOF
+cf_ranges=$(cloudflare_ranges_from_conf "$TMP/cloudflare.conf")
+check "Cloudflare range parser keeps the IPv4 prefix length" \
+  grep -qx '173.245.48.0/20' <<<"$cf_ranges"
+check "Cloudflare range parser keeps the IPv6 prefix length" \
+  grep -qx '2400:cb00::/32' <<<"$cf_ranges"
+check "Cloudflare range parser accepts a single host" \
+  grep -qx '10.0.0.1' <<<"$cf_ranges"
+check "Cloudflare range parser ignores commented ranges" \
+  test "$(grep -c . <<<"$cf_ranges")" -eq 3
+check "Cloudflare range parser returns nothing for a missing file" \
+  test -z "$(cloudflare_ranges_from_conf "$TMP/does-not-exist.conf")"
+
+# The managed-tree cleanup must move files out of the way, never unlink them.
+mkdir -p "$TMP/retire"
+printf 'stale\n' > "$TMP/retire/old.conf"
+retire_out=$(retire_paths "$TMP/retire/old.conf" "$TMP/retire/missing.conf" 2>&1)
+retire_dest=$(sed -n 's/.*-> \(\/tmp\/[^ ]*\) (not deleted)$/\1/p' <<<"$retire_out" | head -n1)
+check "retire_paths moves the live file away" test ! -e "$TMP/retire/old.conf"
+check "retire_paths preserves the content under /tmp" \
+  test -n "$retire_dest" -a "$(cat "$retire_dest" 2>/dev/null)" = stale
+check "retire_paths ignores a missing path" retire_paths "$TMP/retire/missing.conf"
+deploy_body=$(sed -n '/^deploy_angie_tree()/,/^}/p' "$ROOT/setup.sh")
+check "Angie tree deployer never deletes files" \
+  bash -c '! grep -qE "(^|[[:space:]])rm -|-delete([[:space:]]|$)" <<<"$1"' _ "$deploy_body"
+
+# Backup credentials are written verbatim and never pass through a sed
+# replacement or a command line.
+printf '[mysql]\nuser=dba\npassword=dba_passwd\n\n[mysqldump]\nuser=dba\npassword=dba_passwd\n' \
+  > "$TMP/mysqlbkup.cnf.sample"
+write_mysqlbkup_credentials "$TMP/mysqlbkup.cnf.sample" 'demo_user' 'p&ss|w/o\rd$1'
+check "mysqlbkup credentials: user replaced in both sections" \
+  test "$(grep -c '^user=demo_user$' "$TMP/mysqlbkup.cnf.sample")" -eq 2
+check "mysqlbkup credentials: special characters written verbatim" \
+  test "$(grep -cxF 'password=p&ss|w/o\rd$1' "$TMP/mysqlbkup.cnf.sample")" -eq 2
+check "mysqlbkup credentials: no placeholder remains" \
+  bash -c '! grep -q "dba" "$1"' _ "$TMP/mysqlbkup.cnf.sample"
+bkup_missing_fails() { ! write_mysqlbkup_credentials "$1" u p; }
+check "mysqlbkup credentials: missing file is an error" \
+  bkup_missing_fails "$TMP/no-such-sample"
+
+# The embedded backup payload decodes to a plain tar (the installer extracts
+# it without -z) that carries the upstream files and no macOS AppleDouble
+# entries.
+blob_listing=$(blob_mysqlbackup 2>/dev/null | tar -tf - 2>/dev/null || true)
+check "mysqlbackup payload decodes to a plain tar with mysqlbkup.sh" \
+  grep -qx './mysqlbkup.sh' <<<"$blob_listing"
+check "mysqlbackup payload carries the installer and both samples" \
+  test "$(grep -cE '^\./(install|mysqlbkup\.cnf\.sample|mysqlbkup\.config\.sample)$' <<<"$blob_listing")" -eq 3
+check "mysqlbackup payload has no AppleDouble entries" \
+  bash -c '! grep -q "/\\._" <<<"$1"' _ "$blob_listing"
+check "mysqlbackup installer extracts the payload without -z" \
+  grep -qF 'blob_mysqlbackup | tar -xf - -C' "$ROOT/setup.sh"
+
+# The Angie APT key must be scoped to its repository, not globally trusted.
+angie_repo_body=$(sed -n '/^configure_angie_repo()/,/^}/p' "$ROOT/setup.sh")
+check "Angie repository uses a signed-by keyring" \
+  grep -qF 'signed-by=' <<<"$angie_repo_body"
+check "Angie repository no longer installs into trusted.gpg.d" \
+  bash -c '! grep -qF "refresh_blob_key /etc/apt/trusted.gpg.d" <<<"$1"' _ "$angie_repo_body"
+
+# Secrets must not be passed on a command line.
+mariadb_body=$(sed -n '/^install_mariadb()/,/^}/p' "$ROOT/setup.sh")
+check "MariaDB account SQL is fed over stdin" \
+  bash -c '! grep -qF "mariadb -e \"\$sql\"" <<<"$1"' _ "$mariadb_body"
+wp_db_body=$(sed -n '/^harden_wordpress_db()/,/^}/p' "$ROOT/setup.sh")
+check "WordPress database password reaches the helper via the environment" \
+  grep -qF 'WP_CFG_VALUE="$newpass"' <<<"$wp_db_body"
+
 # The live TCP pool is always migrated; there is no opt-out switch.
 php_body=$(sed -n '/^optimize_php_services()/,/^}/p' "$ROOT/setup.sh")
 check "optimize always calls the PHP socket migration" \
@@ -1756,7 +1833,7 @@ valkey_data_size_mb() { printf '0'; }
 
 check_combo() {
   local name=$1 spec=$2 want_php=$3 want_maria=$4 want_cache=$5 want_es=$6 ok=1
-  OPT_DETECTED=($spec)
+  read -r -a OPT_DETECTED <<< "$spec"
   OPT_INSTALL_PLAN=0
   plan_memory_budget
   local total=$(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB ))

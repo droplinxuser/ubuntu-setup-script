@@ -253,7 +253,8 @@ security pass. It is safe to re-run and also upgrades existing WordPress trees.
 | Database users | a `DB_USER` with global privileges is replaced by `wp_<db>`, scoped to that database, with a connection test and rollback |
 | Malware | known webshells (WP-VCD, WP2SHELL, hex-named plugins) quarantined to `/var/lib/setup-quarantine/`; suspicious admins and high-risk plugins reported |
 | Files | world-writable files/dirs fixed; oversized archives inside the web root reported |
-| OS | `unattended-upgrades` and a fail2ban `sshd` jail installed by `--basic`, enabled by `--optimize` when present; MariaDB dumps kept 30 days and `/etc/mysqlbkup.cnf` is `root:root 600` |
+| OS | `unattended-upgrades` and a fail2ban `sshd` jail installed by `--basic`, enabled by `--optimize` when present; the jail's `ignoreip` covers loopback and the SSH client running the deploy; MariaDB dumps kept 30 days and `/etc/mysqlbkup.cnf` is `root:root 600` |
+| APT keys | every third-party repository (Angie, Sury, Elastic, NodeSource) is pinned to its own keyring with `signed-by`; a legacy globally trusted Angie key is retired to `/tmp` |
 | Audit | reports SSH password auth, public 80/443, and a non-loopback Elasticsearch |
 
 Opt-in flags for changes that can affect reachability:
@@ -820,7 +821,7 @@ sudo bash setup.sh --purge
 - **Nothing is uninstalled or deleted.** Package purge/autoremove/clean calls were removed. `--purge` stops/disables the selected services, removes the managed and legacy cron entries, restores recorded basic settings where the original existed, and leaves packages, repositories, keys, configuration, certificates, databases, caches and logs on disk.
 - `--purge all` runs every stop/restore step in a safe order.
 - Bare targets and service flags are combined, so `--purge basic --php` stops both.
-- `--purge others` only disables the managed cron/setup entries it knows about; optional packages, Node.js and repository files are left installed. Composer, fail2ban and unattended-upgrades are no longer installed by this script; if present from an older release, remove them manually.
+- `--purge others` only disables the managed cron/setup entries it knows about; optional packages, Node.js and repository files are left installed. Composer is not installed by this script; `unattended-upgrades` and `fail2ban` are installed by `--basic` (see the security pass above) and are left in place by `--purge`.
 - `--purge angie` stops Angie and leaves `/etc/angie` (including domain vhosts and certificates), cache directories under `/home` and logs intact.
 - `--purge valkey` stops Valkey and leaves the Unix socket, systemd drop-in, group membership, configuration and data intact.
 - `--purge basic` restores files recorded in `/var/lib/setup.sh/backup` by overwriting them (never by unlinking the live path), moves generated drop-ins that did not exist before to `/tmp` (DNS, PAM limits, sysctl, modules-load, logrotate, network oneshot), leaves `/swapfile` and its `/etc/fstab` line enabled, removes the managed and legacy cron entries, restores the original UFW default policies and pre-existing SSH allow rules, and disables UFW again if it was originally inactive. If no original SSH rule existed, the limit rule is kept as a lockout guard.
@@ -1028,7 +1029,7 @@ The script produces a working, internet-facing baseline. For a large or security
 - Back up with snapshots to an external repository; Elasticsearch data is not covered by the MariaDB backup.
 
 **Host / operations**
-- Use SSH keys only, disable password login, keep UFW limited to 22/80/443, and use a brute-force tool of your choice for SSH and web auth endpoints. `--basic` rate-limits every effective SSH port with `ufw limit`; `fail2ban` is not installed by this script.
+- Use SSH keys only (`--harden-ssh` once key access is confirmed), keep UFW limited to 22/80/443 (or `--cloudflare-only`), and add web-auth jails if you need them. `--basic` rate-limits every effective SSH port with `ufw limit` and installs a fail2ban `sshd` jail whose `ignoreip` covers loopback and the SSH client that ran the deploy.
 - Remove the mDNS (`5353/udp`) and WS-Discovery (`3702/udp`) UFW rules if you do not need them; they were pre-existing on this host, not added by the script.
 - Enable `unattended-upgrades` manually if you want automatic security patches, and monitor reboot-required. Keep the kernel/firmware updated. `libgd3` is currently held back by the apt phasing/upgrade policy; review it before the next PHP/GD upgrade.
 - Ship Angie access/error logs, PHP-FPM slow log, MariaDB slow query log, Elasticsearch and Valkey metrics to a central monitor; alert on 5xx rate, p99 latency, disk, memory and queue depth. `--others sysstat` provides `sar`/`iostat`/`pidstat` history.
@@ -1065,7 +1066,7 @@ The package is installed, but `smartd` may refuse to start on machines with no S
 
 ### `--purge others` and pre-existing packages
 
-`--purge others` no longer removes any package, repository or key. It only stops the managed optional services and leaves Node.js, `smartmontools`, `nvme-cli`, `gifsicle` and `sysstat` installed. Remove them manually with APT only after confirming nothing needs them. If a host still has fail2ban, unattended-upgrades or Composer from an older release, remove them manually; this script no longer manages them.
+`--purge others` no longer removes any package, repository or key. It only stops the managed optional services and leaves Node.js, `smartmontools`, `nvme-cli`, `gifsicle` and `sysstat` installed. Remove them manually with APT only after confirming nothing needs them. `fail2ban` and `unattended-upgrades` belong to the `--basic` security pass and are left running by every purge target; Composer is not managed by this script.
 
 ### `--purge --php`
 

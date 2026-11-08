@@ -34,7 +34,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.58"
+readonly SCRIPT_VERSION="1.8.59"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -315,6 +315,24 @@ preserve_to_tmp() {
   dest=$(tmp_dir) || return 1
   mv -- "$path" "${dest}/${base}"
   printf '%s' "${dest}/${base}"
+}
+
+# Retire files or directories that no longer belong in a managed tree.  Each
+# existing path is moved to its own /tmp directory (never unlinked), which is
+# the file-safety policy documented in README.md; missing paths are ignored,
+# so callers can pass fixed lists and unexpanded globs.
+retire_paths() {
+  local path moved
+  for path in "$@"; do
+    [[ -e $path || -L $path ]] || continue
+    moved=$(preserve_to_tmp "$path" 2>/dev/null || true)
+    if [[ -n $moved ]]; then
+      info "Retired ${path} -> ${moved} (not deleted)"
+    else
+      warn "Could not move ${path} out of the live tree; leaving it in place"
+    fi
+  done
+  return 0
 }
 
 # Restore a backed-up directory tree over a live path without deleting files
@@ -1575,8 +1593,22 @@ sql_escape() {
   printf '%s' "$v"
 }
 
-sed_escape_replacement() {
-  printf '%s' "$1" | sed 's/[\\&|]/\\&/g'
+# Fill the mysqlbkup sample with the admin credentials.  The values travel in
+# the environment (awk ENVIRON), never on a command line, so they are not
+# visible in `ps`; they are written verbatim, so no character in the password
+# is interpreted as a regex or a replacement token.  Both the [mysql] and the
+# [mysqldump] section carry the placeholders.
+write_mysqlbkup_credentials() {
+  local file=$1 tmp
+  [[ -f $file ]] || return 1
+  tmp=$(tmp_file) || return 1
+  MYSQLBKUP_USER=$2 MYSQLBKUP_PASS=$3 awk '
+    BEGIN { u = ENVIRON["MYSQLBKUP_USER"]; p = ENVIRON["MYSQLBKUP_PASS"] }
+    /^user=dba$/ { print "user=" u; next }
+    /^password=dba_passwd$/ { print "password=" p; next }
+    { print }
+  ' "$file" > "$tmp" || return 1
+  cat -- "$tmp" > "$file"
 }
 
 size_to_mb() {
@@ -3749,7 +3781,9 @@ tune_php_fpm_version() {
   mkdir -p "$ini_dir" /var/cache/php/opcache
   chown -R www-data:www-data /var/cache/php 2>/dev/null || true
   chmod 750 /var/cache/php /var/cache/php/opcache 2>/dev/null || true
-  sed_in_place -E "s|php8\.[0-9]|php${ver}|g" "$pool"
+  # The pool template names its own version (pid path); rewrite any phpN.N,
+  # not only php8.x, so a 9.x pool is handled the same way.
+  sed_in_place -E "s|php[0-9]+\.[0-9]+|php${ver}|g" "$pool"
   local ini_before=""
   [[ -f $ini ]] && ini_before=$(md5sum "$ini" | awk '{print $1}')
   cat > "$ini" <<EOF
@@ -3985,23 +4019,26 @@ deploy_angie_tree() {
     --exclude='h5bp/tls/private.key' --exclude='h5bp/tls/certificate.pem' \
     "$src"/ "$target"/ || return 1
   mkdir -p "$target/snippets" "$target/custom.d"
-  # Remove macOS AppleDouble files that appear when a local checkout is used
-  # via CONFIG_SOURCE_DIR.
-  find "$target" -name '._*' -delete 2>/dev/null || true
+  # macOS AppleDouble files appear when a local checkout is used via
+  # CONFIG_SOURCE_DIR.  Move them out of the live tree; nothing is unlinked.
+  local -a stale=()
+  mapfile -t stale < <(find "$target" -name '._*' 2>/dev/null || true)
+  (( ${#stale[@]} > 0 )) && retire_paths "${stale[@]}"
 
-  # Remove legacy demo/error pages, sample keys and superseded sample
-  # templates that older deployments may still carry.
-  rm -rf "$target/test"
-  rm -f "$target"/v3.html "$target"/ua.html "$target"/503.html \
-        "$target"/ssl/default/certificate.pem "$target"/ssl/default/private.key
-  rm -f "$target"/conf.d/templates/sample_basic_php.conf \
+  # Legacy demo/error pages, sample keys and superseded sample templates that
+  # older deployments may still carry, plus old setup.sh-managed overrides
+  # that duplicated the cache zones, log_format and limiter variables now
+  # provided by the repository tree (PHP-FPM templates live in configs/php).
+  # None of these ship in the current repository, so each is retired once per
+  # host; they go to /tmp, never to rm, per the file-safety policy.
+  retire_paths "$target/test" \
+        "$target"/v3.html "$target"/ua.html "$target"/503.html \
+        "$target"/ssl/default/certificate.pem "$target"/ssl/default/private.key \
+        "$target"/conf.d/templates/sample_basic_php.conf \
         "$target"/conf.d/templates/sample_psi.conf \
         "$target"/conf.d/templates/sample_pingvin_proxy.conf \
-        "$target"/conf.d/templates/sample_proxy_pass.conf
-  # Old setup.sh-managed overrides duplicated the cache zones, log_format and
-  # limiter variables now provided by the repository tree.  PHP-FPM templates
-  # were also copied here by old releases; they live in configs/php now.
-  rm -f "$target"/scripts/www_*.conf \
+        "$target"/conf.d/templates/sample_proxy_pass.conf \
+        "$target"/scripts/www_*.conf \
         "$target/scripts/custom_dan.ini" \
         "$target/scripts/php-fpm-limits.conf" \
         "$target/scripts/auto_tune.sh" \
@@ -4188,13 +4225,22 @@ ensure_sury_keyring() {
 # Add every selected third-party repository first, then run one apt-get update
 # in prepare_repositories().  The service installers only install packages.
 configure_angie_repo() {
-  refresh_blob_key /etc/apt/trusted.gpg.d/angie-signing.gpg blob_angie_key \
-    || return 1
-  chmod 644 /etc/apt/trusted.gpg.d/angie-signing.gpg
+  local keyring=/usr/share/keyrings/angie-signing.gpg
+  local legacy=/etc/apt/trusted.gpg.d/angie-signing.gpg
+  refresh_blob_key "$keyring" blob_angie_key || return 1
+  chmod 644 "$keyring"
+  # Older releases installed the key into trusted.gpg.d, where it can sign
+  # *every* configured repository.  Scope it to the Angie source with
+  # signed-by (the other third-party repositories already work this way) and
+  # retire the globally trusted copy when it is byte-identical to the embedded
+  # key; an operator-supplied key is left alone.
+  if [[ -f $legacy ]] && cmp -s "$legacy" "$keyring"; then
+    retire_paths "$legacy"
+  fi
   # shellcheck disable=SC1091
   . /etc/os-release
-  printf 'deb https://download.angie.software/angie/%s/%s %s main\n' \
-    "$ID" "$VERSION_ID" "$VERSION_CODENAME" > /etc/apt/sources.list.d/angie.list
+  printf 'deb [signed-by=%s] https://download.angie.software/angie/%s/%s %s main\n' \
+    "$keyring" "$ID" "$VERSION_ID" "$VERSION_CODENAME" > /etc/apt/sources.list.d/angie.list
   chmod 644 /etc/apt/sources.list.d/angie.list
 }
 
@@ -4926,11 +4972,13 @@ EOF
   # skip_name_resolve=1 means 127.0.0.1 is not translated to localhost, so an
   # account created only for 'user'@'localhost' cannot be used over TCP.
   # Create the same account for every loopback spelling.
+  # The statements go in over stdin: a password inside `mariadb -e "..."` is
+  # visible to every local user in the process list for as long as it runs.
   for host in localhost 127.0.0.1 ::1; do
     sql="CREATE USER IF NOT EXISTS '${eu}'@'${host}' IDENTIFIED BY '${ep}'; ALTER USER '${eu}'@'${host}' IDENTIFIED BY '${ep}'; GRANT ALL ON *.* TO '${eu}'@'${host}' WITH GRANT OPTION;"
-    mariadb -e "$sql"
+    mariadb <<<"$sql"
   done
-  mariadb -e 'FLUSH PRIVILEGES;'
+  mariadb <<<'FLUSH PRIVILEGES;'
 
   # MySQL Tuner (embedded)
   blob_mysqltuner > /root/mysqltuner.pl
@@ -4943,17 +4991,19 @@ EOF
   fi
   apt_install lz4
   mkdir -p /root/tools/mysqlbackup-master /var/www
-  blob_mysqlbackup | tar -xzf - -C /root/tools/mysqlbackup-master
+  # blob_mysqlbackup already gunzips: it emits a plain tar (like every other
+  # embedded payload), so extract without -z.  The payload used to be gzipped
+  # twice, which is why the old pipeline passed -z here.
+  blob_mysqlbackup | tar -xf - -C /root/tools/mysqlbackup-master
   chmod +x /root/tools/mysqlbackup-master/install /root/tools/mysqlbackup-master/mysqlbkup.sh
   # The upstream installer uses "mkdir" without -p; make it idempotent.
   sed_in_place 's|^mkdir "\$BACKUP_DIR"|mkdir -p "$BACKUP_DIR"|' \
     /root/tools/mysqlbackup-master/install
 
-  local esc_user esc_pass
-  esc_user=$(sed_escape_replacement "$user")
-  esc_pass=$(sed_escape_replacement "$pass")
-  sed_in_place "s|user=dba|user=${esc_user}|g; s|password=dba_passwd|password=${esc_pass}|g" \
-    /root/tools/mysqlbackup-master/mysqlbkup.cnf.sample
+  # The credentials reach the file through the environment, never through a
+  # sed command line that every local user could read in `ps`.
+  write_mysqlbkup_credentials /root/tools/mysqlbackup-master/mysqlbkup.cnf.sample \
+    "$user" "$pass" || die "Could not write the MariaDB backup credentials"
 
   ( cd /root/tools/mysqlbackup-master && ./install ) || warn "mysqlbkup installer reported an issue"
   # Keep 30 days of dumps (the upstream default is 5) and never expose the
@@ -6963,8 +7013,10 @@ xf_cache_port_from_config() {
   sed -nE "s/^[[:space:]]*\\\$config\[['\"]cache['\"]\]\[['\"]config['\"]\]\[['\"]port['\"]\][[:space:]]*=[[:space:]]*([0-9]+).*/\1/p" "$1" 2>/dev/null | head -n1 || true
 }
 
+# Same depth as the managed wp-cron entry and the XenForo finder, so a site
+# that is hardened here is also the site whose wp-cron.php the cron runs.
 app_find_wordpress_configs() {
-  find /var/www -maxdepth 5 -type f -name wp-config.php 2>/dev/null | sort -u || true
+  find /var/www -maxdepth 6 -type f -name wp-config.php 2>/dev/null | sort -u || true
 }
 
 app_find_xenforo_configs() {
@@ -7026,6 +7078,8 @@ switch ($mode) {
     break;
   case 'set':
     $k = $argv[3] ?? ''; $v = $argv[4] ?? ''; $literal = ($argv[5] ?? '') === 'literal';
+    // Secrets arrive through the environment so they never show up in `ps`.
+    if (getenv('WP_CFG_VALUE') !== false) $v = getenv('WP_CFG_VALUE');
     $c = wp_cfg_read($conf); if ($c === false) exit(1);
     $val = $literal ? $v : "'".str_replace("'", "\\'", $v)."'";
     $line = "define( '".$k."', ".$val." );";
@@ -7088,6 +7142,12 @@ harden_wordpress_db() {
   host=${host%%:*}
   [[ -n $db && -n $user ]] || return 0
   [[ $host == localhost || $host == 127.0.0.1 ]] || return 0
+  # DB_NAME is quoted with backticks below and comes from a file the web user
+  # can write; only a plain identifier is interpolated.
+  if [[ ! $db =~ ^[A-Za-z0-9_]+$ ]]; then
+    harden_warn "  - ${conf}: unusual DB_NAME; database user split skipped"
+    return 0
+  fi
   command -v mariadb >/dev/null 2>&1 || return 0
   grants=$(mariadb -N -e "SHOW GRANTS FOR '$(sql_escape "$user")'@'$(sql_escape "$host")'" 2>/dev/null) || return 0
   global=$(printf '%s\n' "$grants" | grep -E '^GRANT .* ON \*\.\*' | grep -vE '^GRANT USAGE ON \*\.\*' || true)
@@ -7111,7 +7171,7 @@ SQL
   fi
   bak=$(tmp_file); cp -p "$conf" "$bak" 2>/dev/null || bak=""
   php "$helper" set "$conf" DB_USER "$newuser" string >/dev/null 2>&1 || true
-  php "$helper" set "$conf" DB_PASSWORD "$newpass" string >/dev/null 2>&1 || true
+  WP_CFG_VALUE="$newpass" php "$helper" set "$conf" DB_PASSWORD '' string >/dev/null 2>&1 || true
   if [[ $(php "$helper" testdb "$conf" 2>/dev/null) != OK ]]; then
     [[ -n $bak && -f $bak ]] && cp -p "$bak" "$conf"
     chown root:www-data "$conf" 2>/dev/null || true; chmod 640 "$conf" 2>/dev/null || true
@@ -7130,6 +7190,12 @@ harden_wordpress_audit_db() {
   db=$(php "$helper" get "$conf" DB_NAME 2>/dev/null) || return 0
   prefix=$(php "$helper" prefix "$conf" 2>/dev/null) || return 0
   [[ -n $db && -n $prefix ]] || return 0
+  # Both values come from a file the web user can write and are interpolated
+  # into SQL identifiers; only plain identifiers are accepted.
+  if [[ ! $db =~ ^[A-Za-z0-9_]+$ || ! $prefix =~ ^[A-Za-z0-9_]+$ ]]; then
+    harden_warn "  - ${conf}: unusual DB_NAME/table_prefix; database audit skipped"
+    return 0
+  fi
   role=$(mariadb -N -e "SELECT option_value FROM \`${db}\`.\`${prefix}options\` WHERE option_name='default_role' LIMIT 1;" 2>/dev/null)
   reg=$(mariadb -N -e "SELECT option_value FROM \`${db}\`.\`${prefix}options\` WHERE option_name='users_can_register' LIMIT 1;" 2>/dev/null)
   [[ -n $role && $role != subscriber ]] && harden_warn "  - ${db}: default_role=${role} (expected subscriber)"
@@ -7274,6 +7340,19 @@ EOF
   fi
 }
 
+# Cloudflare ranges from the deployed real-IP include, one per line, with the
+# prefix length.  The prefix is part of the range: "173.245.48.0/20" must not
+# collapse to the single host 173.245.48.0, which is what a character class
+# without "/" produced (one address per range was allowed and every other
+# Cloudflare edge was firewalled out).
+cloudflare_ranges_from_conf() {
+  local file=$1
+  [[ -r $file ]] || return 0
+  sed -nE 's#^[[:space:]]*set_real_ip_from[[:space:]]+([0-9a-fA-F:.]+(/[0-9]+)?)[[:space:]]*;.*#\1#p' "$file" \
+    | sort -u
+  return 0
+}
+
 apply_cloudflare_only() {
   local cf=/etc/angie/http.d/cloudflare.conf cidr ranges
   if ! command -v ufw >/dev/null 2>&1 || [[ ! -r $cf ]]; then
@@ -7284,7 +7363,7 @@ apply_cloudflare_only() {
     harden_warn "- Firewall: ufw is not active; --cloudflare-only skipped"
     return 0
   fi
-  ranges=$(grep -cE '^[[:space:]]*set_real_ip_from ' "$cf" 2>/dev/null || true)
+  ranges=$(cloudflare_ranges_from_conf "$cf" | grep -c . || true)
   [[ $ranges =~ ^[0-9]+$ ]] || ranges=0
   if (( ranges == 0 )); then
     harden_warn "- Firewall: ${cf} has no Cloudflare ranges; refusing to remove the public 80/443 rules"
@@ -7298,7 +7377,7 @@ apply_cloudflare_only() {
     [[ -n $cidr ]] || continue
     ufw allow from "$cidr" to any port 80  proto tcp >/dev/null 2>&1 || true
     ufw allow from "$cidr" to any port 443 proto tcp >/dev/null 2>&1 || true
-  done < <(grep -oE 'set_real_ip_from [0-9a-fA-F:.]+' "$cf" | awk '{print $2}')
+  done < <(cloudflare_ranges_from_conf "$cf")
   ufw reload >/dev/null 2>&1 || true
   harden_note "- Firewall: 80/443 restricted to ${ranges} Cloudflare ranges"
 }
@@ -7321,8 +7400,18 @@ EOF
     harden_warn "- OS updates: unattended-upgrades is not installed (run --basic or install it)"
   fi
   if pkg_ok fail2ban; then
+    # Never let the jail ban the operator who is running this deploy: the
+    # SSH client address (when it can be determined) joins the loopback
+    # ranges in ignoreip.  A long install can otherwise trip maxretry from
+    # a second session or an automation retry and lock the operator out.
+    local f2b_ignore="127.0.0.1/8 ::1" f2b_client
+    f2b_client=$(detect_ssh_client_ip 2>/dev/null || true)
+    [[ -n $f2b_client ]] && f2b_ignore+=" ${f2b_client}"
     mkdir -p /etc/fail2ban/jail.d
-    cat > /etc/fail2ban/jail.d/setup-sshd.local <<'EOF'
+    cat > /etc/fail2ban/jail.d/setup-sshd.local <<EOF
+[DEFAULT]
+ignoreip = ${f2b_ignore}
+
 [sshd]
 enabled = true
 backend = systemd
@@ -7332,7 +7421,14 @@ bantime = 1h
 EOF
     chmod 644 /etc/fail2ban/jail.d/setup-sshd.local
     systemctl enable --now fail2ban >/dev/null 2>&1 || true
-    harden_note "- SSH: fail2ban sshd jail enabled"
+    # `enable --now` is a no-op for a running service, so a changed jail file
+    # needs an explicit reload; only report the jail when the service is up.
+    if systemctl is-active --quiet fail2ban 2>/dev/null; then
+      systemctl reload fail2ban >/dev/null 2>&1 || true
+      harden_note "- SSH: fail2ban sshd jail enabled (ignoreip: ${f2b_ignore})"
+    else
+      harden_warn "- SSH: fail2ban is installed but not running; check \`journalctl -u fail2ban\`"
+    fi
   else
     harden_warn "- SSH: fail2ban is not installed (run --basic or install it)"
   fi
@@ -8220,7 +8316,7 @@ optimize_valkey() {
     unit=redis-server cli=redis-cli
   fi
   local active=0 ram_mb max_mb policy backlog io_threads i
-  local conf_before conf_after fd_limit dropin unit_changed=0
+  local conf_before conf_after dropin unit_changed=0
   local online_ok=0 live_io="" live_backlog="" setting k v
   local socket_path group socket_before perm_before perm_after socket_changed=0 group_changed=0
   [[ -f $conf ]] || return 0
@@ -12888,63 +12984,54 @@ B64
 
 blob_mysqlbackup() {
   base64 -d <<'B64' | gzip -dc
-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
+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
 B64
 }
 

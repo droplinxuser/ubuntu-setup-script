@@ -2,6 +2,48 @@
 
 Historical release notes for ubuntu-setup-script. Current behavior is documented in README.md.
 
+## What's new in 1.8.59
+
+- **`--cloudflare-only` now allows the full Cloudflare ranges.** The range
+  parser dropped the prefix length (`173.245.48.0/20` became the single host
+  `173.245.48.0`), so the firewall admitted one address per range and blocked
+  almost every Cloudflare edge. Ranges are read with their prefix by the new
+  `cloudflare_ranges_from_conf` helper, which is unit-tested.
+- **fail2ban cannot ban the operator running the deploy.** The managed sshd
+  jail sets `ignoreip` to loopback plus the detected SSH client address, the
+  jail is reloaded when fail2ban was already running, and the report only
+  claims "enabled" when the service is active.
+- **Secrets no longer appear in the process list.** The MariaDB admin
+  password is sent to `mariadb` over stdin and written into the backup
+  credentials file through the environment (`write_mysqlbkup_credentials`,
+  verbatim, no sed metacharacters); the scoped WordPress database password
+  reaches the wp-config helper through `WP_CFG_VALUE`.
+- **The Angie APT key is scoped to the Angie repository** with `signed-by`
+  (`/usr/share/keyrings/angie-signing.gpg`) instead of the global
+  `trusted.gpg.d`, like the Sury, Elastic and NodeSource keys. A legacy
+  globally trusted copy that is byte-identical to the embedded key is retired
+  to `/tmp`.
+- **The Angie tree deployer follows the file-safety policy.** Legacy files
+  and macOS AppleDouble entries are moved to `/tmp` by `retire_paths` instead
+  of being deleted; a test asserts the deployer contains no `rm`.
+- The WordPress database split and audit only interpolate plain
+  `DB_NAME`/`$table_prefix` identifiers into SQL; anything else is reported
+  and skipped (wp-config.php is writable by the web user).
+- `custom_dan.ini` no longer references `E_STRICT` (unused since PHP 8.0,
+  deprecated constant in 8.4); the effective error level is unchanged.
+- The PHP pool version rewrite handles any `phpN.N` string, not only `php8.x`,
+  and the WordPress config finder uses the same depth as the managed wp-cron
+  entry and the XenForo finder.
+- The embedded mysqlbackup payload was re-packed without macOS AppleDouble
+  entries, so installs no longer log `tar: Ignoring unknown extended header
+  keyword` or extract `._*` files into `/root/tools`.
+- Tooling: `tools/diff_configs.sh` skips files that are not on the host,
+  keeps going after a failed download and compares every installed PHP
+  version; ShellCheck is clean again at the CI warning level (`fd_limit`,
+  SC2206) and the CI job now also checks the stress-site scripts.
+- Tests: 21 new tuning checks (Cloudflare range parser, `retire_paths`,
+  backup credentials, signed-by keyring, stdin/environment secret handling).
+
 ## What's new in 1.8.58
 
 - **A security pass now runs on every `--basic` install and every

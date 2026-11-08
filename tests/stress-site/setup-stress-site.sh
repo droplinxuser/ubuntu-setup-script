@@ -17,7 +17,10 @@ PHP_BIN=${PHP_BIN:-$(command -v php || true)}
 if [[ -n $PHP_BIN && -x $PHP_BIN ]]; then
   PHP_VER=$("$PHP_BIN" -r 'echo PHP_MAJOR_VERSION . "." . PHP_MINOR_VERSION;')
 else
-  PHP_VER=$(ls -1 /etc/php 2>/dev/null | grep -E '^[0-9]+\.[0-9]+$' | sort -V | tail -n1)
+  PHP_VER=$(for d in /etc/php/*/; do
+              d=${d%/}; d=${d##*/}
+              [[ $d =~ ^[0-9]+\.[0-9]+$ ]] && printf '%s\n' "$d"
+            done | sort -V | tail -n1)
 fi
 [[ -n ${PHP_VER:-} ]] || { echo "no PHP-FPM installation found" >&2; exit 1; }
 # The stress seeder is a CLI script; install the matching CLI only for this
