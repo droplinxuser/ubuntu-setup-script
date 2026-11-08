@@ -2,6 +2,35 @@
 
 Historical release notes for ubuntu-setup-script. Current behavior is documented in README.md.
 
+## What's new in 1.8.53
+
+- **`--optimize` enables guest caching for WordPress _and_ XenForo.** It now
+  calls a shared `ensure_fastcgi_cache_zone()` and a new
+  `ensure_xf_guest_cache()` in addition to the existing WordPress cache
+  repair. Detected XenForo vhosts (`h5bp/php_xf.conf`/`xf2.conf` include plus
+  `src/XF.php`) get a complete FastCGI cache block when missing, and a partial
+  block is completed line by line: shared `fastcgicache` zone and
+  `$nocacheuri` map, GET/HEAD, style + variation + language cache key,
+  session-cookie bypass, `cache_lock`, background update,
+  `ignore_headers Cache-Control Expires Set-Cookie`, `200 5m` plus error
+  policy, and no caching of 5xx. The cookie bypass is a managed
+  `map $http_cookie $setup_xf_guest_bypass` file (session, admin, user and
+  TFA-trust cookies) consumed by `fastcgi_no_cache`/`fastcgi_cache_bypass`;
+  no `if` is used in any Angie location block, and a legacy direct-cookie
+  bypass is converted to the map. The repair is idempotent and runs from both
+  the installer and `--optimize`, so older hosts converge on the fresh
+  `app=xf` behavior. WordPress now installs the zone through the same helper
+  (`zz-setup-fastcgi-cache.conf`) and only creates `/home/nginx_cache` when a
+  zone actually needs installing.
+- **`--sync-angie` is merged into `--optimize`.** Angie synchronization was
+  already part of `optimize_angie()`; the separate mode, its Angie-installed
+  precondition and its usage section are gone. `--optimize` always runs
+  fetch -> deploy -> hardware profile, and `--sync-angie` remains only as a
+  deprecated alias that prints a warning and takes the identical path.
+- Tests cover the XenForo map-based bypass, injection/idempotency, the shared
+  zone helper, the installer/optimizer call sites and the deprecated alias
+  (350 tuning checks, 85 dry-run cases).
+
 ## What's new in 1.8.52
 
 - **Install and `--optimize` now leave byte-identical managed configuration.**
