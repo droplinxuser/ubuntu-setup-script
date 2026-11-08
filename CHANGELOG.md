@@ -31,9 +31,10 @@ Historical release notes for ubuntu-setup-script. Current behavior is documented
   - New opt-in flags: `--harden-ssh` (keys-only; refuses without
     `/root/.ssh/authorized_keys`) and `--cloudflare-only` (80/443 allowed only
     from the published Cloudflare ranges).
-- Requires the Angie configuration repository at 1.6.17 for the matching web
-  server rules: dotfile/sensitive-file denies, no PHP in uploads/backups,
-  `Permissions-Policy`, and a buffered access log.
+- Requires the Angie configuration repository at 1.6.18 for the matching web
+  server rules: dotfile/sensitive-file denies, no PHP in uploads/backups and
+  `Permissions-Policy`. Access logging remains **off** by default for
+  performance; `error_log` is still written.
 
 ## What's new in 1.8.57
 

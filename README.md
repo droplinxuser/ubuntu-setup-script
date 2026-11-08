@@ -277,8 +277,10 @@ Environment overrides:
 | `SETUP_ACCESS_LOG=0` | (Angie repo) restore `access_log off` on very high-traffic hosts |
 
 The web-server side of the same work (dotfile and `wp-config.php`/`xmlrpc.php`
-denies, no PHP in uploads/backups, `Permissions-Policy`, buffered access log)
-lives in `server-configs-nginx` 1.6.17 and is deployed by the same commands.
+denies, no PHP in uploads/backups, `Permissions-Policy`) lives in
+`server-configs-nginx` 1.6.18 and is deployed by the same commands. Access
+logging stays **off** for performance; only `error_log` is written. Enable a
+buffered `access_log` per host when a forensic trail is required.
 
 ## Services
 
