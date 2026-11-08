@@ -186,10 +186,11 @@ Recommended changes / additions:
 - Add a WAF at the edge (Cloudflare, Coraza/ModSecurity in front of Angie, or a
   separate reverse proxy). The embedded Naxsi/ngx_waf configs cannot be enabled
   on this Angie build.
-- Angie writes a buffered access log by default
-  (`/var/www/logs/angie/access.log`, `buffer=64k flush=5s`) so an intrusion
-  can be investigated; `/etc/logrotate.d/setup-logs` keeps 14 days. Ship it
-  off-box for longer retention or fail2ban web jails.
+- Angie access logs are disabled by default for performance (only
+  `error_log` is written). If you need forensics or fail2ban web jails, enable
+  a buffered per-vhost log
+  (`access_log /var/www/logs/angie/access.log main buffer=64k flush=5s;`) and
+  ship it off-box; `/etc/logrotate.d/setup-logs` keeps 14 days.
 - Add `limit_req` to login/registration/password-reset endpoints with tighter
   rates than the general PHP limit.
 - Use `client_max_body_size` per app. 100 MB is fine for XenForo/Lychee large
