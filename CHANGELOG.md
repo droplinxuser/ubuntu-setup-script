@@ -22,8 +22,8 @@ Historical release notes for ubuntu-setup-script. Current behavior is documented
 - On the 16-thread / 27.8 GB host with a 54 MB database, 1 MB cache and empty
   index: `PHP=9216 MariaDB=128 Cache=128 Elasticsearch=512 MB`; all services
   stay active and the forum keeps serving 200s.
-- Tests: 358 tuning checks (20% targets, minima, proportional caps, dynamic
-  installed sets) and 86 dry-run cases.
+- Tests: 372 tuning checks (20% targets, minima, proportional caps, and all
+  seven supported service combinations) and 86 dry-run cases.
 
 ## What's new in 1.8.56
 

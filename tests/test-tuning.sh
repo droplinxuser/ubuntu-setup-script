@@ -1736,6 +1736,54 @@ check "full stack priority plan stays inside the 80% budget" \
        -le $(( 27812 * 80 / 100 ))
 valkey_live_used_mb() { return 0; }
 
+# ---------------------------------------------------------------------------
+# Supported service combinations
+# ---------------------------------------------------------------------------
+# Every documented host layout must reserve only the services it actually has
+# and still stay inside the shared 80% budget.
+mem_total_mb() { printf '32768'; }
+nproc() { printf '16'; }
+php_pool_max_children() { printf '64'; }
+php_worker_allowance_mb() { printf '96'; }
+mariadb_data_size_mb() { printf '2000'; }
+mariadb_data_dir_size_mb() { printf '0'; }
+mariadb_current_pool_mb() { printf '0'; }
+elasticsearch_data_size_mb() { printf '1000'; }
+elasticsearch_data_dir_size_mb() { printf '0'; }
+elasticsearch_current_heap_mb() { printf '0'; }
+valkey_live_used_mb() { printf '500'; }
+valkey_data_size_mb() { printf '0'; }
+
+check_combo() {
+  local name=$1 spec=$2 want_php=$3 want_maria=$4 want_cache=$5 want_es=$6 ok=1
+  OPT_DETECTED=($spec)
+  OPT_INSTALL_PLAN=0
+  plan_memory_budget
+  local total=$(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB ))
+  if (( want_php )); then (( OPT_PHP_BUDGET_MB > 0 )) || ok=0; else (( OPT_PHP_BUDGET_MB == 0 )) || ok=0; fi
+  if (( want_maria )); then (( OPT_MARIADB_BUDGET_MB > 0 )) || ok=0; else (( OPT_MARIADB_BUDGET_MB == 0 )) || ok=0; fi
+  if (( want_cache )); then (( OPT_VALKEY_BUDGET_MB > 0 )) || ok=0; else (( OPT_VALKEY_BUDGET_MB == 0 )) || ok=0; fi
+  if (( want_es )); then (( OPT_ES_BUDGET_MB > 0 )) || ok=0; else (( OPT_ES_BUDGET_MB == 0 )) || ok=0; fi
+  check "${name}: reserves only installed services" test "$ok" -eq 1
+  check "${name}: stays inside the 80% budget" test "$total" -le $(( 32768 * 80 / 100 ))
+}
+
+check_combo "Angie+PHP+MariaDB+Valkey+Elasticsearch" \
+  "angie php:8.5 mariadb valkey elastic" 1 1 1 1
+check_combo "Angie+PHP+MariaDB+Elasticsearch" \
+  "angie php:8.5 mariadb elastic" 1 1 0 1
+check_combo "Angie+PHP+MariaDB+Valkey" \
+  "angie php:8.5 mariadb valkey" 1 1 1 0
+check_combo "Angie+PHP+Valkey" \
+  "angie php:8.5 valkey" 1 0 1 0
+check_combo "Angie+PHP" \
+  "angie php:8.5" 1 0 0 0
+check_combo "MariaDB alone" \
+  "mariadb" 0 1 0 0
+check_combo "Elasticsearch alone" \
+  "elastic" 0 0 0 1
+valkey_live_used_mb() { return 0; }
+
 # An existing server may already allow more than the computed thread*32
 # ceiling.  A tune must preserve it instead of rewriting it to 2000.
 systemctl() { return 0; }
