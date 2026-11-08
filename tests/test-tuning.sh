@@ -1315,10 +1315,8 @@ check "Angie sync deploys the tree itself (deployer merged into setup.sh)" \
   grep -q 'deploy_angie_tree' <<<"$sync_body"
 check "setup.sh no longer shells out to the repository nginx_conf.sh" \
   bash -c '! grep -q "nginx_conf.sh" "$1"' _ "$ROOT/setup.sh"
-check "--sync-angie runs the same optimize pipeline as --optimize" \
-  bash -c 'sed -n "/--sync-angie)/,/;;/p" "$1" | grep -q "OPTIMIZE=1"' _ "$ROOT/setup.sh"
-check "--sync-angie is a deprecated alias for --optimize" \
-  bash -c 'grep -q "deprecated alias for --optimize" "$1" && ! grep -q "requires Angie to be installed" "$1"' _ "$ROOT/setup.sh"
+check "--sync-angie has been removed from the CLI" \
+  bash -c '! grep -q -- "--sync-angie" "$1"' _ "$ROOT/setup.sh"
 check "optimize_angie enables the XenForo guest cache" \
   grep -q 'ensure_xf_guest_cache' <<<"$opt_body"
 deploy_body=$(sed -n '/^deploy_angie_configs()/,/^}/p' "$ROOT/setup.sh")

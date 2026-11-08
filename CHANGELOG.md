@@ -2,6 +2,18 @@
 
 Historical release notes for ubuntu-setup-script. Current behavior is documented in README.md.
 
+## What's new in 1.8.54
+
+- **The `--sync-angie` CLI option is removed.** Angie synchronization is
+  always part of `--optimize` (fetch -> deploy -> hardware and guest-cache
+  profile), so the deprecated alias is gone: `--sync-angie` now fails with
+  `Unknown argument` like any other retired flag. Internal helpers keep their
+  names (`sync_angie_repo_configs()`, called by install and `--optimize`);
+  only the user-facing command and its `SYNC_ANGIE` state are purged.
+- Help text, README, changelog references and tests were updated. The dry-run
+  matrix asserts that `--sync-angie` is rejected, and the tuning suite asserts
+  that the option no longer exists in the script.
+
 ## What's new in 1.8.53
 
 - **`--optimize` enables guest caching for WordPress _and_ XenForo.** It now

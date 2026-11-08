@@ -122,6 +122,7 @@ run fail --dry-run --domain example.com app=bogus
 run fail --dry-run --domain example.com --purge
 run fail --dry-run --angie
 run fail --dry-run --bogus
+run fail --dry-run --sync-angie
 
 # The single optimize command must include the OS layer.
 out=$(bash "$SCRIPT_DIR/setup.sh" --dry-run --optimize 2>&1)
