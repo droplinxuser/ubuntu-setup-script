@@ -896,6 +896,9 @@ mariadb_current_pool_mb() { printf '0'; }
 elasticsearch_data_size_mb() { printf '0'; }
 elasticsearch_current_heap_mb() { printf '0'; }
 valkey_live_used_mb() { return 0; }
+mariadb_data_dir_size_mb() { printf '0'; }
+elasticsearch_data_dir_size_mb() { printf '0'; }
+valkey_data_size_mb() { printf '0'; }
 OPT_DETECTED=(angie php:8.4 mariadb valkey elastic)
 plan_memory_budget
 check "PHP budget is at most 50% of RAM" \
@@ -957,8 +960,8 @@ elasticsearch_data_size_mb() { printf '0'; }
 php_pool_max_children() { printf '128'; }
 OPT_DETECTED=(angie php:8.4 mariadb valkey elastic)
 plan_memory_budget
-check "tiny live database keeps the hardware-scaled floor" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 8192
+check "tiny live database uses the 128 MB minimum" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 128
 check "tiny live database stays far below RAM/4" \
   test "$OPT_MARIADB_BUDGET_MB" -le $(( 262144 / 4 ))
 check "tiny database floor stays inside the 80% budget" \
@@ -974,10 +977,10 @@ OPT_DETECTED=(angie php:8.3 mariadb redis elastic)
 # A database larger than the remaining budget gets the largest feasible pool.
 mariadb_data_size_mb() { printf '40960'; }
 plan_memory_budget
-check "oversized database gets a pool that covers the data" \
-  test "$OPT_MARIADB_BUDGET_MB" -ge 40960 -a "$OPT_MARIADB_BUDGET_MB" -le 43008
-check "oversized database keeps the data target but not the full +5%" \
-  test "$OPT_DB_SIZE_MB" -eq 40960 -a "$OPT_MARIADB_BUDGET_MB" -ge 40960 -a "$OPT_MARIADB_BUDGET_MB" -lt 43008
+check "oversized database gets data+20%" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 49152
+check "oversized database covers the data within 20% headroom" \
+  test "$OPT_DB_SIZE_MB" -eq 40960 -a "$OPT_MARIADB_BUDGET_MB" -ge 40960 -a "$OPT_MARIADB_BUDGET_MB" -le 49152
 
 # On a large host the pool follows the live working set plus 5% headroom.
 mem_total_mb() { printf '262144'; }
@@ -986,8 +989,8 @@ mariadb_data_size_mb() { printf '73599'; }
 elasticsearch_data_size_mb() { printf '0'; }
 OPT_DETECTED=(angie php:8.4 mariadb valkey)
 plan_memory_budget
-check "large host sizes the pool to data+5%" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 77278
+check "large host sizes the pool to data+20%" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 88318
 check "data-sized pool is not marked as preserved" \
   test "$OPT_MARIADB_KEPT_MB" -eq 0
 check "data-sized pool keeps the plan inside the 80% budget" \
@@ -995,25 +998,25 @@ check "data-sized pool keeps the plan inside the 80% budget" \
        -le $(( 262144 * 80 / 100 ))
 
 # Tiny statistics drift must not change the planned size on every run.
-mariadb_current_pool_mb() { printf '77300'; }
+mariadb_current_pool_mb() { printf '88300'; }
 plan_memory_budget
 check "small statistics drift keeps the live pool" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 77300
+  test "$OPT_MARIADB_BUDGET_MB" -eq 88300
 
 # A live pool above the data target is kept while it still fits the budget:
 # shrinking would force a restart and a cold buffer pool for no RAM benefit.
 mariadb_current_pool_mb() { printf '120000'; }
 plan_memory_budget
-check "oversized live pool is reduced to data+5%" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 77278
+check "oversized live pool is reduced to data+20%" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 88318
 check "shrunk pool is not marked as preserved" \
   test "$OPT_MARIADB_KEPT_MB" -eq 0
 
 # A pool that would exceed the shared budget is capped.
 mariadb_current_pool_mb() { printf '200000'; }
 plan_memory_budget
-check "pool above the shared budget is capped to the target" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 77278
+check "pool above the target is capped to data+20%" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 88318
 
 # A database larger than the shared budget receives the capped pool.
 mariadb_current_pool_mb() { printf '0'; }
@@ -1042,28 +1045,28 @@ check "MariaDB-only large database can use the full 80% budget" \
 mariadb_data_size_mb() { printf ''; }
 OPT_DETECTED=(mariadb)
 plan_memory_budget
-check "MariaDB-only unknown data falls back to 80% RAM" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 52428
+check "MariaDB-only unknown data uses the 128 MB minimum" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 128
 
 # Valkey gets a larger share when no database/search tier shares the host.
 mariadb_data_size_mb() { printf '0'; }
 OPT_DETECTED=(valkey)
 plan_memory_budget
-check "Valkey-only budget uses 50% of RAM" \
-  test "$OPT_VALKEY_BUDGET_MB" -eq 32768
+check "Valkey-only empty cache uses the 128 MB minimum" \
+  test "$OPT_VALKEY_BUDGET_MB" -eq 128
 php_pool_max_children() { printf '128'; }
 OPT_DETECTED=(angie php:8.3 valkey)
 plan_memory_budget
-check "Angie+PHP+Valkey budget uses 25% of RAM" \
-  test "$OPT_VALKEY_BUDGET_MB" -eq 16384
+check "Angie+PHP+Valkey empty cache uses the 128 MB minimum" \
+  test "$OPT_VALKEY_BUDGET_MB" -eq 128
 
 # Elasticsearch-only fallback when the index size cannot be measured.
 elasticsearch_data_size_mb() { printf ''; }
 elasticsearch_current_heap_mb() { printf '0'; }
 OPT_DETECTED=(elastic)
 plan_memory_budget
-check "Elasticsearch-only unknown index falls back to 50% RAM" \
-  test "$OPT_ES_BUDGET_MB" -eq 31744
+check "Elasticsearch-only unknown index uses the 512 MB minimum" \
+  test "$OPT_ES_BUDGET_MB" -eq 512
 
 # A reachable but empty cluster is a measurement, not a failure: start from a
 # RAM-scaled floor (total/16, 512 MB..4 GB) and give the spare budget to the
@@ -1071,8 +1074,8 @@ check "Elasticsearch-only unknown index falls back to 50% RAM" \
 elasticsearch_data_size_mb() { printf '0'; }
 OPT_DETECTED=(elastic)
 plan_memory_budget
-check "measured empty Elasticsearch-only host uses the small floor" \
-  test "$OPT_ES_BUDGET_MB" -eq 4096
+check "measured empty Elasticsearch-only host uses the 512 MB minimum" \
+  test "$OPT_ES_BUDGET_MB" -eq 512
 
 mariadb_current_pool_mb() { printf '0'; }
 mariadb_data_size_mb() { printf '20000'; }
@@ -1085,15 +1088,15 @@ mariadb_data_size_mb() { printf '20000'; }
 elasticsearch_data_size_mb() { printf '4096'; }
 elasticsearch_current_heap_mb() { printf '0'; }
 plan_memory_budget
-check "small Elasticsearch index uses index+5%" \
-  test "$OPT_ES_BUDGET_MB" -eq 4608
+check "small Elasticsearch index uses index+20%" \
+  test "$OPT_ES_BUDGET_MB" -eq 5120
 check "Elasticsearch index size is recorded" \
   test "$OPT_ES_SIZE_MB" -eq 4096
 
 elasticsearch_data_size_mb() { printf '20000'; }
 plan_memory_budget
-check "large Elasticsearch index gets index+5% headroom" \
-  test "$OPT_ES_BUDGET_MB" -eq 21504
+check "large Elasticsearch index gets index+20% headroom" \
+  test "$OPT_ES_BUDGET_MB" -eq 24064
 check "Elasticsearch heap fits the 20 GB index" \
   test "$OPT_ES_BUDGET_MB" -ge 20000
 check "Elasticsearch plan stays inside the 80% budget" \
@@ -1117,16 +1120,16 @@ mariadb_data_size_mb() { printf '20000'; }
 elasticsearch_data_size_mb() { printf '13000'; }
 elasticsearch_current_heap_mb() { printf '20000'; }
 plan_memory_budget
-check "oversized Elasticsearch heap is reduced to index+5%" \
-  test "$OPT_ES_BUDGET_MB" -eq 13824
+check "oversized Elasticsearch heap is reduced to index+20%" \
+  test "$OPT_ES_BUDGET_MB" -eq 15872
 check "shrunk Elasticsearch heap is not marked as preserved" \
   test "$OPT_ES_KEPT_MB" -eq 0
 
 # Small statistics drift must not change the heap on every run.
-elasticsearch_current_heap_mb() { printf '14000'; }
+elasticsearch_current_heap_mb() { printf '15800'; }
 plan_memory_budget
 check "Elasticsearch statistics drift keeps the live heap" \
-  test "$OPT_ES_BUDGET_MB" -eq 14000
+  test "$OPT_ES_BUDGET_MB" -eq 15800
 
 # A heap that would exceed the shared budget is capped.
 mem_total_mb() { printf '65536'; }
@@ -1135,8 +1138,8 @@ mariadb_data_size_mb() { printf '40000'; }
 elasticsearch_data_size_mb() { printf '4096'; }
 elasticsearch_current_heap_mb() { printf '30000'; }
 plan_memory_budget
-check "Elasticsearch heap above the shared budget is capped" \
-  test "$OPT_ES_BUDGET_MB" -eq 4096
+check "Elasticsearch heap is capped to index+20%" \
+  test "$OPT_ES_BUDGET_MB" -ge 4608 -a "$OPT_ES_BUDGET_MB" -le 5120
 
 elasticsearch_current_heap_mb() { printf '0'; }
 elasticsearch_data_size_mb() { printf '0'; }
@@ -1649,12 +1652,12 @@ OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
 OPT_INSTALL_PLAN=1
 plan_memory_budget
 OPT_INSTALL_PLAN=0
-check "fresh install keeps MariaDB above the 256 MB floor" \
-  test "$OPT_MARIADB_BUDGET_MB" -ge 1738
-check "fresh install uses the RAM-scaled empty-index ES floor" \
-  test "$OPT_ES_BUDGET_MB" -eq 2048
-check "fresh install keeps the empty-database floor" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 1738
+check "fresh install sizes MariaDB from the empty-data minimum" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 128
+check "fresh install uses the empty-index minimum" \
+  test "$OPT_ES_BUDGET_MB" -eq 512
+check "fresh install keeps the empty-database minimum" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 128
 check "fresh install full-stack plan stays inside the 80% budget" \
   test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
        -le $(( 27812 * 80 / 100 ))
@@ -1666,8 +1669,8 @@ mariadb_data_size_mb() { printf '4'; }
 OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
 OPT_INSTALL_PLAN=0
 plan_memory_budget
-check "measured-empty live database keeps the hardware floor" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 1738
+check "measured-empty live database uses the minimum" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 128
 
 # ---------------------------------------------------------------------------
 # Live-data protection
@@ -1683,8 +1686,8 @@ elasticsearch_current_heap_mb() { printf '4096'; }
 OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
 OPT_INSTALL_PLAN=0
 plan_memory_budget
-check "live MariaDB pool is reduced to data+5%" \
-  test "$OPT_MARIADB_KEPT_MB" -eq 0 -a "$OPT_MARIADB_BUDGET_MB" -eq 2150
+check "live MariaDB pool is reduced to data+20%" \
+  test "$OPT_MARIADB_KEPT_MB" -eq 0 -a "$OPT_MARIADB_BUDGET_MB" -eq 2457
 check "live Elasticsearch heap is reduced to index+5%" \
   test "$OPT_ES_KEPT_MB" -eq 0 -a "$OPT_ES_BUDGET_MB" -eq 1024
 
@@ -1749,8 +1752,8 @@ OPT_DETECTED=(mariadb)
 OPT_INSTALL_PLAN=1
 plan_memory_budget
 OPT_INSTALL_PLAN=0
-check "database-only fresh install keeps the large fallback" \
-  test "$OPT_MARIADB_BUDGET_MB" -gt 20000
+check "database-only fresh install uses the minimum for an empty database" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 128
 
 # ---------------------------------------------------------------------------
 # --restart-all plan de-duplicates the Valkey unit alias
