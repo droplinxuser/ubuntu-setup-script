@@ -6029,6 +6029,7 @@ OPT_PHP_CHILDREN=0
 OPT_MARIADB_BUDGET_MB=0
 OPT_MARIADB_KEPT_MB=0
 OPT_VALKEY_BUDGET_MB=0
+OPT_VALKEY_LIVE_MB=0
 OPT_ES_BUDGET_MB=0
 OPT_ES_KEPT_MB=0
 # Set while plan_install_budget() runs.  A fresh install has no live database
@@ -6190,6 +6191,7 @@ plan_memory_budget() {
   OPT_MARIADB_BUDGET_MB=0
   OPT_MARIADB_KEPT_MB=0
   OPT_VALKEY_BUDGET_MB=0
+  OPT_VALKEY_LIVE_MB=0
   OPT_ES_BUDGET_MB=0
   OPT_ES_KEPT_MB=0
 
@@ -6261,6 +6263,22 @@ plan_memory_budget() {
       fi
     fi
     OPT_VALKEY_BUDGET_MB=$(tune_clamp $(( total * cache_pct / 100 )) 256 "$cache_cap")
+
+    # A live cache may already hold more than the percentage plan.  Reserve it
+    # (plus 10% headroom) here, before MariaDB/Elasticsearch are sized, so the
+    # protection in optimize_valkey() cannot overcommit the shared budget.
+    if (( ! OPT_INSTALL_PLAN )); then
+      local live_cache live_floor live_cap
+      live_cache=$(valkey_live_used_mb 2>/dev/null || true)
+      if [[ $live_cache =~ ^[0-9]+$ ]] && (( live_cache > 0 )); then
+        OPT_VALKEY_LIVE_MB=$live_cache
+        live_floor=$(( live_cache * 110 / 100 ))
+        (( live_floor < 256 )) && live_floor=256
+        live_cap=$(( total * 80 / 100 ))
+        (( live_floor > live_cap )) && live_floor=$live_cap
+        (( live_floor > OPT_VALKEY_BUDGET_MB )) && OPT_VALKEY_BUDGET_MB=$live_floor
+      fi
+    fi
   fi
 
   # The heap follows the live index store (+5%) up to the 31 GB
@@ -6371,13 +6389,17 @@ plan_memory_budget() {
     (( OPT_MARIADB_BUDGET_MB < 256 )) && OPT_MARIADB_BUDGET_MB=256
     (( OPT_MARIADB_BUDGET_MB > db_cap )) && OPT_MARIADB_BUDGET_MB=$db_cap
 
-    # Keep a live pool within 2% of the target so small statistics drift does
-    # not cause a restart on every run.  Larger pools are reduced to the
-    # data-sized target.
+    # Never shrink a live pool that already covers the working-set target and
+    # still fits MariaDB's own share of the budget: resizing forces a restart,
+    # a cold buffer pool and a slow first traffic burst for no RAM benefit.
+    # A pool within 2% of the target is also kept to absorb statistics drift.
     current_pool=$(mariadb_current_pool_mb)
     if [[ $current_pool =~ ^[0-9]+$ ]] && (( current_pool > 0 && current_pool <= db_cap )); then
-      if (( current_pool * 100 >= OPT_MARIADB_BUDGET_MB * 98 \
-            && current_pool * 100 <= OPT_MARIADB_BUDGET_MB * 102 )); then
+      if (( current_pool >= OPT_MARIADB_BUDGET_MB )); then
+        OPT_MARIADB_BUDGET_MB=$current_pool
+        OPT_MARIADB_KEPT_MB=$current_pool
+      elif (( current_pool * 100 >= OPT_MARIADB_BUDGET_MB * 98 \
+              && current_pool * 100 <= OPT_MARIADB_BUDGET_MB * 102 )); then
         OPT_MARIADB_BUDGET_MB=$current_pool
         OPT_MARIADB_KEPT_MB=$current_pool
       fi
@@ -6391,10 +6413,16 @@ plan_memory_budget() {
     es_cap=$(( fixed_available - OPT_MARIADB_BUDGET_MB - OPT_VALKEY_BUDGET_MB ))
     (( es_cap < 512 )) && es_cap=512
     (( OPT_ES_BUDGET_MB > es_cap )) && OPT_ES_BUDGET_MB=$es_cap
+    # Keep a live heap that already covers the index target and still fits the
+    # search share of the budget; shrinking would force a JVM restart and cold
+    # caches for no RAM benefit.  A heap within 2% is kept for statistics drift.
     current_heap=$(elasticsearch_current_heap_mb)
     if [[ $current_heap =~ ^[0-9]+$ ]] && (( current_heap > 0 && current_heap <= es_cap )); then
-      if (( current_heap * 100 >= OPT_ES_BUDGET_MB * 98 \
-            && current_heap * 100 <= OPT_ES_BUDGET_MB * 102 )); then
+      if (( current_heap >= OPT_ES_BUDGET_MB )); then
+        OPT_ES_BUDGET_MB=$current_heap
+        OPT_ES_KEPT_MB=$current_heap
+      elif (( current_heap * 100 >= OPT_ES_BUDGET_MB * 98 \
+              && current_heap * 100 <= OPT_ES_BUDGET_MB * 102 )); then
         OPT_ES_BUDGET_MB=$current_heap
         OPT_ES_KEPT_MB=$current_heap
       fi
@@ -6430,7 +6458,7 @@ plan_memory_budget() {
   local allocated leftover room add
   allocated=$(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB ))
   leftover=$(( usable - allocated ))
-  if (( leftover > 0 && has_es && OPT_ES_SIZE_MB == 0 && es_cap > OPT_ES_BUDGET_MB )); then
+  if (( leftover > 0 && has_es && OPT_ES_SIZE_MB == 0 && OPT_ES_KEPT_MB == 0 && es_cap > OPT_ES_BUDGET_MB )); then
     if (( has_php || has_maria || has_cache )); then
       room=$(( total / 8 ))
     else
@@ -6444,7 +6472,7 @@ plan_memory_budget() {
     (( add > 0 )) && OPT_ES_BUDGET_MB=$(( OPT_ES_BUDGET_MB + add ))
   fi
   leftover=$(( usable - OPT_PHP_BUDGET_MB - OPT_MARIADB_BUDGET_MB - OPT_VALKEY_BUDGET_MB - OPT_ES_BUDGET_MB ))
-  if (( leftover > 0 && has_maria && db_spare_ok && db_cap > OPT_MARIADB_BUDGET_MB )); then
+  if (( leftover > 0 && has_maria && db_spare_ok && OPT_MARIADB_KEPT_MB == 0 && db_cap > OPT_MARIADB_BUDGET_MB )); then
     if (( has_php || has_es || has_cache )); then
       room=$(( total / 4 ))
     else
@@ -7765,6 +7793,33 @@ valkey_mb_from_config() {
   esac
 }
 
+# Live cache working set in MB, read from the running Valkey/Redis.  Used by
+# the planner so maxmemory can never be sized below data that is already
+# stored (or its 10% headroom).  Returns non-zero when no server is reachable.
+valkey_live_used_mb() {
+  local cli="" sock="" used
+  if [[ -S /run/valkey/valkey.sock ]] && command -v valkey-cli >/dev/null 2>&1; then
+    cli=valkey-cli; sock=/run/valkey/valkey.sock
+  elif [[ -S /run/redis/redis.sock ]] && command -v redis-cli >/dev/null 2>&1; then
+    cli=redis-cli; sock=/run/redis/redis.sock
+  elif command -v valkey-cli >/dev/null 2>&1; then
+    cli=valkey-cli
+  elif command -v redis-cli >/dev/null 2>&1; then
+    cli=redis-cli
+  else
+    return 1
+  fi
+  if [[ -n $sock ]]; then
+    used=$("$cli" -s "$sock" info memory 2>/dev/null || true)
+  else
+    used=$("$cli" info memory 2>/dev/null || true)
+  fi
+  used=$(printf '%s\n' "$used" \
+    | awk -F: '/^used_memory:/{gsub(/\r/, "", $2); print int($2 / 1048576); exit}')
+  [[ $used =~ ^[0-9]+$ ]] || return 1
+  printf '%s' "$used"
+}
+
 restart_php_workers_for_group() {
   local group=$1 unit
   while IFS= read -r unit; do
@@ -7826,6 +7881,9 @@ optimize_valkey() {
         max_mb=$needed_mb
       fi
     fi
+  fi
+  if [[ ${OPT_VALKEY_LIVE_MB:-0} -gt 0 ]]; then
+    opt_report "- Live working set=${OPT_VALKEY_LIVE_MB}mb; maxmemory=${max_mb}mb (10% headroom)"
   fi
   policy=$(awk '/^[[:space:]]*maxmemory-policy[[:space:]]/{print $2; exit}' "$conf")
   [[ -n $policy ]] || policy=allkeys-lru

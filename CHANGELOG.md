@@ -2,6 +2,31 @@
 
 Historical release notes for ubuntu-setup-script. Current behavior is documented in README.md.
 
+## What's new in 1.8.55
+
+- **Live working sets are budgeted and never shrunk unnecessarily.**
+  `--optimize` now treats a running service's current allocation as a floor
+  when it already covers the live data and still fits its share of the 80%
+  RAM budget:
+  - MariaDB: `information_schema` data+index size +5% is the target; a live
+    buffer pool at or above that target is kept while it stays under
+    `db_cap`, instead of being reduced to the target and forcing a restart and
+    a cold buffer pool.
+  - Elasticsearch: `_cluster/stats` store size +5% is the target; a live heap
+    at or above it is kept under `es_cap` for the same reason.
+  - Valkey/Redis: `used_memory` is read from the live server and
+    `used_memory * 1.1` becomes a floor in the planner *before* MariaDB and
+    Elasticsearch are sized, so the protection in `optimize_valkey()` cannot
+    overcommit the shared budget. The report prints the live working set.
+  - Sizing still respects the total RAM cap: if the data does not fit, the
+    pool/heap is capped at its budget share and the report says so.
+- The spare-RAM top-up no longer overrides a kept live allocation.
+- On the test host this keeps MariaDB at 6776 MB (54 MB live data),
+  Elasticsearch at 3072 MB (0.3 MB index) and Valkey at 2781 MB (1 MB used),
+  with every service reporting "configuration already optimized".
+- Tests: 352 tuning checks (live pool/heap kept, Valkey floor, budget caps)
+  and the existing 86 dry-run cases.
+
 ## What's new in 1.8.54
 
 - **The `--sync-angie` CLI option is removed.** Angie synchronization is
