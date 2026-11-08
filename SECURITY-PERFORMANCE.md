@@ -186,10 +186,10 @@ Recommended changes / additions:
 - Add a WAF at the edge (Cloudflare, Coraza/ModSecurity in front of Angie, or a
   separate reverse proxy). The embedded Naxsi/ngx_waf configs cannot be enabled
   on this Angie build.
-- Angie access logs are disabled by default for performance (only
-  `error_log` is written). If you need forensics or fail2ban web jails, enable
-  a buffered per-vhost log (`access_log ... buffer=64k flush=5s;`) and ship it
-  off-box; do not make it the default on a high-request site.
+- Angie writes a buffered access log by default
+  (`/var/www/logs/angie/access.log`, `buffer=64k flush=5s`) so an intrusion
+  can be investigated; `/etc/logrotate.d/setup-logs` keeps 14 days. Ship it
+  off-box for longer retention or fail2ban web jails.
 - Add `limit_req` to login/registration/password-reset endpoints with tighter
   rates than the general PHP limit.
 - Use `client_max_body_size` per app. 100 MB is fine for XenForo/Lychee large
@@ -266,10 +266,13 @@ Already good:
 
 Recommended changes:
 
-- **Create per-application users** limited to their own database and required
-  privileges. The setup `demo` user has `ALL ... WITH GRANT OPTION` and is used
-  by the backup job. Do not put that account in XenForo/WordPress config.
-- Rotate the demo/admin password; it is written to `/etc/mysqlbkup.cnf`.
+- **Per-application users**: the setup `demo` account keeps
+  `ALL ... WITH GRANT OPTION` for the backup job. `setup.sh --optimize` now
+  moves every WordPress `DB_USER` that has global privileges to a `wp_<db>`
+  account scoped to that database, with a connection test and automatic
+  rollback. XenForo and custom apps still need the same treatment manually.
+- The demo/admin password is written to `/etc/mysqlbkup.cnf`, which the
+  installer now leaves `root:root 600`.
 - Enable binary logs (`log_bin`, `binlog_format=ROW`,
   `binlog_expire_logs_seconds`) if you need point-in-time recovery. This adds
   write I/O; test it.
@@ -367,8 +370,10 @@ Already good:
 
 - UFW default deny incoming, allow outgoing; every effective SSH port is
   rate-limited with `ufw limit`, and 80/443 are allowed.
-- `sysstat` history is optional (`--others sysstat`); fail2ban and
-  unattended-upgrades are not installed by this script.
+- `sysstat` history is optional (`--others sysstat`). `--basic` installs and
+  enables `unattended-upgrades` and a fail2ban `sshd` jail; `--optimize` only
+  enables them when already installed. `--harden-ssh` switches to keys-only
+  access after confirming `/root/.ssh/authorized_keys` is present.
 - BBR/fq, large connection backlogs, file-max/nr_open, security sysctls,
   protected links/symlinks/fifos/regular files. A sysctl.d drop-in keeps fq
   as the default qdisc when a package upgrade restarts systemd-sysctl.

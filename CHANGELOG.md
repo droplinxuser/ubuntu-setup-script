@@ -2,6 +2,39 @@
 
 Historical release notes for ubuntu-setup-script. Current behavior is documented in README.md.
 
+## What's new in 1.8.58
+
+- **A security pass now runs on every `--basic` install and every
+  `--optimize`.** It is idempotent and also works on existing WordPress trees.
+  - `wp-config.php` -> `root:www-data 640`; the nightly `chown` cron no longer
+    resets it to `www-data`.
+  - Adds `DISALLOW_FILE_EDIT`, `DISALLOW_FILE_MODS`
+    (`SETUP_WP_ALLOW_FILE_MODS=1` skips it), `DISABLE_WP_CRON`,
+    `WP_DEBUG_DISPLAY=false`, `FORCE_SSL_ADMIN`; replaces placeholder salts.
+  - Adds the managed `*/5` `wp-cron.php` crontab entry before disabling
+    WP-Cron, so scheduled work still runs.
+  - Replaces a WordPress database user that has global privileges with a
+    per-site `wp_<db>` account limited to its own database. The connection is
+    tested and the original credentials are restored automatically on failure
+    (`SETUP_WP_DB_SPLIT=0` skips this step).
+  - Quarantines known WordPress webshells (`wp-vcd.php`, `wp-tmp.php`,
+    `wp-feed.php`, WP2SHELL markers and hex-named plugin directories) to
+    `/var/lib/setup-quarantine/` and reports suspicious administrators,
+    high-risk plugins, world-writable files and oversized archives.
+    `SETUP_PURGE_MALWARE=1` deletes instead of quarantining.
+  - Installs and enables `unattended-upgrades` and a fail2ban `sshd` jail from
+    `--basic`; `--optimize` only enables them when they are already installed.
+    MariaDB dumps are kept for 30 days and `/etc/mysqlbkup.cnf` is `root:root
+    600` so the PHP user cannot read the admin password.
+  - Reports SSH password authentication, public 80/443 rules and a
+    non-loopback Elasticsearch before they are exploited.
+  - New opt-in flags: `--harden-ssh` (keys-only; refuses without
+    `/root/.ssh/authorized_keys`) and `--cloudflare-only` (80/443 allowed only
+    from the published Cloudflare ranges).
+- Requires the Angie configuration repository at 1.6.17 for the matching web
+  server rules: dotfile/sensitive-file denies, no PHP in uploads/backups,
+  `Permissions-Policy`, and a buffered access log.
+
 ## What's new in 1.8.57
 
 - **No RAM is overcommitted to a data service beyond its live working set.**
