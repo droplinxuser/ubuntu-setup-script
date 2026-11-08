@@ -2,6 +2,66 @@
 
 Historical release notes for ubuntu-setup-script. Current behavior is documented in README.md.
 
+## What's new in 1.8.52
+
+- **Install and `--optimize` now leave byte-identical managed configuration.**
+  On a clean Ubuntu 26.04 host (16 threads, 27.8 GB RAM, NVMe) a full-stack
+  install followed by `--optimize` produced an empty diff across `/etc/angie`,
+  `/etc/php`, `/etc/mysql`, `/etc/valkey`, `/etc/elasticsearch`, systemd
+  drop-ins, sysctl, limits, cron and logrotate, and every service reported
+  "configuration already optimized". MariaDB performance and logging
+  directives now have one owner: `write_mariadb_tuning_dropin()` writes
+  `99-setup-optimize.cnf` from both paths instead of the installer embedding a
+  second block in `50-server.cnf`.
+- **The first `--optimize` no longer shrinks a fresh MariaDB.** A newly
+  initialised database reports a few MB of system tables; the planner treated
+  that as a populated working set and dropped the pool from the installer's
+  6776 MB to its 1738 MB floor on the test host. A database whose working set
+  already fits inside the hardware floor is now treated like an empty one and
+  may grow into the spare budget (up to RAM/4).
+- **Explicit operator sizes survive tuning.** `--php children=`,
+  `--php max_requests=`, `--mariadb size=`, `--valkey ram=` and
+  `--elastic ram=` are recorded in `/var/lib/setup.sh/explicit-options.conf`
+  and honoured by later `--optimize` runs. Previously the first tune replaced
+  a requested 2 GB Valkey with the planner's 2.7 GB and re-derived
+  `pm.max_requests`.
+- **CPU and disk sizing follow the real host.** New `effective_cpus()` honours
+  the cgroup v2/v1 CPU quota (a 2-vCPU container no longer receives 144 PHP
+  workers and 16 MariaDB I/O threads), and `storage_backing_class()` resolves
+  the device that actually backs `/var/www` instead of classifying any NVMe
+  device on the host. NVMe now keeps the 4000/8000 IOPS profile; a SATA boot
+  disk with an NVMe scratch disk no longer inherits it.
+- **Angie's PHP upstream keepalive scales with the FPM pool.** It was
+  `nproc*2` (32 on the 16-thread host) against 144 workers; it is now
+  `max_children/2` (72), capped at 16..512.
+- **Elasticsearch thread pools scale with the host.** Managed
+  `thread_pool.search.size` (CPU/2, 4..16) and `thread_pool.write.size`
+  (CPU/4, 2..8) bound the bursts that reached ten cores on a single
+  match query. Throughput was unchanged (9.5k -> 9.7k req/s) while CPU
+  spreading and co-tenancy improved. The base YAML block, single-node replica
+  repair and index template are now applied at install time as well as by
+  `--optimize`, `vm.max_map_count` is always persisted, and the Valkey
+  `ReadWritePaths` drop-in is shared by both paths.
+- **A live MariaDB ceiling above 2000 connections is preserved.** The 2000
+  cap now applies only to the computed value, not to a kept live ceiling.
+- **Swap creation checks free disk.** A 50%-of-RAM target on a small VPS no
+  longer fills `/`; at least 256 MiB must remain free.
+- **XenForo static assets get immutable caching.** `tune_xf_static_assets()`
+  adds one idempotent 30-day `Cache-Control: public, immutable` location for
+  `/js`, `/styles` and `/data`, re-applied after each Angie repository sync.
+- **Install order matches `--optimize` for the WordPress cache**, and
+  `purge_php_installations()` no longer trips the ERR trap when no PHP package
+  is installed (the `sort -u` SIGPIPE).
+- **Measured on the test host** (loopback, 8 s per scenario): static 201k
+  req/s, PHP hello 122k, MariaDB 27.8k, Valkey 30.5k, Elasticsearch 9.7k,
+  Node.js 30.7k, full four-service page 7.1k, guest FastCGI cache 117-121k.
+  XenForo 2.3.13 with 200 threads: guest forum list 17k (compressed HTML),
+  guest thread 15.5k, authenticated forum list 1.36k (+25% after disabling the
+  Featured/Trending/Members-online widgets), authenticated thread 1.11k.
+  Valkey-backed XF sessions/registry measured 2% slower than MariaDB on this
+  single host, so DB sessions remain the default and page/session caching stay
+  documented rather than enabled.
+
 ## What's new in 1.8.51
 
 - **The Angie tree deployer is part of setup.sh and `--sync-angie` is a

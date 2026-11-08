@@ -127,6 +127,17 @@ no_slow_admin_alias() { ! mariadb_logging_settings | grep -q '^log_slow_admin_st
 check "MariaDB logging helper omits the deprecated slow-admin alias" \
   no_slow_admin_alias
 
+# Disk classification must follow the device that actually backs /var/www.
+findmnt() { printf '%s\n' "${FINDMNT_SRC:-/dev/null}"; }
+lsblk() { printf '%s\n' "${LSBLK_OUT:-}"; }
+LSBLK_OUT=$'nvme0n1p4 part\n└─nvme0n1 disk'
+check "storage class follows the mounted NVMe parent" \
+  test "$(storage_backing_class /var/www)" = nvme
+LSBLK_OUT=$'sda1 part\n└─sda disk'
+check "storage class reports hdd for a spinning parent" \
+  test "$(storage_backing_class /var/www)" = hdd
+unset -f findmnt lsblk
+
 # Older releases wrote performance directives bare in 50-server.cnf, without
 # the managed markers.  Once the 99- drop-in exists, all of them must leave
 # 50-server.cnf while base settings remain.
@@ -497,6 +508,18 @@ check "XF cache repair is idempotent" \
 tune_reset_changes
 tune_xf_cache_vary "$TMP/xf-cache.conf"
 check "XF cache repair records no second change" test "${#TUNE_CHANGES[@]}" -eq 0
+
+# Static assets get one immutable, 30-day location block.
+printf '    ### End Xenforo\n' > "$TMP/xf2.conf"
+tune_reset_changes
+tune_xf_static_assets "$TMP/xf2.conf"
+check "XF static assets get a 30-day immutable cache" \
+  grep -q 'public, immutable' "$TMP/xf2.conf"
+check "XF static asset repair is idempotent" \
+  test "$(grep -c 'static asset cache' "$TMP/xf2.conf")" -eq 1
+tune_reset_changes
+tune_xf_static_assets "$TMP/xf2.conf"
+check "XF static asset repair records no second change" test "${#TUNE_CHANGES[@]}" -eq 0
 
 # ---------------------------------------------------------------------------
 # FastCGI snippet and server-level index repair (pretty URLs)
@@ -922,8 +945,10 @@ check "database-fit plan stays inside the 80% budget" \
   test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
        -le $(( 65536 * 80 / 100 ))
 
-# A freshly installed database can be only a few MB.  Do not collapse the
-# buffer pool on a large host; keep a 1/16-RAM floor (capped at 8 GB).
+# A freshly installed database can be only a few MB.  Keep the 1/16-RAM floor
+# (capped at 8 GB) and let the empty database grow into spare budget up to
+# RAM/4, exactly like the fresh-install plan, so the first --optimize cannot
+# shrink what the installer sized.
 mem_total_mb() { printf '262144'; }
 mariadb_current_pool_mb() { printf '0'; }
 mariadb_data_size_mb() { printf '81'; }
@@ -932,7 +957,9 @@ php_pool_max_children() { printf '128'; }
 OPT_DETECTED=(angie php:8.4 mariadb valkey elastic)
 plan_memory_budget
 check "tiny fresh database keeps the hardware-scaled floor" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 8192
+  test "$OPT_MARIADB_BUDGET_MB" -ge 8192
+check "tiny fresh database may use spare budget up to RAM/4" \
+  test "$OPT_MARIADB_BUDGET_MB" -le $(( 262144 / 4 ))
 check "tiny database floor stays inside the 80% budget" \
   test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
        -le $(( 262144 * 80 / 100 ))
@@ -1574,8 +1601,28 @@ check "fresh install full-stack plan stays inside the 80% budget" \
   test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
        -le $(( 27812 * 80 / 100 ))
 
+# A database that has just been initialised reports a few MB of system data.
+# The first --optimize must not mistake that for a populated working set and
+# shrink the installer's spare-RAM buffer pool back to the 1/16-RAM floor.
+mariadb_data_size_mb() { printf '4'; }
+OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
+OPT_INSTALL_PLAN=0
+plan_memory_budget
+check "measured-empty database keeps the spare-RAM growth budget" \
+  test "$OPT_MARIADB_BUDGET_MB" -gt 1738
+
+# An existing server may already allow more than the computed thread*32
+# ceiling.  A tune must preserve it instead of rewriting it to 2000.
+systemctl() { return 0; }
+mariadb() { printf '5000\n'; }
+mariadb_compute_profile 4096
+check "existing max_connections above 2000 is preserved" \
+  test "$MARIADB_PROFILE_MAX_CONN" -eq 5000
+unset -f mariadb systemctl
+
 # A database-only host has no competing service, so it must keep the larger
 # 80%-of-usable fallback instead of the shared-host floor.
+mariadb_data_size_mb() { return 0; }
 OPT_DETECTED=(mariadb)
 OPT_INSTALL_PLAN=1
 plan_memory_budget
