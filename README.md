@@ -240,6 +240,46 @@ Before changing basic settings, the script records the originals under `/var/lib
 
 ---
 
+## Security hardening
+
+Every `--basic` install and every `--optimize` run finishes with an idempotent
+security pass. It is safe to re-run and also upgrades existing WordPress trees.
+
+| Area | Action |
+| --- | --- |
+| `wp-config.php` | `root:www-data 640`; the nightly chown cron skips it |
+| WordPress constants | `DISALLOW_FILE_EDIT`, `DISALLOW_FILE_MODS`, `DISABLE_WP_CRON`, `WP_DEBUG_DISPLAY=false`, `FORCE_SSL_ADMIN`; placeholder salts replaced |
+| WP-Cron | managed `*/5` `wp-cron.php` entry added before WP-Cron is disabled |
+| Database users | a `DB_USER` with global privileges is replaced by `wp_<db>`, scoped to that database, with a connection test and rollback |
+| Malware | known webshells (WP-VCD, WP2SHELL, hex-named plugins) quarantined to `/var/lib/setup-quarantine/`; suspicious admins and high-risk plugins reported |
+| Files | world-writable files/dirs fixed; oversized archives inside the web root reported |
+| OS | `unattended-upgrades` and a fail2ban `sshd` jail installed by `--basic`, enabled by `--optimize` when present; MariaDB dumps kept 30 days and `/etc/mysqlbkup.cnf` is `root:root 600` |
+| Audit | reports SSH password auth, public 80/443, and a non-loopback Elasticsearch |
+
+Opt-in flags for changes that can affect reachability:
+
+```bash
+# Keys-only SSH. Refuses to run if /root/.ssh/authorized_keys is missing.
+sudo bash setup.sh --optimize --harden-ssh
+
+# Allow 80/443 only from the Cloudflare ranges in
+# /etc/angie/http.d/cloudflare.conf (direct-to-origin access stops working).
+sudo bash setup.sh --optimize --cloudflare-only
+```
+
+Environment overrides:
+
+| Variable | Effect |
+| --- | --- |
+| `SETUP_WP_DB_SPLIT=0` | keep the existing WordPress database user |
+| `SETUP_WP_ALLOW_FILE_MODS=1` | do not set `DISALLOW_FILE_MODS` (admin plugin installs stay enabled) |
+| `SETUP_PURGE_MALWARE=1` | delete quarantined malware instead of keeping it |
+| `SETUP_ACCESS_LOG=0` | (Angie repo) restore `access_log off` on very high-traffic hosts |
+
+The web-server side of the same work (dotfile and `wp-config.php`/`xmlrpc.php`
+denies, no PHP in uploads/backups, `Permissions-Policy`, buffered access log)
+lives in `server-configs-nginx` 1.6.17 and is deployed by the same commands.
+
 ## Services
 
 ### Angie (`--angie`)
