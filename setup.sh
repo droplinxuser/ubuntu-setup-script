@@ -6055,6 +6055,24 @@ mariadb_data_size_mb() {
   printf '%s' $(( bytes / 1024 / 1024 ))
 }
 
+# Fallback when SQL is unavailable (served stopped): estimate the live store
+# from the data directory.  Used only when the exact query cannot run.
+mariadb_data_dir_size_mb() {
+  local dir
+  dir=$(mariadb -N -B -e 'SELECT @@datadir' 2>/dev/null | head -n1 || true)
+  if [[ -z $dir || ! -d $dir ]]; then
+    for dir in /var/lib/mariadb /var/lib/mysql; do
+      [[ -d $dir ]] && break
+    done
+  fi
+  [[ -d $dir ]] || { printf '0'; return 0; }
+  local mb=""
+  mb=$(du -sm "$dir" 2>/dev/null | awk 'NR==1 { print $1 }' || true)
+  [[ $mb =~ ^[0-9]+$ ]] || mb=0
+  printf '%s' "$mb"
+  return 0
+}
+
 # The live buffer pool, in MB.  Used to avoid shrinking a pool an operator
 # already sized for this host.
 mariadb_current_pool_mb() {
@@ -6143,6 +6161,17 @@ elasticsearch_data_size_mb() {
   printf '%s' $(( bytes / 1024 / 1024 ))
 }
 
+# Fallback when the HTTP API is unavailable: estimate the index store from
+# the Elasticsearch data directory.
+elasticsearch_data_dir_size_mb() {
+  local dir=/var/lib/elasticsearch mb=""
+  [[ -d $dir ]] || { printf '0'; return 0; }
+  mb=$(du -sm "$dir" 2>/dev/null | awk 'NR==1 { print $1 }' || true)
+  [[ $mb =~ ^[0-9]+$ ]] || mb=0
+  printf '%s' "$mb"
+  return 0
+}
+
 # Current JVM heap in MB.  Prefer the live node stats, then the -Xmx value
 # from jvm.options.d, so an operator-sized heap is not shrunk.
 elasticsearch_current_heap_mb() {
@@ -6177,15 +6206,15 @@ elasticsearch_current_heap_mb() {
 
 plan_memory_budget() {
   local total usable
-  local has_php=0 has_angie=0 has_maria=0 has_cache=0 has_es=0
+  local has_php=0 has_maria=0 has_cache=0 has_es=0
   local cpu=1 allowance=64 php_capacity=0 php_floor=0 php_budget=0 children=0
   local maria_target=0 valkey_target=0 es_target=0
   local maria_alloc=0 valkey_alloc=0 es_alloc=0
-  local data="" db_floor=0 current_pool=0 kept_pool=0
+  local data="" current_pool=0 kept_pool=0
   local cache_used=""
   local es_store="" es_kept=0 current_heap=0
   local remaining data_pool targets_sum alloc_total excess dec
-  local explicit="" room_pct
+  local explicit=""
 
   total=$(mem_total_mb)
   (( total > 0 )) || total=1024
@@ -6205,7 +6234,6 @@ plan_memory_budget() {
   OPT_ES_SIZE_MB=0
 
   [[ " ${OPT_DETECTED[*]} " == *" php:"* ]] && has_php=1
-  [[ " ${OPT_DETECTED[*]} " == *" angie "* ]] && has_angie=1
   [[ " ${OPT_DETECTED[*]} " == *" mariadb "* ]] && has_maria=1
   [[ " ${OPT_DETECTED[*]} " == *" valkey "* || " ${OPT_DETECTED[*]} " == *" redis "* ]] && has_cache=1
   [[ " ${OPT_DETECTED[*]} " == *" elastic "* ]] && has_es=1
@@ -6246,42 +6274,21 @@ plan_memory_budget() {
     (( php_floor > usable / 2 )) && php_floor=$(( usable / 2 ))
   fi
 
-  # MariaDB target: live data+index +5%, or a stability floor when the
-  # database is empty (fresh install).  A live pool is only kept when it is
-  # already within 2% of that target; a grossly oversized pool is reduced so
-  # the freed RAM can go to the other services.
-  db_floor=$(( total / 16 ))
-  (( db_floor > 8192 )) && db_floor=8192
-  (( db_floor < 256 )) && db_floor=256
+  # MariaDB target: live data+index plus at most 20% headroom.  Nothing is
+  # added for an empty database beyond a small operational minimum, so spare
+  # RAM is not wasted on an idle buffer pool.
   if (( has_maria )); then
     explicit=$(explicit_option mariadb_size_mb 2>/dev/null || true)
-    if [[ $explicit =~ ^[0-9]+$ ]] && (( explicit >= 256 )); then
+    if [[ $explicit =~ ^[0-9]+$ ]] && (( explicit >= 128 )); then
       maria_target=$explicit
     else
       data=$(mariadb_data_size_mb)
-      if [[ $data =~ ^[0-9]+$ ]]; then
-        OPT_DB_SIZE_MB=$data
-        if (( data > 0 )); then
-          maria_target=$(( data * 105 / 100 ))
-          (( maria_target < db_floor )) && maria_target=$db_floor
-        else
-          maria_target=$db_floor
-        fi
-      elif (( OPT_INSTALL_PLAN )); then
-        if (( has_php || has_es )); then
-          maria_target=$db_floor
-        else
-          maria_target=$(( total * 80 / 100 ))
-        fi
-      else
-        if (( !has_php && !has_cache && !has_es )); then
-          maria_target=$(( total * 80 / 100 ))
-        else
-          maria_target=$(( total * 40 / 100 ))
-        fi
-      fi
+      [[ $data =~ ^[0-9]+$ ]] || data=$(mariadb_data_dir_size_mb)
+      [[ $data =~ ^[0-9]+$ ]] || data=0
+      OPT_DB_SIZE_MB=$data
+      maria_target=$(( data * 120 / 100 ))
+      (( maria_target < 128 )) && maria_target=128
     fi
-    (( maria_target < 256 )) && maria_target=256
     current_pool=$(mariadb_current_pool_mb)
     if [[ $current_pool =~ ^[0-9]+$ ]] && (( current_pool > 0 )); then
       if (( current_pool * 100 <= maria_target * 102 \
@@ -6292,8 +6299,8 @@ plan_memory_budget() {
     fi
   fi
 
-  # Valkey target: live used_memory +10% headroom when the cache already has
-  # data; an empty cache keeps the growth-oriented percentage plan.
+  # Valkey target: live used_memory plus at most 20% headroom.  An empty or
+  # stopped cache gets the small operational minimum, not a RAM percentage.
   if (( has_cache )); then
     explicit=$(explicit_option valkey_mb 2>/dev/null || true)
     if [[ $explicit =~ ^[0-9]+$ ]] && (( explicit >= 1 )); then
@@ -6302,62 +6309,30 @@ plan_memory_budget() {
       if (( ! OPT_INSTALL_PLAN )); then
         cache_used=$(valkey_live_used_mb 2>/dev/null || true)
       fi
-      room_pct=10
-      local cache_cap=8192
-      if (( !has_maria && !has_es )); then
-        if (( has_angie || has_php )); then
-          room_pct=25
-          cache_cap=32768
-        else
-          room_pct=50
-          cache_cap=65536
-        fi
-      fi
-      valkey_target=$(( total * room_pct / 100 ))
-      (( valkey_target > cache_cap )) && valkey_target=$cache_cap
-      if [[ $cache_used =~ ^[0-9]+$ ]] && (( cache_used > 0 )); then
+      [[ $cache_used =~ ^[0-9]+$ ]] || cache_used=$(valkey_data_size_mb)
+      [[ $cache_used =~ ^[0-9]+$ ]] || cache_used=0
+      if (( cache_used > 0 )); then
         OPT_VALKEY_LIVE_MB=$cache_used
-        local cache_floor=$(( cache_used * 110 / 100 ))
-        (( cache_floor < 256 )) && cache_floor=256
-        (( cache_floor > valkey_target )) && valkey_target=$cache_floor
       fi
+      valkey_target=$(( cache_used * 120 / 100 ))
+      (( valkey_target < 128 )) && valkey_target=128
     fi
-    (( valkey_target < 256 )) && valkey_target=256
+    (( valkey_target < 128 )) && valkey_target=128
   fi
 
-  # Elasticsearch target: live index store +5% when the store is populated,
-  # a small hardware-scaled floor for an empty/new index, and the standard
-  # percentage only when the store cannot be measured at all.
+  # Elasticsearch target: live index store plus at most 20% headroom, with a
+  # 512 MB operational minimum for an empty index; no RAM-percentage fallback.
   if (( has_es )); then
     explicit=$(explicit_option elastic_mb 2>/dev/null || true)
     if [[ $explicit =~ ^[0-9]+$ ]] && (( explicit >= 1 )); then
       es_target=$explicit
     else
       es_store=$(elasticsearch_data_size_mb)
-      if [[ $es_store =~ ^[0-9]+$ ]]; then
-        OPT_ES_SIZE_MB=$es_store
-        if (( es_store > 0 )); then
-          es_target=$(( es_store * 105 / 100 ))
-        else
-          es_target=$(( total / 16 ))
-          (( es_target < 512 )) && es_target=512
-          (( es_target > 4096 )) && es_target=4096
-        fi
-      elif (( OPT_INSTALL_PLAN )) && (( has_maria )); then
-        es_target=$(( total / 16 ))
-        (( es_target < 512 )) && es_target=512
-        (( es_target > 4096 )) && es_target=4096
-      else
-        local es_cap=31744
-        if (( has_php || has_maria )); then es_cap=8192; fi
-        if (( !has_angie && !has_php && !has_maria && !has_cache )); then
-          es_target=$(( total * 50 / 100 ))
-        else
-          es_target=$(( total * 25 / 100 ))
-        fi
-        (( es_target > es_cap )) && es_target=$es_cap
-        (( es_target < 512 )) && es_target=512
-      fi
+      [[ $es_store =~ ^[0-9]+$ ]] || es_store=$(elasticsearch_data_dir_size_mb)
+      [[ $es_store =~ ^[0-9]+$ ]] || es_store=0
+      OPT_ES_SIZE_MB=$es_store
+      es_target=$(( es_store * 120 / 100 ))
+      (( es_target < 512 )) && es_target=512
     fi
     (( es_target < 512 )) && es_target=512
     (( es_target > 31744 )) && es_target=31744
@@ -7732,7 +7707,7 @@ valkey_mb_from_config() {
 
 # Live cache working set in MB, read from the running Valkey/Redis.  Used by
 # the planner so maxmemory can never be sized below data that is already
-# stored (or its 10% headroom).  Returns non-zero when no server is reachable.
+# stored (or its 20% headroom).  Returns non-zero when no server is reachable.
 valkey_live_used_mb() {
   local cli="" sock="" used
   if [[ -S /run/valkey/valkey.sock ]] && command -v valkey-cli >/dev/null 2>&1; then
@@ -7755,6 +7730,20 @@ valkey_live_used_mb() {
     | awk -F: '/^used_memory:/{gsub(/\r/, "", $2); print int($2 / 1048576); exit}')
   [[ $used =~ ^[0-9]+$ ]] || return 1
   printf '%s' "$used"
+}
+
+# Fallback working set when the cache is stopped: the RDB snapshot size.
+valkey_data_size_mb() {
+  local file size
+  for file in /var/lib/valkey/dump.rdb /var/lib/redis/dump.rdb; do
+    [[ -f $file ]] || continue
+    size=$(stat -c %s "$file" 2>/dev/null || echo 0)
+    [[ $size =~ ^[0-9]+$ ]] || size=0
+    printf '%s' $(( size / 1024 / 1024 ))
+    return 0
+  done
+  printf '0'
+  return 0
 }
 
 restart_php_workers_for_group() {
@@ -7805,7 +7794,7 @@ optimize_valkey() {
     used_mb=$("$cli" info memory 2>/dev/null \
       | awk -F: '/^used_memory:/{gsub(/\r/, "", $2); print int($2 / 1048576)}')
     [[ $used_mb =~ ^[0-9]+$ ]] || used_mb=0
-    needed_mb=$(( used_mb * 110 / 100 ))
+    needed_mb=$(( used_mb * 120 / 100 ))
     if (( needed_mb > max_mb )); then
       local hard_cap
       hard_cap=$(( ${OPT_MEM_TOTAL_MB:-$(mem_total_mb)} * 80 / 100 ))
@@ -7820,7 +7809,7 @@ optimize_valkey() {
     fi
   fi
   if [[ ${OPT_VALKEY_LIVE_MB:-0} -gt 0 ]]; then
-    opt_report "- Live working set=${OPT_VALKEY_LIVE_MB}mb; maxmemory=${max_mb}mb (10% headroom)"
+    opt_report "- Live working set=${OPT_VALKEY_LIVE_MB}mb; maxmemory=${max_mb}mb (live + up to 20%, 128 MB minimum)"
   fi
   policy=$(awk '/^[[:space:]]*maxmemory-policy[[:space:]]/{print $2; exit}' "$conf")
   [[ -n $policy ]] || policy=allkeys-lru

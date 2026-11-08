@@ -2,6 +2,29 @@
 
 Historical release notes for ubuntu-setup-script. Current behavior is documented in README.md.
 
+## What's new in 1.8.57
+
+- **No RAM is overcommitted to a data service beyond its live working set.**
+  MariaDB, Valkey and Elasticsearch are now sized from measured live data with
+  at most **20% headroom**:
+  - MariaDB: `information_schema` data+index (or the data-directory size when
+    SQL is unavailable) ×1.20, minimum 128 MB.
+  - Valkey/Redis: live `used_memory` (or the RDB size when stopped) ×1.20,
+    minimum 128 MB.
+  - Elasticsearch: `_cluster/stats` index store (or the data-directory size)
+    ×1.20, minimum 512 MB, 31 GB ceiling.
+  The former `RAM/16` floors, 10/25/50% cache plans and 25/40/80% unmeasured
+  fallbacks are gone; an empty service gets only its operational minimum.
+  Any remaining memory stays with PHP (CPU-capped) and the OS page cache.
+- Targets are still reserved before PHP and scaled proportionally if they
+  cannot all fit, trimmed Elasticsearch → Valkey → MariaDB, so headroom is a
+  maximum rather than a guarantee.
+- On the 16-thread / 27.8 GB host with a 54 MB database, 1 MB cache and empty
+  index: `PHP=9216 MariaDB=128 Cache=128 Elasticsearch=512 MB`; all services
+  stay active and the forum keeps serving 200s.
+- Tests: 358 tuning checks (20% targets, minima, proportional caps, dynamic
+  installed sets) and 86 dry-run cases.
+
 ## What's new in 1.8.56
 
 - **Live data services are funded first, then the remainder goes to the

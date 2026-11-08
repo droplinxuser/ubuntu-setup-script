@@ -523,18 +523,21 @@ TTLs). The repair is idempotent and runs both on install and on `--optimize`,
 so an older host gets the same guest cache as a fresh `app=xf` or
 `app=wordpress` vhost.
 
-Live data is funded first. MariaDB gets its live `information_schema`
-data+index size plus 5% (with the hardware floor for an empty/tiny database);
-Valkey gets live `used_memory` plus 10% (or the growth percentage when the
-cache is empty); Elasticsearch gets the live index store plus 5% (with a small
-floor for an empty index). PHP-FPM is sized after those targets from what
-remains (CPU-capped, 8-worker floor), and unallocated memory stays with the OS
-page cache. If all live targets cannot fit, they are scaled proportionally and
-trimmed Elasticsearch first, then Valkey, then MariaDB; the report says when a
-store does not fully fit. The rules adapt to the installed set (MariaDB-only,
-MariaDB+Valkey, MariaDB+Elasticsearch, cache-only, search-only, full stack).
-A pool/heap grossly above its target is reduced so the freed RAM can serve the
-request tier; a value within 2% of the target is kept to avoid restart churn.
+Live data is funded first, with at most **20% headroom**. MariaDB gets its live
+`information_schema` data+index size ×1.20 (or the data-directory size when
+SQL is unavailable; 128 MB minimum). Valkey gets live `used_memory` ×1.20 (or
+the RDB size when stopped; 128 MB minimum). Elasticsearch gets the live index
+store ×1.20 (or the data-directory size; 512 MB minimum, 31 GB ceiling).
+There are no RAM-percentage plans or large floors: an empty service gets only
+its operational minimum, so spare RAM is not wasted. PHP-FPM is sized after
+those targets from what remains (CPU-capped, 8-worker floor), and unallocated
+memory stays with the OS page cache. If the targets cannot all fit, they are
+scaled proportionally and trimmed Elasticsearch first, then Valkey, then
+MariaDB; the report says when a store does not fully fit. The rules adapt to
+the installed set (MariaDB-only, MariaDB+Valkey, MariaDB+Elasticsearch,
+cache-only, search-only, full stack). A pool/heap grossly above its target is
+reduced so the freed RAM can serve the request tier; a value within 2% of the
+target is kept to avoid restart churn.
 
 `--optimize` audits WordPress (`wp-config.php`) and XenForo
 (`src/config.php`) installations under `/var/www`. The report lists the config
