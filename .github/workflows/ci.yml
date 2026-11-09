@@ -18,6 +18,8 @@ jobs:
           bash -n tests/test-tuning.sh
           bash -n tests/stress-site/setup-stress-site.sh
           bash -n tests/stress-site/run-stress.sh
+          bash -n tests/stress-site/run-stress-remote.sh
+          bash -n tests/stress-site/collect-metrics.sh
           bash -n tools/diff_configs.sh
 
       - name: ShellCheck
@@ -25,7 +27,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y shellcheck
           shellcheck -S warning setup.sh tests/test-dry-run-matrix.sh tests/test-tuning.sh \
-            tests/stress-site/setup-stress-site.sh tests/stress-site/run-stress.sh tools/diff_configs.sh
+            tests/stress-site/setup-stress-site.sh tests/stress-site/run-stress.sh \
+            tests/stress-site/run-stress-remote.sh tests/stress-site/collect-metrics.sh tools/diff_configs.sh
 
       - name: Dry-run matrix
         run: bash tests/test-dry-run-matrix.sh

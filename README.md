@@ -69,7 +69,7 @@ sudo bash setup.sh \
 
 ### Large-site starting profile
 
-`size=auto` sizes InnoDB to 40% of RAM; PHP, OPcache/JIT, memory/realpath settings and Valkey are sized from RAM automatically. Add `children=` only after measuring worker RSS.
+`size=auto` (the default since 1.9.0) sizes InnoDB from the shared memory plan (live data+index, 128 MB minimum); PHP, OPcache/JIT, memory/realpath settings and Valkey are sized from RAM, CPU, disk class and host type automatically. Add `children=` only after measuring worker RSS. Explicit sizes (`size=`, `ram=`, `children=`) are recorded and reserved verbatim by the plan, so a later `--optimize` keeps them.
 
 ```bash
 sudo bash setup.sh \
@@ -368,13 +368,15 @@ Recommended application settings:
 - Guest traffic stays on Angie's FastCGI cache. Do not cache authenticated
   pages; the vhost's cookie bypass is intentional.
 
-### MariaDB (`--mariadb user=... pass=... size=4gb|auto [bind=...]`)
+### MariaDB (`--mariadb user=... pass=... [size=4gb|auto] [bind=...]`)
 
 - Installs `mariadb-server` and `mariadb-client`.
 - Adds a systemd `LimitNOFILE=1048576` drop-in and silences the package's unset-environment warning.
-- Writes a managed `[mariadbd]` block into `/etc/mysql/mariadb.conf.d/50-server.cnf`:
-  - `max_connections = CPU threads × 32` (clamped to 200–2000, never below a live larger ceiling)
-  - `innodb_buffer_pool_size = size` (`size=auto` = shared 80%-of-RAM plan, minimum 256 MB)
+- Writes a managed `[mariadbd]` base block into `/etc/mysql/mariadb.conf.d/50-server.cnf` (charset, `skip_name_resolve`, `local_infile=0`, `secure_file_priv`, bind address) and the hardware profile into `99-setup-optimize.cnf`; `--optimize` writes the same two files:
+  - `max_connections = PHP workers × 1.25 + 50` (CPU threads × 32 without a PHP tier; clamped to 200–2000, never below a live larger ceiling)
+  - `innodb_buffer_pool_size = size` (`size=auto`, the default, = shared 80%-of-RAM plan from the live data+index size, minimum 128 MB)
+  - `innodb_io_capacity`/`_max` by disk class and host type: NVMe 10000/20000 (3000/6000 on a VPS), SSD 4000/8000 (1000/2000 on a VPS), HDD 400/800; `innodb_flush_neighbors=1` and 4 I/O threads on rotational disks, otherwise `clamp(threads/2, 4, 16)`; `SETUP_MARIADB_IO_CAPACITY="read max"` pins a host
+  - `thread_cache_size = clamp(threads × 8, 32, 256)`, `tmp_table_size`/`max_heap_table_size = clamp(RAM/256, 32, 256) MB` (at most pool/8)
   - `innodb_log_file_size = size / 4` (clamped 64 MB–2 GB), `innodb_log_buffer_size = 64M`
   - `innodb_flush_log_at_trx_commit = 2` (durable across server crash; use `1` if every committed transaction must survive an OS crash)
   - `innodb_snapshot_isolation = 1` (standard MVCC isolation)
@@ -426,7 +428,7 @@ The MariaDB backup cron entry is added only when MariaDB is selected.
 - Replaces the managed directives in `/etc/valkey/valkey.conf` (no duplicates):
   - `supervised systemd`
   - `save ""` (cache-only; enable AOF/RDB if you store sessions or queues)
-  - `maxmemory` from `ram=` or 10% of RAM (minimum 256 MB, maximum 8 GB)
+  - `maxmemory` from `ram=` or the shared memory plan (live working set +20%, 128 MB minimum); `maxclients` follows the PHP pool (workers × 4 + 2000, minimum 10000)
   - `maxmemory-policy` from `policy=` (default `allkeys-lru`)
   - `maxmemory-samples 10`
   - `bind 127.0.0.1 -::1`, `protected-mode yes`
@@ -567,10 +569,14 @@ so an older host gets the same guest cache as a fresh `app=xf` or
 `app=wordpress` vhost.
 
 Live data is funded first, with at most **20% headroom**. MariaDB gets its live
-`information_schema` data+index size ×1.20 (or the data-directory size when
-SQL is unavailable; 128 MB minimum). Valkey gets live `used_memory` ×1.20 (or
-the RDB size when stopped; 128 MB minimum). Elasticsearch gets the live index
-store ×1.20 (or the data-directory size; 512 MB minimum, 31 GB ceiling).
+`information_schema` data+index size ×1.20 (or the data-directory size without
+redo/undo/temp files when SQL is unavailable; 128 MB minimum). Valkey gets live
+`used_memory` ×1.20 (or the RDB size when stopped; 128 MB minimum).
+Elasticsearch gets a **quarter of the live index store**, rounded up to 512 MB
+(512 MB minimum, capped at 25% of RAM and 31 GB): the OS page cache, not the
+heap, serves the index, and sizing the heap to the store took RAM from the
+page cache and MariaDB. Explicit `--mariadb size=`, `--valkey ram=` and
+`--elastic ram=` values are reserved verbatim and never scaled.
 There are no RAM-percentage plans or large floors: an empty service gets only
 its operational minimum, so spare RAM is not wasted. PHP-FPM is sized after
 those targets from what remains (CPU-capped, 8-worker floor), and unallocated
@@ -699,6 +705,33 @@ On a single-node Elasticsearch cluster, yellow health caused solely by
 unassigned replicas is corrected automatically: replicas are set to zero on
 existing indices and a low-priority template keeps new indices green.
 Multi-node clusters and unassigned primary shards are left unchanged.
+
+---
+
+### Hardware profile (shared by `--basic` and `--optimize`)
+
+Every tuned value comes from one helper used by both paths, so a fresh install
+and a later `--optimize` write the same bytes (verified on the dev-host host: the
+post-install and post-optimize configuration snapshots are identical). The
+inputs are the effective CPU count and RAM (both cgroup-aware), the storage
+class of the relevant data directory (NVMe / SSD or paravirtual / HDD) and the
+host type (`dedi` or `vps` from `systemd-detect-virt`, or `--basic server=`).
+
+| Area | Rule |
+|---|---|
+| PHP-FPM workers | 16 per core on dedicated hardware, 8 on a VPS; at most RAM/2 at 96 MB per worker; floor `min(8, RAM/2/96)` (a 1 GB host keeps 5, not 8); a live pool keeps its count; `children=` wins (clamped to 512) |
+| MariaDB | see the MariaDB section: io_capacity by disk × host type, I/O threads, flush_neighbors, LRU depth, thread cache, temp tables, connections from the PHP pool |
+| Elasticsearch | heap = store/4 (512 MB..25% RAM..31 GB); search threads `clamp(cpus/2, 1, 16)`, write threads `clamp(cpus/4, 1, min(8, cpus+1))` |
+| Valkey / Redis | maxmemory from the plan; `maxclients` from the PHP pool; `io_threads` clamped to 1..8 on both paths |
+| Angie | `worker_processes` = effective CPUs, `worker_connections = clamp(cpus × 2048, 8192, 65535)`, upstream keepalive from the PHP pool, `open_file_cache max = clamp(RAM_MB × 8, 10000, 200000)`, cache budget from RAM/disk/installed services, `limit_req_log_level info` |
+| Kernel | `somaxconn`/SYN backlog `cpus × 4096` (VPS: `cpus × 2048`, max 65536), conntrack `RAM_MB × 16` (VPS: `× 8`), `vm.dirty_background_bytes = clamp(RAM/100, 64 MB, 512 MB)` and `vm.dirty_bytes = 4×` (tighter on HDD), 16 MB socket buffers under 4 GB RAM, IPv6 fragment thresholds like IPv4 |
+| Host | swap = RAM/2 clamped to 1..8 GiB (4 GiB on a VPS); CPU governor only on dedicated hardware; THP `madvise` via `setup-io-tuning.service`; `fstrim.timer` on SSD/NVMe; I/O scheduler and readahead by device class via `/etc/udev/rules.d/60-setup-io.rules` |
+
+Environment overrides: `SETUP_MARIADB_IO_CAPACITY="read max"`,
+`SETUP_LIMIT_REQ_EXEMPT="ip,cidr,..."` (rate-limit exemptions for a load
+generator or monitor, managed lines in the Angie geo whitelist),
+`SETUP_TCP_CC`/`SETUP_QDISC`, `SETUP_STATE_DIR` (state directory for tests and
+image builds).
 
 ---
 
@@ -987,6 +1020,43 @@ Findings and the adjustments applied:
 
 ---
 
+### Remote stress test from a workstation
+
+`tests/stress-site/run-stress-remote.sh TARGET_IP DOMAIN [report.md]` drives
+the same stress site from another machine with [`oha`](https://github.com/hatoo/oha)
+(one static binary, downloaded to `.tools/` when missing; nothing is installed
+on the server) and reports requests/s, latency percentiles **and the HTTP
+status distribution**. The status column matters: Angie's per-IP rate limiter
+exempts only loopback, so a remote benchmark is answered with `429` after
+100 GET/s per IP. Run the install or `--optimize` with
+`SETUP_LIMIT_REQ_EXEMPT=<load generator IP>` (or set it on the live host and
+re-run `--optimize`) before measuring from another host. Pair it with
+`sudo bash tests/stress-site/collect-metrics.sh /tmp/metrics.log 5` on the
+server, which samples CPU/steal, load, TIME_WAIT and conntrack, listen
+overflows, PHP-FPM status, MariaDB/Valkey/Elasticsearch counters and the
+growth of every service error log, so a bottleneck can be matched to the
+scenario that produced it.
+
+Measured from a macOS workstation over a 1 GbE LAN against the dev-host host
+(16 threads / 27 GiB / NVMe, 200 connections, 15 s per scenario, 1.9.0):
+
+| Scenario | req/s | p50 | p99 | Server CPU |
+|---|---:|---:|---:|---|
+| static (Angie) | ~18.5k | 8.7 ms | 13.6 ms | ~15% (client/LAN bound) |
+| PHP hello | ~19.2k | 8.1 ms | 12.7 ms | ~50% |
+| MariaDB via PHP | ~16.9k | 8.6 ms | 13.4 ms | ~60% |
+| Valkey via PHP | ~17.7k | 8.3 ms | 12.6 ms | ~55% |
+| Elasticsearch via PHP (100 conns) | ~10.3k | 8.8 ms | 18.0 ms | ~60% |
+| full stack, uncached | ~7.2k | 18.0 ms | 29.5 ms | ~92% |
+| full stack, FastCGI cached | ~20k | 8.7 ms | 13.6 ms | ~20% |
+| 1 s PHP sleep | 146 | 1.02 s | 1.24 s | pool saturated (144 workers) |
+
+Before the exemption the same run reported ~20k req/s for every PHP scenario
+with >99% `429` responses and 266 MB of rate-limit warnings written to the
+vhost error log in two minutes; 1.9.0 logs rejections at `info` level.
+
+---
+
 ## Security and production checklist (large sites)
 
 The script produces a working, internet-facing baseline. For a large or security-sensitive site, review these items:
@@ -1124,7 +1194,10 @@ By default `--elastic host=localhost` binds to loopback and security is disabled
 | `/var/cache/php/opcache` | OPcache file cache (owned by `www-data`) |
 | `/var/www/logs/php/php-fpm-slow.log` | PHP-FPM slow-request log |
 | `/etc/systemd/system/php<ver>-fpm.service.d/limits.conf` | PHP-FPM nofile drop-in |
-| `/etc/mysql/mariadb.conf.d/50-server.cnf` | MariaDB managed block |
+| `/var/lib/setup.sh/explicit-options.conf` | Recorded explicit `--php children=`, `--mariadb size=`, `--valkey ram=`, `--elastic ram=` values that `--optimize` keeps |
+| `/etc/systemd/system/setup-io-tuning.service`, `/etc/udev/rules.d/60-setup-io.rules` | THP `madvise` oneshot and per-device-class I/O scheduler/readahead rule (restored by `--purge basic`) |
+| `/etc/mysql/mariadb.conf.d/50-server.cnf` | MariaDB managed base block (charset, name resolution, local_infile, bind address) |
+| `/etc/mysql/mariadb.conf.d/99-setup-optimize.cnf` | MariaDB hardware profile (buffer pool, I/O, connections, logging) |
 | `/etc/valkey/valkey.conf`, `/run/valkey/valkey.sock` | Valkey settings and local Unix socket |
 | `/etc/systemd/system/valkey-server.service.d/limits.conf` | Valkey nofile drop-in |
 | `/etc/elasticsearch/` | Elasticsearch configuration, JVM options and scripts |
