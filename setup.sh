@@ -74,6 +74,20 @@ if [[ -n ${SETUP_PRECOMPRESS_ASSETS+x} ]]; then
   PRECOMPRESS_ASSETS_PERSIST=1
 fi
 [[ $PRECOMPRESS_ASSETS == 1 ]] || PRECOMPRESS_ASSETS=0
+# Node.js major installed by --others nodejs.  NodeSource publishes one APT
+# line per major, so this value decides what `apt-get install nodejs` resolves
+# to.  A major change swaps NODE_MODULE_VERSION (the native-addon ABI), so a
+# host that already runs another major is left alone unless the switch is
+# explicitly allowed: prebuilt addons die otherwise (soketi 1.6.1 bundles a
+# uWebSockets.js with Node 14/16/18 binaries only, so upgrading 18 -> 26 broke
+# a live websocket service).  Pin a host with SETUP_NODE_MAJOR or
+# /etc/default/setup-tuning (NODE_MAJOR=18), and allow a one-off switch with
+# SETUP_NODE_ALLOW_MAJOR_UPGRADE=1.
+NODE_MAJOR="${SETUP_NODE_MAJOR:-${NODE_MAJOR:-26}}"
+[[ $NODE_MAJOR =~ ^[0-9]+$ ]] || NODE_MAJOR=26
+NODE_ALLOW_MAJOR_UPGRADE="${SETUP_NODE_ALLOW_MAJOR_UPGRADE:-${NODE_ALLOW_MAJOR_UPGRADE:-0}}"
+[[ $NODE_ALLOW_MAJOR_UPGRADE == 1 ]] || NODE_ALLOW_MAJOR_UPGRADE=0
+NODE_MAJOR_SWITCH_BLOCKED=0
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 # SETUP_STATE_DIR lets the unit tests (and a chroot/image build) use a private
@@ -4769,13 +4783,69 @@ configure_elastic_repo() {
   chmod 644 /etc/apt/sources.list.d/elastic-9.x.list
 }
 
+# Major version of the Node.js runtime currently on PATH (empty when absent).
+node_installed_major() {
+  local v
+  if command -v node >/dev/null 2>&1; then
+    v=$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null) || v=""
+  fi
+  if [[ -z $v ]]; then
+    # node may be installed but not on the caller's PATH; the package version
+    # ("26.13.0-1nodesource1") then supplies the same leading major.
+    v=$(dpkg-query -W -f='${Version}' nodejs 2>/dev/null || true)
+    v=${v%%.*}
+  fi
+  [[ $v =~ ^[0-9]+$ ]] && printf '%s' "$v"
+  return 0
+}
+
+# Refuse to move an existing Node.js install across majors unless the operator
+# asked for it.  Returns 0 (warning once) when the switch is blocked, 1 when
+# installing NODE_MAJOR is safe.
+node_major_switch_blocked() {
+  local current
+  if (( NODE_MAJOR_SWITCH_BLOCKED )); then
+    return 0
+  fi
+  if (( NODE_ALLOW_MAJOR_UPGRADE == 1 )); then
+    return 1
+  fi
+  current=$(node_installed_major)
+  if [[ -z $current || $current == "$NODE_MAJOR" ]]; then
+    return 1
+  fi
+  warn "Node.js ${current}.x is installed; refusing to switch it to ${NODE_MAJOR}.x."
+  warn "A new major replaces NODE_MODULE_VERSION and breaks prebuilt native"
+  warn "addons (soketi's uWebSockets.js only ships Node 14/16/18 builds)."
+  warn "Keep the working runtime:  SETUP_NODE_MAJOR=${current}"
+  warn "Allow the switch once:     SETUP_NODE_ALLOW_MAJOR_UPGRADE=1"
+  NODE_MAJOR_SWITCH_BLOCKED=1
+  return 0
+}
+
+# An older run may have left a NodeSource line for another major.  Leaving it
+# in place after deciding to keep the installed runtime would let the next
+# `apt-get install/upgrade` make the very jump we just refused, so retire it.
+node_retire_conflicting_repo() {
+  local keep=$1 f=/etc/apt/sources.list.d/nodesource.sources major
+  [[ -n $keep && -f $f ]] || return 0
+  major=$(sed -n \
+    's|^URIs:[[:space:]]*https://deb.nodesource.com/node_\([0-9][0-9]*\)\.x.*|\1|p' \
+    "$f" | head -n 1)
+  [[ -n $major && $major != "$keep" ]] || return 0
+  mv "$f" "${f}.disabled" \
+    || { warn "Could not retire ${f}; check it points at ${keep}.x"; return 0; }
+  warn "Retired ${f} (it points at ${major}.x) as ${f}.disabled:"
+  warn "a later apt install/upgrade could otherwise move the retained ${keep}.x runtime."
+}
+
 configure_nodesource_repo() {
   refresh_blob_key_dearmor /usr/share/keyrings/nodesource.gpg blob_nodesource_key \
     || return 1
   chmod 644 /usr/share/keyrings/nodesource.gpg
   cat > /etc/apt/sources.list.d/nodesource.sources <<EOF
 Types: deb
-URIs: https://deb.nodesource.com/node_26.x
+URIs: https://deb.nodesource.com/node_${NODE_MAJOR}.x
 Suites: nodistro
 Components: main
 Architectures: $(dpkg --print-architecture)
@@ -4802,8 +4872,13 @@ prepare_repositories() {
   if [[ ${ENABLED[others]:-0} -eq 1 ]]; then
     for item in "${OTHERS[@]}"; do
       if [[ $item == nodejs ]]; then
-        configure_nodesource_repo || die "Could not configure the NodeSource APT repository"
-        configured=1
+        if node_major_switch_blocked; then
+          info "Leaving the installed Node.js runtime unchanged"
+          node_retire_conflicting_repo "$(node_installed_major)"
+        else
+          configure_nodesource_repo || die "Could not configure the NodeSource APT repository"
+          configured=1
+        fi
         break
       fi
     done
@@ -6067,10 +6142,14 @@ install_others() {
         gifsicle --version | head -n 1 || true
         ;;
       nodejs)
-        info "Installing Node.js from the prepared NodeSource 26.x repository"
-        pkg_record_origin nodejs
-        apt_install nodejs
-        node -v
+        if node_major_switch_blocked; then
+          info "Node.js $(node -v 2>/dev/null) is already installed; not replacing it with ${NODE_MAJOR}.x"
+        else
+          info "Installing Node.js from the prepared NodeSource ${NODE_MAJOR}.x repository"
+          pkg_record_origin nodejs
+          apt_install nodejs
+          node -v
+        fi
         ;;
       sysstat)
         info "Installing sysstat (sar/iostat history)"

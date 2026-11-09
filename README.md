@@ -480,10 +480,12 @@ Available names: `smartmon`, `nvme`, `gif`, `nodejs`, `sysstat`, or `all`.
 | `smartmon` | `smartmontools` (and tries to enable `smartd`) |
 | `nvme` | `nvme-cli` — **only when the server is dedicated and the storage is actually NVMe**; otherwise skipped |
 | `gif` | `gifsicle` |
-| `nodejs` | NodeSource 26.x repository/key (embedded) and `nodejs` |
+| `nodejs` | NodeSource 26.x repository/key (embedded) and `nodejs` (select the major with `SETUP_NODE_MAJOR`) |
 | `sysstat` | `sysstat` and its collect/summary timers (`sar`, `iostat`, `pidstat`) |
 
 `--others all` expands to `smartmon nvme gif nodejs sysstat` (subject to the NVMe gate).
+
+The `nodejs` item defaults to the NodeSource 26.x line. NodeSource serves exactly one major per APT line, so changing `SETUP_NODE_MAJOR` changes the runtime that `apt-get install nodejs` resolves to, and a new major changes `NODE_MODULE_VERSION` (the native-addon ABI). setup.sh therefore refuses to move an existing install across majors on its own: it prints the installed major, leaves the package untouched, retires a `/etc/apt/sources.list.d/nodesource.sources` line that points at another major (renamed `.disabled`, so a later apt run cannot make the jump either) and continues with the other items. Pin the host with `SETUP_NODE_MAJOR=18` (or `NODE_MAJOR=18` in `/etc/default/setup-tuning`) when a colocated app needs a specific ABI — soketi 1.6.1 bundles a uWebSockets.js with Node 14/16/18 binaries only — or allow a one-off switch with `SETUP_NODE_ALLOW_MAJOR_UPGRADE=1`.
 
 The `nvme` item is gated: it installs only when `server=dedi` (or auto-detection says dedicated) **and** an NVMe block device is present (`/sys/block/nvme*` or `lsblk` transport `nvme`). On a VPS/container or non-NVMe server it logs a skip and continues.
 
