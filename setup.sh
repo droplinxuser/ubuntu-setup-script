@@ -54,6 +54,15 @@ TCP_CC="${SETUP_TCP_CC:-$TCP_CC}"
 QDISC="${SETUP_QDISC:-$QDISC}"
 [[ $TCP_CC =~ ^[a-z0-9_]+$ ]] || TCP_CC=bbr
 [[ $QDISC =~ ^[a-z0-9_]+$ ]] || QDISC=fq
+# Rate-limit exemptions (load generator, monitor, reverse proxy) live in the
+# same host file so a plain --optimize keeps them; SETUP_LIMIT_REQ_EXEMPT in
+# the environment overrides and is persisted there (an empty value clears).
+LIMIT_REQ_EXEMPT="${LIMIT_REQ_EXEMPT:-}"
+LIMIT_REQ_EXEMPT_PERSIST=0
+if [[ -n ${SETUP_LIMIT_REQ_EXEMPT+x} ]]; then
+  LIMIT_REQ_EXEMPT=$SETUP_LIMIT_REQ_EXEMPT
+  LIMIT_REQ_EXEMPT_PERSIST=1
+fi
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 # SETUP_STATE_DIR lets the unit tests (and a chroot/image build) use a private
@@ -3221,6 +3230,9 @@ tune_xf_cache_vary() {
         if (index($0, "$cookie_xf_language_id") == 0) {
           sub(/";[[:space:]]*$/, "$cookie_xf_style_id$cookie_xf_language_id\";")
         }
+        if (index($0, "$setup_cache_enc") == 0) {
+          sub(/";[[:space:]]*$/, "$setup_cache_enc\";")
+        }
       }
       { print }
     ' "$file" > "$tmp"
@@ -3233,7 +3245,7 @@ tune_xf_cache_vary() {
       "$(basename "$file"): background cache update"
   fi
   if [[ $(md5sum "$file" | awk '{print $1}') != "$before" ]]; then
-    tune_note "$(basename "$file"): cache key varies on style/language"
+    tune_note "$(basename "$file"): cache key varies on style/language/encoding"
   fi
   return 0
 }
@@ -3279,7 +3291,7 @@ tune_limit_req_exemptions() {
   local file=$1 label=$2 tmp entry
   local -a entries=()
   grep -qE '^[[:space:]]*geo[[:space:]]+\$limit_req_whitelist[[:space:]]*[{]' "$file" || return 0
-  local raw=${SETUP_LIMIT_REQ_EXEMPT:-}
+  local raw=${LIMIT_REQ_EXEMPT:-}
   raw=${raw//,/ }
   for entry in $raw; do
     [[ $entry =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ || $entry =~ ^[0-9a-fA-F:]+(/[0-9]+)?$ ]] || {
@@ -3307,6 +3319,22 @@ tune_limit_req_exemptions() {
     fi
   fi
   return 0
+}
+
+# Keep an environment-supplied exemption list in /etc/default/setup-tuning so
+# the next plain --optimize does not silently remove it again.
+persist_limit_req_exemptions() {
+  (( LIMIT_REQ_EXEMPT_PERSIST )) || return 0
+  [[ ${EUID} -eq 0 ]] || return 0
+  local f=/etc/default/setup-tuning line
+  line="LIMIT_REQ_EXEMPT=\"${LIMIT_REQ_EXEMPT}\""
+  if [[ -f $f ]] && grep -qE '^LIMIT_REQ_EXEMPT=' "$f"; then
+    sed_in_place -E "s|^LIMIT_REQ_EXEMPT=.*|${line}|" "$f"
+  else
+    printf '%s\n' "$line" >> "$f"
+  fi
+  chmod 644 "$f" 2>/dev/null || true
+  tune_note "limit_req: exemptions persisted in ${f}"
 }
 
 tune_angie_configs() {
@@ -3564,6 +3592,7 @@ tune_angie_configs() {
     tune_ensure_line "$f_limit" '^[[:space:]]*limit_req_log_level[[:space:]]' \
       'limit_req_log_level info;' "${f_limit#"${target}"/}: added limit_req_log_level=info"
     tune_limit_req_exemptions "$f_limit" "${f_limit#"${target}"/}"
+    persist_limit_req_exemptions
   else
     tune_miss "http.d: no active limit_req_zone"
   fi
@@ -7354,7 +7383,8 @@ ensure_xf_cookie_bypass_map() {
   local target=${1:-/etc/angie} suffix file
   suffix=$(angie_http_suffix "$target")
   file="${target}/http.d/zz-setup-fastcgi-cache-map${suffix}"
-  if [[ ! -f $file ]] || ! grep -qE 'map[[:space:]]+\$http_cookie[[:space:]]+\$setup_xf_guest_bypass' "$file"; then
+  if [[ ! -f $file ]] || ! grep -qE 'map[[:space:]]+\$http_cookie[[:space:]]+\$setup_xf_guest_bypass' "$file" \
+     || ! grep -qE 'map[[:space:]]+\$http_accept_encoding[[:space:]]+\$setup_cache_enc' "$file"; then
     cat > "$file" <<'EOF'
 # BEGIN setup.sh XenForo cookie bypass map
 # Authenticated/session cookies bypass the guest cache.  This is a map (http
@@ -7365,6 +7395,15 @@ map $http_cookie $setup_xf_guest_bypass {
     ~*xf_session_admin= 1;
     ~*xf_user=          1;
     ~*xf_tfa_trust=     1;
+}
+# XenForo gzips its own output when the client accepts gzip.  The cache key
+# must vary on that, otherwise the first visitor's encoding is served to
+# everyone for the TTL: an identity body is then Brotli-compressed by Angie on
+# every hit (measured 42% of 16 cores at 8k req/s), and a gzip body would
+# reach a client that did not ask for it.  Two variants only: gzip or plain.
+map $http_accept_encoding $setup_cache_enc {
+    default "";
+    ~*gzip  gzip;
 }
 # END setup.sh XenForo cookie bypass map
 EOF
@@ -7436,7 +7475,7 @@ ensure_xf_guest_cache() {
 
 # BEGIN setup.sh XenForo guest cache
 fastcgi_cache_methods GET HEAD;
-fastcgi_cache_key "\$request_method\$scheme\$host\$request_uri\$cookie_xf_style_variation\$cookie_xf_style_id\$cookie_xf_language_id";
+fastcgi_cache_key "\$request_method\$scheme\$host\$request_uri\$cookie_xf_style_variation\$cookie_xf_style_id\$cookie_xf_language_id\$setup_cache_enc";
 fastcgi_cache_lock on;
 fastcgi_cache_background_update on;
 fastcgi_cache_use_stale error timeout invalid_header updating http_503;

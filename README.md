@@ -729,7 +729,9 @@ host type (`dedi` or `vps` from `systemd-detect-virt`, or `--basic server=`).
 
 Environment overrides: `SETUP_MARIADB_IO_CAPACITY="read max"`,
 `SETUP_LIMIT_REQ_EXEMPT="ip,cidr,..."` (rate-limit exemptions for a load
-generator or monitor, managed lines in the Angie geo whitelist),
+generator or monitor, managed lines in the Angie geo whitelist; persisted as
+`LIMIT_REQ_EXEMPT` in `/etc/default/setup-tuning` so later runs keep it,
+an empty value clears),
 `SETUP_TCP_CC`/`SETUP_QDISC`, `SETUP_STATE_DIR` (state directory for tests and
 image builds).
 

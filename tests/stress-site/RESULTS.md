@@ -50,6 +50,91 @@ Findings:
   with a 125 ms p99 (cold buffer pool/thread pool); two immediate re-runs
   gave 17.2k and 18.6k with a 13 ms p99, so the table shows the re-runs.
 
+Packages added to the 557-package headless baseline by the full-stack test
+(85, from `dpkg-query` minus the saved baseline; `shellcheck` and
+`libfcgi-bin` are test tooling, everything else was installed by `setup.sh`
+or pulled in as a dependency):
+
+`angie angie-module-brotli apt-transport-https cpufrequtils curl elasticsearch
+fail2ban fontconfig-config fonts-dejavu-core fonts-dejavu-mono galera-4 gawk
+gifsicle git git-man libabsl20260107 libaio1t64 libaom3 libargon2-1 libavif16
+libcpufreq0 libdav1d7 libdbi-perl libdeflate0 liberror-perl libfcgi-bin
+libfcgi0t64 libfontconfig1 libgav1-2 libgd3 libheif-plugin-aomdec libheif1
+libimagequant0 libjbig0 libjpeg-turbo8 libjpeg8 liblerc4 libmariadb3 libmpfr6
+libnvme1t64 libpcre2-posix3 libsensors-config libsensors5 libsharpyuv0
+libsodium23 libtiff6 liburing2 libwebp7 libx11-6 libx11-data libxau6 libxcb1
+libxdmcp6 libxpm4 libxslt1.1 libyuv0 libzip5 mariadb-client
+mariadb-client-core mariadb-common mariadb-server mariadb-server-core
+mysql-common nodejs nvme-cli php-common php8.5-cli php8.5-common php8.5-curl
+php8.5-fpm php8.5-gd php8.5-gmp php8.5-igbinary php8.5-mbstring php8.5-mysql
+php8.5-readline php8.5-redis php8.5-xml php8.5-zip shellcheck smartmontools
+socat sysstat valkey-server valkey-tools`
+
+A restore script (`restore-baseline.sh`, kept on the host) purges this set
+plus the service trees, data directories, state and the stress site and
+returned the host to an empty diff against the baseline before each fresh
+install in this session.
+
+
+### XenForo 2.3.13 on the 1.9.0 host: guest and member tiers (2026-11-09)
+
+XenForo 2.3.13 was installed into the `--domain xf.test.local app=xf` vhost
+(CLI `xf:install`, friendly URLs on) and seeded through XF's own services with
+50 members, 150 threads and 2,250 posts. Measured from the Mac mini over
+**Wi-Fi** (dev-host's wired port had no carrier), 12-15 s runs, so absolute
+guest numbers are link-bound; the member and uncached-guest numbers are
+server-CPU-bound and comparable.
+
+| Tier / scenario | Config | req/s | p50 | p99 | Server |
+|---|---|---:|---:|---:|---|
+| guest, cached home (200c, `X-5m-Cache: HIT`) | default | 8,190-8,250 | 24 ms | 38-44 ms | 41% CPU (Brotli per hit), ~67 MB/s |
+| guest, cached home, `Accept-Encoding: identity` | default | 2,614 | 59 ms | 200 ms | 1-6% CPU, ~92 MB/s = Wi-Fi limit |
+| guest, cached thread page (200c) | default | 6,240 | 30 ms | 67 ms | link-bound |
+| static `css.php` (200c) | default | 20,513 | 9 ms | 15 ms | client-bound |
+| guest, uncached home (100c, cookie bypass) | default, 144 workers | 1,111 | 90 ms | 131 ms | 98-100% CPU |
+| guest, uncached thread (100c) | default, 144 workers | 715 | 142 ms | 191 ms | 100% CPU |
+| member home (100c) | default, 144 workers | 967 | 104 ms | 149 ms | 100% CPU |
+| member thread (100c) | default, 144 workers | 536 | 197 ms | 258 ms | 100% CPU |
+| member forum list (100c) | default, 144 workers | 649 | 153 ms | 249 ms | 100% CPU |
+| member home / thread / forum list | + Valkey cache & sessions over the socket, `p:` persistent DB | 981 / 540 / 715 | 102 / 191 / 143 ms | 156 / 268 / 206 ms | 100% CPU |
+| member home / thread, guest uncached home | + `--php children=48` (3 x cores) | 993 / 555 / 1,140 | **47 / 88 / 42 ms** | **71 / 133 / 65 ms** | 100% CPU |
+| member home (200c) | 48 workers | 1,023 | 48 ms | 68 ms | 100% CPU |
+| member home | 48 workers, forum-list sidebar widgets removed | 965 | 50 ms | 73 ms | no change on this data set |
+
+Findings and what was changed:
+
+- **Guest tier is solved by the edge cache; the remaining cost is per-hit
+  compression.** Every cached hit was Brotli-compressed by Angie (level 5)
+  because the cache held the identity body: 41% of 16 cores at 8k req/s,
+  about 0.8 ms CPU per page. XenForo gzips its own output (level 9) when the
+  client accepts gzip, but the cache key did not vary on encoding, so the
+  first visitor's encoding was served to everyone for the TTL. 1.9.0 adds a
+  normalised `$setup_cache_enc` (gzip or plain) map and appends it to the
+  XenForo cache key, so a gzip client primes a gzip entry that is served
+  without recompression and an identity client never receives gzip bytes.
+- **A cached 301 outlives a configuration change.** `fastcgi_cache_valid 301
+  404 24h` kept the pre-friendly-URL `/ -> /index.php` redirect for 24 h after
+  friendly URLs were enabled, which made `/` a redirect loop for guests until
+  the cache was purged. Purge `/home/nginx_cache` after changing XF's URL
+  options; a shorter 301 TTL in the Angie repository would limit the blast
+  radius.
+- **The member tier is PHP CPU-bound at ~15 ms per page**, not database,
+  cache or session bound: MariaDB stayed at 14-18% CPU with no slow queries
+  or disk temp tables, Valkey as the XF cache/session store and a persistent
+  database connection changed nothing (within noise), confirming the
+  single-host note already in the optimize report.
+- **Fewer PHP workers, same throughput, half the latency.** The 144-worker
+  pool (sized by the memory plan) and a 48-worker pool (3 x cores) deliver
+  the same ~1,000 req/s, but p50 drops from 102 ms to 47 ms and p99 from
+  156 ms to 71 ms because a CPU-bound app gains nothing from 9 workers per
+  core except contention. For XenForo on a host like this, pass
+  `--php children=$((3 * $(nproc)))`; the memory plan then reserves the
+  freed RAM for the page cache.
+- Removing the featured/trending/members-online sidebar widgets did not
+  change the member home page on this seeded board (the page was already
+  35 KB); the +39% recorded on an earlier host depended on live widget data.
+
+
 ## setup.sh 1.8.36 - 8 vCPU / 15 GiB validation (2026-11-05)
 
 Host: `stress-vps`, 8 vCPU, 15.1 GiB RAM, Ubuntu 26.04.1, Angie 1.12.4,
