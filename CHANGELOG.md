@@ -2,6 +2,35 @@
 
 Historical release notes for ubuntu-setup-script. Current behavior is documented in README.md.
 
+## What's new in 1.10.0
+
+- **`--domain` provisions the whole site.** `db=NAME` creates the MariaDB
+  database, `user=U pass=P` creates an account with `ALL PRIVILEGES` on that
+  database only (localhost, 127.0.0.1 and ::1; the statements go in over
+  stdin and the password is redacted in the run log), and `sql=FILE` imports
+  a `.sql`, `.sql.gz`, `.xz`, `.zst` or `.bz2` dump into the still-empty
+  database in bulk-load mode. Nothing is created unless it is declared: the
+  automatic `<domain_with_underscores>` database is gone, and MariaDB is only
+  required when `db=` is used. After an import the shared memory plan is
+  rebuilt from the live data+index size and the MariaDB profile is rewritten
+  and applied (online buffer-pool resize, or a restart with the web tiers
+  paused), so a restored site is tuned for its data without waiting for the
+  next `--optimize`.
+- **Every vhost is a full template from `server-configs-nginx`
+  `conf.d/templates`.** Without `app=` the basic `example.com.conf` template
+  is rendered (static root, `h5bp/basic.conf`, TLS, plus the port-80
+  redirect) instead of an empty file; `blank` is now an alias of `basic`.
+  New apps `flarum`, `shlink` and `sfs`. All templates share one token-based
+  substitution (`domain_render_vhost`), which also fixes a domain that
+  contains a placeholder (`blog.example.com` used to be substituted twice).
+  A self-signed certificate is generated for every domain.
+- **Removed:** `--harden-ssh`, `--cloudflare-only` and the fail2ban `sshd`
+  jail (and its install). The audit still reports SSH password
+  authentication and public 80/443; brute-force protection and origin-only
+  firewalling are the operator's or the provider's.
+- Tests: `--domain` database/user/dump cases and the removed flags in the
+  dry-run matrix; `normalize_app` checks replace the Cloudflare parser tests.
+
 ## What's new in 1.9.0
 
 Install/optimize parity, shared sizing helpers and hardware-adaptive tuning,
@@ -61,7 +90,7 @@ pool, which the installer sized from stale log files in the data directory).
   follows the PHP pool (10000 minimum). Kernel: `vm.dirty_background_bytes`
   and `vm.dirty_bytes` replace the 30%/5% ratios (64 MB..512 MB and
   256 MB..2 GB, tighter on HDD), TCP buffer maxima drop to 16 MB under 4 GB
-  of RAM, IPv6 fragment thresholds scale like IPv4, a VPS gets smaller
+  of RAM, a VPS gets smaller
   conntrack/backlog ceilings, and the base profile's `net.nf_conntrack_max`
   alias is removed so one key owns the value. Swap is capped at 8 GiB
   (4 GiB on a VPS) with a 1 GiB floor. The CPU governor step is skipped on a

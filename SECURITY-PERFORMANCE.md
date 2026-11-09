@@ -9,7 +9,7 @@ mostly about identity/secrets, certificates, per-tenant isolation, backups,
 monitoring and scaling beyond one 16-core machine.
 
 > **Note:** this audit describes a host built with `setup.sh` 1.6.7. Since
-> 1.8.58, `--basic` installs and enables `unattended-upgrades` and a fail2ban
+> 1.8.58 (fail2ban and the `--harden-ssh`/`--cloudflare-only` flags were removed again in 1.10.0; brute-force protection and origin-only firewalling are the operator's), `--basic` installs and enables `unattended-upgrades` and a fail2ban
 > `sshd` jail again (and `--optimize` configures them when they are already
 > installed); from 1.8.59 the jail's `ignoreip` includes the SSH client that
 > runs the deploy. Composer is still not installed; where this document
@@ -374,9 +374,8 @@ Already good:
 - UFW default deny incoming, allow outgoing; every effective SSH port is
   rate-limited with `ufw limit`, and 80/443 are allowed.
 - `sysstat` history is optional (`--others sysstat`). `--basic` installs and
-  enables `unattended-upgrades` and a fail2ban `sshd` jail; `--optimize` only
-  enables them when already installed. `--harden-ssh` switches to keys-only
-  access after confirming `/root/.ssh/authorized_keys` is present.
+  enables `unattended-upgrades`; `--optimize` only enables it when already
+  installed. SSH hardening and fail2ban are the operator's (removed in 1.10.0).
 - BBR/fq, large connection backlogs, file-max/nr_open, security sysctls,
   protected links/symlinks/fifos/regular files. A sysctl.d drop-in keeps fq
   as the default qdisc when a package upgrade restarts systemd-sysctl.

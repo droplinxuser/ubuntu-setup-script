@@ -9,6 +9,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 # /tmp expires them.
 TMP=$(mktemp -d /tmp/setup-test-matrix.XXXXXX)
 cd "$TMP" || exit 1
+printf 'CREATE TABLE t (id INT);\n' > "$TMP/dump.sql"
 
 PASS=0
 FAIL=0
@@ -73,6 +74,12 @@ run ok   --dry-run --domain a.example.com app=pingvin
 run ok   --dry-run --domain a.example.com app=chevereto
 run ok   --dry-run --domain a.example.com app=polr
 run ok   --dry-run --domain a.example.com app=lychee
+run ok   --dry-run --domain a.example.com app=flarum
+run ok   --dry-run --domain a.example.com app=shlink b.example.com app=sfs
+run ok   --dry-run --domain a.example.com app=basic
+run ok   --dry-run --domain blog.example.com db=blogdb
+run ok   --dry-run --domain blog.example.com app=xf db=xenforodb user=demo pass=temp sql=$TMP/dump.sql
+run ok   --dry-run --domain a.example.com db=adb user=u pass=p b.example.com app=wordpress db=bdb
 
 # Optimize-only mode.
 run ok   --dry-run --optimize
@@ -120,6 +127,14 @@ run fail --dry-run --basic --elastic ram=0
 run fail --dry-run --basic --others bogus
 run fail --dry-run --domain -bad.com
 run fail --dry-run --domain example.com app=bogus
+run fail --dry-run --domain example.com user=u pass=p
+run fail --dry-run --domain example.com db=d user=u
+run fail --dry-run --domain example.com db=d sql=$TMP/dump.sql user=u pass=p sql=/nonexistent/dump.sql
+run fail --dry-run --domain example.com sql=$TMP/dump.sql
+run fail --dry-run --domain example.com db=bad-name
+run fail --dry-run --domain db=early example.com
+run fail --dry-run --basic --harden-ssh
+run fail --dry-run --optimize --cloudflare-only
 run fail --dry-run --domain example.com --purge
 run fail --dry-run --angie
 run fail --dry-run --bogus

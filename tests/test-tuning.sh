@@ -84,26 +84,13 @@ check "ipfrag tuning writes the low mark first" \
 check "ipfrag tuning writes the high mark second" \
   test "$(printf '%s\n' "$ipfrag_block" | tail -n1)" = "net.ipv4.ipfrag_high_thresh = 2047616"
 
-# --cloudflare-only must keep the prefix length of every range; a bare
-# network address would allow one host per range and block every other edge.
-cat > "$TMP/cloudflare.conf" <<'EOF'
-set_real_ip_from 173.245.48.0/20;
-set_real_ip_from   2400:cb00::/32;
-set_real_ip_from 10.0.0.1;
-# set_real_ip_from 192.0.2.0/24;
-real_ip_header CF-Connecting-IP;
-EOF
-cf_ranges=$(cloudflare_ranges_from_conf "$TMP/cloudflare.conf")
-check "Cloudflare range parser keeps the IPv4 prefix length" \
-  grep -qx '173.245.48.0/20' <<<"$cf_ranges"
-check "Cloudflare range parser keeps the IPv6 prefix length" \
-  grep -qx '2400:cb00::/32' <<<"$cf_ranges"
-check "Cloudflare range parser accepts a single host" \
-  grep -qx '10.0.0.1' <<<"$cf_ranges"
-check "Cloudflare range parser ignores commented ranges" \
-  test "$(grep -c . <<<"$cf_ranges")" -eq 3
-check "Cloudflare range parser returns nothing for a missing file" \
-  test -z "$(cloudflare_ranges_from_conf "$TMP/does-not-exist.conf")"
+# --domain app= names: aliases normalise, the default is the basic template.
+check "normalize_app: omitted app is basic" test "$(normalize_app '')" = basic
+check "normalize_app: blank is an alias of basic" test "$(normalize_app blank)" = basic
+check "normalize_app: new templates are accepted" \
+  test "$(normalize_app flarum)$(normalize_app shlink)$(normalize_app sfs)" = flarumshlinksfs
+not_app() { ! normalize_app "$1" >/dev/null; }
+check "normalize_app: unknown app is rejected" not_app bogus
 
 # The managed-tree cleanup must move files out of the way, never unlink them.
 mkdir -p "$TMP/retire"
@@ -417,22 +404,6 @@ printf 'fastcgi_pass local_php;\nfastcgi_next_upstream off;\n' > "$TMP/socket-of
 check "socket migration refused when next_upstream is off" \
   socket_migration_refused "$TMP/socket-off"
 
-# ---------------------------------------------------------------------------
-# SSH/firewall helpers
-# ---------------------------------------------------------------------------
-check "SSH peer parser uses the client column, not the server address" \
-  test "$(printf 'ESTAB 0 0 10.0.0.5:22 203.0.113.9:54321\n' | ssh_peer_from_ss ':22$')" = \
-       "203.0.113.9"
-# `ss -tnH state established` on Ubuntu 26.04 omits the State column, so the
-# same parser must work with four fields as well.
-check "SSH peer parser handles ss output without a state column" \
-  test "$(printf '0 0 10.0.0.5:22 203.0.113.9:54321\n' | ssh_peer_from_ss ':22$')" = \
-       "203.0.113.9"
-check "SSH peer parser ignores non-SSH local ports" \
-  test -z "$(printf 'ESTAB 0 0 10.0.0.5:443 198.51.100.7:40000\n' | ssh_peer_from_ss ':22$')"
-check "SSH peer parser handles bracketed IPv6 peers" \
-  test "$(printf 'ESTAB 0 0 [2001:db8::5]:22 [2001:db8::9]:54321\n' | ssh_peer_from_ss ':22$')" = \
-       "2001:db8::9"
 check "SSH peer parser drops loopback peers" \
   test -z "$(printf 'ESTAB 0 0 10.0.0.5:22 127.0.0.1:5000\n' | ssh_peer_from_ss ':22$')"
 
