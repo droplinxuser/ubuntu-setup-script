@@ -21,8 +21,9 @@ on non-cacheable pages.
   same p50 (24-25 ms) and sequential latency (14 ms) as before.  A Unix-socket
   connect is cheap; the keepalive benefit did not exist on this workload.
   `angie_disable_php_keepalive` removes the directive (and any
-  `keepalive_timeout` inside that upstream) from adopted hosts; the dry-run
-  report prints `keepalive=off`.
+  `keepalive_timeout` inside that upstream) from adopted hosts, and
+  `angie_disable_php_keep_conn` forces `fastcgi_keep_conn off` in every
+  `h5bp/php*.conf`; the dry-run report prints `keepalive=off`.
 - **Pool size confirmed:** 8/12/16/24/32 FPM workers all served `/login` at
   the same p50 (24-28 ms) and p99 (31-72 ms) under 8 concurrent clients;
   2 per logical CPU (16) is kept for headroom on job/media bursts.

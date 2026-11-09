@@ -827,6 +827,21 @@ angie_disable_php_keepalive() {
   return 0
 }
 
+# `fastcgi_keep_conn on` only has an effect when an upstream keepalive cache
+# exists (Angie's documentation requires the keepalive directive).  Set it to
+# off in every PHP include so a future keepalive value cannot silently pin
+# the pool again, and so an old config tree gets the same behaviour as the
+# current repository default.
+angie_disable_php_keep_conn() {
+  local target=${1:-/etc/angie} file
+  for file in "$target"/h5bp/php*.conf; do
+    [[ -f $file ]] || continue
+    tune_replace "$file" '^([[:space:]]*fastcgi_keep_conn[[:space:]]+)on;' '\1off;' \
+      "${file#"$target"/}: fastcgi_keep_conn=off"
+  done
+  return 0
+}
+
 tune_angie_configs() {
   local target=${1:-/etc/angie}
   local nginx_conf="${target}/angie.conf"
@@ -1003,6 +1018,7 @@ tune_angie_configs() {
   tune_replace "$nginx_conf" '^([[:space:]]*worker_connections[[:space:]]+)[0-9]+;' "\\1${worker_connections};" "angie.conf: worker_connections=${worker_connections}"
   tune_replace "$nginx_conf" '^([[:space:]]*client_body_buffer_size[[:space:]]+).*;' "\\1${body_buffer};" "angie.conf: client_body_buffer_size=${body_buffer}"
   angie_disable_php_keepalive "$nginx_conf"
+  angie_disable_php_keep_conn "$target"
 
   if ! grep -qE '^[[:space:]]*worker_rlimit_nofile[[:space:]]' "$nginx_conf"; then
     tune_insert_after "$nginx_conf" '^[[:space:]]*worker_processes[[:space:]]' \
