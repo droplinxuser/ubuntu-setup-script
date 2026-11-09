@@ -23,8 +23,10 @@
 # =============================================================================
 
 set -Eeuo pipefail
-if (( BASH_VERSINFO[0] < 4 )); then
-  printf '%s: bash 4.0 or newer is required (found %s)\n' "${0##*/}" "$BASH_VERSION" >&2
+# 4.4 is the real floor: empty-array expansion under `set -u` and `wait` on
+# a process-substitution PID (the log mirror) both need it.
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
+  printf '%s: bash 4.4 or newer is required (found %s)\n' "${0##*/}" "$BASH_VERSION" >&2
   exit 1
 fi
 shopt -s inherit_errexit 2>/dev/null || true
@@ -34,7 +36,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.11.0"
+readonly SCRIPT_VERSION="1.12.0"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -73,6 +75,33 @@ if [[ -n ${SETUP_PRECOMPRESS_ASSETS+x} ]]; then
   PRECOMPRESS_ASSETS=$SETUP_PRECOMPRESS_ASSETS
   PRECOMPRESS_ASSETS_PERSIST=1
 fi
+# OPcache JIT.  Off by default: the tracing JIT crashed php-fpm 8.3 on a live
+# WordPress site, and on PHP 8.5 neither mode measured faster than the plain
+# bytecode cache for XenForo 2.3 or WordPress 7 (dev-host, tests/stress-site/
+# RESULTS.md).  SETUP_PHP_JIT=tracing|function|off selects the pool-wide
+# mode (persisted as PHP_JIT).  While it is on, every WordPress document
+# root keeps `opcache.jit = off` through a [PATH=] section of the managed ini
+# (applied per request by php-fpm, unlike a per-vhost fastcgi_param, which
+# sticks to the worker); SETUP_PHP_JIT_WORDPRESS=1 lets WordPress use the
+# JIT as well (persisted as PHP_JIT_WORDPRESS).
+PHP_JIT="${PHP_JIT:-off}"
+PHP_JIT_PERSIST=0
+if [[ -n ${SETUP_PHP_JIT+x} ]]; then
+  PHP_JIT=$SETUP_PHP_JIT
+  PHP_JIT_PERSIST=1
+fi
+case $PHP_JIT in
+  tracing|function|off) ;;
+  on|1|yes) PHP_JIT=tracing ;;
+  *) PHP_JIT=off ;;
+esac
+PHP_JIT_WORDPRESS="${PHP_JIT_WORDPRESS:-0}"
+PHP_JIT_WORDPRESS_PERSIST=0
+if [[ -n ${SETUP_PHP_JIT_WORDPRESS+x} ]]; then
+  PHP_JIT_WORDPRESS=$SETUP_PHP_JIT_WORDPRESS
+  PHP_JIT_WORDPRESS_PERSIST=1
+fi
+[[ $PHP_JIT_WORDPRESS == 1 ]] || PHP_JIT_WORDPRESS=0
 [[ $PRECOMPRESS_ASSETS == 1 ]] || PRECOMPRESS_ASSETS=0
 # Node.js major installed by --others nodejs.  NodeSource publishes one APT
 # line per major, so this value decides what `apt-get install nodejs` resolves
@@ -1337,7 +1366,8 @@ validate_all() {
   fi
   if [[ -n ${OPT[basic.swap]:-} ]]; then
     local swap=${OPT[basic.swap]^^}
-    [[ $swap =~ ^[1-9][0-9]*([KMGTP]i?)?$ ]] \
+    # The value was upper-cased above, so the optional binary suffix is "I".
+    [[ $swap =~ ^[1-9][0-9]*([KMGTP]I?)?$ ]] \
       || die "--basic swap='${OPT[basic.swap]}' is invalid (use e.g. 8G)"
     OPT[basic.swap]=$swap
   fi
@@ -1676,8 +1706,11 @@ effective_backlog() {
   somaxconn=$(sysctl_target_somaxconn)
   live=$(cat /proc/sys/net/core/somaxconn 2>/dev/null || printf '')
   # A kernel that cannot be tuned (unprivileged container) caps what a
-  # listener may ask for; never exceed it.
-  if [[ $live =~ ^[0-9]+$ ]] && (( live < somaxconn )) && [[ ! -w /proc/sys/net/core/somaxconn ]]; then
+  # listener may ask for; never exceed it.  Only root can tell: for an
+  # unprivileged --dry-run the file is read-only anyway, and clamping there
+  # would print a backlog the real run never writes.
+  if [[ $live =~ ^[0-9]+$ ]] && (( live < somaxconn )) && (( EUID == 0 )) \
+     && [[ ! -w /proc/sys/net/core/somaxconn ]]; then
     somaxconn=$live
   fi
   (( somaxconn > 65535 )) && somaxconn=65535
@@ -2211,8 +2244,14 @@ configure_swap() {
   local desired existing
   step "Swap (${size})"
 
-  desired=$(numfmt --from=iec "${size^^}") \
+  # The validator accepts 8G and 8Gi; numfmt's iec mode only knows the
+  # one-letter form, so drop the "i" before parsing.
+  local size_iec=${size^^}
+  size_iec=${size_iec%I}
+  desired=$(numfmt --from=iec "$size_iec") \
     || die "Could not parse swap size '${size}'"
+  (( desired >= 64 * 1024 * 1024 )) \
+    || die "--basic swap='${size}' is too small (mkswap needs at least 64M)"
 
   if [[ -f /swapfile ]]; then
     existing=$(stat -c %s /swapfile 2>/dev/null || echo 0)
@@ -3141,6 +3180,27 @@ tune_ensure_line() {
   return 0
 }
 
+# Like tune_ensure_line, but the directive is inserted before the last
+# closing brace so it lands inside the include's location block (the h5bp
+# php_*.conf includes are one `location ~ \.php` each).  Appending after the
+# brace put cache directives in the server context, where they also applied
+# to the admin/login locations that deliberately include plain php.conf.
+tune_ensure_in_location() {
+  local file=$1 pattern=$2 line=$3 desc=$4 tmp last
+  [[ -f $file ]] || { tune_miss "file not found for ${desc}: ${file}"; return 0; }
+  grep -qE "$pattern" "$file" && return 0
+  last=$(grep -nE '^[[:space:]]*\}[[:space:]]*$' "$file" | tail -n1 | cut -d: -f1 || true)
+  if [[ -z $last ]]; then
+    tune_ensure_line "$file" "$pattern" "$line" "$desc"
+    return 0
+  fi
+  tmp=$(tmp_file) || return 1
+  awk -v n="$last" -v line="$line" 'NR == n { print line } { print }' "$file" > "$tmp"
+  cat -- "$tmp" > "$file"
+  tune_note "$desc"
+  return 0
+}
+
 # A cached 500 (or a stale 500 served by fastcgi_cache_use_stale) hides a
 # recovered application and makes the error look permanent.  Older installs
 # carry the original policy; --optimize upgrades them in place so an existing
@@ -3403,20 +3463,30 @@ tune_limit_req_exemptions() {
   return 0
 }
 
+# Record one KEY="VALUE" line in /etc/default/setup-tuning (the host file
+# every run sources at startup), replacing an existing line for the key.
+# Shared by every environment-supplied option that must survive a plain
+# --optimize: rate-limit exemptions, asset precompression, the OPcache JIT
+# mode and the Node.js major.
+persist_tuning_var() {
+  local key=$1 value=$2 f=/etc/default/setup-tuning line
+  [[ ${EUID} -eq 0 ]] || return 0
+  line="${key}=\"${value}\""
+  if [[ -f $f ]] && grep -qE "^${key}=" "$f"; then
+    sed_in_place -E "s|^${key}=.*|${line}|" "$f"
+  else
+    printf '%s\n' "$line" >> "$f"
+  fi
+  chmod 644 "$f" 2>/dev/null || true
+}
+
 # Keep an environment-supplied exemption list in /etc/default/setup-tuning so
 # the next plain --optimize does not silently remove it again.
 persist_limit_req_exemptions() {
   (( LIMIT_REQ_EXEMPT_PERSIST )) || return 0
   [[ ${EUID} -eq 0 ]] || return 0
-  local f=/etc/default/setup-tuning line
-  line="LIMIT_REQ_EXEMPT=\"${LIMIT_REQ_EXEMPT}\""
-  if [[ -f $f ]] && grep -qE '^LIMIT_REQ_EXEMPT=' "$f"; then
-    sed_in_place -E "s|^LIMIT_REQ_EXEMPT=.*|${line}|" "$f"
-  else
-    printf '%s\n' "$line" >> "$f"
-  fi
-  chmod 644 "$f" 2>/dev/null || true
-  tune_note "limit_req: exemptions persisted in ${f}"
+  persist_tuning_var LIMIT_REQ_EXEMPT "$LIMIT_REQ_EXEMPT"
+  tune_note "limit_req: exemptions persisted in /etc/default/setup-tuning"
 }
 
 # Keep SETUP_PRECOMPRESS_ASSETS in /etc/default/setup-tuning like the
@@ -3424,15 +3494,8 @@ persist_limit_req_exemptions() {
 persist_precompress_assets() {
   (( PRECOMPRESS_ASSETS_PERSIST )) || return 0
   [[ ${EUID} -eq 0 ]] || return 0
-  local f=/etc/default/setup-tuning line
-  line="PRECOMPRESS_ASSETS=\"${PRECOMPRESS_ASSETS}\""
-  if [[ -f $f ]] && grep -qE '^PRECOMPRESS_ASSETS=' "$f"; then
-    sed_in_place -E "s|^PRECOMPRESS_ASSETS=.*|${line}|" "$f"
-  else
-    printf '%s\n' "$line" >> "$f"
-  fi
-  chmod 644 "$f" 2>/dev/null || true
-  tune_note "precompress: PRECOMPRESS_ASSETS=${PRECOMPRESS_ASSETS} persisted in ${f}"
+  persist_tuning_var PRECOMPRESS_ASSETS "$PRECOMPRESS_ASSETS"
+  tune_note "precompress: PRECOMPRESS_ASSETS=${PRECOMPRESS_ASSETS} persisted in /etc/default/setup-tuning"
 }
 
 # Document root of an Angie vhost file ("" when none).  Shared by the
@@ -3638,7 +3701,10 @@ tune_angie_configs() {
   php_keepalive=$ANGIE_PHP_KEEPALIVE
   # The open-file cache holds static assets, templates and cache objects;
   # size it with RAM (and the file count that implies), not the core count.
-  open_files=$(tune_clamp $(( mem_mb * 8 )) 10000 200000)
+  # Cached descriptors are real fds of the worker, so the cache can never
+  # exceed what worker_rlimit_nofile leaves after the connections themselves
+  # (a 4-core/32 GB host used to get 200000 entries against a 65536 limit).
+  open_files=$(angie_open_file_cache_max "$mem_mb" "$worker_rlimit" "$worker_connections")
 
   if (( mem_mb < 2048 )); then
     fastcgi_buffers='32 16k'; fastcgi_busy='256k'; body_buffer='64k'
@@ -4095,7 +4161,7 @@ sync_php_ini_template() {
   # ini value, then the host's /etc/timezone.
   local tz=${PHP_INI_TZ:-}
   if [[ -z $tz && -f $target ]]; then
-    tz=$(awk -F= '/^[[:space:]]*date\.timezone[[:space:]]*=/{v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", v); print v; exit}' "$target")
+    tz=$(ini_get "$target" date.timezone)
   fi
   if [[ -z $tz && -r /etc/timezone ]]; then
     tz=$(head -n1 /etc/timezone | tr -d '[:space:]')
@@ -4169,6 +4235,51 @@ php_pool_set_listener() {
   tune_pool_set "$pool" listen.mode 0660 "PHP ${ver}: listen.mode=0660"
 }
 
+# OPcache JIT mode and buffer for the pool, from PHP_JIT and the OPcache
+# size: "disable 0" when off (no buffer is allocated), otherwise the mode
+# with a buffer of a quarter of the OPcache (32..256 MB).  Shared by the ini
+# writer and the dry run.  Argument: opcache.memory_consumption in MB.
+php_jit_settings() {
+  local opcache_mb=${1:-128} mode=$PHP_JIT buf=0
+  case $mode in
+    tracing|function) buf=$(tune_clamp $(( opcache_mb / 4 )) 32 256) ;;
+    *) mode=disable ;;
+  esac
+  # Newline-terminated: callers `read` it, and read returns 1 at EOF without one.
+  printf '%s %s\n' "$mode" "$buf"
+}
+
+# [PATH=] sections that keep the JIT off for every WordPress document root
+# while the pool-wide JIT is on.  php-fpm applies a PATH section at request
+# start and restores the global value afterwards, so the setting cannot leak
+# to the next vhost the way a fastcgi_param PHP_ADMIN_VALUE does.  Prints
+# nothing when the JIT is off or WordPress is allowed to use it.
+php_jit_path_sections() {
+  local target=${1:-/etc/angie} file root
+  [[ $PHP_JIT == tracing || $PHP_JIT == function ]] || return 0
+  (( PHP_JIT_WORDPRESS )) && return 0
+  [[ -d $target/conf.d ]] || return 0
+  while IFS= read -r file; do
+    root=$(angie_vhost_root "$file")
+    [[ -n $root ]] || continue
+    printf '\n; %s: WordPress keeps the bytecode cache only (SETUP_PHP_JIT_WORDPRESS=1 lifts this)\n[PATH=%s]\nopcache.jit = off\n' "$(basename "$file" .conf)" "$root"
+  done < <(angie_wordpress_vhosts "$target" | sort -u)
+}
+
+# Keep the operator's JIT choice in /etc/default/setup-tuning so a plain
+# --optimize does not silently turn it back off.  Written once per run.
+PHP_JIT_PERSISTED=0
+persist_php_jit() {
+  if (( PHP_JIT_PERSIST )); then
+    persist_tuning_var PHP_JIT "$PHP_JIT"
+    tune_note "PHP: PHP_JIT=${PHP_JIT} persisted in /etc/default/setup-tuning"
+  fi
+  if (( PHP_JIT_WORDPRESS_PERSIST )); then
+    persist_tuning_var PHP_JIT_WORDPRESS "$PHP_JIT_WORDPRESS"
+    tune_note "PHP: PHP_JIT_WORDPRESS=${PHP_JIT_WORDPRESS} persisted in /etc/default/setup-tuning"
+  fi
+}
+
 tune_php_fpm_version() {
   local ver=$1
   local socket=${2:-}
@@ -4215,7 +4326,9 @@ tune_php_fpm_version() {
   local app_cap
   if [[ -z $explicit_value ]] && app_cap=$(php_app_worker_cap "$nproc") \
      && [[ $app_cap =~ ^[0-9]+$ ]] && (( max_children == app_cap )); then
-    tune_note "PHP ${ver}: max_children capped at ${app_cap} (XenForo/WordPress with a local database are CPU-bound; --php children= overrides)"
+    # Informational: the note must not mark the pool dirty, or every
+    # --optimize on an application host reloads an unchanged PHP-FPM.
+    tune_summary "PHP ${ver}: max_children capped at ${app_cap} (XenForo/WordPress with a local database are CPU-bound; --php children= overrides)"
   fi
   max_requests=$(( nproc * 1024 ))
   if explicit_value=$(explicit_option php_max_requests); then
@@ -4223,10 +4336,22 @@ tune_php_fpm_version() {
   fi
 
   opcache_mb=$(( ram_mb / 16 )); (( opcache_mb < 128 )) && opcache_mb=128; (( opcache_mb > 512 )) && opcache_mb=512
-  # OPcache JIT stays off.  The tracing JIT in php8.3 crashed on real
-  # WordPress workloads (workers died with "segfault at 67c9 ... in
-  # php-fpm8.3" and every request on the killed worker returned 502); the
-  # bytecode cache is what actually helps a database-bound CMS.
+  # OPcache JIT is off unless SETUP_PHP_JIT asks for it (see the top of the
+  # file): the tracing JIT in php8.3 crashed on real WordPress workloads
+  # (workers died with "segfault at 67c9 ... in php-fpm8.3" and every request
+  # on the killed worker returned 502), and the bytecode cache is what helps
+  # a database-bound CMS.  WordPress roots stay off through [PATH=] sections.
+  local jit_mode jit_buffer_mb jit_buffer
+  read -r jit_mode jit_buffer_mb < <(php_jit_settings "$opcache_mb")
+  jit_buffer=0
+  (( jit_buffer_mb > 0 )) && jit_buffer="${jit_buffer_mb}M"
+  # Scripts restored from the OPcache file cache are never JIT-compiled
+  # (measured: with the file cache in place the JIT buffer stayed at 2.5 KB
+  # through a full load test on 8.4; with it cleared the same warm-up
+  # compiled 850 KB).  The file cache only warms restarts, so it is dropped
+  # while the JIT is on; the directory stays for the next switch back.
+  local opcache_file_cache=/var/cache/php/opcache
+  [[ $jit_mode == disable ]] || opcache_file_cache=""
   memory_mb=$(( ram_mb / 8 )); (( memory_mb < 256 )) && memory_mb=256; (( memory_mb > 512 )) && memory_mb=512
   # Under 2 GB a 256M per-request ceiling lets a handful of workers claim
   # the whole host; XenForo and WordPress run within 128M.
@@ -4247,11 +4372,11 @@ tune_php_fpm_version() {
   # directory that no longer exists (seen on Ubuntu 24.04); php-fpm -t then
   # fails as soon as request_slowlog_timeout is set.
   local fpm_user fpm_group slowlog accesslog poollog
-  fpm_user=$(awk -F= '/^[[:space:]]*user[[:space:]]*=/{v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/,"",v); print v; exit}' "$pool")
-  fpm_group=$(awk -F= '/^[[:space:]]*group[[:space:]]*=/{v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/,"",v); print v; exit}' "$pool")
-  slowlog=$(awk -F= '/^[[:space:]]*slowlog[[:space:]]*=/{v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/,"",v); print v; exit}' "$pool")
-  accesslog=$(awk -F= '/^[[:space:]]*access\.log[[:space:]]*=/{v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/,"",v); print v; exit}' "$pool")
-  poollog=$(awk -F= '/^[[:space:]]*error_log[[:space:]]*=/{v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/,"",v); print v; exit}' "$pool")
+  fpm_user=$(ini_get "$pool" user)
+  fpm_group=$(ini_get "$pool" group)
+  slowlog=$(ini_get "$pool" slowlog)
+  accesslog=$(ini_get "$pool" access.log)
+  poollog=$(ini_get "$pool" error_log)
   if [[ -z $slowlog ]]; then
     slowlog=/var/www/logs/php/php-fpm-slow.log
     tune_pool_set "$pool" slowlog "$slowlog" "PHP ${ver}: slowlog=${slowlog}"
@@ -4291,8 +4416,10 @@ tune_php_fpm_version() {
   chown -R www-data:www-data /var/cache/php 2>/dev/null || true
   chmod 750 /var/cache/php /var/cache/php/opcache 2>/dev/null || true
   # The pool template names its own version (pid path); rewrite any phpN.N,
-  # not only php8.x, so a 9.x pool is handled the same way.
-  sed_in_place -E "s|php[0-9]+\.[0-9]+|php${ver}|g" "$pool"
+  # not only php8.x, so a 9.x pool is handled the same way.  The listener is
+  # excluded: php_pool_set_listener already wrote the path Angie points at,
+  # and renaming a versioned socket here would leave the upstream dangling.
+  sed_in_place -E "/^[[:space:]]*listen[[:space:]]*=/! s|php[0-9]+\.[0-9]+|php${ver}|g" "$pool"
   local ini_before=""
   [[ -f $ini ]] && ini_before=$(md5sum "$ini" | awk '{print $1}')
   cat > "$ini" <<EOF
@@ -4307,12 +4434,12 @@ opcache.enable = 1
 opcache.enable_cli = 0
 opcache.memory_consumption = ${opcache_mb}
 opcache.interned_strings_buffer = $(( opcache_mb / 8 < 16 ? 16 : (opcache_mb / 8 > 64 ? 64 : opcache_mb / 8) ))
-opcache.jit = disable
-opcache.jit_buffer_size = 0
+opcache.jit = ${jit_mode}
+opcache.jit_buffer_size = ${jit_buffer}
 opcache.max_accelerated_files = 128256
 opcache.validate_timestamps = 1
 opcache.revalidate_freq = 60
-opcache.file_cache = /var/cache/php/opcache
+opcache.file_cache = ${opcache_file_cache}
 opcache.file_cache_only = 0
 mysqlnd.net_cmd_buffer_size = 524288
 mysqli.default_socket = /run/mysqld/mysqld.sock
@@ -4341,11 +4468,22 @@ session.sid_length = 48
 session.sid_bits_per_character = 6
 EOF
   fi
+  # Per-directory sections must come last: everything after a section header
+  # belongs to that section.
+  php_jit_path_sections /etc/angie >> "$ini"
   chmod 644 "$ini"
-  local ini_after
+  if (( ! PHP_JIT_PERSISTED )); then
+    persist_php_jit
+    PHP_JIT_PERSISTED=1
+  fi
+  local ini_after jit_desc=off
+  if [[ $jit_mode != disable ]]; then
+    jit_desc="${jit_mode}/${jit_buffer}"
+    (( PHP_JIT_WORDPRESS )) || jit_desc+=" (WordPress roots off)"
+  fi
   ini_after=$(md5sum "$ini" | awk '{print $1}')
   if [[ $ini_before != "$ini_after" ]]; then
-    tune_note "PHP ${ver}: memory_limit=${memory_mb}M opcache=${opcache_mb}M jit=off"
+    tune_note "PHP ${ver}: memory_limit=${memory_mb}M opcache=${opcache_mb}M jit=${jit_desc}"
     if [[ ${SETUP_PHP_SESSION_HARDENING:-0} == 1 ]]; then
       tune_note "PHP ${ver}: optional session/cgi hardening"
     fi
@@ -4519,6 +4657,9 @@ EOF
 # This deployer used to live in the server-configs-nginx repository as a
 # separate script.  It now lives here so a fresh install and `--optimize`
 # share exactly one implementation: fetch -> sync tree -> hardware profile.
+# deploy_angie_tree reloads a running Angie after the sync unless the caller
+# tunes the tree first and reloads/restarts it itself.
+ANGIE_SYNC_RELOAD=1
 ANGIE_CACHE_DIRS=(/home/nginx_cache /home/nginx_cache_chev /home/xf_proxy_cache
                   /home/proxy_cache /home/proxy_cdn)
 
@@ -4626,7 +4767,11 @@ deploy_angie_tree() {
     warn "Angie configuration test failed; live service left untouched"
     return 1
   fi
-  if systemctl is-active --quiet angie 2>/dev/null; then
+  # The install and --optimize paths tune the synced tree before they reload
+  # or restart it themselves (ANGIE_SYNC_RELOAD=0); reloading here as well
+  # briefly ran the repository defaults (65535 connections, 16g cache zones)
+  # on every --optimize and doubled the reloads.
+  if (( ANGIE_SYNC_RELOAD )) && systemctl is-active --quiet angie 2>/dev/null; then
     systemctl daemon-reload || true
     if systemctl reload angie.service 2>/dev/null; then
       info "Angie configuration reloaded"
@@ -4661,37 +4806,68 @@ sync_angie_repo_configs() {
   return 0
 }
 
+# The hardware-aware Angie profile applied to a freshly synced /etc/angie:
+# guest caches, asset precompression, the tuner and dynamic compression, in
+# the one order both the installer and --optimize use (the repository
+# templates are restored first so the tuner's cache values win).  Returns 1
+# when the tuner fails; the compression outcome is left in
+# ANGIE_COMPRESSION_SUMMARY for the caller's report.
+ANGIE_COMPRESSION_SUMMARY=""
+angie_apply_profile() {
+  local target=${1:-/etc/angie}
+  optimize_wordpress_cache "$target" || warn "WordPress cache setup was skipped"
+  ensure_xf_guest_cache "$target" || warn "XenForo cache setup was skipped"
+  configure_asset_precompression "$target" || warn "Asset precompression was skipped"
+  tune_angie_configs "$target" || return 1
+  # Dynamic Brotli compression.  The module is optional, so a failure here
+  # must not stop the run; gzip remains active.
+  ensure_angie_compression "$target" || warn "Angie compression setup was skipped"
+  (( ANGIE_COMPRESSION_CHANGED )) && TUNE_DIRTY=1
+  if (( ANGIE_COMPRESSION_SKIPPED )); then
+    ANGIE_COMPRESSION_SUMMARY="Compression: unchanged (SETUP_ANGIE_COMPRESSION=0)"
+  elif (( ANGIE_BROTLI_OK )); then
+    ANGIE_COMPRESSION_SUMMARY="Compression: Brotli level ${ANGIE_BROTLI_LEVEL} (gzip fallback)"
+  else
+    ANGIE_COMPRESSION_SUMMARY="Compression: gzip only (Brotli module unavailable)"
+  fi
+  return 0
+}
+
+# md5 of one file, "absent" when it does not exist: the before/after probe
+# every tuner uses to decide whether a service needs a restart.
+file_md5() {
+  [[ -f $1 ]] || { printf 'absent'; return 0; }
+  md5sum "$1" | awk '{print $1}'
+}
+
+# One digest for a configuration tree, so --optimize can tell whether the
+# sync + profile actually changed anything before reloading a service.
+config_tree_digest() {
+  local dir=$1
+  [[ -d $dir ]] || { printf 'absent'; return 0; }
+  (cd "$dir" && find . -type f -print0 2>/dev/null | sort -z | xargs -0 md5sum 2>/dev/null) | md5sum | awk '{print $1}'
+}
+
 deploy_angie_configs() {
   step "Angie configuration (server-configs-nginx)"
+  # install_angie validates and restarts the service after this function;
+  # the sync itself must not reload the untuned tree first.
+  ANGIE_SYNC_RELOAD=0
   if ! sync_angie_repo_configs; then
+    ANGIE_SYNC_RELOAD=1
     warn "Angie config deployment failed"
     return 1
   fi
+  ANGIE_SYNC_RELOAD=1
 
   # Hardware-aware Angie tuning is owned by setup.sh so the same code runs
   # during install and during `--optimize`.
   tune_reset_changes
-  # Restore the repository's WordPress/FastCGI cache templates *before* the
-  # tuner adjusts them; --optimize uses this order, and the reverse order let
-  # the repo template overwrite tuned cache values on the next run.
-  optimize_wordpress_cache /etc/angie || warn "WordPress cache setup was skipped"
-  ensure_xf_guest_cache /etc/angie || warn "XenForo cache setup was skipped"
-  configure_asset_precompression /etc/angie || warn "Asset precompression was skipped"
-  if ! tune_angie_configs /etc/angie; then
+  if ! angie_apply_profile /etc/angie; then
     warn "Angie tuning failed"
     return 1
   fi
-  # Dynamic Brotli compression.  The module is optional, so a failure here
-  # must not stop the Angie install; gzip remains active.
-  ensure_angie_compression /etc/angie || warn "Angie compression setup was skipped"
-  if (( ANGIE_COMPRESSION_SKIPPED )); then
-    info "Compression: unchanged (SETUP_ANGIE_COMPRESSION=0)"
-  elif (( ANGIE_BROTLI_OK )); then
-    info "Compression: Brotli level ${ANGIE_BROTLI_LEVEL} (gzip fallback)"
-  else
-    info "Compression: gzip only (Brotli module unavailable)"
-  fi
-  # Enable the same WordPress FastCGI guest cache that --optimize installs.
+  info "$ANGIE_COMPRESSION_SUMMARY"
   local change
   for change in "${TUNE_CHANGES[@]}"; do info "tune: ${change}"; done
   for change in "${TUNE_MISSES[@]}"; do warn "tune not applied: ${change}"; done
@@ -5507,11 +5683,16 @@ local_infile = 0
 innodb_read_only_compressed = OFF
 
 EOF
-  cat >> "$cnf" <<EOF
+  # An empty bind keeps the operator's choice: a host whose packaged
+  # bind-address line is commented out listens on every interface on
+  # purpose, and --optimize must not pin it back to loopback.
+  if [[ -n $bind ]]; then
+    cat >> "$cnf" <<EOF
 
 bind-address = ${bind}
-${MARIADB_END}
 EOF
+  fi
+  printf '%s\n' "$MARIADB_END" >> "$cnf"
 }
 
 # Wait up to N seconds for the server to answer SELECT 1 (install restart,
@@ -5587,6 +5768,14 @@ install_mariadb() {
 
   mariadb_wait_ready 30 || true
 
+  # Same guard as --optimize: let the server parse the generated files before
+  # the restart, so a rejected directive is reported instead of a dead unit.
+  if command -v mariadbd >/dev/null 2>&1 \
+     && ! mariadbd --defaults-file=/etc/mysql/my.cnf --help --verbose >/dev/null 2>&1; then
+    warn "MariaDB rejected the generated configuration:"
+    mariadbd --defaults-file=/etc/mysql/my.cnf --help --verbose 2>&1 | grep -iE 'error|unknown' | head -n 5 >&2 || true
+    return 1
+  fi
   if ! systemctl restart mariadb; then
     journalctl -u mariadb -n 80 --no-pager || true
     return 1
@@ -5732,7 +5921,9 @@ install_valkey() {
   systemctl daemon-reload
 
   valkey-server -v
-  systemctl enable --now valkey-server
+  # The package may have auto-started the stock configuration; one restart
+  # loads the written file (enable --now followed by restart started it twice).
+  systemctl enable valkey-server
   systemctl restart valkey-server
   systemctl status valkey-server -l --no-pager || true
 
@@ -5786,7 +5977,10 @@ valkey_clamp_io_threads() {
 # startup-only keys), derived from the same helper so the live process and
 # the file cannot drift apart.
 valkey_runtime_settings() {
-  valkey_tuning_lines "$@" | grep -vE '^(tcp-backlog|io-threads) '
+  # io-threads-do-reads is immutable on Redis 7 and unknown to CONFIG SET on
+  # Valkey 8+ (measured: "Unknown option" on 9.0.4); sending it made every
+  # online tune fail and forced a cache-wiping restart.
+  valkey_tuning_lines "$@" | grep -vE '^(tcp-backlog|io-threads|io-threads-do-reads) '
 }
 
 valkey_write_systemd_limits() {
@@ -5910,10 +6104,10 @@ elasticsearch_write_performance_block() {
   search_threads=$(( cpus / 2 ))
   (( search_threads < 1 )) && search_threads=1
   (( search_threads > 16 )) && search_threads=16
+  # cpus/4 is always below the processors+1 ceiling Elasticsearch enforces.
   write_threads=$(( cpus / 4 ))
   (( write_threads < 1 )) && write_threads=1
   (( write_threads > 8 )) && write_threads=8
-  (( write_threads > cpus + 1 )) && write_threads=$(( cpus + 1 ))
   elasticsearch_comment_keys "$file" \
     bootstrap.memory_lock indices.query.bool.max_clause_count \
     indices.memory.index_buffer_size indices.fielddata.cache.size \
@@ -6067,13 +6261,9 @@ install_elastic() {
   mkdir -p /etc/elasticsearch/jvm.options.d
   write_es_jvm_options "$ram_mb"
 
-  mkdir -p /etc/elasticsearch/scripts
-  cat > /etc/elasticsearch/scripts/xf-date-weighted.groovy <<'EOF'
-_score / pow(2.0F, min(10.0F * halflife, abs(now - doc['date'].value)) / halflife)
-EOF
-  chmod 644 /etc/elasticsearch/scripts/xf-date-weighted.groovy
-  chown root:elasticsearch /etc/elasticsearch/scripts/xf-date-weighted.groovy 2>/dev/null || true
-
+  # (The Groovy date-weighting script older releases wrote here was dead
+  # since Elasticsearch 6 removed Groovy scripting; XenForo Enhanced Search
+  # uses Painless inline scripts.)
   systemctl daemon-reload
   systemctl enable elasticsearch.service
   systemctl restart elasticsearch.service
@@ -6441,6 +6631,21 @@ purge_service_stop() {
   systemctl disable --now "$unit" 2>/dev/null || true
 }
 
+# Print the SSH port a recorded `ufw ...` rule line refers to and return 0,
+# or return 1 when the rule is not an SSH rule.  Shared by the two purge
+# passes over the recorded firewall rules.
+ufw_rule_ssh_port() {
+  local line=$1 p
+  shift
+  for p in "$@"; do
+    if [[ $line =~ (^|[[:space:]])${p}(/tcp)?([[:space:]]|$) ]]; then
+      printf '%s' "$p"
+      return 0
+    fi
+  done
+  return 1
+}
+
 purge_basic() {
   step "Purge basic setup"
   if [[ -f "${STATE_DIR}/swapfile-managed" ]]; then
@@ -6479,21 +6684,14 @@ purge_basic() {
   fi
 
   if [[ -f "${STATE_DIR}/ufw-added" ]]; then
-    local line is_ssh
+    local line
     local -a rule
     while IFS= read -r line; do
       [[ $line == ufw\ * ]] || continue
       # Never remove an SSH rule during purge.  If the provider image had no
       # SSH allow rule and UFW is active, removing ours is a guaranteed
       # lockout for a remote operator.
-      is_ssh=0
-      for p in "${ssh_ports[@]}"; do
-        if [[ $line =~ (^|[[:space:]])${p}(/tcp)?([[:space:]]|$) ]]; then
-          is_ssh=1
-          break
-        fi
-      done
-      if (( is_ssh )); then
+      if ufw_rule_ssh_port "$line" "${ssh_ports[@]}" >/dev/null; then
         info "Keeping SSH firewall rule: ${line}"
         continue
       fi
@@ -6507,19 +6705,11 @@ purge_basic() {
   # limit in configure_ufw().  Put it back on purge so the original firewall
   # state is restored (the limit rule is kept as the last-resort lockout guard).
   if [[ -f "${STATE_DIR}/ufw-added-before" ]]; then
-    local line is_ssh ssh_p
+    local line ssh_p
     local -a rule
     while IFS= read -r line; do
       [[ $line == ufw\ allow* ]] || continue
-      is_ssh=0 ssh_p=""
-      for p in "${ssh_ports[@]}"; do
-        if [[ $line =~ (^|[[:space:]])${p}(/tcp)?([[:space:]]|$) ]]; then
-          is_ssh=1
-          ssh_p=$p
-          break
-        fi
-      done
-      (( is_ssh )) || continue
+      ssh_p=$(ufw_rule_ssh_port "$line" "${ssh_ports[@]}") || continue
       ufw show added 2>/dev/null | grep -qxF -- "$line" && continue
       # allow and limit cannot coexist for the same port; remove the transient
       # limit before restoring the operator's original allow rule.
@@ -6604,7 +6794,10 @@ purge_angie() {
   info "Leaving Angie files under /etc/angie, /var/lib/angie, /var/log/angie, /var/cache/angie and ${LOG_ROOT}/angie"
   info "Leaving cache directories and /root installer files in place"
   cron_remove_line '/etc/angie/scripts/cloudflare.sh' || true
-  cron_remove_line '/usr/bin/find /var/www' || true
+  # Match the ownership job only: the managed wp-cron entry also starts with
+  # "/usr/bin/find /var/www" and must survive an Angie-only purge (PHP keeps
+  # running and DISABLE_WP_CRON stays in wp-config.php).
+  cron_remove_line '/usr/bin/find /var/www -mindepth 1' || true
   cron_remove_line "$CRON_WWW_CHOWN_LEGACY" || true
   cron_remove_line "$CRON_WWW_CHOWN" || true
   cron_remove_line "$CRON_PRECOMPRESS" || true
@@ -6631,7 +6824,11 @@ purge_php() {
       apt_purge_pattern "php${v}-*"
     done
   fi
-  systemctl disable --now phpsessionclean.timer 2>/dev/null || true
+  # The session GC timer is shared by every installed version; stop it only
+  # when no php-fpm unit remains enabled.
+  if ! systemctl list-unit-files 'php*-fpm.service' --state=enabled --no-legend 2>/dev/null | grep -q .; then
+    systemctl disable --now phpsessionclean.timer 2>/dev/null || true
+  fi
   systemctl daemon-reload || true
   info "Leaving PHP configuration, logs, caches and packages in place"
   ok "PHP purged (files preserved)"
@@ -6694,10 +6891,16 @@ purge_elastic() {
 
 purge_others() {
   step "Purge other packages"
-  # No package, repository, keyring or Composer file is removed.  Operators can
-  # remove anything they no longer want once they are sure it is unused.
+  # Stop and disable the units install_others enabled; like every other purge
+  # no package, repository, keyring or Composer file is removed.
+  local unit
+  for unit in smartmontools smartd sysstat-collect.timer sysstat-summary.timer sysstat; do
+    if systemctl is-enabled --quiet "$unit" 2>/dev/null || systemctl is-active --quiet "$unit" 2>/dev/null; then
+      systemctl disable --now "$unit" 2>/dev/null && info "Disabled ${unit}"
+    fi
+  done
   info "Leaving optional packages, repositories, keyrings and Composer in place"
-  ok "Other packages left installed"
+  ok "Other packages stopped (files preserved)"
 }
 
 build_purge_order() {
@@ -6827,6 +7030,11 @@ print_plan() {
         printf '  %-10s server=%s host=%s time=%s swap=%s\n' "$s" \
           "${OPT[basic.server]:-auto}" "${OPT[basic.host]:-auto-generated}" \
           "${OPT[basic.time]:-Asia/Manila}" "${OPT[basic.swap]:-auto (50% of RAM)}"
+        # The host-wide side effects the real run performs, so the preview is
+        # not only the tunables.
+        printf '  %-10s apt update/upgrade, cron/logrotate installed, automatic security updates enabled\n' ""
+        printf '  %-10s DNS resolvers 8.8.8.8/1.1.1.1, UFW default deny with SSH/80/443 allowed\n' ""
+        printf '  %-10s OS profile (sysctl, PAM limits, governor, udev I/O rules) and the managed root crontab\n' ""
         ;;
       php)
         printf '  %-10s version=%s children=%s max_requests=%s\n' "$s" \
@@ -6918,6 +7126,17 @@ opt_restore() {
     if [[ -d $src ]]; then
       mkdir -p "$path"
       cp -a "${src}/." "$path/"
+      # A file the tune created (a drop-in such as 99-setup-optimize.cnf or
+      # zz-setup-optimize.options on a host that had none) is not in the
+      # snapshot, and left in place it would win again on the rollback
+      # restart.  Move such files to /tmp like the single-file `.absent` path.
+      local extra rel
+      while IFS= read -r -d '' extra; do
+        rel=${extra#"$path"/}
+        [[ -e "${src}/${rel}" ]] && continue
+        moved=$(preserve_to_tmp "$extra") || continue
+        [[ -n $moved ]] && opt_report "ROLLBACK: moved new \`${extra}\` to \`${moved}\` (not deleted)"
+      done < <(find "$path" -type f -print0 2>/dev/null)
     else
       cp -a "$src" "$path"
     fi
@@ -7294,7 +7513,12 @@ plan_memory_budget() {
         OPT_VALKEY_LIVE_MB=$cache_used
       fi
       valkey_target=$(( cache_used * 120 / 100 ))
-      (( valkey_target < 128 )) && valkey_target=128
+      # Live data +20% can only grow 20% per run (allkeys-lru keeps the
+      # working set at maxmemory), and a fresh install has no data at all;
+      # a RAM-proportional floor gives the cache room to show real demand.
+      local floor_mb
+      floor_mb=$(valkey_floor_mb "$total")
+      (( valkey_target < floor_mb )) && valkey_target=$floor_mb
     fi
     (( valkey_target < 128 )) && valkey_target=128
   fi
@@ -7519,6 +7743,19 @@ angie_worker_limits() {
   fi
   ANGIE_PHP_KEEPALIVE=$(tune_clamp "$ka_base" 16 512)
 }
+
+# open_file_cache max for a host: RAM-proportional (8 entries per MB,
+# 10000..200000) but never more than the descriptors a worker keeps after its
+# connections, since every cached entry is an open fd.  Shared by the tuner
+# and the dry run.  Arguments: RAM MB, worker_rlimit_nofile, worker_connections.
+angie_open_file_cache_max() {
+  local mem_mb=$1 rlimit=$2 conns=$3 open_files fd_room
+  open_files=$(tune_clamp $(( mem_mb * 8 )) 10000 200000)
+  fd_room=$(( rlimit - conns - 1024 ))
+  (( fd_room < 1000 )) && fd_room=1000
+  (( open_files > fd_room )) && open_files=$fd_room
+  printf '%s' "$open_files"
+}
 ANGIE_WORKER_PROCESSES=""
 ANGIE_WORKER_RLIMIT=""
 ANGIE_WORKER_CONNECTIONS=""
@@ -7644,10 +7881,22 @@ php_fpm_versions() {
   done | sort -V
 }
 
+# Value of the first active `key = value` line in an ini-style file (pool,
+# php.ini), trimmed; nothing when absent.  One reader for every pool/ini
+# directive the tuners inspect.
+ini_get() {
+  local file=$1 key=$2
+  [[ -f $file ]] || return 0
+  awk -F= -v key="$key" '
+    index($0, key) && $1 ~ ("^[[:space:]]*" key "[[:space:]]*$") {
+      v = $2; sub(/^[^=]*=/, "", $0); v = $0
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", v); print v; exit
+    }' "$file"
+}
+
 php_pool_listen() {
   local ver=$1 pool="/etc/php/${1}/fpm/pool.d/www.conf"
-  [[ -f $pool ]] || return 0
-  awk -F= '/^[[:space:]]*listen[[:space:]]*=/{v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/,"",v); print v; exit}' "$pool"
+  ini_get "$pool" listen
 }
 
 php_pool_max_children() {
@@ -7892,6 +8141,24 @@ optimize_wordpress_cache() {
   return 0
 }
 
+# The cache status add_header inside php_xf.conf / php_xf_proxy.conf replaces
+# the server-level add_header set from basic_xf.conf, so PHP responses lost
+# HSTS and Referrer-Policy (measured on a fresh vhost).  Re-include the same
+# snippets inside the location when the server block carries them.
+tune_xf_location_security_headers() {
+  local target=$1 file=$2 snippet pattern
+  [[ -f $file ]] || return 0
+  grep -qE '^[[:space:]]*add_header[[:space:]]' "$file" || return 0
+  for snippet in security/strict-transport-security.conf security/referrer-policy.conf; do
+    [[ -f "${target}/h5bp/${snippet}" ]] || continue
+    grep -qE "^[[:space:]]*include[[:space:]]+h5bp/${snippet//./\\.};" "${target}/h5bp/basic_xf.conf" 2>/dev/null || continue
+    pattern="^[[:space:]]*include[[:space:]]+h5bp/${snippet//./\\.};"
+    tune_ensure_in_location "$file" "$pattern" "include h5bp/${snippet};" \
+      "$(basename "$file"): ${snippet##*/} kept on PHP responses"
+  done
+  return 0
+}
+
 # XenForo guest cache cookie bypass is decided in a map, never with `if`.
 # `map` lives in the http context; the result is consumed by
 # fastcgi_no_cache/fastcgi_cache_bypass.  Keeping it in its own managed file
@@ -7985,10 +8252,18 @@ ensure_xf_guest_cache() {
   fi
   ensure_fastcgi_cache_zone "$target" || true
   local changes_before=${#TUNE_CHANGES[@]}
+  # The proxy include (css.php, proxy.php, sitemap.php) is repaired on both
+  # paths below; php_xf.conf gets its headers with the injected block or
+  # from the repair at the end.
+  tune_xf_location_security_headers "$target" "${target}/h5bp/php_xf_proxy.conf"
 
   local lock='$setup_xf_guest_bypass $nocacheuri'
   if ! grep -qE '^[[:space:]]*fastcgi_cache[[:space:]]+fastcgicache;' "$file"; then
-    cat >> "$file" <<EOF
+    # The block belongs inside the include's `location ~ \.php`; appended
+    # after its closing brace it would land in the server context and also
+    # cache the admin/login locations that include plain php.conf.
+    local block last tmp
+    block=$(cat <<EOF
 
 # BEGIN setup.sh XenForo guest cache
 fastcgi_cache_methods GET HEAD;
@@ -8006,37 +8281,55 @@ fastcgi_cache_valid 301 404 24h;
 fastcgi_cache_valid any 5s;
 fastcgi_cache_valid 500 502 503 504 0s;
 add_header X-5m-Cache \$upstream_cache_status always;
+# add_header in a location drops the server-level security headers.
+include h5bp/security/strict-transport-security.conf;
+include h5bp/security/referrer-policy.conf;
 # END setup.sh XenForo guest cache
 EOF
+    )
+    last=$(grep -nE '^[[:space:]]*\}[[:space:]]*$' "$file" | tail -n1 | cut -d: -f1 || true)
+    if [[ -n $last ]]; then
+      # head/tail rather than awk -v: mawk and BSD awk reject newlines in -v.
+      tmp=$(tmp_file) || return 1
+      {
+        head -n "$(( last - 1 ))" "$file"
+        printf '%s\n' "$block"
+        tail -n "+${last}" "$file"
+      } > "$tmp"
+      cat -- "$tmp" > "$file"
+    else
+      printf '%s\n' "$block" >> "$file"
+    fi
     tune_note "XenForo: FastCGI guest cache enabled for ${#xf_vhosts[@]} vhost(s)"
     return 0
   fi
 
-  tune_ensure_line "$file" '^[[:space:]]*fastcgi_cache_methods[[:space:]]' \
+  tune_ensure_in_location "$file" '^[[:space:]]*fastcgi_cache_methods[[:space:]]' \
     'fastcgi_cache_methods GET HEAD;' "XenForo: cache methods added"
-  tune_ensure_line "$file" '^[[:space:]]*fastcgi_cache_key[[:space:]]' \
+  tune_ensure_in_location "$file" '^[[:space:]]*fastcgi_cache_key[[:space:]]' \
     'fastcgi_cache_key "$request_method$scheme$host$request_uri$cookie_xf_style_variation";' \
     "XenForo: cache key added"
-  tune_ensure_line "$file" '^[[:space:]]*fastcgi_cache_lock[[:space:]]+on;' \
+  tune_ensure_in_location "$file" '^[[:space:]]*fastcgi_cache_lock[[:space:]]+on;' \
     'fastcgi_cache_lock on;' "XenForo: cache stampede lock added"
-  tune_ensure_line "$file" '^[[:space:]]*fastcgi_cache_use_stale[[:space:]]' \
+  tune_ensure_in_location "$file" '^[[:space:]]*fastcgi_cache_use_stale[[:space:]]' \
     'fastcgi_cache_use_stale error timeout invalid_header updating http_503;' \
     "XenForo: stale-on-error policy added"
-  tune_ensure_line "$file" '^[[:space:]]*fastcgi_ignore_headers[[:space:]]' \
+  tune_ensure_in_location "$file" '^[[:space:]]*fastcgi_ignore_headers[[:space:]]' \
     'fastcgi_ignore_headers Cache-Control Expires Set-Cookie;' \
     "XenForo: Set-Cookie/Cache-Control ignored for guest cache"
-  tune_ensure_line "$file" '^[[:space:]]*fastcgi_no_cache[[:space:]]' \
+  tune_ensure_in_location "$file" '^[[:space:]]*fastcgi_no_cache[[:space:]]' \
     "fastcgi_no_cache ${lock};" "XenForo: session cookie bypass added"
-  tune_ensure_line "$file" '^[[:space:]]*fastcgi_cache_bypass[[:space:]]' \
+  tune_ensure_in_location "$file" '^[[:space:]]*fastcgi_cache_bypass[[:space:]]' \
     "fastcgi_cache_bypass ${lock};" "XenForo: session cookie bypass added"
   tune_xf_cache_bypass_var "$file"
-  tune_ensure_line "$file" '^[[:space:]]*fastcgi_cache_valid[[:space:]]+200[[:space:]]' \
+  tune_ensure_in_location "$file" '^[[:space:]]*fastcgi_cache_valid[[:space:]]+200[[:space:]]' \
     'fastcgi_cache_valid 200 5m;' "XenForo: guest cache TTL guaranteed"
-  tune_ensure_line "$file" '^[[:space:]]*fastcgi_cache_valid[[:space:]]+500([[:space:]]+[0-9]+)+[[:space:]]+0s;' \
+  tune_ensure_in_location "$file" '^[[:space:]]*fastcgi_cache_valid[[:space:]]+500([[:space:]]+[0-9]+)+[[:space:]]+0s;' \
     'fastcgi_cache_valid 500 502 503 504 0s;' "XenForo: error responses never cached"
   # Run the key/background repair last: it needs the lock line above to exist
   # before it can decide whether background_update is missing.
   tune_xf_cache_vary "$file"
+  tune_xf_location_security_headers "$target" "$file"
   if (( ${#TUNE_CHANGES[@]} == changes_before )); then
     opt_report "- XenForo: FastCGI guest cache already enabled for ${#xf_vhosts[@]} vhost(s)"
   fi
@@ -8575,8 +8868,13 @@ optimize_angie() {
 
   # Keep /etc/angie byte-for-byte aligned with the canonical repository before
   # applying the hardware-aware profile.  The repository deployer owns the
-  # tree layout and validates/reloads Angie; setup.sh owns the tuning below.
+  # tree layout and validates it; the reload happens once below, after the
+  # tuning, and only when the tree actually changed.
+  local digest_before digest_after
+  digest_before=$(config_tree_digest /etc/angie)
+  ANGIE_SYNC_RELOAD=0
   if sync_angie_repo_configs; then
+    ANGIE_SYNC_RELOAD=1
     opt_report "- Repository: synchronized from ${CONFIG_REPO_URL} (${CONFIG_REPO_REF})"
     [[ -f $limit_file ]] && limit_after=$(md5sum "$limit_file" | awk '{print $1}')
     [[ -f $default_file ]] && default_after=$(md5sum "$default_file" | awk '{print $1}')
@@ -8585,6 +8883,7 @@ optimize_angie() {
       opt_report "- Repository: systemd limit/default files refreshed"
     fi
   else
+    ANGIE_SYNC_RELOAD=1
     rc=1
     opt_report "- **FAILED** Angie repository synchronization; restored the existing /etc/angie tree"
     opt_restore /etc/angie angie
@@ -8594,28 +8893,23 @@ optimize_angie() {
     ensure_angie_limits || true
     unit_changed=$ANGIE_UNIT_CHANGED
   fi
-  optimize_wordpress_cache /etc/angie || true
-  ensure_xf_guest_cache /etc/angie || true
-  configure_asset_precompression /etc/angie || true
-  if ! tune_angie_configs /etc/angie; then
+  # Same profile as the installer (angie_apply_profile): guest caches,
+  # precompression, the tuner and dynamic Brotli (the module is installed
+  # when missing; a failure moves the optional files to /tmp, gzip stays).
+  if ! angie_apply_profile /etc/angie; then
     opt_restore /etc/angie angie
     opt_report "- **FAILED** tuning returned an error; configuration rolled back"
     return 1
   fi
-  # Dynamic Brotli is part of the same profile on a fresh install.  The
-  # function installs the small Angie module when it is missing, then validates
-  # the tree; a failure moves the optional files to /tmp and leaves gzip
-  # active.
-  ensure_angie_compression /etc/angie || true
-  if (( ANGIE_COMPRESSION_CHANGED )); then
-    TUNE_DIRTY=1
-  fi
-  if (( ANGIE_COMPRESSION_SKIPPED )); then
-    opt_report "- Compression: unchanged (SETUP_ANGIE_COMPRESSION=0)"
-  elif (( ANGIE_BROTLI_OK )); then
-    opt_report "- Compression: Brotli level ${ANGIE_BROTLI_LEVEL} (gzip fallback)"
+  opt_report "- ${ANGIE_COMPRESSION_SUMMARY}"
+  # The sync restores every repository file before the tuner re-applies the
+  # same values, so TUNE_DIRTY is set on every run; compare the tree instead
+  # so an already-optimized host is not reloaded.
+  digest_after=$(config_tree_digest /etc/angie)
+  if [[ $digest_before == "$digest_after" ]]; then
+    TUNE_DIRTY=0
   else
-    opt_report "- Compression: gzip only (Brotli module unavailable)"
+    TUNE_DIRTY=1
   fi
   local angie_test_log
   angie_test_log=$(tmp_file)
@@ -8848,8 +9142,10 @@ optimize_php_services() {
     # Keep the systemd fd/core limits in sync with the installer; an old
     # server may still be capped at the package default (1024 fds) while the
     # pool asks for 524288.
+    local limits_changed=0
     if php_fpm_write_systemd_limits "$ver"; then
       systemctl daemon-reload || true
+      limits_changed=1
       tune_note "PHP ${ver}: systemd LimitNOFILE=524288"
     fi
     if ! tune_php_fpm_version "$ver"; then
@@ -8896,6 +9192,11 @@ optimize_php_services() {
         # 1-3 second 502 window on a busy site.
         OPT_CUTOVER=1
         opt_report "- Reload: **OK** (graceful; no request was dropped)"
+        # SIGUSR2 re-reads the pool, not the unit: LimitNOFILE/UMask from the
+        # drop-in reach the workers only after a full restart.
+        if (( limits_changed )); then
+          opt_report "- Note: the systemd limits drop-in applies on the next full restart"
+        fi
         if [[ -f "/etc/php/${ver}/fpm/php-fpm.conf" ]] \
            && grep -q 'process_control_timeout' "/etc/php/${ver}/fpm/php-fpm.conf"; then
           opt_report "- Note: master-level process_control_timeout applies on the next full restart"
@@ -9083,12 +9384,14 @@ optimize_mariadb() {
   local base_cnf=/etc/mysql/mariadb.conf.d/50-server.cnf base_before="" base_bind=""
   if [[ -f $base_cnf ]]; then
     base_before=$(md5sum "$base_cnf" | awk '{print $1}')
+    # Only an active bind-address line is carried into the managed block; a
+    # commented-out line means the operator listens on every interface and
+    # --optimize leaves that alone (the installer validates its own bind=).
     base_bind=$(sed -nE 's/^[[:space:]]*bind-address[[:space:]]*=[[:space:]]*//p' "$base_cnf" | tail -n1 | tr -d '[:space:]')
-    [[ -n $base_bind ]] || base_bind=127.0.0.1
     mariadb_write_base_block "$base_cnf" "$base_bind" || true
     if [[ $base_before != "$(md5sum "$base_cnf" | awk '{print $1}')" ]]; then
       base_changed=1
-      opt_report "- Base settings converged in 50-server.cnf (charset, skip_name_resolve, local_infile=0, bind-address=${base_bind}); restart required"
+      opt_report "- Base settings converged in 50-server.cnf (charset, skip_name_resolve, local_infile=0, bind-address=${base_bind:-unchanged}); restart required"
     fi
   fi
 
@@ -9216,6 +9519,17 @@ valkey_live_used_mb() {
 }
 
 # Fallback working set when the cache is stopped: the RDB snapshot size.
+# RAM-proportional minimum for the cache's maxmemory: 1/64 of RAM, 128 MB to
+# 1 GB.  Shared by the memory plan (install and --optimize) and the dry run.
+valkey_floor_mb() {
+  local ram_mb=${1:-0} floor
+  [[ $ram_mb =~ ^[0-9]+$ ]] || ram_mb=0
+  floor=$(( ram_mb / 64 ))
+  (( floor < 128 )) && floor=128
+  (( floor > 1024 )) && floor=1024
+  printf '%s' "$floor"
+}
+
 valkey_data_size_mb() {
   local file size
   for file in /var/lib/valkey/dump.rdb /var/lib/redis/dump.rdb; do
@@ -9633,10 +9947,10 @@ optimize_elastic() {
     fi
   fi
 
-  es_before=$([[ -f $yml ]] && md5sum "$yml" | awk '{print $1}' || echo absent)
-  jvm_before=$([[ -f $jvm ]] && md5sum "$jvm" | awk '{print $1}' || echo absent)
-  legacy_before=$([[ -f $legacy ]] && md5sum "$legacy" | awk '{print $1}' || echo absent)
-  unit_before=$([[ -f $unit ]] && md5sum "$unit" | awk '{print $1}' || echo absent)
+  es_before=$(file_md5 "$yml")
+  jvm_before=$(file_md5 "$jvm")
+  legacy_before=$(file_md5 "$legacy")
+  unit_before=$(file_md5 "$unit")
 
   write_es_jvm_options "$heap_mb"
 
@@ -9674,14 +9988,14 @@ optimize_elastic() {
   elasticsearch_write_systemd_limits
   systemctl daemon-reload || true
 
-  es_after=$([[ -f $yml ]] && md5sum "$yml" | awk '{print $1}' || echo absent)
-  jvm_after=$([[ -f $jvm ]] && md5sum "$jvm" | awk '{print $1}' || echo absent)
-  unit_after=$([[ -f $unit ]] && md5sum "$unit" | awk '{print $1}' || echo absent)
+  es_after=$(file_md5 "$yml")
+  jvm_after=$(file_md5 "$jvm")
+  unit_after=$(file_md5 "$unit")
   [[ $es_before != "$es_after" || $jvm_before != "$jvm_after" \
      || $unit_before != "$unit_after" ]] && changed=1
   # Moving the legacy jvm.options file changes the effective heap without
   # changing the managed file, so count it as a change too.
-  if [[ $legacy_before != "$([[ -f $legacy ]] && md5sum "$legacy" | awk '{print $1}' || echo absent)" ]]; then
+  if [[ $legacy_before != "$(file_md5 "$legacy")" ]]; then
     changed=1
     opt_report "- Moved legacy \`${legacy}\` to /tmp (superseded by zz-setup-optimize.options; not deleted)"
   fi
@@ -9896,11 +10210,13 @@ write_optimize_report() {
       echo "No supported installed services were detected."
     else
       echo "Detected: ${OPT_DETECTED[*]}"
-      echo
-      for line in "${OPT_REPORT[@]}"; do
-        printf '%s\n' "$line"
-      done
     fi
+    echo
+    # The OS profile, security hardening and cron results are collected even
+    # when no service was detected; an OS-only run must not lose them.
+    for line in "${OPT_REPORT[@]}"; do
+      printf '%s\n' "$line"
+    done
   } > "$file"
   cp -f "$file" /var/log/setup-optimize-latest.md
   OPT_REPORT_WRITTEN=1
@@ -9967,6 +10283,18 @@ optimize_plan() {
     [[ $explicit_requests =~ ^[0-9]+$ ]] || explicit_requests=$(( nproc * 1024 ))
     printf '  PHP-FPM:  max_children=%s max_requests=%s backlog=%s\n' \
       "$max_children" "$explicit_requests" "$backlog"
+    # Same helper as the ini writer, so the preview shows the JIT the run
+    # would write (opcache.memory_consumption follows RAM/16, 128..512 MB).
+    local plan_opcache_mb jit_mode jit_buffer_mb wp_roots
+    plan_opcache_mb=$(( ram_mb / 16 )); (( plan_opcache_mb < 128 )) && plan_opcache_mb=128; (( plan_opcache_mb > 512 )) && plan_opcache_mb=512
+    read -r jit_mode jit_buffer_mb < <(php_jit_settings "$plan_opcache_mb")
+    if [[ $jit_mode == disable ]]; then
+      printf '  PHP-FPM:  opcache=%sM jit=off (SETUP_PHP_JIT=tracing|function enables it)\n' "$plan_opcache_mb"
+    else
+      wp_roots=$(php_jit_path_sections /etc/angie | grep -c '^\[PATH=' || true)
+      printf '  PHP-FPM:  opcache=%sM jit=%s buffer=%sM (WordPress roots kept off: %s)\n' \
+        "$plan_opcache_mb" "$jit_mode" "$jit_buffer_mb" "${wp_roots:-0}"
+    fi
   fi
   if [[ " ${OPT_DETECTED[*]} " == *" mariadb "* ]]; then
     size_mb=$OPT_MARIADB_BUDGET_MB
@@ -10573,6 +10901,21 @@ list_active_php_units() {
     | awk '{print $1}' | grep -E '^php.*-fpm\.service$' || true
 }
 
+# The active cache unit name, or nothing.  valkey and valkey-server are
+# aliases for the same unit, so only the first active name is printed and the
+# cache is never listed (or restarted) twice.  Shared by the restart-all plan
+# and the restart itself.
+active_cache_unit() {
+  local unit
+  for unit in valkey-server valkey redis-server; do
+    if systemctl is-active --quiet "$unit" 2>/dev/null; then
+      printf '%s' "$unit"
+      return 0
+    fi
+  done
+  return 0
+}
+
 restart_all_plan() {
   local unit cache_unit=""
   local -a active=() php_units=()
@@ -10580,14 +10923,7 @@ restart_all_plan() {
   mapfile -t php_units < <(list_active_php_units)
   systemctl is-active --quiet angie 2>/dev/null && active+=(angie)
   systemctl is-active --quiet mariadb 2>/dev/null && active+=(mariadb)
-  # valkey and valkey-server are aliases for the same unit; report only the
-  # first active name so the plan does not list the cache service twice.
-  for unit in valkey-server valkey redis-server; do
-    if systemctl is-active --quiet "$unit" 2>/dev/null; then
-      cache_unit=$unit
-      break
-    fi
-  done
+  cache_unit=$(active_cache_unit)
   [[ -n $cache_unit ]] && active+=("$cache_unit")
   systemctl is-active --quiet elasticsearch 2>/dev/null && active+=(elasticsearch)
   active+=("${php_units[@]}")
@@ -10635,12 +10971,8 @@ run_restart_all() {
   systemctl daemon-reload || warn "systemctl daemon-reload failed"
   systemctl is-active --quiet angie 2>/dev/null && angie_active=1
   mapfile -t php_units < <(list_active_php_units)
-  for unit in valkey-server valkey redis-server; do
-    if systemctl is-active --quiet "$unit" 2>/dev/null; then
-      cache_units+=("$unit")
-      break
-    fi
-  done
+  unit=$(active_cache_unit)
+  [[ -n $unit ]] && cache_units+=("$unit")
   systemctl is-active --quiet elasticsearch 2>/dev/null && elastic_active=1
   systemctl is-active --quiet mariadb 2>/dev/null && mariadb_active=1
 

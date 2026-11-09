@@ -2,7 +2,109 @@
 
 Historical release notes for ubuntu-setup-script. Current behavior is documented in README.md.
 
-## Unreleased
+## What's new in 1.12.0
+
+Full re-validation on the dev-host development host (16 threads / 27 GiB / NVMe,
+Ubuntu 26.04.1) from a wiped 557-package baseline: a fresh `--basic --angie
+--php --mariadb --valkey --elastic --others all --domain xf.test.local app=xf
+... --domain wp.test.local app=wordpress ...` install followed by `--optimize`
+produced byte-identical configuration trees (308 files; only the crontab's
+install-timestamp comment differed), XenForo 2.3.13 and WordPress 7.1.4 were
+installed and seeded into the two vhosts, and the guest and member tiers were
+load-tested from a workstation (`tests/stress-site/RESULTS.md`). Five
+independent code reviews of `setup.sh` (one per service area) fed the fixes
+below; `shellcheck`, `tests/test-tuning.sh` and `tests/test-dry-run-matrix.sh`
+pass on the host.
+
+- **OPcache JIT is selectable, per application.** `SETUP_PHP_JIT=tracing|function|off`
+  sets the pool-wide mode (buffer = OPcache/4, 32–256 MB; persisted as
+  `PHP_JIT`), and while it is on every WordPress document root keeps
+  `opcache.jit = off` through a `[PATH=<root>]` section at the end of
+  `zz-setup-optimize.ini` (`SETUP_PHP_JIT_WORDPRESS=1` lifts it). php-fpm
+  applies a PATH section per request and restores the pool value afterwards,
+  which is why it is used instead of a per-vhost `fastcgi_param
+  PHP_ADMIN_VALUE` (that one sticks to the worker, the open_basedir leak fixed
+  in 1.11.x). Verified on the test host: `opcache_get_status()` reports the
+  JIT on under the XenForo root and off under the WordPress root of the same
+  pool. While the JIT is on the managed ini also leaves `opcache.file_cache` empty: scripts restored from the file cache are never JIT-compiled (with the file cache in place the JIT buffer stayed at 2.5 KB through a whole load test on 8.4; cleared, the same warm-up compiled 850 KB), so the warm-restart cache and the JIT are mutually exclusive. The default stays off: on PHP 8.5.12 the JIT compiles nothing (the buffer never grows past 2.4 KB in any mode) and every mode is within noise of off; on PHP 8.4 with a working JIT, `tracing` gained 3-5% on every CPU-bound tier (XenForo member home 957 -> 986 req/s, member thread 478 -> 500, WordPress uncached 252 -> 261, member 244 -> 253, p50 latency 3-5% lower) with 0.9 MB of compiled code, while `function` filled the 64 MB buffer and was equal or slower (XenForo member forum 670 -> 588). No php-fpm segfault occurred in any run on 8.4/8.5. Set `SETUP_PHP_JIT=tracing` on a XenForo host running PHP 8.4; keep WordPress on the bytecode cache unless it has been load-tested with the JIT on its own PHP build. The dry run prints the JIT
+  the run would write.
+- **Rollback really rolls back.** `opt_restore` of a directory snapshot now
+  moves files that were created after the backup (a `99-setup-optimize.cnf`
+  or `zz-setup-optimize.options` written on a host that had none) to `/tmp`
+  instead of leaving them in place, where they won again on the rollback
+  restart of MariaDB or Elasticsearch.
+- **Valkey online tuning works again.** `io-threads-do-reads` is immutable on
+  Redis 7 and unknown to `CONFIG SET` on Valkey 9 ("Unknown option" measured
+  on 9.0.4), so every `--optimize` that touched `valkey.conf` reported an
+  online failure and restarted the cache, wiping it. The key stays in the
+  file and is no longer sent at runtime. `install_valkey` also no longer
+  starts the service twice (`enable --now` followed by `restart`).
+- **Valkey maxmemory has a RAM floor.** The plan sized the cache at live
+  data +20% with a 128 MB floor, so a fresh install (no data) got 128 MB on
+  any host and later runs could only grow it 20% at a time (allkeys-lru keeps
+  the working set at maxmemory). `valkey_floor_mb` = RAM/64 clamped to
+  128 MB..1 GB applies on both paths (434 MB on the 27 GB test host).
+- **Angie: one reload per `--optimize`, none when nothing changed.** The
+  repository sync reloaded Angie before the tuner ran, so every `--optimize`
+  briefly served the repository defaults (65535 connections, 16 GB cache
+  zones) and then reloaded again; the sync now leaves the reload to the caller
+  (`ANGIE_SYNC_RELOAD`), and the decision to reload compares a digest of
+  `/etc/angie` before and after (`config_tree_digest`) instead of the
+  always-dirty tuner flag, so "Restart: skipped (configuration already
+  optimized)" is reachable. The install and optimize paths share one
+  `angie_apply_profile` sequence.
+- **Angie `open_file_cache` is bounded by the fd limit.** `clamp(RAM × 8,
+  10000, 200000)` could exceed `worker_rlimit_nofile - worker_connections`
+  (a 4-core/32 GB host: 200000 entries against 65536 descriptors);
+  `angie_open_file_cache_max` caps it.
+- **XenForo guest cache repairs land inside the location.** The
+  `ensure_xf_guest_cache` fallback appended directives after the include's
+  closing brace, i.e. into the server context, where `fastcgi_cache` also
+  applied to the admin/login locations that deliberately include plain
+  `php.conf`. `tune_ensure_in_location` inserts before the last brace. The
+  same repair re-includes `strict-transport-security.conf` and
+  `referrer-policy.conf` inside `php_xf.conf`/`php_xf_proxy.conf`: `add_header`
+  in a location replaces the server-level set, and a fresh `app=xf` vhost
+  served every PHP response without HSTS (server-configs-nginx 1.6.19 ships
+  the same fix in the templates).
+- **`--purge --angie` no longer deletes the WordPress cron job.** The
+  ownership-job pattern `/usr/bin/find /var/www` also matched the managed
+  `wp-cron.php` entry; the match is now the full `-mindepth 1` form.
+- **`--purge others` stops what `--others` started** (`smartmontools`/`smartd`
+  and the `sysstat` timers) instead of being a no-op, and `--purge --php
+  ver=X` keeps `phpsessionclean.timer` while another PHP-FPM unit is enabled.
+- **MariaDB.** `--optimize` no longer pins `bind-address = 127.0.0.1` on a
+  host whose packaged line is commented out (listen on every interface on
+  purpose); the managed block omits the directive when no active line
+  exists. The installer validates the generated files with `mariadbd --help
+  --verbose` before the restart, as `--optimize` already did.
+- **Correctness.** `--basic swap=8Gi` (accepted by the validator) no longer
+  dies in `numfmt`, and sizes under 64 MB are rejected up front. A non-root
+  `--dry-run` printed `backlog=4096` because the somaxconn clamp fired on the
+  read-only `/proc` file; the clamp now applies to root only. The OS-only
+  `--optimize` report (no detected service) kept nothing of the hardening,
+  cron and ownership results; they are always written now. The pool rewrite
+  of `phpN.N` skips the `listen =` line, so a versioned socket path is not
+  renamed away from the Angie upstream. `--dry-run --basic` lists the
+  host-wide side effects (apt upgrade, DNS, UFW, packages, crontab). The
+  `--optimize` report says when the PHP-FPM systemd drop-in still needs a
+  full restart (SIGUSR2 does not apply `LimitNOFILE`). The bash gate is 4.4
+  (empty-array expansion under `set -u` and `wait` on a process-substitution
+  PID both need it). The dead Groovy date-weighting script is no longer
+  written to `/etc/elasticsearch/scripts`.
+- **Shared helpers, less duplication.** `persist_tuning_var` (rate-limit
+  exemptions, precompression, JIT), `ini_get` (every pool/ini directive
+  reader; seven awk one-liners), `file_md5` (the eight "md5 or absent"
+  probes), `active_cache_unit` (restart-all plan and run), `ufw_rule_ssh_port`
+  (the two purge passes over recorded firewall rules), `angie_apply_profile`
+  (installer and `--optimize`), `config_tree_digest`, and the dead
+  `write.size > cpus + 1` guard in the Elasticsearch thread-pool block.
+- **Tests.** `tests/test-tuning.sh` covers the JIT settings and `[PATH=]`
+  sections, the Valkey floor, the open_file_cache bound, `ini_get`,
+  `tune_ensure_in_location`, `ufw_rule_ssh_port`, `config_tree_digest` and
+  the rollback of files created during a tune.
+
+## What was fixed between 1.11.0 and 1.12.0 (unreleased patches)
 
 Three production regressions found on live hosts and repaired in the script so
 fresh installs and `--optimize` runs carry the fix:

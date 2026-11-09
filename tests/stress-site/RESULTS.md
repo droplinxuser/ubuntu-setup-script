@@ -1,5 +1,108 @@
 # Full-stack stress test reports
 
+
+## setup.sh 1.12.0 - dev-host re-validation and OPcache JIT benchmark (2026-11-09)
+
+Host: dev-host, 16 threads / 27.2 GiB / NVMe, Ubuntu 26.04.1, wiped to the
+557-package baseline, installed with `--basic --angie --php --mariadb --valkey
+--elastic --others all --domain xf.test.local app=xf ... --domain
+wp.test.local app=wordpress ...` (2 min 24 s), then `--optimize` (11 s): the
+post-install and post-optimize snapshots of 308 managed files were identical
+except for the crontab's install-timestamp comment. XenForo 2.3.13 (CLI
+`xf:install`, friendly URLs, 50 members / 150 threads / 2,400 posts seeded
+through XF's own services) and WordPress 7.1.4 (`wp_install()` from the CLI,
+10 subscribers / 200 posts / 996 comments, `/%postname%/` permalinks) were
+installed into the two vhosts; a second `--optimize` then capped the pool at
+64 workers (4 per core), enabled the WordPress guest cache and hardened
+`wp-config.php`.
+
+Load generator: `oha` from an Apple-silicon Mac over Wi-Fi (link-bound for
+the cached guest tiers; the uncached and member tiers are server-CPU-bound at
+100% and comparable between runs), 15 s per scenario, 200 connections for the
+cached guest pages and 100 for everything else; `collect-metrics.sh` sampled
+the server every 5 s. "uncached" guest requests carry a cookie that bypasses
+the guest cache without being a login (`xf_session=bench`,
+`comment_author_bench=1`); member requests carry a real session cookie.
+Health counters (php-fpm segfaults, `max children reached`, slow log, Angie
+error logs, MariaDB slow queries, journal errors) were zero before and after
+every run.
+
+### PHP 8.5.12 (deb.sury.org), JIT off vs tracing vs function
+
+| Scenario | JIT off req/s (p50 / p99 ms) | tracing 64M | function 64M | tracing 256M |
+|---|---:|---:|---:|---:|
+| xf-guest-cached | 8489 (22 / 39) | 8921 (22 / 38) | 8686 (22 / 38) | 8436 (23 / 47) |
+| xf-guest-uncached | 1111 (58 / 84) | 1083 (59 / 85) | 1062 (61 / 86) | 1085 (59 / 86) |
+| xf-guest-thread-u | 652 (100 / 138) | 621 (106 / 142) | 616 (106 / 145) | 630 (104 / 142) |
+| xf-member-home | 956 (67 / 96) | 924 (70 / 98) | 915 (70 / 98) | 924 (67 / 95) |
+| xf-member-forum | 679 (96 / 129) | 653 (100 / 134) | 646 (101 / 136) | 656 (99 / 133) |
+| xf-member-thread | 483 (141 / 188) | 463 (147 / 197) | 431 (149 / 246) | 467 (145 / 197) |
+| wp-guest-cached | 4605 (40 / 78) | 4728 (42 / 65) | 4246 (40 / 85) | 4277 (45 / 90) |
+| wp-guest-uncached | 255 (259 / 343) | 252 (263 / 342) | 248 (267 / 347) | 250 (263 / 334) |
+| wp-guest-post-u | 230 (285 / 427) | 226 (287 / 522) | 227 (289 / 444) | 225 (289 / 501) |
+| wp-member-home | 246 (275 / 409) | 244 (278 / 415) | 238 (280 / 490) | 243 (272 / 466) |
+| wp-member-post | 225 (298 / 438) | 223 (300 / 443) | 221 (304 / 431) | 222 (302 / 419) |
+
+Every mode is within run-to-run noise (about 3%) of JIT off, and
+`opcache_get_status()['jit']` explains why: on this 8.5.12 build the JIT
+reports `on=true` but the buffer use stays at 2,373 bytes in every mode, for
+the FPM pool and for a CLI hot-loop test alike, and `opcache.jit_debug=1`
+prints nothing. The JIT compiles nothing on PHP 8.5.12 as packaged, so
+enabling it only costs the per-request mode checks.
+
+The per-application mechanism was verified on the same pool: with
+`opcache.jit=tracing` pool-wide and a `[PATH=/var/www/wp.test.local/public]`
+section setting `opcache.jit=off`, `opcache_get_status()` fetched through the
+XenForo root reported `on=true` and through the WordPress root `on=false`
+(both with the cache bypassed), and the WordPress numbers matched the JIT-off
+run (248 / 239 req/s guest-uncached / member-home).
+
+### PHP 8.4 (deb.sury.org), the same matrix
+
+PHP 8.4 was installed with `--purge --php ver=8.5` followed by `--basic --php
+ver=8.4` (the documented version switch; XenForo and WordPress kept working
+on the new socket) because its JIT does compile (the CLI hot loop grows the
+buffer in both modes).
+
+| Scenario | JIT off req/s (p50 / p99 ms) | tracing 64M, file cache cleared | function 64M, file cache cleared | tracing 64M, file cache kept |
+|---|---:|---:|---:|---:|
+| xf-guest-cached | 8350 (23 / 39) | 8552 (23 / 41) | 8001 (24 / 41) | 8300 (24 / 38) |
+| xf-guest-uncached | 1120 (57 / 87) | 1152 (55 / 87) | 1070 (59 / 90) | 1077 (59 / 87) |
+| xf-guest-thread-u | 645 (100 / 137) | 672 (97 / 131) | 603 (108 / 146) | 617 (106 / 143) |
+| xf-member-home | 957 (68 / 97) | 986 (65 / 93) | 922 (70 / 102) | 851 (71 / 182) |
+| xf-member-forum | 670 (97 / 134) | 699 (93 / 128) | 588 (103 / 235) | 628 (100 / 226) |
+| xf-member-thread | 478 (142 / 186) | 500 (136 / 179) | 454 (149 / 201) | 467 (145 / 191) |
+| wp-guest-cached | 4307 (44 / 100) | 4186 (46 / 89) | 4267 (45 / 100) | 4563 (43 / 79) |
+| wp-guest-uncached | 252 (261 / 343) | 261 (253 / 330) | 253 (259 / 338) | 247 (265 / 368) |
+| wp-guest-post-u | 229 (287 / 433) | 232 (277 / 662) | 227 (287 / 522) | 226 (289 / 431) |
+| wp-member-home | 244 (276 / 420) | 253 (265 / 393) | 244 (277 / 420) | 241 (280 / 436) |
+| wp-member-post | 223 (301 / 429) | 231 (291 / 413) | 224 (298 / 421) | 221 (305 / 436) |
+
+The first 8.4 pass (last column) was as flat as 8.5 until
+`opcache_get_status()` showed the same 2.5 KB buffer use: scripts restored
+from `opcache.file_cache` (`/var/cache/php/opcache`) are never JIT-compiled,
+and after a php-fpm restart every script comes from that cache. With the
+directory cleared before the restart the warm-up alone compiled 850 KB, and
+the tracing JIT then gains 3-5% on every CPU-bound tier (XenForo member home
+957 -> 986 req/s, member thread 478 -> 500, member forum 670 -> 699,
+WordPress uncached 252 -> 261, member 244 -> 253; p50 3-5% lower) at 0.9 MB
+of compiled code. The function JIT compiles everything, filled 61 MB of the
+64 MB buffer and was equal or slower (member forum 588). Health counters
+stayed at zero (no segfault) in every run. 1.12.0 therefore leaves
+`opcache.file_cache` empty while `SETUP_PHP_JIT` is on, defaults to off, and
+keeps WordPress roots off through the `[PATH=]` section when it is on.
+
+### Code changes measured after the review
+
+The five reviews (PHP, MariaDB, Angie, Valkey/Elasticsearch, OS/CLI) and the
+host runs produced the 1.12.0 fixes listed in CHANGELOG.md; the ones with a
+measured effect on this host: `--optimize` now reloads Angie once per run
+instead of twice (and not at all when the tree is unchanged), the first
+`--optimize` on a host with `valkey.conf` changes keeps the cache (the
+online `CONFIG SET` loop no longer fails on `io-threads-do-reads`), Valkey
+starts at 434 MB instead of 128 MB on this 27 GB host, and XenForo PHP
+responses carry HSTS and Referrer-Policy again.
+
 ## setup.sh 1.11.0 - dev-host audit run and XenForo profiling (2026-11-09)
 
 Host: dev-host, 16 threads / 27.2 GiB / NVMe (Crucial P3 Plus), Ubuntu 26.04.1,
