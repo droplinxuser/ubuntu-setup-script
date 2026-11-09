@@ -7,9 +7,12 @@
 # Usage:
 #   OHA=.tools/oha bash tests/stress-site/run-stress-remote.sh TARGET_IP DOMAIN [report.md] [scenario ...]
 #   e.g. bash tests/stress-site/run-stress-remote.sh 192.0.2.10 stress.invalid /tmp/remote.md
-# Scenarios (default: all): static php-hello mariadb valkey elastic node full-uncached full-cached slow xf-guest xf-member wp-guest
-# Env: CONNS (default 200), DURATION (default 15s), SCHEME (https), XF_COOKIE (member cookie for xf-member),
-#      XF_PATH (/ ), WP_PATH (/), OHA (path to the oha binary; downloaded to .tools/ when missing).
+# Scenarios (default: all): static php-hello mariadb valkey elastic node full-uncached full-cached slow
+#   xf-guest xf-guest-uncached xf-member xf-member-thread wp-guest wp-guest-uncached wp-member wp-member-post
+# Env: CONNS (default 200; the uncached/member scenarios use CONNS/2), DURATION (default 15s), SCHEME (https),
+#      XF_COOKIE / WP_COOKIE (member cookies for the member scenarios), XF_PATH (/), XF_THREAD (a thread URL),
+#      WP_PATH (/), WP_POST (a post URL), OHA (path to the oha binary; downloaded to .tools/ when missing).
+#      The *-uncached scenarios send a cookie that bypasses the guest cache without being a login.
 set -u
 
 TARGET=${1:?target ip}
@@ -25,6 +28,9 @@ WP_DOMAIN=${WP_DOMAIN:-$DOMAIN}
 XF_PATH=${XF_PATH:-/}
 WP_PATH=${WP_PATH:-/}
 XF_COOKIE=${XF_COOKIE:-}
+WP_COOKIE=${WP_COOKIE:-}
+XF_THREAD=${XF_THREAD:-}
+WP_POST=${WP_POST:-}
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd -- "$HERE/../.." && pwd)
 OHA=${OHA:-$ROOT/.tools/oha}
@@ -90,11 +96,23 @@ want node          && run_one node-proxy    "$DOMAIN" /node/       "$CONNS"
 want full-uncached && run_one full-uncached "$DOMAIN" /            "$CONNS"
 want full-cached   && run_one full-cached   "$DOMAIN" /cached.php  "$CONNS"
 want slow          && run_one slow-1s       "$DOMAIN" "/slow.php?ms=1000" "$CONNS"
+half=$(( CONNS / 2 > 0 ? CONNS / 2 : 1 ))
 want xf-guest      && run_one xf-guest      "$XF_DOMAIN" "$XF_PATH" "$CONNS"
+want xf-guest-uncached && run_one xf-guest-uncached "$XF_DOMAIN" "$XF_PATH" "$half" -H "Cookie: xf_session=bench"
 if want xf-member && [[ -n $XF_COOKIE ]]; then
-  run_one xf-member "$XF_DOMAIN" "$XF_PATH" "$CONNS" -H "Cookie: ${XF_COOKIE}"
+  run_one xf-member "$XF_DOMAIN" "$XF_PATH" "$half" -H "Cookie: ${XF_COOKIE}"
+fi
+if want xf-member-thread && [[ -n $XF_COOKIE && -n $XF_THREAD ]]; then
+  run_one xf-member-thread "$XF_DOMAIN" "$XF_THREAD" "$half" -H "Cookie: ${XF_COOKIE}"
 fi
 want wp-guest      && run_one wp-guest      "$WP_DOMAIN" "$WP_PATH" "$CONNS"
+want wp-guest-uncached && run_one wp-guest-uncached "$WP_DOMAIN" "$WP_PATH" "$half" -H "Cookie: comment_author_bench=1"
+if want wp-member && [[ -n $WP_COOKIE ]]; then
+  run_one wp-member "$WP_DOMAIN" "$WP_PATH" "$half" -H "Cookie: ${WP_COOKIE}"
+fi
+if want wp-member-post && [[ -n $WP_COOKIE && -n $WP_POST ]]; then
+  run_one wp-member-post "$WP_DOMAIN" "$WP_POST" "$half" -H "Cookie: ${WP_COOKIE}"
+fi
 
 cat "$TMP/table.md" >> "$REPORT"
 {

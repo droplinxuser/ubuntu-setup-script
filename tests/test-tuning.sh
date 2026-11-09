@@ -642,10 +642,42 @@ check "shipped custom_dan.ini disables OPcache JIT" \
   test "$(grep -cE '^[[:space:]]*opcache\.jit[[:space:]]*=[[:space:]]*disable' "$ROOT/configs/php/custom_dan.ini")" -eq 1
 check "shipped custom_dan.ini ships no JIT buffer" \
   test "$(grep -cE '^[[:space:]]*opcache\.jit_buffer_size[[:space:]]*=[[:space:]]*0$' "$ROOT/configs/php/custom_dan.ini")" -eq 1
-check "the optimizer writes JIT disabled" \
-  test "$(grep -cE '^opcache\.jit = disable$' "$ROOT/setup.sh")" -eq 1
-check "the optimizer never writes tracing JIT" \
-  test "$(grep -cE '^opcache\.jit = tracing$' "$ROOT/setup.sh")" -eq 0
+check "the optimizer writes the JIT mode from php_jit_settings" \
+  test "$(grep -cE '^opcache\.jit = \$\{jit_mode\}$' "$ROOT/setup.sh")" -eq 1
+PHP_JIT=off
+check "PHP_JIT=off disables the JIT with no buffer" \
+  test "$(php_jit_settings 512)" = "disable 0"
+PHP_JIT=tracing
+check "PHP_JIT=tracing sizes the buffer from the OPcache (512M -> 128M)" \
+  test "$(php_jit_settings 512)" = "tracing 128"
+check "the JIT buffer never drops below 32M" \
+  test "$(php_jit_settings 64)" = "tracing 32"
+PHP_JIT=function
+check "PHP_JIT=function keeps the function mode" \
+  test "$(php_jit_settings 128)" = "function 32"
+PHP_JIT=bogus
+check "an unknown PHP_JIT value falls back to disabled" \
+  test "$(php_jit_settings 512)" = "disable 0"
+# [PATH=] sections: only while the JIT is on, only for WordPress roots, and
+# never when WordPress is allowed to use it.
+mkdir -p "$TMP/jit-angie/conf.d" "$TMP/jit-wp/public" "$TMP/jit-xf/public/src"
+: > "$TMP/jit-wp/public/wp-config.php"
+: > "$TMP/jit-xf/public/src/XF.php"
+printf 'server {\n    root %s/jit-wp/public;\n    include h5bp/php_wp.conf;\n}\n' "$TMP" > "$TMP/jit-angie/conf.d/wp.conf"
+printf 'server {\n    root %s/jit-xf/public;\n    include h5bp/php_xf.conf;\n}\n' "$TMP" > "$TMP/jit-angie/conf.d/xf.conf"
+PHP_JIT=tracing PHP_JIT_WORDPRESS=0
+check "WordPress roots get a [PATH=] section with the JIT off" \
+  test "$(php_jit_path_sections "$TMP/jit-angie" | grep -c "^\[PATH=$TMP/jit-wp/public\]")" -eq 1
+check "the [PATH=] section turns the JIT off, not disabled" \
+  test "$(php_jit_path_sections "$TMP/jit-angie" | grep -c '^opcache\.jit = off$')" -eq 1
+check "XenForo roots get no [PATH=] section" \
+  test "$(php_jit_path_sections "$TMP/jit-angie" | grep -c 'jit-xf')" -eq 0
+PHP_JIT_WORDPRESS=1
+check "PHP_JIT_WORDPRESS=1 writes no [PATH=] section" \
+  test -z "$(php_jit_path_sections "$TMP/jit-angie")"
+PHP_JIT=off PHP_JIT_WORDPRESS=0
+check "a disabled JIT writes no [PATH=] section" \
+  test -z "$(php_jit_path_sections "$TMP/jit-angie")"
 
 mkdir -p "$TMP/index-repair"
 cat > "$TMP/index-repair/wordpress.conf" <<'EOF'
@@ -1158,13 +1190,13 @@ check "MariaDB-only unknown data uses the 128 MB minimum" \
 mariadb_data_size_mb() { printf '0'; }
 OPT_DETECTED=(valkey)
 plan_memory_budget
-check "Valkey-only empty cache uses the 128 MB minimum" \
-  test "$OPT_VALKEY_BUDGET_MB" -eq 128
+check "Valkey-only empty cache uses the RAM floor (RAM/64, 128 MB..1 GB)" \
+  test "$OPT_VALKEY_BUDGET_MB" -eq "$(valkey_floor_mb "$(mem_total_mb)")"
 php_pool_max_children() { printf '128'; }
 OPT_DETECTED=(angie php:8.3 valkey)
 plan_memory_budget
-check "Angie+PHP+Valkey empty cache uses the 128 MB minimum" \
-  test "$OPT_VALKEY_BUDGET_MB" -eq 128
+check "Angie+PHP+Valkey empty cache uses the RAM floor" \
+  test "$OPT_VALKEY_BUDGET_MB" -eq "$(valkey_floor_mb "$(mem_total_mb)")"
 
 # Elasticsearch-only fallback when the index size cannot be measured.
 elasticsearch_data_size_mb() { printf ''; }
@@ -1438,11 +1470,14 @@ check "setup.sh no longer shells out to the repository nginx_conf.sh" \
   bash -c '! grep -q "nginx_conf.sh" "$1"' _ "$ROOT/setup.sh"
 check "--sync-angie has been removed from the CLI" \
   bash -c '! grep -q -- "--sync-angie" "$1"' _ "$ROOT/setup.sh"
-check "optimize_angie enables the XenForo guest cache" \
-  grep -q 'ensure_xf_guest_cache' <<<"$opt_body"
-deploy_body=$(sed -n '/^deploy_angie_configs()/,/^}/p' "$ROOT/setup.sh")
-check "the installer enables the same XenForo guest cache" \
-  grep -q 'ensure_xf_guest_cache' <<<"$deploy_body"
+profile_body=$(sed -n "/^angie_apply_profile()/,/^}/p" "$ROOT/setup.sh")
+check "the shared Angie profile enables the XenForo guest cache" \
+  grep -q "ensure_xf_guest_cache" <<<"$profile_body"
+check "optimize_angie applies the shared Angie profile" \
+  grep -q "angie_apply_profile" <<<"$opt_body"
+deploy_body=$(sed -n "/^deploy_angie_configs()/,/^}/p" "$ROOT/setup.sh")
+check "the installer applies the same Angie profile" \
+  grep -q "angie_apply_profile" <<<"$deploy_body"
 check "WordPress and XenForo share one FastCGI cache zone helper" \
   bash -c 'grep -q "ensure_fastcgi_cache_zone" "$1" && grep -q "ensure_fastcgi_cache_zone" <<<"$(sed -n "/^optimize_wordpress_cache()/,/^}/p" "$1")"' _ "$ROOT/setup.sh"
 
@@ -1493,6 +1528,33 @@ tune_reset_changes
 ensure_xf_guest_cache "$TMP/xfguest"
 check "second XenForo conversion records no change" \
   test "${#TUNE_CHANGES[@]}" -eq 0
+
+# A real include is one `location ~ \.php` block: the injected block must land
+# inside the braces (server-context directives would also cache the admin and
+# login locations), and the security headers the location-level add_header
+# drops are re-included when basic_xf.conf carries them.
+mkdir -p "$TMP/xfguest/h5bp/security"
+printf 'location ~ [^/]\\.php(/|$) {\n    fastcgi_pass local_php;\n}\n' > "$TMP/xfguest/h5bp/php_xf.conf"
+printf 'location ~ [^/]\\.php(/|$) {\n    fastcgi_pass local_php;\n    add_header X-1h-Cache-Status $upstream_cache_status;\n}\n' > "$TMP/xfguest/h5bp/php_xf_proxy.conf"
+printf 'include h5bp/security/strict-transport-security.conf;\ninclude h5bp/security/referrer-policy.conf;\n' > "$TMP/xfguest/h5bp/basic_xf.conf"
+: > "$TMP/xfguest/h5bp/security/strict-transport-security.conf"
+: > "$TMP/xfguest/h5bp/security/referrer-policy.conf"
+tune_reset_changes
+OPT_REPORT=()
+ensure_xf_guest_cache "$TMP/xfguest"
+check "injected XenForo cache block stays inside the location" \
+  test "$(tail -n1 "$TMP/xfguest/h5bp/php_xf.conf")" = '}'
+check "injected XenForo cache block is complete" \
+  bash -c 'grep -q "^fastcgi_cache fastcgicache;" "$1" && grep -q "^fastcgi_cache_bypass" "$1"' _ "$TMP/xfguest/h5bp/php_xf.conf"
+check "HSTS is re-included inside the cached PHP location" \
+  grep -q '^include h5bp/security/strict-transport-security.conf;' "$TMP/xfguest/h5bp/php_xf.conf"
+check "Referrer-Policy is re-included inside the proxy PHP location" \
+  grep -q '^include h5bp/security/referrer-policy.conf;' "$TMP/xfguest/h5bp/php_xf_proxy.conf"
+check "the proxy include keeps its closing brace last" \
+  test "$(tail -n1 "$TMP/xfguest/h5bp/php_xf_proxy.conf")" = '}'
+tune_reset_changes
+ensure_xf_guest_cache "$TMP/xfguest"
+check "in-location repair is idempotent" test "${#TUNE_CHANGES[@]}" -eq 0
 run_body=$(sed -n '/^run_optimize()/,/^}/p' "$ROOT/setup.sh")
 check "run_optimize calls the application connection audit" \
   grep -q 'audit_app_persistent_connections' <<<"$run_body"
@@ -2302,6 +2364,62 @@ order_ok() {
      && $o == *"net.ipv4.ipfrag_high_thresh "*"net.ipv4.ipfrag_low_thresh "* ]]
 }
 check "restore_sysctl_values writes the non-zero member of each dirty pair, ratios first, ipfrag_low last" order_ok
+
+# ---------------------------------------------------------------------------
+# 1.12.0 helpers: Valkey floor, Angie open_file_cache bound, ini reader,
+# in-location insertion, ufw SSH rule matcher, tree digest, rollback of files
+# created during a tune.
+# ---------------------------------------------------------------------------
+check "valkey_floor_mb keeps the 128 MB minimum on a small host" test "$(valkey_floor_mb 1024)" -eq 128
+check "valkey_floor_mb is 1/64 of RAM (27812 MB -> 434)" test "$(valkey_floor_mb 27812)" -eq 434
+check "valkey_floor_mb caps at 1 GB" test "$(valkey_floor_mb 131072)" -eq 1024
+check "valkey_floor_mb tolerates garbage" test "$(valkey_floor_mb x)" -eq 128
+
+check "open_file_cache follows RAM when the fd limit allows it" \
+  test "$(angie_open_file_cache_max 4096 131072 32768)" -eq 32768
+check "open_file_cache is bounded by rlimit minus connections (4 CPU / 32 GB)" \
+  test "$(angie_open_file_cache_max 32768 65536 8192)" -eq 56320
+check "open_file_cache keeps the 10000 floor on a small host" \
+  test "$(angie_open_file_cache_max 1024 65536 8192)" -eq 10000
+
+printf 'user = www-data\n; group = x\ngroup=adm \nlisten = /run/php/php-fpm.sock\naccess.log = /x.log\npm.max_children = 64\n' > "$TMP/pool-ini.conf"
+check "ini_get reads a trimmed value" test "$(ini_get "$TMP/pool-ini.conf" group)" = adm
+check "ini_get skips commented lines" test "$(ini_get "$TMP/pool-ini.conf" user)" = www-data
+check "ini_get handles dotted keys" test "$(ini_get "$TMP/pool-ini.conf" access.log)" = /x.log
+check "ini_get does not match a key prefix" test "$(ini_get "$TMP/pool-ini.conf" pm)" = ""
+check "ini_get prints nothing for an absent key" test -z "$(ini_get "$TMP/pool-ini.conf" missing)"
+
+printf 'location ~ \\.php$ {\n    fastcgi_pass local_php;\n}\n' > "$TMP/loc.conf"
+tune_reset_changes
+tune_ensure_in_location "$TMP/loc.conf" '^[[:space:]]*fastcgi_cache[[:space:]]' 'fastcgi_cache fastcgicache;' "cache added"
+check "tune_ensure_in_location inserts before the closing brace" \
+  test "$(sed -n '3p' "$TMP/loc.conf")" = 'fastcgi_cache fastcgicache;'
+check "tune_ensure_in_location keeps the brace last" test "$(tail -n1 "$TMP/loc.conf")" = '}'
+tune_reset_changes
+tune_ensure_in_location "$TMP/loc.conf" '^[[:space:]]*fastcgi_cache[[:space:]]' 'fastcgi_cache fastcgicache;' "cache added"
+check "tune_ensure_in_location is idempotent" test "$TUNE_DIRTY" -eq 0
+
+check "ufw_rule_ssh_port prints the matching SSH port" test "$(ufw_rule_ssh_port 'ufw allow 22/tcp' 22)" = 22
+check "ufw_rule_ssh_port matches an alternate port" test "$(ufw_rule_ssh_port 'ufw limit 2222/tcp' 22 2222)" = 2222
+not_ssh_rule() { ! ufw_rule_ssh_port "$@" >/dev/null; }
+check "ufw_rule_ssh_port rejects a web rule" not_ssh_rule 'ufw allow 80/tcp' 22
+check "ufw_rule_ssh_port does not match a port substring" not_ssh_rule 'ufw allow 2200/tcp' 22
+
+mkdir -p "$TMP/digest/a"; printf 'x\n' > "$TMP/digest/a/one.conf"
+d1=$(config_tree_digest "$TMP/digest"); d2=$(config_tree_digest "$TMP/digest")
+check "config_tree_digest is stable" test "$d1" = "$d2"
+printf 'y\n' > "$TMP/digest/a/one.conf"
+check "config_tree_digest changes with the content" test "$d1" != "$(config_tree_digest "$TMP/digest")"
+check "config_tree_digest reports an absent tree" test "$(config_tree_digest "$TMP/nope")" = absent
+
+OPT_BACKUP_DIR="$TMP/optbk"; mkdir -p "$OPT_BACKUP_DIR" "$TMP/live/etc"
+printf 'a\n' > "$TMP/live/etc/a.conf"
+opt_backup "$TMP/live/etc" live-etc
+printf 'changed\n' > "$TMP/live/etc/a.conf"; printf 'b\n' > "$TMP/live/etc/99-new.cnf"
+opt_restore "$TMP/live/etc" live-etc
+check "opt_restore puts back the recorded file" test "$(cat "$TMP/live/etc/a.conf")" = a
+check "opt_restore moves a file created after the backup out of the tree" test ! -e "$TMP/live/etc/99-new.cnf"
+OPT_BACKUP_DIR=""
 
 
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"

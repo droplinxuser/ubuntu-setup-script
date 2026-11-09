@@ -30,6 +30,23 @@ run() {
   fi
 }
 
+# Same as run, with one VAR=value placed in the environment of the call.
+run_env() {
+  local expect=$1 var=$2
+  shift 2
+  local out rc
+  out=$(env "$var" bash "$SCRIPT_DIR/setup.sh" "$@" 2>&1)
+  rc=$?
+  if [[ $expect == ok && $rc -eq 0 ]] || [[ $expect == fail && $rc -ne 0 ]]; then
+    PASS=$((PASS + 1))
+    printf 'PASS  rc=%d  %s %s\n' "$rc" "$var" "$*"
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL  rc=%d expected=%s  %s %s\n' "$rc" "$expect" "$var" "$*"
+    printf '%s\n' "$out" | sed 's/^/      /' | head -6
+  fi
+}
+
 # Basic CLI.
 run ok   --help
 run ok   --version
@@ -113,6 +130,8 @@ run ok   --dry-run --purge php mariadb
 run fail --dry-run --basic server=cloud
 run fail --dry-run --basic host=-bad
 run fail --dry-run --basic swap=0
+run ok   --dry-run --basic swap=8Gi
+run ok   --dry-run --purge others
 run fail --dry-run --basic time=Nowhere/Nothing
 run fail --dry-run --basic --mariadb user=u size=4gb
 run fail --dry-run --basic --mariadb user=u pass=p size=0
@@ -191,6 +210,10 @@ else
   FAIL=$((FAIL + 1))
   printf 'FAIL  run log leaks or omits a password argument\n'
 fi
+# Environment overrides are validated and fall back safely.
+run_env ok SETUP_PHP_JIT=tracing --dry-run --optimize
+run_env ok SETUP_PHP_JIT=bogus --dry-run --optimize
+run_env ok SETUP_PHP_JIT_WORDPRESS=1 --dry-run --optimize
 
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
