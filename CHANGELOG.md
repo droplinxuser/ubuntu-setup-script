@@ -4,8 +4,23 @@ Historical release notes for ubuntu-setup-script. Current behavior is documented
 
 ## Unreleased
 
-Two production regressions found on a live Angie + PHP 8.3 + WordPress host and
-repaired in the script so fresh installs and `--optimize` runs carry the fix:
+Three production regressions found on live hosts and repaired in the script so
+fresh installs and `--optimize` runs carry the fix:
+
+- **`--others nodejs` no longer switches an existing Node.js major.**
+  NodeSource publishes one APT line per major and the item hardcoded 26.x, so
+  `apt-get install nodejs` silently upgraded a working 18.20.8 (Node 18) to
+  26.13.0 on a live websocket host. A new major changes
+  `NODE_MODULE_VERSION` (108 -> 147), so soketi 1.6.1's bundled
+  uWebSockets.js, which only ships ABI 83/93/108 binaries, died with
+  `Cannot find module './uws_linux_x64_147.node'` and every proxied request
+  returned 502 from Angie. The major is now selectable with
+  `SETUP_NODE_MAJOR` / `NODE_MAJOR` in `/etc/default/setup-tuning`, and an
+  already-installed major is left alone unless
+  `SETUP_NODE_ALLOW_MAJOR_UPGRADE=1` is set, and a leftover
+  `nodesource.sources` line for another major is renamed `.disabled` so a
+  later apt run cannot make the same jump. The refusal names the installed
+  major, the ABI hazard and both overrides.
 
 - **Per-request `open_basedir` is removed from deployed includes.**
   `--optimize` now comments out every active
