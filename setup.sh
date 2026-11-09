@@ -3228,6 +3228,36 @@ tune_fastcgi_path_translated_all() {
   return 0
 }
 
+# A per-request `PHP_ADMIN_VALUE open_basedir=...` is cached by the FPM worker
+# that handled the request and is never reset, so one vhost that sets it
+# silently restricts every other vhost served by the shared pool.  The next
+# WordPress request on that worker then sees file_exists(wp-config.php) == false
+# and redirects to /wp-admin/setup-config.php (denied -> 403), and PHP cannot
+# open the primary script at all ("Unable to open primary script ...
+# Operation not permitted" -> 404).  Tenant isolation belongs in a dedicated
+# pool, never in a fastcgi_param, so comment out every deployed copy.
+tune_strip_php_admin_open_basedir() {
+  local file=$1 label=${2:-${1##*/}} before
+  [[ -f $file ]] || return 0
+  before=$(md5sum "$file" | awk '{print $1}')
+  sed_in_place -E 's|^([[:space:]]*)(fastcgi_param[[:space:]]+PHP_ADMIN_VALUE[[:space:]]+"?open_basedir=.*)$|\1# \2|' "$file"
+  if [[ $(md5sum "$file" | awk '{print $1}') != "$before" ]]; then
+    tune_note "${label}: per-request open_basedir disabled (it leaks across the shared PHP-FPM pool)"
+  fi
+  return 0
+}
+
+# Apply the repair to every deployed PHP location include and to any vhost
+# that inlined the param itself.
+tune_strip_php_admin_open_basedir_all() {
+  local target=$1 file
+  for file in "${target}"/h5bp/php*.conf "${target}"/conf.d/*.conf; do
+    [[ -f $file ]] || continue
+    tune_strip_php_admin_open_basedir "$file"
+  done
+  return 0
+}
+
 # A bare `location / { try_files ... }` with no index directive resolves "/"
 # to the directory instead of index.php on older vhosts.  Add a server-level
 # index to the shared WordPress and Polr includes when they lack one.
@@ -3570,6 +3600,7 @@ tune_angie_configs() {
   tune_ensure_index "${target}/h5bp/wordpress.conf"
   tune_ensure_index "${target}/h5bp/php_polr.conf"
   tune_fastcgi_path_translated_all "$target"
+  tune_strip_php_admin_open_basedir_all "$target"
 
   local nproc mem_mb disk_free_mb disk_class
   local worker_rlimit worker_connections php_keepalive open_files
@@ -4139,7 +4170,7 @@ tune_php_fpm_version() {
   fi
 
   local nproc ram_mb max_children max_requests php_budget backlog
-  local opcache_mb jit_mb memory_mb realpath_kb
+  local opcache_mb memory_mb realpath_kb
   local current_children
   nproc=$(effective_cpus)
   (( nproc > 0 )) || nproc=1
@@ -4178,7 +4209,10 @@ tune_php_fpm_version() {
   fi
 
   opcache_mb=$(( ram_mb / 16 )); (( opcache_mb < 128 )) && opcache_mb=128; (( opcache_mb > 512 )) && opcache_mb=512
-  jit_mb=$(( ram_mb / 128 )); (( jit_mb < 32 )) && jit_mb=32; (( jit_mb > 128 )) && jit_mb=128
+  # OPcache JIT stays off.  The tracing JIT in php8.3 crashed on real
+  # WordPress workloads (workers died with "segfault at 67c9 ... in
+  # php-fpm8.3" and every request on the killed worker returned 502); the
+  # bytecode cache is what actually helps a database-bound CMS.
   memory_mb=$(( ram_mb / 8 )); (( memory_mb < 256 )) && memory_mb=256; (( memory_mb > 512 )) && memory_mb=512
   # Under 2 GB a 256M per-request ceiling lets a handful of workers claim
   # the whole host; XenForo and WordPress run within 128M.
@@ -4259,8 +4293,8 @@ opcache.enable = 1
 opcache.enable_cli = 0
 opcache.memory_consumption = ${opcache_mb}
 opcache.interned_strings_buffer = $(( opcache_mb / 8 < 16 ? 16 : (opcache_mb / 8 > 64 ? 64 : opcache_mb / 8) ))
-opcache.jit_buffer_size = ${jit_mb}M
-opcache.jit = tracing
+opcache.jit = disable
+opcache.jit_buffer_size = 0
 opcache.max_accelerated_files = 128256
 opcache.validate_timestamps = 1
 opcache.revalidate_freq = 60
@@ -4297,7 +4331,7 @@ EOF
   local ini_after
   ini_after=$(md5sum "$ini" | awk '{print $1}')
   if [[ $ini_before != "$ini_after" ]]; then
-    tune_note "PHP ${ver}: memory_limit=${memory_mb}M opcache=${opcache_mb}M jit=${jit_mb}M"
+    tune_note "PHP ${ver}: memory_limit=${memory_mb}M opcache=${opcache_mb}M jit=off"
     if [[ ${SETUP_PHP_SESSION_HARDENING:-0} == 1 ]]; then
       tune_note "PHP ${ver}: optional session/cgi hardening"
     fi

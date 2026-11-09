@@ -594,6 +594,59 @@ tune_reset_changes
 tune_fastcgi_snippet "$TMP/fcgi-repair/fastcgi-php.conf"
 check "FastCGI snippet repair is idempotent" test "$TUNE_DIRTY" -eq 0
 
+# ---------------------------------------------------------------------------
+# Per-request open_basedir repair
+# ---------------------------------------------------------------------------
+mkdir -p "$TMP/basedir-repair/h5bp" "$TMP/basedir-repair/conf.d"
+cat > "$TMP/basedir-repair/h5bp/php_polr.conf" <<'EOF'
+location ~ [^/]\.php(/|$) {
+    fastcgi_pass local_php;
+    fastcgi_param PHP_ADMIN_VALUE open_basedir=/var/www/example.app/;
+}
+EOF
+cat > "$TMP/basedir-repair/conf.d/site.conf" <<'EOF'
+server {
+  location ~ \.php$ {
+    fastcgi_param PHP_ADMIN_VALUE "open_basedir=/var/www/inline.app/";
+  }
+}
+EOF
+cat > "$TMP/basedir-repair/h5bp/php.conf" <<'EOF'
+location ~ [^/]\.php(/|$) {
+    fastcgi_pass local_php;
+    #fastcgi_param PHP_ADMIN_VALUE open_basedir=$document_root/:/tmp/;
+}
+EOF
+tune_reset_changes
+tune_strip_php_admin_open_basedir_all "$TMP/basedir-repair"
+check "open_basedir param in an h5bp include is commented out" \
+  grep -qx '    # fastcgi_param PHP_ADMIN_VALUE open_basedir=/var/www/example.app/;' \
+  "$TMP/basedir-repair/h5bp/php_polr.conf"
+check "open_basedir param inlined in conf.d is commented out" \
+  grep -qx '    # fastcgi_param PHP_ADMIN_VALUE "open_basedir=/var/www/inline.app/";' \
+  "$TMP/basedir-repair/conf.d/site.conf"
+check "already-commented open_basedir line is left alone" \
+  grep -qx '    #fastcgi_param PHP_ADMIN_VALUE open_basedir=$document_root/:/tmp/;' \
+  "$TMP/basedir-repair/h5bp/php.conf"
+check "open_basedir repair leaves no active param behind" \
+  test "$(grep -rE '^[[:space:]]*fastcgi_param[[:space:]]+PHP_ADMIN_VALUE' "$TMP/basedir-repair" | wc -l | tr -d ' ')" -eq 0
+check "open_basedir repair marks configuration dirty" test "$TUNE_DIRTY" -eq 1
+tune_reset_changes
+tune_strip_php_admin_open_basedir_all "$TMP/basedir-repair"
+check "open_basedir repair is idempotent" test "$TUNE_DIRTY" -eq 0
+
+# ---------------------------------------------------------------------------
+# OPcache JIT stays disabled
+# ---------------------------------------------------------------------------
+check "shipped custom_dan.ini disables OPcache JIT" \
+  test "$(grep -cE '^[[:space:]]*opcache\.jit[[:space:]]*=[[:space:]]*disable' "$ROOT/configs/php/custom_dan.ini")" -eq 1
+check "shipped custom_dan.ini ships no JIT buffer" \
+  test "$(grep -cE '^[[:space:]]*opcache\.jit_buffer_size[[:space:]]*=[[:space:]]*0$' "$ROOT/configs/php/custom_dan.ini")" -eq 1
+check "the optimizer writes JIT disabled" \
+  test "$(grep -cE '^opcache\.jit = disable$' "$ROOT/setup.sh")" -eq 1
+check "the optimizer never writes tracing JIT" \
+  test "$(grep -cE '^opcache\.jit = tracing$' "$ROOT/setup.sh")" -eq 0
+
 mkdir -p "$TMP/index-repair"
 cat > "$TMP/index-repair/wordpress.conf" <<'EOF'
 location / {

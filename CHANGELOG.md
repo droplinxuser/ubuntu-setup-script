@@ -2,6 +2,27 @@
 
 Historical release notes for ubuntu-setup-script. Current behavior is documented in README.md.
 
+## Unreleased
+
+Two production regressions found on a live Angie + PHP 8.3 + WordPress host and
+repaired in the script so fresh installs and `--optimize` runs carry the fix:
+
+- **Per-request `open_basedir` is removed from deployed includes.**
+  `--optimize` now comments out every active
+  `fastcgi_param PHP_ADMIN_VALUE open_basedir=...` in `h5bp/php*.conf` and
+  `conf.d/*.conf`. PHP-FPM caches admin values per worker and never resets
+  them, so one vhost that set `open_basedir` silently restricted every other
+  vhost on the shared pool: WordPress then found no `wp-config.php`, redirected
+  to `/wp-admin/setup-config.php` (denied -> 403) and PHP could not open the
+  primary script at all ("Operation not permitted" -> 404). Tenant isolation
+  belongs in a dedicated pool, not in a FastCGI param.
+- **OPcache JIT is no longer enabled.** `zz-setup-optimize.ini` and
+  `configs/php/custom_dan.ini` now ship `opcache.jit = disable` /
+  `opcache.jit_buffer_size = 0`. The tracing JIT segfaulted PHP-FPM 8.3.36 on
+  a WordPress workload (`segfault at 67c9 ... in php-fpm8.3`), and every
+  request handled by a killed worker returned 502. The OPcache bytecode cache
+  is unchanged; only JIT is off.
+
 ## What's new in 1.11.0
 
 Audit of install/optimize parity, hardware rules and duplicated code (two
