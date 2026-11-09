@@ -3,6 +3,30 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.14.1 (2026-11-09)
+
+Live-host audit of live-origin.example (XenForo 2.3.10 + XFMG, 8 vCPU Xeon E3-class,
+32 GiB, PHP 8.5, Angie 1.12.4, MariaDB 11.8, Valkey sessions/cache), focused
+on non-cacheable pages.
+
+- **Removed the PHP upstream keepalive cache.** `upstream local_php` shipped
+  `keepalive 64`, and the tuner rewrote it to `children/2` (16 here).  Every
+  idle FastCGI connection occupies one PHP-FPM worker, and the cache is per
+  Angie worker, so 16 idle connections pinned all 16 FPM workers.  A request
+  that landed on an Angie worker without a cached connection then waited for
+  the upstream `keepalive_timeout` (60 s default) until a worker was freed:
+  measured 4-7 of every 64 non-cacheable `/login` requests took 60-112 s.
+  With the cache removed (and `fastcgi_keep_conn off` in the config repo),
+  3 x 128 requests had p99 33-38 ms, max 93 ms, no request over 1 s, and the
+  same p50 (24-25 ms) and sequential latency (14 ms) as before.  A Unix-socket
+  connect is cheap; the keepalive benefit did not exist on this workload.
+  `angie_disable_php_keepalive` removes the directive (and any
+  `keepalive_timeout` inside that upstream) from adopted hosts; the dry-run
+  report prints `keepalive=off`.
+- **Pool size confirmed:** 8/12/16/24/32 FPM workers all served `/login` at
+  the same p50 (24-28 ms) and p99 (31-72 ms) under 8 concurrent clients;
+  2 per logical CPU (16) is kept for headroom on job/media bursts.
+
 ## 1.14.0 (2026-11-09)
 
 Full-stack audit on dev-host (16 threads / 27.2 GiB / NVMe, Ubuntu 26.04.1) from
