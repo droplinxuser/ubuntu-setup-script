@@ -779,6 +779,14 @@ check "client_body_buffer_size is inside the http block and sized for RAM" \
 check "worker_rlimit_nofile is inserted after worker_processes" \
   test "$(awk '/^worker_processes/{getline; print}' "$TMP/angie/angie.conf")" = \
        "$(grep 'worker_rlimit_nofile' "$TMP/angie/angie.conf")"
+# Idle FastCGI upstream connections pin PHP-FPM workers (see the live live-origin.example
+# audit): the tuner must remove the cache inside `upstream local_php` and
+# leave the http-level keepalive_timeout alone.
+check "PHP upstream keepalive cache is removed" \
+  test "$(awk '/^upstream[[:space:]]+local_php/{f=1} f&&/^[[:space:]]*}[[:space:]]*$/{f=0} f&&/^[[:space:]]*keepalive([[:space:]]|_timeout)/{n++} END{print n+0}' "$TMP/angie/angie.conf")" -eq 0
+check "the report exposes keepalive as off" test "$ANGIE_PHP_KEEPALIVE" = off
+check "http-level keepalive_timeout is preserved" \
+  grep -q '^[[:space:]]*keepalive_timeout 30s;' "$TMP/angie/angie.conf"
 
 # Multi-line proxy_cache_path directives must have their max_size rewritten.
 if grep -q 'max_size=16g' "$TMP/angie/http.d/proxy_cache.conf"; then

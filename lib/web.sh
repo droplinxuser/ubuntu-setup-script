@@ -800,6 +800,33 @@ configure_asset_precompression() {
   return 0
 }
 
+# Remove the FastCGI upstream keepalive cache from angie.conf.  Every idle
+# connection in that cache occupies one PHP-FPM worker (FPM waits on the open
+# socket for the next request), and the cache is per Angie worker, so the
+# total can reach keepalive x worker_processes and pin the whole FPM pool.
+# A request that then lands on an Angie worker without a cached connection
+# waits for keepalive_timeout (60 s upstream default) before a worker frees.
+# Measured on the live live-origin.example host: 4-7 of 64 non-cacheable /login
+# requests stalled 60-112 s with keepalive 16; with the cache removed, 3 x
+# 128 requests stayed at p99 33-38 ms / max 93 ms and p50 was unchanged.
+angie_disable_php_keepalive() {
+  local file=${1:-} tmp
+  [[ -n $file && -f $file ]] || return 0
+  tmp=$(tmp_file) || return 1
+  awk '
+    /^[[:space:]]*upstream[[:space:]]+local_php[[:space:]]*\{/ { in_php = 1 }
+    in_php && /^[[:space:]]*keepalive([[:space:]]|_timeout[[:space:]])/ { next }
+    in_php && /^[[:space:]]*#[[:space:]]*Reuse enough idle FastCGI/ { next }
+    in_php && /^[[:space:]]*\}/ { in_php = 0 }
+    { print }
+  ' "$file" > "$tmp" || return 1
+  if ! cmp -s "$file" "$tmp"; then
+    cat "$tmp" > "$file"
+    tune_note "angie.conf: removed the PHP upstream keepalive cache (idle connections pin FPM workers)"
+  fi
+  return 0
+}
+
 tune_angie_configs() {
   local target=${1:-/etc/angie}
   local nginx_conf="${target}/angie.conf"
@@ -816,7 +843,7 @@ tune_angie_configs() {
   tune_strip_php_admin_open_basedir_all "$target"
 
   local nproc mem_mb disk_free_mb disk_class
-  local worker_rlimit worker_connections php_keepalive open_files
+  local worker_rlimit worker_connections open_files
   local fastcgi_buffers fastcgi_busy body_buffer ssl_cache_mb
   local cache_total_mb fcgi_mb chev_mb xf_mb proxy_mb cdn_mb
   local fcgi_zone chev_zone xf_zone proxy_zone cdn_zone
@@ -834,7 +861,6 @@ tune_angie_configs() {
   angie_worker_limits "$nproc"
   worker_rlimit=$ANGIE_WORKER_RLIMIT
   worker_connections=$ANGIE_WORKER_CONNECTIONS
-  php_keepalive=$ANGIE_PHP_KEEPALIVE
   # The open-file cache holds static assets, templates and cache objects;
   # size it with RAM (and the file count that implies), not the core count.
   # Cached descriptors are real fds of the worker, so the cache can never
@@ -976,7 +1002,7 @@ tune_angie_configs() {
   tune_replace "$nginx_conf" '^([[:space:]]*worker_rlimit_nofile[[:space:]]+)[0-9]+;' "\\1${worker_rlimit};" "angie.conf: worker_rlimit_nofile=${worker_rlimit}"
   tune_replace "$nginx_conf" '^([[:space:]]*worker_connections[[:space:]]+)[0-9]+;' "\\1${worker_connections};" "angie.conf: worker_connections=${worker_connections}"
   tune_replace "$nginx_conf" '^([[:space:]]*client_body_buffer_size[[:space:]]+).*;' "\\1${body_buffer};" "angie.conf: client_body_buffer_size=${body_buffer}"
-  tune_replace "$nginx_conf" '^([[:space:]]*keepalive[[:space:]]+)[0-9]+;' "\\1${php_keepalive};" "angie.conf: PHP upstream keepalive=${php_keepalive}"
+  angie_disable_php_keepalive "$nginx_conf"
 
   if ! grep -qE '^[[:space:]]*worker_rlimit_nofile[[:space:]]' "$nginx_conf"; then
     tune_insert_after "$nginx_conf" '^[[:space:]]*worker_processes[[:space:]]' \

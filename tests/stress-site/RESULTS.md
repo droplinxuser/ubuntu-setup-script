@@ -1,6 +1,60 @@
 # Full-stack stress test reports
 
 
+## live-origin.example live audit - non-cacheable pages (2026-11-09)
+
+Host: live-origin.example, 8 vCPU (Xeon E3-class, 4 cores x 2 threads), 32 GiB,
+RAID NVMe, Ubuntu 26.04.1, Angie 1.12.4, PHP 8.5 FPM (`pm=static`, 16
+workers), MariaDB 11.8 (1.98 GB pool, 900 MB database, 169 disk reads),
+Valkey (sessions + XF registry), XenForo 2.3.10 + XFMG. HTTP/3 already
+enabled; Brotli dynamic + static; MariaDB `innodb_flush_log_at_trx_commit=2`;
+governor `performance`.
+
+Method: loopback requests to `https://live-origin.example/login/` with `--resolve`
+(so the ~300 ms long-haul RTT is excluded), 64-128 requests at 8 concurrent
+clients, CPU time from `/proc/<pid>/stat`, PHP-FPM/Angie worker states, and
+`ss -x` connection counts. No production data was changed.
+
+### Finding: idle FastCGI keepalive pinned every PHP worker
+
+`upstream local_php` had `keepalive 16` (the tuner wrote `children/2`).  With
+16 FPM workers and 16 idle upstream connections, every worker was blocked in
+`unix_stream_data_wait` while Angie workers sat in `ep_poll`.  Requests that
+landed on an Angie worker without a cached upstream connection waited for the
+upstream `keepalive_timeout` (60 s default).
+
+| `/login/`, 64 requests, 8 concurrent | p50 | p90 | p99 | max | >10 s |
+|---|---:|---:|---:|---:|---:|
+| keepalive 16, default timeout | 21 ms | 31 ms | 60.0 s | 71.5 s | 4-6 |
+| keepalive 16 + `keepalive_timeout 5s` | 22 ms | 30 ms | 4.98 s | 4.99 s | 0 |
+| keepalive 2 + `keepalive_timeout 5s` | 24 ms | 28 ms | 4.86 s | 4.86 s | 0 |
+| **keepalive 1 + `keepalive_timeout 5s`** | **24 ms** | **29 ms** | **0.08 s** | **0.08 s** | **0** |
+| **no upstream keepalive, `keep_conn off`** | **25 ms** | **30 ms** | **0.037 s** | **0.09 s** | **0** |
+
+The no-keepalive configuration was validated with 3 x 128 requests: p50
+24-25 ms, p99 33-38 ms, max 93 ms, and only the FPM listener socket remained
+(`ss -x` = 1).  Sequential latency stayed at 14 ms.  It is the simplest safe
+setting, so `setup.sh` now removes the directive and the config repo ships
+`fastcgi_keep_conn off`.
+
+### Other measurements
+
+- **FPM children:** 8 / 12 / 16 / 24 / 32 workers gave the same p50
+  (25-28 ms) and p99 (31-72 ms) for 128 `/login` requests at 8 concurrent
+  clients; 16 (2 per logical CPU) is kept for media/job bursts.
+- **Guest pages:** cached `/` 5.4 ms, 200 rps at 8 clients; the FastCGI cache
+  is not affected by the keepalive fix.
+- **Perf:** 20% of samples were idle even during the 8-client burst; top PHP
+  symbols were `zend_hash_find` (1.5%), `execute_ex` (1.2%), `_emalloc`
+  (0.7%).  The page is not CPU-bound at current traffic.
+- **MariaDB:** buffer pool holds the whole 900 MB database (`read_requests`
+  95M vs `reads` 169); one 1.44 s `DELETE FROM xf_content_activity_log WHERE
+  log_date < ...` (352k rows) was the only slow query, a scheduled cleanup.
+- **Live bug (not performance):** Angie's error log repeats `open()
+  /var/www/live-origin.example/public/data/xfmg/video/... failed (13: Permission
+  denied)`; the video subdirectories are `root:www-data 2710` while the rest
+  of `data/` is `www-data`.  Videos served from those paths return 403.
+
 ## setup.sh 1.14.0 - dev-host JIT/PHP-FPM sweep, modularization and parity (2026-11-09)
 
 Host: dev-host, 16 threads (8 cores) / 27.2 GiB / NVMe, Ubuntu 26.04.1, clean

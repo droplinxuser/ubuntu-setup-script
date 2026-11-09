@@ -753,19 +753,18 @@ angie_worker_limits() {
   ANGIE_WORKER_CONNECTIONS=$(tune_clamp $(( nproc * per_core_conn )) 8192 65535)
   (( ANGIE_WORKER_CONNECTIONS > ANGIE_WORKER_RLIMIT - 1024 )) && ANGIE_WORKER_CONNECTIONS=$(( ANGIE_WORKER_RLIMIT - 1024 ))
   (( ANGIE_WORKER_CONNECTIONS < 1024 )) && ANGIE_WORKER_CONNECTIONS=1024
-  # Angie's upstream keepalive pool must cover concurrent PHP requests.  Key
-  # it to the FPM worker count instead of the CPU count: on a 16-thread host
-  # with 144 workers, nproc*2 left only 32 reusable upstream connections.
-  # The count the PHP tuner actually wrote (live pool kept, explicit
-  # children=, application cap) wins over the plan; on a fresh install Angie
-  # is tuned before PHP, so the plan is all there is.
-  local ka_base=$(( nproc * 2 ))
-  if [[ ${PHP_WRITTEN_CHILDREN:-0} =~ ^[0-9]+$ ]] && (( PHP_WRITTEN_CHILDREN > 0 )); then
-    ka_base=$(( PHP_WRITTEN_CHILDREN / 2 ))
-  elif [[ ${OPT_PHP_CHILDREN:-0} =~ ^[0-9]+$ ]] && (( OPT_PHP_CHILDREN > 0 )); then
-    ka_base=$(( OPT_PHP_CHILDREN / 2 ))
-  fi
-  ANGIE_PHP_KEEPALIVE=$(tune_clamp "$ka_base" 16 512)
+  # Angie must NOT keep idle FastCGI connections to PHP-FPM.  Every idle
+  # keepalive slot pins one FPM worker (FPM waits on the same socket for the
+  # next request) and the cache is per Angie worker.  On dev-host that produced
+  # 16 idle connections for 16 workers; any request that landed on an Angie
+  # worker without a cached connection then waited for the upstream
+  # keepalive_timeout (60 s default) for a worker to be freed.  Measured on
+  # the live 8 CPU host: 4-7 of every 64 non-cacheable /login requests took
+  # 60-112 s; after removing the cache, 3 x 128 requests had p99 33-38 ms and
+  # no request above 93 ms, with identical p50 (24-25 ms) and sequential
+  # latency (14 ms).  A Unix-socket connect is cheaper than any keepalive
+  # benefit here.  ANGIE_PHP_KEEPALIVE is kept as "off" for the report.
+  ANGIE_PHP_KEEPALIVE="off"
 }
 PHP_WRITTEN_CHILDREN=0
 
