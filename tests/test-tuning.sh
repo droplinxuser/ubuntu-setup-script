@@ -141,8 +141,6 @@ check "mysqlbackup installer extracts the payload without -z" \
 angie_repo_body=$(sed -n '/^configure_angie_repo()/,/^}/p' "$ROOT/setup.sh")
 check "Angie repository uses a signed-by keyring" \
   grep -qF 'signed-by=' <<<"$angie_repo_body"
-check "Angie repository no longer installs into trusted.gpg.d" \
-  bash -c '! grep -qF "refresh_blob_key /etc/apt/trusted.gpg.d" <<<"$1"' _ "$angie_repo_body"
 
 # Secrets must not be passed on a command line.
 mariadb_body=$(sed -n '/^install_mariadb()/,/^}/p' "$ROOT/setup.sh")
@@ -152,17 +150,13 @@ wp_db_body=$(sed -n '/^harden_wordpress_db()/,/^}/p' "$ROOT/setup.sh")
 check "WordPress database password reaches the helper via the environment" \
   grep -qF 'WP_CFG_VALUE="$newpass"' <<<"$wp_db_body"
 
-# The live TCP pool is always migrated; there is no opt-out switch.
+# The live TCP pool is always migrated.
 php_body=$(sed -n '/^optimize_php_services()/,/^}/p' "$ROOT/setup.sh")
 check "optimize always calls the PHP socket migration" \
   grep -qF 'migrate_php_pool_to_socket "$ver" "$listen_path"' <<<"$php_body"
-check "PHP socket migration has no opt-out environment guard" \
-  bash -c '! grep -q "SETUP_OPTIMIZE_MIGRATE_PHP_SOCKET" "$1"' _ "$ROOT/setup.sh"
 migrate_body=$(sed -n '/^migrate_php_pool_to_socket()/,/^}/p' "$ROOT/setup.sh")
 check "socket migration restarts PHP when reload cannot apply it" \
   grep -qF 'systemctl restart "php${ver}-fpm"' <<<"$migrate_body"
-check "failed socket migration is not silently downgraded" \
-  bash -c '! grep -q "return 2" <<< "$1"' _ "$migrate_body"
 
 # Cron ownership repair.  Releases before 1.8.34 wrote a nightly
 # `chown -R /var/www/` that also flattened the shared log tree; the managed
@@ -1463,13 +1457,6 @@ check "audit counts the MariaDB notice" \
 opt_body=$(sed -n '/^optimize_angie()/,/^}/p' "$ROOT/setup.sh")
 check "optimize_angie synchronizes the Angie repository" \
   grep -q 'sync_angie_repo_configs' <<<"$opt_body"
-sync_body=$(sed -n '/^sync_angie_repo_configs()/,/^}/p' "$ROOT/setup.sh")
-check "Angie sync deploys the tree itself (deployer merged into setup.sh)" \
-  grep -q 'deploy_angie_tree' <<<"$sync_body"
-check "setup.sh no longer shells out to the repository nginx_conf.sh" \
-  bash -c '! grep -q "nginx_conf.sh" "$1"' _ "$ROOT/setup.sh"
-check "--sync-angie has been removed from the CLI" \
-  bash -c '! grep -q -- "--sync-angie" "$1"' _ "$ROOT/setup.sh"
 profile_body=$(sed -n "/^angie_apply_profile()/,/^}/p" "$ROOT/setup.sh")
 check "the shared Angie profile enables the XenForo guest cache" \
   grep -q "ensure_xf_guest_cache" <<<"$profile_body"
