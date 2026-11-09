@@ -785,6 +785,10 @@ check "worker_rlimit_nofile is inserted after worker_processes" \
 check "PHP upstream keepalive cache is removed" \
   test "$(awk '/^upstream[[:space:]]+local_php/{f=1} f&&/^[[:space:]]*}[[:space:]]*$/{f=0} f&&/^[[:space:]]*keepalive([[:space:]]|_timeout)/{n++} END{print n+0}' "$TMP/angie/angie.conf")" -eq 0
 check "the report exposes keepalive as off" test "$ANGIE_PHP_KEEPALIVE" = off
+check "fastcgi_keep_conn is forced off in every PHP include" \
+  test "$(grep -h '^fastcgi_keep_conn on;' "$TMP/angie"/h5bp/php*.conf | wc -l)" -eq 0
+check "fastcgi_keep_conn off is present where it was on" \
+  grep -q '^fastcgi_keep_conn off;' "$TMP/angie/h5bp/php.conf"
 check "http-level keepalive_timeout is preserved" \
   grep -q '^[[:space:]]*keepalive_timeout 30s;' "$TMP/angie/angie.conf"
 
