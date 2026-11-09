@@ -1,6 +1,88 @@
 # Full-stack stress test reports
 
 
+## setup.sh 1.14.0 - dev-host JIT/PHP-FPM sweep, modularization and parity (2026-11-09)
+
+Host: dev-host, 16 threads (8 cores) / 27.2 GiB / NVMe, Ubuntu 26.04.1, clean
+557-package baseline. Fresh install from the local checkouts
+(`--basic server=dedi --angie --php --mariadb user=demo pass=temp --valkey
+--elastic --others all`, 1 min 35 s), then `--optimize` (12 s). XenForo
+2.3.13 (CLI `xf:install`, friendly URLs, 50 members / 150 threads / 2,250
+replies) and WordPress 7.1.4 (`wp_install()` from the CLI, 200 posts / 201
+comments, `/%postname%/`) were deployed from the local archives; a second
+`--optimize` (10 s) capped the pool at 32 workers and enabled the WordPress
+guest cache.
+
+### Install/optimize parity
+
+Captured 11 configuration trees (`/etc/angie`, `/etc/php`, `/etc/mysql`,
+`/etc/valkey`, `/etc/elasticsearch`, `/etc/systemd/system`, `/etc/sysctl.d`,
+`/etc/security/limits.d`, `/etc/logrotate.d`, `/etc/default`,
+`/var/www/logs`) plus enabled units, active units, sysctls, crontab and the
+package list. After install vs after `--optimize`: every configuration tree
+digest was identical; only runtime counters (`fs.file-nr`,
+`fs.dentry-state`, conntrack, ns_last_pid) and log contents changed. A repeat
+`--optimize` changed nothing and reloaded nothing ("configuration already
+optimized" for all five services).
+
+The `lib/*.sh` split was verified by concatenating driver head + modules +
+tail and diffing against the pre-split file: byte-for-byte identical.
+
+### OPcache JIT sweep (PHP 8.5.12, 32 workers, 100 connections, 20 s)
+
+| Variant | xf member req/s (p50/p99 ms) | xf thread | wp member |
+|---|---:|---:|---:|
+| tracing, 64 MB buffer | **909** (69 / 99) | **485** | **234.5** (283 / 800) |
+| tracing, 128 MB buffer | 906 (69 / 99) | 485 | 229 (285 / 1095) |
+| tracing, 256 MB buffer | 899 (73 / 102) | 473 | 225 |
+| function, 128 MB buffer | 852 (76 / 109) | 437 (151 / **554**) | 251 |
+| tracing, aggressive hotness (16/64/8/32) | 911 (69 / 100) | 484 | 262 |
+| tracing, conservative (128/255/32/128) | 889 (72 / 102) | 475 | 267 |
+| JIT off | 864 (73 / 103) | 475 | 244.5 (273 / 658) |
+
+Tracing beats JIT off by ~5% on XenForo members and ties on WordPress
+members (WordPress guest-uncached is 7% better with tracing). 64 MB and
+128 MB are within noise; 256 MB is slower; `function` is 6-8% slower with a
+554 ms p99. The chosen profile is tracing / OPcache÷8 (64 MB with a 512 MB
+OPcache) and PHP's default thresholds on 4+ CPUs.
+
+### PHP-FPM pool size (tracing/64 MB, 100 connections, 15 s, two runs)
+
+| Workers | xf member req/s / p50 | xf thread req/s / p50 | wp member req/s / p50 |
+|---:|---:|---:|---:|
+| 16 | 645 / 22 ms | 456 / 35 ms | 233 / 67 ms |
+| 24 | 886 / 26 ms | 515 / 46 ms | 242 / 95 ms |
+| **32** | **942 / 33 ms** | **511 / 62 ms** | 241 / 130 ms |
+| 40 | 932 / 41 ms | 506 / 80 ms | 238 / 169 ms |
+| 64 | 914 / 68 ms | 492 / 138 ms | 231 / 280 ms |
+| 96 | 921 / 103 ms | 495 / 201 ms | 236 / 420 ms |
+
+32 workers (2 per logical CPU) is the knee: it maximises throughput and
+halves p50/p99 against the old 4-per-CPU cap. Higher counts only grow the run
+queue; 16 leaves half the CPU idle. CPU busy at 32 workers is 86-91% during
+the member runs, i.e. the pool is sized to the cores rather than overcommitted.
+
+### Full suite, before vs after (12 s, 200 connections cached / 100 otherwise)
+
+| Scenario | 1.13.1 (64 workers, JIT 128M) | 1.14.0 (32 workers, JIT 64M) |
+|---|---:|---:|
+| xf-guest (cached) | 7668 (25 / 45 ms) | 8185 (24 / 41 ms) |
+| xf-guest-uncached | 1059 (60 / 89) | 1045 (31 / 46) |
+| xf-member | 930 (**70 / 99**) | 954 (**34 / 50**) |
+| xf-member-thread | 495 (140 / 180) | 505 (**59 / 114**) |
+| wp-guest (cached) | 6038 (32 / 61) | 4010 (43 / 129) *link-bound, Wi-Fi noise* |
+| wp-guest-uncached | 285 (232 / 288) | 261 (**125 / 195**) |
+| wp-member | 270 (254 / 352) | 249 (**130 / 218**) |
+| wp-member-post | 244 (278 / 397) | 231 (**140 / 227**) |
+
+Guest cached pages are served by the Angie FastCGI cache and stay link-bound
+(7-8k req/s over the Wi-Fi link); the authenticated and uncached tiers are
+CPU-bound and now run with half the latency. No 429s (the workstation is in
+`LIMIT_REQ_EXEMPT`), no FPM `max children reached`, no new PHP-FPM/Angie/
+MariaDB error entries, and the MariaDB slow log stayed empty. The PHP-FPM
+slow log recorded WordPress block-render traces under 100 concurrent members
+(at 10 s), the expected cost of CPU saturation at maximum throughput.
+
 ## setup.sh 1.13.0 - dev-host audit, refactor validation and authenticated-tier tuning (2026-11-09)
 
 Host: dev-host, 16 threads / 27.2 GiB / NVMe, Ubuntu 26.04.1, wiped to the

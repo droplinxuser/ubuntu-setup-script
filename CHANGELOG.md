@@ -3,6 +3,59 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.14.0 (2026-11-09)
+
+Full-stack audit on dev-host (16 threads / 27.2 GiB / NVMe, Ubuntu 26.04.1) from
+the 557-package baseline: fresh `--basic --angie --php --mariadb --valkey
+--elastic --others all` install, `--optimize` parity, XenForo 2.3.13 and
+WordPress 7.1.4 deployment from the local archives, and JIT/PHP-FPM sweeps
+from the workstation (see `tests/stress-site/RESULTS.md`).
+
+- **Modularized:** `setup.sh` is now a 217-line driver; the implementation
+  lives in `lib/*.sh` (common, cli, validate, util, os, web, services, purge,
+  runner, optimize, security, diagnostics, restart, payloads) sourced in the
+  same order the monolithic file used. The split is lossless: head + modules
+  + tail reconstruct the previous file byte-for-byte. `tests/test-tuning.sh`
+  concatenates the driver and modules for its source-level checks; CI runs
+  `bash -n` and shellcheck over every module.
+- **PHP-FPM application pool is 2 workers per logical CPU** (was 4). With 100
+  concurrent members on 16 threads, 32 workers beat 64 on throughput and
+  halved latency: XenForo member 942 vs 914 req/s, p50 33 vs 68 ms, p99 49 vs
+  118 ms; XenForo thread p50 62 vs 138 ms; WordPress member p50 130 vs 280 ms.
+  16 workers left the CPU at ~50-60% and lost 30%; 40+ only added queueing.
+- **OPcache JIT buffer is OPcache/8 (32-128 MB)** and the tracing hotness
+  thresholds are written explicitly (PHP defaults on 4+ CPUs, a conservative
+  set on 1-2 CPUs, `SETUP_PHP_JIT_HOT_{LOOP,FUNC,RETURN,SIDE_EXIT}` override).
+  The buffer is per worker, so 64 MB keeps a 32-worker pool at 2 GiB instead
+  of 4 GiB. Measured: 64 MB and 128 MB tied (XenForo 909 vs 906 req/s), 256 MB
+  was slower; `function` lost 6-8% with a 554 ms p99; JIT off cost 5% on
+  XenForo members.
+- **Rate-limit exemptions work with `sudo -E`-less runs:** pass
+  `SETUP_LIMIT_REQ_EXEMPT` through `env` (documented); the value is persisted
+  in `/etc/default/setup-tuning` and survives a plain `--optimize`.
+
+### Fixes from the 1.13.1 full-stack install-log audit (Ubuntu 26.04.1):
+
+- **Cron:** `write_cron` no longer trusts the command-line service selection.
+  `install_basic` calls it before the installers run, so a failed or
+  interrupted install could leave Angie/MariaDB jobs pointing at missing
+  binaries. It now uses `cron_angie_configured`/`cron_mariadb_configured`
+  only; the final post-install pass adds the entries.
+- **MariaDB backup:** an existing `/etc/mysqlbkup.config` survives a
+  `--mariadb` re-run (including a larger `MAX_BACKUPS`), and the embedded
+  installer's competing "Setup cron" suggestion is filtered out.
+- **Diagnostics:** `cache and data sizes` includes `/var/lib/mariadb`, the
+  MariaDB 11.8 datadir on Ubuntu 26.04.
+- **DNS:** the drop-in sets `Domains=~.` so `8.8.8.8`/`1.1.1.1` are the
+  default route for every query, not only a fallback behind DHCP DNS.
+- **Run log:** timestamps are UTC (the timezone change no longer makes a
+  2-minute run look 8 hours long) and ANSI colour sequences are stripped from
+  the finished log file.
+- **Install log:** the PHP-FPM tuning changes and the MariaDB profile are
+  printed, matching the `--optimize` audit trail.
+- **Swap:** the auto-swap skip message now says the existing swap meets or
+  exceeds the target instead of claiming it is "at least 50% of RAM".
+
 ## 1.13.1 (2026-11-09)
 
 - **PHP-FPM is always `pm = static`** (the 1.13.0 `ondemand` rule for small
