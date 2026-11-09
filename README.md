@@ -142,18 +142,18 @@ select a fork or branch.
   `h5bp/php*.conf` and any per-request `PHP_ADMIN_VALUE open_basedir` is
   commented out (PHP-FPM caches admin values per worker, so one vhost's
   setting leaked onto every other vhost of the shared pool).
-- **OPcache JIT** is off by default (the tracing JIT crashed php-fpm 8.3 on a
-  live WordPress site). `SETUP_PHP_JIT=tracing|function` turns it on for the
-  pool with a buffer of OPcache/4 (32-256 MB), persisted as `PHP_JIT`; while
-  it is on, every WordPress document root keeps `opcache.jit = off` through a
+- **OPcache JIT** is always the tracing JIT for the pool, with a buffer of
+  OPcache/4 (32-256 MB); there is no mode switch (an old `SETUP_PHP_JIT` or
+  persisted `PHP_JIT` value is ignored with a notice). WordPress roots use it
+  too; `SETUP_PHP_JIT_WORDPRESS=0` (persisted as `PHP_JIT_WORDPRESS`) keeps
+  `opcache.jit = off` for every WordPress document root through a
   `[PATH=<root>]` section of the managed ini (applied per request by php-fpm,
-  so it cannot leak like a FastCGI param; `SETUP_PHP_JIT_WORDPRESS=1` lifts
-  it) and `opcache.file_cache` is left empty, because scripts restored from
-  the file cache are never JIT-compiled. Measured on the test host (XenForo
-  2.3.13 + WordPress 7.1.4): the Sury PHP 8.5.12 build compiles nothing in
-  any mode; on PHP 8.4 `tracing` gained 3-5% on every CPU-bound tier and
-  `function` was equal or slower. Use `tracing` on a XenForo host running
-  8.4; keep WordPress on the bytecode cache unless it has been load-tested.
+  so it cannot leak like a FastCGI param) for a site that misbehaves with the
+  JIT. `opcache.file_cache` stays empty, because scripts restored from the
+  file cache are never JIT-compiled. Measured on the test host (XenForo
+  2.3.13 + WordPress 7.1.4): the Sury PHP 8.5.12 build compiles nothing; on
+  PHP 8.4 `tracing` gained 2-5% on every CPU-bound XenForo tier with no
+  crash, and `function` was equal or slower. The pool is always `pm = static`.
 - Session/cgi hardening (`session.*` strict settings, `cgi.fix_pathinfo=0`,
   `display_errors=Off`, central `error_log`) is **opt-in**:
   `SETUP_PHP_SESSION_HARDENING=1`. It broke Joomla/Polr logins on a mixed
@@ -319,7 +319,7 @@ data directory (NVMe / SSD / HDD) and the host class (`dedi`/`vps`).
 
 | Area | Rule |
 |---|---|
-| PHP-FPM | 16 workers per core (VPS 8), at most RAM/2 at 96 MB each, 512 max, floor `min(8, RAM/2/96)`; 4 per core (VPS 3) on a XenForo/WordPress host with a local database; live count kept; `children=` wins. `pm = static`, or `ondemand` (10 s idle) under 2 GB RAM or on a VPS with 8 workers or fewer. `opcache.max_accelerated_files` = PHP files under the vhost roots x 1.5 (16384..128256; the ceiling when no root is found); `memory_limit`, OPcache and realpath sizes from one RAM profile shared with the dry run |
+| PHP-FPM | 16 workers per core (VPS 8), at most RAM/2 at 96 MB each, 512 max, floor `min(8, RAM/2/96)`; 4 per core (VPS 3) on a XenForo/WordPress host with a local database; live count kept; `children=` wins. `pm = static` always. `opcache.max_accelerated_files` = PHP files under the vhost roots x 1.5 (16384..128256; the ceiling when no root is found); `memory_limit`, OPcache and realpath sizes from one RAM profile shared with the dry run |
 | MariaDB | see the service section: pool from live data with floor `clamp(RAM/16, 256 MB, 4 GB)` for an empty or unmeasured database, io_capacity by disk x host, thread pool, connections from the PHP pool, table caches from connections, Aria page cache `clamp(RAM/128, 16, 256) MB` |
 | Elasticsearch | heap = store/4 (512 MB..25% RAM..31 GB); `node.processors` = effective CPUs; search threads cpus/2 (max 16), write threads cpus/4 (max 8) |
 | Valkey / Redis | maxmemory = live +20% with floor `clamp(RAM/64, 128 MB, 1 GB)`; maxclients from the PHP pool; io_threads 1..8 (a larger `io_threads=` is clamped with a warning) |
@@ -330,7 +330,7 @@ data directory (NVMe / SSD / HDD) and the host class (`dedi`/`vps`).
 Environment overrides persisted in `/etc/default/setup-tuning`:
 `SETUP_LIMIT_REQ_EXEMPT="ip,cidr,..."` (rate-limit exemptions for a load
 generator or monitor; empty clears), `SETUP_PRECOMPRESS_ASSETS=0|1`,
-`SETUP_PHP_JIT`, `SETUP_PHP_JIT_WORDPRESS`, `SETUP_NODE_MAJOR`. Others:
+`SETUP_PHP_JIT_WORDPRESS` (0 exempts WordPress roots from the always-on tracing JIT), `SETUP_NODE_MAJOR`. Others:
 `SETUP_MARIADB_IO_CAPACITY`, `SETUP_BROTLI_LEVEL`, `SETUP_GZIP_LEVEL`,
 `SETUP_ANGIE_COMPRESSION`, `SETUP_PHP_SESSION_HARDENING`, `SETUP_WP_DB_SPLIT`,
 `SETUP_WP_ALLOW_FILE_MODS`, `SETUP_WP_GUEST_CACHE`, `SETUP_PURGE_MALWARE`,
@@ -434,7 +434,7 @@ tests. Angie configuration and Cloudflare IP ranges are downloaded.
 |---|---|
 | `/run/setup.sh.lock`, `/tmp/setup-optimize.*` | run lock; `--optimize` rollback backups |
 | `/var/lib/setup.sh/` | originals for `--purge basic`, UFW/swap state, package-origin markers, `explicit-options.conf` |
-| `/etc/default/setup-tuning` | persisted overrides (`TCP_CC`, `QDISC`, `LIMIT_REQ_EXEMPT`, `PRECOMPRESS_ASSETS`, `PHP_JIT`, `PHP_JIT_WORDPRESS`, `NODE_MAJOR`) |
+| `/etc/default/setup-tuning` | persisted overrides (`TCP_CC`, `QDISC`, `LIMIT_REQ_EXEMPT`, `PRECOMPRESS_ASSETS`, `PHP_JIT_WORDPRESS`, `NODE_MAJOR`) |
 | `/etc/angie/` | Angie tree (`conf.d/<domain>.conf`, `ssl/<domain>/`, `http.d/zz-setup-*.conf` managed maps/zones) |
 | `/home/nginx_cache*`, `/home/xf_proxy_cache`, `/home/proxy_cache*` | Angie cache directories |
 | `/etc/php/<ver>/fpm/conf.d/zz-setup-optimize.ini`, `custom_dan.ini`, `pool.d/www.conf` | PHP tuning |

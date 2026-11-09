@@ -644,36 +644,36 @@ tune_strip_php_admin_open_basedir_all "$TMP/basedir-repair"
 check "open_basedir repair is idempotent" test "$TUNE_DIRTY" -eq 0
 
 # ---------------------------------------------------------------------------
-# OPcache JIT stays disabled
+# OPcache JIT: always the tracing JIT; the pool is always static
 # ---------------------------------------------------------------------------
-check "shipped custom_dan.ini disables OPcache JIT" \
+check "shipped custom_dan.ini disables OPcache JIT (the managed ini turns it on)" \
   test "$(grep -cE '^[[:space:]]*opcache\.jit[[:space:]]*=[[:space:]]*disable' "$ROOT/configs/php/custom_dan.ini")" -eq 1
 check "shipped custom_dan.ini ships no JIT buffer" \
   test "$(grep -cE '^[[:space:]]*opcache\.jit_buffer_size[[:space:]]*=[[:space:]]*0$' "$ROOT/configs/php/custom_dan.ini")" -eq 1
 check "the optimizer writes the JIT mode from php_jit_settings" \
   test "$(grep -cE '^opcache\.jit = \$\{jit_mode\}$' "$ROOT/setup.sh")" -eq 1
-PHP_JIT=off
-check "PHP_JIT=off disables the JIT with no buffer" \
-  test "$(php_jit_settings 512)" = "disable 0"
-PHP_JIT=tracing
-check "PHP_JIT=tracing sizes the buffer from the OPcache (512M -> 128M)" \
+check "the tracing JIT is always on (512M OPcache -> 128M buffer)" \
   test "$(php_jit_settings 512)" = "tracing 128"
 check "the JIT buffer never drops below 32M" \
   test "$(php_jit_settings 64)" = "tracing 32"
-PHP_JIT=function
-check "PHP_JIT=function keeps the function mode" \
-  test "$(php_jit_settings 128)" = "function 32"
-PHP_JIT=bogus
-check "an unknown PHP_JIT value falls back to disabled" \
-  test "$(php_jit_settings 512)" = "disable 0"
-# [PATH=] sections: only while the JIT is on, only for WordPress roots, and
-# never when WordPress is allowed to use it.
+check "the JIT buffer never exceeds 256M" \
+  test "$(php_jit_settings 4096)" = "tracing 256"
+check "a garbage OPcache size still yields the tracing JIT" \
+  test "$(php_jit_settings garbage)" = "tracing 32"
+check "the pool is always static" \
+  test "$(grep -c 'tune_pool_set "\$pool" pm static ' "$ROOT/setup.sh")" -eq 1
+check "no ondemand pool mode remains" \
+  test "$(grep -c 'pm_mode=ondemand' "$ROOT/setup.sh")" -eq 0
+check "the OPcache file cache stays empty (restored scripts are never JIT-compiled)" \
+  test "$(grep -c 'local opcache_file_cache=""' "$ROOT/setup.sh")" -eq 1
+# [PATH=] sections: only for WordPress roots and only when
+# SETUP_PHP_JIT_WORDPRESS=0 exempts WordPress from the always-on JIT.
 mkdir -p "$TMP/jit-angie/conf.d" "$TMP/jit-wp/public" "$TMP/jit-xf/public/src"
 : > "$TMP/jit-wp/public/wp-config.php"
 : > "$TMP/jit-xf/public/src/XF.php"
 printf 'server {\n    root %s/jit-wp/public;\n    include h5bp/php_wp.conf;\n}\n' "$TMP" > "$TMP/jit-angie/conf.d/wp.conf"
 printf 'server {\n    root %s/jit-xf/public;\n    include h5bp/php_xf.conf;\n}\n' "$TMP" > "$TMP/jit-angie/conf.d/xf.conf"
-PHP_JIT=tracing PHP_JIT_WORDPRESS=0
+PHP_JIT_WORDPRESS=0
 check "WordPress roots get a [PATH=] section with the JIT off" \
   test "$(php_jit_path_sections "$TMP/jit-angie" | grep -c "^\[PATH=$TMP/jit-wp/public\]")" -eq 1
 check "the [PATH=] section turns the JIT off, not disabled" \
@@ -681,10 +681,7 @@ check "the [PATH=] section turns the JIT off, not disabled" \
 check "XenForo roots get no [PATH=] section" \
   test "$(php_jit_path_sections "$TMP/jit-angie" | grep -c 'jit-xf')" -eq 0
 PHP_JIT_WORDPRESS=1
-check "PHP_JIT_WORDPRESS=1 writes no [PATH=] section" \
-  test -z "$(php_jit_path_sections "$TMP/jit-angie")"
-PHP_JIT=off PHP_JIT_WORDPRESS=0
-check "a disabled JIT writes no [PATH=] section" \
+check "PHP_JIT_WORDPRESS=1 (the default) writes no [PATH=] section" \
   test -z "$(php_jit_path_sections "$TMP/jit-angie")"
 
 mkdir -p "$TMP/index-repair"
