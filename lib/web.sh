@@ -624,6 +624,17 @@ persist_precompress_assets() {
   tune_note "precompress: PRECOMPRESS_ASSETS=${PRECOMPRESS_ASSETS} persisted in /etc/default/setup-tuning"
 }
 
+# Keep SETUP_XF_JOB_CRON in /etc/default/setup-tuning the same way.  Called
+# from write_cron, which runs more than once per install, so the flag is
+# cleared after the first write to keep the report to one line.
+persist_xf_job_cron() {
+  (( XF_JOB_CRON_PERSIST )) || return 0
+  [[ ${EUID} -eq 0 ]] || return 0
+  persist_tuning_var XF_JOB_CRON "$XF_JOB_CRON"
+  XF_JOB_CRON_PERSIST=0
+  tune_note "cron: XF_JOB_CRON=${XF_JOB_CRON} persisted in /etc/default/setup-tuning"
+}
+
 # Document root of an Angie vhost file ("" when none).  Shared by the
 # WordPress/XenForo vhost scanners, the worker cap and asset precompression.
 angie_vhost_root() {
@@ -650,7 +661,7 @@ app_db_host_is_local() {
 # apply.  XenForo and WordPress with a local database spend their request
 # time on the CPU (about 15 ms of PHP per page on a modern core), so workers
 # beyond two per logical CPU only queue on the run queue.  Measured on the
-# dev-host audit host (16 threads / 27 GiB / NVMe, PHP 8.5, tracing JIT, 100
+# dev audit host (16 threads / 27 GiB / NVMe, PHP 8.5, tracing JIT, 100
 # concurrent members):
 #
 #   workers  xf member req/s / p50   xf thread req/s / p50   wp member p50
@@ -806,7 +817,7 @@ configure_asset_precompression() {
 # total can reach keepalive x worker_processes and pin the whole FPM pool.
 # A request that then lands on an Angie worker without a cached connection
 # waits for keepalive_timeout (60 s upstream default) before a worker frees.
-# Measured on the live live-origin.example host: 4-7 of 64 non-cacheable /login
+# Measured on the live XenForo origin: 4-7 of 64 non-cacheable /login
 # requests stalled 60-112 s with keepalive 16; with the cache removed, 3 x
 # 128 requests stayed at p99 33-38 ms / max 93 ms and p50 was unchanged.
 angie_disable_php_keepalive() {
@@ -1452,7 +1463,7 @@ php_pool_set_listener() {
 # The buffer is reserved per PHP-FPM worker, so it is a real memory decision,
 # not just a tuning knob: 512 MB OPcache / 8 = 64 MB, which on the 32-worker
 # application pool is 2 GiB of reservation instead of the 4 GiB the old
-# quarter-size (128 MB) buffer asked for.  Measured on dev-host (PHP 8.5.12,
+# quarter-size (128 MB) buffer asked for.  Measured on the dev host (PHP 8.5.12,
 # tracing JIT, 32 workers, 20 s runs): 64 MB and 128 MB were within 0.5% of
 # each other on every tier (XenForo member 909 vs 906 req/s, WordPress
 # member 234 vs 229); 256 MB was slower (899 / 225).  Function JIT lost 6-8%
@@ -1472,7 +1483,7 @@ php_jit_settings() {
 # Tracing-JIT hotness thresholds.  Higher values compile later (less CPU
 # spent in the JIT, more in the interpreter); lower values compile sooner.
 # PHP's defaults are used on every host with four or more effective CPUs: an
-# aggressive set (16/64/8/32) measured within noise of the defaults on dev-host,
+# aggressive set (16/64/8/32) measured within noise of the defaults on the dev host,
 # while a conservative set (128/255/32/128) lost 3-4% on the member tiers.
 # A 1-2 CPU host pays proportionally more for compilation, so it gets the
 # conservative set, which keeps the single PHP worker serving requests.
@@ -1808,7 +1819,7 @@ EOF
 ANGIE_COMPRESSION_CHANGED=0
 ANGIE_COMPRESSION_SKIPPED=0
 ANGIE_BROTLI_OK=0
-ANGIE_BROTLI_LEVEL=5
+ANGIE_BROTLI_LEVEL=4
 
 # Dynamic Brotli level: SETUP_BROTLI_LEVEL when valid, otherwise 5, or 4 on a
 # 1-2 CPU host where per-response compression competes with PHP for cores.
@@ -1816,8 +1827,13 @@ ANGIE_BROTLI_LEVEL=5
 angie_brotli_level() {
   local level=${SETUP_BROTLI_LEVEL:-}
   if ! [[ $level =~ ^([1-9]|1[01])$ ]]; then
-    level=5
-    (( $(effective_cpus) <= 2 )) && level=4
+    # Dynamic responses only (static assets use precompressed .br siblings).
+    # Measured on an 8 vCPU XenForo origin (130 KB HTML thread page, Angie
+    # CPU per request): level 5 = 5.3 ms, level 4 = 2.7 ms, level 3 = 1.5 ms
+    # for 21 / 23 / 24 KB on the wire.  Level 4 halves the compression CPU of
+    # every member page for 10% more bytes; 1-2 CPU hosts take level 3.
+    level=4
+    (( $(effective_cpus) <= 2 )) && level=3
   fi
   printf '%s' "$level"
 }

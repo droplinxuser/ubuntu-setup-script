@@ -469,7 +469,7 @@ cron_mariadb_configured() {
 
 write_cron() {
   local cur tmp line group seen=" "
-  local angie_cron=0 mariadb_cron=0 wp_cron=0
+  local angie_cron=0 mariadb_cron=0 wp_cron=0 xf_cron=0
   local -a lines=() existing=() preserved=()
 
   # Regenerate entries for installed services even when this run only selected
@@ -506,6 +506,21 @@ write_cron() {
   if (( wp_cron )); then
     lines+=("*/5 * * * * ${CRON_WP_CRON} >/dev/null 2>&1")
   fi
+  # XenForo job runner: one entry for the host while XF_JOB_CRON=1 (default),
+  # PHP is installed and at least one XenForo root exists.  The entry itself
+  # loops over every root, so a site added later needs no cron change.
+  persist_xf_job_cron
+  if (( XF_JOB_CRON )) && command -v php >/dev/null 2>&1; then
+    local xf_conf
+    while IFS= read -r xf_conf; do
+      [[ -n $xf_conf ]] || continue
+      xf_cron=1
+      break
+    done < <(app_find_xenforo_configs)
+  fi
+  if (( xf_cron )); then
+    lines+=("* * * * * ${CRON_XF_JOBS} >/dev/null 2>&1")
+  fi
   # Precompressed-asset refresh: only while the feature is on and the helper
   # exists (configure_asset_precompression writes it); dropped otherwise.
   if (( PRECOMPRESS_ASSETS )) && [[ -x $CRON_PRECOMPRESS ]]; then
@@ -527,6 +542,8 @@ write_cron() {
       group=mariadb
     elif [[ $line == *wp-cron.php* ]]; then
       group=wordpress
+    elif [[ $line == *xf:run-jobs* ]]; then
+      group=xenforo
     elif [[ $line == *"${CRON_PRECOMPRESS}"* ]]; then
       group=precompress
     elif [[ $line == *'/etc/angie/'* || $line == *'/usr/bin/find /var/www'* || $line == *"${CRON_WWW_CHOWN_LEGACY}"* ]]; then
@@ -543,7 +560,7 @@ write_cron() {
         (( mariadb_cron )) && continue
         cron_mariadb_configured || continue
         ;;
-      wordpress|precompress)
+      wordpress|precompress|xenforo)
         # Regenerated above when needed; drop a stale entry otherwise.
         continue
         ;;

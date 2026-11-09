@@ -1,9 +1,108 @@
 # Full-stack stress test reports
 
 
-## live-origin.example live audit - non-cacheable pages (2026-11-09)
+## Live XenForo origin, audit 2 - non-cacheable pages, CPU per request (2026-11-10)
 
-Host: live-origin.example, 8 vCPU (Xeon E3-class, 4 cores x 2 threads), 32 GiB,
+Host as in the first audit (8 vCPU Xeon E3-class, 32 GiB, PHP 8.5.12 FPM
+`pm=static` 16, Angie 1.12.4, MariaDB 11.8, Valkey 9, XenForo 2.3.10 + XFMG
+2.3.9).  The origin is reachable only through its front proxy and loopback, so
+load ran on the host: `curl -Z --parallel-max 8 --http1.1` against
+`https://live-origin.example` resolved to 127.0.0.1 with an `xf_session=nocache` cookie
+(bypasses the guest cache like a member session), `Accept-Encoding: gzip,
+deflate, br, zstd`, 300-400 requests per page.  CPU time per request is the
+utime+stime delta of each service's processes divided by the requests.
+
+### Real traffic (6-minute sample, 3,581 requests)
+
+61% of guest PHP hits were cache HITs, 588 MISS + 213 STALE renders at 15 ms
+average; 152 member page requests at 30 ms average; `css.php` served from
+the cache for members too; 80 `job.php` calls (0.5 s total); 575 requests
+(16%) answered **403** for `/data/xfmg/video/...` because the directories were
+`root 2700` (created by a root CLI job run); `br` on 1105 of 1930 HTML
+responses, `gzip` on 102.  The proxy keeps 13 HTTP/1.1 connections open
+(TLS reuse, ECDSA P-256 certificate), so handshakes are not a cost.
+
+### Baseline, CPU ms per request (c=8)
+
+| Page (uncached) | p50 | p99 | PHP | Angie | MariaDB | Valkey | total |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `/login/` | 18.8 ms | 31.7 ms | 11.9 | 2.9 | 1.2 | 0.3 | 16.3 |
+| `/` (XFMG gallery home) | 123.5 ms | 162.3 ms | 37.3 | 5.1 | **50.8** | 0.3 | 93.5 |
+| `/whats-new/` | 55.5 ms | 74.0 ms | 36.0 | 5.0 | 8.9 | 0.3 | 50.2 |
+| thread page | 55.0 ms | 86.2 ms | 41.6 | 5.6 | 4.3 | 0.4 | 51.8 |
+| media item page | 41.7 ms | 60.5 ms | 23.4 | 4.5 | 8.8 | 0.3 | 36.9 |
+
+The gallery home's MariaDB share is one statement: `SELECT COUNT(*) FROM
+xf_mg_media_item WHERE (album_state = 'visible' OR album_state IS NULL) AND
+category_id IN (<all 31 categories>) AND media_state = 'visible'` (the
+pagination total), `type ALL`, about 74 000 rows, 36-56 ms, once per view.  A
+covering `(media_state, album_state, category_id)` index turned it into an
+index range scan of 55k entries: 47 -> 31 ms on a scratch copy.  The real
+fix is for XFMG to cache that total.
+
+### Compression level sweep (Angie CPU ms per request, bytes on the wire)
+
+| Setting | `/login/` Angie CPU | `/login/` KB | thread Angie CPU | thread KB | thread total CPU |
+|---|---:|---:|---:|---:|---:|
+| brotli 5 (was default) | 2.73 | 13 | 6.47 | 21 | 52.9 |
+| **brotli 4 (new default)** | 2.30 | 14 | 3.93 | 23 | 49.7 |
+| brotli 3 (1-2 CPU default) | 1.17 | 15 | 2.70 | 24 | 49.1 |
+| brotli 1 | 1.17 | 16 | 2.27 | 33 | 49.0 |
+| gzip 5, brotli off | 1.73 | 14 | 4.30 | 25 | 49.5 |
+| gzip 3 | 1.37 | 15 | 3.07 | 29 | 48.2 |
+| gzip 1 | 1.23 | 15 | 2.87 | 31 | 48.2 |
+
+About 1.2 ms of the Angie figure is TLS and request handling; the rest is
+the compressor.  PHP, MariaDB and Valkey CPU did not move between rows.
+
+### `opcache.huge_code_pages`
+
+| | thread PHP CPU | whats-new PHP CPU | login PHP CPU |
+|---|---:|---:|---:|
+| off | 40.5 | 37.0 | 12.9 |
+| on (two runs) | 40.3 / 40.1 | 37.3 / 37.1 | 12.3 |
+
+`AnonHugePages` of a worker stayed at 0 kB after the reload: the Ubuntu
+build does not map its text segment onto huge pages, so the directive is
+inert here.  Not adopted.
+
+### Dev-host validation of 1.15.0 (16 threads / 27 GiB / NVMe, same day)
+
+Fresh 1.14.1 install from the 557-package baseline (3 min 16 s), XenForo
+2.3.13 (51 users / 150 threads / 2,400 posts) and WordPress 7.1.4 (202 posts)
+deployed from the local archives, `--optimize` (12 s), then the 1.15.0 code:
+590 + 161 unit/dry-run checks pass, shellcheck findings unchanged, the
+`--optimize` diff against the 1.14.1 tuned state is exactly the crontab
+entry, `brotli_comp_level 4` and `gzip_comp_level 4`, the cron entry runs in
+1.0 s by hand, and a repeat `--optimize` changes nothing.
+
+Load from the workstation (oha, Wi-Fi, 15 s, 200 connections / 100 for the
+uncached and member tiers):
+
+| Scenario | 1.14.1 req/s (p50 / p99 ms) | 1.15.0 req/s (p50 / p99 ms) |
+|---|---:|---:|
+| xf-guest (cached) | 8023 (24 / 42) | 7991 (24 / 41) |
+| xf-guest-uncached | 1210 (83 / 136) | 1043 (96 / 121) |
+| xf-member | 1015 (99 / 159) | 893 (112 / 137) |
+| xf-member-thread | 531 (189 / 240) | 543 (187 / 283) |
+| wp-guest (cached) | 4498 (39 / 106) | 6404 (30 / 54) |
+| wp-guest-uncached | 295 (345 / 415) | 301 (338 / 398) |
+| wp-member | 286 (355 / 443) | 290 (348 / 440) |
+| wp-member-post | 264 (386 / 531) | 268 (379 / 464) |
+
+The two XenForo rows that moved were re-measured with the compression level
+flipped back and forth on the same host state: brotli 5 gave 887 and 869
+member req/s, brotli 4 gave 851 and 863 (uncached 1017-1038 in all four
+runs), so the level does not change throughput at this scale; the samplers
+show MariaDB's CPU share rising from 18% to 27% between the two suites
+because the job runner executed XenForo's hourly cron for the first time
+(the trending-content widget now has data to render, the cost the 1.13.0
+audit measured).  The compression saving is the Angie CPU per request
+measured on the live origin above, not a throughput change on a 16-thread
+LAN host.
+## Live XenForo origin audit - non-cacheable pages (2026-11-09)
+
+Host: production XenForo origin, 8 vCPU (Xeon E3-class, 4 cores x 2 threads), 32 GiB,
 RAID NVMe, Ubuntu 26.04.1, Angie 1.12.4, PHP 8.5 FPM (`pm=static`, 16
 workers), MariaDB 11.8 (1.98 GB pool, 900 MB database, 169 disk reads),
 Valkey (sessions + XF registry), XenForo 2.3.10 + XFMG. HTTP/3 already
@@ -51,13 +150,13 @@ setting, so `setup.sh` now removes the directive and the config repo ships
   95M vs `reads` 169); one 1.44 s `DELETE FROM xf_content_activity_log WHERE
   log_date < ...` (352k rows) was the only slow query, a scheduled cleanup.
 - **Live bug (not performance):** Angie's error log repeats `open()
-  /var/www/live-origin.example/public/data/xfmg/video/... failed (13: Permission
+  /var/www/<site>/public/data/xfmg/video/... failed (13: Permission
   denied)`; the video subdirectories are `root:www-data 2710` while the rest
   of `data/` is `www-data`.  Videos served from those paths return 403.
 
 ## setup.sh 1.14.0 - dev-host JIT/PHP-FPM sweep, modularization and parity (2026-11-09)
 
-Host: dev-host, 16 threads (8 cores) / 27.2 GiB / NVMe, Ubuntu 26.04.1, clean
+Host: dev host, 16 threads (8 cores) / 27.2 GiB / NVMe, Ubuntu 26.04.1, clean
 557-package baseline. Fresh install from the local checkouts
 (`--basic server=dedi --angie --php --mariadb user=demo pass=temp --valkey
 --elastic --others all`, 1 min 35 s), then `--optimize` (12 s). XenForo
@@ -139,7 +238,7 @@ slow log recorded WordPress block-render traces under 100 concurrent members
 
 ## setup.sh 1.13.0 - dev-host audit, refactor validation and authenticated-tier tuning (2026-11-09)
 
-Host: dev-host, 16 threads / 27.2 GiB / NVMe, Ubuntu 26.04.1, wiped to the
+Host: dev host, 16 threads / 27.2 GiB / NVMe, Ubuntu 26.04.1, wiped to the
 557-package baseline. Fresh install with the local checkouts (`--basic
 --angie --php --mariadb --valkey --elastic --others all --domain
 xf.test.local app=xf ... --domain wp.test.local app=wordpress ...`, 97 s)
@@ -263,7 +362,7 @@ reference (JIT off vs tracing within 3-4% on WordPress).
 
 ## setup.sh 1.12.0 - dev-host re-validation and OPcache JIT benchmark (2026-11-09)
 
-Host: dev-host, 16 threads / 27.2 GiB / NVMe, Ubuntu 26.04.1, wiped to the
+Host: dev host, 16 threads / 27.2 GiB / NVMe, Ubuntu 26.04.1, wiped to the
 557-package baseline, installed with `--basic --angie --php --mariadb --valkey
 --elastic --others all --domain xf.test.local app=xf ... --domain
 wp.test.local app=wordpress ...` (2 min 24 s), then `--optimize` (11 s): the
@@ -365,7 +464,7 @@ responses carry HSTS and Referrer-Policy again.
 
 ## setup.sh 1.11.0 - dev-host audit run and XenForo profiling (2026-11-09)
 
-Host: dev-host, 16 threads / 27.2 GiB / NVMe (Crucial P3 Plus), Ubuntu 26.04.1,
+Host: dev host, 16 threads / 27.2 GiB / NVMe (Crucial P3 Plus), Ubuntu 26.04.1,
 Angie 1.12.4, PHP 8.5.12, MariaDB 11.8.6, Valkey 9.0.4, Elasticsearch 9.5.6,
 reached over **Wi-Fi** only (the wired port had no carrier), so every
 link-bound number tops out around 90 MB/s. The host was wiped to the
@@ -464,7 +563,7 @@ state and left an empty package diff against the baseline.
 
 ## setup.sh 1.9.0 - dev-host re-validation from a macOS workstation (2026-11-09)
 
-Host: dev-host, 16 threads / 27.2 GiB / NVMe (Crucial P3 Plus), Ubuntu 26.04.1,
+Host: dev host, 16 threads / 27.2 GiB / NVMe (Crucial P3 Plus), Ubuntu 26.04.1,
 Angie 1.12.4, PHP 8.5.12 (144 static workers), MariaDB 11.8.6, Valkey 9.0.4,
 Elasticsearch 9.5.6. The host was wiped to its 557-package headless baseline,
 installed with `--basic --angie --php --mariadb --valkey --elastic --others
@@ -543,7 +642,7 @@ install in this session.
 XenForo 2.3.13 was installed into the `--domain xf.test.local app=xf` vhost
 (CLI `xf:install`, friendly URLs on) and seeded through XF's own services with
 50 members, 150 threads and 2,250 posts. Measured from the Mac mini over
-**Wi-Fi** (dev-host's wired port had no carrier), 12-15 s runs, so absolute
+**Wi-Fi** (the dev host's wired port had no carrier), 12-15 s runs, so absolute
 guest numbers are link-bound; the member and uncached-guest numbers are
 server-CPU-bound and comparable.
 
@@ -616,11 +715,11 @@ they are indicative rather than ceilings.
 | 1.6.11 | 2026-11-04 | 48 vCPU / 125 GiB dedicated | 128,738 | 117,206 | 6,163 | 128,811 | Re-validation after the socket migration; 280k static / 179k cached in the aggressive run; no errors |
 | Remote origin | 2026-11-04 | 12 vCPU Ubuntu 24.04 origin, `wrk` over HTTPS | 29,118 (RTT-bound) | - | 2,844-2,972 | 4,363 | Uncached PHP CPU-bound at 0% idle with 128 workers; no server-side errors |
 | 1.8.36 | 2026-11-05 | 8 vCPU / 15.1 GiB VPS | 156,990 | 68,619 | 3,618 | 93,116 | Every service at 94-100% CPU; WordPress cached 9,028 req/s; Valkey ~200k ops/s on one core |
-| 1.8.50 | 2026-11 | dev-host, 16 threads / 27.2 GiB / NVMe | 273,123 | 154,058 | 7,686 | 197,738 | Memory plan at 64 MB/worker (144 workers), ES heap 3 GB; XenForo guest HIT 41.9k/35.0k vs logged-in 983/936 req/s |
+| 1.8.50 | 2026-11 | dev host, 16 threads / 27.2 GiB / NVMe | 273,123 | 154,058 | 7,686 | 197,738 | Memory plan at 64 MB/worker (144 workers), ES heap 3 GB; XenForo guest HIT 41.9k/35.0k vs logged-in 983/936 req/s |
 
 Durable findings behind the current defaults:
 
-- Guest-page caching is the largest win on every host (2.5k -> 67k on 8 vCPU, 7.7k -> 198k on dev-host for the same page; WordPress 242 -> 9,972); the logged-in and POST bypasses were confirmed each time.
+- Guest-page caching is the largest win on every host (2.5k -> 67k on 8 vCPU, 7.7k -> 198k on the dev host for the same page; WordPress 242 -> 9,972); the logged-in and POST bypasses were confirmed each time.
 - PHP-FPM over `/run/php/php-fpm.sock` beat loopback TCP (+9% php-hello) and is the default everywhere.
 - MariaDB and Valkey on Unix sockets removed the worst p99 tails; per-request loopback TCP (Elasticsearch, Node) exhausts the ephemeral port range, so TIME_WAIT is watched in later runs.
 - Valkey: socket 132k/113k vs TCP 70k/76k SET/GET ops/s; `io-threads` 1 -> 4 gave nothing, so 1 stays; one core tops out around 200k ops/s.

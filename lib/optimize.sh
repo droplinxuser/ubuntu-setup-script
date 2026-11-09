@@ -755,7 +755,7 @@ angie_worker_limits() {
   (( ANGIE_WORKER_CONNECTIONS < 1024 )) && ANGIE_WORKER_CONNECTIONS=1024
   # Angie must NOT keep idle FastCGI connections to PHP-FPM.  Every idle
   # keepalive slot pins one FPM worker (FPM waits on the same socket for the
-  # next request) and the cache is per Angie worker.  On dev-host that produced
+  # next request) and the cache is per Angie worker.  On the dev host that produced
   # 16 idle connections for 16 workers; any request that landed on an Angie
   # worker without a cached connection then waited for the upstream
   # keepalive_timeout (60 s default) for a worker to be freed.  Measured on
@@ -773,8 +773,11 @@ PHP_WRITTEN_CHILDREN=0
 angie_gzip_level() {
   local level=${SETUP_GZIP_LEVEL:-}
   if ! [[ $level =~ ^[1-9]$ ]]; then
-    level=5
-    (( $(effective_cpus) <= 2 )) && level=4
+    # gzip is the fallback for the few clients without Brotli; measured on
+    # the same 8 vCPU origin: level 5 = 3.1 ms, level 3 = 1.9 ms per 130 KB
+    # page (25 vs 29 KB).  Level 4 matches the Brotli choice.
+    level=4
+    (( $(effective_cpus) <= 2 )) && level=3
   fi
   printf '%s' "$level"
 }

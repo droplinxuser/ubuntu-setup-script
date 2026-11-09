@@ -3,9 +3,52 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
-## 1.14.1 (2026-11-09)
+## 1.15.0 (2026-11-10)
 
-Live-host audit of live-origin.example (XenForo 2.3.10 + XFMG, 8 vCPU Xeon E3-class,
+Second live-host audit of a production XenForo origin (XenForo 2.3.10 + XFMG 2.3.9,
+8 vCPU, PHP 8.5.12, Angie 1.12.4) focused on the pages the FastCGI cache
+cannot serve: member pages, the uncached gallery home and `/login/`.  Every
+candidate was measured on the host with a loopback load generator and CPU
+time per request split by service (PHP-FPM, Angie, MariaDB, Valkey); see
+`tests/stress-site/RESULTS.md`.
+
+- **Dynamic Brotli level 4 (3 on 1-2 CPU hosts), gzip 4 (3).**  Level 5
+  cost 5.3 ms of Angie CPU per 130 KB thread page against 2.7 ms at level 4
+  and 1.5 ms at level 3, for 21 / 23 / 24 KB on the wire; on `/login/` the
+  Angie share fell from 2.7 to 2.3 ms.  Compression was 12% of the total CPU
+  of a member page at level 5; level 4 halves it for 10% more bytes.
+  `SETUP_BROTLI_LEVEL` / `SETUP_GZIP_LEVEL` still pin a host; the config
+  repository ships the same defaults.
+- **Managed XenForo job runner.**  `write_cron` adds one entry that runs
+  `cmd.php xf:run-jobs --max-execution-time=50` every minute as www-data for
+  every XenForo root under /var/www (`SETUP_XF_JOB_CRON=0` removes it,
+  persisted as `XF_JOB_CRON`).  The audited host ran its queue, including
+  XFMG video transcoding, inside member page requests (`jobRunTrigger =
+  activity`) and by hand as root: 183 `data/xfmg/video/*` directories were
+  `root 2700`, so Angie answered 403 for every video below them (16% of all
+  requests in a 6-minute sample).  The `--optimize` report tells the operator
+  to switch *Options > Performance > Job run trigger* to server-based.
+- **Documentation:** the JIT buffer is part of the OPcache shared-memory
+  segment (one per pool), not a per-worker allocation as 1.14.0 said.
+
+Measured and rejected:
+
+- `opcache.huge_code_pages = 1`: no effect on Ubuntu's PHP 8.5 build (the
+  workers mapped no huge pages; PHP CPU per request unchanged within 1%).
+- A covering index for XFMG's gallery `COUNT(*)` (74k rows scanned on every
+  uncached gallery home view, 36-56 ms, 51 ms of MariaDB CPU per request on
+  that page): a `(media_state, album_state, category_id)` index cut the
+  statement from 47 to 31 ms on a scratch copy because 55k index entries
+  still have to be counted.  Reported to the operator; the fix belongs in
+  XFMG (cache the total).
+
+Observed, not changed: 30,429 `Access denied for user <removed>@'localhost'`
+MariaDB connection attempts between 19:29 and 20:53 local time (a user that
+does not exist; `Aborted_connects` = 99% of all connections), and idle
+persistent XenForo links hitting `wait_timeout = 600` (harmless: mysqli
+revalidates a pooled link with COM_CHANGE_USER and reconnects).## 1.14.1 (2026-11-09)
+
+Live-host audit of a production XenForo origin (XenForo 2.3.10 + XFMG, 8 vCPU Xeon E3-class,
 32 GiB, PHP 8.5, Angie 1.12.4, MariaDB 11.8, Valkey sessions/cache), focused
 on non-cacheable pages.
 
@@ -30,7 +73,7 @@ on non-cacheable pages.
 
 ## 1.14.0 (2026-11-09)
 
-Full-stack audit on dev-host (16 threads / 27.2 GiB / NVMe, Ubuntu 26.04.1) from
+Full-stack audit on the dev host (16 threads / 27.2 GiB / NVMe, Ubuntu 26.04.1) from
 the 557-package baseline: fresh `--basic --angie --php --mariadb --valkey
 --elastic --others all` install, `--optimize` parity, XenForo 2.3.13 and
 WordPress 7.1.4 deployment from the local archives, and JIT/PHP-FPM sweeps
@@ -95,7 +138,7 @@ from the workstation (see `tests/stress-site/RESULTS.md`).
 
 ## 1.13.0 (2026-11-09)
 
-Audit session on the dev-host development host (16 threads / 27 GiB / NVMe,
+Audit session on the development host (16 threads / 27 GiB / NVMe,
 Ubuntu 26.04.1) from the 557-package baseline: fresh full-stack install with
 XenForo 2.3.13 and WordPress 7.1.4 vhosts, `--optimize` parity, three
 independent code reviews of `setup.sh` (PHP/Angie, MariaDB/Valkey/
@@ -166,7 +209,7 @@ Everything below was re-tested on that host (see tests/stress-site/RESULTS.md).
 
 ## 1.12.0 (2026-11-09)
 
-Validated on the dev-host development host (16 threads / 27 GiB / NVMe, Ubuntu
+Validated on the development host (16 threads / 27 GiB / NVMe, Ubuntu
 26.04.1) from a wiped 557-package baseline: a fresh full-stack install with
 XenForo and WordPress vhosts followed by `--optimize` produced byte-identical
 configuration trees (308 files), every mode ran on the host, five independent
@@ -230,7 +273,7 @@ workstation before and after the changes.
 ## 1.11.0 (2026-11-09)
 
 Audit of install/optimize parity, hardware rules and duplicated code (two
-code reviews plus a repeated-block scan), validated on dev-host: identical
+code reviews plus a repeated-block scan), validated on the dev host: identical
 configuration trees after install and `--optimize` (241 files), every mode
 clean on the host, remote `oha` suite matching 1.9.0.
 
