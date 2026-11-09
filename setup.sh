@@ -36,7 +36,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.13.0"
+readonly SCRIPT_VERSION="1.13.1"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -75,33 +75,26 @@ if [[ -n ${SETUP_PRECOMPRESS_ASSETS+x} ]]; then
   PRECOMPRESS_ASSETS=$SETUP_PRECOMPRESS_ASSETS
   PRECOMPRESS_ASSETS_PERSIST=1
 fi
-# OPcache JIT.  Off by default: the tracing JIT crashed php-fpm 8.3 on a live
-# WordPress site, and on PHP 8.5 neither mode measured faster than the plain
-# bytecode cache for XenForo 2.3 or WordPress 7 (dev-host, tests/stress-site/
-# RESULTS.md).  SETUP_PHP_JIT=tracing|function|off selects the pool-wide
-# mode (persisted as PHP_JIT).  While it is on, every WordPress document
-# root keeps `opcache.jit = off` through a [PATH=] section of the managed ini
-# (applied per request by php-fpm, unlike a per-vhost fastcgi_param, which
-# sticks to the worker); SETUP_PHP_JIT_WORDPRESS=1 lets WordPress use the
-# JIT as well (persisted as PHP_JIT_WORDPRESS).
-PHP_JIT="${PHP_JIT:-off}"
-PHP_JIT_PERSIST=0
-if [[ -n ${SETUP_PHP_JIT+x} ]]; then
-  PHP_JIT=$SETUP_PHP_JIT
-  PHP_JIT_PERSIST=1
+# OPcache JIT: the tracing JIT is always on for the pool (buffer OPcache/4,
+# 32..256 MB; measured +2-5% on the CPU-bound XenForo tiers on PHP 8.4, see
+# tests/stress-site/RESULTS.md).  There is no mode switch any more; an old
+# SETUP_PHP_JIT / persisted PHP_JIT value is ignored.  WordPress roots use
+# it too by default; SETUP_PHP_JIT_WORDPRESS=0 (persisted as
+# PHP_JIT_WORDPRESS) keeps `opcache.jit = off` for every WordPress document
+# root through a [PATH=] section of the managed ini (applied per request by
+# php-fpm, unlike a per-vhost fastcgi_param, which sticks to the worker) for
+# a site that misbehaves with the JIT.
+PHP_JIT=tracing
+if [[ -n ${SETUP_PHP_JIT+x} && ${SETUP_PHP_JIT} != tracing ]]; then
+  printf 'setup.sh: SETUP_PHP_JIT=%s is ignored; the tracing JIT is always on (SETUP_PHP_JIT_WORDPRESS=0 exempts WordPress roots)\n' "$SETUP_PHP_JIT" >&2
 fi
-case $PHP_JIT in
-  tracing|function|off) ;;
-  on|1|yes) PHP_JIT=tracing ;;
-  *) PHP_JIT=off ;;
-esac
-PHP_JIT_WORDPRESS="${PHP_JIT_WORDPRESS:-0}"
+PHP_JIT_WORDPRESS="${PHP_JIT_WORDPRESS:-1}"
 PHP_JIT_WORDPRESS_PERSIST=0
 if [[ -n ${SETUP_PHP_JIT_WORDPRESS+x} ]]; then
   PHP_JIT_WORDPRESS=$SETUP_PHP_JIT_WORDPRESS
   PHP_JIT_WORDPRESS_PERSIST=1
 fi
-[[ $PHP_JIT_WORDPRESS == 1 ]] || PHP_JIT_WORDPRESS=0
+[[ $PHP_JIT_WORDPRESS == 0 ]] || PHP_JIT_WORDPRESS=1
 [[ $PRECOMPRESS_ASSETS == 1 ]] || PRECOMPRESS_ASSETS=0
 # Node.js major installed by --others nodejs.  NodeSource publishes one APT
 # line per major, so this value decides what `apt-get install nodejs` resolves
@@ -4517,28 +4510,24 @@ php_pool_set_listener() {
   tune_pool_set "$pool" listen.mode 0660 "PHP ${ver}: listen.mode=0660"
 }
 
-# OPcache JIT mode and buffer for the pool, from PHP_JIT and the OPcache
-# size: "disable 0" when off (no buffer is allocated), otherwise the mode
-# with a buffer of a quarter of the OPcache (32..256 MB).  Shared by the ini
-# writer and the dry run.  Argument: opcache.memory_consumption in MB.
+# OPcache JIT mode and buffer for the pool: always the tracing JIT with a
+# buffer of a quarter of the OPcache (32..256 MB).  Shared by the ini writer
+# and the dry run.  Argument: opcache.memory_consumption in MB.
 php_jit_settings() {
-  local opcache_mb=${1:-128} mode=$PHP_JIT buf=0
-  case $mode in
-    tracing|function) buf=$(tune_clamp $(( opcache_mb / 4 )) 32 256) ;;
-    *) mode=disable ;;
-  esac
+  local opcache_mb=${1:-128} buf
+  [[ $opcache_mb =~ ^[0-9]+$ ]] || opcache_mb=128
+  buf=$(tune_clamp $(( opcache_mb / 4 )) 32 256)
   # Newline-terminated: callers `read` it, and read returns 1 at EOF without one.
-  printf '%s %s\n' "$mode" "$buf"
+  printf 'tracing %s\n' "$buf"
 }
 
 # [PATH=] sections that keep the JIT off for every WordPress document root
-# while the pool-wide JIT is on.  php-fpm applies a PATH section at request
-# start and restores the global value afterwards, so the setting cannot leak
-# to the next vhost the way a fastcgi_param PHP_ADMIN_VALUE does.  Prints
-# nothing when the JIT is off or WordPress is allowed to use it.
+# when SETUP_PHP_JIT_WORDPRESS=0 asks for it.  php-fpm applies a PATH
+# section at request start and restores the global value afterwards, so the
+# setting cannot leak to the next vhost the way a fastcgi_param
+# PHP_ADMIN_VALUE does.  Prints nothing by default (WordPress uses the JIT).
 php_jit_path_sections() {
   local target=${1:-/etc/angie} file root
-  [[ $PHP_JIT == tracing || $PHP_JIT == function ]] || return 0
   (( PHP_JIT_WORDPRESS )) && return 0
   [[ -d $target/conf.d ]] || return 0
   while IFS= read -r file; do
@@ -4548,14 +4537,10 @@ php_jit_path_sections() {
   done < <(angie_wordpress_vhosts "$target" | sort -u)
 }
 
-# Keep the operator's JIT choice in /etc/default/setup-tuning so a plain
-# --optimize does not silently turn it back off.  Written once per run.
+# Keep the operator's WordPress JIT choice in /etc/default/setup-tuning so a
+# plain --optimize does not silently change it.  Written once per run.
 PHP_JIT_PERSISTED=0
 persist_php_jit() {
-  if (( PHP_JIT_PERSIST )); then
-    persist_tuning_var PHP_JIT "$PHP_JIT"
-    tune_note "PHP: PHP_JIT=${PHP_JIT} persisted in /etc/default/setup-tuning"
-  fi
   if (( PHP_JIT_WORDPRESS_PERSIST )); then
     persist_tuning_var PHP_JIT_WORDPRESS "$PHP_JIT_WORDPRESS"
     tune_note "PHP: PHP_JIT_WORDPRESS=${PHP_JIT_WORDPRESS} persisted in /etc/default/setup-tuning"
@@ -4671,22 +4656,16 @@ tune_php_fpm_version() {
 
   php_ini_profile "$ram_mb"
   opcache_mb=$PHP_PROFILE_OPCACHE_MB
-  # OPcache JIT is off unless SETUP_PHP_JIT asks for it (see the top of the
-  # file): the tracing JIT in php8.3 crashed on real WordPress workloads
-  # (workers died with "segfault at 67c9 ... in php-fpm8.3" and every request
-  # on the killed worker returned 502), and the bytecode cache is what helps
-  # a database-bound CMS.  WordPress roots stay off through [PATH=] sections.
+  # The tracing JIT is always on (see the top of the file); WordPress roots
+  # can be exempted through [PATH=] sections with SETUP_PHP_JIT_WORDPRESS=0.
   local jit_mode jit_buffer_mb jit_buffer
   read -r jit_mode jit_buffer_mb < <(php_jit_settings "$opcache_mb")
-  jit_buffer=0
-  (( jit_buffer_mb > 0 )) && jit_buffer="${jit_buffer_mb}M"
+  jit_buffer="${jit_buffer_mb}M"
   # Scripts restored from the OPcache file cache are never JIT-compiled
   # (measured: with the file cache in place the JIT buffer stayed at 2.5 KB
   # through a full load test on 8.4; with it cleared the same warm-up
-  # compiled 850 KB).  The file cache only warms restarts, so it is dropped
-  # while the JIT is on; the directory stays for the next switch back.
-  local opcache_file_cache=/var/cache/php/opcache
-  [[ $jit_mode == disable ]] || opcache_file_cache=""
+  # compiled 850 KB).  The file cache only warms restarts, so it stays off.
+  local opcache_file_cache=""
   memory_mb=$PHP_PROFILE_MEMORY_MB
   realpath_kb=$PHP_PROFILE_REALPATH_KB
 
@@ -4694,17 +4673,11 @@ tune_php_fpm_version() {
   chown www-data:www-data /run/php 2>/dev/null || true
   chmod 755 /run/php
 
-  # Resident workers suit a host that serves PHP all day; a small VPS (or any
-  # host under 2 GB) cannot keep a full static pool paged in next to the
-  # database, so workers are forked on demand and retired after 10 s idle.
-  local pm_mode=static
-  if (( ram_mb < 2048 )) || { host_is_vps && (( max_children <= 8 )); }; then
-    pm_mode=ondemand
-  fi
-  tune_pool_set "$pool" pm "$pm_mode" "PHP ${ver}: pm=${pm_mode}"
-  if [[ $pm_mode == ondemand ]]; then
-    tune_pool_set "$pool" pm.process_idle_timeout 10s "PHP ${ver}: pm.process_idle_timeout=10s"
-  fi
+  # Always a static pool: the worker count is already sized to the host
+  # (php_plan_max_children), resident workers answer the first request after
+  # an idle period without a fork, and a fixed footprint is what the shared
+  # memory plan budgets for.
+  tune_pool_set "$pool" pm static "PHP ${ver}: pm=static"
   tune_pool_set "$pool" pm.max_children "$max_children" "PHP ${ver}: max_children=${max_children}"
   tune_pool_set "$pool" pm.max_requests "$max_requests" "PHP ${ver}: max_requests=${max_requests}"
   php_pool_set_listener "$pool" "$ver" "$socket"
@@ -4751,7 +4724,6 @@ tune_php_fpm_version() {
   tune_pool_dedupe "$pool" \
     user group listen listen.allowed_clients listen.backlog listen.owner \
     listen.group listen.mode pm pm.max_children pm.max_requests \
-    pm.process_idle_timeout \
     request_terminate_timeout catch_workers_output security.limit_extensions \
     rlimit_files rlimit_core process_control_timeout
   # OPcache's script table is sized from the PHP files the vhosts actually
@@ -4825,11 +4797,8 @@ EOF
     persist_php_jit
     PHP_JIT_PERSISTED=1
   fi
-  local ini_after jit_desc=off
-  if [[ $jit_mode != disable ]]; then
-    jit_desc="${jit_mode}/${jit_buffer}"
-    (( PHP_JIT_WORDPRESS )) || jit_desc+=" (WordPress roots off)"
-  fi
+  local ini_after jit_desc="${jit_mode}/${jit_buffer}"
+  (( PHP_JIT_WORDPRESS )) || jit_desc+=" (WordPress roots off)"
   ini_after=$(md5sum "$ini" | awk '{print $1}')
   if [[ $ini_before != "$ini_after" ]]; then
     tune_note "PHP ${ver}: memory_limit=${memory_mb}M opcache=${opcache_mb}M jit=${jit_desc}"
@@ -10893,13 +10862,9 @@ optimize_plan() {
     plan_opcache_mb=$PHP_PROFILE_OPCACHE_MB
     printf '  PHP-FPM:  memory_limit=%sM realpath_cache=%sk\n' "$PHP_PROFILE_MEMORY_MB" "$PHP_PROFILE_REALPATH_KB"
     read -r jit_mode jit_buffer_mb < <(php_jit_settings "$plan_opcache_mb")
-    if [[ $jit_mode == disable ]]; then
-      printf '  PHP-FPM:  opcache=%sM jit=off (SETUP_PHP_JIT=tracing|function enables it)\n' "$plan_opcache_mb"
-    else
-      wp_roots=$(php_jit_path_sections /etc/angie | grep -c '^\[PATH=' || true)
-      printf '  PHP-FPM:  opcache=%sM jit=%s buffer=%sM (WordPress roots kept off: %s)\n' \
-        "$plan_opcache_mb" "$jit_mode" "$jit_buffer_mb" "${wp_roots:-0}"
-    fi
+    wp_roots=$(php_jit_path_sections /etc/angie | grep -c '^\[PATH=' || true)
+    printf '  PHP-FPM:  pm=static opcache=%sM jit=%s buffer=%sM (WordPress roots kept off: %s)\n' \
+      "$plan_opcache_mb" "$jit_mode" "$jit_buffer_mb" "${wp_roots:-0}"
   fi
   if [[ " ${OPT_DETECTED[*]} " == *" mariadb "* ]]; then
     size_mb=$OPT_MARIADB_BUDGET_MB

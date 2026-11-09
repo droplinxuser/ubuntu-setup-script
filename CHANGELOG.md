@@ -3,6 +3,18 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.13.1 (2026-11-09)
+
+- **PHP-FPM is always `pm = static`** (the 1.13.0 `ondemand` rule for small
+  hosts is gone) and **the OPcache tracing JIT is always on** for the pool
+  (buffer OPcache/4, 32-256 MB). `SETUP_PHP_JIT` and a persisted `PHP_JIT`
+  no longer select a mode (a non-`tracing` value prints a notice and is
+  ignored). WordPress roots use the JIT too; `SETUP_PHP_JIT_WORDPRESS=0`
+  restores the per-root `[PATH=]` exemption (`opcache.jit = off`) for a site
+  that misbehaves. `opcache.file_cache` stays empty, as scripts restored
+  from it are never JIT-compiled. The dry run prints `pm=static` and the JIT
+  buffer.
+
 ## 1.13.0 (2026-11-09)
 
 Audit session on the dev-host development host (16 threads / 27 GiB / NVMe,
