@@ -173,14 +173,17 @@ sudo bash setup.sh \
 
 ### Domains
 
-`--domain` is standalone: Angie and MariaDB must already be installed and MariaDB must be running. It creates the document root, a blank Angie vhost and the database. Existing vhost files are preserved.
+`--domain` is standalone: Angie must already be installed, and MariaDB must be running when `db=` is used. It creates the document root, a self-signed certificate, a full Angie vhost from the repository templates (the basic template when `app=` is omitted) and, only when declared, the database, a scoped user and a dump import. Existing vhost files and databases are preserved.
 
 ```bash
-# One domain
+# One domain, basic vhost, no database
 sudo bash setup.sh --domain google.com
 
 # Multiple domains
 sudo bash setup.sh --domain google.com example.org my-site.example.com
+
+# XenForo vhost + database + scoped user + dump import, then MariaDB re-sized
+sudo bash setup.sh --domain forum.example.com app=xf db=xenforodb user=demo pass=temp sql=/root/backup.sql
 
 # Full install and domain creation in one command
 sudo bash setup.sh \
@@ -253,20 +256,11 @@ security pass. It is safe to re-run and also upgrades existing WordPress trees.
 | Database users | a `DB_USER` with global privileges is replaced by `wp_<db>`, scoped to that database, with a connection test and rollback |
 | Malware | known webshells (WP-VCD, WP2SHELL, hex-named plugins) quarantined to `/var/lib/setup-quarantine/`; suspicious admins and high-risk plugins reported |
 | Files | world-writable files/dirs fixed; oversized archives inside the web root reported |
-| OS | `unattended-upgrades` and a fail2ban `sshd` jail installed by `--basic`, enabled by `--optimize` when present; the jail's `ignoreip` covers loopback and the SSH client running the deploy; MariaDB dumps kept 30 days and `/etc/mysqlbkup.cnf` is `root:root 600` |
+| OS | `unattended-upgrades` installed by `--basic`, enabled by `--optimize` when present; MariaDB dumps kept 30 days and `/etc/mysqlbkup.cnf` is `root:root 600` |
 | APT keys | every third-party repository (Angie, Sury, Elastic, NodeSource) is pinned to its own keyring with `signed-by`; a legacy globally trusted Angie key is retired to `/tmp` |
 | Audit | reports SSH password auth, public 80/443, and a non-loopback Elasticsearch |
 
-Opt-in flags for changes that can affect reachability:
-
-```bash
-# Keys-only SSH. Refuses to run if /root/.ssh/authorized_keys is missing.
-sudo bash setup.sh --optimize --harden-ssh
-
-# Allow 80/443 only from the Cloudflare ranges in
-# /etc/angie/http.d/cloudflare.conf (direct-to-origin access stops working).
-sudo bash setup.sh --optimize --cloudflare-only
-```
+SSH hardening, brute-force protection (fail2ban) and origin-only firewalling are left to the operator or the provider; the audit only reports password authentication and public 80/443.
 
 Environment overrides:
 
@@ -492,43 +486,55 @@ Available names: `smartmon`, `nvme`, `gif`, `nodejs`, `sysstat`, or `all`.
 
 The `nvme` item is gated: it installs only when `server=dedi` (or auto-detection says dedicated) **and** an NVMe block device is present (`/sys/block/nvme*` or `lsblk` transport `nvme`). On a VPS/container or non-NVMe server it logs a skip and continues.
 
-### Domains (`--domain DOMAIN [DOMAIN...] [app=TYPE]`)
+### Domains (`--domain DOMAIN [app=TYPE] [db=NAME [user=U pass=P] [sql=FILE]] [DOMAIN ...]`)
 
-A standalone action that does **not** require `--basic`. It requires Angie and MariaDB to be installed and MariaDB to be running. For each domain it creates:
+A standalone action that does **not** require `--basic`. It requires Angie to be installed, and MariaDB to be running when `db=` is given. For each domain it creates:
 
 | Artifact | Example for `google.com` |
 |---|---|
 | Document root | `/var/www/google.com/public/` (owned by `www-data`, mode 755) |
-| Angie vhost | `/etc/angie/conf.d/google.com.conf` (mode 644) |
-| MariaDB database | `google_com` (`utf8mb4` / `utf8mb4_general_ci`) |
-| Self-signed certificate | `/etc/angie/ssl/google.com/{fullchain.pem,privkey.pem}` when `app=` is not `blank` |
+| Self-signed certificate | `/etc/angie/ssl/google.com/{fullchain.pem,privkey.pem}` (every template terminates TLS) |
+| Angie vhost | `/etc/angie/conf.d/google.com.conf` (mode 644), rendered from `conf.d/templates` of `server-configs-nginx`; `example.com.conf` (static root, `h5bp/basic.conf`, plus the port-80 redirect) when `app=` is omitted |
+| MariaDB database | only with `db=NAME` (`utf8mb4` / `utf8mb4_general_ci`) |
+| Database user | only with `user=U pass=P` (requires `db=`): `ALL PRIVILEGES` on that database for `localhost`, `127.0.0.1` and `::1`; an existing account is re-keyed to `pass=` |
+| Dump import | only with `sql=FILE` (requires `db=`): `.sql`, `.sql.gz`, `.xz`, `.zst` or `.bz2`, imported into an **empty** database in bulk-load mode; a non-empty database is left alone with a warning |
+| MariaDB re-optimization | after any import: the shared memory plan is rebuilt from the live data+index size and the `99-setup-optimize.cnf` profile is rewritten (online buffer-pool resize, or a restart with the web tiers paused) |
 
 ```bash
-# Blank vhost + database (original behaviour)
+# Basic vhost, no database
 sudo bash setup.sh --domain google.com
 sudo bash setup.sh --domain google.com example.org my-site.example.com
+
+# Application vhost with database, scoped user and a dump
+sudo bash setup.sh --domain forum.example.com app=xf db=xenforodb user=demo pass=temp sql=/root/backup.sql
+
+# Database only (no user), several domains in one group
+sudo bash setup.sh --domain blog.example.com app=wordpress db=blogdb user=blog pass=secret \
+                            docs.example.com app=php db=docsdb
 
 # Ready-to-use application vhosts
 sudo bash setup.sh --domain forum.example.com app=xf
 sudo bash setup.sh --domain blog.example.com app=wordpress
+sudo bash setup.sh --domain forum.example.org app=flarum
 sudo bash setup.sh --domain files.example.com app=pingvin
 sudo bash setup.sh --domain images.example.com app=chevereto
 sudo bash setup.sh --domain go.example.com app=polr
+sudo bash setup.sh --domain s.example.com app=shlink
+sudo bash setup.sh --domain dl.example.com app=sfs
 sudo bash setup.sh --domain photos.example.com app=lychee
 sudo bash setup.sh --domain app.example.com app=php
 sudo bash setup.sh --domain node.example.com app=node
 ```
 
-`app=TYPE` applies to every domain in that `--domain` group; use separate `--domain ... app=...` groups for different apps. Supported values: `blank` (default), `xf`, `wordpress`, `pingvin`, `chevereto`, `polr`, `lychee`, `php`, `node`.
+`app=TYPE` applies to every domain in that `--domain` group (or to the domain right before it); `db=`, `user=`, `pass=` and `sql=` always belong to the domain they follow. Supported `app` values: `basic` (default; `blank` is an alias), `xf`, `wordpress`, `flarum`, `pingvin`, `chevereto`, `polr`, `lychee`, `shlink`, `sfs`, `php`, `node`. The `sample_proxy.conf` and `sample_cp_shlink.conf` templates need site-specific values (origin, auth file) and are not generated.
 
-- `xf`, `wordpress`, `pingvin`, `chevereto` and `polr` use the templates from `server-configs-nginx` (the repo is the single source of truth). `lychee` and `php` use a Laravel/front-controller vhost. `node` proxies to `127.0.0.1:3000` and adds a WebSocket location.
+- Every app uses its template from `server-configs-nginx` (the repo is the single source of truth); placeholders are replaced token-wise, so a domain such as `blog.example.com` is never substituted twice. `lychee` and `php` use the front-controller vhost. `node` proxies to `127.0.0.1:3000` and adds a WebSocket location.
 - The vhost is tested with `angie -t` before it is kept; a broken generated config is moved to `/tmp` (never deleted) and the script fails loudly.
 - The certificate is self-signed and valid for the domain and `www.` name. Replace it with ACME/Let's Encrypt (Angie has `http_acme` built in) for production.
 - App code is **not** downloaded. The script provisions the vhost, certificate, document root and database; install the application itself (Composer, WP-CLI, Node, etc.) on top.
 - Domain names are lowercased and validated as hostnames. A trailing dot is removed.
-- Dots become underscores and hyphens become underscores in the database name: `my-site.example.com` → `my_site_example_com`.
-- The database name must be at most 64 characters.
-- Re-running is idempotent. An existing non-empty Angie config file is **not overwritten** (so your vhost content is preserved); an empty placeholder is upgraded. An existing database is left as-is.
+- `db=` accepts letters, digits and underscore (at most 64 characters); `user=` the same (at most 80). The password is sent to MariaDB over stdin and redacted in the run log.
+- Re-running is idempotent. An existing non-empty Angie config file is **not overwritten** (so your vhost content is preserved); an empty placeholder is upgraded. An existing database is left as-is, and a dump is never imported over existing tables.
 - `--domain` can be combined with a normal install, e.g. `--basic ... --angie --mariadb ... --domain google.com app=wordpress`; the domain step runs after Angie and MariaDB.
 - There is no domain purge target. Remove the directory, Angie config/certificate and database manually if needed.
 
@@ -724,7 +730,7 @@ host type (`dedi` or `vps` from `systemd-detect-virt`, or `--basic server=`).
 | Elasticsearch | heap = store/4 (512 MB..25% RAM..31 GB); search threads `clamp(cpus/2, 1, 16)`, write threads `clamp(cpus/4, 1, min(8, cpus+1))` |
 | Valkey / Redis | maxmemory from the plan; `maxclients` from the PHP pool; `io_threads` clamped to 1..8 on both paths |
 | Angie | `worker_processes` = effective CPUs, `worker_connections = clamp(cpus × 2048, 8192, 65535)`, upstream keepalive from the PHP pool, `open_file_cache max = clamp(RAM_MB × 8, 10000, 200000)`, cache budget from RAM/disk/installed services, `limit_req_log_level info` |
-| Kernel | `somaxconn`/SYN backlog `cpus × 4096` (VPS: `cpus × 2048`, max 65536), conntrack `RAM_MB × 16` (VPS: `× 8`), `vm.dirty_background_bytes = clamp(RAM/100, 64 MB, 512 MB)` and `vm.dirty_bytes = 4×` (tighter on HDD), 16 MB socket buffers under 4 GB RAM, IPv6 fragment thresholds like IPv4 |
+| Kernel | `somaxconn`/SYN backlog `cpus × 4096` (VPS: `cpus × 2048`, max 65536), conntrack `RAM_MB × 16` (VPS: `× 8`), `vm.dirty_background_bytes = clamp(RAM/100, 64 MB, 512 MB)` and `vm.dirty_bytes = 4×` (tighter on HDD), 16 MB socket buffers under 4 GB RAM |
 | Host | swap = RAM/2 clamped to 1..8 GiB (4 GiB on a VPS); CPU governor only on dedicated hardware; THP `madvise` via `setup-io-tuning.service`; `fstrim.timer` on SSD/NVMe; I/O scheduler and readahead by device class via `/etc/udev/rules.d/60-setup-io.rules` |
 
 Environment overrides: `SETUP_MARIADB_IO_CAPACITY="read max"`,
@@ -856,7 +862,7 @@ sudo bash setup.sh --purge
 - **Nothing is uninstalled or deleted.** Package purge/autoremove/clean calls were removed. `--purge` stops/disables the selected services, removes the managed and legacy cron entries, restores recorded basic settings where the original existed, and leaves packages, repositories, keys, configuration, certificates, databases, caches and logs on disk.
 - `--purge all` runs every stop/restore step in a safe order.
 - Bare targets and service flags are combined, so `--purge basic --php` stops both.
-- `--purge others` only disables the managed cron/setup entries it knows about; optional packages, Node.js and repository files are left installed. Composer is not installed by this script; `unattended-upgrades` and `fail2ban` are installed by `--basic` (see the security pass above) and are left in place by `--purge`.
+- `--purge others` only disables the managed cron/setup entries it knows about; optional packages, Node.js and repository files are left installed. Composer and fail2ban are not installed by this script; `unattended-upgrades` is installed by `--basic` (see the security pass above) and is left in place by `--purge`.
 - `--purge angie` stops Angie and leaves `/etc/angie` (including domain vhosts and certificates), cache directories under `/home` and logs intact.
 - `--purge valkey` stops Valkey and leaves the Unix socket, systemd drop-in, group membership, configuration and data intact.
 - `--purge basic` restores files recorded in `/var/lib/setup.sh/backup` by overwriting them (never by unlinking the live path), moves generated drop-ins that did not exist before to `/tmp` (DNS, PAM limits, sysctl, modules-load, logrotate, network oneshot), leaves `/swapfile` and its `/etc/fstab` line enabled, removes the managed and legacy cron entries, restores the original UFW default policies and pre-existing SSH allow rules, and disables UFW again if it was originally inactive. If no original SSH rule existed, the limit rule is kept as a lockout guard.
@@ -1101,7 +1107,7 @@ The script produces a working, internet-facing baseline. For a large or security
 - Back up with snapshots to an external repository; Elasticsearch data is not covered by the MariaDB backup.
 
 **Host / operations**
-- Use SSH keys only (`--harden-ssh` once key access is confirmed), keep UFW limited to 22/80/443 (or `--cloudflare-only`), and add web-auth jails if you need them. `--basic` rate-limits every effective SSH port with `ufw limit` and installs a fail2ban `sshd` jail whose `ignoreip` covers loopback and the SSH client that ran the deploy.
+- Use SSH keys only and keep UFW limited to 22/80/443 (or your CDN's ranges). `--basic` rate-limits every effective SSH port with `ufw limit`; add fail2ban or web-auth jails yourself if you need them.
 - Remove the mDNS (`5353/udp`) and WS-Discovery (`3702/udp`) UFW rules if you do not need them; they were pre-existing on this host, not added by the script.
 - Enable `unattended-upgrades` manually if you want automatic security patches, and monitor reboot-required. Keep the kernel/firmware updated. `libgd3` is currently held back by the apt phasing/upgrade policy; review it before the next PHP/GD upgrade.
 - Ship Angie access/error logs, PHP-FPM slow log, MariaDB slow query log, Elasticsearch and Valkey metrics to a central monitor; alert on 5xx rate, p99 latency, disk, memory and queue depth. `--others sysstat` provides `sar`/`iostat`/`pidstat` history.
@@ -1138,7 +1144,7 @@ The package is installed, but `smartd` may refuse to start on machines with no S
 
 ### `--purge others` and pre-existing packages
 
-`--purge others` no longer removes any package, repository or key. It only stops the managed optional services and leaves Node.js, `smartmontools`, `nvme-cli`, `gifsicle` and `sysstat` installed. Remove them manually with APT only after confirming nothing needs them. `fail2ban` and `unattended-upgrades` belong to the `--basic` security pass and are left running by every purge target; Composer is not managed by this script.
+`--purge others` no longer removes any package, repository or key. It only stops the managed optional services and leaves Node.js, `smartmontools`, `nvme-cli`, `gifsicle` and `sysstat` installed. Remove them manually with APT only after confirming nothing needs them. `unattended-upgrades` belongs to the `--basic` security pass and is left running by every purge target; fail2ban and Composer are not managed by this script.
 
 ### `--purge --php`
 

@@ -34,7 +34,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.9.0"
+readonly SCRIPT_VERSION="1.10.0"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -466,6 +466,11 @@ apt_clean() {
 declare -A ENABLED=()
 declare -A OPT=()
 declare -A DOMAIN_APP=()
+# Per-domain database provisioning (--domain ... db= user= pass= sql=).
+declare -A DOMAIN_DB=()
+declare -A DOMAIN_DB_USER=()
+declare -A DOMAIN_DB_PASS=()
+declare -A DOMAIN_SQL=()
 OTHERS=()
 DOMAINS=()
 PURGE=0
@@ -473,10 +478,6 @@ OPTIMIZE=0
 DIAGNOSTICS=0
 RESTART_ALL=0
 DRY_RUN=0
-# Opt-in hardening that can affect reachability.  The safe WordPress/file/OS
-# hardening runs unconditionally; these two need an explicit decision.
-HARDEN_SSH=0
-CLOUDFLARE_ONLY=0
 PURGE_TARGETS=()
 PURGE_ORDER=()
 SERVICE_ORDER=(basic angie php mariadb valkey elastic others domain)
@@ -529,21 +530,27 @@ Services (optional; only the ones listed are installed):
       sysstat    sar/iostat performance history
 
 Domain setup (standalone; Angie + MariaDB must already be installed/running):
-  --domain DOMAIN [DOMAIN...] [app=TYPE]
-      Creates:
+  --domain DOMAIN [app=TYPE] [db=NAME [user=U pass=P] [sql=FILE]] [DOMAIN ...]
+      Creates, per domain:
         /var/www/<domain>/public/
-        /etc/angie/conf.d/<domain>.conf   (ready vhost, or empty when app=blank)
-        MariaDB database <domain with dots replaced by underscores>
+        /etc/angie/ssl/<domain>/          (self-signed; replace with ACME)
+        /etc/angie/conf.d/<domain>.conf   (full vhost from the Angie repo's
+                                           conf.d/templates; the basic
+                                           template when app= is omitted)
       app=TYPE may be given inside a --domain group and applies to every
       domain in that group. TYPE is one of:
-        blank (default) xf wordpress pingvin chevereto polr lychee php node
-      Existing non-empty vhost files are preserved. A self-signed certificate
-      is generated under /etc/angie/ssl/<domain>/; replace it with an ACME /
-      Let's Encrypt certificate for production.
-      Example: --domain forum.example.com app=xf
-        -> /var/www/forum.example.com/public/
-        -> /etc/angie/conf.d/forum.example.com.conf  (XenForo vhost)
-        -> database forum_example_com
+        basic (default) xf wordpress flarum pingvin chevereto polr lychee
+        shlink sfs php node
+      db=NAME            create the MariaDB database (only when declared)
+      user=U pass=P      create that user with ALL privileges on db= only
+                         (localhost, 127.0.0.1 and ::1); both are required
+      sql=FILE           import a dump (.sql, .sql.gz, .xz, .zst, .bz2)
+                         into db= when the database is still empty, then
+                         re-size the MariaDB profile for the imported data
+      db=/user=/pass=/sql= follow the domain they belong to.
+      Existing non-empty vhost files and existing databases are preserved.
+      Example: --domain forum.example.com app=xf db=xenforodb user=demo \
+                 pass=temp sql=/root/backup.sql
       --domain can be repeated and combined with a normal install. There is
       no --purge for domains; remove the files/database manually.
 
@@ -582,7 +589,7 @@ Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
       Existing application vhosts and credentials are preserved.
       --dry-run only prints the planned OS and service values.
 
-Security hardening (runs automatically; these flags go further):
+Security hardening (runs automatically):
   --optimize and --basic always:
       - fix wp-config.php ownership/mode (root:www-data 640)
       - add DISALLOW_FILE_EDIT, DISALLOW_FILE_MODS, DISABLE_WP_CRON,
@@ -592,17 +599,9 @@ Security hardening (runs automatically; these flags go further):
         account limited to its own database (SETUP_WP_DB_SPLIT=0 disables)
       - quarantine known webshells/malware and report risky plugins,
         world-writable files and oversized backup archives
-      - enable unattended-upgrades and fail2ban when installed (--basic
-        installs them; --optimize never installs packages)
+      - enable unattended-upgrades when installed (--basic installs it;
+        --optimize never installs packages)
       - report SSH, firewall and Elasticsearch exposure
-  --harden-ssh          keys-only SSH (PasswordAuthentication no,
-                        PermitRootLogin prohibit-password). Refuses to run
-                        without /root/.ssh/authorized_keys.
-  --cloudflare-only     delete the public 80/443 rules and allow those ports
-                        only from the published Cloudflare ranges (requires
-                        /etc/angie/http.d/cloudflare.conf). This blocks
-                        direct-to-origin access and any non-Cloudflare
-                        monitor; verify before enabling.
 
 Purge (stop/restore) mode:
   --purge [all|basic|angie|php|mariadb|valkey|elastic|others]
@@ -775,6 +774,19 @@ parse_args() {
               shift
               continue
               ;;
+            db=*|user=*|pass=*|sql=*)
+              # Database options belong to the domain immediately before them.
+              (( ${#group[@]} > 0 )) || die "--domain: '${1%%=*}=' must follow a domain name"
+              key=${group[-1],,}; key=${key%.}
+              case "$1" in
+                db=*)   DOMAIN_DB[$key]=${1#*=} ;;
+                user=*) DOMAIN_DB_USER[$key]=${1#*=} ;;
+                pass=*) DOMAIN_DB_PASS[$key]=${1#*=} ;;
+                sql=*)  DOMAIN_SQL[$key]=${1#*=} ;;
+              esac
+              shift
+              continue
+              ;;
           esac
           d=${1,,}; d=${d%.}
           group+=("$d"); got_domain=1
@@ -795,10 +807,6 @@ parse_args() {
           fi
         done
         ;;
-      --harden-ssh)
-        HARDEN_SSH=1; shift ;;
-      --cloudflare-only)
-        CLOUDFLARE_ONLY=1; shift ;;
       --optimize)
         OPTIMIZE=1; shift ;;
       --diagnostics)
@@ -926,52 +934,6 @@ sshd_listen_ports() {
   printf '%s\n' "$ports"
 }
 
-# Peer address from `ss -t` output.  The last two fields are always
-# Local Address:Port and Peer Address:Port; the State column is present or
-# absent depending on the ss version and flags (with -H + a state filter this
-# host emits four fields).  Reading a fixed column is therefore unsafe:
-# field 4 is the server address in the five-field form and the client address
-# in the four-field form.  An optional local-port regex keeps ordinary web
-# connections out of the result.
-ssh_peer_from_ss() {
-  local port_re=${1:-}
-  awk -v re="$port_re" '
-    NF >= 4 {
-      local_addr = $(NF - 1)
-      peer = $NF
-      if (re != "" && local_addr !~ re) next
-      print peer
-    }' \
-    | sed -E 's/:[0-9]+$//; s/^\[//; s/\]$//' \
-    | grep -vE '^(127\.|::1$|0\.0\.0\.0$|::$)' \
-    | head -n1
-}
-
-# Best-effort detection of the SSH client address that started this run.
-# sudo normally strips SSH_CONNECTION from the child environment, so also walk
-# the parent process chain and, as a last resort, inspect established sshd
-# sockets.
-detect_ssh_client_ip() {
-  local ip="${SSH_CONNECTION:-}" pid=$PPID i env
-  ip=${ip%% *}
-  [[ $ip =~ ^[0-9a-fA-F:.]+$ ]] && { printf '%s' "$ip"; return 0; }
-  for ((i = 0; i < 6; i++)); do
-    [[ -r "/proc/${pid}/environ" ]] || break
-    env=$(tr '\0' '\n' < "/proc/${pid}/environ" 2>/dev/null || true)
-    ip=$(printf '%s\n' "$env" \
-      | awk -F= '/^SSH_CONNECTION=/{print $2; exit}' | awk '{print $1}')
-    [[ $ip =~ ^[0-9a-fA-F:.]+$ ]] && { printf '%s' "$ip"; return 0; }
-    pid=$(awk '{print $4}' "/proc/${pid}/stat" 2>/dev/null || true)
-    [[ -n $pid && $pid != 0 ]] || break
-  done
-  local ssh_ports_re
-  ssh_ports_re=$(sshd_listen_ports | paste -sd'|' -)
-  ip=$(ss -tnH state established 2>/dev/null \
-    | ssh_peer_from_ss ":(${ssh_ports_re})$" || true)
-  [[ $ip =~ ^[0-9a-fA-F:.]+$ ]] && printf '%s' "$ip"
-  return 0
-}
-
 # Resolve the IPV4 keyword to a usable local address.  Sets REPLY.
 resolve_ipv4_token() {
   local public localip
@@ -1068,22 +1030,19 @@ validate_domain() {
   [[ $d =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]
 }
 
-domain_to_db() {
-  local d=${1,,}
-  d=${d//./_}
-  printf '%s' "$d" | sed 's/[^a-z0-9_]/_/g'
-}
-
 normalize_app() {
   local a=${1,,}
   case "$a" in
-    ""|blank|none|plain) printf 'blank' ;;
+    ""|basic|blank|none|plain|static) printf 'basic' ;;
     xf|xenforo)          printf 'xf' ;;
     wp|wordpress)        printf 'wordpress' ;;
+    flarum)              printf 'flarum' ;;
     pingvin)             printf 'pingvin' ;;
     chev|chevereto)      printf 'chevereto' ;;
     polr)                printf 'polr' ;;
     lychee)              printf 'lychee' ;;
+    shlink)              printf 'shlink' ;;
+    sfs)                 printf 'sfs' ;;
     node|nodejs)         printf 'node' ;;
     php|generic)         printf 'php' ;;
     *) return 1 ;;
@@ -1357,12 +1316,28 @@ validate_all() {
       d=${d,,}
       d=${d%.}
       validate_domain "$d" || die "--domain '${d}' is not a valid domain name"
-      db=$(domain_to_db "$d")
-      (( ${#db} <= 64 )) || die "Database name '${db}' for '${d}' exceeds 64 characters"
-      app=${DOMAIN_APP[$d]:-blank}
+      app=${DOMAIN_APP[$d]:-basic}
       app=$(normalize_app "$app") \
-        || die "--domain '${d}': unknown app='${app}' (use blank, xf, wordpress, pingvin, chevereto, polr, lychee, php or node)"
+        || die "--domain '${d}': unknown app='${app}' (use basic, xf, wordpress, flarum, pingvin, chevereto, polr, lychee, shlink, sfs, php or node)"
       DOMAIN_APP[$d]=$app
+      db=${DOMAIN_DB[$d]:-}
+      if [[ -n $db ]]; then
+        [[ $db =~ ^[A-Za-z0-9_]{1,64}$ ]] \
+          || die "--domain '${d}': db='${db}' is invalid (letters, digits and underscore, at most 64 characters)"
+      fi
+      if [[ -n ${DOMAIN_DB_USER[$d]:-} || -n ${DOMAIN_DB_PASS[$d]:-} ]]; then
+        [[ -n $db ]] || die "--domain '${d}': user=/pass= require db="
+        [[ -n ${DOMAIN_DB_USER[$d]:-} && -n ${DOMAIN_DB_PASS[$d]:-} ]] \
+          || die "--domain '${d}': user= and pass= must be given together"
+        [[ ${DOMAIN_DB_USER[$d]} =~ ^[A-Za-z0-9_]{1,80}$ ]] \
+          || die "--domain '${d}': user= may only contain letters, digits and underscore"
+        [[ ${DOMAIN_DB_PASS[$d]} != *$'\n'* ]] || die "--domain '${d}': pass= must not contain a newline"
+      fi
+      if [[ -n ${DOMAIN_SQL[$d]:-} ]]; then
+        [[ -n $db ]] || die "--domain '${d}': sql= requires db="
+        [[ -f ${DOMAIN_SQL[$d]} && -r ${DOMAIN_SQL[$d]} ]] \
+          || die "--domain '${d}': sql='${DOMAIN_SQL[$d]}' is not a readable file"
+      fi
       [[ $seen == *" $d "* ]] && continue
       seen+="${d} "
       dedup+=("$d")
@@ -2268,7 +2243,6 @@ SYSCTL_MANAGED_KEYS=(
   net.ipv4.neigh.default.gc_thresh3
   net.ipv4.ipfrag_low_thresh net.ipv4.ipfrag_high_thresh
   net.netfilter.nf_conntrack_max
-  net.ipv6.ip6frag_low_thresh net.ipv6.ip6frag_high_thresh
   fs.file-max fs.nr_open fs.inotify.max_user_watches
   vm.min_free_kbytes kernel.shmmax kernel.shmall
   vm.dirty_background_bytes vm.dirty_bytes vm.dirty_background_ratio vm.dirty_ratio
@@ -2439,8 +2413,6 @@ net.ipv4.neigh.default.gc_thresh3 = ${arp_thresh3}
 # Keep low <= high.  A lower high mark is rejected while the old low mark is
 # still above it, so write the low mark first and the high mark second.
 $(ipfrag_sysctl_lines "$ipfrag_high" "$ipfrag_low")
-net.ipv6.ip6frag_low_thresh = ${ipfrag_low}
-net.ipv6.ip6frag_high_thresh = ${ipfrag_high}
 net.netfilter.nf_conntrack_max = ${conntrack_max}
 # Byte thresholds override the percentage knobs from the base profile.
 vm.dirty_background_bytes = $(( dirty_bg_mb * 1048576 ))
@@ -3681,6 +3653,10 @@ tune_angie_configs() {
   tune_cache_error_policy "$target/h5bp/php_xf_proxy.conf" "h5bp/php_xf_proxy.conf"
   tune_cache_error_policy "$target/h5bp/php_chev.conf" "h5bp/php_chev.conf"
   tune_cache_error_policy "$target/h5bp/php_flarum.conf" "h5bp/php_flarum.conf"
+  # The cache key references $setup_cache_enc, so the map that defines it
+  # must exist before the first XenForo vhost is tested (a fresh install
+  # tunes the include long before --domain app=xf runs).
+  ensure_xf_cookie_bypass_map "$target" || true
   tune_xf_cache_vary "$target/h5bp/php_xf.conf"
   tune_xf_cache_vary "$target/h5bp/php_xf_proxy.conf"
   tune_xf_static_assets "$target/h5bp/xf2.conf"
@@ -5791,23 +5767,175 @@ install_others() {
 # ---------------------------------------------------------------------------
 # Domains
 # ---------------------------------------------------------------------------
+# Render a vhost from a server-configs-nginx template.  Every template uses
+# the same placeholders (domain.com / sample.com / example.com, Let's Encrypt
+# or /etc/angie/ssl/default certificate paths, the hostname_ssl include), so
+# one token-based substitution pass serves all of them.  Tokens are replaced
+# before the real domain is inserted, so a domain that itself contains
+# "example.com" (blog.example.com) is never substituted twice.
+domain_render_vhost() {
+  local app=$1 d=$2 certdir=$3 vhost=$4 src tpl tls
+  case "$app" in
+    basic)      tpl=example.com.conf ;;
+    xf)         tpl=sample_xf.conf ;;
+    wordpress)  tpl=sample_wordpress.conf ;;
+    flarum)     tpl=sample_flarum.conf ;;
+    pingvin)    tpl=sample_pingvin.conf ;;
+    chevereto)  tpl=sample_chev.conf ;;
+    polr)       tpl=sample_polr.conf ;;
+    php|lychee) tpl=sample_php.conf ;;
+    shlink)     tpl=sample_shlink.conf ;;
+    sfs)        tpl=sample_sfs.conf ;;
+    node)       tpl=sample_node.conf ;;
+    *) die "Internal error: unhandled app '${app}' for ${d}" ;;
+  esac
+  src="/etc/angie/conf.d/templates/${tpl}"
+  [[ -f $src ]] || die "Missing Angie template ${src} (app=${app})"
+  cp "$src" "$vhost"
+  tls="include h5bp/tls/ssl_engine.conf;\n    include h5bp/tls/policy_balanced.conf;\n    ssl_certificate     ${certdir}/fullchain.pem;\n    ssl_certificate_key ${certdir}/privkey.pem;"
+  sed_in_place \
+    -e 's|www\.example\.com|@@WWW@@|g' -e 's|www\.domain\.com|@@WWW@@|g' \
+    -e 's|example\.com|@@DOMAIN@@|g' -e 's|domain\.com|@@DOMAIN@@|g' -e 's|sample\.com|@@DOMAIN@@|g' \
+    -e "s|@@WWW@@|www.${d}|g" -e "s|@@DOMAIN@@|${d}|g" \
+    -e "s#/etc/letsencrypt/live/${d}/fullchain.pem#${certdir}/fullchain.pem#g" \
+    -e "s#/etc/letsencrypt/live/${d}/privkey.pem#${certdir}/privkey.pem#g" \
+    -e "s#/etc/angie/ssl/default/#${certdir}/#g" \
+    -e "s|include h5bp/hostname_ssl.conf;|${tls}|g" \
+    "$vhost"
+  case "$app" in
+    basic)
+      # The basic template has no port-80 listener; add the same redirect
+      # every application template carries.
+      local tmp
+      tmp=$(tmp_file)
+      {
+        printf 'server {\n    listen      80;\n    listen [::]:80;\n    server_name %s www.%s;\n    return 301 https://%s$request_uri;\n}\n' "$d" "$d" "$d"
+        cat "$vhost"
+      } > "$tmp"
+      cat "$tmp" > "$vhost"
+      ;;
+    xf)
+      sed_in_place -e "s#/var/www/html/${d}/websocket.log#${LOG_ROOT}/angie/${d}-websocket.log#g" "$vhost"
+      ;;
+    pingvin)
+      mkdir -p "/var/www/${d}/data" "/var/www/${d}/frontend"
+      sed_in_place -e "s#/var/www/pingvin_source#/var/www/${d}#g" \
+        -e "s#/var/www/pingvin_data#/var/www/${d}/data#g" \
+        -e '/set_real_ip_from 1\.2\.3\.4;/d' \
+        -e '/real_ip_header X-Forwarded-For;/d' \
+        -e '/real_ip_recursive on;/d' \
+        -e '/realip_remote_addr/d' \
+        "$vhost"
+      ;;
+  esac
+}
+
+# Create the declared database, a user limited to it and import a dump.
+# Nothing is created unless db= was given; user=/pass= create (or re-key) the
+# account for every loopback spelling, like the --mariadb admin user; sql= is
+# imported only into an empty database.  Returns 0 when a dump was imported.
+domain_provision_database() {
+  local d=$1 db user pass sql host eu ep edb tables size start end
+  local -a reader=(cat)
+  db=${DOMAIN_DB[$d]:-}
+  if [[ -z $db ]]; then
+    info "${d}: no db= declared; no database created"
+    return 1
+  fi
+  user=${DOMAIN_DB_USER[$d]:-}
+  pass=${DOMAIN_DB_PASS[$d]:-}
+  sql=${DOMAIN_SQL[$d]:-}
+  edb=$(sql_escape "$db")
+  mariadb <<<"CREATE DATABASE IF NOT EXISTS \`${db}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
+  mariadb -N -B -e "SHOW DATABASES LIKE '${edb}'" | grep -qx "$db" \
+    || die "Failed to create MariaDB database '${db}' for ${d}"
+  info "${d}: database ${db}"
+  if [[ -n $user ]]; then
+    eu=$(sql_escape "$user")
+    ep=$(sql_escape "$pass")
+    # Statements go in over stdin so the password never reaches `ps`.
+    for host in localhost 127.0.0.1 ::1; do
+      mariadb <<<"CREATE USER IF NOT EXISTS '${eu}'@'${host}' IDENTIFIED BY '${ep}'; ALTER USER '${eu}'@'${host}' IDENTIFIED BY '${ep}'; GRANT ALL PRIVILEGES ON \`${db//_/\\_}\`.* TO '${eu}'@'${host}';"
+    done
+    mariadb <<<'FLUSH PRIVILEGES;'
+    info "${d}: user ${user} (localhost, 127.0.0.1, ::1) has ALL PRIVILEGES on ${db}; password set from pass="
+  fi
+  [[ -n $sql ]] || return 1
+  tables=$(mariadb -N -B -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${edb}'" 2>/dev/null || true)
+  if [[ $tables =~ ^[0-9]+$ ]] && (( tables > 0 )); then
+    warn "${d}: database ${db} already holds ${tables} table(s); skipping the import of ${sql} (empty it first to re-import)"
+    return 1
+  fi
+  case "$sql" in
+    *.gz)  reader=(gzip -dc) ;;
+    *.xz)  reader=(xz -dc) ;;
+    *.zst) reader=(zstd -dc) ;;
+    *.bz2) reader=(bzip2 -dc) ;;
+  esac
+  command -v "${reader[0]}" >/dev/null 2>&1 || die "${d}: ${reader[0]} is required to read ${sql}"
+  info "${d}: importing ${sql} ($(du -h "$sql" 2>/dev/null | cut -f1)) into ${db}"
+  start=$(date +%s)
+  # Bulk-load mode for the whole dump: one transaction, no per-row unique or
+  # FK checks, no binlog.  The dump's own DROP/CREATE statements still apply.
+  if ! {
+       printf 'SET autocommit=0; SET unique_checks=0; SET foreign_key_checks=0; SET SESSION sql_log_bin=0;\n'
+       "${reader[@]}" "$sql"
+       printf '\nCOMMIT;\n'
+     } | mariadb --max-allowed-packet=1G "$db"; then
+    die "${d}: import of ${sql} into ${db} failed (the database may be partially loaded)"
+  fi
+  end=$(date +%s)
+  tables=$(mariadb -N -B -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${edb}'" 2>/dev/null || echo '?')
+  size=$(mariadb -N -B -e "SELECT ROUND(COALESCE(SUM(data_length + index_length), 0) / 1048576) FROM information_schema.tables WHERE table_schema='${edb}'" 2>/dev/null || echo '?')
+  ok "${d}: imported ${tables} table(s), ${size} MB data+index, in $(format_duration $(( end - start )))"
+  return 0
+}
+
+# After a dump import the live data size is known, so size the buffer pool
+# and the rest of the MariaDB profile for it right away instead of waiting
+# for the next --optimize.  Reuses the optimize path: shared memory plan,
+# drop-in rewrite, then an online buffer-pool resize or a restart with the
+# web tiers paused.
+reoptimize_mariadb_after_import() {
+  step "MariaDB re-optimization for the imported data"
+  local line
+  OPT_INSTALL_PLAN=0
+  detect_installed_services
+  plan_memory_budget
+  info "Memory plan: ${OPT_MEM_BUDGET_MB}MB usable of ${OPT_MEM_TOTAL_MB}MB (PHP=${OPT_PHP_BUDGET_MB}MB MariaDB=${OPT_MARIADB_BUDGET_MB}MB Cache=${OPT_VALKEY_BUDGET_MB}MB Elasticsearch=${OPT_ES_BUDGET_MB}MB)"
+  OPT_REPORT=()
+  if optimize_mariadb; then
+    ok "MariaDB profile re-sized for the imported data (buffer pool ${OPT_MARIADB_BUDGET_MB}MB, data+index ${OPT_DB_SIZE_MB}MB)"
+  else
+    warn "MariaDB re-optimization reported a problem (see the lines below)"
+  fi
+  for line in "${OPT_REPORT[@]}"; do
+    info "  ${line}"
+  done
+}
+
 create_domains() {
   step "Domains"
   (( ${#DOMAINS[@]} > 0 )) || return 0
 
   [[ -d /etc/angie/conf.d ]] \
     || die "Angie is not installed (/etc/angie/conf.d missing). Install with --angie first."
-  command -v mariadb >/dev/null 2>&1 \
-    || die "MariaDB client not found. Install MariaDB with --mariadb first."
-  systemctl is-active --quiet mariadb \
-    || die "MariaDB is not running. Install/start it with --mariadb first."
+  local d need_db=0
+  for d in "${DOMAINS[@]}"; do
+    [[ -n ${DOMAIN_DB[$d]:-} ]] && need_db=1
+  done
+  if (( need_db )); then
+    command -v mariadb >/dev/null 2>&1 \
+      || die "MariaDB client not found; db= needs MariaDB (install it with --mariadb first)."
+    systemctl is-active --quiet mariadb \
+      || die "MariaDB is not running; db= needs MariaDB (install/start it with --mariadb first)."
+  fi
   command -v openssl >/dev/null 2>&1 || apt_install openssl
   ensure_log_dirs
 
-  local d db dir conf app certdir src tmp changed=0 pv
+  local dir conf app certdir tmp changed=0 imported=0 pv
   for d in "${DOMAINS[@]}"; do
-    app=${DOMAIN_APP[$d]:-blank}
-    db=$(domain_to_db "$d")
+    app=${DOMAIN_APP[$d]:-basic}
     dir="/var/www/${d}/public"
     conf="/etc/angie/conf.d/${d}.conf"
     certdir="/etc/angie/ssl/${d}"
@@ -5832,20 +5960,20 @@ create_domains() {
     chmod 755 "/var/www/${d}" "$dir"
     info "Directory: ${dir}"
 
-    if [[ $app != blank ]]; then
-      mkdir -p "$certdir"
-      chmod 700 "$certdir"
-      if [[ ! -s "${certdir}/fullchain.pem" || ! -s "${certdir}/privkey.pem" ]]; then
-        info "Generating a self-signed certificate for ${d}"
-        openssl req -x509 -nodes -newkey rsa:2048 -days 397 \
-          -subj "/CN=${d}" \
-          -addext "subjectAltName=DNS:${d},DNS:www.${d}" \
-          -keyout "${certdir}/privkey.pem" \
-          -out "${certdir}/fullchain.pem" >/dev/null 2>&1 \
-          || die "Could not generate a certificate for ${d}"
-        chmod 600 "${certdir}/privkey.pem"
-        chmod 644 "${certdir}/fullchain.pem"
-      fi
+    # Every template (the basic one included) terminates TLS; a self-signed
+    # certificate makes the vhost valid until ACME/Let's Encrypt replaces it.
+    mkdir -p "$certdir"
+    chmod 700 "$certdir"
+    if [[ ! -s "${certdir}/fullchain.pem" || ! -s "${certdir}/privkey.pem" ]]; then
+      info "Generating a self-signed certificate for ${d}"
+      openssl req -x509 -nodes -newkey rsa:2048 -days 397 \
+        -subj "/CN=${d}" \
+        -addext "subjectAltName=DNS:${d},DNS:www.${d}" \
+        -keyout "${certdir}/privkey.pem" \
+        -out "${certdir}/fullchain.pem" >/dev/null 2>&1 \
+        || die "Could not generate a certificate for ${d}"
+      chmod 600 "${certdir}/privkey.pem"
+      chmod 644 "${certdir}/fullchain.pem"
     fi
 
     # Never overwrite an existing non-empty vhost; the operator may have
@@ -5854,83 +5982,7 @@ create_domains() {
       info "Angie config already exists and is non-empty; keeping ${conf}"
     else
       tmp=$(tmp_file)
-      case "$app" in
-        blank)
-          : > "$tmp"
-          ;;
-        xf)
-          src=/etc/angie/conf.d/templates/sample_xf.conf
-          [[ -f $src ]] || die "Missing Angie template ${src}"
-          cp "$src" "$tmp"
-          sed_in_place -e "s|domain\.com|${d}|g" -e "s|sample\.com|${d}|g" \
-            -e "s#/etc/letsencrypt/live/${d}/fullchain.pem#${certdir}/fullchain.pem#g" \
-            -e "s#/etc/letsencrypt/live/${d}/privkey.pem#${certdir}/privkey.pem#g" \
-            -e "s#/var/www/html/${d}/websocket.log#${LOG_ROOT}/angie/${d}-websocket.log#g" \
-            "$tmp"
-          ;;
-        wordpress)
-          src=/etc/angie/conf.d/templates/sample_wordpress.conf
-          [[ -f $src ]] || die "Missing Angie template ${src}"
-          cp "$src" "$tmp"
-          sed_in_place -e "s|domain\.com|${d}|g" -e "s|sample\.com|${d}|g" \
-            -e "s|include h5bp/hostname_ssl.conf;|include h5bp/tls/ssl_engine.conf;\n    include h5bp/tls/policy_balanced.conf;\n    ssl_certificate     ${certdir}/fullchain.pem;\n    ssl_certificate_key ${certdir}/privkey.pem;|g" \
-            "$tmp"
-          ;;
-        pingvin)
-          src=/etc/angie/conf.d/templates/sample_pingvin.conf
-          [[ -f $src ]] || die "Missing Angie template ${src}"
-          cp "$src" "$tmp"
-          mkdir -p "/var/www/${d}/data" "/var/www/${d}/frontend"
-          sed_in_place -e "s|domain\.com|${d}|g" -e "s|sample\.com|${d}|g" \
-            -e "s#/var/www/pingvin_source#/var/www/${d}#g" \
-            -e "s#/var/www/pingvin_data#/var/www/${d}/data#g" \
-            -e '/set_real_ip_from 1\.2\.3\.4;/d' \
-            -e '/real_ip_header X-Forwarded-For;/d' \
-            -e '/real_ip_recursive on;/d' \
-            -e '/realip_remote_addr/d' \
-            -e "s|include h5bp/hostname_ssl.conf;|include h5bp/tls/ssl_engine.conf;\n    include h5bp/tls/policy_balanced.conf;\n    ssl_certificate     ${certdir}/fullchain.pem;\n    ssl_certificate_key ${certdir}/privkey.pem;|g" \
-            "$tmp"
-          ;;
-        chevereto)
-          src=/etc/angie/conf.d/templates/sample_chev.conf
-          [[ -f $src ]] || die "Missing Angie template ${src}"
-          cp "$src" "$tmp"
-          sed_in_place -e "s|domain\.com|${d}|g" -e "s|sample\.com|${d}|g" \
-            -e "s#/etc/letsencrypt/live/${d}/fullchain.pem#${certdir}/fullchain.pem#g" \
-            -e "s#/etc/letsencrypt/live/${d}/privkey.pem#${certdir}/privkey.pem#g" \
-            "$tmp"
-          ;;
-        polr)
-          src=/etc/angie/conf.d/templates/sample_polr.conf
-          [[ -f $src ]] || die "Missing Angie template ${src}"
-          cp "$src" "$tmp"
-          sed_in_place -e "s|domain\.com|${d}|g" -e "s|sample\.com|${d}|g" \
-            -e "s|include h5bp/hostname_ssl.conf;|include h5bp/tls/ssl_engine.conf;\n    include h5bp/tls/policy_balanced.conf;\n    ssl_certificate     ${certdir}/fullchain.pem;\n    ssl_certificate_key ${certdir}/privkey.pem;|g" \
-            "$tmp"
-          ;;
-        php|lychee)
-          src=/etc/angie/conf.d/templates/sample_php.conf
-          [[ -f $src ]] || die "Missing Angie template ${src}"
-          cp "$src" "$tmp"
-          sed_in_place -e "s|domain\.com|${d}|g" \
-            -e "s#/etc/letsencrypt/live/${d}/fullchain.pem#${certdir}/fullchain.pem#g" \
-            -e "s#/etc/letsencrypt/live/${d}/privkey.pem#${certdir}/privkey.pem#g" \
-            "$tmp"
-          ;;
-        node)
-          src=/etc/angie/conf.d/templates/sample_node.conf
-          [[ -f $src ]] || die "Missing Angie template ${src}"
-          cp "$src" "$tmp"
-          sed_in_place -e "s|domain\.com|${d}|g" \
-            -e "s#/etc/letsencrypt/live/${d}/fullchain.pem#${certdir}/fullchain.pem#g" \
-            -e "s#/etc/letsencrypt/live/${d}/privkey.pem#${certdir}/privkey.pem#g" \
-            "$tmp"
-          ;;
-        *)
-          die "Internal error: unhandled app '${app}' for ${d}"
-          ;;
-      esac
-
+      domain_render_vhost "$app" "$d" "$certdir" "$tmp"
       install -m 644 "$tmp" "$conf"
       local domain_test_log
       domain_test_log=$(tmp_file)
@@ -5949,19 +6001,20 @@ create_domains() {
       info "Created Angie vhost: ${conf} (app=${app})"
     fi
 
-    mariadb -e "CREATE DATABASE IF NOT EXISTS \`${db}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
-    if ! mariadb -N -B -e "SHOW DATABASES LIKE '${db}'" | grep -qx "$db"; then
-      die "Failed to create MariaDB database '${db}' for ${d}"
+    if domain_provision_database "$d"; then
+      imported=1
     fi
-    info "Database: ${db}"
   done
 
   if (( changed )); then
     systemctl reload angie 2>/dev/null || systemctl restart angie 2>/dev/null \
       || warn "Could not reload Angie after creating vhosts"
   fi
+  if (( imported )); then
+    reoptimize_mariadb_after_import
+  fi
   for d in "${DOMAINS[@]}"; do
-    [[ ${DOMAIN_APP[$d]:-blank} == xf ]] || continue
+    [[ ${DOMAIN_APP[$d]:-basic} == xf ]] || continue
     info "XenForo ${d}: dynamic Brotli is enabled; keep XF's Redis cache off on a single local-MariaDB host (measured slower), and disable the Members online / Trending / Featured widgets if you do not need them (measured +39% authenticated throughput)."
   done
   ok "Domain setup complete"
@@ -6397,7 +6450,15 @@ print_plan() {
         ;;
       domain)
         for dd in "${DOMAINS[@]}"; do
-          printf '  %-10s %s app=%s\n' "$s" "$dd" "${DOMAIN_APP[$dd]:-blank}"
+          printf '  %-10s %s app=%s' "$s" "$dd" "${DOMAIN_APP[$dd]:-basic}"
+          if [[ -n ${DOMAIN_DB[$dd]:-} ]]; then
+            printf ' db=%s' "${DOMAIN_DB[$dd]}"
+            [[ -n ${DOMAIN_DB_USER[$dd]:-} ]] && printf ' user=%s pass=***' "${DOMAIN_DB_USER[$dd]}"
+            [[ -n ${DOMAIN_SQL[$dd]:-} ]] && printf ' sql=%s' "${DOMAIN_SQL[$dd]}"
+          else
+            printf ' (no database)'
+          fi
+          printf '\n'
         done
         ;;
       *)
@@ -7883,74 +7944,10 @@ harden_wordpress() {
   return "$rc"
 }
 
-harden_ssh() {
-  local f=/etc/ssh/sshd_config.d/99-setup-hardening.conf
-  if [[ ! -s /root/.ssh/authorized_keys ]]; then
-    harden_warn "- SSH: /root/.ssh/authorized_keys is missing or empty; refusing to disable password authentication"
-    return 0
-  fi
-  cat > "$f" <<'EOF'
-# Managed by setup.sh: keys-only remote access.
-PermitRootLogin prohibit-password
-PasswordAuthentication no
-KbdInteractiveAuthentication no
-EOF
-  chmod 644 "$f"
-  if sshd -t 2>/dev/null; then
-    systemctl reload ssh >/dev/null 2>&1 || systemctl reload sshd >/dev/null 2>&1 || true
-    harden_note "- SSH: keys-only (PasswordAuthentication no, PermitRootLogin prohibit-password)"
-  else
-    rm -f "$f"
-    harden_warn "- SSH: sshd configuration test failed; hardening reverted"
-  fi
-}
-
-# Cloudflare ranges from the deployed real-IP include, one per line, with the
-# prefix length.  The prefix is part of the range: "173.245.48.0/20" must not
-# collapse to the single host 173.245.48.0, which is what a character class
-# without "/" produced (one address per range was allowed and every other
-# Cloudflare edge was firewalled out).
-cloudflare_ranges_from_conf() {
-  local file=$1
-  [[ -r $file ]] || return 0
-  sed -nE 's#^[[:space:]]*set_real_ip_from[[:space:]]+([0-9a-fA-F:.]+(/[0-9]+)?)[[:space:]]*;.*#\1#p' "$file" \
-    | sort -u
-  return 0
-}
-
-apply_cloudflare_only() {
-  local cf=/etc/angie/http.d/cloudflare.conf cidr ranges
-  if ! command -v ufw >/dev/null 2>&1 || [[ ! -r $cf ]]; then
-    harden_warn "- Firewall: cannot apply --cloudflare-only (ufw or ${cf} missing)"
-    return 0
-  fi
-  if ! ufw status 2>/dev/null | grep -q '^Status: active'; then
-    harden_warn "- Firewall: ufw is not active; --cloudflare-only skipped"
-    return 0
-  fi
-  ranges=$(cloudflare_ranges_from_conf "$cf" | grep -c . || true)
-  [[ $ranges =~ ^[0-9]+$ ]] || ranges=0
-  if (( ranges == 0 )); then
-    harden_warn "- Firewall: ${cf} has no Cloudflare ranges; refusing to remove the public 80/443 rules"
-    return 0
-  fi
-  ufw --force delete allow 80/tcp  >/dev/null 2>&1 || true
-  ufw --force delete allow 443/tcp >/dev/null 2>&1 || true
-  ufw --force delete allow 80      >/dev/null 2>&1 || true
-  ufw --force delete allow 443     >/dev/null 2>&1 || true
-  while read -r cidr; do
-    [[ -n $cidr ]] || continue
-    ufw allow from "$cidr" to any port 80  proto tcp >/dev/null 2>&1 || true
-    ufw allow from "$cidr" to any port 443 proto tcp >/dev/null 2>&1 || true
-  done < <(cloudflare_ranges_from_conf "$cf")
-  ufw reload >/dev/null 2>&1 || true
-  harden_note "- Firewall: 80/443 restricted to ${ranges} Cloudflare ranges"
-}
-
 harden_system() {
   local install=${1:-0} cfgf sshd_t
   if (( install )); then
-    apt_install unattended-upgrades fail2ban || true
+    apt_install unattended-upgrades || true
   fi
   if pkg_ok unattended-upgrades; then
     cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
@@ -7963,39 +7960,6 @@ EOF
     harden_note "- OS updates: unattended-upgrades enabled"
   else
     harden_warn "- OS updates: unattended-upgrades is not installed (run --basic or install it)"
-  fi
-  if pkg_ok fail2ban; then
-    # Never let the jail ban the operator who is running this deploy: the
-    # SSH client address (when it can be determined) joins the loopback
-    # ranges in ignoreip.  A long install can otherwise trip maxretry from
-    # a second session or an automation retry and lock the operator out.
-    local f2b_ignore="127.0.0.1/8 ::1" f2b_client
-    f2b_client=$(detect_ssh_client_ip 2>/dev/null || true)
-    [[ -n $f2b_client ]] && f2b_ignore+=" ${f2b_client}"
-    mkdir -p /etc/fail2ban/jail.d
-    cat > /etc/fail2ban/jail.d/setup-sshd.local <<EOF
-[DEFAULT]
-ignoreip = ${f2b_ignore}
-
-[sshd]
-enabled = true
-backend = systemd
-maxretry = 5
-findtime = 10m
-bantime = 1h
-EOF
-    chmod 644 /etc/fail2ban/jail.d/setup-sshd.local
-    systemctl enable --now fail2ban >/dev/null 2>&1 || true
-    # `enable --now` is a no-op for a running service, so a changed jail file
-    # needs an explicit reload; only report the jail when the service is up.
-    if systemctl is-active --quiet fail2ban 2>/dev/null; then
-      systemctl reload fail2ban >/dev/null 2>&1 || true
-      harden_note "- SSH: fail2ban sshd jail enabled (ignoreip: ${f2b_ignore})"
-    else
-      harden_warn "- SSH: fail2ban is installed but not running; check \`journalctl -u fail2ban\`"
-    fi
-  else
-    harden_warn "- SSH: fail2ban is not installed (run --basic or install it)"
   fi
   if [[ -f /etc/mysqlbkup.cnf ]]; then
     # This file holds the MariaDB admin/backup password.  Never make it
@@ -8011,14 +7975,12 @@ EOF
       sed_in_place 's/^MAX_BACKUPS=.*/MAX_BACKUPS=30/' "$cfgf"
     fi
   done
-  (( HARDEN_SSH )) && harden_ssh
-  (( CLOUDFLARE_ONLY )) && apply_cloudflare_only
   sshd_t=$(sshd -T 2>/dev/null || true)
   if grep -qi '^passwordauthentication yes' <<<"$sshd_t"; then
-    harden_warn "- SSH: password authentication is enabled; use --harden-ssh after confirming key access"
+    harden_warn "- SSH: password authentication is enabled; switch to keys-only access once key login is confirmed"
   fi
   if ufw status 2>/dev/null | grep -qE '^(80|443)(/tcp)?[[:space:]]+ALLOW[[:space:]]+Anywhere'; then
-    harden_warn "- Firewall: 80/443 are open to the internet; use --cloudflare-only if the origin is behind Cloudflare"
+    harden_warn "- Firewall: 80/443 are open to the internet; restrict them to your CDN/proxy ranges if the origin is not meant to be reached directly"
   fi
   if systemctl is-active --quiet elasticsearch 2>/dev/null; then
     # The installer writes network.host: "localhost" (quoted); ::1 and the
