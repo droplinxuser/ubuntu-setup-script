@@ -159,6 +159,74 @@ run fail --dry-run --angie
 run fail --dry-run --bogus
 run fail --dry-run --sync-angie
 
+# --check is an alias for --dry-run; -h is an alias for --help.
+run ok   --check --basic
+run ok   -h
+
+# kv flags reject unknown keys and bare tokens.
+run fail --dry-run --basic foo=1
+run fail --dry-run --basic foo
+run fail --dry-run --basic --php foo=1
+run fail --dry-run --basic --valkey foo=1
+run fail --dry-run --basic --elastic foo=1
+run fail --dry-run --basic --mariadb user=a pass=b foo=1
+
+# --mariadb bind= accepts ::1 and IPv4 lists; size= accepts m/mb/g/gb.
+run ok   --dry-run --basic --mariadb user=a pass=b bind=::1
+run ok   --dry-run --basic --mariadb user=a pass=b bind=127.0.0.1,2.3.4.5
+run ok   --dry-run --basic --mariadb user=a pass=b size=512m
+run fail --dry-run --basic --mariadb user=a pass=b bind=1.2.3
+
+# --php children=auto, --valkey ram units and every eviction policy,
+# --elastic host= as IPv4.
+run ok   --dry-run --basic --php children=auto
+run ok   --dry-run --basic --valkey ram=2G
+run ok   --dry-run --basic --valkey ram=512m
+run ok   --dry-run --basic --valkey policy=allkeys-lru
+run ok   --dry-run --basic --valkey policy=allkeys-lfu
+run ok   --dry-run --basic --valkey policy=volatile-lru
+run ok   --dry-run --basic --valkey policy=volatile-lfu
+run ok   --dry-run --basic --valkey policy=volatile-ttl
+run ok   --dry-run --basic --valkey policy=allkeys-random
+run ok   --dry-run --basic --valkey policy=volatile-random
+run ok   --dry-run --basic --elastic host=10.0.0.5
+run fail --dry-run --basic --elastic host=10.0.0.999
+
+# --others needs a package; duplicates are de-duplicated.
+run fail --dry-run --basic --others
+run ok   --dry-run --basic --others nvme
+run ok   --dry-run --basic --others smartmon smartmon
+
+# --domain app= aliases (normalize_app).
+run ok   --dry-run --domain a.example.com app=xenforo
+run ok   --dry-run --domain a.example.com app=wp
+run ok   --dry-run --domain a.example.com app=chev
+run ok   --dry-run --domain a.example.com app=nodejs
+run ok   --dry-run --domain a.example.com app=generic
+run ok   --dry-run --domain a.example.com app=none
+run ok   --dry-run --domain a.example.com app=plain
+run ok   --dry-run --domain a.example.com app=static
+
+# --domain names are lower-cased, a trailing dot is stripped, and a repeated
+# domain is de-duplicated.
+run ok   --dry-run --domain EXAMPLE.COM
+run ok   --dry-run --domain example.com.
+run ok   --dry-run --domain example.com example.com
+
+# --domain may be combined with a full install, but any service other than
+# --domain needs --basic, and --diagnostics is read-only.
+run ok   --dry-run --basic --angie --domain x.example.com
+run fail --dry-run --domain x.example.com --angie
+run fail --dry-run --diagnostics --domain x.example.com
+
+# --purge targets: unknown names and malformed --php ver= fail; flag and
+# bare-name forms are both accepted.
+run fail --dry-run --purge bogus
+run fail --dry-run --purge --php ver=8
+run ok   --dry-run --purge --basic
+run ok   --dry-run --purge --others
+run ok   --dry-run --purge basic
+
 # The single optimize command must include the OS layer.
 out=$(bash "$SCRIPT_DIR/setup.sh" --dry-run --optimize 2>&1)
 if [[ $out == *"OS: governor="* && $out == *"limits=1M-nofile"* ]]; then
@@ -214,6 +282,20 @@ fi
 run_env ok SETUP_PHP_JIT=tracing --dry-run --optimize
 run_env ok SETUP_PHP_JIT=bogus --dry-run --optimize
 run_env ok SETUP_PHP_JIT_WORDPRESS=1 --dry-run --optimize
+# Network tuning, rate-limit exemptions and asset precompression overrides.
+run_env ok SETUP_TCP_CC=cubic --dry-run --optimize
+run_env ok SETUP_QDISC=fq_codel --dry-run --optimize
+run_env ok SETUP_LIMIT_REQ_EXEMPT=10.0.0.5 --dry-run --optimize
+run_env ok SETUP_PRECOMPRESS_ASSETS=1 --dry-run --optimize
+# An invalid SETUP_NODE_MAJOR falls back to the default major, never fails.
+run_env ok SETUP_NODE_MAJOR=bogus --dry-run --basic --others nodejs
+# SETUP_ANGIE_COMPRESSION only tests for 0; any other value keeps Brotli on.
+run_env ok SETUP_ANGIE_COMPRESSION=gzip --dry-run --basic --angie
+run_env ok SETUP_WP_DB_SPLIT=0 --dry-run --domain a.example.com app=wordpress
+run_env ok SETUP_PURGE_MALWARE=0 --dry-run --optimize
+# A dry run exits before fetch_server_configs, so CONFIG_SOURCE_DIR is not
+# checked and a missing directory does not fail.
+run_env ok CONFIG_SOURCE_DIR=/nonexistent --dry-run --basic --angie
 
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

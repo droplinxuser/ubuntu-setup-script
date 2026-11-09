@@ -247,15 +247,22 @@ lychee shlink sfs php node`; `basic` is the default) and tested with
 `angie -t`, and only when declared: the database (utf8mb4), a user with
 `ALL` on that database for the three loopback hosts, and a dump import
 (`.sql`, `.gz`, `.xz`, `.zst`, `.bz2`) into an empty database followed by a
-MariaDB re-size. Existing vhost files and databases are preserved;
+MariaDB re-size (and the Valkey/Elasticsearch shares it was taken from). A
+dump that carries its own `CREATE DATABASE`/`USE` for another schema (taken
+with `--databases`) is refused before anything is loaded. Existing vhost
+files and databases are preserved (an existing tree is not re-chowned);
 application code is not installed. Can be combined with an install.
 
 ## `--optimize`
 
 Tunes the OS and every installed service in place (Ubuntu 22.04, 24.04,
 26.04). It never installs, starts or purges a managed service and never
-touches swap; the only packages it may add are `cpufrequtils` and
-`angie-module-brotli`. Steps:
+touches swap, the resolver (DNS) or the firewall (UFW), which stay as
+`--basic` or the operator left them; the only packages it may add are
+`cpufrequtils` and `angie-module-brotli`. The drivers run with `set -e`
+live, so a failed write inside a tuner aborts the run with its line number
+instead of being skipped (before 1.13.0 the `if ! run_optimize` call had
+suspended errexit for the whole run). Steps:
 
 1. OS profile (governor, PAM limits, sysctls) and the security pass.
 2. Angie: `/etc/angie` is synced from `server-configs-nginx`, the WordPress
@@ -263,7 +270,11 @@ touches swap; the only packages it may add are `cpufrequtils` and
    zone, `$nocacheuri` and cookie-bypass maps), the hardware profile is
    applied, `angie -t` runs, and the service is reloaded **once, and only
    when the tree digest changed**; a failed sync or test restores the previous
-   tree. Legacy underscore-named `http.d` files are tuned in place.
+   tree, its unit drop-in and `/etc/default/angie`. Legacy underscore-named
+   `http.d` files are tuned in place. A WordPress vhost whose
+   `include h5bp/wordpress_cache.conf;` was removed is an opt-out: it is
+   reported, never re-enabled through the shared `php_wp.conf`
+   (`SETUP_WP_GUEST_CACHE=1` adds the include to such vhosts).
 3. PHP-FPM: every `/etc/php/<ver>/fpm` tree; a live TCP pool used through the
    `local_php` upstream is migrated to the Unix socket (graceful reload, or
    a short explicit restart when SIGUSR2 cannot open the listener).
@@ -273,10 +284,14 @@ touches swap; the only packages it may add are `cpufrequtils` and
    reserved verbatim, PHP is sized from the remainder, and targets that do not
    fit are trimmed Elasticsearch first, then Valkey, then MariaDB. A value
    within 2% of its target is kept. A MariaDB restart pauses Angie and PHP
-   first and resumes them after `SELECT 1`; the buffer pool is resized online
-   when nothing else changed. Every failed service is rolled back from
-   `/tmp/setup-optimize.*` (files created during the tune are moved out of
-   the tree so a rejected drop-in cannot win again).
+   first and resumes them after `SELECT 1`; when only the buffer pool, redo
+   log, `tmp_table_size`/`max_heap_table_size` changed they are applied
+   online with `SET GLOBAL` and nothing restarts. A `--domain ... sql=`
+   import re-plans MariaDB **and** the Valkey/Elasticsearch shares it was
+   taken from. Every failed service is rolled back from
+   `/tmp/setup-optimize.*` through one shared restart/rollback helper (files
+   created during the tune are moved out of the tree so a rejected drop-in
+   cannot win again).
 5. Audit of WordPress/XenForo configs (persistent `p:` database host, Valkey
    socket) with the exact snippets to apply; application files are never
    edited. Legacy cron and `/var/www` ownership from releases before 1.8.34
@@ -287,7 +302,15 @@ touches swap; the only packages it may add are `cpufrequtils` and
 
 Explicit values (`--basic server=`, `--php children=`/`max_requests=`,
 `--mariadb size=`, `--valkey ram=`, `--elastic ram=`) are recorded in
-`/var/lib/setup.sh/explicit-options.conf` and kept by later runs.
+`/var/lib/setup.sh/explicit-options.conf` and kept by later runs; a
+`--mariadb size=`/`--valkey ram=` under the 128 MB planner floor is raised
+to 128m with a warning so install and the first `--optimize` agree.
+
+Install and `--optimize` write the same files from the same functions. The
+one documented difference is timing: `--domain app=xf|wordpress` creates an
+empty document root, so the application-aware PHP worker cap and the
+per-root OPcache JIT sections can only apply once the application files
+exist, on the first `--optimize` after the upload (or after a `sql=` import).
 
 ## Hardware profile
 
@@ -296,37 +319,45 @@ data directory (NVMe / SSD / HDD) and the host class (`dedi`/`vps`).
 
 | Area | Rule |
 |---|---|
-| PHP-FPM | 16 workers per core (VPS 8), at most RAM/2 at 96 MB each, 512 max, floor `min(8, RAM/2/96)`; 4 per core (VPS 3) on a XenForo/WordPress host with a local database; live count kept; `children=` wins |
-| MariaDB | see the service section: pool from live data, io_capacity by disk x host, thread pool, connections from the PHP pool, table caches from connections |
-| Elasticsearch | heap = store/4 (512 MB..25% RAM..31 GB); search threads cpus/2 (max 16), write threads cpus/4 (max 8) |
-| Valkey / Redis | maxmemory = live +20% with floor `clamp(RAM/64, 128 MB, 1 GB)`; maxclients from the PHP pool; io_threads 1..8 |
-| Angie | `worker_processes` = CPUs, `worker_connections = clamp(cpus x 2048, 8192, 65535)`, `worker_rlimit_nofile = clamp(cpus x 8192, 65536, 524288)`, upstream keepalive from the PHP pool, `open_file_cache max = clamp(RAM_MB x 8, 10000, 200000)` bounded by `rlimit - connections`, FastCGI buffers and cache zones by RAM, cache disk budget by RAM/free disk/installed services (50% RAM Angie-only, 30% Angie+PHP, 25% full stack), Brotli 5 (4 on 1-2 CPUs) |
-| Kernel | `somaxconn`/SYN backlog `cpus x 4096` (VPS x 2048, max 65536), conntrack `RAM_MB x 16` (VPS x 8), `vm.dirty_background_bytes = clamp(RAM/100, 64 MB, 512 MB)` and `vm.dirty_bytes = 4x` (tighter on HDD), `vm.min_free_kbytes` 1% of RAM (16 MB floor under 4 GB, 256 MB cap), BBR + fq (`SETUP_TCP_CC`, `SETUP_QDISC`), 1M-nofile PAM limits |
-| Host | swap RAM/2 clamped 1..8 GiB (VPS 4); governor on dedicated hardware only; THP `madvise`; `fstrim.timer` on SSD/NVMe; I/O scheduler and readahead per device class (whole disks) |
+| PHP-FPM | 16 workers per core (VPS 8), at most RAM/2 at 96 MB each, 512 max, floor `min(8, RAM/2/96)`; 4 per core (VPS 3) on a XenForo/WordPress host with a local database; live count kept; `children=` wins. `pm = static`, or `ondemand` (10 s idle) under 2 GB RAM or on a VPS with 8 workers or fewer. `opcache.max_accelerated_files` = PHP files under the vhost roots x 1.5 (16384..128256; the ceiling when no root is found); `memory_limit`, OPcache and realpath sizes from one RAM profile shared with the dry run |
+| MariaDB | see the service section: pool from live data with floor `clamp(RAM/16, 256 MB, 4 GB)` for an empty or unmeasured database, io_capacity by disk x host, thread pool, connections from the PHP pool, table caches from connections, Aria page cache `clamp(RAM/128, 16, 256) MB` |
+| Elasticsearch | heap = store/4 (512 MB..25% RAM..31 GB); `node.processors` = effective CPUs; search threads cpus/2 (max 16), write threads cpus/4 (max 8) |
+| Valkey / Redis | maxmemory = live +20% with floor `clamp(RAM/64, 128 MB, 1 GB)`; maxclients from the PHP pool; io_threads 1..8 (a larger `io_threads=` is clamped with a warning) |
+| Angie | `worker_processes` = CPUs (`worker_cpu_affinity auto` commented out under a cgroup CPU quota), `worker_connections = clamp(cpus x 2048, 8192, 65535)` and `worker_rlimit_nofile = clamp(cpus x 8192, 65536, 524288)` (VPS: 1024 and 4096 per core), upstream keepalive from the PHP pool actually written, `open_file_cache max = clamp(RAM_MB x 8, 10000, 200000)` bounded by `rlimit - connections`, FastCGI buffers and cache zones by RAM, cache disk budget by RAM/free disk/installed services (50% RAM Angie-only, 30% Angie+PHP, 25% full stack; a populated FastCGI, proxy or CDN cache is never shrunk below its live size), `directio 16m` on NVMe/SSD (4m on HDD), Brotli and gzip 5 (4 on 1-2 CPUs; `SETUP_BROTLI_LEVEL`, `SETUP_GZIP_LEVEL`) |
+| Kernel | `somaxconn`/SYN backlog `cpus x 4096` (VPS x 2048, max 65536), conntrack `RAM_MB x 16` (VPS x 8), `tcp_rmem`/`tcp_wmem` default 85 KB under 4 GB, 128 KB under 16 GB, 256 KB above, `netdev_budget 600/8000 us` on dedicated hosts with 8+ CPUs, `vm.dirty_background_bytes = clamp(RAM/100, 64 MB, 512 MB)` and `vm.dirty_bytes = 4x` (tighter on HDD), `vm.min_free_kbytes` 1% of RAM (16 MB floor under 4 GB, 256 MB cap), `vm.swappiness` 1 on NVMe/SSD (10 on HDD), `kernel.shmmax = min(1 GiB, RAM/4)`, `ip_local_reserved_ports` = 3306, 6379, 9200, 9300 and the sshd ports (the ephemeral range is 1024-65535), BBR + fq (`SETUP_TCP_CC`, `SETUP_QDISC`), 1M-nofile PAM limits. The base profile's `ip_forward`/`forwarding = 0` lines are dropped on a host that already forwards (bridge, Docker/LXD, WireGuard/Tailscale interfaces) and its IPv6 `autoconf`/`accept_ra = 0` lines on a host whose address or default route comes from router advertisements |
+| Host | swap RAM/2 clamped 1..8 GiB (VPS 4); governor on dedicated hardware only (the previous governor is recorded for `--purge`); THP `madvise`; `fstrim.timer` on SSD/NVMe; I/O scheduler and readahead per device class for every whole disk by its rotational flag (NVMe `none`, flash `mq-deadline`/128k, rotational `mq-deadline`/1024k; dm/md/loop/zram skipped) |
 
 Environment overrides persisted in `/etc/default/setup-tuning`:
 `SETUP_LIMIT_REQ_EXEMPT="ip,cidr,..."` (rate-limit exemptions for a load
 generator or monitor; empty clears), `SETUP_PRECOMPRESS_ASSETS=0|1`,
 `SETUP_PHP_JIT`, `SETUP_PHP_JIT_WORDPRESS`, `SETUP_NODE_MAJOR`. Others:
-`SETUP_MARIADB_IO_CAPACITY`, `SETUP_BROTLI_LEVEL`, `SETUP_ANGIE_COMPRESSION`,
-`SETUP_PHP_SESSION_HARDENING`, `SETUP_WP_DB_SPLIT`, `SETUP_WP_ALLOW_FILE_MODS`,
-`SETUP_PURGE_MALWARE`, `SETUP_STATE_DIR` (tests and image builds).
+`SETUP_MARIADB_IO_CAPACITY`, `SETUP_BROTLI_LEVEL`, `SETUP_GZIP_LEVEL`,
+`SETUP_ANGIE_COMPRESSION`, `SETUP_PHP_SESSION_HARDENING`, `SETUP_WP_DB_SPLIT`,
+`SETUP_WP_ALLOW_FILE_MODS`, `SETUP_WP_GUEST_CACHE`, `SETUP_PURGE_MALWARE`,
+`SETUP_STATE_DIR` (tests and image builds).
 
 ## `--diagnostics`, `--restart-all`, `--purge`
 
+- Run logs (`setup_<timestamp>.log`) and `diagnostics.log` created under
+  `sudo` are handed to the invoking user (`SUDO_UID`), mode 600.
 - `--diagnostics` writes one mode-600 `diagnostics.log` beside `setup.sh`
   (hardware, network, sysctls, units, Angie/PHP/MariaDB/Valkey/Elasticsearch
   configuration and runtime statistics, slow and error logs, ownership, UFW,
   SSH, cron, package state) with credentials redacted. Read-only.
 - `--restart-all` repairs `/var/www` log ownership, then stops Angie and
   every active PHP-FPM, restarts Valkey/Redis, Elasticsearch (waits for HTTP)
-  and MariaDB (waits for `SELECT 1`), and starts PHP-FPM then Angie. Only
-  units that were active are touched; `--dry-run` prints the plan.
+  and MariaDB (waits for `SELECT 1`), and starts PHP-FPM then Angie, using
+  the same pause/resume and readiness helpers as the `--optimize` tuners.
+  Only units that were active are touched; `--dry-run` prints the plan.
 - `--purge [all|basic|angie|php [ver=X]|mariadb|valkey|elastic|others]`
   (service flags and bare names combine; no target means everything) stops
   and disables the selected services, removes the managed cron entries and,
-  for `basic`, restores the recorded hostname, timezone, DNS, sysctl, limits
-  and UFW state (SSH rules are never removed; `/swapfile` stays enabled).
+  for `basic`, restores the recorded hostname (only the `127.0.1.1` line of
+  `/etc/hosts`), timezone, DNS, every sysctl key the profile wrote (the base
+  template's keys included), limits, the CPU governor that was active before
+  the install, the `unattended-upgrades` APT file and unit state, and the
+  UFW state (SSH rules are never removed; `/swapfile` stays enabled).
+  `--purge` keeps going past a file it cannot restore and reports it.
   `--purge others` disables the `smartmontools`/`sysstat` units; `--purge
   --php ver=X` keeps `phpsessionclean.timer` while another version is
   enabled. Nothing is uninstalled or deleted; there is no domain purge.

@@ -311,6 +311,20 @@ check "stale Angie cron entry is dropped" \
 check "MariaDB cron entry is kept" \
   cron_contains "$(cat "$CRON_OUT")" 'mysqlbkup'
 
+# A second run with the same installed services must not reinstall an
+# unchanged crontab (every reinstall rewrites the vixie header timestamp,
+# which showed up as a changed file in every --optimize parity snapshot).
+cp "$CRON_OUT" "$CRON_IN"
+: > "$CRON_OUT"
+(
+  cron_angie_configured() { return 1; }
+  cron_mariadb_configured() { return 0; }
+  crontab() { fake_crontab "$@"; }
+  write_cron
+) >/dev/null 2>&1
+check "unchanged managed crontab is not reinstalled" \
+  test ! -s "$CRON_OUT"
+
 # A host with no root crontab at all is the common fresh-install case.  The
 # legacy-cron repair must not read an unset `backup` under `set -u`; that
 # aborted --optimize before any service was tuned.
@@ -1081,9 +1095,9 @@ check "database-fit plan stays inside the 80% budget" \
   test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
        -le $(( 65536 * 80 / 100 ))
 
-# A freshly installed database can be only a few MB.  Keep the 1/16-RAM floor
-# (capped at 8 GB) and let the empty database grow into spare budget up to
-# RAM/4, exactly like the fresh-install plan, so the first --optimize cannot
+# A freshly installed database can be only a few MB.  mariadb_floor_mb gives
+# it RAM/16 (256 MB..4 GB) so the pool has room before the next --optimize;
+# the fresh-install plan uses the same floor, so the first --optimize cannot
 # shrink what the installer sized.
 mem_total_mb() { printf '262144'; }
 mariadb_current_pool_mb() { printf '0'; }
@@ -1092,8 +1106,8 @@ elasticsearch_data_size_mb() { printf '0'; }
 php_pool_max_children() { printf '128'; }
 OPT_DETECTED=(angie php:8.4 mariadb valkey elastic)
 plan_memory_budget
-check "tiny live database uses the 128 MB minimum" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 128
+check "tiny live database uses the RAM floor (RAM/16 capped at 4 GB)" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 4096
 check "tiny live database stays far below RAM/4" \
   test "$OPT_MARIADB_BUDGET_MB" -le $(( 262144 / 4 ))
 check "tiny database floor stays inside the 80% budget" \
@@ -1177,8 +1191,8 @@ check "MariaDB-only large database can use the full 80% budget" \
 mariadb_data_size_mb() { printf ''; }
 OPT_DETECTED=(mariadb)
 plan_memory_budget
-check "MariaDB-only unknown data uses the 128 MB minimum" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 128
+check "MariaDB-only unknown data uses the RAM floor" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 4096
 
 # Valkey gets a larger share when no database/search tier shares the host.
 mariadb_data_size_mb() { printf '0'; }
@@ -1447,12 +1461,21 @@ app_find_xenforo_configs() { :; }
 app_cache_socket_hint() { printf '/run/valkey/valkey.sock'; }
 OPT_REPORT=()
 audit_app_persistent_connections
-check "audit reports a non-persistent MariaDB host" \
-  grep -q 'is not persistent' <<<"${OPT_REPORT[*]}"
+check "audit does not flag a plain WordPress DB_HOST (core has no persistent option)" \
+  grep -q 'no persistent-connection option' <<<"${OPT_REPORT[*]}"
 check "audit recognizes a persistent Valkey socket" \
   grep -q 'with persistent connections' <<<"${OPT_REPORT[*]}"
-check "audit counts the MariaDB notice" \
+check "audit counts no WordPress issue for a plain host" \
+  test "$APP_CONNECTION_ISSUES" -eq 0
+# wpdb::parse_db_host() turns "p:localhost" into host "p": flag it.
+sed -i "s/DB_HOST., .localhost/DB_HOST', 'p:localhost/" "$TMP/wp-config.php"
+OPT_REPORT=()
+audit_app_persistent_connections
+check "audit flags a p: WordPress DB_HOST as broken" \
+  grep -q 'breaks WordPress' <<<"${OPT_REPORT[*]}"
+check "audit counts the broken WordPress host" \
   test "$APP_CONNECTION_ISSUES" -eq 1
+sed -i "s/DB_HOST., .p:localhost/DB_HOST', 'localhost/" "$TMP/wp-config.php"
 
 opt_body=$(sed -n '/^optimize_angie()/,/^}/p' "$ROOT/setup.sh")
 check "optimize_angie synchronizes the Angie repository" \
@@ -1702,7 +1725,7 @@ check "OS tuning applies sysctl before the PAM nofile limits" \
 mariadb_body=$(sed -n '/^optimize_mariadb()/,/^}/p' "$ROOT/setup.sh")
 pause_line=$(printf '%s\n' "$mariadb_body" | grep -n 'opt_pause_web_frontends' | head -n1 | cut -d: -f1)
 resume_line=$(printf '%s\n' "$mariadb_body" | grep -n 'opt_resume_web_frontends' | head -n1 | cut -d: -f1)
-restart_line=$(printf '%s\n' "$mariadb_body" | grep -n 'systemctl restart mariadb' | head -n1 | cut -d: -f1)
+restart_line=$(printf '%s\n' "$mariadb_body" | grep -n 'opt_restart_service mariadb' | head -n1 | cut -d: -f1)
 daemon_line=$(printf '%s\n' "$mariadb_body" | grep -n 'systemctl daemon-reload' | head -n1 | cut -d: -f1)
 check "MariaDB restart pauses web frontends first" \
   test -n "$pause_line" -a -n "$restart_line" -a "$pause_line" -lt "$restart_line"
@@ -1715,30 +1738,36 @@ check "MariaDB restart reloads systemd units before pausing web" \
 # cache/search, restart MariaDB, wait for SQL, then start PHP and Angie.
 restart_body=$(sed -n '/^run_restart_all()/,/^}/p' "$ROOT/setup.sh")
 ra_daemon=$(printf '%s\n' "$restart_body" | grep -n 'systemctl daemon-reload' | head -n1 | cut -d: -f1)
-ra_stop_angie=$(printf '%s\n' "$restart_body" | grep -n 'systemctl stop angie' | head -n1 | cut -d: -f1)
-ra_stop_php=$(printf '%s\n' "$restart_body" | grep -n 'systemctl stop "\$unit"' | head -n1 | cut -d: -f1)
+ra_pause=$(printf '%s\n' "$restart_body" | grep -n 'opt_pause_web_frontends' | head -n1 | cut -d: -f1)
 ra_restart_cache=$(printf '%s\n' "$restart_body" | grep -n 'systemctl restart "\$unit"' | head -n1 | cut -d: -f1)
 ra_restart_es=$(printf '%s\n' "$restart_body" | grep -n 'systemctl restart elasticsearch' | head -n1 | cut -d: -f1)
 ra_restart_db=$(printf '%s\n' "$restart_body" | grep -n 'systemctl restart mariadb' | head -n1 | cut -d: -f1)
-ra_wait_db=$(printf '%s\n' "$restart_body" | grep -n "mariadb -e 'SELECT 1'" | head -n1 | cut -d: -f1)
-ra_start_php=$(printf '%s\n' "$restart_body" | grep -n 'systemctl start "\$unit"' | head -n1 | cut -d: -f1)
-ra_start_angie=$(printf '%s\n' "$restart_body" | grep -n 'systemctl start angie' | head -n1 | cut -d: -f1)
+ra_wait_db=$(printf '%s\n' "$restart_body" | grep -n 'mariadb_wait_ready 300' | head -n1 | cut -d: -f1)
+ra_resume=$(printf '%s\n' "$restart_body" | grep -n 'opt_resume_web_frontends' | head -n1 | cut -d: -f1)
 ra_wait_es=$(printf '%s\n' "$restart_body" | grep -n 'Elasticsearch did not answer HTTP' | head -n1 | cut -d: -f1)
-check "restart-all reloads systemd before stopping Angie" \
-  test -n "$ra_daemon" -a -n "$ra_stop_angie" -a "$ra_daemon" -lt "$ra_stop_angie"
-check "restart-all stops Angie before PHP-FPM" \
-  test -n "$ra_stop_angie" -a -n "$ra_stop_php" -a "$ra_stop_angie" -lt "$ra_stop_php"
+check "restart-all reloads systemd before pausing the web tiers" \
+  test -n "$ra_daemon" -a -n "$ra_pause" -a "$ra_daemon" -lt "$ra_pause"
+check "restart-all pauses the web tiers before restarting cache/search" \
+  test -n "$ra_pause" -a -n "$ra_restart_cache" -a "$ra_pause" -lt "$ra_restart_cache"
+# The shared pause helper stops Angie first, then every PHP-FPM unit; the
+# resume helper starts PHP first, then Angie.
+pause_body=$(sed -n '/^opt_pause_web_frontends()/,/^}/p' "$ROOT/setup.sh")
+check "pause helper stops Angie before PHP-FPM" \
+  test "$(printf '%s\n' "$pause_body" | grep -n 'systemctl stop angie' | head -n1 | cut -d: -f1)" -lt \
+       "$(printf '%s\n' "$pause_body" | grep -n 'systemctl stop "$unit"' | head -n1 | cut -d: -f1)"
+resume_body=$(sed -n '/^opt_resume_web_frontends()/,/^}/p' "$ROOT/setup.sh")
+check "resume helper starts PHP-FPM before Angie" \
+  test "$(printf '%s\n' "$resume_body" | grep -n 'systemctl start "$unit"' | head -n1 | cut -d: -f1)" -lt \
+       "$(printf '%s\n' "$resume_body" | grep -n 'systemctl start angie' | head -n1 | cut -d: -f1)"
 check "restart-all restarts cache/search before MariaDB" \
   test -n "$ra_restart_cache" -a -n "$ra_restart_es" -a -n "$ra_restart_db" \
        -a "$ra_restart_cache" -lt "$ra_restart_db" -a "$ra_restart_es" -lt "$ra_restart_db"
 check "restart-all waits for Elasticsearch before MariaDB" \
   test -n "$ra_restart_es" -a -n "$ra_wait_es" -a -n "$ra_restart_db" \
        -a "$ra_restart_es" -lt "$ra_wait_es" -a "$ra_wait_es" -lt "$ra_restart_db"
-check "restart-all waits for MariaDB before starting PHP" \
-  test -n "$ra_restart_db" -a -n "$ra_wait_db" -a -n "$ra_start_php" \
-       -a "$ra_restart_db" -lt "$ra_wait_db" -a "$ra_wait_db" -lt "$ra_start_php"
-check "restart-all starts PHP before Angie" \
-  test -n "$ra_start_php" -a -n "$ra_start_angie" -a "$ra_start_php" -lt "$ra_start_angie"
+check "restart-all waits for MariaDB before resuming the web tiers" \
+  test -n "$ra_restart_db" -a -n "$ra_wait_db" -a -n "$ra_resume" \
+       -a "$ra_restart_db" -lt "$ra_wait_db" -a "$ra_wait_db" -lt "$ra_resume"
 
 # ---------------------------------------------------------------------------
 # Embedded payload integrity
@@ -1759,6 +1788,22 @@ check "MariaDB shared profile caps the log at 512M" \
   test "$MARIADB_PROFILE_LOG_SIZE" = 512M
 check "MariaDB shared profile keeps a usable connection ceiling" \
   bash -c "(( $MARIADB_PROFILE_MAX_CONN >= 200 && $MARIADB_PROFILE_MAX_CONN <= 2000 ))"
+
+# A XenForo config on a persistent (p:) host keeps one connection per PHP
+# worker open for the worker's lifetime; a second site served by the same
+# pool needs its own transient connection on top (measured "Too many
+# connections" at the old workers*1.25+50 ceiling).
+php_pool_max_children() { printf '144'; }
+app_persistent_db_configs() { printf '0'; }
+mariadb_compute_profile 2048
+check "max_connections is workers*1.25+50 without persistent applications" \
+  test "$MARIADB_PROFILE_MAX_CONN" -eq 230
+app_persistent_db_configs() { printf '1'; }
+mariadb_compute_profile 2048
+check "one persistent application doubles the per-worker connection allowance" \
+  test "$MARIADB_PROFILE_MAX_CONN" -eq 410 -a "$MARIADB_PROFILE_PERSISTENT_APPS" -eq 1
+app_persistent_db_configs() { printf '0'; }  # keep the stub: unset -f would drop the real function too
+php_pool_max_children() { printf '128'; }
 
 valkey_lines=$(valkey_tuning_lines 512 allkeys-lru 2)
 check "Valkey shared lines keep maxmemory and policy" \
@@ -1816,12 +1861,12 @@ OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
 OPT_INSTALL_PLAN=1
 plan_memory_budget
 OPT_INSTALL_PLAN=0
-check "fresh install sizes MariaDB from the empty-data minimum" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 128
+check "fresh install sizes MariaDB from the RAM floor (RAM/16)" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq "$(mariadb_floor_mb "$(mem_total_mb)")"
 check "fresh install uses the empty-index minimum" \
   test "$OPT_ES_BUDGET_MB" -eq 512
-check "fresh install keeps the empty-database minimum" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 128
+check "fresh install keeps the empty-database floor" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq "$(mariadb_floor_mb "$(mem_total_mb)")"
 check "fresh install full-stack plan stays inside the 80% budget" \
   test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
        -le $(( 27812 * 80 / 100 ))
@@ -1833,8 +1878,8 @@ mariadb_data_size_mb() { printf '4'; }
 OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
 OPT_INSTALL_PLAN=0
 plan_memory_budget
-check "measured-empty live database uses the minimum" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 128
+check "measured-empty live database uses the RAM floor" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq "$(mariadb_floor_mb "$(mem_total_mb)")"
 
 # ---------------------------------------------------------------------------
 # Live-data protection
@@ -1964,8 +2009,8 @@ OPT_DETECTED=(mariadb)
 OPT_INSTALL_PLAN=1
 plan_memory_budget
 OPT_INSTALL_PLAN=0
-check "database-only fresh install uses the minimum for an empty database" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 128
+check "database-only fresh install uses the RAM floor for an empty database" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq "$(mariadb_floor_mb "$(mem_total_mb)")"
 
 # ---------------------------------------------------------------------------
 # --restart-all plan de-duplicates the Valkey unit alias
@@ -2275,7 +2320,7 @@ io_body=$(sed -n '/^configure_io_tuning()/,/^}/p' "$ROOT/setup.sh")
 check "udev I/O rule matches whole disks only" \
   bash -c "[[ \$(grep -c 'ENV{DEVTYPE}==\"disk\"' <<<\"\$0\") -eq 3 ]]" "$io_body"
 check "PHP memory_limit drops to 128M under 2 GB" \
-  grep -q '(( ram_mb < 2048 )) && memory_mb=128' <<<"$php_tune_body"
+  grep -q '(( ram_mb < 2048 )) && PHP_PROFILE_MEMORY_MB=128' <<<"$(sed -n '/^php_ini_profile()/,/^}/p' "$ROOT/setup.sh")"
 sysctl_body=$(sed -n '/^configure_sysctl()/,/^}/p' "$ROOT/setup.sh")
 check "min_free_kbytes floor scales below 4 GB" \
   grep -q 'min_free < 16384' <<<"$sysctl_body"
@@ -2408,6 +2453,147 @@ check "opt_restore puts back the recorded file" test "$(cat "$TMP/live/etc/a.con
 check "opt_restore moves a file created after the backup out of the tree" test ! -e "$TMP/live/etc/99-new.cnf"
 OPT_BACKUP_DIR=""
 
+
+# ---------------------------------------------------------------------------
+# 1.13.0 helpers: MariaDB floor, block-device class, sed escaping, snapshot
+# restore, PHP ini profile, gzip level, ES JSON readers, sysctl/cnf parsers,
+# multi-zone cache keep.
+# ---------------------------------------------------------------------------
+check "mariadb_floor_mb keeps the 256 MB minimum on a 1 GB host" test "$(mariadb_floor_mb 1024)" -eq 256
+check "mariadb_floor_mb is 1/16 of RAM (16384 MB -> 1024)" test "$(mariadb_floor_mb 16384)" -eq 1024
+check "mariadb_floor_mb caps at 4 GB" test "$(mariadb_floor_mb 131072)" -eq 4096
+check "mariadb_floor_mb tolerates garbage" test "$(mariadb_floor_mb x)" -eq 256
+
+# The nvme* name wins before any sysfs or lsblk probe; a device without a
+# sysfs rotational flag is treated as spinning when the transport is not
+# paravirtual.
+lsblk() { printf 'sata\n'; }
+check "classify_block_device reports nvme from the device name" \
+  test "$(classify_block_device nvme0n1)" = nvme
+check "classify_block_device falls back to hdd without a sysfs rotational flag" \
+  test "$(classify_block_device setup-test-no-such-disk)" = hdd
+unset -f lsblk
+
+check "sed_replacement_escape escapes &, | and backslash" \
+  test "$(sed_replacement_escape 'a&b|c\d')" = 'a\&b\|c\\d'
+
+# explicit_option_set must round-trip values with sed-special characters and
+# keep one line per key.  STATE_DIR is read-only once setup.sh is sourced,
+# so the round-trip runs in a fresh shell on its own state directory.
+explicit_rt=$(SETUP_STATE_DIR="$TMP/state2" bash -c '
+  source "$1" || exit 1
+  explicit_option_set demo_key "a&b|c"
+  explicit_option_set demo_key "x&y"
+  cat "$SETUP_STATE_DIR/explicit-options.conf"' _ "$ROOT/setup.sh" 2>/dev/null || true)
+check "explicit_option_set keeps one line per key after a rewrite" \
+  test "$(printf '%s\n' "$explicit_rt" | grep -c '^demo_key=')" -eq 1
+check "explicit_option_set stores a value containing & and | literally" \
+  test "$explicit_rt" = 'demo_key=x&y'
+
+# restore_snapshot_dir copies the snapshot over the live tree and moves
+# files that were not in the snapshot out of the way (never unlinks them).
+mkdir -p "$TMP/snap-src" "$TMP/snap-dst"
+printf 'src-a\n' > "$TMP/snap-src/a"
+printf 'src-b\n' > "$TMP/snap-src/b"
+printf 'dst-a\n' > "$TMP/snap-dst/a"
+printf 'src-b\n' > "$TMP/snap-dst/b"
+printf 'extra\n' > "$TMP/snap-dst/c"
+snap_out=$(preserve_to_tmp() { mv "$1" "$TMP/moved-$(basename "$1")"; printf '%s' "$TMP/moved-$(basename "$1")"; }
+           restore_snapshot_dir "$TMP/snap-src" "$TMP/snap-dst")
+check "restore_snapshot_dir restores the snapshot content" \
+  test "$(cat "$TMP/snap-dst/a")" = src-a
+check "restore_snapshot_dir keeps an unchanged snapshot file" \
+  test "$(cat "$TMP/snap-dst/b")" = src-b
+check "restore_snapshot_dir moves a file absent from the snapshot out of the tree" \
+  test ! -e "$TMP/snap-dst/c"
+check "restore_snapshot_dir preserves the moved file" \
+  test "$(cat "$TMP/moved-c" 2>/dev/null)" = extra
+check "restore_snapshot_dir reports the moved file" \
+  grep -qE "^moved $TMP/snap-dst/c " <<<"$snap_out"
+snap_missing_fails() { ! restore_snapshot_dir "$TMP/no-such-snapshot" "$TMP/snap-dst"; }
+check "restore_snapshot_dir fails on a missing snapshot" snap_missing_fails
+
+# php_ini_profile: OPcache RAM/16 (128..512), memory_limit RAM/8 (256..512,
+# 128 under 2 GB), realpath cache RAM*2 KB (4096..16384).
+php_ini_profile 1024
+check "php_ini_profile 1 GB: 128M OPcache, 128M memory_limit, 4096K realpath" \
+  test "$PHP_PROFILE_OPCACHE_MB" -eq 128 -a "$PHP_PROFILE_MEMORY_MB" -eq 128 -a "$PHP_PROFILE_REALPATH_KB" -eq 4096
+php_ini_profile 8192
+check "php_ini_profile 8 GB: 512M OPcache, 512M memory_limit, 16384K realpath" \
+  test "$PHP_PROFILE_OPCACHE_MB" -eq 512 -a "$PHP_PROFILE_MEMORY_MB" -eq 512 -a "$PHP_PROFILE_REALPATH_KB" -eq 16384
+php_ini_profile 4096
+check "php_ini_profile 4 GB: 256M OPcache, 512M memory_limit, 8192K realpath" \
+  test "$PHP_PROFILE_OPCACHE_MB" -eq 256 -a "$PHP_PROFILE_MEMORY_MB" -eq 512 -a "$PHP_PROFILE_REALPATH_KB" -eq 8192
+php_ini_profile garbage
+check "php_ini_profile falls back to the 1 GB profile on garbage" \
+  test "$PHP_PROFILE_OPCACHE_MB" -eq 128 -a "$PHP_PROFILE_MEMORY_MB" -eq 128 -a "$PHP_PROFILE_REALPATH_KB" -eq 4096
+
+# gzip level: explicit, else 5, or 4 on a 1-2 CPU host.
+check "angie_gzip_level honours SETUP_GZIP_LEVEL" \
+  test "$(SETUP_GZIP_LEVEL=7 angie_gzip_level)" = 7
+check "angie_gzip_level ignores an invalid SETUP_GZIP_LEVEL and drops to 4 on 2 CPUs" \
+  test "$(effective_cpus() { printf 2; }; SETUP_GZIP_LEVEL=bogus angie_gzip_level)" = 4
+check "angie_gzip_level defaults to 5 on 8 CPUs" \
+  test "$(effective_cpus() { printf 8; }; SETUP_GZIP_LEVEL='' angie_gzip_level)" = 5
+
+es_json='{"cluster":{"number_of_nodes": 3,"status" : "green","x":{"size_in_bytes":123456}}}'
+check "es_json_num reads a spaced numeric field" test "$(es_json_num "$es_json" number_of_nodes)" = 3
+check "es_json_str reads a spaced string field" test "$(es_json_str "$es_json" status)" = green
+check "es_json_num reads a nested numeric field" test "$(es_json_num "$es_json" size_in_bytes)" = 123456
+check "es_json_num prints nothing for a missing key" test -z "$(es_json_num "$es_json" missing_key)"
+check "es_json_str prints nothing for a missing key" test -z "$(es_json_str "$es_json" missing_key)"
+
+cat > "$TMP/sysctl-keys.conf" <<'EOF'
+# managed base profile
+net.core.somaxconn = 1
+vm.swappiness=10
+net.core.somaxconn = 2
+# commented.key = 1
+EOF
+check "sysctl_file_keys lists each active key once, sorted" \
+  test "$(sysctl_file_keys "$TMP/sysctl-keys.conf" | paste -sd, -)" = "net.core.somaxconn,vm.swappiness"
+
+cat > "$TMP/cnf-bytes.cnf" <<'EOF'
+[mysqld]
+innodb_buffer_pool_size = 2G
+tmp_table_size=64M
+max_heap_table_size = 1024
+EOF
+check "cnf_key_bytes converts a G suffix" test "$(cnf_key_bytes "$TMP/cnf-bytes.cnf" innodb_buffer_pool_size)" = 2147483648
+check "cnf_key_bytes converts an M suffix without spaces" test "$(cnf_key_bytes "$TMP/cnf-bytes.cnf" tmp_table_size)" = 67108864
+check "cnf_key_bytes keeps a bare byte count" test "$(cnf_key_bytes "$TMP/cnf-bytes.cnf" max_heap_table_size)" = 1024
+check "cnf_key_bytes prints nothing for an absent key" test -z "$(cnf_key_bytes "$TMP/cnf-bytes.cnf" innodb_io_capacity)"
+
+# Online-resizable keys: pool and redo log may change without a restart,
+# innodb_io_capacity may not.
+printf '[mysqld]\ninnodb_buffer_pool_size = 1G\ninnodb_log_file_size = 256M\ninnodb_io_capacity = 2000\n' > "$TMP/cnf-online-a"
+printf '[mysqld]\ninnodb_buffer_pool_size = 2G\ninnodb_log_file_size = 512M\ninnodb_io_capacity = 2000\n' > "$TMP/cnf-online-b"
+printf '[mysqld]\ninnodb_buffer_pool_size = 1G\ninnodb_log_file_size = 256M\ninnodb_io_capacity = 4000\n' > "$TMP/cnf-online-c"
+check "cnf_only_pool_changed accepts pool and redo-log changes together" \
+  cnf_only_pool_changed "$TMP/cnf-online-a" "$TMP/cnf-online-b"
+check "cnf_only_pool_changed rejects an innodb_io_capacity change" \
+  cnf_other_changed "$TMP/cnf-online-a" "$TMP/cnf-online-c"
+
+# angie_cache_keep_mb must pick the directive for the named zone when a file
+# carries several multi-line *_cache_path directives.
+cat > "$TMP/multi-proxy_cache.conf" <<'EOF'
+proxy_cache_path /tmp/pc-a levels=1:2 keys_zone=proxy_cache:64m
+  max_size=16g inactive=1d;
+proxy_cache_path /tmp/pc-b levels=1:2 keys_zone=proxy_cdn:64m
+  max_size=8g inactive=1d;
+EOF
+du() { printf '0\tx\n'; }
+angie_cache_keep_mb "$TMP/multi-proxy_cache.conf" 100 proxy_cache
+check "cache keep leaves the plan alone for an empty first zone" test "$ANGIE_CACHE_MB" = 100
+angie_cache_keep_mb "$TMP/multi-proxy_cache.conf" 100 proxy_cdn
+check "cache keep leaves the plan alone for an empty second zone" test "$ANGIE_CACHE_MB" = 100
+du() { printf '900\tx\n'; }
+angie_cache_keep_mb "$TMP/multi-proxy_cache.conf" 100 proxy_cdn
+check "cache keep preserves the configured 8g that covers live usage" test "$ANGIE_CACHE_MB" = 8192
+check "cache keep note names the zone's own directory" grep -qF '/tmp/pc-b' <<<"$ANGIE_CACHE_NOTE"
+cache_note_not_first_zone() { ! grep -qF '/tmp/pc-a' <<<"$ANGIE_CACHE_NOTE"; }
+check "cache keep note does not name the other zone's directory" cache_note_not_first_zone
+unset -f du
 
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
