@@ -204,9 +204,10 @@ Already good:
 
 - PHP 8.5 with the XenForo profile: `fpm`, `cli`, `opcache`, `mysql`, `gd`,
   `curl`, `xml`, `zip`, `gmp`, `mbstring`, `redis`.
-- OPcache/JIT settings in `custom_dan.ini` are active immediately because
-  `php8.5-opcache` is installed. `intl`, `imagick`, `bcmath` and `apcu` are
-  not installed; add them only if an add-on requires them.
+- OPcache settings in `custom_dan.ini` are active immediately because
+  `php8.5-opcache` is installed. JIT stays off: the tracing JIT segfaults
+  PHP-FPM on real WordPress workloads. `intl`, `imagick`, `bcmath` and `apcu`
+  are not installed; add them only if an add-on requires them.
 - `memory_limit` 512 MB, realpath cache 16 MB, file cache under
   `/var/cache/php/opcache`.
 - 108 static workers, `max_requests=16384`, `request_terminate_timeout=100s`,
