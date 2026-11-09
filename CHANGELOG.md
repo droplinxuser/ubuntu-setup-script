@@ -2,6 +2,102 @@
 
 Historical release notes for ubuntu-setup-script. Current behavior is documented in README.md.
 
+## What's new in 1.11.0
+
+Audit of install/optimize parity, hardware rules and duplicated code (two
+independent code reviews of `setup.sh` plus a mechanical repeated-block scan),
+validated on the dev-host development host (16 threads / 27 GiB / NVMe, Ubuntu
+26.04.1): a fresh `--basic --angie --php --mariadb --valkey --elastic --others
+all --domain xf.test.local app=xf db=... user=... pass=...` install followed by
+`--optimize` produced identical configuration trees (241 files; only the
+crontab's install-timestamp comment differed), every mode ran clean on the real
+host (`--optimize --dry-run`, `--optimize`, `--diagnostics`, `--restart-all
+--dry-run`, `--restart-all`, `--purge all`), and the remote `oha` suite driven
+from a workstation matched the 1.9.0 numbers (`tests/stress-site/RESULTS.md`).
+
+- **Application-aware PHP-FPM worker cap.** When every PHP vhost in `conf.d`
+  is a XenForo or WordPress site with a local database (loopback,
+  `p:localhost` or a socket), the pool is capped at 4 workers per core (3 on a
+  VPS), below the generic ceiling and below a live pool's count
+  (`php_app_worker_cap`, applied inside `php_children_ceiling`, reported by
+  the pool tuner). Measured on a seeded XenForo 2.3.13 board (50 members, 150
+  threads, 2,400 posts): the 144-worker pool and a 48-worker pool both serve
+  ~900-950 member req/s, but p50 latency falls from 107 ms to 51 ms (64
+  workers: 73 ms); a CPU-bound page gains nothing from nine runnable workers
+  per core. A host that also runs an unknown PHP application, or whose
+  database is remote, keeps the generic ceiling; `--php children=` wins.
+- **Opt-in precompressed static assets.** `SETUP_PRECOMPRESS_ASSETS=1`
+  (persisted as `PRECOMPRESS_ASSETS` in `/etc/default/setup-tuning`; `0`
+  retires it) writes `.br`/`.gz` siblings for the scripts, styles, fonts and
+  SVGs under every XenForo/WordPress document root (`brotli -q 11`, `gzip
+  -9`; `internal_data`, `data`, uploads and files under 1 KB are skipped),
+  turns `brotli_static` on next to the existing `gzip_static`, installs the
+  15 KB `brotli` CLI, and keeps the siblings fresh from the managed crontab
+  every 5 minutes through `/usr/local/bin/setup-precompress.sh` (a copy of
+  `precompress_static_assets`; stale siblings are rebuilt, orphans removed,
+  mtime/ownership follow the source so a rerun is a no-op). Serving the 177 KB
+  `core-compiled.js` compressed per request cost 50-89% of the 16-core host at
+  1.8k req/s; with siblings the same (link-bound) rate costs 2-5%. Off by
+  default because a CDN-fronted origin rarely serves assets.
+- **Parity fixes.** `--basic server=dedi|vps` is recorded with the other
+  explicit options and honoured by `host_server_type`, so `--optimize` can no
+  longer re-detect a pinned host and silently switch the dedi/vps formulas
+  (workers per core, backlogs, conntrack, io_capacity, governor). The managed
+  crontab is refreshed after every install, not only `--basic`/`--domain`,
+  so an `--angie`- or `--mariadb`-only run gets its entries at once. The
+  shared MariaDB base block creates `secure_file_priv`'s directory on both
+  paths (an adopted host had the directive without the directory). An
+  adopted Redis gets `${LOG_ROOT}/redis` before `--optimize` points it there
+  (the restart used to fail and roll back). The installer prints the
+  Elasticsearch heap/replica lines that only reached the `--optimize`
+  Markdown report. The dry run reports the governor as skipped on a virtual
+  host (the writer already skipped it) and the report counts effective
+  (cgroup) CPUs. `optimize_valkey` reads the live working set through the
+  shared `valkey_live_used_mb` (socket first) instead of a TCP-only probe.
+- **Hardware rules.** A cgroup CPU quota below one core now counts as one
+  (`cgroup_quota_cpus`; a fractional quota truncated to 0 and fell back to the
+  host core count). `vm.min_free_kbytes` keeps 1% of RAM with a 16 MB floor
+  under 4 GB (the 64 MB floor reserved 6% of a 1 GB host). PHP
+  `memory_limit` is 128M under 2 GB. The MariaDB redo log (pool/4) is capped
+  at 4 GB on NVMe instead of 2 GB everywhere, and
+  `table_open_cache`/`table_definition_cache`/`innodb_open_files` follow
+  `max_connections × 16` (4000..32768) instead of the pool size. The dynamic
+  Brotli level defaults to 4 on a 1-2 CPU host (`angie_brotli_level`, shared
+  by the writer and the dry run). The memory planner records and warns when
+  the untrimmable service floors exceed the budget (a 1 GB host running every
+  service) instead of printing allocations that look as if they fit. The udev
+  I/O rule matches whole disks only: it fired on every partition and logged
+  four "could not chase sysfs attribute" errors per device.
+- **Shared helpers, less duplication.** `php_plan_max_children` is the one
+  worker-count decision tree for the pool writer and the dry run;
+  `php_fpm_binary` replaces five binary lookups; `php_pool_set_listener`
+  replaces the two listener blocks (pool tuner and TCP-to-socket migration);
+  `mariadb_wait_ready` replaces five `SELECT 1` loops; `opt_rollback_restart`
+  replaces the six restore-and-restart blocks of the MariaDB, Valkey/Redis
+  and Elasticsearch tuners; `angie_vhost_root` is shared by the vhost
+  scanners, the worker cap and precompression. Dead code removed: the
+  unread `php_allowance` (and `OPT_PHP_ALLOWANCE_MB`) in the pool tuner and an
+  unused `ram_mb` in `optimize_valkey`.
+- **Checked and kept.** A review proposed a RAM-proportional install-time
+  InnoDB pool; the live-data sizing from 1.8.57 stays (the pool follows the
+  data, `--domain sql=` re-sizes after an import, a manual restore is followed
+  by `--optimize`). The install plan keeps the 64 MB per-worker reservation:
+  it is what `--optimize` measures for a freshly started pool, so the two
+  budgets stay equal. XenForo's cache and sessions in Valkey over the Unix
+  socket measured no gain on a single host (888 vs 883 member req/s, p50
+  72.5 vs 73 ms); the audit hint stays a hint.
+- **`--purge` restores paired sysctls in an order the kernel accepts.** The
+  foreground `vm.dirty_bytes`/`vm.dirty_ratio` are written before their
+  background counterparts (restoring `vm.dirty_background_bytes=0` re-enables
+  the background ratio, which the kernel rejected while the still-tuned
+  `dirty_bytes` was below it: `--purge all` logged "Could not restore
+  vm.dirty_background_bytes=0" twice), and the low fragment threshold stays
+  last.
+- Tests: 480 tuning checks (41 new: sysctl restore order, quota rounding, the worker decision
+  tree, Brotli level, pinned server type, redo cap and table caches,
+  overcommit, the app cap on fixture vhosts, precompression) and the 101-case
+  dry-run matrix; shellcheck clean.
+
 ## What's new in 1.10.0
 
 - **`--domain` provisions the whole site.** `db=NAME` creates the MariaDB

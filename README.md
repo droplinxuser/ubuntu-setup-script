@@ -283,7 +283,7 @@ buffered `access_log` per host when a forensic trail is required.
 
 - Installs the Angie signing key and APT repository.
 - Installs `angie`.
-- Installs the official `angie-module-brotli` dynamic module and enables dynamic Brotli at level 5 with gzip as the compatibility fallback. On a 149 KB XenForo thread page this produced 10.9 KB on the wire versus 13.7 KB for gzip (20% smaller); guest pages were 79-93% smaller than identity. `--optimize` installs and enables the same module, so both paths stay in parity. Static assets are deliberately left to the CDN (`brotli_static off`): precompressing thousands of files only helps the first origin miss and adds deployment churn. Set `SETUP_BROTLI_LEVEL=1..11` to override the level or `SETUP_ANGIE_COMPRESSION=0` to disable it.
+- Installs the official `angie-module-brotli` dynamic module and enables dynamic Brotli at level 5 with gzip as the compatibility fallback. On a 149 KB XenForo thread page this produced 10.9 KB on the wire versus 13.7 KB for gzip (20% smaller); guest pages were 79-93% smaller than identity. `--optimize` installs and enables the same module, so both paths stay in parity. Static assets are left to the CDN by default (`brotli_static off`). An origin that serves its own assets can set `SETUP_PRECOMPRESS_ASSETS=1` (persisted as `PRECOMPRESS_ASSETS` in `/etc/default/setup-tuning`; `0` turns it off again): every XenForo/WordPress document root gets `.br`/`.gz` siblings for its scripts, styles, fonts and SVGs (`brotli -q 11`, `gzip -9`, skipping `internal_data`, `data`, uploads and files under 1 KB), `brotli_static`/`gzip_static` serve them, and `/usr/local/bin/setup-precompress.sh` runs from the managed crontab every 5 minutes so an application upgrade is re-compressed and orphaned siblings are dropped. Measured on the 16-core test host: serving the 177 KB `core-compiled.js` compressed per request cost 50-89% CPU at 1.8k req/s (the Wi-Fi link limit); with siblings the same rate costs 2-5%. Set `SETUP_BROTLI_LEVEL=1..11` to override the level or `SETUP_ANGIE_COMPRESSION=0` to disable it.
 - Downloads [`droplinxuser/server-configs-nginx`](https://github.com/droplinxuser/server-configs-nginx) once per run and deploys it with the built-in deployer (`deploy_angie_tree`), the same code used by `--optimize`.
 - The repository (not `setup.sh`) owns `angie.conf`, `h5bp/`, `conf.d/`, `http.d/`, `snippets/`, the cache/rate-limit settings, template repairs and the Cloudflare helper.
 - Uses the repo's `scripts/limit_nofile.conf` and `scripts/etc_default_nginx` for the systemd `LimitNOFILE` drop-in and `/etc/default/angie`.
@@ -302,6 +302,7 @@ buffered `access_log` per host when a forensic trail is required.
 - Fills in the dynamic values from `setup.sh`:
   - `pm.max_children` on a fresh install comes from the shared plan: `CPU threads × 16`, capped by `50% of RAM / 96 MB`, 512 and at least 8, and the plan reserves 64 MB per worker (the measured XF floor) so a first `--optimize` does not have to shrink the budget. On `--optimize` a live pool keeps its worker count and the planner reserves `max_children × measured allowance` instead: it samples the running workers, adds 50% headroom to the average RSS, clamps the allowance to 64–192 MB, and leaves the freed RAM for MariaDB/Elasticsearch. A measured 28 MB XenForo worker on the 27.8 GB test host therefore reserves 64 MB (the floor), and the count stays 144.
   - `pm.max_requests = CPU threads × 1024`
+  - **CPU-bound application hosts.** When every PHP vhost in `conf.d` is a XenForo or WordPress site whose database is local (loopback, `p:localhost` or a socket), the pool is capped at 4 workers per core (3 on a VPS), below the generic ceiling and below a live pool\x27s count. Measured on the 16-thread test host with a seeded XenForo board (50 members, 150 threads, 2,400 posts): the 144-worker pool and a 48-worker pool both serve about 900-950 member req/s, but p50 latency drops from 107 ms to 51 ms (64 workers: 73 ms) because a CPU-bound page gains nothing from nine runnable workers per core. A host that also runs an unknown PHP application, or whose database is remote (I/O-bound workers), keeps the generic ceiling; `children=` always wins.
   - override either with `children=` / `max_requests=`
 - Sizes OPcache, JIT and `memory_limit` from RAM instead of fixed 512 MB values:
   - OPcache 128–512 MB, JIT 32–128 MB, `memory_limit` 256–512 MB, realpath cache 4–16 MB.
@@ -725,19 +726,23 @@ host type (`dedi` or `vps` from `systemd-detect-virt`, or `--basic server=`).
 
 | Area | Rule |
 |---|---|
-| PHP-FPM workers | 16 per core on dedicated hardware, 8 on a VPS; at most RAM/2 at 96 MB per worker; floor `min(8, RAM/2/96)` (a 1 GB host keeps 5, not 8); a live pool keeps its count; `children=` wins (clamped to 512) |
-| MariaDB | see the MariaDB section: io_capacity by disk × host type, I/O threads, flush_neighbors, LRU depth, thread cache, temp tables, connections from the PHP pool |
+| PHP-FPM workers | 16 per core on dedicated hardware, 8 on a VPS; at most RAM/2 at 96 MB per worker; floor `min(8, RAM/2/96)` (a 1 GB host keeps 5, not 8); a live pool keeps its count; 4 per core (VPS 3) when every PHP vhost is XenForo/WordPress with a local database; `children=` wins (clamped to 512) |
+| MariaDB | see the MariaDB section: io_capacity by disk × host type, I/O threads, flush_neighbors, LRU depth, thread cache, temp tables, connections from the PHP pool; redo log = pool/4 capped at 4 GB on NVMe (2 GB otherwise); `table_open_cache`/`table_definition_cache`/`innodb_open_files = clamp(max_connections × 16, 4000, 32768)` |
 | Elasticsearch | heap = store/4 (512 MB..25% RAM..31 GB); search threads `clamp(cpus/2, 1, 16)`, write threads `clamp(cpus/4, 1, min(8, cpus+1))` |
 | Valkey / Redis | maxmemory from the plan; `maxclients` from the PHP pool; `io_threads` clamped to 1..8 on both paths |
-| Angie | `worker_processes` = effective CPUs, `worker_connections = clamp(cpus × 2048, 8192, 65535)`, upstream keepalive from the PHP pool, `open_file_cache max = clamp(RAM_MB × 8, 10000, 200000)`, cache budget from RAM/disk/installed services, `limit_req_log_level info` |
-| Kernel | `somaxconn`/SYN backlog `cpus × 4096` (VPS: `cpus × 2048`, max 65536), conntrack `RAM_MB × 16` (VPS: `× 8`), `vm.dirty_background_bytes = clamp(RAM/100, 64 MB, 512 MB)` and `vm.dirty_bytes = 4×` (tighter on HDD), 16 MB socket buffers under 4 GB RAM |
-| Host | swap = RAM/2 clamped to 1..8 GiB (4 GiB on a VPS); CPU governor only on dedicated hardware; THP `madvise` via `setup-io-tuning.service`; `fstrim.timer` on SSD/NVMe; I/O scheduler and readahead by device class via `/etc/udev/rules.d/60-setup-io.rules` |
+| Angie | `worker_processes` = effective CPUs, `worker_connections = clamp(cpus × 2048, 8192, 65535)`, upstream keepalive from the PHP pool, `open_file_cache max = clamp(RAM_MB × 8, 10000, 200000)`, cache budget from RAM/disk/installed services, `limit_req_log_level info`; Brotli level 5, or 4 on a 1-2 CPU host |
+| Kernel | `somaxconn`/SYN backlog `cpus × 4096` (VPS: `cpus × 2048`, max 65536), conntrack `RAM_MB × 16` (VPS: `× 8`), `vm.dirty_background_bytes = clamp(RAM/100, 64 MB, 512 MB)` and `vm.dirty_bytes = 4×` (tighter on HDD), 16 MB socket buffers under 4 GB RAM; `vm.min_free_kbytes` = 1% of RAM with a 16 MB floor under 4 GB (64 MB above, 256 MB cap); a cgroup CPU quota below one core counts as one |
+| Host | swap = RAM/2 clamped to 1..8 GiB (4 GiB on a VPS); CPU governor only on dedicated hardware; THP `madvise` via `setup-io-tuning.service`; `fstrim.timer` on SSD/NVMe; I/O scheduler and readahead by device class via `/etc/udev/rules.d/60-setup-io.rules` (whole disks only; partitions have no scheduler attribute) |
 
 Environment overrides: `SETUP_MARIADB_IO_CAPACITY="read max"`,
 `SETUP_LIMIT_REQ_EXEMPT="ip,cidr,..."` (rate-limit exemptions for a load
 generator or monitor, managed lines in the Angie geo whitelist; persisted as
 `LIMIT_REQ_EXEMPT` in `/etc/default/setup-tuning` so later runs keep it,
 an empty value clears),
+`SETUP_PRECOMPRESS_ASSETS=1` (precompressed `.br`/`.gz` static assets for
+XenForo/WordPress roots served by `brotli_static`/`gzip_static`, kept fresh by
+`/usr/local/bin/setup-precompress.sh` from cron; persisted as
+`PRECOMPRESS_ASSETS`, `0` turns it off and retires the helper),
 `SETUP_TCP_CC`/`SETUP_QDISC`, `SETUP_STATE_DIR` (state directory for tests and
 image builds).
 
@@ -828,7 +833,7 @@ The script is safe to re-run:
 - Domain directories and databases use idempotent creation; existing Angie domain configs are preserved.
 - PHP, MariaDB, Angie, Valkey and Elasticsearch services are restarted after configuration changes so changed parameters take effect. Angie and PHP-FPM use a graceful `reload` when possible, Valkey applies runtime values with `CONFIG SET`, and startup-only changes are deferred; a repeat `--optimize` run with unchanged files restarts nothing.
 - A fresh install and `--optimize` write the same managed configuration for the same hardware: MariaDB tuning lives only in `99-setup-optimize.cnf`, Elasticsearch's base and performance blocks come from one helper, and a full-stack install followed by `--optimize` was verified to produce a zero-byte diff.
-- Explicit values from `--php children=`, `--php max_requests=`, `--mariadb size=`, `--valkey ram=` and `--elastic ram=` are recorded in `/var/lib/setup.sh/explicit-options.conf` and are not replaced by later `--optimize` runs.
+- Explicit values from `--basic server=`, `--php children=`, `--php max_requests=`, `--mariadb size=`, `--valkey ram=` and `--elastic ram=` are recorded in `/var/lib/setup.sh/explicit-options.conf` and are not replaced by later `--optimize` runs (a pinned `server=dedi|vps` keeps the host class, so `--optimize` cannot silently switch the dedi/vps formulas).
 
 A second run is normally much faster than the first (typically under a minute for the full stack).
 
@@ -1202,7 +1207,8 @@ By default `--elastic host=localhost` binds to loopback and security is disabled
 | `/var/cache/php/opcache` | OPcache file cache (owned by `www-data`) |
 | `/var/www/logs/php/php-fpm-slow.log` | PHP-FPM slow-request log |
 | `/etc/systemd/system/php<ver>-fpm.service.d/limits.conf` | PHP-FPM nofile drop-in |
-| `/var/lib/setup.sh/explicit-options.conf` | Recorded explicit `--php children=`, `--mariadb size=`, `--valkey ram=`, `--elastic ram=` values that `--optimize` keeps |
+| `/var/lib/setup.sh/explicit-options.conf` | Recorded explicit `--basic server=`, `--php children=`, `--mariadb size=`, `--valkey ram=`, `--elastic ram=` values that `--optimize` keeps |
+| `/usr/local/bin/setup-precompress.sh` | Cron helper that keeps precompressed static-asset siblings fresh (`SETUP_PRECOMPRESS_ASSETS=1`); regenerated by every install/`--optimize` |
 | `/etc/systemd/system/setup-io-tuning.service`, `/etc/udev/rules.d/60-setup-io.rules` | THP `madvise` oneshot and per-device-class I/O scheduler/readahead rule (restored by `--purge basic`) |
 | `/etc/mysql/mariadb.conf.d/50-server.cnf` | MariaDB managed base block (charset, name resolution, local_infile, bind address) |
 | `/etc/mysql/mariadb.conf.d/99-setup-optimize.cnf` | MariaDB hardware profile (buffer pool, I/O, connections, logging) |
