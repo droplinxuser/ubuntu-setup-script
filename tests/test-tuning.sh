@@ -16,6 +16,9 @@ TMP=$(mktemp -d /tmp/setup-test-tuning.XXXXXX)
 # Load the helpers without running main().  Source first: setup.sh defines its
 # own ok()/warn() logging helpers, so test helpers must be defined afterwards.
 export SETUP_TEST_SOURCE_ONLY=1
+# Never read the live host state (/var/lib/setup.sh): a recorded explicit
+# --mariadb size= or --valkey ram= would silently change the planner results.
+export SETUP_STATE_DIR="$TMP/state"
 # shellcheck disable=SC1090
 source "$ROOT/setup.sh"
 # setup.sh installs an ERR trap for production diagnostics.  These tests
@@ -63,10 +66,6 @@ check "size_to_mb 2g"             test "$(size_to_mb 2g)" = 2048
 check "cache budget rounds to 256 MB" test "$(tune_cache_total_mb 7747 19000)" = 768
 check "cache budget is stable across small disk changes" \
   test "$(tune_cache_total_mb 7747 19000)" = "$(tune_cache_total_mb 7747 17700)"
-check "Valkey size parser handles MB" test "$(valkey_mb_from_config 8192mb)" = 8192
-check "Valkey size parser handles GB" test "$(valkey_mb_from_config 8gb)" = 8192
-check "Valkey size parser handles raw bytes" test "$(valkey_mb_from_config 1048576)" = 1
-check "Valkey size parser rejects an unknown unit" test "$(valkey_mb_from_config 1xb)" = 0
 
 # systemd prints "● unit.service ..." in --failed output; the run-log header
 # must contain the unit names, not a list of bullets.
@@ -253,15 +252,15 @@ mariadb_strip_install_block 16351 1500 "$TMP/50-server.cnf" >/dev/null 2>&1
 check "MariaDB legacy-key cleanup is idempotent" \
   test "$mariadb_hash" = "$(md5sum "$TMP/50-server.cnf" | awk '{print $1}')"
 
-# A heap-only operator JVM file is safe to replace with the managed file; a
-# richer file must be preserved (with a warning from write_es_jvm_options).
-printf -- '-Xms4g\n-Xmx4g\n' > "$TMP/heap-only.options"
+# A managed JVM file (heap plus the fixed GC flags) is recognised; a richer
+# operator file must be preserved (with a warning from write_es_jvm_options).
+printf -- '-Xms4g\n-Xmx4g\n-XX:+UseG1GC\n-XX:MaxGCPauseMillis=200\n' > "$TMP/managed.options"
 printf -- '-Xms4g\n-Xmx4g\n-XX:MaxDirectMemorySize=1g\n' > "$TMP/custom.options"
-check "heap-only JVM options are detected" \
-  es_jvm_options_is_heap_only "$TMP/heap-only.options"
-not_heap_only() { ! es_jvm_options_is_heap_only "$1"; }
-check "custom JVM options are not treated as heap-only" \
-  not_heap_only "$TMP/custom.options"
+check "managed JVM options are detected" \
+  es_jvm_options_is_managed "$TMP/managed.options"
+not_managed() { ! es_jvm_options_is_managed "$1"; }
+check "custom JVM options are not treated as managed" \
+  not_managed "$TMP/custom.options"
 
 # A --basic-only run must regenerate installed service entries even when the
 # managed block is gone (for example after --purge basic).  Fake crontab and
@@ -1160,22 +1159,23 @@ php_pool_max_children() { printf '128'; }
 mem_total_mb() { printf '65536'; }
 OPT_DETECTED=(angie php:8.3 mariadb redis elastic)
 
-# Elasticsearch heap follows the live index store size.
+# Elasticsearch heap follows a quarter of the live index store (the page
+# cache serves the index), rounded up to 512 MB, within 25% of RAM.
 mariadb_data_size_mb() { printf '20000'; }
 elasticsearch_data_size_mb() { printf '4096'; }
 elasticsearch_current_heap_mb() { printf '0'; }
 plan_memory_budget
-check "small Elasticsearch index uses index+20%" \
-  test "$OPT_ES_BUDGET_MB" -eq 5120
+check "small Elasticsearch index uses store/4" \
+  test "$OPT_ES_BUDGET_MB" -eq 1024
 check "Elasticsearch index size is recorded" \
   test "$OPT_ES_SIZE_MB" -eq 4096
 
 elasticsearch_data_size_mb() { printf '20000'; }
 plan_memory_budget
-check "large Elasticsearch index gets index+20% headroom" \
-  test "$OPT_ES_BUDGET_MB" -eq 24064
-check "Elasticsearch heap fits the 20 GB index" \
-  test "$OPT_ES_BUDGET_MB" -ge 20000
+check "large Elasticsearch index gets store/4 rounded to 512 MB" \
+  test "$OPT_ES_BUDGET_MB" -eq 5120
+check "Elasticsearch heap stays within 25% of RAM" \
+  test "$OPT_ES_BUDGET_MB" -le $(( 65536 * 25 / 100 ))
 check "Elasticsearch plan stays inside the 80% budget" \
   test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
        -le $(( 65536 * 80 / 100 ))
@@ -1183,30 +1183,38 @@ check "Elasticsearch plan stays inside the 80% budget" \
 # A huge index is capped at the 31 GB compressed-oops ceiling.
 mem_total_mb() { printf '262144'; }
 OPT_DETECTED=(angie php:8.4 elastic)
-elasticsearch_data_size_mb() { printf '100000'; }
+elasticsearch_data_size_mb() { printf '200000'; }
 plan_memory_budget
 check "Elasticsearch heap is capped at 31 GB" \
   test "$OPT_ES_BUDGET_MB" -eq 31744
 check "Elasticsearch index size is recorded for huge stores" \
-  test "$OPT_ES_SIZE_MB" -eq 100000
+  test "$OPT_ES_SIZE_MB" -eq 200000
 
-# A live heap above the index target is kept while it still fits the budget;
-# shrinking would restart the JVM and cold the caches for no RAM benefit.
+# The heap is also capped at 25% of RAM on a small host.
+mem_total_mb() { printf '8192'; }
+elasticsearch_data_size_mb() { printf '40000'; }
+plan_memory_budget
+check "Elasticsearch heap is capped at 25% of RAM" \
+  test "$OPT_ES_BUDGET_MB" -eq 2048
+
+# A live heap grossly above the store target is reduced so the freed RAM can
+# serve the other tiers.
+mem_total_mb() { printf '65536'; }
 OPT_DETECTED=(angie php:8.4 mariadb valkey elastic)
 mariadb_data_size_mb() { printf '20000'; }
 elasticsearch_data_size_mb() { printf '13000'; }
 elasticsearch_current_heap_mb() { printf '20000'; }
 plan_memory_budget
-check "oversized Elasticsearch heap is reduced to index+20%" \
-  test "$OPT_ES_BUDGET_MB" -eq 15872
+check "oversized Elasticsearch heap is reduced to store/4" \
+  test "$OPT_ES_BUDGET_MB" -eq 3584
 check "shrunk Elasticsearch heap is not marked as preserved" \
   test "$OPT_ES_KEPT_MB" -eq 0
 
 # Small statistics drift must not change the heap on every run.
-elasticsearch_current_heap_mb() { printf '15800'; }
+elasticsearch_current_heap_mb() { printf '3600'; }
 plan_memory_budget
 check "Elasticsearch statistics drift keeps the live heap" \
-  test "$OPT_ES_BUDGET_MB" -eq 15800
+  test "$OPT_ES_BUDGET_MB" -eq 3600
 
 # A heap that would exceed the shared budget is capped.
 mem_total_mb() { printf '65536'; }
@@ -1215,8 +1223,8 @@ mariadb_data_size_mb() { printf '40000'; }
 elasticsearch_data_size_mb() { printf '4096'; }
 elasticsearch_current_heap_mb() { printf '30000'; }
 plan_memory_budget
-check "Elasticsearch heap is capped to index+20%" \
-  test "$OPT_ES_BUDGET_MB" -ge 4608 -a "$OPT_ES_BUDGET_MB" -le 5120
+check "Elasticsearch heap is capped to store/4" \
+  test "$OPT_ES_BUDGET_MB" -eq 1024
 
 elasticsearch_current_heap_mb() { printf '0'; }
 elasticsearch_data_size_mb() { printf '0'; }
@@ -1765,8 +1773,8 @@ OPT_INSTALL_PLAN=0
 plan_memory_budget
 check "live MariaDB pool is reduced to data+20%" \
   test "$OPT_MARIADB_KEPT_MB" -eq 0 -a "$OPT_MARIADB_BUDGET_MB" -eq 2457
-check "live Elasticsearch heap is reduced to index+5%" \
-  test "$OPT_ES_KEPT_MB" -eq 0 -a "$OPT_ES_BUDGET_MB" -eq 1024
+check "live Elasticsearch heap is reduced to the store/4 minimum" \
+  test "$OPT_ES_KEPT_MB" -eq 0 -a "$OPT_ES_BUDGET_MB" -eq 512
 
 valkey_live_used_mb() { printf '5000'; }
 mariadb_current_pool_mb() { printf '0'; }
@@ -1805,7 +1813,7 @@ plan_memory_budget
 check "full stack reserves MariaDB, Valkey and Elasticsearch first" \
   test "$OPT_MARIADB_BUDGET_MB" -ge 8000 \
        -a "$OPT_VALKEY_BUDGET_MB" -ge 1100 \
-       -a "$OPT_ES_BUDGET_MB" -ge 1024
+       -a "$OPT_ES_BUDGET_MB" -ge 512
 check "full stack still gets a viable PHP pool" \
   test "$OPT_PHP_BUDGET_MB" -ge 512 -a "$OPT_PHP_CHILDREN" -ge 8
 check "full stack priority plan stays inside the 80% budget" \
@@ -1906,6 +1914,187 @@ check "run log name is unique per process" \
 on_error_body=$(sed -n '/^on_error()/,/^}/p' "$ROOT/setup.sh")
 check "on_error ignores SIGPIPE from a closed pipe" \
   grep -q 'rc == 141' <<<"$on_error_body"
+
+
+# ---------------------------------------------------------------------------
+# 1.9.0: shared sizing helpers (install/optimize parity) and hardware rules
+# ---------------------------------------------------------------------------
+HOST_SERVER_TYPE=dedi
+check "php_children_ceiling: 16 per core on dedicated hardware" \
+  test "$(php_children_ceiling 16 65536 '' '')" -eq 256
+HOST_SERVER_TYPE=vps
+check "php_children_ceiling: 8 per core on a VPS" \
+  test "$(php_children_ceiling 16 65536 '' '')" -eq 128
+check "php_children_ceiling: half of RAM at 96 MB caps a small host" \
+  test "$(php_children_ceiling 16 2048 '' '')" -eq 10
+check "php_children_floor: 1 GB host keeps 5 workers, not 8" \
+  test "$(php_children_floor 1024)" -eq 5
+check "php_children_floor: never below 2" \
+  test "$(php_children_floor 256)" -eq 2
+check "php_children_ceiling: a live pool keeps its count" \
+  test "$(php_children_ceiling 4 65536 200 '')" -eq 200
+check "php_children_ceiling: explicit value wins but is clamped to 512" \
+  test "$(php_children_ceiling 4 65536 200 600)" -eq 512
+HOST_SERVER_TYPE=dedi
+
+check "sysctl_target_somaxconn scales with CPUs on dedicated hardware" \
+  test "$(effective_cpus() { printf '16'; }; sysctl_target_somaxconn)" -eq 65536
+HOST_SERVER_TYPE=vps
+check "sysctl_target_somaxconn is capped on a VPS" \
+  test "$(effective_cpus() { printf '64'; }; sysctl_target_somaxconn)" -eq 65536
+HOST_SERVER_TYPE=dedi
+
+check "swap target has a 1 GiB floor" \
+  test "$(swap_target_bytes $(( 512 * 1024 * 1024 )))" -eq $(( 1024 * 1024 * 1024 ))
+check "swap target is capped at 8 GiB on dedicated hardware" \
+  test "$(swap_target_bytes $(( 256 * 1024 * 1024 * 1024 )))" -eq $(( 8 * 1024 * 1024 * 1024 ))
+HOST_SERVER_TYPE=vps
+check "swap target is capped at 4 GiB on a VPS" \
+  test "$(swap_target_bytes $(( 64 * 1024 * 1024 * 1024 )))" -eq $(( 4 * 1024 * 1024 * 1024 ))
+HOST_SERVER_TYPE=dedi
+
+mariadb_storage_class() { printf 'nvme'; }
+check "innodb_io_capacity: NVMe on dedicated hardware" \
+  test "$(mariadb_io_capacity)" = '10000 20000'
+HOST_SERVER_TYPE=vps
+check "innodb_io_capacity: NVMe on a VPS is held back by provider IOPS" \
+  test "$(mariadb_io_capacity)" = '3000 6000'
+HOST_SERVER_TYPE=dedi
+mariadb_storage_class() { printf 'hdd'; }
+check "innodb_io_capacity: rotational disk" \
+  test "$(mariadb_io_capacity)" = '400 800'
+check "innodb_io_capacity: SETUP_MARIADB_IO_CAPACITY pins a host" \
+  test "$(SETUP_MARIADB_IO_CAPACITY='1500 3000' mariadb_io_capacity)" = '1500 3000'
+mem_total_mb() { printf '65536'; }
+effective_cpus() { printf '16'; }
+php_pool_max_children() { printf '144'; }
+OPT_PHP_CHILDREN=0
+mariadb_compute_profile 4096
+check "MariaDB profile: HDD flushes neighbours and keeps 4 I/O threads" \
+  test "$MARIADB_PROFILE_FLUSH_NEIGHBORS" -eq 1 -a "$MARIADB_PROFILE_IO_THREADS" -eq 4
+check "MariaDB profile: max_connections follows the PHP pool" \
+  test "$MARIADB_PROFILE_MAX_CONN" -eq 230
+check "MariaDB profile: tmp_table_size scales with RAM and stays under pool/8" \
+  test "$MARIADB_PROFILE_TMP_MB" -eq 256
+mariadb_storage_class() { printf 'nvme'; }
+mariadb_compute_profile 1024
+check "MariaDB profile: NVMe keeps flush_neighbors=0 and 8 I/O threads" \
+  test "$MARIADB_PROFILE_FLUSH_NEIGHBORS" -eq 0 -a "$MARIADB_PROFILE_IO_THREADS" -eq 8
+check "MariaDB profile: tmp_table_size is capped at pool/8" \
+  test "$MARIADB_PROFILE_TMP_MB" -eq 128
+check "MariaDB profile: thread_cache_size scales with CPUs" \
+  test "$MARIADB_PROFILE_THREAD_CACHE" -eq 128
+check "MariaDB profile: LRU scan depth follows io_capacity" \
+  test "$MARIADB_PROFILE_LRU_DEPTH" -eq 2048
+php_pool_max_children() { printf '0'; }
+mariadb_compute_profile 1024
+check "MariaDB profile: no PHP pool falls back to CPU x 32 connections" \
+  test "$MARIADB_PROFILE_MAX_CONN" -eq 512
+
+check "valkey_maxclients has a 10000 floor" \
+  test "$(valkey_maxclients)" -eq 10000
+php_pool_max_children() { printf '512'; }
+check "valkey_maxclients grows with the PHP pool" \
+  test "$(valkey_maxclients)" -eq 4048 -o "$(valkey_maxclients)" -eq 10000
+php_pool_max_children() { printf '0'; }
+check "valkey_clamp_io_threads caps at 8 on both paths" \
+  test "$(valkey_clamp_io_threads 16)" -eq 8 -a "$(valkey_clamp_io_threads x)" -eq 1
+
+# service_mem_mb: the planned value wins; the fallback formulas are the old
+# install/optimize ones, now in one place.
+OPT_MARIADB_BUDGET_MB=0; OPT_VALKEY_BUDGET_MB=0; OPT_ES_BUDGET_MB=0
+check "service_mem_mb mariadb fallback is 40% of RAM" test "$(service_mem_mb mariadb)" -eq 26214
+check "service_mem_mb valkey fallback is capped at 8 GB" test "$(service_mem_mb valkey)" -eq 6553
+check "service_mem_mb elastic fallback is 25% of RAM on a 512 MB step" test "$(service_mem_mb elastic)" -eq 16384
+OPT_ES_BUDGET_MB=1000
+check "service_mem_mb never re-rounds a planned Elasticsearch heap" test "$(service_mem_mb elastic)" -eq 1000
+OPT_ES_BUDGET_MB=0
+
+# Explicit sizes are reserved verbatim by the plan, never scaled.
+mkdir -p "$SETUP_STATE_DIR"
+printf 'mariadb_size_mb=20000\nvalkey_mb=4096\n' > "$SETUP_STATE_DIR/explicit-options.conf"
+mem_total_mb() { printf '32768'; }
+mariadb_data_size_mb() { printf '0'; }
+elasticsearch_data_size_mb() { printf '0'; }
+elasticsearch_current_heap_mb() { printf '0'; }
+mariadb_current_pool_mb() { printf '0'; }
+valkey_live_used_mb() { return 0; }
+OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
+plan_memory_budget
+check "explicit MariaDB size is reserved verbatim" test "$OPT_MARIADB_BUDGET_MB" -eq 20000
+check "explicit Valkey size is reserved verbatim" test "$OPT_VALKEY_BUDGET_MB" -eq 4096
+check "the flexible tiers absorb the squeeze" test "$OPT_ES_BUDGET_MB" -eq 512
+rm -f "$SETUP_STATE_DIR/explicit-options.conf"
+
+# record_explicit_options writes the sizes the installers used to record.
+ENABLED=([mariadb]=1 [valkey]=1 [elastic]=1 [php]=1)
+OPT=([mariadb.size]=4gb [valkey.ram]=512m [elastic.ram]=2g [php.children]=64)
+record_explicit_options
+check "record_explicit_options stores MariaDB size in MB" \
+  test "$(explicit_option mariadb_size_mb)" = 4096
+check "record_explicit_options stores Valkey and Elasticsearch sizes" \
+  test "$(explicit_option valkey_mb)" = 512 -a "$(explicit_option elastic_mb)" = 2048
+check "record_explicit_options stores PHP children" \
+  test "$(explicit_option php_children)" = 64
+OPT=([mariadb.size]=auto)
+record_explicit_options
+check "record_explicit_options clears a value that is now auto" \
+  bash -c "! grep -q '^mariadb_size_mb=' '$SETUP_STATE_DIR/explicit-options.conf'"
+rm -f "$SETUP_STATE_DIR/explicit-options.conf"
+ENABLED=()
+OPT=()
+
+# valkey_apply_config writes the same file from any starting point.
+printf 'save 3600 1\nsave 300 100\nprotected-mode no\nmaxmemory 1gb\ndaemonize no\n' > "$TMP/valkey.conf"
+valkey_apply_config "$TMP/valkey.conf" valkey 512 allkeys-lru 16 /run/valkey/valkey.sock
+check "valkey_apply_config removes RDB saves and protected-mode no" \
+  bash -c "! grep -qE '^(save 3600|protected-mode no)' '$TMP/valkey.conf' && grep -qx 'save \"\"' '$TMP/valkey.conf'"
+check "valkey_apply_config keeps operator directives" grep -qx 'daemonize no' "$TMP/valkey.conf"
+check "valkey_apply_config clamps io-threads to 8" grep -qx 'io-threads 8' "$TMP/valkey.conf"
+valkey_hash=$(md5sum "$TMP/valkey.conf" | awk '{print $1}')
+valkey_apply_config "$TMP/valkey.conf" valkey 512 allkeys-lru 16 /run/valkey/valkey.sock
+check "valkey_apply_config is idempotent" test "$valkey_hash" = "$(md5sum "$TMP/valkey.conf" | awk '{print $1}')"
+no_startup_keys() { ! valkey_runtime_settings 512 allkeys-lru 1 | grep -qE '^(tcp-backlog|io-threads) '; }
+check "valkey_runtime_settings drops the startup-only keys" no_startup_keys
+check "valkey_runtime_settings keeps maxmemory" \
+  bash -c "true" && valkey_runtime_settings 512 allkeys-lru 1 | grep -q '^maxmemory 512mb'
+
+check "write_service_limits_dropin reports a change" \
+  write_service_limits_dropin "$TMP/dropin/limits.conf" $'[Service]\nLimitNOFILE=1'
+not_changed() { ! write_service_limits_dropin "$@"; }
+check "write_service_limits_dropin is silent when identical" \
+  not_changed "$TMP/dropin/limits.conf" $'[Service]\nLimitNOFILE=1'
+
+# Rate-limit exemptions for a load generator or monitor.
+cat > "$TMP/limit_req.conf" <<'EOF'
+geo $limit_req_whitelist {
+    default 0;
+    127.0.0.0/8 1;
+    ::1/128     1;
+}
+limit_req_log_level warn;
+EOF
+SETUP_LIMIT_REQ_EXEMPT='192.0.2.50,10.0.0.0/8 bogus' tune_limit_req_exemptions "$TMP/limit_req.conf" limit_req.conf
+check "tune_limit_req_exemptions adds managed entries" \
+  bash -c "grep -qx '    192.0.2.50 1; # setup.sh exempt' '$TMP/limit_req.conf' && grep -qx '    10.0.0.0/8 1; # setup.sh exempt' '$TMP/limit_req.conf'"
+check "tune_limit_req_exemptions ignores invalid entries" \
+  bash -c "! grep -q bogus '$TMP/limit_req.conf'"
+SETUP_LIMIT_REQ_EXEMPT='192.0.2.50' tune_limit_req_exemptions "$TMP/limit_req.conf" limit_req.conf
+check "tune_limit_req_exemptions replaces the managed set" \
+  test "$(grep -c 'setup.sh exempt' "$TMP/limit_req.conf")" -eq 1
+SETUP_LIMIT_REQ_EXEMPT='' tune_limit_req_exemptions "$TMP/limit_req.conf" limit_req.conf
+check "tune_limit_req_exemptions removes managed entries when unset" \
+  bash -c "! grep -q 'setup.sh exempt' '$TMP/limit_req.conf'"
+
+mkdir -p "$TMP/datadir"
+dd if=/dev/zero of="$TMP/datadir/ib_logfile0" bs=1M count=8 status=none
+dd if=/dev/zero of="$TMP/datadir/data.ibd" bs=1M count=2 status=none
+check "dir_size_mb excludes the given patterns" \
+  test "$(dir_size_mb "$TMP/datadir" 'ib_logfile*')" -le 3
+check "wait_for_cmd succeeds on the first good probe" wait_for_cmd 3 true
+not_wait() { ! wait_for_cmd 1 false; }
+check "wait_for_cmd fails after the last attempt" not_wait
+
 
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

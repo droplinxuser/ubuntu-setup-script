@@ -2,6 +2,97 @@
 
 Historical release notes for ubuntu-setup-script. Current behavior is documented in README.md.
 
+## What's new in 1.9.0
+
+Install/optimize parity, shared sizing helpers and hardware-adaptive tuning,
+validated on the dev-host development host (16 threads / 27 GiB / NVMe, Ubuntu
+26.04.1): a fresh `--basic --angie --php --mariadb --valkey --elastic
+--others all` install followed by `--optimize` now produces byte-identical
+service configuration (the only pre-1.9.0 difference was the MariaDB buffer
+pool, which the installer sized from stale log files in the data directory).
+
+- **One memory plan for both paths.** `record_explicit_options` stores
+  `--php children=`, `--mariadb size=`, `--valkey ram=` and `--elastic ram=`
+  *before* the install plan is built, and the plan reserves explicit sizes
+  verbatim (they are never scaled down), so the first `--optimize` no longer
+  re-splits RAM. The install plan starts from the services already on the
+  host, so adding `--php --mariadb` to an Angie host sizes the Angie cache
+  like `--optimize` will. A service that is not installed yet is no longer
+  measured from a previous installation's data directory, and the directory
+  fallback excludes redo/undo logs and temp tablespaces.
+- **Shared helpers replace copy-pasted blocks:** `service_mem_mb` (the one
+  fallback formula per service), `valkey_apply_config` (base + tuning
+  directives; `--optimize` now also turns off RDB saves/AOF and sets the
+  managed bind/log path on an adopted Valkey or Redis), `valkey_runtime_settings`
+  (the `CONFIG SET` list is derived from the file writer),
+  `write_service_limits_dropin` with per-service wrappers for MariaDB, PHP-FPM
+  and Valkey, `ensure_es_max_map_count`, `elasticsearch_write_managed_yaml`,
+  `php_children_ceiling`/`php_children_floor`, `angie_worker_limits`,
+  `mariadb_write_base_block`, `wait_for_cmd`, `dir_size_mb`. Dead code removed:
+  `valkey_mb_from_config`, `es_jvm_options_is_heap_only`,
+  `elasticsearch_rollback`, six inline RAM reads and two PHP unit loops.
+- **Parity fixes:** `--optimize` converges the MariaDB base block
+  (`skip_name_resolve`, `local_infile=0`, charset, `secure_file_priv`) on
+  adopted hosts; the installer refreshes the managed crontab *after* the
+  WordPress hardening so a fresh install gets the wp-cron entry; a `--php`
+  only run keeps the host timezone in `custom_dan.ini`; Valkey `io_threads`
+  is clamped to 1..8 on both paths; the planned Elasticsearch heap is no
+  longer rounded a second time; the dry run prints the same Angie and PHP-FPM
+  values the real run writes; PHP `listen.backlog`, MariaDB `back_log` and
+  Valkey `tcp-backlog` are derived from the CPU formula instead of the live
+  `somaxconn`, so they no longer depend on run order.
+- **Hardware-adaptive rules.** RAM detection honours a cgroup memory limit
+  (`mem_total_mb`), like the existing CPU quota detection. MariaDB:
+  `innodb_io_capacity` by disk class *and* host type (NVMe dedicated
+  10000/20000, NVMe VPS 3000/6000, SSD 4000/8000 or 1000/2000, HDD 400/800;
+  `SETUP_MARIADB_IO_CAPACITY="r w"` pins a host), probed on the MariaDB data
+  directory; `innodb_flush_neighbors=1` and 4 I/O threads on rotational disks,
+  otherwise `clamp(cpus/2, 4, 16)` threads; `innodb_lru_scan_depth` follows
+  io_capacity; `thread_cache_size = clamp(cpus*8, 32, 256)`;
+  `tmp_table_size`/`max_heap_table_size = clamp(RAM/256, 32, 256) MB` capped
+  at pool/8; `max_connections` follows the PHP pool (`workers*1.25+50`) with
+  the CPU formula as the no-PHP fallback. PHP-FPM: 16 workers per core on
+  dedicated hardware, 8 on a VPS; the 8-worker floor is reduced on hosts
+  under 1.5 GB; `opcache.interned_strings_buffer` scales with the OPcache
+  size. Elasticsearch: the heap is a quarter of the index store (rounded up to
+  512 MB, capped at 25% of RAM and 31 GB) instead of store+20%, because the
+  page cache, not the heap, serves the index; search/write thread pools no
+  longer reserve 4/2 threads on a 1-2 vCPU host. Valkey: `maxclients`
+  follows the PHP pool (10000 minimum). Kernel: `vm.dirty_background_bytes`
+  and `vm.dirty_bytes` replace the 30%/5% ratios (64 MB..512 MB and
+  256 MB..2 GB, tighter on HDD), TCP buffer maxima drop to 16 MB under 4 GB
+  of RAM, IPv6 fragment thresholds scale like IPv4, a VPS gets smaller
+  conntrack/backlog ceilings, and the base profile's `net.nf_conntrack_max`
+  alias is removed so one key owns the value. Swap is capped at 8 GiB
+  (4 GiB on a VPS) with a 1 GiB floor. The CPU governor step is skipped on a
+  virtual host. New `configure_io_tuning` (install and optimize): transparent
+  huge pages set to `madvise` through a oneshot unit, `fstrim.timer` enabled
+  on SSD/NVMe, and a udev rule that sets the I/O scheduler and readahead per
+  device class; `--purge` restores all of it. Angie: `worker_processes` is
+  written from the effective CPU count (cgroup-aware) and `open_file_cache`
+  scales with RAM.
+- **Remote load tests no longer measure the rate limiter.** Angie's per-IP
+  limit answered more than 99% of a LAN benchmark with 429 and wrote 266 MB
+  of per-rejection warnings in two minutes. `limit_req_log_level` is now
+  `info` (below the `warn` error_log level) and
+  `SETUP_LIMIT_REQ_EXEMPT="ip,cidr,..."` adds managed geo-whitelist entries
+  for a load generator or monitor. `tests/stress-site/run-stress-remote.sh`
+  drives `oha` (a single static binary) from a workstation and reports the
+  status-code distribution; `tests/stress-site/collect-metrics.sh` samples
+  CPU, sockets, PHP-FPM, MariaDB, Valkey, Elasticsearch and log growth on the
+  server during a run.
+- `--mariadb size=` now defaults to `auto` (the shared plan), and
+  `SETUP_STATE_DIR` overrides `/var/lib/setup.sh` so the unit tests never
+  read the live host's recorded options (21 planner tests silently depended
+  on it).
+- The Elasticsearch loopback audit accepted only an unquoted `localhost`; the
+  installer's quoted value and `::1`/`_local_` no longer trigger a false
+  warning.
+- Tests: 58 new tuning checks (worker ceilings/floors, VPS limits, swap caps,
+  io_capacity tiers, MariaDB profile values, explicit-size pinning,
+  `record_explicit_options`, `valkey_apply_config` idempotency, limits
+  drop-ins, rate-limit exemptions, `dir_size_mb`, `wait_for_cmd`).
+
 ## What's new in 1.8.59
 
 - **`--cloudflare-only` now allows the full Cloudflare ranges.** The range

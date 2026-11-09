@@ -42,6 +42,7 @@ run ok   --dry-run --basic --angie
 run ok   --dry-run --basic --php
 run ok   --dry-run --basic --php ver=8.4 children=32 max_requests=4096
 run ok   --dry-run --basic --mariadb user=demo pass=temp size=4gb
+run ok   --dry-run --basic --mariadb user=demo pass=temp
 run ok   --dry-run --basic --mariadb user=demo pass=temp size=auto bind=127.0.0.1,IPV4
 run ok   --dry-run --basic --valkey
 run ok   --dry-run --basic --valkey ram=2g policy=noeviction io_threads=2

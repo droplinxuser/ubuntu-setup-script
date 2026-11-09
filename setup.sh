@@ -34,7 +34,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.8.59"
+readonly SCRIPT_VERSION="1.9.0"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -56,7 +56,9 @@ QDISC="${SETUP_QDISC:-$QDISC}"
 [[ $QDISC =~ ^[a-z0-9_]+$ ]] || QDISC=fq
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
-readonly STATE_DIR="/var/lib/setup.sh"
+# SETUP_STATE_DIR lets the unit tests (and a chroot/image build) use a private
+# state directory instead of the live host state.
+readonly STATE_DIR="${SETUP_STATE_DIR:-/var/lib/setup.sh}"
 readonly BACKUP_DIR="${STATE_DIR}/backup"
 # Every service writes its logs below this single directory so an operator can
 # collect one tree (tar -czf /tmp/logs.tgz -C /var/www logs) for inspection.
@@ -493,22 +495,25 @@ Services (optional; only the ones listed are installed):
       ver          PHP version (default: latest stable in Sury)
       children     PHP-FPM worker count (default: auto from RAM/CPU)
       max_requests recycle a worker after N requests (default: threads x 1024)
-  --mariadb   user=demo pass=temp size=4gb|auto [bind=127.0.0.1[,ADDR...]|IPV4]
-      size     auto = 40% of RAM (minimum 256 MB), sized to leave room for
+  --mariadb   user=demo pass=temp [size=4gb|auto] [bind=127.0.0.1[,ADDR...]|IPV4]
+      size     auto (default) = sized by the shared memory plan from the live
+               data+index size (128 MB minimum), leaving room for
                Elasticsearch, Valkey and PHP workers.
       bind     comma-separated IPv4 addresses and/or ::1 (default 127.0.0.1)
                IPV4 auto-detects the server's public IPv4; on NAT it falls
                back to the local outbound IPv4
                e.g. bind=127.0.0.1,2.3.4.5  or  bind=127.0.0.1,IPV4
   --valkey    [ram=2g] [policy=allkeys-lru] [io_threads=1]
-      ram        maxmemory (default: 10% of RAM, clamped to 256 MB..8 GB)
+      ram        maxmemory (default: live working set +20%, 128 MB minimum,
+                 from the shared memory plan)
       policy     maxmemory-policy (default allkeys-lru; use noeviction or
                  volatile-lru when Valkey stores sessions/jobs that must survive)
       io_threads extra socket I/O threads (default 1; raise only after
                  valkey-benchmark shows the main thread is saturated)
   --elastic   [ram=4g|auto] [host=localhost]
-      ram        JVM heap (default: auto = 25% of RAM, clamped to
-                 512 MB..31 GB, leaving room for MariaDB/Valkey/PHP)
+      ram        JVM heap (default: auto = index store / 4, clamped to
+                 512 MB..25% of RAM (31 GB ceiling); the page cache serves
+                 the index)
   --others    smartmon nvme gif nodejs sysstat
               (or: --others all)
       nvme-cli is installed only on a dedicated server with NVMe storage.
@@ -1374,7 +1379,9 @@ validate_all() {
   if [[ ${ENABLED[mariadb]:-0} -eq 1 ]]; then
     [[ -n ${OPT[mariadb.user]:-} ]] || die "--mariadb user= is required"
     [[ -n ${OPT[mariadb.pass]:-} ]] || die "--mariadb pass= is required"
-    [[ -n ${OPT[mariadb.size]:-} ]] || die "--mariadb size= is required (for example size=4gb)"
+    # size= defaults to auto: the shared memory planner sizes the buffer pool
+    # from the live data, exactly as --optimize does.
+    [[ -n ${OPT[mariadb.size]:-} ]] || OPT[mariadb.size]=auto
     [[ ${OPT[mariadb.user]} =~ ^[A-Za-z0-9_]+$ ]] \
       || die "--mariadb user= may only contain letters, digits and underscore"
     [[ ${OPT[mariadb.pass]} != *$'\n'* ]] || die "--mariadb pass= must not contain a newline"
@@ -1637,13 +1644,55 @@ mb_to_config() {
 # configure_sysctl on install, but --optimize must respect whatever the live
 # kernel already allows instead of asking for 65535 unconditionally.
 effective_backlog() {
-  local somaxconn
-  somaxconn=$(cat /proc/sys/net/core/somaxconn 2>/dev/null || printf '4096')
-  [[ $somaxconn =~ ^[0-9]+$ ]] || somaxconn=4096
+  # Derive the value from the same CPU formula configure_sysctl writes, so
+  # MariaDB back_log, Valkey tcp-backlog and PHP listen.backlog do not depend
+  # on whether the sysctl step already ran in this process (installing a
+  # service without --basic used to bake the kernel default 4096 into the
+  # service file, and the next --optimize rewrote it).
+  local somaxconn live
+  somaxconn=$(sysctl_target_somaxconn)
+  live=$(cat /proc/sys/net/core/somaxconn 2>/dev/null || printf '')
+  # A kernel that cannot be tuned (unprivileged container) caps what a
+  # listener may ask for; never exceed it.
+  if [[ $live =~ ^[0-9]+$ ]] && (( live < somaxconn )) && [[ ! -w /proc/sys/net/core/somaxconn ]]; then
+    somaxconn=$live
+  fi
   (( somaxconn > 65535 )) && somaxconn=65535
   (( somaxconn < 1024 )) && somaxconn=1024
   printf '%s' "$somaxconn"
 }
+
+# net.core.somaxconn for this host.  One formula shared by configure_sysctl
+# and effective_backlog.  A VPS keeps a lower ceiling: provider conntrack and
+# hypervisor limits make larger values unreachable and they only pin kernel
+# memory.
+sysctl_target_somaxconn() {
+  local cpu val
+  cpu=$(effective_cpus)
+  (( cpu > 0 )) || cpu=1
+  if host_is_vps; then
+    val=$(( cpu * 2048 )); (( val < 4096 )) && val=4096; (( val > 65536 )) && val=65536
+  else
+    val=$(( cpu * 4096 )); (( val < 4096 )) && val=4096; (( val > 262144 )) && val=262144
+  fi
+  printf '%s' "$val"
+}
+
+# True on a virtual machine or container.  --basic server=dedi|vps wins so an
+# operator can pin a host; otherwise systemd-detect-virt/DMI decide.  The
+# result is cached because the tuners call it many times per run.
+HOST_SERVER_TYPE=""
+host_server_type() {
+  if [[ -z $HOST_SERVER_TYPE ]]; then
+    case ${OPT[basic.server]:-} in
+      dedi|vps) HOST_SERVER_TYPE=${OPT[basic.server]} ;;
+      *) HOST_SERVER_TYPE=$(detect_server_type) ;;
+    esac
+    [[ $HOST_SERVER_TYPE == vps ]] || HOST_SERVER_TYPE=dedi
+  fi
+  printf '%s' "$HOST_SERVER_TYPE"
+}
+host_is_vps() { [[ $(host_server_type) == vps ]]; }
 
 # ---------------------------------------------------------------------------
 # Server configuration repository
@@ -2003,8 +2052,14 @@ cpu_performance_governor_available() {
 
 configure_cpu_governor() {
   step "CPU governor (dedicated server)"
-  # Many dedicated hosts, and every VM, expose no cpufreq interface.  Treat
-  # that as an informational skip instead of a failed service/warning.
+  # A guest's governor is the hypervisor's business; a VPS that exposes a
+  # cpufreq interface (nested virtualisation, some LXC hosts) must not fight
+  # it.  Many dedicated hosts expose no cpufreq interface either; treat both
+  # as an informational skip instead of a failed service/warning.
+  if host_is_vps; then
+    info "Virtual host: leaving the CPU governor to the hypervisor"
+    return 0
+  fi
   if ! cpu_performance_governor_available; then
     info "No performance CPU governor on this host; skipping governor setup"
     return 0
@@ -2139,13 +2194,26 @@ configure_swap() {
   swapon --show
 }
 
+# Swap target: half of RAM, but never below 1 GiB and never above 8 GiB on a
+# dedicated host (4 GiB on a VPS).  Half of a 256 GB host is a 128 GB file
+# that only prolongs an OOM situation.
+swap_target_bytes() {
+  local ram=$1 target min=$(( 1024 * 1024 * 1024 )) max
+  max=$(( 8 * 1024 * 1024 * 1024 ))
+  host_is_vps && max=$(( 4 * 1024 * 1024 * 1024 ))
+  target=$(( ram / 2 ))
+  (( target < min )) && target=$min
+  (( target > max )) && target=$max
+  printf '%s' "$target"
+}
+
 configure_swap_auto() {
   local ram current target needed old_size new_size
   step "Swap (auto: 50% of RAM)"
 
   ram=$(ram_total_bytes)
   current=$(swap_total_bytes)
-  target=$(( ram / 2 ))
+  target=$(swap_target_bytes "$ram")
   info "RAM: $(numfmt --to=iec "$ram"); current swap: $(numfmt --to=iec "$current"); target swap: $(numfmt --to=iec "$target")"
 
   if (( current >= target )); then
@@ -2191,8 +2259,11 @@ SYSCTL_MANAGED_KEYS=(
   net.ipv4.neigh.default.gc_thresh3
   net.ipv4.ipfrag_low_thresh net.ipv4.ipfrag_high_thresh
   net.netfilter.nf_conntrack_max
+  net.ipv6.ip6frag_low_thresh net.ipv6.ip6frag_high_thresh
   fs.file-max fs.nr_open fs.inotify.max_user_watches
   vm.min_free_kbytes kernel.shmmax kernel.shmall
+  vm.dirty_background_bytes vm.dirty_bytes vm.dirty_background_ratio vm.dirty_ratio
+  vm.swappiness vm.overcommit_memory vm.overcommit_ratio
 )
 
 record_sysctl_values() {
@@ -2292,7 +2363,7 @@ configure_sysctl() {
   local arp_thresh3 arp_thresh2
   cpu=$(effective_cpus)
   (( cpu > 0 )) || cpu=1
-  ram_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
+  ram_mb=$(mem_total_mb)
   (( ram_mb > 0 )) || ram_mb=1024
   min_free=$(( ram_mb * 1024 / 100 ))       # 1% of RAM, in kB
   (( min_free < 67584 ))  && min_free=67584
@@ -2301,14 +2372,38 @@ configure_sysctl() {
   # Scale listener/connection limits with CPU count and RAM.  The clamps keep
   # a 1 GB VPS conservative and stop a 256-core host from reserving absurd
   # amounts of unswappable kernel memory.
-  somaxconn=$(( cpu * 4096 ));          (( somaxconn < 4096 )) && somaxconn=4096;             (( somaxconn > 262144 )) && somaxconn=262144
-  syn_backlog=$(( cpu * 4096 ));        (( syn_backlog < 1024 )) && syn_backlog=1024;          (( syn_backlog > 262144 )) && syn_backlog=262144
+  # somaxconn is shared with effective_backlog (service listen backlogs).
+  somaxconn=$(sysctl_target_somaxconn)
+  syn_backlog=$somaxconn
   netdev_backlog=$(( cpu * 2048 ));     (( netdev_backlog < 4096 )) && netdev_backlog=4096;    (( netdev_backlog > 65536 )) && netdev_backlog=65536
   tw_buckets=$(( ram_mb * 16 ));        (( tw_buckets < 65536 )) && tw_buckets=65536;          (( tw_buckets > 2621440 )) && tw_buckets=2621440
   max_orphans=$(( ram_mb * 2 ));        (( max_orphans < 16384 )) && max_orphans=16384;        (( max_orphans > 262144 )) && max_orphans=262144
   file_max=$(( ram_mb * 1024 ));        (( file_max < 1048576 )) && file_max=1048576;          (( file_max > 10485760 )) && file_max=10485760
   inotify_watches=$(( ram_mb * 4096 )); (( inotify_watches < 524288 )) && inotify_watches=524288; (( inotify_watches > 2097152 )) && inotify_watches=2097152
   conntrack_max=$(( ram_mb * 16 ));     (( conntrack_max < 65536 )) && conntrack_max=65536;    (( conntrack_max > 4194304 )) && conntrack_max=4194304
+  if host_is_vps; then
+    # Provider conntrack/hypervisor limits make larger tables unreachable;
+    # they only pin guest kernel memory.
+    conntrack_max=$(( ram_mb * 8 ));    (( conntrack_max < 32768 )) && conntrack_max=32768;    (( conntrack_max > 1048576 )) && conntrack_max=1048576
+    (( netdev_backlog > 16384 )) && netdev_backlog=16384
+  fi
+  # Writeback thresholds in bytes.  The stock 30%/5% ratios let a 64 GB host
+  # accumulate ~19 GB of dirty pages and then stall every writer (Angie
+  # cache, Elasticsearch segments, logs) on the flush; rotational disks get
+  # tighter caps.
+  local disk_class dirty_bg_mb dirty_mb rmem_max
+  disk_class=$(storage_class)
+  dirty_bg_mb=$(( ram_mb / 100 ));      (( dirty_bg_mb < 64 )) && dirty_bg_mb=64;              (( dirty_bg_mb > 512 )) && dirty_bg_mb=512
+  [[ $disk_class == hdd ]] && (( dirty_bg_mb > 256 )) && dirty_bg_mb=256
+  dirty_mb=$(( dirty_bg_mb * 4 ));      (( dirty_mb < 256 )) && dirty_mb=256;                  (( dirty_mb > 2048 )) && dirty_mb=2048
+  [[ $disk_class == hdd ]] && (( dirty_mb > 1024 )) && dirty_mb=1024
+  # Socket buffer maxima: 32 MB is plenty for 1-10G links; a small host
+  # cannot afford 32 MB per socket.
+  rmem_max=33554432
+  (( ram_mb < 4096 )) && rmem_max=16777216
+  # The base profile also sets the net.nf_conntrack_max alias, which the
+  # de-duplication cannot match against net.netfilter.nf_conntrack_max.
+  sed_in_place -E '/^[[:space:]]*net\.nf_conntrack_max[[:space:]]*=/d' /etc/sysctl.conf
   ipfrag_high=$(( ram_mb * 32 ));       (( ipfrag_high < 262144 )) && ipfrag_high=262144;      (( ipfrag_high > 4194304 )) && ipfrag_high=4194304
   ipfrag_low=$(( ipfrag_high * 3 / 4 ))
   arp_thresh3=$(( cpu * 1024 ));        (( arp_thresh3 < 2048 )) && arp_thresh3=2048;          (( arp_thresh3 > 262144 )) && arp_thresh3=262144
@@ -2318,10 +2413,10 @@ configure_sysctl() {
 # BEGIN setup.sh tuning
 # Larger socket buffers and connection headroom for high-request-rate sites.
 net.core.optmem_max = 262144
-net.core.rmem_max = 33554432
-net.core.wmem_max = 33554432
-net.ipv4.tcp_rmem = 8192 262144 33554432
-net.ipv4.tcp_wmem = 8192 262144 33554432
+net.core.rmem_max = ${rmem_max}
+net.core.wmem_max = ${rmem_max}
+net.ipv4.tcp_rmem = 8192 262144 ${rmem_max}
+net.ipv4.tcp_wmem = 8192 262144 ${rmem_max}
 net.core.somaxconn = ${somaxconn}
 net.core.netdev_max_backlog = ${netdev_backlog}
 net.ipv4.tcp_max_syn_backlog = ${syn_backlog}
@@ -2335,7 +2430,12 @@ net.ipv4.neigh.default.gc_thresh3 = ${arp_thresh3}
 # Keep low <= high.  A lower high mark is rejected while the old low mark is
 # still above it, so write the low mark first and the high mark second.
 $(ipfrag_sysctl_lines "$ipfrag_high" "$ipfrag_low")
+net.ipv6.ip6frag_low_thresh = ${ipfrag_low}
+net.ipv6.ip6frag_high_thresh = ${ipfrag_high}
 net.netfilter.nf_conntrack_max = ${conntrack_max}
+# Byte thresholds override the percentage knobs from the base profile.
+vm.dirty_background_bytes = $(( dirty_bg_mb * 1048576 ))
+vm.dirty_bytes = $(( dirty_mb * 1048576 ))
 fs.file-max = ${file_max}
 fs.nr_open = ${file_max}
 fs.inotify.max_user_watches = ${inotify_watches}
@@ -2449,6 +2549,60 @@ EOF
   # start would not re-apply a changed qdisc/congestion-control value.
   systemctl restart setup-network-tuning.service \
     || warn "Could not apply ${TCP_CC}/${QDISC} tuning"
+}
+
+# Storage-class dependent host settings that no service file carries:
+#   * transparent huge pages -> madvise (MariaDB and Valkey both warn about
+#     "always"; latency spikes under memory pressure)
+#   * periodic TRIM on SSD/NVMe
+#   * I/O scheduler and readahead per device class via a udev rule
+# Shared by --basic and --optimize; everything is recorded for --purge.
+configure_io_tuning() {
+  step "Storage/THP profile"
+  ensure_state
+  local class unit=/etc/systemd/system/setup-io-tuning.service
+  local rule=/etc/udev/rules.d/60-setup-io.rules
+  class=$(storage_class)
+  record_original "$unit" setup-io-tuning.service
+  record_original "$rule" udev-60-setup-io.rules
+  cat > "$unit" <<'EOF'
+[Unit]
+Description=Apply transparent-hugepage tuning (setup.sh)
+After=local-fs.target
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'for f in enabled defrag; do p=/sys/kernel/mm/transparent_hugepage/$f; [ -w "$p" ] && echo madvise > "$p"; done; exit 0'
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
+EOF
+  chmod 644 "$unit"
+  cat > "$rule" <<'EOF'
+# setup.sh: I/O scheduler and readahead by device class.
+# NVMe: no scheduler (the device queues), small readahead for random I/O.
+ACTION=="add|change", KERNEL=="nvme[0-9]*n[0-9]*", ATTR{queue/scheduler}="none", ATTR{bdi/read_ahead_kb}="128"
+# SSD and paravirtual disks: mq-deadline, small readahead.
+ACTION=="add|change", KERNEL=="sd[a-z]*|vd[a-z]*|xvd[a-z]*", ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="mq-deadline", ATTR{bdi/read_ahead_kb}="128"
+# Rotational disks: mq-deadline with a larger readahead for sequential scans.
+ACTION=="add|change", KERNEL=="sd[a-z]*", ATTR{queue/rotational}=="1", ATTR{queue/scheduler}="mq-deadline", ATTR{bdi/read_ahead_kb}="1024"
+EOF
+  chmod 644 "$rule"
+  systemctl daemon-reload || true
+  systemctl enable setup-io-tuning.service >/dev/null 2>&1 || true
+  systemctl restart setup-io-tuning.service 2>/dev/null || warn "Could not apply the THP setting"
+  udevadm control --reload-rules 2>/dev/null || true
+  udevadm trigger --subsystem-match=block --action=change 2>/dev/null || true
+  case $class in
+    nvme|ssd)
+      if systemctl list-unit-files fstrim.timer >/dev/null 2>&1; then
+        if ! systemctl is-enabled --quiet fstrim.timer 2>/dev/null; then
+          touch "${STATE_DIR}/fstrim-timer-enabled"
+        fi
+        systemctl enable --now fstrim.timer >/dev/null 2>&1 || warn "Could not enable fstrim.timer"
+      fi
+      ;;
+  esac
+  info "Storage class ${class}: THP=madvise, scheduler/readahead rule installed$( [[ $class != hdd ]] && printf ', fstrim.timer enabled')"
 }
 
 configure_limits() {
@@ -2615,6 +2769,7 @@ install_basic() {
 
   configure_sysctl
   configure_limits
+  configure_io_tuning
   ensure_log_dirs
   configure_logrotate
 
@@ -3114,6 +3269,46 @@ tune_xf_static_assets() {
   return 0
 }
 
+# Per-IP rate limiting exempts loopback only.  A load generator, uptime
+# monitor or reverse proxy on another host is throttled to 100 GET/s and
+# answered with 429, which silently invalidates a remote benchmark (every
+# earlier external run that used wrk, which does not report status codes,
+# measured the rate limiter).  SETUP_LIMIT_REQ_EXEMPT="10.0.0.5,192.0.2.0/24"
+# adds managed entries to the geo whitelist; an empty value removes them.
+tune_limit_req_exemptions() {
+  local file=$1 label=$2 tmp entry
+  local -a entries=()
+  grep -qE '^[[:space:]]*geo[[:space:]]+\$limit_req_whitelist[[:space:]]*[{]' "$file" || return 0
+  local raw=${SETUP_LIMIT_REQ_EXEMPT:-}
+  raw=${raw//,/ }
+  for entry in $raw; do
+    [[ $entry =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ || $entry =~ ^[0-9a-fA-F:]+(/[0-9]+)?$ ]] || {
+      tune_miss "${label}: ignoring invalid SETUP_LIMIT_REQ_EXEMPT entry '${entry}'"
+      continue
+    }
+    entries+=("$entry")
+  done
+  tmp=$(tmp_file) || return 1
+  awk -v n="${#entries[@]}" -v list="${entries[*]}" '
+    BEGIN { split(list, arr, " ") }
+    /# setup.sh exempt$/ { next }
+    { print }
+    /^[[:space:]]*geo[[:space:]]+\$limit_req_whitelist[[:space:]]*[{]/ && !done {
+      for (i = 1; i <= n; i++) printf "    %s 1; # setup.sh exempt\n", arr[i]
+      done = 1
+    }
+  ' "$file" > "$tmp" || return 1
+  if ! cmp -s "$file" "$tmp"; then
+    cat "$tmp" > "$file"
+    if (( ${#entries[@]} > 0 )); then
+      tune_note "${label}: rate-limit exemptions: ${entries[*]}"
+    else
+      tune_note "${label}: removed managed rate-limit exemptions"
+    fi
+  fi
+  return 0
+}
+
 tune_angie_configs() {
   local target=${1:-/etc/angie}
   local nginx_conf="${target}/angie.conf"
@@ -3138,28 +3333,19 @@ tune_angie_configs() {
 
   nproc=$(effective_cpus)
   (( nproc > 0 )) || nproc=1
-  mem_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 1024)
+  mem_mb=$(mem_total_mb)
   (( mem_mb > 0 )) || mem_mb=1024
 
   disk_class=$(storage_class)
+  disk_free_mb=$(angie_disk_free_mb)
 
-  disk_free_mb=$(df -Pm /var/www 2>/dev/null | awk 'NR==2{print $4}' || true)
-  [[ $disk_free_mb =~ ^[0-9]+$ ]] || disk_free_mb=$(df -Pm / 2>/dev/null | awk 'NR==2{print $4}' || true)
-  [[ $disk_free_mb =~ ^[0-9]+$ ]] || disk_free_mb=10240
-
-  worker_rlimit=$(tune_clamp $(( nproc * 8192 )) 65536 524288)
-  worker_connections=$(tune_clamp $(( nproc * 2048 )) 8192 65535)
-  (( worker_connections > worker_rlimit - 1024 )) && worker_connections=$(( worker_rlimit - 1024 ))
-  (( worker_connections < 1024 )) && worker_connections=1024
-  # Angie's upstream keepalive pool must cover concurrent PHP requests.  Key
-  # it to the planned FPM worker count instead of the CPU count: on a 16-thread
-  # host with 144 workers, nproc*2 left only 32 reusable upstream connections.
-  local ka_base=$(( nproc * 2 ))
-  if [[ ${OPT_PHP_CHILDREN:-0} =~ ^[0-9]+$ ]] && (( OPT_PHP_CHILDREN > 0 )); then
-    ka_base=$(( OPT_PHP_CHILDREN / 2 ))
-  fi
-  php_keepalive=$(tune_clamp "$ka_base" 16 512)
-  open_files=$(tune_clamp $(( nproc * 2048 )) 10000 200000)
+  angie_worker_limits "$nproc"
+  worker_rlimit=$ANGIE_WORKER_RLIMIT
+  worker_connections=$ANGIE_WORKER_CONNECTIONS
+  php_keepalive=$ANGIE_PHP_KEEPALIVE
+  # The open-file cache holds static assets, templates and cache objects;
+  # size it with RAM (and the file count that implies), not the core count.
+  open_files=$(tune_clamp $(( mem_mb * 8 )) 10000 200000)
 
   if (( mem_mb < 2048 )); then
     fastcgi_buffers='32 16k'; fastcgi_busy='256k'; body_buffer='64k'
@@ -3259,6 +3445,7 @@ tune_angie_configs() {
   proxy_size=$(tune_size_value "$proxy_mb")
   cdn_size=$(tune_size_value "$cdn_mb")
 
+  tune_replace "$nginx_conf" '^([[:space:]]*worker_processes[[:space:]]+)[^;]+;' "\\1${ANGIE_WORKER_PROCESSES};" "angie.conf: worker_processes=${ANGIE_WORKER_PROCESSES}"
   tune_replace "$nginx_conf" '^([[:space:]]*worker_rlimit_nofile[[:space:]]+)[0-9]+;' "\\1${worker_rlimit};" "angie.conf: worker_rlimit_nofile=${worker_rlimit}"
   tune_replace "$nginx_conf" '^([[:space:]]*worker_connections[[:space:]]+)[0-9]+;' "\\1${worker_connections};" "angie.conf: worker_connections=${worker_connections}"
   tune_replace "$nginx_conf" '^([[:space:]]*client_body_buffer_size[[:space:]]+).*;' "\\1${body_buffer};" "angie.conf: client_body_buffer_size=${body_buffer}"
@@ -3366,6 +3553,17 @@ tune_angie_configs() {
     tune_replace "$f_limit" \
       'zone=limit_req_get_perip:[0-9]+m' "zone=limit_req_get_perip:${limit_get}m" \
       "${f_limit#"${target}"/}: GET zone=${limit_get}m"
+    # A flood of rejected requests must not turn into a flood of log writes:
+    # at 20k req/s the per-rejection warning wrote 266 MB of error log in two
+    # minutes (measured), which is a self-inflicted disk bottleneck.  Log
+    # rejections at info level (below the configured warn error_log level);
+    # the 429 count stays visible in the Angie status and access metrics.
+    tune_replace "$f_limit" \
+      '^([[:space:]]*limit_req_log_level[[:space:]]+)[a-z]+;' '\1info;' \
+      "${f_limit#"${target}"/}: limit_req_log_level=info"
+    tune_ensure_line "$f_limit" '^[[:space:]]*limit_req_log_level[[:space:]]' \
+      'limit_req_log_level info;' "${f_limit#"${target}"/}: added limit_req_log_level=info"
+    tune_limit_req_exemptions "$f_limit" "${f_limit#"${target}"/}"
   else
     tune_miss "http.d: no active limit_req_zone"
   fi
@@ -3595,8 +3793,10 @@ sync_php_ini_template() {
   [[ -n $template ]] || template="${SCRIPT_DIR}/configs/php/custom_dan.ini"
   [[ -f $template ]] || { tune_miss "PHP ${ver}: custom_dan.ini template not found"; return 0; }
 
-  local tz=""
-  if [[ -f $target ]]; then
+  # Precedence: an explicit install timezone (--basic time=), then the live
+  # ini value, then the host's /etc/timezone.
+  local tz=${PHP_INI_TZ:-}
+  if [[ -z $tz && -f $target ]]; then
     tz=$(awk -F= '/^[[:space:]]*date\.timezone[[:space:]]*=/{v=$2; gsub(/^[[:space:]]+|[[:space:]]+$/, "", v); print v; exit}' "$target")
   fi
   if [[ -z $tz && -r /etc/timezone ]]; then
@@ -3656,12 +3856,12 @@ tune_php_fpm_version() {
     [[ -n $socket ]] || socket=/run/php/php-fpm.sock
   fi
 
-  local nproc ram_mb max_children max_requests max_by_cpu php_budget backlog
+  local nproc ram_mb max_children max_requests php_budget backlog
   local opcache_mb jit_mb memory_mb realpath_kb php_allowance
-  local current_children max_by_ram
+  local current_children
   nproc=$(effective_cpus)
   (( nproc > 0 )) || nproc=1
-  ram_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
+  ram_mb=$(mem_total_mb)
   backlog=$(effective_backlog)
 
   php_allowance=${OPT_PHP_ALLOWANCE_MB:-0}
@@ -3679,34 +3879,29 @@ tune_php_fpm_version() {
   # its stock 64-worker pool, and that placeholder must not override the
   # hardware-sized pool.
   [[ ${PHP_FRESH_INSTALL:-0} == 1 ]] && current_children=0
+  local live_children="" explicit_value
   if (( current_children > 0 )) \
      && systemctl is-active --quiet "php${ver}-fpm" 2>/dev/null; then
     # A live pool keeps its worker count: the reservation is a memory
     # estimate, not a worker quota.
-    max_children=$current_children
+    live_children=$current_children
+  fi
+  # An explicit --php children=/max_requests= written at install time is an
+  # operator decision, not a hardware guess: keep it across --optimize runs.
+  explicit_value=$(explicit_option php_children 2>/dev/null || true)
+  if [[ -n $live_children || -n $explicit_value ]]; then
+    max_children=$(php_children_ceiling "$nproc" "$ram_mb" "$live_children" "$explicit_value")
   elif (( ${OPT_PHP_CHILDREN:-0} > 0 )); then
     # The shared planner already derived the count with the same CPU/RAM
     # ceilings used here, so a fresh install and --optimize agree.
     max_children=$OPT_PHP_CHILDREN
   elif (( php_budget > 0 )); then
     # Standalone call (no plan): fall back to the reservation divisor.
-    max_children=$(( php_budget / 96 ))
+    max_children=$(php_children_ceiling "$nproc" "$ram_mb" "$(( php_budget / 96 ))" "")
   else
-    max_children=$(( ram_mb * 50 / 100 / 96 ))
+    max_children=$(php_children_ceiling "$nproc" "$ram_mb" "" "")
   fi
-  max_by_ram=$(( ram_mb * 50 / 100 / 96 ))
-  (( max_children > max_by_ram )) && max_children=$max_by_ram
-  max_by_cpu=$(( nproc * 16 ))
-  (( max_children > max_by_cpu )) && max_children=$max_by_cpu
-  (( max_children > 512 )) && max_children=512
-  (( max_children < 8 )) && max_children=8
   max_requests=$(( nproc * 1024 ))
-  # An explicit --php children=/max_requests= written at install time is an
-  # operator decision, not a hardware guess: keep it across --optimize runs.
-  local explicit_value
-  if explicit_value=$(explicit_option php_children); then
-    [[ $explicit_value =~ ^[0-9]+$ ]] && (( explicit_value > 0 )) && max_children=$explicit_value
-  fi
   if explicit_value=$(explicit_option php_max_requests); then
     [[ $explicit_value =~ ^[0-9]+$ ]] && (( explicit_value > 0 )) && max_requests=$explicit_value
   fi
@@ -3797,7 +3992,7 @@ realpath_cache_ttl = 43200
 opcache.enable = 1
 opcache.enable_cli = 0
 opcache.memory_consumption = ${opcache_mb}
-opcache.interned_strings_buffer = 32
+opcache.interned_strings_buffer = $(( opcache_mb / 8 < 16 ? 16 : (opcache_mb / 8 > 64 ? 64 : opcache_mb / 8) ))
 opcache.jit_buffer_size = ${jit_mb}M
 opcache.jit = tracing
 opcache.max_accelerated_files = 128256
@@ -4396,7 +4591,11 @@ purge_php_installations() {
 
 install_php() {
   local ver=${OPT[php.ver]:-}
-  local tz=${OPT[basic.time]:-Asia/Manila}
+  # The php.ini timezone follows --basic time=; a --php-only run keeps the
+  # host's own timezone (sync_php_ini_template falls back to /etc/timezone),
+  # exactly like --optimize does.
+  local tz=""
+  [[ ${ENABLED[basic]:-0} -eq 1 ]] && tz=${OPT[basic.time]:-Asia/Manila}
   local php_backup=""
   step "PHP ${ver:-auto}"
 
@@ -4423,9 +4622,6 @@ install_php() {
   # still in use by another process.
   [[ -S /run/php/php-fpm.sock ]] \
     && info "Leaving existing FastCGI socket for PHP-FPM to validate"
-  mkdir -p /run/php
-  chown www-data:www-data /run/php 2>/dev/null || true
-  chmod 755 /run/php
 
   # XenForo-focused extension set: runtime, database, media, HTTP, XML,
   # archives, math, multibyte, Redis, OPcache and the CLI for XenForo cmd.php.
@@ -4476,7 +4672,8 @@ install_php() {
     || die "PHP php.ini template not found: configs/php/custom_dan.ini"
 
   install -m 644 "$pool_template" "/etc/php/${ver}/fpm/pool.d/www.conf"
-  install -m 644 "$ini_template" "/etc/php/${ver}/fpm/conf.d/custom_dan.ini"
+  # Same template writer as --optimize (timezone handling included).
+  PHP_INI_TZ="$tz" sync_php_ini_template "$ver" || die "Could not write custom_dan.ini"
 
   # Hardware-aware pool/ini tuning lives in tune_php_fpm_version, shared with
   # the --optimize command.  It writes the socket listener and the final
@@ -4489,34 +4686,18 @@ install_php() {
     return 1
   fi
   PHP_FRESH_INSTALL=0
+  # Explicit --php children=/max_requests= were recorded by
+  # record_explicit_options before the plan; tune_php_fpm_version applied
+  # them, so only report them here.
   if [[ -n ${OPT[php.children]:-} && ${OPT[php.children]} != auto ]]; then
-    tune_pool_set "/etc/php/${ver}/fpm/pool.d/www.conf" pm.max_children \
-      "${OPT[php.children]}" "PHP ${ver}: max_children override=${OPT[php.children]}"
     info "PHP max_children overridden to ${OPT[php.children]}"
-    explicit_option_set php_children "${OPT[php.children]}"
-  else
-    explicit_option_unset php_children
   fi
   if [[ -n ${OPT[php.max_requests]:-} ]]; then
-    tune_pool_set "/etc/php/${ver}/fpm/pool.d/www.conf" pm.max_requests \
-      "${OPT[php.max_requests]}" "PHP ${ver}: max_requests override=${OPT[php.max_requests]}"
-    explicit_option_set php_max_requests "${OPT[php.max_requests]}"
-  else
-    explicit_option_unset php_max_requests
+    info "PHP max_requests overridden to ${OPT[php.max_requests]}"
   fi
-  sed_in_place -E "s|^date\.timezone = .*|date.timezone = ${tz}|" \
-    "/etc/php/${ver}/fpm/conf.d/custom_dan.ini"
-
-  mkdir -p /var/cache/php/opcache
-  chown -R www-data:www-data /var/cache/php
-  chmod 750 /var/cache/php /var/cache/php/opcache
   ensure_log_dirs
 
-  mkdir -p "/etc/systemd/system/php${ver}-fpm.service.d"
-  install -m 644 "${SCRIPT_DIR}/configs/php/php-fpm-limits.conf" \
-    "/etc/systemd/system/php${ver}-fpm.service.d/limits.conf"
-  # Bound worker shutdown so a restart cannot sit in "deactivating".
-  ensure_fpm_global_timeout "$ver"
+  php_fpm_write_systemd_limits "$ver" || true
   systemctl daemon-reload
 
   # Only one PHP-FPM version can own the shared /run/php/php-fpm.sock socket.
@@ -4595,11 +4776,42 @@ configure_mariadb_apparmor() {
   fi
 }
 
+# Storage class of the MariaDB data directory (not /var/www: a separate data
+# volume must be classified on its own device).
+mariadb_storage_class() {
+  local dir="" class=""
+  if command -v mariadb >/dev/null 2>&1; then
+    dir=$(mariadb -N -B -e 'SELECT @@datadir' 2>/dev/null | head -n1 || true)
+  fi
+  if [[ -z $dir || ! -d $dir ]]; then
+    for dir in /var/lib/mysql /var/lib/mariadb; do
+      [[ -d $dir ]] && break
+    done
+  fi
+  [[ -d $dir ]] && class=$(storage_backing_class "$dir" 2>/dev/null || true)
+  [[ -n $class ]] || class=$(storage_class)
+  printf '%s' "$class"
+}
+
+# innodb_io_capacity / innodb_io_capacity_max by disk class and host type.
+# A VPS keeps lower background-flush targets: provider IOPS caps make the
+# dedicated-host values unreachable and InnoDB then flushes too aggressively.
+# SETUP_MARIADB_IO_CAPACITY="read max" pins a host.
 mariadb_io_capacity() {
-  case $(storage_class) in
-    nvme) printf '4000 8000' ;;
-    ssd)  printf '2000 4000' ;;
-    *)    printf '400 800' ;;
+  local class virt=dedi
+  if [[ ${SETUP_MARIADB_IO_CAPACITY:-} =~ ^[0-9]+[[:space:]]+[0-9]+$ ]]; then
+    printf '%s' "$SETUP_MARIADB_IO_CAPACITY"
+    return 0
+  fi
+  class=$(mariadb_storage_class)
+  host_is_vps && virt=vps
+  case "${class}-${virt}" in
+    nvme-dedi) printf '10000 20000' ;;
+    nvme-vps)  printf '3000 6000' ;;
+    ssd-dedi)  printf '4000 8000' ;;
+    ssd-vps)   printf '1000 2000' ;;
+    hdd-dedi)  printf '400 800' ;;
+    *)         printf '200 400' ;;
   esac
 }
 
@@ -4614,6 +4826,11 @@ MARIADB_PROFILE_THREADS=""
 MARIADB_PROFILE_MAX_CONN=""
 MARIADB_PROFILE_IO_READ=""
 MARIADB_PROFILE_IO_WRITE=""
+MARIADB_PROFILE_IO_THREADS=""
+MARIADB_PROFILE_FLUSH_NEIGHBORS=""
+MARIADB_PROFILE_LRU_DEPTH=""
+MARIADB_PROFILE_THREAD_CACHE=""
+MARIADB_PROFILE_TMP_MB=""
 MARIADB_PROFILE_BACKLOG=""
 
 # Remove the performance/logging directives from 50-server.cnf once the
@@ -4664,9 +4881,47 @@ mariadb_compute_profile() {
   (( threads > 64 )) && threads=64
   # PHP-FPM opens one MariaDB connection per active request.  A 500-connection
   # cap was hit at 500 concurrent requests (observed as "Too many connections"
-  # / HTTP 503 during the aggressive run).  Size the server above the FPM pool
-  # plus admin/backup headroom; the thread pool makes extra sessions cheap.
-  max_conn=$(( threads * 32 ))
+  # / HTTP 503 during the aggressive run).  Size the server from the PHP pool
+  # (every worker plus 25% and admin/backup/cron headroom); without a PHP
+  # tier fall back to the CPU formula.  The thread pool makes extra sessions
+  # cheap, so the ceiling errs on the high side.
+  local php_total
+  php_total=$(php_pool_max_children 2>/dev/null || true)
+  [[ $php_total =~ ^[0-9]+$ ]] || php_total=0
+  (( ${OPT_PHP_CHILDREN:-0} > php_total )) && php_total=$OPT_PHP_CHILDREN
+  if (( php_total > 0 )); then
+    max_conn=$(( php_total * 5 / 4 + 50 ))
+  else
+    max_conn=$(( threads * 32 ))
+  fi
+  # Disk-class dependent I/O behaviour.  Flushing neighbour pages only helps
+  # rotational disks; I/O threads beyond ~16 add contention, and an HDD
+  # cannot keep 16 threads busy.  The LRU scan depth follows io_capacity.
+  local disk_class io_read io_write io_threads lru_depth flush_neighbors tmp_mb thread_cache ram_mb
+  disk_class=$(mariadb_storage_class)
+  read -r io_read io_write <<< "$(mariadb_io_capacity)"
+  if [[ $disk_class == hdd ]]; then
+    io_threads=4
+    flush_neighbors=1
+  else
+    io_threads=$(( threads / 2 ))
+    (( io_threads < 4 )) && io_threads=4
+    (( io_threads > 16 )) && io_threads=16
+    flush_neighbors=0
+  fi
+  lru_depth=$(( io_read / 2 ))
+  (( lru_depth < 256 )) && lru_depth=256
+  (( lru_depth > 2048 )) && lru_depth=2048
+  thread_cache=$(( threads * 8 ))
+  (( thread_cache < 32 )) && thread_cache=32
+  (( thread_cache > 256 )) && thread_cache=256
+  # In-memory temp tables: forum GROUP BY/ORDER BY queries spill to disk at a
+  # fixed 64M on large sites; scale with RAM but never above pool/8.
+  ram_mb=$(mem_total_mb)
+  tmp_mb=$(( ram_mb / 256 ))
+  (( tmp_mb < 32 )) && tmp_mb=32
+  (( tmp_mb > 256 )) && tmp_mb=256
+  (( tmp_mb > size_mb / 8 && size_mb / 8 >= 32 )) && tmp_mb=$(( size_mb / 8 ))
   # Never lower an existing, larger ceiling: a busy application may already
   # allow more than threads*32 connections, and a tune must not turn into
   # "Too many connections" during a traffic peak.
@@ -4691,7 +4946,13 @@ mariadb_compute_profile() {
   MARIADB_PROFILE_ARIA_MB=$aria_mb
   MARIADB_PROFILE_THREADS=$threads
   MARIADB_PROFILE_MAX_CONN=$max_conn
-  read -r MARIADB_PROFILE_IO_READ MARIADB_PROFILE_IO_WRITE <<< "$(mariadb_io_capacity)"
+  MARIADB_PROFILE_IO_READ=$io_read
+  MARIADB_PROFILE_IO_WRITE=$io_write
+  MARIADB_PROFILE_IO_THREADS=$io_threads
+  MARIADB_PROFILE_FLUSH_NEIGHBORS=$flush_neighbors
+  MARIADB_PROFILE_LRU_DEPTH=$lru_depth
+  MARIADB_PROFILE_THREAD_CACHE=$thread_cache
+  MARIADB_PROFILE_TMP_MB=$tmp_mb
   MARIADB_PROFILE_BACKLOG=$(effective_backlog)
 }
 
@@ -4730,7 +4991,7 @@ mariadb_performance_settings() {
 max_connections = ${max_conn}
 max_connect_errors = 524288
 back_log = ${MARIADB_PROFILE_BACKLOG}
-thread_cache_size = 64
+thread_cache_size = ${MARIADB_PROFILE_THREAD_CACHE}
 thread_handling = pool-of-threads
 thread_pool_size = ${MARIADB_PROFILE_THREADS}
 max_allowed_packet = 64M
@@ -4747,14 +5008,14 @@ innodb_buffer_pool_load_at_startup = ON
 innodb_buffer_pool_dump_pct = 25
 innodb_stats_on_metadata = OFF
 innodb_lock_wait_timeout = 100
-innodb_flush_neighbors = 0
+innodb_flush_neighbors = ${MARIADB_PROFILE_FLUSH_NEIGHBORS}
 innodb_stats_persistent = ON
 innodb_stats_auto_recalc = ON
-innodb_lru_scan_depth = 2048
+innodb_lru_scan_depth = ${MARIADB_PROFILE_LRU_DEPTH}
 innodb_io_capacity = ${MARIADB_PROFILE_IO_READ}
 innodb_io_capacity_max = ${MARIADB_PROFILE_IO_WRITE}
-innodb_read_io_threads = ${MARIADB_PROFILE_THREADS}
-innodb_write_io_threads = ${MARIADB_PROFILE_THREADS}
+innodb_read_io_threads = ${MARIADB_PROFILE_IO_THREADS}
+innodb_write_io_threads = ${MARIADB_PROFILE_IO_THREADS}
 innodb_flush_log_at_trx_commit = 2
 EOF
   if (( major > 11 || (major == 11 && minor >= 8) )); then
@@ -4776,8 +5037,8 @@ join_buffer_size = 512K
 read_buffer_size = 512K
 read_rnd_buffer_size = 512K
 sort_buffer_size = 1M
-tmp_table_size = 64M
-max_heap_table_size = 64M
+tmp_table_size = ${MARIADB_PROFILE_TMP_MB}M
+max_heap_table_size = ${MARIADB_PROFILE_TMP_MB}M
 table_open_cache = ${MARIADB_PROFILE_OPEN_CACHE}
 table_definition_cache = ${MARIADB_PROFILE_OPEN_CACHE}
 innodb_open_files = ${MARIADB_PROFILE_OPEN_CACHE}
@@ -4809,22 +5070,14 @@ EOF
   chmod 644 "$cnf"
 }
 
-configure_mariadb() {
-  local size_mb=$1 bind=$2
-  local cnf=/etc/mysql/mariadb.conf.d/50-server.cnf
-  local optcnf=/etc/mysql/mariadb.conf.d/99-setup-optimize.cnf
-  local tmp
-  [[ -f $cnf ]] || die "MariaDB config ${cnf} not found"
-
-  # A fresh install writes performance values into 50-server.cnf.  If an
-  # earlier --optimize created the 99- drop-in, move it out of the live tree
-  # so the newly written 50- block is the single owner again instead of
-  # leaving two overlapping definitions.
-  if [[ -f $optcnf ]]; then
-    local moved
-    moved=$(preserve_to_tmp "$optcnf" 2>/dev/null || true)
-    [[ -n $moved ]] && info "Moved previous optimize tuning to ${moved}"
-  fi
+# Base (non-performance) settings in 50-server.cnf: charset, name resolution,
+# query cache off, secure_file_priv, local_infile=0 and the bind address.
+# Shared by the installer and --optimize so a host adopted by --optimize gets
+# the same security-relevant defaults as a fresh install.  Performance keys
+# live only in the 99-setup-optimize.cnf drop-in (write_mariadb_tuning_dropin).
+mariadb_write_base_block() {
+  local cnf=$1 bind=$2 tmp
+  [[ -f $cnf ]] || return 1
 
   # Comment out expire_logs_days if it is active.
   sed_in_place -E 's|^([[:space:]]*)expire_logs_days([[:space:]]*=)|\1#expire_logs_days\2|' "$cnf"
@@ -4864,6 +5117,13 @@ EOF
 bind-address = ${bind}
 ${MARIADB_END}
 EOF
+}
+
+configure_mariadb() {
+  local size_mb=$1 bind=$2
+  local cnf=/etc/mysql/mariadb.conf.d/50-server.cnf
+  [[ -f $cnf ]] || die "MariaDB config ${cnf} not found"
+  mariadb_write_base_block "$cnf" "$bind"
   write_mariadb_tuning_dropin "$size_mb"
 }
 
@@ -4876,26 +5136,11 @@ install_mariadb() {
   step "MariaDB"
 
   if [[ ${size,,} == auto ]]; then
-    local ram_mb
-    if (( ${OPT_MARIADB_BUDGET_MB:-0} > 0 )); then
-      size_mb=$OPT_MARIADB_BUDGET_MB
-      info "MariaDB size=auto resolved to $(mb_to_config "$size_mb") (shared memory plan)"
-    else
-      ram_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
-      size_mb=$(( ram_mb * 40 / 100 ))
-      (( size_mb < 256 )) && size_mb=256
-      info "MariaDB size=auto resolved to $(mb_to_config "$size_mb") (40% of RAM)"
-    fi
+    size_mb=$(service_mem_mb mariadb)
+    info "MariaDB size=auto resolved to $(mb_to_config "$size_mb") (shared memory plan)"
   else
     size_mb=$(size_to_mb "$size")
     [[ -n $size_mb ]] || die "Could not parse MariaDB size '${size}'"
-  fi
-
-  # Remember an explicit --mariadb size= so --optimize keeps it.
-  if [[ ${size,,} != auto ]]; then
-    explicit_option_set mariadb_size_mb "$size_mb"
-  else
-    explicit_option_unset mariadb_size_mb
   fi
 
   bind=${OPT[mariadb.bind]:-127.0.0.1}
@@ -4927,21 +5172,7 @@ install_mariadb() {
   systemctl enable --now mariadb
   systemctl status mariadb --no-pager || true
 
-  mkdir -p /etc/systemd/system/mariadb.service.d
-  local mariadb_limits_src="${SCRIPT_DIR}/configs/mariadb/limit_nofile.conf"
-  if [[ -f $mariadb_limits_src ]]; then
-    install -m 644 "$mariadb_limits_src" \
-      /etc/systemd/system/mariadb.service.d/limits.conf
-  else
-    cat > /etc/systemd/system/mariadb.service.d/limits.conf <<'EOF'
-[Service]
-LimitNOFILE=1048576
-LimitCORE=0
-# Silence the package unit's "unset environment variable" journal warning.
-Environment=MYSQLD_OPTS=
-Environment=_WSREP_NEW_CLUSTER=
-EOF
-  fi
+  mariadb_write_systemd_limits || true
 
   configure_mariadb "$size_mb" "$bind"
 
@@ -5038,7 +5269,7 @@ valkey_tuning_lines() {
 maxmemory ${max_mb}mb
 maxmemory-policy ${policy}
 maxmemory-samples 10
-maxclients 20000
+maxclients $(valkey_maxclients)
 tcp-backlog $(effective_backlog)
 timeout 0
 tcp-keepalive 300
@@ -5051,6 +5282,21 @@ lazyfree-lazy-server-del yes
 lazyfree-lazy-user-del yes
 lazyfree-lazy-user-flush yes
 EOF
+}
+
+# Client ceiling for the cache: every PHP worker can hold a few connections
+# (persistent plus a transient one), plus admin/cron headroom.  A fixed 20000
+# was far above what a small VPS can serve and below what a 512-worker host
+# may open.
+valkey_maxclients() {
+  local children total
+  children=$(php_pool_max_children 2>/dev/null || true)
+  [[ $children =~ ^[0-9]+$ ]] || children=0
+  (( ${OPT_PHP_CHILDREN:-0} > children )) && children=$OPT_PHP_CHILDREN
+  total=$(( children * 4 + 2000 ))
+  (( total < 10000 )) && total=10000
+  (( total > 100000 )) && total=100000
+  printf '%s' "$total"
 }
 
 install_valkey() {
@@ -5069,87 +5315,162 @@ install_valkey() {
   local conf=/etc/valkey/valkey.conf
   [[ -f $conf ]] || die "Valkey config ${conf} not found"
 
-  local line ram_mb valkey_mb policy io_threads
-  ram_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
+  local valkey_mb policy io_threads
   if [[ -n ${OPT[valkey.ram]:-} && ${OPT[valkey.ram],,} != auto ]]; then
     valkey_mb=$(size_to_mb "${OPT[valkey.ram]}")
-  elif (( ${OPT_VALKEY_BUDGET_MB:-0} > 0 )); then
-    valkey_mb=$OPT_VALKEY_BUDGET_MB
   else
-    valkey_mb=$(( ram_mb / 10 ))          # ~10% of RAM for cache
-    (( valkey_mb < 256 )) && valkey_mb=256
-    (( valkey_mb > 8192 )) && valkey_mb=8192
+    valkey_mb=$(service_mem_mb valkey)
   fi
   policy=${OPT[valkey.policy]:-allkeys-lru}
   # For typical web-cache command sizes, extra I/O threads add more CPU
   # contention than throughput.  Benchmarks on a 16-core host showed
   # io-threads=1 at 6.5k full-page req/s vs 5.1k at io-threads=8.
   io_threads=${OPT[valkey.io_threads]:-1}
-  # Remember an explicit --valkey ram= so --optimize does not "raise" it.
-  if [[ -n ${OPT[valkey.ram]:-} && ${OPT[valkey.ram],,} != auto ]]; then
-    explicit_option_set valkey_mb "$valkey_mb"
-  else
-    explicit_option_unset valkey_mb
-  fi
 
-  # Normalise the directives this script owns: remove active copies, then
-  # append the canonical values once.  This also upgrades old profiles that
-  # had "protected-mode no" without leaving contradictory duplicates.
-  sed_in_place -E '/^[[:space:]]*(bind|protected-mode|save|maxmemory|maxmemory-policy|maxmemory-samples|supervised|io-threads|io-threads-do-reads|tcp-backlog|tcp-keepalive|timeout|maxclients|hz|appendonly|lazyfree-[a-z-]+|unixsocket|unixsocketperm|logfile)[[:space:]]/d' "$conf"
-  local -a vlines=(
-    'supervised systemd'
-    "logfile ${LOG_ROOT}/valkey/valkey.log"
-    'save ""'
-    'appendonly no'
-    'bind 127.0.0.1 -::1'
-    'protected-mode yes'
-    'unixsocket /run/valkey/valkey.sock'
-    'unixsocketperm 770'
-  )
-  for line in "${vlines[@]}"; do
-    printf '%s\n' "$line" >> "$conf"
-  done
-  valkey_tuning_lines "$valkey_mb" "$policy" "$io_threads" >> "$conf"
-  info "Valkey maxmemory: ${valkey_mb} MB ($(printf '%s' "$policy"); ~10% of RAM by default)"
-  tail -20 "$conf"
+  # One writer for the base and tuning directives, shared with --optimize.
+  valkey_apply_config "$conf" valkey "$valkey_mb" "$policy" "$io_threads" /run/valkey/valkey.sock
+  info "Valkey maxmemory: ${valkey_mb} MB (${policy}; shared memory plan)"
+  tail -24 "$conf"
 
-  mkdir -p /etc/systemd/system/valkey-server.service.d
-  cat > /etc/systemd/system/valkey-server.service.d/limits.conf <<EOF
-[Service]
-LimitNOFILE=524288
-LimitCORE=0
-# The packaged unit uses ProtectSystem=strict; allow the central log tree.
-ReadWritePaths=${LOG_ROOT}/valkey
-EOF
+  valkey_write_systemd_limits valkey-server valkey || true
   systemctl daemon-reload
-
-  # Local PHP workers should use the Unix socket instead of opening a fresh
-  # TCP connection (and burning an ephemeral port) for every request.
-  if getent group valkey >/dev/null 2>&1; then
-    if ! id -nG www-data 2>/dev/null | grep -qw valkey; then
-      usermod -aG valkey www-data || warn "Could not add www-data to the valkey group"
-    fi
-  fi
 
   valkey-server -v
   systemctl enable --now valkey-server
   systemctl restart valkey-server
   systemctl status valkey-server -l --no-pager || true
 
-  # Refresh PHP-FPM workers so they inherit the valkey supplementary group.
-  local unit
-  while IFS= read -r unit; do
-    [[ -n $unit ]] || continue
-    systemctl restart "$unit" 2>/dev/null || true
-  done < <(systemctl list-units --type=service --state=active --no-legend 'php*-fpm.service' 2>/dev/null | awk '{print $1}')
+  # Local PHP workers should use the Unix socket instead of opening a fresh
+  # TCP connection (and burning an ephemeral port) for every request.  They
+  # inherit the valkey group only after a restart.
+  if valkey_ensure_www_group valkey; then
+    restart_php_workers_for_group valkey
+  fi
 
-  local i
-  for i in {1..20}; do
-    valkey-cli ping 2>/dev/null | grep -q PONG && break
-    sleep 1
-  done
+  wait_for_cmd 20 valkey_pong valkey-cli || true
   valkey-cli ping
   ok "Valkey installed and running"
+}
+
+# Base and tuning directives for Valkey/Redis.  Active copies of every
+# managed key are removed and the canonical block appended once, so a fresh
+# install and --optimize write byte-identical files and an old profile with
+# "protected-mode no" or RDB saves is upgraded without contradictory
+# duplicates.  Operator directives outside the managed set survive.
+valkey_apply_config() {
+  local conf=$1 kind=$2 max_mb=$3 policy=$4 io_threads=$5 socket=${6:-}
+  [[ -n $socket ]] || socket="/run/${kind}/${kind}.sock"
+  io_threads=$(valkey_clamp_io_threads "$io_threads")
+  sed_in_place -E '/^[[:space:]]*(bind|protected-mode|save|maxmemory|maxmemory-policy|maxmemory-samples|supervised|io-threads|io-threads-do-reads|tcp-backlog|tcp-keepalive|timeout|maxclients|hz|appendonly|lazyfree-[a-z-]+|unixsocket|unixsocketperm|logfile)[[:space:]]/d' "$conf"
+  {
+    printf '%s\n' 'supervised systemd' \
+      "logfile ${LOG_ROOT}/${kind}/${kind}.log" \
+      'save ""' \
+      'appendonly no' \
+      'bind 127.0.0.1 -::1' \
+      'protected-mode yes' \
+      "unixsocket ${socket}" \
+      'unixsocketperm 770'
+    valkey_tuning_lines "$max_mb" "$policy" "$io_threads"
+  } >> "$conf"
+}
+
+# Valkey's own guidance caps useful I/O threads well below the core count.
+# The installer and --optimize clamp identically so an install-time value is
+# never silently rewritten by the next tune.
+valkey_clamp_io_threads() {
+  local n=$1
+  [[ $n =~ ^[0-9]+$ ]] || n=1
+  (( n < 1 )) && n=1
+  (( n > 8 )) && n=8
+  printf '%s' "$n"
+}
+
+# Runtime-settable subset of valkey_tuning_lines (everything except the
+# startup-only keys), derived from the same helper so the live process and
+# the file cannot drift apart.
+valkey_runtime_settings() {
+  valkey_tuning_lines "$@" | grep -vE '^(tcp-backlog|io-threads) '
+}
+
+valkey_write_systemd_limits() {
+  local unit=$1 kind=$2
+  write_service_limits_dropin "/etc/systemd/system/${unit}.service.d/limits.conf" \
+"[Service]
+LimitNOFILE=524288
+LimitCORE=0
+# The packaged unit uses ProtectSystem=strict; allow the central log tree.
+ReadWritePaths=${LOG_ROOT}/${kind}"
+}
+
+# Add www-data to the cache's group for the Unix socket.  Returns 0 only when
+# the membership changed (the PHP workers then need a restart to pick it up).
+valkey_ensure_www_group() {
+  local group=$1
+  if ! getent group "$group" >/dev/null 2>&1; then
+    warn "Service group ${group} does not exist; the Unix socket will not be accessible to www-data"
+    return 1
+  fi
+  id -nG www-data 2>/dev/null | grep -qw "$group" && return 1
+  if usermod -aG "$group" www-data 2>/dev/null; then
+    return 0
+  fi
+  warn "Could not add www-data to the ${group} group"
+  return 1
+}
+
+valkey_pong() { "$1" ping 2>/dev/null | grep -q PONG; }
+
+# Run a probe once per second until it succeeds or N attempts are used up.
+wait_for_cmd() {
+  local attempts=$1 i
+  shift
+  for (( i = 1; i < attempts; i++ )); do
+    "$@" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  "$@" >/dev/null 2>&1
+}
+
+# Write a systemd drop-in (0644) only when its content changed.  Returns 0
+# when the file was created or changed, so the caller reloads/restarts, and 1
+# when it was already identical.
+write_service_limits_dropin() {
+  local path=$1 content=$2 before=""
+  mkdir -p "$(dirname "$path")"
+  [[ -f $path ]] && before=$(md5sum "$path" | awk '{print $1}')
+  printf '%s\n' "$content" > "$path"
+  chmod 644 "$path"
+  [[ $before != "$(md5sum "$path" | awk '{print $1}')" ]]
+}
+
+mariadb_write_systemd_limits() {
+  local src="${SCRIPT_DIR}/configs/mariadb/limit_nofile.conf" content
+  if [[ -f $src ]]; then
+    content=$(<"$src")
+  else
+    content='[Service]
+LimitNOFILE=1048576
+LimitCORE=0
+# Silence the package unit'"'"'s "unset environment variable" journal warning.
+Environment=MYSQLD_OPTS=
+Environment=_WSREP_NEW_CLUSTER='
+  fi
+  write_service_limits_dropin /etc/systemd/system/mariadb.service.d/limits.conf "$content"
+}
+
+php_fpm_write_systemd_limits() {
+  local ver=$1 src="${SCRIPT_DIR}/configs/php/php-fpm-limits.conf" content
+  if [[ -f $src ]]; then
+    content=$(<"$src")
+  else
+    content='[Service]
+LimitNOFILE=524288
+LimitCORE=0
+TimeoutStopSec=15
+UMask=0027'
+  fi
+  write_service_limits_dropin "/etc/systemd/system/php${ver}-fpm.service.d/limits.conf" "$content"
 }
 
 # ---------------------------------------------------------------------------
@@ -5188,12 +5509,15 @@ elasticsearch_write_performance_block() {
   # On a shared web/database host a simple query was measured bursting to 10
   # cores; scale the pools with the effective CPU count and cap them so the
   # search tier cannot starve PHP and MariaDB.
+  # A 1-2 vCPU host must not reserve four search threads that PHP and
+  # MariaDB need; Elasticsearch also rejects write.size above processors+1.
   search_threads=$(( cpus / 2 ))
-  (( search_threads < 4 )) && search_threads=4
+  (( search_threads < 1 )) && search_threads=1
   (( search_threads > 16 )) && search_threads=16
   write_threads=$(( cpus / 4 ))
-  (( write_threads < 2 )) && write_threads=2
+  (( write_threads < 1 )) && write_threads=1
   (( write_threads > 8 )) && write_threads=8
+  (( write_threads > cpus + 1 )) && write_threads=$(( cpus + 1 ))
   elasticsearch_comment_keys "$file" \
     bootstrap.memory_lock indices.query.bool.max_clause_count \
     indices.memory.index_buffer_size indices.fielddata.cache.size \
@@ -5216,6 +5540,46 @@ thread_pool.write.size: ${write_threads}
 EOF
   chmod 644 "$file"
 }
+
+# Elasticsearch refuses to start when vm.max_map_count is too low.  Always
+# own the managed drop-in so the value survives a reboot, and raise the live
+# value only when it is lower (a runtime value raised by hand must not hide a
+# missing persistent file).  Shared by install and --optimize.
+ensure_es_max_map_count() {
+  local f=/etc/sysctl.d/99-elasticsearch.conf rc=0
+  if [[ $(cat "$f" 2>/dev/null) != 'vm.max_map_count = 1048576' ]]; then
+    printf 'vm.max_map_count = 1048576\n' > "$f"
+    chmod 644 "$f"
+    ES_MAP_COUNT_NOTE="vm.max_map_count ensured in ${f}"
+  fi
+  if [[ $(sysctl -n vm.max_map_count 2>/dev/null || echo 0) -lt 1048576 ]]; then
+    sysctl -w vm.max_map_count=1048576 >/dev/null 2>&1 || rc=1
+  fi
+  return "$rc"
+}
+ES_MAP_COUNT_NOTE=""
+
+# The complete managed YAML: base block (cluster name, bind, paths,
+# single-node discovery, security flags) followed by the performance block.
+# With an empty host the existing network.host is kept (an adopted node keeps
+# its bind); the base block is then only rewritten when it is already managed.
+elasticsearch_write_managed_yaml() {
+  local yml=$1 host=${2:-}
+  if [[ -n $host ]]; then
+    elasticsearch_write_base_config "$yml" "$host"
+  elif grep -qxF "$ES_BEGIN" "$yml"; then
+    host=$(sed -nE 's/^[[:space:]]*network\.host[[:space:]]*:[[:space:]]*//p' "$yml" 2>/dev/null \
+      | head -n1 | tr -d '"')
+    [[ -n $host ]] || host=localhost
+    elasticsearch_write_base_config "$yml" "$host"
+  fi
+  # Drop a previous managed block so repeated runs stay idempotent, then
+  # append the performance block.
+  elasticsearch_strip_managed "$yml"
+  elasticsearch_write_performance_block "$yml"
+  ES_MANAGED_HOST=$host
+}
+ES_MANAGED_HOST=""
 
 elasticsearch_write_systemd_limits() {
   local dir=/etc/systemd/system/elasticsearch.service.d
@@ -5267,36 +5631,20 @@ install_elastic() {
   local ram_mb ram_total_mb
   step "Elasticsearch"
 
-  ram_total_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
+  ram_total_mb=$(mem_total_mb)
   if [[ $ram_lc == auto ]]; then
-    if (( ${OPT_ES_BUDGET_MB:-0} > 0 )); then
-      ram_mb=$OPT_ES_BUDGET_MB
-      info "Elasticsearch heap auto-resolved to ${ram_mb} MB (shared memory plan)"
-    else
-      # 25% of RAM leaves room for MariaDB's buffer pool, Valkey, PHP-FPM and
-      # the kernel page cache.  Round down to a 512 MB boundary for predictable
-      # JVM heap ergonomics and honour Elasticsearch's practical 31 GB ceiling.
-      ram_mb=$(( ram_total_mb * 25 / 100 ))
-      (( ram_mb > 31744 )) && ram_mb=31744
-      (( ram_mb < 512 )) && ram_mb=512
-      ram_mb=$(( ram_mb / 512 * 512 ))
-      (( ram_mb < 512 )) && ram_mb=512
-      info "Elasticsearch heap auto-resolved to ${ram_mb} MB (25% of RAM)"
-    fi
+    ram_mb=$(service_mem_mb elastic)
+    info "Elasticsearch heap auto-resolved to ${ram_mb} MB (shared memory plan)"
     ram_lc="${ram_mb}m"
-  elif [[ $ram_lc == *g ]]; then
-    ram_mb=$(( ${ram_lc%g} * 1024 ))
   else
-    ram_mb=${ram_lc%m}
+    ram_mb=$(size_to_mb "$ram_lc")
+    [[ $ram_mb =~ ^[0-9]+$ ]] || die "Could not parse Elasticsearch heap '${ram}'"
+    # The plan normalised the explicit value to the 512 MB step --optimize
+    # writes; use that so both paths produce the same -Xmx.
+    (( ${OPT_ES_BUDGET_MB:-0} > 0 )) && ram_mb=$OPT_ES_BUDGET_MB
   fi
   if (( ram_mb > ram_total_mb / 2 )); then
     warn "Elasticsearch heap (${ram_lc}) exceeds 50% of RAM; the kernel may OOM-kill it."
-  fi
-  # Remember an explicit --elastic ram= so --optimize keeps it.
-  if [[ ${ram,,} != auto ]]; then
-    explicit_option_set elastic_mb "$ram_mb"
-  else
-    explicit_option_unset elastic_mb
   fi
 
   case "$host" in
@@ -5310,22 +5658,13 @@ install_elastic() {
   apt_install elasticsearch
   ensure_log_dirs
 
-  # Elasticsearch's bootstrap check needs a large vm.max_map_count.  Always
-  # rewrite the managed file: an older/lower value must not survive a reboot.
-  printf 'vm.max_map_count = 1048576\n' > /etc/sysctl.d/99-elasticsearch.conf
-  chmod 644 /etc/sysctl.d/99-elasticsearch.conf
-  sysctl -w vm.max_map_count=1048576 >/dev/null || warn "Could not set vm.max_map_count"
+  ensure_es_max_map_count || warn "Could not set vm.max_map_count"
 
   local yml=/etc/elasticsearch/elasticsearch.yml es_url
   [[ -f $yml ]] || die "Elasticsearch config ${yml} not found"
-  if [[ $host == *:* ]]; then
-    es_url="http://[${host}]:9200"
-  else
-    es_url="http://${host}:9200"
-  fi
 
-  elasticsearch_write_base_config "$yml" "$host"
-  elasticsearch_write_performance_block "$yml"
+  elasticsearch_write_managed_yaml "$yml" "$host"
+  es_url=$(elasticsearch_http_url "$yml")
 
   elasticsearch_write_systemd_limits
 
@@ -5343,18 +5682,7 @@ EOF
   systemctl enable elasticsearch.service
   systemctl restart elasticsearch.service
 
-  local i
-  for i in {1..180}; do
-    if curl -fsS "$es_url" >/dev/null 2>&1; then
-      break
-    fi
-    if (( i >= 180 )); then
-      break
-    fi
-    sleep 1
-  done
-
-  if ! curl -fsS "$es_url" >/dev/null 2>&1; then
+  if ! wait_for_cmd 180 curl -fsS "$es_url"; then
     journalctl -u elasticsearch -n 80 --no-pager || true
     die "Elasticsearch did not become ready on ${host}:9200"
   fi
@@ -5742,6 +6070,13 @@ purge_basic() {
   restore_original /etc/systemd/system/setup-network-tuning.service setup-network-tuning.service
   systemctl daemon-reload || true
   restore_original /etc/systemd/resolved.conf.d/dns_servers.conf dns_servers.conf
+  systemctl disable --now setup-io-tuning.service 2>/dev/null || true
+  restore_original /etc/systemd/system/setup-io-tuning.service setup-io-tuning.service
+  restore_original /etc/udev/rules.d/60-setup-io.rules udev-60-setup-io.rules
+  udevadm control --reload-rules 2>/dev/null || true
+  if [[ -f "${STATE_DIR}/fstrim-timer-enabled" ]]; then
+    systemctl disable --now fstrim.timer 2>/dev/null || true
+  fi
   if [[ -f /etc/sysctl.conf ]]; then
     sysctl -e -p /etc/sysctl.conf || true
   fi
@@ -6020,13 +6355,13 @@ print_plan() {
         ;;
       valkey)
         printf '  %-10s ram=%s policy=%s io_threads=%s\n' "$s" \
-          "${OPT[valkey.ram]:-auto (10% of RAM)}" \
+          "${OPT[valkey.ram]:-auto (memory plan)}" \
           "${OPT[valkey.policy]:-allkeys-lru}" \
           "${OPT[valkey.io_threads]:-1}"
         ;;
       elastic)
         printf '  %-10s host=%s ram=%s\n' "$s" \
-          "${OPT[elastic.host]:-localhost}" "${OPT[elastic.ram]:-auto (25% of RAM)}"
+          "${OPT[elastic.host]:-localhost}" "${OPT[elastic.ram]:-auto (memory plan)}"
         ;;
       others)
         printf '  %-10s %s\n' "$s" "${OTHERS[*]:-}"
@@ -6150,8 +6485,39 @@ OPT_ES_KEPT_MB=0
 # --optimize applies instead of the larger "unmeasured" fallbacks.
 OPT_INSTALL_PLAN=0
 
+# RAM available to this host in MB.  Like effective_cpus, honour a cgroup
+# memory limit: inside a container or an LXC-class VPS /proc/meminfo reports
+# the hypervisor's RAM, which would size PHP workers, the buffer pool and the
+# kernel limits for memory this guest cannot use.
 mem_total_mb() {
-  awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || printf '1024'
+  local mb limit=""
+  mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || true)
+  [[ $mb =~ ^[0-9]+$ ]] && (( mb > 0 )) || mb=1024
+  if [[ -r /sys/fs/cgroup/memory.max ]]; then
+    limit=$(< /sys/fs/cgroup/memory.max)
+  elif [[ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then
+    limit=$(< /sys/fs/cgroup/memory/memory.limit_in_bytes)
+  fi
+  if [[ $limit =~ ^[0-9]+$ ]] && (( limit > 0 )); then
+    limit=$(( limit / 1024 / 1024 ))
+    (( limit > 0 && limit < mb )) && mb=$limit
+  fi
+  printf '%s' "$mb"
+}
+
+# Directory size in whole MB (0 when missing).  The optional patterns are
+# passed to du --exclude so log/undo/temp files are not counted as data.
+dir_size_mb() {
+  local dir=$1 mb=""
+  shift
+  [[ -d $dir ]] || { printf '0'; return 0; }
+  local -a excl=()
+  local pat
+  for pat in "$@"; do excl+=("--exclude=${pat}"); done
+  mb=$(du -sm "${excl[@]}" "$dir" 2>/dev/null | awk 'NR==1 { print $1 }' || true)
+  [[ $mb =~ ^[0-9]+$ ]] || mb=0
+  printf '%s' "$mb"
+  return 0
 }
 
 # Data + index bytes for user schemas as whole MB.  The InnoDB buffer pool
@@ -6178,11 +6544,12 @@ mariadb_data_dir_size_mb() {
       [[ -d $dir ]] && break
     done
   fi
-  [[ -d $dir ]] || { printf '0'; return 0; }
-  local mb=""
-  mb=$(du -sm "$dir" 2>/dev/null | awk 'NR==1 { print $1 }' || true)
-  [[ $mb =~ ^[0-9]+$ ]] || mb=0
-  printf '%s' "$mb"
+  # Redo/undo logs, temp tablespaces and binlogs are not data+index; counting
+  # them made the fallback disagree with the information_schema measurement
+  # (a fresh install was sized from 300 MB of log files, then shrunk by the
+  # first --optimize).
+  dir_size_mb "$dir" 'ib_logfile*' 'ibtmp*' 'undo*' 'aria_log*' '*.log' \
+    '*-bin.*' 'ddl_recovery*' 'ib_buffer_pool' 'tc.log'
   return 0
 }
 
@@ -6277,11 +6644,7 @@ elasticsearch_data_size_mb() {
 # Fallback when the HTTP API is unavailable: estimate the index store from
 # the Elasticsearch data directory.
 elasticsearch_data_dir_size_mb() {
-  local dir=/var/lib/elasticsearch mb=""
-  [[ -d $dir ]] || { printf '0'; return 0; }
-  mb=$(du -sm "$dir" 2>/dev/null | awk 'NR==1 { print $1 }' || true)
-  [[ $mb =~ ^[0-9]+$ ]] || mb=0
-  printf '%s' "$mb"
+  dir_size_mb /var/lib/elasticsearch 'translog' '*.log'
   return 0
 }
 
@@ -6323,6 +6686,7 @@ plan_memory_budget() {
   local cpu=1 allowance=64 php_capacity=0 php_floor=0 php_budget=0 children=0
   local maria_target=0 valkey_target=0 es_target=0
   local maria_alloc=0 valkey_alloc=0 es_alloc=0
+  local maria_fixed=0 valkey_fixed=0 es_fixed=0
   local data="" current_pool=0 kept_pool=0
   local cache_used=""
   local es_store="" es_kept=0 current_heap=0
@@ -6364,26 +6728,14 @@ plan_memory_budget() {
         [[ $php_allowance =~ ^[0-9]+$ ]] && allowance=$php_allowance
       fi
     fi
-    php_capacity=$(( cpu * 16 ))
-    local by_ram=$(( total * 50 / 100 / 96 ))
-    (( by_ram > 0 && php_capacity > by_ram )) && php_capacity=$by_ram
-    (( php_capacity > 512 )) && php_capacity=512
-    (( php_capacity < 8 )) && php_capacity=8
+    local live_children=""
     if (( ! OPT_INSTALL_PLAN )); then
-      local live_children
       live_children=$(php_pool_max_children)
-      if [[ $live_children =~ ^[0-9]+$ ]] && (( live_children > 0 )); then
-        php_capacity=$live_children
-      fi
     fi
     explicit=$(explicit_option php_children 2>/dev/null || true)
-    if [[ $explicit =~ ^[0-9]+$ ]] && (( explicit > 0 )); then
-      php_capacity=$explicit
-    fi
-    (( php_capacity > 512 )) && php_capacity=512
-    (( php_capacity < 8 )) && php_capacity=8
-    php_floor=$(( 8 * allowance ))
-    (( php_floor < 512 )) && php_floor=512
+    php_capacity=$(php_children_ceiling "$cpu" "$total" "$live_children" "$explicit")
+    php_floor=$(( $(php_children_floor "$total") * allowance ))
+    (( php_floor < 256 )) && php_floor=256
     (( php_floor > usable / 2 )) && php_floor=$(( usable / 2 ))
   fi
 
@@ -6394,9 +6746,15 @@ plan_memory_budget() {
     explicit=$(explicit_option mariadb_size_mb 2>/dev/null || true)
     if [[ $explicit =~ ^[0-9]+$ ]] && (( explicit >= 128 )); then
       maria_target=$explicit
+      maria_fixed=1
     else
-      data=$(mariadb_data_size_mb)
-      [[ $data =~ ^[0-9]+$ ]] || data=$(mariadb_data_dir_size_mb)
+      data=""
+      # A service that is not installed yet has nothing to measure; the
+      # directory fallback would count a previous installation's files.
+      if (( ! OPT_INSTALL_PLAN )) || pkg_ok mariadb-server; then
+        data=$(mariadb_data_size_mb)
+        [[ $data =~ ^[0-9]+$ ]] || data=$(mariadb_data_dir_size_mb)
+      fi
       [[ $data =~ ^[0-9]+$ ]] || data=0
       OPT_DB_SIZE_MB=$data
       maria_target=$(( data * 120 / 100 ))
@@ -6418,6 +6776,7 @@ plan_memory_budget() {
     explicit=$(explicit_option valkey_mb 2>/dev/null || true)
     if [[ $explicit =~ ^[0-9]+$ ]] && (( explicit >= 1 )); then
       valkey_target=$explicit
+      valkey_fixed=1
     else
       if (( ! OPT_INSTALL_PLAN )); then
         cache_used=$(valkey_live_used_mb 2>/dev/null || true)
@@ -6439,13 +6798,25 @@ plan_memory_budget() {
     explicit=$(explicit_option elastic_mb 2>/dev/null || true)
     if [[ $explicit =~ ^[0-9]+$ ]] && (( explicit >= 1 )); then
       es_target=$explicit
+      es_fixed=1
     else
-      es_store=$(elasticsearch_data_size_mb)
-      [[ $es_store =~ ^[0-9]+$ ]] || es_store=$(elasticsearch_data_dir_size_mb)
+      es_store=""
+      if (( ! OPT_INSTALL_PLAN )) || pkg_ok elasticsearch; then
+        es_store=$(elasticsearch_data_size_mb)
+        [[ $es_store =~ ^[0-9]+$ ]] || es_store=$(elasticsearch_data_dir_size_mb)
+      fi
       [[ $es_store =~ ^[0-9]+$ ]] || es_store=0
       OPT_ES_SIZE_MB=$es_store
-      es_target=$(( es_store * 120 / 100 ))
+      # The heap does not hold the index: the OS page cache serves the store
+      # and the heap holds fielddata, aggregations and request buffers.  A
+      # quarter of the store (rounded up to 512 MB) is ample for forum/blog
+      # search; sizing the heap to the store took RAM from the page cache
+      # and MariaDB.  Capped at 25% of RAM like the stand-alone fallback.
+      es_target=$(( es_store / 4 ))
       (( es_target < 512 )) && es_target=512
+      local es_cap=$(( total * 25 / 100 ))
+      (( es_cap < 512 )) && es_cap=512
+      (( es_target > es_cap )) && es_target=$es_cap
     fi
     (( es_target < 512 )) && es_target=512
     (( es_target > 31744 )) && es_target=31744
@@ -6469,28 +6840,42 @@ plan_memory_budget() {
   # proportionally and trim Elasticsearch first, then Valkey, then MariaDB.
   data_pool=$(( usable - php_floor ))
   (( data_pool < 0 )) && data_pool=0
+  # Explicit operator sizes are never scaled: the installer writes them
+  # verbatim, so the plan reserves them verbatim too; otherwise the next
+  # --optimize would shrink what the operator asked for.
+  local fixed_sum=0 flex_pool flex_sum
+  (( maria_fixed ))  && fixed_sum=$(( fixed_sum + maria_target ))
+  (( valkey_fixed )) && fixed_sum=$(( fixed_sum + valkey_target ))
+  (( es_fixed ))     && fixed_sum=$(( fixed_sum + es_target ))
+  flex_pool=$(( data_pool - fixed_sum ))
+  (( flex_pool < 0 )) && flex_pool=0
   targets_sum=$(( maria_target + valkey_target + es_target ))
   if (( targets_sum <= data_pool )); then
     maria_alloc=$maria_target
     valkey_alloc=$valkey_target
     es_alloc=$es_target
   elif (( targets_sum > 0 )); then
-    maria_alloc=$(( maria_target * data_pool / targets_sum ))
-    valkey_alloc=$(( valkey_target * data_pool / targets_sum ))
-    es_alloc=$(( es_target * data_pool / targets_sum ))
+    flex_sum=$(( targets_sum - fixed_sum ))
+    (( flex_sum > 0 )) || flex_sum=1
+    maria_alloc=$maria_target
+    valkey_alloc=$valkey_target
+    es_alloc=$es_target
+    (( maria_fixed ))  || maria_alloc=$(( maria_target * flex_pool / flex_sum ))
+    (( valkey_fixed )) || valkey_alloc=$(( valkey_target * flex_pool / flex_sum ))
+    (( es_fixed ))     || es_alloc=$(( es_target * flex_pool / flex_sum ))
     (( has_maria && maria_alloc < 256 )) && maria_alloc=256
     (( has_cache && valkey_alloc < 256 )) && valkey_alloc=256
     (( has_es && es_alloc < 512 )) && es_alloc=512
     alloc_total=$(( maria_alloc + valkey_alloc + es_alloc ))
     excess=$(( alloc_total - data_pool ))
     while (( excess > 0 )); do
-      if (( has_es && es_alloc > 512 )); then
+      if (( has_es && ! es_fixed && es_alloc > 512 )); then
         dec=$(( es_alloc - 512 )); (( dec > excess )) && dec=$excess
         es_alloc=$(( es_alloc - dec )); excess=$(( excess - dec ))
-      elif (( has_cache && valkey_alloc > 256 )); then
+      elif (( has_cache && ! valkey_fixed && valkey_alloc > 256 )); then
         dec=$(( valkey_alloc - 256 )); (( dec > excess )) && dec=$excess
         valkey_alloc=$(( valkey_alloc - dec )); excess=$(( excess - dec ))
-      elif (( has_maria && maria_alloc > 256 )); then
+      elif (( has_maria && ! maria_fixed && maria_alloc > 256 )); then
         dec=$(( maria_alloc - 256 )); (( dec > excess )) && dec=$excess
         maria_alloc=$(( maria_alloc - dec )); excess=$(( excess - dec ))
       else
@@ -6504,14 +6889,16 @@ plan_memory_budget() {
   remaining=$(( usable - maria_alloc - valkey_alloc - es_alloc ))
   (( remaining < 0 )) && remaining=0
   if (( has_php )); then
+    local floor_children
+    floor_children=$(php_children_floor "$total")
     children=$(( remaining / allowance ))
     (( children > php_capacity )) && children=$php_capacity
-    (( children < 8 )) && children=8
+    (( children < floor_children )) && children=$floor_children
     (( children > 512 )) && children=512
     php_budget=$(( children * allowance ))
-    if (( php_budget > remaining && children > 8 )); then
+    if (( php_budget > remaining && children > floor_children )); then
       children=$(( remaining / allowance ))
-      (( children < 8 )) && children=8
+      (( children < floor_children )) && children=$floor_children
       php_budget=$(( children * allowance ))
     fi
   fi
@@ -6534,17 +6921,156 @@ plan_memory_budget() {
   return 0
 }
 
+# PHP-FPM worker ceiling for this host.  One formula for the memory plan, the
+# pool writer and the dry run so the preview, a fresh install and --optimize
+# agree.  Arguments: cpus, total RAM MB, live pool count ("" when none) and an
+# explicit --php children= value ("" when none).
+#   * per core: 16 workers on dedicated hardware, 8 on a VPS (shared cores and
+#     steal time make deep oversubscription counter-productive)
+#   * RAM: at most half of RAM at the 96 MB reservation divisor
+#   * a live pool keeps its count (it is a memory estimate, not a quota)
+#   * an explicit value wins, clamped to the same floor/512 ceiling
+php_children_ceiling() {
+  local cpu=$1 ram_mb=$2 live=${3:-} explicit=${4:-}
+  local per_core=16 cap by_ram floor
+  host_is_vps && per_core=8
+  cap=$(( cpu * per_core ))
+  by_ram=$(( ram_mb * 50 / 100 / 96 ))
+  (( by_ram > 0 && cap > by_ram )) && cap=$by_ram
+  if [[ $live =~ ^[0-9]+$ ]] && (( live > 0 )); then
+    cap=$live
+  fi
+  if [[ $explicit =~ ^[0-9]+$ ]] && (( explicit > 0 )); then
+    cap=$explicit
+  fi
+  floor=$(php_children_floor "$ram_mb")
+  (( cap > 512 )) && cap=512
+  (( cap < floor )) && cap=$floor
+  printf '%s' "$cap"
+}
+
+# Minimum pool size.  Eight workers were kept on every host, which on a 1 GB
+# VPS reserved 768 MB for PHP alone; keep the floor within half of RAM.
+php_children_floor() {
+  local ram_mb=$1 floor
+  floor=$(( ram_mb * 50 / 100 / 96 ))
+  (( floor > 8 )) && floor=8
+  (( floor < 2 )) && floor=2
+  printf '%s' "$floor"
+}
+
+# Angie worker limits shared by tune_angie_configs and the dry run.
+# worker_processes follows the effective CPU count (Angie's "auto" counts the
+# affinity mask, not a cgroup quota).
+angie_worker_limits() {
+  local nproc=$1
+  ANGIE_WORKER_PROCESSES=$nproc
+  ANGIE_WORKER_RLIMIT=$(tune_clamp $(( nproc * 8192 )) 65536 524288)
+  ANGIE_WORKER_CONNECTIONS=$(tune_clamp $(( nproc * 2048 )) 8192 65535)
+  (( ANGIE_WORKER_CONNECTIONS > ANGIE_WORKER_RLIMIT - 1024 )) && ANGIE_WORKER_CONNECTIONS=$(( ANGIE_WORKER_RLIMIT - 1024 ))
+  (( ANGIE_WORKER_CONNECTIONS < 1024 )) && ANGIE_WORKER_CONNECTIONS=1024
+  # Angie's upstream keepalive pool must cover concurrent PHP requests.  Key
+  # it to the planned FPM worker count instead of the CPU count: on a 16-thread
+  # host with 144 workers, nproc*2 left only 32 reusable upstream connections.
+  local ka_base=$(( nproc * 2 ))
+  if [[ ${OPT_PHP_CHILDREN:-0} =~ ^[0-9]+$ ]] && (( OPT_PHP_CHILDREN > 0 )); then
+    ka_base=$(( OPT_PHP_CHILDREN / 2 ))
+  fi
+  ANGIE_PHP_KEEPALIVE=$(tune_clamp "$ka_base" 16 512)
+}
+ANGIE_WORKER_PROCESSES=""
+ANGIE_WORKER_RLIMIT=""
+ANGIE_WORKER_CONNECTIONS=""
+ANGIE_PHP_KEEPALIVE=""
+
+# Free disk under the web root (fallback /) in MB, for the cache budget.
+angie_disk_free_mb() {
+  local mb
+  mb=$(df -Pm /var/www 2>/dev/null | awk 'NR==2{print $4}' || true)
+  [[ $mb =~ ^[0-9]+$ ]] || mb=$(df -Pm / 2>/dev/null | awk 'NR==2{print $4}' || true)
+  [[ $mb =~ ^[0-9]+$ ]] || mb=10240
+  printf '%s' "$mb"
+}
+
+# Record (or clear) the explicit operator sizes of this run before the memory
+# plan is built, so the plan reserves them and a later --optimize keeps them.
+# The installers used to write these after tuning, which left the first
+# install's plan blind to --php children=, --mariadb size=, --valkey ram= and
+# --elastic ram= and made the next --optimize re-split RAM.
+record_explicit_options() {
+  local v mb
+  if [[ ${ENABLED[php]:-0} -eq 1 ]]; then
+    v=${OPT[php.children]:-}
+    if [[ -n $v && $v != auto ]]; then explicit_option_set php_children "$v"; else explicit_option_unset php_children; fi
+    v=${OPT[php.max_requests]:-}
+    if [[ -n $v ]]; then explicit_option_set php_max_requests "$v"; else explicit_option_unset php_max_requests; fi
+  fi
+  if [[ ${ENABLED[mariadb]:-0} -eq 1 ]]; then
+    v=${OPT[mariadb.size]:-auto}
+    if [[ ${v,,} != auto ]] && mb=$(size_to_mb "$v") && [[ -n $mb ]]; then
+      explicit_option_set mariadb_size_mb "$mb"
+    else
+      explicit_option_unset mariadb_size_mb
+    fi
+  fi
+  if [[ ${ENABLED[valkey]:-0} -eq 1 ]]; then
+    v=${OPT[valkey.ram]:-auto}
+    if [[ ${v,,} != auto ]] && mb=$(size_to_mb "$v") && [[ -n $mb ]]; then
+      explicit_option_set valkey_mb "$mb"
+    else
+      explicit_option_unset valkey_mb
+    fi
+  fi
+  if [[ ${ENABLED[elastic]:-0} -eq 1 ]]; then
+    v=${OPT[elastic.ram]:-auto}
+    if [[ ${v,,} != auto ]] && mb=$(size_to_mb "$v") && [[ -n $mb ]]; then
+      explicit_option_set elastic_mb "$mb"
+    else
+      explicit_option_unset elastic_mb
+    fi
+  fi
+}
+
+# Planned memory for a data service, or the stand-alone fallback when no plan
+# exists (a direct helper call or a unit test).  One owner for the fallback
+# formulas so a fresh install and --optimize cannot disagree.
+service_mem_mb() {
+  local svc=$1 mb ram
+  ram=$(mem_total_mb)
+  case $svc in
+    mariadb)
+      mb=${OPT_MARIADB_BUDGET_MB:-0}
+      if (( mb <= 0 )); then mb=$(( ram * 40 / 100 )); (( mb < 256 )) && mb=256; fi ;;
+    valkey|redis)
+      mb=${OPT_VALKEY_BUDGET_MB:-0}
+      if (( mb <= 0 )); then mb=$(( ram / 10 )); (( mb < 256 )) && mb=256; (( mb > 8192 )) && mb=8192; fi ;;
+    elastic)
+      # The plan already normalises its value to a 512 MB step and may keep
+      # an operator heap unrounded; never round it again here.
+      mb=${OPT_ES_BUDGET_MB:-0}
+      if (( mb <= 0 )); then
+        mb=$(( ram * 25 / 100 )); (( mb > 31744 )) && mb=31744
+        mb=$(( mb / 512 * 512 )); (( mb < 512 )) && mb=512
+      fi ;;
+    *) return 1 ;;
+  esac
+  printf '%s' "$mb"
+}
+
 # Build the same shared memory plan for a fresh install that --optimize builds
 # for an existing host.  Services that are about to be installed are treated as
 # present so PHP/MariaDB/Valkey/Elasticsearch are sized against one budget from
 # the first write instead of each claiming its own percentage of RAM.
 plan_install_budget() {
-  OPT_DETECTED=()
-  [[ ${ENABLED[angie]:-0} -eq 1 ]]   && OPT_DETECTED+=(angie)
-  [[ ${ENABLED[php]:-0} -eq 1 ]]     && OPT_DETECTED+=("php:${OPT[php.ver]:-auto}")
-  [[ ${ENABLED[mariadb]:-0} -eq 1 ]] && OPT_DETECTED+=(mariadb)
-  [[ ${ENABLED[valkey]:-0} -eq 1 ]]  && OPT_DETECTED+=(valkey)
-  [[ ${ENABLED[elastic]:-0} -eq 1 ]] && OPT_DETECTED+=(elastic)
+  # Start from what is already on the host, then add this run's services: a
+  # later `--php --mariadb` on an Angie host must size the Angie cache and
+  # the data tier exactly like the next --optimize will.
+  detect_installed_services
+  [[ ${ENABLED[angie]:-0} -eq 1   && " ${OPT_DETECTED[*]} " != *" angie "*   ]] && OPT_DETECTED+=(angie)
+  [[ ${ENABLED[php]:-0} -eq 1     && " ${OPT_DETECTED[*]} " != *" php:"*     ]] && OPT_DETECTED+=("php:${OPT[php.ver]:-auto}")
+  [[ ${ENABLED[mariadb]:-0} -eq 1 && " ${OPT_DETECTED[*]} " != *" mariadb "* ]] && OPT_DETECTED+=(mariadb)
+  [[ ${ENABLED[valkey]:-0} -eq 1  && " ${OPT_DETECTED[*]} " != *" valkey "*  ]] && OPT_DETECTED+=(valkey)
+  [[ ${ENABLED[elastic]:-0} -eq 1 && " ${OPT_DETECTED[*]} " != *" elastic "* ]] && OPT_DETECTED+=(elastic)
   # The services do not exist yet, so their size probes cannot return data.
   # Let the planner use the empty-data floors instead of the unmeasured
   # fallbacks; a re-run on an installed host still uses the measured values.
@@ -7456,8 +7982,10 @@ EOF
     harden_warn "- Firewall: 80/443 are open to the internet; use --cloudflare-only if the origin is behind Cloudflare"
   fi
   if systemctl is-active --quiet elasticsearch 2>/dev/null; then
+    # The installer writes network.host: "localhost" (quoted); ::1 and the
+    # _local_ special value are loopback as well.
     if grep -qE '^[[:space:]]*network\.host:' /etc/elasticsearch/elasticsearch.yml 2>/dev/null \
-       && ! grep -qE '^[[:space:]]*network\.host:[[:space:]]*(127\.0\.0\.1|localhost)' /etc/elasticsearch/elasticsearch.yml 2>/dev/null; then
+       && ! grep -qE '^[[:space:]]*network\.host:[[:space:]]*["'"'"']?(127\.0\.0\.1|localhost|::1|\[::1\]|_local_)["'"'"']?[[:space:]]*(#.*)?$' /etc/elasticsearch/elasticsearch.yml 2>/dev/null; then
       harden_warn "- Elasticsearch: network.host is not loopback; bind it to 127.0.0.1 or enable xpack security"
     fi
   fi
@@ -7870,18 +8398,7 @@ optimize_php_services() {
     # Keep the systemd fd/core limits in sync with the installer; an old
     # server may still be capped at the package default (1024 fds) while the
     # pool asks for 524288.
-    local limits_src="${SCRIPT_DIR}/configs/php/php-fpm-limits.conf"
-    local limits_dst="/etc/systemd/system/php${ver}-fpm.service.d/limits.conf"
-    local limits_before=""
-    [[ -f $limits_dst ]] && limits_before=$(md5sum "$limits_dst" | awk '{print $1}')
-    mkdir -p "$(dirname "$limits_dst")"
-    if [[ -f $limits_src ]]; then
-      install -m 644 "$limits_src" "$limits_dst"
-    else
-      printf '[Service]\nLimitNOFILE=524288\nLimitCORE=0\nTimeoutStopSec=15\nUMask=0027\n' > "$limits_dst"
-      chmod 644 "$limits_dst"
-    fi
-    if [[ $limits_before != "$(md5sum "$limits_dst" | awk '{print $1}')" ]]; then
+    if php_fpm_write_systemd_limits "$ver"; then
       systemctl daemon-reload || true
       tune_note "PHP ${ver}: systemd LimitNOFILE=524288"
     fi
@@ -8014,8 +8531,7 @@ opt_pause_web_frontends() {
     else
       warn "Could not stop ${unit} before the MariaDB restart"
     fi
-  done < <(systemctl list-units --type=service --state=active --no-legend --no-pager \
-             'php*-fpm.service' 2>/dev/null | awk '{print $1}')
+  done < <(list_active_php_units)
 }
 
 opt_resume_web_frontends() {
@@ -8051,13 +8567,8 @@ optimize_mariadb() {
   opt_backup /etc/mysql mysql
   opt_backup /etc/systemd/system/mariadb.service.d mariadb-systemd
 
-  if [[ ${OPT_MARIADB_BUDGET_MB:-0} -gt 0 ]]; then
-    size_mb=$OPT_MARIADB_BUDGET_MB
-  else
-    size_mb=$(mem_total_mb)
-    size_mb=$(( size_mb * 40 / 100 ))
-    (( size_mb < 256 )) && size_mb=256
-  fi
+  local base_changed=0
+  size_mb=$(service_mem_mb mariadb)
   if (( ${OPT_DB_SIZE_MB:-0} == 0 )); then
     OPT_DB_SIZE_MB=$(mariadb_data_size_mb)
     [[ ${OPT_DB_SIZE_MB:-} =~ ^[0-9]+$ ]] || OPT_DB_SIZE_MB=0
@@ -8091,19 +8602,8 @@ optimize_mariadb() {
 
   # An existing server may still carry the package's default 1024-fd limit.
   # Keep the same systemd drop-in the installer uses.
-  local limits_src="${SCRIPT_DIR}/configs/mariadb/limit_nofile.conf"
-  local limits_dst=/etc/systemd/system/mariadb.service.d/limits.conf
-  local limits_before=""
-  [[ -f $limits_dst ]] && limits_before=$(md5sum "$limits_dst" | awk '{print $1}')
   limit_before=$(systemctl show -p LimitNOFILE --value mariadb 2>/dev/null || true)
-  mkdir -p "$(dirname "$limits_dst")"
-  if [[ -f $limits_src ]]; then
-    install -m 644 "$limits_src" "$limits_dst"
-  else
-    printf '[Service]\nLimitNOFILE=1048576\nLimitCORE=0\nEnvironment=MYSQLD_OPTS=\nEnvironment=_WSREP_NEW_CLUSTER=\n' > "$limits_dst"
-    chmod 644 "$limits_dst"
-  fi
-  if [[ $limits_before != "$(md5sum "$limits_dst" | awk '{print $1}')" ]]; then
+  if mariadb_write_systemd_limits; then
     systemctl daemon-reload || true
     unit_changed=1
     opt_report "- systemd LimitNOFILE=1048576"
@@ -8127,6 +8627,20 @@ optimize_mariadb() {
   # from 50-server.cnf now that the 99- drop-in is authoritative.
   mariadb_strip_install_block "$size_mb" "$max_conn" \
     || warn "Could not remove old performance keys from 50-server.cnf"
+  # Converge the base block too (charset, skip_name_resolve, local_infile=0,
+  # secure_file_priv): a host adopted by --optimize never had it.  The
+  # existing bind-address is kept.
+  local base_cnf=/etc/mysql/mariadb.conf.d/50-server.cnf base_before="" base_bind=""
+  if [[ -f $base_cnf ]]; then
+    base_before=$(md5sum "$base_cnf" | awk '{print $1}')
+    base_bind=$(sed -nE 's/^[[:space:]]*bind-address[[:space:]]*=[[:space:]]*//p' "$base_cnf" | tail -n1 | tr -d '[:space:]')
+    [[ -n $base_bind ]] || base_bind=127.0.0.1
+    mariadb_write_base_block "$base_cnf" "$base_bind" || true
+    if [[ $base_before != "$(md5sum "$base_cnf" | awk '{print $1}')" ]]; then
+      base_changed=1
+      opt_report "- Base settings converged in 50-server.cnf (charset, skip_name_resolve, local_infile=0, bind-address=${base_bind}); restart required"
+    fi
+  fi
 
   # A running server can resize the buffer pool online.  Restarting a busy
   # database just to grow it by a few percent empties every application cache
@@ -8135,7 +8649,7 @@ optimize_mariadb() {
   # only change (or the resize fails).
   local online_mb=""
   if [[ -n $cnf_old ]] && (( active )) && [[ $cnf_before != "$cnf_after" ]] \
-     && cnf_only_pool_changed "$cnf_old" "$cnf"; then
+     && (( base_changed == 0 )) && cnf_only_pool_changed "$cnf_old" "$cnf"; then
     if mariadb -e "SET GLOBAL innodb_buffer_pool_size = $(( size_mb * 1024 * 1024 ))" 2>/dev/null; then
       online_mb=$(mariadb -N -B -e 'SELECT @@innodb_buffer_pool_size' 2>/dev/null \
         | awk '{printf "%d", $1 / 1024 / 1024}')
@@ -8152,7 +8666,7 @@ optimize_mariadb() {
       opt_report "- Online buffer-pool resize failed; falling back to a restart"
     fi
   fi
-  if [[ -n $cnf_before && $cnf_before == "$cnf_after" ]]; then
+  if [[ -n $cnf_before && $cnf_before == "$cnf_after" ]] && (( base_changed == 0 )); then
     if (( unit_changed == 0 )); then
       opt_report "- Restart: skipped (configuration already optimized)"
       return 0
@@ -8240,22 +8754,6 @@ optimize_mariadb() {
   return 0
 }
 
-# Valkey/Redis size values may be written as 8192mb, 8gb, 512kb or raw bytes.
-# Return whole MB so the memory plan and the live config agree.
-valkey_mb_from_config() {
-  local value=${1,,} n unit
-  [[ $value =~ ^([0-9]+)([a-z]*)$ ]] || { printf '0'; return 0; }
-  n=${BASH_REMATCH[1]}
-  unit=${BASH_REMATCH[2]}
-  case $unit in
-    gb|g) printf '%s' $(( n * 1024 )) ;;
-    mb|m) printf '%s' "$n" ;;
-    kb|k) printf '%s' $(( n / 1024 )) ;;
-    ""|b) printf '%s' $(( n / 1024 / 1024 )) ;;
-    *) printf '0' ;;
-  esac
-}
-
 # Live cache working set in MB, read from the running Valkey/Redis.  Used by
 # the planner so maxmemory can never be sized below data that is already
 # stored (or its 20% headroom).  Returns non-zero when no server is reachable.
@@ -8317,7 +8815,7 @@ optimize_valkey() {
   fi
   local active=0 ram_mb max_mb policy backlog io_threads i
   local conf_before conf_after dropin unit_changed=0
-  local online_ok=0 live_io="" live_backlog="" setting k v
+  local online_ok=0 live_io="" live_backlog="" k v
   local socket_path group socket_before perm_before perm_after socket_changed=0 group_changed=0
   [[ -f $conf ]] || return 0
   systemctl is-active --quiet "$unit" 2>/dev/null && active=1
@@ -8327,14 +8825,7 @@ optimize_valkey() {
   # Reset the shared change tracker so a previous service's restart does not
   # force an unnecessary cache restart on an otherwise unchanged run.
   tune_reset_changes
-  if [[ ${OPT_VALKEY_BUDGET_MB:-0} -gt 0 ]]; then
-    max_mb=$OPT_VALKEY_BUDGET_MB
-  else
-    ram_mb=$(mem_total_mb)
-    max_mb=$(( ram_mb / 10 ))
-    (( max_mb < 256 )) && max_mb=256
-    (( max_mb > 8192 )) && max_mb=8192
-  fi
+  max_mb=$(service_mem_mb "$kind")
   backlog=$(effective_backlog)
   # A restart applies maxmemory immediately.  Lowering it below the data that
   # is already stored mass-evicts the cache (and any sessions/jobs using it),
@@ -8367,34 +8858,14 @@ optimize_valkey() {
   # Preserve an explicit install-time io-threads value (the installer defaults
   # to 1); forcing 1 here would silently undo `--valkey io_threads=N`.
   io_threads=$(awk '/^[[:space:]]*io-threads[[:space:]]/{print $2; exit}' "$conf")
-  [[ $io_threads =~ ^[0-9]+$ ]] || io_threads=1
-  (( io_threads < 1 )) && io_threads=1
-  (( io_threads > 8 )) && io_threads=8
+  io_threads=$(valkey_clamp_io_threads "$io_threads")
   conf_before=$(md5sum "$conf" | awk '{print $1}')
-
-  conf_set() {
-    local key=$1 value=$2
-    if grep -qE "^[[:space:]]*${key}[[:space:]]" "$conf"; then
-      sed_in_place -E "s|^[[:space:]]*${key}[[:space:]].*|${key} ${value}|" "$conf"
-    else
-      printf '%s %s\n' "$key" "$value" >> "$conf"
-    fi
-  }
-  while read -r key value; do
-    [[ -n $key ]] || continue
-    conf_set "$key" "$value"
-  done < <(valkey_tuning_lines "$max_mb" "$policy" "$io_threads")
 
   # Local PHP should use the Unix socket: it avoids ephemeral-port/TIME_WAIT
   # pressure and was measurably faster for small cache commands.  This is
   # startup-only, so it is applied here and the cache is restarted below.
-  if [[ $kind == redis ]]; then
-    socket_path=/run/redis/redis.sock
-    group=redis
-  else
-    socket_path=/run/valkey/valkey.sock
-    group=valkey
-  fi
+  socket_path="/run/${kind}/${kind}.sock"
+  group=$kind
   socket_before=$(awk '/^[[:space:]]*unixsocket[[:space:]]/{print $2; exit}' "$conf")
   perm_before=$(awk '/^[[:space:]]*unixsocketperm[[:space:]]/{print $2; exit}' "$conf")
   # Keep an operator's existing custom socket path; only add the default when
@@ -8402,8 +8873,9 @@ optimize_valkey() {
   if [[ -n $socket_before && $socket_before == /* ]]; then
     socket_path=$socket_before
   fi
-  conf_set unixsocket "$socket_path"
-  conf_set unixsocketperm 770
+  # Same writer as the installer: base directives (persistence off, local
+  # bind, log path, socket) plus the tuning block.
+  valkey_apply_config "$conf" "$kind" "$max_mb" "$policy" "$io_threads" "$socket_path"
   perm_after=$(awk '/^[[:space:]]*unixsocketperm[[:space:]]/{print $2; exit}' "$conf")
   if [[ $socket_before != "$socket_path" || $perm_before != "$perm_after" || $perm_after != 770 ]]; then
     socket_changed=1
@@ -8415,17 +8887,7 @@ optimize_valkey() {
   else
     socket_changed=1
   fi
-  if getent group "$group" >/dev/null 2>&1; then
-    if ! id -nG www-data 2>/dev/null | grep -qw "$group"; then
-      if usermod -aG "$group" www-data 2>/dev/null; then
-        group_changed=1
-      else
-        warn "Could not add www-data to the ${group} group"
-      fi
-    fi
-  else
-    warn "Service group ${group} does not exist; ${socket_path} will not be accessible to www-data"
-  fi
+  valkey_ensure_www_group "$group" && group_changed=1
   opt_report "- Local socket: \`${socket_path}\` (unixsocketperm 770)"
   opt_report "- Application config (not edited automatically):"
   opt_report "  XenForo: \`\$config['cache']['config']['host'] = '${socket_path}'; \$config['cache']['config']['port'] = 0;\`"
@@ -8436,30 +8898,17 @@ optimize_valkey() {
   opt_report "  Test: \`${cli} -s ${socket_path} ping\`"
 
   conf_after=$(md5sum "$conf" | awk '{print $1}')
-  opt_report "- maxmemory=${max_mb}mb, policy=${policy}, maxclients=20000, tcp-backlog=${backlog}"
+  opt_report "- maxmemory=${max_mb}mb, policy=${policy}, maxclients=$(valkey_maxclients), tcp-backlog=${backlog}"
 
-  # maxclients=20000 is unusable if systemd still caps the unit at 1024 fds.
-  # Always write the same drop-in the installer writes (name, comment and
-  # ReadWritePaths included) so a fresh install and --optimize converge.
+  # A large maxclients is unusable if systemd still caps the unit at 1024
+  # fds.  Same drop-in as the installer (name, comment and ReadWritePaths
+  # included) so a fresh install and --optimize converge.
   dropin="/etc/systemd/system/${unit}.service.d/limits.conf"
-  local log_dir="${LOG_ROOT}/valkey"
-  [[ $kind == redis ]] && log_dir="${LOG_ROOT}/redis"
-  local drop_before=""
-  [[ -f $dropin ]] && drop_before=$(md5sum "$dropin" | awk '{print $1}')
   opt_backup "$(dirname "$dropin")" "${kind}-systemd"
-  mkdir -p "$(dirname "$dropin")"
-  cat > "$dropin" <<EOF
-[Service]
-LimitNOFILE=524288
-LimitCORE=0
-# The packaged unit uses ProtectSystem=strict; allow the central log tree.
-ReadWritePaths=${log_dir}
-EOF
-  chmod 644 "$dropin"
-  if [[ $drop_before != "$(md5sum "$dropin" | awk '{print $1}')" ]]; then
+  if valkey_write_systemd_limits "$unit" "$kind"; then
     unit_changed=1
     systemctl daemon-reload || true
-    opt_report "- systemd limits: LimitNOFILE=524288, ReadWritePaths=${log_dir}"
+    opt_report "- systemd limits: LimitNOFILE=524288, ReadWritePaths=${LOG_ROOT}/${kind}"
   fi
 
   if (( active )) && (( TUNE_DIRTY == 0 )) \
@@ -8479,29 +8928,14 @@ EOF
   # cache just to add timeout/hz/lazyfree defaults.
   if (( active )); then
     online_ok=1
-    local -a runtime_sets=(
-      "maxmemory ${max_mb}mb"
-      "maxmemory-policy ${policy}"
-      "maxmemory-samples 10"
-      "maxclients 20000"
-      "timeout 0"
-      "tcp-keepalive 300"
-      "hz 10"
-      "io-threads-do-reads yes"
-      "lazyfree-lazy-eviction yes"
-      "lazyfree-lazy-expire yes"
-      "lazyfree-lazy-server-del yes"
-      "lazyfree-lazy-user-del yes"
-      "lazyfree-lazy-user-flush yes"
-    )
-    for setting in "${runtime_sets[@]}"; do
-      read -r k v <<< "$setting"
+    while read -r k v; do
+      [[ -n $k ]] || continue
       if ! "$cli" CONFIG SET "$k" "$v" >/dev/null 2>&1; then
         online_ok=0
         opt_report "- Online \`CONFIG SET ${k} ${v}\` failed; a restart is required"
         break
       fi
-    done
+    done < <(valkey_runtime_settings "$max_mb" "$policy" "$io_threads")
     # io-threads is fixed at startup.  A systemd fd drop-in also needs a new
     # process before maxclients can exceed the old limit.
     live_io=$("$cli" CONFIG GET io-threads 2>/dev/null | tail -n1 || true)
@@ -8533,11 +8967,7 @@ EOF
   if (( active )); then
     if systemctl restart "$unit" 2>/dev/null; then
       OPT_CUTOVER=1
-      for i in {1..20}; do
-        "$cli" ping 2>/dev/null | grep -q PONG && break
-        sleep 1
-      done
-      if "$cli" ping 2>/dev/null | grep -q PONG; then
+      if wait_for_cmd 20 valkey_pong "$cli"; then
         opt_report "- Restart: **OK**"
         # A socket path change does not alter the supplementary groups the
         # PHP workers already have.  Restarting PHP just because the cache
@@ -8596,25 +9026,6 @@ es_jvm_options_is_managed() {
     esac
   done < "$file"
   (( other == 0 && xs == 1 && xx == 1 && count >= 4 && count <= 6 ))
-}
-
-es_jvm_options_is_heap_only() {
-  local file=$1 line count=0 xs=0 xx=0 other=0
-  [[ -f $file ]] || return 1
-  while IFS= read -r line; do
-    [[ -n $line ]] || continue
-    if [[ $line =~ ^[[:space:]]*# ]]; then
-      continue
-    fi
-    count=$(( count + 1 ))
-    case $line in
-      -Xms*) xs=$(( xs + 1 )) ;;
-      -Xmx*) xx=$(( xx + 1 )) ;;
-      -XX:+UseG1GC|-XX:MaxGCPauseMillis=200|-XX:+HeapDumpOnOutOfMemoryError|-Dlog4j2.formatMsgNoLookups=true) ;;
-      *) other=$(( other + 1 )) ;;
-    esac
-  done < "$file"
-  (( other == 0 && xs == 1 && xx == 1 && count >= 2 ))
 }
 
 write_es_jvm_options() {
@@ -8762,28 +9173,6 @@ elasticsearch_fix_single_node_replicas() {
   return 1
 }
 
-# Restore the pre-run Elasticsearch tree after a failed restart.  opt_restore
-# copies the backup over the live tree but does not remove files the failed
-# run created; move the managed JVM file out of the live directory when it was
-# not in the backup, so the restored heap file is the only owner.  Nothing is
-# deleted.
-elasticsearch_rollback() {
-  local moved
-  opt_restore /etc/elasticsearch elasticsearch
-  opt_restore /etc/systemd/system/elasticsearch.service.d elasticsearch-systemd
-  if [[ -n ${OPT_BACKUP_DIR:-} \
-        && ! -e "${OPT_BACKUP_DIR}/elasticsearch/jvm.options.d/zz-setup-optimize.options" \
-        && -e $ES_JVM_OPTIONS ]]; then
-    moved=$(preserve_to_tmp "$ES_JVM_OPTIONS" 2>/dev/null || true)
-    if [[ -n $moved ]]; then
-      opt_report "- ROLLBACK: moved \`${ES_JVM_OPTIONS}\` to \`${moved}\` (not deleted)"
-    fi
-  fi
-  systemctl daemon-reload || true
-  systemctl restart elasticsearch 2>/dev/null || true
-  return 0
-}
-
 optimize_elastic() {
   local active=0 yml=/etc/elasticsearch/elasticsearch.yml ram_mb heap_mb
   local jvm=$ES_JVM_OPTIONS
@@ -8797,41 +9186,23 @@ optimize_elastic() {
   opt_backup /etc/elasticsearch elasticsearch
   opt_backup /etc/systemd/system/elasticsearch.service.d elasticsearch-systemd
 
-  # Elasticsearch refuses to start when vm.max_map_count is too low.  Always
-  # write the managed drop-in so the setting survives a reboot; a runtime
-  # value raised by hand must not hide a missing persistent file.
-  if [[ $(cat /etc/sysctl.d/99-elasticsearch.conf 2>/dev/null) != 'vm.max_map_count = 1048576' ]]; then
-    printf 'vm.max_map_count = 1048576\n' > /etc/sysctl.d/99-elasticsearch.conf
-    chmod 644 /etc/sysctl.d/99-elasticsearch.conf
-    opt_report "- vm.max_map_count ensured in /etc/sysctl.d/99-elasticsearch.conf"
-  fi
-  if [[ $(sysctl -n vm.max_map_count 2>/dev/null || echo 0) -lt 1048576 ]]; then
-    sysctl -w vm.max_map_count=1048576 >/dev/null 2>&1 || true
-    opt_report "- vm.max_map_count raised to 1048576"
-  fi
+  ES_MAP_COUNT_NOTE=""
+  ensure_es_max_map_count || opt_report "- **WARNING**: could not raise vm.max_map_count"
+  [[ -n $ES_MAP_COUNT_NOTE ]] && opt_report "- ${ES_MAP_COUNT_NOTE}"
 
-  if [[ ${OPT_ES_BUDGET_MB:-0} -gt 0 ]]; then
-    heap_mb=$OPT_ES_BUDGET_MB
-  else
-    ram_mb=$(mem_total_mb)
-    heap_mb=$(( ram_mb * 25 / 100 ))
-    (( heap_mb > 31744 )) && heap_mb=31744
-    (( heap_mb < 512 )) && heap_mb=512
-  fi
-  heap_mb=$(( heap_mb / 512 * 512 ))
-  (( heap_mb < 512 )) && heap_mb=512
+  # The plan already rounds the heap (and may keep a live operator heap
+  # unrounded); rounding again here used to shrink a kept 1000m heap to 512m.
+  heap_mb=$(service_mem_mb elastic)
 
   if (( ${OPT_ES_SIZE_MB:-0} == 0 )); then
     OPT_ES_SIZE_MB=$(elasticsearch_data_size_mb)
     [[ ${OPT_ES_SIZE_MB:-} =~ ^[0-9]+$ ]] || OPT_ES_SIZE_MB=0
   fi
   if (( OPT_ES_SIZE_MB > 0 )); then
-    if (( heap_mb >= OPT_ES_SIZE_MB )); then
-      opt_report "- Index store=${OPT_ES_SIZE_MB}MB; heap=${heap_mb}MB (fits)"
-    elif (( ${OPT_ES_KEPT_MB:-0} > 0 )); then
+    if (( ${OPT_ES_KEPT_MB:-0} > 0 )); then
       opt_report "- Index store=${OPT_ES_SIZE_MB}MB; heap=${heap_mb}MB (kept existing heap)"
     else
-      opt_report "- Index store=${OPT_ES_SIZE_MB}MB; heap=${heap_mb}MB (does not fully fit; OS page cache serves the remainder)"
+      opt_report "- Index store=${OPT_ES_SIZE_MB}MB; heap=${heap_mb}MB (store/4, 512 MB minimum; the page cache serves the index)"
     fi
   fi
 
@@ -8853,20 +9224,11 @@ optimize_elastic() {
 
   # Keep a setup-managed node's base block in sync; a hand-managed node is
   # left alone so --optimize never hijacks an operator's cluster name or bind.
-  if grep -qxF "$ES_BEGIN" "$yml"; then
-    local base_host
-    base_host=$(sed -nE 's/^[[:space:]]*network\.host[[:space:]]*:[[:space:]]*//p' "$yml" 2>/dev/null \
-      | head -n1 | tr -d '"')
-    [[ -n $base_host ]] || base_host=localhost
-    elasticsearch_write_base_config "$yml" "$base_host"
-    opt_report "- Base config: network.host=${base_host}, single-node discovery, x-pack security off"
+  # Same writer as the installer for the base and performance blocks.
+  elasticsearch_write_managed_yaml "$yml"
+  if [[ -n $ES_MANAGED_HOST ]]; then
+    opt_report "- Base config: network.host=${ES_MANAGED_HOST}, single-node discovery, x-pack security off"
   fi
-
-  # Drop a previous managed block so repeated runs stay idempotent, then let
-  # the shared helper append the exact same performance block the installer
-  # writes.
-  elasticsearch_strip_managed "$yml"
-  elasticsearch_write_performance_block "$yml"
   # The managed block comments http.host/transport.host, so the effective
   # endpoint is derived after it is written.  A node intentionally bound to a
   # public IPv4 for a remote XenForo client must be probed there, not on
@@ -9133,10 +9495,9 @@ optimize_plan() {
   detect_installed_services
   plan_memory_budget
   cpu_performance_governor_available || governor_desc="skipped (no performance governor)"
-  disk_free_mb=$(df -Pm /var/www 2>/dev/null | awk 'NR==2{print $4}' || true)
-  [[ $disk_free_mb =~ ^[0-9]+$ ]] || disk_free_mb=$(df -Pm / 2>/dev/null | awk 'NR==2{print $4}')
-  [[ $disk_free_mb =~ ^[0-9]+$ ]] || disk_free_mb=10240
+  disk_free_mb=$(angie_disk_free_mb)
   cache_mb=$(angie_cache_budget_mb "$ram_mb" "$disk_free_mb")
+  angie_worker_limits "$nproc"
   printf '\n%sDRY RUN%s - optimize scan only, no changes will be made.\n' "$C_BOLD" "$C_RESET"
   printf 'Host: %s  %s CPU  %s MB RAM  %s\n' "$(hostname 2>/dev/null || echo unknown)" \
     "$nproc" "$ram_mb" "$(df -h / | awk 'NR==2{print $4 " free"}')"
@@ -9153,11 +9514,9 @@ optimize_plan() {
     "$OPT_MEM_BUDGET_MB" "$OPT_MEM_TOTAL_MB" "$OPT_PHP_BUDGET_MB" \
     "$OPT_MARIADB_BUDGET_MB" "$OPT_VALKEY_BUDGET_MB" "$OPT_ES_BUDGET_MB"
   if [[ " ${OPT_DETECTED[*]} " == *" angie "* ]]; then
-    printf '  Angie: workers=auto connections=%s rlimit=%s keepalive=%s cache_budget=%sMB\n' \
-      "$(tune_clamp $(( nproc * 2048 )) 8192 65535)" \
-      "$(tune_clamp $(( nproc * 8192 )) 65536 524288)" \
-      "$(tune_clamp $(( ${OPT_PHP_CHILDREN:-0} > 0 ? OPT_PHP_CHILDREN / 2 : nproc * 2 )) 16 512)" \
-      "$cache_mb"
+    printf '  Angie: workers=%s connections=%s rlimit=%s keepalive=%s cache_budget=%sMB\n' \
+      "$ANGIE_WORKER_PROCESSES" "$ANGIE_WORKER_CONNECTIONS" "$ANGIE_WORKER_RLIMIT" \
+      "$ANGIE_PHP_KEEPALIVE" "$cache_mb"
     printf '  Angie compression: Brotli level %s dynamic, gzip fallback (module installed on apply)\n' \
       "${SETUP_BROTLI_LEVEL:-5}"
     printf '  Angie repository: sync %s (%s), then apply the hardware profile\n' \
@@ -9165,18 +9524,22 @@ optimize_plan() {
   fi
   printf '  Applications: audit WordPress/XenForo persistent MariaDB and Valkey socket settings\n'
   if [[ ${OPT_DETECTED[*]} == *php:* ]]; then
-    if (( ${OPT_PHP_CHILDREN:-0} > 0 )); then
+    # Same inputs as tune_php_fpm_version: a live pool keeps its count, an
+    # explicit --php children=/max_requests= wins.
+    local live_children explicit_children explicit_requests
+    live_children=$(php_pool_max_children)
+    explicit_children=$(explicit_option php_children 2>/dev/null || true)
+    explicit_requests=$(explicit_option php_max_requests 2>/dev/null || true)
+    if [[ -n $live_children && $live_children != 0 ]] || [[ -n $explicit_children ]]; then
+      max_children=$(php_children_ceiling "$nproc" "$ram_mb" "$live_children" "$explicit_children")
+    elif (( ${OPT_PHP_CHILDREN:-0} > 0 )); then
       max_children=$OPT_PHP_CHILDREN
-    elif (( OPT_PHP_BUDGET_MB > 0 )); then
-      max_children=$(( OPT_PHP_BUDGET_MB / 96 ))
     else
-      max_children=$(( ram_mb * 50 / 100 / 96 ))
+      max_children=$(php_children_ceiling "$nproc" "$ram_mb" "" "")
     fi
-    (( max_children > nproc * 16 )) && max_children=$(( nproc * 16 ))
-    (( max_children > 512 )) && max_children=512
-    (( max_children < 8 )) && max_children=8
+    [[ $explicit_requests =~ ^[0-9]+$ ]] || explicit_requests=$(( nproc * 1024 ))
     printf '  PHP-FPM:  max_children=%s max_requests=%s backlog=%s\n' \
-      "$max_children" "$(( nproc * 1024 ))" "$backlog"
+      "$max_children" "$explicit_requests" "$backlog"
   fi
   if [[ " ${OPT_DETECTED[*]} " == *" mariadb "* ]]; then
     size_mb=$OPT_MARIADB_BUDGET_MB
@@ -9203,17 +9566,11 @@ optimize_plan() {
     fi
   fi
   if [[ " ${OPT_DETECTED[*]} " == *" elastic "* ]]; then
-    heap_mb=$OPT_ES_BUDGET_MB
-    (( heap_mb < 512 )) && heap_mb=512
-    heap_mb=$(( heap_mb / 512 * 512 ))
+    heap_mb=$(service_mem_mb elastic)
     es_size_mb=${OPT_ES_SIZE_MB:-0}
     es_fit=""
     if (( es_size_mb > 0 )); then
-      if (( heap_mb >= es_size_mb )); then
-        es_fit=", index=${es_size_mb}MB (fits)"
-      else
-        es_fit=", index=${es_size_mb}MB (does not fully fit)"
-      fi
+      es_fit=", index=${es_size_mb}MB (heap=store/4, page cache serves the index)"
     fi
     printf '  Elasticsearch: heap=%sMB%s\n' "$heap_mb" "$es_fit"
   fi
@@ -10014,6 +10371,7 @@ run_os_tuning() {
   # hard limit for the next login.
   configure_sysctl
   configure_limits
+  configure_io_tuning
 }
 
 # Repair legacy cron jobs written by older releases.  It is deliberately a
@@ -10348,6 +10706,7 @@ main() {
   # Size every service against one shared RAM budget on a fresh install, just
   # as --optimize does on an existing host.
   if (( ! OPTIMIZE && ! PURGE && ! RESTART_ALL )); then
+    record_explicit_options
     plan_install_budget
   fi
 
@@ -10428,6 +10787,12 @@ main() {
   elif [[ ${ENABLED[domain]:-0} -eq 1 ]]; then
     harden_system 0 || true
     harden_wordpress || warn "WordPress hardening reported an issue (see the run log)"
+  fi
+  # The managed crontab depends on what the security pass found (the wp-cron
+  # entry is added only once DISABLE_WP_CRON exists), so regenerate it after
+  # hardening, in the same order --optimize uses.  write_cron is idempotent.
+  if [[ ${ENABLED[basic]:-0} -eq 1 || ${ENABLED[domain]:-0} -eq 1 ]]; then
+    write_cron || warn "Could not refresh the managed crontab"
   fi
 
   cleanup_configs

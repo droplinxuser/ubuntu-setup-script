@@ -1,5 +1,55 @@
 # Full-stack stress test reports
 
+## setup.sh 1.9.0 - dev-host re-validation from a macOS workstation (2026-11-09)
+
+Host: dev-host, 16 threads / 27.2 GiB / NVMe (Crucial P3 Plus), Ubuntu 26.04.1,
+Angie 1.12.4, PHP 8.5.12 (144 static workers), MariaDB 11.8.6, Valkey 9.0.4,
+Elasticsearch 9.5.6. The host was wiped to its 557-package headless baseline,
+installed with `--basic --angie --php --mariadb --valkey --elastic --others
+all --domain ...` from the refactored script, then `--optimize` was run: the
+configuration snapshots before and after `--optimize` were byte-identical
+(1.8.59 differed in the MariaDB buffer pool, sized from stale log files).
+
+Load generator: `oha` 1.16.0 on an Apple-silicon Mac mini over 1 GbE
+(`tests/stress-site/run-stress-remote.sh`, 200 connections, 15 s per
+scenario, HTTPS keep-alive); `collect-metrics.sh` sampled the server every 5 s.
+
+| Scenario | req/s | p50 | p90 | p99 | Status | Peak server CPU |
+|---|---:|---:|---:|---:|---|---|
+| static | 21,360 | 9.1 ms | 11.5 ms | 14.2 ms | 200 only | ~15% |
+| php-hello | 21,023 | 7.6 ms | 9.4 ms | 12.2 ms | 200 only | ~50% |
+| mariadb-json | 17,168-18,628 (re-runs) | 8.2 ms | 10.2 ms | 12.8 ms | 200 only | ~60% |
+| valkey-json | 17,944 | 8.4 ms | 10.3 ms | 12.4 ms | 200 only | ~55% |
+| elasticsearch (100 conns) | 9,745 | 8.8 ms | 13.5 ms | 34.3 ms | 200 only | ~60% |
+| node-proxy | 18,159 | 10.7 ms | 13.5 ms | 17.0 ms | 200 only | ~20% |
+| full-uncached-200 | 7,214 | 19.6 ms | 24.5 ms | 32.2 ms | 200 only | 94% (CPU bound) |
+| full-cached-200 | 23,365 | 8.4 ms | 10.3 ms | 12.6 ms | 200 only | ~20% |
+| slow-1s-200 | 142 | 1.02 s | 1.05 s | 1.07 s | 200 only | pool saturated |
+
+Findings:
+
+- **The rate limiter, not the stack, had been the ceiling of every earlier
+  external run.** With the stock geo whitelist the same suite reported ~20k
+  req/s per PHP scenario, but 99.5% of those responses were `429` (wrk, used
+  before, does not report status codes). Angie also wrote one warning per
+  rejection: 1.18 M lines / 266 MB of `stress.invalid.error.log` in two
+  minutes. 1.9.0 sets `limit_req_log_level info` and adds
+  `SETUP_LIMIT_REQ_EXEMPT` for the load generator; the exempt run above is
+  the first valid remote measurement of this host.
+- The static/cached/PHP-hello scenarios are bound by the single client and
+  the LAN round trip (~8 ms p50 at 200 connections, server 15-50% busy), so
+  they are not CPU-ceiling numbers; the loopback suite in `run-stress.sh`
+  remains the ceiling test. `full-uncached` is the only scenario that
+  saturates the server (94% CPU at 7.2k req/s, java ~35%, mariadbd ~14%,
+  Angie workers ~9% each).
+- No listen-queue overflows, no PHP-FPM `max children reached`, no MariaDB
+  slow queries or disk temp tables, no Elasticsearch search rejections, no
+  journal errors during the runs. TIME_WAIT peaked at 64k on the server
+  (`tcp_tw_reuse=1`, loopback TCP to Elasticsearch/Node per request).
+- The first MariaDB scenario after the fresh install measured 13.7k req/s
+  with a 125 ms p99 (cold buffer pool/thread pool); two immediate re-runs
+  gave 17.2k and 18.6k with a 13 ms p99, so the table shows the re-runs.
+
 ## setup.sh 1.8.36 - 8 vCPU / 15 GiB validation (2026-11-05)
 
 Host: `stress-vps`, 8 vCPU, 15.1 GiB RAM, Ubuntu 26.04.1, Angie 1.12.4,
