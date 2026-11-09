@@ -1,0 +1,84 @@
+# dev-host test-run manifest - 2026-11-09 (setup.sh 1.13.1 -> 1.14.0)
+
+Host: devhost.example, Ubuntu 26.04.1 LTS, 16 threads (8 cores), 27.2 GiB RAM,
+931 GB NVMe (CT1000P3PSSD8), bare metal.
+Baseline: 557 packages (captured in /root/baseline before testing).
+Final:    557 packages, identical set; 0 added, 0 missing; 0 novel /etc files.
+
+## Packages introduced during the test (82, all purged)
+
+Runtime / services
+  angie  angie-module-brotli  elasticsearch  mariadb-server
+  mariadb-server-core  mariadb-client  mariadb-client-core  mariadb-common
+  mysql-common  valkey-server  valkey-tools  galera-4  socat
+  nodejs  nvme-cli  smartmontools  sysstat  btop  gifsicle  git  git-man
+  curl  cpufrequtils
+
+PHP 8.5 (Sury)
+  php8.5-fpm  php8.5-cli  php8.5-common  php8.5-curl  php8.5-gd  php8.5-gmp
+  php8.5-igbinary  php8.5-mbstring  php8.5-mysql  php8.5-readline
+  php8.5-redis  php8.5-xml  php8.5-zip  php-common
+
+Libraries pulled in as dependencies
+  apt-transport-https  fontconfig-config  fonts-dejavu-core
+  fonts-dejavu-mono  gawk  libabsl20260107  libaio1t64  libaom3  libargon2-1
+  libavif16  libcpufreq0  libdav1d7  libdbi-perl  libdeflate0  liberror-perl
+  libfontconfig1  libgav1-2  libgd3  libheif1  libheif-plugin-aomdec
+  libimagequant0  libjbig0  libjpeg-turbo8  libjpeg8  liblerc4  libmariadb3
+  libmpfr6  libnvme1t64  libpcre2-posix3  libsensors-config  libsensors5
+  libsharpyuv0  libsodium23  libtiff6  liburing2  libwebp7  libx11-6
+  libx11-data  libxau6  libxcb1  libxdmcp6  libxpm4  libxslt1.1  libyuv0
+  libzip5
+
+Every one was removed with `apt-get purge` followed by
+`apt-get autoremove --purge`; the package set was then compared with the
+baseline and matched exactly.
+
+## Configuration changes introduced (all removed)
+
+Files/directories added (120 files under /etc, plus data/cache paths):
+  /etc/angie/**                      (Angie tree, vhosts, TLS, templates)
+  /etc/php/8.5/**                    (FPM pool, custom_dan.ini, managed ini)
+  /etc/mysql/**                      (50-server.cnf edits, 99-setup-optimize.cnf)
+  /etc/valkey, /etc/elasticsearch
+  /etc/apt/sources.list.d/{angie.list,elastic-9.x.list,php.list,nodesource.sources}
+  /usr/share/keyrings/{angie-signing.gpg,deb.sury.org-*.gpg,
+                       debsuryorg-archive-keyring.gpg,elasticsearch-keyring.gpg,
+                       nodesource.gpg}
+  /etc/default/setup-tuning
+  /etc/systemd/system/{angie,elasticsearch,mariadb,php8.5-fpm,valkey-server}.service.d/limits.conf
+  /etc/sysctl.d/99-elasticsearch.conf
+  /etc/mysqlbkup.cnf, /etc/mysqlbkup.config
+  /usr/local/bin/mysqlbkup.sh, /root/tools/, /root/mysqltuner.pl
+  /var/www/**, /var/cache/{php,angie}, /home/nginx_cache*,
+  /var/lib/{setup.sh,elasticsearch,mariadb,mysql,valkey}, /var/lib/mysql-files
+  /etc/security/limits.d/99-setup.conf
+  /etc/sysctl.d/{99-sysctl.conf,90-setup-network.conf}
+  /etc/modules-load.d/setup-network.conf
+  /etc/systemd/system/{setup-network-tuning,setup-io-tuning}.service
+  /etc/systemd/resolved.conf.d/dns_servers.conf
+  /etc/udev/rules.d/60-setup-io.rules
+  /etc/logrotate.d/setup-logs
+  /etc/default/cpufrequtils
+
+Modified then restored (setup.sh recorded originals in /var/lib/setup.sh and
+`--purge all` wrote them back; verified by the managed-key sysctl diff):
+  /etc/sysctl.conf, /etc/security/limits.conf, /etc/apt/apt.conf.d/20auto-upgrades,
+  /etc/hosts (127.0.1.1 line), /etc/hostname (dev-host), /etc/default/ufw (rules),
+  root crontab (managed block removed), CPU governor (powersave),
+  timezone (America/Los_Angeles re-applied).
+
+## Verification after cleanup
+
+  packages            557 == baseline (comm: 0 added, 0 missing)
+  enabled units       identical set
+  running services    identical set (19 services; transient hostnamed/
+                      timedated/packagekit stopped)
+  novel /etc files    0
+  listening ports     22/tcp, 127.0.0.53:53, 127.0.0.54:53 (baseline)
+  failed units        0
+  hostname / timezone dev-host / America/Los_Angeles
+  swap                existing nvme0n1p3 partition (unchanged)
+  firewall            ufw inactive, no user rules
+  crontab             empty
+  config trees        /etc/{angie,php,mysql,valkey,elasticsearch} absent
