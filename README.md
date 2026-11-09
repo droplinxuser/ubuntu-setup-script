@@ -1,1243 +1,422 @@
 # Ubuntu Setup Script
 
-A single, idempotent Bash provisioning script for **Ubuntu 26.04 LTS** (and newer LTS releases such as 28.04). It installs and configures a complete web/database stack from one command. `--purge` stops and disables selected services and restores recorded basic settings, but it deliberately leaves packages, configuration, databases and logs on disk. Angie configuration is downloaded from `server-configs-nginx`; PHP-FPM templates are local under `configs/php/`, so a PHP install needs a repository checkout (or that directory packaged beside `setup.sh`).
+One idempotent Bash script that provisions and tunes a web/database stack on
+**Ubuntu 26.04 LTS** (installs) and tunes existing 22.04/24.04/26.04 hosts
+(`--optimize`): Angie, PHP-FPM, MariaDB, Valkey (or an existing Redis),
+Elasticsearch, Node.js and helper tools, plus per-domain vhosts.
 
-**File-safety policy:** every transient file is created under `/tmp`, and the script never unlinks, purges or otherwise permanently removes files or directories on the server. Anything left in `/tmp` is allowed to expire through the system's normal `/tmp` cleanup. The one intentional file written outside `/tmp` is the requested run log: every invocation creates `setup_<timestamp>.log` in the directory it was started from, so it can be pulled for debugging. `--purge` is therefore a stop/disable operation, not a destructive uninstall; remove data manually only after you have verified it is no longer needed.
-
-Angie configuration is **not** hard-coded in this script. It is downloaded at install time from [`droplinxuser/server-configs-nginx`](https://github.com/droplinxuser/server-configs-nginx), which is the single source of truth for Angie/Nginx configs. PHP-FPM pool and `php.ini` templates are **non-Angie** configuration and live locally under `configs/php/` in this repository.
-
-The script is designed for a fresh server but is safe to re-run on an already configured machine. Only the services named on the command line are touched.
-
-## Repository layout
+- **Single source of truth for Angie:** the configuration tree is downloaded at
+  run time from [`droplinxuser/server-configs-nginx`](https://github.com/droplinxuser/server-configs-nginx)
+  (`CONFIG_SOURCE_DIR=/path` uses a local checkout). PHP-FPM templates live
+  here under `configs/php/`, so run installs from a repository checkout.
+- **File safety:** transient files go under `/tmp`; the script never unlinks
+  anything on the server. `--purge` stops/disables services and restores
+  recorded settings; it removes no package, data or log. Every run writes
+  `setup_<timestamp>-<pid>.log` in the directory it was started from.
+- **Install/optimize parity:** every tuned value comes from one helper shared
+  by the installer and `--optimize`, so a fresh install followed by
+  `--optimize` produces identical configuration (verified byte-for-byte on
+  the test host; see `tests/stress-site/RESULTS.md`).
 
 | Path | Contents |
 |---|---|
-| `setup.sh` | Installer/provisioner (packages, services, domains, purge) |
-| `configs/system/` | DNS, CPU governor, sysctl and limits profiles |
-| `configs/mariadb/` | MariaDB reference profile and systemd limits |
-| `configs/php/` | PHP-FPM pool templates, `custom_dan.ini` and systemd limits |
-| `tests/stress-site/` | Full-stack test site and stress harness |
-| `tests/test-dry-run-matrix.sh` | CLI/dry-run validation matrix |
-| `tests/test-tuning.sh` | Unit tests for the hardware-aware tuning helpers |
-| `/var/www/logs/` (live) | One directory tree for Angie, PHP, MariaDB, Valkey, Node.js, GifSicle and Elasticsearch logs |
-| `tools/diff_configs.sh` | Compare canonical configs (both repos) with live `/etc` |
-
-Angie/Nginx configuration lives only in
-[`droplinxuser/server-configs-nginx`](https://github.com/droplinxuser/server-configs-nginx).
-All non-Angie configuration, including PHP-FPM, MariaDB, Valkey and
-Elasticsearch, lives here.
-
-`setup.sh` prefers the local files under `configs/` when it is run from this
-checkout. System/MariaDB/systemd blobs still have embedded fallbacks, but the
-PHP-FPM pool/ini templates are intentionally local files under `configs/php/`;
-run the install from a repository checkout (or package that directory
-alongside `setup.sh`).
-
----
+| `setup.sh` | Installer, optimizer, diagnostics, restart-all, purge |
+| `configs/system/`, `configs/mariadb/`, `configs/php/` | DNS/sysctl/limits, MariaDB and PHP-FPM templates |
+| `tests/test-tuning.sh`, `tests/test-dry-run-matrix.sh` | Unit tests for the tuning helpers; CLI/dry-run matrix (both run in CI) |
+| `tests/stress-site/` | Synthetic full-stack test site, local and remote load harness, results |
+| `tools/diff_configs.sh` | Compare the canonical configs of both repos with the live `/etc` |
+| `SECURITY-PERFORMANCE.md` | What the script hardens, what it leaves to the operator, and the large-site checklist |
 
 ## Requirements
 
-- Ubuntu 26.04 LTS or newer for installation (`--optimize` also supports 22.04 and 24.04); the script checks `ID=ubuntu` and the version.
-- Bash 4.0 or newer (associative arrays); Ubuntu ships Bash 5.x.
-- Root access (`sudo bash setup.sh ...`).
-- Internet access to the Ubuntu, Angie, Sury, Elastic and NodeSource package repositories, plus GitHub for the Angie/PHP configuration repository. For offline/testing use, set `CONFIG_SOURCE_DIR` to a local checkout.
-- Enough disk/RAM for the selected services:
-  - Elasticsearch: roughly 1.5 GB of disk plus the requested JVM heap.
-  - MariaDB: the requested InnoDB buffer pool plus normal database growth.
-  - PHP: a few hundred MB, plus one static FPM worker per `pm.max_children` slot.
-
----
+- Ubuntu 26.04 LTS or newer for installs; `--optimize`, `--diagnostics` and
+  `--restart-all` also accept 22.04 and 24.04. Bash 4.4+. Root.
+- Network access to the Ubuntu, Angie, Sury, Elastic and NodeSource
+  repositories and to GitHub (or `CONFIG_SOURCE_DIR`).
+- RAM/disk for the selected services (Elasticsearch needs ~1.5 GB of disk plus
+  its heap; MariaDB its buffer pool; PHP one static worker per
+  `pm.max_children` slot).
 
 ## Quick start
 
-The commands below are complete and copy-paste ready for a brand new Ubuntu 26.04 server. Only the services named on a command are installed. `--basic` is required for every install profile; its values are auto-detected when omitted.
-
-> Replace `pass=temp` with a strong password before running any MariaDB command. The password is also written to the local backup configuration.
-
-### Full stack (all services)
+`--basic` is required for every install and all of its values are optional.
+Only the services named on the command line are touched. Replace `pass=temp`
+with a real password (it is also written to `/etc/mysqlbkup.cnf`, mode 600).
 
 ```bash
+# Full stack
 sudo bash setup.sh \
   --basic server=dedi host=web1.example.com time=Asia/Manila swap=8G \
-  --angie \
-  --php ver=8.5 \
-  --mariadb user=demo pass=temp size=4gb bind=127.0.0.1 \
-  --valkey \
-  --elastic host=localhost ram=4g \
-  --others all
-```
-
-### Large-site starting profile
-
-`size=auto` (the default since 1.9.0) sizes InnoDB from the shared memory plan (live data+index, 128 MB minimum); PHP, OPcache/JIT, memory/realpath settings and Valkey are sized from RAM, CPU, disk class and host type automatically. Add `children=` only after measuring worker RSS. Explicit sizes (`size=`, `ram=`, `children=`) are recorded and reserved verbatim by the plan, so a later `--optimize` keeps them.
-
-```bash
-sudo bash setup.sh \
-  --basic server=dedi host=web1.example.com time=Asia/Manila \
-  --angie \
-  --php ver=8.5 \
+  --angie --php ver=8.5 \
   --mariadb user=demo pass=temp size=auto bind=127.0.0.1 \
-  --valkey ram=4g policy=allkeys-lru io_threads=1 \
-  --elastic host=localhost ram=4g \
-  --others all
-```
+  --valkey --elastic host=localhost ram=4g --others all
 
-### Basic-only and minimal profiles
-
-```bash
-# Basic hardening only; auto-detect server type, hostname and swap
-sudo bash setup.sh --basic
-
-# Minimal Angie + PHP, with all basic values auto-detected
+# Minimal web host, everything auto-detected
 sudo bash setup.sh --basic --angie --php
 
-# Basic with explicit dedicated-server values
-sudo bash setup.sh --basic server=dedi host=web1.example.com time=Asia/Manila swap=8G
-
-# Basic on a VPS; the CPU governor step is skipped automatically
-sudo bash setup.sh --basic server=vps host=web-vps.example.com time=UTC swap=2G
-
-# Angie only
-sudo bash setup.sh --basic server=dedi host=web1.example.com time=Asia/Manila swap=8G --angie
-
-# PHP-FPM only, using the latest stable PHP in Sury
-sudo bash setup.sh --basic server=dedi host=web1.example.com time=Asia/Manila swap=8G --php
-
-# Angie + PHP
-sudo bash setup.sh --basic server=dedi host=web1.example.com time=Asia/Manila swap=8G --angie --php ver=8.5
-
-# Valkey only
-sudo bash setup.sh --basic server=dedi host=web1.example.com time=Asia/Manila swap=8G --valkey
-
-# Elasticsearch only
-sudo bash setup.sh --basic server=dedi host=web1.example.com time=Asia/Manila swap=8G --elastic host=localhost ram=4g
-
-# Other utilities only
-sudo bash setup.sh --basic server=dedi host=web1.example.com time=Asia/Manila swap=8G --others all
-```
-
-### MariaDB profiles
-
-```bash
-# Local-only MariaDB (recommended default)
-sudo bash setup.sh \
-  --basic server=dedi host=db1.example.com time=Asia/Manila swap=8G \
-  --mariadb user=demo pass=temp size=4gb bind=127.0.0.1
-
-# Local MariaDB plus the detected public IPv4 (use for remote clients)
-sudo bash setup.sh \
-  --basic server=dedi host=db1.example.com time=Asia/Manila swap=8G \
-  --mariadb user=demo pass=temp size=8gb bind=127.0.0.1,IPV4
-
-# Local MariaDB plus explicit interfaces
-sudo bash setup.sh \
-  --basic server=dedi host=db1.example.com time=Asia/Manila swap=8G \
-  --mariadb user=demo pass=temp size=8gb bind=127.0.0.1,10.0.0.5
-
-# Local MariaDB plus IPv6 loopback
-sudo bash setup.sh \
-  --basic server=dedi host=db1.example.com time=Asia/Manila swap=8G \
-  --mariadb user=demo pass=temp size=8gb bind=127.0.0.1,::1
-```
-
-### Common web stacks
-
-```bash
-# Web app without search: Angie + PHP + MariaDB + Valkey
-sudo bash setup.sh \
-  --basic server=dedi host=web1.example.com time=Asia/Manila swap=8G \
-  --angie \
-  --php ver=8.5 \
-  --mariadb user=demo pass=temp size=4gb bind=127.0.0.1 \
-  --valkey
-
-# Web app with search: Angie + PHP + MariaDB + Valkey + Elasticsearch
-sudo bash setup.sh \
-  --basic server=dedi host=web1.example.com time=Asia/Manila swap=8G \
-  --angie \
-  --php ver=8.5 \
-  --mariadb user=demo pass=temp size=4gb bind=127.0.0.1 \
-  --valkey \
-  --elastic host=localhost ram=4g
-
-# Web app with search and all utilities
-sudo bash setup.sh \
-  --basic server=dedi host=web1.example.com time=Asia/Manila swap=8G \
-  --angie \
-  --php ver=8.5 \
-  --mariadb user=demo pass=temp size=4gb bind=127.0.0.1 \
-  --valkey \
-  --elastic host=localhost ram=4g \
-  --others smartmon nvme gif nodejs
-```
-
-### Domains
-
-`--domain` is standalone: Angie must already be installed, and MariaDB must be running when `db=` is used. It creates the document root, a self-signed certificate, a full Angie vhost from the repository templates (the basic template when `app=` is omitted) and, only when declared, the database, a scoped user and a dump import. Existing vhost files and databases are preserved.
-
-```bash
-# One domain, basic vhost, no database
-sudo bash setup.sh --domain google.com
-
-# Multiple domains
-sudo bash setup.sh --domain google.com example.org my-site.example.com
-
-# XenForo vhost + database + scoped user + dump import, then MariaDB re-sized
+# Application vhost with database, scoped user and a dump import
 sudo bash setup.sh --domain forum.example.com app=xf db=xenforodb user=demo pass=temp sql=/root/backup.sql
 
-# Full install and domain creation in one command
-sudo bash setup.sh \
-  --basic server=dedi host=web1.example.com time=Asia/Manila swap=8G \
-  --angie \
-  --php ver=8.5 \
-  --mariadb user=demo pass=temp size=4gb bind=127.0.0.1 \
-  --valkey \
-  --elastic host=localhost ram=4g \
-  --others all \
-  --domain google.com example.org
+# Tune an existing host (OS profile + every installed service), or preview it
+sudo bash setup.sh --optimize
+bash setup.sh --optimize --dry-run
 ```
 
-If a service flag is omitted, that service is **not** installed. `--basic` values are optional and auto-detected when omitted. `--domain` does **not** require `--basic` when used by itself.
+`--dry-run` (alias `--check`) validates any command and prints the plan as a
+normal user without touching the system. Other modes: `--diagnostics`,
+`--restart-all [--dry-run]`, `--purge [...]`, `--help`, `--version`.
 
-### Dry run / validation
+## `--basic`
 
-`--dry-run` (alias `--check`) parses and validates the command, then prints the resolved install or purge plan without touching the system. It works as a normal user, which makes it safe for CI and for checking combinations:
-
-```bash
-./setup.sh --dry-run --basic server=dedi host=web1.example.com time=Asia/Manila \
-  --angie --php --mariadb user=demo pass=temp size=4gb --valkey --elastic ram=4g
-./setup.sh --dry-run --purge --angie --php ver=8.5
-```
-
----
-
-## Basic setup (`--basic`)
-
-`--basic` is mandatory for installs, but **all of its values are optional**:
-
-| Option | Required | Description |
+| Option | Default | Effect |
 |---|---|---|
-| `server=dedi\|vps` | no | `dedi` also installs `cpufrequtils` and sets the CPU governor to `performance` when the CPU exposes that governor. `vps` skips that step. If omitted, the script detects it with `systemd-detect-virt`, DMI product data and cgroup checks. |
-| `host=FQDN` | no | Hostname set with `hostnamectl`. If omitted, the script generates one from the hardware: `<threads>c-<RAM_GB>g-<storage>` (for example `8c-32g-1T` for 8 threads, 32 GB RAM and 1 TB of disks). |
-| `swap=SIZE` | no | Explicit swap file size, e.g. `8G`, `2G`, `512M`. If omitted, the script only adds swap when the current total is zero **or** below 50% of RAM, and sizes it so the total becomes 50% of RAM. |
-| `time=REGION/CITY` | no | Timezone; defaults to `Asia/Manila`. |
+| `server=dedi\|vps` | auto (`systemd-detect-virt`, DMI, cgroups) | `dedi` sets the `performance` CPU governor; the pin is recorded so `--optimize` keeps the host class |
+| `host=FQDN` | `<threads>c-<RAM_GB>g-<storage>` (e.g. `8c-32g-1T`) | hostname via `hostnamectl` |
+| `swap=SIZE` | add swap only when total swap is 0 or below 50% of RAM, up to 50% of RAM (1-8 GiB, 4 GiB on a VPS) | `/swapfile` of exactly that size (`8G`, `8Gi`, `512M`) |
+| `time=REGION/CITY` | `Asia/Manila` | timezone |
 
-Basic performs:
+It writes the DNS drop-in (`8.8.8.8`, `1.1.1.1`), upgrades packages, installs
+the basic tools and `cron`/`logrotate`/`unattended-upgrades`, applies the OS
+profile (sysctl, PAM limits, governor, THP `madvise`, udev I/O rules, see
+[Hardware profile](#hardware-profile)), writes the managed root crontab
+(ownership repair of `/var/www` that skips logs and `wp-config.php`,
+Cloudflare IP refresh, MariaDB backup at 03:03 and monthly `mariadb-check`,
+`wp-cron.php` every 5 minutes, asset precompression when enabled) and
+configures UFW (deny in, allow out, `ufw limit` on every effective SSH port,
+80/443 open). Originals are recorded under `/var/lib/setup.sh` for
+`--purge basic`.
 
-1. Writes its own `/etc/systemd/resolved.conf.d/dns_servers.conf` (`8.8.8.8`, `1.1.1.1`) and restarts `systemd-resolved`. Other resolver drop-ins are left untouched.
-2. Updates Ubuntu and upgrades packages. Snapd and package caches are left alone.
-3. On a dedicated server, when the CPU exposes the performance governor: installs `cpufrequtils`, writes `/etc/default/cpufrequtils`, enables the service, and sets the `performance` governor. On a VPS or a host without that governor the step is skipped.
-4. Installs basic tools: `wget unzip nano zip software-properties-common rsync ca-certificates curl gnupg dmidecode git`. `openssl` and `logrotate` are installed by the domain/logrotate steps when needed.
-5. Generates a hostname if one was not supplied, then sets the hostname and timezone.
-6. Handles swap:
-   - With `swap=SIZE`: creates/reuses `/swapfile` at exactly that size.
-   - Without `swap`: computes current swap and RAM. If current swap is 0 or below 50% of RAM, it creates/resizes `/swapfile` so the **total** swap becomes 50% of RAM. If current swap is already at least 50%, it leaves the existing configuration untouched.
-7. Replaces `/etc/sysctl.conf` with the tuned profile and applies it (`/etc/sysctl.d/99-sysctl.conf` symlink is added when needed).
-8. Writes the high `nofile` limits to `/etc/security/limits.d/99-setup.conf`; a distribution `/etc/security/limits.conf` is restored if an older release replaced it.
-9. Installs/enables cron and writes a managed crontab block for the selected services and for services already installed and configured by this script:
-   - Angie: daily ownership repair of `/var/www` that skips the shared log tree (`/var/www/logs`, owned per service), `/var/www/mysql_database` and `*.log` files, daily `chmod +x` and execution of `/etc/angie/scripts/cloudflare.sh`.
-   - MariaDB: daily 03:03 mysql backup and monthly `mariadb-check`.
-10. Configures UFW: deny incoming, allow outgoing, rate-limit every effective SSH port with `ufw limit`, allow 80 and 443, enable the firewall. The original active state, added rules and default policies are recorded so `--purge basic` can restore them.
-
-Before changing basic settings, the script records the originals under `/var/lib/setup.sh/backup`. `--purge basic` restores them by overwriting the live files and moves generated drop-ins that did not exist before to `/tmp` instead of leaving them active. `/swapfile` and its `/etc/fstab` entry are left enabled (`/var/lib/setup.sh/swapfile-managed`). Swap is never created or resized by `--optimize`.
-
----
-
-## Security hardening
-
-Every `--basic` install and every `--optimize` run finishes with an idempotent
-security pass. It is safe to re-run and also upgrades existing WordPress trees.
+### Security pass (every `--basic` and `--optimize`)
 
 | Area | Action |
-| --- | --- |
-| `wp-config.php` | `root:www-data 640`; the nightly chown cron skips it |
-| WordPress constants | `DISALLOW_FILE_EDIT`, `DISALLOW_FILE_MODS`, `DISABLE_WP_CRON`, `WP_DEBUG_DISPLAY=false`, `FORCE_SSL_ADMIN`; placeholder salts replaced |
-| WP-Cron | managed `*/5` `wp-cron.php` entry added before WP-Cron is disabled |
-| Database users | a `DB_USER` with global privileges is replaced by `wp_<db>`, scoped to that database, with a connection test and rollback |
-| Malware | known webshells (WP-VCD, WP2SHELL, hex-named plugins) quarantined to `/var/lib/setup-quarantine/`; suspicious admins and high-risk plugins reported |
-| Files | world-writable files/dirs fixed; oversized archives inside the web root reported |
-| OS | `unattended-upgrades` installed by `--basic`, enabled by `--optimize` when present; MariaDB dumps kept 30 days and `/etc/mysqlbkup.cnf` is `root:root 600` |
-| APT keys | every third-party repository (Angie, Sury, Elastic, NodeSource) is pinned to its own keyring with `signed-by`; a legacy globally trusted Angie key is retired to `/tmp` |
-| Audit | reports SSH password auth, public 80/443, and a non-loopback Elasticsearch |
+|---|---|
+| WordPress | `wp-config.php` `root:www-data 640`; `DISALLOW_FILE_EDIT`, `DISALLOW_FILE_MODS` (`SETUP_WP_ALLOW_FILE_MODS=1` keeps plugin installs), `DISABLE_WP_CRON` (+ managed cron entry), `WP_DEBUG_DISPLAY=false`, `FORCE_SSL_ADMIN`; placeholder salts replaced; a `DB_USER` with global privileges is moved to `wp_<db>` scoped to its database (`SETUP_WP_DB_SPLIT=0` disables) |
+| Malware | known webshells quarantined under `/var/lib/setup-quarantine/` (`SETUP_PURGE_MALWARE=1` deletes); suspicious admins, risky plugins, world-writable files and oversized archives reported |
+| APT | every third-party repository pinned to its own `signed-by` keyring |
+| Audit | reports SSH password authentication, public 80/443 and a non-loopback Elasticsearch |
 
-SSH hardening, brute-force protection (fail2ban) and origin-only firewalling are left to the operator or the provider; the audit only reports password authentication and public 80/443.
-
-Environment overrides:
-
-| Variable | Effect |
-| --- | --- |
-| `SETUP_WP_DB_SPLIT=0` | keep the existing WordPress database user |
-| `SETUP_WP_ALLOW_FILE_MODS=1` | do not set `DISALLOW_FILE_MODS` (admin plugin installs stay enabled) |
-| `SETUP_PURGE_MALWARE=1` | delete quarantined malware instead of keeping it |
-| `SETUP_ACCESS_LOG=0` | (Angie repo) restore `access_log off` on very high-traffic hosts |
-
-The web-server side of the same work (dotfile and `wp-config.php`/`xmlrpc.php`
-denies, no PHP in uploads/backups, `Permissions-Policy`) lives in
-`server-configs-nginx` 1.6.18 and is deployed by the same commands. Access
-logging stays **off** for performance; only `error_log` is written. Enable a
-buffered `access_log` per host when a forensic trail is required.
+SSH hardening, brute-force protection and origin-only firewalling are left to
+the operator. The web-server side (dotfile/`wp-config.php`/`xmlrpc.php`
+denies, no PHP from upload directories, security headers) comes from
+`server-configs-nginx`. Angie access logging is off by default; only
+`error_log` is written.
 
 ## Services
 
 ### Angie (`--angie`)
 
-- Installs the Angie signing key and APT repository.
-- Installs `angie`.
-- Installs the official `angie-module-brotli` dynamic module and enables dynamic Brotli at level 5 with gzip as the compatibility fallback. On a 149 KB XenForo thread page this produced 10.9 KB on the wire versus 13.7 KB for gzip (20% smaller); guest pages were 79-93% smaller than identity. `--optimize` installs and enables the same module, so both paths stay in parity. Static assets are left to the CDN by default (`brotli_static off`). An origin that serves its own assets can set `SETUP_PRECOMPRESS_ASSETS=1` (persisted as `PRECOMPRESS_ASSETS` in `/etc/default/setup-tuning`; `0` turns it off again): every XenForo/WordPress document root gets `.br`/`.gz` siblings for its scripts, styles, fonts and SVGs (`brotli -q 11`, `gzip -9`, skipping `internal_data`, `data`, uploads and files under 1 KB), `brotli_static`/`gzip_static` serve them, and `/usr/local/bin/setup-precompress.sh` runs from the managed crontab every 5 minutes so an application upgrade is re-compressed and orphaned siblings are dropped. Measured on the 16-core test host: serving the 177 KB `core-compiled.js` compressed per request cost 50-89% CPU at 1.8k req/s (the Wi-Fi link limit); with siblings the same rate costs 2-5%. Set `SETUP_BROTLI_LEVEL=1..11` to override the level or `SETUP_ANGIE_COMPRESSION=0` to disable it.
-- Downloads [`droplinxuser/server-configs-nginx`](https://github.com/droplinxuser/server-configs-nginx) once per run and deploys it with the built-in deployer (`deploy_angie_tree`), the same code used by `--optimize`.
-- The repository (not `setup.sh`) owns `angie.conf`, `h5bp/`, `conf.d/`, `http.d/`, `snippets/`, the cache/rate-limit settings, template repairs and the Cloudflare helper.
-- Uses the repo's `scripts/limit_nofile.conf` and `scripts/etc_default_nginx` for the systemd `LimitNOFILE` drop-in and `/etc/default/angie`.
-- The repository deployer creates cache directories, removes obsolete setup.sh/pre-refactor config filenames, runs `angie -t`, and reloads Angie. `--optimize` re-runs exactly that deployer plus the hardware and guest-cache profile.
-- Configuration source overrides: `CONFIG_SOURCE_DIR=/path` (local checkout/testing), `CONFIG_REPO_URL=...`, `CONFIG_REPO_REF=main`.
-- Generates `/etc/angie/http.d/cloudflare.conf` via the repo's `scripts/cloudflare.sh` and reloads Angie.
+Installs `angie` and `angie-module-brotli` (dynamic Brotli level 5, gzip
+fallback; `SETUP_BROTLI_LEVEL=1..11`, `SETUP_ANGIE_COMPRESSION=0`), deploys the
+`server-configs-nginx` tree with the built-in deployer, applies the hardware
+profile and guest caches (the same `angie_apply_profile` as `--optimize`),
+installs the systemd `LimitNOFILE` drop-in and `/etc/default/angie` from the
+repository, generates `http.d/cloudflare.conf` and restarts the service.
+`SETUP_PRECOMPRESS_ASSETS=1` (persisted as `PRECOMPRESS_ASSETS` in
+`/etc/default/setup-tuning`) writes `.br`/`.gz` siblings for the static assets
+of every XenForo/WordPress root and keeps them fresh from cron; off by default
+because a CDN normally serves assets. `CONFIG_REPO_URL`/`CONFIG_REPO_REF`
+select a fork or branch.
 
 ### PHP (`--php [ver=8.5] [children=auto|N] [max_requests=N]`)
 
-- Adds the Sury APT repository (keyring embedded in the script and verified against the payload on every run).
-- If `ver=` is omitted, selects the **latest stable PHP** available to APT from the Sury repository (currently 8.5; pre-release packages such as `8.6.0~rc3` are ignored).
-- **Purges previous PHP packages before installing.** All packages matching `php*` (versions, CLI, common, FPM, extensions) are removed first and the old `/etc/php` tree is copied to `/tmp`, so a stopped second PHP version cannot later take over the shared socket. This is intentionally destructive for PHP only; MariaDB/Redis data is not touched.
-- Installs the XenForo profile: `php<ver>-fpm`, `php<ver>-cli`, `php<ver>-opcache`, `php<ver>-mysql`, `php<ver>-gd`, `php<ver>-curl`, `php<ver>-xml`, `php<ver>-zip`, `php<ver>-gmp`, `php<ver>-mbstring`, `php<ver>-redis`. It does not install `intl`, `imagick`, `bcmath`, `apcu`, `igbinary`, `msgpack`, `sqlite3` or `bz2` unless you add them yourself.
-  - OPcache settings in `custom_dan.ini` are active because `php<ver>-opcache` is installed. The JIT is off by default (see the OPcache paragraph below for the switch and the measurements). Add `php<ver>-intl` only if an add-on needs it.
-- Deploys `www.conf` from `configs/php/www_<ver>.conf` and `custom_dan.ini` from `configs/php/custom_dan.ini`. Add a new `configs/php/www_<ver>.conf` to support a new PHP version. These are local non-Angie configs; no Angie repo fetch is needed for a PHP-only install.
-- Fills in the dynamic values from `setup.sh`:
-  - `pm.max_children` on a fresh install comes from the shared plan: `CPU threads × 16`, capped by `50% of RAM / 96 MB`, 512 and at least 8, and the plan reserves 64 MB per worker (the measured XF floor) so a first `--optimize` does not have to shrink the budget. On `--optimize` a live pool keeps its worker count and the planner reserves `max_children × measured allowance` instead: it samples the running workers, adds 50% headroom to the average RSS, clamps the allowance to 64–192 MB, and leaves the freed RAM for MariaDB/Elasticsearch. A measured 28 MB XenForo worker on the 27.8 GB test host therefore reserves 64 MB (the floor), and the count stays 144.
-  - `pm.max_requests = CPU threads × 1024`
-  - **CPU-bound application hosts.** When every PHP vhost in `conf.d` is a XenForo or WordPress site whose database is local (loopback, `p:localhost` or a socket), the pool is capped at 4 workers per core (3 on a VPS), below the generic ceiling and below a live pool\x27s count. Measured on the 16-thread test host with a seeded XenForo board (50 members, 150 threads, 2,400 posts): the 144-worker pool and a 48-worker pool both serve about 900-950 member req/s, but p50 latency drops from 107 ms to 51 ms (64 workers: 73 ms) because a CPU-bound page gains nothing from nine runnable workers per core. A host that also runs an unknown PHP application, or whose database is remote (I/O-bound workers), keeps the generic ceiling; `children=` always wins.
-  - override either with `children=` / `max_requests=`
-- Sizes OPcache and `memory_limit` from RAM instead of fixed 512 MB values:
-  - OPcache 128–512 MB, `memory_limit` 256–512 MB, realpath cache 4–16 MB.
-  - **OPcache JIT** is off by default (`opcache.jit = disable`, no buffer): the tracing JIT crashed PHP-FPM 8.3 on a live WordPress site (`segfault at ... in php-fpm8.3`, every request on the killed worker returned 502). `SETUP_PHP_JIT=tracing` (or `function`) turns it on for the pool with a buffer of a quarter of the OPcache (32–256 MB); the choice is persisted as `PHP_JIT` in `/etc/default/setup-tuning`. While it is on, every WordPress document root found in `conf.d` keeps `opcache.jit = off` through a `[PATH=<root>]` section at the end of `zz-setup-optimize.ini`: php-fpm applies such a section at request start and restores the pool value afterwards, so it cannot leak to the next vhost the way a `fastcgi_param PHP_ADMIN_VALUE` does (verified on the test host: `opcache_get_status()` reports the JIT on under the XenForo root and off under the WordPress root of the same pool). `SETUP_PHP_JIT_WORDPRESS=1` lifts the WordPress exception (persisted as `PHP_JIT_WORDPRESS`). Measured on the 16-thread test host with a seeded XenForo 2.3.13 board and WordPress 7.1.4, 100 connections from a workstation, three runs per mode: on PHP 8.5.12 the JIT compiles nothing (the buffer never grows past 2.4 KB in any mode) and every mode is within noise of off; on PHP 8.4 with a working JIT, `tracing` gained 3-5% on every CPU-bound tier (XenForo member home 957 -> 986 req/s, member thread 478 -> 500, WordPress uncached 252 -> 261, member 244 -> 253, p50 latency 3-5% lower) with 0.9 MB of compiled code, while `function` filled the 64 MB buffer and was equal or slower (XenForo member forum 670 -> 588). No php-fpm segfault occurred in any run on 8.4/8.5. Set `SETUP_PHP_JIT=tracing` on a XenForo host running PHP 8.4; keep WordPress on the bytecode cache unless it has been load-tested with the JIT on its own PHP build.
-- The repo templates provide OPcache file cache under `/var/cache/php/opcache` (left empty by the managed ini while the JIT is on: scripts restored from the file cache are never JIT-compiled, measured below), `request_slowlog_timeout=10s`, `catch_workers_output=yes`, MariaDB Unix-socket defaults and `mysqlnd` statistics disabled. PHP session settings are left at their defaults, and `cgi.fix_pathinfo` keeps PHP's runtime default.
-- `--optimize` writes the performance tuning into `/etc/php/<ver>/fpm/conf.d/zz-setup-optimize.ini` and leaves PHP sessions alone. It also refreshes a stale `conf.d/custom_dan.ini` from `configs/php/custom_dan.ini`, preserving the host's existing `date.timezone`; this removes old 2 GB `memory_limit` and `curl_exec`/`exec` `disable_functions` values, and keeps OPcache JIT disabled. The optimizer also changes `fastcgi_param PATH_TRANSLATED $document_root$fastcgi_path_info;` to `$document_root$fastcgi_script_name;` in every deployed `h5bp/php*.conf` include, so `cgi.fix_pathinfo=0` cannot make PHP-FPM execute the document root, and it comments out any per-request `fastcgi_param PHP_ADMIN_VALUE open_basedir=...` (PHP-FPM caches admin values per worker, so one vhost's `open_basedir` silently restricts every other vhost on the shared pool: WordPress then redirects to `/wp-admin/setup-config.php` and PHP cannot open the primary script). Global session overrides broke Joomla/Polr logins, so `session.*` hardening (strict mode, cookies-only, `HttpOnly`, `Secure`, `SameSite=Lax`, long IDs), `cgi.fix_pathinfo=0`, `display_errors=Off` and the central `error_log` are **opt-in**: run `sudo SETUP_PHP_SESSION_HARDENING=1 ./setup.sh --optimize`. Test every application before enabling it.
-- `setup.sh` creates the log/cache directories and the systemd `LimitNOFILE=524288`, `UMask=0027` drop-in. PHP-FPM and Angie use the Unix socket `/run/php/php-fpm.sock`.
-- Sets the PHP timezone from `--basic time=`.
-- Enables and restarts `php<ver>-fpm` and prints `php<ver> -v`. If the template/tuning/start fails, the previous PHP configuration is restored from `/tmp`.
+- Sury repository (embedded keyring). `ver=` defaults to the latest stable
+  release. **Only one PHP-FPM version can be active** (both Angie and the pool
+  use `/run/php/php-fpm.sock`): a `--php` run purges every `php*` package
+  first and copies the old `/etc/php` to `/tmp`; switch versions with
+  `--purge --php ver=8.4` then `--php ver=8.5`.
+- Installs the XenForo profile (`fpm cli opcache mysql gd curl xml zip gmp
+  mbstring redis`); add `intl`/`imagick`/`bcmath` yourself if an add-on needs
+  them.
+- Pool: `pm=static`; `pm.max_children` from the shared memory plan (16 per
+  core, 8 on a VPS, at most RAM/2 at 96 MB per worker, 512 maximum; 4 per
+  core, VPS 3, when every PHP vhost is XenForo/WordPress with a local
+  database, because those pages are CPU-bound: 144 vs 48 workers served the
+  same ~950 member req/s while p50 fell from 107 ms to 51 ms). A live pool
+  keeps its count; `children=` wins. `pm.max_requests = threads x 1024`,
+  `request_terminate_timeout 300s`, slow log at 10 s, `rlimit_files 524288`,
+  systemd `LimitNOFILE=524288`/`UMask=0027`.
+- `zz-setup-optimize.ini`: `memory_limit` 256-512M (128M under 2 GB),
+  OPcache 128-512 MB with interned strings, realpath cache 4-16 MB, MariaDB
+  socket defaults. `custom_dan.ini` is refreshed from `configs/php/` while the
+  host timezone is kept. `fastcgi_param PATH_TRANSLATED` is repaired in every
+  `h5bp/php*.conf` and any per-request `PHP_ADMIN_VALUE open_basedir` is
+  commented out (PHP-FPM caches admin values per worker, so one vhost's
+  setting leaked onto every other vhost of the shared pool).
+- **OPcache JIT** is off by default (the tracing JIT crashed php-fpm 8.3 on a
+  live WordPress site). `SETUP_PHP_JIT=tracing|function` turns it on for the
+  pool with a buffer of OPcache/4 (32-256 MB), persisted as `PHP_JIT`; while
+  it is on, every WordPress document root keeps `opcache.jit = off` through a
+  `[PATH=<root>]` section of the managed ini (applied per request by php-fpm,
+  so it cannot leak like a FastCGI param; `SETUP_PHP_JIT_WORDPRESS=1` lifts
+  it) and `opcache.file_cache` is left empty, because scripts restored from
+  the file cache are never JIT-compiled. Measured on the test host (XenForo
+  2.3.13 + WordPress 7.1.4): the Sury PHP 8.5.12 build compiles nothing in
+  any mode; on PHP 8.4 `tracing` gained 3-5% on every CPU-bound tier and
+  `function` was equal or slower. Use `tracing` on a XenForo host running
+  8.4; keep WordPress on the bytecode cache unless it has been load-tested.
+- Session/cgi hardening (`session.*` strict settings, `cgi.fix_pathinfo=0`,
+  `display_errors=Off`, central `error_log`) is **opt-in**:
+  `SETUP_PHP_SESSION_HARDENING=1`. It broke Joomla/Polr logins on a mixed
+  host.
 
-**PHP version policy:** the pool listens on `/run/php/php-fpm.sock`, and the Angie `local_php` upstream points to the same socket. Therefore **only one PHP-FPM version can be active at a time**. A new `--php` run purges all existing PHP packages first and performs a clean installation of the requested version.
+### XenForo (`--domain ... app=xf`)
 
-### XenForo tuning (`--domain ... app=xf`)
+The vhost serves guest pages from the FastCGI cache for 5 minutes with a
+map-based bypass for `xf_session`/`xf_user`/admin/login cookies, a key that
+varies on style, style variation, language and `Accept-Encoding`, background
+refresh and stampede lock, 404/301 for 24 h, never 5xx, an immutable 30-day
+location for `/js`, `/styles` and `/data`, and the server-level security
+headers re-included inside the PHP locations (a location-level `add_header`
+would otherwise drop HSTS). `--optimize` repairs or completes the same block
+on older hosts. Application-side findings from the test host: disable the
+"Members online", "Trending" and "Featured" forum-list widgets if unused
+(+39% authenticated throughput), keep sessions/registry in MariaDB on a
+single host (XF's Redis cache measured 27% slower there) and use
+`$config['db']['host'] = 'p:localhost'` for persistent connections.
 
-The generated `app=xf` vhost serves guest pages from Angie's FastCGI cache
-for 5 minutes and bypasses it for `xf_session`, `xf_user`, admin and login
-cookies. The cookie decision is a managed
-`map $http_cookie $setup_xf_guest_bypass` file (no `if` inside location
-blocks), consumed by `fastcgi_no_cache`/`fastcgi_cache_bypass`. The cache key
-varies on the XenForo style variant (`xf_style_id`,
-`xf_style_variation`) and language (`xf_language_id`), matching
-`src/XF/PageCache.php`; without the last two a guest with a non-default style
-or language could receive another guest's cached HTML. Expired entries are
-refreshed in the background (`fastcgi_cache_background_update`) while
-`cache_lock` collapses a stampede. XenForo's own `/js`, `/styles` and `/data`
-assets get one managed `Cache-Control: public, immutable` location with a
-30-day expiry, re-applied after every Angie repository sync. `--optimize`
-repairs or completes this cache block on older hosts (including the shared
-`fastcgicache` zone and `$nocacheuri` map), so an existing XenForo vhost gets
-the same guest cache as a fresh `app=xf` install. The stack-level defaults
-(PHP-FPM static workers, Unix sockets, MariaDB thread pool, Brotli,
-HTTP/2 keepalive) are tuned for XenForo. Measured on the 16-thread test host
-(Ubuntu 26.04, XenForo 2.3.13, 50 authenticated users):
+### MariaDB (`--mariadb user=U pass=P [size=auto|4gb] [bind=127.0.0.1[,ADDR|IPV4|::1]]`)
 
-| Change | Authenticated index | Notes |
-|---|---:|---|
-| Default stack + Brotli 5 | ~1.0k req/s | 51 KB HTML -> 9.8 KB Brotli |
-| Disable "Members online" widget | ~1.2k req/s | 13% smaller HTML |
-| Disable members-online + trending + featured widgets | **~1.43k req/s** | +39%, ACP > Widgets |
-| XenForo Redis registry/session cache | ~0.97k req/s | slower than local MariaDB on one host |
-| MariaDB-backed registry/sessions (no XF cache) | **~1.33k req/s** | recommended for a single host |
-
-Recommended application settings:
-
-- Keep `xf_session_activity` optimization enabled (XenForo default); it skips
-  repeat activity writes within one second.
-- Do **not** enable XF's Redis cache on a single host with local MariaDB just
-  because Valkey is installed. It measured 27% slower than MariaDB sessions.
-  Use it for multi-node installations or a remote/slow database.
-- If you use persistent DB connections, set `$config['db']['host'] =
-  'p:localhost'` and keep the socket path. The synthetic DB endpoint improved
-  from 23k to 38k req/s (+62%); XF itself is mostly CPU-bound.
-- Disable the "Members online", "Trending content" and "Featured content"
-  forum-list widgets when they are not required; they issue several queries
-  and add 13% HTML per authenticated page.
-- Set `opcache.validate_timestamps=0` and reload PHP-FPM on deploy if the
-  application files are stable; it removes per-request stat calls. Measure
-  first: the template-heavy XF workload showed little difference on this host.
-- Guest traffic stays on Angie's FastCGI cache. Do not cache authenticated
-  pages; the vhost's cookie bypass is intentional.
-
-### MariaDB (`--mariadb user=... pass=... [size=4gb|auto] [bind=...]`)
-
-- Installs `mariadb-server` and `mariadb-client`.
-- Adds a systemd `LimitNOFILE=1048576` drop-in and silences the package's unset-environment warning.
-- Writes a managed `[mariadbd]` base block into `/etc/mysql/mariadb.conf.d/50-server.cnf` (charset, `skip_name_resolve`, `local_infile=0`, `secure_file_priv`, bind address) and the hardware profile into `99-setup-optimize.cnf`; `--optimize` writes the same two files:
-  - `max_connections = PHP workers × 1.25 + 50` (CPU threads × 32 without a PHP tier; clamped to 200–2000, never below a live larger ceiling)
-  - `innodb_buffer_pool_size = size` (`size=auto`, the default, = shared 80%-of-RAM plan from the live data+index size, minimum 128 MB)
-  - `innodb_io_capacity`/`_max` by disk class and host type: NVMe 10000/20000 (3000/6000 on a VPS), SSD 4000/8000 (1000/2000 on a VPS), HDD 400/800; `innodb_flush_neighbors=1` and 4 I/O threads on rotational disks, otherwise `clamp(threads/2, 4, 16)`; `SETUP_MARIADB_IO_CAPACITY="read max"` pins a host
-  - `thread_cache_size = clamp(threads × 8, 32, 256)`, `tmp_table_size`/`max_heap_table_size = clamp(RAM/256, 32, 256) MB` (at most pool/8)
-  - `innodb_log_file_size = size / 4` (clamped 64 MB–2 GB), `innodb_log_buffer_size = 64M`
-  - `innodb_flush_log_at_trx_commit = 2` (durable across server crash; use `1` if every committed transaction must survive an OS crash)
-  - `innodb_snapshot_isolation = 1` (standard MVCC isolation)
-  - `innodb_read_io_threads` / `innodb_write_io_threads = CPU threads` (capped 64)
-  - `thread_handling = pool-of-threads` / `thread_pool_size = CPU threads` — on this host this cut p99 for short web queries from ~745 ms to ~9 ms by removing connection-thread churn
-  - `innodb_io_capacity` chosen for NVMe (4000/8000), SSD (2000/4000) or HDD (400/800)
-  - 512k join/read buffers, 1M sort buffer, 64M temp tables, 8k table/open-file caches on ≥4 GB pools
-  - `secure_file_priv=/var/lib/mysql-files`, `local_infile=0`, `wait_timeout=600`, `max_allowed_packet=64M`
-  - Slow query log at `/var/www/logs/mariadb/slow.log` (`long_query_time=1`, `min_examined_row_limit=100`, query plan + explain)
-  - `bind-address` from `bind=` (default `127.0.0.1`)
-- `--optimize` writes performance settings to `/etc/mysql/mariadb.conf.d/99-setup-optimize.cnf` and removes the performance/logging keys from `50-server.cnf`, not only from the marker block: older releases wrote these keys bare, so this is what makes the 99- drop-in the single owner. Base settings (charset, `skip_name_resolve`, `open_files_limit`, `secure_file_priv`, `bind-address`) remain in 50. The optimizer leaves a `/tmp` copy and does not delete the file.
-- Comments out `expire_logs_days`.
-- Creates the requested admin user with `GRANT ALL ... WITH GRANT OPTION` for `localhost`, `127.0.0.1` and `::1` (idempotent `CREATE USER IF NOT EXISTS` + `ALTER USER`). The extra loopback hosts are required because `skip_name_resolve=1` means a TCP connection to `127.0.0.1` does **not** match `'user'@'localhost'`.
-- Creates `/var/www/logs/mariadb`, sets ownership, reloads systemd and restarts MariaDB.
-- Does not download MariaDB tools at runtime: `mysqltuner.pl` and the `mysqlbackup` repository are embedded. It installs `mysqltuner.pl` to `/root/mysqltuner.pl`, installs the backup utility under `/root/tools/mysqlbackup-master`, and writes `/etc/mysqlbkup.cnf` with the requested user/password.
-- Verifies `mysqldump` and `mariadb-check` are present.
-
-**Multiple bind addresses / remote access:** `bind=` accepts a comma-separated list of IPv4 addresses, `::1`, and the special token `IPV4`:
-
-```bash
-# Listen on loopback and a specific interface
-sudo bash setup.sh --basic ... --mariadb user=demo pass=temp size=4gb \
-  bind=127.0.0.1,10.0.0.5
-
-# Listen on loopback plus the detected public IPv4
-sudo bash setup.sh --basic ... --mariadb user=demo pass=temp size=4gb \
-  bind=127.0.0.1,IPV4
-```
-
-`IPV4` first asks an external service for the public address. If that address is not assigned to a local interface (typical behind NAT), it warns and falls back to the local outbound IPv4 instead of writing an unusable bind. Whitespace and duplicate addresses are removed.
-
-The script does **not** open TCP 3306 in UFW and does not create `'user'@'%'` accounts. For remote clients, allow only trusted source addresses and create a matching account:
-
-```bash
-sudo ufw allow from 203.0.113.10 to any port 3306 proto tcp
-sudo mariadb -e "CREATE USER 'app'@'203.0.113.10' IDENTIFIED BY 'strong-password'; \
-  GRANT SELECT,INSERT,UPDATE,DELETE ON appdb.* TO 'app'@'203.0.113.10';"
-```
-
-Use TLS (`require_secure_transport=ON`) if traffic crosses an untrusted network.
-
-The MariaDB backup cron entry is added only when MariaDB is selected.
-
-**Ubuntu 26.04 AppArmor note:** the packaged `mariadbd` AppArmor profile omits `dac_override`/`setuid`/`setgid`, which breaks `mariadb-install-db` on re-installs. The script adds a managed capability override to `/etc/apparmor.d/local/mariadbd` and removes a stale loaded profile before reinstalling. `--purge mariadb` removes the override.
+- Installs `mariadb-server`/`mariadb-client`, the systemd `LimitNOFILE`
+  drop-in and the AppArmor capability override Ubuntu 26.04 needs for
+  `mariadb-install-db`.
+- Base block in `50-server.cnf` (utf8mb4, `skip_name_resolve`,
+  `local_infile=0`, `secure_file_priv`, bind address; a commented-out
+  `bind-address` is left alone by `--optimize`) and the hardware profile in
+  `99-setup-optimize.cnf`: buffer pool from the plan (`size=auto` = live
+  data+index +20%, 128 MB minimum; `size=` reserved verbatim), redo log
+  pool/4 (64 MB..4 GB on NVMe, 2 GB otherwise), `innodb_io_capacity` by disk
+  and host class (NVMe 10000/20000, VPS 3000/6000; SSD 4000/8000, VPS
+  1000/2000; HDD 400/800 with `flush_neighbors=1`; `SETUP_MARIADB_IO_CAPACITY="r m"`
+  pins it), I/O threads `clamp(threads/2, 4, 16)`, `thread_handling =
+  pool-of-threads` sized to the CPUs, `max_connections = PHP workers x 1.25 +
+  50` (threads x 32 without PHP, 200..2000, never below a live larger value),
+  table caches `clamp(max_connections x 16, 4000, 32768)`, temp tables
+  `clamp(RAM/256, 32, 256) MB` capped at pool/8, `flush_log_at_trx_commit=2`,
+  slow log (1 s, 100 rows, plan+explain) and `log_error` under
+  `/var/www/logs/mariadb/`. The generated files are validated with
+  `mariadbd --help --verbose` before any restart.
+- Creates the admin user for `localhost`, `127.0.0.1` and `::1` (needed with
+  `skip_name_resolve`), installs the embedded `mysqltuner.pl` and
+  `mysqlbackup` utility (`/etc/mysqlbkup.cnf`, 30 dumps kept). TCP 3306 is
+  never opened; `bind=IPV4` resolves the public address and falls back to the
+  local outbound IPv4 behind NAT.
 
 ### Valkey (`--valkey [ram=2g] [policy=allkeys-lru] [io_threads=1]`)
 
-- If an existing `redis-server` is present, Valkey installation is skipped with a warning instead of failing the run or purging Redis. Run `--optimize` to tune the existing Redis server with the same cache profile (maxmemory, policy, backlog, maxclients, lazy-free, systemd fd limits, `CONFIG SET` before restart).
-- Replaces the managed directives in `/etc/valkey/valkey.conf` (no duplicates):
-  - `supervised systemd`
-  - `save ""` (cache-only; enable AOF/RDB if you store sessions or queues)
-  - `maxmemory` from `ram=` or the shared memory plan (live working set +20%, 128 MB minimum); `maxclients` follows the PHP pool (workers × 4 + 2000, minimum 10000)
-  - `maxmemory-policy` from `policy=` (default `allkeys-lru`)
-  - `maxmemory-samples 10`
-  - `bind 127.0.0.1 -::1`, `protected-mode yes`
-  - `unixsocket /run/valkey/valkey.sock`, `unixsocketperm 770`; `www-data` is added to the `valkey` group so local PHP can use the socket
-  - `io-threads 1` by default, `tcp-backlog 65535`, `maxclients 20000`, `hz 10`, lazy-free settings
-- Enables/restarts `valkey-server`, refreshes PHP-FPM so workers inherit the `valkey` group, and verifies `valkey-cli ping` returns `PONG`.
+Skipped with a warning when `redis-server` is installed (`--optimize` then
+tunes Redis with the same profile; Valkey wins when both exist). Managed
+`valkey.conf`: loopback bind, `protected-mode`, `unixsocket
+/run/valkey/valkey.sock` mode 770 with `www-data` in the `valkey` group,
+`save ""`/`appendonly no` (cache only), `maxmemory` from the plan (live
+working set +20% with a floor of RAM/64 clamped to 128 MB..1 GB; `ram=`
+verbatim), `maxclients` from the PHP pool (workers x 4 + 2000, min 10000),
+`tcp-backlog`, `hz 10`, lazy-free. `io_threads` stays 1: 8 threads cost 430%
+CPU and lowered full-page throughput. Runtime values are applied with
+`CONFIG SET`; a restart (which empties the cache) happens only for
+startup-only keys. On a single host with local MariaDB, XenForo measured
+faster without the Redis cache (see above).
 
-If both Valkey and Redis are installed, `--optimize` tunes Valkey only, because applying the same shared cache budget twice would overcommit RAM.
+### Elasticsearch (`--elastic [host=localhost] [ram=4g|auto]`)
 
-Benchmarks on this host showed that extra I/O threads are counterproductive for small web-cache commands: full-page throughput was 6.5k req/s with `io_threads=1` vs 5.1k with `io_threads=8`, while Valkey CPU rose from 64% to 430%. Raise `io_threads=` only after `valkey-benchmark` shows the main thread saturated.
+Elastic 9.x repository, managed `elasticsearch.yml` block (`network.host`,
+single-node discovery, X-Pack security off, `bootstrap.memory_lock`, bool
+clause/bucket limits, index buffer and fielddata 20%, search threads
+`clamp(cpus/2, 1, 16)`, write threads `clamp(cpus/4, 1, 8)`, compression,
+200 MB content limit), `jvm.options.d/zz-setup-optimize.options` with the
+heap (`auto` = index store/4 rounded to 512 MB, 512 MB..25% of RAM..31 GB;
+an operator-owned `jvm.options` is kept), systemd `LimitMEMLOCK=infinity`
+and `vm.max_map_count`. On a single node, yellow health caused by unassigned
+replicas is fixed (replicas 0 plus a low-priority template). Keep
+`host=localhost` unless X-Pack security, TLS and a firewall are in place;
+the probe endpoint follows `http.host`/`network.host`/`http.port`.
 
-For local PHP, prefer the Unix socket (`/run/valkey/valkey.sock`) over TCP. In the stress test it raised Valkey endpoint throughput from ~15k to ~29k req/s and removed most of the p99 tail caused by ephemeral-port/TIME_WAIT pressure.
+### Other packages (`--others smartmon nvme gif nodejs sysstat | all`)
 
-**XenForo caution:** a local Redis/Valkey cache is not automatically faster
-than a local MariaDB. On a single 16-thread host, XenForo's registry/session
-cache over the Unix socket measured **0.97k req/s** on authenticated pages,
-while MariaDB-backed sessions/registry measured **1.33k req/s** (+37%). Enable
-XF's Redis cache for multi-node installations, a remote/slow database, or a
-large shared registry; benchmark it first on a single host. `--optimize` prints
-this warning next to the XenForo snippet.
-
-### Elasticsearch (`--elastic [host=localhost] ram=4g`)
-
-- Installs the Elastic 9.x APT repository and signing key (embedded).
-- Installs `elasticsearch`.
-- Writes a managed block to `/etc/elasticsearch/elasticsearch.yml`:
-  - `cluster.name: essearch`
-  - `network.host` from `host=` (default `localhost`)
-  - `http.port: 9200`
-  - `bootstrap.memory_lock: true` (the systemd drop-in sets `LimitMEMLOCK=infinity`)
-  - `indices.query.bool.max_clause_count: 4096`, `search.max_buckets: 65536`
-  - `indices.memory.index_buffer_size: 20%`, `indices.fielddata.cache.size: 20%`
-  - `action.destructive_requires_name: true`, `http.compression: true`, `http.max_content_length: 200mb`
-  - `discovery.type: single-node`
-  - disables `xpack.security.enabled` and `xpack.security.enrollment.enabled`
-  - comments out `cluster.initial_master_nodes`
-  - comments out the package’s `http.host`/`transport.host` so `network.host` actually controls the bind address
-- Writes `/etc/elasticsearch/jvm.options.d/zz-setup-optimize.options` with `-Xms<ram>`, `-Xmx<ram>`, G1GC, a 200 ms pause target and heap-dump-on-OOM. An operator-owned `jvm.options` is preserved; only the legacy script-generated file is moved to `/tmp`. `ram=auto` on a fresh install starts from `RAM/16` (512 MB–4 GB) and then spends any spare shared budget on the search heap (up to `RAM/8` on a shared host; the standard 50% heap when Elasticsearch is the only service). On the 27.8 GB test host this moved the empty-index heap from 512 MB to 3 GB.
-- Writes `/etc/systemd/system/elasticsearch.service.d/limits.conf` with `LimitMEMLOCK=infinity`, `LimitNOFILE=1048576` and `LimitNPROC=4096`.
-- Handles IPv6 hosts correctly when probing `http://[::1]:9200`.
-- Sets `vm.max_map_count=1048576` (persisted in `/etc/sysctl.d/99-elasticsearch.conf`, rewritten on every install/optimize so an older lower value cannot survive a reboot).
-- Enables/restarts Elasticsearch and waits for the HTTP endpoint to become ready.
-- `--optimize` resolves the effective HTTP endpoint from `http.host` (when set) or `network.host`, honours a custom `http.port`, and uses it for the index/heap/readiness/replica calls. A node intentionally bound to a local IPv4 for a remote XenForo client is therefore probed on that address instead of `127.0.0.1`; if the host itself cannot reach the endpoint (firewall/NAT), the active unit plus the exact listener is reported instead of rolling back a healthy tune.
-
-With security disabled, keep `host=localhost` unless you really intend to expose port 9200. The script warns when a non-loopback `host=` is used; enable X-Pack security/TLS and a firewall before exposing it. For a remote Elasticsearch client, allow TCP 9200 only from the XenForo server and prefer a private network or X-Pack security/TLS. The heap is also checked against 50% of RAM and a warning is printed if it is too large.
-
-### Other packages (`--others ...`)
-
-Available names: `smartmon`, `nvme`, `gif`, `nodejs`, `sysstat`, or `all`.
-
-| Name | Installs |
-|---|---|
-| `smartmon` | `smartmontools` (and tries to enable `smartd`) |
-| `nvme` | `nvme-cli` — **only when the server is dedicated and the storage is actually NVMe**; otherwise skipped |
-| `gif` | `gifsicle` |
-| `nodejs` | NodeSource 26.x repository/key (embedded) and `nodejs` (select the major with `SETUP_NODE_MAJOR`) |
-| `sysstat` | `sysstat` and its collect/summary timers (`sar`, `iostat`, `pidstat`) |
-
-`--others all` expands to `smartmon nvme gif nodejs sysstat` (subject to the NVMe gate).
-
-The `nodejs` item defaults to the NodeSource 26.x line. NodeSource serves exactly one major per APT line, so changing `SETUP_NODE_MAJOR` changes the runtime that `apt-get install nodejs` resolves to, and a new major changes `NODE_MODULE_VERSION` (the native-addon ABI). setup.sh therefore refuses to move an existing install across majors on its own: it prints the installed major, leaves the package untouched, retires a `/etc/apt/sources.list.d/nodesource.sources` line that points at another major (renamed `.disabled`, so a later apt run cannot make the jump either) and continues with the other items. Pin the host with `SETUP_NODE_MAJOR=18` (or `NODE_MAJOR=18` in `/etc/default/setup-tuning`) when a colocated app needs a specific ABI — soketi 1.6.1 bundles a uWebSockets.js with Node 14/16/18 binaries only — or allow a one-off switch with `SETUP_NODE_ALLOW_MAJOR_UPGRADE=1`.
-
-The `nvme` item is gated: it installs only when `server=dedi` (or auto-detection says dedicated) **and** an NVMe block device is present (`/sys/block/nvme*` or `lsblk` transport `nvme`). On a VPS/container or non-NVMe server it logs a skip and continues.
+`smartmontools`; `nvme-cli` (dedicated host with NVMe only); `gifsicle`;
+`nodejs` from NodeSource (`SETUP_NODE_MAJOR`, default 26; an installed major
+is never switched silently because the native-addon ABI changes: pin it or
+set `SETUP_NODE_ALLOW_MAJOR_UPGRADE=1`); `sysstat` with its timers.
 
 ### Domains (`--domain DOMAIN [app=TYPE] [db=NAME [user=U pass=P] [sql=FILE]] [DOMAIN ...]`)
 
-A standalone action that does **not** require `--basic`. It requires Angie to be installed, and MariaDB to be running when `db=` is given. For each domain it creates:
+Standalone (needs Angie, and MariaDB when `db=` is given). Per domain:
+`/var/www/<domain>/public/` (www-data), a self-signed certificate under
+`/etc/angie/ssl/<domain>/` (replace with ACME), a vhost rendered from the
+repository template (`app=basic xf wordpress flarum pingvin chevereto polr
+lychee shlink sfs php node`; `basic` is the default) and tested with
+`angie -t`, and only when declared: the database (utf8mb4), a user with
+`ALL` on that database for the three loopback hosts, and a dump import
+(`.sql`, `.gz`, `.xz`, `.zst`, `.bz2`) into an empty database followed by a
+MariaDB re-size. Existing vhost files and databases are preserved;
+application code is not installed. Can be combined with an install.
 
-| Artifact | Example for `google.com` |
-|---|---|
-| Document root | `/var/www/google.com/public/` (owned by `www-data`, mode 755) |
-| Self-signed certificate | `/etc/angie/ssl/google.com/{fullchain.pem,privkey.pem}` (every template terminates TLS) |
-| Angie vhost | `/etc/angie/conf.d/google.com.conf` (mode 644), rendered from `conf.d/templates` of `server-configs-nginx`; `example.com.conf` (static root, `h5bp/basic.conf`, plus the port-80 redirect) when `app=` is omitted |
-| MariaDB database | only with `db=NAME` (`utf8mb4` / `utf8mb4_general_ci`) |
-| Database user | only with `user=U pass=P` (requires `db=`): `ALL PRIVILEGES` on that database for `localhost`, `127.0.0.1` and `::1`; an existing account is re-keyed to `pass=` |
-| Dump import | only with `sql=FILE` (requires `db=`): `.sql`, `.sql.gz`, `.xz`, `.zst` or `.bz2`, imported into an **empty** database in bulk-load mode; a non-empty database is left alone with a warning |
-| MariaDB re-optimization | after any import: the shared memory plan is rebuilt from the live data+index size and the `99-setup-optimize.cnf` profile is rewritten (online buffer-pool resize, or a restart with the web tiers paused) |
+## `--optimize`
 
-```bash
-# Basic vhost, no database
-sudo bash setup.sh --domain google.com
-sudo bash setup.sh --domain google.com example.org my-site.example.com
+Tunes the OS and every installed service in place (Ubuntu 22.04, 24.04,
+26.04). It never installs, starts or purges a managed service and never
+touches swap; the only packages it may add are `cpufrequtils` and
+`angie-module-brotli`. Steps:
 
-# Application vhost with database, scoped user and a dump
-sudo bash setup.sh --domain forum.example.com app=xf db=xenforodb user=demo pass=temp sql=/root/backup.sql
+1. OS profile (governor, PAM limits, sysctls) and the security pass.
+2. Angie: `/etc/angie` is synced from `server-configs-nginx`, the WordPress
+   and XenForo guest caches are enabled or repaired (shared `fastcgicache`
+   zone, `$nocacheuri` and cookie-bypass maps), the hardware profile is
+   applied, `angie -t` runs, and the service is reloaded **once, and only
+   when the tree digest changed**; a failed sync or test restores the previous
+   tree. Legacy underscore-named `http.d` files are tuned in place.
+3. PHP-FPM: every `/etc/php/<ver>/fpm` tree; a live TCP pool used through the
+   `local_php` upstream is migrated to the Unix socket (graceful reload, or
+   a short explicit restart when SIGUSR2 cannot open the listener).
+4. MariaDB, Valkey/Redis and Elasticsearch from the shared 80%-of-RAM plan:
+   live data is funded first (MariaDB data+index +20%, Valkey working set
+   +20% with the RAM floor, Elasticsearch store/4), explicit sizes are
+   reserved verbatim, PHP is sized from the remainder, and targets that do not
+   fit are trimmed Elasticsearch first, then Valkey, then MariaDB. A value
+   within 2% of its target is kept. A MariaDB restart pauses Angie and PHP
+   first and resumes them after `SELECT 1`; the buffer pool is resized online
+   when nothing else changed. Every failed service is rolled back from
+   `/tmp/setup-optimize.*` (files created during the tune are moved out of
+   the tree so a rejected drop-in cannot win again).
+5. Audit of WordPress/XenForo configs (persistent `p:` database host, Valkey
+   socket) with the exact snippets to apply; application files are never
+   edited. Legacy cron and `/var/www` ownership from releases before 1.8.34
+   are repaired.
+6. Verification of every listener (`ss`, SQL, PING, HTTP) and recent
+   error-level journal entries. The Markdown report goes to
+   `/var/log/setup-optimize-<timestamp>.md` (`-latest.md` copy).
 
-# Database only (no user), several domains in one group
-sudo bash setup.sh --domain blog.example.com app=wordpress db=blogdb user=blog pass=secret \
-                            docs.example.com app=php db=docsdb
+Explicit values (`--basic server=`, `--php children=`/`max_requests=`,
+`--mariadb size=`, `--valkey ram=`, `--elastic ram=`) are recorded in
+`/var/lib/setup.sh/explicit-options.conf` and kept by later runs.
 
-# Ready-to-use application vhosts
-sudo bash setup.sh --domain forum.example.com app=xf
-sudo bash setup.sh --domain blog.example.com app=wordpress
-sudo bash setup.sh --domain forum.example.org app=flarum
-sudo bash setup.sh --domain files.example.com app=pingvin
-sudo bash setup.sh --domain images.example.com app=chevereto
-sudo bash setup.sh --domain go.example.com app=polr
-sudo bash setup.sh --domain s.example.com app=shlink
-sudo bash setup.sh --domain dl.example.com app=sfs
-sudo bash setup.sh --domain photos.example.com app=lychee
-sudo bash setup.sh --domain app.example.com app=php
-sudo bash setup.sh --domain node.example.com app=node
-```
+## Hardware profile
 
-`app=TYPE` applies to every domain in that `--domain` group (or to the domain right before it); `db=`, `user=`, `pass=` and `sql=` always belong to the domain they follow. Supported `app` values: `basic` (default; `blank` is an alias), `xf`, `wordpress`, `flarum`, `pingvin`, `chevereto`, `polr`, `lychee`, `shlink`, `sfs`, `php`, `node`. The `sample_proxy.conf` and `sample_cp_shlink.conf` templates need site-specific values (origin, auth file) and are not generated.
-
-- Every app uses its template from `server-configs-nginx` (the repo is the single source of truth); placeholders are replaced token-wise, so a domain such as `blog.example.com` is never substituted twice. `lychee` and `php` use the front-controller vhost. `node` proxies to `127.0.0.1:3000` and adds a WebSocket location.
-- The vhost is tested with `angie -t` before it is kept; a broken generated config is moved to `/tmp` (never deleted) and the script fails loudly.
-- The certificate is self-signed and valid for the domain and `www.` name. Replace it with ACME/Let's Encrypt (Angie has `http_acme` built in) for production.
-- App code is **not** downloaded. The script provisions the vhost, certificate, document root and database; install the application itself (Composer, WP-CLI, Node, etc.) on top.
-- Domain names are lowercased and validated as hostnames. A trailing dot is removed.
-- `db=` accepts letters, digits and underscore (at most 64 characters); `user=` the same (at most 80). The password is sent to MariaDB over stdin and redacted in the run log.
-- Re-running is idempotent. An existing non-empty Angie config file is **not overwritten** (so your vhost content is preserved); an empty placeholder is upgraded. An existing database is left as-is, and a dump is never imported over existing tables.
-- `--domain` can be combined with a normal install, e.g. `--basic ... --angie --mariadb ... --domain google.com app=wordpress`; the domain step runs after Angie and MariaDB.
-- There is no domain purge target. Remove the directory, Angie config/certificate and database manually if needed.
-
----
-
-## Optimize an existing server (Ubuntu 22.04, 24.04 or 26.04)
-
-```bash
-# Tune the OS and every installed service in place
-sudo bash setup.sh --optimize
-
-# Show what would be detected and changed, without touching anything
-bash setup.sh --optimize --dry-run
-```
-
-`--optimize` never installs, purges or starts a managed service, and it never
-creates, resizes or disables swap. The only packages it may add are the small
-`cpufrequtils` helper when the CPU exposes frequency scaling and
-`angie-module-brotli` when Angie is installed, so the compression profile
-matches a fresh `--angie` install. Before tuning Angie, it synchronizes
-`/etc/angie` with the canonical
-[`server-configs-nginx`](https://github.com/droplinxuser/server-configs-nginx)
-repository (or `CONFIG_SOURCE_DIR`) and runs the built-in deployer; the
-hardware-aware Angie profile is then applied to the deployed tree. If the
-download or deployment fails, the previous `/etc/angie` tree is restored and
-the synchronization is reported as a failed step. Synchronization is always
-part of `--optimize`; it is the upgrade path for an existing host whose
-`/etc/angie` tree is out of date.
-
-`--optimize` also enables FastCGI guest caching for every detected WordPress
-and XenForo vhost. It installs the shared `fastcgicache` zone and its
-`$nocacheuri` map when no active `http.d` file defines them, adds the
-WordPress cache include, and repairs or completes XenForo's
-`h5bp/php_xf.conf` cache block (style/language cache key, map-based
-session-cookie bypass, lock/background update, error-response policy and
-TTLs). The repair is idempotent and runs both on install and on `--optimize`,
-so an older host gets the same guest cache as a fresh `app=xf` or
-`app=wordpress` vhost.
-
-Live data is funded first, with at most **20% headroom**. MariaDB gets its live
-`information_schema` data+index size ×1.20 (or the data-directory size without
-redo/undo/temp files when SQL is unavailable; 128 MB minimum). Valkey gets live
-`used_memory` ×1.20 (or the RDB size when stopped; 128 MB minimum).
-Elasticsearch gets a **quarter of the live index store**, rounded up to 512 MB
-(512 MB minimum, capped at 25% of RAM and 31 GB): the OS page cache, not the
-heap, serves the index, and sizing the heap to the store took RAM from the
-page cache and MariaDB. Explicit `--mariadb size=`, `--valkey ram=` and
-`--elastic ram=` values are reserved verbatim and never scaled.
-There are no RAM-percentage plans or large floors: an empty service gets only
-its operational minimum, so spare RAM is not wasted. PHP-FPM is sized after
-those targets from what remains (CPU-capped, 8-worker floor), and unallocated
-memory stays with the OS page cache. If the targets cannot all fit, they are
-scaled proportionally and trimmed Elasticsearch first, then Valkey, then
-MariaDB; the report says when a store does not fully fit. The rules adapt to
-the installed set (MariaDB-only, MariaDB+Valkey, MariaDB+Elasticsearch,
-cache-only, search-only, full stack). A pool/heap grossly above its target is
-reduced so the freed RAM can serve the request tier; a value within 2% of the
-target is kept to avoid restart churn.
-
-`--optimize` audits WordPress (`wp-config.php`) and XenForo
-(`src/config.php`) installations under `/var/www`. The report lists the config
-file, whether MariaDB uses a persistent `p:` host, and whether Valkey/Redis
-uses the local Unix socket with persistent connections. The recommended
-`DB_HOST`, `WP_REDIS_PATH`, `WP_REDIS_PERSISTENT` and XenForo
-`$config['db']['host']` / `$config['cache']['config']` values are printed for
-the admin to apply; application files are never edited. On hosts built
-by releases before 1.8.34 it also repairs the legacy log permissions and cron
-paths: the nightly blanket `chown -R /var/www/`, the old
-`/etc/nginx/scripts/cloudflare.sh` path and the old `/usr/bin/mysqlcheck`
-entry are replaced by the managed, log-safe block, and `/var/www/logs` is
-restored to `root:root 755` with per-service ownership. `/var/www` and
-`/var/www/mysql_database` are reset to root ownership when the legacy cron
-left them web-owned.
-
-It also reconciles the logging and connection profile on old hosts:
-
-- MariaDB gets `slow_query_log=1`, `long_query_time=1`,
-  `min_examined_row_limit=100`, `log_slow_verbosity=query_plan,explain` and a
-  managed `log_error` under `/var/www/logs/mariadb/` (with a restart when the
-  drop-in changes).
-- Elasticsearch’s `http.host`/`transport.host` are commented so `network.host`
-  controls the bind, and a non-loopback bind with X-Pack security disabled is
-  reported. The endpoint used for data/heap/readiness/replica probes follows
-  the effective `http.host`/`network.host` and `http.port`, so a public IPv4
-  intentionally used by a remote client is supported. If only that remote
-  address is reachable (the host itself is blocked by firewall/NAT), the
-  active unit and listener are reported instead of a false rollback.
-- The shared `snippets/fastcgi-php.conf` is repaired so PATH_INFO capture is
-  optional. Without that, a bare `/index.php` can leave
-  `$fastcgi_script_name` empty, pass the document root to PHP-FPM, and make
-  every pretty URL return PHP-FPM’s “Access denied” (403). The WordPress and
-  Polr includes also gain `index index.php index.html;` when an old vhost
-  lacked it.
-- Redis and Valkey get a local Unix socket (`/run/redis/redis.sock` or
-  `/run/valkey/valkey.sock`), `unixsocketperm 770`, `www-data` in the service
-  group, and printed XenForo/WordPress/Laravel snippets. Application config is
-  not edited.
-- A heap-only operator `jvm.options` is moved to `/tmp` so the managed
-  `zz-setup-optimize.options` owns the heap; a richer operator file is kept and
-  the override is reported.
-
-It applies the OS profile first (CPU governor, PAM limits, hardware-scaled
-kernel/network/memory sysctls) and then looks for:
-
-- `angie` + `/etc/angie/angie.conf`
-- every `/etc/php/<version>/fpm` tree
-- MariaDB + `/etc/mysql`
-- Valkey + `/etc/valkey/valkey.conf`, or Redis + `/etc/redis/redis.conf` when Valkey is absent
-- Elasticsearch + `/etc/elasticsearch/elasticsearch.yml`
-
-The OS profile is the same one used by a fresh `--basic` install: performance
-CPU governor (when the host exposes cpufreq), the 1M-nofile PAM limits, and
-the hardware-scaled sysctl set (socket buffers, backlogs, conntrack, file
-descriptors, `vm.min_free_kbytes`, BBR/fq). It is idempotent and safe to run
-on a live server. Swap remains exactly as the operator configured it.
-
-It then applies the same hardware-aware service values used by a normal
-install: Angie
-workers/connections/buffers/cache sizes, PHP-FPM `static` pool sizing, MariaDB
-buffer pool/connection backlog, Valkey/Redis maxmemory, and Elasticsearch
-heap. Redis receives the same cache profile when Valkey is absent. A live
-cache is never shrunk below its working set, and a raised `maxmemory` is capped
-at 80% of RAM with an explicit report when the data does not fit. It also applies the installer's systemd `LimitNOFILE` drop-ins for
-Angie/PHP-FPM/MariaDB, raises `vm.max_map_count` for Elasticsearch, preserves
-an explicit Valkey `io_threads` value, and disables caching/stale serving of
-5xx responses in the WordPress and XenForo FastCGI caches. The Angie cache
-budget is shared only across the cache types that are
-actually present, so a dedicated proxy with one cache type gets the whole
-budget. The share also scales with installed services: Angie-only uses 50%
-of RAM / 10% of free disk, Angie+PHP only 30%, Valkey-only 50%, and the
-shared profile 25%/5% capped at 64 GB. When PHP is absent, MariaDB receives
-the full fixed budget (no PHP worker reservation), though its data+5% target
-still prevents over-allocation. MariaDB's pool and Elasticsearch's heap are sized to the live
-data/index store plus 5%, bounded by the shared budget after reserving the
-other services; MariaDB additionally keeps a 1/16-RAM floor (capped at 8 GB)
-so a freshly installed database cannot collapse a large host to a 256 MB
-pool. A 40%-of-RAM (MariaDB) or 25%-of-RAM (Elasticsearch)
-fallback is used only when the data size cannot be measured. Oversized live
-allocations are reduced to the data-sized target. Elasticsearch keeps its
-31 GB compressed-oops ceiling. A live TCP PHP-FPM pool used through the
-shared `local_php` upstream is migrated to the Unix socket and Angie is
-repointed to it. The graceful reload is tried first; when a build does not
-open the new listener on SIGUSR2 (PHP 8.5 was observed), `--optimize`
-restarts PHP-FPM to complete the migration. That cutover is short and
-explicit, and the migration is mandatory rather than an optional setting.
-Service allocations
-are planned together from one 80%-of-RAM budget, with PHP worker capacity
-reserved first, so MariaDB + PHP + cache + Elasticsearch cannot collectively
-exhaust memory. Each configuration is
-validated and active services are restarted only when their generated files
-actually changed; a failure rolls back the affected service from
-`/tmp/setup-optimize.*`. Before a MariaDB restart, `--optimize` stops Angie
-and every active PHP-FPM version, runs `systemctl daemon-reload`, restarts
-MariaDB, waits for `SELECT 1`, then starts PHP-FPM first and Angie last. This
-prevents a reconnect storm while InnoDB preloads a larger buffer pool. The
-pause/resume is skipped when the buffer pool is resized online or the restart
-is deferred. The final verification checks each service's
-real listener (Angie via `ss`, PHP socket/TCP) plus SQL/PING/HTTP probes and
-lists recent error-level journal entries. The Markdown report is written to
-`/var/log/setup-optimize-<timestamp>.md` and copied to
-`/var/log/setup-optimize-latest.md`.
-
-Older Angie installs whose `http.d` files use underscore names
-(`fastcgi_cache_conf`, `limit_req_conf`, …) are tuned in place as well.
-
-When WordPress vhosts are detected, `--optimize` deploys the Angie
-repository's guest FastCGI cache templates and includes them in
-`h5bp/php_wp.conf`. Only anonymous GET/HEAD responses are cached; logged-in,
-POST/PUT/DELETE/PATCH, authorization, admin/login/REST/XML-RPC, feeds,
-previews, cart/checkout/account and shop-session requests bypass the cache.
-The report and the `X-Cache-Status` header show cache behavior.
-
-On a single-node Elasticsearch cluster, yellow health caused solely by
-unassigned replicas is corrected automatically: replicas are set to zero on
-existing indices and a low-priority template keeps new indices green.
-Multi-node clusters and unassigned primary shards are left unchanged.
-
----
-
-### Hardware profile (shared by `--basic` and `--optimize`)
-
-Every tuned value comes from one helper used by both paths, so a fresh install
-and a later `--optimize` write the same bytes (verified on the dev-host host: the
-post-install and post-optimize configuration snapshots are identical). The
-inputs are the effective CPU count and RAM (both cgroup-aware), the storage
-class of the relevant data directory (NVMe / SSD or paravirtual / HDD) and the
-host type (`dedi` or `vps` from `systemd-detect-virt`, or `--basic server=`).
+Inputs: effective CPUs and RAM (cgroup-aware), the storage class behind the
+data directory (NVMe / SSD / HDD) and the host class (`dedi`/`vps`).
 
 | Area | Rule |
 |---|---|
-| PHP-FPM workers | 16 per core on dedicated hardware, 8 on a VPS; at most RAM/2 at 96 MB per worker; floor `min(8, RAM/2/96)` (a 1 GB host keeps 5, not 8); a live pool keeps its count; 4 per core (VPS 3) when every PHP vhost is XenForo/WordPress with a local database; `children=` wins (clamped to 512) |
-| MariaDB | see the MariaDB section: io_capacity by disk × host type, I/O threads, flush_neighbors, LRU depth, thread cache, temp tables, connections from the PHP pool; redo log = pool/4 capped at 4 GB on NVMe (2 GB otherwise); `table_open_cache`/`table_definition_cache`/`innodb_open_files = clamp(max_connections × 16, 4000, 32768)` |
-| Elasticsearch | heap = store/4 (512 MB..25% RAM..31 GB); search threads `clamp(cpus/2, 1, 16)`, write threads `clamp(cpus/4, 1, min(8, cpus+1))` |
-| Valkey / Redis | maxmemory = live working set +20% with a RAM-proportional floor (`clamp(RAM/64, 128 MB, 1 GB)`, so a fresh install is no longer pinned at 128 MB); `maxclients` from the PHP pool; `io_threads` clamped to 1..8 on both paths |
-| Angie | `worker_processes` = effective CPUs, `worker_connections = clamp(cpus × 2048, 8192, 65535)`, upstream keepalive from the PHP pool, `open_file_cache max = clamp(RAM_MB × 8, 10000, 200000)` bounded by `worker_rlimit_nofile - worker_connections` (cached entries are open descriptors), cache budget from RAM/disk/installed services, `limit_req_log_level info`; Brotli level 5, or 4 on a 1-2 CPU host |
-| Kernel | `somaxconn`/SYN backlog `cpus × 4096` (VPS: `cpus × 2048`, max 65536), conntrack `RAM_MB × 16` (VPS: `× 8`), `vm.dirty_background_bytes = clamp(RAM/100, 64 MB, 512 MB)` and `vm.dirty_bytes = 4×` (tighter on HDD), 16 MB socket buffers under 4 GB RAM; `vm.min_free_kbytes` = 1% of RAM with a 16 MB floor under 4 GB (64 MB above, 256 MB cap); a cgroup CPU quota below one core counts as one |
-| Host | swap = RAM/2 clamped to 1..8 GiB (4 GiB on a VPS); CPU governor only on dedicated hardware; THP `madvise` via `setup-io-tuning.service`; `fstrim.timer` on SSD/NVMe; I/O scheduler and readahead by device class via `/etc/udev/rules.d/60-setup-io.rules` (whole disks only; partitions have no scheduler attribute) |
+| PHP-FPM | 16 workers per core (VPS 8), at most RAM/2 at 96 MB each, 512 max, floor `min(8, RAM/2/96)`; 4 per core (VPS 3) on a XenForo/WordPress host with a local database; live count kept; `children=` wins |
+| MariaDB | see the service section: pool from live data, io_capacity by disk x host, thread pool, connections from the PHP pool, table caches from connections |
+| Elasticsearch | heap = store/4 (512 MB..25% RAM..31 GB); search threads cpus/2 (max 16), write threads cpus/4 (max 8) |
+| Valkey / Redis | maxmemory = live +20% with floor `clamp(RAM/64, 128 MB, 1 GB)`; maxclients from the PHP pool; io_threads 1..8 |
+| Angie | `worker_processes` = CPUs, `worker_connections = clamp(cpus x 2048, 8192, 65535)`, `worker_rlimit_nofile = clamp(cpus x 8192, 65536, 524288)`, upstream keepalive from the PHP pool, `open_file_cache max = clamp(RAM_MB x 8, 10000, 200000)` bounded by `rlimit - connections`, FastCGI buffers and cache zones by RAM, cache disk budget by RAM/free disk/installed services (50% RAM Angie-only, 30% Angie+PHP, 25% full stack), Brotli 5 (4 on 1-2 CPUs) |
+| Kernel | `somaxconn`/SYN backlog `cpus x 4096` (VPS x 2048, max 65536), conntrack `RAM_MB x 16` (VPS x 8), `vm.dirty_background_bytes = clamp(RAM/100, 64 MB, 512 MB)` and `vm.dirty_bytes = 4x` (tighter on HDD), `vm.min_free_kbytes` 1% of RAM (16 MB floor under 4 GB, 256 MB cap), BBR + fq (`SETUP_TCP_CC`, `SETUP_QDISC`), 1M-nofile PAM limits |
+| Host | swap RAM/2 clamped 1..8 GiB (VPS 4); governor on dedicated hardware only; THP `madvise`; `fstrim.timer` on SSD/NVMe; I/O scheduler and readahead per device class (whole disks) |
 
-Environment overrides: `SETUP_MARIADB_IO_CAPACITY="read max"`,
+Environment overrides persisted in `/etc/default/setup-tuning`:
 `SETUP_LIMIT_REQ_EXEMPT="ip,cidr,..."` (rate-limit exemptions for a load
-generator or monitor, managed lines in the Angie geo whitelist; persisted as
-`LIMIT_REQ_EXEMPT` in `/etc/default/setup-tuning` so later runs keep it,
-an empty value clears),
-`SETUP_PRECOMPRESS_ASSETS=1` (precompressed `.br`/`.gz` static assets for
-XenForo/WordPress roots served by `brotli_static`/`gzip_static`, kept fresh by
-`/usr/local/bin/setup-precompress.sh` from cron; persisted as
-`PRECOMPRESS_ASSETS`, `0` turns it off and retires the helper),
-`SETUP_PHP_JIT=tracing|function|off` (OPcache JIT mode for the pool, persisted as
-`PHP_JIT`; WordPress document roots keep `opcache.jit = off` through `[PATH=]`
-sections of the managed ini unless `SETUP_PHP_JIT_WORDPRESS=1`, persisted as
-`PHP_JIT_WORDPRESS`; see the PHP section for the measurements),
-`SETUP_TCP_CC`/`SETUP_QDISC`, `SETUP_STATE_DIR` (state directory for tests and
-image builds).
+generator or monitor; empty clears), `SETUP_PRECOMPRESS_ASSETS=0|1`,
+`SETUP_PHP_JIT`, `SETUP_PHP_JIT_WORDPRESS`, `SETUP_NODE_MAJOR`. Others:
+`SETUP_MARIADB_IO_CAPACITY`, `SETUP_BROTLI_LEVEL`, `SETUP_ANGIE_COMPRESSION`,
+`SETUP_PHP_SESSION_HARDENING`, `SETUP_WP_DB_SPLIT`, `SETUP_WP_ALLOW_FILE_MODS`,
+`SETUP_PURGE_MALWARE`, `SETUP_STATE_DIR` (tests and image builds).
 
----
+## `--diagnostics`, `--restart-all`, `--purge`
 
-## Diagnostics (`--diagnostics`)
-
-```bash
-sudo bash setup.sh --diagnostics
-# writes ./diagnostics.log beside setup.sh
-```
-
-`--diagnostics` is read-only and requires root for service logs. It writes one
-mode-600 file. Common credential forms (`pass=`, `--dbpass=`,
-`IDENTIFIED BY '...'`, `MYSQL_PWD`, `REDISCLI_AUTH`) are redacted before the
-file is written. It covers:
-
-- hardware, CPU topology, memory, disks, filesystems, mounts, swap and limits
-- network addresses, routes, sockets, DNS, qdisc and `ethtool` statistics
-- kernel sysctls, sysctl/limits/modules-load drop-ins
-- systemd units, failed units, timers, unit files and service limits
-- Angie version/config test/loaded config/vhosts/certificate dates, including
-  vhost certificates outside `/etc/angie/ssl`, and `http.d` ACTIVE/INACTIVE
-  include status
-- every PHP-FPM version, pool/ini files, processes and listeners, and the
-  slow/error log paths actually configured in the pool
-- MariaDB variables/status/processlist/InnoDB status/database sizes, resolved
-  `log_error`/slow-log paths, and `mariadb.conf.d` files
-- Valkey and Redis INFO/CONFIG/CLIENT LIST/SLOWLOG/MEMORY/LATENCY, selected
-  persistence/socket/bind settings, and the configured logfile; a host with
-  neither service reports “not installed” instead of connection errors
-- Elasticsearch health, nodes, indices, JVM/OS/thread-pool stats, allocation
-  explain (only when shards are unassigned) and resolved log files; a host
-  without Elasticsearch reports “not installed” and skips the live probes
-- Node.js version, processes, listeners and units
-- journal warnings, per-service logs, kernel OOM/hung-task reports, dmesg
-- PHP-FPM slow log, MariaDB slow log, Angie/PHP/Valkey/ES/Node logs, including
-  paths outside `/var/www/logs`
-- `/var/www`, `/var/www/logs`, `/var/www/logs/*` and
-  `/var/www/mysql_database` ownership and permissions
-- UFW, SSH effective config, cron, upgradable packages and setup state
-
-Use `--diagnostics --dry-run` to print the destination without writing.
-
----
-
-## Restart all (`--restart-all`)
-
-```bash
-sudo bash setup.sh --restart-all
-sudo bash setup.sh --restart-all --dry-run
-```
-
-This is a controlled whole-stack restart, not a configuration change. It
-detects installed services from their configuration paths and active units,
-repairs legacy `/var/www/logs`, `/var/www` and `/var/www/mysql_database`
-ownership first (so a service cannot fail to reopen its logs), then:
-
-1. `systemctl daemon-reload`
-2. stop Angie if active
-3. stop every active `php*-fpm.service`
-4. restart active Valkey/Redis (`valkey-server`, `valkey` or `redis-server`)
-5. restart active Elasticsearch and wait for its HTTP endpoint, up to 300 seconds
-6. restart active MariaDB
-7. wait for `SELECT 1`, up to 300 seconds
-8. start the PHP-FPM versions that were stopped
-9. start Angie again if it was stopped
-
-Only services that were **active** are stopped and restarted. Installed but
-inactive units are reported and skipped. If MariaDB or a dependency fails, the
-script still restores the previously active web tiers where possible and exits
-non-zero with the failure list. `--dry-run` prints the detected/active units
-and the planned order without changing anything.
-
----
+- `--diagnostics` writes one mode-600 `diagnostics.log` beside `setup.sh`
+  (hardware, network, sysctls, units, Angie/PHP/MariaDB/Valkey/Elasticsearch
+  configuration and runtime statistics, slow and error logs, ownership, UFW,
+  SSH, cron, package state) with credentials redacted. Read-only.
+- `--restart-all` repairs `/var/www` log ownership, then stops Angie and
+  every active PHP-FPM, restarts Valkey/Redis, Elasticsearch (waits for HTTP)
+  and MariaDB (waits for `SELECT 1`), and starts PHP-FPM then Angie. Only
+  units that were active are touched; `--dry-run` prints the plan.
+- `--purge [all|basic|angie|php [ver=X]|mariadb|valkey|elastic|others]`
+  (service flags and bare names combine; no target means everything) stops
+  and disables the selected services, removes the managed cron entries and,
+  for `basic`, restores the recorded hostname, timezone, DNS, sysctl, limits
+  and UFW state (SSH rules are never removed; `/swapfile` stays enabled).
+  `--purge others` disables the `smartmontools`/`sysstat` units; `--purge
+  --php ver=X` keeps `phpsessionclean.timer` while another version is
+  enabled. Nothing is uninstalled or deleted; there is no domain purge.
 
 ## Idempotency
 
-The script is safe to re-run:
+APT steps are no-ops when current; managed blocks (crontab, `50-server.cnf`,
+`elasticsearch.yml`, `valkey.conf`, the ini/pool files) are replaced, never
+duplicated; a `--basic`-only re-run regenerates the cron entries of installed
+services; repositories and embedded keys are verified and refreshed; domain
+creation preserves existing vhosts and databases; a repeat `--optimize` with
+unchanged files reloads and restarts nothing.
 
-- APT operations are no-ops when packages are already current.
-- `/swapfile` is reused if it already has the requested size.
-- Auto swap is a no-op once total swap is at least 50% of RAM.
-- Managed blocks in `crontab`, `50-server.cnf`, `elasticsearch.yml` and `valkey.conf` are replaced, not duplicated.
-- A `--basic`-only re-run regenerates the managed cron entries for services that are still installed and configured by this script, even when the managed block was removed (for example by `--purge basic`); stale entries for removed services are dropped.
-- Package-origin markers are retained for diagnostics, but `--purge` no longer removes any package regardless of origin.
-- Package repositories and embedded keys are verified against their payloads and refreshed when they differ.
-- Domain directories and databases use idempotent creation; existing Angie domain configs are preserved.
-- PHP, MariaDB, Angie, Valkey and Elasticsearch services are restarted after configuration changes so changed parameters take effect. Angie and PHP-FPM use a graceful `reload` when possible, Valkey applies runtime values with `CONFIG SET`, and startup-only changes are deferred; a repeat `--optimize` run with unchanged files restarts nothing.
-- A fresh install and `--optimize` write the same managed configuration for the same hardware: MariaDB tuning lives only in `99-setup-optimize.cnf`, Elasticsearch's base and performance blocks come from one helper, and a full-stack install followed by `--optimize` was verified to produce a zero-byte diff.
-- Explicit values from `--basic server=`, `--php children=`, `--php max_requests=`, `--mariadb size=`, `--valkey ram=` and `--elastic ram=` are recorded in `/var/lib/setup.sh/explicit-options.conf` and are not replaced by later `--optimize` runs (a pinned `server=dedi|vps` keeps the host class, so `--optimize` cannot silently switch the dedi/vps formulas).
+## Embedded payloads
 
-A second run is normally much faster than the first (typically under a minute for the full stack).
+`dns_servers.conf`, `sysctl.conf`, `limits.conf`, `mysqltuner.pl` 2.9.3, the
+`mysqlbackup` utility, the Angie/Elastic/NodeSource signing keys and the Sury
+keyring package are embedded for offline, single-file use and verified by the
+tests. Angie configuration and Cloudflare IP ranges are downloaded.
 
----
+## Testing
 
-## Purge / stop
+- `bash tests/test-tuning.sh` (no root): unit tests of the tuning helpers,
+  memory plan, config repairs and rollback. `bash tests/test-dry-run-matrix.sh`:
+  every flag, app type, purge mode and representative invalid input through
+  `--dry-run`. CI runs both plus `shellcheck`.
+- `tests/stress-site/`: `setup-stress-site.sh` deploys a synthetic site
+  (`stress.invalid`) that exercises every tier; `run-stress.sh` drives it
+  locally with `wrk`; `run-stress-remote.sh TARGET_IP DOMAIN` drives it (and
+  real XenForo/WordPress vhosts, guest and member tiers) from a workstation
+  with the static `oha` binary while `collect-metrics.sh` samples the server.
+  Run the install or `--optimize` with `SETUP_LIMIT_REQ_EXEMPT=<generator IP>`
+  first, or every remote PHP request is answered `429`. Results and findings:
+  `tests/stress-site/RESULTS.md`.
 
-```bash
-# Everything this script manages (no packages are removed)
-sudo bash setup.sh --purge all
+## Production checklist
 
-# Selected services only
-sudo bash setup.sh --purge --angie
-sudo bash setup.sh --purge --mariadb
-sudo bash setup.sh --purge --valkey
-sudo bash setup.sh --purge --elastic
-sudo bash setup.sh --purge --others
-sudo bash setup.sh --purge --php ver=8.5
-sudo bash setup.sh --purge --angie --php ver=8.5
-sudo bash setup.sh --purge php mariadb      # bare service names also work
-
-# Basic settings only (restores hostname/timezone/DNS/sysctl/limits/cron/UFW;
-# swap is intentionally left enabled)
-sudo bash setup.sh --purge basic
-
-# No targets = everything
-sudo bash setup.sh --purge
-```
-
-- `--purge --php ver=8.5` stops one version; `--purge php` discovers and stops every installed PHP-FPM version (not just 8.x).
-- **Nothing is uninstalled or deleted.** Package purge/autoremove/clean calls were removed. `--purge` stops/disables the selected services, removes the managed and legacy cron entries, restores recorded basic settings where the original existed, and leaves packages, repositories, keys, configuration, certificates, databases, caches and logs on disk.
-- `--purge all` runs every stop/restore step in a safe order.
-- Bare targets and service flags are combined, so `--purge basic --php` stops both.
-- `--purge others` stops and disables `smartmontools` and the `sysstat` timers it enabled; optional packages, Node.js and repository files are left installed. Composer and fail2ban are not installed by this script; `unattended-upgrades` is installed by `--basic` (see the security pass above) and is left in place by `--purge`.
-- `--purge angie` stops Angie and leaves `/etc/angie` (including domain vhosts and certificates), cache directories under `/home` and logs intact.
-- `--purge valkey` stops Valkey and leaves the Unix socket, systemd drop-in, group membership, configuration and data intact.
-- `--purge basic` restores files recorded in `/var/lib/setup.sh/backup` by overwriting them (never by unlinking the live path), moves generated drop-ins that did not exist before to `/tmp` (DNS, PAM limits, sysctl, modules-load, logrotate, network oneshot), leaves `/swapfile` and its `/etc/fstab` line enabled, removes the managed and legacy cron entries, restores the original UFW default policies and pre-existing SSH allow rules, and disables UFW again if it was originally inactive. If no original SSH rule existed, the limit rule is kept as a lockout guard.
-- **MariaDB data is never removed.** Database files under `/var/lib/mysql` and `/var/lib/mariadb`, configuration and backups stay in place after `--purge mariadb`.
-- There is no `--purge domain` target. Domain vhosts, certificates, `/var/www/<domain>/` and databases stay in place under this policy; remove them manually only after verifying they are unused.
-
----
-
-## Timing summary
-
-At the end of every install run the script prints:
-
-```
-Installation summary
-SERVICE    STATUS   TIME (HH:MM:SS)
--------    ------   --------------
-basic      OK       00:00:19
-angie      OK       00:00:13
-php        OK       00:00:30
-mariadb    OK       00:00:16
-valkey     OK       00:00:08
-elastic    OK       00:01:00
-others     OK       00:00:22
-domain     OK       00:00:00
-TOTAL               00:02:48
-
-All installations completed successfully.
-```
-
-If any service fails, it is marked `FAILED`, the remaining services still run, and the script exits 1 after printing the summary.
-
----
-
-## Embedded and downloaded payloads
-
-Embedded in `setup.sh` for offline/reproducible installation:
-
-- `dns_servers.conf`
-- `sysctl.conf`
-- `limits.conf`
-- `mysqltuner.pl` 2.9.3
-- The `mysqlbackup` utility (`install`, `mysqlbkup.sh`, sample config and sample CNF)
-- Angie, Elasticsearch and NodeSource signing keys
-- The Sury `debsuryorg-archive-keyring` .deb
-
-The large payloads remain embedded to preserve a single-file, offline-capable
-installer. They are verified by the test suite; a future split can move them
-under `payloads/` without changing the runtime interface.
-
-Downloaded at install time (single source of truth):
-
-- Angie configuration from [`droplinxuser/server-configs-nginx`](https://github.com/droplinxuser/server-configs-nginx): `angie.conf`, `h5bp/`, `conf.d/`, `http.d/`, `snippets/`, `scripts/cloudflare.sh`, `scripts/limit_nofile.conf` and `scripts/etc_default_nginx`. The deployer itself lives in `setup.sh`.
-- Cloudflare IP ranges from Cloudflare.
-- Package repositories via APT.
-
-PHP-FPM pool and `php.ini` templates are **not** downloaded from the Angie
-repository; they live in `configs/php/` here. To change Angie behavior, update
-`server-configs-nginx` and re-run the install. Use
-`CONFIG_SOURCE_DIR=/path/to/checkout` to test a local Angie checkout before
-pushing.
-
----
-
-## Tested combinations
-
-The script was tested on Ubuntu 26.04.1 LTS (16 CPU threads, 32 GB installed RAM / 27 GiB usable) with the following real install/re-run/purge cycles (v1.5.0):
-
-| Case | Configuration | Result |
-|---|---|---|
-| Basic only (VPS) | `--basic server=vps host=test-vps time=UTC swap=512M` | PASS |
-| Basic auto | `--basic` with no `server=`, `host=` or `swap=` (dedi + `testhost` + swap to 50% RAM) | PASS |
-| Angie + PHP 8.5 | `--basic ... --angie --php ver=8.5` | PASS |
-| PHP default | `--php` with no `ver=` (auto-selected latest stable, 8.5) | PASS |
-| MariaDB only | `--basic ... --mariadb user=tester pass='t3st&p\|w' size=2gb bind=127.0.0.1` | PASS |
-| MariaDB multi-bind | `bind=127.0.0.1,127.0.0.2` (and whitespace/duplicates) writes and listens on both addresses | PASS |
-| MariaDB `IPV4` bind | `bind=127.0.0.1,IPV4` resolves the public address (or warns/falls back to the local outbound IPv4 on NAT) | PASS |
-| PHP 8.4 only | `--basic ... --php ver=8.4` | PASS |
-| PHP 8.4 → 8.5 switch | second version rejected before packages are installed; purge 8.4, then install 8.5 | PASS |
-| Everything except Elasticsearch | basic + Angie + PHP 8.5 + MariaDB + Valkey + all others | PASS |
-| Elasticsearch only | `--basic ... --elastic host=localhost ram=2g` | PASS |
-| Everything except PHP | basic + Angie + MariaDB + Valkey + Elasticsearch + gif | PASS |
-| Everything | all service groups | PASS |
-| NVMe gating | `--others nvme` installs on dedi + NVMe; skipped on vps or non-NVMe | PASS |
-| Domain only | `--domain google.com` creates `/var/www/google.com/public/`, blank `/etc/angie/conf.d/google.com.conf`, database `google_com` | PASS |
-| Multiple domains | `--domain google.com example.org my-site.test.com` → `google_com`, `example_org`, `my_site_test_com` | PASS |
-| Domain idempotency | re-run preserves existing vhost config; database creation is idempotent | PASS |
-| Domain app vhosts | `app=blank,xf,wordpress,pingvin,chevereto,polr,lychee,php,node` created; every generated vhost passed `angie -t` | PASS |
-| Domain validation | invalid/traversal domains rejected; `--purge --domain` rejected | PASS |
-| App templates | all 16 repository templates pass `angie -t` after the repair pass | PASS |
-| Auto MariaDB size | `size=auto` → 11.1 GB buffer pool on this host (40% of RAM) | PASS |
-| Valkey options | `ram=`, `policy=`, `io_threads=` accepted and written without duplicates | PASS |
-| PHP overrides | `children=` / `max_requests=` accepted and applied | PASS |
-| Purge modes | `--purge`, `--purge all`, `--purge basic`, per-service, versioned PHP, mixed bare targets + flags | PASS |
-| Purge PHP + Composer | `--purge --php` does not pull old PHP/Apache providers; Composer is removed first | PASS |
-| Full purge + fresh install | `--purge all` followed by a complete reinstall from scratch | PASS |
-| Cron idempotency | repeated full/basic runs keep exactly one managed block; `--purge basic` removes it but keeps operator-owned lines | PASS |
-| Pre-existing packages | `--purge others` leaves every optional package installed (nothing is removed); safe after state deletion and repeated purges | PASS (current behavior) |
-| MariaDB TCP login | admin user works via socket and TCP `127.0.0.1` with `skip_name_resolve=1` | PASS |
-| Valkey hardening | loopback bind, `protected-mode yes`, no duplicate managed directives | PASS |
-| Elasticsearch hardening | `bootstrap.memory_lock: true`, `LimitMEMLOCK=infinity`, heap ≤ 50% RAM warning | PASS |
-
-### Brotli results (XenForo 2.3.13, 16-thread host)
-
-| Page | Identity | gzip 5 | Brotli 5 | Brotli vs gzip |
-|---|---:|---:|---:|---:|
-| Guest forum index | 41,657 B | 9,658 B | **8,768 B** | -9.2% |
-| Logged-in index | 51,463 B | 10,589 B | **9,787 B** | -7.6% |
-| Logged-in thread (20 posts) | 210,507 B | 18,825 B | **15,911 B** | -15.5% |
-
-On a fixed 34 KB page, Brotli level 4 served 19.4k responses/s (8.49 KiB),
-level 5 16.4k/s (7.81 KiB), level 9 13.4k/s (7.73 KiB), and levels 10/11
-collapsed to ~1k/~0.4k responses/s. Level 5 is the default: the logged-in
-origin is PHP-bound (~1k req/s), so the smaller payload is worth more than the
-compression CPU. Static asset precompression is intentionally omitted because
-a CDN serves those after the first origin request.
-
-Also checked at CLI level (all using `--dry-run`, no system changes):
-
-- `tests/test-dry-run-matrix.sh` covers 85 cases: every service flag, every
-  domain app type, per-domain and trailing group `app=` forms, every purge
-  mode, `--optimize` and representative invalid inputs.
-
-- `tests/test-tuning.sh` covers 319 checks: Angie directive rewriting, the
-  XenForo guest-cache key (style/language), the multi-line `proxy_cache_path`
-  fix, insertion anchors, miss reporting, PHP pool editing/deduplication, the
-  shared memory budget (including the measured PHP worker allowance and the
-  Elasticsearch empty-index floor), UFW SSH rate-limiting, and a second-run
-  no-op check.
-
-- All 64 combinations of the six install service flags (`angie`, `php`, `mariadb`, `valkey`, `elastic`, `others`) plus `--basic` parse and validate.
-- All 128 bare purge target subsets (including empty/implicit/explicit `all`) parse and validate.
-- 237 parser/validation checks passed in total, including invalid server type, hostname, timezone, swap size, PHP version/children, MariaDB size/bind, Valkey RAM/policy/io_threads, Elasticsearch RAM/host, unknown `--others`, invalid domains/apps, missing values, invalid combinations, `--help` and `--version`.
-- `--dry-run` was verified to make no changes as a normal user.
-
-### Stress test (this machine)
-
-A local site (`stress.invalid`) exercises Angie → PHP-FPM → MariaDB + Valkey + Elasticsearch + Node.js + GifSicle. The repeatable harness is in `tests/stress-site/`; it used `wrk`, `valkey-benchmark`, `pidstat` and the Angie/PHP-FPM status endpoints on 16 CPU threads, 27 GiB RAM, NVMe.
-
-| Target | Concurrency | Result (v1.5.0) |
-|---|---|---|
-| Static file (Angie) | 100 | ~255k req/s, p99 3.4 ms |
-| PHP hello (OPcache) | 100 | ~116k req/s |
-| MariaDB primary-key read via PHP | 100 | ~27k req/s, p99 ~7.5 ms |
-| Valkey endpoint (Unix socket) | 100 | ~29k req/s, p99 ~4 ms typical |
-| Valkey direct `set`/`get`/`incr` | 100 | ~300k ops/s, p50 ~0.15 ms |
-| Elasticsearch search via PHP | 50 | ~15.8k req/s, p99 6.3 ms |
-| Node.js proxy (4 workers) | 100 | ~27k req/s |
-| Full stack, uncached | 200 | ~6.6–7.1k req/s, p50 ~15 ms |
-| Full stack, FastCGI-cached 5 s | 200 | ~180k req/s, p99 3.2 ms |
-| Deliberate 1 s PHP sleep | 200 | ~99 req/s; the 108-worker pool saturates and queues |
-
-Findings and the adjustments applied:
-
-- **The hidden first bottleneck was rate limiting, not the stack.** `limit_req` applied 30 GET/s per IP to every PHP location. Local load tests (and any site behind a CDN/proxy without `real_ip`) saw connection resets at ~33 req/s. Loopback is now exempt, external limits are 100 GET/s and 30 POST/HEAD/s with larger bursts, and rejects use `429` instead of `444`.
-- **PHP worker occupancy sets the uncached ceiling.** The heavy page does four sequential local lookups; 108 workers × ~15 ms ≈ 6–7k req/s. Raising the pool to 160 gave only ~6.6k req/s and more queueing, so the auto formula stays at 108 for this host.
-- **Caching is the real large-site fix.** Caching the same page for 5 seconds raised throughput from ~6.8k to ~180k req/s. Angie's FastCGI cache zones are now enabled, and the XenForo/Chevereto templates use them.
-- **Valkey I/O threads hurt small web commands.** 8 I/O threads used 430% CPU and reduced full-page throughput; 1 thread used 64% CPU and raised it. The default is now `io_threads=1`.
-- **Ephemeral-port/TIME_WAIT pressure caused p99 tails.** At 15k new TCP connections/s the host had 83k TIME_WAIT sockets against a 55k port range. MariaDB and Valkey now use Unix sockets (PHP defaults to them), raising MariaDB to ~27k req/s and Valkey to ~29k req/s with much lower p99.
-- **MariaDB thread pool fixed connection-churn tails.** `thread_handling=pool-of-threads` cut short-query p99 from ~745 ms to ~9 ms without reducing throughput.
-- **Angie memory was oversized.** 300k connections/worker cost ~2 GB RSS. 65k/worker keeps ~1M total connection capacity at ~0.5 GB RSS.
-- **Template and snippet fixes.** Angie does not ship `snippets/fastcgi-php.conf`; without it every PHP vhost failed `angie -t`. `PATH_TRANSLATED` also had to point at the script, not the document root. All 18 repository templates now pass.
-- Remaining ceiling is application work per request (DB + cache + search). For higher full-stack throughput, add FastCGI microcaching, avoid doing all lookups on every request, use persistent/Unix-socket connections, and scale horizontally (CDN, multiple Angie/PHP nodes, separate ES/DB hosts).
-
----
-
-### Remote stress test from a workstation
-
-`tests/stress-site/run-stress-remote.sh TARGET_IP DOMAIN [report.md]` drives
-the same stress site from another machine with [`oha`](https://github.com/hatoo/oha)
-(one static binary, downloaded to `.tools/` when missing; nothing is installed
-on the server) and reports requests/s, latency percentiles **and the HTTP
-status distribution**. The status column matters: Angie's per-IP rate limiter
-exempts only loopback, so a remote benchmark is answered with `429` after
-100 GET/s per IP. Run the install or `--optimize` with
-`SETUP_LIMIT_REQ_EXEMPT=<load generator IP>` (or set it on the live host and
-re-run `--optimize`) before measuring from another host. Pair it with
-`sudo bash tests/stress-site/collect-metrics.sh /tmp/metrics.log 5` on the
-server, which samples CPU/steal, load, TIME_WAIT and conntrack, listen
-overflows, PHP-FPM status, MariaDB/Valkey/Elasticsearch counters and the
-growth of every service error log, so a bottleneck can be matched to the
-scenario that produced it.
-
-Measured from a macOS workstation over a 1 GbE LAN against the dev-host host
-(16 threads / 27 GiB / NVMe, 200 connections, 15 s per scenario, 1.9.0):
-
-| Scenario | req/s | p50 | p99 | Server CPU |
-|---|---:|---:|---:|---|
-| static (Angie) | ~18.5k | 8.7 ms | 13.6 ms | ~15% (client/LAN bound) |
-| PHP hello | ~19.2k | 8.1 ms | 12.7 ms | ~50% |
-| MariaDB via PHP | ~16.9k | 8.6 ms | 13.4 ms | ~60% |
-| Valkey via PHP | ~17.7k | 8.3 ms | 12.6 ms | ~55% |
-| Elasticsearch via PHP (100 conns) | ~10.3k | 8.8 ms | 18.0 ms | ~60% |
-| full stack, uncached | ~7.2k | 18.0 ms | 29.5 ms | ~92% |
-| full stack, FastCGI cached | ~20k | 8.7 ms | 13.6 ms | ~20% |
-| 1 s PHP sleep | 146 | 1.02 s | 1.24 s | pool saturated (144 workers) |
-
-Before the exemption the same run reported ~20k req/s for every PHP scenario
-with >99% `429` responses and 266 MB of rate-limit warnings written to the
-vhost error log in two minutes; 1.9.0 logs rejections at `info` level.
-
----
-
-## Security and production checklist (large sites)
-
-The script produces a working, internet-facing baseline. For a large or security-sensitive site, review these items:
-
-**TLS / Angie**
-- Replace the self-signed per-domain certificates under `/etc/angie/ssl/<domain>/` (or the embedded default certificate) with real certificates (Angie ACME/Let's Encrypt or your CA). The default TLS policy is balanced TLS 1.2/1.3; use a stricter policy if your clients allow it.
-- `access_log off` is set globally and no vhost writes access logs by default. If you need forensics, rate-limit tuning or fail2ban web jails, add a buffered per-vhost log (`access_log ... buffer=64k flush=5s;`); use logrotate/shipping so it cannot fill the disk.
-- Rate limiting and FastCGI cache zones are now enabled, with loopback exempt. For a site behind Cloudflare or another proxy, configure `real_ip` (`/etc/angie/scripts/cloudflare.sh`) first, otherwise every visitor shares the proxy IP and the per-IP limiter will throttle them.
-- Add HTTP/3 (QUIC) if clients support it (`listen 443 quic`, `Alt-Svc`, and `ufw allow 443/udp`). Dynamic Brotli is installed and enabled by `--angie`/`--optimize`; gzip remains the fallback. Static assets are best cached at the CDN rather than precompressed on the origin.
-- Keep `client_max_body_size` and PHP upload limits aligned (both 100 MB now). Put Cloudflare or another CDN in front of static traffic and keep the daily Cloudflare real-IP refresh enabled.
-
-**PHP**
-- `disable_functions` blocks `show_source,phpinfo` by default. For applications that do not need process execution, add `system,passthru,exec,shell_exec,proc_open,popen,pcntl_exec`. Chevereto video processing and some WordPress plugins may need `exec`/`shell_exec`, so test per application.
-- Use `open_basedir` per vhost/pool, especially for multi-tenant hosting. The default pool is shared by every domain. Set it with `php_admin_value[open_basedir]` in a **dedicated pool** (or `open_basedir` in a per-site `.user.ini`); never with `fastcgi_param PHP_ADMIN_VALUE`, because PHP-FPM caches that per worker and it leaks onto whichever vhost the same worker serves next.
-- Session hardening is opt-in (`sudo SETUP_PHP_SESSION_HARDENING=1 ./setup.sh --optimize`) and off by default. The global overrides (`use_strict_mode`, cookies only, `HttpOnly`, `SameSite=Lax`, `cookie_secure=1`, 48-character IDs) broke Joomla/Polr logins on mixed hosts. Enable it only after testing every application, and set `session.cookie_secure=0` for an HTTP-only test vhost.
-- For production, set `opcache.validate_timestamps=0` and reload PHP-FPM on deploy to avoid per-request stat calls. Keep `expose_php=Off`.
-- `memory_limit` is auto-sized to 256–512 MB. Lower it per application where possible; the worker count assumes ~96 MB average, and worst-case memory must still fit in RAM.
-- Do not run untrusted PHP code as the same `www-data` user across unrelated sites; use separate pools/users per tenant.
-- Prefer Unix sockets for local MariaDB/Valkey and keep them on loopback. The script sets the PHP socket defaults and adds `www-data` to the `valkey` group.
-
-**MariaDB**
-- The setup admin user gets `GRANT ALL ... WITH GRANT OPTION`. Create per-application users limited to their own database and remove `GRANT OPTION`; never use the admin account in application config.
-- `innodb_flush_log_at_trx_commit=2` survives a database crash but can lose the last second of commits on an OS/power failure. Use `1` for financial or otherwise critical data.
-- Keep `bind-address=127.0.0.1` unless you really need remote access; if remote, use explicit addresses (or `IPV4`), enable TLS, open 3306 only for trusted source IPs in UFW, and create per-client accounts. `skip_name_resolve=1` is good for latency.
-- The thread pool (`thread_handling=pool-of-threads`) is tuned for many short web queries. If you run long analytical queries, test or use a separate reporting replica.
-- `secure_file_priv` and `local_infile=0` limit file import/export paths. Use the slow query log (enabled at 1 s) to find missing indexes; `log_slow_verbosity` includes query plans.
-- Test the embedded `mysqlbkup` job and store encrypted, off-site copies. A local backup on the same NVMe is not disaster recovery. Enable binary logs if you need point-in-time recovery (adds I/O).
-- Run `/root/mysqltuner.pl` after the site has real traffic and review slow queries; add indexes rather than raising buffers blindly. Consider a read replica or separate database host at scale.
-
-**Valkey**
-- Loopback bind, `protected-mode yes` and the Unix socket are safe for a single host. For remote Valkey, enable ACL users and TLS; do not expose 6379.
-- `save ""` makes it a pure cache. If you store sessions, queues or locks, enable AOF and use a no-eviction policy for that data (or a separate instance).
-- `allkeys-lru` can evict sessions; use `volatile-lru` with TTLs or a dedicated instance for persistent data. Monitor `evicted_keys` and `used_memory`.
-- Keep `io_threads=1` for ordinary small commands; benchmark before raising it. Use the Unix socket from PHP to avoid TIME_WAIT/port pressure.
-- Valkey 9 supports ACLs; create a restricted user for each app instead of sharing the default user if multiple apps use the same instance.
-
-**Elasticsearch**
-- X-Pack security is disabled and the default bind is `localhost`. For any non-loopback host, enable `xpack.security.enabled`, TLS, and authentication; never expose 9200/9300 directly to the internet.
-- Keep `vm.max_map_count=1048576`, the 4 GB locked heap here, and monitor JVM GC, thread-pool rejections and disk watermark. For large indexes, add replicas/shards and consider a dedicated search node.
-- Back up with snapshots to an external repository; Elasticsearch data is not covered by the MariaDB backup.
-
-**Host / operations**
-- Use SSH keys only and keep UFW limited to 22/80/443 (or your CDN's ranges). `--basic` rate-limits every effective SSH port with `ufw limit`; add fail2ban or web-auth jails yourself if you need them.
-- Remove the mDNS (`5353/udp`) and WS-Discovery (`3702/udp`) UFW rules if you do not need them; they were pre-existing on this host, not added by the script.
-- Enable `unattended-upgrades` manually if you want automatic security patches, and monitor reboot-required. Keep the kernel/firmware updated. `libgd3` is currently held back by the apt phasing/upgrade policy; review it before the next PHP/GD upgrade.
-- Ship Angie access/error logs, PHP-FPM slow log, MariaDB slow query log, Elasticsearch and Valkey metrics to a central monitor; alert on 5xx rate, p99 latency, disk, memory and queue depth. `--others sysstat` provides `sar`/`iostat`/`pidstat` history.
-- Load-test after every application or config change. The local `tests/stress-site/` harness is a starting point; tune `pm.max_children`, MariaDB buffers and Elasticsearch heap from measured RSS/CPU, not guesswork.
-- For very large traffic, scale horizontally: CDN for static, multiple Angie/PHP nodes behind a load balancer, MariaDB read replicas, and a separate Elasticsearch cluster. A single 16-core host tops out around the measured full-stack numbers above.
-- Keep the `stress.invalid` site and its `/etc/hosts` entry only on test machines; remove it from production.
-
----
+- Replace the self-signed certificates with ACME (Angie has `http_acme`);
+  behind Cloudflare, enable the real-IP config first or the per-IP limiter
+  throttles everyone; consider HTTP/3 (`listen 443 quic`, `ufw allow 443/udp`).
+- PHP: one pool and user per tenant with `open_basedir` in a dedicated pool
+  (never via `fastcgi_param`); extend `disable_functions` where no app needs
+  process execution; `opcache.validate_timestamps=0` with a reload on deploy.
+- MariaDB: per-application users without `GRANT OPTION`; `flush_log_at_trx_commit=1`
+  for critical data; TLS, UFW source rules and per-client accounts for remote
+  access; off-site encrypted backups and tested restores; binary logs for
+  point-in-time recovery; read replicas at scale.
+- Valkey: `save ""` makes it a cache; use AOF and `noeviction`/`volatile-lru`
+  (or a separate instance) for sessions, queues and locks; ACLs per app.
+- Elasticsearch: never expose 9200/9300 without X-Pack security and TLS;
+  snapshots to an external repository; a dedicated node once traffic grows.
+- Host: keys-only SSH, fail2ban or provider protection, central monitoring and
+  log shipping, alerting on 5xx/p99/disk/memory; remove `stress.invalid` and
+  test data from production.
+- Scale in this order: CDN and edge cache, FastCGI microcache, object cache,
+  database tuning and replicas, search cluster, multiple web nodes behind a
+  load balancer with shared sessions and storage.
 
 ## Troubleshooting
 
-### “Another PHP-FPM version is active”
-
-Another PHP-FPM version is already running. Purge it first:
-
-```bash
-sudo bash setup.sh --purge --php ver=8.4
-```
-
-Then install the desired version. Only one PHP-FPM version can own `/run/php/php-fpm.sock`.
-
-### “Installation of system tables failed” on MariaDB
-
-This is the Ubuntu 26.04 MariaDB AppArmor profile issue. The script adds the required capabilities to `/etc/apparmor.d/local/mariadbd` before installing and removes a stale loaded profile on re-installs. If you interrupted a previous install, purge MariaDB and run the install again:
-
-```bash
-sudo bash setup.sh --purge --mariadb
-sudo bash setup.sh --basic ... --mariadb ...
-```
-
-### `smartd could not be enabled`
-
-The package is installed, but `smartd` may refuse to start on machines with no SMART-capable disks (common on VMs/desktops). This is a warning, not an installation failure; `smartctl` is still available.
-
-### `--purge others` and pre-existing packages
-
-`--purge others` no longer removes any package, repository or key. It stops and disables the units `--others` enabled (`smartmontools`/`smartd` and the `sysstat` collection timers) and leaves Node.js, `smartmontools`, `nvme-cli`, `gifsicle` and `sysstat` installed. Remove them manually with APT only after confirming nothing needs them. `unattended-upgrades` belongs to the `--basic` security pass and is left running by every purge target; fail2ban and Composer are not managed by this script.
-
-### `--purge --php`
-
-PHP purge stops the selected PHP-FPM versions and leaves their packages and configuration in place. Re-running `--php` reuses that installation. If Composer was installed manually or by an older release, it is left in place too; remove it manually if it is no longer needed.
-
-### Rate limiting returns 429 on a site behind Cloudflare / a proxy
-
-The per-IP limiter keys on the direct client address. If all traffic arrives through a CDN or reverse proxy, enable the real-IP configuration for that proxy first (`/etc/angie/scripts/cloudflare.sh` for Cloudflare) and include `cloudflare.conf` in the vhost. Loopback is always exempt. Tune `limit_req` rates in `/etc/angie/http.d/limit_req.conf` and the bursts in `/etc/angie/h5bp/limit_req/*.conf`.
-
-### PHP-FPM slow log fills with queued requests
-
-`request_slowlog_timeout=10s` measures from accept, so a full listen queue can log requests that are simply waiting for a worker. Check `/fpm-status.php` (if enabled) for `listen queue`/`max listen queue` and add workers, cache the endpoint, or reduce upstream latency. A slow log entry is not automatically a bug in that script. The status path must end in `.php` when the pool sets `security.limit_extensions = .php`.
-
-### Angie logs “upstream prematurely closed connection” during a load test
-
-PHP-FPM worker recycling at `pm.max_requests` closes FastCGI keepalive connections, and Angie logs this when a worker exits between requests. A PHP-FPM reload or restart during traffic produces a burst of the same message. For a benchmark, set `pm.max_requests = 0` (or a much higher value) and reload FPM; for production, keep a finite limit and treat occasional entries as expected. The stress harness sets `pm.max_requests = 0` automatically.
-
-### `--domain` says Angie or MariaDB is missing
-
-`--domain` only creates the directory, vhost file and database. It does not install the stack. Install Angie and MariaDB first, or combine them:
-
-```bash
-sudo bash setup.sh --basic ... --angie --mariadb user=demo pass=temp size=4gb --domain google.com
-```
-
-### Elasticsearch is reachable only on localhost
-
-By default `--elastic host=localhost` binds to loopback and security is disabled, matching the original instructions. Do not expose port 9200 to the internet without re-enabling X-Pack security and TLS.
-
----
+| Symptom | Cause / fix |
+|---|---|
+| "Another PHP-FPM version is active" | only one version can own the socket: `--purge --php ver=X`, then install the new one |
+| "Installation of system tables failed" (MariaDB) | Ubuntu 26.04 AppArmor profile; the script adds the override, re-run after `--purge --mariadb` if a previous install was interrupted |
+| `smartd could not be enabled` | no SMART-capable disk (VMs); a warning only |
+| `429` behind Cloudflare/a proxy | the limiter keys on the direct client address: enable real-IP (`/etc/angie/scripts/cloudflare.sh`, `cloudflare.conf`); tune `http.d/limit_req.conf` and `h5bp/limit_req/*.conf` |
+| PHP-FPM slow log full of queued requests | `request_slowlog_timeout` counts from accept; check `listen queue` in `/fpm-status.php`, add workers or cache the endpoint |
+| "upstream prematurely closed connection" during a load test | worker recycling at `pm.max_requests` or an FPM reload; set `pm.max_requests = 0` for a benchmark |
+| `--domain` says Angie or MariaDB is missing | it only creates the vhost/database; install the stack first or combine the flags |
 
 ## Files and state
 
 | Path | Purpose |
 |---|---|
-| `diagnostics.log` | Generated by `--diagnostics` beside `setup.sh` |
-| `CHANGELOG.md` | Historical release notes |
-| `/run/setup.sh.lock` | Real-run serialization lock |
-| `/tmp/setup-optimize.*` | `--optimize` rollback backups |
-| `/var/lib/setup.sh/backup/` | Original basic files saved before `--basic` changes |
-| `/var/lib/setup.sh/original-hostname`, `original-timezone` | Values restored by `--purge basic` |
-| `/var/lib/setup.sh/ufw-*` | UFW active state, added rules, pre-existing rules and default policies used by purge |
-| `/var/lib/setup.sh/swapfile-managed` | Marker: the script created/resized `/swapfile` |
-| `/var/lib/setup.sh/setup-installed-pkg-*`, `preexisting-pkg-*` | Package-origin markers used by `--purge others` |
-| `/etc/angie/` | Angie configuration tree |
-| `/etc/angie/http.d/*.conf` | Repo-managed cache zones, rate limiting, WebSocket/proxy and referer maps (deployed from `server-configs-nginx`) |
-| `/etc/angie/http.d/limit_req*.conf` | Per-IP limiter zones and loopback exemption |
-| `/etc/angie/snippets/fastcgi-php.conf` | Repo-provided Ubuntu-compatible FastCGI snippet (not shipped by Angie) |
-| `/etc/angie/conf.d/<domain>.conf` | Blank or app vhost created by `--domain` |
-| `/etc/angie/ssl/<domain>/` | Per-domain self-signed certificate (replace with ACME/Let's Encrypt) |
-| `/var/www/<domain>/public/` | Document root created by `--domain` (owned by `www-data`) |
-| MariaDB `<domain_with_underscores>` | Database created by `--domain` |
-| `/home/nginx_cache*`, `/home/xf_proxy_cache`, `/home/proxy_cache*` | Angie FastCGI/proxy cache directories (owned by `www-data`) |
-| `/etc/php/<version>/` | PHP-FPM configuration |
-| `/var/cache/php/opcache` | OPcache file cache (owned by `www-data`) |
-| `/var/www/logs/php/php-fpm-slow.log` | PHP-FPM slow-request log |
-| `/etc/systemd/system/php<ver>-fpm.service.d/limits.conf` | PHP-FPM nofile drop-in |
-| `/var/lib/setup.sh/explicit-options.conf` | Recorded explicit `--basic server=`, `--php children=`, `--mariadb size=`, `--valkey ram=`, `--elastic ram=` values that `--optimize` keeps |
-| `/usr/local/bin/setup-precompress.sh` | Cron helper that keeps precompressed static-asset siblings fresh (`SETUP_PRECOMPRESS_ASSETS=1`); regenerated by every install/`--optimize` |
-| `/etc/systemd/system/setup-io-tuning.service`, `/etc/udev/rules.d/60-setup-io.rules` | THP `madvise` oneshot and per-device-class I/O scheduler/readahead rule (restored by `--purge basic`) |
-| `/etc/mysql/mariadb.conf.d/50-server.cnf` | MariaDB managed base block (charset, name resolution, local_infile, bind address) |
-| `/etc/mysql/mariadb.conf.d/99-setup-optimize.cnf` | MariaDB hardware profile (buffer pool, I/O, connections, logging) |
-| `/etc/valkey/valkey.conf`, `/run/valkey/valkey.sock` | Valkey settings and local Unix socket |
-| `/etc/systemd/system/valkey-server.service.d/limits.conf` | Valkey nofile drop-in |
-| `/etc/elasticsearch/` | Elasticsearch configuration, JVM options and scripts |
-| `/etc/systemd/system/elasticsearch.service.d/limits.conf` | Elasticsearch memlock/nofile drop-in |
-| `/root/mysqltuner.pl` | Embedded MySQL Tuner |
-| `/root/tools/mysqlbackup-master/` | Embedded mysqlbackup utility |
-| `/usr/local/bin/mysqlbkup.sh` | Installed backup script |
-| `/etc/mysqlbkup.cnf`, `/etc/mysqlbkup.config` | Backup credentials/config (mode 600) |
+| `/run/setup.sh.lock`, `/tmp/setup-optimize.*` | run lock; `--optimize` rollback backups |
+| `/var/lib/setup.sh/` | originals for `--purge basic`, UFW/swap state, package-origin markers, `explicit-options.conf` |
+| `/etc/default/setup-tuning` | persisted overrides (`TCP_CC`, `QDISC`, `LIMIT_REQ_EXEMPT`, `PRECOMPRESS_ASSETS`, `PHP_JIT`, `PHP_JIT_WORDPRESS`, `NODE_MAJOR`) |
+| `/etc/angie/` | Angie tree (`conf.d/<domain>.conf`, `ssl/<domain>/`, `http.d/zz-setup-*.conf` managed maps/zones) |
+| `/home/nginx_cache*`, `/home/xf_proxy_cache`, `/home/proxy_cache*` | Angie cache directories |
+| `/etc/php/<ver>/fpm/conf.d/zz-setup-optimize.ini`, `custom_dan.ini`, `pool.d/www.conf` | PHP tuning |
+| `/etc/mysql/mariadb.conf.d/50-server.cnf`, `99-setup-optimize.cnf` | MariaDB base block and hardware profile |
+| `/etc/valkey/valkey.conf`, `/run/valkey/valkey.sock` | Valkey |
+| `/etc/elasticsearch/elasticsearch.yml`, `jvm.options.d/zz-setup-optimize.options` | Elasticsearch |
+| `/etc/systemd/system/<unit>.service.d/limits.conf` | fd/memlock drop-ins for Angie, PHP-FPM, MariaDB, Valkey, Elasticsearch |
+| `/etc/sysctl.d/90-setup-network.conf`, `/etc/security/limits.d/99-setup.conf`, `/etc/udev/rules.d/60-setup-io.rules`, `setup-io-tuning.service` | OS profile |
+| `/var/www/logs/<service>/` | one log tree for every service (rotated by `/etc/logrotate.d/setup-logs`) |
+| `/usr/local/bin/setup-precompress.sh`, `/usr/local/bin/mysqlbkup.sh`, `/etc/mysqlbkup.cnf`, `/root/mysqltuner.pl` | cron helpers and embedded tools |
+| `/var/log/setup-optimize-*.md`, `diagnostics.log`, `setup_*.log` | reports and run logs |
 
----
-
-## Notes
-
-- The script is intentionally server-oriented. Running `--basic` changes the hostname, DNS resolver, kernel sysctls, security limits, firewall and timezone. Test it on a disposable server or VM first.
-- An auto-generated hostname uses logical CPU threads, nominal installed RAM (DMI when available) and the sum of physical disks: `8c-32g-1T` = 8 threads, 32 GB RAM, 1 TB. Supply `host=` to override it.
-- Auto swap only acts when the current total swap is zero or below 50% of RAM; it sizes `/swapfile` so the total reaches 50% of RAM. Supply `swap=` for an exact size.
-- `--domain` creates the directory, Angie vhost (blank or `app=TYPE`), certificate and database. It does not install the application code, Angie or MariaDB, and does not purge them.
-- `--purge basic` restores the recorded originals by overwriting them, but a reboot is the cleanest way to reset all runtime kernel tunables. No file is deleted.
-- The script never stores credentials in the repository. MariaDB credentials are written only to `/etc/mysqlbkup.cnf` on the target server (mode 600).
-- `--dry-run` / `--check` is safe as a normal user and makes no changes; use it to validate a command before running it.
-- Package-origin markers in `/var/lib/setup.sh` are kept for diagnostics. Purge no longer removes software regardless of origin, so deleting that directory does not change file-safety behavior.
-- Package versions follow the upstream repositories at install time. Angie/PHP configuration follows the current `server-configs-nginx` branch at install time; other embedded payloads are fixed snapshots.
-- Set `CONFIG_SOURCE_DIR=/path/to/server-configs-nginx` to use a local checkout (for testing or offline installs), `CONFIG_REPO_REF=<branch|tag>` to choose a branch/tag, or `CONFIG_REPO_URL=<url>` for a fork.
+Credentials are never stored in the repository; the MariaDB password is written
+only to `/etc/mysqlbkup.cnf` on the target host. `--basic` changes hostname,
+resolver, sysctls, limits, firewall and timezone: test on a disposable server
+first. Release notes: `CHANGELOG.md`.
