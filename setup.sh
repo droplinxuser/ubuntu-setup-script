@@ -36,7 +36,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.12.0"
+readonly SCRIPT_VERSION="1.13.0"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -283,6 +283,15 @@ log_selection() {
   printf '\n'
 }
 
+# A file created by `sudo bash setup.sh` in the operator's checkout or home
+# would otherwise stay root-owned and unreadable to them (mode 600 is kept).
+give_to_invoking_user() {
+  local f=$1
+  [[ -n ${SUDO_UID:-} && -n ${SUDO_GID:-} && ${SUDO_UID} != 0 ]] || return 0
+  [[ -e $f ]] || return 0
+  chown "${SUDO_UID}:${SUDO_GID}" "$f" 2>/dev/null || true
+}
+
 start_run_log() {
   local stamp
   stamp=$(date +%Y%m%d-%H%M%S)
@@ -299,6 +308,7 @@ start_run_log() {
     return 0
   fi
   chmod 600 "$RUN_LOG_FILE" 2>/dev/null || true
+  give_to_invoking_user "$RUN_LOG_FILE"
 
   # tee mirrors every line to the terminal and the file.  The PID is saved so
   # finish_run_log() can wait for the final line to reach disk before exit.
@@ -404,12 +414,38 @@ retire_paths() {
 
 # Restore a backed-up directory tree over a live path without deleting files
 # that are not in the backup.  Used for install-time rollback of Angie/PHP.
-restore_tree() {
-  local source=$1 target=$2
-  [[ -n $source && -d $source ]] || return 0
-  mkdir -p "$target" || return 1
-  cp -a "${source}/." "$target/" 2>/dev/null || return 1
+# Restore the directory snapshot SRC over the live DST: overwrite in place
+# (never unlink the live path first) and move files created after the
+# snapshot to /tmp, so a generated file (a drop-in or ini the failed tune
+# added) cannot win again after the rollback.  Prints one
+# "moved <live-path> <tmp-path>" line per retired file for the caller to
+# report; nothing is deleted.  Shared by the install-time rollbacks, the
+# --purge restore and the --optimize rollback.
+restore_snapshot_dir() {
+  local src=$1 dst=$2 extra rel moved
+  [[ -n $src && -d $src ]] || return 1
+  mkdir -p "$dst" || return 1
+  cp -a "${src}/." "$dst/" 2>/dev/null || return 1
+  while IFS= read -r -d '' extra; do
+    rel=${extra#"$dst"/}
+    [[ -e "${src}/${rel}" ]] && continue
+    moved=$(preserve_to_tmp "$extra" 2>/dev/null) || continue
+    [[ -n $moved ]] && printf 'moved %s %s\n' "$extra" "$moved"
+  done < <(find "$dst" -type f -print0 2>/dev/null)
   return 0
+}
+
+restore_tree() {
+  local source=$1 target=$2 line
+  [[ -n $source && -d $source ]] || return 0
+  local out rc=0
+  out=$(tmp_file) || return 1
+  restore_snapshot_dir "$source" "$target" > "$out" || rc=1
+  while IFS= read -r line; do
+    [[ $line == moved\ * ]] || continue
+    warn "Rollback moved generated ${line#moved } (not deleted)"
+  done < "$out"
+  return "$rc"
 }
 
 rollback_angie_tree() {
@@ -430,8 +466,12 @@ rollback_php_tree() {
   [[ -n $backup && -d "${backup}/fpm" ]] || return 0
   restore_tree "${backup}/fpm" "/etc/php/${ver}/fpm" \
     || warn "Could not restore the previous PHP ${ver} tree"
-  systemctl restart "php${ver}-fpm" 2>/dev/null || true
-  warn "Rolled back PHP ${ver} configuration from ${backup}"
+  if "php-fpm${ver}" -t >/dev/null 2>&1; then
+    systemctl restart "php${ver}-fpm" 2>/dev/null || true
+    warn "Rolled back PHP ${ver} configuration from ${backup}"
+  else
+    warn "PHP ${ver} rollback restored files but php-fpm${ver} -t still fails; not restarted"
+  fi
 }
 
 on_error() {
@@ -442,6 +482,12 @@ on_error() {
   if (( rc == 141 )); then
     return 0
   fi
+  # A mode driver that already reported its failure (optimize report,
+  # restart-all summary) returns non-zero through handled_return; main()
+  # then exits with that status under set -e without a duplicate [ERR] line.
+  if (( ${RUN_HANDLED_FAILURE:-0} )); then
+    return 0
+  fi
   # Keep the failing command on one line and bounded, so a large heredoc or a
   # generated SQL statement does not flood the operator's terminal/log.
   cmd=$(printf '%s' "$cmd" | tr '\n' ' ' | cut -c1-200)
@@ -449,6 +495,20 @@ on_error() {
     "$(_timestamp)" "$C_RED" "$C_RESET" "$rc" "$line" "$cmd" >&2
 }
 trap 'on_error $LINENO' ERR
+
+# Set by handled_return when a mode driver exits non-zero on purpose.
+RUN_HANDLED_FAILURE=0
+# Return RC from a driver whose failure is already explained to the operator.
+# The drivers are called plainly from main() so set -e and the ERR trap stay
+# live inside them (bash suspends both for the whole function body when the
+# call is the condition of `if !` or part of a && / || list).
+handled_return() {
+  local rc=${1:-0}
+  if (( rc != 0 )); then
+    RUN_HANDLED_FAILURE=1
+  fi
+  return "$rc"
+}
 
 # Serialise real runs.  Two concurrent invocations (an operator plus a cron or
 # CI job) can interleave config rewrites and leave a half-written service
@@ -505,7 +565,15 @@ retry() {
 }
 
 apt_update()  { retry 3 5 apt-get -o DPkg::Lock::Timeout=300 \
-  -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update -y; }
+  -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update -y && APT_LISTS_FRESH=1; }
+# Refresh the package lists at most once per run (update_system and the
+# repository setup already count); used by the few installs outside them.
+APT_LISTS_FRESH=0
+apt_update_once() {
+  (( APT_LISTS_FRESH )) && return 0
+  apt_update || warn "apt-get update failed; continuing with the existing package lists"
+  return 0
+}
 apt_install() {
   # --no-remove aborts instead of letting APT uninstall a conflicting package.
   apt-get install --no-remove "${APT_OPTS[@]}" --no-install-recommends "$@"
@@ -623,7 +691,9 @@ Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
       It never installs, purges or starts a managed service; the only packages
       it may add are the small cpufrequtils helper when the CPU exposes
       frequency scaling and angie-module-brotli when Angie is installed, so
-      install and optimize share the same compression profile.  Allocations
+      install and optimize share the same compression profile.  It also never
+      touches the resolver (DNS), the firewall (UFW) or swap: those are
+      --basic decisions and stay as the operator left them.  Allocations
       are planned together from one
       80%-of-RAM budget, and a service is reloaded (Angie, PHP-FPM) or tuned
       online (Valkey/Redis) only when its generated configuration actually
@@ -1235,38 +1305,51 @@ storage_backing_class() {
     | awk '{ gsub(/^[^A-Za-z0-9]+/, "", $1); if ($2 == "disk") print $1 }')
   (( ${#names[@]} > 0 )) || return 1
   for name in "${names[@]}"; do
-    case "$name" in nvme*) printf 'nvme'; return 0 ;; esac
-    rota=$(cat "/sys/block/${name}/queue/rotational" 2>/dev/null || echo 1)
-    tran=$(lsblk -d -n -o TRAN "/dev/${name}" 2>/dev/null | tr -d '[:space:]')
-    if [[ $rota == 0 ]]; then
-      class=ssd
-    elif [[ $rota != 0 && ( $tran == virtio || $tran == pv ) ]]; then
-      class=ssd
-    fi
+    case "$(classify_block_device "$name")" in
+      nvme) printf 'nvme'; return 0 ;;
+      ssd) class=ssd ;;
+    esac
   done
   printf '%s' "$class"
 }
 
-storage_class() {
-  local backing
-  backing=$(storage_backing_class /var/www 2>/dev/null || true)
-  [[ -n $backing ]] && { printf '%s' "$backing"; return 0; }
-
-  if is_nvme_storage; then
-    printf 'nvme'
-  elif command -v lsblk >/dev/null 2>&1; then
-    if lsblk -d -n -o TYPE,ROTA 2>/dev/null \
-         | awk '$1 == "disk" && $2 == "0" { found = 1 } END { exit !found }'; then
-      printf 'ssd'
-    elif lsblk -d -n -o TYPE,TRAN 2>/dev/null \
-         | awk '$1 == "disk" && ($2 == "virtio" || $2 == "pv") { found = 1 } END { exit !found }'; then
-      printf 'ssd'
-    else
-      printf 'hdd'
-    fi
+# One disk's class (nvme/ssd/hdd) from its name: NVMe by name, flash by the
+# rotational flag, and paravirtual (virtio/Xen) volumes count as flash since
+# the hypervisor hides the medium.  Shared by the data-path and the
+# whole-host classification so both paths agree on every device.
+classify_block_device() {
+  local name=$1 rota tran
+  case "$name" in nvme*) printf 'nvme'; return 0 ;; esac
+  rota=$(cat "/sys/block/${name}/queue/rotational" 2>/dev/null || echo 1)
+  tran=$(lsblk -d -n -o TRAN "/dev/${name}" 2>/dev/null | tr -d '[:space:]')
+  if [[ $rota == 0 || $tran == virtio || $tran == pv ]]; then
+    printf 'ssd'
   else
     printf 'hdd'
   fi
+}
+
+storage_class() {
+  local backing name type class best=hdd
+  backing=$(storage_backing_class /var/www 2>/dev/null || true)
+  [[ -n $backing ]] && { printf '%s' "$backing"; return 0; }
+
+  # No mount information: take the best class among the host's whole disks.
+  if is_nvme_storage; then
+    printf 'nvme'
+    return 0
+  fi
+  if command -v lsblk >/dev/null 2>&1; then
+    while read -r name type; do
+      [[ $type == disk && -n $name ]] || continue
+      class=$(classify_block_device "$name")
+      case $class in
+        nvme) best=nvme; break ;;
+        ssd) best=ssd ;;
+      esac
+    done < <(lsblk -d -n -o NAME,TYPE 2>/dev/null)
+  fi
+  printf '%s' "$best"
 }
 
 latest_sury_php() {
@@ -1437,6 +1520,13 @@ validate_all() {
     [[ ${OPT[mariadb.pass]} != *$'\n'* ]] || die "--mariadb pass= must not contain a newline"
     [[ ${OPT[mariadb.size]} == auto || ${OPT[mariadb.size]} =~ ^[1-9][0-9]*([mM][bB]?|[gG][bB]?)$ ]] \
       || die "--mariadb size='${OPT[mariadb.size]}' is invalid (use auto, 4gb, 512m, ...)"
+    # The planner never sizes a pool below 128 MB; an explicit value under
+    # that would be written by the installer and then raised by the first
+    # --optimize (a restart for nothing).  Clamp it here so both paths agree.
+    if [[ ${OPT[mariadb.size]} != auto ]] && (( $(size_to_mb "${OPT[mariadb.size]}") < 128 )); then
+      warn "--mariadb size=${OPT[mariadb.size]} is below the 128 MB planner floor; using 128m"
+      OPT[mariadb.size]=128m
+    fi
     local bind=${OPT[mariadb.bind]:-127.0.0.1}
     if ! normalize_mariadb_bind "$bind"; then
       die "--mariadb bind='${bind}' contains an invalid address '${BIND_BAD_TOKEN}'. Use comma-separated IPv4 addresses, ::1, and/or IPV4."
@@ -1449,6 +1539,10 @@ validate_all() {
       [[ ${OPT[valkey.ram],,} == auto || ${OPT[valkey.ram]} =~ ^[1-9][0-9]*[gGmM]$ ]] \
         || die "--valkey ram='${OPT[valkey.ram]}' is invalid (use auto, 2g, 512m, ...)"
       OPT[valkey.ram]=${OPT[valkey.ram],,}
+      if [[ ${OPT[valkey.ram]} != auto ]] && (( $(size_to_mb "${OPT[valkey.ram]}") < 128 )); then
+        warn "--valkey ram=${OPT[valkey.ram]} is below the 128 MB planner floor; using 128m"
+        OPT[valkey.ram]=128m
+      fi
     fi
     local vpol=${OPT[valkey.policy]:-allkeys-lru}
     case "$vpol" in
@@ -1459,6 +1553,13 @@ validate_all() {
     local vio=${OPT[valkey.io_threads]:-1}
     [[ $vio =~ ^[1-9][0-9]*$ ]] && (( vio <= 64 )) \
       || die "--valkey io_threads='${vio}' is invalid (use 1..64)"
+    if (( vio > 8 )); then
+      # valkey_clamp_io_threads writes at most 8 (more threads than that
+      # only add contention on the single command thread); say so instead
+      # of silently writing a different value than the one requested.
+      warn "--valkey io_threads=${vio} exceeds the 8-thread ceiling; using 8"
+      vio=8
+    fi
     OPT[valkey.io_threads]=$vio
   fi
 
@@ -1621,13 +1722,15 @@ restore_original() {
   local src="${BACKUP_DIR}/${name}"
   [[ -f "${BACKUP_DIR}/${name}.recorded" ]] || return 0
   if [[ $(<"${BACKUP_DIR}/${name}.recorded") == present && -e $src ]]; then
-    # Copy over the existing path instead of unlinking it first.  Any extra
-    # files that are not part of the backup are intentionally left in place.
+    # Copy over the existing path instead of unlinking it first.  Files the
+    # setup generated inside a restored directory are moved to /tmp.
     if [[ -d $src ]]; then
-      mkdir -p "$path"
-      cp -a "${src}/." "$path/"
+      local line
+      while IFS= read -r line; do
+        [[ $line == moved\ * ]] && info "Moved generated ${line#moved } (nothing deleted)"
+      done < <(restore_snapshot_dir "$src" "$path" || warn "Could not fully restore ${path}")
     else
-      cp -a "$src" "$path"
+      cp -a "$src" "$path" || { warn "Could not restore ${path}"; return 0; }
     fi
     info "Restored ${path} (existing files overwritten; nothing deleted)"
   elif [[ -e $path || -L $path ]]; then
@@ -1646,6 +1749,23 @@ restore_original() {
   fi
 }
 
+# Create or re-key USER for every loopback spelling and grant GRANT_CLAUSE
+# (for example 'ALL ON *.*' or 'ALL PRIVILEGES ON `db`.*') with the optional
+# trailing SUFFIX ('WITH GRANT OPTION').  skip_name_resolve=1 means
+# 127.0.0.1 is not translated to localhost, so an account created only for
+# 'user'@'localhost' cannot be used over TCP.  The statements go in over
+# stdin: a password inside `mariadb -e "..."` is visible to every local user
+# in the process list for as long as it runs.
+mariadb_ensure_local_user() {
+  local user=$1 pass=$2 grant_clause=$3 suffix=${4:-} eu ep host
+  eu=$(sql_escape "$user")
+  ep=$(sql_escape "$pass")
+  for host in localhost 127.0.0.1 ::1; do
+    mariadb <<<"CREATE USER IF NOT EXISTS '${eu}'@'${host}' IDENTIFIED BY '${ep}'; ALTER USER '${eu}'@'${host}' IDENTIFIED BY '${ep}'; GRANT ${grant_clause} TO '${eu}'@'${host}' ${suffix};"
+  done
+  mariadb <<<'FLUSH PRIVILEGES;'
+}
+
 sql_escape() {
   local v=$1
   v=${v//\\/\\\\}
@@ -1661,6 +1781,9 @@ sql_escape() {
 write_mysqlbkup_credentials() {
   local file=$1 tmp
   [[ -f $file ]] || return 1
+  # The upstream tarball ships this file 0644; it is about to hold the
+  # administrative password.
+  chmod 600 "$file" 2>/dev/null || true
   tmp=$(tmp_file) || return 1
   MYSQLBKUP_USER=$2 MYSQLBKUP_PASS=$3 awk '
     BEGIN { u = ENVIRON["MYSQLBKUP_USER"]; p = ENVIRON["MYSQLBKUP_PASS"] }
@@ -1864,10 +1987,16 @@ explicit_option_set() {
   ensure_state
   touch "$file"
   if grep -qE "^${key}=" "$file"; then
-    sed_in_place -E "s|^${key}=.*|${key}=${value}|" "$file"
+    sed_in_place -E "s|^${key}=.*|$(sed_replacement_escape "${key}=${value}")|" "$file"
   else
     printf '%s=%s\n' "$key" "$value" >> "$file"
   fi
+}
+
+# Escape a literal value for the replacement side of an `s|...|...|` sed
+# expression: `&`, `\` and the `|` delimiter would otherwise be interpreted.
+sed_replacement_escape() {
+  printf '%s' "$1" | sed -e 's/[&|\\]/\\&/g'
 }
 
 explicit_option_unset() {
@@ -2045,14 +2174,25 @@ write_cron() {
     fi
   } > "$tmp"
 
+  # Debian's crontab -l omits the vixie header, so the body compares directly.
+  # Reinstalling an unchanged crontab only rewrites the header timestamp,
+  # which made every --optimize report a changed file.
+  CRON_UPDATED=0
+  if [[ $(< "$tmp") == "$cur" ]]; then
+    info "Managed crontab entries unchanged"
+    return 0
+  fi
   # Install the file even when it is empty instead of deleting the user's
   # crontab; writing an empty crontab keeps the file in place.
   if ! crontab "$tmp"; then
     warn "Could not install the managed crontab"
     return 1
   fi
+  CRON_UPDATED=1
   info "Managed crontab entries updated"
 }
+# 1 when the last write_cron installed a new crontab, 0 when it was unchanged.
+CRON_UPDATED=0
 
 cron_remove_line() {
   local needle=$1 cur tmp
@@ -2140,11 +2280,19 @@ configure_cpu_governor() {
     warn "tuned is installed and may override the performance governor; leaving it in place"
   fi
   ensure_state
-  if ! dpkg-query -W -f='${Status}' cpufrequtils 2>/dev/null | grep -q 'ok installed'; then
-    touch "${STATE_DIR}/cpufrequtils-installed"
+  # Remember the governor that was active before the first run so --purge
+  # can put it back (Ubuntu's default is schedutil, not powersave).
+  if [[ ! -s "${STATE_DIR}/original-governor" && -r /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]]; then
+    cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor > "${STATE_DIR}/original-governor" 2>/dev/null || true
   fi
   record_original /etc/default/cpufrequtils cpufrequtils-default
-  apt_install cpufrequtils
+  if ! pkg_ok cpufrequtils; then
+    touch "${STATE_DIR}/cpufrequtils-installed"
+    # --optimize never runs the full update_system; refresh the lists once
+    # so this one install does not fail on a host with stale or empty lists.
+    apt_update_once
+    apt_install cpufrequtils
+  fi
   local cpu_src="${SCRIPT_DIR}/configs/system/cpufrequtils"
   if [[ -f $cpu_src ]]; then
     install -m 644 "$cpu_src" /etc/default/cpufrequtils
@@ -2338,16 +2486,54 @@ SYSCTL_MANAGED_KEYS=(
   vm.min_free_kbytes kernel.shmmax kernel.shmall
   vm.dirty_background_bytes vm.dirty_bytes vm.dirty_background_ratio vm.dirty_ratio
   vm.swappiness vm.overcommit_memory vm.overcommit_ratio
+  net.ipv4.ip_local_reserved_ports net.core.netdev_budget net.core.netdev_budget_usecs
+  net.core.default_qdisc net.ipv4.tcp_congestion_control
 )
 
+# Record the live value of every managed key (plus any extra keys given) once,
+# before the profile is applied.  Every recorded key is also indexed so a
+# later --purge restores keys the base template defines (forwarding, rp_filter,
+# sysrq, ...) and keys added to the profile after this list was written.
 record_sysctl_values() {
   ensure_state
-  local key file
-  for key in "${SYSCTL_MANAGED_KEYS[@]}"; do
+  local key file index="${STATE_DIR}/sysctl-managed-keys"
+  for key in "${SYSCTL_MANAGED_KEYS[@]}" "$@"; do
     file="${STATE_DIR}/sysctl-orig-${key//\//_}"
     [[ -f $file ]] && continue
     sysctl -n "$key" > "$file" 2>/dev/null || true
+    grep -qxF -- "$key" "$index" 2>/dev/null || printf '%s\n' "$key" >> "$index"
   done
+}
+
+# Keys defined in a sysctl file, one per line.
+sysctl_file_keys() {
+  sed -nE 's/^[[:space:]]*([A-Za-z0-9_.\/-]+)[[:space:]]*=.*/\1/p' "$1" 2>/dev/null | sort -u
+}
+
+# The base profile disables packet forwarding and IPv6 autoconfiguration.
+# That is right for a plain web host, but an adopted server that routes
+# (Docker, LXD, a bridge, WireGuard, Tailscale) or takes its IPv6 address from
+# router advertisements would lose connectivity the moment the file is
+# applied.  Drop those lines when the host demonstrably relies on them.
+sysctl_drop_host_overrides() {
+  local file=$1 why=""
+  if [[ $(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null) == 1 ]]; then
+    why="ip_forward is already enabled"
+  elif ip -o link show type bridge 2>/dev/null | grep -q .; then
+    why="a bridge interface exists"
+  elif ip -o link show 2>/dev/null | grep -qE ': (docker|br-|virbr|lxdbr|lxcbr|wg|tailscale|tun|tap|cni|flannel|veth)'; then
+    why="a container/VPN interface exists"
+  fi
+  if [[ -n $why ]]; then
+    sed_in_place -E '/^[[:space:]]*net\.ipv4\.ip_forward[[:space:]]*=/d; /^[[:space:]]*net\.ipv[46]\.conf\.(all|default)\.forwarding[[:space:]]*=/d' "$file"
+    info "Keeping packet forwarding as configured (${why}); the profile's forwarding=0 lines were dropped"
+  fi
+  if ip -6 -o addr show scope global dynamic 2>/dev/null | grep -q . \
+     || ip -6 route show default 2>/dev/null | grep -q 'proto ra'; then
+    sed_in_place -E '/^[[:space:]]*net\.ipv6\.conf\.(all|default)\.(autoconf|accept_ra)[[:space:]]*=/d' "$file"
+    info "Keeping IPv6 autoconfiguration (an address or default route comes from router advertisements)"
+  fi
+  return 0
 }
 
 # Restore a ratio/bytes sysctl pair: write the member that was recorded
@@ -2374,8 +2560,14 @@ restore_sysctl_values() {
   # rejects a low mark above the live high mark).
   restore_sysctl_pair vm.dirty_ratio vm.dirty_bytes
   restore_sysctl_pair vm.dirty_background_ratio vm.dirty_background_bytes
-  local -a ordered=()
-  for key in "${SYSCTL_MANAGED_KEYS[@]}"; do
+  local -a all=("${SYSCTL_MANAGED_KEYS[@]}") ordered=()
+  local seen=" "
+  if [[ -s "${STATE_DIR}/sysctl-managed-keys" ]]; then
+    mapfile -t -O "${#all[@]}" all < "${STATE_DIR}/sysctl-managed-keys"
+  fi
+  for key in "${all[@]}"; do
+    [[ -n $key && $seen != *" ${key} "* ]] || continue
+    seen+="${key} "
     case $key in
       vm.dirty_bytes|vm.dirty_ratio|vm.dirty_background_bytes|vm.dirty_background_ratio|net.ipv4.ipfrag_low_thresh) continue ;;
     esac
@@ -2384,8 +2576,13 @@ restore_sysctl_values() {
   ordered+=(net.ipv4.ipfrag_low_thresh)
   for key in "${ordered[@]}"; do
     file="${STATE_DIR}/sysctl-orig-${key//\//_}"
-    [[ -s $file ]] || continue
+    [[ -f $file ]] || continue
     value=$(<"$file")
+    # An empty recorded value is only meaningful for the reserved-port list
+    # (empty = none reserved); other keys never read back empty.
+    if [[ -z $value && $key != net.ipv4.ip_local_reserved_ports ]]; then
+      continue
+    fi
     sysctl -w "${key}=${value}" >/dev/null 2>&1 \
       || warn "Could not restore ${key}=${value}"
   done
@@ -2447,6 +2644,7 @@ configure_sysctl() {
   else
     blob_sysctl > /etc/sysctl.conf
   fi
+  sysctl_drop_host_overrides /etc/sysctl.conf
 
   # Layered, hardware-aware overrides on top of the base profile.  These
   # matter on busy web/database hosts: larger socket buffers, more orphan
@@ -2501,6 +2699,33 @@ configure_sysctl() {
   # cannot afford 32 MB per socket.
   rmem_max=33554432
   (( ram_mb < 4096 )) && rmem_max=16777216
+  # The per-socket *default* buffer is what every idle keep-alive connection
+  # costs; 256 KB on a 1-2 GB VPS with 10k sockets is most of its RAM.
+  local tcp_default=262144 swappiness=10 shmmax=1073741824
+  if (( ram_mb < 4096 )); then
+    tcp_default=87380
+  elif (( ram_mb < 16384 )); then
+    tcp_default=131072
+  fi
+  # Flash storage pays little for the occasional swap-in, so keep anonymous
+  # pages resident and leave RAM to the page cache (database and index
+  # files); rotational disks keep the conservative 10.
+  case $disk_class in nvme|ssd) swappiness=1 ;; esac
+  # A 1 GiB SysV segment is the historical maximum; never let it exceed a
+  # quarter of RAM on a small host.
+  (( ram_mb / 4 < 1024 )) && shmmax=$(( ram_mb / 4 * 1048576 ))
+  shmall=$(( shmmax / 4096 ))
+  # The widened ephemeral range covers the service ports; reserve them so an
+  # outbound connection can never take 3306/6379/9200 before a restart binds.
+  local reserved_ports
+  reserved_ports=$(printf '%s\n' 3306 6379 9200 9300 "$(sshd_listen_ports)" \
+    | grep -E '^[0-9]+$' | awk '$1 >= 1024' | sort -nu | paste -sd, -)
+  # Busy dedicated hosts with several queues drain more packets per softirq
+  # pass; a VPS shares its hypervisor queue and keeps the kernel default.
+  local netdev_budget_lines=""
+  if (( cpu >= 8 )) && ! host_is_vps; then
+    netdev_budget_lines=$'net.core.netdev_budget = 600\nnet.core.netdev_budget_usecs = 8000'
+  fi
   # The base profile also sets the net.nf_conntrack_max alias, which the
   # de-duplication cannot match against net.netfilter.nf_conntrack_max.
   sed_in_place -E '/^[[:space:]]*net\.nf_conntrack_max[[:space:]]*=/d' /etc/sysctl.conf
@@ -2515,14 +2740,16 @@ configure_sysctl() {
 net.core.optmem_max = 262144
 net.core.rmem_max = ${rmem_max}
 net.core.wmem_max = ${rmem_max}
-net.ipv4.tcp_rmem = 8192 262144 ${rmem_max}
-net.ipv4.tcp_wmem = 8192 262144 ${rmem_max}
+net.ipv4.tcp_rmem = 8192 ${tcp_default} ${rmem_max}
+net.ipv4.tcp_wmem = 8192 ${tcp_default} ${rmem_max}
 net.core.somaxconn = ${somaxconn}
 net.core.netdev_max_backlog = ${netdev_backlog}
+${netdev_budget_lines}
 net.ipv4.tcp_max_syn_backlog = ${syn_backlog}
 net.ipv4.tcp_max_tw_buckets = ${tw_buckets}
 net.ipv4.tcp_max_orphans = ${max_orphans}
 net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.ip_local_reserved_ports = ${reserved_ports}
 net.ipv4.tcp_keepalive_time = 120
 net.ipv4.neigh.default.gc_thresh1 = 32
 net.ipv4.neigh.default.gc_thresh2 = ${arp_thresh2}
@@ -2538,7 +2765,8 @@ fs.file-max = ${file_max}
 fs.nr_open = ${file_max}
 fs.inotify.max_user_watches = ${inotify_watches}
 vm.min_free_kbytes = ${min_free}
-kernel.shmmax = 1073741824
+vm.swappiness = ${swappiness}
+kernel.shmmax = ${shmmax}
 kernel.shmall = ${shmall}
 
 # Security hardening.
@@ -2614,6 +2842,11 @@ EOF
     fi
   fi
 
+  # Record the base template's own keys too (first run only), so --purge can
+  # put every live value back, not just the hardware block.
+  local -a profile_keys=()
+  mapfile -t profile_keys < <(sysctl_file_keys /etc/sysctl.conf)
+  record_sysctl_values "${profile_keys[@]}"
   sysctl -e -p /etc/sysctl.conf || warn "One or more sysctl values could not be applied"
 
   # The congestion-control module and qdisc are module-owned and
@@ -2681,10 +2914,14 @@ EOF
 # udev logs an error per partition when a rule tries to set them.
 # NVMe: no scheduler (the device queues), small readahead for random I/O.
 ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", KERNEL=="nvme[0-9]*n[0-9]*", ATTR{queue/scheduler}="none", ATTR{bdi/read_ahead_kb}="128"
-# SSD and paravirtual disks: mq-deadline, small readahead.
-ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", KERNEL=="sd[a-z]*|vd[a-z]*|xvd[a-z]*", ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="mq-deadline", ATTR{bdi/read_ahead_kb}="128"
-# Rotational disks: mq-deadline with a larger readahead for sequential scans.
-ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", KERNEL=="sd[a-z]*", ATTR{queue/rotational}=="1", ATTR{queue/scheduler}="mq-deadline", ATTR{bdi/read_ahead_kb}="1024"
+# Every other real disk is classified by its rotational flag, so SATA/SAS,
+# virtio, Xen and MMC devices all get a rule.  Stacked and virtual devices
+# (dm/md/loop/zram/ram) have no scheduler and are skipped.
+# SSD and paravirtual flash: mq-deadline, small readahead.
+ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", KERNEL!="nvme*", KERNEL!="dm-*", KERNEL!="md*", KERNEL!="loop*", KERNEL!="zram*", KERNEL!="ram*", KERNEL!="sr*", ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="mq-deadline", ATTR{bdi/read_ahead_kb}="128"
+# Rotational disks (including cloud HDD volumes): larger readahead for
+# sequential scans.
+ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", KERNEL!="nvme*", KERNEL!="dm-*", KERNEL!="md*", KERNEL!="loop*", KERNEL!="zram*", KERNEL!="ram*", KERNEL!="sr*", ATTR{queue/rotational}=="1", ATTR{queue/scheduler}="mq-deadline", ATTR{bdi/read_ahead_kb}="1024"
 EOF
   chmod 644 "$rule"
   systemctl daemon-reload || true
@@ -3071,16 +3308,29 @@ angie_cache_dirs() {
 # Sets ANGIE_CACHE_MB (size to write) and ANGIE_CACHE_NOTE (report line, if
 # the planned value was raised).  A global result is used instead of command
 # substitution so the note reaches the caller's TUNE_CHANGES array.
+# angie_cache_keep_mb FILE PLANNED_MB [ZONE]: with ZONE, only the
+# *_cache_path directive whose keys_zone is ZONE is considered (a proxy file
+# carries two paths); the directive may wrap onto several lines.
 angie_cache_keep_mb() {
-  local file=$1 planned=$2 dir usage existing=0 candidate val
+  local file=$1 planned=$2 zone=${3:-} dir usage existing=0 candidate val directive
   ANGIE_CACHE_MB=$planned
   ANGIE_CACHE_NOTE=""
   [[ -f $file ]] || return 0
-  dir=$(awk '
-    $1 ~ /^(fastcgi|proxy|scgi|uwsgi)_cache_path$/ { print $2; exit }
-  ' "$file" | tr -d ';')
+  # Join each *_cache_path directive onto one line, then pick the first (or
+  # the one naming ZONE).
+  directive=$(awk -v zone="$zone" '
+    collecting { buf = buf " " $0 }
+    !collecting && $1 ~ /^(fastcgi|proxy|scgi|uwsgi)_cache_path$/ { buf = $0; collecting = 1 }
+    collecting && buf ~ /;[[:space:]]*$/ {
+      collecting = 0
+      if (zone == "" || index(buf, "keys_zone=" zone ":") > 0) { print buf; exit }
+      buf = ""
+    }
+  ' "$file")
+  [[ -n $directive ]] || return 0
+  dir=$(printf '%s\n' "$directive" | awk '{print $2}' | tr -d ';')
   # Existing max_size in MB (k/m/g suffix); 0 when the directive has none.
-  val=$(grep -m1 -oE 'max_size=[0-9]+[kKmMgG]' "$file" 2>/dev/null || true)
+  val=$(printf '%s\n' "$directive" | grep -m1 -oE 'max_size=[0-9]+[kKmMgG]' 2>/dev/null || true)
   val=${val#max_size=}
   if [[ $val =~ ^([0-9]+)([kKmMgG])$ ]]; then
     case ${BASH_REMATCH[2]} in
@@ -3473,7 +3723,7 @@ persist_tuning_var() {
   [[ ${EUID} -eq 0 ]] || return 0
   line="${key}=\"${value}\""
   if [[ -f $f ]] && grep -qE "^${key}=" "$f"; then
-    sed_in_place -E "s|^${key}=.*|${line}|" "$f"
+    sed_in_place -E "s|^${key}=.*|$(sed_replacement_escape "$line")|" "$f"
   else
     printf '%s\n' "$line" >> "$f"
   fi
@@ -3791,6 +4041,18 @@ tune_angie_configs() {
     xf_mb=$ANGIE_CACHE_MB
     [[ -n $ANGIE_CACHE_NOTE ]] && tune_summary "${f_xf#"${target}"/}: ${ANGIE_CACHE_NOTE}"
   fi
+  # The proxy/CDN caches ship at 16g and may hold a populated cache on an
+  # adopted host; the same live-usage rule applies to them.
+  if (( have_proxy )); then
+    angie_cache_keep_mb "$f_proxy" "$proxy_mb" proxy_cache
+    proxy_mb=$ANGIE_CACHE_MB
+    [[ -n $ANGIE_CACHE_NOTE ]] && tune_summary "${f_proxy#"${target}"/}: ${ANGIE_CACHE_NOTE}"
+  fi
+  if (( have_cdn )); then
+    angie_cache_keep_mb "$f_proxy" "$cdn_mb" proxy_cdn
+    cdn_mb=$ANGIE_CACHE_MB
+    [[ -n $ANGIE_CACHE_NOTE ]] && tune_summary "${f_proxy#"${target}"/}: ${ANGIE_CACHE_NOTE}"
+  fi
 
   fcgi_zone=$(tune_clamp $(( cache_total_mb / 4 )) 16 512)
   chev_zone=$(tune_clamp $(( cache_total_mb / 8 )) 8 512)
@@ -3805,6 +4067,26 @@ tune_angie_configs() {
   cdn_size=$(tune_size_value "$cdn_mb")
 
   tune_replace "$nginx_conf" '^([[:space:]]*worker_processes[[:space:]]+)[^;]+;' "\\1${ANGIE_WORKER_PROCESSES};" "angie.conf: worker_processes=${ANGIE_WORKER_PROCESSES}"
+  # With a cgroup CPU quota below the host's core count, `auto` affinity
+  # would pin the N workers to CPUs 0..N-1 while every other service floats;
+  # let the scheduler place them instead.
+  local host_cpus
+  host_cpus=$(nproc 2>/dev/null || echo "$nproc")
+  if [[ $host_cpus =~ ^[0-9]+$ ]] && (( nproc < host_cpus )); then
+    tune_replace "$nginx_conf" '^([[:space:]]*)worker_cpu_affinity[[:space:]]+auto;' \
+      '\1# worker_cpu_affinity auto; # setup.sh: cgroup CPU quota, no pinning' \
+      "angie.conf: worker_cpu_affinity disabled (quota ${nproc} of ${host_cpus} CPUs)"
+  fi
+  # Storage-class dependent file I/O: on flash the page cache serves hot
+  # files cheaply, so only very large files bypass it (directio 16m); a
+  # rotational disk keeps the 4m threshold so big downloads do not evict the
+  # cache.  aio threads + sendfile stay on for every class.
+  local directio_mb=4
+  case $disk_class in nvme|ssd) directio_mb=16 ;; esac
+  tune_replace "$nginx_conf" '^([[:space:]]*directio[[:space:]]+)[0-9]+[mMkK];' "\\1${directio_mb}m;" "angie.conf: directio=${directio_mb}m (${disk_class})"
+  local gzip_level
+  gzip_level=$(angie_gzip_level)
+  tune_replace "$target/h5bp/web_performance/compression.conf" '^([[:space:]]*gzip_comp_level[[:space:]]+)[0-9]+;' "\\1${gzip_level};" "h5bp/web_performance/compression.conf: gzip_comp_level=${gzip_level}"
   tune_replace "$nginx_conf" '^([[:space:]]*worker_rlimit_nofile[[:space:]]+)[0-9]+;' "\\1${worker_rlimit};" "angie.conf: worker_rlimit_nofile=${worker_rlimit}"
   tune_replace "$nginx_conf" '^([[:space:]]*worker_connections[[:space:]]+)[0-9]+;' "\\1${worker_connections};" "angie.conf: worker_connections=${worker_connections}"
   tune_replace "$nginx_conf" '^([[:space:]]*client_body_buffer_size[[:space:]]+).*;' "\\1${body_buffer};" "angie.conf: client_body_buffer_size=${body_buffer}"
@@ -4280,6 +4562,57 @@ persist_php_jit() {
   fi
 }
 
+# RAM-derived php.ini values shared by the tuner and the dry-run preview so
+# the plan and the written file cannot disagree.
+php_ini_profile() {
+  local ram_mb=${1:-1024}
+  [[ $ram_mb =~ ^[0-9]+$ ]] && (( ram_mb > 0 )) || ram_mb=1024
+  PHP_PROFILE_OPCACHE_MB=$(( ram_mb / 16 ))
+  (( PHP_PROFILE_OPCACHE_MB < 128 )) && PHP_PROFILE_OPCACHE_MB=128
+  (( PHP_PROFILE_OPCACHE_MB > 512 )) && PHP_PROFILE_OPCACHE_MB=512
+  PHP_PROFILE_MEMORY_MB=$(( ram_mb / 8 ))
+  (( PHP_PROFILE_MEMORY_MB < 256 )) && PHP_PROFILE_MEMORY_MB=256
+  (( PHP_PROFILE_MEMORY_MB > 512 )) && PHP_PROFILE_MEMORY_MB=512
+  # Under 2 GB a 256M per-request ceiling lets a handful of workers claim
+  # the whole host; XenForo and WordPress run within 128M.
+  (( ram_mb < 2048 )) && PHP_PROFILE_MEMORY_MB=128
+  PHP_PROFILE_REALPATH_KB=$(( ram_mb * 2 ))
+  (( PHP_PROFILE_REALPATH_KB < 4096 )) && PHP_PROFILE_REALPATH_KB=4096
+  (( PHP_PROFILE_REALPATH_KB > 16384 )) && PHP_PROFILE_REALPATH_KB=16384
+  # Called plainly under set -e: a false clamp test above must not become
+  # the function's exit status.
+  return 0
+}
+PHP_PROFILE_OPCACHE_MB=128
+PHP_PROFILE_MEMORY_MB=256
+PHP_PROFILE_REALPATH_KB=4096
+
+# opcache.max_accelerated_files for the PHP files under the Angie vhost
+# roots (plus /var/www/*/public without Angie): count * 1.5, clamped to
+# 16384..128256; the old 128256 ceiling when no root can be found.
+php_accelerated_files_target() {
+  local file root count=0 n
+  local -a roots=()
+  for file in /etc/angie/conf.d/*.conf; do
+    [[ -f $file ]] || continue
+    root=$(angie_vhost_root "$file" 2>/dev/null || true)
+    [[ -n $root && -d $root ]] && roots+=("$root")
+  done
+  if (( ${#roots[@]} == 0 )); then
+    for root in /var/www/*/public; do
+      [[ -d $root ]] && roots+=("$root")
+    done
+  fi
+  if (( ${#roots[@]} == 0 )); then
+    printf '128256'
+    return 0
+  fi
+  n=$(find "${roots[@]}" -xdev -type f -name '*.php' 2>/dev/null | wc -l | tr -d ' ')
+  [[ $n =~ ^[0-9]+$ ]] && count=$n
+  (( count == 0 )) && { printf '128256'; return 0; }
+  printf '%s' "$(tune_clamp $(( count * 3 / 2 )) 16384 128256)"
+}
+
 tune_php_fpm_version() {
   local ver=$1
   local socket=${2:-}
@@ -4330,12 +4663,14 @@ tune_php_fpm_version() {
     # --optimize on an application host reloads an unchanged PHP-FPM.
     tune_summary "PHP ${ver}: max_children capped at ${app_cap} (XenForo/WordPress with a local database are CPU-bound; --php children= overrides)"
   fi
+  PHP_WRITTEN_CHILDREN=$max_children
   max_requests=$(( nproc * 1024 ))
   if explicit_value=$(explicit_option php_max_requests); then
     [[ $explicit_value =~ ^[0-9]+$ ]] && (( explicit_value > 0 )) && max_requests=$explicit_value
   fi
 
-  opcache_mb=$(( ram_mb / 16 )); (( opcache_mb < 128 )) && opcache_mb=128; (( opcache_mb > 512 )) && opcache_mb=512
+  php_ini_profile "$ram_mb"
+  opcache_mb=$PHP_PROFILE_OPCACHE_MB
   # OPcache JIT is off unless SETUP_PHP_JIT asks for it (see the top of the
   # file): the tracing JIT in php8.3 crashed on real WordPress workloads
   # (workers died with "segfault at 67c9 ... in php-fpm8.3" and every request
@@ -4352,17 +4687,24 @@ tune_php_fpm_version() {
   # while the JIT is on; the directory stays for the next switch back.
   local opcache_file_cache=/var/cache/php/opcache
   [[ $jit_mode == disable ]] || opcache_file_cache=""
-  memory_mb=$(( ram_mb / 8 )); (( memory_mb < 256 )) && memory_mb=256; (( memory_mb > 512 )) && memory_mb=512
-  # Under 2 GB a 256M per-request ceiling lets a handful of workers claim
-  # the whole host; XenForo and WordPress run within 128M.
-  (( ram_mb < 2048 )) && memory_mb=128
-  realpath_kb=$(( ram_mb * 2 )); (( realpath_kb < 4096 )) && realpath_kb=4096; (( realpath_kb > 16384 )) && realpath_kb=16384
+  memory_mb=$PHP_PROFILE_MEMORY_MB
+  realpath_kb=$PHP_PROFILE_REALPATH_KB
 
   mkdir -p /run/php
   chown www-data:www-data /run/php 2>/dev/null || true
   chmod 755 /run/php
 
-  tune_pool_set "$pool" pm static "PHP ${ver}: pm=static"
+  # Resident workers suit a host that serves PHP all day; a small VPS (or any
+  # host under 2 GB) cannot keep a full static pool paged in next to the
+  # database, so workers are forked on demand and retired after 10 s idle.
+  local pm_mode=static
+  if (( ram_mb < 2048 )) || { host_is_vps && (( max_children <= 8 )); }; then
+    pm_mode=ondemand
+  fi
+  tune_pool_set "$pool" pm "$pm_mode" "PHP ${ver}: pm=${pm_mode}"
+  if [[ $pm_mode == ondemand ]]; then
+    tune_pool_set "$pool" pm.process_idle_timeout 10s "PHP ${ver}: pm.process_idle_timeout=10s"
+  fi
   tune_pool_set "$pool" pm.max_children "$max_children" "PHP ${ver}: max_children=${max_children}"
   tune_pool_set "$pool" pm.max_requests "$max_requests" "PHP ${ver}: max_requests=${max_requests}"
   php_pool_set_listener "$pool" "$ver" "$socket"
@@ -4409,8 +4751,15 @@ tune_php_fpm_version() {
   tune_pool_dedupe "$pool" \
     user group listen listen.allowed_clients listen.backlog listen.owner \
     listen.group listen.mode pm pm.max_children pm.max_requests \
+    pm.process_idle_timeout \
     request_terminate_timeout catch_workers_output security.limit_extensions \
     rlimit_files rlimit_core process_control_timeout
+  # OPcache's script table is sized from the PHP files the vhosts actually
+  # hold (XenForo ~8k, WordPress ~5k, plus 50% for plugins and updates),
+  # instead of the 128k ceiling that reserved shared memory for scripts that
+  # never exist; the ceiling stays for a host whose roots cannot be found.
+  local accel_files
+  accel_files=$(php_accelerated_files_target)
 
   mkdir -p "$ini_dir" /var/cache/php/opcache
   chown -R www-data:www-data /var/cache/php 2>/dev/null || true
@@ -4436,7 +4785,7 @@ opcache.memory_consumption = ${opcache_mb}
 opcache.interned_strings_buffer = $(( opcache_mb / 8 < 16 ? 16 : (opcache_mb / 8 > 64 ? 64 : opcache_mb / 8) ))
 opcache.jit = ${jit_mode}
 opcache.jit_buffer_size = ${jit_buffer}
-opcache.max_accelerated_files = 128256
+opcache.max_accelerated_files = ${accel_files}
 opcache.validate_timestamps = 1
 opcache.revalidate_freq = 60
 opcache.file_cache = ${opcache_file_cache}
@@ -5426,6 +5775,21 @@ mariadb_strip_install_block() {
   return 0
 }
 
+# Number of application configs under /var/www whose database host asks for
+# a persistent connection (XenForo `p:` host; WordPress core has no such
+# option).  Each PHP worker then holds one open connection per such
+# application for its whole life.
+app_persistent_db_configs() {
+  local conf host n=0
+  while IFS= read -r conf; do
+    [[ -n $conf ]] || continue
+    host=$(xf_db_host_from_config "$conf" 2>/dev/null || true)
+    [[ $host == p:* ]] && n=$(( n + 1 ))
+  done < <(app_find_xenforo_configs 2>/dev/null || true)
+  printf '%s' "$n"
+}
+MARIADB_PROFILE_PERSISTENT_APPS=0
+
 mariadb_compute_profile() {
   local size_mb=$1 logsize open_cache aria_mb threads max_conn current_max="" kept_max=0
   local disk_class io_read io_write io_threads lru_depth flush_neighbors tmp_mb thread_cache ram_mb log_cap
@@ -5438,7 +5802,11 @@ mariadb_compute_profile() {
   log_cap=2048
   [[ $disk_class == nvme ]] && log_cap=4096
   (( logsize > log_cap )) && logsize=$log_cap
-  aria_mb=$(( size_mb / 16 ))
+  # Aria serves internal temporary tables, not the InnoDB data: size its
+  # page cache from RAM (RAM/128, 16..256 MB) so it stops changing, and
+  # forcing a restart, every time the buffer pool is re-planned.
+  ram_mb=$(mem_total_mb)
+  aria_mb=$(( ram_mb / 128 ))
   (( aria_mb < 16 )) && aria_mb=16
   (( aria_mb > 256 )) && aria_mb=256
   threads=$(effective_cpus)
@@ -5449,15 +5817,24 @@ mariadb_compute_profile() {
   # (every worker plus 25% and admin/backup/cron headroom); without a PHP
   # tier fall back to the CPU formula.  The thread pool makes extra sessions
   # cheap, so the ceiling errs on the high side.
-  local php_total
+  local php_total persistent_apps=0
   php_total=$(php_pool_max_children 2>/dev/null || true)
   [[ $php_total =~ ^[0-9]+$ ]] || php_total=0
   (( ${OPT_PHP_CHILDREN:-0} > php_total )) && php_total=$OPT_PHP_CHILDREN
   if (( php_total > 0 )); then
-    max_conn=$(( php_total * 5 / 4 + 50 ))
+    # One connection per worker is the whole story only while every
+    # application opens and closes its own.  A XenForo config with a
+    # persistent (`p:`) host keeps one connection per worker open for the
+    # worker's lifetime, so a second site served by the same pool needs its
+    # own transient connection on top (measured: 144 workers with XenForo
+    # on `p:localhost` plus WordPress hit the 230 cap and WordPress answered
+    # "Too many connections" for 80% of its requests).
+    persistent_apps=$(app_persistent_db_configs)
+    max_conn=$(( php_total * (persistent_apps + 1) * 5 / 4 + 50 ))
   else
     max_conn=$(( threads * 32 ))
   fi
+  MARIADB_PROFILE_PERSISTENT_APPS=$persistent_apps
   # Disk-class dependent I/O behaviour.  Flushing neighbour pages only helps
   # rotational disks; I/O threads beyond ~16 add contention, and an HDD
   # cannot keep 16 threads busy.  The LRU scan depth follows io_capacity.
@@ -5479,7 +5856,6 @@ mariadb_compute_profile() {
   (( thread_cache > 256 )) && thread_cache=256
   # In-memory temp tables: forum GROUP BY/ORDER BY queries spill to disk at a
   # fixed 64M on large sites; scale with RAM but never above pool/8.
-  ram_mb=$(mem_total_mb)
   tmp_mb=$(( ram_mb / 256 ))
   (( tmp_mb < 32 )) && tmp_mb=32
   (( tmp_mb > 256 )) && tmp_mb=256
@@ -5790,11 +6166,7 @@ install_mariadb() {
   # Create the same account for every loopback spelling.
   # The statements go in over stdin: a password inside `mariadb -e "..."` is
   # visible to every local user in the process list for as long as it runs.
-  for host in localhost 127.0.0.1 ::1; do
-    sql="CREATE USER IF NOT EXISTS '${eu}'@'${host}' IDENTIFIED BY '${ep}'; ALTER USER '${eu}'@'${host}' IDENTIFIED BY '${ep}'; GRANT ALL ON *.* TO '${eu}'@'${host}' WITH GRANT OPTION;"
-    mariadb <<<"$sql"
-  done
-  mariadb <<<'FLUSH PRIVILEGES;'
+  mariadb_ensure_local_user "$user" "$pass" 'ALL ON *.*' 'WITH GRANT OPTION'
 
   # MySQL Tuner (embedded)
   blob_mysqltuner > /root/mysqltuner.pl
@@ -6108,19 +6480,23 @@ elasticsearch_write_performance_block() {
   write_threads=$(( cpus / 4 ))
   (( write_threads < 1 )) && write_threads=1
   (( write_threads > 8 )) && write_threads=8
+  # indices.query.bool.max_clause_count has been ignored since 8.0 and
+  # search.max_buckets 65536 is the default; both are still commented out of
+  # older files so no stale line remains.  node.processors tells every other
+  # thread pool (get, management, refresh, flush, merge) about the cgroup
+  # quota the two sized pools already follow.
   elasticsearch_comment_keys "$file" \
     bootstrap.memory_lock indices.query.bool.max_clause_count \
     indices.memory.index_buffer_size indices.fielddata.cache.size \
     search.max_buckets action.destructive_requires_name \
     http.compression http.max_content_length http.host transport.host \
-    thread_pool.search.size thread_pool.write.size
+    thread_pool.search.size thread_pool.write.size node.processors
   cat >> "$file" <<EOF
 # BEGIN setup.sh optimize
 bootstrap.memory_lock: true
-indices.query.bool.max_clause_count: 4096
+node.processors: ${cpus}
 indices.memory.index_buffer_size: 20%
 indices.fielddata.cache.size: 20%
-search.max_buckets: 65536
 action.destructive_requires_name: true
 http.compression: true
 http.max_content_length: 200mb
@@ -6171,16 +6547,10 @@ elasticsearch_write_managed_yaml() {
 }
 ES_MANAGED_HOST=""
 
+# Same writer as the PHP/MariaDB drop-ins; returns 0 when the file changed.
 elasticsearch_write_systemd_limits() {
-  local dir=/etc/systemd/system/elasticsearch.service.d
-  mkdir -p "$dir"
-  cat > "${dir}/limits.conf" <<'EOF'
-[Service]
-LimitMEMLOCK=infinity
-LimitNOFILE=1048576
-LimitNPROC=4096
-EOF
-  chmod 644 "${dir}/limits.conf"
+  write_service_limits_dropin /etc/systemd/system/elasticsearch.service.d/limits.conf \
+    $'[Service]\nLimitMEMLOCK=infinity\nLimitNOFILE=1048576\nLimitNPROC=4096'
 }
 
 # Base (non-performance) YAML: cluster name, bind, paths, single-node discovery
@@ -6256,7 +6626,7 @@ install_elastic() {
   elasticsearch_write_managed_yaml "$yml" "$host"
   es_url=$(elasticsearch_http_url "$yml")
 
-  elasticsearch_write_systemd_limits
+  elasticsearch_write_systemd_limits || true
 
   mkdir -p /etc/elasticsearch/jvm.options.d
   write_es_jvm_options "$ram_mb"
@@ -6444,13 +6814,7 @@ domain_provision_database() {
     || die "Failed to create MariaDB database '${db}' for ${d}"
   info "${d}: database ${db}"
   if [[ -n $user ]]; then
-    eu=$(sql_escape "$user")
-    ep=$(sql_escape "$pass")
-    # Statements go in over stdin so the password never reaches `ps`.
-    for host in localhost 127.0.0.1 ::1; do
-      mariadb <<<"CREATE USER IF NOT EXISTS '${eu}'@'${host}' IDENTIFIED BY '${ep}'; ALTER USER '${eu}'@'${host}' IDENTIFIED BY '${ep}'; GRANT ALL PRIVILEGES ON \`${db//_/\\_}\`.* TO '${eu}'@'${host}';"
-    done
-    mariadb <<<'FLUSH PRIVILEGES;'
+    mariadb_ensure_local_user "$user" "$pass" "ALL PRIVILEGES ON \`${db//_/\\_}\`.*"
     info "${d}: user ${user} (localhost, 127.0.0.1, ::1) has ALL PRIVILEGES on ${db}; password set from pass="
   fi
   [[ -n $sql ]] || return 1
@@ -6466,6 +6830,17 @@ domain_provision_database() {
     *.bz2) reader=(bzip2 -dc) ;;
   esac
   command -v "${reader[0]}" >/dev/null 2>&1 || die "${d}: ${reader[0]} is required to read ${sql}"
+  # A dump taken with --databases/--all-databases carries its own CREATE
+  # DATABASE + USE and would load into that schema, not db=: the empty-db
+  # guard, the table count and the user's grant would all miss it.  Refuse
+  # such a dump unless the schema it names is db= itself.
+  local other_db
+  other_db=$("${reader[@]}" "$sql" 2>/dev/null | head -c 262144 \
+    | sed -nE 's/^(CREATE DATABASE( \/\*!32312 IF NOT EXISTS\*\/| IF NOT EXISTS)?|USE)[[:space:]]+`?([A-Za-z0-9_$-]+)`?.*/\3/p' \
+    | grep -vxF -- "$db" | head -n1 || true)
+  if [[ -n $other_db ]]; then
+    die "${d}: ${sql} switches to database '${other_db}' (CREATE DATABASE/USE); dump without --databases or pass db=${other_db}"
+  fi
   info "${d}: importing ${sql} ($(du -h "$sql" 2>/dev/null | cut -f1)) into ${db}"
   start=$(date +%s)
   # Bulk-load mode for the whole dump: one transaction, no per-row unique or
@@ -6502,6 +6877,17 @@ reoptimize_mariadb_after_import() {
   else
     warn "MariaDB re-optimization reported a problem (see the lines below)"
   fi
+  # The re-plan split the same 80% budget again; a larger buffer pool can
+  # only come out of the cache/search shares, so apply those too (both are
+  # idempotent and report "Restart: skipped" when nothing changed).
+  local svc
+  for svc in valkey redis elastic; do
+    [[ " ${OPT_DETECTED[*]} " == *" ${svc} "* ]] || continue
+    case $svc in
+      valkey|redis) optimize_valkey "$svc" || warn "${svc} re-sizing after the import reported a problem" ;;
+      elastic) optimize_elastic || warn "Elasticsearch re-sizing after the import reported a problem" ;;
+    esac
+  done
   for line in "${OPT_REPORT[@]}"; do
     info "  ${line}"
   done
@@ -6548,8 +6934,16 @@ create_domains() {
       fi
     fi
 
-    mkdir -p "$dir" "${LOG_ROOT}/angie"
-    chown -R www-data:www-data "/var/www/${d}"
+    # Only a tree this run creates is chowned recursively.  An existing site
+    # keeps its ownership (root:www-data wp-config.php, deploy-owned files);
+    # the nightly managed cron applies the log-safe ownership pass.
+    if [[ -d "/var/www/${d}" ]]; then
+      mkdir -p "$dir" "${LOG_ROOT}/angie"
+      chown www-data:www-data "$dir" 2>/dev/null || true
+    else
+      mkdir -p "$dir" "${LOG_ROOT}/angie"
+      chown -R www-data:www-data "/var/www/${d}"
+    fi
     chmod 755 "/var/www/${d}" "$dir"
     info "Directory: ${dir}"
 
@@ -6733,22 +7127,36 @@ purge_basic() {
     [[ -n $orig_out ]] && ufw --force default "$orig_out" outgoing || true
   fi
 
-  restore_original /etc/security/limits.conf limits.conf
+  # limits.conf is only restored when it provably still holds our old
+  # whole-file copy (pre-drop-in releases); configure_limits applies the same
+  # rule, so an operator-edited file is never overwritten with a stale snapshot.
+  if [[ -f "${BACKUP_DIR}/limits.conf.recorded" ]] \
+     && [[ $(<"${BACKUP_DIR}/limits.conf.recorded") == present ]] \
+     && cmp -s /etc/security/limits.conf "${SCRIPT_DIR}/configs/system/limits.conf" 2>/dev/null; then
+    restore_original /etc/security/limits.conf limits.conf
+  fi
   restore_original /etc/security/limits.d/99-setup.conf limits.d-99-setup.conf
   restore_original /etc/sysctl.conf sysctl.conf
   restore_original /etc/sysctl.d/99-sysctl.conf sysctl.d-99-sysctl.conf
   restore_original /etc/sysctl.d/90-setup-network.conf sysctl.d-90-setup-network.conf
   restore_original /etc/modules-load.d/setup-network.conf modules-load-setup-network.conf
   restore_original /etc/logrotate.d/setup-logs logrotate-setup-logs
-  # Disable the oneshot before moving its unit file out of the live location.
+  # Disable the oneshots before moving their unit files out of the live
+  # location; one daemon-reload after both so systemd forgets them.
   systemctl disable --now setup-network-tuning.service 2>/dev/null || true
   restore_original /etc/systemd/system/setup-network-tuning.service setup-network-tuning.service
-  systemctl daemon-reload || true
   restore_original /etc/systemd/resolved.conf.d/dns_servers.conf dns_servers.conf
   systemctl disable --now setup-io-tuning.service 2>/dev/null || true
   restore_original /etc/systemd/system/setup-io-tuning.service setup-io-tuning.service
   restore_original /etc/udev/rules.d/60-setup-io.rules udev-60-setup-io.rules
   udevadm control --reload-rules 2>/dev/null || true
+  systemctl daemon-reload || true
+  # unattended-upgrades: put the APT periodic file back and disable the unit
+  # only when it was not enabled before setup.sh enabled it.
+  restore_original /etc/apt/apt.conf.d/20auto-upgrades apt-20auto-upgrades
+  if [[ -f "${STATE_DIR}/unattended-upgrades-enabled" ]]; then
+    systemctl disable --now unattended-upgrades 2>/dev/null || true
+  fi
   if [[ -f "${STATE_DIR}/fstrim-timer-enabled" ]]; then
     systemctl disable --now fstrim.timer 2>/dev/null || true
   fi
@@ -6764,19 +7172,36 @@ purge_basic() {
     orig_host=$(<"${STATE_DIR}/original-hostname")
     if [[ -n $orig_host ]]; then hostnamectl set-hostname "$orig_host" || true; fi
   fi
-  restore_original /etc/hosts hosts
+  # configure_hostname only rewrote the 127.0.1.1 line; put that one line
+  # back instead of the whole snapshot, which would discard every /etc/hosts
+  # entry added since the install (cloud-init, the operator, other tools).
+  if [[ -f "${BACKUP_DIR}/hosts.recorded" && -f "${BACKUP_DIR}/hosts" ]]; then
+    local orig_line
+    orig_line=$(grep -E '^[[:space:]]*127\.0\.1\.1[[:space:]]' "${BACKUP_DIR}/hosts" | head -n1 || true)
+    sed_in_place -E '/^[[:space:]]*127\.0\.1\.1[[:space:]]/d' /etc/hosts
+    [[ -n $orig_line ]] && printf '%s\n' "$orig_line" >> /etc/hosts
+    info "Restored the 127.0.1.1 line of /etc/hosts (other entries untouched)"
+  fi
   if [[ -f "${STATE_DIR}/original-timezone" ]]; then
     local orig_tz
     orig_tz=$(<"${STATE_DIR}/original-timezone")
     if [[ -n $orig_tz ]]; then timedatectl set-timezone "$orig_tz" || true; fi
   fi
 
+  # CPU governor: stop the unit so a reboot cannot re-apply "performance",
+  # put the file back, then restore the governor that was active before.
+  systemctl disable --now cpufrequtils 2>/dev/null || true
+  restore_original /etc/default/cpufrequtils cpufrequtils-default
   if [[ -f "${STATE_DIR}/cpufrequtils-installed" ]]; then
-    cpufreq-set -g powersave 2>/dev/null || true
     apt_purge_pkgs cpufrequtils
-    info "Leaving /etc/default/cpufrequtils in place"
-  else
-    restore_original /etc/default/cpufrequtils cpufrequtils-default
+  fi
+  if [[ -s "${STATE_DIR}/original-governor" ]]; then
+    local orig_gov gov_file
+    orig_gov=$(<"${STATE_DIR}/original-governor")
+    for gov_file in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor; do
+      [[ -w $gov_file ]] && printf '%s\n' "$orig_gov" > "$gov_file" 2>/dev/null
+    done
+    info "CPU governor restored to ${orig_gov}"
   fi
 
   systemctl restart systemd-resolved 2>/dev/null || true
@@ -7123,20 +7548,19 @@ opt_restore() {
   [[ -n $OPT_BACKUP_DIR ]] || return 1
   if [[ -e $src ]]; then
     # Overwrite in place; never unlink the live path before restoring it.
+    # A file the tune created (a drop-in such as 99-setup-optimize.cnf or
+    # zz-setup-optimize.options on a host that had none) is not in the
+    # snapshot and would win again on the rollback restart; the shared
+    # restore moves such files to /tmp like the single-file `.absent` path.
     if [[ -d $src ]]; then
-      mkdir -p "$path"
-      cp -a "${src}/." "$path/"
-      # A file the tune created (a drop-in such as 99-setup-optimize.cnf or
-      # zz-setup-optimize.options on a host that had none) is not in the
-      # snapshot, and left in place it would win again on the rollback
-      # restart.  Move such files to /tmp like the single-file `.absent` path.
-      local extra rel
-      while IFS= read -r -d '' extra; do
-        rel=${extra#"$path"/}
-        [[ -e "${src}/${rel}" ]] && continue
-        moved=$(preserve_to_tmp "$extra") || continue
-        [[ -n $moved ]] && opt_report "ROLLBACK: moved new \`${extra}\` to \`${moved}\` (not deleted)"
-      done < <(find "$path" -type f -print0 2>/dev/null)
+      local line extra
+      while IFS= read -r line; do
+        [[ $line == moved\ * ]] || continue
+        extra=${line#moved }
+        moved=${extra##* }
+        extra=${extra% *}
+        opt_report "ROLLBACK: moved new \`${extra}\` to \`${moved}\` (not deleted)"
+      done < <(restore_snapshot_dir "$src" "$path" || opt_report "ROLLBACK: **FAILED** to fully restore \`${path}\`")
     else
       cp -a "$src" "$path"
     fi
@@ -7158,6 +7582,88 @@ opt_rollback_restart() {
   opt_restore "/etc/systemd/system/${unit}.service.d" "$dropin_name"
   systemctl daemon-reload || true
   systemctl restart "$unit" 2>/dev/null || true
+}
+
+# Restart UNIT and run PROBE (a command; it may set OPT_RESTART_FAIL_NOTE).
+# A failed restart or probe is reported and rolled back to the --optimize
+# snapshot (CONF_DIR plus the unit drop-in); the caller only adds its own
+# service-specific follow-up.  Shared by the MariaDB, Valkey/Redis and
+# Elasticsearch tuners so the three restart paths cannot drift apart.
+opt_restart_service() {
+  local unit=$1 conf_dir=$2 conf_name=$3 dropin_name=$4
+  shift 4
+  OPT_RESTART_FAIL_NOTE=""
+  if ! systemctl restart "$unit" 2>/dev/null; then
+    opt_report "- Restart: **FAILED**; rolling back"
+    opt_rollback_restart "$unit" "$conf_dir" "$conf_name" "$dropin_name"
+    return 1
+  fi
+  OPT_CUTOVER=1
+  if "$@"; then
+    opt_report "- Restart: **OK**${OPT_RESTART_OK_NOTE:+ ${OPT_RESTART_OK_NOTE}}"
+    OPT_RESTART_OK_NOTE=""
+    return 0
+  fi
+  opt_report "- Restart: **FAILED**${OPT_RESTART_FAIL_NOTE:+ (${OPT_RESTART_FAIL_NOTE})}; rolling back"
+  opt_rollback_restart "$unit" "$conf_dir" "$conf_name" "$dropin_name"
+  return 1
+}
+OPT_RESTART_FAIL_NOTE=""
+OPT_RESTART_OK_NOTE=""
+
+mariadb_restart_probe() {
+  mariadb_wait_ready 300 && return 0
+  OPT_RESTART_FAIL_NOTE="SQL probe"
+  return 1
+}
+
+valkey_restart_probe() {
+  wait_for_cmd 20 valkey_pong "$1" && return 0
+  OPT_RESTART_FAIL_NOTE="PING"
+  return 1
+}
+
+# Wait for the Elasticsearch HTTP endpoint after a (re)start.  Returns 0 when
+# it answers 200, 2 when the unit is active and owns the configured listener
+# but this host cannot reach it (firewall/NAT or a client-only allow rule),
+# 1 otherwise.  ES_WAIT_LAST_CODE keeps the last HTTP code for the report.
+elasticsearch_wait_http() {
+  local url=$1 attempts=${2:-300} i code=""
+  ES_WAIT_LAST_CODE=""
+  if ! command -v curl >/dev/null 2>&1; then
+    elasticsearch_listener_on "$url" && return 2
+    return 1
+  fi
+  for (( i = 0; i < attempts; i++ )); do
+    code=$(curl -sS --max-time 3 -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)
+    [[ $code == 200 ]] && return 0
+    ES_WAIT_LAST_CODE=$code
+    if ! systemctl is-active --quiet elasticsearch; then
+      ES_WAIT_LAST_CODE="unit-inactive"
+      return 1
+    fi
+    if [[ $code == 000 || -z $code ]] && elasticsearch_listener_on "$url"; then
+      return 2
+    fi
+    sleep 1
+  done
+  return 1
+}
+ES_WAIT_LAST_CODE=""
+
+elasticsearch_restart_probe() {
+  local url=$1 rc=0
+  elasticsearch_wait_http "$url" 300 || rc=$?
+  case $rc in
+    0) return 0 ;;
+    2)
+      # The unit restarted and owns the configured listener, but this host
+      # cannot reach that address.  Do not roll back a healthy tune.
+      OPT_RESTART_OK_NOTE="(unit active and listening on \`${url#*://}\`; HTTP probe from this host was unavailable — verify from the XenForo client)"
+      return 0 ;;
+  esac
+  OPT_RESTART_FAIL_NOTE="HTTP probe to \`${url}\` returned ${ES_WAIT_LAST_CODE:-no response}"
+  return 1
 }
 
 detect_installed_services() {
@@ -7333,6 +7839,15 @@ elasticsearch_http_url() {
 # True when the exact HTTP endpoint appears in the kernel listener table.
 # Used as a fallback when a firewall or NAT prevents the host from probing
 # its own non-loopback address, so a healthy restart is not rolled back.
+# First numeric / string value of KEY in a flat Elasticsearch JSON reply (no
+# jq dependency; the replies are filter_path-trimmed and small).
+es_json_num() {
+  printf '%s\n' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p" | head -n1
+}
+es_json_str() {
+  printf '%s\n' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -n1
+}
+
 elasticsearch_listener_on() {
   local url=$1 hostport port
   hostport=${url#*://}
@@ -7358,9 +7873,7 @@ elasticsearch_data_size_mb() {
     [[ -n $resp ]] && break
   done
   [[ -n $resp ]] || return 0
-  bytes=$(printf '%s\n' "$resp" \
-    | sed -n 's/.*"size_in_bytes"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
-    | head -n1 || true)
+  bytes=$(es_json_num "$resp" size_in_bytes)
   [[ $bytes =~ ^[0-9]+$ ]] || bytes=0
   printf '%s' $(( bytes / 1024 / 1024 ))
 }
@@ -7484,7 +7997,13 @@ plan_memory_budget() {
       [[ $data =~ ^[0-9]+$ ]] || data=0
       OPT_DB_SIZE_MB=$data
       maria_target=$(( data * 120 / 100 ))
-      (( maria_target < 128 )) && maria_target=128
+      # Live data +20% cannot grow faster than 20% per run and a fresh
+      # install (or a site filled through a web installer) measures nothing;
+      # a RAM-proportional floor gives the pool room before the next
+      # --optimize, like valkey_floor_mb does for the cache.
+      local maria_floor
+      maria_floor=$(mariadb_floor_mb "$total")
+      (( maria_target < maria_floor )) && maria_target=$maria_floor
     fi
     current_pool=$(mariadb_current_pool_mb)
     if [[ $current_pool =~ ^[0-9]+$ ]] && (( current_pool > 0 )); then
@@ -7728,20 +8247,44 @@ php_plan_max_children() {
 # worker_processes follows the effective CPU count (Angie's "auto" counts the
 # affinity mask, not a cgroup quota).
 angie_worker_limits() {
-  local nproc=$1
+  local nproc=$1 per_core_conn=2048 per_core_fds=8192
   ANGIE_WORKER_PROCESSES=$nproc
-  ANGIE_WORKER_RLIMIT=$(tune_clamp $(( nproc * 8192 )) 65536 524288)
-  ANGIE_WORKER_CONNECTIONS=$(tune_clamp $(( nproc * 2048 )) 8192 65535)
+  # A VPS shares its NIC queue and hypervisor with neighbours; the kernel
+  # backlogs are already halved there (sysctl_target_somaxconn), so the
+  # per-worker connection table follows (1024/core, 4096 fds/core).
+  if host_is_vps; then
+    per_core_conn=1024
+    per_core_fds=4096
+  fi
+  ANGIE_WORKER_RLIMIT=$(tune_clamp $(( nproc * per_core_fds )) 65536 524288)
+  ANGIE_WORKER_CONNECTIONS=$(tune_clamp $(( nproc * per_core_conn )) 8192 65535)
   (( ANGIE_WORKER_CONNECTIONS > ANGIE_WORKER_RLIMIT - 1024 )) && ANGIE_WORKER_CONNECTIONS=$(( ANGIE_WORKER_RLIMIT - 1024 ))
   (( ANGIE_WORKER_CONNECTIONS < 1024 )) && ANGIE_WORKER_CONNECTIONS=1024
   # Angie's upstream keepalive pool must cover concurrent PHP requests.  Key
-  # it to the planned FPM worker count instead of the CPU count: on a 16-thread
-  # host with 144 workers, nproc*2 left only 32 reusable upstream connections.
+  # it to the FPM worker count instead of the CPU count: on a 16-thread host
+  # with 144 workers, nproc*2 left only 32 reusable upstream connections.
+  # The count the PHP tuner actually wrote (live pool kept, explicit
+  # children=, application cap) wins over the plan; on a fresh install Angie
+  # is tuned before PHP, so the plan is all there is.
   local ka_base=$(( nproc * 2 ))
-  if [[ ${OPT_PHP_CHILDREN:-0} =~ ^[0-9]+$ ]] && (( OPT_PHP_CHILDREN > 0 )); then
+  if [[ ${PHP_WRITTEN_CHILDREN:-0} =~ ^[0-9]+$ ]] && (( PHP_WRITTEN_CHILDREN > 0 )); then
+    ka_base=$(( PHP_WRITTEN_CHILDREN / 2 ))
+  elif [[ ${OPT_PHP_CHILDREN:-0} =~ ^[0-9]+$ ]] && (( OPT_PHP_CHILDREN > 0 )); then
     ka_base=$(( OPT_PHP_CHILDREN / 2 ))
   fi
   ANGIE_PHP_KEEPALIVE=$(tune_clamp "$ka_base" 16 512)
+}
+PHP_WRITTEN_CHILDREN=0
+
+# gzip level from the same CPU rule as Brotli (5, 4 on 1-2 CPUs);
+# SETUP_GZIP_LEVEL=1..9 pins it.
+angie_gzip_level() {
+  local level=${SETUP_GZIP_LEVEL:-}
+  if ! [[ $level =~ ^[1-9]$ ]]; then
+    level=5
+    (( $(effective_cpus) <= 2 )) && level=4
+  fi
+  printf '%s' "$level"
 }
 
 # open_file_cache max for a host: RAM-proportional (8 entries per MB,
@@ -8081,17 +8624,35 @@ optimize_wordpress_cache() {
     grep -qE 'map[[:space:]].*\$skip_cache' "$file" && active_map=1
   done
 
-  local include_ready=0
+  # Decide per vhost.  The template carries `include h5bp/wordpress_cache.conf;`
+  # in the server block and tells the operator to remove it for a site that
+  # personalises guest pages; a vhost without it is an opt-out, never silently
+  # re-enabled through the shared php_wp.conf (which every WordPress vhost
+  # includes).  SETUP_WP_GUEST_CACHE=1 adds the include to such vhosts.
+  local -a wp_enabled=() wp_optout=()
+  local shared_include=0 vhost
   if (( has_php_wp )) \
-     && grep -qE 'include[[:space:]]+h5bp/wordpress_cache\.conf;' "${target}/h5bp/php_wp.conf"; then
-    include_ready=1
-  elif grep -qRE 'include[[:space:]]+h5bp/wordpress_cache\.conf;' "${target}/conf.d" 2>/dev/null; then
-    include_ready=1
+     && grep -qE '^[[:space:]]*include[[:space:]]+h5bp/wordpress_cache\.conf;' "${target}/h5bp/php_wp.conf"; then
+    shared_include=1
   fi
+  for vhost in "${wp_vhosts[@]}"; do
+    if (( shared_include )) \
+       || grep -qE '^[[:space:]]*include[[:space:]]+h5bp/wordpress_cache\.conf;' "$vhost"; then
+      wp_enabled+=("$vhost")
+    else
+      wp_optout+=("$vhost")
+    fi
+  done
+  local include_ready=0
+  (( ${#wp_enabled[@]} > 0 )) && include_ready=1
 
   if (( active_zone && active_map && include_ready )) \
-     && [[ -f "${target}/h5bp/wordpress_cache.conf" ]]; then
-    opt_report "- WordPress: FastCGI guest cache already enabled for ${#wp_vhosts[@]} vhost(s)"
+     && [[ -f "${target}/h5bp/wordpress_cache.conf" ]] \
+     && { (( ${#wp_optout[@]} == 0 )) || [[ ${SETUP_WP_GUEST_CACHE:-0} != 1 ]]; }; then
+    opt_report "- WordPress: FastCGI guest cache already enabled for ${#wp_enabled[@]} vhost(s)"
+    for vhost in "${wp_optout[@]}"; do
+      opt_report "- WordPress: \`${vhost#"${target}"/}\` has no wordpress_cache include (operator opt-out; SETUP_WP_GUEST_CACHE=1 adds it)"
+    done
     return 0
   fi
 
@@ -8125,19 +8686,49 @@ optimize_wordpress_cache() {
       "${target}/h5bp/wordpress_cache.conf"
     changed=1
   fi
-  if (( has_php_wp )) \
-     && ! grep -qE 'include[[:space:]]+h5bp/wordpress_cache\.conf;' "${target}/h5bp/php_wp.conf" \
-     && ! grep -qRE 'include[[:space:]]+h5bp/wordpress_cache\.conf;' "${target}/conf.d" 2>/dev/null; then
-    printf '\n# BEGIN setup.sh WordPress FastCGI cache\ninclude h5bp/wordpress_cache.conf;\n# END setup.sh WordPress FastCGI cache\n' \
-      >> "${target}/h5bp/php_wp.conf"
-    changed=1
+  # Per-vhost include, only on request: inserted in the server block right
+  # before the php_wp include so the cache directives precede the PHP
+  # location, exactly where the template puts them.
+  if [[ ${SETUP_WP_GUEST_CACHE:-0} == 1 ]]; then
+    for vhost in "${wp_optout[@]}"; do
+      if tune_insert_before "$vhost" '^[[:space:]]*include[[:space:]]+h5bp/php_wp\.conf;' \
+           '    include h5bp/wordpress_cache.conf; # added by setup.sh (SETUP_WP_GUEST_CACHE=1)' \
+           "${vhost#"${target}"/}: wordpress_cache include added"; then
+        wp_enabled+=("$vhost")
+        changed=1
+      fi
+    done
+    wp_optout=()
   fi
 
   if (( changed )); then
-    tune_note "WordPress: FastCGI guest cache enabled for ${#wp_vhosts[@]} vhost(s)"
+    tune_note "WordPress: FastCGI guest cache enabled for ${#wp_enabled[@]} vhost(s)"
   else
-    opt_report "- WordPress: FastCGI guest cache already enabled for ${#wp_vhosts[@]} vhost(s)"
+    opt_report "- WordPress: FastCGI guest cache already enabled for ${#wp_enabled[@]} vhost(s)"
   fi
+  for vhost in "${wp_optout[@]}"; do
+    opt_report "- WordPress: \`${vhost#"${target}"/}\` has no wordpress_cache include (operator opt-out; SETUP_WP_GUEST_CACHE=1 adds it)"
+  done
+  return 0
+}
+
+# Insert LINE before the first line matching PATTERN (ERE) in FILE; no-op
+# when the file has no match or LINE is already present.  Returns 0 only
+# when the file changed.
+tune_insert_before() {
+  local file=$1 pattern=$2 line=$3 note=$4 n tmp
+  [[ -f $file ]] || return 1
+  grep -qF -- "${line%% #*}" "$file" && return 1
+  n=$(grep -nE -- "$pattern" "$file" | head -n1 | cut -d: -f1 || true)
+  [[ -n $n ]] || return 1
+  tmp=$(tmp_file) || return 1
+  {
+    head -n "$(( n - 1 ))" "$file"
+    printf '%s\n' "$line"
+    tail -n "+${n}" "$file"
+  } > "$tmp"
+  cat -- "$tmp" > "$file"
+  tune_note "$note"
   return 0
 }
 
@@ -8258,35 +8849,42 @@ ensure_xf_guest_cache() {
   tune_xf_location_security_headers "$target" "${target}/h5bp/php_xf_proxy.conf"
 
   local lock='$setup_xf_guest_bypass $nocacheuri'
+  # One source of truth for the guest-cache block: "match-pattern<TAB>line".
+  # A fresh include gets the whole block injected; an existing one is
+  # repaired line by line from the same list, so the two paths cannot drift
+  # (the repair list used to lack the 301/302/any TTLs, the status header and
+  # background_update, and wrote a shorter cache key).
+  local -a directives=(
+    $'fastcgi_cache_methods[[:space:]]\tfastcgi_cache_methods GET HEAD;'
+    $'fastcgi_cache_key[[:space:]]\tfastcgi_cache_key "$request_method$scheme$host$request_uri$cookie_xf_style_variation$cookie_xf_style_id$cookie_xf_language_id$setup_cache_enc";'
+    $'fastcgi_cache_lock[[:space:]]+on;\tfastcgi_cache_lock on;'
+    $'fastcgi_cache_background_update[[:space:]]\tfastcgi_cache_background_update on;'
+    $'fastcgi_cache_use_stale[[:space:]]\tfastcgi_cache_use_stale error timeout invalid_header updating http_503;'
+    $'fastcgi_ignore_headers[[:space:]]\tfastcgi_ignore_headers Cache-Control Expires Set-Cookie;'
+    $'fastcgi_cache[[:space:]]+fastcgicache;\tfastcgi_cache fastcgicache;'
+    "fastcgi_no_cache[[:space:]]"$'\t'"fastcgi_no_cache ${lock};"
+    "fastcgi_cache_bypass[[:space:]]"$'\t'"fastcgi_cache_bypass ${lock};"
+    $'fastcgi_cache_valid[[:space:]]+200[[:space:]]\tfastcgi_cache_valid 200 5m;'
+    $'fastcgi_cache_valid[[:space:]]+302[[:space:]]\tfastcgi_cache_valid 302 1h;'
+    $'fastcgi_cache_valid[[:space:]]+301[[:space:]]\tfastcgi_cache_valid 301 404 24h;'
+    $'fastcgi_cache_valid[[:space:]]+any[[:space:]]\tfastcgi_cache_valid any 5s;'
+    $'fastcgi_cache_valid[[:space:]]+500([[:space:]]+[0-9]+)+[[:space:]]+0s;\tfastcgi_cache_valid 500 502 503 504 0s;'
+    $'add_header[[:space:]]+X-5m-Cache[[:space:]]\tadd_header X-5m-Cache $upstream_cache_status always;'
+  )
+  local entry pattern line
   if ! grep -qE '^[[:space:]]*fastcgi_cache[[:space:]]+fastcgicache;' "$file"; then
     # The block belongs inside the include's `location ~ \.php`; appended
     # after its closing brace it would land in the server context and also
     # cache the admin/login locations that include plain php.conf.
     local block last tmp
-    block=$(cat <<EOF
-
-# BEGIN setup.sh XenForo guest cache
-fastcgi_cache_methods GET HEAD;
-fastcgi_cache_key "\$request_method\$scheme\$host\$request_uri\$cookie_xf_style_variation\$cookie_xf_style_id\$cookie_xf_language_id\$setup_cache_enc";
-fastcgi_cache_lock on;
-fastcgi_cache_background_update on;
-fastcgi_cache_use_stale error timeout invalid_header updating http_503;
-fastcgi_ignore_headers Cache-Control Expires Set-Cookie;
-fastcgi_cache fastcgicache;
-fastcgi_no_cache ${lock};
-fastcgi_cache_bypass ${lock};
-fastcgi_cache_valid 200 5m;
-fastcgi_cache_valid 302 1h;
-fastcgi_cache_valid 301 404 24h;
-fastcgi_cache_valid any 5s;
-fastcgi_cache_valid 500 502 503 504 0s;
-add_header X-5m-Cache \$upstream_cache_status always;
-# add_header in a location drops the server-level security headers.
-include h5bp/security/strict-transport-security.conf;
-include h5bp/security/referrer-policy.conf;
-# END setup.sh XenForo guest cache
-EOF
-    )
+    block=$'\n# BEGIN setup.sh XenForo guest cache\n'
+    for entry in "${directives[@]}"; do
+      block+="${entry#*$'\t'}"$'\n'
+    done
+    block+=$'# add_header in a location drops the server-level security headers.\n'
+    block+=$'include h5bp/security/strict-transport-security.conf;\n'
+    block+=$'include h5bp/security/referrer-policy.conf;\n'
+    block+='# END setup.sh XenForo guest cache'
     last=$(grep -nE '^[[:space:]]*\}[[:space:]]*$' "$file" | tail -n1 | cut -d: -f1 || true)
     if [[ -n $last ]]; then
       # head/tail rather than awk -v: mawk and BSD awk reject newlines in -v.
@@ -8304,28 +8902,13 @@ EOF
     return 0
   fi
 
-  tune_ensure_in_location "$file" '^[[:space:]]*fastcgi_cache_methods[[:space:]]' \
-    'fastcgi_cache_methods GET HEAD;' "XenForo: cache methods added"
-  tune_ensure_in_location "$file" '^[[:space:]]*fastcgi_cache_key[[:space:]]' \
-    'fastcgi_cache_key "$request_method$scheme$host$request_uri$cookie_xf_style_variation";' \
-    "XenForo: cache key added"
-  tune_ensure_in_location "$file" '^[[:space:]]*fastcgi_cache_lock[[:space:]]+on;' \
-    'fastcgi_cache_lock on;' "XenForo: cache stampede lock added"
-  tune_ensure_in_location "$file" '^[[:space:]]*fastcgi_cache_use_stale[[:space:]]' \
-    'fastcgi_cache_use_stale error timeout invalid_header updating http_503;' \
-    "XenForo: stale-on-error policy added"
-  tune_ensure_in_location "$file" '^[[:space:]]*fastcgi_ignore_headers[[:space:]]' \
-    'fastcgi_ignore_headers Cache-Control Expires Set-Cookie;' \
-    "XenForo: Set-Cookie/Cache-Control ignored for guest cache"
-  tune_ensure_in_location "$file" '^[[:space:]]*fastcgi_no_cache[[:space:]]' \
-    "fastcgi_no_cache ${lock};" "XenForo: session cookie bypass added"
-  tune_ensure_in_location "$file" '^[[:space:]]*fastcgi_cache_bypass[[:space:]]' \
-    "fastcgi_cache_bypass ${lock};" "XenForo: session cookie bypass added"
+  for entry in "${directives[@]}"; do
+    pattern=${entry%%$'\t'*}
+    line=${entry#*$'\t'}
+    tune_ensure_in_location "$file" "^[[:space:]]*${pattern}" "$line" \
+      "XenForo: ${line%% *} added to the guest cache"
+  done
   tune_xf_cache_bypass_var "$file"
-  tune_ensure_in_location "$file" '^[[:space:]]*fastcgi_cache_valid[[:space:]]+200[[:space:]]' \
-    'fastcgi_cache_valid 200 5m;' "XenForo: guest cache TTL guaranteed"
-  tune_ensure_in_location "$file" '^[[:space:]]*fastcgi_cache_valid[[:space:]]+500([[:space:]]+[0-9]+)+[[:space:]]+0s;' \
-    'fastcgi_cache_valid 500 502 503 504 0s;' "XenForo: error responses never cached"
   # Run the key/background repair last: it needs the lock line above to exist
   # before it can decide whether background_update is missing.
   tune_xf_cache_vary "$file"
@@ -8699,6 +9282,15 @@ harden_system() {
     apt_install unattended-upgrades || true
   fi
   if pkg_ok unattended-upgrades; then
+    # Recorded once so --purge basic can restore the file and the unit state.
+    record_original /etc/apt/apt.conf.d/20auto-upgrades apt-20auto-upgrades
+    if [[ ! -f "${STATE_DIR}/unattended-upgrades-enabled" && ! -f "${STATE_DIR}/unattended-upgrades-was-enabled" ]]; then
+      if systemctl is-enabled --quiet unattended-upgrades 2>/dev/null; then
+        touch "${STATE_DIR}/unattended-upgrades-was-enabled"
+      else
+        touch "${STATE_DIR}/unattended-upgrades-enabled"
+      fi
+    fi
     cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
@@ -8770,10 +9362,15 @@ audit_app_persistent_connections() {
       opt_report "  - DB_HOST was not found; verify the MariaDB connection manually."
       issues=$((issues + 1))
     elif [[ $dbhost == p:* ]]; then
-      opt_report "  - MariaDB host is persistent (\`${dbhost}\`)."
-    else
-      opt_report "  - MariaDB host \`${dbhost}\` is not persistent; set \`define('DB_HOST', 'p:localhost');\`"
+      # wpdb::parse_db_host() splits on the first colon, so "p:localhost"
+      # becomes host "p" and every page is "Error establishing a database
+      # connection" (measured: HTTP 500 on WordPress 7.1).  Core has no
+      # persistent-connection switch; only a custom wp-content/db.php can
+      # open one.
+      opt_report "  - **DB_HOST \`${dbhost}\` breaks WordPress**: core parses it as host \`p\`; set \`define('DB_HOST', '${dbhost#p:}');\`"
       issues=$((issues + 1))
+    else
+      opt_report "  - MariaDB host \`${dbhost}\` (WordPress core opens one connection per request; it has no persistent-connection option)."
     fi
     if [[ -z $redis_value ]]; then
       opt_report "  - No Valkey/Redis cache is configured (optional)."
@@ -8833,16 +9430,15 @@ audit_app_persistent_connections() {
 ANGIE_UNIT_CHANGED=0
 ensure_angie_limits() {
   local angie_limit angie_dropin=/etc/systemd/system/angie.service.d/limits.conf
-  local angie_before="" changed=0
+  local changed=0
   ANGIE_UNIT_CHANGED=0
   angie_limit=$(systemctl show -p LimitNOFILE --value angie 2>/dev/null || true)
-  [[ -f $angie_dropin ]] && angie_before=$(md5sum "$angie_dropin" | awk '{print $1}')
   if [[ $angie_limit != infinity ]] \
      && { ! [[ $angie_limit =~ ^[0-9]+$ ]] || (( angie_limit < 524288 )); }; then
-    mkdir -p /etc/systemd/system/angie.service.d
-    printf '[Service]\nLimitNOFILE=524288\nUMask=0027\n' > "$angie_dropin"
-    chmod 644 "$angie_dropin"
-    if [[ $angie_before != "$(md5sum "$angie_dropin" | awk '{print $1}')" ]]; then
+    # Same writer as the PHP/MariaDB drop-ins; the content mirrors the
+    # repository's scripts/limit_nofile.conf, which the sync installs when
+    # it succeeds.
+    if write_service_limits_dropin "$angie_dropin" $'[Service]\nLimitNOFILE=524288\nUMask=0027'; then
       systemctl daemon-reload || true
       changed=1
       ANGIE_UNIT_CHANGED=1
@@ -8862,6 +9458,10 @@ optimize_angie() {
   opt_report "## Angie"
   opt_report "- Version: \`${version:-unknown}\`; active: ${active}"
   opt_backup /etc/angie angie
+  # The repository sync rewrites the unit drop-in and /etc/default/angie too;
+  # a rollback must cover them like the MariaDB/Valkey/Elasticsearch ones.
+  opt_backup /etc/systemd/system/angie.service.d angie-systemd
+  opt_backup "$default_file" angie-default
   tune_reset_changes
   [[ -f $limit_file ]] && limit_before=$(md5sum "$limit_file" | awk '{print $1}')
   [[ -f $default_file ]] && default_before=$(md5sum "$default_file" | awk '{print $1}')
@@ -8886,9 +9486,7 @@ optimize_angie() {
     ANGIE_SYNC_RELOAD=1
     rc=1
     opt_report "- **FAILED** Angie repository synchronization; restored the existing /etc/angie tree"
-    opt_restore /etc/angie angie
-    /usr/sbin/angie -t >/dev/null 2>&1 \
-      && { systemctl reload angie 2>/dev/null || systemctl restart angie 2>/dev/null; } || true
+    angie_restore_live
     # No repository deployer ran, so keep the standalone limit tuning.
     ensure_angie_limits || true
     unit_changed=$ANGIE_UNIT_CHANGED
@@ -8897,7 +9495,7 @@ optimize_angie() {
   # precompression, the tuner and dynamic Brotli (the module is installed
   # when missing; a failure moves the optional files to /tmp, gzip stays).
   if ! angie_apply_profile /etc/angie; then
-    opt_restore /etc/angie angie
+    angie_restore_live
     opt_report "- **FAILED** tuning returned an error; configuration rolled back"
     return 1
   fi
@@ -8916,9 +9514,7 @@ optimize_angie() {
   if ! /usr/sbin/angie -t >"$angie_test_log" 2>&1; then
     opt_report "- **FAILED** \`angie -t\`:"
     while IFS= read -r change; do opt_report "  \`${change}\`"; done < "$angie_test_log"
-    opt_restore /etc/angie angie
-    /usr/sbin/angie -t >/dev/null 2>&1 \
-      && { systemctl reload angie 2>/dev/null || systemctl restart angie 2>/dev/null; } || true
+    angie_restore_live
     return 1
   fi
   for change in "${TUNE_CHANGES[@]}"; do opt_report "- ${change}"; done
@@ -8949,14 +9545,26 @@ optimize_angie() {
       opt_report "- Reload failed; Restart: **OK**"
     else
       opt_report "- Reload/Restart: **FAILED**; rolling back"
-      opt_restore /etc/angie angie
-      systemctl reload angie 2>/dev/null || systemctl restart angie 2>/dev/null || true
+      angie_restore_live
       return 1
     fi
   else
     opt_report "- Restart: skipped (service was not active)"
   fi
   return "$rc"
+}
+
+# Roll /etc/angie, the unit drop-in and /etc/default/angie back to the
+# --optimize snapshot and put the restored configuration live again.
+angie_restore_live() {
+  opt_restore /etc/angie angie
+  opt_restore /etc/systemd/system/angie.service.d angie-systemd
+  opt_restore /etc/default/angie angie-default
+  systemctl daemon-reload || true
+  if /usr/sbin/angie -t >/dev/null 2>&1; then
+    systemctl reload angie 2>/dev/null || systemctl restart angie 2>/dev/null || true
+  fi
+  return 0
 }
 
 # True when active PHP vhosts use the shared local_php upstream, so the
@@ -9135,6 +9743,7 @@ optimize_php_services() {
     opt_report "## PHP ${ver}"
     opt_report "- Active: ${active}; listen kept: \`${listen_path:-unknown}\`"
     opt_backup "/etc/php/${ver}" "php-${ver}"
+    opt_backup "/etc/systemd/system/php${ver}-fpm.service.d" "php-${ver}-systemd"
     tune_reset_changes
     # Replace a stale managed php.ini copy before tuning.  Keep the live
     # timezone; everything else follows configs/php/custom_dan.ini.
@@ -9150,6 +9759,8 @@ optimize_php_services() {
     fi
     if ! tune_php_fpm_version "$ver"; then
       opt_restore "/etc/php/${ver}" "php-${ver}"
+      opt_restore "/etc/systemd/system/php${ver}-fpm.service.d" "php-${ver}-systemd"
+      systemctl daemon-reload || true
       opt_report "- **FAILED** PHP-FPM configuration test; rolled back"
       rc=1
       OPT_PHP_OK=0
@@ -9208,8 +9819,7 @@ optimize_php_services() {
         # already used a Unix socket must have re-created it.
         if [[ $listen_path == /* && ! -S $listen_path ]]; then
           opt_report "- **FAILED** ${listen_path} was not created; rolling back"
-          opt_restore "/etc/php/${ver}" "php-${ver}"
-          systemctl restart "php${ver}-fpm" 2>/dev/null || true
+          opt_rollback_restart "php${ver}-fpm" "/etc/php/${ver}" "php-${ver}" "php-${ver}-systemd"
           rc=1
           OPT_PHP_OK=0
         else
@@ -9217,8 +9827,7 @@ optimize_php_services() {
         fi
       else
         opt_report "- Reload/Restart: **FAILED**; rolling back"
-        opt_restore "/etc/php/${ver}" "php-${ver}"
-        systemctl restart "php${ver}-fpm" 2>/dev/null || true
+        opt_rollback_restart "php${ver}-fpm" "/etc/php/${ver}" "php-${ver}" "php-${ver}-systemd"
         rc=1
         OPT_PHP_OK=0
       fi
@@ -9249,28 +9858,66 @@ mariadb_server_version() {
 
 # True when two generated MariaDB configs differ only in the buffer-pool size,
 # so the value can be applied online without a restart.
+# Keys of the tuning drop-in that a running server accepts through SET
+# GLOBAL (the redo log is resizable online since MariaDB 10.9).  When only
+# these differ between the old and new file, --optimize applies them online
+# instead of restarting a busy database with the web tiers paused.
+MARIADB_ONLINE_KEYS='innodb_buffer_pool_size|innodb_log_file_size|tmp_table_size|max_heap_table_size'
 cnf_only_pool_changed() {
   local old=$1 new=$2
   [[ -f $old && -f $new ]] || return 1
   diff -q \
-    <(grep -vE '^[[:space:]]*innodb_buffer_pool_size[[:space:]]*=' "$old") \
-    <(grep -vE '^[[:space:]]*innodb_buffer_pool_size[[:space:]]*=' "$new") \
+    <(grep -vE "^[[:space:]]*(${MARIADB_ONLINE_KEYS})[[:space:]]*=" "$old") \
+    <(grep -vE "^[[:space:]]*(${MARIADB_ONLINE_KEYS})[[:space:]]*=" "$new") \
     >/dev/null 2>&1
+}
+
+# Value of KEY in a my.cnf-style FILE as bytes (K/M/G suffixes), empty when
+# the key is absent.
+cnf_key_bytes() {
+  local file=$1 key=$2 val num unit
+  val=$(sed -nE "s/^[[:space:]]*${key}[[:space:]]*=[[:space:]]*([0-9]+[kKmMgG]?).*/\1/p" "$file" 2>/dev/null | tail -n1)
+  [[ -n $val ]] || return 0
+  num=${val%%[kKmMgG]*}
+  unit=${val#"$num"}
+  case ${unit,,} in
+    k) printf '%s' $(( num * 1024 )) ;;
+    m) printf '%s' $(( num * 1048576 )) ;;
+    g) printf '%s' $(( num * 1073741824 )) ;;
+    *) printf '%s' "$num" ;;
+  esac
+}
+
+# Apply the online-capable keys that changed between OLD and NEW with SET
+# GLOBAL; the buffer pool first (it bounds tmp_table_size), then the rest.
+# Returns 1 on the first rejected SET so the caller falls back to a restart.
+mariadb_apply_online_keys() {
+  local old=$1 new=$2 key before after
+  for key in innodb_buffer_pool_size innodb_log_file_size tmp_table_size max_heap_table_size; do
+    before=$(cnf_key_bytes "$old" "$key")
+    after=$(cnf_key_bytes "$new" "$key")
+    [[ -n $after && $before != "$after" ]] || continue
+    mariadb -e "SET GLOBAL ${key} = ${after}" 2>/dev/null || return 1
+    [[ $key == innodb_buffer_pool_size ]] || opt_report "- Applied ${key}=${after} online"
+  done
+  return 0
 }
 
 # Stop the request-serving tiers before a MariaDB restart, then bring them
 # back in dependency order (PHP first, Angie last).  Only services that were
 # active are touched; an OS-only or DB-only host is unaffected.
+# Stop Angie, then every active PHP-FPM unit; WHY names the reason in the log
+# (default: the MariaDB restart; --restart-all passes its own).
 opt_pause_web_frontends() {
+  local why=${1:-the MariaDB restart} unit
   OPT_WEB_PAUSED_ANGIE=0
   OPT_WEB_PAUSED_PHP=()
-  local unit
   if systemctl is-active --quiet angie 2>/dev/null; then
     if systemctl stop angie 2>/dev/null; then
       OPT_WEB_PAUSED_ANGIE=1
-      info "Paused Angie before the MariaDB restart"
+      info "Paused Angie before ${why}"
     else
-      warn "Could not stop Angie before the MariaDB restart"
+      warn "Could not stop Angie before ${why}"
     fi
   fi
   while IFS= read -r unit; do
@@ -9278,29 +9925,30 @@ opt_pause_web_frontends() {
     systemctl is-active --quiet "$unit" 2>/dev/null || continue
     if systemctl stop "$unit" 2>/dev/null; then
       OPT_WEB_PAUSED_PHP+=("$unit")
-      info "Paused ${unit} before the MariaDB restart"
+      info "Paused ${unit} before ${why}"
     else
-      warn "Could not stop ${unit} before the MariaDB restart"
+      warn "Could not stop ${unit} before ${why}"
     fi
   done < <(list_active_php_units)
 }
 
+# Start the paused PHP-FPM units first, then Angie.
 opt_resume_web_frontends() {
-  local unit rc=0
+  local why=${1:-the MariaDB restart} unit rc=0
   for unit in "${OPT_WEB_PAUSED_PHP[@]}"; do
     if ! systemctl start "$unit" 2>/dev/null; then
-      warn "Could not start ${unit} after the MariaDB restart"
+      warn "Could not start ${unit} after ${why}"
       rc=1
     fi
   done
   if (( OPT_WEB_PAUSED_ANGIE )); then
     if ! systemctl start angie 2>/dev/null; then
-      warn "Could not start Angie after the MariaDB restart"
+      warn "Could not start Angie after ${why}"
       rc=1
     fi
   fi
   if (( ${#OPT_WEB_PAUSED_PHP[@]} > 0 || OPT_WEB_PAUSED_ANGIE )); then
-    info "Resumed web frontends after the MariaDB restart"
+    info "Resumed web frontends after ${why}"
   fi
   OPT_WEB_PAUSED_ANGIE=0
   OPT_WEB_PAUSED_PHP=()
@@ -9372,6 +10020,9 @@ optimize_mariadb() {
   write_mariadb_tuning_dropin "$size_mb" "$max_conn" "$cnf"
   cnf_after=$(md5sum "$cnf" | awk '{print $1}')
   opt_report "- Wrote \`${cnf}\` (buffer=${buffer}, max_connections=${max_conn}, back_log=${backlog})"
+  if (( ${MARIADB_PROFILE_PERSISTENT_APPS:-0} > 0 )); then
+    opt_report "- max_connections allows one persistent connection per PHP worker for ${MARIADB_PROFILE_PERSISTENT_APPS} application(s) plus a transient one"
+  fi
   opt_report "- Slow/error logging: /var/www/logs/mariadb/slow.log and error.log"
   opt_report "- innodb_io_capacity=${io_read}/${io_write}, thread_pool_size=${threads}"
   # One owner for the performance values: remove the installer-managed block
@@ -9403,7 +10054,8 @@ optimize_mariadb() {
   local online_mb=""
   if [[ -n $cnf_old ]] && (( active )) && [[ $cnf_before != "$cnf_after" ]] \
      && (( base_changed == 0 )) && cnf_only_pool_changed "$cnf_old" "$cnf"; then
-    if mariadb -e "SET GLOBAL innodb_buffer_pool_size = $(( size_mb * 1024 * 1024 ))" 2>/dev/null; then
+    if mariadb -e "SET GLOBAL innodb_buffer_pool_size = $(( size_mb * 1024 * 1024 ))" 2>/dev/null \
+       && mariadb_apply_online_keys "$cnf_old" "$cnf"; then
       online_mb=$(mariadb -N -B -e 'SELECT @@innodb_buffer_pool_size' 2>/dev/null \
         | awk '{printf "%d", $1 / 1024 / 1024}')
       opt_report "- Applied buffer pool online: ${online_mb:-$size_mb}MB (no restart)"
@@ -9454,33 +10106,21 @@ optimize_mariadb() {
       opt_report "- Paused web frontends before the MariaDB restart (PHP, then Angie)"
     fi
 
-    if systemctl restart mariadb 2>/dev/null; then
-      OPT_CUTOVER=1
-      # A large buffer pool may need to preload at startup; allow up to five
-      # minutes before declaring the restart failed.
-      if mariadb_wait_ready 300; then
-        opt_report "- Restart: **OK**"
-        live_slow=$(mariadb -N -B -e 'SELECT @@slow_query_log' 2>/dev/null || true)
-        live_err=$(mariadb -N -B -e 'SELECT @@log_error' 2>/dev/null || true)
-        opt_report "- Live slow_query_log=${live_slow:-unknown}, log_error=${live_err:-unknown}"
-        if [[ $live_slow != 1 ]]; then
-          opt_report "- **WARNING**: slow_query_log is ${live_slow:-unknown} after restart; check AppArmor/log permissions"
-        fi
-        if ! opt_resume_web_frontends; then
-          opt_report "- Web frontends: **FAILED** to resume; check Angie/PHP-FPM"
-          return 1
-        fi
-        opt_report "- Web frontends resumed after the MariaDB restart"
-      else
-        opt_report "- Restart: **FAILED** (SQL probe); rolling back"
-        opt_rollback_restart mariadb /etc/mysql mysql mariadb-systemd
-        mariadb_wait_ready 30 || true
-        opt_resume_web_frontends || true
+    # A large buffer pool may need to preload at startup; the probe allows up
+    # to five minutes before the restart counts as failed.
+    if opt_restart_service mariadb /etc/mysql mysql mariadb-systemd mariadb_restart_probe; then
+      live_slow=$(mariadb -N -B -e 'SELECT @@slow_query_log' 2>/dev/null || true)
+      live_err=$(mariadb -N -B -e 'SELECT @@log_error' 2>/dev/null || true)
+      opt_report "- Live slow_query_log=${live_slow:-unknown}, log_error=${live_err:-unknown}"
+      if [[ $live_slow != 1 ]]; then
+        opt_report "- **WARNING**: slow_query_log is ${live_slow:-unknown} after restart; check AppArmor/log permissions"
+      fi
+      if ! opt_resume_web_frontends; then
+        opt_report "- Web frontends: **FAILED** to resume; check Angie/PHP-FPM"
         return 1
       fi
+      opt_report "- Web frontends resumed after the MariaDB restart"
     else
-      opt_report "- Restart: **FAILED**; rolling back"
-      opt_rollback_restart mariadb /etc/mysql mysql mariadb-systemd
       mariadb_wait_ready 30 || true
       opt_resume_web_frontends || true
       return 1
@@ -9527,6 +10167,18 @@ valkey_floor_mb() {
   floor=$(( ram_mb / 64 ))
   (( floor < 128 )) && floor=128
   (( floor > 1024 )) && floor=1024
+  printf '%s' "$floor"
+}
+
+# InnoDB buffer-pool floor for a database with little or no measured data:
+# RAM/16 clamped to 256 MB..4 GB (1 GB on a 16 GB host, 1.7 GB on 27 GB).
+# The planner still trims it when the budget is short.
+mariadb_floor_mb() {
+  local ram_mb=${1:-0} floor
+  [[ $ram_mb =~ ^[0-9]+$ ]] || ram_mb=0
+  floor=$(( ram_mb / 16 ))
+  (( floor < 256 )) && floor=256
+  (( floor > 4096 )) && floor=4096
   printf '%s' "$floor"
 }
 
@@ -9712,27 +10364,15 @@ optimize_valkey() {
   fi
 
   if (( active )); then
-    if systemctl restart "$unit" 2>/dev/null; then
-      OPT_CUTOVER=1
-      if wait_for_cmd 20 valkey_pong "$cli"; then
-        opt_report "- Restart: **OK**"
-        # A socket path change does not alter the supplementary groups the
-        # PHP workers already have.  Restarting PHP just because the cache
-        # moved to a Unix socket briefly removes /run/php/php-fpm.sock and
-        # makes Angie return 502s; only a real group change needs it.
-        if (( group_changed )); then
-          restart_php_workers_for_group "$group"
-          opt_report "- PHP-FPM restarted to inherit the ${group} group"
-        fi
-      else
-        opt_report "- Restart: **FAILED** (PING); rolling back"
-        opt_rollback_restart "$unit" "$conf_dir" "$kind" "${kind}-systemd"
-        return 1
-      fi
-    else
-      opt_report "- Restart: **FAILED**; rolling back"
-      opt_rollback_restart "$unit" "$conf_dir" "$kind" "${kind}-systemd"
-      return 1
+    opt_restart_service "$unit" "$conf_dir" "$kind" "${kind}-systemd" valkey_restart_probe "$cli" \
+      || return 1
+    # A socket path change does not alter the supplementary groups the PHP
+    # workers already have.  Restarting PHP just because the cache moved to
+    # a Unix socket briefly removes /run/php/php-fpm.sock and makes Angie
+    # return 502s; only a real group change needs it.
+    if (( group_changed )); then
+      restart_php_workers_for_group "$group"
+      opt_report "- PHP-FPM restarted to inherit the ${group} group"
     fi
   else
     opt_report "- Restart: skipped (service was not active)"
@@ -9812,10 +10452,10 @@ EOF
 
 elasticsearch_single_node_replica_issue() {
   local json=$1 nodes status unassigned primary
-  nodes=$(printf '%s' "$json" | sed -n 's/.*"number_of_nodes"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -n1)
-  status=$(printf '%s' "$json" | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([a-z]*\)".*/\1/p' | head -n1)
-  unassigned=$(printf '%s' "$json" | sed -n 's/.*"unassigned_shards"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -n1)
-  primary=$(printf '%s' "$json" | sed -n 's/.*"unassigned_primary_shards"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -n1)
+  nodes=$(es_json_num "$json" number_of_nodes)
+  status=$(es_json_str "$json" status)
+  unassigned=$(es_json_num "$json" unassigned_shards)
+  primary=$(es_json_num "$json" unassigned_primary_shards)
   [[ $nodes =~ ^[0-9]+$ && $nodes -eq 1 ]] || return 1
   [[ $status == yellow ]] || return 1
   [[ $unassigned =~ ^[0-9]+$ && $unassigned -gt 0 ]] || return 1
@@ -9851,8 +10491,8 @@ elasticsearch_wait_primaries() {
   [[ $code == 000 || -z $code ]] && return 1
   for i in {1..120}; do
     health=$(curl -sS --max-time 5 "${es_url}/_cluster/health" 2>/dev/null) || true
-    status=$(printf '%s' "$health" | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([a-z]*\)".*/\1/p' | head -n1)
-    primary=$(printf '%s' "$health" | sed -n 's/.*"unassigned_primary_shards"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -n1)
+    status=$(es_json_str "$health" status)
+    primary=$(es_json_num "$health" unassigned_primary_shards)
     [[ $status == green ]] && return 0
     if [[ $status == yellow && $primary =~ ^[0-9]+$ && $primary -eq 0 ]]; then
       return 0
@@ -9871,8 +10511,8 @@ elasticsearch_fix_single_node_replicas() {
   es_url=$(elasticsearch_http_url)
   elasticsearch_wait_primaries || true
   health=$(curl -fsS --max-time 5 "${es_url}/_cluster/health" 2>/dev/null) || return 0
-  nodes=$(printf '%s' "$health" | sed -n 's/.*"number_of_nodes"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -n1)
-  status=$(printf '%s' "$health" | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([a-z]*\)".*/\1/p' | head -n1)
+  nodes=$(es_json_num "$health" number_of_nodes)
+  status=$(es_json_str "$health" status)
   unassigned=$(printf '%s' "$health" | sed -n 's/.*"unassigned_shards"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -n1)
   primary=$(printf '%s' "$health" | sed -n 's/.*"unassigned_primary_shards"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -n1)
 
@@ -9920,7 +10560,7 @@ optimize_elastic() {
   local legacy=/etc/elasticsearch/jvm.options.d/jvm.options
   local unit=/etc/systemd/system/elasticsearch.service.d/limits.conf
   local es_before jvm_before legacy_before unit_before es_after jvm_after unit_after changed=0 i
-  local es_url="" last_code="" code=""
+  local es_url=""
   systemctl is-active --quiet elasticsearch 2>/dev/null && active=1
   opt_report "## Elasticsearch"
   opt_report "- Active: ${active}; config: \`${yml}\`"
@@ -9985,7 +10625,7 @@ optimize_elastic() {
     opt_report "- **WARNING**: Elasticsearch network.host=${net_host} with X-Pack security disabled; restrict TCP 9200/9300 to the remote client(s) or enable X-Pack security/TLS"
   fi
 
-  elasticsearch_write_systemd_limits
+  elasticsearch_write_systemd_limits || true
   systemctl daemon-reload || true
 
   es_after=$(file_md5 "$yml")
@@ -10011,52 +10651,15 @@ optimize_elastic() {
       elasticsearch_fix_single_node_replicas || return 1
       return 0
     fi
-    if systemctl restart elasticsearch 2>/dev/null; then
-      OPT_CUTOVER=1
-      # Large heaps and many shards take time to become ready.  Probe the
-      # endpoint the node was configured with; a remote-bound node will not
-      # answer on loopback.
-      local ready=0
-      for i in {1..300}; do
-        code=$(curl -sS --max-time 3 -o /dev/null -w '%{http_code}' "$es_url" 2>/dev/null || true)
-        if [[ $code == 200 ]]; then
-          ready=1
-          break
-        fi
-        last_code=$code
-        # Stop waiting early when the unit is gone, or when it is listening
-        # on the configured address but this host cannot reach it (firewall
-        # or NAT).  The latter is reported below, not rolled back.
-        if ! systemctl is-active --quiet elasticsearch; then
-          last_code="unit-inactive"
-          break
-        fi
-        if [[ $code == 000 || -z $code ]] \
-           && elasticsearch_listener_on "$es_url"; then
-          break
-        fi
-        sleep 1
-      done
-      if (( ready )); then
-        opt_report "- Restart: **OK**"
-        elasticsearch_fix_single_node_replicas || return 1
-      elif [[ $last_code == 000 || -z $last_code ]] \
-           && systemctl is-active --quiet elasticsearch \
-           && elasticsearch_listener_on "$es_url"; then
-        # The unit restarted and owns the configured listener, but this host
-        # cannot reach that address (firewall/NAT or a client-only allow
-        # rule).  Do not roll back a healthy tune; report it instead.
-        opt_report "- Restart: **OK** (unit active and listening on \`${es_url#*://}\`; HTTP probe from this host was unavailable — verify from the XenForo client)"
-        opt_report "- Single-node replica check skipped: the HTTP endpoint was not reachable from this host"
-      else
-        opt_report "- Restart: **FAILED** (HTTP probe to \`${es_url}\` returned ${last_code:-no response}); rolling back"
-        opt_rollback_restart elasticsearch /etc/elasticsearch elasticsearch elasticsearch-systemd
-        return 1
-      fi
+    # Large heaps and many shards take time to become ready.  The probe uses
+    # the endpoint the node was configured with; a remote-bound node will
+    # not answer on loopback (the probe then accepts the owned listener).
+    opt_restart_service elasticsearch /etc/elasticsearch elasticsearch elasticsearch-systemd \
+      elasticsearch_restart_probe "$es_url" || return 1
+    if elasticsearch_wait_http "$es_url" 1; then
+      elasticsearch_fix_single_node_replicas || return 1
     else
-      opt_report "- Restart: **FAILED**; rolling back"
-      opt_rollback_restart elasticsearch /etc/elasticsearch elasticsearch elasticsearch-systemd
-      return 1
+      opt_report "- Single-node replica check skipped: the HTTP endpoint was not reachable from this host"
     fi
   else
     opt_report "- Restart: skipped (service was not active)"
@@ -10286,7 +10889,9 @@ optimize_plan() {
     # Same helper as the ini writer, so the preview shows the JIT the run
     # would write (opcache.memory_consumption follows RAM/16, 128..512 MB).
     local plan_opcache_mb jit_mode jit_buffer_mb wp_roots
-    plan_opcache_mb=$(( ram_mb / 16 )); (( plan_opcache_mb < 128 )) && plan_opcache_mb=128; (( plan_opcache_mb > 512 )) && plan_opcache_mb=512
+    php_ini_profile "$ram_mb"
+    plan_opcache_mb=$PHP_PROFILE_OPCACHE_MB
+    printf '  PHP-FPM:  memory_limit=%sM realpath_cache=%sk\n' "$PHP_PROFILE_MEMORY_MB" "$PHP_PROFILE_REALPATH_KB"
     read -r jit_mode jit_buffer_mb < <(php_jit_settings "$plan_opcache_mb")
     if [[ $jit_mode == disable ]]; then
       printf '  PHP-FPM:  opcache=%sM jit=off (SETUP_PHP_JIT=tracing|function enables it)\n' "$plan_opcache_mb"
@@ -10640,6 +11245,7 @@ run_diagnostics() {
     die "Could not write ${out}; run diagnostics from a writable checkout"
   fi
   chmod 600 "$out"
+  give_to_invoking_user "$out"
   DIAG_FILE=$out
 
   {
@@ -10948,10 +11554,9 @@ restart_all_plan() {
 
 run_restart_all() {
   local unit rc=0
-  local angie_active=0 angie_stopped=0 mariadb_active=0 mariadb_ok=0
+  local angie_active=0 mariadb_active=0
   local elastic_active=0 es_url="" es_ok=0
-  local -a php_units=() stopped_php=() cache_units=() failures=()
-  local i
+  local -a php_units=() cache_units=() failures=()
 
   step "Restarting all detected services"
   detect_installed_services
@@ -10984,27 +11589,17 @@ run_restart_all() {
     fi
   done
 
-  # 1. Stop the request tiers, Angie first, then all active PHP versions.
-  if (( angie_active )); then
-    if systemctl stop angie 2>/dev/null; then
-      angie_stopped=1
-      info "Stopped Angie"
-    else
-      warn "Could not stop Angie"
-      failures+=("stop angie")
-      rc=1
-    fi
+  # 1. Stop the request tiers, Angie first, then all active PHP versions
+  #    (the same pause the MariaDB tuner uses before its restart).
+  opt_pause_web_frontends "the restart"
+  if (( angie_active && OPT_WEB_PAUSED_ANGIE == 0 )); then
+    failures+=("stop angie")
+    rc=1
   fi
-  for unit in "${php_units[@]}"; do
-    if systemctl stop "$unit" 2>/dev/null; then
-      stopped_php+=("$unit")
-      info "Stopped ${unit}"
-    else
-      warn "Could not stop ${unit}"
-      failures+=("stop ${unit}")
-      rc=1
-    fi
-  done
+  if (( ${#OPT_WEB_PAUSED_PHP[@]} < ${#php_units[@]} )); then
+    failures+=("stop php-fpm")
+    rc=1
+  fi
 
   # 2. Restart cache/search before MariaDB.
   for unit in "${cache_units[@]}"; do
@@ -11021,28 +11616,22 @@ run_restart_all() {
       info "Restarted elasticsearch"
       # Type=simple returns before the node is ready.  Wait for the HTTP
       # endpoint before the PHP/Angie tiers are started so the first search
-      # requests do not hit a recovering cluster.
+      # requests do not hit a recovering cluster.  A remote-bound node can be
+      # healthy while the host cannot reach its own public address through
+      # firewall/NAT; the listener is enough (rc 2).
       es_url=$(elasticsearch_http_url 2>/dev/null || true)
-      if [[ -n $es_url ]] && command -v curl >/dev/null 2>&1; then
-        for i in {1..300}; do
-          curl -fsS --max-time 2 "$es_url" >/dev/null 2>&1 && { es_ok=1; break; }
-          sleep 1
-        done
-        # A remote-bound node can be healthy while the host cannot reach its
-        # own public address through firewall/NAT; the listener is enough.
-        if (( ! es_ok )) && elasticsearch_listener_on "$es_url"; then
-          es_ok=1
-          info "Elasticsearch is listening on the configured endpoint"
-        fi
-        if (( es_ok )); then
-          info "Elasticsearch is answering HTTP"
-        else
-          warn "Elasticsearch did not answer HTTP within 300s"
-          failures+=("elasticsearch HTTP probe")
-          rc=1
-        fi
+      if [[ -n $es_url ]]; then
+        elasticsearch_wait_http "$es_url" 300 || es_ok=$?
+        case $es_ok in
+          0) info "Elasticsearch is answering HTTP" ;;
+          2) info "Elasticsearch is listening on the configured endpoint" ;;
+          *)
+            warn "Elasticsearch did not answer HTTP within 300s (${ES_WAIT_LAST_CODE:-no response})"
+            failures+=("elasticsearch HTTP probe")
+            rc=1 ;;
+        esac
       else
-        info "Elasticsearch HTTP endpoint or curl is unavailable; skipping readiness probe"
+        info "Elasticsearch HTTP endpoint is unavailable; skipping readiness probe"
       fi
     else
       warn "Could not restart elasticsearch"
@@ -11055,22 +11644,14 @@ run_restart_all() {
   if (( mariadb_active )); then
     if systemctl restart mariadb 2>/dev/null; then
       info "Restarted mariadb; waiting for SELECT 1"
-      if command -v mariadb >/dev/null 2>&1; then
-        for i in {1..300}; do
-          mariadb -e 'SELECT 1' >/dev/null 2>&1 && { mariadb_ok=1; break; }
-          sleep 1
-        done
-      else
-        warn "mariadb client not found; cannot verify SELECT 1"
-      fi
-      if (( mariadb_ok )); then
+      if ! command -v mariadb >/dev/null 2>&1; then
+        warn "MariaDB was restarted but could not be probed (client missing)"
+        failures+=("mariadb SQL probe")
+        rc=1
+      elif mariadb_wait_ready 300; then
         info "MariaDB is accepting SQL"
       else
-        if command -v mariadb >/dev/null 2>&1; then
-          warn "MariaDB did not answer SELECT 1 within 300s"
-        else
-          warn "MariaDB was restarted but could not be probed (client missing)"
-        fi
+        warn "MariaDB did not answer SELECT 1 within 300s"
         failures+=("mariadb SQL probe")
         rc=1
       fi
@@ -11083,23 +11664,9 @@ run_restart_all() {
 
   # 4. Start PHP-FPM first, then Angie, regardless of a MariaDB probe failure:
   #    restore the services that were active before the restart and report it.
-  for unit in "${stopped_php[@]}"; do
-    if systemctl start "$unit" 2>/dev/null; then
-      info "Started ${unit}"
-    else
-      warn "Could not start ${unit}"
-      failures+=("start ${unit}")
-      rc=1
-    fi
-  done
-  if (( angie_stopped )); then
-    if systemctl start angie 2>/dev/null; then
-      info "Started Angie"
-    else
-      warn "Could not start Angie"
-      failures+=("start angie")
-      rc=1
-    fi
+  if ! opt_resume_web_frontends "the restart"; then
+    failures+=("start php-fpm/angie")
+    rc=1
   fi
 
   if (( rc == 0 )); then
@@ -11107,7 +11674,7 @@ run_restart_all() {
   else
     warn "Restart completed with failures: ${failures[*]}"
   fi
-  return "$rc"
+  handled_return "$rc"
 }
 
 run_os_tuning() {
@@ -11170,9 +11737,14 @@ repair_optimize_legacy_cron() {
       opt_report "- Cron: removed the legacy /usr/bin/mysqlcheck path"
     fi
     if (( had_legacy == 0 && had_cloudflare == 0 && had_mysqlcheck == 0 )); then
-      opt_report "- Cron: managed block ensured for installed services"
+      if (( CRON_UPDATED )); then
+        opt_report "- Cron: managed block updated for installed services"
+      else
+        opt_report "- Cron: managed block already current (not rewritten)"
+      fi
     fi
-    if [[ -n $backup ]]; then
+    # The backup only matters when the crontab was actually replaced.
+    if [[ -n $backup ]] && (( CRON_UPDATED )); then
       opt_report "- Cron: previous crontab saved to \`${backup}\`"
     fi
     return 0
@@ -11317,7 +11889,8 @@ run_optimize() {
     else
       warn "OS tuning or legacy repair reported failures; check the report"
     fi
-    return "$rc"
+    handled_return "$rc"
+    return
   fi
   info "Detected: ${OPT_DETECTED[*]}"
   info "Backups: ${OPT_BACKUP_DIR}"
@@ -11373,7 +11946,7 @@ run_optimize() {
   else
     warn "One or more services failed to optimize; check the report and backups"
   fi
-  return "$rc"
+  handled_return "$rc"
 }
 
 on_exit() {
@@ -11467,21 +12040,17 @@ main() {
 
   if (( RESTART_ALL )); then
     printf '%s%sUbuntu %s service restart%s\n' "$C_BOLD" "$C_BLUE" "${VERSION_ID}" "$C_RESET"
-    if ! run_restart_all; then
-      trap - ERR
-      exit 1
-    fi
+    # Plain calls: `if ! run_x` would suspend set -e and the ERR trap for the
+    # whole run, so a failed write inside a tuner was skipped silently while
+    # the same functions abort a --basic install.  A handled failure returns
+    # through handled_return and exits with that status here.
+    run_restart_all
     exit 0
   fi
 
   if (( OPTIMIZE )); then
     printf '%s%sUbuntu %s optimization (Angie sync + hardware profile)%s\n' "$C_BOLD" "$C_BLUE" "${VERSION_ID}" "$C_RESET"
-    if ! run_optimize; then
-      # The report already explains the failure; suppress a duplicate ERR
-      # trap message from this intentional non-zero exit.
-      trap - ERR
-      exit 1
-    fi
+    run_optimize
     exit 0
   fi
 

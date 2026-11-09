@@ -3,6 +3,77 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.13.0 (2026-11-09)
+
+Audit session on the dev-host development host (16 threads / 27 GiB / NVMe,
+Ubuntu 26.04.1) from the 557-package baseline: fresh full-stack install with
+XenForo 2.3.13 and WordPress 7.1.4 vhosts, `--optimize` parity, three
+independent code reviews of `setup.sh` (PHP/Angie, MariaDB/Valkey/
+Elasticsearch, OS/CLI/purge) and before/after load tests from a workstation.
+Everything below was re-tested on that host (see tests/stress-site/RESULTS.md).
+
+- **`set -e` was off for the whole `--optimize`/`--restart-all` run.** The
+  drivers were called as `if ! run_optimize`, which makes bash suspend
+  errexit and the ERR trap for the entire function, so a failed write inside
+  a tuner was skipped while the same functions abort a `--basic` install.
+  They are now called plainly; a handled failure returns through
+  `handled_return` so the report still explains it without a duplicate
+  `[ERR]` line. `--purge` keeps going past a file it cannot restore.
+- **Adopted hosts keep their routing and IPv6.** The base sysctl template
+  disables forwarding and IPv6 autoconfiguration; those lines are dropped on
+  a host that already forwards (bridge, Docker/LXD, WireGuard/Tailscale) or
+  whose address/default route comes from router advertisements. Every key
+  the profile writes (the template's own included) is recorded once and
+  restored by `--purge basic`; `ip_local_reserved_ports` protects 3306,
+  6379, 9200, 9300 and the sshd ports inside the widened ephemeral range.
+- **Hardware rules added:** `tcp_rmem`/`tcp_wmem` default by RAM,
+  `vm.swappiness` 1 on flash, `kernel.shmmax = min(1 GiB, RAM/4)`,
+  `netdev_budget` on dedicated 8+ CPU hosts; PHP-FPM `pm = ondemand` under
+  2 GB or on a small VPS and `opcache.max_accelerated_files` from the real
+  PHP file count; Angie `directio 16m` on flash, gzip level from the CPU
+  rule, VPS worker-connection factor, `worker_cpu_affinity` dropped under a
+  cgroup quota, upstream keepalive from the pool size actually written;
+  MariaDB buffer-pool floor `clamp(RAM/16, 256 MB, 4 GB)` for an empty or
+  unmeasured database and Aria page cache from RAM; Elasticsearch
+  `node.processors` (two dead keys removed); udev I/O rules for every whole
+  disk by rotational flag.
+- **Fewer restarts.** The redo log, `tmp_table_size` and
+  `max_heap_table_size` join the buffer pool in the online `SET GLOBAL`
+  path; an unchanged managed crontab is no longer reinstalled (every
+  `--optimize` had rewritten its header timestamp); the proxy/CDN caches
+  follow the "never shrink a populated cache" rule.
+- **Rollbacks.** PHP and Angie `--optimize` failures restore the unit
+  drop-ins and `/etc/default/angie` too; install-time rollbacks use the same
+  snapshot restore as `--optimize` (files added after the snapshot are moved
+  out of the tree, `php-fpm -t` before the restart); one
+  `opt_restart_service` helper for the MariaDB/Valkey/Elasticsearch restart,
+  probe and rollback; `--restart-all` reuses the pause/resume and readiness
+  helpers.
+- **Purge and provisioning.** `--purge basic` restores the previous CPU
+  governor (recorded; the unit is disabled), the `unattended-upgrades` file
+  and unit state, and only the `127.0.1.1` line of `/etc/hosts`;
+  `limits.conf` is restored only when it provably holds our old copy; one
+  `daemon-reload` after both oneshot units. `--domain sql=` refuses a dump
+  that switches to another schema and re-plans Valkey/Elasticsearch after
+  the import; an existing site tree is no longer re-chowned on every run.
+  WordPress guest cache is decided per vhost (a removed include is an
+  opt-out; `SETUP_WP_GUEST_CACHE=1` adds it) instead of being re-enabled
+  through the shared `php_wp.conf`.
+- **CLI/state.** `--mariadb size=`/`--valkey ram=` under 128 MB and
+  `io_threads` above 8 are clamped with a warning; run logs and
+  `diagnostics.log` are handed to the `sudo` user; `persist_tuning_var`/
+  `explicit_option_set` escape sed metacharacters; `--optimize` refreshes the
+  APT lists once before its single `cpufrequtils` install; the sample
+  `mysqlbkup.cnf` is mode 600 before it holds the password.
+- **Measured and fixed:** `max_connections` allows one extra connection per PHP worker for every XenForo config on a persistent (`p:`) host (144 workers with XenForo on `p:localhost` plus WordPress exhausted the 230 ceiling and WordPress answered "Too many connections"); the optimize report no longer tells WordPress operators to set `DB_HOST` to `p:localhost` (core parses it as host `p` and the site returns 500) and flags such a value as broken instead.
+- **Shared helpers:** `mariadb_ensure_local_user`, `restore_snapshot_dir`,
+  `opt_restart_service`, `elasticsearch_wait_http`, `es_json_num/str`,
+  `php_ini_profile`, `classify_block_device`, `sysctl_file_keys`,
+  `cnf_key_bytes`, `angie_restore_live`, `tune_insert_before`; the XenForo
+  guest-cache block is rendered and repaired from one directive list. The
+  dry-run matrix grows from 106 to 159 cases and the tuning suite covers the
+  new helpers.
+
 ## 1.12.0 (2026-11-09)
 
 Validated on the dev-host development host (16 threads / 27 GiB / NVMe, Ubuntu

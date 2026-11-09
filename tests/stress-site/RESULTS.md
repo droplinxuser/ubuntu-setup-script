@@ -1,6 +1,130 @@
 # Full-stack stress test reports
 
 
+## setup.sh 1.13.0 - dev-host audit, refactor validation and authenticated-tier tuning (2026-11-09)
+
+Host: dev-host, 16 threads / 27.2 GiB / NVMe, Ubuntu 26.04.1, wiped to the
+557-package baseline. Fresh install with the local checkouts (`--basic
+--angie --php --mariadb --valkey --elastic --others all --domain
+xf.test.local app=xf ... --domain wp.test.local app=wordpress ...`, 97 s)
+followed by `--optimize` (11 s): the 308-file configuration snapshots were
+identical except the root crontab, whose vixie header timestamp changed on
+every run because `write_cron` reinstalled an unchanged crontab (fixed in
+1.13.0; a repeat `--optimize` now changes no file at all). XenForo 2.3.13
+(50 members / 150 threads / 2,400 posts) and WordPress 7.1.4 (10
+subscribers / 200 posts / 996 comments) were installed into the vhosts plus
+the synthetic `stress.invalid` site; the next `--optimize` enabled the
+WordPress guest cache and hardened `wp-config.php`. The pool stayed at 144
+workers (16 per core): the application cap (4 per core) applies only when
+every PHP vhost is XenForo/WordPress, and the synthetic site is neither.
+
+Load generator: `oha` from an Apple-silicon Mac over Wi-Fi, 15 s per
+scenario, 200 connections (100 for uncached/member tiers), the Mac exempted
+from Angie's rate limiter; `collect-metrics.sh` sampled the server. Health
+counters (segfaults, `max children reached`, Angie/MariaDB error and slow
+logs, journal errors) stayed at zero in every run except one XenForo
+`request_slowlog_timeout` trace (below).
+
+### Before and after the 1.13.0 refactor (same application state, PHP 8.5.12)
+
+| Scenario | 1.12.0 code req/s (p50 / p99 ms) | 1.13.0 code req/s (p50 / p99 ms) |
+|---|---:|---:|
+| static | 20262 (9.6 / 17) | 20761 (9.4 / 14) |
+| php-hello | 20122 (7.7 / 12) | 18045 (7.7 / 56) |
+| mariadb-json | 16404 (8.9 / 15) | 15807 (8.8 / 15) |
+| valkey-json | 15503 (8.9 / 21) | 16605 (8.8 / 15) |
+| elasticsearch | 8825 (9.6 / 34) | 8236 (9.9 / 37) |
+| node-proxy | 17273 (11 / 23) | 15477 (12 / 23) |
+| full-uncached | 6880 (20 / 38) | 6371 (22 / 40) |
+| full-cached | 19650 (9.7 / 20) | 22657 (8.6 / 15) |
+| xf-guest (cached) | 8335 (22 / 42) | 8341 (23 / 41) |
+| xf-guest-uncached | 1074 (93 / 128) | 1060 (94 / 134) |
+| xf-member | 926 (108 / 148) | 845 (110 / 237) |
+| xf-member-thread | 301s (bad URL) | 469 (226 / 285) |
+| wp-guest (cached) | 4548 (41 / 89) | 4401 (45 / 80) |
+| wp-guest-uncached | 251 (410 / 506) | 250 (413 / 486) |
+| wp-member | 247 (425 / 553) | 243 (434 / 716) |
+| wp-member-post | 223 (469 / 628) | 219 (478 / 583) |
+
+The link-bound tiers move within the Wi-Fi noise band (the 1.12.0 column
+ran while nothing else happened; the 1.13.0 full suite overlapped a
+`test-tuning.sh` run on the host, and the XenForo/WordPress rows were
+repeated on the idle host). The only real difference is `xf-member`: its
+p99 doubled because XenForo's *Trending content* widget enqueued its job
+(`XF\Job\Manager::_enqueue` on `xf_job`) under 100 concurrent members and
+one request waited more than 10 s on that row lock (the single slow-log
+entry). The 1.13.0 host changes measured here: `vm.swappiness=1`,
+`ip_local_reserved_ports`, `netdev_budget 600/8000`, `directio 16m`,
+`opcache.max_accelerated_files` 128256 -> 16384 (9.6k PHP files x 1.5,
+rounded up by PHP to 32531 buckets), Aria page cache 108 -> 217 MB,
+`node.processors: 16`. None of them moved a CPU-bound tier.
+
+### Authenticated tier: what actually helps (PHP 8.5.12, idle host, 100 connections)
+
+| Step | xf-guest-uncached | xf-member | xf-member-thread | wp-guest-uncached | wp-member |
+|---|---:|---:|---:|---:|---:|
+| widgets on, `localhost`, no cache | 1060 (94 / 134) | 845 (110 / 237) | 469 (226 / 285) | 250 (413 / 486) | 243 (434 / 716) |
+| Members online / Trending / Featured widgets off | 1222 (75 / 185) | **1129 (88 / 123)** | 476 (223 / 282) | 253 (406 / 492) | 250 (426 / 528) |
+| + XenForo `p:localhost` (persistent MariaDB) | **1328 (75 / 102)** | 1110 (90 / 131) | 459 (226 / 311) | WordPress 500 | WordPress 500 |
+| + XenForo Valkey cache + sessions (Unix socket) | 1339 (74 / 102) | 1125 (89 / 121) | 467 (223 / 318) | - | - |
+| Valkey + persistent, widgets back on | 1048 (95 / 127) | 912 (109 / 155) | 468 (223 / 295) | - | - |
+
+- The three sidebar widgets cost a third of the authenticated throughput
+  (845 -> 1129 req/s) and most of the tail latency; the forum list without
+  them is CPU-bound in PHP, not in MariaDB. The report already recommended
+  this; it is now backed by numbers from this host.
+- A persistent MariaDB connection for XenForo adds 8-9% on the uncached
+  guest page (one TCP/auth handshake less per request); the member page is
+  unchanged (its cost is template rendering).
+- XenForo's Redis provider on the local Valkey socket (registry cache plus
+  sessions, 40 keys) is neutral on a single host with a local database,
+  matching the 1.11.0 finding; it is a multi-node tool.
+- **`define('DB_HOST', 'p:localhost')` breaks WordPress.**
+  `wpdb::parse_db_host()` splits the value at the first colon and connects
+  to host `p`, so every page is "Error establishing a database connection"
+  (HTTP 500 for the whole run). The optimize report used to recommend it;
+  1.13.0 flags a `p:` WordPress host as broken instead and no longer counts
+  a plain host as an issue (WordPress core has no persistent-connection
+  option).
+- The thread page (476 req/s, 223 ms) is the slowest XenForo member tier
+  and did not move with any setting: it renders 15 posts with bbcode and
+  attachments per request and is pure PHP CPU.
+
+### PHP 8.4 OPcache JIT through the script's own switches (XenForo, widgets off, persistent + Valkey)
+
+The host was moved to PHP 8.4.27 with `--purge --php ver=8.5` and `--basic
+--php ver=8.4` (64 s; both sites kept working on the new socket), then
+`SETUP_PHP_JIT` drove `--optimize` (graceful PHP reload each time, the
+OPcache file cache wiped before the measurement; the `[PATH=]` section kept
+`opcache.jit` off for the WordPress root, verified with the status probe:
+XenForo root `on=true`, WordPress root `on=false`, 837 KB compiled).
+
+| Scenario | JIT off | tracing (WordPress roots off) | tracing everywhere |
+|---|---:|---:|---:|
+| xf-guest-uncached | 1109 (89 / 130) | 1132 (88 / 123) | 1110 (88 / 145) |
+| xf-member | 959 (104 / 156) | 978 (102 / 150) | 980 (102 / 145) |
+| xf-member-thread | 485 (216 / 288) | **509 (207 / 281)** | 506 (207 / 280) |
+
+The tracing JIT is worth 2-5% on the XenForo tiers on 8.4 (the thread page
+most, as in 1.12.0) and nothing crashed; the default stays off because the
+gain is small and the php-fpm 8.3 segfault on a live WordPress site still
+stands. The WordPress rows of this run are not reported: they answered
+"Too many connections" for 80% of the requests, which exposed the last
+1.13.0 fix below.
+
+### `max_connections` and persistent connections (found by this run)
+
+With XenForo on `p:localhost`, each of the 144 PHP workers keeps one MariaDB
+connection open for its lifetime; the WordPress requests served by the same
+workers then open a second, transient connection, so the pool needed up to
+288 connections against the `workers x 1.25 + 50 = 230` ceiling
+(`Max_used_connections` 231, `Aborted_connects` 26,713). 1.13.0 counts the
+XenForo configs with a persistent host and allows one extra connection per
+worker for each of them (`144 x (1 + 1) x 1.25 + 50 = 410` here); the
+optimize report says so. The clean WordPress JIT comparison was not repeated
+in this session (credit limit); the 1.12.0 table for PHP 8.4 remains the
+reference (JIT off vs tracing within 3-4% on WordPress).
+
 ## setup.sh 1.12.0 - dev-host re-validation and OPcache JIT benchmark (2026-11-09)
 
 Host: dev-host, 16 threads / 27.2 GiB / NVMe, Ubuntu 26.04.1, wiped to the
