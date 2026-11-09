@@ -1,6 +1,6 @@
-# dev-host test-run manifest - 2026-11-09 (setup.sh 1.13.1 -> 1.14.0)
+# Dev-host test-run manifest - 2026-11-09 (setup.sh 1.13.1 -> 1.14.0)
 
-Host: devhost.example, Ubuntu 26.04.1 LTS, 16 threads (8 cores), 27.2 GiB RAM,
+Host: dev host (LAN), Ubuntu 26.04.1 LTS, 16 threads (8 cores), 27.2 GiB RAM,
 931 GB NVMe (CT1000P3PSSD8), bare metal.
 Baseline: 557 packages (captured in /root/baseline before testing).
 Final:    557 packages, identical set; 0 added, 0 missing; 0 novel /etc files.
@@ -64,7 +64,7 @@ Files/directories added (120 files under /etc, plus data/cache paths):
 Modified then restored (setup.sh recorded originals in /var/lib/setup.sh and
 `--purge all` wrote them back; verified by the managed-key sysctl diff):
   /etc/sysctl.conf, /etc/security/limits.conf, /etc/apt/apt.conf.d/20auto-upgrades,
-  /etc/hosts (127.0.1.1 line), /etc/hostname (dev-host), /etc/default/ufw (rules),
+  /etc/hosts (127.0.1.1 line), /etc/hostname (dev host), /etc/default/ufw (rules),
   root crontab (managed block removed), CPU governor (powersave),
   timezone (America/Los_Angeles re-applied).
 

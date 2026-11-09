@@ -36,7 +36,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.14.1"
+readonly SCRIPT_VERSION="1.15.0"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -97,6 +97,23 @@ if [[ -n ${SETUP_PHP_JIT_WORDPRESS+x} ]]; then
 fi
 [[ $PHP_JIT_WORDPRESS == 0 ]] || PHP_JIT_WORDPRESS=1
 [[ $PRECOMPRESS_ASSETS == 1 ]] || PRECOMPRESS_ASSETS=0
+# XenForo job runner.  XenForo runs its job queue (cron tasks, search
+# indexing, XFMG video transcoding) inside member page requests by default
+# ("Job run trigger: activity-based").  With the admin option switched to
+# server-based, a scheduler has to run `cmd.php xf:run-jobs` instead, so
+# setup.sh installs one managed crontab entry that runs the queue of every
+# XenForo root under /var/www once a minute as the PHP user.  Running it as
+# www-data also stops the root-owned data directories a root CLI run leaves
+# behind (Angie then returns 403 for every file below them; 16% of the
+# requests on one audited host).  SETUP_XF_JOB_CRON=0 drops the entry and is
+# persisted in the same host file (XF_JOB_CRON).
+XF_JOB_CRON="${XF_JOB_CRON:-1}"
+XF_JOB_CRON_PERSIST=0
+if [[ -n ${SETUP_XF_JOB_CRON+x} ]]; then
+  XF_JOB_CRON=$SETUP_XF_JOB_CRON
+  XF_JOB_CRON_PERSIST=1
+fi
+[[ $XF_JOB_CRON == 0 ]] || XF_JOB_CRON=1
 # Node.js major installed by --others nodejs.  NodeSource publishes one APT
 # line per major, so this value decides what `apt-get install nodejs` resolves
 # to.  A major change swaps NODE_MODULE_VERSION (the native-addon ABI), so a
@@ -144,6 +161,11 @@ readonly CRON_PRECOMPRESS='/usr/local/bin/setup-precompress.sh'
 # (DISABLE_WP_CRON), this managed entry runs every site's wp-cron.php as the
 # PHP user so scheduled posts, updates and plugin jobs still fire.
 readonly CRON_WP_CRON='/usr/bin/find /var/www -maxdepth 6 -type f -name wp-config.php ! -path "*/mysql_database/*" ! -path "*/backup*/*" ! -path "*/.old/*" -exec /usr/bin/dirname {} \; | while IFS= read -r d; do [ -f "$d/wp-cron.php" ] && /usr/sbin/runuser -u www-data -- /usr/bin/php "$d/wp-cron.php"; done || true'
+# XenForo job runner (XF_JOB_CRON): every XenForo root under /var/www runs its
+# queue once a minute as the PHP user.  --max-execution-time keeps one run
+# inside the minute; XenForo's own job lock prevents overlapping runners.
+# No "%" may appear here: crontab treats it as a newline.
+readonly CRON_XF_JOBS='/usr/bin/find /var/www -maxdepth 6 -type f -path "*/src/config.php" ! -path "*/mysql_database/*" ! -path "*/backup*/*" ! -path "*/.old/*" -exec /usr/bin/dirname {} \; | while IFS= read -r d; do r=$(/usr/bin/dirname "$d"); [ -f "$r/cmd.php" ] && [ -f "$d/XF.php" ] && /usr/sbin/runuser -u www-data -- /usr/bin/php "$r/cmd.php" xf:run-jobs --max-execution-time=50 >/dev/null 2>&1; done || true'
 readonly MARIADB_BEGIN="# BEGIN setup.sh managed mariadb"
 readonly MARIADB_END="# END setup.sh managed mariadb"
 readonly ES_BEGIN="# BEGIN setup.sh managed elasticsearch"

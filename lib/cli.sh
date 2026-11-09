@@ -135,6 +135,8 @@ Security hardening (runs automatically):
       - add DISALLOW_FILE_EDIT, DISALLOW_FILE_MODS, DISABLE_WP_CRON,
         WP_DEBUG_DISPLAY=false and FORCE_SSL_ADMIN when missing
       - add the managed wp-cron.php crontab entry before disabling WP-Cron
+      - add the managed xf:run-jobs crontab entry (every minute, as www-data)
+        for every XenForo root; SETUP_XF_JOB_CRON=0 removes it
       - move a WordPress database user with global privileges to a per-site
         account limited to its own database (SETUP_WP_DB_SPLIT=0 disables)
       - quarantine known webshells/malware and report risky plugins,

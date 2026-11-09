@@ -324,6 +324,54 @@ check "bare legacy chown is replaced by the safe managed line" \
 check "unrelated cron entry is preserved" \
   cron_contains "$(cat "$CRON_OUT")" '/bin/true'
 
+# XenForo job runner: one managed entry while XF_JOB_CRON=1 and a root exists;
+# a stale entry is dropped when the option is off or no root remains.
+cat > "$CRON_IN" <<'EOF'
+# BEGIN setup.sh managed cron
+* * * * * /usr/bin/find /var/www -name stale-entry -exec php cmd.php xf:run-jobs \; >/dev/null 2>&1
+# END setup.sh managed cron
+EOF
+(
+  cron_angie_configured() { return 1; }
+  cron_mariadb_configured() { return 1; }
+  app_find_xenforo_configs() { printf '%s\n' /var/www/xf.example/public/src/config.php; }
+  command() { if [[ ${1:-} == -v && ${2:-} == php ]]; then return 0; fi; builtin command "$@"; }
+  XF_JOB_CRON=1
+  crontab() { fake_crontab "$@"; }
+  write_cron
+) >/dev/null 2>&1
+check "XenForo root gets the managed xf:run-jobs entry every minute" \
+  cron_contains "$(cat "$CRON_OUT")" "* * * * * ${CRON_XF_JOBS}"
+check "stale xf:run-jobs entry is replaced, not duplicated" \
+  test "$(grep -c 'xf:run-jobs' "$CRON_OUT")" = 1
+(
+  cron_angie_configured() { return 1; }
+  cron_mariadb_configured() { return 1; }
+  app_find_xenforo_configs() { printf '%s\n' /var/www/xf.example/public/src/config.php; }
+  command() { if [[ ${1:-} == -v && ${2:-} == php ]]; then return 0; fi; builtin command "$@"; }
+  XF_JOB_CRON=0
+  crontab() { fake_crontab "$@"; }
+  write_cron
+) >/dev/null 2>&1
+check "XF_JOB_CRON=0 drops the xf:run-jobs entry" \
+  cron_not_contains "$(cat "$CRON_OUT")" 'xf:run-jobs'
+(
+  cron_angie_configured() { return 1; }
+  cron_mariadb_configured() { return 1; }
+  app_find_xenforo_configs() { :; }
+  XF_JOB_CRON=1
+  crontab() { fake_crontab "$@"; }
+  write_cron
+) >/dev/null 2>&1
+check "no XenForo root, no xf:run-jobs entry" \
+  cron_not_contains "$(cat "$CRON_OUT")" 'xf:run-jobs'
+check "CRON_XF_JOBS runs the queue as www-data with a per-run time limit" \
+  bash -c '[[ $0 == *"runuser -u www-data -- /usr/bin/php"*"xf:run-jobs --max-execution-time=50"* ]]' "$CRON_XF_JOBS"
+check "CRON_XF_JOBS contains no percent sign (crontab newline)" \
+  bash -c '[[ $0 != *%* ]]' "$CRON_XF_JOBS"
+check "CRON_XF_JOBS skips database dumps, backups and .old copies" \
+  bash -c '[[ $0 == *mysql_database* && $0 == *backup* && $0 == *.old* ]]' "$CRON_XF_JOBS"
+
 cat > "$CRON_IN" <<'EOF'
 # BEGIN setup.sh managed cron
 0 0 * * * /etc/angie/scripts/cloudflare.sh
@@ -779,7 +827,7 @@ check "client_body_buffer_size is inside the http block and sized for RAM" \
 check "worker_rlimit_nofile is inserted after worker_processes" \
   test "$(awk '/^worker_processes/{getline; print}' "$TMP/angie/angie.conf")" = \
        "$(grep 'worker_rlimit_nofile' "$TMP/angie/angie.conf")"
-# Idle FastCGI upstream connections pin PHP-FPM workers (see the live live-origin.example
+# Idle FastCGI upstream connections pin PHP-FPM workers (see the live-origin
 # audit): the tuner must remove the cache inside `upstream local_php` and
 # leave the http-level keepalive_timeout alone.
 check "PHP upstream keepalive cache is removed" \
@@ -2302,15 +2350,15 @@ check "php_plan_max_children falls back to the 96 MB divisor of a standalone bud
 check "php_plan_max_children falls back to the hardware ceiling" \
   test "$(php_plan_max_children 16 27812 "" "" 0)" = 144
 
-# Brotli level: explicit, else 5, or 4 on a 1-2 CPU host.
+# Brotli level: explicit, else 4, or 3 on a 1-2 CPU host.
 effective_cpus() { printf 16; }
 check "angie_brotli_level honours SETUP_BROTLI_LEVEL" \
   test "$(SETUP_BROTLI_LEVEL=7 angie_brotli_level)" = 7
 check "angie_brotli_level ignores an invalid SETUP_BROTLI_LEVEL" \
-  test "$(SETUP_BROTLI_LEVEL=99 angie_brotli_level)" = 5
+  test "$(SETUP_BROTLI_LEVEL=99 angie_brotli_level)" = 4
 effective_cpus() { printf 2; }
-check "angie_brotli_level drops to 4 on a 2 CPU host" \
-  test "$(angie_brotli_level)" = 4
+check "angie_brotli_level drops to 3 on a 2 CPU host" \
+  test "$(angie_brotli_level)" = 3
 effective_cpus() { printf 16; }
 
 # --basic server= is persisted and honoured by host_server_type.
@@ -2583,13 +2631,13 @@ php_ini_profile garbage
 check "php_ini_profile falls back to the 1 GB profile on garbage" \
   test "$PHP_PROFILE_OPCACHE_MB" -eq 128 -a "$PHP_PROFILE_MEMORY_MB" -eq 128 -a "$PHP_PROFILE_REALPATH_KB" -eq 4096
 
-# gzip level: explicit, else 5, or 4 on a 1-2 CPU host.
+# gzip level: explicit, else 4, or 3 on a 1-2 CPU host.
 check "angie_gzip_level honours SETUP_GZIP_LEVEL" \
   test "$(SETUP_GZIP_LEVEL=7 angie_gzip_level)" = 7
-check "angie_gzip_level ignores an invalid SETUP_GZIP_LEVEL and drops to 4 on 2 CPUs" \
-  test "$(effective_cpus() { printf 2; }; SETUP_GZIP_LEVEL=bogus angie_gzip_level)" = 4
-check "angie_gzip_level defaults to 5 on 8 CPUs" \
-  test "$(effective_cpus() { printf 8; }; SETUP_GZIP_LEVEL='' angie_gzip_level)" = 5
+check "angie_gzip_level ignores an invalid SETUP_GZIP_LEVEL and drops to 3 on 2 CPUs" \
+  test "$(effective_cpus() { printf 2; }; SETUP_GZIP_LEVEL=bogus angie_gzip_level)" = 3
+check "angie_gzip_level defaults to 4 on 8 CPUs" \
+  test "$(effective_cpus() { printf 8; }; SETUP_GZIP_LEVEL='' angie_gzip_level)" = 4
 
 es_json='{"cluster":{"number_of_nodes": 3,"status" : "green","x":{"size_in_bytes":123456}}}'
 check "es_json_num reads a spaced numeric field" test "$(es_json_num "$es_json" number_of_nodes)" = 3

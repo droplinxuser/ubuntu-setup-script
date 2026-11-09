@@ -107,7 +107,7 @@ denies, no PHP from upload directories, security headers) comes from
 
 ### Angie (`--angie`)
 
-Installs `angie` and `angie-module-brotli` (dynamic Brotli level 5, gzip
+Installs `angie` and `angie-module-brotli` (dynamic Brotli level 4, 3 on 1-2 CPU hosts; gzip
 fallback; `SETUP_BROTLI_LEVEL=1..11`, `SETUP_ANGIE_COMPRESSION=0`), deploys the
 `server-configs-nginx` tree with the built-in deployer, applies the hardware
 profile and guest caches (the same `angie_apply_profile` as `--optimize`),
@@ -116,8 +116,13 @@ repository, generates `http.d/cloudflare.conf` and restarts the service.
 `SETUP_PRECOMPRESS_ASSETS=1` (persisted as `PRECOMPRESS_ASSETS` in
 `/etc/default/setup-tuning`) writes `.br`/`.gz` siblings for the static assets
 of every XenForo/WordPress root and keeps them fresh from cron; off by default
-because a CDN normally serves assets. `CONFIG_REPO_URL`/`CONFIG_REPO_REF`
-select a fork or branch.
+because a CDN normally serves assets. Every XenForo root also gets a managed
+crontab entry that runs `cmd.php xf:run-jobs` once a minute as www-data
+(`SETUP_XF_JOB_CRON=0` removes it, persisted as `XF_JOB_CRON`); switch
+*Options > Performance > Job run trigger* to server-based in the admin CP so
+member page requests stop running the queue (and never run the queue as root:
+the data directories it creates return 403 through Angie).
+`CONFIG_REPO_URL`/`CONFIG_REPO_REF` select a fork or branch.
 
 ### PHP (`--php [ver=8.5] [children=auto|N] [max_requests=N]`)
 
@@ -149,8 +154,9 @@ select a fork or branch.
   (a conservative set on 1-2 CPU hosts, each value overridable with
   `SETUP_PHP_JIT_HOT_{LOOP,FUNC,RETURN,SIDE_EXIT}`); there is no mode switch
   (an old `SETUP_PHP_JIT` or persisted `PHP_JIT` value is ignored with a
-  notice). The buffer is reserved per worker, so OPcache/8 keeps 32 workers at
-  2 GiB instead of 4 GiB. WordPress roots use it too;
+  notice). The buffer is carved out of the OPcache shared-memory segment,
+  one per pool rather than per worker, so it costs 32-128 MB once; larger
+  buffers measured slower. WordPress roots use it too;
   `SETUP_PHP_JIT_WORDPRESS=0` (persisted as `PHP_JIT_WORDPRESS`) keeps
   `opcache.jit = off` for every WordPress document root through a
   `[PATH=<root>]` section of the managed ini (applied per request by php-fpm,
@@ -337,7 +343,7 @@ data directory (NVMe / SSD / HDD) and the host class (`dedi`/`vps`).
 
 Environment overrides persisted in `/etc/default/setup-tuning`:
 `SETUP_LIMIT_REQ_EXEMPT="ip,cidr,..."` (rate-limit exemptions for a load
-generator or monitor; empty clears), `SETUP_PRECOMPRESS_ASSETS=0|1`,
+generator or monitor; empty clears), `SETUP_PRECOMPRESS_ASSETS=0|1`, `SETUP_XF_JOB_CRON=0|1`,
 `SETUP_PHP_JIT_WORDPRESS` (0 exempts WordPress roots from the always-on tracing JIT), `SETUP_NODE_MAJOR`. Others:
 `SETUP_MARIADB_IO_CAPACITY`, `SETUP_BROTLI_LEVEL`, `SETUP_GZIP_LEVEL`,
 `SETUP_ANGIE_COMPRESSION`, `SETUP_PHP_SESSION_HARDENING`, `SETUP_WP_DB_SPLIT`,

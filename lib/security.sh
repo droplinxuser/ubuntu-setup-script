@@ -426,6 +426,11 @@ audit_app_persistent_connections() {
       opt_report "  - Valkey is not using the local socket; set \`\$config['cache']['config']['host'] = '${socket_hint}';\` and \`\$config['cache']['config']['port'] = 0;\`"
       issues=$((issues + 1))
     fi
+    if (( XF_JOB_CRON )); then
+      opt_report "  - Jobs: the managed crontab runs \`cmd.php xf:run-jobs\` every minute as www-data; set *Options > Performance > Job run trigger* to server-based so member page requests stop running the queue (SETUP_XF_JOB_CRON=0 removes the entry)."
+    else
+      opt_report "  - Jobs: no managed runner (XF_JOB_CRON=0); the queue runs inside page requests."
+    fi
   done < <(app_find_xenforo_configs)
 
   if (( found == 0 )); then
@@ -1883,6 +1888,8 @@ optimize_plan() {
       "$(angie_brotli_level)"
     printf '  Angie static assets: precompressed .br/.gz siblings %s (SETUP_PRECOMPRESS_ASSETS)\n' \
       "$( (( PRECOMPRESS_ASSETS )) && printf on || printf off )"
+    printf '  XenForo jobs: managed xf:run-jobs crontab %s for every XenForo root (SETUP_XF_JOB_CRON)\n' \
+      "$( (( XF_JOB_CRON )) && printf on || printf off )"
     printf '  Angie repository: sync %s (%s), then apply the hardware profile\n' \
       "${CONFIG_REPO_URL}" "${CONFIG_REPO_REF}"
   fi
