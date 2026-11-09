@@ -2297,20 +2297,34 @@ record_sysctl_values() {
   done
 }
 
+# Restore a ratio/bytes sysctl pair: write the member that was recorded
+# non-zero (writing it resets the other to 0, which is the recorded state).
+restore_sysctl_pair() {
+  local ratio_key=$1 bytes_key=$2 rv="" bv="" f
+  f="${STATE_DIR}/sysctl-orig-${ratio_key}"; [[ -s $f ]] && rv=$(<"$f")
+  f="${STATE_DIR}/sysctl-orig-${bytes_key}"; [[ -s $f ]] && bv=$(<"$f")
+  if [[ $rv =~ ^[0-9]+$ ]] && (( rv > 0 )); then
+    sysctl -w "${ratio_key}=${rv}" >/dev/null 2>&1 || warn "Could not restore ${ratio_key}=${rv}"
+  elif [[ $bv =~ ^[0-9]+$ ]] && (( bv > 0 )); then
+    sysctl -w "${bytes_key}=${bv}" >/dev/null 2>&1 || warn "Could not restore ${bytes_key}=${bv}"
+  fi
+}
+
 restore_sysctl_values() {
   local key file value
-  # Order matters for paired keys.  ipfrag_low_thresh must be written after
-  # ipfrag_high_thresh (the kernel rejects a low mark above the live high
-  # mark).  vm.dirty_bytes and vm.dirty_ratio must be restored before their
-  # background counterparts: writing dirty_background_bytes=0 re-enables the
-  # background ratio, which the kernel rejects while the still-live
-  # dirty_bytes is below that ratio's threshold (--purge logged "Could not
-  # restore vm.dirty_background_bytes=0").  Foreground dirty keys first, then
-  # everything else, then the low fragment threshold.
-  local -a ordered=(vm.dirty_bytes vm.dirty_ratio)
+  # Paired keys need care.  The dirty thresholds come as ratio/bytes pairs
+  # and writing one zeroes the other, so a recorded 0 is never written back
+  # (the tune wrote bytes, which zeroed the live ratio; restoring bytes=0 then
+  # left no threshold and --purge logged "Could not restore vm.dirty_bytes=0").
+  # Each pair restores whichever recorded value is non-zero, foreground pair
+  # first.  ipfrag_low_thresh is written after ipfrag_high_thresh (the kernel
+  # rejects a low mark above the live high mark).
+  restore_sysctl_pair vm.dirty_ratio vm.dirty_bytes
+  restore_sysctl_pair vm.dirty_background_ratio vm.dirty_background_bytes
+  local -a ordered=()
   for key in "${SYSCTL_MANAGED_KEYS[@]}"; do
     case $key in
-      vm.dirty_bytes|vm.dirty_ratio|net.ipv4.ipfrag_low_thresh) continue ;;
+      vm.dirty_bytes|vm.dirty_ratio|vm.dirty_background_bytes|vm.dirty_background_ratio|net.ipv4.ipfrag_low_thresh) continue ;;
     esac
     ordered+=("$key")
   done
