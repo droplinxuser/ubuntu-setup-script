@@ -20,7 +20,8 @@ Elasticsearch, Node.js and helper tools, plus per-domain vhosts.
 
 | Path | Contents |
 |---|---|
-| `setup.sh` | Installer, optimizer, diagnostics, restart-all, purge |
+| `setup.sh` | Driver: argument parsing, validation and dispatch; sources `lib/*.sh` |
+| `lib/` | Implementation modules sourced in dependency order: `common` (logging, run log, temp/apt helpers), `cli`, `validate`, `util` (state, logs, cron), `os`, `web` (Angie/PHP-FPM tuning), `services` (repos, PHP, MariaDB, Valkey, Elasticsearch, domains), `purge`, `runner`, `optimize`, `security`, `diagnostics`, `restart`, `payloads` |
 | `configs/system/`, `configs/mariadb/`, `configs/php/` | DNS/sysctl/limits, MariaDB and PHP-FPM templates |
 | `tests/test-tuning.sh`, `tests/test-dry-run-matrix.sh` | Unit tests for the tuning helpers; CLI/dry-run matrix (both run in CI) |
 | `tests/stress-site/` | Synthetic full-stack test site, local and remote load harness, results |
@@ -75,7 +76,8 @@ normal user without touching the system. Other modes: `--diagnostics`,
 | `swap=SIZE` | add swap only when total swap is 0 or below 50% of RAM, up to 50% of RAM (1-8 GiB, 4 GiB on a VPS) | `/swapfile` of exactly that size (`8G`, `8Gi`, `512M`) |
 | `time=REGION/CITY` | `Asia/Manila` | timezone |
 
-It writes the DNS drop-in (`8.8.8.8`, `1.1.1.1`), upgrades packages, installs
+It writes the DNS drop-in (`8.8.8.8`, `1.1.1.1`, with `Domains=~.` so they are
+the default route rather than only a fallback), upgrades packages, installs
 the basic tools and `cron`/`logrotate`/`unattended-upgrades`, applies the OS
 profile (sysctl, PAM limits, governor, THP `madvise`, udev I/O rules, see
 [Hardware profile](#hardware-profile)), writes the managed root crontab
@@ -143,17 +145,22 @@ select a fork or branch.
   commented out (PHP-FPM caches admin values per worker, so one vhost's
   setting leaked onto every other vhost of the shared pool).
 - **OPcache JIT** is always the tracing JIT for the pool, with a buffer of
-  OPcache/4 (32-256 MB); there is no mode switch (an old `SETUP_PHP_JIT` or
-  persisted `PHP_JIT` value is ignored with a notice). WordPress roots use it
-  too; `SETUP_PHP_JIT_WORDPRESS=0` (persisted as `PHP_JIT_WORDPRESS`) keeps
+  OPcache/8 (32-128 MB) and PHP's default hotness thresholds on 4+ CPU hosts
+  (a conservative set on 1-2 CPU hosts, each value overridable with
+  `SETUP_PHP_JIT_HOT_{LOOP,FUNC,RETURN,SIDE_EXIT}`); there is no mode switch
+  (an old `SETUP_PHP_JIT` or persisted `PHP_JIT` value is ignored with a
+  notice). The buffer is reserved per worker, so OPcache/8 keeps 32 workers at
+  2 GiB instead of 4 GiB. WordPress roots use it too;
+  `SETUP_PHP_JIT_WORDPRESS=0` (persisted as `PHP_JIT_WORDPRESS`) keeps
   `opcache.jit = off` for every WordPress document root through a
   `[PATH=<root>]` section of the managed ini (applied per request by php-fpm,
   so it cannot leak like a FastCGI param) for a site that misbehaves with the
   JIT. `opcache.file_cache` stays empty, because scripts restored from the
   file cache are never JIT-compiled. Measured on the test host (XenForo
-  2.3.13 + WordPress 7.1.4): the Sury PHP 8.5.12 build compiles nothing; on
-  PHP 8.4 `tracing` gained 2-5% on every CPU-bound XenForo tier with no
-  crash, and `function` was equal or slower. The pool is always `pm = static`.
+  2.3.13 + WordPress 7.1.4, PHP 8.5.12, 32 workers, 20 s runs, 100 members):
+  tracing beat JIT off by 5% on XenForo members (910 vs 864 req/s, p50 69 vs
+  73 ms); `function` lost 6-8% and had a 554 ms p99; 64 MB and 128 MB buffers
+  were within 0.5%, and 256 MB was slower. The pool is always `pm = static`.
 - Session/cgi hardening (`session.*` strict settings, `cgi.fix_pathinfo=0`,
   `display_errors=Off`, central `error_log`) is **opt-in**:
   `SETUP_PHP_SESSION_HARDENING=1`. It broke Joomla/Polr logins on a mixed
@@ -197,7 +204,8 @@ single host (XF's Redis cache measured 27% slower there) and use
   `mariadbd --help --verbose` before any restart.
 - Creates the admin user for `localhost`, `127.0.0.1` and `::1` (needed with
   `skip_name_resolve`), installs the embedded `mysqltuner.pl` and
-  `mysqlbackup` utility (`/etc/mysqlbkup.cnf`, 30 dumps kept). TCP 3306 is
+  `mysqlbackup` utility (`/etc/mysqlbkup.cnf`, 30 dumps kept; a re-run keeps
+  an existing `/etc/mysqlbkup.config`). TCP 3306 is
   never opened; `bind=IPV4` resolves the public address and falls back to the
   local outbound IPv4 behind NAT.
 
@@ -319,7 +327,7 @@ data directory (NVMe / SSD / HDD) and the host class (`dedi`/`vps`).
 
 | Area | Rule |
 |---|---|
-| PHP-FPM | 16 workers per core (VPS 8), at most RAM/2 at 96 MB each, 512 max, floor `min(8, RAM/2/96)`; 4 per core (VPS 3) on a XenForo/WordPress host with a local database; live count kept; `children=` wins. `pm = static` always. `opcache.max_accelerated_files` = PHP files under the vhost roots x 1.5 (16384..128256; the ceiling when no root is found); `memory_limit`, OPcache and realpath sizes from one RAM profile shared with the dry run |
+| PHP-FPM | 16 workers per logical CPU (VPS 8), at most RAM/2 at 96 MB each, 512 max, floor `min(8, RAM/2/96)`; **2 per logical CPU on a XenForo/WordPress host with a local database** (measured optimum: 32 workers on 16 threads; 64 workers halved throughput per CPU and doubled p50/p99); live count kept unless the application cap is lower; `children=` wins. `pm = static` always. `opcache.max_accelerated_files` = PHP files under the vhost roots x 1.5 (16384..128256; the ceiling when no root is found); `memory_limit`, OPcache, JIT buffer and realpath sizes from one RAM profile shared with the dry run |
 | MariaDB | see the service section: pool from live data with floor `clamp(RAM/16, 256 MB, 4 GB)` for an empty or unmeasured database, io_capacity by disk x host, thread pool, connections from the PHP pool, table caches from connections, Aria page cache `clamp(RAM/128, 16, 256) MB` |
 | Elasticsearch | heap = store/4 (512 MB..25% RAM..31 GB); `node.processors` = effective CPUs; search threads cpus/2 (max 16), write threads cpus/4 (max 8) |
 | Valkey / Redis | maxmemory = live +20% with floor `clamp(RAM/64, 128 MB, 1 GB)`; maxclients from the PHP pool; io_threads 1..8 (a larger `io_threads=` is clamped with a warning) |

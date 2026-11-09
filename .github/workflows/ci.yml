@@ -14,6 +14,7 @@ jobs:
       - name: Bash syntax
         run: |
           bash -n setup.sh
+          for f in lib/*.sh; do bash -n "$f"; done
           bash -n tests/test-dry-run-matrix.sh
           bash -n tests/test-tuning.sh
           bash -n tests/stress-site/setup-stress-site.sh
@@ -26,7 +27,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y shellcheck
-          shellcheck -S warning setup.sh tests/test-dry-run-matrix.sh tests/test-tuning.sh \
+          shellcheck -S warning setup.sh lib/*.sh tests/test-dry-run-matrix.sh tests/test-tuning.sh \
             tests/stress-site/setup-stress-site.sh tests/stress-site/run-stress.sh \
             tests/stress-site/run-stress-remote.sh tests/stress-site/collect-metrics.sh tools/diff_configs.sh
 

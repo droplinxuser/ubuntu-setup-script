@@ -13,6 +13,12 @@ TMP=$(mktemp -d /tmp/setup-test-tuning.XXXXXX)
 # Scratch data stays under /tmp and is allowed to expire there; the tests do
 # not remove it, so a failed run remains inspectable.
 
+# Source-level checks read the whole program: setup.sh is a thin driver and
+# the implementation lives in lib/*.sh.  Concatenated so a function body can
+# be extracted with sed without knowing which module owns it.
+ALL_SRC="$TMP/all-source.sh"
+cat "$ROOT/setup.sh" "$ROOT"/lib/*.sh > "$ALL_SRC"
+
 # Load the helpers without running main().  Source first: setup.sh defines its
 # own ok()/warn() logging helpers, so test helpers must be defined afterwards.
 export SETUP_TEST_SOURCE_ONLY=1
@@ -51,6 +57,8 @@ cron_not_contains() { [[ $1 != *"$2"* ]]; }
 check_tmp_path() { case "$1" in /tmp/*) return 0 ;; *) return 1 ;; esac; }
 check "tmp_file creates under /tmp" check_tmp_path "$(tmp_file)"
 check "tmp_dir creates under /tmp" check_tmp_path "$(tmp_dir)"
+check "run-log timestamps use UTC" \
+  test "$(_timestamp | awk '{print $NF}')" = UTC
 mkdir -p "$TMP/sed-in-place"
 printf 'key = old\n' > "$TMP/sed-in-place/file.conf"
 sed_in_place -E 's/^key = old$/key = new/' "$TMP/sed-in-place/file.conf"
@@ -105,7 +113,7 @@ check "retire_paths moves the live file away" test ! -e "$TMP/retire/old.conf"
 check "retire_paths preserves the content under /tmp" \
   test -n "$retire_dest" -a "$(cat "$retire_dest" 2>/dev/null)" = stale
 check "retire_paths ignores a missing path" retire_paths "$TMP/retire/missing.conf"
-deploy_body=$(sed -n '/^deploy_angie_tree()/,/^}/p' "$ROOT/setup.sh")
+deploy_body=$(sed -n '/^deploy_angie_tree()/,/^}/p' "$ALL_SRC")
 check "Angie tree deployer never deletes files" \
   bash -c '! grep -qE "(^|[[:space:]])rm -|-delete([[:space:]]|$)" <<<"$1"' _ "$deploy_body"
 
@@ -135,26 +143,26 @@ check "mysqlbackup payload carries the installer and both samples" \
 check "mysqlbackup payload has no AppleDouble entries" \
   bash -c '! grep -q "/\\._" <<<"$1"' _ "$blob_listing"
 check "mysqlbackup installer extracts the payload without -z" \
-  grep -qF 'blob_mysqlbackup | tar -xf - -C' "$ROOT/setup.sh"
+  grep -qF 'blob_mysqlbackup | tar -xf - -C' "$ALL_SRC"
 
 # The Angie APT key must be scoped to its repository, not globally trusted.
-angie_repo_body=$(sed -n '/^configure_angie_repo()/,/^}/p' "$ROOT/setup.sh")
+angie_repo_body=$(sed -n '/^configure_angie_repo()/,/^}/p' "$ALL_SRC")
 check "Angie repository uses a signed-by keyring" \
   grep -qF 'signed-by=' <<<"$angie_repo_body"
 
 # Secrets must not be passed on a command line.
-mariadb_body=$(sed -n '/^install_mariadb()/,/^}/p' "$ROOT/setup.sh")
+mariadb_body=$(sed -n '/^install_mariadb()/,/^}/p' "$ALL_SRC")
 check "MariaDB account SQL is fed over stdin" \
   bash -c '! grep -qF "mariadb -e \"\$sql\"" <<<"$1"' _ "$mariadb_body"
-wp_db_body=$(sed -n '/^harden_wordpress_db()/,/^}/p' "$ROOT/setup.sh")
+wp_db_body=$(sed -n '/^harden_wordpress_db()/,/^}/p' "$ALL_SRC")
 check "WordPress database password reaches the helper via the environment" \
   grep -qF 'WP_CFG_VALUE="$newpass"' <<<"$wp_db_body"
 
 # The live TCP pool is always migrated.
-php_body=$(sed -n '/^optimize_php_services()/,/^}/p' "$ROOT/setup.sh")
+php_body=$(sed -n '/^optimize_php_services()/,/^}/p' "$ALL_SRC")
 check "optimize always calls the PHP socket migration" \
   grep -qF 'migrate_php_pool_to_socket "$ver" "$listen_path"' <<<"$php_body"
-migrate_body=$(sed -n '/^migrate_php_pool_to_socket()/,/^}/p' "$ROOT/setup.sh")
+migrate_body=$(sed -n '/^migrate_php_pool_to_socket()/,/^}/p' "$ALL_SRC")
 check "socket migration restarts PHP when reload cannot apply it" \
   grep -qF 'systemctl restart "php${ver}-fpm"' <<<"$migrate_body"
 
@@ -270,6 +278,28 @@ check "basic-only cron run restores installed service entries" \
   grep -q 'mysqlbkup' "$CRON_OUT"
 check "basic-only cron run restores the log-safe chown" \
   grep -qF -- "$CRON_WWW_CHOWN" "$CRON_OUT"
+
+# A service selected on the command line but not installed yet must not get a
+# cron entry: install_basic calls write_cron before the installers run.  A
+# failed or interrupted install would otherwise leave jobs pointing at
+# missing binaries and log directories.
+: > "$CRON_IN"
+: > "$CRON_OUT"
+(
+  # Simulated command-line selection; write_cron must ignore it.
+  # shellcheck disable=SC2034
+  ENABLED[angie]=1
+  # shellcheck disable=SC2034
+  ENABLED[mariadb]=1
+  cron_angie_configured() { return 1; }
+  cron_mariadb_configured() { return 1; }
+  crontab() { fake_crontab "$@"; }
+  write_cron
+) >/dev/null 2>&1
+check "selected-but-uninstalled MariaDB gets no cron entry" \
+  cron_not_contains "$(cat "$CRON_OUT")" 'mysqlbkup'
+check "selected-but-uninstalled Angie gets no cron entry" \
+  cron_not_contains "$(cat "$CRON_OUT")" '/etc/angie/'
 
 cat > "$CRON_IN" <<'EOF'
 0 0 * * * /usr/bin/chown www-data:www-data -R /var/www/ >/dev/null 2>&1
@@ -431,7 +461,7 @@ check "sshd port discovery always returns at least one numeric port" ssh_ports_o
 
 # SSH must be rate-limited by UFW, and an older plain ALLOW rule must be
 # removed so it cannot shadow the LIMIT rule.
-ufw_body=$(sed -n '/^configure_ufw()/,/^}/p' "$ROOT/setup.sh")
+ufw_body=$(sed -n '/^configure_ufw()/,/^}/p' "$ALL_SRC")
 check "UFW inserts a rate-limited SSH rule" \
   grep -q 'insert 1 limit' <<<"$ufw_body"
 check "UFW removes a plain SSH allow rule" \
@@ -462,6 +492,8 @@ fi
 # (for example the boot-time route.flush errors).
 check "embedded sysctl fallback matches configs/system/sysctl.conf" \
   diff -q <(blob_sysctl) "$ROOT/configs/system/sysctl.conf"
+check "DNS drop-in routes every query to the global servers" \
+  grep -qxF 'Domains=~.' "$ROOT/configs/system/dns_servers.conf"
 
 # ---------------------------------------------------------------------------
 # Optimize OS gate and fd-limit profile
@@ -651,21 +683,35 @@ check "shipped custom_dan.ini disables OPcache JIT (the managed ini turns it on)
 check "shipped custom_dan.ini ships no JIT buffer" \
   test "$(grep -cE '^[[:space:]]*opcache\.jit_buffer_size[[:space:]]*=[[:space:]]*0$' "$ROOT/configs/php/custom_dan.ini")" -eq 1
 check "the optimizer writes the JIT mode from php_jit_settings" \
-  test "$(grep -cE '^opcache\.jit = \$\{jit_mode\}$' "$ROOT/setup.sh")" -eq 1
-check "the tracing JIT is always on (512M OPcache -> 128M buffer)" \
-  test "$(php_jit_settings 512)" = "tracing 128"
+  test "$(grep -cE '^opcache\.jit = \$\{jit_mode\}$' "$ALL_SRC")" -eq 1
+check "the tracing JIT is always on (512M OPcache -> 64M buffer)" \
+  test "$(php_jit_settings 512)" = "tracing 64"
 check "the JIT buffer never drops below 32M" \
   test "$(php_jit_settings 64)" = "tracing 32"
-check "the JIT buffer never exceeds 256M" \
-  test "$(php_jit_settings 4096)" = "tracing 256"
+check "the JIT buffer never exceeds 128M" \
+  test "$(php_jit_settings 4096)" = "tracing 128"
 check "a garbage OPcache size still yields the tracing JIT" \
   test "$(php_jit_settings garbage)" = "tracing 32"
+check "4+ CPU hosts use PHP's default tracing thresholds" \
+  test "$(php_jit_threshold_lines 16)" = "opcache.jit_hot_loop = 64
+opcache.jit_hot_func = 127
+opcache.jit_hot_return = 16
+opcache.jit_hot_side_exit = 64"
+check "1-2 CPU hosts use conservative tracing thresholds" \
+  test "$(php_jit_threshold_lines 2)" = "opcache.jit_hot_loop = 128
+opcache.jit_hot_func = 255
+opcache.jit_hot_return = 32
+opcache.jit_hot_side_exit = 128"
+check "SETUP_PHP_JIT_HOT_* overrides one threshold" \
+  test "$(SETUP_PHP_JIT_HOT_LOOP=8 php_jit_threshold_lines 16 | head -n1)" = "opcache.jit_hot_loop = 8"
+check "the managed ini writes the thresholds" \
+  test "$(grep -c '^\$(php_jit_threshold_lines "\$nproc")$' "$ALL_SRC")" -eq 1
 check "the pool is always static" \
-  test "$(grep -c 'tune_pool_set "\$pool" pm static ' "$ROOT/setup.sh")" -eq 1
+  test "$(grep -c 'tune_pool_set "\$pool" pm static ' "$ALL_SRC")" -eq 1
 check "no ondemand pool mode remains" \
-  test "$(grep -c 'pm_mode=ondemand' "$ROOT/setup.sh")" -eq 0
+  test "$(grep -c 'pm_mode=ondemand' "$ALL_SRC")" -eq 0
 check "the OPcache file cache stays empty (restored scripts are never JIT-compiled)" \
-  test "$(grep -c 'local opcache_file_cache=""' "$ROOT/setup.sh")" -eq 1
+  test "$(grep -c 'local opcache_file_cache=""' "$ALL_SRC")" -eq 1
 # [PATH=] sections: only for WordPress roots and only when
 # SETUP_PHP_JIT_WORDPRESS=0 exempts WordPress from the always-on JIT.
 mkdir -p "$TMP/jit-angie/conf.d" "$TMP/jit-wp/public" "$TMP/jit-xf/public/src"
@@ -882,7 +928,7 @@ check "tune_pool_dedupe keeps the value set by tune_pool_set" \
 # --optimize must keep the managed ini performance-only by default.  The
 # 1.8.39 global session hardening broke Joomla/Polr logins, so session and
 # cgi hardening is behind an explicit opt-in flag.
-php_tune_body=$(sed -n '/^tune_php_fpm_version()/,/^}/p' "$ROOT/setup.sh")
+php_tune_body=$(sed -n '/^tune_php_fpm_version()/,/^}/p' "$ALL_SRC")
 php_tune_default=$(awk '/SETUP_PHP_SESSION_HARDENING:-0} == 1/{exit} {print}' <<<"$php_tune_body")
 php_tune_hardening=$(awk '/SETUP_PHP_SESSION_HARDENING:-0} == 1/{f=1} f' <<<"$php_tune_body")
 
@@ -945,7 +991,7 @@ check "custom_dan refresh keeps the performance block" \
 
 check "--optimize calls the custom_dan refresh" \
   grep -q 'sync_php_ini_template "$ver"' \
-  <<<"$(sed -n '/^optimize_php_services()/,/^}/p' "$ROOT/setup.sh")"
+  <<<"$(sed -n '/^optimize_php_services()/,/^}/p' "$ALL_SRC")"
 
 check "default PHP template leaves cgi.fix_pathinfo unset" \
   test -z "$(grep '^cgi\.fix_pathinfo' "$ROOT/configs/php/custom_dan.ini")"
@@ -972,7 +1018,7 @@ check "PATH_TRANSLATED repair is idempotent" test "$TUNE_DIRTY" -eq 0
 
 check "--optimize repairs PATH_TRANSLATED in the PHP includes" \
   grep -q 'tune_fastcgi_path_translated_all "$target"' \
-  <<<"$(sed -n '/^tune_angie_configs()/,/^}/p' "$ROOT/setup.sh")"
+  <<<"$(sed -n '/^tune_angie_configs()/,/^}/p' "$ALL_SRC")"
 
 # Every php*.conf include is covered, including XenForo and future variants.
 mkdir -p "$TMP/path-translated-all/h5bp"
@@ -1474,19 +1520,19 @@ check "audit counts the broken WordPress host" \
   test "$APP_CONNECTION_ISSUES" -eq 1
 sed -i "s/DB_HOST., .p:localhost/DB_HOST', 'localhost/" "$TMP/wp-config.php"
 
-opt_body=$(sed -n '/^optimize_angie()/,/^}/p' "$ROOT/setup.sh")
+opt_body=$(sed -n '/^optimize_angie()/,/^}/p' "$ALL_SRC")
 check "optimize_angie synchronizes the Angie repository" \
   grep -q 'sync_angie_repo_configs' <<<"$opt_body"
-profile_body=$(sed -n "/^angie_apply_profile()/,/^}/p" "$ROOT/setup.sh")
+profile_body=$(sed -n "/^angie_apply_profile()/,/^}/p" "$ALL_SRC")
 check "the shared Angie profile enables the XenForo guest cache" \
   grep -q "ensure_xf_guest_cache" <<<"$profile_body"
 check "optimize_angie applies the shared Angie profile" \
   grep -q "angie_apply_profile" <<<"$opt_body"
-deploy_body=$(sed -n "/^deploy_angie_configs()/,/^}/p" "$ROOT/setup.sh")
+deploy_body=$(sed -n "/^deploy_angie_configs()/,/^}/p" "$ALL_SRC")
 check "the installer applies the same Angie profile" \
   grep -q "angie_apply_profile" <<<"$deploy_body"
 check "WordPress and XenForo share one FastCGI cache zone helper" \
-  bash -c 'grep -q "ensure_fastcgi_cache_zone" "$1" && grep -q "ensure_fastcgi_cache_zone" <<<"$(sed -n "/^optimize_wordpress_cache()/,/^}/p" "$1")"' _ "$ROOT/setup.sh"
+  bash -c 'grep -q "ensure_fastcgi_cache_zone" "$1" && grep -q "ensure_fastcgi_cache_zone" <<<"$(sed -n "/^optimize_wordpress_cache()/,/^}/p" "$1")"' _ "$ALL_SRC"
 
 # A legacy XenForo include without any cache block must be completed by
 # --optimize, and the second run must be a no-op.
@@ -1562,7 +1608,7 @@ check "the proxy include keeps its closing brace last" \
 tune_reset_changes
 ensure_xf_guest_cache "$TMP/xfguest"
 check "in-location repair is idempotent" test "${#TUNE_CHANGES[@]}" -eq 0
-run_body=$(sed -n '/^run_optimize()/,/^}/p' "$ROOT/setup.sh")
+run_body=$(sed -n '/^run_optimize()/,/^}/p' "$ALL_SRC")
 check "run_optimize calls the application connection audit" \
   grep -q 'audit_app_persistent_connections' <<<"$run_body"
 audit_line=$(printf '%s\n' "$run_body" | grep -n 'audit_app_persistent_connections' | head -n1 | cut -d: -f1)
@@ -1711,7 +1757,7 @@ err_out=$(bash -c 'set -E; source "$1"; trap - ERR; trap "on_error $LINENO" ERR;
 check "ERR trap reports the failing command" grep -q 'false' <<<"$err_out"
 check "ERR trap reports the failing line" grep -qE 'line [0-9]+' <<<"$err_out"
 
-tuning_body=$(sed -n '/^run_os_tuning()/,/^}/p' "$ROOT/setup.sh")
+tuning_body=$(sed -n '/^run_os_tuning()/,/^}/p' "$ALL_SRC")
 sysctl_line=$(printf '%s\n' "$tuning_body" | grep -n 'configure_sysctl' | head -n1 | cut -d: -f1)
 limits_line=$(printf '%s\n' "$tuning_body" | grep -n 'configure_limits' | head -n1 | cut -d: -f1)
 check "OS tuning applies sysctl before the PAM nofile limits" \
@@ -1719,7 +1765,7 @@ check "OS tuning applies sysctl before the PAM nofile limits" \
 
 # MariaDB restart must pause the request tiers first, and apply unit changes
 # before stopping them.
-mariadb_body=$(sed -n '/^optimize_mariadb()/,/^}/p' "$ROOT/setup.sh")
+mariadb_body=$(sed -n '/^optimize_mariadb()/,/^}/p' "$ALL_SRC")
 pause_line=$(printf '%s\n' "$mariadb_body" | grep -n 'opt_pause_web_frontends' | head -n1 | cut -d: -f1)
 resume_line=$(printf '%s\n' "$mariadb_body" | grep -n 'opt_resume_web_frontends' | head -n1 | cut -d: -f1)
 restart_line=$(printf '%s\n' "$mariadb_body" | grep -n 'opt_restart_service mariadb' | head -n1 | cut -d: -f1)
@@ -1733,7 +1779,7 @@ check "MariaDB restart reloads systemd units before pausing web" \
 
 # --restart-all must preserve the dependency order: stop Angie/PHP, restart
 # cache/search, restart MariaDB, wait for SQL, then start PHP and Angie.
-restart_body=$(sed -n '/^run_restart_all()/,/^}/p' "$ROOT/setup.sh")
+restart_body=$(sed -n '/^run_restart_all()/,/^}/p' "$ALL_SRC")
 ra_daemon=$(printf '%s\n' "$restart_body" | grep -n 'systemctl daemon-reload' | head -n1 | cut -d: -f1)
 ra_pause=$(printf '%s\n' "$restart_body" | grep -n 'opt_pause_web_frontends' | head -n1 | cut -d: -f1)
 ra_restart_cache=$(printf '%s\n' "$restart_body" | grep -n 'systemctl restart "\$unit"' | head -n1 | cut -d: -f1)
@@ -1748,11 +1794,11 @@ check "restart-all pauses the web tiers before restarting cache/search" \
   test -n "$ra_pause" -a -n "$ra_restart_cache" -a "$ra_pause" -lt "$ra_restart_cache"
 # The shared pause helper stops Angie first, then every PHP-FPM unit; the
 # resume helper starts PHP first, then Angie.
-pause_body=$(sed -n '/^opt_pause_web_frontends()/,/^}/p' "$ROOT/setup.sh")
+pause_body=$(sed -n '/^opt_pause_web_frontends()/,/^}/p' "$ALL_SRC")
 check "pause helper stops Angie before PHP-FPM" \
   test "$(printf '%s\n' "$pause_body" | grep -n 'systemctl stop angie' | head -n1 | cut -d: -f1)" -lt \
        "$(printf '%s\n' "$pause_body" | grep -n 'systemctl stop "$unit"' | head -n1 | cut -d: -f1)"
-resume_body=$(sed -n '/^opt_resume_web_frontends()/,/^}/p' "$ROOT/setup.sh")
+resume_body=$(sed -n '/^opt_resume_web_frontends()/,/^}/p' "$ALL_SRC")
 check "resume helper starts PHP-FPM before Angie" \
   test "$(printf '%s\n' "$resume_body" | grep -n 'systemctl start "$unit"' | head -n1 | cut -d: -f1)" -lt \
        "$(printf '%s\n' "$resume_body" | grep -n 'systemctl start angie' | head -n1 | cut -d: -f1)"
@@ -1820,18 +1866,18 @@ check "Elasticsearch strip removes the old performance key" \
 # Redis so one cache budget is not applied twice.
 check "optimize leaves swap untouched" \
   bash -c '! grep -q "configure_swap_auto" <<< "$1"' _ "$tuning_body"
-detect_body=$(sed -n '/^detect_installed_services()/,/^}/p' "$ROOT/setup.sh")
+detect_body=$(sed -n '/^detect_installed_services()/,/^}/p' "$ALL_SRC")
 check "Valkey takes precedence over Redis in service detection" \
   grep -q '! -f /etc/valkey/valkey.conf' <<<"$detect_body"
 
 # Diagnostics must not present absent services as connection failures.
-diag_body=$(sed -n '/^run_diagnostics()/,/^}/p' "$ROOT/setup.sh")
+diag_body=$(sed -n '/^run_diagnostics()/,/^}/p' "$ALL_SRC")
 check "diagnostics reports absent Valkey/Redis as not installed" \
   grep -q 'Valkey/Redis is not installed' <<<"$diag_body"
 check "diagnostics does not call the Redis client when none is reachable" \
   grep -q 'diag_redis_cli' <<<"$diag_body"
 check "diagnostics skips allocation explain when no shards are unassigned" \
-  grep -q 'No unassigned shards; allocation explain is not needed' "$ROOT/setup.sh"
+  grep -q 'No unassigned shards; allocation explain is not needed' "$ALL_SRC"
 check "diagnostics reports absent Elasticsearch as not installed" \
   grep -q 'Elasticsearch is not installed' <<<"$diag_body"
 check "diagnostics gates Elasticsearch probes on installation" \
@@ -2029,10 +2075,10 @@ check "restart-all plan lists the Valkey alias only once" \
 # ---------------------------------------------------------------------------
 # Run-log robustness
 # ---------------------------------------------------------------------------
-run_log_body=$(sed -n '/^start_run_log()/,/^}/p' "$ROOT/setup.sh")
+run_log_body=$(sed -n '/^start_run_log()/,/^}/p' "$ALL_SRC")
 check "run log name is unique per process" \
   grep -Fq 'setup_${stamp}-$$.log' <<<"$run_log_body"
-on_error_body=$(sed -n '/^on_error()/,/^}/p' "$ROOT/setup.sh")
+on_error_body=$(sed -n '/^on_error()/,/^}/p' "$ALL_SRC")
 check "on_error ignores SIGPIPE from a closed pipe" \
   grep -q 'rc == 141' <<<"$on_error_body"
 
@@ -2313,12 +2359,12 @@ check "a 27 GB host reports no overcommit" \
   test "${OPT_MEM_OVERCOMMIT_MB:-0}" -eq 0
 
 # Source-level guards for rules that need root or /sys to exercise.
-io_body=$(sed -n '/^configure_io_tuning()/,/^}/p' "$ROOT/setup.sh")
+io_body=$(sed -n '/^configure_io_tuning()/,/^}/p' "$ALL_SRC")
 check "udev I/O rule matches whole disks only" \
   bash -c "[[ \$(grep -c 'ENV{DEVTYPE}==\"disk\"' <<<\"\$0\") -eq 3 ]]" "$io_body"
 check "PHP memory_limit drops to 128M under 2 GB" \
-  grep -q '(( ram_mb < 2048 )) && PHP_PROFILE_MEMORY_MB=128' <<<"$(sed -n '/^php_ini_profile()/,/^}/p' "$ROOT/setup.sh")"
-sysctl_body=$(sed -n '/^configure_sysctl()/,/^}/p' "$ROOT/setup.sh")
+  grep -q '(( ram_mb < 2048 )) && PHP_PROFILE_MEMORY_MB=128' <<<"$(sed -n '/^php_ini_profile()/,/^}/p' "$ALL_SRC")"
+sysctl_body=$(sed -n '/^configure_sysctl()/,/^}/p' "$ALL_SRC")
 check "min_free_kbytes floor scales below 4 GB" \
   grep -q 'min_free < 16384' <<<"$sysctl_body"
 
@@ -2337,11 +2383,11 @@ printf "<?php\n\$config['db']['host'] = 'localhost';\n" > "$TMP/capsite/xf/src/c
 check "angie_vhost_root reads the root directive" \
   test "$(angie_vhost_root "$TMP/capsite/conf.d/xf.conf")" = "$TMP/capsite/xf"
 host_is_vps() { return 1; }
-check "php_app_worker_cap: XenForo with a local DB -> 4 per core" \
-  test "$(orig_php_app_worker_cap 16 "$TMP/capsite")" = 64
+check "php_app_worker_cap: XenForo with a local DB -> 2 per logical CPU" \
+  test "$(orig_php_app_worker_cap 16 "$TMP/capsite")" = 32
 host_is_vps() { return 0; }
-check "php_app_worker_cap: 3 per core on a VPS" \
-  test "$(orig_php_app_worker_cap 16 "$TMP/capsite")" = 48
+check "php_app_worker_cap: 2 per logical CPU on a VPS" \
+  test "$(orig_php_app_worker_cap 16 "$TMP/capsite")" = 32
 host_is_vps() { return 1; }
 printf "<?php\n\$config['db']['host'] = 'db.example.net';\n" > "$TMP/capsite/xf/src/config.php"
 no_cap() { ! orig_php_app_worker_cap 16 "$TMP/capsite" >/dev/null; }
@@ -2353,10 +2399,10 @@ rm "$TMP/capsite/conf.d/other.conf"
 printf 'server {\n    root %s;\n    include h5bp/wordpress.conf;\n}\n' "$TMP/capsite/wp" > "$TMP/capsite/conf.d/wp.conf"
 printf "<?php\ndefine('DB_HOST', 'localhost');\n" > "$TMP/capsite/wp/wp-config.php"
 check "php_app_worker_cap: XenForo + WordPress, both local -> cap" \
-  test "$(orig_php_app_worker_cap 8 "$TMP/capsite")" = 32
-php_app_worker_cap() { printf 64; }
+  test "$(orig_php_app_worker_cap 8 "$TMP/capsite")" = 16
+php_app_worker_cap() { printf 32; }
 check "php_children_ceiling applies the app cap below a live 144 pool" \
-  test "$(php_children_ceiling 16 27812 144 "")" = 64
+  test "$(php_children_ceiling 16 27812 144 "")" = 32
 check "php_children_ceiling keeps an explicit value above the cap" \
   test "$(php_children_ceiling 16 27812 144 100)" = 100
 php_app_worker_cap() { return 1; }
