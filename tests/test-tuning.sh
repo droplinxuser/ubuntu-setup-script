@@ -576,6 +576,8 @@ check "XF cache key includes the language id" \
   grep -q '\$cookie_xf_language_id' "$TMP/xf-cache.conf"
 check "XF cache key keeps the style variation" \
   grep -q '\$cookie_xf_style_variation' "$TMP/xf-cache.conf"
+check "XF cache key varies on the normalised Accept-Encoding" \
+  grep -q '\$cookie_xf_language_id\$setup_cache_enc";' "$TMP/xf-cache.conf"
 check "XF cache refreshes in the background" \
   grep -qx 'fastcgi_cache_background_update on;' "$TMP/xf-cache.conf"
 check "XF cache repair is idempotent" \
@@ -2074,15 +2076,15 @@ geo $limit_req_whitelist {
 }
 limit_req_log_level warn;
 EOF
-SETUP_LIMIT_REQ_EXEMPT='192.0.2.50,10.0.0.0/8 bogus' tune_limit_req_exemptions "$TMP/limit_req.conf" limit_req.conf
+LIMIT_REQ_EXEMPT='192.0.2.50,10.0.0.0/8 bogus' tune_limit_req_exemptions "$TMP/limit_req.conf" limit_req.conf
 check "tune_limit_req_exemptions adds managed entries" \
   bash -c "grep -qx '    192.0.2.50 1; # setup.sh exempt' '$TMP/limit_req.conf' && grep -qx '    10.0.0.0/8 1; # setup.sh exempt' '$TMP/limit_req.conf'"
 check "tune_limit_req_exemptions ignores invalid entries" \
   bash -c "! grep -q bogus '$TMP/limit_req.conf'"
-SETUP_LIMIT_REQ_EXEMPT='192.0.2.50' tune_limit_req_exemptions "$TMP/limit_req.conf" limit_req.conf
+LIMIT_REQ_EXEMPT='192.0.2.50' tune_limit_req_exemptions "$TMP/limit_req.conf" limit_req.conf
 check "tune_limit_req_exemptions replaces the managed set" \
   test "$(grep -c 'setup.sh exempt' "$TMP/limit_req.conf")" -eq 1
-SETUP_LIMIT_REQ_EXEMPT='' tune_limit_req_exemptions "$TMP/limit_req.conf" limit_req.conf
+LIMIT_REQ_EXEMPT='' tune_limit_req_exemptions "$TMP/limit_req.conf" limit_req.conf
 check "tune_limit_req_exemptions removes managed entries when unset" \
   bash -c "! grep -q 'setup.sh exempt' '$TMP/limit_req.conf'"
 

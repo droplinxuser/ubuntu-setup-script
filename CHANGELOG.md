@@ -76,11 +76,20 @@ pool, which the installer sized from stale log files in the data directory).
   of per-rejection warnings in two minutes. `limit_req_log_level` is now
   `info` (below the `warn` error_log level) and
   `SETUP_LIMIT_REQ_EXEMPT="ip,cidr,..."` adds managed geo-whitelist entries
-  for a load generator or monitor. `tests/stress-site/run-stress-remote.sh`
+  for a load generator or monitor and is persisted in `/etc/default/setup-tuning`
+  (`LIMIT_REQ_EXEMPT`), so a later plain `--optimize` keeps it. `tests/stress-site/run-stress-remote.sh`
   drives `oha` (a single static binary) from a workstation and reports the
   status-code distribution; `tests/stress-site/collect-metrics.sh` samples
   CPU, sockets, PHP-FPM, MariaDB, Valkey, Elasticsearch and log growth on the
   server during a run.
+- **XenForo guest cache key varies on encoding.** A normalised
+  `$setup_cache_enc` map (gzip or plain) is appended to the XenForo FastCGI
+  cache key, so a gzip-capable client primes a gzip entry that Angie serves
+  without re-compressing (the identity body was Brotli-compressed on every
+  hit: 41% of 16 cores at 8k req/s), and an identity client never receives
+  gzip bytes. Measured XenForo guest/member results are in
+  `tests/stress-site/RESULTS.md`; for a CPU-bound XenForo host a
+  `--php children=3 x cores` pool halves page latency at equal throughput.
 - `--mariadb size=` now defaults to `auto` (the shared plan), and
   `SETUP_STATE_DIR` overrides `/var/lib/setup.sh` so the unit tests never
   read the live host's recorded options (21 planner tests silently depended
