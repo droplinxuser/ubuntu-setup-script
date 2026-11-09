@@ -2236,8 +2236,8 @@ check "precompress_static_assets removes orphaned siblings" test ! -e "$TMP/asse
 # --purge restores paired sysctls in an order the kernel accepts: the
 # foreground dirty keys before the background ones, ipfrag low last.
 mkdir -p "$SETUP_STATE_DIR"
-for k in vm.dirty_background_bytes vm.dirty_bytes vm.dirty_background_ratio vm.dirty_ratio net.ipv4.ipfrag_low_thresh net.ipv4.ipfrag_high_thresh; do
-  printf '0\n' > "$SETUP_STATE_DIR/sysctl-orig-${k//\//_}"
+for k in vm.dirty_background_bytes:0 vm.dirty_bytes:0 vm.dirty_background_ratio:10 vm.dirty_ratio:20 net.ipv4.ipfrag_low_thresh:3145728 net.ipv4.ipfrag_high_thresh:4194304; do
+  printf '%s\n' "${k#*:}" > "$SETUP_STATE_DIR/sysctl-orig-${k%%:*}"
 done
 : > "$TMP/sysctl-order"
 sysctl() { [[ $1 == -w ]] && printf '%s\n' "${2%%=*}" >> "$TMP/sysctl-order"; return 0; }
@@ -2245,10 +2245,10 @@ restore_sysctl_values
 unset -f sysctl
 order_ok() {
   local o; o=$(tr '\n' ' ' < "$TMP/sysctl-order")
-  [[ $o == *"vm.dirty_bytes "*"vm.dirty_background_bytes "* && $o == *"vm.dirty_ratio "*"vm.dirty_background_ratio "* \
+  [[ $o == *"vm.dirty_ratio "*"vm.dirty_background_ratio "* && $o != *"vm.dirty_bytes "* && $o != *"vm.dirty_background_bytes "* \
      && $o == *"net.ipv4.ipfrag_high_thresh "*"net.ipv4.ipfrag_low_thresh "* ]]
 }
-check "restore_sysctl_values restores dirty_bytes before dirty_background_bytes and ipfrag_low last" order_ok
+check "restore_sysctl_values writes the non-zero member of each dirty pair, ratios first, ipfrag_low last" order_ok
 
 
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"

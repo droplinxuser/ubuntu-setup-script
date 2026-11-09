@@ -86,13 +86,13 @@ from a workstation matched the 1.9.0 numbers (`tests/stress-site/RESULTS.md`).
   budgets stay equal. XenForo's cache and sessions in Valkey over the Unix
   socket measured no gain on a single host (888 vs 883 member req/s, p50
   72.5 vs 73 ms); the audit hint stays a hint.
-- **`--purge` restores paired sysctls in an order the kernel accepts.** The
-  foreground `vm.dirty_bytes`/`vm.dirty_ratio` are written before their
-  background counterparts (restoring `vm.dirty_background_bytes=0` re-enables
-  the background ratio, which the kernel rejected while the still-tuned
-  `dirty_bytes` was below it: `--purge all` logged "Could not restore
-  vm.dirty_background_bytes=0" twice), and the low fragment threshold stays
-  last.
+- **`--purge` restores the dirty-page sysctl pairs correctly.** `vm.dirty_*`
+  come as ratio/bytes pairs and writing one zeroes the other, so the tune's
+  byte values had zeroed the live ratios and restoring the recorded `bytes=0`
+  left no threshold (`--purge all` logged "Could not restore
+  vm.dirty_bytes=0" and the background twin). Each pair now restores
+  whichever recorded member is non-zero (`restore_sysctl_pair`), foreground
+  pair first, and the low fragment threshold stays last.
 - Tests: 480 tuning checks (41 new: sysctl restore order, quota rounding, the worker decision
   tree, Brotli level, pinned server type, redo cap and table caches,
   overcommit, the app cap on fixture vhosts, precompression) and the 101-case
