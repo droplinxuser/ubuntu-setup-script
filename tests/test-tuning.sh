@@ -25,6 +25,10 @@ source "$ROOT/setup.sh"
 # deliberately exercise failure paths, so drop the trap; set -e still catches
 # genuinely unexpected errors.
 trap - ERR
+# php_app_worker_cap reads the live /etc/angie tree; keep the generic ceiling
+# in the unit tests and exercise the real function on a fixture further down.
+eval "$(declare -f php_app_worker_cap | sed '1s/^php_app_worker_cap/orig_php_app_worker_cap/')"
+php_app_worker_cap() { return 1; }
 
 t_pass() { PASS=$((PASS + 1)); printf 'PASS  %s\n' "$*"; }
 t_fail() {
@@ -2067,6 +2071,184 @@ check "dir_size_mb excludes the given patterns" \
 check "wait_for_cmd succeeds on the first good probe" wait_for_cmd 3 true
 not_wait() { ! wait_for_cmd 1 false; }
 check "wait_for_cmd fails after the last attempt" not_wait
+
+
+# ---------------------------------------------------------------------------
+# 1.11.0: shared helpers and hardware rules added by the audit
+# ---------------------------------------------------------------------------
+check "cgroup_quota_cpus rounds a fractional quota up to one CPU" \
+  test "$(cgroup_quota_cpus 50000 100000)" = 1
+check "cgroup_quota_cpus rounds 1.5 CPUs up to 2" \
+  test "$(cgroup_quota_cpus 150000 100000)" = 2
+check "cgroup_quota_cpus returns 0 without a numeric quota" \
+  test "$(cgroup_quota_cpus max 100000)" = 0
+
+# php_plan_max_children is the one decision tree for the pool writer and the
+# dry run.
+host_is_vps() { return 1; }
+OPT_PHP_CHILDREN=0
+check "php_plan_max_children keeps a live pool count" \
+  test "$(php_plan_max_children 16 27812 100 "")" = 100
+check "php_plan_max_children lets an explicit value win over the live pool" \
+  test "$(php_plan_max_children 16 27812 100 48)" = 48
+OPT_PHP_CHILDREN=72
+check "php_plan_max_children uses the shared plan without a live pool" \
+  test "$(php_plan_max_children 16 27812 "" "")" = 72
+OPT_PHP_CHILDREN=0
+check "php_plan_max_children falls back to the 96 MB divisor of a standalone budget" \
+  test "$(php_plan_max_children 16 27812 0 "" 4800)" = 50
+check "php_plan_max_children falls back to the hardware ceiling" \
+  test "$(php_plan_max_children 16 27812 "" "" 0)" = 144
+
+# Brotli level: explicit, else 5, or 4 on a 1-2 CPU host.
+effective_cpus() { printf 16; }
+check "angie_brotli_level honours SETUP_BROTLI_LEVEL" \
+  test "$(SETUP_BROTLI_LEVEL=7 angie_brotli_level)" = 7
+check "angie_brotli_level ignores an invalid SETUP_BROTLI_LEVEL" \
+  test "$(SETUP_BROTLI_LEVEL=99 angie_brotli_level)" = 5
+effective_cpus() { printf 2; }
+check "angie_brotli_level drops to 4 on a 2 CPU host" \
+  test "$(angie_brotli_level)" = 4
+effective_cpus() { printf 16; }
+
+# --basic server= is persisted and honoured by host_server_type.
+ENABLED=([basic]=1)
+OPT[basic.server]=vps
+record_explicit_options
+check "record_explicit_options persists --basic server=vps" \
+  test "$(explicit_option server_type)" = vps
+unset "OPT[basic.server]"
+HOST_SERVER_TYPE=""
+detect_server_type() { printf dedi; }
+check "host_server_type prefers the pinned class over detection" \
+  test "$(host_server_type)" = vps
+OPT[basic.server]=""
+record_explicit_options
+HOST_SERVER_TYPE=""
+check "record_explicit_options clears the pin when server= is omitted" \
+  test "$(host_server_type)" = dedi
+unset "OPT[basic.server]"
+
+# MariaDB profile: table caches follow max_connections, the redo cap follows
+# the disk class.
+php_pool_max_children() { printf 1000; }
+mariadb_storage_class() { printf nvme; }
+mariadb_io_capacity() { printf '10000 20000'; }
+mariadb_compute_profile 32768
+check "table_open_cache follows max_connections (1000 workers -> 1300 -> 20800)" \
+  test "$MARIADB_PROFILE_OPEN_CACHE" -eq 20800
+check "redo log reaches 4 GB on NVMe for a 32 GB pool" \
+  test "$(size_to_mb "$MARIADB_PROFILE_LOG_SIZE")" -eq 4096
+mariadb_storage_class() { printf ssd; }
+mariadb_compute_profile 32768
+check "redo log stays at 2 GB on SSD" \
+  test "$(size_to_mb "$MARIADB_PROFILE_LOG_SIZE")" -eq 2048
+php_pool_max_children() { printf 0; }
+effective_cpus() { printf 4; }
+mariadb_compute_profile 2048
+check "table_open_cache keeps the 4000 floor on a small host (4 CPUs, 200 connections)" \
+  test "$MARIADB_PROFILE_OPEN_CACHE" -eq 4000
+effective_cpus() { printf 16; }
+
+# Overcommit is reported when the service floors cannot fit.
+nproc() { printf 1; }
+mem_total_mb() { printf 1024; }
+mariadb_data_size_mb() { printf 0; }
+mariadb_current_pool_mb() { printf 0; }
+elasticsearch_data_size_mb() { printf 0; }
+elasticsearch_current_heap_mb() { printf 0; }
+valkey_live_used_mb() { printf 0; }
+OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
+plan_memory_budget 2>/dev/null
+check "a 1 GB host running every service reports an overcommit" \
+  test "${OPT_MEM_OVERCOMMIT_MB:-0}" -gt 0
+mem_total_mb() { printf 27812; }
+nproc() { printf 16; }
+plan_memory_budget 2>/dev/null
+check "a 27 GB host reports no overcommit" \
+  test "${OPT_MEM_OVERCOMMIT_MB:-0}" -eq 0
+
+# Source-level guards for rules that need root or /sys to exercise.
+io_body=$(sed -n '/^configure_io_tuning()/,/^}/p' "$ROOT/setup.sh")
+check "udev I/O rule matches whole disks only" \
+  bash -c "[[ \$(grep -c 'ENV{DEVTYPE}==\"disk\"' <<<\"\$0\") -eq 3 ]]" "$io_body"
+check "PHP memory_limit drops to 128M under 2 GB" \
+  grep -q '(( ram_mb < 2048 )) && memory_mb=128' <<<"$php_tune_body"
+sysctl_body=$(sed -n '/^configure_sysctl()/,/^}/p' "$ROOT/setup.sh")
+check "min_free_kbytes floor scales below 4 GB" \
+  grep -q 'min_free < 16384' <<<"$sysctl_body"
+
+# ---------------------------------------------------------------------------
+# App-aware worker cap and asset precompression (1.11.0)
+# ---------------------------------------------------------------------------
+check "app_db_host_is_local: localhost" app_db_host_is_local localhost
+check "app_db_host_is_local: persistent loopback" app_db_host_is_local p:127.0.0.1
+check "app_db_host_is_local: socket path" app_db_host_is_local /run/mysqld/mysqld.sock
+not_local() { ! app_db_host_is_local db.internal.example; }
+check "app_db_host_is_local rejects a remote host" not_local
+mkdir -p "$TMP/capsite/conf.d" "$TMP/capsite/xf/src" "$TMP/capsite/wp" "$TMP/capsite/other"
+printf 'server {\n    root %s;\n    include h5bp/php_xf.conf;\n}\n' "$TMP/capsite/xf" > "$TMP/capsite/conf.d/xf.conf"
+: > "$TMP/capsite/xf/src/XF.php"
+printf "<?php\n\$config['db']['host'] = 'localhost';\n" > "$TMP/capsite/xf/src/config.php"
+check "angie_vhost_root reads the root directive" \
+  test "$(angie_vhost_root "$TMP/capsite/conf.d/xf.conf")" = "$TMP/capsite/xf"
+host_is_vps() { return 1; }
+check "php_app_worker_cap: XenForo with a local DB -> 4 per core" \
+  test "$(orig_php_app_worker_cap 16 "$TMP/capsite")" = 64
+host_is_vps() { return 0; }
+check "php_app_worker_cap: 3 per core on a VPS" \
+  test "$(orig_php_app_worker_cap 16 "$TMP/capsite")" = 48
+host_is_vps() { return 1; }
+printf "<?php\n\$config['db']['host'] = 'db.example.net';\n" > "$TMP/capsite/xf/src/config.php"
+no_cap() { ! orig_php_app_worker_cap 16 "$TMP/capsite" >/dev/null; }
+check "php_app_worker_cap: remote database -> no cap" no_cap
+printf "<?php\n\$config['db']['host'] = '127.0.0.1';\n" > "$TMP/capsite/xf/src/config.php"
+printf 'server {\n    root %s;\n    include h5bp/php.conf;\n}\n' "$TMP/capsite/other" > "$TMP/capsite/conf.d/other.conf"
+check "php_app_worker_cap: an unknown PHP vhost -> no cap" no_cap
+rm "$TMP/capsite/conf.d/other.conf"
+printf 'server {\n    root %s;\n    include h5bp/wordpress.conf;\n}\n' "$TMP/capsite/wp" > "$TMP/capsite/conf.d/wp.conf"
+printf "<?php\ndefine('DB_HOST', 'localhost');\n" > "$TMP/capsite/wp/wp-config.php"
+check "php_app_worker_cap: XenForo + WordPress, both local -> cap" \
+  test "$(orig_php_app_worker_cap 8 "$TMP/capsite")" = 32
+php_app_worker_cap() { printf 64; }
+check "php_children_ceiling applies the app cap below a live 144 pool" \
+  test "$(php_children_ceiling 16 27812 144 "")" = 64
+check "php_children_ceiling keeps an explicit value above the cap" \
+  test "$(php_children_ceiling 16 27812 144 100)" = 100
+php_app_worker_cap() { return 1; }
+
+mkdir -p "$TMP/assets/js" "$TMP/assets/internal_data"
+head -c 20000 /dev/zero | tr '\0' 'a' > "$TMP/assets/js/app.js"
+head -c 20000 /dev/zero | tr '\0' 'b' > "$TMP/assets/internal_data/skip.js"
+printf 'x' > "$TMP/assets/js/tiny.js"
+precompress_static_assets "$TMP/assets" >/dev/null
+check "precompress_static_assets writes a gzip sibling" test -s "$TMP/assets/js/app.js.gz"
+check "precompress sibling keeps the source mtime" test ! "$TMP/assets/js/app.js" -nt "$TMP/assets/js/app.js.gz"
+no_skip_siblings() { [[ ! -e "$TMP/assets/internal_data/skip.js.gz" && ! -e "$TMP/assets/js/tiny.js.gz" ]]; }
+check "precompress_static_assets skips internal_data and tiny files" no_skip_siblings
+check "precompress_static_assets is incremental" \
+  test "$(precompress_static_assets "$TMP/assets")" = 0
+rm "$TMP/assets/js/app.js"
+precompress_static_assets "$TMP/assets" >/dev/null
+check "precompress_static_assets removes orphaned siblings" test ! -e "$TMP/assets/js/app.js.gz"
+
+
+# --purge restores paired sysctls in an order the kernel accepts: the
+# foreground dirty keys before the background ones, ipfrag low last.
+mkdir -p "$SETUP_STATE_DIR"
+for k in vm.dirty_background_bytes vm.dirty_bytes vm.dirty_background_ratio vm.dirty_ratio net.ipv4.ipfrag_low_thresh net.ipv4.ipfrag_high_thresh; do
+  printf '0\n' > "$SETUP_STATE_DIR/sysctl-orig-${k//\//_}"
+done
+: > "$TMP/sysctl-order"
+sysctl() { [[ $1 == -w ]] && printf '%s\n' "${2%%=*}" >> "$TMP/sysctl-order"; return 0; }
+restore_sysctl_values
+unset -f sysctl
+order_ok() {
+  local o; o=$(tr '\n' ' ' < "$TMP/sysctl-order")
+  [[ $o == *"vm.dirty_bytes "*"vm.dirty_background_bytes "* && $o == *"vm.dirty_ratio "*"vm.dirty_background_ratio "* \
+     && $o == *"net.ipv4.ipfrag_high_thresh "*"net.ipv4.ipfrag_low_thresh "* ]]
+}
+check "restore_sysctl_values restores dirty_bytes before dirty_background_bytes and ipfrag_low last" order_ok
 
 
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"

@@ -34,7 +34,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.10.0"
+readonly SCRIPT_VERSION="1.11.0"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -63,6 +63,17 @@ if [[ -n ${SETUP_LIMIT_REQ_EXEMPT+x} ]]; then
   LIMIT_REQ_EXEMPT=$SETUP_LIMIT_REQ_EXEMPT
   LIMIT_REQ_EXEMPT_PERSIST=1
 fi
+# Static-asset precompression (.br/.gz siblings served by brotli_static and
+# gzip_static) is off by default: behind a CDN the origin rarely serves
+# assets.  SETUP_PRECOMPRESS_ASSETS=1 turns it on for an origin that serves
+# its own assets and is persisted in the same host file (0 turns it off).
+PRECOMPRESS_ASSETS="${PRECOMPRESS_ASSETS:-0}"
+PRECOMPRESS_ASSETS_PERSIST=0
+if [[ -n ${SETUP_PRECOMPRESS_ASSETS+x} ]]; then
+  PRECOMPRESS_ASSETS=$SETUP_PRECOMPRESS_ASSETS
+  PRECOMPRESS_ASSETS_PERSIST=1
+fi
+[[ $PRECOMPRESS_ASSETS == 1 ]] || PRECOMPRESS_ASSETS=0
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly SCRIPT_DIR
 # SETUP_STATE_DIR lets the unit tests (and a chroot/image build) use a private
@@ -87,6 +98,8 @@ readonly CRON_END="# END setup.sh managed cron"
 readonly CRON_WWW_CHOWN='/usr/bin/find /var/www -mindepth 1 \( -path /var/www/logs -o -path /var/www/mysql_database -o -name "*.log" -o -name "wp-config.php" \) -prune -o -exec /usr/bin/chown -h www-data:www-data {} +'
 # The form written by releases up to 1.8.33, kept so a re-run upgrades it.
 readonly CRON_WWW_CHOWN_LEGACY='/usr/bin/chown www-data:www-data -R /var/www/'
+# Helper that keeps precompressed static assets fresh (SETUP_PRECOMPRESS_ASSETS=1).
+readonly CRON_PRECOMPRESS='/usr/local/bin/setup-precompress.sh'
 # WordPress ships its own pseudo-cron.  When the hardening step disables it
 # (DISABLE_WP_CRON), this managed entry runs every site's wp-cron.php as the
 # PHP user so scheduled posts, updates and plugin jobs still fire.
@@ -1095,20 +1108,29 @@ detect_ram_gb() {
 # host's logical CPUs inside a container or a vCPU-capped cloud guest, which
 # would otherwise size 144 PHP workers and 16 Angie/MariaDB threads for a
 # 2-vCPU quota.
+# CPUs granted by a cgroup CPU quota: ceil(quota / period), 0 when there is no
+# numeric quota ("max").  A fractional quota (cpu.max "50000 100000") rounds
+# up to one CPU; truncating it to 0 would discard the limit and fall back to
+# the host core count.
+cgroup_quota_cpus() {
+  local quota=${1:-} period=${2:-}
+  if [[ $quota =~ ^[0-9]+$ && $period =~ ^[0-9]+$ ]] && (( period > 0 )); then
+    printf '%s' $(( (quota + period - 1) / period ))
+  else
+    printf 0
+  fi
+}
+
 effective_cpus() {
   local n quota period cpus=0
   if [[ -r /sys/fs/cgroup/cpu.max ]]; then
     read -r quota period < /sys/fs/cgroup/cpu.max 2>/dev/null || true
-    if [[ $quota =~ ^[0-9]+$ && $period =~ ^[0-9]+$ ]] && (( period > 0 )); then
-      cpus=$(( quota / period ))
-    fi
+    cpus=$(cgroup_quota_cpus "$quota" "$period")
   elif [[ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us \
           && -r /sys/fs/cgroup/cpu/cpu.cfs_period_us ]]; then
     quota=$(< /sys/fs/cgroup/cpu/cpu.cfs_quota_us)
     period=$(< /sys/fs/cgroup/cpu/cpu.cfs_period_us)
-    if [[ $quota =~ ^[0-9]+$ && $period =~ ^[0-9]+$ ]] && (( period > 0 )); then
-      cpus=$(( quota / period ))
-    fi
+    cpus=$(cgroup_quota_cpus "$quota" "$period")
   fi
   n=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
   [[ $n =~ ^[0-9]+$ ]] && (( n > 0 )) || n=1
@@ -1476,6 +1498,8 @@ ensure_log_dirs() {
   ensure_log_dir gifsicle      www-data     www-data
   getent passwd mysql         >/dev/null 2>&1 && ensure_log_dir mariadb       mysql        mysql
   getent passwd valkey        >/dev/null 2>&1 && ensure_log_dir valkey        valkey       valkey
+  # --optimize points an adopted Redis at ${LOG_ROOT}/redis like Valkey.
+  getent passwd redis         >/dev/null 2>&1 && ensure_log_dir redis         redis        redis
   getent passwd elasticsearch >/dev/null 2>&1 && ensure_log_dir elasticsearch elasticsearch elasticsearch
 
   log_file angie/error.log        www-data www-data
@@ -1489,6 +1513,7 @@ ensure_log_dirs() {
   getent passwd mysql         >/dev/null 2>&1 && log_file mariadb/backup.log mysql mysql
   getent passwd mysql         >/dev/null 2>&1 && log_file mariadb/backup-err.log mysql mysql
   getent passwd valkey        >/dev/null 2>&1 && log_file valkey/valkey.log valkey valkey
+  getent passwd redis         >/dev/null 2>&1 && log_file redis/redis.log   redis  redis
   getent passwd elasticsearch >/dev/null 2>&1 && log_file elasticsearch/essearch.log elasticsearch elasticsearch
   # getent returns 2 when a service user is not installed yet; a chain ending
   # in that test must not fail the whole basic step.
@@ -1670,7 +1695,13 @@ host_server_type() {
   if [[ -z $HOST_SERVER_TYPE ]]; then
     case ${OPT[basic.server]:-} in
       dedi|vps) HOST_SERVER_TYPE=${OPT[basic.server]} ;;
-      *) HOST_SERVER_TYPE=$(detect_server_type) ;;
+      *)
+        # A pinned class from the install (record_explicit_options) wins over
+        # detection so install and --optimize use the same formulas.
+        HOST_SERVER_TYPE=$(explicit_option server_type 2>/dev/null || true)
+        [[ $HOST_SERVER_TYPE == dedi || $HOST_SERVER_TYPE == vps ]] \
+          || HOST_SERVER_TYPE=$(detect_server_type)
+        ;;
     esac
     [[ $HOST_SERVER_TYPE == vps ]] || HOST_SERVER_TYPE=dedi
   fi
@@ -1898,6 +1929,11 @@ write_cron() {
   if (( wp_cron )); then
     lines+=("*/5 * * * * ${CRON_WP_CRON} >/dev/null 2>&1")
   fi
+  # Precompressed-asset refresh: only while the feature is on and the helper
+  # exists (configure_asset_precompression writes it); dropped otherwise.
+  if (( PRECOMPRESS_ASSETS )) && [[ -x $CRON_PRECOMPRESS ]]; then
+    lines+=("*/5 * * * * /usr/bin/nice -n 19 ${CRON_PRECOMPRESS} >/dev/null 2>&1")
+  fi
 
   cur=$(crontab -l 2>/dev/null || true)
   if [[ -n $cur ]]; then
@@ -1914,6 +1950,8 @@ write_cron() {
       group=mariadb
     elif [[ $line == *wp-cron.php* ]]; then
       group=wordpress
+    elif [[ $line == *"${CRON_PRECOMPRESS}"* ]]; then
+      group=precompress
     elif [[ $line == *'/etc/angie/'* || $line == *'/usr/bin/find /var/www'* || $line == *"${CRON_WWW_CHOWN_LEGACY}"* ]]; then
       group=angie
     else
@@ -1928,7 +1966,7 @@ write_cron() {
         (( mariadb_cron )) && continue
         cron_mariadb_configured || continue
         ;;
-      wordpress)
+      wordpress|precompress)
         # Regenerated above when needed; drop a stale entry otherwise.
         continue
         ;;
@@ -2261,13 +2299,19 @@ record_sysctl_values() {
 
 restore_sysctl_values() {
   local key file value
-  # ipfrag_low_thresh must be written after ipfrag_high_thresh; otherwise the
-  # kernel rejects a low value that is above the currently live high mark and
-  # --purge basic logs a spurious failure.  Restore every other key first,
-  # then the low threshold.
-  local -a ordered=()
+  # Order matters for paired keys.  ipfrag_low_thresh must be written after
+  # ipfrag_high_thresh (the kernel rejects a low mark above the live high
+  # mark).  vm.dirty_bytes and vm.dirty_ratio must be restored before their
+  # background counterparts: writing dirty_background_bytes=0 re-enables the
+  # background ratio, which the kernel rejects while the still-live
+  # dirty_bytes is below that ratio's threshold (--purge logged "Could not
+  # restore vm.dirty_background_bytes=0").  Foreground dirty keys first, then
+  # everything else, then the low fragment threshold.
+  local -a ordered=(vm.dirty_bytes vm.dirty_ratio)
   for key in "${SYSCTL_MANAGED_KEYS[@]}"; do
-    [[ $key == net.ipv4.ipfrag_low_thresh ]] && continue
+    case $key in
+      vm.dirty_bytes|vm.dirty_ratio|net.ipv4.ipfrag_low_thresh) continue ;;
+    esac
     ordered+=("$key")
   done
   ordered+=(net.ipv4.ipfrag_low_thresh)
@@ -2349,7 +2393,13 @@ configure_sysctl() {
   ram_mb=$(mem_total_mb)
   (( ram_mb > 0 )) || ram_mb=1024
   min_free=$(( ram_mb * 1024 / 100 ))       # 1% of RAM, in kB
-  (( min_free < 67584 ))  && min_free=67584
+  # The 66 MB floor suits hosts with a few GB of RAM; on a 1-2 GB VPS it
+  # would reserve 3-6% of memory that nothing may use, so the floor scales.
+  if (( ram_mb >= 4096 )); then
+    (( min_free < 67584 ))  && min_free=67584
+  else
+    (( min_free < 16384 ))  && min_free=16384
+  fi
   (( min_free > 262144 )) && min_free=262144
   shmall=$(( 1073741824 / 4096 ))
   # Scale listener/connection limits with CPU count and RAM.  The clamps keep
@@ -2560,12 +2610,14 @@ EOF
   chmod 644 "$unit"
   cat > "$rule" <<'EOF'
 # setup.sh: I/O scheduler and readahead by device class.
+# Whole disks only: partitions have no queue/scheduler or bdi attributes and
+# udev logs an error per partition when a rule tries to set them.
 # NVMe: no scheduler (the device queues), small readahead for random I/O.
-ACTION=="add|change", KERNEL=="nvme[0-9]*n[0-9]*", ATTR{queue/scheduler}="none", ATTR{bdi/read_ahead_kb}="128"
+ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", KERNEL=="nvme[0-9]*n[0-9]*", ATTR{queue/scheduler}="none", ATTR{bdi/read_ahead_kb}="128"
 # SSD and paravirtual disks: mq-deadline, small readahead.
-ACTION=="add|change", KERNEL=="sd[a-z]*|vd[a-z]*|xvd[a-z]*", ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="mq-deadline", ATTR{bdi/read_ahead_kb}="128"
+ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", KERNEL=="sd[a-z]*|vd[a-z]*|xvd[a-z]*", ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="mq-deadline", ATTR{bdi/read_ahead_kb}="128"
 # Rotational disks: mq-deadline with a larger readahead for sequential scans.
-ACTION=="add|change", KERNEL=="sd[a-z]*", ATTR{queue/rotational}=="1", ATTR{queue/scheduler}="mq-deadline", ATTR{bdi/read_ahead_kb}="1024"
+ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", KERNEL=="sd[a-z]*", ATTR{queue/rotational}=="1", ATTR{queue/scheduler}="mq-deadline", ATTR{bdi/read_ahead_kb}="1024"
 EOF
   chmod 644 "$rule"
   systemctl daemon-reload || true
@@ -3309,6 +3361,188 @@ persist_limit_req_exemptions() {
   tune_note "limit_req: exemptions persisted in ${f}"
 }
 
+# Keep SETUP_PRECOMPRESS_ASSETS in /etc/default/setup-tuning like the
+# exemption list, so a plain --optimize keeps the operator's choice.
+persist_precompress_assets() {
+  (( PRECOMPRESS_ASSETS_PERSIST )) || return 0
+  [[ ${EUID} -eq 0 ]] || return 0
+  local f=/etc/default/setup-tuning line
+  line="PRECOMPRESS_ASSETS=\"${PRECOMPRESS_ASSETS}\""
+  if [[ -f $f ]] && grep -qE '^PRECOMPRESS_ASSETS=' "$f"; then
+    sed_in_place -E "s|^PRECOMPRESS_ASSETS=.*|${line}|" "$f"
+  else
+    printf '%s\n' "$line" >> "$f"
+  fi
+  chmod 644 "$f" 2>/dev/null || true
+  tune_note "precompress: PRECOMPRESS_ASSETS=${PRECOMPRESS_ASSETS} persisted in ${f}"
+}
+
+# Document root of an Angie vhost file ("" when none).  Shared by the
+# WordPress/XenForo vhost scanners, the worker cap and asset precompression.
+angie_vhost_root() {
+  local root
+  root=$(grep -m1 -E '^[[:space:]]*root[[:space:]]+' "$1" 2>/dev/null \
+    | sed -E 's/^[[:space:]]*root[[:space:]]+//; s/;.*//; s/^[[:space:]]+//; s/[[:space:]]+$//')
+  root=${root%\"}; root=${root#\"}
+  printf '%s' "${root%/}"
+}
+
+# True when an application's database host is this machine (loopback, a
+# socket path, or the default empty value), i.e. its PHP workers spend the
+# request on the CPU instead of waiting on a network round trip.
+app_db_host_is_local() {
+  local host=${1:-}
+  host=${host#p:}
+  case "$host" in
+    ""|localhost|127.0.0.1|::1|/*|unix:*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Application-aware PHP-FPM worker ceiling, or non-zero when it does not
+# apply.  XenForo and WordPress with a local database spend their request
+# time on the CPU (about 15 ms of PHP per page on a modern core), so workers
+# beyond a few per core only queue on the run queue: on a 16-core NVMe host a
+# 48-worker pool served the same ~1,000 member req/s as the 144-worker pool
+# with half the latency (p50 107 -> 51 ms, p99 150 -> 73 ms).  When every
+# PHP vhost in conf.d is one of those applications with a local database the
+# pool is capped at 4 workers per core (3 on a VPS, where cores are shared);
+# a host that also runs an unknown PHP application, or whose database is
+# remote (I/O-bound workers), keeps the generic ceiling.  --php children=
+# always wins.
+php_app_worker_cap() {
+  local cpu=$1 target=${2:-/etc/angie} per_core=4 apps=0 file root host
+  [[ -d "$target/conf.d" ]] || return 1
+  host_is_vps && per_core=3
+  for file in "$target"/conf.d/*.conf; do
+    [[ -f $file ]] || continue
+    grep -qE '^[[:space:]]*(include[[:space:]]+h5bp/(php[a-z0-9_]*|wordpress|xf2)\.conf;|fastcgi_pass[[:space:]])' "$file" || continue
+    root=$(angie_vhost_root "$file")
+    [[ -n $root ]] || return 1
+    if [[ -f "$root/src/XF.php" && -f "$root/src/config.php" ]]; then
+      host=$(xf_db_host_from_config "$root/src/config.php")
+    elif [[ -f "$root/wp-config.php" ]]; then
+      host=$(wp_db_host_from_config "$root/wp-config.php")
+    else
+      return 1
+    fi
+    app_db_host_is_local "$host" || return 1
+    apps=$(( apps + 1 ))
+  done
+  (( apps > 0 )) || return 1
+  printf '%s' $(( cpu * per_core ))
+}
+
+# Precompress the static assets under one document root so brotli_static and
+# gzip_static serve .br/.gz siblings instead of compressing on every request
+# (serving one 177 KB XenForo script compressed per request cost 50-89% of a
+# 16-core host at 1.8k req/s).  Incremental: a sibling is (re)built only when
+# missing or older than its source, orphaned siblings are removed, a sibling
+# that is not smaller is dropped, and mtime/ownership follow the source so a
+# rerun is a no-op.  Images, woff2 and the application data directories are
+# skipped.  Prints the number of siblings written.
+precompress_static_assets() {
+  local root=$1 f out tmp ext n=0 have_brotli=0
+  [[ -d $root ]] || { printf 0; return 0; }
+  command -v brotli >/dev/null 2>&1 && have_brotli=1
+  while IFS= read -r -d '' f; do
+    for ext in gz br; do
+      [[ $ext == br && $have_brotli -eq 0 ]] && continue
+      out="${f}.${ext}"
+      [[ ! -e $out || $f -nt $out ]] || continue
+      tmp="${out}.tmp.$$"
+      if { [[ $ext == gz ]] && gzip -9 -n -c < "$f" > "$tmp"; } \
+         || { [[ $ext == br ]] && brotli -q 11 -c < "$f" > "$tmp"; }; then
+        if (( $(stat -c %s "$tmp") < $(stat -c %s "$f") )); then
+          touch -r "$f" "$tmp"
+          chown --reference="$f" "$tmp" 2>/dev/null || true
+          chmod 644 "$tmp"
+          mv -f "$tmp" "$out"
+          n=$(( n + 1 ))
+        else
+          rm -f "$tmp" "$out"
+        fi
+      else
+        rm -f "$tmp"
+      fi
+    done
+  done < <(find "$root" -type f -regextype posix-extended \
+             -regex '.*\.(js|mjs|css|svg|json|xml|txt|map|ico|webmanifest|ttf|otf|eot|woff)$' -size +1k \
+             ! -path '*/internal_data/*' ! -path '*/data/*' ! -path '*/src/*' ! -path '*/install/*' \
+             ! -path '*/wp-content/uploads/*' ! -path '*/wp-content/cache/*' ! -path '*/.git/*' \
+             -print0 2>/dev/null)
+  # Siblings whose source is gone (an upgrade removed or renamed the file).
+  while IFS= read -r -d '' f; do
+    [[ -e ${f%.*} ]] || rm -f "$f"
+  done < <(find "$root" -type f -regextype posix-extended \
+             -regex '.*\.(js|mjs|css|svg|json|xml|txt|map|ico|webmanifest|ttf|otf|eot|woff)\.(gz|br)$' \
+             ! -path '*/internal_data/*' ! -path '*/data/*' ! -path '*/wp-content/uploads/*' \
+             -print0 2>/dev/null)
+  printf '%s' "$n"
+}
+
+# Install the cron helper that keeps the siblings fresh.  It carries a copy of
+# precompress_static_assets (declare -f), so the cron job has no dependency on
+# this script's location, and is regenerated by every install/--optimize.
+write_precompress_helper() {
+  local helper=$CRON_PRECOMPRESS tmp
+  tmp=$(tmp_file) || return 1
+  {
+    printf '#!/bin/bash\n'
+    printf '# Managed by setup.sh %s: keep .br/.gz siblings of static assets fresh for\n' "$SCRIPT_VERSION"
+    printf '# brotli_static/gzip_static.  Regenerated by every --optimize; do not edit.\n'
+    printf 'set -u\nexport LC_ALL=C PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n'
+    printf 'ROOTS=(%s)\n' "$(printf '%q ' "$@")"
+    declare -f precompress_static_assets
+    printf 'total=0\nfor root in "${ROOTS[@]}"; do\n  n=$(precompress_static_assets "$root")\n  total=$(( total + ${n:-0} ))\ndone\nprintf "precompressed %%s files\\n" "$total"\n'
+  } > "$tmp"
+  if [[ ! -f $helper ]] || ! cmp -s "$tmp" "$helper"; then
+    cat "$tmp" > "$helper"
+    tune_note "precompress: helper ${helper} written for ${*}"
+  fi
+  chmod 755 "$helper"
+}
+
+# Asset precompression for every detected XenForo/WordPress vhost: writes the
+# cron helper and runs it once (install and --optimize), or retires the
+# helper when the feature is off.  write_cron adds the 5-minute entry so an
+# application upgrade is re-compressed (and stale siblings dropped) quickly.
+configure_asset_precompression() {
+  local target=${1:-/etc/angie} helper=$CRON_PRECOMPRESS file root moved out
+  local -a roots=() nicer=(nice -n 19)
+  persist_precompress_assets
+  if (( ! PRECOMPRESS_ASSETS )); then
+    if [[ -f $helper ]] && grep -q 'Managed by setup.sh' "$helper" 2>/dev/null; then
+      moved=$(preserve_to_tmp "$helper" 2>/dev/null || true)
+      [[ -n $moved ]] && tune_note "precompress: helper moved to ${moved} (PRECOMPRESS_ASSETS=0)"
+      write_cron >/dev/null 2>&1 || true
+    fi
+    return 0
+  fi
+  while IFS= read -r file; do
+    [[ -n $file ]] || continue
+    root=$(angie_vhost_root "$file")
+    [[ -n $root && -d $root ]] && roots+=("$root")
+  done < <({ angie_xenforo_vhosts "$target"; angie_wordpress_vhosts "$target"; } 2>/dev/null | sort -u)
+  if (( ${#roots[@]} == 0 )); then
+    tune_miss "precompress: no XenForo/WordPress vhost with files found; nothing to precompress yet"
+    return 0
+  fi
+  # The brotli CLI (a 15 KB package) builds the .br siblings; without it the
+  # pass produces gzip siblings only.  Installed here, before the first pass,
+  # not in the compression step that runs later in the same Angie pass.
+  if ! command -v brotli >/dev/null 2>&1; then
+    apt_install brotli || warn "Could not install the brotli CLI; precompressed assets will be gzip only"
+  fi
+  write_precompress_helper "${roots[@]}" || return 1
+  # The managed crontab was written before the helper existed on a first run.
+  write_cron >/dev/null 2>&1 || warn "Could not refresh the managed crontab for the precompress helper"
+  command -v ionice >/dev/null 2>&1 && nicer+=(ionice -c 3)
+  out=$("${nicer[@]}" "$helper" 2>/dev/null || true)
+  tune_note "precompress: ${out:-ran} under ${roots[*]} (brotli_static/gzip_static; refreshed every 5 min by cron)"
+  return 0
+}
+
 tune_angie_configs() {
   local target=${1:-/etc/angie}
   local nginx_conf="${target}/angie.conf"
@@ -3847,6 +4081,35 @@ sync_php_ini_template() {
   return 0
 }
 
+# Path of the php-fpm binary for a version (PATH first, then the Debian
+# location), or non-zero when the version is not installed.
+php_fpm_binary() {
+  local ver=$1 bin
+  if bin=$(command -v "php-fpm${ver}" 2>/dev/null) && [[ -n $bin ]]; then
+    printf '%s' "$bin"
+  elif [[ -x "/usr/sbin/php-fpm${ver}" ]]; then
+    printf '%s' "/usr/sbin/php-fpm${ver}"
+  else
+    return 1
+  fi
+}
+
+# Point a pool at its listener (socket path or address) with the socket
+# owner, group and mode Angie expects.  Shared by the pool tuner and the
+# TCP-to-socket migration.  listen.allowed_clients is meaningless (and noisy)
+# for a Unix socket, so it is dropped there.
+php_pool_set_listener() {
+  local pool=$1 ver=$2 socket=$3
+  tune_pool_set "$pool" listen "$socket" "PHP ${ver}: listen=${socket}"
+  if [[ $socket == /* ]] && grep -qE '^[[:space:]]*listen\.allowed_clients[[:space:]]*=' "$pool"; then
+    sed_in_place -E '/^[[:space:]]*listen\.allowed_clients[[:space:]]*=/d' "$pool"
+    tune_note "PHP ${ver}: removed listen.allowed_clients (Unix socket)"
+  fi
+  tune_pool_set "$pool" listen.owner www-data "PHP ${ver}: listen.owner=www-data"
+  tune_pool_set "$pool" listen.group www-data "PHP ${ver}: listen.group=www-data"
+  tune_pool_set "$pool" listen.mode 0660 "PHP ${ver}: listen.mode=0660"
+}
+
 tune_php_fpm_version() {
   local ver=$1
   local socket=${2:-}
@@ -3862,18 +4125,13 @@ tune_php_fpm_version() {
   fi
 
   local nproc ram_mb max_children max_requests php_budget backlog
-  local opcache_mb jit_mb memory_mb realpath_kb php_allowance
+  local opcache_mb jit_mb memory_mb realpath_kb
   local current_children
   nproc=$(effective_cpus)
   (( nproc > 0 )) || nproc=1
   ram_mb=$(mem_total_mb)
   backlog=$(effective_backlog)
 
-  php_allowance=${OPT_PHP_ALLOWANCE_MB:-0}
-  if ! [[ $php_allowance =~ ^[0-9]+$ ]] || (( php_allowance <= 0 )); then
-    php_allowance=$(php_worker_allowance_mb "$ver")
-    [[ $php_allowance =~ ^[0-9]+$ ]] || php_allowance=96
-  fi
   php_budget=${OPT_PHP_BUDGET_MB:-0}
   # Capacity and reservation are different numbers.  A live pool keeps its
   # worker count even when the measured per-worker allowance rises; a fresh
@@ -3894,17 +4152,11 @@ tune_php_fpm_version() {
   # An explicit --php children=/max_requests= written at install time is an
   # operator decision, not a hardware guess: keep it across --optimize runs.
   explicit_value=$(explicit_option php_children 2>/dev/null || true)
-  if [[ -n $live_children || -n $explicit_value ]]; then
-    max_children=$(php_children_ceiling "$nproc" "$ram_mb" "$live_children" "$explicit_value")
-  elif (( ${OPT_PHP_CHILDREN:-0} > 0 )); then
-    # The shared planner already derived the count with the same CPU/RAM
-    # ceilings used here, so a fresh install and --optimize agree.
-    max_children=$OPT_PHP_CHILDREN
-  elif (( php_budget > 0 )); then
-    # Standalone call (no plan): fall back to the reservation divisor.
-    max_children=$(php_children_ceiling "$nproc" "$ram_mb" "$(( php_budget / 96 ))" "")
-  else
-    max_children=$(php_children_ceiling "$nproc" "$ram_mb" "" "")
+  max_children=$(php_plan_max_children "$nproc" "$ram_mb" "$live_children" "$explicit_value" "$php_budget")
+  local app_cap
+  if [[ -z $explicit_value ]] && app_cap=$(php_app_worker_cap "$nproc") \
+     && [[ $app_cap =~ ^[0-9]+$ ]] && (( max_children == app_cap )); then
+    tune_note "PHP ${ver}: max_children capped at ${app_cap} (XenForo/WordPress with a local database are CPU-bound; --php children= overrides)"
   fi
   max_requests=$(( nproc * 1024 ))
   if explicit_value=$(explicit_option php_max_requests); then
@@ -3914,6 +4166,9 @@ tune_php_fpm_version() {
   opcache_mb=$(( ram_mb / 16 )); (( opcache_mb < 128 )) && opcache_mb=128; (( opcache_mb > 512 )) && opcache_mb=512
   jit_mb=$(( ram_mb / 128 )); (( jit_mb < 32 )) && jit_mb=32; (( jit_mb > 128 )) && jit_mb=128
   memory_mb=$(( ram_mb / 8 )); (( memory_mb < 256 )) && memory_mb=256; (( memory_mb > 512 )) && memory_mb=512
+  # Under 2 GB a 256M per-request ceiling lets a handful of workers claim
+  # the whole host; XenForo and WordPress run within 128M.
+  (( ram_mb < 2048 )) && memory_mb=128
   realpath_kb=$(( ram_mb * 2 )); (( realpath_kb < 4096 )) && realpath_kb=4096; (( realpath_kb > 16384 )) && realpath_kb=16384
 
   mkdir -p /run/php
@@ -3923,16 +4178,8 @@ tune_php_fpm_version() {
   tune_pool_set "$pool" pm static "PHP ${ver}: pm=static"
   tune_pool_set "$pool" pm.max_children "$max_children" "PHP ${ver}: max_children=${max_children}"
   tune_pool_set "$pool" pm.max_requests "$max_requests" "PHP ${ver}: max_requests=${max_requests}"
-  tune_pool_set "$pool" listen "$socket" "PHP ${ver}: listen=${socket}"
-  # listen.allowed_clients is meaningless (and noisy) for a Unix socket.
-  if [[ $socket == /* ]] && grep -qE '^[[:space:]]*listen\.allowed_clients[[:space:]]*=' "$pool"; then
-    sed_in_place -E '/^[[:space:]]*listen\.allowed_clients[[:space:]]*=/d' "$pool"
-    tune_note "PHP ${ver}: removed listen.allowed_clients (Unix socket)"
-  fi
+  php_pool_set_listener "$pool" "$ver" "$socket"
   tune_pool_set "$pool" listen.backlog "$backlog" "PHP ${ver}: listen.backlog=${backlog}"
-  tune_pool_set "$pool" listen.owner www-data "PHP ${ver}: listen.owner=www-data"
-  tune_pool_set "$pool" listen.group www-data "PHP ${ver}: listen.group=www-data"
-  tune_pool_set "$pool" listen.mode 0660 "PHP ${ver}: listen.mode=0660"
   # Ensure the pool's log destinations exist before enabling slow logging.  A
   # pool upgraded from an older package may still point slowlog at a
   # directory that no longer exists (seen on Ubuntu 24.04); php-fpm -t then
@@ -4042,12 +4289,8 @@ EOF
     fi
   fi
 
-  local fpm_bin="" fpm_test
-  if command -v "php-fpm${ver}" >/dev/null 2>&1; then
-    fpm_bin=$(command -v "php-fpm${ver}")
-  elif [[ -x "/usr/sbin/php-fpm${ver}" ]]; then
-    fpm_bin="/usr/sbin/php-fpm${ver}"
-  fi
+  local fpm_bin fpm_test
+  fpm_bin=$(php_fpm_binary "$ver" || true)
   if [[ -n $fpm_bin ]]; then
     fpm_test=$(tmp_file)
     if ! "$fpm_bin" -t >"$fpm_test" 2>&1; then
@@ -4078,6 +4321,18 @@ ANGIE_COMPRESSION_SKIPPED=0
 ANGIE_BROTLI_OK=0
 ANGIE_BROTLI_LEVEL=5
 
+# Dynamic Brotli level: SETUP_BROTLI_LEVEL when valid, otherwise 5, or 4 on a
+# 1-2 CPU host where per-response compression competes with PHP for cores.
+# One owner for the install, --optimize and dry-run values.
+angie_brotli_level() {
+  local level=${SETUP_BROTLI_LEVEL:-}
+  if ! [[ $level =~ ^([1-9]|1[01])$ ]]; then
+    level=5
+    (( $(effective_cpus) <= 2 )) && level=4
+  fi
+  printf '%s' "$level"
+}
+
 ensure_angie_compression() {
   local target=${1:-/etc/angie}
   local conf="${target}/angie.conf"
@@ -4092,9 +4347,12 @@ ensure_angie_compression() {
     return 0
   fi
 
-  local brotli_level=${SETUP_BROTLI_LEVEL:-5}
-  [[ $brotli_level =~ ^([1-9]|1[01])$ ]] || brotli_level=5
+  local brotli_level static_mode=off
+  brotli_level=$(angie_brotli_level)
   ANGIE_BROTLI_LEVEL=$brotli_level
+  # brotli_static serves a .br sibling when one exists and falls back to the
+  # dynamic filter otherwise; it is only useful with precompressed assets.
+  (( PRECOMPRESS_ASSETS )) && static_mode=on
 
   local enabled="${target}/modules-enabled"
   local changed=0
@@ -4139,16 +4397,16 @@ EOF
     if [[ -f "${target}/http.d/brotli_conf" ]]; then
       {
         printf '# Managed by setup.sh: dynamic Brotli from http.d/brotli_conf.\n'
-        printf '# Static assets are left to the CDN; dynamic PHP/HTML is compressed here.\n'
+        printf '# brotli_static %s: precompressed .br siblings (SETUP_PRECOMPRESS_ASSETS=%s).\n' "$static_mode" "$PRECOMPRESS_ASSETS"
         cat "${target}/http.d/brotli_conf"
       } > "$tmp"
       sed_in_place -E "s/^brotli_comp_level [0-9]+;/brotli_comp_level ${brotli_level};/" "$tmp"
-      sed_in_place -E 's/^brotli_static on;/brotli_static off;/' "$tmp"
+      sed_in_place -E "s/^brotli_static (on|off);/brotli_static ${static_mode};/" "$tmp"
     else
       cat > "$tmp" <<EOF
 # Managed by setup.sh: dynamic Brotli (template was missing).
 brotli on;
-brotli_static off;
+brotli_static ${static_mode};
 brotli_comp_level ${brotli_level};
 brotli_min_length 50;
 brotli_types text/plain text/css text/xml application/json application/javascript application/xml image/svg+xml font/ttf font/otf;
@@ -4356,6 +4614,7 @@ deploy_angie_configs() {
   # the repo template overwrite tuned cache values on the next run.
   optimize_wordpress_cache /etc/angie || warn "WordPress cache setup was skipped"
   ensure_xf_guest_cache /etc/angie || warn "XenForo cache setup was skipped"
+  configure_asset_precompression /etc/angie || warn "Asset precompression was skipped"
   if ! tune_angie_configs /etc/angie; then
     warn "Angie tuning failed"
     return 1
@@ -4715,11 +4974,7 @@ install_php() {
     return 1
   fi
   systemctl status "php${ver}-fpm" --no-pager || true
-  if command -v "php-fpm${ver}" >/dev/null 2>&1; then
-    "php-fpm${ver}" -v
-  else
-    "/usr/sbin/php-fpm${ver}" -v
-  fi
+  "$(php_fpm_binary "$ver")" -v || true
   ok "PHP ${ver} installed"
 }
 
@@ -4874,11 +5129,16 @@ mariadb_strip_install_block() {
 
 mariadb_compute_profile() {
   local size_mb=$1 logsize open_cache aria_mb threads max_conn current_max="" kept_max=0
+  local disk_class io_read io_write io_threads lru_depth flush_neighbors tmp_mb thread_cache ram_mb log_cap
+  disk_class=$(mariadb_storage_class)
+  # Redo log: a quarter of the pool.  2 GB is enough on SSD/HDD; NVMe absorbs
+  # the longer checkpoint window, so a pool of 16 GB or more gets up to 4 GB
+  # before write bursts stall on checkpoints.
   logsize=$(( size_mb / 4 ))
   (( logsize < 64 )) && logsize=64
-  (( logsize > 2048 )) && logsize=2048
-  open_cache=4000
-  (( size_mb >= 4096 )) && open_cache=8000
+  log_cap=2048
+  [[ $disk_class == nvme ]] && log_cap=4096
+  (( logsize > log_cap )) && logsize=$log_cap
   aria_mb=$(( size_mb / 16 ))
   (( aria_mb < 16 )) && aria_mb=16
   (( aria_mb > 256 )) && aria_mb=256
@@ -4902,8 +5162,6 @@ mariadb_compute_profile() {
   # Disk-class dependent I/O behaviour.  Flushing neighbour pages only helps
   # rotational disks; I/O threads beyond ~16 add contention, and an HDD
   # cannot keep 16 threads busy.  The LRU scan depth follows io_capacity.
-  local disk_class io_read io_write io_threads lru_depth flush_neighbors tmp_mb thread_cache ram_mb
-  disk_class=$(mariadb_storage_class)
   read -r io_read io_write <<< "$(mariadb_io_capacity)"
   if [[ $disk_class == hdd ]]; then
     io_threads=4
@@ -4944,6 +5202,9 @@ mariadb_compute_profile() {
   (( kept_max == 0 && max_conn > 2000 )) && max_conn=2000
   (( max_conn > 100000 )) && max_conn=100000
   (( max_conn < 200 )) && max_conn=200
+  # Table caches follow the connection ceiling (every session can hold a
+  # handful of open tables), not the buffer pool size.
+  open_cache=$(tune_clamp $(( max_conn * 16 )) 4000 32768)
 
   MARIADB_PROFILE_BUFFER=$(mb_to_config "$size_mb")
   MARIADB_PROFILE_LOG_SIZE=$(mb_to_config "$logsize")
@@ -5084,6 +5345,12 @@ mariadb_write_base_block() {
   local cnf=$1 bind=$2 tmp
   [[ -f $cnf ]] || return 1
 
+  # secure_file_priv points here on both paths, so both paths create it
+  # (an adopted host tuned by --optimize had the directive without the dir).
+  mkdir -p /var/lib/mysql-files 2>/dev/null || true
+  chown mysql:mysql /var/lib/mysql-files 2>/dev/null || true
+  chmod 750 /var/lib/mysql-files 2>/dev/null || true
+
   # Comment out expire_logs_days if it is active.
   sed_in_place -E 's|^([[:space:]]*)expire_logs_days([[:space:]]*=)|\1#expire_logs_days\2|' "$cnf"
 
@@ -5122,6 +5389,17 @@ EOF
 bind-address = ${bind}
 ${MARIADB_END}
 EOF
+}
+
+# Wait up to N seconds for the server to answer SELECT 1 (install restart,
+# --optimize restart and the rollback paths all need the same probe).
+mariadb_wait_ready() {
+  local attempts=${1:-30} i
+  for (( i = 0; i < attempts; i++ )); do
+    mariadb -e 'SELECT 1' >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
 }
 
 configure_mariadb() {
@@ -5181,26 +5459,16 @@ install_mariadb() {
 
   configure_mariadb "$size_mb" "$bind"
 
-  mkdir -p /var/lib/mysql-files
-  chown -R mysql:mysql /var/lib/mysql-files
-  chmod 750 /var/lib/mysql-files
   ensure_log_dirs
   systemctl daemon-reload
 
-  local i
-  for i in {1..30}; do
-    mariadb -e 'SELECT 1' >/dev/null 2>&1 && break
-    sleep 1
-  done
+  mariadb_wait_ready 30 || true
 
   if ! systemctl restart mariadb; then
     journalctl -u mariadb -n 80 --no-pager || true
     return 1
   fi
-  for i in {1..30}; do
-    mariadb -e 'SELECT 1' >/dev/null 2>&1 && break
-    sleep 1
-  done
+  mariadb_wait_ready 30 || true
 
   local eu ep sql host
   eu=$(sql_escape "$user")
@@ -5698,6 +5966,14 @@ EOF
   # during install too, not only on the next --optimize, and install the
   # template that keeps new indexes green.
   elasticsearch_fix_single_node_replicas || warn "Could not normalise single-node replicas"
+  # The shared heap/replica helpers report through opt_report; --optimize
+  # writes those lines to its Markdown report, the installer prints them to
+  # the run log so a replica or heap problem is not silently dropped.
+  local line
+  for line in "${OPT_REPORT[@]}"; do
+    info "Elasticsearch: ${line#- }"
+  done
+  OPT_REPORT=()
   ok "Elasticsearch installed and running"
 }
 
@@ -6204,6 +6480,7 @@ purge_angie() {
   cron_remove_line '/usr/bin/find /var/www' || true
   cron_remove_line "$CRON_WWW_CHOWN_LEGACY" || true
   cron_remove_line "$CRON_WWW_CHOWN" || true
+  cron_remove_line "$CRON_PRECOMPRESS" || true
   systemctl daemon-reload || true
   ok "Angie purged (files preserved)"
 }
@@ -6526,6 +6803,17 @@ opt_restore() {
   fi
 }
 
+# Undo a failed service tune: restore its configuration tree and systemd
+# drop-in from the optimize backup, reload systemd and start it again on the
+# previous files.  Shared by the MariaDB, Valkey/Redis and Elasticsearch paths.
+opt_rollback_restart() {
+  local unit=$1 conf_dir=$2 conf_name=$3 dropin_name=$4
+  opt_restore "$conf_dir" "$conf_name"
+  opt_restore "/etc/systemd/system/${unit}.service.d" "$dropin_name"
+  systemctl daemon-reload || true
+  systemctl restart "$unit" 2>/dev/null || true
+}
+
 detect_installed_services() {
   OPT_DETECTED=()
   [[ -x /usr/sbin/angie && -f /etc/angie/angie.conf ]] && OPT_DETECTED+=(angie)
@@ -6773,6 +7061,9 @@ elasticsearch_current_heap_mb() {
 plan_memory_budget() {
   local total usable
   local has_php=0 has_maria=0 has_cache=0 has_es=0
+  # A fresh install has no pool to measure.  It plans at the 64 MB floor that
+  # php_worker_allowance_mb measures for a freshly started, idle pool, so the
+  # first --optimize after the install reserves the same PHP budget.
   local cpu=1 allowance=64 php_capacity=0 php_floor=0 php_budget=0 children=0
   local maria_target=0 valkey_target=0 es_target=0
   local maria_alloc=0 valkey_alloc=0 es_alloc=0
@@ -6790,7 +7081,6 @@ plan_memory_budget() {
   OPT_MEM_BUDGET_MB=$usable
   OPT_PHP_BUDGET_MB=0
   OPT_PHP_CHILDREN=0
-  OPT_PHP_ALLOWANCE_MB=0
   OPT_MARIADB_BUDGET_MB=0
   OPT_MARIADB_KEPT_MB=0
   OPT_VALKEY_BUDGET_MB=0
@@ -6973,6 +7263,15 @@ plan_memory_budget() {
       fi
     done
   fi
+  # The operational floors (256 MB MariaDB/Valkey, 512 MB Elasticsearch, the
+  # PHP worker floor) cannot be trimmed; on a 1 GB host running every service
+  # they exceed the budget.  Record the overcommit so the plan and the report
+  # say so instead of printing allocations that look as if they fit.
+  OPT_MEM_OVERCOMMIT_MB=0
+  if (( maria_alloc + valkey_alloc + es_alloc + php_floor > usable )); then
+    OPT_MEM_OVERCOMMIT_MB=$(( maria_alloc + valkey_alloc + es_alloc + php_floor - usable ))
+    warn "Memory plan: service floors exceed the ${usable} MB budget by ${OPT_MEM_OVERCOMMIT_MB} MB; this host is too small for the selected services"
+  fi
 
   # PHP gets what the data tier did not need, bounded by CPU and the 50%-RAM
   # ceiling.  Eight workers are always kept when PHP is installed.
@@ -7005,7 +7304,6 @@ plan_memory_budget() {
   OPT_VALKEY_BUDGET_MB=$valkey_alloc
   OPT_ES_BUDGET_MB=$es_alloc
   OPT_ES_KEPT_MB=$es_kept
-  OPT_PHP_ALLOWANCE_MB=$allowance
   OPT_PHP_CHILDREN=$children
   OPT_PHP_BUDGET_MB=$php_budget
   return 0
@@ -7030,6 +7328,12 @@ php_children_ceiling() {
   if [[ $live =~ ^[0-9]+$ ]] && (( live > 0 )); then
     cap=$live
   fi
+  # A CPU-bound application host (XenForo/WordPress with a local database)
+  # is capped below the generic and live counts; see php_app_worker_cap.
+  local app_cap
+  if app_cap=$(php_app_worker_cap "$cpu") && [[ $app_cap =~ ^[0-9]+$ ]] && (( cap > app_cap )); then
+    cap=$app_cap
+  fi
   if [[ $explicit =~ ^[0-9]+$ ]] && (( explicit > 0 )); then
     cap=$explicit
   fi
@@ -7047,6 +7351,26 @@ php_children_floor() {
   (( floor > 8 )) && floor=8
   (( floor < 2 )) && floor=2
   printf '%s' "$floor"
+}
+
+# One decision tree for the PHP-FPM worker count, shared by the pool writer
+# and the dry run so the preview and the written pool cannot disagree: a live
+# pool keeps its count (the reservation is a memory estimate, not a quota),
+# an explicit --php children= wins, otherwise the shared memory plan decides;
+# a standalone call without a plan falls back to the 96 MB reservation
+# divisor.  Arguments: cpus, RAM MB, live count (""/0 when none), explicit
+# value ("" when none), planned PHP budget MB (0 when none).
+php_plan_max_children() {
+  local nproc=$1 ram_mb=$2 live=${3:-} explicit=${4:-} php_budget=${5:-0}
+  if [[ -n $live && $live != 0 ]] || [[ -n $explicit ]]; then
+    php_children_ceiling "$nproc" "$ram_mb" "$live" "$explicit"
+  elif (( ${OPT_PHP_CHILDREN:-0} > 0 )); then
+    printf '%s' "$OPT_PHP_CHILDREN"
+  elif [[ $php_budget =~ ^[0-9]+$ ]] && (( php_budget > 0 )); then
+    php_children_ceiling "$nproc" "$ram_mb" "$(( php_budget / 96 ))" ""
+  else
+    php_children_ceiling "$nproc" "$ram_mb" "" ""
+  fi
 }
 
 # Angie worker limits shared by tune_angie_configs and the dry run.
@@ -7089,6 +7413,15 @@ angie_disk_free_mb() {
 # --elastic ram= and made the next --optimize re-split RAM.
 record_explicit_options() {
   local v mb
+  # --basic server=dedi|vps is an operator decision about the host class;
+  # without it a later --optimize would re-detect and silently switch every
+  # dedi/vps formula (workers per core, backlogs, io_capacity, governor).
+  if [[ ${ENABLED[basic]:-0} -eq 1 ]]; then
+    case ${OPT[basic.server]:-} in
+      dedi|vps) explicit_option_set server_type "${OPT[basic.server]}" ;;
+      *) explicit_option_unset server_type ;;
+    esac
+  fi
   if [[ ${ENABLED[php]:-0} -eq 1 ]]; then
     v=${OPT[php.children]:-}
     if [[ -n $v && $v != auto ]]; then explicit_option_set php_children "$v"; else explicit_option_unset php_children; fi
@@ -7206,9 +7539,9 @@ php_pool_max_children() {
 # RAM for it in the shared plan.  A fixed 96 MB is safe for an unknown
 # application, but real workers are commonly 20-50 MB; reserving 96 MB each
 # leaves several GB that MariaDB and Elasticsearch could use.  When a pool is
-# already running, measure it and add headroom to the largest worker (and 3x
-# the average), clamped to a conservative 64-192 MB range.  A fresh install
-# has no pool to measure and keeps the 96 MB default.
+# already running, measure it (1.5x the average RSS) clamped to a conservative
+# 64-192 MB range.  A fresh install has no pool to measure and plans at the
+# 64 MB floor (plan_memory_budget), which is what an idle new pool measures.
 php_worker_allowance_mb() {
   local ver=${1:-} out avg=0 n=0 allowance=96
   if [[ -n $ver ]]; then
@@ -7268,10 +7601,8 @@ angie_wordpress_vhosts() {
   for file in "$target"/conf.d/*.conf; do
     [[ -f $file ]] || continue
     grep -qE '^[[:space:]]*include[[:space:]]+h5bp/(php_wp|wordpress)\.conf;' "$file" || continue
-    root=$(grep -m1 -E '^[[:space:]]*root[[:space:]]+' "$file" 2>/dev/null \
-      | sed -E 's/^[[:space:]]*root[[:space:]]+//; s/;.*//; s/^[[:space:]]+//; s/[[:space:]]+$//')
-    root=${root%\"}; root=${root#\"}
-    [[ -n $root && -f "${root%/}/wp-config.php" ]] && printf '%s\n' "$file"
+    root=$(angie_vhost_root "$file")
+    [[ -n $root && -f "${root}/wp-config.php" ]] && printf '%s\n' "$file"
   done
 }
 
@@ -7282,10 +7613,8 @@ angie_xenforo_vhosts() {
   for file in "$target"/conf.d/*.conf; do
     [[ -f $file ]] || continue
     grep -qE '^[[:space:]]*include[[:space:]]+h5bp/(php_xf|xf2)\.conf;' "$file" || continue
-    root=$(grep -m1 -E '^[[:space:]]*root[[:space:]]+' "$file" 2>/dev/null \
-      | sed -E 's/^[[:space:]]*root[[:space:]]+//; s/;.*//; s/^[[:space:]]+//; s/[[:space:]]+$//')
-    root=${root%\"}; root=${root#\"}
-    [[ -n $root && -f "${root%/}/src/XF.php" ]] && printf '%s\n' "$file"
+    root=$(angie_vhost_root "$file")
+    [[ -n $root && -f "${root}/src/XF.php" ]] && printf '%s\n' "$file"
   done
 }
 
@@ -8140,6 +8469,7 @@ optimize_angie() {
   fi
   optimize_wordpress_cache /etc/angie || true
   ensure_xf_guest_cache /etc/angie || true
+  configure_asset_precompression /etc/angie || true
   if ! tune_angie_configs /etc/angie; then
     opt_restore /etc/angie angie
     opt_report "- **FAILED** tuning returned an error; configuration rolled back"
@@ -8254,11 +8584,7 @@ migrate_php_pool_to_socket() {
 
   [[ -f $pool && -f $angie_conf ]] || { MIGRATE_REASON="pool or angie.conf is missing"; return 1; }
   systemctl is-active --quiet angie || { MIGRATE_REASON="Angie is not active"; return 1; }
-  if command -v "php-fpm${ver}" >/dev/null 2>&1; then
-    fpm_bin=$(command -v "php-fpm${ver}")
-  elif [[ -x "/usr/sbin/php-fpm${ver}" ]]; then
-    fpm_bin="/usr/sbin/php-fpm${ver}"
-  else
+  if ! fpm_bin=$(php_fpm_binary "$ver"); then
     MIGRATE_REASON="php-fpm${ver} binary not found"
     return 1
   fi
@@ -8298,11 +8624,7 @@ migrate_php_pool_to_socket() {
 
   # 2. Move the existing pool to the socket.  The reload is graceful: old
   #    workers finish in-flight TCP requests while the master opens the socket.
-  tune_pool_set "$pool" listen "$socket" "PHP ${ver}: listen=${socket}"
-  sed_in_place -E '/^[[:space:]]*listen\.allowed_clients[[:space:]]*=/d' "$pool"
-  tune_pool_set "$pool" listen.owner www-data "PHP ${ver}: listen.owner=www-data"
-  tune_pool_set "$pool" listen.group www-data "PHP ${ver}: listen.group=www-data"
-  tune_pool_set "$pool" listen.mode 0660 "PHP ${ver}: listen.mode=0660"
+  php_pool_set_listener "$pool" "$ver" "$socket"
   if ! "$fpm_bin" -t >/dev/null 2>&1; then
     cp -a "$bak/www.conf" "$pool"
     cp -a "$bak/angie.conf" "$angie_conf"
@@ -8706,11 +9028,7 @@ optimize_mariadb() {
       OPT_CUTOVER=1
       # A large buffer pool may need to preload at startup; allow up to five
       # minutes before declaring the restart failed.
-      for i in {1..300}; do
-        mariadb -e 'SELECT 1' >/dev/null 2>&1 && break
-        sleep 1
-      done
-      if mariadb -e 'SELECT 1' >/dev/null 2>&1; then
+      if mariadb_wait_ready 300; then
         opt_report "- Restart: **OK**"
         live_slow=$(mariadb -N -B -e 'SELECT @@slow_query_log' 2>/dev/null || true)
         live_err=$(mariadb -N -B -e 'SELECT @@log_error' 2>/dev/null || true)
@@ -8725,27 +9043,15 @@ optimize_mariadb() {
         opt_report "- Web frontends resumed after the MariaDB restart"
       else
         opt_report "- Restart: **FAILED** (SQL probe); rolling back"
-        opt_restore /etc/mysql mysql
-        opt_restore /etc/systemd/system/mariadb.service.d mariadb-systemd
-        systemctl daemon-reload || true
-        systemctl restart mariadb 2>/dev/null || true
-        for i in {1..30}; do
-          mariadb -e 'SELECT 1' >/dev/null 2>&1 && break
-          sleep 1
-        done
+        opt_rollback_restart mariadb /etc/mysql mysql mariadb-systemd
+        mariadb_wait_ready 30 || true
         opt_resume_web_frontends || true
         return 1
       fi
     else
       opt_report "- Restart: **FAILED**; rolling back"
-      opt_restore /etc/mysql mysql
-      opt_restore /etc/systemd/system/mariadb.service.d mariadb-systemd
-      systemctl daemon-reload || true
-      systemctl restart mariadb 2>/dev/null || true
-      for i in {1..30}; do
-        mariadb -e 'SELECT 1' >/dev/null 2>&1 && break
-        sleep 1
-      done
+      opt_rollback_restart mariadb /etc/mysql mysql mariadb-systemd
+      mariadb_wait_ready 30 || true
       opt_resume_web_frontends || true
       return 1
     fi
@@ -8814,7 +9120,7 @@ optimize_valkey() {
     label=Redis conf=/etc/redis/redis.conf conf_dir=/etc/redis
     unit=redis-server cli=redis-cli
   fi
-  local active=0 ram_mb max_mb policy backlog io_threads i
+  local active=0 max_mb policy backlog io_threads i
   local conf_before conf_after dropin unit_changed=0
   local online_ok=0 live_io="" live_backlog="" k v
   local socket_path group socket_before perm_before perm_after socket_changed=0 group_changed=0
@@ -8834,8 +9140,7 @@ optimize_valkey() {
   # hardware plan blindly.
   local used_mb=0 needed_mb
   if (( active )); then
-    used_mb=$("$cli" info memory 2>/dev/null \
-      | awk -F: '/^used_memory:/{gsub(/\r/, "", $2); print int($2 / 1048576)}')
+    used_mb=$(valkey_live_used_mb 2>/dev/null || echo 0)
     [[ $used_mb =~ ^[0-9]+$ ]] || used_mb=0
     needed_mb=$(( used_mb * 120 / 100 ))
     if (( needed_mb > max_mb )); then
@@ -8980,18 +9285,12 @@ optimize_valkey() {
         fi
       else
         opt_report "- Restart: **FAILED** (PING); rolling back"
-        opt_restore "$conf_dir" "$kind"
-        opt_restore "/etc/systemd/system/${unit}.service.d" "${kind}-systemd"
-        systemctl daemon-reload || true
-        systemctl restart "$unit" 2>/dev/null || true
+        opt_rollback_restart "$unit" "$conf_dir" "$kind" "${kind}-systemd"
         return 1
       fi
     else
       opt_report "- Restart: **FAILED**; rolling back"
-      opt_restore "$conf_dir" "$kind"
-      opt_restore "/etc/systemd/system/${unit}.service.d" "${kind}-systemd"
-      systemctl daemon-reload || true
-      systemctl restart "$unit" 2>/dev/null || true
+      opt_rollback_restart "$unit" "$conf_dir" "$kind" "${kind}-systemd"
       return 1
     fi
   else
@@ -9310,18 +9609,12 @@ optimize_elastic() {
         opt_report "- Single-node replica check skipped: the HTTP endpoint was not reachable from this host"
       else
         opt_report "- Restart: **FAILED** (HTTP probe to \`${es_url}\` returned ${last_code:-no response}); rolling back"
-        opt_restore /etc/elasticsearch elasticsearch
-        opt_restore /etc/systemd/system/elasticsearch.service.d elasticsearch-systemd
-        systemctl daemon-reload || true
-        systemctl restart elasticsearch 2>/dev/null || true
+        opt_rollback_restart elasticsearch /etc/elasticsearch elasticsearch elasticsearch-systemd
         return 1
       fi
     else
       opt_report "- Restart: **FAILED**; rolling back"
-      opt_restore /etc/elasticsearch elasticsearch
-      opt_restore /etc/systemd/system/elasticsearch.service.d elasticsearch-systemd
-      systemctl daemon-reload || true
-      systemctl restart elasticsearch 2>/dev/null || true
+      opt_rollback_restart elasticsearch /etc/elasticsearch elasticsearch elasticsearch-systemd
       return 1
     fi
   else
@@ -9400,7 +9693,7 @@ verify_optimized_services() {
     while IFS= read -r ver; do
       systemctl is-active --quiet "php${ver}-fpm" || continue
       sock=$(php_pool_listen "$ver")
-      fpm_bin="/usr/sbin/php-fpm${ver}"
+      fpm_bin=$(php_fpm_binary "$ver" || true)
       if [[ -x $fpm_bin ]] && ! "$fpm_bin" -t >/dev/null 2>&1; then
         opt_report "- PHP ${ver}: **FAILED** configuration test"
         rc=1
@@ -9495,7 +9788,13 @@ optimize_plan() {
   backlog=$(effective_backlog)
   detect_installed_services
   plan_memory_budget
-  cpu_performance_governor_available || governor_desc="skipped (no performance governor)"
+  # Same decision as configure_cpu_governor: a guest never touches the
+  # governor, even when nested virtualisation exposes a cpufreq interface.
+  if host_is_vps; then
+    governor_desc="skipped (virtual host)"
+  elif ! cpu_performance_governor_available; then
+    governor_desc="skipped (no performance governor)"
+  fi
   disk_free_mb=$(angie_disk_free_mb)
   cache_mb=$(angie_cache_budget_mb "$ram_mb" "$disk_free_mb")
   angie_worker_limits "$nproc"
@@ -9514,12 +9813,18 @@ optimize_plan() {
   printf '  Memory: %sMB usable of %sMB (PHP=%sMB MariaDB=%sMB Cache=%sMB Elasticsearch=%sMB)\n' \
     "$OPT_MEM_BUDGET_MB" "$OPT_MEM_TOTAL_MB" "$OPT_PHP_BUDGET_MB" \
     "$OPT_MARIADB_BUDGET_MB" "$OPT_VALKEY_BUDGET_MB" "$OPT_ES_BUDGET_MB"
+  if (( ${OPT_MEM_OVERCOMMIT_MB:-0} > 0 )); then
+    printf '  WARNING: service floors exceed the budget by %sMB; this host is too small for the selected services\n' \
+      "$OPT_MEM_OVERCOMMIT_MB"
+  fi
   if [[ " ${OPT_DETECTED[*]} " == *" angie "* ]]; then
     printf '  Angie: workers=%s connections=%s rlimit=%s keepalive=%s cache_budget=%sMB\n' \
       "$ANGIE_WORKER_PROCESSES" "$ANGIE_WORKER_CONNECTIONS" "$ANGIE_WORKER_RLIMIT" \
       "$ANGIE_PHP_KEEPALIVE" "$cache_mb"
     printf '  Angie compression: Brotli level %s dynamic, gzip fallback (module installed on apply)\n' \
-      "${SETUP_BROTLI_LEVEL:-5}"
+      "$(angie_brotli_level)"
+    printf '  Angie static assets: precompressed .br/.gz siblings %s (SETUP_PRECOMPRESS_ASSETS)\n' \
+      "$( (( PRECOMPRESS_ASSETS )) && printf on || printf off )"
     printf '  Angie repository: sync %s (%s), then apply the hardware profile\n' \
       "${CONFIG_REPO_URL}" "${CONFIG_REPO_REF}"
   fi
@@ -9531,13 +9836,7 @@ optimize_plan() {
     live_children=$(php_pool_max_children)
     explicit_children=$(explicit_option php_children 2>/dev/null || true)
     explicit_requests=$(explicit_option php_max_requests 2>/dev/null || true)
-    if [[ -n $live_children && $live_children != 0 ]] || [[ -n $explicit_children ]]; then
-      max_children=$(php_children_ceiling "$nproc" "$ram_mb" "$live_children" "$explicit_children")
-    elif (( ${OPT_PHP_CHILDREN:-0} > 0 )); then
-      max_children=$OPT_PHP_CHILDREN
-    else
-      max_children=$(php_children_ceiling "$nproc" "$ram_mb" "" "")
-    fi
+    max_children=$(php_plan_max_children "$nproc" "$ram_mb" "$live_children" "$explicit_children" "${OPT_PHP_BUDGET_MB:-0}")
     [[ $explicit_requests =~ ^[0-9]+$ ]] || explicit_requests=$(( nproc * 1024 ))
     printf '  PHP-FPM:  max_children=%s max_requests=%s backlog=%s\n' \
       "$max_children" "$explicit_requests" "$backlog"
@@ -9984,11 +10283,7 @@ run_diagnostics() {
   diag_sh "PHP-FPM versions" 'for d in /etc/php/*/fpm; do [ -d "$d" ] || continue; v=${d%/fpm}; v=${v##*/}; echo "--- PHP $v"; if command -v "php-fpm$v" >/dev/null 2>&1; then "php-fpm$v" -v; elif [ -x "/usr/sbin/php-fpm$v" ]; then "/usr/sbin/php-fpm$v" -v 2>&1; else echo "no php-fpm${v} binary (stale configuration directory)"; fi; done'
   while IFS= read -r ver; do
     [[ -n $ver ]] || continue
-    if command -v "php-fpm${ver}" >/dev/null 2>&1; then
-      fpm_bin=$(command -v "php-fpm${ver}")
-    else
-      fpm_bin="/usr/sbin/php-fpm${ver}"
-    fi
+    fpm_bin=$(php_fpm_binary "$ver" || printf '/usr/sbin/php-fpm%s' "$ver")
     diag "PHP ${ver} FPM version" "$fpm_bin" -v
     diag "PHP ${ver} FPM test" "$fpm_bin" -t
     diag "PHP ${ver} pool" cat "/etc/php/${ver}/fpm/pool.d/www.conf"
@@ -10544,7 +10839,7 @@ run_optimize() {
     opt_report "- Log rotation: logrotate is not installed; central logs may grow"
   fi
   opt_report "## Operating system"
-  opt_report "- CPU governor, PAM limits and kernel/network/memory sysctls tuned for ${OPT_MEM_TOTAL_MB}MB RAM / $(nproc) CPUs"
+  opt_report "- CPU governor, PAM limits and kernel/network/memory sysctls tuned for ${OPT_MEM_TOTAL_MB}MB RAM / $(effective_cpus) CPUs"
   step "Optimizing installed services"
   if (( ${#OPT_DETECTED[@]} == 0 )); then
     info "No supported installed services detected (Angie, PHP-FPM, MariaDB, Valkey/Redis, Elasticsearch)"
@@ -10791,8 +11086,15 @@ main() {
   fi
   # The managed crontab depends on what the security pass found (the wp-cron
   # entry is added only once DISABLE_WP_CRON exists), so regenerate it after
-  # hardening, in the same order --optimize uses.  write_cron is idempotent.
-  if [[ ${ENABLED[basic]:-0} -eq 1 || ${ENABLED[domain]:-0} -eq 1 ]]; then
+  # hardening, in the same order --optimize uses.  write_cron is idempotent
+  # and runs after every install, so a later --angie or --mariadb-only run
+  # gets its entries (cloudflare sync, backups, checks) at once instead of at
+  # the next --optimize.
+  local svc_any=0 svc
+  for svc in basic angie php mariadb valkey elastic others domain; do
+    [[ ${ENABLED[$svc]:-0} -eq 1 ]] && svc_any=1
+  done
+  if (( svc_any )); then
     write_cron || warn "Could not refresh the managed crontab"
   fi
 

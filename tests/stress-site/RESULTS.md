@@ -1,5 +1,104 @@
 # Full-stack stress test reports
 
+## setup.sh 1.11.0 - dev-host audit run and XenForo profiling (2026-11-09)
+
+Host: dev-host, 16 threads / 27.2 GiB / NVMe (Crucial P3 Plus), Ubuntu 26.04.1,
+Angie 1.12.4, PHP 8.5.12, MariaDB 11.8.6, Valkey 9.0.4, Elasticsearch 9.5.6,
+reached over **Wi-Fi** only (the wired port had no carrier), so every
+link-bound number tops out around 90 MB/s. The host was wiped to the
+557-package headless baseline, installed in 1 min 42 s with `--basic --angie
+--php --mariadb user=demo pass=temp --valkey --elastic --others all --domain
+xf.test.local app=xf db=xenforo user=xfuser pass=...` from the local
+`server-configs-nginx` checkout (`CONFIG_SOURCE_DIR`), then `--optimize`
+was run: the 241-file configuration snapshots before and after were
+identical apart from the crontab's install-timestamp comment. Static checks
+(`bash -n`, shellcheck), the 101-case dry-run matrix, the tuning suite (439
+checks before the changes, 479 after), `--optimize --dry-run`,
+`--optimize`, `--diagnostics`, `--restart-all --dry-run`, `--restart-all`
+and `--purge all` all completed without errors on the live host.
+
+Load generator: `oha` 1.16.0 on the Mac mini (`run-stress-remote.sh`, 200
+connections, 15 s per scenario, HTTPS keep-alive, Mac exempted from the rate
+limiter with `SETUP_LIMIT_REQ_EXEMPT`); `collect-metrics.sh` sampled the
+server every 5 s.
+
+| Scenario | req/s | p50 | p90 | p99 | Status |
+|---|---:|---:|---:|---:|---|
+| static | 21,400 | 9.2 ms | 11.5 ms | 14.0 ms | 200 only |
+| php-hello | 20,438 | 7.8 ms | 9.7 ms | 11.9 ms | 200 only |
+| mariadb-json | 18,263 | 8.3 ms | 10.4 ms | 13.0 ms | 200 only |
+| valkey-json | 16,637 | 8.7 ms | 10.9 ms | 13.1 ms | 200 only |
+| elasticsearch (100 conns) | 9,777 | 8.9 ms | 14.1 ms | 28.4 ms | 200 only |
+| node-proxy | 18,133 | 10.8 ms | 13.6 ms | 17.0 ms | 200 only |
+| full-uncached-200 | 7,067 | 19.8 ms | 26.2 ms | 35.0 ms | 200 only |
+| full-cached-200 | 21,120 | 9.3 ms | 11.7 ms | 14.4 ms | 200 only |
+| slow-1s-200 | 148 | 1.02 s | 1.10 s | 1.24 s | 200 only |
+
+Within a few percent of the 1.9.0 run below. Server-side samples showed no
+PHP-FPM listen-queue growth or `max children reached`, no MariaDB slow
+queries, disk temp tables or aborted connects, no Valkey evictions or
+rejections, and no Elasticsearch search rejections. The only journal errors
+during the runs came from the udev I/O rule firing on partitions (fixed in
+1.11.0).
+
+### XenForo 2.3.13: guest and member tiers
+
+Installed into the `--domain xf.test.local app=xf` vhost from the local
+archive (CLI `xf:install`, friendly URLs on) and seeded through XF's own
+services (`XF\Service\User\RegistrationService`, `Thread\CreatorService`,
+`Thread\ReplierService`) with 50 members, 150 threads and 2,400 posts.
+Guest runs use 200 connections, uncached-guest and member runs 100, 12 s
+each; "uncached guest" sends a dummy `xf_session` cookie to bypass the
+guest cache.
+
+| Tier / scenario | 144 workers (plan) | 48 workers | 64 workers (app cap) | 64 + Valkey cache/sessions |
+|---|---:|---:|---:|---:|
+| guest, cached home | 8,084 req/s, p50 24 ms | 8,191, 24 ms | 8,767, 22 ms | 8,629, 23 ms |
+| guest, cached thread | 6,465, 29 ms | 6,843, 28 ms | 7,033, 28 ms | 6,885, 28 ms |
+| guest, uncached home | 1,146, **87 ms** (p99 125) | 1,168, **41 ms** (p99 61) | 1,149, 56 ms (p99 79) | 1,154, 56 ms |
+| guest, uncached thread | 712, 143 ms | 706, 69 ms | 719, 91 ms | 721, 90 ms |
+| member home | 934, **107 ms** (p99 150) | 949, **51 ms** (p99 73) | 883, 73 ms (p99 102) | 888, 73 ms |
+| member thread | 516, 205 ms | 500, 101 ms | 495, 137 ms | 494, 136 ms |
+| member forum view | - | 687, 72 ms | 659, 100 ms | 667, 100 ms |
+
+| Static asset `/js/xf/core-compiled.js` (177 KB, 200 conns) | req/s | server CPU |
+|---|---:|---|
+| dynamic Brotli/gzip per request (`brotli_static off`, no siblings) | 1,859 (br) / 1,719 (gzip) / 512 (identity, 88 MB/s link limit) | **50-89%** of 16 cores |
+| precompressed siblings (`SETUP_PRECOMPRESS_ASSETS=1`) | 1,675 (br) / 1,825 (gzip) / 562 (identity) | **2-5%** |
+
+Findings and what was changed:
+
+- **Guest pages are solved by the edge cache; the remaining origin cost was
+  compression.** Cached guest pages are link-bound (8k req/s at 22 ms p50 is
+  the Wi-Fi round trip, server ~20%). Every static-asset request was
+  compressed on the fly (41% of the host for cached HTML was already fixed in
+  1.9.0 by keying the cache on encoding); the JS/CSS assets a first-time
+  visitor or a crawler fetches cost up to 89% of the host at under 2k req/s.
+  1.11.0 adds opt-in precompressed siblings with `brotli_static`/`gzip_static`
+  (2,575 files for this board, 50 s for the first `brotli -q 11` pass, no-op
+  afterwards) and a 5-minute cron refresh; the same request rate then costs
+  2-5%. It stays off by default for CDN-fronted origins.
+- **The member tier is PHP CPU-bound and over-provisioned by the memory
+  plan.** 144, 64 and 48 workers all deliver ~900-950 member req/s at 100%
+  CPU; only latency changes (p50 107 / 73 / 51 ms). 1.11.0 caps the pool at
+  4 workers per core (3 on a VPS) when every PHP vhost is XenForo/WordPress
+  with a local database; 4 rather than 3 leaves headroom for the I/O-bound
+  requests those applications still have (`proxy.php` image proxy,
+  attachment downloads).
+- **Valkey as XF cache and session store changes nothing on a single host:**
+  888 vs 883 member req/s and 72.5 vs 73 ms p50 with 24.5k keys and 1.8 M
+  keyspace hits during the run. MariaDB stayed below 20% CPU in every member
+  scenario with no slow queries or disk temp tables. The `--optimize` report
+  keeps recommending the socket configuration as a hint for multi-host or
+  remote-database deployments only.
+
+Packages added to the 557-package baseline by this run: the 81 packages
+listed for 1.9.0 (`angie ... valkey-tools`, without `fail2ban`, which 1.10.0
+removed) plus `brotli` (`SETUP_PRECOMPRESS_ASSETS=1`) and the test tooling
+`shellcheck`. `--purge all` stopped every service and restored the recorded
+originals; `restore-baseline.sh` then purged the packages, trees, data and
+state and left an empty package diff against the baseline.
+
 ## setup.sh 1.9.0 - dev-host re-validation from a macOS workstation (2026-11-09)
 
 Host: dev-host, 16 threads / 27.2 GiB / NVMe (Crucial P3 Plus), Ubuntu 26.04.1,
