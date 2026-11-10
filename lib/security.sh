@@ -992,7 +992,7 @@ opt_resume_web_frontends() {
 }
 
 optimize_mariadb() {
-  local active=0 ver size_mb buffer logsize open_cache aria_mb
+  local active=0 ver size_mb buffer open_cache aria_mb
   local threads max_conn io_read io_write cnf_dir cnf backlog cnf_before cnf_after
   local unit_changed=0 limit_before="" i live_slow="" live_err=""
   systemctl is-active --quiet mariadb 2>/dev/null && active=1
@@ -1019,7 +1019,6 @@ optimize_mariadb() {
   fi
   mariadb_compute_profile "$size_mb"
   buffer=$MARIADB_PROFILE_BUFFER
-  logsize=$MARIADB_PROFILE_LOG_SIZE
   open_cache=$MARIADB_PROFILE_OPEN_CACHE
   aria_mb=$MARIADB_PROFILE_ARIA_MB
   threads=$MARIADB_PROFILE_THREADS
