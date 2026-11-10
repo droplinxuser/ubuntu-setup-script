@@ -1,6 +1,82 @@
 # Full-stack stress test reports
 
 
+## Live forum.example.com origin, audit 3 - member pages and the gallery count (2026-11-10)
+
+Host: 8-thread Xeon E3-class, 32 GiB, RAID10, Ubuntu 26.04.1, PHP 8.5.12
+FPM (`pm=static` 16), Angie 1.12.4, MariaDB 11.8.6, Valkey 9.0.4, XenForo
+2.3.13 with XFMG 2.3.9 (about 48 000 users, about 3 500 threads, about 10 000 posts, about 74 000
+media items, terabytes of media, tens of GB of `internal_data`).  The origin is reachable only through its front proxy, so the load
+generator (`oha` 1.16.0) ran on the host against `127.0.0.1` with
+`--connect-to`, exactly as in audit 2.  CPU per request is each service's
+systemd cgroup `usage_usec` delta divided by the completed requests
+(`sample-cpu.sh`/`analyze-cpu.py`).
+
+Member pages were exercised with `Cookie: xf_session=bench`, which bypasses
+the FastCGI guest cache without logging in: the full XenForo render path
+(permissions, templates, session row) runs, with the guest identity.
+
+### Baseline (8 connections, 8 s per scenario, loopback)
+
+| scenario | req/s | p50 ms | p99 ms | PHP ms/req | Angie | MariaDB | Valkey |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `/login/` | 441 | 17.5 | 27.0 | 12.4 | 2.13 | 1.35 | 0.26 |
+| gallery index `/` (uncached) | 62 | 126.8 | 204.0 | 38.9 | 4.80 | **54.0** | 0.30 |
+| `/whats-new/` (uncached) | 137 | 57.3 | 78.5 | 37.4 | 3.90 | 10.0 | 0.34 |
+| thread page (uncached) | 143 | 54.1 | 90.4 | 42.7 | 4.22 | 4.57 | 0.34 |
+
+The 8-thread host is saturated at ~7.4 of 8 cores in the PHP scenarios, so
+req/s is a direct proxy for CPU per request.  99.8 % OPcache hit rate, 607
+scripts cached, JIT tracing on (`kind=5, opt_level=4`), and `strace -c`
+showed 669 syscalls / 13 ms of system time per 5 s - the PHP cost is
+user-space execution, not I/O.
+
+A low-threshold slow log (`long_query_time=0.005`, `log_output=TABLE`)
+captured the gallery index's database work: **383 of 391 slow queries were
+one statement**, `SELECT COUNT(*) FROM xf_mg_media_item WHERE (album_state =
+'visible' OR album_state IS NULL) AND category_id IN (<31 ids>) AND
+media_state IN ('visible')`, at 47.7 ms average - one per view, a full scan
+of about 74 000 rows.
+
+### After the covering index (`mg_count_cover (media_state, album_state, category_id)`)
+
+| scenario | req/s | p50 ms | p99 ms | PHP ms/req | Angie | MariaDB | Valkey |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| gallery index `/` (uncached) | **90** | 86.7 | 126.3 | 40.7 | 4.28 | **30.7** | 0.30 |
+| `/whats-new/` (unchanged) | 137 | 57.0 | 83.3 | 38.6 | 4.10 | 10.0 | 0.35 |
+
+`EXPLAIN` now reports `type=range, key=mg_count_cover, rows=55482, Using
+index`; the query is 23.4 ms (was 47.7 ms).  +45 % requests/s and -32 % p50
+on the page every member lands on, with no application file touched.  The
+`ALTER` ran with `ALGORITHM=INPLACE, LOCK=NONE` in 0.22 s on the live table.
+
+### PHP-FPM and JIT on this host (thread page, 100 conns equivalent)
+
+| configuration | PHP ms/req | req/s |
+|---|---:|---:|
+| tracing 64 MB, 64/127/16/64 (shipped) | **42.8** | 143 |
+| tracing 32 MB / 128 MB | 43.2 / 43.7 | 143 / 140 |
+| aggressive 32/64/8/32 | 42.8 | 143 |
+| conservative 128/255/32/128 | 43.7 | 142 |
+| function JIT | 49.0 | 127 |
+| JIT off | 50.1 | 125 |
+| `opcache.validate_timestamps=0` | 41.7 | 144 |
+
+8 / 12 / 16 workers: 142-144 req/s and 42.6-43.0 ms PHP (no pool effect).
+
+### Left alone, with reasons
+
+- **Brotli 4**: ~4 ms of Angie CPU per thread page, but the proxy-to-client
+  path is the binding constraint for bytes (the external profile is dominated
+  by the front proxy), so lowering the level would cost real users
+  more than it saves.
+- **`opcache.preload`**: could remove the per-request class linking, but a
+  bad preload is fatal at FPM startup on a live board; not attempted.
+- **XFMG `X-Cache` / Valkey sessions**: member responses are session-specific
+  and XenForo has no session cache backend (its `xf_session` row is written
+  per request; MariaDB CPU for it is already ~1 ms).
+
+
 ## Clean Ubuntu 26.04 host, setup.sh 1.16.0 - PHP worker cap, JIT and parity (2026-11-10)
 
 Test target: a pristine Ubuntu 26.04.1 install on a Ryzen 7-class (8 cores /

@@ -3,6 +3,46 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.17.0 (2026-11-10)
+
+Audit of the live **forum.example.com** XenForo origin (8-thread Xeon E3-class,
+32 GiB, RAID, Ubuntu 26.04, PHP 8.5.12-FPM, Angie 1.12.4, MariaDB 11.8,
+Valkey 9, XenForo 2.3.13 + XFMG 2.3.9, about 48 000 users, about 3 500 threads, about 74 000
+media items), focused on the pages the FastCGI cache cannot serve: the gallery
+index and thread pages as a member.  CPU per request is each service's
+systemd cgroup `usage_usec` delta; the load generator ran on the host through
+loopback because the origin is reachable only through its front proxy.
+
+- **XFMG gallery-count covering index.**  The gallery index asks for its
+  pagination total with a `COUNT(*)` over `xf_mg_media_item` filtered by
+  `media_state`, an `album_state = 'visible' OR IS NULL` pair and every
+  visible `category_id`.  With the shipped indexes MariaDB chose a full scan:
+  47.7 ms per view, and 383 of 391 slow queries during a 6 s gallery load
+  (18.3 of 18.4 slow seconds).  A covering
+  `mg_count_cover (media_state, album_state, category_id)` turns it into a
+  55 482-row index-only range scan at 23.4 ms.  End to end the uncached
+  gallery index went from **62 to 90 req/s (+45 %)**, p50 130 -> 88 ms and
+  MariaDB CPU 54.0 -> 30.4 ms per request.  `--optimize` now adds the index
+  when XFMG is installed, the media table exists (any table prefix) and no
+  equivalent index is present, using `ALGORITHM=INPLACE, LOCK=NONE` with a
+  plain `ADD INDEX` fallback; `SETUP_XFMG_INDEX=0` disables it.
+- **JIT re-validated on a Xeon.**  Tracing + 64 MB + PHP's default thresholds
+  64/127/16/64 is 14 % cheaper per thread page than the JIT off (43.8 vs
+  50.1 ms PHP) and 13 % cheaper than the function JIT; 32/128 MB buffers and
+  the aggressive/conservative threshold sets stayed within noise.
+  `opcache.validate_timestamps=0` measured 2.5 % and is **not** adopted: it
+  turns every deploy into a manual OPcache reset.
+- **Worker count.**  8, 12 and 16 workers measured within 1 % of each other
+  on this 8-thread host (142-144 req/s, 42.6-43.0 ms PHP), so the 1.16.0
+  one-worker-per-thread rule is safe here; the database, not the pool, was
+  the bottleneck.
+- **What did not help (measured, left alone).**  Brotli stays at level 4:
+  compression is ~4 ms of Angie CPU per thread page but the front proxy link
+  is the binding constraint for bytes.  XFMG `X-Cache` for members, session
+  storage in Valkey and `opcache.preload` were not attempted: the first is
+  session-specific, XenForo has no session cache backend, and preloading
+  third-party framework code on a live board is a startup-fatal risk.
+
 ## 1.16.0 (2026-11-10)
 
 Third audit, on a clean Ubuntu 26.04 host (Ryzen 7-class, 8 cores / 16
