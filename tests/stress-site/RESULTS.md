@@ -50,6 +50,11 @@ index`; the query is 23.4 ms (was 47.7 ms).  +45 % requests/s and -32 % p50
 on the page every member lands on, with no application file touched.  The
 `ALTER` ran with `ALGORITHM=INPLACE, LOCK=NONE` in 0.22 s on the live table.
 
+This is a **manual, application-level change**: `setup.sh` never alters an
+application schema (no `ALTER TABLE`, no index creation, no data change), so
+`--optimize` reports the finding instead of applying it.  The statement is in
+the README under *Manual follow-ups* and is safe to run online.
+
 ### PHP-FPM and JIT on this host (thread page, 100 conns equivalent)
 
 | configuration | PHP ms/req | req/s |
