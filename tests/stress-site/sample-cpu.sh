@@ -38,7 +38,11 @@ while (( SECONDS - start < DUR )); do
     [[ $usec =~ ^[0-9]+$ ]] || continue
     printf '%s %s %s\n' "$ts" "$name" "$(( usec / 10000 ))" >> "$OUT"
   done
-  hostj=$(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8}' /proc/stat)
+  # /proc/stat fields: user nice system idle iowait irq softirq steal ...
+  # Count only busy time.  Including idle made the "host CPU used" line
+  # report ~one core-second per core per second on an idle host, which hid
+  # whether a run was actually CPU-bound.
+  hostj=$(awk '/^cpu /{print $2+$3+$4+$7+$8+$9}' /proc/stat)
   printf '%s HOST %s\n' "$ts" "$hostj" >> "$OUT"
   sleep 0.5
 done

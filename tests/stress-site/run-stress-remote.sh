@@ -22,6 +22,11 @@ shift 3 2>/dev/null || shift $#
 SCENARIOS=${*:-}
 CONNS=${CONNS:-200}
 DURATION=${DURATION:-15s}
+# Guest pages are served from a 60s/5m FastCGI cache.  Without a warm pass a
+# 10s run starts cold: the first requests render in PHP, and the result mixes
+# cache-miss latency into the "cached" tier (a 3-4x swing between runs).  Two
+# seconds at the same concurrency fills the cache and the PHP/OPcache pools.
+WARMUP=${WARMUP:-2}
 SCHEME=${SCHEME:-https}
 XF_DOMAIN=${XF_DOMAIN:-$DOMAIN}
 WP_DOMAIN=${WP_DOMAIN:-$DOMAIN}
@@ -60,16 +65,29 @@ run_one() {
   local name=$1 host=$2 path=$3 conns=$4; shift 4
   local url="${SCHEME}://${host}${path}" out="$TMP/${name}.json"
   printf '  %-16s %s c=%s %s\n' "$name" "$url" "$conns" "$DURATION" >&2
+  if (( WARMUP > 0 )); then
+    # shellcheck disable=SC2046
+    "$OHA" --no-tui --insecure --output-format json -z "${WARMUP}s" -c "$conns" \
+      $(connect_args "$host") --disable-color "$@" "$url" >/dev/null 2>&1 || true
+  fi
   # shellcheck disable=SC2046
   "$OHA" --no-tui --insecure --output-format json -z "$DURATION" -c "$conns" \
     $(connect_args "$host") --disable-color "$@" "$url" > "$out" 2>"$TMP/${name}.err" || {
     printf '| %s | error | | | | | %s |\n' "$name" "$(head -c 120 "$TMP/${name}.err" | tr '\n|' '  ')" >> "$TMP/table.md"
     return 0
   }
+  local rows_before rows_after
+  rows_before=$(wc -l < "$TMP/table.md")
   jq -r --arg n "$name" '
-    def ms: (. * 1000 | . * 100 | round / 100);
-    "| \($n) | \(.summary.requestsPerSec | round) | \(.latencyPercentiles.p50 | ms) | \(.latencyPercentiles.p90 | ms) | \(.latencyPercentiles.p99 | ms) | \(.latencyPercentiles.p99_9 // .latencyPercentiles["p99.9"] // 0 | ms) | \((.statusCodeDistribution | to_entries | map("\(.key)=\(.value)") | join(" "))) \((.errorDistribution // {}) | to_entries | map("\(.key)=\(.value)") | join(" ")) |"
+    def ms: ((. // 0) * 1000 * 100 | round / 100);
+    "| \($n) | \(.summary.requestsPerSec | round) | \(.latencyPercentiles.p50 | ms) | \(.latencyPercentiles.p90 | ms) | \(.latencyPercentiles.p99 | ms) | \(((.latencyPercentiles.p99_9 // .latencyPercentiles["p99.9"] // 0) | ms)) | \((.statusCodeDistribution | to_entries | map("\(.key)=\(.value)") | join(" "))) \((.errorDistribution // {}) | to_entries | map("\(.key)=\(.value)") | join(" ")) |"
   ' "$out" >> "$TMP/table.md"
+  rows_after=$(wc -l < "$TMP/table.md")
+  if (( rows_after == rows_before )); then
+    # A transient client/link failure can leave oha's JSON unparsable.  Keep
+    # one row per scenario so the report never silently loses a measurement.
+    printf '| %s | no result | | | | | jq could not parse %s |\n' "$name" "$out" >> "$TMP/table.md"
+  fi
 }
 
 {
@@ -95,7 +113,11 @@ want elastic       && run_one elasticsearch "$DOMAIN" /search.php  "$(( CONNS / 
 want node          && run_one node-proxy    "$DOMAIN" /node/       "$CONNS"
 want full-uncached && run_one full-uncached "$DOMAIN" /            "$CONNS"
 want full-cached   && run_one full-cached   "$DOMAIN" /cached.php  "$CONNS"
-want slow          && run_one slow-1s       "$DOMAIN" "/slow.php?ms=1000" "$CONNS"
+# The slow scenario (1s PHP sleeps) must run last: at 200 connections it
+# leaves a listen-queue backlog that outlives the run (16 workers, ~184
+# queued requests), and every scenario started immediately afterwards
+# measures that backlog instead of itself (observed p99 1.9s on the XenForo
+# member thread page).  Keep it after every throughput scenario.
 half=$(( CONNS / 2 > 0 ? CONNS / 2 : 1 ))
 want xf-guest      && run_one xf-guest      "$XF_DOMAIN" "$XF_PATH" "$CONNS"
 want xf-guest-uncached && run_one xf-guest-uncached "$XF_DOMAIN" "$XF_PATH" "$half" -H "Cookie: xf_session=bench"
@@ -113,6 +135,8 @@ fi
 if want wp-member-post && [[ -n $WP_COOKIE && -n $WP_POST ]]; then
   run_one wp-member-post "$WP_DOMAIN" "$WP_POST" "$half" -H "Cookie: ${WP_COOKIE}"
 fi
+
+want slow && run_one slow-1s "$DOMAIN" "/slow.php?ms=1000" "$CONNS"
 
 cat "$TMP/table.md" >> "$REPORT"
 {
