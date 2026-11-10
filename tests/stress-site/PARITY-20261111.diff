@@ -1,0 +1,66 @@
+--- /tmp/state-pre-opt.txt	2026-11-11 02:04:50.726468109 +0800
++++ /tmp/state-post-opt.txt	2026-11-11 02:05:03.448287622 +0800
+@@ -1545,7 +1545,7 @@
+ fs.binfmt_misc.python3/14 = offset 0
+ fs.binfmt_misc.status = enabled
+ fs.dentry-negative = 0
+-fs.dentry-state = 196332	161953	45	0	26527	0
++fs.dentry-state = 200488	165332	45	0	26527	0
+ fs.dir-notify-enable = 1
+ fs.epoll.max_user_watches = 6330902
+ fs.fanotify.max_queued_events = 16384
+@@ -1557,8 +1557,8 @@
+ fs.fuse.default_request_timeout = 0
+ fs.fuse.max_pages_limit = 256
+ fs.fuse.max_request_timeout = 0
+-fs.inode-nr = 169543	441
+-fs.inode-state = 169543	441	0	0	0	0	0
++fs.inode-nr = 173701	441
++fs.inode-state = 173701	441	0	0	0	0	0
+ fs.inotify.max_queued_events = 32768
+ fs.inotify.max_user_instances = 256
+ fs.inotify.max_user_watches = 2097152
+@@ -1581,12 +1581,12 @@
+ fs.protected_regular = 2
+ fs.protected_symlinks = 1
+ fs.quota.allocated_dquots = 9
+-fs.quota.cache_hits = 42554
+-fs.quota.drops = 19621
++fs.quota.cache_hits = 42995
++fs.quota.drops = 19626
+ fs.quota.free_dquots = 2
+-fs.quota.lookups = 42563
++fs.quota.lookups = 43004
+ fs.quota.reads = 0
+-fs.quota.syncs = 1360
++fs.quota.syncs = 1364
+ fs.quota.writes = 0
+ fs.suid_dumpable = 0
+ fs.verity.require_signatures = 0
+@@ -1660,7 +1660,7 @@
+ kernel.msg_next_id = -1
+ kernel.ngroups_max = 65536
+ kernel.nmi_watchdog = 1
+-kernel.ns_last_pid = 121006
++kernel.ns_last_pid = 127501
+ kernel.numa_balancing = 0
+ kernel.numa_balancing_promote_rate_limit_MBps = 65536
+ kernel.oops_all_cpu_backtrace = 0
+@@ -1699,7 +1699,7 @@
+ kernel.randomize_va_space = 2
+ kernel.random.poolsize = 256
+ kernel.random.urandom_min_reseed_secs = 60
+-kernel.random.uuid = e03d6d6f-e301-4bf5-8e3e-15e0f7cd3a19
++kernel.random.uuid = b8c9c095-8956-4cdb-aa0b-6bc72140ec2c
+ kernel.random.write_wakeup_threshold = 256
+ kernel.sched_autogroup_enabled = 1
+ kernel.sched_cfs_bandwidth_slice_us = 5000
+@@ -2622,7 +2622,7 @@
+ net.netfilter.nf_conntrack_acct = 0
+ net.netfilter.nf_conntrack_buckets = 262144
+ net.netfilter.nf_conntrack_checksum = 1
+-net.netfilter.nf_conntrack_count = 514
++net.netfilter.nf_conntrack_count = 66
+ net.netfilter.nf_conntrack_events = 2
+ net.netfilter.nf_conntrack_expect_max = 4096
+ net.netfilter.nf_conntrack_frag6_high_thresh = 4194304

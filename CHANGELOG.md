@@ -3,6 +3,54 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.19.1 (2026-11-11)
+
+Re-validation on the same 16-thread / 27 GiB / NVMe bare-metal host, this
+time with PHP 8.5.12-FPM, Angie 1.12.4, MariaDB 11.8.6, Valkey 9.0.4,
+Elasticsearch 9.5.6, WordPress 7.1.4 (400 posts / 100 users) and XenForo
+2.3.13 (200 threads / 2,600 posts / 60 users).  Fresh install 2 min 56 s,
+`--optimize` 11 s.
+
+- **Install/optimize parity re-confirmed.**  A 3 794-line state snapshot
+  (`/etc` digests, unit states, sysctls, PHP runtime, MariaDB variables,
+  Valkey config, Angie checksums) taken after install and after the first
+  `--optimize` differed only in volatile kernel counters (`fs.dentry-state`,
+  `fs.inode-nr`, `fs.quota.*`, `kernel.ns_last_pid`, `kernel.random.uuid`,
+  `nf_conntrack_count`).  A later `--optimize` after the applications were
+  deployed changed no managed file and reloaded nothing ("configuration
+  already optimized" for every service).
+- **The 1.0-worker-per-core and tracing/64 MB choices hold on PHP 8.5.12.**
+  XenForo member thread at 100 connections: 16 workers 860 req/s at
+  16.10 ms PHP CPU/request, 8 workers 578 at 12.78 (six cores idle), 20/24/32
+  workers 827/802/808 at 17.0-17.5 ms.  Tracing JIT 64 MB 872 req/s at
+  15.81 ms against 821 at 17.11 with JIT off (+8.2% PHP throughput), 787
+  with function JIT, and 858-869 for the aggressive/conservative threshold
+  sets; 32/128 MB were within noise.  WordPress member: 300 req/s at
+  50.0 ms with tracing, 284 at 54.0 with JIT off.
+- **Guest caching is still the largest lever.**  Dedicated runs: XenForo
+  guest 7 451 req/s (0.10 ms Angie/request) against 901 uncached (9.13 ms
+  PHP); WordPress guest 5 308 against 272 uncached (12.6-19x).  Full-suite
+  numbers are lower on the shared Wi-Fi link (4.7k/3.3k) and are reported
+  as link-bound.
+- **Brotli level 3 is the better CPU/bytes point for cached WordPress.**
+  Level 4 = 0.921 ms Angie CPU/request and 13 396 bytes, level 3 = 0.603 ms
+  and 14 000 bytes (-35% CPU, +4.5% bytes), level 2 = 0.545 ms and 14 399
+  bytes.  The shipped default stays 4 (the 1.18.0 measurement was on a
+  proxy-fronted origin); `SETUP_BROTLI_LEVEL=3` is the operator override for
+  a CPU-bound direct origin.
+- **Test harness correctness.**
+  `sample-cpu.sh` counted the idle field of `/proc/stat`, so every report
+  claimed "host CPU used" equal to all cores regardless of load; it now sums
+  user/nice/system/irq/softirq/steal only.  `run-stress-remote.sh` warms the
+  cache and OPcache for two seconds before each scenario, runs the 1 s
+  `slow` scenario last (its 200-connection backlog used to poison the next
+  scenario: p99 1.9 s on the XenForo member thread page), and emits an error
+  row instead of silently dropping a scenario when oha's JSON cannot be
+  parsed.  `bench-one.sh`, `set-jit.sh`, `deploy-apps.sh`, `seed-xf.php`
+  and `seed-wp.php` make the sweep reproducible.
+- **Dead assignments removed** in `tune_xf_cache_bypass_var` (`before`) and
+  `optimize_mariadb` (`logsize`); no behaviour change.
+
 ## 1.19.0 (2026-11-10)
 
 Audit of the 16-thread / 27 GiB / NVMe bare-metal host (`audit-host`,
