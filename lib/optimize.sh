@@ -1560,7 +1560,7 @@ xfmg_cover_index_present_sql() {
 # SETUP_XFMG_INDEX=0 skips the whole pass.
 ensure_xfmg_count_index() {
   local conf root host port user pass dbname table present rows rc
-  local -a mysql_opts
+  local -a mysql_opts findings=()
   [[ ${SETUP_XFMG_INDEX:-1} != 0 ]] || return 0
   command -v mariadb >/dev/null 2>&1 || return 0
   while IFS= read -r conf; do
@@ -1600,7 +1600,7 @@ ensure_xfmg_count_index() {
     [[ -n $table ]] || continue
     present=$(MYSQL_PWD="$pass" mariadb "${mysql_opts[@]}" "$dbname" -e "$(xfmg_cover_index_present_sql "$dbname" "$table")" 2>/dev/null | head -n1 || true)
     if [[ $present =~ ^[1-9] ]]; then
-      opt_report "- ${dbname}.${table}: covering index for the gallery count already present"
+      findings+=("${dbname}.${table}: covering index for the gallery count already present")
       continue
     fi
     rows=$(MYSQL_PWD="$pass" mariadb "${mysql_opts[@]}" "$dbname" -e \
@@ -1613,14 +1613,22 @@ ensure_xfmg_count_index() {
       # INDEX is still online for InnoDB in every supported release.
       if MYSQL_PWD="$pass" mariadb "${mysql_opts[@]}" "$dbname" -e \
         "ALTER TABLE \`${table}\` ADD INDEX mg_count_cover (media_state, album_state, category_id);" >/dev/null 2>&1; then
-        opt_report "- ${dbname}.${table}: added mg_count_cover (online ALTER unsupported; plain ADD INDEX used) for ~${rows:-?} rows"
+        findings+=("${dbname}.${table}: added mg_count_cover (online ALTER unsupported; plain ADD INDEX used) for ~${rows:-?} rows")
       else
-        opt_report "- ${dbname}.${table}: **FAILED** to add the gallery-count index (left unchanged)"
+        findings+=("${dbname}.${table}: **FAILED** to add the gallery-count index (left unchanged)")
       fi
     else
-      opt_report "- ${dbname}.${table}: added covering index mg_count_cover (media_state, album_state, category_id) for ~${rows:-?} rows; the gallery count no longer scans the table"
+      findings+=("${dbname}.${table}: added covering index mg_count_cover (media_state, album_state, category_id) for ~${rows:-?} rows; the gallery count no longer scans the table")
     fi
   done < <(app_find_xenforo_configs 2>/dev/null || true)
+  # Only a host that actually runs XFMG gets a section in the report.
+  if (( ${#findings[@]} > 0 )); then
+    opt_report "## Application query indexes"
+    local line
+    for line in "${findings[@]}"; do
+      opt_report "- ${line}"
+    done
+  fi
   return 0
 }
 

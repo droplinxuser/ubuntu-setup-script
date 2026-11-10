@@ -425,8 +425,8 @@ run_optimize() {
 
   # Application-level query work that the PHP and MariaDB tuners cannot see:
   # XenForo Media Gallery's pagination total is a COUNT(*) that scans the
-  # media table on every member view.  Index-only, online, idempotent.
-  opt_report "## Application query indexes"
+  # media table on every member view.  Index-only, online, idempotent; the
+  # function writes its own report section when an XFMG site is present.
   ensure_xfmg_count_index || rc=1
 
   if (( OPT_CUTOVER )); then
