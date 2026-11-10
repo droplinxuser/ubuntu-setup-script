@@ -43,5 +43,5 @@ for comm in sorted(comm_stamps):
     )
 if len(host) >= 2:
     hs = sorted(host)
-    used = (host[hs[-1]] - host[hs[0]]) / 100.0
-    print(f"host CPU used={used:.0f} core-seconds  avg={used / span:.2f} cores")
+    busy = (host[hs[-1]] - host[hs[0]]) / 100.0
+    print(f"host CPU busy={busy:.0f} core-seconds  avg={busy / span:.2f} cores")
