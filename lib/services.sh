@@ -831,6 +831,12 @@ configure_mariadb() {
   [[ -f $cnf ]] || die "MariaDB config ${cnf} not found"
   mariadb_write_base_block "$cnf" "$bind"
   write_mariadb_tuning_dropin "$size_mb"
+  # A re-install on an old host must land in the same state as --optimize:
+  # 99-setup-optimize.cnf is the only owner of the performance keys, so any
+  # copy the packaged 50-server.cnf (or an old managed block) still carries is
+  # removed here too.  Previously only --optimize did this, so a re-install
+  # could leave two competing definitions.
+  mariadb_strip_install_block "$size_mb" "${MARIADB_PROFILE_MAX_CONN:-0}" "$cnf"
 }
 
 install_mariadb() {
@@ -1064,11 +1070,23 @@ install_valkey() {
   else
     valkey_mb=$(service_mem_mb valkey)
   fi
-  policy=${OPT[valkey.policy]:-allkeys-lru}
+  # Preserve a policy/io-threads value a previous setup.sh tune wrote, exactly
+  # like --optimize does; only a fresh (unmanaged) distro config falls back to
+  # the documented defaults.  Without this a re-install silently reset
+  # `--valkey policy=volatile-lru io_threads=4` to allkeys-lru/1.
+  policy=${OPT[valkey.policy]:-}
+  if [[ -z $policy ]] && valkey_conf_managed "$conf"; then
+    policy=$(valkey_conf_get "$conf" maxmemory-policy)
+  fi
+  [[ -n $policy ]] || policy=allkeys-lru
   # For typical web-cache command sizes, extra I/O threads add more CPU
   # contention than throughput.  Benchmarks on a 16-core host showed
   # io-threads=1 at 6.5k full-page req/s vs 5.1k at io-threads=8.
-  io_threads=${OPT[valkey.io_threads]:-1}
+  io_threads=${OPT[valkey.io_threads]:-}
+  if [[ -z $io_threads ]] && valkey_conf_managed "$conf"; then
+    io_threads=$(valkey_conf_get "$conf" io-threads)
+  fi
+  [[ -n $io_threads ]] || io_threads=1
 
   # One writer for the base and tuning directives, shared with --optimize.
   valkey_apply_config "$conf" valkey "$valkey_mb" "$policy" "$io_threads" /run/valkey/valkey.sock
@@ -1107,8 +1125,10 @@ valkey_apply_config() {
   [[ -n $socket ]] || socket="/run/${kind}/${kind}.sock"
   io_threads=$(valkey_clamp_io_threads "$io_threads")
   sed_in_place -E '/^[[:space:]]*(bind|protected-mode|save|maxmemory|maxmemory-policy|maxmemory-samples|supervised|io-threads|io-threads-do-reads|tcp-backlog|tcp-keepalive|timeout|maxclients|hz|appendonly|lazyfree-[a-z-]+|unixsocket|unixsocketperm|logfile)[[:space:]]/d' "$conf"
+  sed_in_place -E '/^# setup\.sh managed valkey$/d' "$conf"
   {
-    printf '%s\n' 'supervised systemd' \
+    printf '%s\n' '# setup.sh managed valkey' \
+      'supervised systemd' \
       "logfile ${LOG_ROOT}/${kind}/${kind}.log" \
       'save ""' \
       'appendonly no' \
@@ -1118,6 +1138,21 @@ valkey_apply_config() {
       'unixsocketperm 770'
     valkey_tuning_lines "$max_mb" "$policy" "$io_threads"
   } >> "$conf"
+}
+
+# True when FILE already carries the block setup.sh wrote, i.e. the values in
+# it are this tool's output (and may be preserved) rather than distro defaults.
+valkey_conf_managed() {
+  [[ -f ${1:-} ]] && grep -qx '# setup.sh managed valkey' "$1"
+}
+
+# Value of KEY in a space-delimited Valkey/Redis conf; empty when absent.
+# One reader for the installer and --optimize (ini_get cannot parse this
+# format: values are separated by whitespace, not '=').
+valkey_conf_get() {
+  local file=$1 key=$2
+  [[ -f $file ]] || return 0
+  awk -v k="$key" '$1 == k { print $2; exit }' "$file"
 }
 
 # Valkey's own guidance caps useful I/O threads well below the core count.
@@ -1186,10 +1221,10 @@ wait_for_cmd() {
 write_service_limits_dropin() {
   local path=$1 content=$2 before=""
   mkdir -p "$(dirname "$path")"
-  [[ -f $path ]] && before=$(md5sum "$path" | awk '{print $1}')
+  [[ -f $path ]] && before=$(file_md5 "$path")
   printf '%s\n' "$content" > "$path"
   chmod 644 "$path"
-  [[ $before != "$(md5sum "$path" | awk '{print $1}')" ]]
+  [[ $before != "$(file_md5 "$path")" ]]
 }
 
 mariadb_write_systemd_limits() {
@@ -1656,7 +1691,7 @@ reoptimize_mariadb_after_import() {
   OPT_INSTALL_PLAN=0
   detect_installed_services
   plan_memory_budget
-  info "Memory plan: ${OPT_MEM_BUDGET_MB}MB usable of ${OPT_MEM_TOTAL_MB}MB (PHP=${OPT_PHP_BUDGET_MB}MB MariaDB=${OPT_MARIADB_BUDGET_MB}MB Cache=${OPT_VALKEY_BUDGET_MB}MB Elasticsearch=${OPT_ES_BUDGET_MB}MB)"
+  info "$(memory_plan_summary)"
   OPT_REPORT=()
   if optimize_mariadb; then
     ok "MariaDB profile re-sized for the imported data (buffer pool ${OPT_MARIADB_BUDGET_MB}MB, data+index ${OPT_DB_SIZE_MB}MB)"

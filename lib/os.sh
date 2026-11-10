@@ -143,6 +143,15 @@ swap_total_bytes() {
 }
 
 ram_total_bytes() {
+  # Use the same cgroup-aware figure as every service tuner: inside a
+  # container or a vCPU/RAM-capped guest /proc/meminfo reports the host's
+  # memory, which used to size a swap file against RAM the guest cannot see.
+  local mb
+  mb=$(mem_total_mb 2>/dev/null || true)
+  if [[ $mb =~ ^[0-9]+$ ]] && (( mb > 0 )); then
+    printf '%s' $(( mb * 1048576 ))
+    return 0
+  fi
   awk '/^MemTotal:/{printf "%d", $2 * 1024}' /proc/meminfo
 }
 

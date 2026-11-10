@@ -394,8 +394,8 @@ run_optimize() {
   fi
   info "Detected: ${OPT_DETECTED[*]}"
   info "Backups: ${OPT_BACKUP_DIR}"
-  info "Memory budget: ${OPT_MEM_BUDGET_MB}MB usable of ${OPT_MEM_TOTAL_MB}MB (PHP=${OPT_PHP_BUDGET_MB}MB MariaDB=${OPT_MARIADB_BUDGET_MB}MB Cache=${OPT_VALKEY_BUDGET_MB}MB Elasticsearch=${OPT_ES_BUDGET_MB}MB)"
-  opt_report "- Memory budget: ${OPT_MEM_BUDGET_MB}MB usable of ${OPT_MEM_TOTAL_MB}MB (PHP=${OPT_PHP_BUDGET_MB}MB MariaDB=${OPT_MARIADB_BUDGET_MB}MB Cache=${OPT_VALKEY_BUDGET_MB}MB Elasticsearch=${OPT_ES_BUDGET_MB}MB)"
+  info "$(memory_plan_summary 'Memory budget')"
+  opt_report "- $(memory_plan_summary 'Memory budget')"
 
   # PHP first: it owns the FastCGI socket Angie may point at.
   OPT_PHP_OK=0
