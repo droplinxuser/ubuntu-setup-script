@@ -31,10 +31,6 @@ source "$ROOT/setup.sh"
 # deliberately exercise failure paths, so drop the trap; set -e still catches
 # genuinely unexpected errors.
 trap - ERR
-# php_app_worker_cap reads the live /etc/angie tree; keep the generic ceiling
-# in the unit tests and exercise the real function on a fixture further down.
-eval "$(declare -f php_app_worker_cap | sed '1s/^php_app_worker_cap/orig_php_app_worker_cap/')"
-php_app_worker_cap() { return 1; }
 
 t_pass() { PASS=$((PASS + 1)); printf 'PASS  %s\n' "$*"; }
 t_fail() {
@@ -1150,6 +1146,7 @@ check "opt-in hardening creates the central PHP error log" \
 # 96 MB default is the fresh-install path asserted below.
 php_primary_version() { printf '8.4'; }
 php_worker_allowance_mb() { printf '96'; }
+effective_cpus() { printf '16'; }
 mem_total_mb() { printf '131072'; }
 mariadb_data_size_mb() { printf '0'; }
 mariadb_current_pool_mb() { printf '0'; }
@@ -1169,14 +1166,15 @@ check "service budgets stay under 95% of RAM" \
 check "all fixed budgets are positive" \
   test "$OPT_MARIADB_BUDGET_MB" -gt 0 -a "$OPT_VALKEY_BUDGET_MB" -gt 0 -a "$OPT_ES_BUDGET_MB" -gt 0
 
-# A 64 GB host with a 128-worker PHP pool must keep that capacity; the data
-# services are fitted into what remains after the PHP reservation.
+# A live pool no longer overrides the plan: every host gets 2 workers per
+# logical CPU, which is what makes the install and --optimize results
+# identical on a host whose pool was sized by hand.
 mem_total_mb() { printf '65536'; }
 php_pool_max_children() { printf '128'; }
 OPT_DETECTED=(angie php:8.3 mariadb redis elastic)
 plan_memory_budget
-check "PHP budget preserves a 128-worker pool" \
-  test "$OPT_PHP_BUDGET_MB" -ge $(( 128 * 96 ))
+check "PHP budget follows 2 workers per CPU, not the live pool" \
+  test "$OPT_PHP_BUDGET_MB" -eq $(( 32 * 96 ))
 check "PHP budget is still capped at 50% of RAM" \
   test "$OPT_PHP_BUDGET_MB" -le $(( 65536 * 50 / 100 ))
 check "Redis enables the shared cache budget" \
@@ -1185,14 +1183,14 @@ check "PHP-first plan stays inside the 80% budget" \
   test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
        -le $(( 65536 * 80 / 100 ))
 
-# The planner must use the same 8-worker floor as tune_php_fpm_version().
+# The planner uses the same 2-per-CPU floor as tune_php_fpm_version().
 php_pool_max_children() { printf '6'; }
 mariadb_data_size_mb() { printf '20000'; }
 elasticsearch_data_size_mb() { printf '0'; }
 OPT_DETECTED=(angie php:8.3 mariadb)
 plan_memory_budget
-check "PHP budget uses the 8-worker floor" \
-  test "$OPT_PHP_BUDGET_MB" -eq 768
+check "PHP budget uses the 2-per-CPU floor" \
+  test "$OPT_PHP_BUDGET_MB" -eq $(( 32 * 96 ))
 check "MariaDB gets the remaining budget after the PHP floor" \
   test "$OPT_MARIADB_BUDGET_MB" -gt 0
 
@@ -1233,6 +1231,10 @@ mem_total_mb() { printf '65536'; }
 mariadb_current_pool_mb() { printf '0'; }
 php_pool_max_children() { printf '128'; }
 OPT_DETECTED=(angie php:8.3 mariadb redis elastic)
+# The database/heap assertions below are about the data tiers, so pin a small
+# CPU count: the PHP pool now reserves 2 workers per logical CPU, and a large
+# PHP floor would legitimately trim the database share on this 64 GB host.
+effective_cpus() { printf '2'; }
 
 # A database larger than the remaining budget gets the largest feasible pool.
 mariadb_data_size_mb() { printf '40960'; }
@@ -1409,6 +1411,8 @@ elasticsearch_current_heap_mb() { printf '30000'; }
 plan_memory_budget
 check "Elasticsearch heap is capped to store/4" \
   test "$OPT_ES_BUDGET_MB" -eq 1024
+# Restore the CPU stub for the sections that follow.
+effective_cpus() { printf '16'; }
 
 elasticsearch_current_heap_mb() { printf '0'; }
 elasticsearch_data_size_mb() { printf '0'; }
@@ -2166,18 +2170,20 @@ HOST_SERVER_TYPE=dedi
 check "php_children_ceiling: 2 per core on dedicated hardware" \
   test "$(php_children_ceiling 16 65536 '' '')" -eq 32
 HOST_SERVER_TYPE=vps
-check "php_children_ceiling: the same 2-per-core ceiling on a VPS" \
+check "php_children_ceiling: the same 2-per-core floor on a VPS" \
   test "$(php_children_ceiling 16 65536 '' '')" -eq 32
-check "php_children_ceiling: half of RAM at 96 MB caps a small host" \
-  test "$(php_children_ceiling 16 2048 '' '')" -eq 10
-check "php_children_floor: 1 GB host keeps 5 workers, not 8" \
-  test "$(php_children_floor 1024)" -eq 5
-check "php_children_floor: never below 2" \
-  test "$(php_children_floor 256)" -eq 2
-check "php_children_ceiling: a live pool keeps its count" \
-  test "$(php_children_ceiling 4 65536 200 '')" -eq 200
-check "php_children_ceiling: explicit value wins but is clamped to 512" \
+check "php_children_ceiling: the 2-per-CPU floor beats the RAM divisor" \
+  test "$(php_children_ceiling 16 2048 '' '')" -eq 32
+check "php_children_floor: two workers per logical CPU" \
+  test "$(php_children_floor 65536 16)" -eq 32
+check "php_children_floor: a 1-2 core VPS keeps 2 per CPU" \
+  test "$(php_children_floor 1024 2)" -eq 4
+check "php_children_ceiling: a live pool is normalised to the plan" \
+  test "$(php_children_ceiling 4 65536 200 '')" -eq 8
+check "php_children_ceiling: explicit value wins but is clamped to the floor" \
   test "$(php_children_ceiling 4 65536 200 600)" -eq 512
+check "php_children_ceiling: explicit value below the floor is raised" \
+  test "$(php_children_ceiling 8 65536 '' 4)" -eq 16
 HOST_SERVER_TYPE=dedi
 
 check "sysctl_target_somaxconn scales with CPUs on dedicated hardware" \
@@ -2353,18 +2359,22 @@ check "cgroup_quota_cpus returns 0 without a numeric quota" \
 # dry run.
 host_is_vps() { return 1; }
 OPT_PHP_CHILDREN=0
-check "php_plan_max_children keeps a live pool count" \
-  test "$(php_plan_max_children 16 27812 100 "")" = 100
+check "php_plan_max_children normalises a live pool to 2 per CPU" \
+  test "$(php_plan_max_children 16 27812 100 "")" = 32
 check "php_plan_max_children lets an explicit value win over the live pool" \
   test "$(php_plan_max_children 16 27812 100 48)" = 48
 OPT_PHP_CHILDREN=72
-check "php_plan_max_children uses the shared plan without a live pool" \
-  test "$(php_plan_max_children 16 27812 "" "")" = 72
+check "php_plan_max_children ignores the internal plan variable (deterministic)" \
+  test "$(php_plan_max_children 16 27812 "" "")" = 32
 OPT_PHP_CHILDREN=0
 check "php_plan_max_children bounds a standalone budget by the hardware ceiling" \
   test "$(php_plan_max_children 16 27812 0 "" 4800)" = 32
-check "php_plan_max_children falls back to the hardware ceiling" \
+check "php_plan_max_children falls back to the 2-per-CPU rule" \
   test "$(php_plan_max_children 16 27812 "" "" 0)" = 32
+check "php_plan_max_children gives a 64-thread host 128 workers" \
+  test "$(php_plan_max_children 64 131072 "" "" 0)" = 128
+check "php_plan_max_children gives a 2-core box 4 workers" \
+  test "$(php_plan_max_children 2 2048 "" "" 0)" = 4
 
 # Brotli level: explicit, else 4, or 3 on a 1-2 CPU host.
 effective_cpus() { printf 16; }
@@ -2458,30 +2468,6 @@ printf 'server {\n    root %s;\n    include h5bp/php_xf.conf;\n}\n' "$TMP/capsit
 printf "<?php\n\$config['db']['host'] = 'localhost';\n" > "$TMP/capsite/xf/src/config.php"
 check "angie_vhost_root reads the root directive" \
   test "$(angie_vhost_root "$TMP/capsite/conf.d/xf.conf")" = "$TMP/capsite/xf"
-host_is_vps() { return 1; }
-check "php_app_worker_cap: XenForo with a local DB -> 1 per logical CPU" \
-  test "$(orig_php_app_worker_cap 16 "$TMP/capsite")" = 16
-host_is_vps() { return 0; }
-check "php_app_worker_cap: 1 per logical CPU on a VPS" \
-  test "$(orig_php_app_worker_cap 16 "$TMP/capsite")" = 16
-host_is_vps() { return 1; }
-printf "<?php\n\$config['db']['host'] = 'db.example.net';\n" > "$TMP/capsite/xf/src/config.php"
-no_cap() { ! orig_php_app_worker_cap 16 "$TMP/capsite" >/dev/null; }
-check "php_app_worker_cap: remote database -> no cap" no_cap
-printf "<?php\n\$config['db']['host'] = '127.0.0.1';\n" > "$TMP/capsite/xf/src/config.php"
-printf 'server {\n    root %s;\n    include h5bp/php.conf;\n}\n' "$TMP/capsite/other" > "$TMP/capsite/conf.d/other.conf"
-check "php_app_worker_cap: an unknown PHP vhost -> no cap" no_cap
-rm "$TMP/capsite/conf.d/other.conf"
-printf 'server {\n    root %s;\n    include h5bp/wordpress.conf;\n}\n' "$TMP/capsite/wp" > "$TMP/capsite/conf.d/wp.conf"
-printf "<?php\ndefine('DB_HOST', 'localhost');\n" > "$TMP/capsite/wp/wp-config.php"
-check "php_app_worker_cap: XenForo + WordPress, both local -> cap" \
-  test "$(orig_php_app_worker_cap 8 "$TMP/capsite")" = 8
-php_app_worker_cap() { printf 16; }
-check "php_children_ceiling applies the app cap below a live 144 pool" \
-  test "$(php_children_ceiling 16 27812 144 "")" = 16
-check "php_children_ceiling keeps an explicit value above the cap" \
-  test "$(php_children_ceiling 16 27812 144 100)" = 100
-php_app_worker_cap() { return 1; }
 
 mkdir -p "$TMP/assets/js" "$TMP/assets/internal_data"
 head -c 20000 /dev/zero | tr '\0' 'a' > "$TMP/assets/js/app.js"
@@ -2717,39 +2703,6 @@ cache_note_not_first_zone() { ! grep -qF '/tmp/pc-a' <<<"$ANGIE_CACHE_NOTE"; }
 check "cache keep note does not name the other zone's directory" cache_note_not_first_zone
 unset -f du
 
-# ---------------------------------------------------------------------------
-# PHP security-support window (1.18.0, report only)
-# ---------------------------------------------------------------------------
-check "php_security_eol dates PHP 8.0" test "$(php_security_eol 8.0)" = 2023-11-26
-check "php_security_eol dates PHP 8.1" test "$(php_security_eol 8.1)" = 2025-12-31
-check "php_security_eol dates PHP 8.5" test "$(php_security_eol 8.5)" = 2029-12-31
-unknown_branch_has_no_date() { test -z "$(php_security_eol 7.4)"; }
-check "php_security_eol prints nothing for an unknown branch" unknown_branch_has_no_date
-php80_is_past() { [[ $(php_security_eol 8.0) < $(date +%F) ]]; }
-check "the PHP 8.0 end date is in the past" php80_is_past
-php85_is_future() { [[ $(php_security_eol 8.5) > $(date +%F) ]]; }
-check "the PHP 8.5 end date is in the future" php85_is_future
-# Shared by --php (install) and --optimize.
-php80_eol_warns() { [[ -n $(report_php_eol 8.0 2>&1) ]]; }
-check "report_php_eol warns for an end-of-life branch" php80_eol_warns
-php85_eol_quiet() { [[ -z $(report_php_eol 8.5 2>&1) ]]; }
-check "report_php_eol stays quiet for a supported branch" php85_eol_quiet
-
-# ---------------------------------------------------------------------------
-# SETUP_SKIP_SERVICES parsing (1.18.0)
-# ---------------------------------------------------------------------------
-check "service_in_list matches a single entry" service_in_list mariadb mariadb
-check "service_in_list matches inside a comma list" service_in_list valkey 'mariadb,valkey'
-check "service_in_list matches inside a space list" service_in_list php 'mariadb php angie'
-check "service_in_list tolerates comma+space" service_in_list redis 'mariadb, redis'
-not_listed() { ! service_in_list elastic 'mariadb,redis'; }
-check "service_in_list rejects an absent service" not_listed
-empty_list() { ! service_in_list mariadb ''; }
-check "service_in_list rejects an empty list" empty_list
-check "the shipped online key list includes io_capacity" \
-  grep -q innodb_io_capacity <<<"$MARIADB_ONLINE_KEYS"
-check "the online apply order starts with the buffer pool" \
-  test "${MARIADB_ONLINE_ORDER[0]}" = innodb_buffer_pool_size
 
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

@@ -297,12 +297,11 @@ suspended errexit for the whole run). Steps:
    (`SETUP_WP_GUEST_CACHE=1` adds the include to such vhosts).
 3. PHP-FPM: every `/etc/php/<ver>/fpm` tree; a live TCP pool used through the
    `local_php` upstream is migrated to the Unix socket (graceful reload, or
-   a short explicit restart when SIGUSR2 cannot open the listener).  A pool
-   far deeper than the plan is reported with the memory the reload returns
-   (a 64-thread board ran 512 static workers, 51.8 GB resident; 64 workers
-   served the same rate at 4x better p50), and a branch past its
-   security-support window is flagged (`php_security_eol`, report only - the
-   installed version is never changed).
+   a short explicit restart when SIGUSR2 cannot open the listener).  The pool
+   is always `pm = static` with **at least 2 workers per logical CPU** (see
+   the hardware table); a pool sized by hand is normalised to that rule, and
+   the report names the before/after and the resident memory it returns (a
+   64-thread board left on 512 static workers is set to 128).
 4. MariaDB, Valkey/Redis and Elasticsearch from the shared 80%-of-RAM plan:
    live data is funded first (MariaDB data+index +20%, Valkey working set
    +20% with the RAM floor, Elasticsearch store/4), explicit sizes are
@@ -314,8 +313,7 @@ suspended errexit for the whole run). Steps:
    `innodb_io_capacity`(_max), `table_open_cache`, `max_connections`,
    `thread_pool_size`, `innodb_flush_neighbors`) they are applied online with
    `SET GLOBAL`, each read back, and nothing restarts. A startup-only key or
-   the managed base block still needs a restart; `SETUP_SKIP_SERVICES=mariadb`
-   leaves the database untouched when that restart must wait for a window.
+   the managed base block still needs a restart.
    A `--domain ... sql=`
    import re-plans MariaDB **and** the Valkey/Elasticsearch shares it was
    taken from. Every failed service is rolled back from
@@ -386,7 +384,7 @@ data directory (NVMe / SSD / HDD) and the host class (`dedi`/`vps`).
 
 | Area | Rule |
 |---|---|
-| PHP-FPM | 2 workers per logical CPU, at most RAM/2 at 96 MB each, 512 max, floor `min(8, RAM/2/96)`; **1 per logical CPU on a XenForo/WordPress host with a local database** (measured on a 16-thread Ryzen 7-class: 16 workers served 1044 member req/s at 11.2 ms PHP per request, 32 workers 936 req/s at 12.3 ms, 48 workers 627/20.3 ms on thread pages; the install plan budgets a fresh worker at 64 MB so the same host no longer writes 144 workers on install and 32 on the first `--optimize`); live count kept unless the application cap is lower; `children=` wins. `pm = static` always. `opcache.max_accelerated_files` = PHP files under the vhost roots x 1.5 (16384..128256; the ceiling when no root is found); `memory_limit`, OPcache, JIT buffer and realpath sizes from one RAM profile shared with the dry run |
+| PHP-FPM | **at least 2 workers per logical CPU on every host** (`pm = static`), which is both the floor and the target: a pool sized by hand is normalised to it, so a fresh install and `--optimize` write the same count (a 64-thread board left on 512 static workers is set to 128). An explicit `--php children=` wins and is clamped to floor..max(512, 2 x CPUs). `pm.max_requests = threads x 1024`, `request_terminate_timeout 300s`, slow log at 10 s, `rlimit_files 524288`, systemd `LimitNOFILE=524288`/`UMask=0027`. `opcache.max_accelerated_files` = PHP files under the vhost roots x 1.5 (16384..128256; the ceiling when no root is found); `memory_limit`, OPcache, JIT buffer and realpath sizes from one RAM profile shared with the dry run |
 | MariaDB | see the service section: pool from live data with floor `clamp(RAM/16, 256 MB, 4 GB)` for an empty or unmeasured database, io_capacity by disk x host, thread pool, connections from the PHP pool, table caches from connections, Aria page cache `clamp(RAM/128, 16, 256) MB` |
 | Elasticsearch | heap = store/4 (512 MB..25% RAM..31 GB); `node.processors` = effective CPUs; search threads cpus/2 (max 16), write threads cpus/4 (max 8) |
 | Valkey / Redis | maxmemory = live +20% with floor `clamp(RAM/64, 128 MB, 1 GB)`; maxclients from the PHP pool; io_threads 1..8 (a larger `io_threads=` is clamped with a warning) |
@@ -401,9 +399,7 @@ generator or monitor; empty clears), `SETUP_PRECOMPRESS_ASSETS=0|1`, `SETUP_XF_J
 `SETUP_MARIADB_IO_CAPACITY`, `SETUP_BROTLI_LEVEL`, `SETUP_GZIP_LEVEL`,
 `SETUP_ANGIE_COMPRESSION`, `SETUP_PHP_SESSION_HARDENING`, `SETUP_WP_DB_SPLIT`,
 `SETUP_WP_ALLOW_FILE_MODS`, `SETUP_WP_GUEST_CACHE`, `SETUP_PURGE_MALWARE`,
-`SETUP_SKIP_SERVICES` (comma/space list of `angie|php|mariadb|valkey|redis|elastic`
-that `--optimize` leaves untouched, for a live box where a restart has to wait
-for a window), `SETUP_STATE_DIR` (tests and image builds).
+`SETUP_STATE_DIR` (tests and image builds).
 
 ## `--diagnostics`, `--restart-all`, `--purge`
 

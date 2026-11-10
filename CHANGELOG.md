@@ -20,22 +20,23 @@ cgroup `usage_usec` delta.
   right number for releases, but the change was silent in the report; it now
   prints `pool right-sized 512 -> 64 workers (~51 GB -> ~6 GB resident at
   103 MB each)` so an operator sees what the reload returns.
-- **PHP security-support warning.**  The board ran PHP 8.0.30, end-of-life
-  since 2023-11-26.  The report now dates every installed branch with
-  `php_security_eol` and warns when it is past its security-fix window
-  (`## PHP 8.0`, `**WARNING** PHP 8.0 has had no security fixes since
-  2023-11-26`).  It reports only: the version is never changed.  The same
-  helper runs from `--php` at install time, so a pinned old branch is flagged
-  there too.
+- **PHP-FPM: at least 2 workers per logical CPU on every host.**  `pm` stays
+  `static` and the count is now the same floor and target for every server -
+  a XenForo/WordPress host with a local database included - so a fresh
+  install and `--optimize` always write the same value.  A pool sized by hand
+  is normalised to the rule (the audited 64-thread board was left on 512
+  static workers, 51.8 GB resident; the plan is 128, and the report names the
+  before/after and the memory the reload returns).  `--php children=` still
+  wins, clamped to floor..max(512, 2 x CPUs).  The application-specific
+  1-per-CPU cap and the live-pool override are gone: both could make two
+  commands write different pools on the same host.
 - **Capacity tuning without a database restart.**  `innodb_io_capacity`,
   `innodb_io_capacity_max`, `table_open_cache`, `max_connections`,
   `thread_pool_size` and `innodb_flush_neighbors` are dynamic in the
   supported MariaDB releases, so they join the online `SET GLOBAL` path
-  (each value is read back; a rejection falls back to the restart).  On a
+  (each value is read back; a rejection falls back to the restart).  On the
   live 64-thread board that removed the restart the capacity profile would
-  otherwise have needed.  `SETUP_SKIP_SERVICES` (comma/space list) leaves a
-  service untouched so an operator can tune PHP/Angie/OS now and schedule the
-  one restart the database still needs for startup-only keys.
+  otherwise have needed.
 - **Install and `--optimize` re-verified end to end.**  A fresh install on a
   clean 16-thread host followed by `--optimize` produced a byte-identical
   1 017-file `/etc` tree, identical unit states, root crontab, PHP runtime,
