@@ -314,15 +314,9 @@ suspended errexit for the whole run). Steps:
    cannot win again).
 5. Audit of WordPress/XenForo configs (persistent `p:` database host, Valkey
    socket) with the exact snippets to apply; application files are never
-   edited. On a XenForo site with **XFMG** installed, the covering index
-   `mg_count_cover (media_state, album_state, category_id)` is added online
-   (`ALGORITHM=INPLACE, LOCK=NONE`, plain `ADD INDEX` fallback) when it is
-   missing: the gallery's pagination total is a `COUNT(*)` over
-   `xf_mg_media_item` that otherwise scans the whole table on every member
-   view (measured 47.7 -> 23.4 ms, half of that page's database CPU,
-   +45 % uncached gallery throughput; `SETUP_XFMG_INDEX=0` skips it).
-   Legacy cron and `/var/www` ownership from releases before 1.8.34
-   are repaired.
+   edited and **application schemas are never altered** (see "Manual
+   follow-ups" below for changes worth making by hand). Legacy cron and
+   `/var/www` ownership from releases before 1.8.34 are repaired.
 6. Verification of every listener (`ss`, SQL, PING, HTTP) and recent
    error-level journal entries. The Markdown report goes to
    `/var/log/setup-optimize-<timestamp>.md` (`-latest.md` copy).
@@ -338,6 +332,33 @@ one documented difference is timing: `--domain app=xf|wordpress` creates an
 empty document root, so the application-aware PHP worker cap and the
 per-root OPcache JIT sections can only apply once the application files
 exist, on the first `--optimize` after the upload (or after a `sql=` import).
+
+## Manual follow-ups (never automated)
+
+setup.sh does not rewrite application files and **does not alter application
+schemas**: no `ALTER TABLE`, no index creation, no data change on a forum or
+CMS database. Schema work is an operator decision taken with the vendor's
+upgrade path in mind. Two measured items are worth applying by hand:
+
+- **XFMG gallery count (XenForo + XenForo Media Gallery).** The gallery
+  index computes its pagination total with `SELECT COUNT(*) FROM
+  xf_mg_media_item WHERE (album_state = 'visible' OR album_state IS NULL)
+  AND category_id IN (...) AND media_state IN ('visible')`. Without a
+  covering index that is a full table scan on every member view. Measured on
+  a live board with 74 118 media rows: 47.7 ms -> 23.4 ms, MariaDB CPU for
+  the page 54.0 -> 30.7 ms, uncached gallery index 62 -> 90 req/s (+45 %),
+  p50 130 -> 88 ms. Add it yourself during a maintenance window:
+
+  ```sql
+  ALTER TABLE xf_mg_media_item
+    ADD INDEX mg_count_cover (media_state, album_state, category_id),
+    ALGORITHM=INPLACE, LOCK=NONE;
+  ```
+- **XenForo media widgets and job runner.** Disabling the Members online /
+  Trending / Featured widgets on the forum list and switching *Options >
+  Performance > Job run trigger* to server-based (paired with the managed
+  `xf:run-jobs` crontab entry) were worth +39 % authenticated throughput in
+  the same audit. Both are ACP settings, so setup.sh only reports them.
 
 ## Hardware profile
 

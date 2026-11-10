@@ -13,19 +13,19 @@ index and thread pages as a member.  CPU per request is each service's
 systemd cgroup `usage_usec` delta; the load generator ran on the host through
 loopback because the origin is reachable only through its front proxy.
 
-- **XFMG gallery-count covering index.**  The gallery index asks for its
-  pagination total with a `COUNT(*)` over `xf_mg_media_item` filtered by
-  `media_state`, an `album_state = 'visible' OR IS NULL` pair and every
-  visible `category_id`.  With the shipped indexes MariaDB chose a full scan:
-  47.7 ms per view, and 383 of 391 slow queries during a 6 s gallery load
-  (18.3 of 18.4 slow seconds).  A covering
-  `mg_count_cover (media_state, album_state, category_id)` turns it into a
-  55 482-row index-only range scan at 23.4 ms.  End to end the uncached
-  gallery index went from **62 to 90 req/s (+45 %)**, p50 130 -> 88 ms and
-  MariaDB CPU 54.0 -> 30.4 ms per request.  `--optimize` now adds the index
-  when XFMG is installed, the media table exists (any table prefix) and no
-  equivalent index is present, using `ALGORITHM=INPLACE, LOCK=NONE` with a
-  plain `ADD INDEX` fallback; `SETUP_XFMG_INDEX=0` disables it.
+- **XFMG gallery count is the member-side database hotspot (reported, not
+  automated).**  The gallery index asks for its pagination total with a
+  `COUNT(*)` over `xf_mg_media_item` filtered by `media_state`, an
+  `album_state = 'visible' OR IS NULL` pair and every visible `category_id`.
+  With the shipped indexes MariaDB chose a full scan: 47.7 ms per view, and
+  383 of 391 slow queries during a 6 s gallery load (18.3 of 18.4 slow
+  seconds).  A covering `mg_count_cover (media_state, album_state,
+  category_id)` turns it into a 55 482-row index-only range scan at 23.4 ms;
+  end to end the uncached gallery index went from **62 to 90 req/s (+45 %)**,
+  p50 130 -> 88 ms and MariaDB CPU 54.0 -> 30.4 ms per request.  **setup.sh
+  does not apply it**: no `ALTER TABLE`, index creation or data change on an
+  application schema.  The README lists the exact statement under *Manual
+  follow-ups* so the operator can run it in a maintenance window.
 - **JIT re-validated on a Xeon.**  Tracing + 64 MB + PHP's default thresholds
   64/127/16/64 is 14 % cheaper per thread page than the JIT off (43.8 vs
   50.1 ms PHP) and 13 % cheaper than the function JIT; 32/128 MB buffers and

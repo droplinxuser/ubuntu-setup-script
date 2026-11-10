@@ -1556,53 +1556,6 @@ check "XenForo cache port parser" \
   test "$(xf_cache_port_from_config "$TMP/xf-config.php")" = 0
 check "Unix socket detector accepts a Valkey socket" \
   app_is_socket_path /run/valkey/valkey.sock
-
-# 1.16.0: XenForo db block parser and the XFMG covering-index check.
-cat > "$TMP/xf-db-single.php" <<'EOF'
-<?php
-$config['db']['host'] = '127.0.0.1';
-$config['db']['port'] = '3307';
-$config['db']['username'] = 'xf_user';
-$config['db']['password'] = 'simplepass';
-$config['db']['dbname'] = 'forum_db';
-EOF
-check "xf_db_config_value reads a single-quoted db name" \
-  test "$(xf_db_config_value "$TMP/xf-db-single.php" dbname)" = forum_db
-check "xf_db_config_value reads a numeric port" \
-  test "$(xf_db_config_value "$TMP/xf-db-single.php" port)" = 3307
-check "xf_db_config_value reads a password with quotes in it" \
-  test "$(xf_db_config_value "$TMP/xf-db-single.php" password)" = simplepass
-# A value that contains its own quote character: only the PHP reader is exact.
-cat > "$TMP/xf-db-quoted.php" <<'EOF'
-<?php
-$config['db']['host'] = 'localhost';
-$config['db']['password'] = 'it\'s a pass';
-$config['db']['dbname'] = 'quoted_db';
-EOF
-if command -v php >/dev/null 2>&1; then
-  check "xf_db_config_fields reads a password with an escaped quote" \
-    test "$(xf_db_config_fields "$TMP/xf-db-quoted.php" | sed -n 4p)" = "it's a pass"
-  check "xf_db_config_fields prints the database name on line 5" \
-    test "$(xf_db_config_fields "$TMP/xf-db-quoted.php" | sed -n 5p)" = quoted_db
-fi
-cat > "$TMP/xf-db-double.php" <<'EOF'
-<?php
-$config["db"]["host"] = "localhost";
-$config["db"]["dbname"] = "other_db";
-EOF
-check "xf_db_config_value accepts double quotes" \
-  test "$(xf_db_config_value "$TMP/xf-db-double.php" dbname)" = other_db
-missing_key() { test -z "$(xf_db_config_value "$TMP/xf-db-double.php" username)"; }
-check "xf_db_config_value prints nothing for a missing key" missing_key
-missing_file() { test -z "$(xf_db_config_value "$TMP/no-such-config.php" dbname)"; }
-check "xf_db_config_value tolerates a missing file" missing_file
-xfmg_sql=$(xfmg_cover_index_present_sql "db'x" "xf_mg_media_item")
-check "xfmg_cover_index_present_sql escapes a quote in the schema" \
-  grep -q "table_schema='db''x'" <<<"$xfmg_sql"
-check "xfmg_cover_index_present_sql looks for the table" \
-  grep -q "table_name='xf_mg_media_item'" <<<"$xfmg_sql"
-check "xfmg_cover_index_present_sql accepts every column order" \
-  grep -q "media_state,album_state,category_id" <<<"$xfmg_sql"
 tcp_not_socket() { ! app_is_socket_path 127.0.0.1; }
 check "Unix socket detector rejects TCP" tcp_not_socket
 
