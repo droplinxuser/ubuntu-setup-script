@@ -1898,6 +1898,10 @@ check "MariaDB shared profile keeps a usable connection ceiling" \
 # connections" at the old workers*1.25+50 ceiling).
 php_pool_max_children() { printf '144'; }
 app_persistent_db_configs() { printf '0'; }
+# Keep the unit test hermetic: on a host where MariaDB is already running,
+# mariadb_compute_profile keeps the live @@max_connections when it is higher
+# (a deliberate production rule), which would mask the formula under test.
+mariadb() { return 1; }
 mariadb_compute_profile 2048
 check "max_connections is workers*1.25+50 without persistent applications" \
   test "$MARIADB_PROFILE_MAX_CONN" -eq 230
@@ -1905,6 +1909,7 @@ app_persistent_db_configs() { printf '1'; }
 mariadb_compute_profile 2048
 check "one persistent application doubles the per-worker connection allowance" \
   test "$MARIADB_PROFILE_MAX_CONN" -eq 410 -a "$MARIADB_PROFILE_PERSISTENT_APPS" -eq 1
+unset -f mariadb
 app_persistent_db_configs() { printf '0'; }  # keep the stub: unset -f would drop the real function too
 php_pool_max_children() { printf '128'; }
 
@@ -2697,6 +2702,19 @@ check "cache keep note names the zone's own directory" grep -qF '/tmp/pc-b' <<<"
 cache_note_not_first_zone() { ! grep -qF '/tmp/pc-a' <<<"$ANGIE_CACHE_NOTE"; }
 check "cache keep note does not name the other zone's directory" cache_note_not_first_zone
 unset -f du
+
+# ---------------------------------------------------------------------------
+# PHP security-support window (1.18.0, report only)
+# ---------------------------------------------------------------------------
+check "php_security_eol dates PHP 8.0" test "$(php_security_eol 8.0)" = 2023-11-26
+check "php_security_eol dates PHP 8.1" test "$(php_security_eol 8.1)" = 2025-12-31
+check "php_security_eol dates PHP 8.5" test "$(php_security_eol 8.5)" = 2029-12-31
+unknown_branch_has_no_date() { test -z "$(php_security_eol 7.4)"; }
+check "php_security_eol prints nothing for an unknown branch" unknown_branch_has_no_date
+php80_is_past() { [[ $(php_security_eol 8.0) < $(date +%F) ]]; }
+check "the PHP 8.0 end date is in the past" php80_is_past
+php85_is_future() { [[ $(php_security_eol 8.5) > $(date +%F) ]]; }
+check "the PHP 8.5 end date is in the future" php85_is_future
 
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

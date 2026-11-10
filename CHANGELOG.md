@@ -3,6 +3,43 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.18.0 (2026-11-10)
+
+Audit of a second live XenForo origin (64-thread Xeon, 128 GiB, RAID10,
+Ubuntu 24.04, PHP 8.0.30-FPM, Angie 1.12.4, MariaDB 10.11, Valkey 7.2,
+sessions in Valkey via the SV/RedisCache add-on, about 230 000 threads and
+800 000 posts), focused on the member pages the FastCGI cache cannot serve.
+Load ran on the host through loopback; CPU per request is each service's
+cgroup `usage_usec` delta.
+
+- **Report the pool right-sizing, with the memory it returns.**  The host ran
+  **512** static workers: 51.8 GB resident (~103 MB each) on 64 threads.
+  64 workers served the same request rate with **p50 298 -> 70 ms** at 256
+  connections and brought the pool's resident memory to **~4 GB**; 128
+  workers landed in between (p50 138 ms).  `--optimize` had been writing the
+  right number for releases, but the change was silent in the report; it now
+  prints `pool right-sized 512 -> 64 workers (~51 GB -> ~6 GB resident at
+  103 MB each)` so an operator sees what the reload returns.
+- **PHP security-support warning.**  The board ran PHP 8.0.30, end-of-life
+  since 2023-11-26.  The report now dates every installed branch with
+  `php_security_eol` and warns when it is past its security-fix window
+  (`## PHP 8.0`, `**WARNING** PHP 8.0 has had no security fixes since
+  2023-11-26`).  It reports only: the version is never changed.
+- **Hermetic test for the MariaDB connection ceiling.**  The
+  `max_connections` unit tests read the live `@@max_connections` when a
+  MariaDB server happened to be running (a deliberate production rule: never
+  lower a live ceiling), so they failed on a host with a busy database.  The
+  tests now stub the client and assert the formula on any host.
+- **Measured, not adopted: the board index is an add-on problem.**  On this
+  board the index page costs **~1.1 s of MariaDB CPU per member view**: two
+  third-party statements scan `xf_user` (~67 000 rows, 119 ms) and all
+  `xf_thread` rows through a shop add-on's ban table (233 846 rows, 338 ms).
+  That is application schema/ACP work, not infrastructure, and setup.sh never
+  alters an application schema.  The JIT question was also left alone: on
+  PHP 8.0 the tracing JIT measured anywhere from 5 % better to 45 % worse
+  than the JIT off under live traffic, which is not enough evidence to change
+  the default.
+
 ## 1.17.0 (2026-11-10)
 
 Audit of the live **forum.example.com** XenForo origin (8-thread Xeon E3-class,
