@@ -309,9 +309,14 @@ suspended errexit for the whole run). Steps:
    reserved verbatim, PHP is sized from the remainder, and targets that do not
    fit are trimmed Elasticsearch first, then Valkey, then MariaDB. A value
    within 2% of its target is kept. A MariaDB restart pauses Angie and PHP
-   first and resumes them after `SELECT 1`; when only the buffer pool, redo
-   log, `tmp_table_size`/`max_heap_table_size` changed they are applied
-   online with `SET GLOBAL` and nothing restarts. A `--domain ... sql=`
+   first and resumes them after `SELECT 1`; when only dynamic variables
+   changed (buffer pool, redo log, `tmp_table_size`/`max_heap_table_size`,
+   `innodb_io_capacity`(_max), `table_open_cache`, `max_connections`,
+   `thread_pool_size`, `innodb_flush_neighbors`) they are applied online with
+   `SET GLOBAL`, each read back, and nothing restarts. A startup-only key or
+   the managed base block still needs a restart; `SETUP_SKIP_SERVICES=mariadb`
+   leaves the database untouched when that restart must wait for a window.
+   A `--domain ... sql=`
    import re-plans MariaDB **and** the Valkey/Elasticsearch shares it was
    taken from. Every failed service is rolled back from
    `/tmp/setup-optimize.*` through one shared restart/rollback helper (files
@@ -396,7 +401,9 @@ generator or monitor; empty clears), `SETUP_PRECOMPRESS_ASSETS=0|1`, `SETUP_XF_J
 `SETUP_MARIADB_IO_CAPACITY`, `SETUP_BROTLI_LEVEL`, `SETUP_GZIP_LEVEL`,
 `SETUP_ANGIE_COMPRESSION`, `SETUP_PHP_SESSION_HARDENING`, `SETUP_WP_DB_SPLIT`,
 `SETUP_WP_ALLOW_FILE_MODS`, `SETUP_WP_GUEST_CACHE`, `SETUP_PURGE_MALWARE`,
-`SETUP_STATE_DIR` (tests and image builds).
+`SETUP_SKIP_SERVICES` (comma/space list of `angie|php|mariadb|valkey|redis|elastic`
+that `--optimize` leaves untouched, for a live box where a restart has to wait
+for a window), `SETUP_STATE_DIR` (tests and image builds).
 
 ## `--diagnostics`, `--restart-all`, `--purge`
 

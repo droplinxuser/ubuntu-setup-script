@@ -425,27 +425,38 @@ check "network profile honours SETUP_TCP_CC/SETUP_QDISC" \
 check "network profile falls back for unsafe values" \
   test "$(SETUP_TCP_CC='x;y' SETUP_QDISC='a/b' bash -c 'source "$1"; printf "%s/%s" "$TCP_CC" "$QDISC"' _ "$ROOT/setup.sh")" = "bbr/fq"
 
-# MariaDB config diff: only the buffer-pool line may be applied online.
+# MariaDB config diff: only the online-capable lines may be applied online.
 cat > "$TMP/cnf-a" <<'EOF'
 [mysqld]
 innodb_buffer_pool_size = 1000M
 max_connections = 500
+innodb_flush_method = fsync
 EOF
 cat > "$TMP/cnf-b" <<'EOF'
 [mysqld]
 innodb_buffer_pool_size = 2000M
 max_connections = 500
+innodb_flush_method = fsync
 EOF
 cat > "$TMP/cnf-c" <<'EOF'
 [mysqld]
 innodb_buffer_pool_size = 2000M
 max_connections = 600
+innodb_flush_method = fsync
+EOF
+cat > "$TMP/cnf-d" <<'EOF'
+[mysqld]
+innodb_buffer_pool_size = 1000M
+max_connections = 500
+innodb_flush_method = O_DIRECT
 EOF
 check "cnf_only_pool_changed accepts a pool-only change" \
   cnf_only_pool_changed "$TMP/cnf-a" "$TMP/cnf-b"
+check "cnf_only_pool_changed accepts max_connections (dynamic)" \
+  cnf_only_pool_changed "$TMP/cnf-a" "$TMP/cnf-c"
 cnf_other_changed() { ! cnf_only_pool_changed "$1" "$2"; }
-check "cnf_only_pool_changed rejects other setting changes" \
-  cnf_other_changed "$TMP/cnf-a" "$TMP/cnf-c"
+check "cnf_only_pool_changed rejects a startup-only setting" \
+  cnf_other_changed "$TMP/cnf-a" "$TMP/cnf-d"
 check "Angie-only cache budget uses 50% RAM" \
   test "$(tune_cache_total_mb 7747 59000 50 10)" = 3840
 check "Angie+PHP cache budget uses 30% RAM" \
@@ -2672,15 +2683,18 @@ check "cnf_key_bytes converts an M suffix without spaces" test "$(cnf_key_bytes 
 check "cnf_key_bytes keeps a bare byte count" test "$(cnf_key_bytes "$TMP/cnf-bytes.cnf" max_heap_table_size)" = 1024
 check "cnf_key_bytes prints nothing for an absent key" test -z "$(cnf_key_bytes "$TMP/cnf-bytes.cnf" innodb_io_capacity)"
 
-# Online-resizable keys: pool and redo log may change without a restart,
-# innodb_io_capacity may not.
+# Online-resizable keys: pool, redo log and the capacity keys may change
+# without a restart; a key that the server only reads at startup may not.
 printf '[mysqld]\ninnodb_buffer_pool_size = 1G\ninnodb_log_file_size = 256M\ninnodb_io_capacity = 2000\n' > "$TMP/cnf-online-a"
 printf '[mysqld]\ninnodb_buffer_pool_size = 2G\ninnodb_log_file_size = 512M\ninnodb_io_capacity = 2000\n' > "$TMP/cnf-online-b"
 printf '[mysqld]\ninnodb_buffer_pool_size = 1G\ninnodb_log_file_size = 256M\ninnodb_io_capacity = 4000\n' > "$TMP/cnf-online-c"
+printf '[mysqld]\ninnodb_buffer_pool_size = 1G\ninnodb_log_file_size = 256M\ninnodb_flush_method = O_DIRECT\n' > "$TMP/cnf-online-d"
 check "cnf_only_pool_changed accepts pool and redo-log changes together" \
   cnf_only_pool_changed "$TMP/cnf-online-a" "$TMP/cnf-online-b"
-check "cnf_only_pool_changed rejects an innodb_io_capacity change" \
-  cnf_other_changed "$TMP/cnf-online-a" "$TMP/cnf-online-c"
+check "cnf_only_pool_changed accepts an innodb_io_capacity change (dynamic)" \
+  cnf_only_pool_changed "$TMP/cnf-online-a" "$TMP/cnf-online-c"
+check "cnf_only_pool_changed rejects a startup-only key" \
+  cnf_other_changed "$TMP/cnf-online-a" "$TMP/cnf-online-d"
 
 # angie_cache_keep_mb must pick the directive for the named zone when a file
 # carries several multi-line *_cache_path directives.
@@ -2715,6 +2729,27 @@ php80_is_past() { [[ $(php_security_eol 8.0) < $(date +%F) ]]; }
 check "the PHP 8.0 end date is in the past" php80_is_past
 php85_is_future() { [[ $(php_security_eol 8.5) > $(date +%F) ]]; }
 check "the PHP 8.5 end date is in the future" php85_is_future
+# Shared by --php (install) and --optimize.
+php80_eol_warns() { [[ -n $(report_php_eol 8.0 2>&1) ]]; }
+check "report_php_eol warns for an end-of-life branch" php80_eol_warns
+php85_eol_quiet() { [[ -z $(report_php_eol 8.5 2>&1) ]]; }
+check "report_php_eol stays quiet for a supported branch" php85_eol_quiet
+
+# ---------------------------------------------------------------------------
+# SETUP_SKIP_SERVICES parsing (1.18.0)
+# ---------------------------------------------------------------------------
+check "service_in_list matches a single entry" service_in_list mariadb mariadb
+check "service_in_list matches inside a comma list" service_in_list valkey 'mariadb,valkey'
+check "service_in_list matches inside a space list" service_in_list php 'mariadb php angie'
+check "service_in_list tolerates comma+space" service_in_list redis 'mariadb, redis'
+not_listed() { ! service_in_list elastic 'mariadb,redis'; }
+check "service_in_list rejects an absent service" not_listed
+empty_list() { ! service_in_list mariadb ''; }
+check "service_in_list rejects an empty list" empty_list
+check "the shipped online key list includes io_capacity" \
+  grep -q innodb_io_capacity <<<"$MARIADB_ONLINE_KEYS"
+check "the online apply order starts with the buffer pool" \
+  test "${MARIADB_ONLINE_ORDER[0]}" = innodb_buffer_pool_size
 
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

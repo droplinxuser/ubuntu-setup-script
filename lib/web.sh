@@ -32,6 +32,19 @@ tune_clamp() {
   printf '%s' "$value"
 }
 
+# True when SERVICE appears in a comma or space separated list.  Used by the
+# optimizer for SETUP_SKIP_SERVICES, and by the tests.
+service_in_list() {
+  local want=${1:-} list=${2:-} s
+  [[ -n $want && -n $list ]] || return 1
+  local -a items
+  IFS=', ' read -r -a items <<< "$list"
+  for s in "${items[@]}"; do
+    [[ $s == "$want" ]] && return 0
+  done
+  return 1
+}
+
 # Tuner-facing name for mb_to_config(); one implementation keeps the installer
 # and --optimize reporting identical.
 tune_size_value() { mb_to_config "$1"; }
