@@ -297,7 +297,12 @@ suspended errexit for the whole run). Steps:
    (`SETUP_WP_GUEST_CACHE=1` adds the include to such vhosts).
 3. PHP-FPM: every `/etc/php/<ver>/fpm` tree; a live TCP pool used through the
    `local_php` upstream is migrated to the Unix socket (graceful reload, or
-   a short explicit restart when SIGUSR2 cannot open the listener).
+   a short explicit restart when SIGUSR2 cannot open the listener).  A pool
+   far deeper than the plan is reported with the memory the reload returns
+   (a 64-thread board ran 512 static workers, 51.8 GB resident; 64 workers
+   served the same rate at 4x better p50), and a branch past its
+   security-support window is flagged (`php_security_eol`, report only - the
+   installed version is never changed).
 4. MariaDB, Valkey/Redis and Elasticsearch from the shared 80%-of-RAM plan:
    live data is funded first (MariaDB data+index +20%, Valkey working set
    +20% with the RAM floor, Elasticsearch store/4), explicit sizes are
@@ -359,6 +364,15 @@ upgrade path in mind. Two measured items are worth applying by hand:
   Performance > Job run trigger* to server-based (paired with the managed
   `xf:run-jobs` crontab entry) were worth +39 % authenticated throughput in
   the same audit. Both are ACP settings, so setup.sh only reports them.
+- **A shop add-on that filters the thread list.** On a board with a
+  DragonByte-style shop add-on, the index page ran
+  `SELECT thread_id FROM xf_thread LEFT JOIN <shop>_thread_ban ...` (one full
+  scan of the thread table, 338 ms) plus
+  `SELECT xf_user.* WHERE is_banned = 0 AND user_state = 'valid'`
+  (119 ms) - about **1.1 s of MariaDB CPU per member view**, the single
+  largest member-facing cost measured.  Fix it in the add-on or its ACP
+  widget, or add an index on the add-on's ban table by hand; the optimizer
+  will never touch that schema.
 
 ## Hardware profile
 

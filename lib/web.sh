@@ -1629,6 +1629,19 @@ tune_php_fpm_version() {
     tune_summary "PHP ${ver}: max_children capped at ${app_cap} (XenForo/WordPress with a local database are CPU-bound; --php children= overrides)"
   fi
   PHP_WRITTEN_CHILDREN=$max_children
+  # A pool far larger than the plan is the most expensive misconfiguration
+  # seen in the field: a 64-thread host ran 512 static workers (51.8 GB
+  # resident, ~103 MB each) and served the same ~850 thread-page req/s as 64
+  # workers with a 4x better p50.  Report the delta so the operator sees the
+  # memory and latency the next reload returns.
+  if (( current_children > 0 )) && (( current_children > max_children * 2 )); then
+    local per_worker was_gb now_gb
+    per_worker=$(php_worker_allowance_mb "$ver" 2>/dev/null || true)
+    [[ $per_worker =~ ^[0-9]+$ ]] && (( per_worker > 0 )) || per_worker=96
+    was_gb=$(( current_children * per_worker / 1024 ))
+    now_gb=$(( max_children * per_worker / 1024 ))
+    tune_summary "PHP ${ver}: pool right-sized ${current_children} -> ${max_children} workers (~${was_gb} GB -> ~${now_gb} GB resident at ${per_worker} MB each; a pool deeper than the thread count only queues on the scheduler)"
+  fi
   max_requests=$(( nproc * 1024 ))
   if explicit_value=$(explicit_option php_max_requests); then
     [[ $explicit_value =~ ^[0-9]+$ ]] && (( explicit_value > 0 )) && max_requests=$explicit_value

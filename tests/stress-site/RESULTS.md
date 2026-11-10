@@ -1,6 +1,60 @@
 # Full-stack stress test reports
 
 
+## Live forum.example.com origin, audit 4 - pool right-sizing on 64 threads (2026-11-10)
+
+Host: 64-thread Xeon, 128 GiB, RAID10, Ubuntu 24.04.5, PHP 8.0.30 FPM,
+Angie 1.12.4, MariaDB 10.11.14, Valkey 7.2 (sessions and entity cache through
+the SV/RedisCache add-on), XenForo with about 230 000 threads, 800 000 posts
+and 75 000 members (about 700 live sessions).  The origin answers through its
+front proxy, so the load generator (`oha` 1.16.0) ran on the host against
+`127.0.0.1`; CPU per request is each service's cgroup `usage_usec` delta.
+Member pages were exercised with a cache-bypassing `xf_session` cookie, which
+runs the full render path without being logged in.
+
+### The pool was eight times deeper than the thread count
+
+Baseline: `pm = static`, **512 workers**, **51.8 GB resident** (~103 MB each).
+
+| workers | resident | thread c=256 | p50 | p99 | login c=256 | p50 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 512 | 51.8 GB | 852 req/s | 298 ms | 566 ms | 3139 req/s | 73 ms |
+| 128 | 4.4 GB | 886 req/s | 138 ms | 282 ms | 3227 req/s | 28 ms |
+| 64  | ~4 GB | 746 req/s | **70 ms** | 305 ms | 1798 req/s | **11 ms** |
+
+Throughput at 256 connections is flat within the noise of a live board, the
+percentiles are 4-6x better once the pool is not 8x oversubscribed, and the
+reload returns ~45 GB of RAM to the page cache.  This is the state the
+shipped rule (one worker per thread when every PHP vhost is a local-database
+XenForo/WordPress site) already produces; only the report was silent about
+it before 1.18.0.
+
+### Where the member time actually goes
+
+The board index is the expensive page, and it is an application problem:
+
+| statement (from the slow log at 50 ms) | per view | rows examined |
+|---|---:|---:|
+| `SELECT xf_user.* ... WHERE is_banned = 0 AND user_state = 'valid'` | 119 ms | ~67 000 |
+| `SELECT thread_id FROM xf_thread LEFT JOIN <shop>_thread_ban ...` | 338 ms | 233 846 |
+
+Six of the first and one of the second per index view: **~1.1 s of MariaDB
+CPU per member view**, which is why the index page measures 28-45 req/s at
+256 connections (p50 1.1-1.4 s) while a thread page does 750-880 req/s.  Both
+statements come from third-party add-ons.  setup.sh does not alter an
+application schema, so the fix is ACP/shop-add-on work or a hand-applied
+index (README, *Manual follow-ups*).
+
+### JIT on PHP 8.0: not enough signal to change the default
+
+Tracing vs JIT-off on the thread page, PHP CPU per request, four interleaved
+runs on a live board: 51.2 vs 45.5 ms, then 54.8 vs 45.2 ms, and one run at
+98.4 ms when the board's own traffic spiked.  Background load from the
+board's ~700 sessions dominates the difference, so the shipped tracing
+default stays.  PHP 8.0 itself is end-of-life since 2023-11-26; the optimizer
+now says so in its report.
+
+
 ## Live forum.example.com origin, audit 3 - member pages and the gallery count (2026-11-10)
 
 Host: 8-thread Xeon E3-class, 32 GiB, RAID10, Ubuntu 26.04.1, PHP 8.5.12

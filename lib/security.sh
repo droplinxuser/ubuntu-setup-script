@@ -758,6 +758,16 @@ optimize_php_services() {
     # every request returns 502.  Installations still use the socket template.
     listen_path=$(php_pool_listen "$ver")
     opt_report "## PHP ${ver}"
+    # php.net security-support windows.  A branch past its end date gets no
+    # security fixes, and the older JIT/OPcache generations cost more per
+    # request than the current one: report it, never change the version.
+    local php_eol today_iso
+    php_eol=$(php_security_eol "$ver")
+    today_iso=$(date +%F)
+    if [[ -n $php_eol ]] && [[ $today_iso > $php_eol ]]; then
+      opt_report "- **WARNING** PHP ${ver} has had no security fixes since ${php_eol}; plan an upgrade (the pool and OPcache settings carry over unchanged)"
+      warn "PHP ${ver} is end-of-life since ${php_eol}; upgrade to a supported branch"
+    fi
     opt_report "- Active: ${active}; listen kept: \`${listen_path:-unknown}\`"
     opt_backup "/etc/php/${ver}" "php-${ver}"
     opt_backup "/etc/systemd/system/php${ver}-fpm.service.d" "php-${ver}-systemd"

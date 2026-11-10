@@ -917,6 +917,20 @@ plan_install_budget() {
   info "Memory plan: ${OPT_MEM_BUDGET_MB}MB usable of ${OPT_MEM_TOTAL_MB}MB (PHP=${OPT_PHP_BUDGET_MB}MB MariaDB=${OPT_MARIADB_BUDGET_MB}MB Cache=${OPT_VALKEY_BUDGET_MB}MB Elasticsearch=${OPT_ES_BUDGET_MB}MB)"
 }
 
+# Security-support end date for a PHP branch (php.net supported versions).
+# Used by the optimizer report only: it never changes the installed version.
+php_security_eol() {
+  case "${1:-}" in
+    8.0) printf '2023-11-26' ;;
+    8.1) printf '2025-12-31' ;;
+    8.2) printf '2026-12-31' ;;
+    8.3) printf '2027-12-31' ;;
+    8.4) printf '2028-12-31' ;;
+    8.5) printf '2029-12-31' ;;
+    *) printf '' ;;
+  esac
+}
+
 php_fpm_versions() {
   local d ver
   for d in /etc/php/*/fpm; do
