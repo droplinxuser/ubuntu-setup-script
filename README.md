@@ -314,7 +314,14 @@ suspended errexit for the whole run). Steps:
    cannot win again).
 5. Audit of WordPress/XenForo configs (persistent `p:` database host, Valkey
    socket) with the exact snippets to apply; application files are never
-   edited. Legacy cron and `/var/www` ownership from releases before 1.8.34
+   edited. On a XenForo site with **XFMG** installed, the covering index
+   `mg_count_cover (media_state, album_state, category_id)` is added online
+   (`ALGORITHM=INPLACE, LOCK=NONE`, plain `ADD INDEX` fallback) when it is
+   missing: the gallery's pagination total is a `COUNT(*)` over
+   `xf_mg_media_item` that otherwise scans the whole table on every member
+   view (measured 47.7 -> 23.4 ms, half of that page's database CPU,
+   +45 % uncached gallery throughput; `SETUP_XFMG_INDEX=0` skips it).
+   Legacy cron and `/var/www` ownership from releases before 1.8.34
    are repaired.
 6. Verification of every listener (`ss`, SQL, PING, HTTP) and recent
    error-level journal entries. The Markdown report goes to

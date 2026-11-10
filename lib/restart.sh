@@ -423,6 +423,12 @@ run_optimize() {
     warn "Application connection notices: ${APP_CONNECTION_ISSUES} item(s) need attention (see the report)"
   fi
 
+  # Application-level query work that the PHP and MariaDB tuners cannot see:
+  # XenForo Media Gallery's pagination total is a COUNT(*) that scans the
+  # media table on every member view.  Index-only, online, idempotent.
+  opt_report "## Application query indexes"
+  ensure_xfmg_count_index || rc=1
+
   if (( OPT_CUTOVER )); then
     local cached
     cached=$(count_optimize_cache_entries "${OPT_START_EPOCH:-0}")
