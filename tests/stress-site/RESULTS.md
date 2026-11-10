@@ -12,9 +12,10 @@ archives through `setup.sh --domain ... app=xf|wordpress db=...`.
 
 Method: every scenario is a 12 s keep-alive run at 100 connections with
 `Accept-Encoding: gzip, br`; CPU is the delta of each service's systemd
-cgroup `cpu.stat usage_usec`, divided by the completed requests, so it is
-independent of the client link.  The host was saturated (15.7-16.0 of 16
-threads) in every PHP scenario.
+cgroup `cpu.stat usage_usec` (`sample-cpu.sh` + `analyze-cpu.py` in this
+directory), divided by the completed requests, so it is independent of the
+client link.  The host was saturated (15.7-16.0 of 16 threads) in every PHP
+scenario.
 
 ### End state (setup.sh 1.16.0: 16 workers, tracing JIT 64 MB, guest cache)
 
