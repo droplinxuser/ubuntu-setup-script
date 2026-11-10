@@ -397,15 +397,35 @@ run_optimize() {
   info "Memory budget: ${OPT_MEM_BUDGET_MB}MB usable of ${OPT_MEM_TOTAL_MB}MB (PHP=${OPT_PHP_BUDGET_MB}MB MariaDB=${OPT_MARIADB_BUDGET_MB}MB Cache=${OPT_VALKEY_BUDGET_MB}MB Elasticsearch=${OPT_ES_BUDGET_MB}MB)"
   opt_report "- Memory budget: ${OPT_MEM_BUDGET_MB}MB usable of ${OPT_MEM_TOTAL_MB}MB (PHP=${OPT_PHP_BUDGET_MB}MB MariaDB=${OPT_MARIADB_BUDGET_MB}MB Cache=${OPT_VALKEY_BUDGET_MB}MB Elasticsearch=${OPT_ES_BUDGET_MB}MB)"
 
+  # SETUP_SKIP_SERVICES lets an operator run the tuner on a live box without
+  # touching a service that would need a restart.  MariaDB is the common case:
+  # the buffer pool and the capacity keys are applied online, but a change to
+  # a startup-only key (innodb_read_io_threads, the managed base block) needs a
+  # restart, and a forum should schedule that.  Values: comma or space list of
+  # angie|php|mariadb|valkey|redis|elastic.
+  service_skipped() {
+    service_in_list "$1" "${SETUP_SKIP_SERVICES:-}"
+  }
+
   # PHP first: it owns the FastCGI socket Angie may point at.
   OPT_PHP_OK=0
   OPT_PHP_SOCKET=""
   if [[ ${OPT_DETECTED[*]} == *php:* ]]; then
-    OPT_PHP_OK=1
-    optimize_php_services || { rc=1; OPT_PHP_OK=0; }
+    if service_skipped php; then
+      opt_report "## PHP: skipped (SETUP_SKIP_SERVICES)"
+      warn "PHP-FPM left untouched (SETUP_SKIP_SERVICES)"
+    else
+      OPT_PHP_OK=1
+      optimize_php_services || { rc=1; OPT_PHP_OK=0; }
+    fi
   fi
   for service in angie mariadb valkey redis elastic; do
     [[ " ${OPT_DETECTED[*]} " == *" ${service} "* ]] || continue
+    if service_skipped "$service"; then
+      opt_report "- ${service}: skipped (SETUP_SKIP_SERVICES)"
+      warn "${service} left untouched (SETUP_SKIP_SERVICES)"
+      continue
+    fi
     case "$service" in
       angie)   optimize_angie   || rc=1 ;;
       mariadb) optimize_mariadb || rc=1 ;;

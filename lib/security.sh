@@ -758,16 +758,8 @@ optimize_php_services() {
     # every request returns 502.  Installations still use the socket template.
     listen_path=$(php_pool_listen "$ver")
     opt_report "## PHP ${ver}"
-    # php.net security-support windows.  A branch past its end date gets no
-    # security fixes, and the older JIT/OPcache generations cost more per
-    # request than the current one: report it, never change the version.
-    local php_eol today_iso
-    php_eol=$(php_security_eol "$ver")
-    today_iso=$(date +%F)
-    if [[ -n $php_eol ]] && [[ $today_iso > $php_eol ]]; then
-      opt_report "- **WARNING** PHP ${ver} has had no security fixes since ${php_eol}; plan an upgrade (the pool and OPcache settings carry over unchanged)"
-      warn "PHP ${ver} is end-of-life since ${php_eol}; upgrade to a supported branch"
-    fi
+    # Same end-of-life check the installer runs (report only).
+    report_php_eol "$ver"
     opt_report "- Active: ${active}; listen kept: \`${listen_path:-unknown}\`"
     opt_backup "/etc/php/${ver}" "php-${ver}"
     opt_backup "/etc/systemd/system/php${ver}-fpm.service.d" "php-${ver}-systemd"
@@ -886,10 +878,14 @@ mariadb_server_version() {
 # True when two generated MariaDB configs differ only in the buffer-pool size,
 # so the value can be applied online without a restart.
 # Keys of the tuning drop-in that a running server accepts through SET
-# GLOBAL (the redo log is resizable online since MariaDB 10.9).  When only
-# these differ between the old and new file, --optimize applies them online
-# instead of restarting a busy database with the web tiers paused.
-MARIADB_ONLINE_KEYS='innodb_buffer_pool_size|innodb_log_file_size|tmp_table_size|max_heap_table_size'
+# GLOBAL.  The redo log is resizable online since MariaDB 10.9, and the
+# capacity keys (io_capacity, table_open_cache, thread_pool_size,
+# max_connections, flush_neighbors) are dynamic in the supported releases;
+# each non-pool SET is verified by reading the variable back, so a server that
+# refuses one falls back to the restart path.  When only these differ between
+# the old and the new file, --optimize applies them online instead of
+# restarting a busy database with the web tiers paused.
+MARIADB_ONLINE_KEYS='innodb_buffer_pool_size|innodb_log_file_size|tmp_table_size|max_heap_table_size|innodb_io_capacity|innodb_io_capacity_max|table_open_cache|thread_pool_size|max_connections|innodb_flush_neighbors'
 cnf_only_pool_changed() {
   local old=$1 new=$2
   [[ -f $old && -f $new ]] || return 1
@@ -917,15 +913,26 @@ cnf_key_bytes() {
 
 # Apply the online-capable keys that changed between OLD and NEW with SET
 # GLOBAL; the buffer pool first (it bounds tmp_table_size), then the rest.
-# Returns 1 on the first rejected SET so the caller falls back to a restart.
+# Every non-pool key is read back after the SET, and the first rejection or
+# mismatch returns 1 so the caller falls back to a restart.
+MARIADB_ONLINE_ORDER=(innodb_buffer_pool_size innodb_log_file_size tmp_table_size
+                      max_heap_table_size innodb_io_capacity innodb_io_capacity_max
+                      table_open_cache max_connections thread_pool_size
+                      innodb_flush_neighbors)
 mariadb_apply_online_keys() {
-  local old=$1 new=$2 key before after
-  for key in innodb_buffer_pool_size innodb_log_file_size tmp_table_size max_heap_table_size; do
+  local old=$1 new=$2 key before after live
+  for key in "${MARIADB_ONLINE_ORDER[@]}"; do
     before=$(cnf_key_bytes "$old" "$key")
     after=$(cnf_key_bytes "$new" "$key")
     [[ -n $after && $before != "$after" ]] || continue
     mariadb -e "SET GLOBAL ${key} = ${after}" 2>/dev/null || return 1
-    [[ $key == innodb_buffer_pool_size ]] || opt_report "- Applied ${key}=${after} online"
+    if [[ $key != innodb_buffer_pool_size ]]; then
+      # The pool rounds to its chunk granularity, so it is reported by the
+      # caller instead of compared here; everything else must take exactly.
+      live=$(mariadb -N -B -e "SELECT @@${key}" 2>/dev/null || true)
+      [[ $live =~ ^[0-9]+$ ]] && (( live == after )) || return 1
+      opt_report "- Applied ${key}=${after} online"
+    fi
   done
   return 0
 }

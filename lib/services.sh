@@ -258,6 +258,9 @@ install_php() {
   # so the parent shell reports and reuses the same value.
   ensure_state
   printf '%s\n' "$ver" > "${STATE_DIR}/php-selected-version"
+  # A pinned old branch (--php ver=8.0) gets the same end-of-life warning the
+  # optimizer prints; the upgrade itself stays an operator decision.
+  report_php_eol "$ver"
 
   if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE '(^|:)9000$'; then
     die "Port 9000 is already in use by another process. Only one PHP version can run at a time; free the port first."

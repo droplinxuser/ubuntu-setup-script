@@ -24,7 +24,22 @@ cgroup `usage_usec` delta.
   since 2023-11-26.  The report now dates every installed branch with
   `php_security_eol` and warns when it is past its security-fix window
   (`## PHP 8.0`, `**WARNING** PHP 8.0 has had no security fixes since
-  2023-11-26`).  It reports only: the version is never changed.
+  2023-11-26`).  It reports only: the version is never changed.  The same
+  helper runs from `--php` at install time, so a pinned old branch is flagged
+  there too.
+- **Capacity tuning without a database restart.**  `innodb_io_capacity`,
+  `innodb_io_capacity_max`, `table_open_cache`, `max_connections`,
+  `thread_pool_size` and `innodb_flush_neighbors` are dynamic in the
+  supported MariaDB releases, so they join the online `SET GLOBAL` path
+  (each value is read back; a rejection falls back to the restart).  On a
+  live 64-thread board that removed the restart the capacity profile would
+  otherwise have needed.  `SETUP_SKIP_SERVICES` (comma/space list) leaves a
+  service untouched so an operator can tune PHP/Angie/OS now and schedule the
+  one restart the database still needs for startup-only keys.
+- **Install and `--optimize` re-verified end to end.**  A fresh install on a
+  clean 16-thread host followed by `--optimize` produced a byte-identical
+  1 017-file `/etc` tree, identical unit states, root crontab, PHP runtime,
+  MariaDB variables and Valkey settings (no diff line at all).
 - **Hermetic test for the MariaDB connection ceiling.**  The
   `max_connections` unit tests read the live `@@max_connections` when a
   MariaDB server happened to be running (a deliberate production rule: never

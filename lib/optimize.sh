@@ -918,7 +918,8 @@ plan_install_budget() {
 }
 
 # Security-support end date for a PHP branch (php.net supported versions).
-# Used by the optimizer report only: it never changes the installed version.
+# Used by the installer and the optimizer report only: it never changes the
+# installed version.
 php_security_eol() {
   case "${1:-}" in
     8.0) printf '2023-11-26' ;;
@@ -929,6 +930,22 @@ php_security_eol() {
     8.5) printf '2029-12-31' ;;
     *) printf '' ;;
   esac
+}
+
+# Warn when a PHP branch is past its security-support window.  Shared by
+# `--php` and `--optimize` so a pinned old branch is flagged at install time
+# too.  Reports only; the version is never changed.
+report_php_eol() {
+  local ver=${1:-} eol today
+  eol=$(php_security_eol "$ver")
+  [[ -n $eol ]] || return 0
+  today=$(date +%F)
+  [[ $today > $eol ]] || return 0
+  warn "PHP ${ver} is end-of-life since ${eol}; no security fixes are published for this branch"
+  if (( ${OPTIMIZE:-0} )); then
+    opt_report "- **WARNING** PHP ${ver} has had no security fixes since ${eol}; plan an upgrade (the pool and OPcache settings carry over unchanged)"
+  fi
+  return 0
 }
 
 php_fpm_versions() {
