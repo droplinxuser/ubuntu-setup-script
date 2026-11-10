@@ -759,7 +759,6 @@ optimize_php_services() {
     listen_path=$(php_pool_listen "$ver")
     opt_report "## PHP ${ver}"
     # Same end-of-life check the installer runs (report only).
-    report_php_eol "$ver"
     opt_report "- Active: ${active}; listen kept: \`${listen_path:-unknown}\`"
     opt_backup "/etc/php/${ver}" "php-${ver}"
     opt_backup "/etc/systemd/system/php${ver}-fpm.service.d" "php-${ver}-systemd"

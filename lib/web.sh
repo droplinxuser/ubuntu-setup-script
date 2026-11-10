@@ -32,19 +32,6 @@ tune_clamp() {
   printf '%s' "$value"
 }
 
-# True when SERVICE appears in a comma or space separated list.  Used by the
-# optimizer for SETUP_SKIP_SERVICES, and by the tests.
-service_in_list() {
-  local want=${1:-} list=${2:-} s
-  [[ -n $want && -n $list ]] || return 1
-  local -a items
-  IFS=', ' read -r -a items <<< "$list"
-  for s in "${items[@]}"; do
-    [[ $s == "$want" ]] && return 0
-  done
-  return 1
-}
-
 # Tuner-facing name for mb_to_config(); one implementation keeps the installer
 # and --optimize reporting identical.
 tune_size_value() { mb_to_config "$1"; }
@@ -668,49 +655,6 @@ app_db_host_is_local() {
     ""|localhost|127.0.0.1|::1|/*|unix:*) return 0 ;;
     *) return 1 ;;
   esac
-}
-
-# Application-aware PHP-FPM worker ceiling, or non-zero when it does not
-# apply.  XenForo and WordPress with a local database spend their request
-# time on the CPU (11-19 ms of PHP per page on a modern core), so a worker
-# beyond one per logical CPU only adds run-queue latency and cache pressure.
-# Measured on the 8-core/16-thread Ryzen 7-class audit host (27 GiB, NVMe,
-# PHP 8.5, tracing JIT, 100 connections, three repeats, PHP CPU per request
-# from the service cgroup so it is independent of the client link):
-#
-#   workers  xf member req/s  php ms/req   xf thread req/s  php ms/req
-#      16          1044          11.20           686           18.10
-#      24          1000          11.87           641           19.21
-#      32           936          12.27           648           19.60
-#      48            --             --           627           20.25
-#
-# 16 workers (one per hardware thread) won on both page types and at 200
-# connections (xf-member 1046 vs 996 req/s at 32): oversubscription cost
-# 7-10% of PHP CPU to context switching and SMT cache contention.  A host
-# that also runs an unknown PHP application, or whose database is remote
-# (I/O-bound workers), keeps the generic 2-per-CPU ceiling; --php children=
-# always wins.
-php_app_worker_cap() {
-  local cpu=$1 target=${2:-/etc/angie} per_core=1 apps=0 file root host
-  [[ -d "$target/conf.d" ]] || return 1
-  host_is_vps && per_core=1
-  for file in "$target"/conf.d/*.conf; do
-    [[ -f $file ]] || continue
-    grep -qE '^[[:space:]]*(include[[:space:]]+h5bp/(php[a-z0-9_]*|wordpress|xf2)\.conf;|fastcgi_pass[[:space:]])' "$file" || continue
-    root=$(angie_vhost_root "$file")
-    [[ -n $root ]] || return 1
-    if [[ -f "$root/src/XF.php" && -f "$root/src/config.php" ]]; then
-      host=$(xf_db_host_from_config "$root/src/config.php")
-    elif [[ -f "$root/wp-config.php" ]]; then
-      host=$(wp_db_host_from_config "$root/wp-config.php")
-    else
-      return 1
-    fi
-    app_db_host_is_local "$host" || return 1
-    apps=$(( apps + 1 ))
-  done
-  (( apps > 0 )) || return 1
-  printf '%s' $(( cpu * per_core ))
 }
 
 # Precompress the static assets under one document root so brotli_static and
@@ -1634,12 +1578,10 @@ tune_php_fpm_version() {
   # operator decision, not a hardware guess: keep it across --optimize runs.
   explicit_value=$(explicit_option php_children 2>/dev/null || true)
   max_children=$(php_plan_max_children "$nproc" "$ram_mb" "$live_children" "$explicit_value" "$php_budget")
-  local app_cap
-  if [[ -z $explicit_value ]] && app_cap=$(php_app_worker_cap "$nproc") \
-     && [[ $app_cap =~ ^[0-9]+$ ]] && (( max_children == app_cap )); then
+  if [[ -z $explicit_value ]] && (( max_children == nproc * 2 )); then
     # Informational: the note must not mark the pool dirty, or every
-    # --optimize on an application host reloads an unchanged PHP-FPM.
-    tune_summary "PHP ${ver}: max_children capped at ${app_cap} (XenForo/WordPress with a local database are CPU-bound; --php children= overrides)"
+    # --optimize on a host already at the floor reloads an unchanged PHP-FPM.
+    tune_summary "PHP ${ver}: max_children=${max_children} (floor: 2 per logical CPU; --php children= overrides)"
   fi
   PHP_WRITTEN_CHILDREN=$max_children
   # A pool far larger than the plan is the most expensive misconfiguration

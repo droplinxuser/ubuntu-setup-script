@@ -466,7 +466,7 @@ plan_memory_budget() {
     fi
     explicit=$(explicit_option php_children 2>/dev/null || true)
     php_capacity=$(php_children_ceiling "$cpu" "$total" "$live_children" "$explicit")
-    php_floor=$(( $(php_children_floor "$total") * allowance ))
+    php_floor=$(( $(php_children_floor "$total" "$cpu") * allowance ))
     (( php_floor < 256 )) && php_floor=256
     (( php_floor > usable / 2 )) && php_floor=$(( usable / 2 ))
   fi
@@ -642,11 +642,11 @@ plan_memory_budget() {
   (( remaining < 0 )) && remaining=0
   if (( has_php )); then
     local floor_children
-    floor_children=$(php_children_floor "$total")
+    floor_children=$(php_children_floor "$total" "$cpu")
     children=$(( remaining / allowance ))
     (( children > php_capacity )) && children=$php_capacity
     (( children < floor_children )) && children=$floor_children
-    (( children > 512 )) && children=512
+    (( children > 512 && children > floor_children )) && children=512
     php_budget=$(( children * allowance ))
     if (( php_budget > remaining && children > floor_children )); then
       children=$(( remaining / allowance ))
@@ -672,80 +672,81 @@ plan_memory_budget() {
   return 0
 }
 
-# PHP-FPM worker ceiling for this host.  One formula for the memory plan, the
-# pool writer and the dry run so the preview, a fresh install and --optimize
-# agree.  Arguments: cpus, total RAM MB, live pool count ("" when none) and an
-# explicit --php children= value ("" when none).
-#   * per core: 2 workers.  A PHP worker is a runnable process, so a pool
-#     deeper than the thread count only queues on the scheduler; 2 keeps a
-#     slot for a worker blocked on I/O (a remote database, an object store)
-#     while staying inside one thread's worth of runnable processes.  The old
-#     16-per-core rule wrote 144 workers on a 16-thread host at install time
-#     and the first --optimize cut it to 32, so the same host produced two
-#     different pools depending on which command ran.
-#   * RAM: at most half of RAM at the 96 MB reservation divisor
-#   * a live pool keeps its count (it is a memory estimate, not a quota)
-#   * an explicit value wins, clamped to the same floor/512 ceiling
+# PHP-FPM worker count for this host.  One formula for the memory plan, the
+# pool writer and the dry run so a fresh install, --optimize and the preview
+# always agree.  Arguments: cpus, total RAM MB, an optional live pool count
+# (accepted for signature compatibility and reported by the pool writer, but
+# never used to size the pool) and an explicit --php children= value.
+#
+#   * floor: 2 workers per logical CPU on every host.  A PHP worker is a
+#     runnable process, so a pool that cannot fill the thread count leaves
+#     cores idle while requests queue; two per thread also keeps a slot for a
+#     worker blocked on I/O.  The floor is the same for a XenForo/WordPress
+#     host with a local database: those pages are CPU-bound, but starving the
+#     pool costs more than the few percent of CPU that oversubscription adds.
+#   * ceiling: the same 2 per logical CPU, so the plan is exactly 2 x CPUs
+#     unless an explicit value or the RAM floor says otherwise.  This is what
+#     makes the install and --optimize results identical on a host whose pool
+#     was hand-sized (a 64-thread board left on 512 static workers is
+#     normalised to 128, which is the floor for that host).
+#   * RAM: at the 96 MB reservation divisor the floor still wins, so a small
+#     host is not under-provisioned; the reservation is a planning estimate,
+#     not a hard limit.
+#   * an explicit value wins, clamped to floor..max(512, 2 x CPUs).
 php_children_ceiling() {
   local cpu=$1 ram_mb=$2 live=${3:-} explicit=${4:-}
-  local per_core=2 cap by_ram floor
-  cap=$(( cpu * per_core ))
-  by_ram=$(( ram_mb * 50 / 100 / 96 ))
-  (( by_ram > 0 && cap > by_ram )) && cap=$by_ram
-  if [[ $live =~ ^[0-9]+$ ]] && (( live > 0 )); then
-    cap=$live
-  fi
-  # A CPU-bound application host (XenForo/WordPress with a local database)
-  # is capped below the generic and live counts; see php_app_worker_cap.
-  local app_cap
-  if app_cap=$(php_app_worker_cap "$cpu") && [[ $app_cap =~ ^[0-9]+$ ]] && (( cap > app_cap )); then
-    cap=$app_cap
-  fi
+  local cap floor max_cap
+  (( cpu > 0 )) || cpu=1
+  cap=$(( cpu * 2 ))
+  floor=$(php_children_floor "$ram_mb" "$cpu")
   if [[ $explicit =~ ^[0-9]+$ ]] && (( explicit > 0 )); then
     cap=$explicit
   fi
-  floor=$(php_children_floor "$ram_mb")
-  (( cap > 512 )) && cap=512
+  max_cap=$(( cpu * 2 ))
+  (( max_cap < 512 )) && max_cap=512
+  (( cap > max_cap )) && cap=$max_cap
   (( cap < floor )) && cap=$floor
   printf '%s' "$cap"
 }
 
-# Minimum pool size.  Eight workers were kept on every host, which on a 1 GB
-# VPS reserved 768 MB for PHP alone; keep the floor within half of RAM.
+# Minimum pool size: at least two workers per logical CPU, and at least the
+# 8-worker floor the old rule used on a host large enough to hold it.  The
+# CPU term comes first so a 1-2 core VPS is never given fewer than 2-4
+# workers.
 php_children_floor() {
-  local ram_mb=$1 floor
-  floor=$(( ram_mb * 50 / 100 / 96 ))
-  (( floor > 8 )) && floor=8
+  local ram_mb=$1 cpu=${2:-0} floor
+  [[ $cpu =~ ^[0-9]+$ ]] && (( cpu > 0 )) || cpu=$(effective_cpus)
+  (( cpu > 0 )) || cpu=1
+  floor=$(( cpu * 2 ))
   (( floor < 2 )) && floor=2
   printf '%s' "$floor"
 }
 
 # One decision tree for the PHP-FPM worker count, shared by the pool writer
-# and the dry run so the preview and the written pool cannot disagree: a live
-# pool keeps its count (the reservation is a memory estimate, not a quota),
-# an explicit --php children= wins, otherwise the shared memory plan decides;
-# a standalone call without a plan falls back to the 96 MB reservation
-# divisor.  Arguments: cpus, RAM MB, live count (""/0 when none), explicit
-# value ("" when none), planned PHP budget MB (0 when none).
+# and the dry run: an explicit --php children= wins, otherwise the hardware
+# rule above decides.  The live count is accepted so callers keep one call
+# shape, but it never overrides the plan (that is what keeps install and
+# --optimize byte-identical on a host whose pool was sized by hand).  A
+# standalone call without a plan uses the same rule; the PHP budget only
+# caps when it is below the hardware value.
 php_plan_max_children() {
   local nproc=$1 ram_mb=$2 live=${3:-} explicit=${4:-} php_budget=${5:-0}
-  if [[ -n $live && $live != 0 ]] || [[ -n $explicit ]]; then
-    php_children_ceiling "$nproc" "$ram_mb" "$live" "$explicit"
-  elif (( ${OPT_PHP_CHILDREN:-0} > 0 )); then
-    printf '%s' "$OPT_PHP_CHILDREN"
-  elif [[ $php_budget =~ ^[0-9]+$ ]] && (( php_budget > 0 )); then
-    # The 64 MB divisor is the reservation a freshly started, idle pool
-    # actually uses.  The budget caps the hardware ceiling; it does not
-    # replace it, or a host whose measured data tier is still empty would
-    # write a pool far deeper than its thread count.
-    local cap by_budget
-    cap=$(php_children_ceiling "$nproc" "$ram_mb" "" "")
-    by_budget=$(( php_budget / 64 ))
-    (( by_budget > 0 && by_budget < cap )) && cap=$by_budget
-    printf '%s' "$cap"
-  else
-    php_children_ceiling "$nproc" "$ram_mb" "" ""
+  local cap
+  if [[ $explicit =~ ^[0-9]+$ ]] && (( explicit > 0 )); then
+    php_children_ceiling "$nproc" "$ram_mb" "" "$explicit"
+    return 0
   fi
+  cap=$(php_children_ceiling "$nproc" "$ram_mb" "" "")
+  if [[ $php_budget =~ ^[0-9]+$ ]] && (( php_budget > 0 )); then
+    # The budget can only raise the pool to the hardware value, never below
+    # the 2-per-CPU floor.
+    local by_budget floor
+    by_budget=$(( php_budget / 64 ))
+    floor=$(php_children_floor "$ram_mb" "$nproc")
+    (( by_budget < floor )) && by_budget=$floor
+    (( by_budget < cap )) && cap=$by_budget
+  fi
+  printf '%s' "$cap"
 }
 
 # Angie worker limits shared by tune_angie_configs and the dry run.
@@ -915,37 +916,6 @@ plan_install_budget() {
   plan_memory_budget
   OPT_INSTALL_PLAN=0
   info "Memory plan: ${OPT_MEM_BUDGET_MB}MB usable of ${OPT_MEM_TOTAL_MB}MB (PHP=${OPT_PHP_BUDGET_MB}MB MariaDB=${OPT_MARIADB_BUDGET_MB}MB Cache=${OPT_VALKEY_BUDGET_MB}MB Elasticsearch=${OPT_ES_BUDGET_MB}MB)"
-}
-
-# Security-support end date for a PHP branch (php.net supported versions).
-# Used by the installer and the optimizer report only: it never changes the
-# installed version.
-php_security_eol() {
-  case "${1:-}" in
-    8.0) printf '2023-11-26' ;;
-    8.1) printf '2025-12-31' ;;
-    8.2) printf '2026-12-31' ;;
-    8.3) printf '2027-12-31' ;;
-    8.4) printf '2028-12-31' ;;
-    8.5) printf '2029-12-31' ;;
-    *) printf '' ;;
-  esac
-}
-
-# Warn when a PHP branch is past its security-support window.  Shared by
-# `--php` and `--optimize` so a pinned old branch is flagged at install time
-# too.  Reports only; the version is never changed.
-report_php_eol() {
-  local ver=${1:-} eol today
-  eol=$(php_security_eol "$ver")
-  [[ -n $eol ]] || return 0
-  today=$(date +%F)
-  [[ $today > $eol ]] || return 0
-  warn "PHP ${ver} is end-of-life since ${eol}; no security fixes are published for this branch"
-  if (( ${OPTIMIZE:-0} )); then
-    opt_report "- **WARNING** PHP ${ver} has had no security fixes since ${eol}; plan an upgrade (the pool and OPcache settings carry over unchanged)"
-  fi
-  return 0
 }
 
 php_fpm_versions() {
