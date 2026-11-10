@@ -3,6 +3,43 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.16.0 (2026-11-10)
+
+Third audit, on a clean Ubuntu 26.04 host (Ryzen 7-class, 8 cores / 16
+threads, 27 GiB, NVMe) with a real XenForo 2.3.13 (600 threads, 2 983 posts,
+201 members) and WordPress 7.1.4 (401 posts) deployed from the local archives.
+CPU per request is the service cgroup's `usage_usec` delta, so the numbers do
+not depend on the client link; see `tests/stress-site/RESULTS.md`.
+
+- **PHP-FPM workers: one per hardware thread on application hosts, two per
+  thread otherwise.**  16 workers served 1 044 member req/s at 11.20 ms PHP
+  per request, 24 gave 1 000/11.87, 32 gave 936/12.27 and 48 gave
+  627/20.25 (thread page); 200-connection runs agreed (1 046 vs 996 req/s).
+  The old `2 per logical CPU` application cap and the `16/8 per core`
+  generic ceiling both oversubscribed the run queue.  WordPress moved the
+  same way (51.6 -> 57.6 ms PHP per request at 32 workers).
+- **Install and `--optimize` now write the same pool.**  A fresh install
+  planned a 64 MB reservation per worker and derived 144 workers on a
+  16-thread host; the first `--optimize` measured ~96 MB and wrote 32, so the
+  same host had two different pools.  The worker count now comes from
+  CPU/RAM/apps only (`php_children_ceiling`): 2 per thread generic, 1 per
+  thread for local-database XenForo/WordPress, bounded by RAM/2 at 96 MB and
+  an explicit `children=`.
+- **`--domain` ends with the `--optimize` pass.**  Creating a vhost changes
+  the plan (worker cap, OPcache file budget, guest cache for the new root,
+  wp-cron / XenForo job entries), and the old code left those for a later
+  run.  `install --domain`, `--domain` on a tuned host and `--domain` then
+  `--optimize` now produce byte-identical trees (verified with 1 113-file
+  /etc snapshots; the second `--optimize` is a no-op).  `SETUP_DOMAIN_OPTIMIZE=0`
+  opts out.
+- **PHP OPcache JIT re-validated.**  Tracing (kind 5, opt_level 4) with the
+  PHP default thresholds 64/127/16/64 and a 64 MB buffer: 19.40 ms PHP per
+  thread-page request against 20.94 ms with the JIT off (7.4%) and 21.57 ms
+  with the function JIT (11%).  32 MB and 128 MB buffers were within noise of
+  64 MB; only ~0.8 MB of the buffer was in use, so the 32 MB floor is safe on
+  small hosts.  The conservative 128/255/32/128 set lost throughput and
+  tripled p99.
+
 ## 1.15.0 (2026-11-10)
 
 Second live-host audit of a production XenForo origin (XenForo 2.3.10 + XFMG 2.3.9,

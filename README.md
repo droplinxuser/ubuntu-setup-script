@@ -134,12 +134,11 @@ the data directories it creates return 403 through Angie).
 - Installs the XenForo profile (`fpm cli opcache mysql gd curl xml zip gmp
   mbstring redis`); add `intl`/`imagick`/`bcmath` yourself if an add-on needs
   them.
-- Pool: `pm=static`; `pm.max_children` from the shared memory plan (16 per
-  core, 8 on a VPS, at most RAM/2 at 96 MB per worker, 512 maximum; 4 per
-  core, VPS 3, when every PHP vhost is XenForo/WordPress with a local
-  database, because those pages are CPU-bound: 144 vs 48 workers served the
-  same ~950 member req/s while p50 fell from 107 ms to 51 ms). A live pool
-  keeps its count; `children=` wins. `pm.max_requests = threads x 1024`,
+- Pool: `pm=static`; `pm.max_children` from the shared memory plan (2 per
+  core, at most RAM/2 at 96 MB per worker, 512 maximum; 1 per core when every
+  PHP vhost is XenForo/WordPress with a local database, because those pages
+  are CPU-bound). A live pool keeps its count; `children=` wins.
+  `pm.max_requests = threads x 1024`,
   `request_terminate_timeout 300s`, slow log at 10 s, `rlimit_files 524288`,
   systemd `LimitNOFILE=524288`/`UMask=0027`.
 - `zz-setup-optimize.ini`: `memory_limit` 256-512M (128M under 2 GB),
@@ -267,6 +266,13 @@ with `--databases`) is refused before anything is loaded. Existing vhost
 files and databases are preserved (an existing tree is not re-chowned);
 application code is not installed. Can be combined with an install.
 
+The run ends with the same tuning pass `--optimize` performs, because a new
+vhost changes the plan (PHP-FPM worker cap, OPcache file budget, guest cache
+for the new root, managed wp-cron / XenForo job entries): a domain install
+therefore leaves the host in the state "install, then `--optimize`" produced.
+`SETUP_DOMAIN_OPTIMIZE=0` skips that pass for a deployment script that copies
+the application files afterwards and tunes separately.
+
 ## `--optimize`
 
 Tunes the OS and every installed service in place (Ubuntu 22.04, 24.04,
@@ -333,7 +339,7 @@ data directory (NVMe / SSD / HDD) and the host class (`dedi`/`vps`).
 
 | Area | Rule |
 |---|---|
-| PHP-FPM | 16 workers per logical CPU (VPS 8), at most RAM/2 at 96 MB each, 512 max, floor `min(8, RAM/2/96)`; **2 per logical CPU on a XenForo/WordPress host with a local database** (measured optimum: 32 workers on 16 threads; 64 workers halved throughput per CPU and doubled p50/p99); live count kept unless the application cap is lower; `children=` wins. `pm = static` always. `opcache.max_accelerated_files` = PHP files under the vhost roots x 1.5 (16384..128256; the ceiling when no root is found); `memory_limit`, OPcache, JIT buffer and realpath sizes from one RAM profile shared with the dry run |
+| PHP-FPM | 2 workers per logical CPU, at most RAM/2 at 96 MB each, 512 max, floor `min(8, RAM/2/96)`; **1 per logical CPU on a XenForo/WordPress host with a local database** (measured on a 16-thread Ryzen 7-class: 16 workers served 1044 member req/s at 11.2 ms PHP per request, 32 workers 936 req/s at 12.3 ms, 48 workers 627/20.3 ms on thread pages; the install plan budgets a fresh worker at 64 MB so the same host no longer writes 144 workers on install and 32 on the first `--optimize`); live count kept unless the application cap is lower; `children=` wins. `pm = static` always. `opcache.max_accelerated_files` = PHP files under the vhost roots x 1.5 (16384..128256; the ceiling when no root is found); `memory_limit`, OPcache, JIT buffer and realpath sizes from one RAM profile shared with the dry run |
 | MariaDB | see the service section: pool from live data with floor `clamp(RAM/16, 256 MB, 4 GB)` for an empty or unmeasured database, io_capacity by disk x host, thread pool, connections from the PHP pool, table caches from connections, Aria page cache `clamp(RAM/128, 16, 256) MB` |
 | Elasticsearch | heap = store/4 (512 MB..25% RAM..31 GB); `node.processors` = effective CPUs; search threads cpus/2 (max 16), write threads cpus/4 (max 8) |
 | Valkey / Redis | maxmemory = live +20% with floor `clamp(RAM/64, 128 MB, 1 GB)`; maxclients from the PHP pool; io_threads 1..8 (a larger `io_threads=` is clamped with a warning) |

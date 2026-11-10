@@ -659,29 +659,28 @@ app_db_host_is_local() {
 
 # Application-aware PHP-FPM worker ceiling, or non-zero when it does not
 # apply.  XenForo and WordPress with a local database spend their request
-# time on the CPU (about 15 ms of PHP per page on a modern core), so workers
-# beyond two per logical CPU only queue on the run queue.  Measured on the
-# dev audit host (16 threads / 27 GiB / NVMe, PHP 8.5, tracing JIT, 100
-# concurrent members):
+# time on the CPU (11-19 ms of PHP per page on a modern core), so a worker
+# beyond one per logical CPU only adds run-queue latency and cache pressure.
+# Measured on the 8-core/16-thread Ryzen 7-class audit host (27 GiB, NVMe,
+# PHP 8.5, tracing JIT, 100 connections, three repeats, PHP CPU per request
+# from the service cgroup so it is independent of the client link):
 #
-#   workers  xf member req/s / p50   xf thread req/s / p50   wp member p50
-#      16         645 /  22 ms            456 /  35 ms           67 ms
-#      24         886 /  26 ms            515 /  46 ms           95 ms
-#      32         942 /  33 ms            511 /  62 ms          130 ms
-#      40         932 /  41 ms            506 /  80 ms          169 ms
-#      64         914 /  68 ms            492 / 138 ms          280 ms
-#      96         921 / 103 ms            495 / 201 ms          420 ms
+#   workers  xf member req/s  php ms/req   xf thread req/s  php ms/req
+#      16          1044          11.20           686           18.10
+#      24          1000          11.87           641           19.21
+#      32           936          12.27           648           19.60
+#      48            --             --           627           20.25
 #
-# 32 workers (2 per logical CPU) maximises throughput and halves p50/p99
-# against the old 4-per-CPU cap (64 here).  When every PHP vhost in conf.d is
-# one of those applications with a local database the pool is capped at 2
-# workers per logical CPU; a host that also runs an unknown PHP application,
-# or whose database is remote (I/O-bound workers), keeps the generic ceiling.
-# --php children= always wins.
+# 16 workers (one per hardware thread) won on both page types and at 200
+# connections (xf-member 1046 vs 996 req/s at 32): oversubscription cost
+# 7-10% of PHP CPU to context switching and SMT cache contention.  A host
+# that also runs an unknown PHP application, or whose database is remote
+# (I/O-bound workers), keeps the generic 2-per-CPU ceiling; --php children=
+# always wins.
 php_app_worker_cap() {
-  local cpu=$1 target=${2:-/etc/angie} per_core=2 apps=0 file root host
+  local cpu=$1 target=${2:-/etc/angie} per_core=1 apps=0 file root host
   [[ -d "$target/conf.d" ]] || return 1
-  host_is_vps && per_core=2
+  host_is_vps && per_core=1
   for file in "$target"/conf.d/*.conf; do
     [[ -f $file ]] || continue
     grep -qE '^[[:space:]]*(include[[:space:]]+h5bp/(php[a-z0-9_]*|wordpress|xf2)\.conf;|fastcgi_pass[[:space:]])' "$file" || continue

@@ -1,6 +1,89 @@
 # Full-stack stress test reports
 
 
+## Clean Ubuntu 26.04 host, setup.sh 1.16.0 - PHP worker cap, JIT and parity (2026-11-10)
+
+Test target: a pristine Ubuntu 26.04.1 install on a Ryzen 7-class (8 cores /
+16 threads, 27 812 MiB, NVMe, no other workload), reached over the LAN from a
+macOS workstation with `oha` 1.16.0.  XenForo 2.3.13 (8 forums, 600 threads,
+2 983 posts, 201 members) and WordPress 7.1.4 (401 posts, 102 users, block
+theme, `redis-cache` with PhpRedis to Valkey) were deployed from the local
+archives through `setup.sh --domain ... app=xf|wordpress db=...`.
+
+Method: every scenario is a 12 s keep-alive run at 100 connections with
+`Accept-Encoding: gzip, br`; CPU is the delta of each service's systemd
+cgroup `cpu.stat usage_usec`, divided by the completed requests, so it is
+independent of the client link.  The host was saturated (15.7-16.0 of 16
+threads) in every PHP scenario.
+
+### End state (setup.sh 1.16.0: 16 workers, tracing JIT 64 MB, guest cache)
+
+| scenario | req/s | p50 ms | p99 ms | KB/req | PHP ms/req | Angie | MariaDB | Valkey |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| XenForo guest (cached) | 8 266 | 11.3 | 18.5 | 7.2 | 0 | 0.10 | 0 | 0 |
+| XenForo guest (cache bypassed) | 1 345 | 73.6 | 84.1 | 7.2 | 9.13 | 0.22 | 1.84 | 0.002 |
+| XenForo member home | 1 024 | 96.4 | 160.8 | 7.9 | 11.36 | 0.24 | 3.29 | 0.002 |
+| XenForo member thread | 678 | 146.7 | 240.2 | 15.0 | 18.20 | 0.30 | 4.19 | 0.002 |
+| WordPress guest (cached) | 6 016 | 16.1 | 24.4 | 12.9 | 0 | 0.92 | 0 | 0 |
+| WordPress guest (cache bypassed) | 247 | 412.4 | 488.8 | 12.9 | 53.93 | 1.46 | 0.41 | 1.39 |
+| WordPress member | 238 | 429.8 | 478.5 | 14.0 | 55.59 | 1.55 | 0.42 | 1.53 |
+
+The WordPress rows are link-bound: 53.9 ms of PHP per request across 16
+workers caps the host at ~296 req/s and the Wi-Fi client delivered 247.  The
+XenForo rows are host-bound.  Guest caching is the largest single lever:
+XenForo 6.1x and WordPress 24x the uncached request rate, at 0.1 ms and
+0.9 ms of Angie CPU per request.
+
+### PHP-FPM worker count (XenForo, three repeats, 8 s, 100 connections)
+
+| workers | member req/s | PHP ms/req | thread req/s | PHP ms/req |
+|---:|---:|---:|---:|---:|
+| 8  | 471 (thread only) | - | 471 | 14.21 |
+| 12 | - | - | 612 | 15.88 |
+| 16 | 1 044 | 11.20 | 686 | 18.10 |
+| 24 | 1 000 | 11.87 | 641 | 19.21 |
+| 32 | 936 | 12.27 | 648 | 19.60 |
+| 48 | - | - | 627 | 20.25 |
+
+200 connections agreed (member: 1 046 at 16 vs 996 at 32).  Eight workers
+have the lowest CPU per request but cannot fill the 16 threads.  WordPress
+moved the same way (51.6 ms at 16 vs 57.6 ms at 32).  The old install plan
+wrote 144 workers for this host and the first `--optimize` wrote 32; the
+ceiling (2 per thread generic, 1 per thread for local-database applications)
+now makes both write 32 and 16 respectively, and `--domain` runs the
+optimizer so a domain install lands on 16.
+
+### OPcache JIT (XenForo member thread, 100 connections, 10 s)
+
+| configuration | req/s | PHP ms/req | p99 ms |
+|---|---:|---:|---:|
+| tracing, 64 MB, 64/127/16/64 (default) | 636-655 | 19.27-19.40 | 250-360 |
+| tracing, 32 MB | 636 | 19.48 | 370 |
+| tracing, 128 MB | 653 | 19.52 | 318 |
+| tracing, aggressive 16/64/8/32 | 638 | 19.67 | 394 |
+| tracing, conservative 128/255/32/128 | 522 | 19.61 | 1 719 |
+| function JIT, 64 MB | 571 | 21.57 | 545 |
+| JIT off | 617 | 20.94 | 271 |
+
+Tracing at PHP's default thresholds wins; the JIT is worth 7.4% of PHP CPU
+against off and 11% against the function JIT.  Only ~0.8 MB of the 64 MB
+buffer was in use after 100 warm requests (`opcache_get_status()` shows
+`kind=5, opt_level=4`), so the 32 MB floor the script clamps to is safe on
+small hosts.  OPcache itself reached a 97.2% hit rate with 626 scripts.
+
+### Parity
+
+1 113-file `/etc` snapshots (md5 per file, unit states, root crontab, PHP
+runtime, MariaDB variables) taken around each step:
+
+- install, then `--optimize`: identical apart from kernel counters.
+- `--domain app=wordpress`, then `--optimize`: identical.
+- `--domain app=xf`, then `--optimize`: identical.
+- a second `--optimize`: no file changes (the only differences ever observed
+  were `opcache.max_accelerated_files`, which follows the PHP file count when
+  test artifacts are added to a document root).
+
+
 ## Live XenForo origin, audit 2 - non-cacheable pages, CPU per request (2026-11-10)
 
 Host as in the first audit (8 vCPU Xeon E3-class, 32 GiB, PHP 8.5.12 FPM

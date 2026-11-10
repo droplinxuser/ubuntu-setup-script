@@ -1412,7 +1412,7 @@ OPT_DETECTED=(angie php:8.3 mariadb redis elastic)
 # different numbers (and the heap changes on the first --optimize run).
 nproc() { printf '16'; }
 mem_total_mb() { printf '27812'; }
-php_pool_max_children() { printf '144'; }
+php_pool_max_children() { printf '32'; }
 php_worker_allowance_mb() { printf '64'; }
 php_primary_version() { printf '8.5'; }
 mariadb_data_size_mb() { printf '0'; }
@@ -1426,12 +1426,12 @@ install_php_budget=$OPT_PHP_BUDGET_MB
 install_children=$OPT_PHP_CHILDREN
 install_es_budget=$OPT_ES_BUDGET_MB
 check "install plan derives the same worker count as the tuner" \
-  test "$install_children" -eq 144
+  test "$install_children" -eq 32
 check "install plan reserves 64 MB per fresh worker, not 96 MB" \
-  test "$install_php_budget" -eq $(( 144 * 64 ))
+  test "$install_php_budget" -eq $(( 32 * 64 ))
 
 # The same host, now sized by --optimize after the install ran (live pool of
-# 144 workers measured at the 64 MB floor).
+# 32 workers measured at the 64 MB floor).
 OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
 plan_memory_budget
 check "install and --optimize reserve the same PHP budget" \
@@ -2147,11 +2147,11 @@ check "on_error ignores SIGPIPE from a closed pipe" \
 # 1.9.0: shared sizing helpers (install/optimize parity) and hardware rules
 # ---------------------------------------------------------------------------
 HOST_SERVER_TYPE=dedi
-check "php_children_ceiling: 16 per core on dedicated hardware" \
-  test "$(php_children_ceiling 16 65536 '' '')" -eq 256
+check "php_children_ceiling: 2 per core on dedicated hardware" \
+  test "$(php_children_ceiling 16 65536 '' '')" -eq 32
 HOST_SERVER_TYPE=vps
-check "php_children_ceiling: 8 per core on a VPS" \
-  test "$(php_children_ceiling 16 65536 '' '')" -eq 128
+check "php_children_ceiling: the same 2-per-core ceiling on a VPS" \
+  test "$(php_children_ceiling 16 65536 '' '')" -eq 32
 check "php_children_ceiling: half of RAM at 96 MB caps a small host" \
   test "$(php_children_ceiling 16 2048 '' '')" -eq 10
 check "php_children_floor: 1 GB host keeps 5 workers, not 8" \
@@ -2345,10 +2345,10 @@ OPT_PHP_CHILDREN=72
 check "php_plan_max_children uses the shared plan without a live pool" \
   test "$(php_plan_max_children 16 27812 "" "")" = 72
 OPT_PHP_CHILDREN=0
-check "php_plan_max_children falls back to the 96 MB divisor of a standalone budget" \
-  test "$(php_plan_max_children 16 27812 0 "" 4800)" = 50
+check "php_plan_max_children bounds a standalone budget by the hardware ceiling" \
+  test "$(php_plan_max_children 16 27812 0 "" 4800)" = 32
 check "php_plan_max_children falls back to the hardware ceiling" \
-  test "$(php_plan_max_children 16 27812 "" "" 0)" = 144
+  test "$(php_plan_max_children 16 27812 "" "" 0)" = 32
 
 # Brotli level: explicit, else 4, or 3 on a 1-2 CPU host.
 effective_cpus() { printf 16; }
@@ -2443,11 +2443,11 @@ printf "<?php\n\$config['db']['host'] = 'localhost';\n" > "$TMP/capsite/xf/src/c
 check "angie_vhost_root reads the root directive" \
   test "$(angie_vhost_root "$TMP/capsite/conf.d/xf.conf")" = "$TMP/capsite/xf"
 host_is_vps() { return 1; }
-check "php_app_worker_cap: XenForo with a local DB -> 2 per logical CPU" \
-  test "$(orig_php_app_worker_cap 16 "$TMP/capsite")" = 32
+check "php_app_worker_cap: XenForo with a local DB -> 1 per logical CPU" \
+  test "$(orig_php_app_worker_cap 16 "$TMP/capsite")" = 16
 host_is_vps() { return 0; }
-check "php_app_worker_cap: 2 per logical CPU on a VPS" \
-  test "$(orig_php_app_worker_cap 16 "$TMP/capsite")" = 32
+check "php_app_worker_cap: 1 per logical CPU on a VPS" \
+  test "$(orig_php_app_worker_cap 16 "$TMP/capsite")" = 16
 host_is_vps() { return 1; }
 printf "<?php\n\$config['db']['host'] = 'db.example.net';\n" > "$TMP/capsite/xf/src/config.php"
 no_cap() { ! orig_php_app_worker_cap 16 "$TMP/capsite" >/dev/null; }
@@ -2459,10 +2459,10 @@ rm "$TMP/capsite/conf.d/other.conf"
 printf 'server {\n    root %s;\n    include h5bp/wordpress.conf;\n}\n' "$TMP/capsite/wp" > "$TMP/capsite/conf.d/wp.conf"
 printf "<?php\ndefine('DB_HOST', 'localhost');\n" > "$TMP/capsite/wp/wp-config.php"
 check "php_app_worker_cap: XenForo + WordPress, both local -> cap" \
-  test "$(orig_php_app_worker_cap 8 "$TMP/capsite")" = 16
-php_app_worker_cap() { printf 32; }
+  test "$(orig_php_app_worker_cap 8 "$TMP/capsite")" = 8
+php_app_worker_cap() { printf 16; }
 check "php_children_ceiling applies the app cap below a live 144 pool" \
-  test "$(php_children_ceiling 16 27812 144 "")" = 32
+  test "$(php_children_ceiling 16 27812 144 "")" = 16
 check "php_children_ceiling keeps an explicit value above the cap" \
   test "$(php_children_ceiling 16 27812 144 100)" = 100
 php_app_worker_cap() { return 1; }
