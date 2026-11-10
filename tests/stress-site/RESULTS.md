@@ -1,6 +1,167 @@
 # Full-stack stress test reports
 
 
+## Clean Ubuntu 26.04 host, setup.sh 1.19.1 - PHP 8.5.12 re-validation (2026-11-11)
+
+Target: pristine Ubuntu 26.04.1 on the 16-thread / 27 812 MiB / NVMe
+bare-metal host (`audit-host`), reached from the macOS workstation over Wi-Fi
+(`oha` 1.16.0).  Stack: Angie 1.12.4, PHP 8.5.12-FPM, MariaDB 11.8.6,
+Valkey 9.0.4, Elasticsearch 9.5.6, Node.js 26.  WordPress 7.1.4 (100 users,
+400 posts, 300 comments) and XenForo 2.3.13 (60 users, 200 threads, 2 600
+posts) were deployed from the local archives through
+`setup.sh --domain ... app=wordpress|xf`, then seeded through each
+application's own services.
+
+Fresh install: 2 min 56 s (`--basic server=dedi --angie --php --mariadb
+user=demo pass=temp --valkey --elastic --others all`).  `--optimize`: 11 s.
+Tests: **601/601 tuning checks and 161/161 CLI/dry-run checks pass**.
+
+### Install / optimize parity
+
+A 3 794-line state snapshot (file digests under `/etc`, unit-file and active
+unit lists, every sysctl, root crontab, PHP runtime, MariaDB global variables,
+Valkey config, Angie checksums) was compared around the first `--optimize`:
+
+```
+DIFF_LINES=82   # only volatile values:
+session-37.scope -> session-38.scope
+fs.dentry-state, fs.file-nr, fs.inode-nr/state, fs.quota.{allocated_dquots,
+cache_hits, drops, lookups, syncs}, kernel.ns_last_pid, kernel.random.uuid,
+net.netfilter.nf_conntrack_count
+```
+
+After the applications were deployed, a second `--optimize` changed **no**
+managed file and reloaded nothing; every service reported "configuration
+already optimized".  The generated crontab, `/etc/angie`, `/etc/php`,
+`/etc/mysql`, `/etc/valkey` and `/etc/elasticsearch` were byte-identical
+across the two paths.
+
+### Full suite, 10 s per scenario (200 connections, 100 for uncached/member)
+
+Two seconds of the same load warm the FastCGI cache and OPcache first (1.19.1
+adds this; without it a "cached" row could start cold and swing 3-4x).
+
+| Scenario | req/s | p50 ms | p99 ms | status |
+|---|---:|---:|---:|---|
+| static | 14 987 | 13.1 | 20.2 | 200 |
+| php-hello | 17 193 | 11.5 | 17.0 | 200 |
+| mariadb-json | 15 703 | 12.5 | 18.9 | 200 |
+| valkey-json | 15 536 | 12.6 | 19.2 | 200 |
+| elasticsearch (100c) | 6 525 | 10.9 | 130.5 | 200 |
+| node-proxy | 11 772 | 16.6 | 25.7 | 200 |
+| full-uncached | 6 532 | 30.1 | 51.3 | 200 |
+| full-cached | 14 845 | 13.1 | 20.6 | 200 |
+| xf-guest (cached) | 4 701 | 41.7 | 67.3 | 200 |
+| xf-guest-uncached | 1 078 | 92.0 | 109.2 | 200 |
+| xf-member home | 1 066 | 92.3 | 109.9 | 200 |
+| xf-member thread | 865 | 114.1 | 131.5 | 200 |
+| wp-guest (cached) | 3 451 | 54.2 | 115.6 | 200 |
+| wp-guest-uncached | 273 | 370.5 | 526.1 | 200 |
+| wp-member home | 259 | 390.6 | 540.6 | 200 |
+| wp-member post | 264 | 384.0 | 543.2 | 200 |
+| slow-1s (200c) | 20 | - | - | queue-bound |
+
+The cached guest tiers are link-bound on the shared Wi-Fi link (dedicated
+runs below reach 7 451 / 5 308 req/s); the uncached and member tiers are
+CPU-bound and repeat within 1-2%.  No `max children reached`, listen-queue
+overflow, PHP-FPM slow-log entry, Angie error, MariaDB slow query or OOM
+during any run.  FPM status after the suite: 16/16 processes, max listen
+queue 0, max active 16.
+
+### Guest cache is the largest lever
+
+Dedicated runs with server-side cgroup sampling (`bench-one.sh` +
+`sample-cpu.sh`, 8 s, 100/200 connections):
+
+| Tier | req/s | p50 ms | PHP ms/req | Angie ms/req | MariaDB ms/req |
+|---|---:|---:|---:|---:|---:|
+| XenForo guest (cached, 200c) | 7 451 | 23.6 | 0 | 0.099 | 0 |
+| XenForo guest (cache bypass) | 901 | 97.1 | 9.13 | 0.22 | 1.84 |
+| XenForo member home | 1 066 | 92.3 | 12.4 | 0.26 | 2.54 |
+| XenForo member thread | 865 | 114.1 | 15.8 | 0.26 | 1.91 |
+| WordPress guest (cached, 200c) | 5 308 | 29.4 | 0 | 0.928 | 0 |
+| WordPress guest (cache bypass) | 273 | 370.5 | 53.9 | 1.46 | 0.41 |
+| WordPress member | 259 | 390.6 | 51.3 | 1.65 | 4.32 |
+
+Caching removes PHP and MariaDB entirely for guests: 8.3x the XenForo guest
+request rate and 19x the WordPress rate.  The remaining cached WordPress cost
+is Angie compressing each hit (0.93 ms/request, ~4.9 cores at 5.3k req/s);
+XenForo's PHP sends gzip itself and costs 0.10 ms.
+
+### OPcache JIT sweep (XenForo member thread, 100c, 8 s)
+
+| configuration | req/s | p50 ms | PHP ms/req |
+|---|---:|---:|---:|
+| tracing, 64 MB (shipped) | **872** | 113.9 | **15.81** |
+| tracing, conservative 128/255/32/128 | 869 | 114.0 | 15.88 |
+| tracing, 32 MB | 866 | 114.9 | 16.03 |
+| tracing, 128 MB | 862 | 115.3 | 16.09 |
+| tracing, aggressive 16/64/8/32 | 858 | 114.8 | 16.12 |
+| JIT off | 821 | 119.6 | 17.11 |
+| function JIT, 64 MB | 787 | 124.5 | 17.57 |
+
+Tracing/64 MB at PHP's default hotness wins; the JIT is worth 8.2% of PHP
+throughput against off and 10.8% against function JIT.  32 MB and 128 MB are
+within noise of 64 MB.  WordPress member moved the same direction: tracing
+300 req/s at 50.0 ms, JIT off 284 at 54.0 (7.4%).  `opcache_get_status()`
+reports `kind=5, opt_level=4`, 857 KB of the 64 MB buffer used, 99.99% hit
+rate and 740 cached scripts.
+
+### PHP-FPM pool sweep (XenForo member thread, 100c, 8 s)
+
+| workers | req/s | p50 ms | PHP ms/req | PHP cores used |
+|---:|---:|---:|---:|---:|
+| 8 | 578 | 173.2 | 12.78 | 5.9 |
+| 12 | 763 | 132.0 | 14.34 | 8.3 |
+| **16** | **860** | **114.5** | **16.10** | **11.0** |
+| 20 | 827 | 120.1 | 17.00 | 11.1 |
+| 24 | 802 | 122.8 | 17.46 | 11.0 |
+| 32 | 808 | 122.7 | 17.54 | 10.6 |
+
+Eight workers leave half the host idle; beyond 16 the same CPU is shared by
+more processes, so requests per second fall and per-request CPU rises.  The
+host is saturated at 16 workers (`pm=static`, 16 = 1.0 per logical CPU), and
+200 connections do not raise throughput above 854 req/s (p50 doubles), which
+confirms the pool, not the link, is the ceiling.  WordPress member agrees:
+8 workers 216 req/s / 38.1 ms, 16 workers 292 / 51.4.
+
+### Authenticated traffic: why there is no cache to add
+
+XenForo and WordPress bypass the FastCGI cache whenever a session cookie is
+present, by design.  The member tiers are PHP CPU-bound (12-16 ms XenForo,
+50-54 ms WordPress) with MariaDB at 2-4 ms; adding Valkey sessions or an
+object cache cannot remove the template/block rendering that dominates.
+The measured levers are the pool size and JIT above; the largest remaining
+application-level lever on XenForo is its sidebar widgets (previous audits:
++39% authenticated throughput when Members online / Trending / Featured are
+disabled).  `--optimize` reports that recommendation rather than editing the
+application.
+
+### Brotli level on cached WordPress
+
+| level | Angie ms/req | bytes (home) |
+|---|---:|---:|
+| 2 | 0.545 | 14 399 |
+| 3 | 0.603 | 14 000 |
+| 4 (shipped) | 0.921 | 13 396 |
+
+Level 3 saves 35% of the compression CPU for 4.5% more bytes.  The shipped
+default stays 4 (chosen on a proxy-fronted origin in 1.18.0);
+`SETUP_BROTLI_LEVEL=3` is the documented override for a CPU-bound origin.
+
+### Harness fixes made by this audit
+
+- `sample-cpu.sh` summed the idle field of `/proc/stat`, so the "host CPU
+  used" line always reported one core-second per core per second.  It now
+  sums user/nice/system/irq/softirq/steal only.
+- `run-stress-remote.sh` warms each scenario for 2 s, runs `slow-1s` last
+  (its 200-connection backlog previously poisoned the next scenario: p99
+  1.9 s on the XenForo thread page), and writes an explicit error row when a
+  scenario's JSON cannot be parsed instead of dropping it.
+- `bench-one.sh`, `set-jit.sh`, `deploy-apps.sh`, `seed-xf.php` and
+  `seed-wp.php` reproduce the sweep and the application deployment.
+
+
 ## Live forum.example.com origin, audit 4 - pool right-sizing on 64 threads (2026-11-10)
 
 Host: 64-thread Xeon, 128 GiB, RAID10, Ubuntu 24.04.5, PHP 8.0.30 FPM,
