@@ -678,48 +678,94 @@ plan_memory_budget() {
 # (accepted for signature compatibility and reported by the pool writer, but
 # never used to size the pool) and an explicit --php children= value.
 #
-#   * floor: 2 workers per logical CPU on every host.  A PHP worker is a
-#     runnable process, so a pool that cannot fill the thread count leaves
-#     cores idle while requests queue; two per thread also keeps a slot for a
-#     worker blocked on I/O.  The floor is the same for a XenForo/WordPress
-#     host with a local database: those pages are CPU-bound, but starving the
-#     pool costs more than the few percent of CPU that oversubscription adds.
-#   * ceiling: the same 2 per logical CPU, so the plan is exactly 2 x CPUs
-#     unless an explicit value or the RAM floor says otherwise.  This is what
-#     makes the install and --optimize results identical on a host whose pool
-#     was hand-sized (a 64-thread board left on 512 static workers is
-#     normalised to 128, which is the floor for that host).
-#   * RAM: at the 96 MB reservation divisor the floor still wins, so a small
-#     host is not under-provisioned; the reservation is a planning estimate,
-#     not a hard limit.
-#   * an explicit value wins, clamped to floor..max(512, 2 x CPUs).
+#   * target: working threads per logical CPU, in tenths, follows the
+#     blocking profile of the host (php_workers_per_cpu_tenths).  A static
+#     pool one deep per core is the measured optimum when PHP and a local
+#     MariaDB share a flash-backed bare-metal host: the page is CPU-bound,
+#     so extra workers only contend for the same cores.  On the 16-thread
+#     audit host (XenForo member page, loopback load, c=64):
+#       16 workers  834 req/s, 14.38 ms PHP CPU/request, p50 76 ms
+#       20 workers  825 req/s, 14.97 ms
+#       24 workers  819 req/s, 15.29 ms
+#       32 workers  808 req/s, 15.68 ms, p50 79 ms
+#     The same direction held on the XenForo thread page (470 vs 446 req/s)
+#     and the WordPress member page (298 vs 282 req/s).  A host that can
+#     block instead of compute (spinning disk, remote database, shared
+#     virtual CPU) keeps headroom at 1.5-2.0 workers per core.
+#   * explicit value: `--php children=` wins, clamped to floor..max(512,
+#     2 x CPUs) so a typo cannot create a 10 000-process pool.
+#   * RAM: at the 96 MB reservation divisor the target still wins, so a
+#     small host is not under-provisioned; the reservation is a planning
+#     estimate, not a hard limit.
+# SETUP_PHP_WORKERS_PER_CPU (e.g. 1.0, 1.5, 2.0) pins the factor for an
+# operator or a test that wants the old two-per-core profile.
+php_workers_per_cpu_tenths() {
+  local disk class pin=${SETUP_PHP_WORKERS_PER_CPU:-}
+  if [[ -n $pin ]]; then
+    local tenths
+    tenths=$(awk -v v="$pin" 'BEGIN{ if (v+0 > 0) printf "%d", (v*10)+0.5 }' 2>/dev/null || true)
+    if [[ $tenths =~ ^[0-9]+$ ]] && (( tenths > 0 )); then
+      printf '%s' "$tenths"
+      return 0
+    fi
+  fi
+  disk=$(storage_class 2>/dev/null || true)
+  [[ -n $disk ]] || disk=ssd
+  # A spinning disk (or a database on another machine) blocks; the pool needs
+  # a slot to switch to while a worker waits.
+  [[ $disk == hdd ]] && { printf 20; return 0; }
+  host_has_local_db || { printf 15; return 0; }
+  class=$(host_server_type 2>/dev/null || true)
+  [[ $class == vps ]] && { printf 15; return 0; }
+  printf 10
+}
+
+# True when a MariaDB instance runs on this host, whether it is already
+# installed (--optimize) or is part of this install run.  Both paths must
+# answer the same way or a fresh install and the next --optimize would size
+# the pool differently.
+host_has_local_db() {
+  [[ ${ENABLED[mariadb]:-0} -eq 1 ]] && return 0
+  [[ " ${OPT_DETECTED[*]:-} " == *" mariadb "* ]] && return 0
+  pkg_ok mariadb-server 2>/dev/null && return 0
+  return 1
+}
+
+# Workers for CPU cores at a tenths-of-a-worker factor.  Pure: the tests pin
+# the factor, the tuner derives it from the hardware profile.
+php_children_from_tenths() {
+  local cpu=$1 tenths=$2 n
+  [[ $cpu =~ ^[0-9]+$ ]] && (( cpu > 0 )) || cpu=1
+  [[ $tenths =~ ^[0-9]+$ ]] && (( tenths > 0 )) || tenths=10
+  n=$(( (cpu * tenths + 9) / 10 ))
+  (( n < 2 )) && n=2
+  printf '%s' "$n"
+}
+
 php_children_ceiling() {
   local cpu=$1 ram_mb=$2 live=${3:-} explicit=${4:-}
   local cap floor max_cap
   (( cpu > 0 )) || cpu=1
-  cap=$(( cpu * 2 ))
   floor=$(php_children_floor "$ram_mb" "$cpu")
+  cap=$floor
   if [[ $explicit =~ ^[0-9]+$ ]] && (( explicit > 0 )); then
     cap=$explicit
+    max_cap=$(( cpu * 2 ))
+    (( max_cap < 512 )) && max_cap=512
+    (( cap > max_cap )) && cap=$max_cap
+    (( cap < floor )) && cap=$floor
   fi
-  max_cap=$(( cpu * 2 ))
-  (( max_cap < 512 )) && max_cap=512
-  (( cap > max_cap )) && cap=$max_cap
-  (( cap < floor )) && cap=$floor
   printf '%s' "$cap"
 }
 
-# Minimum pool size: at least two workers per logical CPU, and at least the
-# 8-worker floor the old rule used on a host large enough to hold it.  The
-# CPU term comes first so a 1-2 core VPS is never given fewer than 2-4
-# workers.
+# Minimum pool size: the hardware target, never below two workers (a pool of
+# one cannot answer a second request while the first is in the database).
 php_children_floor() {
-  local ram_mb=$1 cpu=${2:-0} floor
+  local ram_mb=$1 cpu=${2:-0} tenths
   [[ $cpu =~ ^[0-9]+$ ]] && (( cpu > 0 )) || cpu=$(effective_cpus)
   (( cpu > 0 )) || cpu=1
-  floor=$(( cpu * 2 ))
-  (( floor < 2 )) && floor=2
-  printf '%s' "$floor"
+  tenths=$(php_workers_per_cpu_tenths)
+  php_children_from_tenths "$cpu" "$tenths"
 }
 
 # One decision tree for the PHP-FPM worker count, shared by the pool writer
@@ -738,8 +784,8 @@ php_plan_max_children() {
   fi
   cap=$(php_children_ceiling "$nproc" "$ram_mb" "" "")
   if [[ $php_budget =~ ^[0-9]+$ ]] && (( php_budget > 0 )); then
-    # The budget can only raise the pool to the hardware value, never below
-    # the 2-per-CPU floor.
+    # The budget can only lower the pool to what its RAM reservation allows,
+    # never below the hardware floor.
     local by_budget floor
     by_budget=$(( php_budget / 64 ))
     floor=$(php_children_floor "$ram_mb" "$nproc")
@@ -878,10 +924,12 @@ service_mem_mb() {
   case $svc in
     mariadb)
       mb=${OPT_MARIADB_BUDGET_MB:-0}
-      if (( mb <= 0 )); then mb=$(( ram * 40 / 100 )); (( mb < 256 )) && mb=256; fi ;;
+      # Stand-alone fallback (no plan): use the planner's own floor so a
+      # helper call cannot size the pool differently from an install.
+      (( mb > 0 )) || mb=$(mariadb_floor_mb "$ram") ;;
     valkey|redis)
       mb=${OPT_VALKEY_BUDGET_MB:-0}
-      if (( mb <= 0 )); then mb=$(( ram / 10 )); (( mb < 256 )) && mb=256; (( mb > 8192 )) && mb=8192; fi ;;
+      (( mb > 0 )) || mb=$(valkey_floor_mb "$ram") ;;
     elastic)
       # The plan already normalises its value to a 512 MB step and may keep
       # an operator heap unrounded; never round it again here.
@@ -915,11 +963,22 @@ plan_install_budget() {
   OPT_INSTALL_PLAN=1
   plan_memory_budget
   OPT_INSTALL_PLAN=0
-  info "Memory plan: ${OPT_MEM_BUDGET_MB}MB usable of ${OPT_MEM_TOTAL_MB}MB (PHP=${OPT_PHP_BUDGET_MB}MB MariaDB=${OPT_MARIADB_BUDGET_MB}MB Cache=${OPT_VALKEY_BUDGET_MB}MB Elasticsearch=${OPT_ES_BUDGET_MB}MB)"
+  info "$(memory_plan_summary)"
 }
 
-php_fpm_versions() {
-  local d ver
+# The one-line memory-plan summary used by the installer, --optimize and the
+# report.  Four copies of this string used to drift whenever a field was
+# added; the label stays a parameter ("Memory plan" vs "Memory budget").
+memory_plan_summary() {
+  local label=${1:-Memory plan}
+  printf '%s: %sMB usable of %sMB (PHP=%sMB MariaDB=%sMB Cache=%sMB Elasticsearch=%sMB)' \
+    "$label" \
+    "${OPT_MEM_BUDGET_MB:-0}" "${OPT_MEM_TOTAL_MB:-0}" \
+    "${OPT_PHP_BUDGET_MB:-0}" "${OPT_MARIADB_BUDGET_MB:-0}" \
+    "${OPT_VALKEY_BUDGET_MB:-0}" "${OPT_ES_BUDGET_MB:-0}"
+}
+
+php_fpm_versions() {  local d ver
   for d in /etc/php/*/fpm; do
     [[ -d $d ]] || continue
     ver=$(basename "$(dirname "$d")")
@@ -1305,7 +1364,7 @@ EOF
 tune_xf_cache_bypass_var() {
   local file=$1 tmp before
   [[ -f $file ]] || return 0
-  before=$(md5sum "$file" | awk '{print $1}')
+  before=$(file_md5 "$file")
   tmp=$(tmp_file) || return 1
   awk '
     /^[[:space:]]*fastcgi_no_cache[[:space:]]/ {

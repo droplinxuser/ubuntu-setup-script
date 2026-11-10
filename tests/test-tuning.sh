@@ -25,6 +25,10 @@ export SETUP_TEST_SOURCE_ONLY=1
 # Never read the live host state (/var/lib/setup.sh): a recorded explicit
 # --mariadb size= or --valkey ram= would silently change the planner results.
 export SETUP_STATE_DIR="$TMP/state"
+# Pin the PHP-FPM pool factor for the sizing arithmetic.  The default is
+# hardware-derived (1.0 worker per core on a local-DB flash host); the tests
+# that exercise the derivation clear this variable themselves.
+export SETUP_PHP_WORKERS_PER_CPU=2
 # shellcheck disable=SC1090
 source "$ROOT/setup.sh"
 # setup.sh installs an ERR trap for production diagnostics.  These tests
@@ -733,10 +737,14 @@ check "open_basedir repair is idempotent" test "$TUNE_DIRTY" -eq 0
 # ---------------------------------------------------------------------------
 # OPcache JIT: always the tracing JIT; the pool is always static
 # ---------------------------------------------------------------------------
-check "shipped custom_dan.ini disables OPcache JIT (the managed ini turns it on)" \
-  test "$(grep -cE '^[[:space:]]*opcache\.jit[[:space:]]*=[[:space:]]*disable' "$ROOT/configs/php/custom_dan.ini")" -eq 1
+check "shipped custom_dan.ini leaves opcache.jit to the managed ini" \
+  test "$(grep -cE '^[[:space:]]*opcache\.jit[[:space:]]*=' "$ROOT/configs/php/custom_dan.ini")" -eq 0
 check "shipped custom_dan.ini ships no JIT buffer" \
-  test "$(grep -cE '^[[:space:]]*opcache\.jit_buffer_size[[:space:]]*=[[:space:]]*0$' "$ROOT/configs/php/custom_dan.ini")" -eq 1
+  test "$(grep -cE '^[[:space:]]*opcache\.jit_buffer_size[[:space:]]*=' "$ROOT/configs/php/custom_dan.ini")" -eq 0
+check "shipped custom_dan.ini does not duplicate the managed memory_limit" \
+  test "$(grep -cE '^[[:space:]]*memory_limit[[:space:]]*=' "$ROOT/configs/php/custom_dan.ini")" -eq 0
+check "shipped custom_dan.ini does not duplicate the managed OPcache size" \
+  test "$(grep -cE '^[[:space:]]*opcache\.(memory_consumption|interned_strings_buffer)[[:space:]]*=' "$ROOT/configs/php/custom_dan.ini")" -eq 0
 check "the optimizer writes the JIT mode from php_jit_settings" \
   test "$(grep -cE '^opcache\.jit = \$\{jit_mode\}$' "$ALL_SRC")" -eq 1
 check "the tracing JIT is always on (512M OPcache -> 64M buffer)" \
@@ -2166,6 +2174,10 @@ check "on_error ignores SIGPIPE from a closed pipe" \
 # ---------------------------------------------------------------------------
 # 1.9.0: shared sizing helpers (install/optimize parity) and hardware rules
 # ---------------------------------------------------------------------------
+# The pool factor is hardware-derived; pin it here so the arithmetic below
+# is deterministic on any test host.  The adaptive rule itself is covered
+# separately at the end of this block.
+export SETUP_PHP_WORKERS_PER_CPU=2
 HOST_SERVER_TYPE=dedi
 check "php_children_ceiling: 2 per core on dedicated hardware" \
   test "$(php_children_ceiling 16 65536 '' '')" -eq 32
@@ -2184,6 +2196,30 @@ check "php_children_ceiling: explicit value wins but is clamped to the floor" \
   test "$(php_children_ceiling 4 65536 200 600)" -eq 512
 check "php_children_ceiling: explicit value below the floor is raised" \
   test "$(php_children_ceiling 8 65536 '' 4)" -eq 16
+
+# --- adaptive pool factor (1.19.0) -----------------------------------------
+check "php_children_from_tenths: one worker per core" \
+  test "$(php_children_from_tenths 16 10)" -eq 16
+check "php_children_from_tenths: one and a half per core rounds up" \
+  test "$(php_children_from_tenths 15 15)" -eq 23
+check "php_children_from_tenths: two per core" \
+  test "$(php_children_from_tenths 16 20)" -eq 32
+check "php_children_from_tenths: never fewer than two workers" \
+  test "$(php_children_from_tenths 1 10)" -eq 2
+check "php_children_from_tenths: rejects a zero factor" \
+  test "$(php_children_from_tenths 16 0)" -eq 16
+check "pool factor: local database on flash bare metal is 1.0/core" \
+  test "$( storage_class() { printf nvme; }; host_has_local_db() { return 0; }; host_server_type() { printf dedi; }; SETUP_PHP_WORKERS_PER_CPU= php_workers_per_cpu_tenths )" -eq 10
+check "pool factor: a spinning disk keeps 2.0/core of headroom" \
+  test "$( storage_class() { printf hdd; }; host_has_local_db() { return 0; }; host_server_type() { printf dedi; }; SETUP_PHP_WORKERS_PER_CPU= php_workers_per_cpu_tenths )" -eq 20
+check "pool factor: a remote database keeps 1.5/core" \
+  test "$( storage_class() { printf nvme; }; host_has_local_db() { return 1; }; host_server_type() { printf dedi; }; SETUP_PHP_WORKERS_PER_CPU= php_workers_per_cpu_tenths )" -eq 15
+check "pool factor: a shared vCPU keeps 1.5/core" \
+  test "$( storage_class() { printf ssd; }; host_has_local_db() { return 0; }; host_server_type() { printf vps; }; SETUP_PHP_WORKERS_PER_CPU= php_workers_per_cpu_tenths )" -eq 15
+check "pool factor: SETUP_PHP_WORKERS_PER_CPU pins the factor" \
+  test "$(SETUP_PHP_WORKERS_PER_CPU=1.5 php_workers_per_cpu_tenths)" -eq 15
+check "pool factor: a local MariaDB in this install run counts as local" \
+  test "$( storage_class() { printf nvme; }; OPT_DETECTED=(); ENABLED=([mariadb]=1); host_server_type() { printf dedi; }; SETUP_PHP_WORKERS_PER_CPU= php_workers_per_cpu_tenths )" -eq 10
 HOST_SERVER_TYPE=dedi
 
 check "sysctl_target_somaxconn scales with CPUs on dedicated hardware" \
@@ -2249,11 +2285,11 @@ php_pool_max_children() { printf '0'; }
 check "valkey_clamp_io_threads caps at 8 on both paths" \
   test "$(valkey_clamp_io_threads 16)" -eq 8 -a "$(valkey_clamp_io_threads x)" -eq 1
 
-# service_mem_mb: the planned value wins; the fallback formulas are the old
-# install/optimize ones, now in one place.
+# service_mem_mb: the planned value wins; a stand-alone call uses the same
+# floors as the planner so an install and a later --optimize agree.
 OPT_MARIADB_BUDGET_MB=0; OPT_VALKEY_BUDGET_MB=0; OPT_ES_BUDGET_MB=0
-check "service_mem_mb mariadb fallback is 40% of RAM" test "$(service_mem_mb mariadb)" -eq 26214
-check "service_mem_mb valkey fallback is capped at 8 GB" test "$(service_mem_mb valkey)" -eq 6553
+check "service_mem_mb mariadb fallback is the RAM/16 planner floor" test "$(service_mem_mb mariadb)" -eq 4096
+check "service_mem_mb valkey fallback is the RAM/64 planner floor (1 GB cap)" test "$(service_mem_mb valkey)" -eq 1024
 check "service_mem_mb elastic fallback is 25% of RAM on a 512 MB step" test "$(service_mem_mb elastic)" -eq 16384
 OPT_ES_BUDGET_MB=1000
 check "service_mem_mb never re-rounds a planned Elasticsearch heap" test "$(service_mem_mb elastic)" -eq 1000

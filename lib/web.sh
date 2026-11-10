@@ -334,7 +334,7 @@ tune_ensure_in_location() {
 tune_cache_error_policy() {
   local file=$1 label=$2 before after tmp
   [[ -f $file ]] || return 0
-  before=$(md5sum "$file" | awk '{print $1}')
+  before=$(file_md5 "$file")
   sed_in_place -E '/^[[:space:]]*fastcgi_cache_use_stale/ s/[[:space:]]+http_500([[:space:]]|;)/\1/g' "$file"
   if ! grep -qE '^[[:space:]]*fastcgi_cache_valid[[:space:]]+500([[:space:]]+[0-9]+)+[[:space:]]+0s;' "$file"; then
     tmp=$(tmp_file)
@@ -354,7 +354,7 @@ tune_cache_error_policy() {
     fi
     cat "$tmp" > "$file"
   fi
-  after=$(md5sum "$file" | awk '{print $1}')
+  after=$(file_md5 "$file")
   [[ $before != "$after" ]] \
     && tune_note "${label}: never cache error responses; stale 500 disabled"
   return 0
@@ -439,9 +439,9 @@ tune_fastcgi_path_translated_all() {
 tune_strip_php_admin_open_basedir() {
   local file=$1 label=${2:-${1##*/}} before
   [[ -f $file ]] || return 0
-  before=$(md5sum "$file" | awk '{print $1}')
+  before=$(file_md5 "$file")
   sed_in_place -E 's|^([[:space:]]*)(fastcgi_param[[:space:]]+PHP_ADMIN_VALUE[[:space:]]+"?open_basedir=.*)$|\1# \2|' "$file"
-  if [[ $(md5sum "$file" | awk '{print $1}') != "$before" ]]; then
+  if [[ $(file_md5 "$file") != "$before" ]]; then
     tune_note "${label}: per-request open_basedir disabled (it leaks across the shared PHP-FPM pool)"
   fi
   return 0
@@ -490,7 +490,7 @@ tune_xf_cache_vary() {
   local file=$1
   [[ -f $file ]] || return 0
   local before tmp
-  before=$(md5sum "$file" | awk '{print $1}')
+  before=$(file_md5 "$file")
   if grep -qE '^[[:space:]]*fastcgi_cache_key[[:space:]]' "$file"; then
     tmp=$(tmp_file)
     awk '
@@ -512,7 +512,7 @@ tune_xf_cache_vary() {
       'fastcgi_cache_background_update on;' \
       "$(basename "$file"): background cache update"
   fi
-  if [[ $(md5sum "$file" | awk '{print $1}') != "$before" ]]; then
+  if [[ $(file_md5 "$file") != "$before" ]]; then
     tune_note "$(basename "$file"): cache key varies on style/language/encoding"
   fi
   return 0
@@ -1010,9 +1010,9 @@ tune_angie_configs() {
     while IFS= read -r file; do
       [[ -n $file ]] || continue
       local before after
-      before=$(md5sum "$file" | awk '{print $1}')
+      before=$(file_md5 "$file")
       sed_in_place -E "s#^([[:space:]]*fastcgi_pass[[:space:]]+)(127\.0\.0\.1|localhost):9000;#\\1unix:${php_socket};#g" "$file"
-      after=$(md5sum "$file" | awk '{print $1}')
+      after=$(file_md5 "$file")
       [[ $before != "$after" ]] && tune_note "${file#"${target}"/}: fastcgi_pass -> unix:${php_socket}"
     done < <(grep -rlE '^[[:space:]]*fastcgi_pass[[:space:]]+(127\.0\.0\.1|localhost):9000;' "$target" 2>/dev/null || true)
 
@@ -1056,7 +1056,7 @@ tune_angie_configs() {
       "${f_proxy#"${target}"/}: cdn zone=${cdn_zone}m"
 
     local before tmp
-    before=$(md5sum "$f_proxy" | awk '{print $1}')
+    before=$(file_md5 "$f_proxy")
     tmp=$(tmp_file)
     # proxy_cache_path directives commonly wrap onto a second line, so track
     # the active cache path and rewrite the first max_size seen afterwards
@@ -1074,7 +1074,7 @@ tune_angie_configs() {
       }
     ' "$f_proxy" > "$tmp"
     cat "$tmp" > "$f_proxy"
-    [[ $(md5sum "$f_proxy" | awk '{print $1}') != "$before" ]] \
+    [[ $(file_md5 "$f_proxy") != "$before" ]] \
       && tune_note "${f_proxy#"${target}"/}: proxy=${proxy_size} cdn=${cdn_size}"
   else
     tune_miss "http.d: no active proxy_cache_path"
@@ -1578,10 +1578,12 @@ tune_php_fpm_version() {
   # operator decision, not a hardware guess: keep it across --optimize runs.
   explicit_value=$(explicit_option php_children 2>/dev/null || true)
   max_children=$(php_plan_max_children "$nproc" "$ram_mb" "$live_children" "$explicit_value" "$php_budget")
-  if [[ -z $explicit_value ]] && (( max_children == nproc * 2 )); then
+  if [[ -z $explicit_value ]]; then
     # Informational: the note must not mark the pool dirty, or every
-    # --optimize on a host already at the floor reloads an unchanged PHP-FPM.
-    tune_summary "PHP ${ver}: max_children=${max_children} (floor: 2 per logical CPU; --php children= overrides)"
+    # --optimize on a host already at the target reloads an unchanged PHP-FPM.
+    local per_cpu
+    per_cpu=$(awk -v t="$(php_workers_per_cpu_tenths)" 'BEGIN{printf "%.1f", t/10}')
+    tune_summary "PHP ${ver}: max_children=${max_children} (hardware target: ${per_cpu} workers per logical CPU; --php children= overrides)"
   fi
   PHP_WRITTEN_CHILDREN=$max_children
   # A pool far larger than the plan is the most expensive misconfiguration
@@ -1690,7 +1692,7 @@ tune_php_fpm_version() {
   # and renaming a versioned socket here would leave the upstream dangling.
   sed_in_place -E "/^[[:space:]]*listen[[:space:]]*=/! s|php[0-9]+\.[0-9]+|php${ver}|g" "$pool"
   local ini_before=""
-  [[ -f $ini ]] && ini_before=$(md5sum "$ini" | awk '{print $1}')
+  [[ -f $ini ]] && ini_before=$(file_md5 "$ini")
   cat > "$ini" <<EOF
 ; Managed by setup.sh --optimize (hardware-aware PHP tuning).
 ; This file sorts last in conf.d so it wins over earlier defaults.
@@ -1748,7 +1750,7 @@ EOF
   fi
   local ini_after jit_desc="${jit_mode}/${jit_buffer}"
   (( PHP_JIT_WORDPRESS )) || jit_desc+=" (WordPress roots off)"
-  ini_after=$(md5sum "$ini" | awk '{print $1}')
+  ini_after=$(file_md5 "$ini")
   if [[ $ini_before != "$ini_after" ]]; then
     tune_note "PHP ${ver}: memory_limit=${memory_mb}M opcache=${opcache_mb}M jit=${jit_desc}"
     if [[ ${SETUP_PHP_SESSION_HARDENING:-0} == 1 ]]; then

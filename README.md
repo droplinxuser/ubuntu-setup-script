@@ -134,10 +134,15 @@ the data directories it creates return 403 through Angie).
 - Installs the XenForo profile (`fpm cli opcache mysql gd curl xml zip gmp
   mbstring redis`); add `intl`/`imagick`/`bcmath` yourself if an add-on needs
   them.
-- Pool: `pm=static`; `pm.max_children` from the shared memory plan (2 per
-  core, at most RAM/2 at 96 MB per worker, 512 maximum; 1 per core when every
-  PHP vhost is XenForo/WordPress with a local database, because those pages
-  are CPU-bound). A live pool keeps its count; `children=` wins.
+- Pool: `pm=static`; `pm.max_children` from the shared memory plan, at most
+  RAM/2 at 96 MB per worker, 512 maximum. The worker density is derived from
+  what the host can block on: **1.0 per logical CPU** when a local MariaDB and
+  flash storage share the host, 1.5 on a shared/virtual CPU or a remote
+  database, 2.0 on spinning disks. Measured on the 16-thread audit host
+  (XenForo member page, loopback, 64 connections): 16 workers 834 req/s at
+  14.38 ms PHP CPU/request, 32 workers 808 req/s at 15.68 ms — extra workers
+  only contend for the same cores. `SETUP_PHP_WORKERS_PER_CPU` pins the
+  factor; `--php children=` wins.
   `pm.max_requests = threads x 1024`,
   `request_terminate_timeout 300s`, slow log at 10 s, `rlimit_files 524288`,
   systemd `LimitNOFILE=524288`/`UMask=0027`.
@@ -298,10 +303,12 @@ suspended errexit for the whole run). Steps:
 3. PHP-FPM: every `/etc/php/<ver>/fpm` tree; a live TCP pool used through the
    `local_php` upstream is migrated to the Unix socket (graceful reload, or
    a short explicit restart when SIGUSR2 cannot open the listener).  The pool
-   is always `pm = static` with **at least 2 workers per logical CPU** (see
-   the hardware table); a pool sized by hand is normalised to that rule, and
-   the report names the before/after and the resident memory it returns (a
-   64-thread board left on 512 static workers is set to 128).
+   is always `pm = static`, one worker per logical CPU when a local database
+   and flash storage share the host, 1.5 on a shared CPU or remote database,
+   2.0 on spinning disks (see the hardware table); a pool sized by hand is
+   normalised to that rule, and the report names the before/after and the
+   resident memory it returns (a 64-thread board left on 512 static workers
+   is set to 64).
 4. MariaDB, Valkey/Redis and Elasticsearch from the shared 80%-of-RAM plan:
    live data is funded first (MariaDB data+index +20%, Valkey working set
    +20% with the RAM floor, Elasticsearch store/4), explicit sizes are
@@ -384,7 +391,7 @@ data directory (NVMe / SSD / HDD) and the host class (`dedi`/`vps`).
 
 | Area | Rule |
 |---|---|
-| PHP-FPM | **at least 2 workers per logical CPU on every host** (`pm = static`), which is both the floor and the target: a pool sized by hand is normalised to it, so a fresh install and `--optimize` write the same count (a 64-thread board left on 512 static workers is set to 128). An explicit `--php children=` wins and is clamped to floor..max(512, 2 x CPUs). `pm.max_requests = threads x 1024`, `request_terminate_timeout 300s`, slow log at 10 s, `rlimit_files 524288`, systemd `LimitNOFILE=524288`/`UMask=0027`. `opcache.max_accelerated_files` = PHP files under the vhost roots x 1.5 (16384..128256; the ceiling when no root is found); `memory_limit`, OPcache, JIT buffer and realpath sizes from one RAM profile shared with the dry run |
+| PHP-FPM | `pm = static`, `pm.max_children` = logical CPUs x the host's blocking factor (1.0 for a local database on flash, 1.5 for a shared/virtual CPU or a remote database, 2.0 for spinning disks), bounded by the RAM plan; a pool sized by hand is normalised to the same count, so a fresh install and `--optimize` write the same value (a 64-thread board left on 512 static workers is set to 64). `SETUP_PHP_WORKERS_PER_CPU` pins the factor; an explicit `--php children=` wins and is clamped to floor..max(512, 2 x CPUs). `pm.max_requests = threads x 1024`, `request_terminate_timeout 300s`, slow log at 10 s, `rlimit_files 524288`, systemd `LimitNOFILE=524288`/`UMask=0027`. `opcache.max_accelerated_files` = PHP files under the vhost roots x 1.5 (16384..128256; the ceiling when no root is found); `memory_limit`, OPcache, JIT buffer and realpath sizes from one RAM profile shared with the dry run |
 | MariaDB | see the service section: pool from live data with floor `clamp(RAM/16, 256 MB, 4 GB)` for an empty or unmeasured database, io_capacity by disk x host, thread pool, connections from the PHP pool, table caches from connections, Aria page cache `clamp(RAM/128, 16, 256) MB` |
 | Elasticsearch | heap = store/4 (512 MB..25% RAM..31 GB); `node.processors` = effective CPUs; search threads cpus/2 (max 16), write threads cpus/4 (max 8) |
 | Valkey / Redis | maxmemory = live +20% with floor `clamp(RAM/64, 128 MB, 1 GB)`; maxclients from the PHP pool; io_threads 1..8 (a larger `io_threads=` is clamped with a warning) |

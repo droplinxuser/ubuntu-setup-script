@@ -480,8 +480,8 @@ optimize_angie() {
   opt_backup /etc/systemd/system/angie.service.d angie-systemd
   opt_backup "$default_file" angie-default
   tune_reset_changes
-  [[ -f $limit_file ]] && limit_before=$(md5sum "$limit_file" | awk '{print $1}')
-  [[ -f $default_file ]] && default_before=$(md5sum "$default_file" | awk '{print $1}')
+  [[ -f $limit_file ]] && limit_before=$(file_md5 "$limit_file")
+  [[ -f $default_file ]] && default_before=$(file_md5 "$default_file")
 
   # Keep /etc/angie byte-for-byte aligned with the canonical repository before
   # applying the hardware-aware profile.  The repository deployer owns the
@@ -493,8 +493,8 @@ optimize_angie() {
   if sync_angie_repo_configs; then
     ANGIE_SYNC_RELOAD=1
     opt_report "- Repository: synchronized from ${CONFIG_REPO_URL} (${CONFIG_REPO_REF})"
-    [[ -f $limit_file ]] && limit_after=$(md5sum "$limit_file" | awk '{print $1}')
-    [[ -f $default_file ]] && default_after=$(md5sum "$default_file" | awk '{print $1}')
+    [[ -f $limit_file ]] && limit_after=$(file_md5 "$limit_file")
+    [[ -f $default_file ]] && default_after=$(file_md5 "$default_file")
     if [[ $limit_before != "$limit_after" || $default_before != "$default_after" ]]; then
       unit_changed=1
       opt_report "- Repository: systemd limit/default files refreshed"
@@ -884,7 +884,14 @@ mariadb_server_version() {
 # refuses one falls back to the restart path.  When only these differ between
 # the old and the new file, --optimize applies them online instead of
 # restarting a busy database with the web tiers paused.
-MARIADB_ONLINE_KEYS='innodb_buffer_pool_size|innodb_log_file_size|tmp_table_size|max_heap_table_size|innodb_io_capacity|innodb_io_capacity_max|table_open_cache|thread_pool_size|max_connections|innodb_flush_neighbors'
+MARIADB_ONLINE_ORDER=(innodb_buffer_pool_size innodb_log_file_size tmp_table_size
+                      max_heap_table_size innodb_io_capacity innodb_io_capacity_max
+                      table_open_cache max_connections thread_pool_size
+                      innodb_flush_neighbors)
+# One list, two views: the array drives the SET order and the ERE used to
+# ignore those keys when deciding whether a restart is needed.  Keeping a
+# separate regex string here let the two drift apart.
+MARIADB_ONLINE_KEYS=$(IFS='|'; printf '%s' "${MARIADB_ONLINE_ORDER[*]}")
 cnf_only_pool_changed() {
   local old=$1 new=$2
   [[ -f $old && -f $new ]] || return 1
@@ -914,10 +921,6 @@ cnf_key_bytes() {
 # GLOBAL; the buffer pool first (it bounds tmp_table_size), then the rest.
 # Every non-pool key is read back after the SET, and the first rejection or
 # mismatch returns 1 so the caller falls back to a restart.
-MARIADB_ONLINE_ORDER=(innodb_buffer_pool_size innodb_log_file_size tmp_table_size
-                      max_heap_table_size innodb_io_capacity innodb_io_capacity_max
-                      table_open_cache max_connections thread_pool_size
-                      innodb_flush_neighbors)
 mariadb_apply_online_keys() {
   local old=$1 new=$2 key before after live
   for key in "${MARIADB_ONLINE_ORDER[@]}"; do
@@ -1043,7 +1046,7 @@ optimize_mariadb() {
   cnf="${cnf_dir}/99-setup-optimize.cnf"
 
   cnf_before=""
-  [[ -f $cnf ]] && cnf_before=$(md5sum "$cnf" | awk '{print $1}')
+  [[ -f $cnf ]] && cnf_before=$(file_md5 "$cnf")
   local cnf_old=""
   if [[ -f $cnf ]]; then
     cnf_old=$(tmp_file)
@@ -1051,7 +1054,7 @@ optimize_mariadb() {
   fi
 
   write_mariadb_tuning_dropin "$size_mb" "$max_conn" "$cnf"
-  cnf_after=$(md5sum "$cnf" | awk '{print $1}')
+  cnf_after=$(file_md5 "$cnf")
   opt_report "- Wrote \`${cnf}\` (buffer=${buffer}, max_connections=${max_conn}, back_log=${backlog})"
   if (( ${MARIADB_PROFILE_PERSISTENT_APPS:-0} > 0 )); then
     opt_report "- max_connections allows one persistent connection per PHP worker for ${MARIADB_PROFILE_PERSISTENT_APPS} application(s) plus a transient one"
@@ -1067,13 +1070,13 @@ optimize_mariadb() {
   # existing bind-address is kept.
   local base_cnf=/etc/mysql/mariadb.conf.d/50-server.cnf base_before="" base_bind=""
   if [[ -f $base_cnf ]]; then
-    base_before=$(md5sum "$base_cnf" | awk '{print $1}')
+    base_before=$(file_md5 "$base_cnf")
     # Only an active bind-address line is carried into the managed block; a
     # commented-out line means the operator listens on every interface and
     # --optimize leaves that alone (the installer validates its own bind=).
     base_bind=$(sed -nE 's/^[[:space:]]*bind-address[[:space:]]*=[[:space:]]*//p' "$base_cnf" | tail -n1 | tr -d '[:space:]')
     mariadb_write_base_block "$base_cnf" "$base_bind" || true
-    if [[ $base_before != "$(md5sum "$base_cnf" | awk '{print $1}')" ]]; then
+    if [[ $base_before != "$(file_md5 "$base_cnf")" ]]; then
       base_changed=1
       opt_report "- Base settings converged in 50-server.cnf (charset, skip_name_resolve, local_infile=0, bind-address=${base_bind:-unchanged}); restart required"
     fi
@@ -1285,21 +1288,21 @@ optimize_valkey() {
   if [[ ${OPT_VALKEY_LIVE_MB:-0} -gt 0 ]]; then
     opt_report "- Live working set=${OPT_VALKEY_LIVE_MB}mb; maxmemory=${max_mb}mb (live + up to 20%, 128 MB minimum)"
   fi
-  policy=$(awk '/^[[:space:]]*maxmemory-policy[[:space:]]/{print $2; exit}' "$conf")
+  policy=$(valkey_conf_get "$conf" maxmemory-policy)
   [[ -n $policy ]] || policy=allkeys-lru
   # Preserve an explicit install-time io-threads value (the installer defaults
   # to 1); forcing 1 here would silently undo `--valkey io_threads=N`.
-  io_threads=$(awk '/^[[:space:]]*io-threads[[:space:]]/{print $2; exit}' "$conf")
+  io_threads=$(valkey_conf_get "$conf" io-threads)
   io_threads=$(valkey_clamp_io_threads "$io_threads")
-  conf_before=$(md5sum "$conf" | awk '{print $1}')
+  conf_before=$(file_md5 "$conf")
 
   # Local PHP should use the Unix socket: it avoids ephemeral-port/TIME_WAIT
   # pressure and was measurably faster for small cache commands.  This is
   # startup-only, so it is applied here and the cache is restarted below.
   socket_path="/run/${kind}/${kind}.sock"
   group=$kind
-  socket_before=$(awk '/^[[:space:]]*unixsocket[[:space:]]/{print $2; exit}' "$conf")
-  perm_before=$(awk '/^[[:space:]]*unixsocketperm[[:space:]]/{print $2; exit}' "$conf")
+  socket_before=$(valkey_conf_get "$conf" unixsocket)
+  perm_before=$(valkey_conf_get "$conf" unixsocketperm)
   # Keep an operator's existing custom socket path; only add the default when
   # the service has no socket configured.
   if [[ -n $socket_before && $socket_before == /* ]]; then
@@ -1308,7 +1311,7 @@ optimize_valkey() {
   # Same writer as the installer: base directives (persistence off, local
   # bind, log path, socket) plus the tuning block.
   valkey_apply_config "$conf" "$kind" "$max_mb" "$policy" "$io_threads" "$socket_path"
-  perm_after=$(awk '/^[[:space:]]*unixsocketperm[[:space:]]/{print $2; exit}' "$conf")
+  perm_after=$(valkey_conf_get "$conf" unixsocketperm)
   if [[ $socket_before != "$socket_path" || $perm_before != "$perm_after" || $perm_after != 770 ]]; then
     socket_changed=1
   fi
@@ -1329,7 +1332,7 @@ optimize_valkey() {
   opt_report "  Laravel/phpredis: \`'host' => '${socket_path}', 'port' => 0\`"
   opt_report "  Test: \`${cli} -s ${socket_path} ping\`"
 
-  conf_after=$(md5sum "$conf" | awk '{print $1}')
+  conf_after=$(file_md5 "$conf")
   opt_report "- maxmemory=${max_mb}mb, policy=${policy}, maxclients=$(valkey_maxclients), tcp-backlog=${backlog}"
 
   # A large maxclients is unusable if systemd still caps the unit at 1024

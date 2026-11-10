@@ -77,6 +77,38 @@ workload after every step; do not copy numbers from another host.
 7. Load-test each step with a realistic traffic mix; the included harness is
    synthetic.
 
+### Alternative PHP application servers (evaluated, not adopted)
+
+FrankenPHP, Swoole and RoadRunner were assessed against the XenForo and
+WordPress profiles this repository deploys.
+
+- **FrankenPHP 1.13.5** (PHP 8.5.12, classic mode, same document root and
+  database, loopback TLS, 16 threads) served the XenForo member page at
+  **688 req/s with 21.7 ms of host CPU per request**, against **852 req/s and
+  17.4 ms** for Angie + PHP-FPM 8.4 with 16 static workers on the same host.
+  32 FrankenPHP threads reached 702 req/s at 22.7 ms. It is a single static
+  binary with the required extensions (mysqli, pdo_mysql, redis, OPcache, gd,
+  intl), so the test is reproducible, but it is 17-19% slower here and it
+  replaces the FastCGI cache, Brotli/gzip, rate limiting and HTTP/3 setup
+  Angie already provides. Its worker mode is not usable for these applications:
+  XenForo and WordPress keep per-request state in superglobals and bootstrap
+  their container on every request, so a long-lived worker leaks state between
+  visitors unless the application is rewritten.
+- **Swoole** requires coroutine-aware database/cache clients and a rewritten
+  request lifecycle; neither XenForo nor WordPress core is coroutine-safe, and
+  their plugin ecosystems assume one request per process. It would only apply
+  to a bespoke service, not to the applications this script installs.
+- **RoadRunner** needs a PSR-7 worker and a request/response bridge. Community
+  WordPress bridges exist but are experimental and break plugins that read
+  `$_SERVER`/`$_SESSION` or register shutdown functions; XenForo has no
+  maintained bridge.
+
+The measured bottleneck on the audit host is CPU in PHP userland plus MariaDB
+(15-16 ms + 3 ms per member request), not the FastCGI hop (0.3 ms). Changing
+the SAPI does not remove that work; the levers that do are the guest cache
+(5-10x on anonymous traffic), the tracing JIT (~3-5%), and the pool depth and
+MariaDB profile documented above.
+
 ## 4. Reproduce the measurements
 
 ```bash
