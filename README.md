@@ -345,7 +345,7 @@ upgrade path in mind. Two measured items are worth applying by hand:
   xf_mg_media_item WHERE (album_state = 'visible' OR album_state IS NULL)
   AND category_id IN (...) AND media_state IN ('visible')`. Without a
   covering index that is a full table scan on every member view. Measured on
-  a live board with 74 118 media rows: 47.7 ms -> 23.4 ms, MariaDB CPU for
+  a live board with about 74 000 media rows: 47.7 ms -> 23.4 ms, MariaDB CPU for
   the page 54.0 -> 30.7 ms, uncached gallery index 62 -> 90 req/s (+45 %),
   p50 130 -> 88 ms. Add it yourself during a maintenance window:
 
