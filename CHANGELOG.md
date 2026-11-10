@@ -3,6 +3,57 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.19.0 (2026-11-10)
+
+Audit of the 16-thread / 27 GiB / NVMe bare-metal host (`audit-host`,
+Ubuntu 26.04.1, PHP 8.4.27-FPM, Angie 1.12.4, MariaDB 11.8, Valkey,
+Elasticsearch 9.5) with WordPress 7.1.4 and XenForo 2.3.13 deployed from the
+local archives. Load ran from a macOS workstation over TLS and from the host
+over loopback; CPU is the host's busy-jiffy delta per successful request.
+
+- **PHP-FPM depth follows what the host can block on, not a flat 2/core.**
+  Measured on the XenForo member page (loopback, 64 connections, 20 s):
+  16 static workers **834 req/s at 14.38 ms host CPU/request**, 20 workers
+  825 at 14.97, 24 workers 819 at 15.29, 32 workers **808 at 15.68**.
+  The same direction held for the XenForo thread page (470 vs 446 req/s) and
+  the WordPress member page (298 vs 282). The target is now 1.0 worker per
+  logical CPU for a local database on flash, 1.5 for a shared/virtual CPU or
+  a database on another host, and 2.0 for spinning disks;
+  `SETUP_PHP_WORKERS_PER_CPU` pins the factor and `--php children=` still
+  wins. Install and `--optimize` share the one helper, so both write 16 on
+  the audit host.
+- **One owner per php.ini directive.**  `configs/php/custom_dan.ini` set
+  `opcache.jit = disable`, `memory_limit`, the OPcache sizes and the mysqlnd
+  sockets while the managed `zz-setup-optimize.ini` set different values for
+  the same keys; which one a worker used depended on whether the zz file
+  existed. The template now keeps only directives the managed profile does
+  not own.
+- **Duplicated implementations collapsed.**  The 27 inline
+  `md5sum … | awk '{print $1}'` copies use `file_md5`; the MariaDB online-key
+  ERE is derived from the SET order array instead of being maintained twice;
+  the four copies of the memory-plan summary are one helper; Valkey config
+  reads go through `valkey_conf_get`; and `service_mem_mb`'s stand-alone
+  fallbacks use the planner's own MariaDB/Valkey floors.
+- **Re-install now matches `--optimize`.**  `configure_mariadb` strips the
+  duplicate performance keys from `50-server.cnf` on install too (previously
+  only `--optimize` did), and a re-install preserves an operator's
+  `maxmemory-policy`/`io-threads` instead of resetting them to the defaults.
+  Swap sizing honours a cgroup memory limit instead of `/proc/meminfo`.
+- **FrankenPHP measured, not adopted.**  FrankenPHP 1.13.5 (PHP 8.5.12,
+  classic mode, same tree and database, loopback TLS) served the same member
+  page at **688 req/s / 21.7 ms** against **852 req/s / 17.4 ms** for
+  Angie+PHP-FPM; 32 threads reached 702 req/s. Its worker mode is not
+  compatible with XenForo/WordPress request lifecycles. Details in
+  `SECURITY-PERFORMANCE.md`.
+- **OPcache JIT re-confirmed.**  On this host, tracing/64 MB with PHP's
+  default hotness thresholds used 15.56 ms PHP CPU/request against 16.26 ms
+  with JIT off (+3.2% throughput); 128 MB was within noise, aggressive
+  thresholds were slightly worse, and function JIT lost 7.7%.
+- **Validation.**  601 tuning tests and 161 CLI/dry-run checks pass; a fresh
+  install followed by `--optimize` produced an identical `/etc`, unit,
+  crontab, PHP, MariaDB and Valkey state (only volatile kernel counters
+  differ).
+
 ## 1.18.0 (2026-11-10)
 
 Audit of a second live XenForo origin (64-thread Xeon, 128 GiB, RAID10,
