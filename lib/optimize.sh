@@ -676,15 +676,19 @@ plan_memory_budget() {
 # pool writer and the dry run so the preview, a fresh install and --optimize
 # agree.  Arguments: cpus, total RAM MB, live pool count ("" when none) and an
 # explicit --php children= value ("" when none).
-#   * per core: 16 workers on dedicated hardware, 8 on a VPS (shared cores and
-#     steal time make deep oversubscription counter-productive)
+#   * per core: 2 workers.  A PHP worker is a runnable process, so a pool
+#     deeper than the thread count only queues on the scheduler; 2 keeps a
+#     slot for a worker blocked on I/O (a remote database, an object store)
+#     while staying inside one thread's worth of runnable processes.  The old
+#     16-per-core rule wrote 144 workers on a 16-thread host at install time
+#     and the first --optimize cut it to 32, so the same host produced two
+#     different pools depending on which command ran.
 #   * RAM: at most half of RAM at the 96 MB reservation divisor
 #   * a live pool keeps its count (it is a memory estimate, not a quota)
 #   * an explicit value wins, clamped to the same floor/512 ceiling
 php_children_ceiling() {
   local cpu=$1 ram_mb=$2 live=${3:-} explicit=${4:-}
-  local per_core=16 cap by_ram floor
-  host_is_vps && per_core=8
+  local per_core=2 cap by_ram floor
   cap=$(( cpu * per_core ))
   by_ram=$(( ram_mb * 50 / 100 / 96 ))
   (( by_ram > 0 && cap > by_ram )) && cap=$by_ram
@@ -730,7 +734,15 @@ php_plan_max_children() {
   elif (( ${OPT_PHP_CHILDREN:-0} > 0 )); then
     printf '%s' "$OPT_PHP_CHILDREN"
   elif [[ $php_budget =~ ^[0-9]+$ ]] && (( php_budget > 0 )); then
-    php_children_ceiling "$nproc" "$ram_mb" "$(( php_budget / 96 ))" ""
+    # The 64 MB divisor is the reservation a freshly started, idle pool
+    # actually uses.  The budget caps the hardware ceiling; it does not
+    # replace it, or a host whose measured data tier is still empty would
+    # write a pool far deeper than its thread count.
+    local cap by_budget
+    cap=$(php_children_ceiling "$nproc" "$ram_mb" "" "")
+    by_budget=$(( php_budget / 64 ))
+    (( by_budget > 0 && by_budget < cap )) && cap=$by_budget
+    printf '%s' "$cap"
   else
     php_children_ceiling "$nproc" "$ram_mb" "" ""
   fi
