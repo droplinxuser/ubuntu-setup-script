@@ -1362,9 +1362,8 @@ EOF
 # Replace the old direct-cookie bypass with the map variable.  The URI map
 # ($nocacheuri) remains from the shared fastcgi_cache.conf.
 tune_xf_cache_bypass_var() {
-  local file=$1 tmp before
+  local file=$1 tmp
   [[ -f $file ]] || return 0
-  before=$(file_md5 "$file")
   tmp=$(tmp_file) || return 1
   awk '
     /^[[:space:]]*fastcgi_no_cache[[:space:]]/ {
