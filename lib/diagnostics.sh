@@ -1,3 +1,5 @@
+# shellcheck shell=bash
+# Sourced by setup.sh (not executed directly).
 # ---------------------------------------------------------------------------
 # Diagnostics: one read-only report for an OpenCode/analysis session
 # ---------------------------------------------------------------------------

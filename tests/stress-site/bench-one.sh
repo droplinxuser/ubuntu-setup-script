@@ -31,7 +31,7 @@ warm=$(( SECS > 4 ? 3 : 1 ))
 "$OHA" --no-tui --insecure --output-format json -z "${warm}s" -c "$CONNS" \
   --connect-to "$host:443:$HOSTPORT" ${args[@]+"${args[@]}"} "$URL" >/dev/null 2>&1 || true
 
-rssh "sudo -n bash ${REMOTE_DIR}/tests/stress-site/sample-cpu.sh $(( SECS + 3 )) /tmp/bench-cpu.txt >/dev/null 2>&1" >/dev/null 2>&1 &
+rssh "bash ${REMOTE_DIR}/tests/stress-site/sample-cpu.sh $(( SECS + 3 )) /tmp/bench-cpu.txt >/dev/null 2>&1" >/dev/null 2>&1 &
 sampler=$!
 sleep 1
 "$OHA" --no-tui --insecure --output-format json -z "${SECS}s" -c "$CONNS" \

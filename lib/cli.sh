@@ -1,3 +1,7 @@
+# shellcheck shell=bash
+# Sourced by setup.sh (not executed directly).  Variables defined here are
+# consumed by other modules, so SC2034 (unused) is not meaningful in a module.
+# shellcheck disable=SC2034
 # ---------------------------------------------------------------------------
 # Command line
 # ---------------------------------------------------------------------------
@@ -224,6 +228,31 @@ kv_set() {
   OPT["${ctx}.${key}"]=$val
 }
 
+# Consume a run of key=value arguments for one service context, stopping at
+# the next --flag.  The count is returned in KV_CONSUMED because a function
+# cannot shift its caller's positional parameters; parse_args then advances
+# with `shift "$KV_CONSUMED"`.  One implementation replaced five near-identical
+# loops (--basic, --php, --mariadb, --valkey, --elastic).
+KV_CONSUMED=0
+kv_consume() {
+  local ctx=$1 allow_cont=$2 last_key=""
+  shift 2
+  KV_CONSUMED=0
+  while (( $# )) && [[ $1 != --* ]]; do
+    if [[ $1 == *=* ]]; then
+      last_key=${1%%=*}
+      kv_set "$ctx" "$last_key" "${1#*=}"
+    elif [[ $allow_cont == 1 && $last_key == bind ]]; then
+      # Allow: bind=127.0.0.1, 2.3.4.5  (the shell splits on the space)
+      OPT["${ctx}.bind"]="${OPT[${ctx}.bind]:-},$1"
+    else
+      die "--${ctx}: expected key=value, got '$1'"
+    fi
+    KV_CONSUMED=$(( KV_CONSUMED + 1 ))
+    shift
+  done
+}
+
 NORMALIZED_ARGS=()
 # People paste commands from documentation into shells that keep typographic
 # dashes (em dash U+2014, en dash U+2013). Accept them instead of failing with
@@ -244,48 +273,29 @@ parse_args() {
     case "$1" in
       --basic)
         ENABLED[basic]=1; shift
-        while (( $# )) && [[ $1 != --* ]]; do
-          [[ $1 == *=* ]] || die "--basic: expected key=value, got '$1'"
-          kv_set basic "${1%%=*}" "${1#*=}"; shift
-        done
+        kv_consume basic 0 "$@"
+        shift "$KV_CONSUMED"
         ;;
       --php)
         ENABLED[php]=1; shift
-        while (( $# )) && [[ $1 != --* ]]; do
-          [[ $1 == *=* ]] || die "--php: expected key=value, got '$1'"
-          kv_set php "${1%%=*}" "${1#*=}"; shift
-        done
+        kv_consume php 0 "$@"
+        shift "$KV_CONSUMED"
         ;;
       --mariadb)
         ENABLED[mariadb]=1; shift
-        local last_key=""
-        while (( $# )) && [[ $1 != --* ]]; do
-          if [[ $1 == *=* ]]; then
-            last_key=${1%%=*}
-            kv_set mariadb "$last_key" "${1#*=}"
-          elif [[ $last_key == bind ]]; then
-            # Allow: bind=127.0.0.1, 2.3.4.5  (the shell splits on the space)
-            OPT[mariadb.bind]="${OPT[mariadb.bind]:-},$1"
-          else
-            die "--mariadb: expected key=value, got '$1'"
-          fi
-          shift
-        done
+        kv_consume mariadb 1 "$@"
+        shift "$KV_CONSUMED"
         ;;
       --elastic)
         ENABLED[elastic]=1; shift
-        while (( $# )) && [[ $1 != --* ]]; do
-          [[ $1 == *=* ]] || die "--elastic: expected key=value, got '$1'"
-          kv_set elastic "${1%%=*}" "${1#*=}"; shift
-        done
+        kv_consume elastic 0 "$@"
+        shift "$KV_CONSUMED"
         ;;
       --angie) ENABLED[angie]=1; shift ;;
       --valkey)
         ENABLED[valkey]=1; shift
-        while (( $# )) && [[ $1 != --* ]]; do
-          [[ $1 == *=* ]] || die "--valkey: expected key=value, got '$1'"
-          kv_set valkey "${1%%=*}" "${1#*=}"; shift
-        done
+        kv_consume valkey 0 "$@"
+        shift "$KV_CONSUMED"
         ;;
       --others)
         ENABLED[others]=1; shift

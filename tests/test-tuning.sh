@@ -2209,17 +2209,17 @@ check "php_children_from_tenths: never fewer than two workers" \
 check "php_children_from_tenths: rejects a zero factor" \
   test "$(php_children_from_tenths 16 0)" -eq 16
 check "pool factor: local database on flash bare metal is 1.0/core" \
-  test "$( storage_class() { printf nvme; }; host_has_local_db() { return 0; }; host_server_type() { printf dedi; }; SETUP_PHP_WORKERS_PER_CPU= php_workers_per_cpu_tenths )" -eq 10
+  test "$( storage_class() { printf nvme; }; host_has_local_db() { return 0; }; host_server_type() { printf dedi; }; SETUP_PHP_WORKERS_PER_CPU='' php_workers_per_cpu_tenths )" -eq 10
 check "pool factor: a spinning disk keeps 2.0/core of headroom" \
-  test "$( storage_class() { printf hdd; }; host_has_local_db() { return 0; }; host_server_type() { printf dedi; }; SETUP_PHP_WORKERS_PER_CPU= php_workers_per_cpu_tenths )" -eq 20
+  test "$( storage_class() { printf hdd; }; host_has_local_db() { return 0; }; host_server_type() { printf dedi; }; SETUP_PHP_WORKERS_PER_CPU='' php_workers_per_cpu_tenths )" -eq 20
 check "pool factor: a remote database keeps 1.5/core" \
-  test "$( storage_class() { printf nvme; }; host_has_local_db() { return 1; }; host_server_type() { printf dedi; }; SETUP_PHP_WORKERS_PER_CPU= php_workers_per_cpu_tenths )" -eq 15
+  test "$( storage_class() { printf nvme; }; host_has_local_db() { return 1; }; host_server_type() { printf dedi; }; SETUP_PHP_WORKERS_PER_CPU='' php_workers_per_cpu_tenths )" -eq 15
 check "pool factor: a shared vCPU keeps 1.5/core" \
-  test "$( storage_class() { printf ssd; }; host_has_local_db() { return 0; }; host_server_type() { printf vps; }; SETUP_PHP_WORKERS_PER_CPU= php_workers_per_cpu_tenths )" -eq 15
+  test "$( storage_class() { printf ssd; }; host_has_local_db() { return 0; }; host_server_type() { printf vps; }; SETUP_PHP_WORKERS_PER_CPU='' php_workers_per_cpu_tenths )" -eq 15
 check "pool factor: SETUP_PHP_WORKERS_PER_CPU pins the factor" \
   test "$(SETUP_PHP_WORKERS_PER_CPU=1.5 php_workers_per_cpu_tenths)" -eq 15
 check "pool factor: a local MariaDB in this install run counts as local" \
-  test "$( storage_class() { printf nvme; }; OPT_DETECTED=(); ENABLED=([mariadb]=1); host_server_type() { printf dedi; }; SETUP_PHP_WORKERS_PER_CPU= php_workers_per_cpu_tenths )" -eq 10
+  test "$( storage_class() { printf nvme; }; OPT_DETECTED=(); ENABLED=([mariadb]=1); host_server_type() { printf dedi; }; SETUP_PHP_WORKERS_PER_CPU='' php_workers_per_cpu_tenths )" -eq 10
 HOST_SERVER_TYPE=dedi
 
 check "sysctl_target_somaxconn scales with CPUs on dedicated hardware" \
