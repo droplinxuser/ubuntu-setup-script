@@ -36,7 +36,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.20.3"
+readonly SCRIPT_VERSION="1.20.4"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -160,12 +160,12 @@ readonly CRON_PRECOMPRESS='/usr/local/bin/setup-precompress.sh'
 # WordPress ships its own pseudo-cron.  When the hardening step disables it
 # (DISABLE_WP_CRON), this managed entry runs every site's wp-cron.php as the
 # PHP user so scheduled posts, updates and plugin jobs still fire.
-readonly CRON_WP_CRON='/usr/bin/find /var/www -maxdepth 6 -type f -name wp-config.php ! -path "*/mysql_database/*" ! -path "*/backup*/*" ! -path "*/.old/*" -exec /usr/bin/dirname {} \; | while IFS= read -r d; do [ -f "$d/wp-cron.php" ] && /usr/sbin/runuser -u www-data -- /usr/bin/php "$d/wp-cron.php"; done || true'
+readonly CRON_WP_CRON='/usr/bin/find /var/www -maxdepth 6 -type f -name wp-config.php ! -path "*/mysql_database/*" ! -path "*/backup*/*" ! -path "*/.old/*" -exec /usr/bin/dirname {} \; | while IFS= read -r d; do [ -f "$d/wp-cron.php" ] && /usr/sbin/runuser -u www-data -- /usr/bin/php "$d/wp-cron.php"; done'
 # XenForo job runner (XF_JOB_CRON): every XenForo root under /var/www runs its
 # queue once a minute as the PHP user.  --max-execution-time keeps one run
 # inside the minute; XenForo's own job lock prevents overlapping runners.
 # No "%" may appear here: crontab treats it as a newline.
-readonly CRON_XF_JOBS='/usr/bin/find /var/www -maxdepth 6 -type f -path "*/src/config.php" ! -path "*/mysql_database/*" ! -path "*/backup*/*" ! -path "*/.old/*" -exec /usr/bin/dirname {} \; | while IFS= read -r d; do r=$(/usr/bin/dirname "$d"); [ -f "$r/cmd.php" ] && [ -f "$d/XF.php" ] && /usr/sbin/runuser -u www-data -- /usr/bin/php "$r/cmd.php" xf:run-jobs --max-execution-time=50 >/dev/null 2>&1; done || true'
+readonly CRON_XF_JOBS='/usr/bin/find /var/www -maxdepth 6 -type f -path "*/src/config.php" ! -path "*/mysql_database/*" ! -path "*/backup*/*" ! -path "*/.old/*" -exec /usr/bin/dirname {} \; | while IFS= read -r d; do r=$(/usr/bin/dirname "$d"); [ -f "$r/cmd.php" ] && [ -f "$d/XF.php" ] && /usr/sbin/runuser -u www-data -- /usr/bin/php "$r/cmd.php" xf:run-jobs --max-execution-time=50 >/dev/null 2>&1; done'
 readonly MARIADB_BEGIN="# BEGIN setup.sh managed mariadb"
 readonly MARIADB_END="# END setup.sh managed mariadb"
 readonly ES_BEGIN="# BEGIN setup.sh managed elasticsearch"
