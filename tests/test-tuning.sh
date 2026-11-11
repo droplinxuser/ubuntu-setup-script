@@ -205,7 +205,7 @@ lsblk() { printf '%s\n' "${LSBLK_OUT:-}"; }
 LSBLK_OUT=$'nvme0n1p4 part\n└─nvme0n1 disk'
 check "storage class follows the mounted NVMe parent" \
   test "$(storage_backing_class /var/www)" = nvme
-LSBLK_OUT=$'sda1 part\n└─sda disk'
+LSBLK_OUT=$'sdzz1 part\n└─sdzz disk'
 check "storage class reports hdd for a spinning parent" \
   test "$(storage_backing_class /var/www)" = hdd
 unset -f findmnt lsblk
@@ -2759,6 +2759,46 @@ check "cache keep note names the zone's own directory" grep -qF '/tmp/pc-b' <<<"
 cache_note_not_first_zone() { ! grep -qF '/tmp/pc-a' <<<"$ANGIE_CACHE_NOTE"; }
 check "cache keep note does not name the other zone's directory" cache_note_not_first_zone
 unset -f du
+
+
+# Upstream preservation: a repository rename must not break a vhost that an
+# operator still points at the old name (the live soketi host hit
+# "host not found in upstream" and --optimize rolled back).
+mkdir -p "$TMP/up-old/conf.d" "$TMP/up-old/http.d" "$TMP/up-snap"
+cat > "$TMP/up-old/conf.d/site.conf" <<'EOF'
+server { location / { proxy_pass http://legacy_ws; } }
+EOF
+cat > "$TMP/up-old/http.d/ws.conf" <<'EOF'
+upstream legacy_ws {
+    zone legacy_zone 64k;
+    server 127.0.0.1:6001;
+    keepalive_timeout 1h;
+}
+EOF
+angie_snapshot_upstreams "$TMP/up-old" "$TMP/up-snap"
+check "upstream snapshot captures the named block" \
+  grep -q '^upstream legacy_ws {' "$TMP/up-snap/legacy_ws.conf"
+check "upstream snapshot does not capture host:port directives" \
+  test -z "$(angie_referenced_upstreams "$TMP/up-old" | grep -v '^legacy_ws$')"
+
+mkdir -p "$TMP/up-new/conf.d" "$TMP/up-new/http.d"
+cp "$TMP/up-old/conf.d/site.conf" "$TMP/up-new/conf.d/"
+printf 'upstream new_ws {\n    server 127.0.0.1:6001;\n}\n' > "$TMP/up-new/http.d/ws.conf"
+angie_restore_upstreams "$TMP/up-new" "$TMP/up-snap"
+check "upstream restore keeps a referenced block the new tree dropped" \
+  grep -q '^upstream legacy_ws {' "$TMP/up-new/http.d/zz-setup-preserved-upstreams.conf"
+check "upstream restore drops the old zone name" \
+  test -z "$(grep -E '^[[:space:]]*zone[[:space:]]' "$TMP/up-new/http.d/zz-setup-preserved-upstreams.conf")"
+check "upstream restore retains the server address" \
+  grep -q '127.0.0.1:6001' "$TMP/up-new/http.d/zz-setup-preserved-upstreams.conf"
+cp "$TMP/up-new/http.d/zz-setup-preserved-upstreams.conf" "$TMP/up-first.conf"
+angie_restore_upstreams "$TMP/up-new" "$TMP/up-snap"
+check "upstream restore is idempotent on the second run" \
+  cmp -s "$TMP/up-first.conf" "$TMP/up-new/http.d/zz-setup-preserved-upstreams.conf"
+printf 'upstream legacy_ws {\n    server 127.0.0.1:6001;\n}\n' >> "$TMP/up-new/http.d/ws.conf"
+angie_restore_upstreams "$TMP/up-new" "$TMP/up-snap"
+check "upstream restore removes the managed include once the tree defines it" \
+  test ! -f "$TMP/up-new/http.d/zz-setup-preserved-upstreams.conf"
 
 
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"

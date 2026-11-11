@@ -3,6 +3,33 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.20.2 (2026-11-11)
+
+Fix a `--optimize` failure on hosts whose vhost still uses an upstream name
+that the canonical Angie tree renamed or dropped.
+
+- **Symptom.**  `setup.sh --optimize` synced `/etc/angie` from
+  `server-configs-nginx`, then `angie -t` failed with
+  `[emerg] host not found in upstream "soketi_websocket"` and the run rolled
+  the whole tree back (exit 1) — on a live host (Angie 1.12.4, Ubuntu 22.04,
+  3 vCPU) whose custom `soketi.example.com.conf` proxies to
+  `http://soketi_websocket`.  The repository's `http.d/xf_websocket.conf` now
+  defines `xf_websocket` and `xf_websocket_so`, so the rsync overwrote the
+  operator-edited file that used to define the old name.
+- **Fix.**  `deploy_angie_tree()` snapshots every `upstream NAME { ... }`
+  block before rsync, compares the names still referenced by deployed vhosts
+  with the names the new tree defines, and writes the missing blocks to one
+  managed include, `http.d/zz-setup-preserved-upstreams.conf` (zone names
+  stripped so a zone cannot collide).  The include is regenerated on every
+  install/`--optimize`, left byte-identical when nothing changed, and moved
+  out of the tree once the canonical tree defines the name again.
+- **Scope.**  Only bare upstream names are considered (`proxy_pass`,
+  `grpc(s)_pass`, `uwsgi_pass`, `scgi_pass`, `fastcgi_pass`); `host:port`,
+  `unix:` paths and `$variables` are ignored.  A fresh install has no
+  previous tree to preserve from and behaves exactly as before.
+- New tuning checks cover the snapshot, restore, idempotence and removal
+  paths; **616/616 tuning checks and 173/173 CLI/dry-run checks pass**.
+
 ## 1.20.1 (2026-11-11)
 
 Refactor and validation release. **No configuration value changed**: a fresh

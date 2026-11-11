@@ -129,6 +129,12 @@ crontab entry that runs `cmd.php xf:run-jobs` once a minute as www-data
 member page requests stop running the queue (and never run the queue as root:
 the data directories it creates return 403 through Angie).
 `CONFIG_REPO_URL`/`CONFIG_REPO_REF` select a fork or branch.
+An upstream name that a deployed vhost still references but the canonical
+tree no longer defines (a repository rename, or an operator-edited
+`http.d` file) is preserved in `http.d/zz-setup-preserved-upstreams.conf`
+instead of making `angie -t` fail with *host not found in upstream*; the
+include is regenerated on each install/`--optimize` and retired once the
+repository defines the name again.
 
 ### PHP (`--php [ver=8.5] [children=auto|N] [max_requests=N]`)
 
