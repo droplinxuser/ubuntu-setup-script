@@ -557,8 +557,7 @@ mariadb_strip_install_block() {
     $0 ~ ("^[[:space:]]*(" keys ")[[:space:]]*=") { next }
     { print }
   ' "$cnf" > "$tmp"
-  if ! cmp -s "$cnf" "$tmp"; then
-    cat "$tmp" > "$cnf"
+  if commit_if_changed "$cnf" "$tmp"; then
     info "Removed duplicate MariaDB performance keys from ${cnf}; 99-setup-optimize.cnf owns them"
     opt_report "- Removed duplicate performance keys from \`${cnf}\`; \`99-setup-optimize.cnf\` owns them"
   fi

@@ -184,42 +184,75 @@ php_upgrade_snapshot() {
   fi
 }
 
+# Core extensions the default install_php() package set already installs.
+readonly PHP_UPGRADE_CORE_EXT=" fpm cli common mysql gd curl xml zip gmp mbstring redis readline opcache "
+
+# Classify one installed PHP package for TARGET.  One implementation serves
+# the real plan and --dry-run, so a release that bundles an extension, or a
+# repository that lags one, cannot be reported differently by the two paths
+# (the dry run used to duplicate this table and mishandled OPcache on 9.x).
+# Prints:
+#   ignore            not an extension package
+#   core:<ext>        covered by the default --php package set
+#   bundled:<ext>     built into this PHP release (no package exists)
+#   keep:<pkg>        install this target-version package
+#   skip:<reason>     no target package; the caller reports it, never fails
+php_upgrade_classify_package() {
+  local target=$1 pkg=$2 ext pkg_target major minor
+  ext=$(php_upgrade_ext_name "$pkg")
+  [[ -n $ext ]] || { printf 'ignore'; return 0; }
+  case $PHP_UPGRADE_CORE_EXT in
+    *" $ext "*)
+      if [[ $ext == redis ]] && ! apt-cache show "php${target}-redis" >/dev/null 2>&1; then
+        printf 'skip:php%s-redis is not published yet' "$target"
+      elif [[ $ext == opcache ]]; then
+        # OPcache is mandatory and built in from PHP 8.5 on.
+        major=${target%%.*}; minor=${target#*.}
+        if (( major > 8 || (major == 8 && minor >= 5) )); then
+          printf 'bundled:%s' "$ext"
+        else
+          printf 'core:%s' "$ext"
+        fi
+      else
+        printf 'core:%s' "$ext"
+      fi
+      return 0
+      ;;
+  esac
+  if [[ $ext == *[!a-z0-9]* ]]; then
+    printf 'skip:unexpected package name'
+    return 0
+  fi
+  pkg_target="php${target}-${ext}"
+  if apt-cache show "$pkg_target" >/dev/null 2>&1; then
+    printf 'keep:%s' "$pkg_target"
+  else
+    printf 'skip:%s is not published' "$pkg_target"
+  fi
+}
+
 # Build the extension mapping for the target version.  A package is only kept
 # when the target repository publishes the same extension; anything missing is
 # reported instead of failing the whole upgrade.
 php_upgrade_plan_extensions() {
-  local target=$1 dir=$PHP_UPGRADE_MANIFEST_DIR ext flag pkg pkg_target
-  local core=" fpm cli common mysql gd curl xml zip gmp mbstring redis readline opcache "
+  local target=$1 dir=$PHP_UPGRADE_MANIFEST_DIR ext flag pkg class pkg_target
   PHP_UPGRADE_TARGET_PKGS=()
   PHP_UPGRADE_SKIPPED=()
   [[ -f "$dir/extensions.txt" ]] || return 0
 
   while IFS=$'\t' read -r ext flag pkg; do
     [[ -n $ext ]] || continue
-    case $core in
-      *" $ext "*)
-        # OPcache is bundled from 8.5 on and needs no package.  Redis is a
-        # PECL build and is the one default extension that can lag a brand-new
-        # release, so call it out instead of failing the install later.
-        if [[ $ext == redis ]] && ! apt-cache show "php${target}-redis" >/dev/null 2>&1; then
-          PHP_UPGRADE_SKIPPED+=("redis (php${target}-redis is not published yet)")
-        fi
-        continue
+    class=$(php_upgrade_classify_package "$target" "$pkg")
+    case $class in
+      keep:*)
+        pkg_target=${class#keep:}
+        [[ " ${PHP_UPGRADE_TARGET_PKGS[*]} " == *" ${pkg_target} "* ]] \
+          || PHP_UPGRADE_TARGET_PKGS+=("$pkg_target")
+        ;;
+      skip:*)
+        PHP_UPGRADE_SKIPPED+=("${ext} (${pkg}: ${class#skip:})")
         ;;
     esac
-    if [[ $ext == *[!a-z0-9]* ]]; then
-      PHP_UPGRADE_SKIPPED+=("${ext} (${pkg}: unexpected package name)")
-      continue
-    fi
-    pkg_target="php${target}-${ext}"
-    if apt-cache show "$pkg_target" >/dev/null 2>&1; then
-      [[ " ${PHP_UPGRADE_TARGET_PKGS[*]} " == *" ${pkg_target} "* ]] \
-        || PHP_UPGRADE_TARGET_PKGS+=("$pkg_target")
-    elif [[ $ext == opcache ]] && (( ${target%%.*} >= 8 && ${target#*.} >= 5 )); then
-      : # OPcache is built into PHP 8.5+, no package is expected.
-    else
-      PHP_UPGRADE_SKIPPED+=("${ext} (${pkg}: ${pkg_target} is not published)")
-    fi
   done < "$dir/extensions.txt"
 }
 
@@ -228,8 +261,10 @@ php_upgrade_plan_extensions() {
 # warning: PHP 8.6 was still 8.6.0~rc5 at the time of this audit.
 php_upgrade_validate_target() {
   local target=$1 candidate upstream
+  # Do not make awk exit at the first match: with `set -o pipefail`, apt-cache
+  # is then killed by SIGPIPE (141) and the whole dry run reports failure.
   candidate=$(apt-cache policy "php${target}-fpm" 2>/dev/null \
-    | awk '/^[[:space:]]*Candidate:/{print $2; exit}')
+    | awk '/^[[:space:]]*Candidate:/{ if (!found) { print $2; found=1 } }')
   if [[ -z $candidate || $candidate == "(none)" ]]; then
     local -a known=()
     mapfile -t known < <(apt-cache pkgnames 2>/dev/null \
@@ -638,30 +673,23 @@ php_upgrade_plan() {
     printf 'Packages   : %s installed PHP package(s)\n' "$(php_upgrade_installed_packages | wc -l | tr -d ' ')"
     printf '\nExtensions to carry over (mapped to php%s-*):\n' "$target"
     php_upgrade_installed_packages > "$dir/pkgs.txt"
-    local core=" fpm cli common mysql gd curl xml zip gmp mbstring redis readline opcache "
+    local class
     while IFS= read -r pkg; do
+      class=$(php_upgrade_classify_package "$target" "$pkg")
       ext=$(php_upgrade_ext_name "$pkg")
-      [[ -n $ext ]] || continue
-      case $core in
-        *" $ext "*)
-          if [[ $ext == redis ]] && ! apt-cache show "php${target}-redis" >/dev/null 2>&1; then
-            printf '  %-14s !! php%s-redis is not published yet\n' "$ext" "$target"
-          else
-            printf '  %-14s (core/default)\n' "$ext"
-          fi
-          continue
-          ;;
+      case $class in
+        ignore) continue ;;
+        core:*)    printf '  %-14s (core/default)\n' "$ext" ;;
+        bundled:*) printf '  %-14s (bundled in PHP %s)\n' "$ext" "$target" ;;
+        keep:*)    printf '  %-14s -> %s\n' "$ext" "${class#keep:}" ;;
+        skip:*)    printf '  %-14s !! %s\n' "$ext" "${class#skip:}" ;;
       esac
-      if apt-cache show "php${target}-${ext}" >/dev/null 2>&1; then
-        printf '  %-14s -> php%s-%s\n' "$ext" "$target" "$ext"
-      else
-        printf '  %-14s !! no php%s-%s in the repository\n' "$ext" "$target" "$ext"
-      fi
     done < "$dir/pkgs.txt"
   else
     printf 'Current    : none (no PHP-FPM installed; the run installs %s fresh)\n' "$target"
   fi
-  candidate=$(apt-cache policy "php${target}-fpm" 2>/dev/null | awk '/^[[:space:]]*Candidate:/{print $2; exit}')
+  candidate=$( { apt-cache policy "php${target}-fpm" 2>/dev/null || true; } \
+    | awk '/^[[:space:]]*Candidate:/{ if (!found) { print $2; found=1 } }')
   printf '\nRepository : %s\n' "${candidate:-not configured yet; the real run adds the Sury repository and re-checks}"
   printf '\nSteps:\n'
   printf '  1. snapshot packages, extension flags, custom .ini/pools and /etc/php\n'

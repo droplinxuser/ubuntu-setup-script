@@ -408,7 +408,9 @@ run_optimize() {
     OPT_PHP_OK=1
     optimize_php_services || { rc=1; OPT_PHP_OK=0; }
   fi
-  for service in angie mariadb valkey redis elastic; do
+  for service in "${OPTIMIZE_ORDER[@]}"; do
+    # optimize_php_services() ran above (it is versioned, not a single unit).
+    [[ $service == php ]] && continue
     [[ " ${OPT_DETECTED[*]} " == *" ${service} "* ]] || continue
     case "$service" in
       angie)   optimize_angie   || rc=1 ;;
@@ -608,11 +610,17 @@ main() {
     fetch_server_configs || die "Could not prepare the Angie configuration repository"
   fi
 
-  if [[ ${ENABLED[angie]:-0} -eq 1 ]];   then run_service angie   install_angie; fi
-  if [[ ${ENABLED[php]:-0} -eq 1 ]];     then run_service php     install_php; fi
-  if [[ ${ENABLED[mariadb]:-0} -eq 1 ]]; then run_service mariadb install_mariadb; fi
-  if [[ ${ENABLED[valkey]:-0} -eq 1 ]];  then run_service valkey  install_valkey; fi
-  if [[ ${ENABLED[elastic]:-0} -eq 1 ]]; then run_service elastic install_elastic; fi
+  local s
+  for s in "${INSTALL_ORDER[@]}"; do
+    [[ ${ENABLED[$s]:-0} -eq 1 ]] || continue
+    case $s in
+      angie)   run_service angie   install_angie ;;
+      php)     run_service php     install_php ;;
+      mariadb) run_service mariadb install_mariadb ;;
+      valkey)  run_service valkey  install_valkey ;;
+      elastic) run_service elastic install_elastic ;;
+    esac
+  done
   if [[ ${ENABLED[others]:-0} -eq 1 ]];  then run_service others  install_others; fi
   if [[ ${ENABLED[domain]:-0} -eq 1 ]];  then run_service domain  create_domains; fi
 

@@ -3,6 +3,52 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.20.1 (2026-11-11)
+
+Refactor and validation release. **No configuration value changed**: a fresh
+install and `--optimize` still produce a byte-identical tree and identical
+effective values (375 managed files / 942 values, zero diff), and a second
+`--optimize` changes nothing. **609/609 tuning checks and 173/173 CLI/dry-run
+checks pass**; ShellCheck is clean at `-S warning`.
+
+- **One compare/commit helper.**  `commit_if_changed()` in `lib/common.sh`
+  replaces eleven copies of the stage-under-/tmp, `cmp`, `cat > live`,
+  `tune_note` block (`tune_replace`, `tune_insert_after`, `tune_ensure_line`,
+  `tune_pool_set`, `tune_pool_dedupe`, the rate-limit, cache, keepalive,
+  static-asset, precompress and MariaDB duplicate-key writers).  Every writer
+  still keeps the live inode and every tuner still reports a change only when
+  the bytes differ, so service reloads are unchanged.
+- **One PHP extension classifier.**  `--upgrade-php` maps the installed
+  extension set in the real plan and in `--dry-run` through
+  `php_upgrade_classify_package()`; the dry run no longer carries its own
+  copy of the core-extension table.  The duplicated table had drifted:
+  OPcache was reported missing on a 9.x target even though it is bundled
+  from 8.5 on.
+- **One apply order.**  `INSTALL_ORDER` and `OPTIMIZE_ORDER` in `lib/cli.sh`
+  drive the installer and `run_optimize()` loops; `--purge` keeps its own
+  dependency order.  The two inline lists could (and did) drift.
+- **Module split.**  The per-service optimize/verify/profile code moved out
+  of `lib/security.sh` (88 KB of two unrelated responsibilities) into
+  `lib/service-optimizers.sh` (Angie, PHP-FPM, MariaDB, Valkey/Redis,
+  Elasticsearch, verification and the Markdown report).  `lib/security.sh`
+  now owns hardening only.  Both are sourced by `setup.sh`; no function was
+  renamed.
+- **Fixed: `--dry-run --upgrade-php` could exit 141 (SIGPIPE).**  The target
+  candidate was read with `apt-cache policy ... | awk '...; exit'`; under
+  `set -o pipefail`, awk closing the pipe killed apt-cache with SIGPIPE and
+  a successful dry run reported FAILURE.  The parser now reads the whole
+  policy output.  Caught by `tests/test-dry-run-matrix.sh`.
+- **Audit on the 16-thread / 27.8 GiB / NVMe host.**  Full stack plus
+  XenForo 2.3.13 and WordPress 7.1.4 from the local archives.  JIT tracing
+  is +4.8% over off (606 vs 578 thread req/s); 16 static workers is the
+  throughput peak (616 req/s; 20 -> 600, 24 -> 582); `validate_timestamps=0`
+  and `catch_workers_output=no` measured neutral; XF-in-Valkey (-7/-11%) and
+  the WP Redis object cache (-7%) are slower on a single local-DB host and
+  were reverted.  Details: `tests/stress-site/TUNING-20261111-1.20.1.md`.
+- **`--upgrade-php` re-tested in both directions** (8.5 -> 8.4 -> 8.5,
+  1m10s / 59s) with managed files identical to the pre-upgrade tree after
+  version normalisation; see `tests/upgrade-php/RESULTS-20261111-1.20.1.md`.
+
 ## 1.20.0 (2026-11-11)
 
 New standalone mode: **`--upgrade-php=X.Y`** replaces the installed PHP with
