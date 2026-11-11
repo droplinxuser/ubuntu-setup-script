@@ -3,6 +3,31 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.20.6 (2026-11-11)
+
+Fix XenForo `MySQL query error [1020]: Record has changed since last read`
+after `--optimize` on MariaDB servers.
+
+- **Cause.**  The MariaDB base block wrote `innodb_snapshot_isolation = 1`.
+  MariaDB 11.6.2+ enables snapshot isolation by default, and with it on,
+  InnoDB rejects an UPDATE that touches a row changed by another transaction
+  since the REPEATABLE READ snapshot with `ER_CHECKREAD` (1020).  XenForo 2.3
+  does not treat 1020 as a retryable deadlock, so a concurrent reply failed
+  in `Thread::updateForumRecord()` (`xf_forum`) even though the retry would
+  have succeeded.  Ubuntu 26.04 ships MariaDB 11.8, so the failure surfaced
+  after the database server was optimized.
+- **Fix.**  Both the reference `configs/mariadb/mariadb_server.cnf` and the
+  generated `50-server.cnf` base block now write
+  `innodb_snapshot_isolation = 0`, restoring MySQL-compatible REPEATABLE READ
+  (MariaDB's behaviour before 11.6.2).  An operator who wants the stricter
+  snapshot isolation can override it in a later `.cnf` drop-in.
+- `--optimize` detects the base-block change, validates the configuration
+  with `mariadbd --help --verbose`, pauses the web frontends and restarts
+  MariaDB once.  Verify with
+  `mariadb -N -B -e 'SELECT @@innodb_snapshot_isolation'` (expect `0`).
+- Two tuning checks assert the reference config and the generated block;
+  **629/629 tuning checks and 173/173 CLI/dry-run checks pass**.
+
 ## 1.20.5 (2026-11-11)
 
 Fix `--optimize` failing on Angie when an operator `http.d` file duplicates a

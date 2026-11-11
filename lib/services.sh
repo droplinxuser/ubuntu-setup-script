@@ -838,7 +838,11 @@ ${MARIADB_BEGIN}
 collation-server = utf8mb4_general_ci
 character-set-server = utf8mb4
 
-innodb_snapshot_isolation = 1
+# MySQL-compatible REPEATABLE READ: XenForo 2.3 does not retry MariaDB's
+# ER_CHECKREAD (1020, "Record has changed since last read") and MariaDB
+# 11.6.2+ enables snapshot isolation by default.  A later .cnf drop-in can
+# override this when an application is written for the stricter behaviour.
+innodb_snapshot_isolation = 0
 skip_name_resolve = 1
 query_cache_size = 0
 query_cache_type = 0

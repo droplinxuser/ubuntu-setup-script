@@ -195,6 +195,14 @@ check "MariaDB logging helper sets the central slow log" \
   test "$(mariadb_logging_settings | grep -c '^slow_query_log_file = /var/www/logs/mariadb/slow.log$')" -eq 1
 check "MariaDB logging helper sets log_error" \
   test "$(mariadb_logging_settings | grep -c '^log_error = /var/www/logs/mariadb/error.log$')" -eq 1
+# XenForo 2.3 does not retry MariaDB error 1020; snapshot isolation must stay
+# off so REPEATABLE READ keeps MySQL's behaviour (MariaDB 11.6.2+ defaults it
+# on, which produced xf_forum/xf_user write failures on a live board).
+check "MariaDB reference config disables snapshot isolation" \
+  grep -qx 'innodb_snapshot_isolation = 0' "$ROOT/configs/mariadb/mariadb_server.cnf"
+mariadb_base_body=$(sed -n '/^mariadb_write_base_block()/,/^}/p' "$ALL_SRC")
+check "MariaDB base block writes snapshot isolation off" \
+  grep -qx 'innodb_snapshot_isolation = 0' <<<"$mariadb_base_body"
 no_slow_admin_alias() { ! mariadb_logging_settings | grep -q '^log_slow_admin_statements[[:space:]]*='; }
 check "MariaDB logging helper omits the deprecated slow-admin alias" \
   no_slow_admin_alias
