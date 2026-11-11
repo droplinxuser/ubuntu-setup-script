@@ -4,7 +4,8 @@
 # XenForo thread page (the CPU-bound tier with no FastCGI cache), and records
 # throughput plus per-service CPU.  The original pool is restored at the end.
 #
-# Usage: PATH=<password-ssh shim>:$PATH bash tests/stress-site/fpm-sweep.sh [out.md]
+# Usage: PATH=<ssh shim>:$PATH bash tests/stress-site/fpm-sweep.sh [out.md]
+# The remote SSH user must be root or have passwordless sudo (sudo -n).
 # Env: TARGET, REMOTE_DIR, URL, COOKIE, CONNS (100), SECS (8),
 #      WORKERS ("8 12 16 20 24"), dyn=1 to also test pm=dynamic at 16.
 set -u
