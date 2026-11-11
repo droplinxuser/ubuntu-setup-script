@@ -509,6 +509,10 @@ main() {
       optimize_plan
       exit 0
     fi
+    if [[ -n ${UPGRADE_PHP:-} ]]; then
+      php_upgrade_plan
+      exit 0
+    fi
     [[ ${ENABLED[basic]:-0} -eq 1 ]] && resolve_basic_defaults
     print_plan
     exit 0
@@ -527,19 +531,26 @@ main() {
   # shellcheck disable=SC1091
   . /etc/os-release
   [[ ${ID:-} == ubuntu ]] || die "This script only supports Ubuntu (found: ${ID:-unknown})"
-  if (( OPTIMIZE || RESTART_ALL )); then
+  if (( OPTIMIZE || RESTART_ALL )) || [[ -n ${UPGRADE_PHP:-} ]]; then
     if ! optimize_os_supported "${VERSION_ID:-}"; then
-      die "--optimize/--restart-all supports Ubuntu 22.04, 24.04 or 26.04 (found ${VERSION_ID:-unknown})"
+      die "--optimize/--restart-all/--upgrade-php supports Ubuntu 22.04, 24.04 or 26.04 (found ${VERSION_ID:-unknown})"
     fi
   elif (( ${VERSION_ID%%.*} < 26 )); then
     die "This script requires Ubuntu 26.04 or newer (found ${VERSION_ID})"
   fi
 
   # Size every service against one shared RAM budget on a fresh install, just
-  # as --optimize does on an existing host.
-  if (( ! OPTIMIZE && ! PURGE && ! RESTART_ALL )); then
+  # as --optimize does on an existing host.  --upgrade-php plans from the live
+  # PHP worker measurement instead (the upgrade driver calls the planner).
+  if (( ! OPTIMIZE && ! PURGE && ! RESTART_ALL )) && [[ -z ${UPGRADE_PHP:-} ]]; then
     record_explicit_options
     plan_install_budget
+  fi
+
+  if [[ -n ${UPGRADE_PHP:-} ]]; then
+    printf '%s%sUbuntu %s PHP upgrade%s\n' "$C_BOLD" "$C_BLUE" "${VERSION_ID}" "$C_RESET"
+    run_php_upgrade
+    exit 0
   fi
 
   if (( RESTART_ALL )); then

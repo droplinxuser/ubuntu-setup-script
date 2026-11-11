@@ -36,7 +36,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.19.2"
+readonly SCRIPT_VERSION="1.20.0"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -233,6 +233,9 @@ source "${SCRIPT_DIR}/lib/restart.sh"
 
 # shellcheck source=lib/payloads.sh
 source "${SCRIPT_DIR}/lib/payloads.sh"
+
+# shellcheck source=lib/php-upgrade.sh
+source "${SCRIPT_DIR}/lib/php-upgrade.sh"
 
 
 # Tests source this file with SETUP_TEST_SOURCE_ONLY=1 to exercise the pure

@@ -20,6 +20,10 @@ OPTIMIZE=0
 DIAGNOSTICS=0
 RESTART_ALL=0
 DRY_RUN=0
+# --upgrade-php=X.Y: replace the installed PHP with another version while
+# keeping the extension set and custom configuration.  Empty means off.
+UPGRADE_PHP=""
+UPGRADE_PHP_SEEN=0
 PURGE_TARGETS=()
 PURGE_ORDER=()
 SERVICE_ORDER=(basic angie php mariadb valkey elastic others domain)
@@ -133,6 +137,34 @@ Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
       Existing application vhosts and credentials are preserved.
       --dry-run only prints the planned OS and service values.
 
+PHP upgrade (standalone):
+  --upgrade-php=VERSION        e.g. --upgrade-php=8.6
+      Replaces every installed PHP package with VERSION and keeps the host's
+      extension set and custom configuration:
+        - records every installed PHP package, which extensions were installed
+          manually, custom .ini fragments/FPM pools and exact package versions;
+        - adds the Sury repository and checks that phpVERSION-fpm is published
+          (an explicitly requested pre-release is allowed with a warning);
+        - purges all PHP packages and the dependencies that only PHP kept
+          installed.  Pre-existing unrelated autoremove candidates are kept,
+          because only the before/after autoremove delta is removed;
+        - installs phpVERSION-fpm/cli and the default extension set plus every
+          extension the old version had (packages the new version does not
+          publish are reported and skipped, not fatal);
+        - migrates operator-owned .ini fragments and extra FPM pools, then
+          validates them with php-fpm -t;
+        - runs the same hardware-aware tuner as install/--optimize (socket,
+          static pool, OPcache, tracing JIT, realpath/memory limits) and
+          reloads Angie when it is active;
+        - verifies the CLI version, FPM service, socket, extension packages
+          and JIT, then writes /var/log/setup-php-upgrade-<timestamp>.md.
+      The old /etc/php tree and package versions are kept under
+      /var/lib/setup.sh/php-upgrade-<timestamp>/ for a rollback.
+      On a host with no PHP installed the same command installs VERSION fresh.
+      Use --dry-run to print the purge/install plan without changes.  It
+      cannot be combined with install flags, --optimize, --purge,
+      --diagnostics, --restart-all or --domain.
+
 Security hardening (runs automatically):
   --optimize and --basic always:
       - fix wp-config.php ownership/mode (root:www-data 640)
@@ -195,7 +227,8 @@ Notes:
     directory where setup.sh was started.  Copy that file when reporting an
     issue; it includes the host facts and the exit status.
   * Only one PHP-FPM version can own the shared Unix socket at a time.
-    Switch versions by purging the old one first:
+    Upgrade an existing host in place with --upgrade-php=8.6 (keeps extensions
+    and custom configuration), or switch manually:
       --purge --php ver=8.4   then   --basic ... --php ver=8.5
 
 Examples:
@@ -210,6 +243,9 @@ Examples:
 
   bash setup.sh --domain google.com
   bash setup.sh --domain google.com example.org
+
+  bash setup.sh --upgrade-php=8.6
+  bash setup.sh --upgrade-php=8.6 --dry-run
 
   bash setup.sh --purge all
 EOF
@@ -361,6 +397,17 @@ parse_args() {
         ;;
       --optimize)
         OPTIMIZE=1; shift ;;
+      --upgrade-php=*)
+        (( UPGRADE_PHP_SEEN == 0 )) || die "--upgrade-php may only be given once"
+        UPGRADE_PHP_SEEN=1
+        UPGRADE_PHP=${1#*=}
+        shift ;;
+      --upgrade-php)
+        (( UPGRADE_PHP_SEEN == 0 )) || die "--upgrade-php may only be given once"
+        UPGRADE_PHP_SEEN=1
+        (( $# >= 2 )) || die "--upgrade-php requires a version, e.g. --upgrade-php=8.6"
+        UPGRADE_PHP=$2
+        shift 2 ;;
       --diagnostics)
         DIAGNOSTICS=1; shift ;;
       --restart-all)

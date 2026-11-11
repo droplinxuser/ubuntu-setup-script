@@ -421,6 +421,32 @@ latest_sury_php() {
 validate_all() {
   local svc
 
+  # --upgrade-php is a standalone mode like --optimize: it works on an
+  # installed host, needs the Sury repository and must not be mixed with
+  # install/purge/diagnostics flags that would change the same packages.
+  if [[ -n ${UPGRADE_PHP:-} ]]; then
+    [[ $UPGRADE_PHP =~ ^[0-9]+\.[0-9]+$ ]] \
+      || die "--upgrade-php='${UPGRADE_PHP}' is invalid (use e.g. --upgrade-php=8.6)"
+    local major=${UPGRADE_PHP%%.*} minor=${UPGRADE_PHP#*.}
+    (( major == 8 && minor >= 1 )) \
+      || die "--upgrade-php supports PHP 8.1 and newer (found ${UPGRADE_PHP})"
+    (( OPTIMIZE )) && die "--upgrade-php cannot be combined with --optimize (the upgrade runs the PHP tuner itself)"
+    (( PURGE )) && die "--upgrade-php cannot be combined with --purge"
+    (( DIAGNOSTICS )) && die "--upgrade-php cannot be combined with --diagnostics"
+    (( RESTART_ALL )) && die "--upgrade-php cannot be combined with --restart-all"
+    [[ ${#DOMAINS[@]} -eq 0 ]] \
+      || die "--upgrade-php cannot be combined with --domain"
+    [[ ${#ENABLED[@]} -eq 0 ]] \
+      || die "--upgrade-php is standalone and cannot be combined with install flags"
+    # The pool template is version-specific.  A dry run on a machine without
+    # the repository still prints the plan; the real run must fail before it
+    # purges PHP if a template is missing.
+    if (( ! DRY_RUN )) && [[ ! -f "${SCRIPT_DIR}/configs/php/www_${UPGRADE_PHP//./}.conf" ]]; then
+      die "No FPM pool template for PHP ${UPGRADE_PHP} (${SCRIPT_DIR}/configs/php/www_${UPGRADE_PHP//./}.conf); add one before upgrading"
+    fi
+    return 0
+  fi
+
   if (( OPTIMIZE )); then
     (( DIAGNOSTICS )) && die "--optimize cannot be combined with --diagnostics"
     (( RESTART_ALL )) && die "--optimize cannot be combined with --restart-all"

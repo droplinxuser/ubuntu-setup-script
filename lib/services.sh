@@ -198,6 +198,12 @@ install_angie() {
 # ---------------------------------------------------------------------------
 # PHP
 # ---------------------------------------------------------------------------
+# Extra PHP extension packages requested by --upgrade-php, already mapped to
+# the target version.  install_php() appends them to its default package set so
+# an upgraded host keeps every extension it had and a fresh --php install
+# ignores this array.
+PHP_EXTRA_PACKAGES=()
+
 # A clean PHP install is required: a stopped but installed second PHP version
 # still owns a pool that can later bind /run/php/php-fpm.sock and break the
 # selected version.  Remove every PHP package first, keeping the old /etc/php
@@ -285,14 +291,51 @@ install_php() {
   local -a php_pkgs=(
     "php${ver}-fpm" "php${ver}-cli"
     "php${ver}-mysql" "php${ver}-gd" "php${ver}-curl" "php${ver}-xml"
-    "php${ver}-zip" "php${ver}-gmp" "php${ver}-mbstring" "php${ver}-redis"
+    "php${ver}-zip" "php${ver}-gmp" "php${ver}-mbstring"
   )
+  # Redis is in the default set but is a PECL build, so a brand-new PHP
+  # release can lag it by days or weeks (PHP 8.6.0~rc5 shipped only the 30
+  # in-tree extensions).  A missing optional package must not abort the whole
+  # installation; the caller and the upgrade report name it instead.
+  local -a php_optional=("php${ver}-redis")
   if apt-cache show "php${ver}-opcache" >/dev/null 2>&1; then
     php_pkgs+=("php${ver}-opcache")
   else
     info "PHP ${ver} bundles OPcache in the core package; skipping php${ver}-opcache"
   fi
+  # --upgrade-php hands install_php() the extension packages the old version
+  # had, already rewritten to the target version.  Skip a package the default
+  # set already covers and one the target repository does not publish (an
+  # extension can lag a new PHP major by a few weeks).  The caller has already
+  # filtered and reported the unavailable ones; this is a second guard so a
+  # direct caller of install_php() cannot fail the whole install on one name.
+  local extra pkg
+  for extra in "${PHP_EXTRA_PACKAGES[@]}"; do
+    [[ -n $extra ]] || continue
+    for pkg in "${php_pkgs[@]}"; do
+      [[ $pkg == "$extra" ]] && continue 2
+    done
+    [[ " ${php_optional[*]} " == *" ${extra} "* ]] && continue
+    php_optional+=("$extra")
+  done
+  # Install the core set first: a host without php-fpm is worse than a host
+  # with php-fpm and one missing optional extension.
   apt_install "${php_pkgs[@]}"
+  local -a optional_ok=() optional_skip=()
+  for pkg in "${php_optional[@]}"; do
+    if apt-cache show "$pkg" >/dev/null 2>&1; then
+      optional_ok+=("$pkg")
+    else
+      optional_skip+=("$pkg")
+    fi
+  done
+  if (( ${#optional_ok[@]} > 0 )); then
+    apt_install "${optional_ok[@]}"
+  fi
+  for pkg in "${optional_skip[@]:-}"; do
+    [[ -n $pkg ]] || continue
+    warn "PHP ${ver}: extension package ${pkg} is not published yet; skipped (install it later when the repository has it)"
+  done
 
   # Preserve the package-created configuration so a bad template, tuning pass
   # or failed start can be rolled back.
