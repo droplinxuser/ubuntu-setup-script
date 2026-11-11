@@ -2801,5 +2801,17 @@ check "upstream restore removes the managed include once the tree defines it" \
   test ! -f "$TMP/up-new/http.d/zz-setup-preserved-upstreams.conf"
 
 
+# Hardening must not fork one chmod process per world-writable file.  A live
+# XenForo host had 598 757 of them and --optimize spent ~9 minutes in this
+# loop, which looked like a hang; find now batches paths per chmod.
+harden_files_body=$(sed -n '/^harden_wordpress_files()/,/^}/p' "$ALL_SRC")
+check "world-writable fix uses a batched chmod" \
+  grep -q -- '-exec chmod o-w {} +' <<<"$harden_files_body"
+check "world-writable fix does not fork chmod per path" \
+  bash -c '! grep -q "chmod o-w \"\$f\"" <<< "$1"' _ "$harden_files_body"
+check "world-writable fix reports the count before fixing" \
+  grep -q 'world-writable files: ${count}' <<<"$harden_files_body"
+
+
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
