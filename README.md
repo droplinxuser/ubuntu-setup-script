@@ -211,8 +211,10 @@ single host (XF's Redis cache measured 27% slower there) and use
   drop-in and the AppArmor capability override Ubuntu 26.04 needs for
   `mariadb-install-db`.
 - Base block in `50-server.cnf` (utf8mb4, `skip_name_resolve`,
-  `local_infile=0`, `secure_file_priv`, bind address; a commented-out
-  `bind-address` is left alone by `--optimize`) and the hardware profile in
+  `innodb_snapshot_isolation=0` so REPEATABLE READ keeps MySQL's behaviour
+  and XenForo does not hit MariaDB error 1020, `local_infile=0`,
+  `secure_file_priv`, bind address; a commented-out `bind-address` is left
+  alone by `--optimize`) and the hardware profile in
   `99-setup-optimize.cnf`: buffer pool from the plan (`size=auto` = live
   data+index +20%, 128 MB minimum; `size=` reserved verbatim), redo log
   pool/4 (64 MB..4 GB on NVMe, 2 GB otherwise), `innodb_io_capacity` by disk

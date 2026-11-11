@@ -10,7 +10,14 @@
 collation-server = utf8mb4_general_ci
 character-set-server = utf8mb4
 
-innodb_snapshot_isolation = 1
+# XenForo and other MySQL-compatible apps expect MySQL's REPEATABLE READ
+# behaviour.  MariaDB 11.6.2+ enables snapshot isolation by default; with it
+# on, a concurrent write to a row read earlier in the transaction fails with
+# error 1020 (ER_CHECKREAD, "Record has changed since last read"), which
+# XenForo 2.3 does not retry (seen on xf_forum/xf_user writes).  Keep the
+# MySQL-compatible behaviour; an operator who wants strict snapshot isolation
+# can override this in a later .cnf drop-in.
+innodb_snapshot_isolation = 0
 skip_name_resolve = 1
 query_cache_size = 0
 query_cache_type = 0
