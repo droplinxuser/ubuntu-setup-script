@@ -3,6 +3,32 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.20.5 (2026-11-11)
+
+Fix `--optimize` failing on Angie when an operator `http.d` file duplicates a
+single-instance directive that the canonical tree also sets.
+
+- **Symptom.**  On a live host, a custom `http.d/zz-pixvid-ratelimit.conf`
+  carried `limit_req_status 429` and `limit_req_log_level info`, while the
+  synced `http.d/limit_req.conf` defines the same http-context directives.
+  `angie -t` returned
+  `[emerg] "limit_req_status" directive is duplicate in .../zz-pixvid-ratelimit.conf:20`;
+  the repository sync rolled the whole `/etc/angie` tree back and the run
+  exited 1.
+- **Fix.**  `tune_angie_dedupe_http()` scans the active `http.d/*.conf` files
+  for the single-instance directives (`limit_req_status`, `limit_conn_status`,
+  `limit_req_log_level`, `limit_conn_log_level`, `limit_req_dry_run`,
+  `limit_conn_dry_run`).  When a directive appears more than once it keeps the
+  canonical `limit_req.conf` occurrence (otherwise the first file in include
+  order) and comments the other copies with
+  `# setup.sh: duplicate <directive> (kept in <file>)`.  It runs both after the
+  repository sync (before the deployer's `angie -t`) and at the end of the
+  hardware tuner, because the tuner can add `limit_req_log_level` itself.
+- A unique directive in the operator file is left untouched; only real
+  duplicates are commented, and the tree is already snapshotted for rollback.
+- Existing hosts get the repair on the next `--optimize` / `--angie` run.
+  **627/627 tuning checks and 173/173 CLI/dry-run checks pass.**
+
 ## 1.20.4 (2026-11-11)
 
 Fix the managed cron redirection for the WordPress and XenForo job runners.

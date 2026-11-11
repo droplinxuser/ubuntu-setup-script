@@ -2821,5 +2821,23 @@ check "world-writable fix reports the count before fixing" \
   grep -q 'world-writable files: ${count}' <<<"$harden_files_body"
 
 
+# A custom http.d limit file can duplicate an http-context directive that the
+# canonical limit_req.conf owns; angie -t refuses to load until one copy is
+# commented.  Keep the canonical file and mark the operator copy.
+mkdir -p "$TMP/dedupe/http.d"
+printf 'limit_req_status 429;\nlimit_req_log_level warn;\n' > "$TMP/dedupe/http.d/limit_req.conf"
+printf 'limit_req_status 429;\nlimit_conn_status 429;\nlimit_req_log_level info;\n' > "$TMP/dedupe/http.d/zz-custom.conf"
+tune_reset_changes
+tune_angie_dedupe_http "$TMP/dedupe"
+check "duplicate http directive keeps the canonical file" \
+  grep -qx 'limit_req_status 429;' "$TMP/dedupe/http.d/limit_req.conf"
+check "duplicate http directive comments the operator copy" \
+  grep -qx '# setup.sh: duplicate limit_req_status 429; (kept in http.d/limit_req.conf)' "$TMP/dedupe/http.d/zz-custom.conf"
+check "duplicate http directive leaves a unique directive active" \
+  grep -qx 'limit_conn_status 429;' "$TMP/dedupe/http.d/zz-custom.conf"
+check "duplicate http log level is commented in the operator copy" \
+  grep -qx '# setup.sh: duplicate limit_req_log_level info; (kept in http.d/limit_req.conf)' "$TMP/dedupe/http.d/zz-custom.conf"
+
+
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

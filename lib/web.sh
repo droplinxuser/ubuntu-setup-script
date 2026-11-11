@@ -542,6 +542,49 @@ tune_xf_static_assets() {
   return 0
 }
 
+# Directives that may appear only once in the http context.  A custom
+# http.d file (for example zz-pixvid-ratelimit.conf) can predate the canonical
+# limit_req.conf and carry its own limit_req_status/limit_req_log_level; the
+# repository sync then makes `angie -t` fail with "directive is duplicate"
+# and the whole tree rolls back.  Keep the canonical definition and comment
+# the operator copy with a marker; --optimize already snapshots /etc/angie.
+ANGIE_SINGLE_HTTP_DIRECTIVES=(limit_req_status limit_conn_status
+                              limit_req_log_level limit_conn_log_level
+                              limit_req_dry_run limit_conn_dry_run)
+
+tune_angie_dedupe_http() {
+  local target=${1:-/etc/angie} directive file keep rel before
+  local -a files=() hits=()
+  [[ -d $target/http.d ]] || return 0
+  mapfile -t files < <(find "$target/http.d" -maxdepth 1 -type f -name '*.conf' 2>/dev/null | sort)
+  for directive in "${ANGIE_SINGLE_HTTP_DIRECTIVES[@]}"; do
+    hits=()
+    for file in "${files[@]}"; do
+      grep -qE "^[[:space:]]*${directive}[[:space:]]" "$file" 2>/dev/null || continue
+      hits+=("$file")
+    done
+    (( ${#hits[@]} > 1 )) || continue
+    # The repository's limit file owns the global limiter values; otherwise
+    # keep the first file in include order (lexical in http.d).
+    keep=${hits[0]}
+    for file in "${hits[@]}"; do
+      [[ ${file##*/} == limit_req.conf ]] && { keep=$file; break; }
+    done
+    rel=${keep#"$target"/}
+    for file in "${hits[@]}"; do
+      [[ $file == "$keep" ]] && continue
+      before=$(file_md5 "$file")
+      sed_in_place -E \
+        "s|^([[:space:]]*)(${directive}[[:space:]].*)\$|\\1# setup.sh: duplicate \\2 (kept in ${rel})|" \
+        "$file"
+      [[ $(file_md5 "$file") != "$before" ]] \
+        && info "Angie: commented duplicate ${directive} in ${file#"$target"/} (kept in ${rel})"
+    done
+  done
+  return 0
+}
+
+
 # Per-IP rate limiting exempts loopback only.  A load generator, uptime
 # monitor or reverse proxy on another host is throttled to 100 GET/s and
 # answered with 429, which silently invalidates a remote benchmark (every
@@ -1186,6 +1229,10 @@ tune_angie_configs() {
   tune_xf_static_assets "$target/h5bp/xf2.conf"
 
   tune_summary "angie summary: ${nproc} CPU / ${mem_mb}MB RAM / ${disk_class} / cache_budget=${cache_total_mb}MB"
+  # The tuner may have added or rewritten an http-context directive that an
+  # operator file also sets; resolve any duplicate before the caller's
+  # angie -t (deploy_angie_tree already does this before tuning too).
+  tune_angie_dedupe_http "$target"
   return 0
 }
 
@@ -2103,6 +2150,10 @@ deploy_angie_tree() {
   # Re-add any operator-referenced upstream the new tree dropped (rsync
   # overwrites the file that used to define it; a custom vhost survives).
   angie_restore_upstreams "$target" "$upstream_snapshot"
+
+  # A custom http.d file may carry a directive the canonical tree also sets;
+  # Angie rejects duplicates in the http context before the tuner can run.
+  tune_angie_dedupe_http "$target" || true
 
   # Normalise ownership/modes for everything except operator certificates and
   # stream configs.  scripts/*.sh stay executable for the Cloudflare cron job.
