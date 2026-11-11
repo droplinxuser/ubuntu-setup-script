@@ -2,6 +2,9 @@
 # Unit tests for the hardware-aware tuning helpers in setup.sh.
 # No root, no services and no system changes are required.
 # Usage: bash tests/test-tuning.sh
+# The suites assign globals (ENABLED/OPT/...) that the sourced helpers read;
+# ShellCheck cannot follow that across the source boundary.
+# shellcheck disable=SC2034
 set -Eeuo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
@@ -287,9 +290,9 @@ check "basic-only cron run restores the log-safe chown" \
 : > "$CRON_OUT"
 (
   # Simulated command-line selection; write_cron must ignore it.
-  # shellcheck disable=SC2034
+  # shellcheck disable=SC2034,SC2154
   ENABLED[angie]=1
-  # shellcheck disable=SC2034
+  # shellcheck disable=SC2034,SC2154
   ENABLED[mariadb]=1
   cron_angie_configured() { return 1; }
   cron_mariadb_configured() { return 1; }
@@ -2196,6 +2199,24 @@ check "php_children_ceiling: explicit value wins but is clamped to the floor" \
   test "$(php_children_ceiling 4 65536 200 600)" -eq 512
 check "php_children_ceiling: explicit value below the floor is raised" \
   test "$(php_children_ceiling 8 65536 '' 4)" -eq 16
+
+# --- --upgrade-php parsing and extension mapping (1.20.0) ------------------
+check "upgrade parse: --upgrade-php=8.6" \
+  test "$( UPGRADE_PHP=''; UPGRADE_PHP_SEEN=0; parse_args --upgrade-php=8.6; printf '%s' "$UPGRADE_PHP" )" = 8.6
+check "upgrade parse: --upgrade-php 8.6" \
+  test "$( UPGRADE_PHP=''; UPGRADE_PHP_SEEN=0; parse_args --upgrade-php 8.6; printf '%s' "$UPGRADE_PHP" )" = 8.6
+check "upgrade parse: a second --upgrade-php fails" \
+  test "$( UPGRADE_PHP=''; UPGRADE_PHP_SEEN=0; rc=0; ( parse_args --upgrade-php=8.6 --upgrade-php=8.5 ) >/dev/null 2>&1 || rc=$?; printf '%s' "$rc" )" -ne 0
+check "upgrade extension name: versioned package" \
+  test "$(php_upgrade_ext_name php8.5-redis)" = redis
+check "upgrade extension name: unversioned package" \
+  test "$(php_upgrade_ext_name php-redis)" = redis
+check "upgrade extension name: fpm" \
+  test "$(php_upgrade_ext_name php8.6-fpm)" = fpm
+check "upgrade extension name: Apache module is not an extension" \
+  test -z "$(php_upgrade_ext_name libapache2-mod-php8.5)"
+check "upgrade extension name: meta package is not an extension" \
+  test -z "$(php_upgrade_ext_name php8.5)"
 
 # --- adaptive pool factor (1.19.0) -----------------------------------------
 check "php_children_from_tenths: one worker per core" \

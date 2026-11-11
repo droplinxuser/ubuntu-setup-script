@@ -227,6 +227,22 @@ run ok   --dry-run --purge --basic
 run ok   --dry-run --purge --others
 run ok   --dry-run --purge basic
 
+# --upgrade-php: standalone PHP version replacement.  The dry run works on a
+# host with or without PHP installed and must reject malformed or conflicting
+# invocations before anything is purged.
+run ok   --dry-run --upgrade-php=8.6
+run ok   --dry-run --upgrade-php 8.6
+run fail --dry-run --upgrade-php
+run fail --dry-run --upgrade-php=abc
+run fail --dry-run --upgrade-php=7.4
+run fail --dry-run --upgrade-php=8.6 --basic
+run fail --dry-run --upgrade-php=8.6 --optimize
+run fail --dry-run --upgrade-php=8.6 --purge
+run fail --dry-run --upgrade-php=8.6 --diagnostics
+run fail --dry-run --upgrade-php=8.6 --restart-all
+run fail --dry-run --upgrade-php=8.6 --domain example.com
+run fail --dry-run --upgrade-php=8.6 --upgrade-php=8.5
+
 # The single optimize command must include the OS layer.
 out=$(bash "$SCRIPT_DIR/setup.sh" --dry-run --optimize 2>&1)
 if [[ $out == *"OS: governor="* && $out == *"limits=1M-nofile"* ]]; then
