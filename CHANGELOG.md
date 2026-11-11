@@ -3,6 +3,66 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.20.0 (2026-11-11)
+
+New standalone mode: **`--upgrade-php=X.Y`** replaces the installed PHP with
+another version in place, keeping the operator's extension set and custom
+configuration, and applies the same hardware profile as install/`--optimize`.
+Audited on the 16-thread / 27.8 GiB / NVMe host with PHP 8.4 -> 8.6 (RC) and
+8.6 -> 8.5, plus a no-PHP host where the mode performs a fresh install.
+**609/609 tuning checks and 173/173 CLI/dry-run checks pass**; ShellCheck is
+clean at `-S warning`.
+
+- **New mode and CLI.**  `--upgrade-php=8.6` and
+  `--upgrade-php 8.6` are accepted (only once); the version must be 8.1+ and
+  the mode is standalone.  `--dry-run` prints the detected packages,
+  extension mapping, purge/install steps and target candidate without
+  touching the host.  Conflicts with install flags, `--optimize`, `--purge`,
+  `--diagnostics`, `--restart-all` and `--domain` fail before any change.
+- **Package/extension preservation.**  The run snapshots every installed PHP
+  package with its exact version, the extension inventory (and the
+  `apt-mark showmanual` flag), operator `.ini` drop-ins, extra FPM pools, the
+  PECL list and `/etc/php` under `/var/lib/setup.sh/php-upgrade-<ts>/`, then
+  maps each extension to `phpX.Y-<ext>`.  A target that does not publish an
+  extension (PHP 8.6.0~rc5 shipped only the 30 in-tree extensions: no
+  `redis`, `igbinary` or `apcu`) installs the rest and exits non-zero with
+  `ATTENTION` and the exact list, so monitoring catches the gap.
+- **Dependency purge is a delta, not a blanket autoremove.**  Every `php*`
+  package and `libapache2-mod-php*` is purged, then only packages that became
+  newly orphaned (before/after `apt-get -s autoremove`) are removed.
+  Pre-existing unrelated autoremove candidates survive, and a core-package
+  deny list guards against a parsing accident.
+- **Custom configuration is validated before it goes live.**  Operator-owned
+  regular `.ini` files in `conf.d` (plus their cross-SAPI symlinks) and extra
+  `pool.d/*.conf` files are migrated with version paths rewritten.  `dpkg -S`
+  cannot identify Sury's postinst-generated files, so package-owned entries
+  are recognised as symlinks instead.  `php-fpm -t` validates the migrated
+  set; rejected files are moved out of the live tree with the reason.  FPM is
+  reloaded afterwards, which fixes the case where a migrated extra pool
+  existed on disk but had never bound its socket (found in the 8.6 -> 8.5
+  audit).
+- **Timezone continuity and parity fix.**  The upgrade keeps the old tree's
+  `date.timezone` instead of re-deriving it from the host, and
+  `sync_php_ini_template` now prefers `timedatectl` over the legacy
+  `/etc/timezone` (on 26.04 the latter can stay at the image's zone while
+  `timedatectl` reports the live one; `--optimize` used to rewrite the zone
+  an install had just written).
+- **A lagging optional extension no longer breaks a PHP install.**  `redis`
+  moved out of the mandatory package set in `install_php`: the core packages
+  are installed first, then each optional/extra package is checked with
+  `apt-cache show` and skipped with a warning when the target repository has
+  not published it.  This also protects a plain `--php ver=<new major>`.
+- **Verified parity and rollback.**  On the audit host the upgraded
+  `/etc/php/8.5/fpm/pool.d/www.conf`, `conf.d/zz-setup-optimize.ini`,
+  `conf.d/custom_dan.ini` and the systemd limits drop-in are byte-identical
+  to a fresh `--basic --php ver=8.5` install, and a following `--optimize`
+  changed nothing.  A failed 8.6 install on the first attempt (missing
+  `php8.6-redis`) rolled back to 8.4 automatically with the old tree and
+  packages intact; the rollback also removes a partially installed target
+  first.
+- **`configs/php/www_86.conf`** added so the 8.6 example resolves the same
+  pool template as every other version.
+
 ## 1.19.2 (2026-11-11)
 
 Audit on a freshly restored 16-thread / 27.8 GiB / NVMe bare-metal host
