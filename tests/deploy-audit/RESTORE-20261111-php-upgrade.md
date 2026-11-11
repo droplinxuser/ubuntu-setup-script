@@ -1,8 +1,9 @@
 # Restore report - PHP upgrade audit (2026-11-11)
 
 Target: `rt@192.0.2.10` (`audit-host`, 16 threads / 27 812 MiB / NVMe,
-Ubuntu 26.04.1).  Baseline before the `--upgrade-php` work:
-`tests/deploy-audit/baseline/baseline-20261111-pristine.txt` (526 packages).
+Ubuntu 26.04.1).  Baseline before the `--upgrade-php` work: 526 packages (the
+full host manifest is kept off the public repository; it carries machine
+identifiers).
 
 ## Sequence
 
@@ -49,9 +50,9 @@ Ubuntu 26.04.1).  Baseline before the `--upgrade-php` work:
   …); `tcp_bbr` and the test-time conntrack values are gone after the reboot
   (`tcp_congestion_control = cubic`).
 
-Full comparison: `tests/deploy-audit/restore-delta-20261111-upgrade.md`;
-restored manifest:
-`tests/deploy-audit/baseline/restored-20261111-1851.txt`.
+Full comparison: `tests/deploy-audit/restore-delta-20261111-upgrade.md`.  The
+full restored host manifest is not published (machine identifiers); the
+package and file counts above are the comparison.
 
 Remaining differences from the pre-test image, all expected and non-active:
 

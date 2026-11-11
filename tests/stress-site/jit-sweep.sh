@@ -3,7 +3,8 @@
 # The host-side helper applies one profile and reloads PHP-FPM; bench-one.sh
 # then measures throughput and per-service CPU for that profile.
 #
-# Usage: PATH=<password-ssh shim>:$PATH bash tests/stress-site/jit-sweep.sh [out.md]
+# Usage: PATH=<ssh shim>:$PATH bash tests/stress-site/jit-sweep.sh [out.md]
+# The remote SSH user must be root or have passwordless sudo (sudo -n).
 # Env: TARGET, REMOTE_DIR, URL, COOKIE, CONNS (100), SECS (8), VARIANTS.
 set -u
 OUT=${1:-/tmp/jit-sweep.md}
