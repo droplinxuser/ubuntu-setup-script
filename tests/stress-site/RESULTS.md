@@ -5,12 +5,13 @@
 
 Target: the same 16-thread / 27 812 MiB / NVMe bare-metal host, restored to a
 526-package pristine Ubuntu 26.04.1 baseline before the run.  Fresh install
-4 min 11 s (`--basic server=dedi --angie --php --mariadb user=demo pass=temp
+3 min 23 s (4 min 11 s on the first run before the apt cache was warm;
+`--basic server=dedi --angie --php --mariadb user=demo pass=temp
 --valkey --elastic --others all`), first `--optimize` 12 s, an `--optimize`
 after WordPress/XenForo deployment 19 s.
 
-- **Install/optimize parity.**  A 3 814-line host snapshot taken immediately
-  after the install and again after `--optimize` differed in 146 lines, all
+- **Install/optimize parity.**  A 3 812-line host snapshot taken immediately
+  after the install and again after `--optimize` differed in 144 lines, all
   volatile (`fs.dentry-state`, `fs.inode-nr`, `fs.quota.*`,
   `kernel.ns_last_pid`, `nf_conntrack_count`, memory counters, fd numbers).
   No managed file, unit state or sysctl changed between the two paths.
