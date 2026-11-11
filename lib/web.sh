@@ -268,11 +268,7 @@ tune_replace() {
   # Use a delimiter that does not collide with regex alternation (`|`) or
   # common path characters in these directives.
   sed -E "s#${pattern}#${replacement}#" "$file" > "$tmp" || return 1
-  if cmp -s "$file" "$tmp"; then
-    return 0
-  fi
-  cat -- "$tmp" > "$file"
-  tune_note "$desc"
+  commit_if_changed "$file" "$tmp" && tune_note "$desc"
   return 0
 }
 
@@ -292,8 +288,7 @@ tune_insert_after() {
     $0 ~ anchor && !done { print; print line; done=1; next }
     { print }
   ' "$file" > "$tmp"
-  if ! cmp -s "$file" "$tmp"; then
-    cat "$tmp" > "$file"
+  if commit_if_changed "$file" "$tmp"; then
     tune_note "$desc"
   fi
 }
@@ -387,10 +382,8 @@ tune_fastcgi_snippet() {
     }
     { print }
   ' "$file" > "$tmp"
-  if ! cmp -s "$file" "$tmp"; then
-    cat "$tmp" > "$file"
-    tune_note "snippets/fastcgi-php.conf: PATH_INFO capture is optional"
-  fi
+  commit_if_changed "$file" "$tmp" \
+    && tune_note "snippets/fastcgi-php.conf: PATH_INFO capture is optional"
   return 0
 }
 
@@ -412,10 +405,8 @@ tune_fastcgi_path_translated() {
     }
     { print }
   ' "$file" > "$tmp"
-  if ! cmp -s "$file" "$tmp"; then
-    cat "$tmp" > "$file"
-    tune_note "${file##*/}: PATH_TRANSLATED uses the PHP script"
-  fi
+  commit_if_changed "$file" "$tmp" \
+    && tune_note "${file##*/}: PATH_TRANSLATED uses the PHP script"
   return 0
 }
 
@@ -546,10 +537,8 @@ tune_xf_static_assets() {
     }
     { print }
   ' "$file" > "$tmp"
-  if ! cmp -s "$file" "$tmp"; then
-    cat "$tmp" > "$file"
-    tune_note "$(basename "$file"): static assets cached 30d (immutable)"
-  fi
+  commit_if_changed "$file" "$tmp" \
+    && tune_note "$(basename "$file"): static assets cached 30d (immutable)"
   return 0
 }
 
@@ -582,8 +571,7 @@ tune_limit_req_exemptions() {
       done = 1
     }
   ' "$file" > "$tmp" || return 1
-  if ! cmp -s "$file" "$tmp"; then
-    cat "$tmp" > "$file"
+  if commit_if_changed "$file" "$tmp"; then
     if (( ${#entries[@]} > 0 )); then
       tune_note "${label}: rate-limit exemptions: ${entries[*]}"
     else
@@ -724,8 +712,7 @@ write_precompress_helper() {
     declare -f precompress_static_assets
     printf 'total=0\nfor root in "${ROOTS[@]}"; do\n  n=$(precompress_static_assets "$root")\n  total=$(( total + ${n:-0} ))\ndone\nprintf "precompressed %%s files\\n" "$total"\n'
   } > "$tmp"
-  if [[ ! -f $helper ]] || ! cmp -s "$tmp" "$helper"; then
-    cat "$tmp" > "$helper"
+  if commit_if_changed "$helper" "$tmp"; then
     tune_note "precompress: helper ${helper} written for ${*}"
   fi
   chmod 755 "$helper"
@@ -791,10 +778,8 @@ angie_disable_php_keepalive() {
     in_php && /^[[:space:]]*\}/ { in_php = 0 }
     { print }
   ' "$file" > "$tmp" || return 1
-  if ! cmp -s "$file" "$tmp"; then
-    cat "$tmp" > "$file"
-    tune_note "angie.conf: removed the PHP upstream keepalive cache (idle connections pin FPM workers)"
-  fi
+  commit_if_changed "$file" "$tmp" \
+    && tune_note "angie.conf: removed the PHP upstream keepalive cache (idle connections pin FPM workers)"
   return 0
 }
 
@@ -1164,8 +1149,7 @@ tune_angie_configs() {
         print line
       }
     ' "$file" > "$tmp"
-    if ! cmp -s "$file" "$tmp"; then
-      cat "$tmp" > "$file"
+    if commit_if_changed "$file" "$tmp"; then
       tune_note "${file#"${target}"/}: custom cache capped at ${extra_zone}m zone / ${extra_max}M max"
     fi
   done
@@ -1219,11 +1203,7 @@ tune_pool_set() {
     cat -- "$file" > "$tmp" || return 1
     printf '%s = %s\n' "$key" "$value" >> "$tmp"
   fi
-  if cmp -s "$file" "$tmp"; then
-    return 0
-  fi
-  cat -- "$tmp" > "$file"
-  tune_note "$desc"
+  commit_if_changed "$file" "$tmp" && tune_note "$desc"
   return 0
 }
 
@@ -1267,10 +1247,8 @@ tune_pool_dedupe() {
         print lines[i]
       }
     }' "$file" > "$tmp"
-  if ! cmp -s "$file" "$tmp"; then
-    cat "$tmp" > "$file"
-    tune_note "$(basename "$file"): removed duplicate managed directives"
-  fi
+  commit_if_changed "$file" "$tmp" \
+    && tune_note "$(basename "$file"): removed duplicate managed directives"
   return 0
 }
 
@@ -1898,8 +1876,7 @@ brotli_min_length 50;
 brotli_types text/plain text/css text/xml application/json application/javascript application/xml image/svg+xml font/ttf font/otf;
 EOF
     fi
-    if ! cmp -s "$tmp" "${target}/http.d/brotli.conf"; then
-      cat "$tmp" > "${target}/http.d/brotli.conf"
+    if commit_if_changed "${target}/http.d/brotli.conf" "$tmp"; then
       chmod 644 "${target}/http.d/brotli.conf"
       changed=1
     fi

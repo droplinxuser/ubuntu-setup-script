@@ -27,6 +27,12 @@ UPGRADE_PHP_SEEN=0
 PURGE_TARGETS=()
 PURGE_ORDER=()
 SERVICE_ORDER=(basic angie php mariadb valkey elastic others domain)
+# Apply order per mode.  main() and run_optimize() used to repeat these lists
+# inline; one definition keeps them from drifting.  PHP goes first in
+# --optimize because it owns the FastCGI socket Angie points at; --purge has
+# its own dependency order in build_purge_order().
+INSTALL_ORDER=(angie php mariadb valkey elastic)
+OPTIMIZE_ORDER=(php angie mariadb valkey redis elastic)
 declare -A SVC_STATUS=()
 declare -A SVC_SECONDS=()
 

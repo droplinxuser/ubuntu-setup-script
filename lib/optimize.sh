@@ -1382,10 +1382,8 @@ tune_xf_cache_bypass_var() {
     }
     { print }
   ' "$file" > "$tmp"
-  if ! cmp -s "$file" "$tmp"; then
-    cat "$tmp" > "$file"
-    tune_note "XenForo: cookie bypass moved to a map"
-  fi
+  commit_if_changed "$file" "$tmp" \
+    && tune_note "XenForo: cookie bypass moved to a map"
   return 0
 }
 

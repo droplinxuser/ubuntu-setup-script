@@ -242,6 +242,20 @@ sed_in_place() {
   cat -- "$tmp" > "$file"
 }
 
+# Copy a staged file over its live path only when the bytes differ, keeping
+# the live inode (ownership, mode and hard links survive, unlike mv/install).
+# Every config writer used to repeat this compare/cat/note block; one helper
+# keeps them from drifting (some used `cat --`, some `cat`, some wrote
+# unconditionally and reloaded a service for an unchanged file).
+# Returns 0 when the live file changed, 1 when it was already identical.
+commit_if_changed() {
+  local live=$1 staged=$2
+  [[ -e $live ]] || { cat -- "$staged" > "$live"; return 0; }
+  cmp -s -- "$live" "$staged" && return 1
+  cat -- "$staged" > "$live"
+  return 0
+}
+
 # Move a path that must leave its live location into a fresh /tmp directory.
 # The data is preserved (never unlinked) and /tmp expires it automatically.
 preserve_to_tmp() {

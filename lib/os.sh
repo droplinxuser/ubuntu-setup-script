@@ -423,9 +423,7 @@ sysctl_dedupe_keys() {
       }
     }
   ' "$file" > "$tmp"
-  if ! cmp -s "$file" "$tmp"; then
-    cat "$tmp" > "$file"
-  fi
+  commit_if_changed "$file" "$tmp" || true
   return 0
 }
 

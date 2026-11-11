@@ -21,7 +21,7 @@ Elasticsearch, Node.js and helper tools, plus per-domain vhosts.
 | Path | Contents |
 |---|---|
 | `setup.sh` | Driver: argument parsing, validation and dispatch; sources `lib/*.sh` |
-| `lib/` | Implementation modules sourced in dependency order: `common` (logging, run log, temp/apt helpers), `cli`, `validate`, `util` (state, logs, cron), `os`, `web` (Angie/PHP-FPM tuning), `services` (repos, PHP, MariaDB, Valkey, Elasticsearch, domains), `purge`, `runner`, `optimize`, `security`, `diagnostics`, `restart`, `payloads` |
+| `lib/` | Implementation modules sourced in dependency order: `common` (logging, run log, temp/apt helpers), `cli`, `validate`, `util` (state, logs, cron), `os`, `web` (Angie/PHP-FPM tuning), `services` (repos, PHP, MariaDB, Valkey, Elasticsearch, domains), `purge`, `runner`, `optimize`, `security` (hardening), `service-optimizers` (per-service tune/verify, shared by `--optimize`/`--upgrade-php`), `diagnostics`, `restart`, `payloads` |
 | `configs/system/`, `configs/mariadb/`, `configs/php/` | DNS/sysctl/limits, MariaDB and PHP-FPM templates |
 | `tests/test-tuning.sh`, `tests/test-dry-run-matrix.sh` | Unit tests for the tuning helpers; CLI/dry-run matrix (both run in CI) |
 | `tests/stress-site/` | Synthetic full-stack test site, local and remote load harness, results |
