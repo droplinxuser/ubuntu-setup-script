@@ -3,6 +3,22 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.20.4 (2026-11-11)
+
+Fix the managed cron redirection for the WordPress and XenForo job runners.
+
+- **Before:** `write_cron()` generated
+  `… done || true >/dev/null 2>&1`.  Shell precedence applies the redirect to
+  `true`, not to the `find | while` pipeline, so `find`/`dirname` errors still
+  went to cron mail (the per-run PHP command had its own redirect).
+- **After:** the redirect precedes the fallback:
+  `… done >/dev/null 2>&1 || true`, so the whole pipeline is quiet while a
+  failed lookup still leaves the job successful.
+- Existing hosts get the corrected line on the next `--basic` or
+  `--optimize` (the managed block is regenerated); `--purge basic` removes it.
+- New tuning checks cover the generated XF line and the WordPress/XF source
+  form; **623/623 tuning checks and 173/173 CLI/dry-run checks pass**.
+
 ## 1.20.3 (2026-11-11)
 
 Fix the hardening step looking hung on hosts with a large `0666` file tree.

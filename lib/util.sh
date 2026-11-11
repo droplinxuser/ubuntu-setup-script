@@ -508,7 +508,7 @@ write_cron() {
     fi
   done < <(app_find_wordpress_configs)
   if (( wp_cron )); then
-    lines+=("*/5 * * * * ${CRON_WP_CRON} >/dev/null 2>&1")
+    lines+=("*/5 * * * * ${CRON_WP_CRON} >/dev/null 2>&1 || true")
   fi
   # XenForo job runner: one entry for the host while XF_JOB_CRON=1 (default),
   # PHP is installed and at least one XenForo root exists.  The entry itself
@@ -523,7 +523,7 @@ write_cron() {
     done < <(app_find_xenforo_configs)
   fi
   if (( xf_cron )); then
-    lines+=("* * * * * ${CRON_XF_JOBS} >/dev/null 2>&1")
+    lines+=("* * * * * ${CRON_XF_JOBS} >/dev/null 2>&1 || true")
   fi
   # Precompressed-asset refresh: only while the feature is on and the helper
   # exists (configure_asset_precompression writes it); dropped otherwise.

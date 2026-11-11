@@ -345,6 +345,8 @@ EOF
 ) >/dev/null 2>&1
 check "XenForo root gets the managed xf:run-jobs entry every minute" \
   cron_contains "$(cat "$CRON_OUT")" "* * * * * ${CRON_XF_JOBS}"
+check "managed XF cron redirects the whole loop, not just true" \
+  cron_contains "$(cat "$CRON_OUT")" "${CRON_XF_JOBS} >/dev/null 2>&1 || true"
 check "stale xf:run-jobs entry is replaced, not duplicated" \
   test "$(grep -c 'xf:run-jobs' "$CRON_OUT")" = 1
 (
@@ -374,6 +376,12 @@ check "CRON_XF_JOBS contains no percent sign (crontab newline)" \
   bash -c '[[ $0 != *%* ]]' "$CRON_XF_JOBS"
 check "CRON_XF_JOBS skips database dumps, backups and .old copies" \
   bash -c '[[ $0 == *mysql_database* && $0 == *backup* && $0 == *.old* ]]' "$CRON_XF_JOBS"
+check "managed WordPress cron redirects the whole loop" \
+  grep -q 'CRON_WP_CRON} >/dev/null 2>&1 || true' "$ALL_SRC"
+check "managed XF cron redirects the whole loop (source)" \
+  grep -q 'CRON_XF_JOBS} >/dev/null 2>&1 || true' "$ALL_SRC"
+check "CRON_XF_JOBS no longer ends with its own || true" \
+  bash -c '[[ $0 != *"done || true" ]]' "$CRON_XF_JOBS"
 
 cat > "$CRON_IN" <<'EOF'
 # BEGIN setup.sh managed cron
