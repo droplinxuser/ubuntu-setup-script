@@ -30,8 +30,9 @@ Elasticsearch, Node.js and helper tools, plus per-domain vhosts.
 
 ## Requirements
 
-- Ubuntu 26.04 LTS or newer for installs; `--optimize`, `--diagnostics` and
-  `--restart-all` also accept 22.04 and 24.04. Bash 4.4+. Root.
+- Ubuntu 26.04 LTS or newer for installs; `--optimize`, `--upgrade-php`,
+  `--diagnostics` and `--restart-all` also accept 22.04 and 24.04. Bash 4.4+.
+  Root.
 - Network access to the Ubuntu, Angie, Sury, Elastic and NodeSource
   repositories and to GitHub (or `CONFIG_SOURCE_DIR`).
 - RAM/disk for the selected services (Elasticsearch needs ~1.5 GB of disk plus
@@ -61,11 +62,16 @@ sudo bash setup.sh --domain forum.example.com app=xf db=xenforodb user=demo pass
 # Tune an existing host (OS profile + every installed service), or preview it
 sudo bash setup.sh --optimize
 bash setup.sh --optimize --dry-run
+
+# Replace the installed PHP with a newer version, keeping extensions/config
+sudo bash setup.sh --upgrade-php=8.6
+bash setup.sh --upgrade-php=8.6 --dry-run
 ```
 
 `--dry-run` (alias `--check`) validates any command and prints the plan as a
-normal user without touching the system. Other modes: `--diagnostics`,
-`--restart-all [--dry-run]`, `--purge [...]`, `--help`, `--version`.
+normal user without touching the system. Other modes: `--upgrade-php=X.Y`,
+`--diagnostics`, `--restart-all [--dry-run]`, `--purge [...]`, `--help`,
+`--version`.
 
 ## `--basic`
 
@@ -129,7 +135,9 @@ the data directories it creates return 403 through Angie).
 - Sury repository (embedded keyring). `ver=` defaults to the latest stable
   release. **Only one PHP-FPM version can be active** (both Angie and the pool
   use `/run/php/php-fpm.sock`): a `--php` run purges every `php*` package
-  first and copies the old `/etc/php` to `/tmp`; switch versions with
+  first and copies the old `/etc/php` to `/tmp`. To change the version on an
+  existing host use `--upgrade-php=8.6`, which also carries the extension set
+  and custom configuration; switching manually means
   `--purge --php ver=8.4` then `--php ver=8.5`.
 - Installs the XenForo profile (`fpm cli opcache mysql gd curl xml zip gmp
   mbstring redis`); add `intl`/`imagick`/`bcmath` yourself if an add-on needs
@@ -347,6 +355,48 @@ one documented difference is timing: `--domain app=xf|wordpress` creates an
 empty document root, so the application-aware PHP worker cap and the
 per-root OPcache JIT sections can only apply once the application files
 exist, on the first `--optimize` after the upload (or after a `sql=` import).
+
+## `--upgrade-php=X.Y`
+
+Replaces the installed PHP with another version in place instead of purging
+and reinstalling the host. It is standalone (`--dry-run` allowed) and cannot
+be combined with install flags, `--optimize`, `--purge`, `--diagnostics`,
+`--restart-all` or `--domain`.
+
+1. **Snapshot:** every installed PHP package with its exact version, each
+   extension and whether `apt-mark` calls it manual, operator-owned `.ini`
+   drop-ins in `conf.d`, extra FPM pools, the PECL list and a copy of
+   `/etc/php` under `/var/lib/setup.sh/php-upgrade-<timestamp>/`.
+2. **Target check:** adds/refreshes the Sury repository and requires
+   `phpX.Y-fpm` to be published. A pre-release (for example PHP 8.6.0~rc5)
+   is accepted when named explicitly, with a warning.
+3. **Purge:** every `php*` package plus `libapache2-mod-php*`, then the
+   dependencies that only PHP kept installed. The dependency set is the
+   before/after `apt-get -s autoremove` delta, so pre-existing unrelated
+   autoremove candidates are never touched.
+4. **Install:** `phpX.Y-fpm`/`cli` and the default set, then every old
+   extension mapped to `phpX.Y-<ext>`. An extension the new release does not
+   publish yet is reported and skipped; core PHP still installs. A missing
+   extension makes the run exit non-zero (`ATTENTION`) without undoing the
+   upgrade, so automation notices.
+5. **Migrate:** operator `.ini` files and extra pools are copied with the
+   version path rewritten, validated with `php-fpm -t` (rejected files are
+   moved out of the live tree), and FPM is reloaded so the workers actually
+   load them. The PHP `date.timezone` from the old tree is preserved.
+6. **Tune:** the same shared tuner as install/`--optimize` writes the pool
+   (`pm=static`, hardware worker count, backlog), `zz-setup-optimize.ini`
+   (memory/realpath/OPcache/tracing JIT), systemd limits and log paths;
+   Angie is reloaded when active.
+7. **Verify/report:** CLI version, FPM unit, the primary and every extra pool
+   socket, extension packages and the JIT are checked; a Markdown report is
+   written to `/var/log/setup-php-upgrade-<timestamp>.md` with the rollback
+   commands. On a host with no PHP installed the same command performs a
+   fresh install.
+
+The managed files produced by an upgrade are byte-identical to a
+`--basic ... --php ver=X.Y` install (verified on the audit host: pool,
+`zz-setup-optimize.ini`, `custom_dan.ini` and the systemd drop-in), and a
+following `--optimize` changes nothing.
 
 ## Manual follow-ups (never automated)
 
