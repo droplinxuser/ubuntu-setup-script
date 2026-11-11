@@ -1339,10 +1339,18 @@ sync_php_ini_template() {
   [[ -f $template ]] || { tune_miss "PHP ${ver}: custom_dan.ini template not found"; return 0; }
 
   # Precedence: an explicit install timezone (--basic time=), then the live
-  # ini value, then the host's /etc/timezone.
+  # ini value, then the host's timezone.  timedatectl is the authority on
+  # current Ubuntu: /etc/timezone can stay stale after `timedatectl
+  # set-timezone` (observed on 26.04: /etc/timezone said America/Los_Angeles
+  # while the live zone was Asia/Manila), and reading it made --optimize
+  # rewrite the timezone an install had just written.
   local tz=${PHP_INI_TZ:-}
   if [[ -z $tz && -f $target ]]; then
     tz=$(ini_get "$target" date.timezone)
+  fi
+  if [[ -z $tz ]]; then
+    tz=$(timedatectl show -p Timezone --value 2>/dev/null || true)
+    tz=${tz//[[:space:]]/}
   fi
   if [[ -z $tz && -r /etc/timezone ]]; then
     tz=$(head -n1 /etc/timezone | tr -d '[:space:]')

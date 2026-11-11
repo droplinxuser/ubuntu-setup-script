@@ -94,10 +94,13 @@ log_selection() {
   (( ${#ENABLED[@]} > 0 )) && services="${!ENABLED[*]}"
   (( ${#DOMAINS[@]} > 0 )) && domains="${DOMAINS[*]}"
   printf '\n--- selection ---\n'
-  printf 'Modes        : dry_run=%s optimize=%s purge=%s diagnostics=%s restart_all=%s\n' \
-    "${DRY_RUN:-0}" "${OPTIMIZE:-0}" "${PURGE:-0}" "${DIAGNOSTICS:-0}" "${RESTART_ALL:-0}"
+  printf 'Modes        : dry_run=%s optimize=%s purge=%s diagnostics=%s restart_all=%s upgrade_php=%s\n' \
+    "${DRY_RUN:-0}" "${OPTIMIZE:-0}" "${PURGE:-0}" "${DIAGNOSTICS:-0}" "${RESTART_ALL:-0}" "${UPGRADE_PHP:-off}"
   printf 'Services     : %s\n' "$services"
   printf 'Domains      : %s\n' "$domains"
+  if [[ -n ${UPGRADE_PHP:-} ]]; then
+    printf 'PHP upgrade  : target=%s\n' "$UPGRADE_PHP"
+  fi
   if [[ ${ENABLED[mariadb]:-0} -eq 1 ]]; then
     printf 'MariaDB      : user=%s size=%s bind=%s\n' \
       "${OPT[mariadb.user]:-}" "${OPT[mariadb.size]:-}" "${OPT[mariadb.bind]:-}"
