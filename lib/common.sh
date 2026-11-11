@@ -1,3 +1,5 @@
+# shellcheck shell=bash
+# Sourced by setup.sh (not executed directly).
 # ---------------------------------------------------------------------------
 # Logging / small helpers
 # ---------------------------------------------------------------------------
@@ -141,11 +143,21 @@ start_run_log() {
     return 0
   fi
   chmod 600 "$RUN_LOG_FILE" 2>/dev/null || true
-  give_to_invoking_user "$RUN_LOG_FILE"
+  # Deliberately keep the log root-owned for the whole run.  Handing it to the
+  # invoking user before tee starts is a real failure on a protected host: with
+  # fs.protected_regular=2 (a value this script itself applies) and a run from a
+  # sticky world-writable directory such as /tmp, the kernel refuses root's
+  # O_CREAT open of a file owned by somebody else, so tee could not open the
+  # log and every run in /tmp produced an empty file.  finish_run_log() gives
+  # the completed file to SUDO_UID after the last write instead.
 
   # tee mirrors every line to the terminal and the file.  The PID is saved so
   # finish_run_log() can wait for the final line to reach disk before exit.
-  exec > >(tee -a "$RUN_LOG_FILE") 2>&1
+  # Drop the inherited ERR trap in the tee subshell: when the reader of a pipe
+  # goes away (`setup.sh ... | head`), tee exits non-zero and the trap would
+  # print a second, false "[ERR] command failed ... tee" line for a run that
+  # already succeeded.
+  exec > >(trap - ERR; exec tee -a "$RUN_LOG_FILE") 2>&1
   RUN_LOG_TEE_PID=$!
   RUN_LOG_STARTED=1
   RUN_LOG_START_EPOCH=$(date +%s)
@@ -179,6 +191,10 @@ finish_run_log() {
   # finished, so strip the ANSI sequences from the finished file in place.
   if [[ -n $RUN_LOG_FILE && -f $RUN_LOG_FILE ]]; then
     sed_in_place -E $'s/\x1b\\[[0-9;]*m//g' "$RUN_LOG_FILE" 2>/dev/null || true
+    # Hand the finished log to the operator who ran sudo.  Done here, not in
+    # start_run_log(), so root owns the file while tee still has it open (see
+    # the protected_regular note above).
+    give_to_invoking_user "$RUN_LOG_FILE"
   fi
   RUN_LOG_STARTED=0
 }
@@ -204,7 +220,9 @@ _tmp_mktemp() {
   }
   printf '%s\n' "$path"
 }
+# shellcheck disable=SC2120  # optional caller arguments are intentional
 tmp_file() { _tmp_mktemp "$@"; }
+# shellcheck disable=SC2120
 tmp_dir()  { _tmp_mktemp -d "$@"; }
 
 # GNU sed -i creates its scratch file next to the target, which is outside
