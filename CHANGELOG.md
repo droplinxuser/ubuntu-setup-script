@@ -3,6 +3,28 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.20.3 (2026-11-11)
+
+Fix the hardening step looking hung on hosts with a large `0666` file tree.
+
+- **Symptom.**  `setup.sh --optimize` on a 12-thread / 64 GiB XenForo host
+  (1 642 020 files under `/var/www`, 598 757 of them world-writable) spent
+  ~9 minutes with no output, then finished successfully.  The run was not
+  deadlocked: `find … -print0` and the `while read` loop were progressing
+  (the pipe write counter rose, the remaining match count fell from 47 635 to
+  27 273 to 0), but the loop forked one `chmod` process per path.
+- **Fix.**  `harden_wordpress_files()` now counts the matches without
+  forking (`-print0 | tr -cd '\0' | wc -c`), fixes them with
+  `find … -exec chmod o-w {} +` (one process per ARG_MAX chunk instead of
+  one per file), logs the count before the batch, and keeps the same
+  "world-writable entries fixed: N" report line.  On the audit host the
+  598 757 chmod forks become a few hundred.
+- **Why the files were 0666.**  The attachment tree was restored/uploaded
+  with an open umask; the hardening pass is the intended repair.  Nothing
+  else in the step changed.
+- New tuning checks assert the batched form and the pre-fix count line;
+  **619/619 tuning checks and 173/173 CLI/dry-run checks pass**.
+
 ## 1.20.2 (2026-11-11)
 
 Fix a `--optimize` failure on hosts whose vhost still uses an upstream name

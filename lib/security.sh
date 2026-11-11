@@ -180,14 +180,26 @@ harden_wordpress_audit_db() {
 }
 
 harden_wordpress_files() {
-  local n=0 f
+  local n=0 f count
   [[ -d /var/www ]] || return 0
-  while IFS= read -r -d '' f; do
-    chmod o-w "$f" 2>/dev/null && n=$((n+1))
-  done < <(find /var/www -xdev -type f -perm -0002 -print0 2>/dev/null)
-  while IFS= read -r -d '' f; do
-    chmod o-w "$f" 2>/dev/null && n=$((n+1))
-  done < <(find /var/www -xdev -type d -perm -0002 -print0 2>/dev/null)
+  # Fix world-writable entries in batches, not one chmod process per file.
+  # A large forum tree had ~1.6M 0666 attachment files; the per-file loop
+  # forked 1.6M chmod processes and made --optimize look stuck for ~10
+  # minutes at the "Security hardening" step.  Count without forking, then
+  # let find pass as many paths per chmod as ARG_MAX allows.
+  count=$(find /var/www -xdev -type f -perm -0002 -print0 2>/dev/null \
+    | tr -cd '\0' | wc -c)
+  if (( count > 0 )); then
+    harden_note "  - world-writable files: ${count} under /var/www; fixing in batches"
+    find /var/www -xdev -type f -perm -0002 -exec chmod o-w {} + 2>/dev/null || true
+    n=$(( n + count ))
+  fi
+  count=$(find /var/www -xdev -type d -perm -0002 -print0 2>/dev/null \
+    | tr -cd '\0' | wc -c)
+  if (( count > 0 )); then
+    find /var/www -xdev -type d -perm -0002 -exec chmod o-w {} + 2>/dev/null || true
+    n=$(( n + count ))
+  fi
   (( n > 0 )) && harden_note "  - world-writable entries fixed: ${n}"
   local -a big risky
   mapfile -t big < <(find /var/www -type f \( -name '*.zip' -o -name '*.sql' -o -name '*.sql.gz' -o -name '*.lz4' -o -name '*.tar.gz' \) -size +100M ! -path '*/mysql_database/*' ! -path '*/wpvividbackups/*' 2>/dev/null | head -20 || true)
