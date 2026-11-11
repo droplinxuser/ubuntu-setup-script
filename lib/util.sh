@@ -1,3 +1,7 @@
+# shellcheck shell=bash
+# Sourced by setup.sh (not executed directly).  Variables defined here are
+# consumed by other modules, so SC2034 (unused) is not meaningful in a module.
+# shellcheck disable=SC2034
 # ---------------------------------------------------------------------------
 # Small utilities
 # ---------------------------------------------------------------------------

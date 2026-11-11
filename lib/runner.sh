@@ -1,3 +1,5 @@
+# shellcheck shell=bash
+# Sourced by setup.sh (not executed directly).
 # ---------------------------------------------------------------------------
 # Runner / summary
 # ---------------------------------------------------------------------------
@@ -14,6 +16,7 @@ run_service() {
   end=$(date +%s)
   SVC_SECONDS[$name]=$(( end - start ))
   if [[ $name == php && -s "${STATE_DIR}/php-selected-version" ]]; then
+    # shellcheck disable=SC2154  # associative key, not an unset variable
     OPT[php.ver]=$(<"${STATE_DIR}/php-selected-version")
   fi
   if (( rc == 0 )); then

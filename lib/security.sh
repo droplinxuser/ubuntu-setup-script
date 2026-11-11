@@ -1,3 +1,7 @@
+# shellcheck shell=bash
+# Sourced by setup.sh (not executed directly).  Variables defined here are
+# consumed by other modules, so SC2034 (unused) is not meaningful in a module.
+# shellcheck disable=SC2034
 # ---------------------------------------------------------------------------
 # Security hardening (new installs and --optimize)
 # ---------------------------------------------------------------------------
@@ -944,6 +948,7 @@ mariadb_apply_online_keys() {
 # active are touched; an OS-only or DB-only host is unaffected.
 # Stop Angie, then every active PHP-FPM unit; WHY names the reason in the log
 # (default: the MariaDB restart; --restart-all passes its own).
+# shellcheck disable=SC2120
 opt_pause_web_frontends() {
   local why=${1:-the MariaDB restart} unit
   OPT_WEB_PAUSED_ANGIE=0
@@ -969,6 +974,7 @@ opt_pause_web_frontends() {
 }
 
 # Start the paused PHP-FPM units first, then Angie.
+# shellcheck disable=SC2120
 opt_resume_web_frontends() {
   local why=${1:-the MariaDB restart} unit rc=0
   for unit in "${OPT_WEB_PAUSED_PHP[@]}"; do

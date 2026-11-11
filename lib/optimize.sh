@@ -1,3 +1,7 @@
+# shellcheck shell=bash
+# Sourced by setup.sh (not executed directly).  Variables defined here are
+# consumed by other modules, so SC2034 (unused) is not meaningful in a module.
+# shellcheck disable=SC2034
 # =============================================================================
 # --optimize: scan installed services and tune their live configuration
 # =============================================================================
@@ -290,6 +294,7 @@ mariadb_current_pool_mb() {
 # example an IPv4 address used by a XenForo instance on another host).
 # Resolve the endpoint the node is configured to use instead of assuming
 # 127.0.0.1:9200.  http.host wins over network.host, matching Elasticsearch.
+# shellcheck disable=SC2120  # default argument; callers may pass a path
 elasticsearch_http_url() {
   local yml=${1:-/etc/elasticsearch/elasticsearch.yml}
   local raw host="" port=""
@@ -969,6 +974,7 @@ plan_install_budget() {
 # The one-line memory-plan summary used by the installer, --optimize and the
 # report.  Four copies of this string used to drift whenever a field was
 # added; the label stays a parameter ("Memory plan" vs "Memory budget").
+# shellcheck disable=SC2120
 memory_plan_summary() {
   local label=${1:-Memory plan}
   printf '%s: %sMB usable of %sMB (PHP=%sMB MariaDB=%sMB Cache=%sMB Elasticsearch=%sMB)' \
