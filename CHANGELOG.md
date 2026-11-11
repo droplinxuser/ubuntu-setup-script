@@ -8,7 +8,8 @@ README.md; measurements in tests/stress-site/RESULTS.md.
 Audit on a freshly restored 16-thread / 27.8 GiB / NVMe bare-metal host
 (Ubuntu 26.04.1, PHP 8.5.12-FPM, Angie 1.12.4, MariaDB 11.8.6, Valkey 9.0.4,
 Elasticsearch 9.5.6, WordPress 7.1.4 and XenForo 2.3.13 from the local
-archives).  Fresh install 4 min 11 s, `--optimize` 12 s.  Tests: **601/601
+archives).  Fresh install 3 min 23 s (4 min 11 s on the first run, before
+the apt cache was warm), `--optimize` 12-13 s.  Tests: **601/601
 tuning checks and 161/161 CLI/dry-run checks pass**; ShellCheck is clean at
 `-S warning`.
 
@@ -34,13 +35,14 @@ tuning checks and 161/161 CLI/dry-run checks pass**; ShellCheck is clean at
   and the `OPT[php.ver]` associative key are annotated locally.  `shellcheck
   -S warning` on `setup.sh`, `lib/*.sh`, the tests and the stress harness is
   now silent; the test file's `VAR= cmd` forms use an explicit `VAR=''`.
-- **Install/optimize parity re-confirmed.**  A 3 814-line snapshot (`/etc`
+- **Install/optimize parity re-confirmed.**  A 3 812-line snapshot (`/etc`
   digests, units, sysctls, crontab, PHP runtime, MariaDB variables, Valkey
-  config, Angie checksums) around the first `--optimize` differed in 146
+  config, Angie checksums) around the first `--optimize` differed in 144
   lines, every one a volatile counter (`fs.dentry-state`, `fs.inode-*`,
   `fs.quota.*`, `kernel.ns_last_pid`, `nf_conntrack_count`, memory/fd
-  numbers).  A later `--optimize` after both applications were deployed
-  reported "configuration already optimized" for every service.
+  numbers).  Re-checked with the final 1.19.2 tree on a second clean install:
+  144 lines, same volatile set.  A later `--optimize` after both applications
+  were deployed reported "configuration already optimized" for every service.
 - **Tracing JIT at PHP's default hotness stays the best configuration**
   (authenticated XenForo thread, 100 connections, 8 s, `oha` from the LAN):
   tracing/64 MB **614 req/s at 22.73 ms PHP CPU/request**, JIT off 580 at
