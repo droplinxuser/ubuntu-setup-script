@@ -1,6 +1,51 @@
 # Full-stack stress test reports
 
 
+## 1.19.2 re-audit: restore, refactor and JIT/FPM sweeps (2026-11-11)
+
+Target: the same 16-thread / 27 812 MiB / NVMe bare-metal host, restored to a
+526-package pristine Ubuntu 26.04.1 baseline before the run.  Fresh install
+4 min 11 s (`--basic server=dedi --angie --php --mariadb user=demo pass=temp
+--valkey --elastic --others all`), first `--optimize` 12 s, an `--optimize`
+after WordPress/XenForo deployment 19 s.
+
+- **Install/optimize parity.**  A 3 814-line host snapshot taken immediately
+  after the install and again after `--optimize` differed in 146 lines, all
+  volatile (`fs.dentry-state`, `fs.inode-nr`, `fs.quota.*`,
+  `kernel.ns_last_pid`, `nf_conntrack_count`, memory counters, fd numbers).
+  No managed file, unit state or sysctl changed between the two paths.
+- **Run-log regression fixed.**  A `sudo` run started from `/tmp` (or any
+  sticky world-writable directory) produced a 0-byte run log and a false
+  `[ERR] command failed ... tee -a` line.  The log is now root-owned while
+  tee holds it and handed to `SUDO_UID` after the final write, and a closed
+  consumer pipe (`... | head`) no longer logs an error.  Verified from `/tmp`
+  with `fs.protected_regular=2`: 1 361-byte log, exit 1 for the expected
+  `--basic is required` failure, no `[ERR]`.
+- **JIT sweep (12 profiles, authenticated XenForo thread, 100c/8 s):**
+  tracing/64 MB **614 req/s** at 22.73 ms PHP CPU per request against 580 at
+  24.53 with JIT off (+5.9%) and 569 at 24.88 with function JIT (+7.9%).
+  32/128 MB, aggressive (16/64/8/32), conservative (128/255/32/128),
+  root-trace 256/1024, side-trace 128, polymorphic-calls 4 and a combined
+  profile all landed within the ±2% run noise.  Shipped defaults stay.
+- **PHP-FPM sweep (static, authenticated thread, 100c/8 s):** 8 workers 412
+  req/s, 12 -> 511, **16 -> 572**, 20 -> 574, 24 -> 548.  PHP-FPM used ~11 of
+  16 logical CPUs (1 100% of one core) with MariaDB at 135% and Angie at 14%:
+  the tier is per-request PHP CPU, not worker starvation, so the shipped
+  1.0 worker/core target holds and extra workers only raise per-request CPU.
+- **Guest caching still dominates:** cached XenForo 4 713 req/s vs 1 084
+  uncached, WordPress 3 335 vs 273 (12.2x).  Full suite after the refactor:
+  14 830 static, 17 143 PHP hello, 6 621 full-stack uncached, 15 129 cached,
+  873 XenForo member home, 591 member thread, 264 WordPress member.  The
+  member thread page is heavier than the 1.19.1 sample (60 members / 200
+  threads / 2 600 posts); the other tiers repeat within 5-8%.
+- **No server-side errors at peak:** Angie error logs empty, PHP-FPM slow log
+  empty, MariaDB `Slow_queries=0`, `Max_used_connections=25`,
+  `max children reached=0`, listen queue 0, no OOM kill.  `Aborted_connects`
+  81 over the whole session (client-side connection teardown).
+
+Raw: `FINAL-20261111-1.19.2.md`, `JIT-SWEEP-20261111.md`,
+`FPM-SWEEP-20261111.md`; host delta and baseline under `tests/deploy-audit/`.
+
 ## Clean Ubuntu 26.04 host, setup.sh 1.19.1 - PHP 8.5.12 re-validation (2026-11-11)
 
 Target: pristine Ubuntu 26.04.1 on the 16-thread / 27 812 MiB / NVMe

@@ -461,9 +461,13 @@ tests. Angie configuration and Cloudflare IP ranges are downloaded.
   locally with `wrk`; `run-stress-remote.sh TARGET_IP DOMAIN` drives it (and
   real XenForo/WordPress vhosts, guest and member tiers) from a workstation
   with the static `oha` binary while `collect-metrics.sh` samples the server.
-  Run the install or `--optimize` with `SETUP_LIMIT_REQ_EXEMPT=<generator IP>`
-  first, or every remote PHP request is answered `429`. Results and findings:
-  `tests/stress-site/RESULTS.md`.
+  `bench-one.sh` measures one tier with per-service CPU attribution,
+  `jit-sweep.sh` A/Bs OPcache JIT profiles and `fpm-sweep.sh` (with
+  `set-fpm.sh`) sweeps PHP-FPM worker counts; both restore the pool when they
+  finish.  Run the install or `--optimize` with
+  `SETUP_LIMIT_REQ_EXEMPT=<generator IP>` first, or every remote PHP request
+  is answered `429`. Results and findings: `tests/stress-site/RESULTS.md`;
+  per-sweep tables: `JIT-SWEEP-*.md`, `FPM-SWEEP-*.md`, `FINAL-*.md`.
 
 ## Production checklist
 

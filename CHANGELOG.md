@@ -3,6 +3,70 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.19.2 (2026-11-11)
+
+Audit on a freshly restored 16-thread / 27.8 GiB / NVMe bare-metal host
+(Ubuntu 26.04.1, PHP 8.5.12-FPM, Angie 1.12.4, MariaDB 11.8.6, Valkey 9.0.4,
+Elasticsearch 9.5.6, WordPress 7.1.4 and XenForo 2.3.13 from the local
+archives).  Fresh install 4 min 11 s, `--optimize` 12 s.  Tests: **601/601
+tuning checks and 161/161 CLI/dry-run checks pass**; ShellCheck is clean at
+`-S warning`.
+
+- **Run log no longer empties itself under `sudo` in a sticky directory.**
+  A run started from `/tmp` wrote a 0-byte `setup_*.log` and logged a false
+  `[ERR] command failed (exit 1) at line 148: tee -a "$RUN_LOG_FILE"` after a
+  successful install.  `start_run_log` handed the log to `SUDO_UID` before
+  `tee` opened it; with `fs.protected_regular=2` (a value this script itself
+  writes) the kernel refuses root's `O_CREAT` open of a file owned by another
+  user in a sticky world-writable directory, so `tee` failed and the mirror
+  was lost.  The file now stays root-owned for the whole run and is handed to
+  the invoking user in `finish_run_log` after the ANSI-strip rewrite.  The
+  `tee` subshell clears the inherited ERR trap, so a consumer that closes the
+  pipe (`setup.sh --help | head`) no longer emits a second, false error for a
+  run that already succeeded.
+- **Five duplicated CLI key=value loops collapsed into `kv_consume`.**
+  `--basic`, `--php`, `--mariadb`, `--valkey` and `--elastic` shared the same
+  validation/shift logic (with `--mariadb bind=` continuation as the only
+  special case); one helper now owns it and `parse_args` advances by the
+  returned count.  No behaviour change (161/161 matrix checks pass).
+- **Every module declares `# shellcheck shell=bash`** and documents the
+  cross-module globals that made SC2034 fire.  Six optional-argument helpers
+  and the `OPT[php.ver]` associative key are annotated locally.  `shellcheck
+  -S warning` on `setup.sh`, `lib/*.sh`, the tests and the stress harness is
+  now silent; the test file's `VAR= cmd` forms use an explicit `VAR=''`.
+- **Install/optimize parity re-confirmed.**  A 3 814-line snapshot (`/etc`
+  digests, units, sysctls, crontab, PHP runtime, MariaDB variables, Valkey
+  config, Angie checksums) around the first `--optimize` differed in 146
+  lines, every one a volatile counter (`fs.dentry-state`, `fs.inode-*`,
+  `fs.quota.*`, `kernel.ns_last_pid`, `nf_conntrack_count`, memory/fd
+  numbers).  A later `--optimize` after both applications were deployed
+  reported "configuration already optimized" for every service.
+- **Tracing JIT at PHP's default hotness stays the best configuration**
+  (authenticated XenForo thread, 100 connections, 8 s, `oha` from the LAN):
+  tracing/64 MB **614 req/s at 22.73 ms PHP CPU/request**, JIT off 580 at
+  24.53 (+5.9%), function JIT 569 at 24.88 (+7.9%).  Tracing with 32 MB
+  (616), 128 MB (612), aggressive 16/64/8/32 (617), conservative
+  128/255/32/128 (619), root traces 256 (607) / 1024 (610), side traces 128
+  (609), polymorphic calls 4 (615) and a combined profile (602) are all
+  within the ±2% noise; none justifies changing `php_jit_settings` or
+  `php_jit_threshold_lines`.
+- **PHP-FPM 1.0 worker per logical CPU is confirmed on the CPU-bound tier:**
+  8 workers 412 req/s, 12 -> 511, **16 -> 572**, 20 -> 574, 24 -> 548.  PHP-FPM
+  consumed ~1 100% of one core (11 of 16 CPUs), MariaDB 135% and Angie 14%:
+  the authenticated ceiling is per-request PHP execution, not pool depth, so
+  `pm.max_children` stays hardware-sized and extra workers only raise CPU per
+  request.
+- **Test harness:** `set-jit.sh` gained the multi-tracer limit profiles
+  (`roots256`, `roots1024`, `poly4`, `side128`, `combined`); new
+  `jit-sweep.sh`, `fpm-sweep.sh` and `set-fpm.sh` make both sweeps
+  reproducible, and `set-fpm.sh` restores the pool on exit or interruption.
+  `bench-one.sh` no longer needs passwordless sudo for its server-side CPU
+  sampler (it only reads cgroup and `/proc`).
+- **Guest caching remains the largest lever:** XenForo guest 4 713 req/s vs
+  1 084 uncached, WordPress 3 335 vs 273 (12.2x).  No Angie error, PHP-FPM
+  slow request, MariaDB slow query, OOM kill and no `max children reached`
+  during the final suite.
+
 ## 1.19.1 (2026-11-11)
 
 Re-validation on the same 16-thread / 27 GiB / NVMe bare-metal host, this
