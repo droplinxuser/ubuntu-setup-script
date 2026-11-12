@@ -72,7 +72,7 @@ server-configs-nginx 1.6.25.
   SQL runs, and every create/grant statement now fails the step instead of
   being skipped inside an `if`.  A truncated gzip/xz/zstd dump fails the
   import without sending `COMMIT`.
-- **Tests.**  769 tuning checks and 192 dry-run combinations pass on the
+- **Tests.**  769 tuning checks and 193 dry-run combinations pass on the
   host.  The new suite covers the cache guard, MariaDB clamp detection,
   dirty thresholds, udev readahead, the network unit, swap failure paths,
   reserved accounts/schemas and the `--php`/`--upgrade-php` matrix.
