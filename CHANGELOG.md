@@ -3,6 +3,46 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.20.8 (2026-11-13)
+
+Guest caches no longer replay another visitor's cookies (with
+server-configs-nginx 1.6.23).
+
+- **What was wrong.**  The XenForo and Chevereto guest caches stored the
+  first visitor's `Set-Cookie` and sent it to every guest served from the
+  cache: one shared `xf_csrf` on XenForo, one shared `PHPSESSID` (and
+  `auth_token`) on Chevereto.  WordPress was not affected.
+- **Config repository.**  `h5bp/php_xf.conf` and the new
+  `h5bp/php_chev_cache.conf` serve cacheable guest requests from a named
+  location that hides `Set-Cookie`; members, POSTs and no-cache URIs stay in
+  an uncached PHP location with their cookies intact.
+- **`setup.sh`.**
+  - `--optimize`, `--domain` and the installer move a Chevereto vhost's
+    server-level `include h5bp/php_chev.conf;` to
+    `include h5bp/php_chev_cache.conf;` (the nested `/dashboard` include is
+    left alone), and point a `php_xf.conf` include nested inside a location
+    at `h5bp/php.conf`, because a named location is server-level only.  Only
+    that one line of a deployed vhost changes; without the new files in the
+    tree nothing is rewritten.
+  - A Chevereto site that allows guest uploads (`guest_uploads = 1`, read
+    with one SELECT from its settings table) keeps, or is returned to, the
+    uncached include: a cached page cannot carry the visitor's upload token,
+    and the first guest upload from it was rejected in testing.
+    `SETUP_CHEV_GUEST_CACHE=1` forces the cache on, `=0` off.
+  - The XenForo cache repair keeps `fastcgi_hide_header Set-Cookie;` in the
+    named location.  A hand-written single-location `php_xf.conf` can not
+    hide the header without breaking logins, so there `Set-Cookie` is removed
+    from `fastcgi_ignore_headers` instead: a response that sets a cookie is
+    simply not stored.
+  - The cache error-policy tuner skips an include that has no cache, and
+    covers `php_chev_cache.conf`.
+- **XenForo config audit.**  A regression check for the `SV\RedisCache`
+  array form (`$config['cache']['config'] = [ 'host' => ..., 'port' => 0 ]`).
+- **Tests.**  25 new tuning checks (**668/668**, CLI/dry-run 173/173) and
+  `tests/stress-site/guest-cache-cookie-test.sh`, 61 functional checks run
+  from a workstation against the three applications; see
+  `tests/stress-site/GUEST-CACHE-20261113.md`.
+
 ## 1.20.7 (2026-11-12)
 
 Zero-warning fresh install, install/`--optimize` log-permission parity and a
