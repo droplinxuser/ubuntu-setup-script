@@ -1419,9 +1419,12 @@ elasticsearch_write_managed_yaml() {
 ES_MANAGED_HOST=""
 
 # Same writer as the PHP/MariaDB drop-ins; returns 0 when the file changed.
+# UMask=0027 makes the JVM create its logs 0640 like every other service in
+# /var/www/logs; without it a fresh install left them 0644 until the next
+# --optimize tightened them, and every rotation reopened them 0644.
 elasticsearch_write_systemd_limits() {
   write_service_limits_dropin /etc/systemd/system/elasticsearch.service.d/limits.conf \
-    $'[Service]\nLimitMEMLOCK=infinity\nLimitNOFILE=1048576\nLimitNPROC=4096'
+    $'[Service]\nLimitMEMLOCK=infinity\nLimitNOFILE=1048576\nLimitNPROC=4096\nUMask=0027'
 }
 
 # Base (non-performance) YAML: cluster name, bind, paths, single-node discovery

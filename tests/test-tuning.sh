@@ -871,6 +871,39 @@ check "fastcgi_keep_conn is forced off in every PHP include" \
   test "$(grep -h '^fastcgi_keep_conn on;' "$TMP/angie"/h5bp/php*.conf | wc -l)" -eq 0
 check "fastcgi_keep_conn off is present where it was on" \
   grep -q '^fastcgi_keep_conn off;' "$TMP/angie/h5bp/php.conf"
+# The current server-configs-nginx tree already ships `off`: a second pass
+# has nothing to rewrite and must not report six "tune not applied" warnings
+# on every fresh install.
+tune_reset_changes
+angie_disable_php_keep_conn "$TMP/angie"
+check "fastcgi_keep_conn already off is not a missed tune" \
+  test "${#TUNE_MISSES[@]}" -eq 0
+check "fastcgi_keep_conn already off is not reported as a change" \
+  test "${#TUNE_CHANGES[@]}" -eq 0
+check "the Elasticsearch drop-in creates logs 0640 (UMask=0027)" \
+  grep -q 'UMask=0027' <(declare -f elasticsearch_write_systemd_limits)
+check "the CPU governor uses a native unit, not the SysV cpufrequtils package" \
+  test "$(declare -f configure_cpu_governor | grep -c 'apt_install cpufrequtils')" -eq 0
+check "the CPU governor unit escapes the shell variable for systemd" \
+  grep -qF '"$$f"' <(declare -f configure_cpu_governor)
+# ufw reloads its own sysctl file on every start; it must agree with the
+# managed profile or install, --optimize and a reboot end with different
+# log_martians values.
+printf 'net/ipv4/icmp_echo_ignore_all=0\nnet/ipv4/conf/all/log_martians=0\nnet/ipv4/conf/default/log_martians=0\n' > "$TMP/ufw-sysctl.conf"
+printf 'net.ipv4.conf.all.log_martians = 1\nnet.ipv4.conf.default.log_martians = 1\n' > "$TMP/profile-sysctl.conf"
+ufw_align_sysctl "$TMP/ufw-sysctl.conf" "$TMP/profile-sysctl.conf" >/dev/null
+check "ufw sysctl file follows the managed log_martians value" \
+  test "$(grep -c 'log_martians=1$' "$TMP/ufw-sysctl.conf")" -eq 2
+check "ufw sysctl alignment leaves unrelated keys alone" \
+  grep -qx 'net/ipv4/icmp_echo_ignore_all=0' "$TMP/ufw-sysctl.conf"
+cp "$TMP/ufw-sysctl.conf" "$TMP/ufw-sysctl.before"
+ufw_align_sysctl "$TMP/ufw-sysctl.conf" "$TMP/profile-sysctl.conf" >/dev/null
+check "ufw sysctl alignment is idempotent" \
+  cmp -s "$TMP/ufw-sysctl.conf" "$TMP/ufw-sysctl.before"
+printf '# no martian keys\n' > "$TMP/profile-empty.conf"
+ufw_align_sysctl "$TMP/ufw-sysctl.conf" "$TMP/profile-empty.conf" >/dev/null
+check "ufw sysctl alignment does nothing without a managed value" \
+  cmp -s "$TMP/ufw-sysctl.conf" "$TMP/ufw-sysctl.before"
 check "http-level keepalive_timeout is preserved" \
   grep -q '^[[:space:]]*keepalive_timeout 30s;' "$TMP/angie/angie.conf"
 
@@ -1596,6 +1629,33 @@ check "XenForo cache host parser" \
   test "$(xf_cache_host_from_config "$TMP/xf-config.php")" = /run/valkey/valkey.sock
 check "XenForo cache port parser" \
   test "$(xf_cache_port_from_config "$TMP/xf-config.php")" = 0
+# The installer block followed by an operator override: PHP keeps the last
+# assignment, and the cache block uses the manual's array-literal form.
+cat > "$TMP/xf-config-override.php" <<'EOF'
+<?php
+$config['db']['host'] = 'localhost';
+$config['db']['port'] = 3306;
+$config["db"]["host"] = "p:localhost";
+$config['cache']['enabled'] = true;
+$config['cache']['provider'] = 'Redis';
+$config['cache']['config'] = [
+    'host' => '/run/valkey/valkey.sock',
+    'port' => 0,
+    'database' => 1,
+];
+EOF
+check "XenForo DB host parser keeps the last assignment" \
+  test "$(xf_db_host_from_config "$TMP/xf-config-override.php")" = p:localhost
+check "XenForo cache host parser reads the array-literal form" \
+  test "$(xf_cache_host_from_config "$TMP/xf-config-override.php")" = /run/valkey/valkey.sock
+check "XenForo cache port parser reads the array-literal form" \
+  test "$(xf_cache_port_from_config "$TMP/xf-config-override.php")" = 0
+printf '<?php\n$config["cache"]["config"] = array("host" => "127.0.0.1", "port" => "6379");\n' > "$TMP/xf-config-tcp.php"
+check "XenForo cache parser reads a one-line array() with a TCP endpoint" \
+  test "$(xf_cache_host_from_config "$TMP/xf-config-tcp.php"):$(xf_cache_port_from_config "$TMP/xf-config-tcp.php")" = 127.0.0.1:6379
+printf '<?php\n$config["db"]["host"] = "localhost";\n' > "$TMP/xf-config-nocache.php"
+check "XenForo cache parser reports no backend when none is configured" \
+  test -z "$(xf_cache_host_from_config "$TMP/xf-config-nocache.php")"
 check "Unix socket detector accepts a Valkey socket" \
   app_is_socket_path /run/valkey/valkey.sock
 tcp_not_socket() { ! app_is_socket_path 127.0.0.1; }

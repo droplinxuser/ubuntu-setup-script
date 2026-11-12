@@ -3,6 +3,52 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.20.7 (2026-11-12)
+
+Zero-warning fresh install, install/`--optimize` log-permission parity and a
+correct XenForo config audit.  Found by a full install, `--optimize`,
+`--domain`, `--upgrade-php` (8.5 -> 8.4 -> 8.5), `--diagnostics` and
+`--restart-all` pass on a 16-thread / 28 GB / NVMe bare-metal Ubuntu 26.04.1
+host with WordPress 7.1.4, XenForo 2.3.13 and Chevereto 4.5.9 deployed.
+
+- **CPU governor without `cpufrequtils`.**  The package ships SysV init
+  scripts only, so systemd logged `SysV service ... lacks a native systemd
+  unit file ... expect removal soon` for `cpufrequtils` and `loadcpufreq` on
+  every `daemon-reload` (104 journal warnings during one install), and apt
+  printed two `update-rc.d` warnings.  The governor is now set by a native
+  oneshot unit, `setup-cpu-governor.service`, plus one sysfs write per CPU at
+  run time.  `--optimize` no longer installs any package for the governor.
+  Hosts provisioned by 1.20.6 or older get the unit, and the SysV services
+  this script installed are disabled (the package stays; the log says how to
+  remove it).  `--purge` disables the new unit and restores the recorded
+  governor as before.  `configs/system/cpufrequtils` is removed.
+- **Elasticsearch logs are created 0640.**  The systemd drop-in gains
+  `UMask=0027`.  Before, a fresh install left eight log files 0644 until the
+  next `--optimize` tightened them (the only file-mode difference between
+  install and `--optimize`), and each rotation reopened them 0644.
+- **No false "tune not applied" warnings.**  `server-configs-nginx` already
+  ships `fastcgi_keep_conn off`, so every fresh install logged six
+  `tune not applied: no match for h5bp/php*.conf` warnings.  The rewrite now
+  runs only where an old tree still has `on`.
+- **XenForo config audit reads the live values.**  The parser took the first
+  `$config['db']['host']` assignment (PHP keeps the last) and did not
+  understand the array-literal `$config['cache']['config'] = [...]` form the
+  XenForo manual uses, so a site with `p:localhost` and a Valkey socket was
+  still reported as non-persistent with no cache backend, and the run ended
+  with an "Application connection notices" warning.  Both forms are parsed
+  now; WordPress `define()` keeps first-wins semantics.
+- **`log_martians` survives the firewall and a reboot.**  ufw loads its own
+  `/etc/ufw/sysctl.conf` on `ufw enable` and on every boot, after
+  systemd-sysctl; its stock `log_martians=0` replaced the managed profile's
+  `1`.  A re-install therefore ended with `0` while `--optimize` set `1`
+  (three live sysctl values differed), and a reboot undid `--optimize`.  The
+  shared sysctl step now aligns ufw's file with the managed value (recorded
+  for `--purge`), so install, `--optimize` and a reboot agree.
+- Fourteen new tuning checks cover the above; **643/643 tuning checks and
+  173/173 CLI/dry-run checks pass** on the audit host.
+- Measurements (unchanged tuning defaults, re-confirmed on three apps): see
+  `tests/stress-site/TUNING-20261112-1.20.7.md`.
+
 ## 1.20.6 (2026-11-11)
 
 Fix XenForo `MySQL query error [1020]: Record has changed since last read`

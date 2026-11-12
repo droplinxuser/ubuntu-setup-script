@@ -299,8 +299,8 @@ the application files afterwards and tunes separately.
 Tunes the OS and every installed service in place (Ubuntu 22.04, 24.04,
 26.04). It never installs, starts or purges a managed service and never
 touches swap, the resolver (DNS) or the firewall (UFW), which stay as
-`--basic` or the operator left them; the only packages it may add are
-`cpufrequtils` and `angie-module-brotli`. The drivers run with `set -e`
+`--basic` or the operator left them; the only package it may add is
+`angie-module-brotli`. The drivers run with `set -e`
 live, so a failed write inside a tuner aborts the run with its line number
 instead of being skipped (before 1.13.0 the `if ! run_optimize` call had
 suspended errexit for the whole run). Steps:

@@ -835,6 +835,9 @@ angie_disable_php_keep_conn() {
   local target=${1:-/etc/angie} file
   for file in "$target"/h5bp/php*.conf; do
     [[ -f $file ]] || continue
+    # The current repository already ships `off`; only an old tree has
+    # something to rewrite, and "nothing to do" is not a missed tune.
+    grep -qE '^[[:space:]]*fastcgi_keep_conn[[:space:]]+on;' "$file" || continue
     tune_replace "$file" '^([[:space:]]*fastcgi_keep_conn[[:space:]]+)on;' '\1off;' \
       "${file#"$target"/}: fastcgi_keep_conn=off"
   done
@@ -1868,7 +1871,7 @@ ensure_angie_compression() {
   local enabled="${target}/modules-enabled"
   local changed=0
   if ! pkg_ok angie-module-brotli; then
-    # --optimize is normally install-free (except cpufrequtils).  This one
+    # --optimize is otherwise install-free.  This one
     # small module is part of the same compression profile as a fresh --angie
     # install, so installing it here keeps both paths identical.  If the
     # repository or package is unavailable, fall back to gzip.

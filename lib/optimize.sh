@@ -1529,16 +1529,45 @@ wp_redis_persistent_from_config() {
   grep -qE "^[[:space:]]*define[[:space:]]*\([[:space:]]*['\"]WP_REDIS_PERSISTENT['\"][[:space:]]*,[[:space:]]*(true|TRUE|True|1)[[:space:]]*\)" "$1" 2>/dev/null
 }
 
+# XenForo's config.php is plain PHP assignments, so the LAST assignment of a
+# key is the live one (a site-specific override appended below the installer's
+# block is common).  WordPress define() is the opposite: the first one wins.
 xf_db_host_from_config() {
-  sed -nE "s/^[[:space:]]*\\\$config\[['\"]db['\"]\]\[['\"]host['\"]\][[:space:]]*=[[:space:]]*['\"]([^'\"]*)['\"].*/\1/p" "$1" 2>/dev/null | head -n1 || true
+  sed -nE "s/^[[:space:]]*\\\$config\[['\"]db['\"]\]\[['\"]host['\"]\][[:space:]]*=[[:space:]]*['\"]([^'\"]*)['\"].*/\1/p" "$1" 2>/dev/null | tail -n1 || true
+}
+
+# The array-literal form from the XenForo manual, joined onto one line:
+#   $config['cache']['config'] = [
+#       'host' => '/run/valkey/valkey.sock',
+#       'port' => 0,
+#   ];
+# Prints the last such statement, or nothing.
+xf_cache_config_literal() {
+  awk '
+    /^[[:space:]]*\$config\[[\047"]cache[\047"]\]\[[\047"]config[\047"]\][[:space:]]*=[[:space:]]*(\[|array[[:space:]]*\()/ { buf = ""; on = 1 }
+    on { buf = buf " " $0; if ($0 ~ /;[[:space:]]*((\/\/|#).*)?$/) { on = 0; last = buf } }
+    END { if (last != "") print last }
+  ' "$1" 2>/dev/null || true
 }
 
 xf_cache_host_from_config() {
-  sed -nE "s/^[[:space:]]*\\\$config\[['\"]cache['\"]\]\[['\"]config['\"]\]\[['\"]host['\"]\][[:space:]]*=[[:space:]]*['\"]([^'\"]*)['\"].*/\1/p" "$1" 2>/dev/null | head -n1 || true
+  local value
+  value=$(sed -nE "s/^[[:space:]]*\\\$config\[['\"]cache['\"]\]\[['\"]config['\"]\]\[['\"]host['\"]\][[:space:]]*=[[:space:]]*['\"]([^'\"]*)['\"].*/\1/p" "$1" 2>/dev/null | tail -n1 || true)
+  if [[ -z $value ]]; then
+    value=$(xf_cache_config_literal "$1" \
+      | sed -nE "s/.*['\"]host['\"][[:space:]]*=>[[:space:]]*['\"]([^'\"]*)['\"].*/\1/p" || true)
+  fi
+  printf '%s' "$value"
 }
 
 xf_cache_port_from_config() {
-  sed -nE "s/^[[:space:]]*\\\$config\[['\"]cache['\"]\]\[['\"]config['\"]\]\[['\"]port['\"]\][[:space:]]*=[[:space:]]*([0-9]+).*/\1/p" "$1" 2>/dev/null | head -n1 || true
+  local value
+  value=$(sed -nE "s/^[[:space:]]*\\\$config\[['\"]cache['\"]\]\[['\"]config['\"]\]\[['\"]port['\"]\][[:space:]]*=[[:space:]]*['\"]?([0-9]+).*/\1/p" "$1" 2>/dev/null | tail -n1 || true)
+  if [[ -z $value ]]; then
+    value=$(xf_cache_config_literal "$1" \
+      | sed -nE "s/.*['\"]port['\"][[:space:]]*=>[[:space:]]*['\"]?([0-9]+).*/\1/p" || true)
+  fi
+  printf '%s' "$value"
 }
 
 # Same depth as the managed wp-cron entry and the XenForo finder, so a site
