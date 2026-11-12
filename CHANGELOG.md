@@ -3,6 +3,80 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.2 (2026-11-13)
+
+Security and correctness fixes found by the 1.21.1 audit, validated on the
+Ubuntu 26.04.1 test host (16 logical CPUs, 27 812 MiB RAM, NVMe, bare metal)
+with WordPress 7.1.4, XenForo 2.3.13 and Chevereto 4.5.9.  Pair with
+server-configs-nginx 1.6.25.
+
+- **Host-header cache poisoning (config repository; reproduced, then
+  closed).**  The guest cache keys on `$host`, but PHP received the raw
+  `Host` header as `HTTP_HOST`.  `Host: wp.test.local:8443` on the 443
+  listener shared the normal cache entry but WordPress answered with a
+  cacheable 301 to itself; XenForo rendered the wrong base URL.  A new
+  `http.d/fastcgi_host.conf` passes `$php_http_host` to FastCGI: the header
+  only when it is exactly `$host` or `$host:<public port>`, otherwise
+  `$host`.  `custom.d/php_public_port.map` declares a NAT/load-balancer port
+  that differs from the local listener.  Verified: PHP sees
+  `wp.test.local` for `Host: wp.test.local:8443` and for uppercase or
+  `:443` spellings; normal requests still hit the cache and stay 200.
+- **XenForo REST/OAuth responses in the guest cache (config repository).**
+  `//api/`, `/Api/` and `/?api/` with `XF-Api-Key` were stored.  The URI
+  maps are case-insensitive and slash-tolerant, and a new `$xf_api_request`
+  map (also covering `XF-Api-User` and `Authorization`) is folded into
+  `$nocacheuri` and repeated on the FastCGI/proxy bypass lines.  Verified:
+  all spellings answer `BYPASS` with and without a key, before and after
+  `--optimize`.
+- **Backup and hidden PHP files served as downloads (config repository).**
+  `/wp-config.php.save`, `/wp-config.txt`, `/backup.zip`,
+  `/src/config.php.save` and `/app/env.php.save` returned 200.  New
+  `h5bp/location/security_backup_files.conf` blocks PHP below dot paths and
+  every `.php*` suffix, and `security_root_archives.conf` blocks archives
+  and dumps in an application document root only.  Verified: all five
+  probes are 403, while `/wp-content/uploads/2026/release.zip` and a normal
+  image stay 200.
+- **MariaDB online resize clamp.**  MariaDB 11.8 accepts a
+  `SET GLOBAL innodb_buffer_pool_size` above the running server's startup
+  maximum, returns success and silently clamps the pool, so the report said
+  the resize was applied.  `optimize_mariadb` now reads the live pool back
+  and, when it is more than 2% below the target, reports the clamp and
+  falls back to a restart.  Verified: a 1024 MB pool was raised to the
+  1738 MB target only after the restart path ran.
+- **Valkey maxmemory guard.**  A full cache under an evicting policy kept
+  being re-sized to `used + 20%` on every run (512 -> 613 -> 735 MB).  The
+  guard now keeps the current size when the cache is full, takes the plan
+  when the plan is larger, raises only for real data growth, caps at the
+  host budget and never touches an explicit `--valkey ram=`.  The install
+  plan measures an already-installed cache like `--optimize`.
+- **PHP version changes are explicit.**  `--php` is now a first
+  installation: on a host that already runs PHP-FPM it keeps the packages,
+  extensions and extra pools and only re-applies the managed
+  configuration; another `ver=` is refused with a pointer to
+  `--upgrade-php`.  `--upgrade-php` preflights the purge with the real apt
+  options and refuses a transaction that would remove an application such
+  as phpMyAdmin (`SETUP_PHP_ALLOW_COLLATERAL=1` overrides), then restores
+  the units that were serving if the real purge still fails.  Packages that
+  only exist unversioned (`php-pear`, the PHP libraries) are carried over
+  under their own name instead of a non-existent `phpX.Y-` build.
+- **Installer hardening and small-host tuning.**  A refused swap file
+  (LXC/OpenVZ, btrfs/ZFS) no longer aborts the rest of `--basic` or leaves
+  a multi-GB file behind; an active swap file that cannot be deactivated is
+  left alone instead of being truncated.  Dirty-page thresholds are capped
+  at RAM/20 and RAM/5 on small hosts; the network oneshot prefixes every
+  command with `-` so one unavailable module cannot fail the unit; udev
+  readahead follows the detected storage class; the precompress helper runs
+  as `www-data`, never root.
+- **Domain and import guards.**  `--domain` refuses MariaDB system schemas
+  and reserved accounts (`root`, `mysql`, `mariadb.sys`, ...) before any
+  SQL runs, and every create/grant statement now fails the step instead of
+  being skipped inside an `if`.  A truncated gzip/xz/zstd dump fails the
+  import without sending `COMMIT`.
+- **Tests.**  769 tuning checks and 192 dry-run combinations pass on the
+  host.  The new suite covers the cache guard, MariaDB clamp detection,
+  dirty thresholds, udev readahead, the network unit, swap failure paths,
+  reserved accounts/schemas and the `--php`/`--upgrade-php` matrix.
+
 ## 1.21.1 (2026-11-13)
 
 Two shell errors that a successful run printed, found on a fresh install and
