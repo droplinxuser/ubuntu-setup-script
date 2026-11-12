@@ -512,6 +512,16 @@ mariadb_apply_online_keys() {
   return 0
 }
 
+# True when the live pool (LIVE_MB, read back after an online SET) is more
+# than 2% below TARGET_MB, i.e. the server clamped the resize.  The pool
+# rounds to its chunk granularity, so a small difference is not a failure,
+# and an unreadable value is not treated as one either (the SET succeeded).
+mariadb_pool_resize_short() {
+  local live_mb=${1:-} target_mb=${2:-}
+  [[ $live_mb =~ ^[0-9]+$ && $target_mb =~ ^[0-9]+$ ]] || return 1
+  (( live_mb * 100 < target_mb * 98 ))
+}
+
 # Stop the request-serving tiers before a MariaDB restart, then bring them
 # back in dependency order (PHP first, Angie last).  Only services that were
 # active are touched; an OS-only or DB-only host is unaffected.
@@ -667,16 +677,23 @@ optimize_mariadb() {
     if mariadb -e "SET GLOBAL innodb_buffer_pool_size = $(( size_mb * 1024 * 1024 ))" 2>/dev/null \
        && mariadb_apply_online_keys "$cnf_old" "$cnf"; then
       online_mb=$(mariadb -N -B -e 'SELECT @@innodb_buffer_pool_size' 2>/dev/null \
-        | awk '{printf "%d", $1 / 1024 / 1024}')
-      opt_report "- Applied buffer pool online: ${online_mb:-$size_mb}MB (no restart)"
-      if (( unit_changed == 0 )); then
-        return 0
+        | awk '{printf "%d", $1 / 1024 / 1024}' || true)
+      # MariaDB 11.8 accepts a SET above @@innodb_buffer_pool_size_max with
+      # exit status 0 and silently clamps it (warning 1292), so the statement
+      # succeeding proves nothing: compare the pool that is actually live.
+      if mariadb_pool_resize_short "$online_mb" "$size_mb"; then
+        opt_report "- Online buffer-pool resize was clamped at ${online_mb}MB (target ${size_mb}MB; the running server cannot grow past its startup maximum); falling back to a restart"
+      else
+        opt_report "- Applied buffer pool online: ${online_mb:-$size_mb}MB (no restart)"
+        if (( unit_changed == 0 )); then
+          return 0
+        fi
+        if [[ $limit_before =~ ^[0-9]+$ ]] && (( limit_before >= 65536 )); then
+          opt_report "- Restart: deferred (LimitNOFILE=${limit_before} is already sufficient; the drop-in applies on the next restart)"
+          return 0
+        fi
+        # The fd drop-in still needs a restart; fall through to apply it.
       fi
-      if [[ $limit_before =~ ^[0-9]+$ ]] && (( limit_before >= 65536 )); then
-        opt_report "- Restart: deferred (LimitNOFILE=${limit_before} is already sufficient; the drop-in applies on the next restart)"
-        return 0
-      fi
-      # The fd drop-in still needs a restart; fall through to apply it.
     else
       opt_report "- Online buffer-pool resize failed; falling back to a restart"
     fi
@@ -744,8 +761,10 @@ optimize_mariadb() {
 # Live cache working set in MB, read from the running Valkey/Redis.  Used by
 # the planner so maxmemory can never be sized below data that is already
 # stored (or its 20% headroom).  Returns non-zero when no server is reachable.
-valkey_live_used_mb() {
-  local cli="" sock="" used
+# Run a command against the local Valkey/Redis, preferring the Unix socket.
+# Returns non-zero when no client is installed or the server is unreachable.
+valkey_live_cli() {
+  local cli="" sock=""
   if [[ -S /run/valkey/valkey.sock ]] && command -v valkey-cli >/dev/null 2>&1; then
     cli=valkey-cli; sock=/run/valkey/valkey.sock
   elif [[ -S /run/redis/redis.sock ]] && command -v redis-cli >/dev/null 2>&1; then
@@ -758,14 +777,123 @@ valkey_live_used_mb() {
     return 1
   fi
   if [[ -n $sock ]]; then
-    used=$("$cli" -s "$sock" info memory 2>/dev/null || true)
+    "$cli" -s "$sock" "$@" 2>/dev/null
   else
-    used=$("$cli" info memory 2>/dev/null || true)
+    "$cli" "$@" 2>/dev/null
   fi
+}
+
+valkey_live_used_mb() {
+  local used
+  used=$(valkey_live_cli info memory || true)
   used=$(printf '%s\n' "$used" \
     | awk -F: '/^used_memory:/{gsub(/\r/, "", $2); print int($2 / 1048576); exit}')
   [[ $used =~ ^[0-9]+$ ]] || return 1
   printf '%s' "$used"
+}
+
+# The managed cache configuration: Valkey's, else a pre-existing Redis's.
+valkey_active_conf() {
+  if [[ -f /etc/valkey/valkey.conf ]]; then
+    printf '/etc/valkey/valkey.conf'
+  elif [[ -f /etc/redis/redis.conf ]]; then
+    printf '/etc/redis/redis.conf'
+  fi
+}
+
+# A maxmemory value as written in valkey.conf ("512mb", "1gb", plain bytes)
+# in MB; 0 for anything else, including "0" (no limit).
+valkey_size_to_mb() {
+  local val=${1,,} num
+  num=${val%%[a-z]*}
+  [[ $num =~ ^[0-9]+$ ]] || { printf '0'; return 0; }
+  case ${val#"$num"} in
+    g|gb) printf '%s' $(( num * 1024 )) ;;
+    m|mb) printf '%s' "$num" ;;
+    k|kb) printf '%s' $(( num / 1024 )) ;;
+    "")   printf '%s' $(( num / 1048576 )) ;;
+    *)    printf '0' ;;
+  esac
+}
+
+# maxmemory currently in force, in MB: the running server's value, else the
+# configuration file's.  0 means "no limit" or "unknown"; both tell the
+# planner there is no current size worth keeping.
+valkey_current_maxmemory_mb() {
+  local out bytes conf
+  # CONFIG GET prints the name and the value on separate lines.
+  out=$(valkey_live_cli config get maxmemory || true)
+  bytes=${out##*$'\n'}
+  if [[ $bytes =~ ^[0-9]+$ ]]; then
+    printf '%s' $(( bytes / 1048576 ))
+    return 0
+  fi
+  conf=$(valkey_active_conf)
+  if [[ -n $conf ]]; then
+    valkey_size_to_mb "$(valkey_conf_get "$conf" maxmemory)"
+  else
+    printf '0'
+  fi
+}
+
+# 1 when the configured maxmemory-policy evicts keys at the limit, 0 for
+# noeviction.  A config without the directive gets allkeys-lru from the
+# shared writer, so it counts as evicting.
+valkey_policy_evicts() {
+  local conf policy=""
+  conf=$(valkey_active_conf)
+  if [[ -n $conf ]]; then
+    policy=$(valkey_conf_get "$conf" maxmemory-policy)
+  fi
+  if [[ $policy == noeviction ]]; then
+    printf '0'
+  else
+    printf '1'
+  fi
+}
+
+# The one decision about an automatically sized maxmemory, shared by the
+# memory plan (which feeds the install path, --optimize and the dry run), so
+# all of them print and write the same number.  Arguments, all in MB:
+#   PLANNED   what the plan would write (RAM floor, or a scaled-down share)
+#   USED      live used_memory
+#   CURRENT   maxmemory in force now (0 = none/unknown)
+#   HARD_CAP  the most the host can give the cache
+#   EVICTS    1 when the policy evicts at the limit
+# Prints "MB REASON":
+#   plan    PLANNED already leaves live data its 20% headroom
+#   full    the cache simply fills its current maxmemory under an evicting
+#           policy; that is how an LRU cache always looks, not a sign of
+#           demand.  Sizing to used+20% here grew maxmemory by 20% on every
+#           run (512 -> 613 -> 735 ...), so CURRENT is kept: nothing is
+#           evicted, nothing is rewritten, and --valkey ram= is the way to
+#           grow it.  A full cache below PLANNED takes PLANNED.
+#   raised  live data needs more than PLANNED; used+20%, so a restart never
+#           mass-evicts the cache (and any sessions/jobs stored in it)
+#   capped  as raised, but limited to HARD_CAP
+valkey_guard_maxmemory_mb() {
+  local planned=$1 used=${2:-0} current=${3:-0} hard_cap=${4:-0} evicts=${5:-1}
+  local needed=$(( used * 120 / 100 ))
+  if (( needed <= planned )); then
+    printf '%s plan' "$planned"
+    return 0
+  fi
+  # used_memory may sit a little above maxmemory (eviction is approximate),
+  # hence the 2% window.
+  if (( evicts == 1 && current > 0 && current <= hard_cap \
+        && used * 100 <= current * 102 && needed > current )); then
+    if (( current >= planned )); then
+      printf '%s full' "$current"
+    else
+      printf '%s plan' "$planned"
+    fi
+    return 0
+  fi
+  if (( needed > hard_cap )); then
+    printf '%s capped' "$hard_cap"
+  else
+    printf '%s raised' "$needed"
+  fi
 }
 
 # Fallback working set when the cache is stopped: the RDB snapshot size.
@@ -837,31 +965,37 @@ optimize_valkey() {
   tune_reset_changes
   max_mb=$(service_mem_mb "$kind")
   backlog=$(effective_backlog)
-  # A restart applies maxmemory immediately.  Lowering it below the data that
-  # is already stored mass-evicts the cache (and any sessions/jobs using it),
-  # so give the live working set 10% of headroom instead of following the
-  # hardware plan blindly.
-  local used_mb=0 needed_mb
-  if (( active )); then
-    used_mb=$(valkey_live_used_mb 2>/dev/null || echo 0)
-    [[ $used_mb =~ ^[0-9]+$ ]] || used_mb=0
-    needed_mb=$(( used_mb * 120 / 100 ))
-    if (( needed_mb > max_mb )); then
-      local hard_cap
-      hard_cap=$(( ${OPT_MEM_TOTAL_MB:-$(mem_total_mb)} * 80 / 100 ))
-      (( hard_cap < 256 )) && hard_cap=256
-      if (( needed_mb > hard_cap )); then
-        opt_report "- maxmemory capped at ${hard_cap}mb (live data needs ${needed_mb}mb; add RAM or reduce the working set)"
-        max_mb=$hard_cap
-      else
-        opt_report "- maxmemory raised to ${needed_mb}mb (in use=${used_mb}mb; refusing to evict live data)"
-        max_mb=$needed_mb
+  # max_mb is final: the memory plan already applied the live-data guard
+  # (valkey_guard_maxmemory_mb), so the dry run, the plan summary and this
+  # writer cannot disagree.  Only explain the decision here.
+  local used_mb=${OPT_VALKEY_LIVE_MB:-0}
+  case ${OPT_VALKEY_GUARD:-} in
+    full)
+      opt_report "- Cache is full (in use=${used_mb}mb of maxmemory=${max_mb}mb, evicting policy): keeping maxmemory=${max_mb}mb; \`--valkey ram=<size>\` grows it"
+      ;;
+    capped)
+      opt_report "- maxmemory capped at ${max_mb}mb (live data needs $(( used_mb * 120 / 100 ))mb; add RAM or reduce the working set)"
+      ;;
+    raised)
+      opt_report "- maxmemory raised to ${max_mb}mb (in use=${used_mb}mb; refusing to evict live data)"
+      ;;
+    explicit)
+      # An operator size is written verbatim; say so when it is below the
+      # data already stored, because the eviction policy will trim the cache.
+      if (( active )); then
+        used_mb=$(valkey_live_used_mb 2>/dev/null || echo 0)
+        [[ $used_mb =~ ^[0-9]+$ ]] || used_mb=0
+        if (( used_mb > max_mb )); then
+          opt_report "- maxmemory=${max_mb}mb is the explicit \`--valkey ram=\` size (in use=${used_mb}mb; the eviction policy trims the cache to fit)"
+        fi
       fi
-    fi
-  fi
-  if [[ ${OPT_VALKEY_LIVE_MB:-0} -gt 0 ]]; then
-    opt_report "- Live working set=${OPT_VALKEY_LIVE_MB}mb; maxmemory=${max_mb}mb (live + up to 20%, 128 MB minimum)"
-  fi
+      ;;
+    *)
+      if (( used_mb > 0 )); then
+        opt_report "- Live working set=${used_mb}mb; maxmemory=${max_mb}mb (live + up to 20%, 128 MB minimum)"
+      fi
+      ;;
+  esac
   policy=$(valkey_conf_get "$conf" maxmemory-policy)
   [[ -n $policy ]] || policy=allkeys-lru
   # Preserve an explicit install-time io-threads value (the installer defaults
@@ -1526,12 +1660,19 @@ optimize_plan() {
       "$size_mb" "$max_conn" "$backlog" "$db_fit"
   fi
   if [[ " ${OPT_DETECTED[*]} " == *" valkey "* || " ${OPT_DETECTED[*]} " == *" redis "* ]]; then
+    # The plan's value is final (live-data guard included), so this is the
+    # number the run writes.
     max_mb=$OPT_VALKEY_BUDGET_MB
+    local cache_label=Valkey cache_note=""
     if [[ " ${OPT_DETECTED[*]} " == *" redis "* ]]; then
-      printf '  Redis: maxmemory=%sMB backlog=%s\n' "$max_mb" "$backlog"
-    else
-      printf '  Valkey: maxmemory=%sMB backlog=%s\n' "$max_mb" "$backlog"
+      cache_label=Redis
     fi
+    case ${OPT_VALKEY_GUARD:-} in
+      full)   cache_note=" (cache is full; kept, --valkey ram=<size> grows it)" ;;
+      raised) cache_note=" (raised to keep live data)" ;;
+      capped) cache_note=" (capped; live data needs more)" ;;
+    esac
+    printf '  %s: maxmemory=%sMB backlog=%s%s\n' "$cache_label" "$max_mb" "$backlog" "$cache_note"
   fi
   if [[ " ${OPT_DETECTED[*]} " == *" elastic "* ]]; then
     heap_mb=$(service_mem_mb elastic)

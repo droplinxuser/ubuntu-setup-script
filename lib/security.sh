@@ -34,13 +34,29 @@ function wp_cfg_get($c, $k) {
   if (preg_match("/define\s*\(\s*(['\"])".preg_quote($k, '/')."\\1\s*,\s*(['\"])(.*?)\\2\s*\)/s", $c, $m)) return $m[3];
   return '';
 }
+// This runs as root inside a directory the PHP user owns.  A predictable
+// "<path>.new" could be planted there as a symlink and make root write and
+// chown an arbitrary file, so the staging file gets a random name, is created
+// with O_EXCL (fopen 'x' never follows or reuses an existing entry), takes its
+// mode from the umask instead of a path-based chmod, and is re-owned with the
+// no-follow lchown/lchgrp.
 function wp_cfg_write($path, $c) {
-  $tmp = $path.'.new';
-  if (file_put_contents($tmp, $c) === false) return false;
-  chmod($tmp, fileperms($path) & 0777);
-  @chown($tmp, fileowner($path));
-  @chgrp($tmp, filegroup($path));
-  return rename($tmp, $path);
+  if (is_link($path) || !is_file($path)) return false;
+  $mode = fileperms($path) & 0666;
+  $tmp = dirname($path).'/.wp-config.'.bin2hex(random_bytes(12)).'.tmp';
+  $old = umask(0777 & ~$mode);
+  $fh = @fopen($tmp, 'x');
+  umask($old);
+  if ($fh === false) return false;
+  $ok = fwrite($fh, $c) === strlen($c);
+  $ok = fclose($fh) && $ok;
+  if ($ok) {
+    @lchown($tmp, fileowner($path));
+    @lchgrp($tmp, filegroup($path));
+    $ok = rename($tmp, $path);
+  }
+  if (!$ok) @unlink($tmp);
+  return $ok;
 }
 switch ($mode) {
   case 'get':
@@ -147,8 +163,11 @@ SQL
   php "$helper" set "$conf" DB_USER "$newuser" string >/dev/null 2>&1 || true
   WP_CFG_VALUE="$newpass" php "$helper" set "$conf" DB_PASSWORD '' string >/dev/null 2>&1 || true
   if [[ $(php "$helper" testdb "$conf" 2>/dev/null) != OK ]]; then
-    [[ -n $bak && -f $bak ]] && cp -p "$bak" "$conf"
-    chown root:www-data "$conf" 2>/dev/null || true; chmod 640 "$conf" 2>/dev/null || true
+    if [[ -n $bak && -f $bak && ! -L $conf ]]; then
+      cp -p "$bak" "$conf"
+      chown -h root:www-data "$conf" 2>/dev/null || true
+      chmod 640 "$conf" 2>/dev/null || true
+    fi
     [[ -n $bak ]] && rm -f "$bak"
     harden_warn "  - ${conf}: scoped-user test failed; original credentials restored"
     return 0
@@ -275,11 +294,18 @@ harden_wordpress() {
   for conf in "${configs[@]}"; do
     case "$conf" in */backup/*|*/mysql_database/*|*/logs/*) continue ;; esac
     harden_note "- WordPress \`${conf}\`"
+    # The directory belongs to the PHP user, so the entry can be swapped for a
+    # symlink after find listed it as a regular file.  Root must not chown,
+    # chmod or rewrite through one.
+    if [[ -L $conf ]]; then
+      harden_note "  - is a symbolic link; skipped (root does not write through links in a web root)"
+      continue
+    fi
     if [[ -z $(php "$helper" get "$conf" DB_NAME 2>/dev/null) ]]; then
       harden_note "  - not a WordPress config (no DB_NAME); skipped"
       continue
     fi
-    chown root:www-data "$conf" 2>/dev/null || true
+    chown -h root:www-data "$conf" 2>/dev/null || true
     chmod 640 "$conf" 2>/dev/null || true
     for kv in "DISALLOW_FILE_EDIT:true" "DISABLE_WP_CRON:true" "WP_DEBUG_DISPLAY:false" "FORCE_SSL_ADMIN:true"; do
       php "$helper" set "$conf" "${kv%%:*}" "${kv#*:}" literal >/dev/null 2>&1 \

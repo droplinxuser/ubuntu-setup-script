@@ -204,20 +204,69 @@ install_angie() {
 # ignores this array.
 PHP_EXTRA_PACKAGES=()
 
-# A clean PHP install is required: a stopped but installed second PHP version
-# still owns a pool that can later bind /run/php/php-fpm.sock and break the
-# selected version.  Remove every PHP package first, keeping the old /etc/php
-# tree recoverable under /tmp.
+# Changing the PHP version needs a clean slate: a stopped but installed second
+# PHP version still owns a pool that can later bind /run/php/php-fpm.sock and
+# break the selected version.  Remove every PHP package first, keeping the old
+# /etc/php tree recoverable under /tmp.  Only the --upgrade-php driver calls
+# this (through php_upgrade_purge and install_php); a plain --php never
+# purges.
+#
+# Nothing is stopped until apt has shown that the purge can run and what it
+# would take along, and the units that were serving are brought back when the
+# real purge still fails: a held package or a dpkg lock must not leave the
+# sites down.
+#
+# php_purge_preflight is that check on its own: --upgrade-php runs it before
+# its first removal (the Apache PHP module), purge_php_installations repeats
+# it right before the units are stopped.
+php_purge_preflight() {
+  local -a pkgs=() collateral=()
+  local sim="" sim_rc=0
+  mapfile -t pkgs < <(dpkg-query -W -f='${binary:Package}\n' 2>/dev/null \
+    | grep -E '^(php([0-9]+\.[0-9]+)?(-|$)|libapache2-mod-php)' | sort -u || true)
+  (( ${#pkgs[@]} > 0 )) || return 0
+
+  # Dry transaction with the options of the real one, so a held package or a
+  # broken dependency fails here, while PHP is still serving.
+  sim=$(apt-get -s purge "${APT_OPTS[@]}" "${pkgs[@]}" 2>&1) || sim_rc=$?
+  if (( sim_rc != 0 )); then
+    printf '%s\n' "$sim" | tail -n 5 >&2 || true
+    die "apt cannot purge the existing PHP packages (see the lines above); nothing was stopped or removed"
+  fi
+  # Reverse dependencies apt would remove with PHP: phpMyAdmin, Composer,
+  # Roundcube and the like are applications, not part of the PHP set, and the
+  # upgrade would not bring them back.
+  mapfile -t collateral < <(printf '%s\n' "$sim" \
+    | awk '/^(Remv|Purg) /{ sub(/:.*/, "", $2); print $2 }' \
+    | grep -vE '^(php([0-9]+\.[0-9]+)?(-|$)|libapache2-mod-php)' | sort -u || true)
+  if (( ${#collateral[@]} > 0 )); then
+    if [[ ${SETUP_PHP_ALLOW_COLLATERAL:-0} == 1 ]]; then
+      info "Purging PHP also removes (SETUP_PHP_ALLOW_COLLATERAL=1): ${collateral[*]}"
+    else
+      die "Purging PHP would also remove: ${collateral[*]}. Nothing was stopped or removed. Remove or re-home these packages first, or allow it with SETUP_PHP_ALLOW_COLLATERAL=1"
+    fi
+  fi
+  return 0
+}
+
 purge_php_installations() {
-  local -a pkgs=() units=()
+  local -a pkgs=() units=() was_enabled=() was_active=()
+  local unit
   mapfile -t pkgs < <(dpkg-query -W -f='${binary:Package}\n' 2>/dev/null \
     | grep -E '^php([0-9]+\.[0-9]+)?(-|$)' | sort -u || true)
   (( ${#pkgs[@]} > 0 )) || return 0
 
+  php_purge_preflight
+
   mapfile -t units < <(systemctl list-units --all --no-legend --no-pager 'php*-fpm.service' 2>/dev/null \
     | awk '{print $1}' | grep -E '^php.*-fpm\.service$' || true)
-  local unit
   for unit in "${units[@]}"; do
+    if systemctl is-enabled --quiet "$unit" 2>/dev/null; then
+      was_enabled+=("$unit")
+    fi
+    if systemctl is-active --quiet "$unit" 2>/dev/null; then
+      was_active+=("$unit")
+    fi
     systemctl disable --now "$unit" 2>/dev/null || true
   done
 
@@ -230,18 +279,44 @@ purge_php_installations() {
   fi
 
   info "Purging existing PHP packages for a clean installation: ${pkgs[*]}"
-  apt-get purge "${APT_OPTS[@]}" "${pkgs[@]}" \
-    || die "Could not purge the existing PHP packages"
+  if ! apt-get purge "${APT_OPTS[@]}" "${pkgs[@]}"; then
+    # Put back exactly what was serving.  A unit whose package the failed
+    # transaction did remove cannot start; that is reported, not hidden.
+    for unit in "${was_enabled[@]}"; do
+      systemctl enable "$unit" 2>/dev/null \
+        || warn "Could not re-enable ${unit} after the failed purge"
+    done
+    for unit in "${was_active[@]}"; do
+      systemctl start "$unit" 2>/dev/null \
+        || warn "Could not restart ${unit} after the failed purge"
+    done
+    die "Could not purge the existing PHP packages; the PHP-FPM units that were running were started again"
+  fi
 
   # apt purge normally removes the tree; if conffiles survived, keep them in
   # /tmp instead of leaving a stale pool next to the new installation.
   if [[ -e /etc/php ]]; then
     local moved
     moved=$(preserve_to_tmp /etc/php 2>/dev/null || true)
-    [[ -n $moved ]] && info "Moved leftover /etc/php to ${moved}"
+    if [[ -n $moved ]]; then
+      info "Moved leftover /etc/php to ${moved}"
+    fi
   fi
   systemctl daemon-reload || true
   systemctl reset-failed 'php*-fpm' 2>/dev/null || true
+}
+
+# Candidate version of phpVER-fpm in the configured repositories, empty when
+# the package is not published.  awk reads to the end on purpose: exiting at
+# the first match kills apt-cache with SIGPIPE and fails the pipeline.
+php_fpm_candidate() {
+  local cand
+  cand=$(apt-cache policy "php${1}-fpm" 2>/dev/null \
+    | awk '/^[[:space:]]*Candidate:/{ if (!found) { print $2; found=1 } }' || true)
+  if [[ -n $cand && $cand != "(none)" ]]; then
+    printf '%s' "$cand"
+  fi
+  return 0
 }
 
 install_php() {
@@ -251,12 +326,33 @@ install_php() {
   # exactly like --optimize does.
   local tz=""
   [[ ${ENABLED[basic]:-0} -eq 1 ]] && tz=${OPT[basic.time]:-Asia/Manila}
-  local php_backup="" change
+  local php_backup="" change installed="" reapply=0 upgrade_driver=0
   step "PHP ${ver:-auto}"
 
-  # The requested PHP version must be the only one installed, not merely the
-  # only one active.  Purge everything before selecting/installing.
-  purge_php_installations
+  # run_php_upgrade sets PHP_UPGRADE_MODE (upgrade|install) before it calls
+  # in here; nothing else does.  That driver is the only caller allowed to
+  # replace an installed PHP.
+  if [[ -n ${PHP_UPGRADE_MODE:-} ]]; then
+    upgrade_driver=1
+  fi
+
+  # --php is a first installation.  On a host that already runs PHP-FPM it
+  # keeps the packages (extra extensions such as imagick, custom pools) and
+  # only re-applies the managed configuration of the installed version; a
+  # different version is --upgrade-php's job.  validate_all makes the same
+  # decision before the run starts; this repeats it against the live package
+  # database for a direct caller.
+  if (( ! upgrade_driver )); then
+    installed=$(php_installed_version)
+    if [[ -n $installed ]]; then
+      [[ -n $ver ]] || ver=$installed
+      [[ $ver == "$installed" ]] \
+        || die "PHP ${installed} is already installed and --php only performs a first installation; change the version with --upgrade-php=${ver}"
+      reapply=1
+      OPT[php.ver]=$ver
+      info "PHP ${ver} is already installed: keeping its packages, extensions and extra pools, re-applying the managed configuration"
+    fi
+  fi
 
   if [[ -z $ver ]]; then
     ver=$(latest_sury_php)
@@ -264,21 +360,39 @@ install_php() {
     OPT[php.ver]=$ver
     info "Auto-selected latest stable PHP: ${ver}"
   fi
+
+  # Everything that can refuse the request is checked before a unit is
+  # stopped or a package is removed.  PHP-FPM is not an Angie concern: its
+  # pool/ini templates live in this repository under configs/php and do not
+  # depend on the Angie config repository being fetched.
+  local pool_template="${SCRIPT_DIR}/configs/php/www_${ver//./}.conf"
+  local ini_template="${SCRIPT_DIR}/configs/php/custom_dan.ini"
+  [[ -f $pool_template ]] \
+    || die "PHP ${ver} FPM pool template not found: configs/php/www_${ver//./}.conf"
+  [[ -f $ini_template ]] \
+    || die "PHP php.ini template not found: configs/php/custom_dan.ini"
+  [[ -n $(php_fpm_candidate "$ver") ]] \
+    || die "php${ver}-fpm is not published by the configured repositories; nothing was changed"
+
+  # The requested PHP version must be the only one installed, not merely the
+  # only one active.  The upgrade driver has normally purged already (this is
+  # then a no-op); on its fresh-install path this removes stray PHP packages
+  # of a version without FPM.
+  if (( upgrade_driver )); then
+    purge_php_installations
+  fi
+
   # run_service executes installers in a subshell; persist the selected version
   # so the parent shell reports and reuses the same value.
   ensure_state
   printf '%s\n' "$ver" > "${STATE_DIR}/php-selected-version"
-  # A pinned old branch (--php ver=8.0) gets the same end-of-life warning the
-  # optimizer prints; the upgrade itself stays an operator decision.
 
-  if ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE '(^|:)9000$'; then
-    die "Port 9000 is already in use by another process. Only one PHP version can run at a time; free the port first."
-  fi
   # A stale socket left by a purged/crashed pool is replaced by PHP-FPM
   # itself when it binds.  setup.sh does not unlink it in case the path is
   # still in use by another process.
-  [[ -S /run/php/php-fpm.sock ]] \
-    && info "Leaving existing FastCGI socket for PHP-FPM to validate"
+  if (( ! reapply )) && [[ -S /run/php/php-fpm.sock ]]; then
+    info "Leaving existing FastCGI socket for PHP-FPM to validate"
+  fi
 
   # XenForo-focused extension set: runtime, database, media, HTTP, XML,
   # archives, math, multibyte, Redis, OPcache and the CLI for XenForo cmd.php.
@@ -321,16 +435,26 @@ install_php() {
   # Install the core set first: a host without php-fpm is worse than a host
   # with php-fpm and one missing optional extension.
   apt_install "${php_pkgs[@]}"
-  local -a optional_ok=() optional_skip=()
+  local -a optional_ok=() optional_skip=() unversioned_ok=()
   for pkg in "${php_optional[@]}"; do
-    if apt-cache show "$pkg" >/dev/null 2>&1; then
-      optional_ok+=("$pkg")
-    else
+    if ! apt-cache show "$pkg" >/dev/null 2>&1; then
       optional_skip+=("$pkg")
+    elif [[ $pkg == php-* ]]; then
+      unversioned_ok+=("$pkg")
+    else
+      optional_ok+=("$pkg")
     fi
   done
   if (( ${#optional_ok[@]} > 0 )); then
     apt_install "${optional_ok[@]}"
+  fi
+  # Unversioned packages --upgrade-php carries over under their own name
+  # (php-pear, PHP libraries).  Their dependencies are not tied to this PHP
+  # version, so they get their own transaction: one that cannot be satisfied
+  # must not undo an otherwise complete installation.
+  if (( ${#unversioned_ok[@]} > 0 )); then
+    apt_install "${unversioned_ok[@]}" \
+      || warn "PHP ${ver}: could not install ${unversioned_ok[*]}; install them by hand once their dependencies resolve"
   fi
   for pkg in "${optional_skip[@]:-}"; do
     [[ -n $pkg ]] || continue
@@ -355,25 +479,28 @@ install_php() {
       || warn "Could not pin /usr/bin/php to PHP ${ver}"
   fi
 
-  # PHP-FPM is not an Angie concern: its pool/ini templates live in this
-  # repository under configs/php and no longer depend on the Angie config
-  # repository being fetched.
-  local pool_template="${SCRIPT_DIR}/configs/php/www_${ver//./}.conf"
-  local ini_template="${SCRIPT_DIR}/configs/php/custom_dan.ini"
-  [[ -f $pool_template ]] \
-    || die "PHP ${ver} FPM pool template not found: configs/php/www_${ver//./}.conf"
-  [[ -f $ini_template ]] \
-    || die "PHP php.ini template not found: configs/php/custom_dan.ini"
-
-  install -m 644 "$pool_template" "/etc/php/${ver}/fpm/pool.d/www.conf"
+  # The templates were checked before anything was installed.  A re-run on an
+  # installed host keeps its www.conf, as --optimize does: the tuner below
+  # normalises the managed keys in place, and replacing the file would drop
+  # the measured worker count and any operator key the template lacks.
+  if (( ! reapply )) || [[ ! -f "/etc/php/${ver}/fpm/pool.d/www.conf" ]]; then
+    install -m 644 "$pool_template" "/etc/php/${ver}/fpm/pool.d/www.conf"
+  fi
   # Same template writer as --optimize (timezone handling included).
   PHP_INI_TZ="$tz" sync_php_ini_template "$ver" || die "Could not write custom_dan.ini"
 
   # Hardware-aware pool/ini tuning lives in tune_php_fpm_version, shared with
   # the --optimize command.  It writes the socket listener and the final
-  # performance values in conf.d/zz-setup-optimize.ini.
+  # performance values in conf.d/zz-setup-optimize.ini.  Only a first
+  # installation is "fresh" for the tuner (it then ignores the stock pool the
+  # package auto-started); a re-run sizes the live pool exactly like
+  # --optimize.
   tune_reset_changes
-  PHP_FRESH_INSTALL=1
+  if (( reapply )); then
+    PHP_FRESH_INSTALL=0
+  else
+    PHP_FRESH_INSTALL=1
+  fi
   if ! tune_php_fpm_version "$ver"; then
     PHP_FRESH_INSTALL=0
     rollback_php_tree "$php_backup" "$ver"
@@ -403,17 +530,29 @@ install_php() {
   systemctl daemon-reload
 
   # Only one PHP-FPM version can own the shared /run/php/php-fpm.sock socket.
-  # (The conflict was checked before apt_install; this just clears any
-  # previous failed state for the same version.)
+  # (--php refuses a second version and --upgrade-php purges the old one
+  # first; this just clears any previous failed state for the same version.)
   systemctl reset-failed "php${ver}-fpm" 2>/dev/null || true
-  if ! systemctl enable --now "php${ver}-fpm" \
-     || ! systemctl restart "php${ver}-fpm"; then
+  if (( reapply )); then
+    # A serving pool is reloaded (graceful: the master re-executes and
+    # workers finish their requests), not restarted; a stopped one is started.
+    if ! systemctl enable "php${ver}-fpm" \
+       || ! systemctl reload-or-restart "php${ver}-fpm"; then
+      rollback_php_tree "$php_backup" "$ver"
+      return 1
+    fi
+  elif ! systemctl enable --now "php${ver}-fpm" \
+       || ! systemctl restart "php${ver}-fpm"; then
     rollback_php_tree "$php_backup" "$ver"
     return 1
   fi
   systemctl status "php${ver}-fpm" --no-pager || true
   "$(php_fpm_binary "$ver")" -v || true
-  ok "PHP ${ver} installed"
+  if (( reapply )); then
+    ok "PHP ${ver} configuration re-applied (packages kept)"
+  else
+    ok "PHP ${ver} installed"
+  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -1692,13 +1831,23 @@ domain_provision_database() {
   user=${DOMAIN_DB_USER[$d]:-}
   pass=${DOMAIN_DB_PASS[$d]:-}
   sql=${DOMAIN_SQL[$d]:-}
+  # validate_all rejects the system schemas; a grant of ALL on `mysql`.* would
+  # hand the grant tables to a site account, so the guard is repeated in front
+  # of the statements.
+  if mariadb_reserved_db "$db"; then
+    die "${d}: db='${db}' is a MariaDB system schema"
+  fi
   edb=$(sql_escape "$db")
-  mariadb <<<"CREATE DATABASE IF NOT EXISTS \`${db}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
+  # The caller runs this function as an `if` condition, where errexit is off:
+  # every step that must not be skipped carries its own `|| die`.
+  mariadb <<<"CREATE DATABASE IF NOT EXISTS \`${db}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;" \
+    || die "Failed to create MariaDB database '${db}' for ${d}"
   mariadb -N -B -e "SHOW DATABASES LIKE '${edb}'" | grep -qx "$db" \
     || die "Failed to create MariaDB database '${db}' for ${d}"
   info "${d}: database ${db}"
   if [[ -n $user ]]; then
-    mariadb_ensure_local_user "$user" "$pass" "ALL PRIVILEGES ON \`${db//_/\\_}\`.*"
+    mariadb_ensure_local_user "$user" "$pass" "ALL PRIVILEGES ON \`${db//_/\\_}\`.*" \
+      || die "${d}: could not create or grant MariaDB user '${user}' on ${db}"
     info "${d}: user ${user} (localhost, 127.0.0.1, ::1) has ALL PRIVILEGES on ${db}; password set from pass="
   fi
   [[ -n $sql ]] || return 1
@@ -1729,12 +1878,19 @@ domain_provision_database() {
   start=$(date +%s)
   # Bulk-load mode for the whole dump: one transaction, no per-row unique or
   # FK checks, no binlog.  The dump's own DROP/CREATE statements still apply.
+  #
+  # The three writers are chained with && and the group runs under pipefail:
+  # as separate statements inside an `if` condition a failing gzip/xz/zstd
+  # was ignored, COMMIT was still sent and a truncated archive was reported
+  # as a successful import.  Now a reader failure ends the stream without
+  # COMMIT (the open transaction is rolled back when the client disconnects)
+  # and fails the pipeline.
   if ! {
-       printf 'SET autocommit=0; SET unique_checks=0; SET foreign_key_checks=0; SET SESSION sql_log_bin=0;\n'
-       "${reader[@]}" "$sql"
-       printf '\nCOMMIT;\n'
+       printf 'SET autocommit=0; SET unique_checks=0; SET foreign_key_checks=0; SET SESSION sql_log_bin=0;\n' \
+         && "${reader[@]}" "$sql" \
+         && printf '\nCOMMIT;\n'
      } | mariadb --max-allowed-packet=1G "$db"; then
-    die "${d}: import of ${sql} into ${db} failed (the database may be partially loaded)"
+    die "${d}: import of ${sql} into ${db} failed: ${reader[0]} could not read the whole file (truncated or corrupt archive) or MariaDB rejected a statement. No COMMIT was sent for an incomplete stream, but the dump's own DROP/CREATE statements are not transactional, so the database may be partially loaded"
   fi
   end=$(date +%s)
   tables=$(mariadb -N -B -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='${edb}'" 2>/dev/null || echo '?')

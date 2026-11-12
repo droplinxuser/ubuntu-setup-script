@@ -428,8 +428,46 @@ latest_sury_php() {
     if [[ -z $best ]] || [[ $(printf '%s\n%s\n' "$best" "$ver" | sort -V | tail -n1) == "$ver" ]]; then
       best=$ver
     fi
-  done < <(apt-cache pkgnames 2>/dev/null | grep -E '^php[0-9]+\.[0-9]+-fpm$' | sort -u)
+  done < <(apt-cache pkgnames 2>/dev/null | grep -E '^php[0-9]+\.[0-9]+-fpm$' | sort -u || true)
   printf '%s' "$best"
+}
+
+# Accounts and schemas the server itself depends on.  Re-keying root replaces
+# its unix_socket authentication (every later passwordless `mariadb` call of
+# this script then fails), and a grant on the mysql schema hands out the grant
+# tables.  The comparison ignores case: a name that differs only in case is
+# either the same object or a look-alike nobody should create.
+mariadb_reserved_user() {
+  case ${1,,} in
+    root|mysql|mariadb.sys|mariadb|debian-sys-maint) return 0 ;;
+  esac
+  return 1
+}
+
+mariadb_reserved_db() {
+  case ${1,,} in
+    mysql|sys|information_schema|performance_schema) return 0 ;;
+  esac
+  return 1
+}
+
+# The PHP-FPM version an existing host serves from: the pool that owns the
+# socket Angie uses when that version is a real installed package, otherwise
+# the newest installed one.  Prints nothing on a host without PHP-FPM (and on
+# a machine without dpkg, where a dry run is only a syntax check).
+php_installed_version() {
+  local primary=""
+  local -a versions=()
+  command -v dpkg-query >/dev/null 2>&1 || return 0
+  mapfile -t versions < <(php_upgrade_installed_versions || true)
+  (( ${#versions[@]} > 0 )) || return 0
+  primary=$(php_primary_version 2>/dev/null || true)
+  if [[ -n $primary && " ${versions[*]} " == *" ${primary} "* ]]; then
+    printf '%s' "$primary"
+  else
+    printf '%s' "${versions[-1]}"
+  fi
+  return 0
 }
 
 validate_all() {
@@ -438,7 +476,14 @@ validate_all() {
   # --upgrade-php is a standalone mode like --optimize: it works on an
   # installed host, needs the Sury repository and must not be mixed with
   # install/purge/diagnostics flags that would change the same packages.
-  if [[ -n ${UPGRADE_PHP:-} ]]; then
+  #
+  # Branch on the flag having been given, not on its value: an empty value
+  # (--upgrade-php="$VER" with VER unset) used to fall through into whatever
+  # mode the remaining flags selected, so `--upgrade-php= --purge` ran a full
+  # purge.
+  if (( ${UPGRADE_PHP_SEEN:-0} )) || [[ -n ${UPGRADE_PHP:-} ]]; then
+    [[ -n ${UPGRADE_PHP:-} ]] \
+      || die "--upgrade-php requires a version, e.g. --upgrade-php=8.6 (the value is empty)"
     [[ $UPGRADE_PHP =~ ^[0-9]+\.[0-9]+$ ]] \
       || die "--upgrade-php='${UPGRADE_PHP}' is invalid (use e.g. --upgrade-php=8.6)"
     local major=${UPGRADE_PHP%%.*} minor=${UPGRADE_PHP#*.}
@@ -560,6 +605,9 @@ validate_all() {
       if [[ -n $db ]]; then
         [[ $db =~ ^[A-Za-z0-9_]{1,64}$ ]] \
           || die "--domain '${d}': db='${db}' is invalid (letters, digits and underscore, at most 64 characters)"
+        if mariadb_reserved_db "$db"; then
+          die "--domain '${d}': db='${db}' is a MariaDB system schema; choose a database name of your own"
+        fi
       fi
       if [[ -n ${DOMAIN_DB_USER[$d]:-} || -n ${DOMAIN_DB_PASS[$d]:-} ]]; then
         [[ -n $db ]] || die "--domain '${d}': user=/pass= require db="
@@ -567,6 +615,9 @@ validate_all() {
           || die "--domain '${d}': user= and pass= must be given together"
         [[ ${DOMAIN_DB_USER[$d]} =~ ^[A-Za-z0-9_]{1,80}$ ]] \
           || die "--domain '${d}': user= may only contain letters, digits and underscore"
+        if mariadb_reserved_user "${DOMAIN_DB_USER[$d]}"; then
+          die "--domain '${d}': user='${DOMAIN_DB_USER[$d]}' is a MariaDB system account; choose an account name of your own"
+        fi
         [[ ${DOMAIN_DB_PASS[$d]} != *$'\n'* ]] || die "--domain '${d}': pass= must not contain a newline"
       fi
       if [[ -n ${DOMAIN_SQL[$d]:-} ]]; then
@@ -586,6 +637,27 @@ validate_all() {
       [[ ${OPT[php.ver]} =~ ^[0-9]+\.[0-9]+$ ]] \
         || die "--php ver='${OPT[php.ver]}' is invalid (use e.g. 8.5)"
     fi
+    # --php is a first installation.  On a host that already runs PHP-FPM it
+    # only re-applies the managed configuration of that version; changing the
+    # version is --upgrade-php's job (it carries the extensions and custom
+    # pools over).  Decided here, before --basic or anything else has run, and
+    # shown by --dry-run: a request for another version must not get as far
+    # as the installer.
+    local php_installed
+    php_installed=$(php_installed_version)
+    if [[ -n $php_installed ]]; then
+      if [[ -z ${OPT[php.ver]:-} ]]; then
+        OPT[php.ver]=$php_installed
+      elif [[ ${OPT[php.ver]} != "$php_installed" ]]; then
+        die "PHP ${php_installed} is already installed and --php only performs a first installation; change the version with --upgrade-php=${OPT[php.ver]}"
+      fi
+    fi
+    # The pool template is version-specific (see --upgrade-php above).  With
+    # no ver= on a host without PHP the version is only known once the Sury
+    # repository is configured; install_php repeats the check then.
+    if [[ -n ${OPT[php.ver]:-} && ! -f "${SCRIPT_DIR}/configs/php/www_${OPT[php.ver]//./}.conf" ]]; then
+      die "No FPM pool template for PHP ${OPT[php.ver]} (${SCRIPT_DIR}/configs/php/www_${OPT[php.ver]//./}.conf); use a version that has one"
+    fi
     if [[ -n ${OPT[php.children]:-} ]]; then
       [[ ${OPT[php.children]} == auto || ${OPT[php.children]} =~ ^[1-9][0-9]*$ ]] \
         || die "--php children='${OPT[php.children]}' is invalid (use auto or a positive integer)"
@@ -604,6 +676,9 @@ validate_all() {
     [[ -n ${OPT[mariadb.size]:-} ]] || OPT[mariadb.size]=auto
     [[ ${OPT[mariadb.user]} =~ ^[A-Za-z0-9_]+$ ]] \
       || die "--mariadb user= may only contain letters, digits and underscore"
+    if mariadb_reserved_user "${OPT[mariadb.user]}"; then
+      die "--mariadb user='${OPT[mariadb.user]}' is a MariaDB system account (root keeps its unix_socket login); choose an admin account name of your own"
+    fi
     [[ ${OPT[mariadb.pass]} != *$'\n'* ]] || die "--mariadb pass= must not contain a newline"
     [[ ${OPT[mariadb.size]} == auto || ${OPT[mariadb.size]} =~ ^[1-9][0-9]*([mM][bB]?|[gG][bB]?)$ ]] \
       || die "--mariadb size='${OPT[mariadb.size]}' is invalid (use auto, 4gb, 512m, ...)"

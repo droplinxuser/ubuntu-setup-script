@@ -160,14 +160,26 @@ restore_original() {
 # 'user'@'localhost' cannot be used over TCP.  The statements go in over
 # stdin: a password inside `mariadb -e "..."` is visible to every local user
 # in the process list for as long as it runs.
+# Returns non-zero as soon as one statement fails, with an explicit status
+# rather than through errexit: --domain calls this inside an `if`, where a
+# failed statement would otherwise be skipped and reported as success.
 mariadb_ensure_local_user() {
   local user=$1 pass=$2 grant_clause=$3 suffix=${4:-} eu ep host
+  # validate_all already rejects these names; this is the last guard in front
+  # of the statement that would replace root@localhost's unix_socket
+  # authentication with a password and break every later `mariadb` call.
+  if mariadb_reserved_user "$user"; then
+    warn "MariaDB account '${user}' is reserved for the server; not creating or re-keying it"
+    return 1
+  fi
   eu=$(sql_escape "$user")
   ep=$(sql_escape "$pass")
   for host in localhost 127.0.0.1 ::1; do
-    mariadb <<<"CREATE USER IF NOT EXISTS '${eu}'@'${host}' IDENTIFIED BY '${ep}'; ALTER USER '${eu}'@'${host}' IDENTIFIED BY '${ep}'; GRANT ${grant_clause} TO '${eu}'@'${host}' ${suffix};"
+    mariadb <<<"CREATE USER IF NOT EXISTS '${eu}'@'${host}' IDENTIFIED BY '${ep}'; ALTER USER '${eu}'@'${host}' IDENTIFIED BY '${ep}'; GRANT ${grant_clause} TO '${eu}'@'${host}' ${suffix};" \
+      || return 1
   done
-  mariadb <<<'FLUSH PRIVILEGES;'
+  mariadb <<<'FLUSH PRIVILEGES;' || return 1
+  return 0
 }
 
 sql_escape() {
@@ -527,8 +539,13 @@ write_cron() {
   fi
   # Precompressed-asset refresh: only while the feature is on and the helper
   # exists (configure_asset_precompression writes it); dropped otherwise.
+  # The helper runs as the web user, never as root (see PRECOMPRESS_USER).
+  # Earlier releases wrote the entry without runuser; every existing
+  # precompress line is dropped below and regenerated from this one, so a
+  # re-run upgrades it.  No "%" may appear here: crontab treats it as a
+  # newline.
   if (( PRECOMPRESS_ASSETS )) && [[ -x $CRON_PRECOMPRESS ]]; then
-    lines+=("*/5 * * * * /usr/bin/nice -n 19 ${CRON_PRECOMPRESS} >/dev/null 2>&1")
+    lines+=("*/5 * * * * /usr/bin/nice -n 19 ${PRECOMPRESS_RUNNER} ${CRON_PRECOMPRESS} >/dev/null 2>&1")
   fi
 
   cur=$(crontab -l 2>/dev/null || true)

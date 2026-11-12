@@ -1267,8 +1267,8 @@ check "opt-in hardening creates the central PHP error log" \
 # Shared memory budget
 # ---------------------------------------------------------------------------
 # Keep these tests independent of any PHP-FPM pool that happens to run on the
-# machine executing the suite; the real helper measures the live pool and the
-# 96 MB default is the fresh-install path asserted below.
+# machine executing the suite; the real helper measures the live pool, and a
+# fixed 96 MB keeps the arithmetic asserted below stable.
 php_primary_version() { printf '8.4'; }
 php_worker_allowance_mb() { printf '96'; }
 effective_cpus() { printf '16'; }
@@ -1279,6 +1279,12 @@ elasticsearch_data_size_mb() { printf '0'; }
 elasticsearch_current_heap_mb() { printf '0'; }
 valkey_live_used_mb() { return 0; }
 mariadb_data_dir_size_mb() { printf '0'; }
+# No current maxmemory and no installed cache by default: the planner then
+# never probes the machine running the suite (the cache-guard tests below
+# set these explicitly).
+valkey_current_maxmemory_mb() { printf '0'; }
+valkey_policy_evicts() { printf '1'; }
+valkey_active_conf() { :; }
 elasticsearch_data_dir_size_mb() { printf '0'; }
 valkey_data_size_mb() { printf '0'; }
 OPT_DETECTED=(angie php:8.4 mariadb valkey elastic)
@@ -3178,6 +3184,278 @@ check "the plan helper returns the explicit worker count" \
   test "$(php_plan_max_children 16 32768 "" 4 0)" = 4
 
 
+# ---------------------------------------------------------------------------
+# Valkey maxmemory: a full cache keeps its size, the guard never ratchets
+# ---------------------------------------------------------------------------
+# Arguments: planned, used, current maxmemory, hard cap, evicting policy.
+check "cache guard: the plan stands when live data has its 20% headroom" \
+  test "$(valkey_guard_maxmemory_mb 434 100 434 22249 1)" = "434 plan"
+check "cache guard: a full evicting cache keeps its current maxmemory" \
+  test "$(valkey_guard_maxmemory_mb 434 512 512 22249 1)" = "512 full"
+check "cache guard: used_memory slightly above maxmemory still counts as full" \
+  test "$(valkey_guard_maxmemory_mb 434 520 512 22249 1)" = "512 full"
+check "cache guard: a full cache below the plan takes the plan, not used+20%" \
+  test "$(valkey_guard_maxmemory_mb 434 400 400 22249 1)" = "434 plan"
+check "cache guard: noeviction data is never dropped (used+20%)" \
+  test "$(valkey_guard_maxmemory_mb 434 512 512 22249 0)" = "614 raised"
+check "cache guard: data above the current maxmemory is given headroom" \
+  test "$(valkey_guard_maxmemory_mb 434 600 512 22249 1)" = "720 raised"
+check "cache guard: an unlimited or unknown maxmemory follows live data" \
+  test "$(valkey_guard_maxmemory_mb 434 3000 0 22249 1)" = "3600 raised"
+check "cache guard: a half-empty cache is sized to live data, not kept" \
+  test "$(valkey_guard_maxmemory_mb 434 1000 2000 22249 1)" = "1200 raised"
+check "cache guard: live data beyond the host is capped" \
+  test "$(valkey_guard_maxmemory_mb 434 30000 0 22249 0)" = "22249 capped"
+check "cache guard: a maxmemory above the hard cap is not kept" \
+  test "$(valkey_guard_maxmemory_mb 434 30000 30000 22249 1)" = "22249 capped"
+check "cache guard: a scaled-down share never evicts a full cache" \
+  test "$(valkey_guard_maxmemory_mb 300 1000 1000 1638 1)" = "1000 full"
+# Feeding the result back in must not move it: that is the "second run
+# changes nothing" property (the old code grew 512 -> 614 -> 737 ...).
+guard_stable() {
+  local first second
+  first=$(valkey_guard_maxmemory_mb "$@")
+  second=$(valkey_guard_maxmemory_mb "${first%% *}" "$2" "${first%% *}" "$4" "$5")
+  [[ ${second%% *} == "${first%% *}" ]]
+}
+check "cache guard: a second pass keeps a full cache's size" guard_stable 434 512 512 22249 1
+check "cache guard: a second pass keeps a raised size" guard_stable 434 3000 0 22249 1
+check "cache guard: a second pass keeps a capped size" guard_stable 434 30000 0 22249 0
+
+check "valkey_size_to_mb reads the writer's own unit" test "$(valkey_size_to_mb 512mb)" -eq 512
+check "valkey_size_to_mb reads gigabytes" test "$(valkey_size_to_mb 2GB)" -eq 2048
+check "valkey_size_to_mb reads plain bytes" test "$(valkey_size_to_mb 536870912)" -eq 512
+check "valkey_size_to_mb treats no limit and garbage as 0" \
+  test "$(valkey_size_to_mb 0)" -eq 0 -a "$(valkey_size_to_mb '')" -eq 0 -a "$(valkey_size_to_mb 5tb)" -eq 0
+
+# The plan owns the decision, so the install path, --optimize and the dry run
+# all read the same OPT_VALKEY_BUDGET_MB.
+rm -f "$SETUP_STATE_DIR/explicit-options.conf"
+effective_cpus() { printf '16'; }
+mem_total_mb() { printf '27812'; }
+php_primary_version() { printf '8.4'; }
+php_worker_allowance_mb() { printf '64'; }
+php_pool_max_children() { printf '16'; }
+mariadb_data_size_mb() { printf '2000'; }
+mariadb_data_dir_size_mb() { printf '0'; }
+mariadb_current_pool_mb() { printf '0'; }
+elasticsearch_data_size_mb() { printf '0'; }
+elasticsearch_data_dir_size_mb() { printf '0'; }
+elasticsearch_current_heap_mb() { printf '0'; }
+valkey_data_size_mb() { printf '0'; }
+valkey_live_used_mb() { printf '512'; }
+valkey_current_maxmemory_mb() { printf '512'; }
+valkey_policy_evicts() { printf '1'; }
+OPT_DETECTED=(angie php:8.4 mariadb valkey elastic)
+OPT_INSTALL_PLAN=0
+plan_memory_budget
+check "plan: a full 512 MB cache keeps 512 MB instead of growing to 614" \
+  test "$OPT_VALKEY_BUDGET_MB" -eq 512 -a "$OPT_VALKEY_GUARD" = full
+plan_memory_budget
+check "plan: a second run changes nothing" test "$OPT_VALKEY_BUDGET_MB" -eq 512
+
+valkey_policy_evicts() { printf '0'; }
+plan_memory_budget
+check "plan: a noeviction cache still gets live data +20%" \
+  test "$OPT_VALKEY_BUDGET_MB" -eq 614 -a "$OPT_VALKEY_GUARD" = live
+valkey_policy_evicts() { printf '1'; }
+
+valkey_live_used_mb() { printf '100'; }
+plan_memory_budget
+check "plan: a mostly empty cache gets the RAM floor" \
+  test "$OPT_VALKEY_BUDGET_MB" -eq 434 -a "$OPT_VALKEY_GUARD" = plan
+
+# An explicit --valkey ram= is never touched by the live-data guard.
+valkey_live_used_mb() { printf '5000'; }
+valkey_current_maxmemory_mb() { printf '5000'; }
+printf 'valkey_mb=512\n' > "$SETUP_STATE_DIR/explicit-options.conf"
+plan_memory_budget
+check "plan: an explicit cache size ignores live data" \
+  test "$OPT_VALKEY_BUDGET_MB" -eq 512 -a "$OPT_VALKEY_GUARD" = explicit
+rm -f "$SETUP_STATE_DIR/explicit-options.conf"
+
+# A re-run of the installer on a host that already has the cache measures it
+# like --optimize; a cache that is not installed yet is not probed at all.
+valkey_live_used_mb() { printf '512'; }
+valkey_current_maxmemory_mb() { printf '512'; }
+valkey_active_conf() { printf '/etc/valkey/valkey.conf'; }
+OPT_INSTALL_PLAN=1
+plan_memory_budget
+check "install plan on an installed cache matches --optimize" test "$OPT_VALKEY_BUDGET_MB" -eq 512
+valkey_active_conf() { :; }
+plan_memory_budget
+check "install plan for a new cache uses the RAM floor without probing" \
+  test "$OPT_VALKEY_BUDGET_MB" -eq 434 -a "$OPT_VALKEY_LIVE_MB" -eq 0
+OPT_INSTALL_PLAN=0
+
+# A plan that cannot fit every target scales the cache share down; the guard
+# then keeps a full cache at its current size instead of evicting it.
+mem_total_mb() { printf '2048'; }
+effective_cpus() { printf '2'; }
+mariadb_data_size_mb() { printf '5000'; }
+valkey_live_used_mb() { printf '1000'; }
+valkey_current_maxmemory_mb() { printf '1000'; }
+plan_memory_budget 2>/dev/null
+check "a squeezed plan never shrinks a full cache below its data" \
+  test "$OPT_VALKEY_BUDGET_MB" -eq 1000 -a "$OPT_VALKEY_GUARD" = full
+# A database larger than RAM fills the data pool, so PHP is at its floor and
+# cannot pay for what the guard gives back to the cache (400 MB used -> 480);
+# MariaDB gives it up instead and the healthy host plans without overcommit.
+mem_total_mb() { printf '27812'; }
+effective_cpus() { printf '16'; }
+mariadb_data_size_mb() { printf '40000'; }
+valkey_live_used_mb() { printf '400'; }
+valkey_current_maxmemory_mb() { printf '1024'; }
+plan_memory_budget
+check "a squeezed plan keeps live cache data +20% without overcommit" \
+  test "$OPT_VALKEY_BUDGET_MB" -eq 480 -a "$OPT_MEM_OVERCOMMIT_MB" -eq 0
+check "a squeezed plan with a re-raised cache still fits the budget" \
+  test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
+       -le 22249
+valkey_live_used_mb() { return 0; }
+valkey_current_maxmemory_mb() { printf '0'; }
+effective_cpus() { printf '16'; }
+mem_total_mb() { printf '27812'; }
+mariadb_data_size_mb() { printf '0'; }
+
+valkey_opt_body=$(sed -n '/^optimize_valkey()/,/^}/p' "$ALL_SRC")
+check "optimize_valkey writes the planned size without re-deriving it" \
+  bash -c '! grep -qE "needed_mb|hard_cap" <<< "$1"' _ "$valkey_opt_body"
+check "optimize_valkey reports a full cache and how to grow it" \
+  grep -q 'Cache is full.*--valkey ram=' <<<"$valkey_opt_body"
+check "the dry run prints the same planned cache size" \
+  grep -q 'max_mb=\$OPT_VALKEY_BUDGET_MB' <<<"$(sed -n '/^optimize_plan()/,/^}/p' "$ALL_SRC")"
+
+# ---------------------------------------------------------------------------
+# Overcommit uses the PHP budget that is really reserved
+# ---------------------------------------------------------------------------
+# 1 GB host with PHP and MariaDB: eight floor workers at 96 MB need 768 MB,
+# but php_floor is capped at half the 819 MB budget (409 MB) for the
+# data-tier split.  256 + 409 looked as if it fitted; 256 + 768 does not.
+mem_total_mb() { printf '1024'; }
+php_worker_allowance_mb() { printf '96'; }
+php_children_floor() { printf '8'; }
+OPT_DETECTED=(angie php:8.4 mariadb)
+plan_memory_budget 2>/dev/null
+check "overcommit is measured against the real PHP reservation" \
+  test "$OPT_PHP_BUDGET_MB" -eq 768 \
+       -a "$OPT_MEM_OVERCOMMIT_MB" -eq $(( OPT_MARIADB_BUDGET_MB + 768 - 819 ))
+mem_total_mb() { printf '27812'; }
+plan_memory_budget 2>/dev/null
+check "the 27 GB reference host still reports no overcommit" test "$OPT_MEM_OVERCOMMIT_MB" -eq 0
+# The suite stubs php_children_floor above; put the real one back.
+eval "$(sed -n '/^php_children_floor()/,/^}/p' "$ALL_SRC")"
+
+# ---------------------------------------------------------------------------
+# PHP worker allowance: the unmeasurable fallback equals the install value
+# ---------------------------------------------------------------------------
+# The suite stubs php_worker_allowance_mb, so load the real body in a subshell
+# and feed it a fake `ps` (RSS in kB, one line per process).
+real_worker_allowance() {
+  (
+    eval "$(sed -n '/^php_worker_allowance_mb()/,/^}/p' "$ALL_SRC")"
+    ps() { printf '%s' "$FAKE_PS"; }
+    php_worker_allowance_mb 8.4
+  )
+}
+FAKE_PS=""
+check "a stopped PHP-FPM plans at the install value (64 MB)" test "$(real_worker_allowance)" -eq 64
+FAKE_PS=$'40960\n'
+check "a lone master process plans at the install value (64 MB)" test "$(real_worker_allowance)" -eq 64
+FAKE_PS=$'81920\n81920\n81920\n'
+check "a running pool is measured (1.5x the 80 MB average)" test "$(real_worker_allowance)" -eq 120
+FAKE_PS=$'20480\n20480\n'
+check "a light pool keeps the 64 MB floor" test "$(real_worker_allowance)" -eq 64
+
+# ---------------------------------------------------------------------------
+# MariaDB: an online buffer-pool resize that the server clamped
+# ---------------------------------------------------------------------------
+check "a pool clamped at 1744 MB of 4096 MB is short" mariadb_pool_resize_short 1744 4096
+check "a pool at the target is not short" not mariadb_pool_resize_short 4096 4096
+check "chunk rounding within 2% is not short" not mariadb_pool_resize_short 4032 4096
+check "a pool above the target is not short" not mariadb_pool_resize_short 4160 4096
+check "an unreadable pool size is not treated as clamped" not mariadb_pool_resize_short "" 4096
+maria_opt_body=$(sed -n '/^optimize_mariadb()/,/^}/p' "$ALL_SRC")
+check "optimize_mariadb reads the pool back before reporting an online resize" \
+  grep -q 'mariadb_pool_resize_short "\$online_mb" "\$size_mb"' <<<"$maria_opt_body"
+check "the tuning drop-in never sets innodb_buffer_pool_size_max" \
+  bash -c '! grep -qE "^[[:space:]]*innodb_buffer_pool_size_max[[:space:]]*=" "$1"' _ "$ALL_SRC"
+
+# ---------------------------------------------------------------------------
+# Writeback thresholds on small hosts
+# ---------------------------------------------------------------------------
+check "dirty thresholds: 512 MB host is capped at RAM/20 and RAM/5" \
+  test "$(sysctl_dirty_thresholds_mb 512 ssd)" = "25 102"
+check "dirty thresholds: 1 GB host is capped at RAM/20 and RAM/5" \
+  test "$(sysctl_dirty_thresholds_mb 1024 ssd)" = "51 204"
+check "dirty thresholds: tiny host keeps 8 MB and twice the background mark" \
+  test "$(sysctl_dirty_thresholds_mb 64 ssd)" = "8 16"
+check "dirty thresholds: 2 GB host keeps the 64/256 MB floors" \
+  test "$(sysctl_dirty_thresholds_mb 2048 ssd)" = "64 256"
+check "dirty thresholds: 27 GB NVMe reference host is unchanged (278/1112)" \
+  test "$(sysctl_dirty_thresholds_mb 27812 nvme)" = "278 1112"
+check "dirty thresholds: large flash host keeps the 512 MB/2 GB caps" \
+  test "$(sysctl_dirty_thresholds_mb 131072 nvme)" = "512 2048"
+check "dirty thresholds: rotational disks keep the tighter caps" \
+  test "$(sysctl_dirty_thresholds_mb 131072 hdd)" = "256 1024"
+check "configure_sysctl takes both thresholds from the helper" \
+  grep -q 'sysctl_dirty_thresholds_mb "\$ram_mb" "\$disk_class"' <<<"$sysctl_body"
+
+# ---------------------------------------------------------------------------
+# udev readahead follows the storage class
+# ---------------------------------------------------------------------------
+check "rotational readahead stays 1024 kB on an hdd-class host" \
+  test "$(io_rotational_read_ahead_kb hdd)" -eq 1024
+check "rotational readahead is the flash value on an ssd-class host" \
+  test "$(io_rotational_read_ahead_kb ssd)" -eq 128
+check "rotational readahead is the flash value on an nvme-class host" \
+  test "$(io_rotational_read_ahead_kb nvme)" -eq 128
+check "the rotational udev rule takes its readahead from the storage class" \
+  grep -q 'ATTR{queue/rotational}=="1".*ATTR{bdi/read_ahead_kb}="\${rot_ra_kb}"' <<<"$io_body"
+check "no udev rule hard-codes the 1024 kB readahead" \
+  bash -c '! grep -q "read_ahead_kb}=\"1024\"" <<< "$1"' _ "$io_body"
+
+# ---------------------------------------------------------------------------
+# setup-network-tuning.service survives a container
+# ---------------------------------------------------------------------------
+net_unit=$(QDISC=fq TCP_CC=bbr network_tuning_unit_text nf_conntrack sch_fq tcp_bbr)
+check "network unit: every ExecStart tolerates failure" \
+  bash -c '! grep -qE "^ExecStart=[^-]" <<< "$1"' _ "$net_unit"
+check "network unit: one modprobe line per module" \
+  test "$(grep -c '^ExecStart=-/sbin/modprobe ' <<<"$net_unit")" -eq 3
+check "network unit: the qdisc has its own sysctl line" \
+  grep -qx 'ExecStart=-/sbin/sysctl -w net.core.default_qdisc=fq' <<<"$net_unit"
+check "network unit: the congestion control has its own sysctl line" \
+  grep -qx 'ExecStart=-/sbin/sysctl -w net.ipv4.tcp_congestion_control=bbr' <<<"$net_unit"
+check "network unit: still a oneshot that stays active" \
+  bash -c 'grep -qx "Type=oneshot" <<< "$1" && grep -qx "RemainAfterExit=yes" <<< "$1"' _ "$net_unit"
+check "network unit: rewritten and reloaded only when its content changes" \
+  grep -q 'if commit_if_changed "\$net_unit" "\$net_unit_tmp"; then' <<<"$sysctl_body"
+
+# ---------------------------------------------------------------------------
+# Swap file: containers and btrfs/ZFS must not abort --basic
+# ---------------------------------------------------------------------------
+swap_body=$(sed -n '/^create_swap_file()/,/^}/p' "$ALL_SRC")
+check "a refused mkswap/swapon is handled, not fatal" \
+  grep -q 'if ! mkswap /swapfile >/dev/null 2>&1 || ! swapon /swapfile 2>/dev/null; then' <<<"$swap_body"
+check "the unusable swap file is removed" grep -q 'rm -f /swapfile' <<<"$swap_body"
+check "a refused swap file is reported at INFO level" \
+  grep -q 'info "Swap file not enabled' <<<"$swap_body"
+check "no caller truncates the swap file after a failed swapoff" \
+  bash -c '! grep -q "swapoff /swapfile 2>/dev/null || true" "$1"' _ "$ALL_SRC"
+# release_swap_file with stubbed swapon/swapoff (functions shadow the tools).
+release_quiet() { release_swap_file 2>/dev/null; }
+swapoff_called=0
+swapon() { printf '/swapfile\n'; }
+swapoff() { return 1; }
+check "an active swap file that cannot be released stops the re-create" not release_quiet
+swapoff() { return 0; }
+check "a released swap file may be re-created" release_swap_file
+swapon() { :; }
+swapoff() { swapoff_called=2; return 1; }
+check "an inactive swap file needs no swapoff" release_swap_file
+check "swapoff is not attempted on an inactive file" test "$swapoff_called" -ne 2
+unset -f swapon swapoff
 
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
