@@ -3,6 +3,23 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.1 (2026-11-13)
+
+Two shell errors that a successful run printed, found on a fresh install and
+`--domain` pass on Ubuntu 26.04.1 (the runs still exited 0).
+
+- `--others nodejs` on a host without Node.js printed `services.sh: line 54:
+  v: unbound variable` twice: `node_installed_major` read a local it had not
+  assigned.
+- `--domain` and `--optimize` printed `[ERR ] command failed (exit 1)` when
+  the last XenForo or WordPress vhost had no application files yet:
+  `angie_xenforo_vhosts` and `angie_wordpress_vhosts` ended on a failed test.
+- Test tooling: `tests/deploy-audit/state-snapshot.sh` prints the managed
+  state for an install versus `--optimize` diff; `exercise-apps.sh keep` now
+  writes the `cookies.tsv` the load-tier scripts read (they stop if it is
+  missing instead of measuring guests); the JIT sweep also measures the
+  PHP 8.4+ built-in thresholds.
+
 ## 1.21.0 (2026-11-13)
 
 Guest-cache hardening, compressed cache entries for WordPress and Chevereto,

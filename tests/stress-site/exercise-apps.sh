@@ -67,4 +67,10 @@ echo "-- other: $(grep -vcE 'wp.test.local|xf.test.local|chev.test.local' $LOG)"
 echo "xf_error_log rows: $(mariadb -N xenforo -e 'select count(*) from xf_error_log')"; mariadb -N xenforo -e 'select left(message,180) from xf_error_log group by 1 limit 6'
 cp $LOG /root/audit/php-$V-diagnostics.log
 rm -f /etc/php/$V/fpm/conf.d/zzz-audit.ini /etc/php/$V/cli/conf.d/zzz-audit.ini; systemctl reload php$V-fpm; : > $LOG; chmod 640 $LOG; chown www-data:www-data $LOG
-[ "${1:-}" = keep ] || true
+# cookies.tsv: "<jar name>\t<Cookie header value>" for loopback-tiers.sh and sweep-php.sh
+# (only cookies valid for "/", which is what the measured pages receive).
+for jar in $J/*.jar; do
+  printf '%s\t%s\n' "$(basename "$jar" .jar)" \
+    "$(awk -F'\t' 'NF >= 7 && $3 == "/" { printf "%s%s=%s", sep, $6, $7; sep = "; " }' "$jar")"
+done > $J/cookies.tsv
+[ "${1:-}" = keep ] || rm -f $J/*.jar $J/cookies.tsv

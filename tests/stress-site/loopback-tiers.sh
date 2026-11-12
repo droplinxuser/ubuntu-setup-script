@@ -6,6 +6,7 @@ C=${1:-100}; S=${2:-10}; F=${3:-.}
 R=/root/work/ubuntu-setup-script/tests/stress-site
 CK=/root/audit/cookies/cookies.tsv
 ck() { awk -F'\t' -v k="$1" '$1 == k { print $2 }' $CK; }
+[[ -s $CK ]] || { echo "missing $CK: run exercise-apps.sh keep first" >&2; exit 1; }
 WPP=$(cat /root/audit/cookies/wp-post.url); XFT=$(cat /root/audit/cookies/xf-thread.url)
 CHI=$(cat /root/audit/cookies/ch-image.url 2>/dev/null || echo https://chev.test.local/explore/recent)
 one() { # label url cookiekey

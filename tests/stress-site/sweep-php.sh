@@ -5,6 +5,7 @@ V=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
 INI=/etc/php/$V/fpm/conf.d/zzz-audit.ini; POOL=/etc/php/$V/fpm/pool.d/www.conf
 R=/root/work/ubuntu-setup-script/tests/stress-site; CK=/root/audit/cookies/cookies.tsv
 ck() { awk -F'\t' -v k="$1" '$1 == k { print $2 }' $CK; }
+[[ -s $CK ]] || { echo "missing $CK: run exercise-apps.sh keep first" >&2; exit 1; }
 XFT=$(cat /root/audit/cookies/xf-thread.url)
 measure() { # url cookiekey -> "rps phpms"
   local url=$1 key=${2:-} out total
@@ -28,6 +29,7 @@ jit)
   j() { printf 'opcache.jit = %s\nopcache.jit_buffer_size = %s\nopcache.jit_hot_loop = %s\nopcache.jit_hot_func = %s\nopcache.jit_hot_return = %s\nopcache.jit_hot_side_exit = %s\n' "$@" > $INI; }
   j off 0 64 127 16 64;          row "jit off"
   j tracing 64M 64 127 16 64;    row "tracing 64M, default thresholds (shipped)"
+  j tracing 64M 61 127 8 8;      row "tracing 64M, PHP 8.4+ built-in thresholds (loop 61 / func 127 / return 8 / side 8)"
   j tracing 128M 64 127 16 64;   row "tracing 128M, default thresholds"
   j tracing 64M 32 63 8 32;      row "tracing 64M, eager (loop 32 / func 63 / return 8 / side 32)"
   j tracing 64M 128 255 32 128;  row "tracing 64M, lazy (loop 128 / func 255 / return 32 / side 128)"

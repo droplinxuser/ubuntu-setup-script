@@ -1123,7 +1123,7 @@ angie_wordpress_vhosts() {
     [[ -f $file ]] || continue
     grep -qE '^[[:space:]]*include[[:space:]]+h5bp/(php_wp|wordpress)\.conf;' "$file" || continue
     root=$(angie_vhost_root "$file")
-    [[ -n $root && -f "${root}/wp-config.php" ]] && printf '%s\n' "$file"
+    if [[ -n $root && -f "${root}/wp-config.php" ]]; then printf '%s\n' "$file"; fi
   done
 }
 
@@ -1135,7 +1135,7 @@ angie_xenforo_vhosts() {
     [[ -f $file ]] || continue
     grep -qE '^[[:space:]]*include[[:space:]]+h5bp/(php_xf|xf2)\.conf;' "$file" || continue
     root=$(angie_vhost_root "$file")
-    [[ -n $root && -f "${root}/src/XF.php" ]] && printf '%s\n' "$file"
+    if [[ -n $root && -f "${root}/src/XF.php" ]]; then printf '%s\n' "$file"; fi
   done
 }
 
