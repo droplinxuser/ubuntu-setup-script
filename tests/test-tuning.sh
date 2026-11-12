@@ -47,6 +47,10 @@ t_fail() {
   # names the broken check without requiring the job log.
   printf '::error file=tests/test-tuning.sh,title=Tuning test failed::%s\n' "$*"
 }
+# Negate a shell function or command inside check (a new bash -c would not
+# see the sourced functions and "! missing-command" would pass).
+not() { ! "$@"; }
+
 check() {
   local desc=$1
   shift
@@ -665,13 +669,17 @@ EOF
 tune_reset_changes
 tune_xf_cache_vary "$TMP/xf-cache.conf"
 check "XF cache key includes the style id" \
-  grep -q '\$cookie_xf_style_id' "$TMP/xf-cache.conf"
+  grep -q '|\$setup_xf_key_style|' "$TMP/xf-cache.conf"
 check "XF cache key includes the language id" \
-  grep -q '\$cookie_xf_language_id' "$TMP/xf-cache.conf"
+  grep -q '|\$setup_xf_key_language|' "$TMP/xf-cache.conf"
 check "XF cache key keeps the style variation" \
-  grep -q '\$cookie_xf_style_variation' "$TMP/xf-cache.conf"
+  grep -q '|\$setup_xf_key_variation|' "$TMP/xf-cache.conf"
 check "XF cache key varies on the normalised Accept-Encoding" \
-  grep -q '\$cookie_xf_language_id\$setup_cache_enc";' "$TMP/xf-cache.conf"
+  grep -q '|\$setup_cache_enc";' "$TMP/xf-cache.conf"
+check "XF cache key carries no raw cookie value" \
+  bash -c '! grep -q "cookie_xf_" "$1"' _ "$TMP/xf-cache.conf"
+check "XF cache key separates the URI from the tokens" \
+  grep -q '\$request_uri|' "$TMP/xf-cache.conf"
 check "XF cache refreshes in the background" \
   grep -qx 'fastcgi_cache_background_update on;' "$TMP/xf-cache.conf"
 check "XF cache repair is idempotent" \
@@ -812,6 +820,62 @@ check "XenForo roots get no [PATH=] section" \
 PHP_JIT_WORDPRESS=1
 check "PHP_JIT_WORDPRESS=1 (the default) writes no [PATH=] section" \
   test -z "$(php_jit_path_sections "$TMP/jit-angie")"
+
+# Guest-cache page compression and Chevereto session GC ([PATH=] sections).
+mkdir -p "$TMP/jit-angie/h5bp" "$TMP/jit-chev/public/app"
+: > "$TMP/jit-chev/public/app/env.php"
+printf 'server {\n    root %s/jit-wp/public;\n    include h5bp/wordpress_cache.conf;\n    include h5bp/php_wp.conf;\n}\n' "$TMP" > "$TMP/jit-angie/conf.d/wp.conf"
+printf 'server {\n    root %s/jit-chev/public;\n    include h5bp/php_chev_cache.conf;\n}\n' "$TMP" > "$TMP/jit-angie/conf.d/chev.conf"
+printf 'fastcgi_cache_key "$scheme$request_method$host$request_uri";\n' > "$TMP/jit-angie/h5bp/wordpress_cache.conf"
+printf 'fastcgi_cache_key "$request_method$scheme$host$request_uri";\n' > "$TMP/jit-angie/h5bp/php_chev_cache.conf"
+PHP_PAGE_GZIP=1
+check "a cache key without the encoding token gets no page compression" \
+  test "$(php_jit_path_sections "$TMP/jit-angie" | grep -c '^zlib\.output_compression = On$')" -eq 0
+check "a Chevereto root always gets PHP session GC" \
+  test "$(php_jit_path_sections "$TMP/jit-angie" | grep -A3 "^\[PATH=$TMP/jit-chev/public\]" | grep -c '^session\.gc_probability = 1$')" -eq 1
+printf 'fastcgi_cache_key "$scheme$request_method$host$request_uri|$guest_cache_enc";\n' > "$TMP/jit-angie/h5bp/wordpress_cache.conf"
+printf 'fastcgi_cache_key "$request_method$scheme$host$request_uri|$guest_cache_enc";\n' > "$TMP/jit-angie/h5bp/php_chev_cache.conf"
+check "WordPress and Chevereto roots behind an encoding-aware cache compress in PHP" \
+  test "$(php_jit_path_sections "$TMP/jit-angie" | grep -c '^zlib\.output_compression = On$')" -eq 2
+check "each document root gets exactly one [PATH=] section" \
+  test "$(php_jit_path_sections "$TMP/jit-angie" | grep -c '^\[PATH=')" -eq 2
+check "XenForo roots get no page compression (XenForo compresses itself)" \
+  test "$(php_jit_path_sections "$TMP/jit-angie" | grep -c 'jit-xf')" -eq 0
+PHP_JIT_WORDPRESS=0
+check "JIT exemption and page compression share one WordPress section" \
+  test "$(php_jit_path_sections "$TMP/jit-angie" | grep -A6 "^\[PATH=$TMP/jit-wp/public\]" | grep -cE '^(opcache\.jit = off|zlib\.output_compression = On)$')" -eq 2
+PHP_JIT_WORDPRESS=1
+PHP_PAGE_GZIP=0
+check "SETUP_PHP_PAGE_GZIP=0 writes no compression section" \
+  test "$(php_jit_path_sections "$TMP/jit-angie" | grep -c '^zlib\.output_compression')" -eq 0
+PHP_PAGE_GZIP=1
+rm -f "$TMP/jit-angie/conf.d/chev.conf" "$TMP/jit-angie/h5bp/wordpress_cache.conf"
+printf 'server {\n    root %s/jit-wp/public;\n    include h5bp/php_wp.conf;\n}\n' "$TMP" > "$TMP/jit-angie/conf.d/wp.conf"
+
+# A systemd drop-in with unchanged content is not rewritten (no mtime bump,
+# so systemd does not ask for a daemon-reload).
+mkdir -p "$TMP/dropin"
+check "a new drop-in is reported as changed" \
+  write_service_limits_dropin "$TMP/dropin/limits.conf" $'[Service]\nLimitNOFILE=1'
+touch -d '2001-01-01 00:00:00' "$TMP/dropin/limits.conf"
+check "an identical drop-in is reported as unchanged" \
+  not write_service_limits_dropin "$TMP/dropin/limits.conf" $'[Service]\nLimitNOFILE=1'
+check "an identical drop-in keeps its mtime" \
+  test "$(date -r "$TMP/dropin/limits.conf" +%Y)" = 2001
+check "a changed drop-in is rewritten" \
+  write_service_limits_dropin "$TMP/dropin/limits.conf" $'[Service]\nLimitNOFILE=2'
+
+# Extensions a previous --upgrade-php could not install stay wanted.
+PHP_UPGRADE_SKIPPED=("imagick (php8.5-imagick: php8.6-imagick is not published)" "redis (php8.5-redis: php8.6-redis is not published yet)")
+PHP_UPGRADE_PENDING_FILE="$TMP/pending/php-pending-extensions"
+php_upgrade_record_pending
+check "skipped extensions are recorded for the next upgrade" \
+  test "$(tr '\n' ' ' < "$PHP_UPGRADE_PENDING_FILE")" = "imagick redis "
+PHP_UPGRADE_SKIPPED=()
+php_upgrade_record_pending
+check "the pending list is removed once nothing is missing" \
+  test ! -e "$PHP_UPGRADE_PENDING_FILE"
+
 
 mkdir -p "$TMP/index-repair"
 cat > "$TMP/index-repair/wordpress.conf" <<'EOF'
@@ -1725,7 +1789,7 @@ ensure_xf_guest_cache "$TMP/xfguest"
 check "XenForo guest cache block is injected when missing" \
   grep -q '^fastcgi_cache fastcgicache;' "$TMP/xfguest/h5bp/php_xf.conf"
 check "XenForo guest cache key varies on style and language" \
-  bash -c 'grep -q "cookie_xf_style_id" "$1" && grep -q "cookie_xf_language_id" "$1"' _ "$TMP/xfguest/h5bp/php_xf.conf"
+  bash -c 'grep -q "setup_xf_key_style" "$1" && grep -q "setup_xf_key_language" "$1" && ! grep -q "cookie_xf_" "$1"' _ "$TMP/xfguest/h5bp/php_xf.conf"
 check "XenForo guest cache bypasses session cookies" \
   grep -q 'fastcgi_cache_bypass.*setup_xf_guest_bypass' "$TMP/xfguest/h5bp/php_xf.conf"
 check "XenForo cookie bypass is a map, not an if" \
@@ -2049,7 +2113,7 @@ elasticsearch_data_size_mb() { printf '0'; }
 elasticsearch_current_heap_mb() { printf '0'; }
 OPT_DETECTED=(angie php:8.3 mariadb valkey elastic)
 plan_memory_budget
-check "small host keeps the 256 MB cache floor" test "$OPT_VALKEY_BUDGET_MB" -ge 256
+check "small host keeps the cache at its 128 MB target, not above" test "$OPT_VALKEY_BUDGET_MB" -eq 128
 check "small host keeps the 512 MB search floor" test "$OPT_ES_BUDGET_MB" -ge 512
 OPT_DETECTED=(angie)
 plan_memory_budget
@@ -2417,8 +2481,8 @@ check "php_children_ceiling: a live pool is normalised to the plan" \
   test "$(php_children_ceiling 4 65536 200 '')" -eq 8
 check "php_children_ceiling: explicit value wins but is clamped to the floor" \
   test "$(php_children_ceiling 4 65536 200 600)" -eq 512
-check "php_children_ceiling: explicit value below the floor is raised" \
-  test "$(php_children_ceiling 8 65536 '' 4)" -eq 16
+check "php_children_ceiling: explicit value below the hardware target is kept" \
+  test "$(php_children_ceiling 8 65536 '' 4)" -eq 4
 
 # --- --upgrade-php parsing and extension mapping (1.20.0) ------------------
 check "upgrade parse: --upgrade-php=8.6" \
@@ -3049,6 +3113,70 @@ check "duplicate http directive leaves a unique directive active" \
   grep -qx 'limit_conn_status 429;' "$TMP/dedupe/http.d/zz-custom.conf"
 check "duplicate http log level is commented in the operator copy" \
   grep -qx '# setup.sh: duplicate limit_req_log_level info; (kept in http.d/limit_req.conf)' "$TMP/dedupe/http.d/zz-custom.conf"
+
+# ---------------------------------------------------------------------------
+# 1.21.0: cache error policy order, validated XenForo key, virtual disks
+# ---------------------------------------------------------------------------
+cat > "$TMP/cache-order.conf" <<'EOF'
+location @c {
+fastcgi_cache fastcgicache;
+fastcgi_cache_valid 200 5m;
+fastcgi_cache_valid any 5s;
+fastcgi_cache_valid 500 502 503 504 0s;
+}
+EOF
+tune_reset_changes
+tune_cache_error_policy "$TMP/cache-order.conf" "order"
+check "5xx rule is moved in front of the any rule" \
+  test "$(grep -n 'fastcgi_cache_valid 500' "$TMP/cache-order.conf" | cut -d: -f1)" -lt "$(grep -n 'fastcgi_cache_valid any' "$TMP/cache-order.conf" | cut -d: -f1)"
+check "moving the 5xx rule keeps a single copy" \
+  test "$(grep -c 'fastcgi_cache_valid 500' "$TMP/cache-order.conf")" -eq 1
+check "moving the 5xx rule keeps it inside the location" \
+  test "$(tail -n1 "$TMP/cache-order.conf")" = "}"
+tune_reset_changes
+tune_cache_error_policy "$TMP/cache-order.conf" "order"
+check "5xx rule order repair is idempotent" test "${#TUNE_CHANGES[@]}" -eq 0
+
+cat > "$TMP/xf-key-old.conf" <<'EOF'
+    fastcgi_cache_key "$request_method$scheme$host$request_uri$cookie_xf_style_variation$cookie_xf_style_id$cookie_xf_language_id$setup_cache_enc";
+EOF
+tune_xf_cache_vary "$TMP/xf-key-old.conf"
+check "a deployed raw-cookie XF key is replaced" \
+  bash -c '! grep -q "cookie_xf_" "$1" && grep -q "setup_xf_key_language" "$1"' _ "$TMP/xf-key-old.conf"
+check "the replaced XF key keeps its indentation" \
+  grep -q '^    fastcgi_cache_key "' "$TMP/xf-key-old.conf"
+cat > "$TMP/xf-key-repo.conf" <<'EOF'
+fastcgi_cache_key       "$request_method|$scheme|$host|$request_uri|$xf_key_variation|$xf_key_style|$xf_key_language|$xf_key_enc";
+EOF
+before_key=$(file_md5 "$TMP/xf-key-repo.conf")
+tune_xf_cache_vary "$TMP/xf-key-repo.conf"
+check "the repository's validated XF key is left alone" \
+  test "$(file_md5 "$TMP/xf-key-repo.conf")" = "$before_key"
+
+mkdir -p "$TMP/sysblock/sda/device" "$TMP/sysblock/sdb/device"
+printf 'QEMU    \n' > "$TMP/sysblock/sda/device/vendor"
+printf 'QEMU HARDDISK\n' > "$TMP/sysblock/sda/device/model"
+printf 'ATA     \n' > "$TMP/sysblock/sdb/device/vendor"
+printf 'ST4000NM0035\n' > "$TMP/sysblock/sdb/device/model"
+SETUP_SYS_BLOCK="$TMP/sysblock"
+check "a QEMU SCSI disk is recognised as virtual" block_device_is_virtual sda
+check "a physical SATA disk is not virtual" not block_device_is_virtual sdb
+unset SETUP_SYS_BLOCK
+check "SETUP_STORAGE_CLASS pins the storage class" \
+  test "$(SETUP_STORAGE_CLASS=hdd storage_class)" = hdd
+check "SETUP_STORAGE_CLASS pins the data-path class too" \
+  test "$(SETUP_STORAGE_CLASS=ssd storage_backing_class /var/www)" = ssd
+check "an invalid SETUP_STORAGE_CLASS is ignored" \
+  test "$(SETUP_STORAGE_CLASS=floppy storage_class)" != floppy
+
+# An explicit --php children= is honoured below the hardware target as well.
+check "an explicit worker count below the hardware target is kept" \
+  test "$(php_children_ceiling 16 32768 "" 4)" = 4
+check "an explicit worker count of one is raised to two" \
+  test "$(php_children_ceiling 16 32768 "" 1)" = 2
+check "the plan helper returns the explicit worker count" \
+  test "$(php_plan_max_children 16 32768 "" 4 0)" = 4
+
 
 
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"

@@ -1505,7 +1505,7 @@ optimize_plan() {
     plan_opcache_mb=$PHP_PROFILE_OPCACHE_MB
     printf '  PHP-FPM:  memory_limit=%sM realpath_cache=%sk\n' "$PHP_PROFILE_MEMORY_MB" "$PHP_PROFILE_REALPATH_KB"
     read -r jit_mode jit_buffer_mb < <(php_jit_settings "$plan_opcache_mb")
-    wp_roots=$(php_jit_path_sections /etc/angie | grep -c '^\[PATH=' || true)
+    wp_roots=$(php_jit_path_sections /etc/angie | grep -c '^opcache\.jit = off$' || true)
     printf '  PHP-FPM:  pm=static opcache=%sM jit=%s buffer=%sM (WordPress roots kept off: %s)\n' \
       "$plan_opcache_mb" "$jit_mode" "$jit_buffer_mb" "${wp_roots:-0}"
   fi

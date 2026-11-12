@@ -340,6 +340,11 @@ is_nvme_storage() {
 # parent devices fixes both cases.
 storage_backing_class() {
   local target=${1:-/var/www} src dev name rota tran class=hdd
+  # Operator pin (environment or STORAGE_CLASS= in /etc/default/setup-tuning)
+  # for a volume whose medium the kernel can not see.
+  case ${SETUP_STORAGE_CLASS:-${STORAGE_CLASS:-}} in
+    nvme|ssd|hdd) printf '%s' "${SETUP_STORAGE_CLASS:-$STORAGE_CLASS}"; return 0 ;;
+  esac
   command -v findmnt >/dev/null 2>&1 || return 1
   src=$(findmnt -n -o SOURCE -T "$target" 2>/dev/null | head -n1)
   [[ -n $src ]] || src=$(findmnt -n -o SOURCE -T / 2>/dev/null | head -n1)
@@ -364,12 +369,18 @@ storage_backing_class() {
 # rotational flag, and paravirtual (virtio/Xen) volumes count as flash since
 # the hypervisor hides the medium.  Shared by the data-path and the
 # whole-host classification so both paths agree on every device.
+block_device_is_virtual() {
+  local name=$1 id
+  id="$(cat "${SETUP_SYS_BLOCK:-/sys/block}/${name}/device/vendor" 2>/dev/null || true) $(cat "${SETUP_SYS_BLOCK:-/sys/block}/${name}/device/model" 2>/dev/null || true)"
+  [[ $id =~ (QEMU|VMware|Virtual|Msft|Google|VBOX|Amazon|Linode|HC\ Volume|DO\ Volume|BlockVolume) ]]
+}
+
 classify_block_device() {
   local name=$1 rota tran
   case "$name" in nvme*) printf 'nvme'; return 0 ;; esac
   rota=$(cat "/sys/block/${name}/queue/rotational" 2>/dev/null || echo 1)
   tran=$(lsblk -d -n -o TRAN "/dev/${name}" 2>/dev/null | tr -d '[:space:]')
-  if [[ $rota == 0 || $tran == virtio || $tran == pv ]]; then
+  if [[ $rota == 0 || $tran == virtio || $tran == pv ]] || block_device_is_virtual "$name"; then
     printf 'ssd'
   else
     printf 'hdd'
@@ -378,6 +389,9 @@ classify_block_device() {
 
 storage_class() {
   local backing name type class best=hdd
+  case ${SETUP_STORAGE_CLASS:-${STORAGE_CLASS:-}} in
+    nvme|ssd|hdd) printf '%s' "${SETUP_STORAGE_CLASS:-$STORAGE_CLASS}"; return 0 ;;
+  esac
   backing=$(storage_backing_class /var/www 2>/dev/null || true)
   [[ -n $backing ]] && { printf '%s' "$backing"; return 0; }
 

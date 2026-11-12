@@ -177,6 +177,7 @@ Environment options:
 | `SETUP_PHP_WORKERS_PER_CPU` | by host class (see the pool table) | pins the workers-per-CPU factor |
 | `SETUP_PHP_JIT_HOT_LOOP`, `_FUNC`, `_RETURN`, `_SIDE_EXIT` | PHP defaults on 4+ CPU hosts; a conservative set on 1-2 CPUs | JIT hotness thresholds |
 | `SETUP_PHP_JIT_WORDPRESS=0` | 1 (WordPress uses the JIT) | keeps `opcache.jit = off` for every WordPress document root through a `[PATH=<root>]` section of the managed ini, for a site that misbehaves with the JIT; persisted as `PHP_JIT_WORDPRESS` |
+| `SETUP_PHP_PAGE_GZIP=0` | 1 | by default the managed ini turns `zlib.output_compression` (level 4) on in a `[PATH=<root>]` section for every WordPress and Chevereto document root whose guest cache key carries the encoding token, so the FastCGI cache stores the gzip page (0.12 ms of Angie CPU per hit instead of about 1 ms to compress each hit); Chevereto roots also get PHP session GC (`session.gc_probability = 1`, divisor 1000) because no timer cleans its session directory; persisted as `PHP_PAGE_GZIP` |
 | `SETUP_PHP_SESSION_HARDENING=1` | off | opt-in `session.*` strict settings, `cgi.fix_pathinfo=0`, `display_errors=Off` and a central `error_log`; it broke Joomla/Polr logins on a mixed host |
 
 Install behaviour:
@@ -493,9 +494,9 @@ It is standalone and cannot be combined with install flags, `--optimize`,
 | 1. Snapshot | every installed PHP package with its exact version, each extension and whether `apt-mark` calls it manual, operator-owned `.ini` drop-ins in `conf.d`, extra FPM pools, the PECL list and a copy of `/etc/php` under `/var/lib/setup.sh/php-upgrade-<timestamp>/` |
 | 2. Target check | adds/refreshes the Sury repository and requires `phpX.Y-fpm` to be published. A pre-release (for example PHP 8.6.0~rc5) is accepted when named explicitly, with a warning |
 | 3. Purge | every `php*` package plus `libapache2-mod-php*`, then the dependencies that only PHP kept installed. The dependency set is the before/after `apt-get -s autoremove` delta, so pre-existing unrelated autoremove candidates are never touched |
-| 4. Install | `phpX.Y-fpm`/`cli` and the default set, then every old extension mapped to `phpX.Y-<ext>`. An extension the new release does not publish yet is reported and skipped; core PHP still installs. A missing extension makes the run exit non-zero (`ATTENTION`) without undoing the upgrade, so automation notices |
+| 4. Install | `phpX.Y-fpm`/`cli` and the default set, then every old extension mapped to `phpX.Y-<ext>`. An extension the new release does not publish yet is reported and skipped; core PHP still installs. A missing extension makes the run exit non-zero (`ATTENTION`) without undoing the upgrade, so automation notices. The skipped names are kept in `/var/lib/setup.sh/php-pending-extensions` and installed by the next `--upgrade-php` whose target publishes them (an 8.5 -> 8.6 RC -> 8.5 round trip keeps imagick) |
 | 5. Migrate | operator `.ini` files and extra pools are copied with the version path rewritten, validated with `php-fpm -t` (rejected files are moved out of the live tree), and FPM is reloaded so the workers actually load them. The PHP `date.timezone` from the old tree is preserved |
-| 6. Tune | the same shared tuner as install/`--optimize` writes the pool (`pm=static`, hardware worker count, backlog), `zz-setup-optimize.ini` (memory/realpath/OPcache/tracing JIT), systemd limits and log paths; Angie is reloaded when active |
+| 6. Tune | the same shared tuner as install/`--optimize` writes the pool (`pm=static`, hardware worker count, backlog), `zz-setup-optimize.ini` (memory/realpath/OPcache/tracing JIT), systemd limits and log paths; Angie is reloaded when active; the systemd drop-in of a PHP-FPM version that is no longer installed is removed |
 | 7. Verify/report | CLI version, FPM unit, the primary and every extra pool socket, extension packages and the JIT are checked; a Markdown report with the rollback commands is written to `/var/log/setup-php-upgrade-<timestamp>.md` |
 
 The managed files produced by an upgrade are byte-identical to a
@@ -565,6 +566,8 @@ them:
 | `SETUP_PRECOMPRESS_ASSETS` | `0\|1` | static-asset precompression |
 | `SETUP_XF_JOB_CRON` | `0\|1` | managed XenForo job-runner crontab entry |
 | `SETUP_PHP_JIT_WORDPRESS` | `0\|1` | 0 exempts WordPress roots from the always-on tracing JIT |
+| `SETUP_PHP_PAGE_GZIP` | `0\|1` | 0 stops PHP from gzipping WordPress/Chevereto pages for the guest cache (default 1: the cache stores the compressed page) |
+| `SETUP_STORAGE_CLASS` | `nvme\|ssd\|hdd` | pins the storage class when the kernel cannot see the medium (read on each run; persist it as `STORAGE_CLASS=` in `/etc/default/setup-tuning`) |
 | `SETUP_NODE_MAJOR` | major number | Node.js major installed by `--others nodejs` |
 
 Read on each run, not persisted:
@@ -643,7 +646,13 @@ tests. Angie configuration and Cloudflare IP ranges are downloaded.
   `bench-one.sh` measures one tier with per-service CPU attribution,
   `jit-sweep.sh` A/Bs OPcache JIT profiles and `fpm-sweep.sh` (with
   `set-fpm.sh`) sweeps PHP-FPM worker counts; both restore the pool when they
-  finish.  Run the install or `--optimize` with
+  finish.  `deploy-three-apps.sh` installs WordPress, XenForo and Chevereto
+  from local archives on `--domain` vhosts, `exercise-apps.sh` walks their
+  guest, member, admin and CLI paths, `compat-php.sh` lints every PHP file
+  and re-runs the walk with each application in its strict debug mode (the
+  applications hide `E_DEPRECATED` themselves), `loopback-tiers.sh` measures
+  the load tiers on the host with `wrk`, and `sweep-php.sh jit|fpm|stock`
+  A/Bs JIT profiles, worker counts and the distribution defaults.  Run the install or `--optimize` with
   `SETUP_LIMIT_REQ_EXEMPT=<generator IP>` first, or every remote PHP request
   is answered `429`. Results and findings: `tests/stress-site/RESULTS.md`;
   per-sweep tables: `JIT-SWEEP-*.md`, `FPM-SWEEP-*.md`, `FINAL-*.md`.

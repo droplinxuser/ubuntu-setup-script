@@ -338,22 +338,23 @@ tune_cache_error_policy() {
   grep -qE '^[[:space:]]*(fastcgi|proxy)_cache[[:space:]]' "$file" || return 0
   before=$(file_md5 "$file")
   sed_in_place -E '/^[[:space:]]*fastcgi_cache_use_stale/ s/[[:space:]]+http_500([[:space:]]|;)/\1/g' "$file"
-  if ! grep -qE '^[[:space:]]*fastcgi_cache_valid[[:space:]]+500([[:space:]]+[0-9]+)+[[:space:]]+0s;' "$file"; then
+  # fastcgi_cache_valid is first-match in file order: a 5xx line placed after
+  # "any" is never reached and the error is cached for the "any" TTL.  Put
+  # (or move) the 0s line in front of the first fastcgi_cache_valid.
+  local l5 lany
+  l5=$(grep -nE '^[[:space:]]*fastcgi_cache_valid[[:space:]]+500([[:space:]]+[0-9]+)+[[:space:]]+0s;' "$file" | head -n1 | cut -d: -f1 || true)
+  lany=$(grep -nE '^[[:space:]]*fastcgi_cache_valid[[:space:]]+any[[:space:]]' "$file" | head -n1 | cut -d: -f1 || true)
+  if [[ -z $l5 ]] || { [[ -n $lany ]] && (( l5 > lany )); }; then
     tmp=$(tmp_file)
-    if grep -qE '^[[:space:]]*fastcgi_cache_valid[[:space:]]+any[[:space:]]' "$file"; then
-      awk '
-        /^[[:space:]]*fastcgi_cache_valid[[:space:]]+any[[:space:]]/ && !done {
-          print
-          print "fastcgi_cache_valid 500 502 503 504 0s;"
-          done = 1
-          next
-        }
-        { print }
-      ' "$file" > "$tmp"
-    else
-      cat "$file" > "$tmp"
-      printf '\nfastcgi_cache_valid 500 502 503 504 0s;\n' >> "$tmp"
-    fi
+    awk '
+      /^[[:space:]]*fastcgi_cache_valid[[:space:]]+500([[:space:]]+[0-9]+)+[[:space:]]+0s;/ { next }
+      /^[[:space:]]*fastcgi_cache_valid[[:space:]]/ && !done {
+        print "fastcgi_cache_valid 500 502 503 504 0s;"
+        done = 1
+      }
+      { print }
+      END { if (!done) print "\nfastcgi_cache_valid 500 502 503 504 0s;" }
+    ' "$file" > "$tmp"
     cat "$tmp" > "$file"
   fi
   after=$(file_md5 "$file")
@@ -484,6 +485,12 @@ tune_ensure_index() {
 # receive another guest's cached HTML.  Add both cookies to the key and enable
 # a background refresh so an expiring entry does not make one visitor wait on
 # PHP while cache_lock serializes the stampede.
+# The guest-cache key.  Cookie values are attacker-chosen, so only validated
+# tokens (maps in zz-setup-fastcgi-cache-map) enter it, each behind a
+# delimiter: with the raw cookies appended to $request_uri, "GET /" with
+# xf_style_variation=threads/x.1/ stored the forum index under the thread's
+# key for every guest.
+XF_CACHE_KEY='"$request_method|$scheme|$host|$request_uri|$setup_xf_key_variation|$setup_xf_key_style|$setup_xf_key_language|$setup_cache_enc"'
 tune_xf_cache_vary() {
   local file=$1
   [[ -f $file ]] || return 0
@@ -491,14 +498,14 @@ tune_xf_cache_vary() {
   before=$(file_md5 "$file")
   if grep -qE '^[[:space:]]*fastcgi_cache_key[[:space:]]' "$file"; then
     tmp=$(tmp_file)
-    awk '
-      /^[[:space:]]*fastcgi_cache_key[[:space:]]/ {
-        if (index($0, "$cookie_xf_language_id") == 0) {
-          sub(/";[[:space:]]*$/, "$cookie_xf_style_id$cookie_xf_language_id\";")
-        }
-        if (index($0, "$setup_cache_enc") == 0) {
-          sub(/";[[:space:]]*$/, "$setup_cache_enc\";")
-        }
+    # A key built from validated tokens (the repository's $xf_key_* or this
+    # script's $setup_xf_key_* maps) is left alone.  Any other key, including
+    # the forms that appended raw $cookie_xf_* values, is replaced.
+    awk -v key="$XF_CACHE_KEY" '
+      /^[[:space:]]*fastcgi_cache_key[[:space:]]/ && index($0, "xf_key_language") == 0 {
+        match($0, /^[[:space:]]*/)
+        print substr($0, 1, RLENGTH) "fastcgi_cache_key " key ";"
+        next
       }
       { print }
     ' "$file" > "$tmp"
@@ -532,6 +539,10 @@ tune_xf_static_assets() {
       print "    location ~* ^/(?:js|styles|data)/(?:.*\\.(?:js|css|png|jpe?g|gif|svg|webp|avif|woff2?|ttf|eot|ico))$ {"
       print "        expires 30d;"
       print "        add_header Cache-Control \"public, immutable\";"
+      print "        # add_header and a regex location replace the inherited header set and"
+      print "        # the method limits of the /data/, /js/ and /styles/ prefix blocks."
+      print "        include h5bp/security/x-content-type-options.conf;"
+      print "        limit_except GET OPTIONS { deny all; }"
       print "        access_log off;"
       print "        try_files $uri =404;"
       print "    }"
@@ -1502,29 +1513,101 @@ php_jit_threshold_lines() {
     "$loop" "$func" "$ret" "$side"
 }
 
-# [PATH=] sections that keep the JIT off for every WordPress document root
-# when SETUP_PHP_JIT_WORDPRESS=0 asks for it.  php-fpm applies a PATH
-# section at request start and restores the global value afterwards, so the
-# setting cannot leak to the next vhost the way a fastcgi_param
-# PHP_ADMIN_VALUE does.  Prints nothing by default (WordPress uses the JIT).
-php_jit_path_sections() {
+# Document roots whose guest cache may store PHP's own gzip output.  A cached
+# WordPress or Chevereto page used to be stored uncompressed and compressed
+# again by Angie on every hit (about 1 ms of CPU; 14.8k req/s with all 16
+# threads busy on the audit host).  With zlib.output_compression on for the
+# document root the cache stores the gzip body and a hit costs 0.12 ms (72k
+# req/s), the way XenForo's self-compressed pages always did.  Only roots
+# whose deployed cache key carries the encoding token are listed, so a gzip
+# body can never be handed to a client that did not ask for one.
+# SETUP_PHP_PAGE_GZIP=0 (persisted as PHP_PAGE_GZIP) turns it off.
+php_page_gzip_roots() {
   local target=${1:-/etc/angie} file root
-  (( PHP_JIT_WORDPRESS )) && return 0
+  (( PHP_PAGE_GZIP )) || return 0
   [[ -d $target/conf.d ]] || return 0
-  while IFS= read -r file; do
-    root=$(angie_vhost_root "$file")
-    [[ -n $root ]] || continue
-    printf '\n; %s: WordPress keeps the bytecode cache only (SETUP_PHP_JIT_WORDPRESS=1 lifts this)\n[PATH=%s]\nopcache.jit = off\n' "$(basename "$file" .conf)" "$root"
-  done < <(angie_wordpress_vhosts "$target" | sort -u)
+  if grep -qE '^[[:space:]]*fastcgi_cache_key[[:space:]].*_cache_enc' "$target/h5bp/wordpress_cache.conf" 2>/dev/null; then
+    while IFS= read -r file; do
+      grep -qE '^[[:space:]]*include[[:space:]]+h5bp/wordpress_cache\.conf;' "$file" || continue
+      root=$(angie_vhost_root "$file")
+      [[ -n $root ]] && printf '%s\n' "$root"
+    done < <(angie_wordpress_vhosts "$target")
+  fi
+  if grep -qE '^[[:space:]]*fastcgi_cache_key[[:space:]].*_cache_enc' "$target/h5bp/php_chev_cache.conf" 2>/dev/null; then
+    for file in "$target"/conf.d/*.conf; do
+      [[ -f $file ]] || continue
+      grep -qE '^[[:space:]]*include[[:space:]]+h5bp/php_chev_cache\.conf;' "$file" || continue
+      root=$(angie_vhost_root "$file")
+      [[ -n $root && -f "${root}/app/env.php" ]] && printf '%s\n' "$root"
+    done
+  fi
+  return 0
 }
 
-# Keep the operator's WordPress JIT choice in /etc/default/setup-tuning so a
-# plain --optimize does not silently change it.  Written once per run.
+# Document roots of Chevereto vhosts: the vhost includes one of the Chevereto
+# PHP locations and the root holds app/env.php.
+angie_chevereto_roots() {
+  local target=${1:-/etc/angie} file root
+  for file in "$target"/conf.d/*.conf; do
+    [[ -f $file ]] || continue
+    grep -qE '^[[:space:]]*include[[:space:]]+h5bp/php_chev(_cache)?\.conf;' "$file" || continue
+    root=$(angie_vhost_root "$file")
+    [[ -n $root && -f "${root}/app/env.php" ]] && printf '%s\n' "$root"
+  done
+  return 0
+}
+
+# [PATH=] sections of the managed ini, one per document root:
+#   * `opcache.jit = off` for every WordPress root when
+#     SETUP_PHP_JIT_WORDPRESS=0 asks for it;
+#   * `zlib.output_compression` for the roots php_page_gzip_roots lists.
+#   * PHP's own session GC for Chevereto roots.
+# php-fpm applies a PATH section at request start and restores the global
+# value afterwards, so the setting cannot leak to the next vhost the way a
+# fastcgi_param PHP_VALUE / PHP_ADMIN_VALUE does (measured: a PHP_VALUE set
+# for one vhost was still active for another vhost on the same worker).
+php_jit_path_sections() {
+  local target=${1:-/etc/angie} file root
+  local -A body=()
+  [[ -d $target/conf.d ]] || return 0
+  if (( ! PHP_JIT_WORDPRESS )); then
+    while IFS= read -r file; do
+      root=$(angie_vhost_root "$file")
+      [[ -n $root ]] || continue
+      body[$root]+=$'; WordPress keeps the bytecode cache only (SETUP_PHP_JIT_WORDPRESS=1 lifts this)\nopcache.jit = off\n'
+    done < <(angie_wordpress_vhosts "$target" | sort -u)
+  fi
+  # Chevereto keeps its PHP sessions in its own directory (/tmp unless
+  # CHEVERETO_SESSION_SAVE_PATH says otherwise) and starts one for every
+  # cookie-less request.  The distribution turns PHP's session GC off and its
+  # sessionclean timer only visits session.save_path, so nothing ever removed
+  # them: one load test left 585,000 files (2.4 GB of tmpfs) behind.
+  while IFS= read -r root; do
+    [[ -n $root ]] || continue
+    body[$root]+=$'; Chevereto session files are collected by PHP (no timer visits its save path)\nsession.gc_probability = 1\nsession.gc_divisor = 1000\n'
+  done < <(angie_chevereto_roots "$target" | sort -u)
+  while IFS= read -r root; do
+    [[ -n $root ]] || continue
+    body[$root]+=$'; guest cache stores the compressed page (SETUP_PHP_PAGE_GZIP=0 turns this off)\nzlib.output_compression = On\nzlib.output_compression_level = 4\n'
+  done < <(php_page_gzip_roots "$target" | sort -u)
+  (( ${#body[@]} > 0 )) || return 0
+  while IFS= read -r root; do
+    printf '\n[PATH=%s]\n%s' "$root" "${body[$root]}"
+  done < <(printf '%s\n' "${!body[@]}" | sort)
+}
+
+# Keep the operator's WordPress JIT and page-gzip choices in
+# /etc/default/setup-tuning so a plain --optimize does not silently change
+# them.  Written once per run.
 PHP_JIT_PERSISTED=0
 persist_php_jit() {
   if (( PHP_JIT_WORDPRESS_PERSIST )); then
     persist_tuning_var PHP_JIT_WORDPRESS "$PHP_JIT_WORDPRESS"
     tune_note "PHP: PHP_JIT_WORDPRESS=${PHP_JIT_WORDPRESS} persisted in /etc/default/setup-tuning"
+  fi
+  if (( PHP_PAGE_GZIP_PERSIST )); then
+    persist_tuning_var PHP_PAGE_GZIP "$PHP_PAGE_GZIP"
+    tune_note "PHP: PHP_PAGE_GZIP=${PHP_PAGE_GZIP} persisted in /etc/default/setup-tuning"
   fi
 }
 
