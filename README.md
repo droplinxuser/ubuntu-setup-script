@@ -185,8 +185,10 @@ Install behaviour:
 | Area | Detail |
 |---|---|
 | Repository | Sury, with an embedded keyring |
-| One version only | both Angie and the pool use `/run/php/php-fpm.sock`, so only one PHP-FPM version can be active; a `--php` run purges every `php*` package first and copies the old `/etc/php` to `/tmp` |
-| Changing version | use `--upgrade-php=8.6`, which also carries the extension set and custom configuration; switching manually means `--purge --php ver=8.4` then `--php ver=8.5` |
+| One version only | both Angie and the pool use `/run/php/php-fpm.sock`, so only one PHP-FPM version can be active |
+| First installation | `--php` installs the requested version (or the newest Sury build) on a host without PHP-FPM |
+| Existing host | `--php` keeps the installed packages, extensions and extra pools and re-applies only the managed configuration. A different `ver=` is refused, because changing the version needs the extension carry-over and a clean purge |
+| Changing version | use `--upgrade-php=8.6`, which preflights the purge (a held package or an application that would be removed stops it while PHP is still serving), then carries the extension set and custom configuration |
 | Extensions | the XenForo profile: `fpm cli opcache mysql gd curl xml zip gmp mbstring redis`; add `intl`/`imagick`/`bcmath` yourself if an add-on needs them |
 
 Pool (`pool.d/www.conf`):
@@ -684,7 +686,7 @@ tests. Angie configuration and Cloudflare IP ranges are downloaded.
 
 | Symptom | Cause / fix |
 |---|---|
-| "Another PHP-FPM version is active" | only one version can own the socket: `--purge --php ver=X`, then install the new one |
+| "Another PHP-FPM version is active" | only one version can own the socket: use `--upgrade-php=X.Y`, which carries extensions and custom pools over; `--php ver=X` is a first installation and refuses to replace an existing version |
 | "Installation of system tables failed" (MariaDB) | Ubuntu 26.04 AppArmor profile; the script adds the override, re-run after `--purge --mariadb` if a previous install was interrupted |
 | `smartd could not be enabled` | no SMART-capable disk (VMs); a warning only |
 | `429` behind Cloudflare/a proxy | the limiter keys on the direct client address: enable real-IP (`/etc/angie/scripts/cloudflare.sh`, `cloudflare.conf`); tune `http.d/limit_req.conf` and `h5bp/limit_req/*.conf` |
