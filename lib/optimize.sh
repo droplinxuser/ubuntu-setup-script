@@ -173,7 +173,10 @@ detect_installed_services() {
   while IFS= read -r ver; do
     OPT_DETECTED+=("php:${ver}")
   done < <(php_fpm_versions)
-  if command -v mariadbd >/dev/null 2>&1 || command -v mariadb >/dev/null 2>&1; then
+  # The server binary, not the client: a web node with mariadb-client and a
+  # remote database is not a local MariaDB host (it was planned a buffer pool,
+  # 1.0 PHP workers per core and a systemd drop-in for a unit it lacks).
+  if command -v mariadbd >/dev/null 2>&1; then
     [[ -d /etc/mysql ]] && OPT_DETECTED+=(mariadb)
   fi
   [[ -f /etc/valkey/valkey.conf ]] && OPT_DETECTED+=(valkey)
@@ -469,9 +472,16 @@ plan_memory_budget() {
     if (( ! OPT_INSTALL_PLAN )); then
       live_children=$(php_pool_max_children)
     fi
+    local php_floor_children
     explicit=$(explicit_option php_children 2>/dev/null || true)
     php_capacity=$(php_children_ceiling "$cpu" "$total" "$live_children" "$explicit")
-    php_floor=$(( $(php_children_floor "$total" "$cpu") * allowance ))
+    php_floor_children=$(php_children_floor "$total" "$cpu")
+    # An explicit --php children= below the hardware target lowers the floor
+    # too; otherwise the plan lifts the pool straight back to the target.
+    if [[ $explicit =~ ^[0-9]+$ ]] && (( explicit > 0 && php_capacity < php_floor_children )); then
+      php_floor_children=$php_capacity
+    fi
+    php_floor=$(( php_floor_children * allowance ))
     (( php_floor < 256 )) && php_floor=256
     (( php_floor > usable / 2 )) && php_floor=$(( usable / 2 ))
   fi
@@ -595,6 +605,9 @@ plan_memory_budget() {
   (( maria_fixed ))  && fixed_sum=$(( fixed_sum + maria_target ))
   (( valkey_fixed )) && fixed_sum=$(( fixed_sum + valkey_target ))
   (( es_fixed ))     && fixed_sum=$(( fixed_sum + es_target ))
+  # Data +20% of a database larger than RAM would take the whole pool in the
+  # proportional split and push Elasticsearch and Valkey to their floors.
+  (( maria_fixed == 0 && maria_target > data_pool )) && maria_target=$data_pool
   flex_pool=$(( data_pool - fixed_sum ))
   (( flex_pool < 0 )) && flex_pool=0
   targets_sum=$(( maria_target + valkey_target + es_target ))
@@ -611,8 +624,12 @@ plan_memory_budget() {
     (( maria_fixed ))  || maria_alloc=$(( maria_target * flex_pool / flex_sum ))
     (( valkey_fixed )) || valkey_alloc=$(( valkey_target * flex_pool / flex_sum ))
     (( es_fixed ))     || es_alloc=$(( es_target * flex_pool / flex_sum ))
-    (( has_maria && maria_alloc < 256 )) && maria_alloc=256
-    (( has_cache && valkey_alloc < 256 )) && valkey_alloc=256
+    # The floors lift a scaled-down share only: they never raise a service
+    # above its own target (Valkey's can be 128 MB) or change an explicit size.
+    (( has_maria && ! maria_fixed && maria_alloc < 256 && maria_alloc < maria_target )) \
+      && maria_alloc=$(( maria_target < 256 ? maria_target : 256 ))
+    (( has_cache && ! valkey_fixed && valkey_alloc < 256 && valkey_alloc < valkey_target )) \
+      && valkey_alloc=$(( valkey_target < 256 ? valkey_target : 256 ))
     (( has_es && es_alloc < 512 )) && es_alloc=512
     alloc_total=$(( maria_alloc + valkey_alloc + es_alloc ))
     excess=$(( alloc_total - data_pool ))
@@ -631,6 +648,11 @@ plan_memory_budget() {
       fi
     done
   fi
+  # A "kept" live value that the split then changed is no longer kept: the
+  # heap must be normalised below, or this run writes an odd size (913 MB)
+  # and the next run rewrites it (two restarts for the same inputs).
+  (( es_kept != 0 && es_alloc != es_kept )) && es_kept=0
+  (( kept_pool != 0 && maria_alloc != kept_pool )) && kept_pool=0
   # The operational floors (256 MB MariaDB/Valkey, 512 MB Elasticsearch, the
   # PHP worker floor) cannot be trimmed; on a 1 GB host running every service
   # they exceed the budget.  Record the overcommit so the plan and the report
@@ -646,8 +668,7 @@ plan_memory_budget() {
   remaining=$(( usable - maria_alloc - valkey_alloc - es_alloc ))
   (( remaining < 0 )) && remaining=0
   if (( has_php )); then
-    local floor_children
-    floor_children=$(php_children_floor "$total" "$cpu")
+    local floor_children=$php_floor_children
     children=$(( remaining / allowance ))
     (( children > php_capacity )) && children=$php_capacity
     (( children < floor_children )) && children=$floor_children
@@ -758,7 +779,11 @@ php_children_ceiling() {
     max_cap=$(( cpu * 2 ))
     (( max_cap < 512 )) && max_cap=512
     (( cap > max_cap )) && cap=$max_cap
-    (( cap < floor )) && cap=$floor
+    # An explicit count is the operator's decision in both directions.  It
+    # used to be raised to the hardware target while the run log said
+    # "max_children overridden to 12" (the pool was written with 24).  Two is
+    # the only floor: one worker cannot answer a second request.
+    (( cap < 2 )) && cap=2
   fi
   printf '%s' "$cap"
 }
@@ -866,7 +891,11 @@ ANGIE_PHP_KEEPALIVE=""
 # Free disk under the web root (fallback /) in MB, for the cache budget.
 angie_disk_free_mb() {
   local mb
-  mb=$(df -Pm /var/www 2>/dev/null | awk 'NR==2{print $4}' || true)
+  # The cache zones live under /home (angie_cache_dirs), which can be its
+  # own filesystem; measure that one, not the web root.
+  local dir=/home
+  [[ -d $dir ]] || dir=/var/www
+  mb=$(df -Pm "$dir" 2>/dev/null | awk 'NR==2{print $4}' || true)
   [[ $mb =~ ^[0-9]+$ ]] || mb=$(df -Pm / 2>/dev/null | awk 'NR==2{print $4}' || true)
   [[ $mb =~ ^[0-9]+$ ]] || mb=10240
   printf '%s' "$mb"
@@ -1440,7 +1469,8 @@ ensure_xf_cookie_bypass_map() {
   suffix=$(angie_http_suffix "$target")
   file="${target}/http.d/zz-setup-fastcgi-cache-map${suffix}"
   if [[ ! -f $file ]] || ! grep -qE 'map[[:space:]]+\$http_cookie[[:space:]]+\$setup_xf_guest_bypass' "$file" \
-     || ! grep -qE 'map[[:space:]]+\$http_accept_encoding[[:space:]]+\$setup_cache_enc' "$file"; then
+     || ! grep -qE 'map[[:space:]]+\$http_accept_encoding[[:space:]]+\$setup_cache_enc' "$file" \
+     || ! grep -qE 'map[[:space:]]+\$cookie_xf_language_id[[:space:]]+\$setup_xf_key_language' "$file"; then
     cat > "$file" <<'EOF'
 # BEGIN setup.sh XenForo cookie bypass map
 # Authenticated/session cookies bypass the guest cache.  This is a map (http
@@ -1460,6 +1490,20 @@ map $http_cookie $setup_xf_guest_bypass {
 map $http_accept_encoding $setup_cache_enc {
     default "";
     ~*gzip  gzip;
+}
+# Cache-key tokens: the style, style-variation and language cookies are
+# visitor-controlled, so only a well-formed value enters the key.
+map $cookie_xf_style_variation $setup_xf_key_variation {
+    default "";
+    "~^[A-Za-z0-9_-]{1,32}$" $cookie_xf_style_variation;
+}
+map $cookie_xf_style_id $setup_xf_key_style {
+    default "";
+    "~^[0-9]{1,6}$" $cookie_xf_style_id;
+}
+map $cookie_xf_language_id $setup_xf_key_language {
+    default "";
+    "~^[0-9]{1,6}$" $cookie_xf_language_id;
 }
 # END setup.sh XenForo cookie bypass map
 EOF
@@ -1545,7 +1589,7 @@ ensure_xf_guest_cache() {
   # background_update, and wrote a shorter cache key).
   local -a directives=(
     $'fastcgi_cache_methods[[:space:]]\tfastcgi_cache_methods GET HEAD;'
-    $'fastcgi_cache_key[[:space:]]\tfastcgi_cache_key "$request_method$scheme$host$request_uri$cookie_xf_style_variation$cookie_xf_style_id$cookie_xf_language_id$setup_cache_enc";'
+    "fastcgi_cache_key[[:space:]]"$'\t'"fastcgi_cache_key ${XF_CACHE_KEY};"
     $'fastcgi_cache_lock[[:space:]]+on;\tfastcgi_cache_lock on;'
     $'fastcgi_cache_background_update[[:space:]]\tfastcgi_cache_background_update on;'
     $'fastcgi_cache_use_stale[[:space:]]\tfastcgi_cache_use_stale error timeout invalid_header updating http_503;'
@@ -1554,10 +1598,11 @@ ensure_xf_guest_cache() {
     "fastcgi_no_cache[[:space:]]"$'\t'"fastcgi_no_cache ${lock};"
     "fastcgi_cache_bypass[[:space:]]"$'\t'"fastcgi_cache_bypass ${lock};"
     $'fastcgi_cache_valid[[:space:]]+200[[:space:]]\tfastcgi_cache_valid 200 5m;'
-    $'fastcgi_cache_valid[[:space:]]+302[[:space:]]\tfastcgi_cache_valid 302 1h;'
-    $'fastcgi_cache_valid[[:space:]]+301[[:space:]]\tfastcgi_cache_valid 301 404 24h;'
-    $'fastcgi_cache_valid[[:space:]]+any[[:space:]]\tfastcgi_cache_valid any 5s;'
     $'fastcgi_cache_valid[[:space:]]+500([[:space:]]+[0-9]+)+[[:space:]]+0s;\tfastcgi_cache_valid 500 502 503 504 0s;'
+    $'fastcgi_cache_valid[[:space:]]+(301[[:space:]]+)?302[[:space:]]\tfastcgi_cache_valid 302 1h;'
+    $'fastcgi_cache_valid[[:space:]]+301[[:space:]]\tfastcgi_cache_valid 301 1h;'
+    $'fastcgi_cache_valid[[:space:]]+([0-9]+[[:space:]]+)*404[[:space:]]\tfastcgi_cache_valid 404 1m;'
+    $'fastcgi_cache_valid[[:space:]]+any[[:space:]]\tfastcgi_cache_valid any 5s;'
     $'add_header[[:space:]]+X-5m-Cache[[:space:]]\tadd_header X-5m-Cache $upstream_cache_status always;'
   )
   local entry pattern line

@@ -36,7 +36,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.20.8"
+readonly SCRIPT_VERSION="1.21.0"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -96,6 +96,18 @@ if [[ -n ${SETUP_PHP_JIT_WORDPRESS+x} ]]; then
   PHP_JIT_WORDPRESS_PERSIST=1
 fi
 [[ $PHP_JIT_WORDPRESS == 0 ]] || PHP_JIT_WORDPRESS=1
+# Guest-cache page compression: PHP gzips the output of WordPress and
+# Chevereto document roots that sit behind the FastCGI guest cache, so the
+# cache stores the compressed page instead of Angie compressing every hit
+# (see php_page_gzip_roots).  SETUP_PHP_PAGE_GZIP=0 turns it off and is
+# persisted in the same host file (PHP_PAGE_GZIP).
+PHP_PAGE_GZIP="${PHP_PAGE_GZIP:-1}"
+PHP_PAGE_GZIP_PERSIST=0
+if [[ -n ${SETUP_PHP_PAGE_GZIP+x} ]]; then
+  PHP_PAGE_GZIP=$SETUP_PHP_PAGE_GZIP
+  PHP_PAGE_GZIP_PERSIST=1
+fi
+[[ $PHP_PAGE_GZIP == 0 ]] || PHP_PAGE_GZIP=1
 [[ $PRECOMPRESS_ASSETS == 1 ]] || PRECOMPRESS_ASSETS=0
 # XenForo job runner.  XenForo runs its job queue (cron tasks, search
 # indexing, XFMG video transcoding) inside member page requests by default

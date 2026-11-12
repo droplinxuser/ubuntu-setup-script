@@ -28,6 +28,8 @@
 # profile, MariaDB, Valkey and Elasticsearch are left to --optimize.
 
 PHP_UPGRADE_MANIFEST_DIR=""
+# Extensions a previous upgrade could not install on its target (one per line).
+PHP_UPGRADE_PENDING_FILE="${STATE_DIR}/php-pending-extensions"
 PHP_UPGRADE_OLD_VERSION=""
 PHP_UPGRADE_OLD_PACKAGES=()
 PHP_UPGRADE_OLD_PACKAGE_VERSIONS=()
@@ -129,6 +131,16 @@ php_upgrade_snapshot() {
     printf '%s\t%s\t%s\n' "$ext" "$flag" "$pkg" >> "$dir/extensions.txt"
   done
 
+  # Extensions an earlier upgrade had to leave out because its target did not
+  # publish them yet (8.6 RC had no imagick): they are still wanted.  Without
+  # this an 8.5 -> 8.6 -> 8.5 round trip silently lost imagick for good.
+  local pending
+  while IFS= read -r pending; do
+    [[ $pending =~ ^[a-z0-9]+$ ]] || continue
+    grep -qE "^${pending}"$'\t' "$dir/extensions.txt" && continue
+    printf '%s\t1\tphp%s-%s\n' "$pending" "${old:-0.0}" "$pending" >> "$dir/extensions.txt"
+  done < <(cat -- "$PHP_UPGRADE_PENDING_FILE" 2>/dev/null || true)
+
   # Extension inventory is complete; the raw manual list is already saved
   # next to it for the audit trail.
 
@@ -229,6 +241,42 @@ php_upgrade_classify_package() {
   else
     printf 'skip:%s is not published' "$pkg_target"
   fi
+}
+
+# Remember the extensions this upgrade could not carry over, so the next
+# --upgrade-php installs them again once its target publishes them.  The list
+# is rewritten on every real run and removed when nothing is missing.
+php_upgrade_record_pending() {
+  local entry ext
+  local -a names=()
+  for entry in "${PHP_UPGRADE_SKIPPED[@]}"; do
+    ext=${entry%% *}
+    [[ $ext =~ ^[a-z0-9]+$ ]] && names+=("$ext")
+  done
+  if (( ${#names[@]} > 0 )); then
+    mkdir -p "$(dirname "$PHP_UPGRADE_PENDING_FILE")"
+    printf '%s\n' "${names[@]}" | sort -u > "$PHP_UPGRADE_PENDING_FILE"
+  else
+    rm -f "$PHP_UPGRADE_PENDING_FILE"
+  fi
+  return 0
+}
+
+# systemd drop-ins of PHP-FPM versions that are no longer installed.  Each
+# upgrade used to leave /etc/systemd/system/phpX.Y-fpm.service.d behind.
+php_upgrade_remove_stale_dropins() {
+  local dir ver removed=0
+  for dir in /etc/systemd/system/php*-fpm.service.d; do
+    [[ -d $dir ]] || continue
+    ver=${dir##*/php}; ver=${ver%-fpm.service.d}
+    [[ $ver =~ ^[0-9]+\.[0-9]+$ ]] || continue
+    [[ -x "/usr/sbin/php-fpm${ver}" ]] && continue
+    rm -f "$dir/limits.conf"
+    rmdir "$dir" 2>/dev/null || true
+    removed=1
+  done
+  (( removed )) && { systemctl daemon-reload 2>/dev/null || true; }
+  return 0
 }
 
 # Build the extension mapping for the target version.  A package is only kept
@@ -768,6 +816,8 @@ run_php_upgrade() {
   php_upgrade_optimize || rc=1
   php_upgrade_reload_angie || rc=1
   php_upgrade_verify "$target" || rc=1
+  php_upgrade_remove_stale_dropins
+  php_upgrade_record_pending
   if (( ${#PHP_UPGRADE_SKIPPED[@]} > 0 )); then
     # Everything the host had should exist on the target.  A repository that
     # has not published an extension for a brand-new release leaves the site

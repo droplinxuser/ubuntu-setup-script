@@ -3,6 +3,102 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.0 (2026-11-13)
+
+Guest-cache hardening, compressed cache entries for WordPress and Chevereto,
+and `--upgrade-php` parity fixes (with server-configs-nginx 1.6.24).  Found
+by a full install, `--optimize`, `--domain`, `--upgrade-php` (8.5 -> 8.4 ->
+8.6 RC5 -> 8.3 -> 8.5), `--diagnostics`, `--restart-all`, `--purge` and
+re-install pass on a 16-thread / 28 GB / NVMe bare-metal Ubuntu 26.04.1 host
+with WordPress 7.1.4, XenForo 2.3.13 and Chevereto 4.5.9, plus two read-only
+code audits.  Measurements: `tests/stress-site/TUNING-20261113-1.21.0.md`.
+
+- **Security (config repository; reproduced on the audit host, then closed).**
+  - `/any/script.php/x` skipped every `\.php$` deny rule and was executed:
+    `/wp-config.php/x`, `/wp-admin/install.php/x`, `/src/config.php/x`,
+    `/app/env.php/y` and a PHP file below Chevereto's writable `content/`.
+    The WordPress, XenForo and Chevereto PHP includes now answer
+    `\.php/` with 404 (none of the three routes through PATH_INFO).
+  - A PHP file below XenForo's writable `/data/` was executed.  `xf2.conf`
+    returns 404 for PHP below `data`, `js`, `styles`, `src`, `library` and
+    `internal_data`.
+  - The XenForo guest-cache key appended raw cookie values to
+    `$request_uri`: `GET /` with `xf_style_variation=threads/x.1/` stored the
+    forum index under that thread's key for every guest.  The key now uses
+    validated tokens behind delimiters.
+  - `fastcgi_cache_valid` is first-match in file order, so the `5xx 0s` line
+    placed after `any` never applied (errors were cached 5-15 s).  The line
+    now comes first; XenForo 404s are cached 1 minute instead of 24 hours.
+- **`setup.sh` side of those fixes.**
+  - `tune_xf_cache_vary` replaces any XenForo key that is not built from
+    validated tokens (the form older releases wrote included) with
+    `$request_method|$scheme|$host|$request_uri|<variation>|<style>|<language>|<encoding>`;
+    the maps live in the managed `zz-setup-fastcgi-cache-map` file.  The
+    repository's own validated key is left alone.
+  - `tune_cache_error_policy` puts (or moves) the `5xx 0s` line in front of
+    the first `fastcgi_cache_valid`.
+  - The injected XenForo static-asset location keeps `nosniff` and the
+    GET-only method limit that the regex location used to drop.
+- **Compressed guest-cache entries for WordPress and Chevereto.**  Their
+  cached pages were stored uncompressed and Brotli-compressed by Angie on
+  every hit: about 1 ms of CPU per hit, 14.8k req/s with all 16 threads busy.
+  The managed PHP ini now turns `zlib.output_compression` (level 4) on in a
+  `[PATH=<root>]` section for every WordPress/Chevereto root whose cache key
+  carries the encoding token, so the cache stores the gzip page: 0.12 ms per
+  hit and 67-72k req/s on the same host (XenForo, which compresses itself,
+  was already there).  A client without gzip gets the plain entry.  A
+  per-request `fastcgi_param PHP_VALUE` was tried first and rejected: the
+  value stayed active for other vhosts on the same worker.
+  `SETUP_PHP_PAGE_GZIP=0` turns the feature off (persisted as
+  `PHP_PAGE_GZIP`).
+- **Chevereto session files are collected.**  Chevereto starts a PHP session
+  for every cookie-less request and keeps the files in its own directory
+  (`/tmp` by default), which the distribution's `sessionclean` timer never
+  visits; one load test left 585,000 files (2.4 GB of tmpfs).  Chevereto
+  roots get `session.gc_probability = 1`, `session.gc_divisor = 1000` in
+  their `[PATH=]` section (585k -> 28k files after the first collection).
+- **`--upgrade-php`.**
+  - An extension the target does not publish is remembered in
+    `/var/lib/setup.sh/php-pending-extensions` and installed by the next
+    upgrade that can.  Before, 8.5 -> 8.6 RC -> 8.5 lost `imagick` for good.
+  - The systemd drop-in directory of a PHP-FPM version that is no longer
+    installed is removed (each hop used to leave one behind).
+  - `write_service_limits_dropin` no longer rewrites an identical file.  The
+    mtime bump made systemd print "unit file ... changed on disk, run
+    daemon-reload" on every later `systemctl` call after an upgrade.
+- **Detection and memory plan.**
+  - `mariadb` is detected by the server binary only.  A web node with
+    `mariadb-client` and a remote database was planned a buffer pool, 1.0
+    PHP workers per core and a drop-in for a unit it does not have.
+  - A SCSI-attached virtual disk (QEMU, VMware, Hyper-V, Google, cloud block
+    volumes) reports `rotational=1` and was tuned as an HDD.  It is now
+    classed `ssd` from its vendor/model string; `SETUP_STORAGE_CLASS`
+    (or `STORAGE_CLASS=` in `/etc/default/setup-tuning`) pins the class.
+  - The 256 MB scarcity floor no longer raises MariaDB or Valkey above its
+    own target or changes an explicit `size=`/`ram=`.
+  - The MariaDB target is capped at the data pool before the proportional
+    split, so a database larger than RAM no longer pushes Elasticsearch to
+    its floor.
+  - A "kept" Elasticsearch heap or buffer pool that the split then changed
+    is no longer treated as kept (it produced an unrounded heap and a second
+    restart on the next run).
+  - The Angie cache disk cap measures `/home`, where the cache zones live.
+- **`--php children=N` below the hardware target is honoured.**  The count
+  was raised to the hardware default (12 became 24 on a 16-thread VPS-class
+  host) while the run log said "max_children overridden to 12".  An explicit
+  value is now kept in both directions (minimum 2), in the pool writer and
+  in the memory plan.
+- **MariaDB first start.**  The systemd drop-in is written before the
+  package is installed, so the package's own first start no longer logs
+  "Referenced but unset environment variable ... MYSQLD_OPTS".
+- **Tests.**  30 new tuning checks (**698/698**, CLI/dry-run 173/173).
+  New helpers in `tests/stress-site/`: `deploy-three-apps.sh`,
+  `exercise-apps.sh`, `compat-php.sh`, `loopback-tiers.sh`, `sweep-php.sh`.
+- **Not changed (reported by the audit, left for a decision).**  Several
+  active PHP-FPM versions each get the full worker pool; the PHP worker
+  count is CPU-bound only, with no RAM ceiling on small hosts.
+
+
 ## 1.20.8 (2026-11-13)
 
 Guest caches no longer replay another visitor's cookies (with

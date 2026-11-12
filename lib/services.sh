@@ -930,6 +930,10 @@ install_mariadb() {
   done
 
   configure_mariadb_apparmor
+  # The package starts mariadb.service from its postinst.  Without the
+  # drop-in that first start logs "Referenced but unset environment variable
+  # ... MYSQLD_OPTS, _WSREP_NEW_CLUSTER" and runs with the stock file limit.
+  mariadb_write_systemd_limits || true
   apt_install mariadb-server mariadb-client
   systemctl enable --now mariadb
   systemctl status mariadb --no-pager || true
@@ -1271,10 +1275,16 @@ wait_for_cmd() {
 write_service_limits_dropin() {
   local path=$1 content=$2 before=""
   mkdir -p "$(dirname "$path")"
-  [[ -f $path ]] && before=$(file_md5 "$path")
+  # Leave an identical file alone: rewriting it bumps the mtime, and systemd
+  # then reports "unit file ... changed on disk, run daemon-reload" on every
+  # later systemctl call although nothing changed (seen after --upgrade-php).
+  if [[ -f $path ]] && [[ "$(cat -- "$path")" == "$content" ]]; then
+    [[ $(stat -c '%a' "$path" 2>/dev/null) == 644 ]] || chmod 644 "$path"
+    return 1
+  fi
   printf '%s\n' "$content" > "$path"
   chmod 644 "$path"
-  [[ $before != "$(file_md5 "$path")" ]]
+  return 0
 }
 
 mariadb_write_systemd_limits() {
