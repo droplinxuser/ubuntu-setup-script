@@ -73,16 +73,32 @@ rm -f /usr/local/bin/wp /usr/local/bin/mysqlbkup.sh /usr/local/bin/setup-*.sh \
       /etc/apparmor.d/local/usr.sbin.mariadbd /etc/udev/rules.d/*setup*.rules \
       /etc/tmpfiles.d/setup-*.conf /etc/cron.d/setup-*
 rm -f /etc/mysqlbkup.cnf /etc/mysqlbkup.config
+rm -rf /root/mysqltuner.pl /root/tools/mysqlbackup-master
+rmdir /root/tools 2>/dev/null || true
+rm -rf /tmp/php-config.* /tmp/php-install.* /tmp/hsperfdata_root /tmp/node-compile-cache
 find /tmp -maxdepth 1 \( -name 'sess_*' -o -name 'setup-optimize*' -o -name 'angie-*' -o -name 'php-upgrade*' \) \
   -exec rm -rf {} + 2>/dev/null || true
 sed -i '/# audit$/d' /etc/hosts
-crontab -l 2>/dev/null | grep -q 'setup.sh managed cron' && crontab -r 2>/dev/null || true
+# Drop root's crontab when only the managed block (or nothing) is left in it.
+if crontab -l >/dev/null 2>&1 \
+   && ! crontab -l 2>/dev/null | sed '/# BEGIN setup.sh managed cron/,/# END setup.sh managed cron/d' | grep -q '[^[:space:]]'; then
+  crontab -r 2>/dev/null || true
+fi
 
 echo "== firewall"
 if command -v ufw >/dev/null 2>&1; then
   ufw --force reset >/dev/null 2>&1 || true
   ufw --force disable >/dev/null 2>&1 || true
   rm -f /etc/ufw/*.rules.[0-9]* /etc/ufw/*.[0-9]*_[0-9]* 2>/dev/null || true
+  # ufw leaves its (empty) chains loaded after a reset; only drop them when
+  # nothing but ufw chains is left, so a host with its own rules is untouched.
+  for ipt in iptables ip6tables; do
+    command -v "$ipt" >/dev/null 2>&1 || continue
+    if ! "$ipt" -S 2>/dev/null | grep -vE '^-P (INPUT|FORWARD|OUTPUT) ACCEPT$|ufw-' | grep -q .; then
+      "$ipt" -F 2>/dev/null || true
+      "$ipt" -X 2>/dev/null || true
+    fi
+  done
 fi
 
 echo "== accounts created by the removed packages"
@@ -93,6 +109,11 @@ for g in angie elasticsearch valkey redis mysql; do
   getent group "$g" >/dev/null 2>&1 && groupdel "$g" >/dev/null 2>&1 || true
 done
 
+# Kernel modules the profile loaded (BBR, fq, conntrack for ufw); unloading
+# fails harmlessly while one is still in use.
+for m in tcp_bbr sch_fq xt_recent xt_conntrack xt_LOG xt_limit xt_hl xt_addrtype nf_conntrack; do
+  modprobe -r "$m" >/dev/null 2>&1 || true
+done
 systemctl daemon-reload
 systemctl reset-failed >/dev/null 2>&1 || true
 sysctl --system >/dev/null 2>&1 || true
