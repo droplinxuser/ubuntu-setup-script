@@ -27,6 +27,11 @@ echo "== packages"
 bash "$HERE/host-manifest.sh" > "$WORK/current.txt" 2>&1
 bash "$HERE/compare-manifest.sh" "$BASE" "$WORK/current.txt" > "$WORK/delta.md" 2>&1
 ADDED=$(sed -n 's/^- Added: //p' "$WORK/delta.md" | head -n1 | tr ' ' '\n' | sed '/^$/d; /^none$/d')
+# A package the baseline already had but the run upgraded (libc6, locales)
+# shows up in the delta as added and removed.  Purging it would make apt
+# refuse the whole transaction, so only names absent from the baseline go.
+BASE_NAMES=$(awk -F'\t' '/^== packages ==/{p=1; next} /^== /{p=0} p && NF {print $1}' "$BASE")
+ADDED=$(printf '%s\n' "$ADDED" | grep -vxFf <(printf '%s\n' "$BASE_NAMES") || true)
 echo "added packages: $(printf '%s\n' "$ADDED" | sed '/^$/d' | wc -l)"
 for unit in angie mariadb valkey-server elasticsearch 'php*-fpm' sysstat smartmontools; do
   systemctl stop "$unit" >/dev/null 2>&1 || true
