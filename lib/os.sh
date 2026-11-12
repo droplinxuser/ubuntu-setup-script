@@ -207,10 +207,38 @@ create_swap_file() {
     dd if=/dev/zero of=/swapfile bs=1M count="$count" status=none
   fi
   chmod 600 /swapfile
-  mkswap /swapfile >/dev/null
-  swapon /swapfile
+  # LXC/OpenVZ containers may not manage swap at all and btrfs/ZFS reject a
+  # plain swap file; there mkswap/swapon failing is the expected outcome, not
+  # an error.  Aborting here used to skip the rest of --basic (sysctl, limits,
+  # cron, firewall) and leave a multi-GB file behind, so drop the unusable
+  # file and its fstab entry and carry on without swap.
+  if ! mkswap /swapfile >/dev/null 2>&1 || ! swapon /swapfile 2>/dev/null; then
+    rm -f /swapfile
+    if grep -qE '^[[:space:]]*/swapfile[[:space:]]' /etc/fstab 2>/dev/null; then
+      sed_in_place -E '/^[[:space:]]*\/swapfile[[:space:]]/d' /etc/fstab
+    fi
+    info "Swap file not enabled: this system refused /swapfile (normal in LXC/OpenVZ containers and on btrfs/ZFS); continuing without it"
+    return 0
+  fi
   ensure_swap_fstab
   mark_swap_managed
+}
+
+swapfile_active() {
+  swapon --show=NAME --noheadings 2>/dev/null | grep -qx '/swapfile'
+}
+
+# Deactivate /swapfile before it is re-created.  Returns 1 when the file is
+# active and the kernel cannot release it (its pages do not fit in free RAM):
+# create_swap_file truncates the path, which must never happen to a swap file
+# that is still in use, so the caller keeps the existing swap instead.
+release_swap_file() {
+  swapfile_active || return 0
+  if swapoff /swapfile 2>/dev/null; then
+    return 0
+  fi
+  warn "Could not deactivate the active /swapfile (its pages do not fit in free RAM); leaving the existing swap unchanged"
+  return 1
 }
 
 configure_swap() {
@@ -229,14 +257,17 @@ configure_swap() {
 
   if [[ -f /swapfile ]]; then
     existing=$(stat -c %s /swapfile 2>/dev/null || echo 0)
-    if [[ $existing -eq $desired ]] && swapon --show=NAME --noheadings 2>/dev/null | grep -qx '/swapfile'; then
+    if [[ $existing -eq $desired ]] && swapfile_active; then
       info "Swap file already present with the requested size"
       ensure_swap_fstab
       mark_swap_managed
       swapon --show
       return 0
     fi
-    swapoff /swapfile 2>/dev/null || true
+    if ! release_swap_file; then
+      swapon --show
+      return 0
+    fi
   fi
 
   create_swap_file "$desired"
@@ -278,8 +309,11 @@ configure_swap_auto() {
 
   if [[ -f /swapfile ]]; then
     old_size=$(stat -c %s /swapfile 2>/dev/null || echo 0)
-    if swapon --show=NAME --noheadings 2>/dev/null | grep -qx '/swapfile'; then
-      swapoff /swapfile 2>/dev/null || true
+    if swapfile_active; then
+      if ! release_swap_file; then
+        swapon --show
+        return 0
+      fi
       # The old file was counted in "current", so add the difference to it.
       new_size=$(( old_size + needed ))
     else
@@ -480,6 +514,60 @@ ufw_align_sysctl() {
   return 0
 }
 
+# vm.dirty_background_bytes / vm.dirty_bytes in MB for a host with RAM_MB of
+# memory on storage CLASS, printed as "background foreground".  1% of RAM
+# (64-512 MB) starts the background flush and four times that (256 MB-2 GB)
+# blocks writers; rotational disks get tighter caps because they drain slowly.
+# The 64/256 MB floors assume a few GB of RAM: on a 512 MB host 256 MB of
+# dirty pages is half the machine, so the background mark never exceeds
+# RAM/20 and the foreground mark never exceeds RAM/5 (the stock 5%/20%
+# ratios).  Those caps only bind below about 1.3 GB.
+sysctl_dirty_thresholds_mb() {
+  local ram_mb=$1 class=${2:-} bg fg cap
+  bg=$(( ram_mb / 100 ))
+  if (( bg < 64 )); then bg=64; fi
+  if (( bg > 512 )); then bg=512; fi
+  if [[ $class == hdd ]] && (( bg > 256 )); then bg=256; fi
+  fg=$(( bg * 4 ))
+  if (( fg < 256 )); then fg=256; fi
+  if (( fg > 2048 )); then fg=2048; fi
+  if [[ $class == hdd ]] && (( fg > 1024 )); then fg=1024; fi
+  cap=$(( ram_mb / 20 ))
+  if (( cap < 8 )); then cap=8; fi
+  if (( bg > cap )); then bg=$cap; fi
+  cap=$(( ram_mb / 5 ))
+  if (( cap < bg * 2 )); then cap=$(( bg * 2 )); fi
+  if (( fg > cap )); then fg=$cap; fi
+  printf '%s %s' "$bg" "$fg"
+}
+
+# setup-network-tuning.service: load the modules that own the qdisc and
+# congestion-control sysctls, then set them.  Every ExecStart carries the "-"
+# prefix and each key has its own line: a container cannot load modules and
+# may not own every key, and a oneshot stops at the first failing command, so
+# without the prefix the unit was failed on every boot and the keys after the
+# failure were never applied.  Arguments: the modules to load.
+network_tuning_unit_text() {
+  local mod
+  cat <<'EOF'
+[Unit]
+Description=Apply network qdisc/congestion-control tuning after kernel modules load
+After=systemd-modules-load.service
+[Service]
+Type=oneshot
+EOF
+  for mod in "$@"; do
+    printf 'ExecStart=-/sbin/modprobe %s\n' "$mod"
+  done
+  printf 'ExecStart=-/sbin/sysctl -w net.core.default_qdisc=%s\n' "$QDISC"
+  printf 'ExecStart=-/sbin/sysctl -w net.ipv4.tcp_congestion_control=%s\n' "$TCP_CC"
+  cat <<'EOF'
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
 configure_sysctl() {
   step "sysctl tweaks"
   record_sysctl_values
@@ -539,10 +627,7 @@ configure_sysctl() {
   # tighter caps.
   local disk_class dirty_bg_mb dirty_mb rmem_max
   disk_class=$(storage_class)
-  dirty_bg_mb=$(( ram_mb / 100 ));      (( dirty_bg_mb < 64 )) && dirty_bg_mb=64;              (( dirty_bg_mb > 512 )) && dirty_bg_mb=512
-  [[ $disk_class == hdd ]] && (( dirty_bg_mb > 256 )) && dirty_bg_mb=256
-  dirty_mb=$(( dirty_bg_mb * 4 ));      (( dirty_mb < 256 )) && dirty_mb=256;                  (( dirty_mb > 2048 )) && dirty_mb=2048
-  [[ $disk_class == hdd ]] && (( dirty_mb > 1024 )) && dirty_mb=1024
+  read -r dirty_bg_mb dirty_mb <<< "$(sysctl_dirty_thresholds_mb "$ram_mb" "$disk_class")"
   # Socket buffer maxima: 32 MB is plenty for 1-10G links; a small host
   # cannot afford 32 MB per socket.
   rmem_max=33554432
@@ -702,33 +787,32 @@ EOF
   # systemd-sysctl runs before modules-load on Ubuntu, which logs "No such
   # file or directory" on every boot. Apply them from a small oneshot unit
   # after the modules are available instead.
-  record_original /etc/systemd/system/setup-network-tuning.service setup-network-tuning.service
-  {
-    cat <<'EOF'
-[Unit]
-Description=Apply network qdisc/congestion-control tuning after kernel modules load
-After=systemd-modules-load.service
-[Service]
-Type=oneshot
-EOF
-    for mod in "${net_mods[@]}"; do
-      printf 'ExecStart=/sbin/modprobe %s\n' "$mod"
-    done
-    printf 'ExecStart=/sbin/sysctl -w net.core.default_qdisc=%s net.ipv4.tcp_congestion_control=%s\n' \
-      "$QDISC" "$TCP_CC"
-    cat <<'EOF'
-RemainAfterExit=yes
-[Install]
-WantedBy=multi-user.target
-EOF
-  } > /etc/systemd/system/setup-network-tuning.service
-  chmod 644 /etc/systemd/system/setup-network-tuning.service
-  systemctl daemon-reload || true
+  local net_unit=/etc/systemd/system/setup-network-tuning.service net_unit_tmp
+  record_original "$net_unit" setup-network-tuning.service
+  # Rewrite the unit (and reload systemd) only when its content changes, so a
+  # repeated --optimize on a converged host touches nothing here.
+  net_unit_tmp=$(tmp_file) || die "Could not stage setup-network-tuning.service"
+  network_tuning_unit_text "${net_mods[@]}" > "$net_unit_tmp"
+  if commit_if_changed "$net_unit" "$net_unit_tmp"; then
+    chmod 644 "$net_unit"
+    systemctl daemon-reload || true
+  fi
   systemctl enable setup-network-tuning.service >/dev/null 2>&1 || true
   # restart (not start): the oneshot stays "active" from a previous run, and a
   # start would not re-apply a changed qdisc/congestion-control value.
   systemctl restart setup-network-tuning.service \
     || warn "Could not apply ${TCP_CC}/${QDISC} tuning"
+}
+
+# Readahead (kB) for disks whose queue/rotational flag is 1.  The storage
+# class owns the decision: only a host classified hdd gets the large
+# sequential readahead; on nvme/ssd a "rotational" disk is a mis-reporting
+# virtual device and takes the same 128 kB as the flash rules.
+io_rotational_read_ahead_kb() {
+  case ${1:-} in
+    hdd) printf '1024' ;;
+    *)   printf '128' ;;
+  esac
 }
 
 # Storage-class dependent host settings that no service file carries:
@@ -740,9 +824,10 @@ EOF
 configure_io_tuning() {
   step "Storage/THP profile"
   ensure_state
-  local class unit=/etc/systemd/system/setup-io-tuning.service
+  local class rot_ra_kb unit=/etc/systemd/system/setup-io-tuning.service
   local rule=/etc/udev/rules.d/60-setup-io.rules
   class=$(storage_class)
+  rot_ra_kb=$(io_rotational_read_ahead_kb "$class")
   record_original "$unit" setup-io-tuning.service
   record_original "$rule" udev-60-setup-io.rules
   cat > "$unit" <<'EOF'
@@ -757,7 +842,9 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
   chmod 644 "$unit"
-  cat > "$rule" <<'EOF'
+  # Unquoted here-document: only ${rot_ra_kb} expands (udev's own $-free
+  # match syntax is used throughout).
+  cat > "$rule" <<EOF
 # setup.sh: I/O scheduler and readahead by device class.
 # Whole disks only: partitions have no queue/scheduler or bdi attributes and
 # udev logs an error per partition when a rule tries to set them.
@@ -768,9 +855,11 @@ ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", KERNEL=="nvme[0-
 # (dm/md/loop/zram/ram) have no scheduler and are skipped.
 # SSD and paravirtual flash: mq-deadline, small readahead.
 ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", KERNEL!="nvme*", KERNEL!="dm-*", KERNEL!="md*", KERNEL!="loop*", KERNEL!="zram*", KERNEL!="ram*", KERNEL!="sr*", ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="mq-deadline", ATTR{bdi/read_ahead_kb}="128"
-# Rotational disks (including cloud HDD volumes): larger readahead for
-# sequential scans.
-ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", KERNEL!="nvme*", KERNEL!="dm-*", KERNEL!="md*", KERNEL!="loop*", KERNEL!="zram*", KERNEL!="ram*", KERNEL!="sr*", ATTR{queue/rotational}=="1", ATTR{queue/scheduler}="mq-deadline", ATTR{bdi/read_ahead_kb}="1024"
+# Disks that report themselves rotational.  The readahead follows the
+# storage class setup.sh detected (or STORAGE_CLASS pins): ${rot_ra_kb} kB for
+# class "${class}".  A virtual SCSI disk on flash often still reports
+# rotational=1, and 1024 kB suits only real sequential HDD scans.
+ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", KERNEL!="nvme*", KERNEL!="dm-*", KERNEL!="md*", KERNEL!="loop*", KERNEL!="zram*", KERNEL!="ram*", KERNEL!="sr*", ATTR{queue/rotational}=="1", ATTR{queue/scheduler}="mq-deadline", ATTR{bdi/read_ahead_kb}="${rot_ra_kb}"
 EOF
   chmod 644 "$rule"
   systemctl daemon-reload || true

@@ -138,6 +138,14 @@ php_upgrade_snapshot() {
   while IFS= read -r pending; do
     [[ $pending =~ ^[a-z0-9]+$ ]] || continue
     grep -qE "^${pending}"$'\t' "$dir/extensions.txt" && continue
+    # A list written by an earlier release can name an unversioned-only
+    # package (pear).  It is wanted under its own name, php-pear; mapped to
+    # phpX.Y-pear it could never be satisfied and every upgrade ended with
+    # exit 1.
+    if php_upgrade_unversioned_only "$pending"; then
+      printf '%s\t1\tphp-%s\n' "$pending" "$pending" >> "$dir/extensions.txt"
+      continue
+    fi
     printf '%s\t1\tphp%s-%s\n' "$pending" "${old:-0.0}" "$pending" >> "$dir/extensions.txt"
   done < <(cat -- "$PHP_UPGRADE_PENDING_FILE" 2>/dev/null || true)
 
@@ -231,6 +239,17 @@ php_upgrade_classify_package() {
       return 0
       ;;
   esac
+  # An unversioned package with no per-version build keeps its own name:
+  # php-pear used to be mapped to a php8.6-pear that never existed, was
+  # reported as skipped, purged with the old PHP and never reinstalled.
+  if [[ $pkg == php-* ]] && php_upgrade_unversioned_only "$ext"; then
+    if apt-cache show "$pkg" >/dev/null 2>&1; then
+      printf 'keep:%s' "$pkg"
+    else
+      printf 'skip:%s is not installable from the configured repositories' "$pkg"
+    fi
+    return 0
+  fi
   if [[ $ext == *[!a-z0-9]* ]]; then
     printf 'skip:unexpected package name'
     return 0
@@ -241,6 +260,24 @@ php_upgrade_classify_package() {
   else
     printf 'skip:%s is not published' "$pkg_target"
   fi
+  return 0
+}
+
+# True when no phpX.Y-EXT package exists for any PHP version, i.e. EXT only
+# ever ships as the unversioned php-EXT (php-pear, the php-composer-* and
+# php-symfony-* libraries).  An extension that does have versioned builds
+# (php-imagick next to php8.5-imagick) is not one of these: its unversioned
+# package is a dependency stub that would pull another PHP version in.
+# awk reads the whole list on purpose (no early exit, no SIGPIPE to
+# apt-cache under pipefail).
+php_upgrade_unversioned_only() {
+  local ext=$1 hit
+  hit=$(apt-cache pkgnames 2>/dev/null \
+    | awk -v e="$ext" '{ n = $0; if (sub(/^php[0-9]+\.[0-9]+-/, "", n) && n == e) found = 1 } END { print found + 0 }' || true)
+  if [[ $hit == 1 ]]; then
+    return 1
+  fi
+  return 0
 }
 
 # Remember the extensions this upgrade could not carry over, so the next
@@ -251,7 +288,12 @@ php_upgrade_record_pending() {
   local -a names=()
   for entry in "${PHP_UPGRADE_SKIPPED[@]}"; do
     ext=${entry%% *}
-    [[ $ext =~ ^[a-z0-9]+$ ]] && names+=("$ext")
+    [[ $ext =~ ^[a-z0-9]+$ ]] || continue
+    # The pending list holds extensions waiting for a phpX.Y-EXT build.  An
+    # unversioned-only package has none on any version; recorded here it
+    # would be re-read as phpX.Y-EXT and fail every later upgrade.
+    php_upgrade_unversioned_only "$ext" && continue
+    names+=("$ext")
   done
   if (( ${#names[@]} > 0 )); then
     mkdir -p "$(dirname "$PHP_UPGRADE_PENDING_FILE")"
@@ -331,6 +373,10 @@ php_upgrade_validate_target() {
 # the /tmp backup; the dependency delta is computed around it.
 php_upgrade_purge() {
   local -a extra=() post=() newly=() purge=()
+  # Before the first removal: apt must be able to run the purge, and it must
+  # not take applications along (phpMyAdmin, Composer, ...).  Dies with PHP
+  # still installed and serving.
+  php_purge_preflight
   mapfile -t PHP_UPGRADE_PRE_AUTOREMOVE < <(php_upgrade_autoremove_set)
 
   # Packages outside the ^php pattern first: libapache2-mod-phpX.Y depends on
@@ -600,9 +646,17 @@ php_upgrade_rollback() {
     rm -rf "/etc/php/${target}"
   fi
   if (( ${#PHP_UPGRADE_OLD_PACKAGE_VERSIONS[@]} > 0 )); then
-    apt-get install "${APT_OPTS[@]}" --allow-downgrades \
-      "${PHP_UPGRADE_OLD_PACKAGE_VERSIONS[@]}" >/dev/null 2>&1 \
-      || warn "Could not reinstall every old package; check apt history"
+    # One pkg=version the archive no longer serves fails the whole
+    # transaction, and Sury drops a point release as soon as the next one is
+    # published.  The same packages at their current point release still
+    # bring the old branch back, so try that before giving up.
+    if ! apt-get install "${APT_OPTS[@]}" --allow-downgrades \
+         "${PHP_UPGRADE_OLD_PACKAGE_VERSIONS[@]}" >/dev/null 2>&1; then
+      local -a old_names=("${PHP_UPGRADE_OLD_PACKAGE_VERSIONS[@]%%=*}")
+      info "The exact old package versions are no longer in the repository; installing the current PHP ${old} packages instead"
+      apt-get install "${APT_OPTS[@]}" "${old_names[@]}" >/dev/null 2>&1 \
+        || warn "Could not reinstall every old package; check apt history"
+    fi
   fi
   if [[ -d "$dir/php-config/$old" ]]; then
     rm -rf "/etc/php/${old}"
@@ -655,7 +709,16 @@ php_upgrade_write_report() {
       while IFS=$'\t' read -r ext flag pkg; do
         local target="php${new}-${ext}"
         local state=yes
-        dpkg-query -W -f='${db:Status-Status}' "$target" 2>/dev/null | grep -qx installed || state="no (not published)"
+        if ! dpkg-query -W -f='${db:Status-Status}' "$target" 2>/dev/null | grep -qx installed; then
+          # An unversioned package (php-pear) is carried over under its own
+          # name; there is no phpX.Y-pear to look for.
+          if [[ $pkg == php-* ]] \
+             && dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null | grep -qx installed; then
+            state="yes (${pkg})"
+          else
+            state="no (not published)"
+          fi
+        fi
         if [[ $ext == opcache ]]; then
           local mj=${new%%.*} mn=${new#*.}
           if (( mj > 8 || (mj == 8 && mn >= 5) )); then state="bundled in PHP ${new}"; fi

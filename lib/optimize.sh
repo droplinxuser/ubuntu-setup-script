@@ -208,6 +208,9 @@ OPT_MARIADB_BUDGET_MB=0
 OPT_MARIADB_KEPT_MB=0
 OPT_VALKEY_BUDGET_MB=0
 OPT_VALKEY_LIVE_MB=0
+# Why the plan chose the cache size (valkey_guard_maxmemory_mb): plan, live,
+# full, raised, capped or explicit.  Read by the report and the dry run.
+OPT_VALKEY_GUARD=""
 OPT_ES_BUDGET_MB=0
 OPT_ES_KEPT_MB=0
 # Set while plan_install_budget() runs.  A fresh install has no live database
@@ -429,7 +432,7 @@ plan_memory_budget() {
   local maria_alloc=0 valkey_alloc=0 es_alloc=0
   local maria_fixed=0 valkey_fixed=0 es_fixed=0
   local data="" current_pool=0 kept_pool=0
-  local cache_used=""
+  local cache_used="" cache_current=0 cache_evicts=1 cache_cap=0 cache_plan=""
   local es_store="" es_kept=0 current_heap=0
   local remaining data_pool targets_sum alloc_total excess dec
   local explicit=""
@@ -445,6 +448,7 @@ plan_memory_budget() {
   OPT_MARIADB_KEPT_MB=0
   OPT_VALKEY_BUDGET_MB=0
   OPT_VALKEY_LIVE_MB=0
+  OPT_VALKEY_GUARD=""
   OPT_ES_BUDGET_MB=0
   OPT_ES_KEPT_MB=0
   OPT_DB_SIZE_MB=0
@@ -523,29 +527,47 @@ plan_memory_budget() {
     fi
   fi
 
-  # Valkey target: live used_memory plus at most 20% headroom.  An empty or
-  # stopped cache gets the small operational minimum, not a RAM percentage.
+  # Valkey target: the RAM-proportional floor, or live used_memory plus 20%
+  # headroom when the data already stored needs more.  A cache that merely
+  # fills its current maxmemory keeps that size (valkey_guard_maxmemory_mb).
   if (( has_cache )); then
     explicit=$(explicit_option valkey_mb 2>/dev/null || true)
     if [[ $explicit =~ ^[0-9]+$ ]] && (( explicit >= 1 )); then
+      # An explicit --valkey ram= is the operator's decision: the live-data
+      # guard never changes it.
       valkey_target=$explicit
       valkey_fixed=1
+      OPT_VALKEY_GUARD=explicit
     else
-      if (( ! OPT_INSTALL_PLAN )); then
+      # A cache that is not installed yet has nothing to measure.  One that
+      # is installed is measured on the install path too, so a re-run of
+      # --valkey and the next --optimize write the same maxmemory.
+      if (( ! OPT_INSTALL_PLAN )) || [[ -n $(valkey_active_conf) ]]; then
         cache_used=$(valkey_live_used_mb 2>/dev/null || true)
+        cache_current=$(valkey_current_maxmemory_mb 2>/dev/null || true)
+        cache_evicts=$(valkey_policy_evicts 2>/dev/null || true)
       fi
       [[ $cache_used =~ ^[0-9]+$ ]] || cache_used=$(valkey_data_size_mb)
       [[ $cache_used =~ ^[0-9]+$ ]] || cache_used=0
+      [[ $cache_current =~ ^[0-9]+$ ]] || cache_current=0
+      [[ $cache_evicts =~ ^[01]$ ]] || cache_evicts=1
       if (( cache_used > 0 )); then
         OPT_VALKEY_LIVE_MB=$cache_used
       fi
-      valkey_target=$(( cache_used * 120 / 100 ))
-      # Live data +20% can only grow 20% per run (allkeys-lru keeps the
-      # working set at maxmemory), and a fresh install has no data at all;
-      # a RAM-proportional floor gives the cache room to show real demand.
+      # The most the host can give the cache: the whole usable budget.
+      cache_cap=$usable
+      (( cache_cap < 256 )) && cache_cap=256
+      # A fresh install has no data at all, so the floor is RAM-proportional:
+      # it gives the cache room before the operator has to size it.
       local floor_mb
       floor_mb=$(valkey_floor_mb "$total")
-      (( valkey_target < floor_mb )) && valkey_target=$floor_mb
+      cache_plan=$(valkey_guard_maxmemory_mb "$floor_mb" "$cache_used" "$cache_current" "$cache_cap" "$cache_evicts")
+      valkey_target=${cache_plan%% *}
+      OPT_VALKEY_GUARD=${cache_plan##* }
+      # Above the floor, live + 20% is the ordinary target, not a rescue.
+      if [[ $OPT_VALKEY_GUARD == raised ]]; then
+        OPT_VALKEY_GUARD=live
+      fi
     fi
     (( valkey_target < 128 )) && valkey_target=128
   fi
@@ -648,21 +670,33 @@ plan_memory_budget() {
       fi
     done
   fi
+  # The split may have scaled the cache below the data it already holds.
+  # Applying that would mass-evict on the next restart, so the same guard
+  # runs again on the scaled share.  PHP cannot absorb what the guard gives
+  # back: this branch is only reached when the data tier already fills its
+  # pool, so PHP sits at its floor.  The amount is therefore taken from the
+  # other flexible data services, in the trim order used above
+  # (Elasticsearch, then MariaDB); only what their floors cannot give up is
+  # left for the overcommit check below.
+  if (( has_cache && ! valkey_fixed && valkey_alloc < valkey_target )); then
+    cache_plan=$(valkey_guard_maxmemory_mb "$valkey_alloc" "$cache_used" "$cache_current" "$cache_cap" "$cache_evicts")
+    valkey_alloc=${cache_plan%% *}
+    OPT_VALKEY_GUARD=${cache_plan##* }
+    excess=$(( maria_alloc + valkey_alloc + es_alloc - data_pool ))
+    if (( excess > 0 && has_es && ! es_fixed && es_alloc > 512 )); then
+      dec=$(( es_alloc - 512 )); (( dec > excess )) && dec=$excess
+      es_alloc=$(( es_alloc - dec )); excess=$(( excess - dec ))
+    fi
+    if (( excess > 0 && has_maria && ! maria_fixed && maria_alloc > 256 )); then
+      dec=$(( maria_alloc - 256 )); (( dec > excess )) && dec=$excess
+      maria_alloc=$(( maria_alloc - dec )); excess=$(( excess - dec ))
+    fi
+  fi
   # A "kept" live value that the split then changed is no longer kept: the
   # heap must be normalised below, or this run writes an odd size (913 MB)
   # and the next run rewrites it (two restarts for the same inputs).
   (( es_kept != 0 && es_alloc != es_kept )) && es_kept=0
   (( kept_pool != 0 && maria_alloc != kept_pool )) && kept_pool=0
-  # The operational floors (256 MB MariaDB/Valkey, 512 MB Elasticsearch, the
-  # PHP worker floor) cannot be trimmed; on a 1 GB host running every service
-  # they exceed the budget.  Record the overcommit so the plan and the report
-  # say so instead of printing allocations that look as if they fit.
-  OPT_MEM_OVERCOMMIT_MB=0
-  if (( maria_alloc + valkey_alloc + es_alloc + php_floor > usable )); then
-    OPT_MEM_OVERCOMMIT_MB=$(( maria_alloc + valkey_alloc + es_alloc + php_floor - usable ))
-    warn "Memory plan: service floors exceed the ${usable} MB budget by ${OPT_MEM_OVERCOMMIT_MB} MB; this host is too small for the selected services"
-  fi
-
   # PHP gets what the data tier did not need, bounded by CPU and the 50%-RAM
   # ceiling.  Eight workers are always kept when PHP is installed.
   remaining=$(( usable - maria_alloc - valkey_alloc - es_alloc ))
@@ -686,6 +720,19 @@ plan_memory_budget() {
   if (( has_es && es_alloc > 0 && es_kept == 0 )); then
     es_alloc=$(( es_alloc / 512 * 512 ))
     (( es_alloc < 512 )) && es_alloc=512
+  fi
+
+  # The operational floors (256 MB MariaDB/Valkey, 512 MB Elasticsearch, the
+  # PHP worker floor) cannot be trimmed; on a 1 GB host running every service
+  # they exceed the budget.  Record the overcommit so the plan and the report
+  # say so instead of printing allocations that look as if they fit.  The
+  # comparison uses the PHP budget that is actually reserved: the earlier
+  # php_floor is capped at half the budget for the data-tier split, so it
+  # under-reported a pool whose floor workers need more than that.
+  OPT_MEM_OVERCOMMIT_MB=0
+  if (( maria_alloc + valkey_alloc + es_alloc + php_budget > usable )); then
+    OPT_MEM_OVERCOMMIT_MB=$(( maria_alloc + valkey_alloc + es_alloc + php_budget - usable ))
+    warn "Memory plan: service floors exceed the ${usable} MB budget by ${OPT_MEM_OVERCOMMIT_MB} MB; this host is too small for the selected services"
   fi
 
   OPT_MARIADB_BUDGET_MB=$maria_alloc
@@ -1057,14 +1104,15 @@ php_pool_max_children() {
 }
 
 # Per-worker memory allowance used to size the PHP-FPM pool and to reserve
-# RAM for it in the shared plan.  A fixed 96 MB is safe for an unknown
-# application, but real workers are commonly 20-50 MB; reserving 96 MB each
-# leaves several GB that MariaDB and Elasticsearch could use.  When a pool is
-# already running, measure it (1.5x the average RSS) clamped to a conservative
-# 64-192 MB range.  A fresh install has no pool to measure and plans at the
-# 64 MB floor (plan_memory_budget), which is what an idle new pool measures.
+# RAM for it in the shared plan.  When a pool is already running, measure it
+# (1.5x the average RSS) clamped to a conservative 64-192 MB range; real
+# workers are commonly 20-50 MB.  When nothing can be measured (PHP-FPM is
+# stopped, or only the master is visible) the answer is the same 64 MB a
+# fresh install plans with (plan_memory_budget), which is also what an idle
+# new pool measures.  It used to be 96 MB here, so --optimize on a host with
+# PHP-FPM stopped planned a smaller buffer pool than the install had written.
 php_worker_allowance_mb() {
-  local ver=${1:-} out avg=0 n=0 allowance=96
+  local ver=${1:-} out avg=0 n=0 allowance=64
   if [[ -n $ver ]]; then
     out=$(ps -o rss= -C "php-fpm${ver}" 2>/dev/null || true)
   fi

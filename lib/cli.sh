@@ -232,9 +232,10 @@ Notes:
     directory where setup.sh was started.  Copy that file when reporting an
     issue; it includes the host facts and the exit status.
   * Only one PHP-FPM version can own the shared Unix socket at a time.
-    Upgrade an existing host in place with --upgrade-php=8.6 (keeps extensions
-    and custom configuration), or switch manually:
-      --purge --php ver=8.4   then   --basic ... --php ver=8.5
+    --php is a first installation: on a host that already runs PHP-FPM it
+    keeps the installed packages and only re-applies the managed
+    configuration, and it refuses another ver=.  Change the version with
+    --upgrade-php=8.6 (keeps extensions and custom configuration).
 
 Examples:
   bash setup.sh --basic server=dedi host=custom.host time=Asia/Manila swap=8G \
@@ -406,11 +407,17 @@ parse_args() {
         (( UPGRADE_PHP_SEEN == 0 )) || die "--upgrade-php may only be given once"
         UPGRADE_PHP_SEEN=1
         UPGRADE_PHP=${1#*=}
+        # An empty value is a mistake (--upgrade-php="$VER" with VER unset),
+        # never a request for another mode.  validate_all also branches on
+        # UPGRADE_PHP_SEEN, so the remaining flags cannot take over.
+        [[ -n $UPGRADE_PHP ]] \
+          || die "--upgrade-php requires a version, e.g. --upgrade-php=8.6 (the value is empty)"
         shift ;;
       --upgrade-php)
         (( UPGRADE_PHP_SEEN == 0 )) || die "--upgrade-php may only be given once"
         UPGRADE_PHP_SEEN=1
-        (( $# >= 2 )) || die "--upgrade-php requires a version, e.g. --upgrade-php=8.6"
+        (( $# >= 2 )) && [[ -n $2 ]] \
+          || die "--upgrade-php requires a version, e.g. --upgrade-php=8.6"
         UPGRADE_PHP=$2
         shift 2 ;;
       --diagnostics)

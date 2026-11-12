@@ -58,7 +58,17 @@ run ok   --dry-run --basic server=dedi
 run ok   --dry-run --basic server=vps host=test.example.com swap=4G time=UTC
 run ok   --dry-run --basic --angie
 run ok   --dry-run --basic --php
-run ok   --dry-run --basic --php ver=8.4 children=32 max_requests=4096
+# --php is a first installation: on a host that already runs PHP-FPM only the
+# installed version is accepted (--upgrade-php changes it), so the explicit
+# ver= below follows the host.  The plan of a bare --php names that version.
+PHP_HOST_VER=$(bash "$SCRIPT_DIR/setup.sh" --dry-run --basic --php 2>&1 \
+  | sed -nE 's/.*[[:space:]]version=([0-9]+\.[0-9]+)[[:space:]].*/\1/p' | head -n1)
+run ok   --dry-run --basic --php ver="${PHP_HOST_VER:-8.4}" children=32 max_requests=4096
+if [[ -n $PHP_HOST_VER ]]; then
+  PHP_OTHER_VER=8.4
+  [[ $PHP_HOST_VER == 8.4 ]] && PHP_OTHER_VER=8.5
+  run fail --dry-run --basic --php ver="$PHP_OTHER_VER"
+fi
 run ok   --dry-run --basic --mariadb user=demo pass=temp size=4gb
 run ok   --dry-run --basic --mariadb user=demo pass=temp
 run ok   --dry-run --basic --mariadb user=demo pass=temp size=auto bind=127.0.0.1,IPV4
@@ -137,6 +147,23 @@ run fail --dry-run --basic --mariadb user=u size=4gb
 run fail --dry-run --basic --mariadb user=u pass=p size=0
 run fail --dry-run --basic --mariadb user=u pass=p size=4gb bind=bogus
 run fail --dry-run --basic --php ver=8
+# A version without a pool template (configs/php/www_<XY>.conf) is rejected
+# before anything is installed.
+run fail --dry-run --basic --php ver=8.0
+# Reserved MariaDB accounts and system schemas, in any letter case.
+run fail --dry-run --basic --mariadb user=root pass=x
+run fail --dry-run --basic --mariadb user=ROOT pass=x
+run fail --dry-run --basic --mariadb user=mysql pass=x
+run fail --dry-run --basic --mariadb user=mariadb pass=x
+run ok   --dry-run --basic --mariadb user=rooter pass=x
+run fail --dry-run --domain example.com db=mysql
+run fail --dry-run --domain example.com db=MySQL
+run fail --dry-run --domain example.com db=sys
+run fail --dry-run --domain example.com db=information_schema
+run fail --dry-run --domain example.com db=performance_schema
+run fail --dry-run --domain example.com db=appdb user=root pass=x
+run fail --dry-run --domain example.com db=appdb user=Mysql pass=x
+run ok   --dry-run --domain example.com db=mysql_app user=sysop pass=x
 run fail --dry-run --basic --php children=0
 run fail --dry-run --basic --valkey policy=bogus
 run fail --dry-run --basic --valkey io_threads=0
@@ -234,6 +261,13 @@ run ok   --dry-run --upgrade-php=8.6
 run ok   --dry-run --upgrade-php 8.6
 run fail --dry-run --upgrade-php
 run fail --dry-run --upgrade-php=abc
+# An empty value must fail, not fall through into the mode the other flags
+# select (--upgrade-php= --purge used to run a full purge).
+run fail --dry-run --upgrade-php=
+run fail --dry-run --upgrade-php= --purge
+run fail --dry-run --upgrade-php= --basic
+run fail --dry-run --upgrade-php ''
+run fail --dry-run --upgrade-php --purge
 run fail --dry-run --upgrade-php=7.4
 run fail --dry-run --upgrade-php=8.6 --basic
 run fail --dry-run --upgrade-php=8.6 --optimize
