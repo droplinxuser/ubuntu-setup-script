@@ -1110,6 +1110,114 @@ angie_xenforo_vhosts() {
   done
 }
 
+# Rewrite one `include h5bp/<from>;` of a vhost file, but only at the given
+# nesting level: "server" (directly inside a server block) or "nested"
+# (inside a location).  Brace depth is counted outside comments; a quoted
+# regex quantifier such as "{3}" opens and closes on the same line, so it
+# does not move the depth.  Prints nothing; returns 0 when the file changed.
+angie_rewrite_include_at_level() {
+  local file=$1 from=$2 to=$3 level=$4 tmp
+  [[ -f $file ]] || return 1
+  grep -qE "^[[:space:]]*include[[:space:]]+h5bp/${from//./\\.};" "$file" || return 1
+  tmp=$(tmp_file) || return 1
+  awk -v from="$from" -v to="$to" -v level="$level" '
+    {
+      line = $0
+      code = line
+      sub(/#.*/, "", code)
+      if (code ~ ("^[[:space:]]*include[[:space:]]+h5bp/" from ";")) {
+        # depth 1 = server block, 2+ = inside a location
+        if ((level == "server" && depth == 1) || (level == "nested" && depth >= 2)) {
+          sub("h5bp/" from ";", "h5bp/" to ";", line)
+        }
+      }
+      print line
+      n = split(code, ch, "")
+      for (i = 1; i <= n; i++) {
+        if (ch[i] == "{") depth++
+        else if (ch[i] == "}") depth--
+      }
+    }
+  ' "$file" > "$tmp" || return 1
+  commit_if_changed "$file" "$tmp"
+}
+
+# One value from a Chevereto app/env.php (`'KEY' => 'value'`).
+chevereto_env_value() {
+  sed -nE "s/.*['\"]$2['\"][[:space:]]*=>[[:space:]]*['\"]([^'\"]*)['\"].*/\1/p" "$1" 2>/dev/null | tail -n1 || true
+}
+
+# Whether a Chevereto site lets guests upload: prints 1, 0, or nothing when
+# it cannot be determined (no env.php, environment-only configuration, or
+# MariaDB not reachable as root).  Read-only: one SELECT on the settings table.
+chevereto_guest_uploads() {
+  local root=$1 env db prefix value
+  env="${root}/app/env.php"
+  [[ -f $env ]] || return 0
+  db=$(chevereto_env_value "$env" CHEVERETO_DB_NAME)
+  prefix=$(chevereto_env_value "$env" CHEVERETO_DB_TABLE_PREFIX)
+  [[ -n $prefix ]] || prefix=chv_
+  [[ $db =~ ^[A-Za-z0-9_]+$ && $prefix =~ ^[A-Za-z0-9_]+$ ]] || return 0
+  command -v mariadb >/dev/null 2>&1 || return 0
+  value=$(mariadb -N -B -e "SELECT setting_value FROM \`${db}\`.\`${prefix}settings\` WHERE setting_name = 'guest_uploads'" 2>/dev/null || true)
+  [[ $value == 0 || $value == 1 ]] && printf '%s' "$value"
+  return 0
+}
+
+# The guest caches for XenForo and Chevereto live in a named location, which
+# Angie only accepts at the server level, once per server:
+#   * Chevereto: h5bp/php_chev.conf is now the plain (never cached) PHP
+#     location and may stay nested; the server-level include moves to
+#     h5bp/php_chev_cache.conf.  A vhost that is not migrated keeps working,
+#     it just serves guests uncached.
+#     Chevereto embeds the session's auth_token in every page and cannot
+#     refresh it from the browser, so a cookie-less guest on a cached page
+#     has no valid token: with guest uploads enabled the first upload from
+#     such a page is rejected until the page is reloaded (measured).  A site
+#     that allows guest uploads therefore keeps the uncached include;
+#     SETUP_CHEV_GUEST_CACHE=1 forces the cache on, =0 forces it off.
+#   * XenForo: h5bp/php_xf.conf carries the named location itself, so a copy
+#     nested inside a location (never in the template, but possible in a
+#     hand-written vhost) is pointed at the generic h5bp/php.conf.
+# Deployed vhosts are otherwise left alone.
+angie_migrate_guest_cache_includes() {
+  local target=${1:-/etc/angie} vhost rel root guest want
+  [[ -d "${target}/conf.d" ]] || return 0
+  for vhost in "$target"/conf.d/*.conf; do
+    [[ -f $vhost ]] || continue
+    rel=${vhost#"${target}"/}
+    if [[ -f "${target}/h5bp/php_chev_cache.conf" ]] \
+       && grep -qE '^[[:space:]]*include[[:space:]]+h5bp/php_chev(_cache)?\.conf;' "$vhost"; then
+      want=cache
+      case "${SETUP_CHEV_GUEST_CACHE:-}" in
+        0) want=plain ;;
+        1) want=cache ;;
+        *)
+          # A vhost without a root directive makes the helper's pipeline fail.
+          root=$(angie_vhost_root "$vhost" || true)
+          guest=""
+          if [[ -n $root ]]; then guest=$(chevereto_guest_uploads "$root" || true); fi
+          if [[ $guest == 1 ]]; then want=plain; fi
+          ;;
+      esac
+      if [[ $want == cache ]]; then
+        if angie_rewrite_include_at_level "$vhost" php_chev.conf php_chev_cache.conf server; then
+          tune_note "${rel}: Chevereto guest cache include is h5bp/php_chev_cache.conf (cookie-safe)"
+        fi
+      elif angie_rewrite_include_at_level "$vhost" php_chev_cache.conf php_chev.conf server; then
+        tune_note "${rel}: Chevereto guest cache turned off (guest uploads are enabled or SETUP_CHEV_GUEST_CACHE=0)"
+      elif [[ ${SETUP_CHEV_GUEST_CACHE:-} != 0 ]]; then
+        opt_report "- Chevereto: \`${rel}\` allows guest uploads, so guest pages are not cached (a cached page cannot carry the visitor's upload token; SETUP_CHEV_GUEST_CACHE=1 overrides)"
+      fi
+    fi
+    if grep -qE '^[[:space:]]*location[[:space:]]+@xf_guest_cache' "${target}/h5bp/php_xf.conf" 2>/dev/null \
+       && angie_rewrite_include_at_level "$vhost" php_xf.conf php.conf nested; then
+      tune_note "${rel}: nested h5bp/php_xf.conf include replaced by h5bp/php.conf (the guest cache is server-level only)"
+    fi
+  done
+  return 0
+}
+
 # Download the cache templates from the Angie config repository.  Kept
 # separate from the installer fetch path so a failed download is a reported
 # miss instead of aborting --optimize.
@@ -1419,6 +1527,17 @@ ensure_xf_guest_cache() {
   tune_xf_location_security_headers "$target" "${target}/h5bp/php_xf_proxy.conf"
 
   local lock='$setup_xf_guest_bypass $nocacheuri'
+  # The repository include serves cacheable guests from the named location
+  # @xf_guest_cache, where Set-Cookie is hidden, so the cache may ignore it.
+  # An older or hand-written include has one location for guests and members:
+  # hiding the header there would break logins, and ignoring it would replay
+  # the first visitor's cookies to every guest.  Such a file must not store
+  # a response that sets a cookie at all.
+  local split=0 ignore='fastcgi_ignore_headers Cache-Control Expires;'
+  if grep -qE '^[[:space:]]*location[[:space:]]+@xf_guest_cache' "$file"; then
+    split=1
+    ignore='fastcgi_ignore_headers Cache-Control Expires Set-Cookie;'
+  fi
   # One source of truth for the guest-cache block: "match-pattern<TAB>line".
   # A fresh include gets the whole block injected; an existing one is
   # repaired line by line from the same list, so the two paths cannot drift
@@ -1430,7 +1549,7 @@ ensure_xf_guest_cache() {
     $'fastcgi_cache_lock[[:space:]]+on;\tfastcgi_cache_lock on;'
     $'fastcgi_cache_background_update[[:space:]]\tfastcgi_cache_background_update on;'
     $'fastcgi_cache_use_stale[[:space:]]\tfastcgi_cache_use_stale error timeout invalid_header updating http_503;'
-    $'fastcgi_ignore_headers[[:space:]]\tfastcgi_ignore_headers Cache-Control Expires Set-Cookie;'
+    "fastcgi_ignore_headers[[:space:]]"$'\t'"${ignore}"
     $'fastcgi_cache[[:space:]]+fastcgicache;\tfastcgi_cache fastcgicache;'
     "fastcgi_no_cache[[:space:]]"$'\t'"fastcgi_no_cache ${lock};"
     "fastcgi_cache_bypass[[:space:]]"$'\t'"fastcgi_cache_bypass ${lock};"
@@ -1478,6 +1597,14 @@ ensure_xf_guest_cache() {
     tune_ensure_in_location "$file" "^[[:space:]]*${pattern}" "$line" \
       "XenForo: ${line%% *} added to the guest cache"
   done
+  if (( split )); then
+    tune_ensure_in_location "$file" '^[[:space:]]*fastcgi_hide_header[[:space:]]+Set-Cookie;' \
+      'fastcgi_hide_header Set-Cookie;' \
+      "XenForo: cached guest pages no longer replay Set-Cookie"
+  elif grep -qE '^[[:space:]]*fastcgi_ignore_headers[[:space:]].*Set-Cookie' "$file"; then
+    sed_in_place -E '/^[[:space:]]*fastcgi_ignore_headers[[:space:]]/ s/[[:space:]]+Set-Cookie//' "$file"
+    tune_note "XenForo: single-location include no longer caches responses that set a cookie"
+  fi
   tune_xf_cache_bypass_var "$file"
   # Run the key/background repair last: it needs the lock line above to exist
   # before it can decide whether background_update is missing.

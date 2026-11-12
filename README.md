@@ -229,6 +229,12 @@ one vhost's setting leaked onto every other vhost of the shared pool).
 
 ### XenForo (`--domain ... app=xf`)
 
+Cacheable guest requests are served from a named location
+(`@xf_guest_cache`) that never forwards `Set-Cookie`, so one visitor's
+`xf_csrf` cookie is not replayed to the next; XenForo's own JavaScript
+fetches a fresh token from `/login/keep-alive` when the cookie is missing.
+Members, POSTs and no-cache URIs stay in the uncached PHP location.
+
 The vhost serves guest pages from the FastCGI cache for 5 minutes with a
 map-based bypass for `xf_session`/`xf_user`/admin/login cookies, a key that
 varies on style, style variation, language and `Accept-Encoding`, background
@@ -577,6 +583,7 @@ Read on each run, not persisted:
 | `SETUP_WP_GUEST_CACHE` | 1 re-adds the guest-cache include to WordPress vhosts that removed it |
 | `SETUP_PURGE_MALWARE` | 1 deletes known webshells instead of quarantining them |
 | `SETUP_DOMAIN_OPTIMIZE` | 0 skips the tuning pass at the end of `--domain` |
+| `SETUP_CHEV_GUEST_CACHE` | 1 forces the Chevereto guest cache on, 0 off; by default it is on unless the site allows guest uploads |
 | `SETUP_NODE_ALLOW_MAJOR_UPGRADE` | 1 allows a one-off Node.js major switch |
 | `CONFIG_REPO_URL`, `CONFIG_REPO_REF`, `CONFIG_SOURCE_DIR` | source of the Angie configuration tree |
 | `SETUP_STATE_DIR` | private state directory for tests and image builds |

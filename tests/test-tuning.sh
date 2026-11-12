@@ -634,6 +634,7 @@ check "tune_insert_after leaves http2 on intact" \
 # Error-response cache policy (applies to old installs during --optimize)
 # ---------------------------------------------------------------------------
 cat > "$TMP/cache-policy.conf" <<'EOF'
+fastcgi_cache fastcgicache;
 fastcgi_cache_valid any 5s;
 fastcgi_cache_use_stale error timeout updating http_500 http_503;
 EOF
@@ -1654,6 +1655,17 @@ printf '<?php\n$config["cache"]["config"] = array("host" => "127.0.0.1", "port" 
 check "XenForo cache parser reads a one-line array() with a TCP endpoint" \
   test "$(xf_cache_host_from_config "$TMP/xf-config-tcp.php"):$(xf_cache_port_from_config "$TMP/xf-config-tcp.php")" = 127.0.0.1:6379
 printf '<?php\n$config["db"]["host"] = "localhost";\n' > "$TMP/xf-config-nocache.php"
+cat > "$TMP/xf-config-sv.php" <<'EOF'
+<?php
+$config['cache']['provider']  = 'SV\RedisCache\Redis';
+$config['cache']['config']    = [
+    'host'     => '/run/valkey/valkey.sock',
+    'port'     => 0,
+    'database' => 1
+];
+EOF
+check "XenForo cache parser reads the SV RedisCache array form" \
+  test "$(xf_cache_host_from_config "$TMP/xf-config-sv.php"):$(xf_cache_port_from_config "$TMP/xf-config-sv.php")" = /run/valkey/valkey.sock:0
 check "XenForo cache parser reports no backend when none is configured" \
   test -z "$(xf_cache_host_from_config "$TMP/xf-config-nocache.php")"
 check "Unix socket detector accepts a Valkey socket" \
@@ -1767,6 +1779,138 @@ check "Referrer-Policy is re-included inside the proxy PHP location" \
   grep -q '^include h5bp/security/referrer-policy.conf;' "$TMP/xfguest/h5bp/php_xf_proxy.conf"
 check "the proxy include keeps its closing brace last" \
   test "$(tail -n1 "$TMP/xfguest/h5bp/php_xf_proxy.conf")" = '}'
+# Cookie safety.  A single-location include serves guests and members from
+# the same block, so it must never store a response that sets a cookie
+# (ignoring Set-Cookie there replayed the first visitor's xf_csrf to every
+# guest); hiding the header is only possible in the split include.
+check "single-location XenForo cache does not ignore Set-Cookie" \
+  bash -c 'grep -q "^fastcgi_ignore_headers Cache-Control Expires;" "$1" && ! grep -q "fastcgi_hide_header" "$1"' _ "$TMP/xfguest/h5bp/php_xf.conf"
+printf 'location ~ [^/]\\.php(/|$) {\nfastcgi_cache fastcgicache;\nfastcgi_ignore_headers  Cache-Control Expires Set-Cookie;\n}\n' > "$TMP/xfguest/h5bp/php_xf.conf"
+tune_reset_changes
+ensure_xf_guest_cache "$TMP/xfguest"
+check "legacy single-location include stops ignoring Set-Cookie" \
+  bash -c 'grep -q "^fastcgi_ignore_headers  Cache-Control Expires;" "$1" && ! grep -q "Set-Cookie" "$1"' _ "$TMP/xfguest/h5bp/php_xf.conf"
+# The repository include: uncached PHP location plus @xf_guest_cache.
+cat > "$TMP/xfguest/h5bp/php_xf.conf" <<'EOF'
+error_page 418 = @xf_guest_cache;
+location ~ [^/]\.php(/|$) {
+if ($xf_guest_cacheable) { return 418; }
+fastcgi_pass local_php;
+}
+location @xf_guest_cache {
+fastcgi_pass local_php;
+fastcgi_ignore_headers  Cache-Control Expires Set-Cookie;
+fastcgi_cache           fastcgicache;
+}
+EOF
+tune_reset_changes
+ensure_xf_guest_cache "$TMP/xfguest"
+check "split XenForo include keeps ignoring Set-Cookie for the cache" \
+  grep -q '^fastcgi_ignore_headers  Cache-Control Expires Set-Cookie;' "$TMP/xfguest/h5bp/php_xf.conf"
+check "split XenForo include hides Set-Cookie on cached guest pages" \
+  test "$(grep -c '^fastcgi_hide_header Set-Cookie;' "$TMP/xfguest/h5bp/php_xf.conf")" -eq 1
+check "the repaired cache directives land in @xf_guest_cache, not the member location" \
+  test "$(awk '/^location @xf_guest_cache/{f=1} f && /^fastcgi_(hide_header|cache_key|no_cache|cache_valid)/{n++} !f && /^fastcgi_(hide_header|cache_key|no_cache|cache_valid|cache )/{bad++} END{print (n >= 4 && bad == 0) ? "ok" : "bad"}' "$TMP/xfguest/h5bp/php_xf.conf")" = ok
+check "the member location still hands guests to the named location" \
+  grep -q '^if (\$xf_guest_cacheable) { return 418; }' "$TMP/xfguest/h5bp/php_xf.conf"
+tune_reset_changes
+ensure_xf_guest_cache "$TMP/xfguest"
+check "split XenForo include repair is idempotent" \
+  test "${#TUNE_CHANGES[@]}" -eq 0
+
+# Vhost include migration: the Chevereto server-level include moves to the
+# cookie-safe cache variant, a nested one stays; a nested php_xf.conf include
+# becomes php.conf (a named location is server-level only).
+mkdir -p "$TMP/gcm/conf.d" "$TMP/gcm/h5bp"
+: > "$TMP/gcm/h5bp/php_chev_cache.conf"
+printf 'location @xf_guest_cache {\n}\n' > "$TMP/gcm/h5bp/php_xf.conf"
+cat > "$TMP/gcm/conf.d/chev.conf" <<'EOF'
+server {
+    listen 80;
+    return 301 https://chev.example$request_uri;
+}
+server {
+    root /var/www/chev.example/public;
+    location ~* \.(gif|jpg)$ { expires 365d; }
+    location ~ "^/a{2}" { return 403; }
+    location ~ ^/(dashboard|update) {
+        include h5bp/php_chev.conf;
+    }
+    # include h5bp/php_chev.conf;
+    include h5bp/php_chev.conf;
+    include h5bp/basic.conf;
+}
+EOF
+cat > "$TMP/gcm/conf.d/xf.conf" <<'EOF'
+server {
+    location ~ ^/(admin.php|install) {
+        include h5bp/php_xf.conf;
+    }
+    include h5bp/php_xf.conf;
+}
+EOF
+cp "$TMP/gcm/conf.d/chev.conf" "$TMP/gcm/chev.before"
+tune_reset_changes
+angie_migrate_guest_cache_includes "$TMP/gcm"
+check "Chevereto server-level include moves to php_chev_cache.conf" \
+  grep -qx '    include h5bp/php_chev_cache.conf;' "$TMP/gcm/conf.d/chev.conf"
+check "Chevereto nested include stays on the uncached php_chev.conf" \
+  grep -qx '        include h5bp/php_chev.conf;' "$TMP/gcm/conf.d/chev.conf"
+check "a commented-out include is left alone" \
+  grep -qx '    # include h5bp/php_chev.conf;' "$TMP/gcm/conf.d/chev.conf"
+check "the Chevereto migration changes exactly one line" \
+  test "$(diff "$TMP/gcm/chev.before" "$TMP/gcm/conf.d/chev.conf" | grep -c '^>')" -eq 1
+check "a nested php_xf.conf include becomes php.conf" \
+  grep -qx '        include h5bp/php.conf;' "$TMP/gcm/conf.d/xf.conf"
+check "the server-level php_xf.conf include is kept" \
+  grep -qx '    include h5bp/php_xf.conf;' "$TMP/gcm/conf.d/xf.conf"
+check "the include migration reports both vhosts" \
+  test "${#TUNE_CHANGES[@]}" -eq 2
+tune_reset_changes
+angie_migrate_guest_cache_includes "$TMP/gcm"
+check "the include migration is idempotent" \
+  test "${#TUNE_CHANGES[@]}" -eq 0
+# A Chevereto site with guest uploads enabled keeps (or returns to) the
+# uncached include: a cached page cannot carry the visitor's upload token.
+cp "$TMP/gcm/chev.before" "$TMP/gcm/conf.d/chev.conf"
+rm -f "$TMP/gcm/conf.d/xf.conf"
+chevereto_guest_uploads() { printf 1; }
+tune_reset_changes; OPT_REPORT=()
+angie_migrate_guest_cache_includes "$TMP/gcm"
+check "guest uploads enabled: the Chevereto vhost stays uncached" \
+  cmp -s "$TMP/gcm/chev.before" "$TMP/gcm/conf.d/chev.conf"
+check "guest uploads enabled: the report explains why" \
+  grep -q 'allows guest uploads' <<<"${OPT_REPORT[*]}"
+SETUP_CHEV_GUEST_CACHE=1 angie_migrate_guest_cache_includes "$TMP/gcm"
+check "SETUP_CHEV_GUEST_CACHE=1 forces the Chevereto guest cache on" \
+  grep -qx '    include h5bp/php_chev_cache.conf;' "$TMP/gcm/conf.d/chev.conf"
+angie_migrate_guest_cache_includes "$TMP/gcm"
+check "guest uploads enabled later: the cache include is turned back off" \
+  cmp -s "$TMP/gcm/chev.before" "$TMP/gcm/conf.d/chev.conf"
+chevereto_guest_uploads() { printf 0; }
+SETUP_CHEV_GUEST_CACHE=0 angie_migrate_guest_cache_includes "$TMP/gcm"
+check "SETUP_CHEV_GUEST_CACHE=0 keeps the Chevereto guest cache off" \
+  cmp -s "$TMP/gcm/chev.before" "$TMP/gcm/conf.d/chev.conf"
+chevereto_guest_uploads() { :; }
+angie_migrate_guest_cache_includes "$TMP/gcm"
+check "unknown guest-upload setting: the cookie-safe cache is used" \
+  grep -qx '    include h5bp/php_chev_cache.conf;' "$TMP/gcm/conf.d/chev.conf"
+printf "<?php\nreturn [\n    'CHEVERETO_DB_NAME' => 'chevdb', 'CHEVERETO_DB_TABLE_PREFIX' => 'c1_',\n];\n" > "$TMP/chev-env.php"
+check "Chevereto env.php parser reads the database name and prefix" \
+  test "$(chevereto_env_value "$TMP/chev-env.php" CHEVERETO_DB_NAME):$(chevereto_env_value "$TMP/chev-env.php" CHEVERETO_DB_TABLE_PREFIX)" = chevdb:c1_
+# Without the cache variant in the tree (an older config repository) nothing
+# is rewritten: the vhost would otherwise point at a missing file.
+mkdir -p "$TMP/gcm-old/conf.d" "$TMP/gcm-old/h5bp"
+cp "$TMP/gcm/chev.before" "$TMP/gcm-old/conf.d/chev.conf"
+angie_migrate_guest_cache_includes "$TMP/gcm-old"
+check "no migration without h5bp/php_chev_cache.conf" \
+  cmp -s "$TMP/gcm/chev.before" "$TMP/gcm-old/conf.d/chev.conf"
+# An include that does not cache has no error policy to repair.
+printf 'location ~ [^/]\\.php(/|$) {\nfastcgi_pass local_php;\n}\n' > "$TMP/nocache.conf"
+cp "$TMP/nocache.conf" "$TMP/nocache.before"
+tune_cache_error_policy "$TMP/nocache.conf" "no cache"
+check "cache error policy leaves a non-caching include untouched" \
+  cmp -s "$TMP/nocache.conf" "$TMP/nocache.before"
 tune_reset_changes
 ensure_xf_guest_cache "$TMP/xfguest"
 check "in-location repair is idempotent" test "${#TUNE_CHANGES[@]}" -eq 0

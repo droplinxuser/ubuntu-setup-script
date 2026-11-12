@@ -333,6 +333,9 @@ tune_ensure_in_location() {
 tune_cache_error_policy() {
   local file=$1 label=$2 before after tmp
   [[ -f $file ]] || return 0
+  # An include without a cache (h5bp/php_chev.conf since the guest cache moved
+  # to php_chev_cache.conf) has no error policy to repair.
+  grep -qE '^[[:space:]]*(fastcgi|proxy)_cache[[:space:]]' "$file" || return 0
   before=$(file_md5 "$file")
   sed_in_place -E '/^[[:space:]]*fastcgi_cache_use_stale/ s/[[:space:]]+http_500([[:space:]]|;)/\1/g' "$file"
   if ! grep -qE '^[[:space:]]*fastcgi_cache_valid[[:space:]]+500([[:space:]]+[0-9]+)+[[:space:]]+0s;' "$file"; then
@@ -1222,6 +1225,7 @@ tune_angie_configs() {
   tune_cache_error_policy "$target/h5bp/php_xf.conf" "h5bp/php_xf.conf"
   tune_cache_error_policy "$target/h5bp/php_xf_proxy.conf" "h5bp/php_xf_proxy.conf"
   tune_cache_error_policy "$target/h5bp/php_chev.conf" "h5bp/php_chev.conf"
+  tune_cache_error_policy "$target/h5bp/php_chev_cache.conf" "h5bp/php_chev_cache.conf"
   tune_cache_error_policy "$target/h5bp/php_flarum.conf" "h5bp/php_flarum.conf"
   # The cache key references $setup_cache_enc, so the map that defines it
   # must exist before the first XenForo vhost is tested (a fresh install
@@ -2257,6 +2261,7 @@ angie_apply_profile() {
   local target=${1:-/etc/angie}
   optimize_wordpress_cache "$target" || warn "WordPress cache setup was skipped"
   ensure_xf_guest_cache "$target" || warn "XenForo cache setup was skipped"
+  angie_migrate_guest_cache_includes "$target" || warn "Guest cache include migration was skipped"
   configure_asset_precompression "$target" || warn "Asset precompression was skipped"
   tune_angie_configs "$target" || return 1
   # Dynamic Brotli compression.  The module is optional, so a failure here
