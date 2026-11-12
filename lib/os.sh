@@ -82,29 +82,49 @@ configure_cpu_governor() {
   if [[ ! -s "${STATE_DIR}/original-governor" && -r /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]]; then
     cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor > "${STATE_DIR}/original-governor" 2>/dev/null || true
   fi
-  record_original /etc/default/cpufrequtils cpufrequtils-default
-  if ! pkg_ok cpufrequtils; then
-    touch "${STATE_DIR}/cpufrequtils-installed"
-    # --optimize never runs the full update_system; refresh the lists once
-    # so this one install does not fail on a host with stale or empty lists.
-    apt_update_once
-    apt_install cpufrequtils
-  fi
-  local cpu_src="${SCRIPT_DIR}/configs/system/cpufrequtils"
-  if [[ -f $cpu_src ]]; then
-    install -m 644 "$cpu_src" /etc/default/cpufrequtils
-  else
-    printf 'GOVERNOR="performance"\n' > /etc/default/cpufrequtils
-  fi
-  cat /etc/default/cpufrequtils
+  # A native oneshot unit owns the governor.  The cpufrequtils package that
+  # releases up to 1.20.6 installed ships SysV init scripts only, and systemd
+  # logs "lacks a native systemd unit file ... expect removal soon" for both
+  # of them on every daemon-reload.  Nothing from the package is needed: the
+  # governor is one sysfs write per CPU.
+  local unit=/etc/systemd/system/setup-cpu-governor.service tmp gov_file
+  tmp=$(tmp_file) || return 1
+  cat > "$tmp" <<'EOF'
+# setup.sh: keep the performance CPU governor across reboots.
+[Unit]
+Description=Performance CPU governor (setup.sh)
+ConditionPathExists=/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+After=systemd-modules-load.service
 
-  systemctl daemon-reload || true
-  systemctl enable cpufrequtils || warn "Could not enable cpufrequtils"
-  systemctl restart cpufrequtils || warn "Could not start cpufrequtils"
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'for f in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor; do [ -w "$$f" ] && echo performance > "$$f"; done; exit 0'
 
-  if command -v cpufreq-set >/dev/null 2>&1; then
-    cpufreq-set -g performance || warn "cpufreq-set could not set the performance governor"
-    cpufreq-info || true
+[Install]
+WantedBy=multi-user.target
+EOF
+  if commit_if_changed "$unit" "$tmp"; then
+    chmod 644 "$unit"
+    systemctl daemon-reload || true
+  fi
+  systemctl enable setup-cpu-governor.service >/dev/null 2>&1 \
+    || warn "Could not enable setup-cpu-governor.service"
+  # Apply now as well: a oneshot that is already "active (exited)" is not
+  # re-run by `start`, and the write is idempotent.
+  for gov_file in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor; do
+    [[ -w $gov_file ]] && printf 'performance\n' > "$gov_file" 2>/dev/null || true
+  done
+  systemctl start setup-cpu-governor.service \
+    || warn "Could not start setup-cpu-governor.service"
+  info "CPU governor: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || printf unknown) (setup-cpu-governor.service)"
+
+  # Hosts provisioned by 1.20.6 or older: this script installed cpufrequtils
+  # there.  Stop its SysV services so only the native unit sets the governor;
+  # the package itself stays (packages are never purged by setup.sh).
+  if [[ -f "${STATE_DIR}/cpufrequtils-installed" ]] && pkg_ok cpufrequtils; then
+    systemctl disable --now cpufrequtils loadcpufreq >/dev/null 2>&1 || true
+    info "cpufrequtils is superseded by setup-cpu-governor.service; its SysV services are disabled. Remove the package with 'apt-get purge cpufrequtils' to silence systemd's SysV deprecation notices."
   fi
 }
 
@@ -436,6 +456,30 @@ ipfrag_sysctl_lines() {
   printf 'net.ipv4.ipfrag_high_thresh = %s\n' "$high"
 }
 
+# ufw loads its own /etc/ufw/sysctl.conf (IPT_SYSCTL in /etc/default/ufw)
+# every time it starts: on `ufw enable` and on every boot, after
+# systemd-sysctl has applied /etc/sysctl.conf.  Its stock
+# `log_martians=0` therefore silently replaced the managed profile's value,
+# so a fresh install (sysctl first, firewall second) and `--optimize` (sysctl
+# only) ended with different live values, and a reboot undid --optimize.
+# Make ufw's file agree with the managed profile for the keys both set.
+# $1/$2 are the two files (tests pass fixtures).
+ufw_align_sysctl() {
+  local ufw_file=${1:-/etc/ufw/sysctl.conf} profile=${2:-/etc/sysctl.conf} want tmp
+  [[ -f $ufw_file && -f $profile ]] || return 0
+  want=$(awk -F= '/^[[:space:]]*net\.ipv4\.conf\.all\.log_martians[[:space:]]*=/ { gsub(/[[:space:]]/, "", $2); v = $2 } END { print v }' "$profile" 2>/dev/null || true)
+  [[ $want =~ ^[01]$ ]] || return 0
+  grep -qE "^net/ipv4/conf/(all|default)/log_martians=" "$ufw_file" || return 0
+  tmp=$(tmp_file) || return 1
+  sed -E "s#^(net/ipv4/conf/(all|default)/log_martians)=.*#\1=${want}#" "$ufw_file" > "$tmp" || return 1
+  if ! cmp -s -- "$ufw_file" "$tmp"; then
+    [[ $ufw_file == /etc/ufw/sysctl.conf ]] && record_original "$ufw_file" ufw-sysctl.conf
+    cat -- "$tmp" > "$ufw_file"
+    info "UFW: log_martians=${want} in ${ufw_file} (ufw reloads this file on every start; it now matches the managed sysctl profile)"
+  fi
+  return 0
+}
+
 configure_sysctl() {
   step "sysctl tweaks"
   record_sysctl_values
@@ -652,6 +696,7 @@ EOF
   mapfile -t profile_keys < <(sysctl_file_keys /etc/sysctl.conf)
   record_sysctl_values "${profile_keys[@]}"
   sysctl -e -p /etc/sysctl.conf || warn "One or more sysctl values could not be applied"
+  ufw_align_sysctl /etc/ufw/sysctl.conf /etc/sysctl.conf
 
   # The congestion-control module and qdisc are module-owned and
   # systemd-sysctl runs before modules-load on Ubuntu, which logs "No such

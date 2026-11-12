@@ -116,9 +116,8 @@ Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
       current CPU/RAM/disk.  It also enables FastCGI guest caching for
       detected WordPress and XenForo vhosts, including the shared cache
       zone, style/language cache keys and session-cookie bypass.
-      It never installs, purges or starts a managed service; the only packages
-      it may add are the small cpufrequtils helper when the CPU exposes
-      frequency scaling and angie-module-brotli when Angie is installed, so
+      It never installs, purges or starts a managed service; the only package
+      it may add is angie-module-brotli when Angie is installed, so
       install and optimize share the same compression profile.  It also never
       touches the resolver (DNS), the firewall (UFW) or swap: those are
       --basic decisions and stay as the operator left them.  Allocations

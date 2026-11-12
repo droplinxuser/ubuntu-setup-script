@@ -8,7 +8,6 @@ other service configs live here.
 | Path | Purpose |
 |---|---|
 | `system/dns_servers.conf` | systemd-resolved global DNS drop-in |
-| `system/cpufrequtils` | CPU governor default (`performance`) |
 | `system/sysctl.conf` | kernel/network tuning profile |
 | `system/limits.conf` | PAM/security file-descriptor limits |
 | `mariadb/mariadb_server.cnf` | reference MariaDB server profile |

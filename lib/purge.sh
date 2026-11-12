@@ -130,6 +130,7 @@ purge_basic() {
   fi
   restore_original /etc/security/limits.d/99-setup.conf limits.d-99-setup.conf
   restore_original /etc/sysctl.conf sysctl.conf
+  restore_original /etc/ufw/sysctl.conf ufw-sysctl.conf
   restore_original /etc/sysctl.d/99-sysctl.conf sysctl.d-99-sysctl.conf
   restore_original /etc/sysctl.d/90-setup-network.conf sysctl.d-90-setup-network.conf
   restore_original /etc/modules-load.d/setup-network.conf modules-load-setup-network.conf
@@ -183,6 +184,8 @@ purge_basic() {
 
   # CPU governor: stop the unit so a reboot cannot re-apply "performance",
   # put the file back, then restore the governor that was active before.
+  systemctl disable --now setup-cpu-governor.service 2>/dev/null || true
+  # Hosts provisioned by 1.20.6 or older used the cpufrequtils package.
   systemctl disable --now cpufrequtils 2>/dev/null || true
   restore_original /etc/default/cpufrequtils cpufrequtils-default
   if [[ -f "${STATE_DIR}/cpufrequtils-installed" ]]; then

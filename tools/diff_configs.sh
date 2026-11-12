@@ -37,7 +37,6 @@ compare_files() {
 # Remote URL and live path for every non-PHP file, compared in this order.
 config_files=(
     "${SETUP_REPO}/configs/system/dns_servers.conf /etc/systemd/resolved.conf.d/dns_servers.conf"
-    "${SETUP_REPO}/configs/system/cpufrequtils /etc/default/cpufrequtils"
     "${SETUP_REPO}/configs/system/sysctl.conf /etc/sysctl.conf"
     "${SETUP_REPO}/configs/system/limits.conf /etc/security/limits.d/99-setup.conf"
     "${SETUP_REPO}/configs/mariadb/limit_nofile.conf /etc/systemd/system/mariadb.service.d/limits.conf"
