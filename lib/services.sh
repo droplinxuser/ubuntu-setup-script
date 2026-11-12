@@ -47,7 +47,7 @@ configure_elastic_repo() {
 
 # Major version of the Node.js runtime currently on PATH (empty when absent).
 node_installed_major() {
-  local v
+  local v=""
   if command -v node >/dev/null 2>&1; then
     v=$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null) || v=""
   fi
