@@ -93,9 +93,9 @@ bash setup.sh --upgrade-php=8.6 --dry-run
 | Option | Default | Effect |
 |---|---|---|
 | `server=dedi\|vps` | auto (`systemd-detect-virt`, DMI, cgroups) | `dedi` sets the `performance` CPU governor; the pin is recorded so `--optimize` keeps the host class |
-| `host=FQDN` | `<threads>c-<RAM_GB>g-<storage>` (e.g. `8c-32g-1T`) | hostname via `hostnamectl` |
+| `host=FQDN` | `<threads>c-<RAM_GB>g-<storage>` (e.g. `8c-32g-1T`) | hostname via `hostnamectl`; a repeat `--basic` without `host=` keeps the current name |
 | `swap=SIZE` | add swap only when total swap is 0 or below 50% of RAM, up to 50% of RAM (1-8 GiB, 4 GiB on a VPS) | `/swapfile` of exactly that size (`8G`, `8Gi`, `512M`) |
-| `time=REGION/CITY` | `Asia/Manila` | timezone |
+| `time=REGION/CITY` | `Asia/Manila` | timezone; a repeat `--basic` without `time=` keeps the current zone |
 
 What `--basic` does:
 
@@ -315,7 +315,7 @@ Managed `valkey.conf`:
 |---|---|
 | Network | loopback bind, `protected-mode` |
 | Socket | `unixsocket /run/valkey/valkey.sock`, mode 770, with `www-data` in the `valkey` group |
-| Persistence | `save ""`, `appendonly no` (cache only) |
+| Persistence | `save ""`, `appendonly no` (cache only).  `--optimize` keeps `appendonly yes` and a non-loopback `bind` of a Redis/Valkey it did not install |
 | `maxclients` | PHP workers x 4 + 2000, minimum 10000 |
 | Other | `tcp-backlog`, `hz 10`, lazy-free |
 

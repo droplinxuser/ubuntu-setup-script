@@ -3,6 +3,77 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.3 (2026-11-13)
+
+Findings of an independent review of 1.21.2 (shell libraries and the Angie
+configuration), validated on the Ubuntu 26.04.1 test host (16 logical CPUs,
+27 812 MiB RAM, NVMe, bare metal) with WordPress 7.1.4, XenForo 2.3.13 and
+Chevereto 4.5.9.  Pair with server-configs-nginx 1.6.26.
+
+- **Log files are no longer followed through symbolic links (privilege
+  escalation).**  The log directories under `/var/www/logs` belong to their
+  service account, and root ran `chmod 640`/`chown` on the files inside
+  them.  A compromised PHP application could replace `php-error.log` with a
+  link to `/etc/passwd` and the next install, `--optimize` or
+  `--restart-all` handed that file to `www-data`.  `secure_log_file` leaves
+  a link alone and reports it, creates a missing file with `O_EXCL` and
+  changes the owner with `-h`; `log_file`, the Angie deployer and the
+  PHP-FPM log path all use it.
+- **An interrupted run cannot leave the site stopped.**  Angie and PHP-FPM
+  are paused while MariaDB restarts.  A dropped SSH session (HUP), a closed
+  output pipe or Ctrl-C in that window left them stopped; HUP and PIPE are
+  now trapped and `on_exit` resumes whatever is still paused.
+- **Adopted Redis/Valkey keeps its persistence and bind address.**
+  `--optimize` wrote `save ""`, `appendonly no` and `bind 127.0.0.1 -::1`
+  into every cache it found.  A service setup.sh did not install that has
+  `appendonly yes` or binds a non-loopback address keeps those lines (marked
+  in the file, reported, and kept on later runs).  A cache installed by
+  `--valkey` is unchanged.
+- **`--upgrade-php` keeps the socket of a migrated extra pool.**  The
+  version rewrite also renamed `listen = /run/php/php8.3-fpm-shop.sock`,
+  while the operator's vhost still pointed at the old name: 502 with a
+  passing report.  The `listen` line is now left alone, as it already was
+  for `www.conf`, and the dot in the old version is escaped.
+- **Repeat runs keep earlier choices.**  `--basic` without `host=`/`time=`
+  on a host it already configured keeps the live hostname and timezone
+  instead of generating a new name and moving the clock to Asia/Manila;
+  `--valkey` without `policy=`/`io_threads=` keeps the previous values (the
+  validation wrote the defaults back, so the preservation code never ran).
+- **Backup credentials with `#`, `"` or `\`.**  `/etc/mysqlbkup.cnf` is an
+  option file: `pass='Ab#9xQ'` was read as `Ab` and every nightly dump
+  failed.  User and password are written quoted and escaped.
+- **Generated vhosts get anchored route locations.**  `--optimize` rewrites
+  the XenForo `^/(admin.php|install)` and Chevereto `^/(dashboard|update)`
+  locations of existing vhosts to the anchored 1.6.26 form, so `/install.sh`,
+  `/install.log` or `/update.log` are no longer served.  Verified on the
+  host: 200 before, 403/404 after.
+- **XenForo static assets.**  One `Cache-Control: public, max-age=2592000,
+  immutable` header instead of two, and HSTS on `/js`, `/styles`, `/data`.
+- **Smaller fixes.**  Automatic swap is sized to the free disk (256 MiB kept
+  free, the old file's space counted) before an active swap file is
+  released, and no longer aborts `--basic` on a small disk.  The WordPress
+  database-user split never re-keys an account that already exists (two
+  database names sharing 24 characters collided).  The malware rule for
+  `plugin-<10 hex>` directories needs at least one hex letter
+  (`akismet-2024051001` was quarantined).  The optimize report is 0640.
+- **`--purge` then re-install is the fresh-install state again.**  The
+  purge disables `phpsessionclean.timer` and the sysstat units, which only
+  the package postinst enabled; a re-install on the kept packages left them
+  off (PHP sessions were then never collected).  `--php` and `--others
+  sysstat` enable them again.  Verified: the state snapshot after purge,
+  re-install and `--optimize` is identical to the one before the purge.
+- **Tests.**  802 tuning checks and 193 dry-run combinations pass on the
+  host.  A test that called a function removed in an earlier release (and
+  passed on its "command not found") is gone.
+
+Reviewed and left as is, with the reason: the Angie tree is fetched from the
+`main` branch (pin `CONFIG_REPO_REF` to a tag for change control);
+`/etc/sysctl.conf` is replaced as a whole; `--purge basic` removes the
+managed cron block; the memory plan counts only the `www` pool; storage
+class in an LXC container follows the host's disks (set
+`SETUP_STORAGE_CLASS`); a Redis with `requirepass` is not probed with a
+password.
+
 ## 1.21.2 (2026-11-13)
 
 Security and correctness fixes found by the 1.21.1 audit, validated on the
