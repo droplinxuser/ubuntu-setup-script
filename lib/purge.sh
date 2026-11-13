@@ -181,6 +181,11 @@ purge_basic() {
     orig_tz=$(<"${STATE_DIR}/original-timezone")
     if [[ -n $orig_tz ]]; then timedatectl set-timezone "$orig_tz" || true; fi
   fi
+  # The originals are back: a later --basic is a first run again.
+  local marker
+  for marker in "${STATE_DIR}/applied-hostname" "${STATE_DIR}/applied-timezone"; do
+    [[ -f $marker ]] && : > "$marker"
+  done
 
   # CPU governor: stop the unit so a reboot cannot re-apply "performance",
   # put the file back, then restore the governor that was active before.

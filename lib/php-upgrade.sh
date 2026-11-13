@@ -452,7 +452,7 @@ php_upgrade_migrate_custom() {
         continue
       fi
       mkdir -p "$(dirname "$dest")"
-      if sed -E "s/php${old}/php${new}/g" "$backup/$rel" > "$dest" 2>/dev/null; then
+      if sed -E "s/php${old//./\\.}/php${new}/g" "$backup/$rel" > "$dest" 2>/dev/null; then
         migrated=$(( migrated + 1 ))
         local -a linkdirs=()
         IFS=, read -r -a linkdirs <<< "$links"
@@ -472,7 +472,11 @@ php_upgrade_migrate_custom() {
       [[ -n $rel ]] || continue
       dest="/etc/php/$new/fpm/pool.d/$rel"
       [[ -e $dest ]] && continue
-      sed -E "s/php${old}/php${new}/g" "$backup/fpm/pool.d/$rel" > "$dest" 2>/dev/null || {
+      # The listener keeps its path, as tune_php_fpm_version does for
+      # www.conf: an operator vhost points at exactly this socket
+      # (fastcgi_pass unix:/run/php/php8.3-fpm-shop.sock) and renaming it to
+      # the new version would answer 502 while the upgrade reports success.
+      sed -E "/^[[:space:]]*listen[[:space:]]*=/! s/php${old//./\\.}/php${new}/g" "$backup/fpm/pool.d/$rel" > "$dest" 2>/dev/null || {
         rm -f "$dest"
         warn "PHP ${new}: could not migrate pool ${rel}"
         continue

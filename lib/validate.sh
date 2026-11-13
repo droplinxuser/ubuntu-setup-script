@@ -586,7 +586,12 @@ validate_all() {
       || die "--basic swap='${OPT[basic.swap]}' is invalid (use e.g. 8G)"
     OPT[basic.swap]=$swap
   fi
-  local tz=${OPT[basic.time]:-Asia/Manila}
+  local tz=${OPT[basic.time]:-}
+  if [[ -z $tz ]]; then
+    # No time=: keep the zone an earlier --basic applied; Asia/Manila is the
+    # documented default of a first run only.
+    tz=$(basic_applied_value timezone 2>/dev/null) || tz=Asia/Manila
+  fi
   validate_timezone "$tz" || die "--basic time='${tz}' is not a valid timezone"
   OPT[basic.time]=$tz
 
@@ -706,23 +711,30 @@ validate_all() {
         OPT[valkey.ram]=128m
       fi
     fi
-    local vpol=${OPT[valkey.policy]:-allkeys-lru}
-    case "$vpol" in
-      allkeys-lru|allkeys-lfu|volatile-lru|volatile-lfu|volatile-ttl|allkeys-random|volatile-random|noeviction) ;;
-      *) die "--valkey policy='${vpol}' is invalid" ;;
-    esac
-    OPT[valkey.policy]=$vpol
-    local vio=${OPT[valkey.io_threads]:-1}
-    [[ $vio =~ ^[1-9][0-9]*$ ]] && (( vio <= 64 )) \
-      || die "--valkey io_threads='${vio}' is invalid (use 1..64)"
-    if (( vio > 8 )); then
-      # valkey_clamp_io_threads writes at most 8 (more threads than that
-      # only add contention on the single command thread); say so instead
-      # of silently writing a different value than the one requested.
-      warn "--valkey io_threads=${vio} exceeds the 8-thread ceiling; using 8"
-      vio=8
+    # Only a value that was given is validated and stored.  An absent
+    # policy=/io_threads= stays unset so install_valkey can keep what a
+    # previous run wrote (allkeys-lru / 1 on a first install); writing the
+    # default back here silently reset `policy=noeviction io_threads=4` on
+    # the next `--valkey` run.
+    if [[ -n ${OPT[valkey.policy]:-} ]]; then
+      case "${OPT[valkey.policy]}" in
+        allkeys-lru|allkeys-lfu|volatile-lru|volatile-lfu|volatile-ttl|allkeys-random|volatile-random|noeviction) ;;
+        *) die "--valkey policy='${OPT[valkey.policy]}' is invalid" ;;
+      esac
     fi
-    OPT[valkey.io_threads]=$vio
+    if [[ -n ${OPT[valkey.io_threads]:-} ]]; then
+      local vio=${OPT[valkey.io_threads]}
+      [[ $vio =~ ^[1-9][0-9]*$ ]] && (( vio <= 64 )) \
+        || die "--valkey io_threads='${vio}' is invalid (use 1..64)"
+      if (( vio > 8 )); then
+        # valkey_clamp_io_threads writes at most 8 (more threads than that
+        # only add contention on the single command thread); say so instead
+        # of silently writing a different value than the one requested.
+        warn "--valkey io_threads=${vio} exceeds the 8-thread ceiling; using 8"
+        vio=8
+      fi
+      OPT[valkey.io_threads]=$vio
+    fi
   fi
 
   if [[ ${ENABLED[elastic]:-0} -eq 1 ]]; then
