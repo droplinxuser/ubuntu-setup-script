@@ -6,8 +6,14 @@ PW=$(cat /root/audit/test-admin-pass); V=$(php -r 'echo PHP_MAJOR_VERSION.".".PH
 J=/root/audit/cookies; mkdir -p $J; rm -f $J/*.jar
 LOG=/var/www/logs/php/php-error.log
 WP=/var/www/wp.test.local/public; XF=/var/www/xf.test.local/public; CH=/var/www/chev.test.local/public
-printf 'error_reporting = E_ALL\nlog_errors = On\n' > /etc/php/$V/fpm/conf.d/zzz-audit.ini
-printf 'error_reporting = E_ALL\nlog_errors = On\nerror_log = %s\ndisplay_errors = Off\n' "$LOG" > /etc/php/$V/cli/conf.d/zzz-audit.ini
+# Functional test: keep the production error_reporting (E_ALL & ~E_DEPRECATED)
+# and only route the central log.  Forcing E_ALL here made applications that
+# convert any PHP error into an exception (Chevereto with debug enabled)
+# answer 403/500 for a vendor deprecation, which is not a functional failure.
+# tests/stress-site/compat-php.sh is the run that forces E_ALL for the
+# deprecation scan; it enables each application's own debug mode.
+printf 'log_errors = On\nerror_log = %s\n' "$LOG" > /etc/php/$V/fpm/conf.d/zzz-audit.ini
+printf 'log_errors = On\nerror_log = %s\n' "$LOG" > /etc/php/$V/cli/conf.d/zzz-audit.ini
 systemctl reload php$V-fpm; : > $LOG; chmod 666 $LOG
 q() { local h=$1; shift; curl -sk -o /tmp/ex.body -w '%{http_code}' --resolve $h:443:127.0.0.1 "$@"; }
 st() { printf '%-34s %s\n' "$1" "$2"; }
@@ -31,7 +37,11 @@ st "wp comment POST" "$(PID=$(curl -sk --resolve wp.test.local:443:127.0.0.1 "$P
 (cd $WP && runuser -u www-data -- php wp-cron.php); st "wp-cron cli" $?
 # ---- XenForo
 xflogin() { local who=$1 jar=$J/xf-$2.jar t
-  t=$(curl -sk --resolve xf.test.local:443:127.0.0.1 -c $jar https://xf.test.local/login/ | grep -oE 'name="_xfToken" value="[^"]+' | head -1 | sed 's/.*value="//')
+  # Save the body to a file before grep: piping curl into `head` makes curl
+  # die on SIGPIPE before it writes the cookie jar, so the following POST
+  # arrives without the session cookie and the login is rejected.
+  curl -sk --resolve xf.test.local:443:127.0.0.1 -c $jar -o $J/xf-login.html https://xf.test.local/login/
+  t=$(grep -oE 'name="_xfToken" value="[^"]+' $J/xf-login.html | head -1 | sed 's/.*value="//')
   st "xf login $who" "$(q xf.test.local -b $jar -c $jar --data-urlencode "login=$who" --data-urlencode "password=$PW" --data-urlencode "_xfToken=$t" -d 'remember=1&_xfRedirect=https%3A%2F%2Fxf.test.local%2F' https://xf.test.local/login/login)"; }
 xflogin admin admin; xflogin "$XFM" member
 THREAD=$(curl -sk --resolve xf.test.local:443:127.0.0.1 https://xf.test.local/whats-new/posts/ -L | grep -oE '/threads/[a-z0-9.%-]+/' | head -1); echo "https://xf.test.local$THREAD" > $J/xf-thread.url
@@ -47,7 +57,13 @@ for u in '' '?users/list' '?options/' '?nodes/' '?add-ons/' '?styles/' '?tools/r
 (cd $XF && runuser -u www-data -- php cmd.php xf:run-jobs --max-execution-time=20 >/dev/null 2>&1); st "xf run-jobs cli" $?
 (cd $XF && runuser -u www-data -- php cmd.php xf-rebuild:threads -n >/dev/null 2>&1); st "xf rebuild cli" $?
 # ---- Chevereto
-t=$(curl -sk --resolve chev.test.local:443:127.0.0.1 -c $J/ch-admin.jar https://chev.test.local/login | grep -oE 'auth_token = "[a-f0-9]+' | head -1 | grep -oE '[a-f0-9]+$')
+# The login_cookie unique key has one-second resolution: a second login for
+# the same user in the same second raises SQLSTATE 23000 and Chevereto renders
+# a 500. Clear the previous audit's cookies first so repeated runs stay clean.
+mariadb -N chevereto -e 'DELETE FROM chv_login_cookies' 2>/dev/null || true
+sleep 1
+curl -sk --resolve chev.test.local:443:127.0.0.1 -c $J/ch-admin.jar -o $J/chev-login.html https://chev.test.local/login
+t=$(grep -oE 'auth_token = "[a-f0-9]+' $J/chev-login.html | head -1 | grep -oE '[a-f0-9]+$')
 st "chev login admin" "$(q chev.test.local -b $J/ch-admin.jar -c $J/ch-admin.jar --data-urlencode login-subject=admin --data-urlencode "password=$PW" --data-urlencode "auth_token=$t" -d keep-login=1 https://chev.test.local/login)"
 for u in / /explore /explore/recent /explore/trending /explore/albums /explore/users /login /signup /page/tos /search/images/?q=test /api/1/upload /sitemap.xml; do st "chev guest $u" "$(q chev.test.local "https://chev.test.local$u")"; done
 for u in / /admin /dashboard /dashboard/settings /dashboard/images /dashboard/users /dashboard/settings/system /settings /upload /explore; do st "chev admin $u" "$(q chev.test.local -L -b $J/ch-admin.jar "https://chev.test.local$u")"; done
@@ -57,6 +73,11 @@ t=$(curl -sk --resolve chev.test.local:443:127.0.0.1 -b $J/ch-admin.jar https://
 st "chev upload POST" "$(q chev.test.local -b $J/ch-admin.jar -F "source=@/tmp/ex.png" -F type=file -F action=upload -F "auth_token=$t" -F nsfw=0 https://chev.test.local/json) $(head -c 120 /tmp/ex.body | tr -d '\n')"
 IMG=$(grep -oE '"url_viewer":"[^"]+' /tmp/ex.body | head -1 | sed 's/.*:"//; s#\\/#/#g'); [ -n "$IMG" ] && { echo "$IMG" > $J/ch-image.url; st "chev image page" "$(q chev.test.local "$IMG")"; }
 (cd $CH && runuser -u www-data -- php app/bin/legacy -C cron >/dev/null 2>&1); st "chev cron cli" $?
+# Path handling: a raw dot-segment (curl --path-as-is) must never reach PHP,
+# and a direct front controller on Chevereto must redirect instead of 500.
+st "chev rejected dot segment" "$(q chev.test.local --path-as-is https://chev.test.local/foo/../index.php)"
+st "chev canonical /index.php" "$(q chev.test.local --path-as-is https://chev.test.local/index.php)"
+st "xf rejected dot segment" "$(q xf.test.local --path-as-is https://xf.test.local/foo/../index.php)"
 sleep 1
 echo "=== PHP $V diagnostics (unique, by app) ==="
 for app in wp.test.local xf.test.local chev.test.local; do
