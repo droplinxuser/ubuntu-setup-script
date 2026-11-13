@@ -1,0 +1,79 @@
+# Test-run package manifest - 2026-11-14 (setup.sh 1.21.4 -> 1.6.27)
+
+Host: SER8 (`16c-32g-1T`), Ubuntu 26.04.1 LTS, 16 logical CPUs, 27 812 MiB
+RAM, 931 GB NVMe, bare metal, kernel 7.0.0-43.
+Profile: the host was already installed by the previous audit with
+`--basic --angie --php ver=8.5 --mariadb user=admin pass=temp size=auto
+--valkey --elastic ram=4g --others all`; this run re-used it, upgraded PHP
+8.5 -> 8.6 -> 8.5 and 8.5 -> 8.4 -> 8.5, and deployed WordPress 7.1.4,
+XenForo 2.3.13 and Chevereto 4.5.9 through `--domain`.
+
+Baseline: 526 packages.
+Installed: 623 packages (97 added, 0 removed, 0 version changed).
+Final:     526 packages, 0 added, 0 removed, 0 version changed.
+
+## Packages present during the test (97, all purged)
+
+Runtime / services
+  angie  angie-module-brotli  elasticsearch  mariadb-server
+  mariadb-server-core  mariadb-client  mariadb-client-core  mariadb-common
+  mysql-common  valkey-server  valkey-tools  galera-4  socat
+  nodejs  nvme-cli  smartmontools  sysstat  gifsicle  git  git-man
+  curl  apt-transport-https  debsuryorg-archive-keyring  wrk
+
+PHP 8.5 (Sury)
+  php8.5-fpm  php8.5-cli  php8.5-common  php8.5-curl  php8.5-gd  php8.5-gmp
+  php8.5-igbinary  php8.5-imagick  php8.5-mbstring  php8.5-mysql
+  php8.5-readline  php8.5-redis  php8.5-xml  php8.5-zip  php-common
+
+PHP 8.4 and 8.6 RC were installed and removed by `--upgrade-php`.  The 8.6
+run also proved the missing `php8.6-redis`, `php8.6-imagick` and
+`php8.6-igbinary` packages; the new preflight now refuses that purge when an
+application needs them.
+
+Libraries pulled in as dependencies
+  fontconfig-config  fonts-dejavu-core  fonts-dejavu-mono  gawk
+  imagemagick-7-common  libabsl20260107  libaio1t64  libaom3  libargon2-1
+  libavif16  libdav1d7  libdbi-perl  libdeflate0  liberror-perl
+  libfftw3-double3  libfontconfig1  libgav1-2  libgd3  libgomp1
+  libheif-plugin-aomdec  libheif1  libimagequant0  libjbig0
+  libjpeg-turbo8  libjpeg8  liblcms2-2  liblerc4  liblqr-1-0  libltdl7
+  libluajit-5.1-2  libluajit-5.1-common  libmagickcore-7.q16-10
+  libmagickwand-7.q16-10  libmariadb3  libmpfr6  libnvme1t64
+  libopenjp2-7  libpcre2-posix3  libraw23t64  libsensors-config
+  libsensors5  libsharpyuv0  libsodium23  libtiff6  liburing2  libwebp7
+  libwebpdemux2  libwebpmux3  libx11-6  libx11-data  libxau6  libxcb1
+  libxdmcp6  libxext6  libxpm4  libxslt1.1  libyuv0  libzip5
+
+`wrk` is the loopback load generator; everything else came from setup.sh.
+
+## Changes before restore
+
+- Added `/etc` files: 276 (managed Angie/PHP/MariaDB/Valkey/Elasticsearch
+  trees, certificates, sysctl/limits/units, APT keys).
+- Changed `/etc` files: 15 (account/group databases, `/etc/hosts`,
+  `/etc/ld.so.cache`, sysctl and UFW state).
+- Added unit files: the five services plus the setup-* tuning units,
+  smartmontools and sysstat.
+- Active services: Angie, PHP 8.5 FPM, MariaDB, Valkey, Elasticsearch.
+
+## Restore verification
+
+`tests/deploy-audit/restore-baseline.sh` exit 0.
+
+- Package count 526; delta 0 added / 0 removed / 0 version changed.
+- `/etc` delta 0 added / 0 removed / 0 changed after removing the two
+  test-run edits the purge cannot know about: the three `*.test.local`
+  lines in `/etc/hosts` and the non-empty `/etc/sysctl.conf` (the baseline
+  file is empty).
+- 0 failed systemd units; UFW inactive; listeners are SSH and the local
+  resolver only.
+- No `/etc/angie`, `/etc/php`, `/etc/mysql`, `/etc/valkey`,
+  `/etc/elasticsearch`, `/var/www` or `/var/lib/setup.sh`.
+- Only the three Ubuntu APT sources remain; no service accounts; no root
+  crontab; no test `/etc/hosts` entries.
+- Runtime kernel values are `cubic` / `fq_codel`; `tcp_bbr` is still loaded
+  by the live SSH/qdisc state (`tcp_allowed_congestion_control` lists it)
+  and resets on reboot.  `kernel.panic` is back to 0.
+
+Full report: `tests/stress-site/AUDIT-20261114-1.21.4.md`.
