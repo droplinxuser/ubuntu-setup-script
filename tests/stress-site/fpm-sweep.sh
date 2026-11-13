@@ -48,7 +48,9 @@ done
 if [[ ${dyn:-0} == 1 ]]; then
   # Optional pm=dynamic comparison at the shipped worker ceiling.  The pool
   # state from the last static run is still saved, so restore still works.
-  if ssh "$TARGET" "sudo -n bash -c 'p=\$(ls -d /etc/php/*/fpm/pool.d/www.conf | head -1); sed -i -E \"s|^[[:space:]]*pm[[:space:]]*=.*|pm = dynamic|; s|^[[:space:]]*pm\.start_servers[[:space:]]*=.*|pm.start_servers = 4|; s|^[[:space:]]*pm\.min_spare_servers[[:space:]]*=.*|pm.min_spare_servers = 2|; s|^[[:space:]]*pm\.max_spare_servers[[:space:]]*=.*|pm.max_spare_servers = 6|\" \"\$p\"; systemctl reload php*-fpm'" >/dev/null 2>&1; then
+  # set-fpm.sh maintains the start/spare keys: switching a static pool to
+  # dynamic without them makes php-fpm refuse to start.
+  if ssh "$TARGET" "sudo -n bash ${REMOTE_DIR}/tests/stress-site/set-fpm.sh dynamic ${WORKERS##* }" >/dev/null 2>&1; then
     sleep 1
     row=$(bash "$ROOT/tests/stress-site/bench-one.sh" "fpm-dynamic" "$URL" "${COOKIE:--}" "$CONNS" "$SECS" 2>/dev/null | tail -1)
     rps=$(printf '%s' "$row" | awk -F'|' '{gsub(/ /,"",$3); print $3}')
