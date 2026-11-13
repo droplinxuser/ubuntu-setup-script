@@ -23,15 +23,65 @@ set_key() {
   fi
 }
 
+# The shipped pool is pm=static and deliberately carries no start/spare keys.
+# Switching it to pm=dynamic without them makes PHP-FPM refuse to start
+# ("pm.min_spare_servers(0) must be a positive value"), and the service then
+# restarts in a loop while every request answers 502.  The sweep must never
+# leave the host in that state.
+ensure_dynamic_keys() {
+  local key value
+  for kv in "pm.start_servers 2" "pm.min_spare_servers 1" "pm.max_spare_servers 3"; do
+    key=${kv% *}; value=${kv#* }
+    set_key "$key" "$value"
+  done
+}
+
+# Remove the start/spare keys a dynamic A/B run adds, so restoring a static
+# pool returns the file to the shipped content instead of leaving inert keys.
+drop_dynamic_keys() {
+  sed -i -E "/^[[:space:]]*pm\.(start_servers|min_spare_servers|max_spare_servers)[[:space:]]*=/d" "$POOL"
+}
+
+# Validate a candidate pool before it goes live; restore the saved state when
+# it is rejected so a failed sweep cannot take the site down.
+apply_or_restore() {
+  local bin
+  bin=$(command -v "php-fpm${VER}" || echo "/usr/sbin/php-fpm${VER}")
+  if ! "$bin" -t >/dev/null 2>&1; then
+    "$bin" -t 2>&1 | tail -3 >&2
+    if [[ -f $STATE ]]; then
+      # shellcheck disable=SC1090
+      . "$STATE"
+      set_key pm.max_children "$ORIGINAL_MAX_CHILDREN"
+      set_key pm "$ORIGINAL_PM"
+      [[ $ORIGINAL_PM == static ]] && drop_dynamic_keys
+      systemctl reload "php${VER}-fpm" 2>/dev/null || true
+      echo "candidate pool rejected; restored pm=${ORIGINAL_PM} pm.max_children=${ORIGINAL_MAX_CHILDREN}" >&2
+    fi
+    exit 3
+  fi
+  systemctl reload "php${VER}-fpm"
+}
+
 if [[ $ACTION == restore ]]; then
   [[ -f $STATE ]] || { echo "no saved state at ${STATE}" >&2; exit 1; }
   # shellcheck disable=SC1090
   . "$STATE"
   set_key pm.max_children "$ORIGINAL_MAX_CHILDREN"
   set_key pm "$ORIGINAL_PM"
+  [[ $ORIGINAL_PM == static ]] && drop_dynamic_keys
   systemctl reload "php${VER}-fpm"
   echo "restored pm=${ORIGINAL_PM} pm.max_children=${ORIGINAL_MAX_CHILDREN}"
   exit 0
+fi
+
+# `dynamic N` exists for the A/B sweep: the shipped pool is static, so a bare
+# change of pm= alone would leave the spare-server values unset and PHP-FPM
+# would refuse to start.
+DYNAMIC=0
+if [[ $ACTION == dynamic ]]; then
+  DYNAMIC=1
+  ACTION=${2:?dynamic requires a worker count}
 fi
 
 [[ $ACTION =~ ^[0-9]+$ ]] && (( ACTION >= 2 )) || { echo "worker count must be >= 2" >&2; exit 2; }
@@ -45,7 +95,13 @@ if [[ ! -f $STATE ]]; then
   chmod 600 "$STATE"
 fi
 
-set_key pm static
-set_key pm.max_children "$ACTION"
-systemctl reload "php${VER}-fpm"
-echo "applied pm=static pm.max_children=${ACTION} to php${VER}-fpm"
+if (( DYNAMIC )); then
+  set_key pm dynamic
+  set_key pm.max_children "$ACTION"
+  ensure_dynamic_keys
+else
+  set_key pm static
+  set_key pm.max_children "$ACTION"
+fi
+apply_or_restore
+echo "applied pm=$([[ $DYNAMIC == 1 ]] && echo dynamic || echo static) pm.max_children=${ACTION} to php${VER}-fpm"
