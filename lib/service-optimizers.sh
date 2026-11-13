@@ -20,7 +20,6 @@
 ANGIE_UNIT_CHANGED=0
 ensure_angie_limits() {
   local angie_limit angie_dropin=/etc/systemd/system/angie.service.d/limits.conf
-  local changed=0
   ANGIE_UNIT_CHANGED=0
   angie_limit=$(systemctl show -p LimitNOFILE --value angie 2>/dev/null || true)
   if [[ $angie_limit != infinity ]] \
@@ -35,7 +34,10 @@ ensure_angie_limits() {
       tune_summary "Angie: systemd LimitNOFILE=524288 (applies on next restart)"
     fi
   fi
-  return "$changed"
+  # ANGIE_UNIT_CHANGED is the "a change was written" signal.  Returning it as
+  # the status made success look like failure to a caller (1 = changed), so the
+  # helper always succeeds; callers read the flag.
+  return 0
 }
 
 optimize_angie() {
