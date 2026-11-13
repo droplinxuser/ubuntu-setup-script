@@ -3571,5 +3571,58 @@ check "--php re-enables the session GC timer after a purge" \
 check "--others sysstat re-enables the units a purge disabled" \
   grep -q 'systemctl enable sysstat.service sysstat-rotate.timer' "$ALL_SRC"
 
+# ---------------------------------------------------------------------------
+# 1.21.4: application-aware PHP extension preflight and extension accounting
+# ---------------------------------------------------------------------------
+mkdir -p "$TMP/apps/wp/public/wp-includes" "$TMP/apps/xf/public/src" \
+         "$TMP/apps/chev/public/app/bin" "$TMP/apps/plain"
+: > "$TMP/apps/wp/public/wp-config.php"
+: > "$TMP/apps/wp/public/wp-includes/version.php"
+: > "$TMP/apps/xf/public/src/XF.php"
+: > "$TMP/apps/xf/public/src/config.php"
+: > "$TMP/apps/chev/public/app/env.php"
+: > "$TMP/apps/chev/public/app/bin/legacy"
+app_roots=$(php_upgrade_app_roots "$TMP/apps")
+has_ext() { "$@" | grep -qx redis; }
+lacks_ext() { ! "$@" | grep -qx redis; }
+check "app detection finds WordPress" grep -qx $'wordpress\t'"$TMP/apps/wp/public" <<<"$app_roots"
+check "app detection finds XenForo" grep -qx $'xenforo\t'"$TMP/apps/xf/public" <<<"$app_roots"
+check "app detection finds Chevereto" grep -qx $'chevereto\t'"$TMP/apps/chev/public" <<<"$app_roots"
+check "app detection lists each document root once" test "$(wc -l <<<"$app_roots" | tr -d ' ')" = 3
+check "app detection ignores an unrelated directory" not grep -q plain <<<"$app_roots"
+check "Chevereto requirements include redis" \
+  has_ext php_upgrade_app_required_extensions chevereto "$TMP/apps/chev/public"
+check "WordPress requirements skip redis without an object-cache drop-in" \
+  lacks_ext php_upgrade_app_required_extensions wordpress "$TMP/apps/wp/public"
+mkdir -p "$TMP/apps/wp/public/wp-content"
+: > "$TMP/apps/wp/public/wp-content/object-cache.php"
+check "WordPress requirements add redis with an object-cache drop-in" \
+  has_ext php_upgrade_app_required_extensions wordpress "$TMP/apps/wp/public"
+printf "// \$config['cache']['provider'] = 'Redis';\n" > "$TMP/apps/xf/public/src/config.php"
+check "XenForo ignores a commented Redis example" \
+  lacks_ext php_upgrade_app_required_extensions xenforo "$TMP/apps/xf/public"
+printf "\$config['cache']['provider'] = 'Redis';\n" > "$TMP/apps/xf/public/src/config.php"
+check "XenForo detects a configured Redis cache" \
+  has_ext php_upgrade_app_required_extensions xenforo "$TMP/apps/xf/public"
+check "a core extension needs no package lookup" php_upgrade_extension_available 9.9 gd
+check "an unpublished extension is reported unavailable" not php_upgrade_extension_available 9.9 redis
+php_upgrade_preflight_apps 9.9 "$TMP/apps"
+check "the preflight blocks a target without redis" \
+  test "$(printf '%s\n' "${PHP_UPGRADE_BLOCKERS[@]}" | grep -c '|redis$')" -eq 3
+php_upgrade_preflight_apps 9.9 "$TMP/apps/plain"
+check "the preflight is empty without an application" test "${#PHP_UPGRADE_BLOCKERS[@]}" -eq 0
+blocker_desc=$(php_upgrade_describe_blocker "chevereto|/var/www/chev|redis")
+check "the blocker names the site and the missing package" \
+  grep -qF 'chevereto at /var/www/chev requires the redis extension' <<<"$blocker_desc"
+
+mkdir -p "$TMP/php-manifest"
+printf 'common\t0\tphp-common\ncommon\t0\tphp8.5-common\nredis\t1\tphp8.5-redis\n' \
+  > "$TMP/php-manifest/extensions.txt"
+PHP_UPGRADE_MANIFEST_DIR="$TMP/php-manifest"
+php_upgrade_plan_extensions 9.9
+check "carried extensions are de-duplicated" test "$PHP_UPGRADE_CARRIED_COUNT" -eq 1
+check "an unpublished extension still counts as skipped" \
+  test "${#PHP_UPGRADE_SKIPPED[@]}" -eq 1
+
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

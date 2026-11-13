@@ -3,6 +3,57 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.4 (2026-11-14)
+
+PHP version-management audit on the same Ubuntu 26.04.1 host (16 logical
+CPUs, 27 812 MiB RAM, NVMe, bare metal) with WordPress 7.1.4, XenForo 2.3.13
+and Chevereto 4.5.9.  Pair with server-configs-nginx 1.6.27.
+
+- **`--upgrade-php` refuses to break an installed application.**  PHP
+  8.6.0~rc5 publishes no `php8.6-redis`; the previous release purged PHP
+  8.5, installed 8.6 and reported the gap afterwards, leaving Chevereto and
+  a Redis-backed XenForo answering 500 ("Redis extension not loaded").  A
+  preflight now detects WordPress, XenForo and Chevereto below `/var/www`
+  (including a WordPress object-cache drop-in and a XenForo `config.php`
+  that configures Redis/Valkey), checks the target repository for every
+  hard requirement and aborts **before the purge**.  Nothing is changed on
+  refusal; `SETUP_PHP_ALLOW_MISSING_EXT=1` accepts the loss explicitly.
+  Verified: `--upgrade-php=8.6` now exits 1 with PHP 8.5 still serving; the
+  dry run prints the same BLOCKED section.
+- **Extension accounting is correct.**  The summary reported only the
+  non-core packages (`Extensions carried 2` after a full 8.4 install) and
+  the dry run listed `common` twice (php-common and php8.4-common).  The
+  count now covers every distinct carried extension (14 for 8.4, 15 for
+  8.5) and the preview de-duplicates names.
+- **Chevereto 4.5.9 on PHP 8.4+.**  Its bundled Intervention Image 2.x
+  declares `ImageManager $manager = null`; PHP 8.4 deprecates the implicit
+  nullable type, and Chevereto's shutdown handler converts that deprecation
+  into a failed request.  The first request handled by each worker after a
+  restart therefore answered 403/500 on `/login` and every upload.  This is
+  an application defect, not a server setting: the audit host uses the
+  upstream one-line fix (`?ImageManager $manager = null`) and records the
+  finding.  With it, Chevereto is clean on 8.4 and 8.5.
+- **Functional tests run with production error reporting.**
+  `tests/stress-site/exercise-apps.sh` forced `error_reporting=E_ALL` for
+  the functional pass, which made any application that throws on a vendor
+  deprecation fail the run.  It now keeps `E_ALL & ~E_DEPRECATED` and only
+  routes the central log; `compat-php.sh` remains the run that forces
+  `E_ALL` for the deprecation scan.  The harness also saves a login page to
+  a file instead of piping curl into `head` (SIGPIPE could kill curl before
+  it wrote the cookie jar) and clears stale Chevereto login cookies before
+  its one-second-resolution unique key can collide.
+- **Path hardening and Chevereto front controller.**  See
+  server-configs-nginx 1.6.27: dot-segment requests are rejected with 400
+  before they reach PHP, and a direct `/index.php` is redirected to `/`
+  instead of producing Chevereto's 500.
+- **Validation.**  819 tuning checks and 193 CLI/dry-run checks pass.  On
+  PHP 8.5: 8.4 -> 8.5 and 8.5 -> 8.4 round trips succeed, all three
+  applications answer with zero PHP diagnostics, `--optimize` is a no-op
+  on the second pass, and `--diagnostics`, `--restart-all`, `--purge
+  --dry-run` and `--php ver=` refusal behave as documented.  PHP 8.6 RC is
+  installable for WordPress/XenForo but blocked for Redis-dependent sites
+  by the new preflight.
+
 ## 1.21.3 (2026-11-13)
 
 Findings of an independent review of 1.21.2 (shell libraries and the Angie

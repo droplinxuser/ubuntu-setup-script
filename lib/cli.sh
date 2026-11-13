@@ -150,6 +150,10 @@ PHP upgrade (standalone):
           manually, custom .ini fragments/FPM pools and exact package versions;
         - adds the Sury repository and checks that phpVERSION-fpm is published
           (an explicitly requested pre-release is allowed with a warning);
+        - detects WordPress/XenForo/Chevereto below /var/www and refuses,
+          before purging, when the target cannot provide an extension they
+          need (PHP 8.6 publishes no redis yet).  Nothing changes on refusal;
+          SETUP_PHP_ALLOW_MISSING_EXT=1 accepts the loss explicitly;
         - purges all PHP packages and the dependencies that only PHP kept
           installed.  Pre-existing unrelated autoremove candidates are kept,
           because only the before/after autoremove delta is removed;

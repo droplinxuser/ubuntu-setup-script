@@ -1,5 +1,34 @@
 # Full-stack stress test reports
 
+## 1.21.4 PHP version-management audit (2026-11-14)
+
+Same 16-thread / 27 812 MiB / NVMe bare-metal host, WordPress 7.1.4,
+XenForo 2.3.13 and Chevereto 4.5.9.  The full report is
+`AUDIT-20261114-1.21.4.md`.
+
+- **Distribution defaults -> shipped tuning (PHP 8.5, 64c, 8 s, loopback):**
+  WordPress member 131 -> 278 req/s, WordPress post 108 -> 223, XenForo
+  member thread 231 -> 458, Chevereto guest home 1 528 -> 2 677.  Cached
+  guest tiers stay Angie-bound (63-82k req/s).
+- **JIT:** tracing 64 MB 497 req/s on the XenForo member thread against 470
+  with JIT off (+5.7%) and 453 with function JIT (-3.6%).  32/64/128 MB and
+  the hotness alternatives are within noise; shipped defaults hold.
+- **PHP-FPM:** static 8/12/16/20/24 = 334/426/487/325/470 on the XenForo
+  member thread.  16 (one per logical CPU) is the optimum.
+- **PHP versions:** 8.4 and 8.5 both run the three applications cleanly.
+  PHP 8.6.0~rc5 runs WordPress/XenForo but publishes no `redis`, `imagick`
+  or `igbinary`; the new `--upgrade-php` preflight refuses to purge a host
+  whose Chevereto/XenForo/WordPress needs them.
+- **Chevereto on 8.4+:** its bundled Intervention Image 2.x emits an
+  implicit-nullable deprecation that its shutdown handler turns into a
+  failed request after each FPM restart; the upstream one-line
+  `?ImageManager` fix makes it clean.
+- **Workstation (oha, Wi-Fi, 100/50c, 10 s, limiter exempted):** XenForo
+  guest 6 502 req/s at p50 13.7 ms, WordPress guest 5 082 at 18.2 ms,
+  XenForo member home 862 at 54.9 ms, WordPress member 260 at 193.6 ms.
+  Every response was 2xx.  Chevereto member `/explore` measures 17 req/s
+  because all connections share one `PHPSESSID` and PHP serialises the
+  session file lock; it is not a server bottleneck.
 
 ## 1.19.2 re-audit: restore, refactor and JIT/FPM sweeps (2026-11-11)
 

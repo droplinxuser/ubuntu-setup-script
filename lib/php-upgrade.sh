@@ -40,6 +40,12 @@ PHP_UPGRADE_CUSTOM_INIS=()
 PHP_UPGRADE_CUSTOM_POOLS=()
 PHP_UPGRADE_PECL=()
 PHP_UPGRADE_PRE_AUTOREMOVE=()
+# Number of distinct extensions the target will keep (core + migrated +
+# bundled), and the applications whose hard requirements the target cannot
+# satisfy.  Both are filled by php_upgrade_plan_extensions/preflight so the
+# dry run, the real run and the summary agree.
+PHP_UPGRADE_CARRIED_COUNT=0
+PHP_UPGRADE_BLOCKERS=()
 PHP_UPGRADE_ANGIE_ACTIVE=0
 PHP_UPGRADE_OPTIMIZE_OK=0
 PHP_UPGRADE_VERIFY_OK=0
@@ -326,24 +332,154 @@ php_upgrade_remove_stale_dropins() {
 # reported instead of failing the whole upgrade.
 php_upgrade_plan_extensions() {
   local target=$1 dir=$PHP_UPGRADE_MANIFEST_DIR ext flag pkg class pkg_target
+  local -a carried=()
+  local -A seen_ext=()
   PHP_UPGRADE_TARGET_PKGS=()
   PHP_UPGRADE_SKIPPED=()
+  PHP_UPGRADE_CARRIED_COUNT=0
   [[ -f "$dir/extensions.txt" ]] || return 0
 
   while IFS=$'\t' read -r ext flag pkg; do
     [[ -n $ext ]] || continue
     class=$(php_upgrade_classify_package "$target" "$pkg")
     case $class in
+      ignore) ;;
       keep:*)
         pkg_target=${class#keep:}
         [[ " ${PHP_UPGRADE_TARGET_PKGS[*]} " == *" ${pkg_target} "* ]] \
           || PHP_UPGRADE_TARGET_PKGS+=("$pkg_target")
+        [[ -n ${seen_ext[$ext]:-} ]] || { seen_ext[$ext]=1; carried+=("$ext"); }
+        ;;
+      core:*|bundled:*)
+        # php-common and phpX.Y-common both map to "common": count the
+        # extension once, the way the report lists it.
+        [[ -n ${seen_ext[$ext]:-} ]] || { seen_ext[$ext]=1; carried+=("$ext"); }
         ;;
       skip:*)
         PHP_UPGRADE_SKIPPED+=("${ext} (${pkg}: ${class#skip:})")
         ;;
     esac
   done < "$dir/extensions.txt"
+  PHP_UPGRADE_CARRIED_COUNT=${#carried[@]}
+}
+
+# ---------------------------------------------------------------------------
+# Application-aware extension preflight
+# ---------------------------------------------------------------------------
+# A PHP purge is only safe when the target can still serve the applications
+# the host runs.  PHP 8.6.0~rc5 publishes no php8.6-redis; Chevereto hard-fails
+# ("Redis extension not loaded", HTTP 500 on /dashboard) without it.  The
+# upgrade used to purge first and report the gap afterwards, leaving a live
+# site broken.  Detect the applications before the purge and refuse unless the
+# operator explicitly accepts the loss with SETUP_PHP_ALLOW_MISSING_EXT=1.
+
+# Print "app<TAB>document-root" for every supported application below BASE
+# (default /var/www).  The directory argument makes this unit-testable.
+php_upgrade_app_roots() {
+  local base=${1:-/var/www} d app
+  local -A seen_root=()
+  for d in "$base"/* "$base"/*/public; do
+    [[ -d $d ]] || continue
+    app=""
+    if [[ -f $d/wp-config.php && -f $d/wp-includes/version.php ]]; then
+      app=wordpress
+    elif [[ -f $d/src/XF.php && -f $d/src/config.php ]]; then
+      app=xenforo
+    elif [[ -f $d/app/env.php && -f $d/app/bin/legacy ]]; then
+      app=chevereto
+    fi
+    [[ -n $app ]] || continue
+    [[ -n ${seen_root[$d]:-} ]] && continue
+    seen_root[$d]=1
+    printf '%s\t%s\n' "$app" "$d"
+  done
+}
+
+# Extensions an application cannot run without.  Only names that are not
+# always built into PHP or installed by the default --php set are listed, so a
+# normal target never produces a false blocker.  Optional integrations add
+# their cache extension in php_upgrade_app_required_extensions().
+php_upgrade_app_requirements() {
+  case $1 in
+    # Chevereto 4.5.9 aborts at bootstrap when redis is missing.
+    chevereto) printf '%s\n' redis mysqli gd curl mbstring ;;
+    # Core WordPress runs on the default set; redis matters only when an
+    # object-cache drop-in is installed.
+    wordpress) printf '%s\n' mysqli gd curl mbstring ;;
+    xenforo)   printf '%s\n' mysqli gd curl mbstring xml zip ;;
+  esac
+}
+
+# Print the required extension list for one app/root pair, adding redis when
+# the site is actually configured to use it.
+php_upgrade_app_required_extensions() {
+  local app=$1 root=$2
+  php_upgrade_app_requirements "$app"
+  case $app in
+    wordpress)
+      if [[ -f $root/wp-content/object-cache.php ]]; then
+        printf 'redis\n'
+      fi
+      ;;
+    xenforo)
+      # Only a configured cache counts: the stock config.php ships commented
+      # Redis examples, and treating those as a requirement would block an
+      # otherwise safe upgrade.
+      if [[ -f $root/src/config.php ]] \
+         && awk '!/^[[:space:]]*(#|\/\/|\*)/' "$root/src/config.php" \
+            | grep -qiE '\bredis\b|\bvalkey\b'; then
+        printf 'redis\n'
+      fi
+      ;;
+  esac
+  return 0
+}
+
+# True when EXT will be available on TARGET: built into PHP, covered by the
+# default package set, or published as phpTARGET-EXT.
+php_upgrade_extension_available() {
+  local target=$1 ext=$2
+  case $ext in
+    # Compiled into phpX.Y-common/cli on every supported release.
+    json|exif|fileinfo|session|tokenizer|ctype|iconv|hash|openssl|posix|random|date|filter|spl|standard|pcre|reflection|zlib|opcache)
+      return 0 ;;
+    mysqli|pdo_mysql|mysqlnd)
+      apt-cache show "php${target}-mysql" >/dev/null 2>&1
+      return ;;
+  esac
+  case " $PHP_UPGRADE_CORE_EXT " in
+    *" $ext "*)
+      # redis is in the default set but is a PECL build and can lag a new
+      # PHP release, so it still needs a package check.
+      [[ $ext == redis ]] || return 0
+      ;;
+  esac
+  apt-cache show "php${target}-${ext}" >/dev/null 2>&1
+}
+
+# Fill PHP_UPGRADE_BLOCKERS with "app|root|ext" entries when an installed
+# application would lose a hard requirement on TARGET.
+php_upgrade_preflight_apps() {
+  local target=$1 base=${2:-/var/www} app root ext
+  PHP_UPGRADE_BLOCKERS=()
+  while IFS=$'\t' read -r app root; do
+    [[ -n $app ]] || continue
+    while IFS= read -r ext; do
+      [[ -n $ext ]] || continue
+      php_upgrade_extension_available "$target" "$ext" \
+        || PHP_UPGRADE_BLOCKERS+=("${app}|${root}|${ext}")
+    done < <(php_upgrade_app_required_extensions "$app" "$root")
+  done < <(php_upgrade_app_roots "$base")
+  return 0
+}
+
+# Human-readable reason for one blocker: which site needs what, and why the
+# target cannot provide it.
+php_upgrade_describe_blocker() {
+  local entry=$1 app root ext
+  IFS='|' read -r app root ext <<<"$entry"
+  printf '%s at %s requires the %s extension (php%s-%s is not published)' \
+    "$app" "$root" "$ext" "${UPGRADE_PHP}" "$ext"
 }
 
 # Verify the requested version is a real package in the Sury repository.  A
@@ -789,17 +925,39 @@ php_upgrade_plan() {
     printf '\nExtensions to carry over (mapped to php%s-*):\n' "$target"
     php_upgrade_installed_packages > "$dir/pkgs.txt"
     local class
+    local -A seen_ext=()
     while IFS= read -r pkg; do
       class=$(php_upgrade_classify_package "$target" "$pkg")
       ext=$(php_upgrade_ext_name "$pkg")
       case $class in
         ignore) continue ;;
-        core:*)    printf '  %-14s (core/default)\n' "$ext" ;;
-        bundled:*) printf '  %-14s (bundled in PHP %s)\n' "$ext" "$target" ;;
-        keep:*)    printf '  %-14s -> %s\n' "$ext" "${class#keep:}" ;;
-        skip:*)    printf '  %-14s !! %s\n' "$ext" "${class#skip:}" ;;
+        core:*)    [[ -n ${seen_ext[$ext]:-} ]] && continue; seen_ext[$ext]=1
+                   printf '  %-14s (core/default)\n' "$ext" ;;
+        bundled:*) [[ -n ${seen_ext[$ext]:-} ]] && continue; seen_ext[$ext]=1
+                   printf '  %-14s (bundled in PHP %s)\n' "$ext" "$target" ;;
+        keep:*)    [[ -n ${seen_ext[$ext]:-} ]] && continue; seen_ext[$ext]=1
+                   printf '  %-14s -> %s\n' "$ext" "${class#keep:}" ;;
+        skip:*)    [[ -n ${seen_ext[$ext]:-} ]] && continue; seen_ext[$ext]=1
+                   printf '  %-14s !! %s\n' "$ext" "${class#skip:}" ;;
       esac
     done < "$dir/pkgs.txt"
+    printf '\nApplication requirements:\n'
+    local app root found_app=0
+    while IFS=$'\t' read -r app root; do
+      [[ -n $app ]] || continue
+      found_app=1
+      printf '  %-11s %s\n' "$app" "$root"
+    done < <(php_upgrade_app_roots)
+    (( found_app )) || printf '  none detected under /var/www\n'
+    php_upgrade_preflight_apps "$target"
+    if (( ${#PHP_UPGRADE_BLOCKERS[@]} > 0 )); then
+      printf '\nBLOCKED: the purge would break installed application(s):\n'
+      local blocker
+      for blocker in "${PHP_UPGRADE_BLOCKERS[@]}"; do
+        printf '  - %s\n' "$(php_upgrade_describe_blocker "$blocker")"
+      done
+      printf '  The real run refuses before purging. Override with SETUP_PHP_ALLOW_MISSING_EXT=1.\n'
+    fi
   else
     printf 'Current    : none (no PHP-FPM installed; the run installs %s fresh)\n' "$target"
   fi
@@ -857,6 +1015,24 @@ run_php_upgrade() {
     warn "Extension(s) without a ${target} package: ${PHP_UPGRADE_SKIPPED[*]}"
   fi
 
+  # Refuse before the purge when a detected application would lose an
+  # extension it cannot start without.  The check runs after the Sury
+  # repository is configured, so "not published" means it is really absent
+  # from the target the operator is about to install.
+  php_upgrade_preflight_apps "$target"
+  if (( ${#PHP_UPGRADE_BLOCKERS[@]} > 0 )); then
+    local blocker
+    warn "PHP ${target} cannot serve every installed application:"
+    for blocker in "${PHP_UPGRADE_BLOCKERS[@]}"; do
+      warn "  - $(php_upgrade_describe_blocker "$blocker")"
+    done
+    if [[ ${SETUP_PHP_ALLOW_MISSING_EXT:-0} == 1 ]]; then
+      warn "SETUP_PHP_ALLOW_MISSING_EXT=1: continuing, the affected sites will fail until the extension is published"
+    else
+      die "Refusing to ${old:+replace PHP ${old} with }PHP ${target}: the purge would break the site(s) above. Nothing was changed. Re-run with SETUP_PHP_ALLOW_MISSING_EXT=1 to accept the loss."
+    fi
+  fi
+
   if [[ -n $old ]]; then
     step "Purging PHP ${old} and its dependencies"
     php_upgrade_purge
@@ -897,7 +1073,7 @@ run_php_upgrade() {
   printf '\n%sPHP upgrade summary%s\n' "$C_BOLD" "$C_BLUE"
   printf '%-24s %s\n' 'From' "${old:-none}"
   printf '%-24s %s\n' 'To' "$target"
-  printf '%-24s %s\n' 'Extensions carried' "${#PHP_UPGRADE_TARGET_PKGS[@]}"
+  printf '%-24s %s\n' 'Extensions carried' "$PHP_UPGRADE_CARRIED_COUNT"
   printf '%-24s %s\n' 'Extensions skipped' "${#PHP_UPGRADE_SKIPPED[@]}"
   printf '%-24s %s\n' 'FPM' "$(systemctl is-active "php${target}-fpm" 2>/dev/null || printf unknown)"
   printf '%-24s %s\n' 'Angie' "$([[ $PHP_UPGRADE_ANGIE_ACTIVE == 1 ]] && printf reloaded || printf not-running)"
