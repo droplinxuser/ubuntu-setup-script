@@ -3,6 +3,53 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.5 (2026-11-14)
+
+Fifth audit of the 1.21 line on the Ubuntu 26.04.1 test host (16 logical
+CPUs, 27 812 MiB RAM, NVMe, bare metal) with WordPress 7.1.4, XenForo 2.3.13
+and Chevereto 4.5.9.  Pair with server-configs-nginx 1.6.27.
+
+- **WordPress database-user split works with a TCP loopback host.**  The
+  hardening pass creates a per-site account and moves `wp-config.php` to it,
+  but the account was created at `localhost` only.  A site configured with
+  `DB_HOST = '127.0.0.1'` (or `::1`) failed the connection probe and the split
+  was silently skipped, leaving the global account in place.  The scoped
+  account is now granted at `localhost`, `127.0.0.1` and `::1` (matching
+  `--domain`), and the probe connects over the host the site actually uses.
+- **`ensure_angie_limits` no longer reports success as failure.**  The helper
+  returned 1 when it wrote a drop-in (an inverted status that only survived
+  because its single caller used `|| true`).  It always returns 0 now and the
+  `ANGIE_UNIT_CHANGED` flag carries the "a change was written" signal.
+- **The functional suite fails on an unexpected response.**  It printed the
+  code and kept going, so a request that never reached the server (curl 000)
+  or a 403/500 could be read as a pass.  `expect` records each unexpected
+  code, the run ends with `result: N unexpected response(s)` and exits
+  non-zero.  Login, reply, search, upload, dot-segment and front-controller
+  checks are covered.
+- **XenForo thread discovery is deterministic.**  The reply/search tests used
+  `/whats-new/posts/`, which is empty for a guest on a freshly seeded board;
+  the reply was then posted to `https://xf.test.localadd-reply` (000) and the
+  search POST ran without a token (400), both unnoticed.  The suite falls
+  back to the first seeded `xf_thread` row and follows the canonical slug
+  redirect.
+- **Chevereto login tolerates one token/session race.**  A page token from a
+  request whose `Set-Cookie` was lost makes the first POST answer 403; the
+  suite now retries once with a clean jar before recording a failure (a second
+  failure is still fatal).
+- **`set-fpm.sh` validates before reloading.**  It runs `php-fpm -t` and
+  restores the saved pool when the candidate is rejected, so an invalid sweep
+  cannot leave PHP-FPM restart-looping behind 502s.  It also gained an
+  explicit `dynamic N` action that writes the start/spare keys a static pool
+  does not carry, and `fpm-sweep.sh` uses it for its dynamic comparison
+  (the old inline sed produced exactly the missing-spares failure above).
+- **Validation.**  819 tuning checks and 193 CLI/dry-run checks pass;
+  `shellcheck -S warning` is clean.  A full install finished in 3:08 with
+  zero errors, `--optimize` is a byte-identical no-op on the second pass,
+  PHP 8.5 -> 8.4 -> 8.5 round-tripped with 15 extensions carried, and all
+  three applications answer with zero PHP diagnostics.  Sustained 60 s
+  authenticated XenForo load: 521 req/s, p50 122 ms, p99 142 ms, 100 %
+  success, no new error-log lines, 0 failed units.
+
 ## 1.21.4 (2026-11-14)
 
 PHP version-management audit on the same Ubuntu 26.04.1 host (16 logical

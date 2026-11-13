@@ -151,16 +151,28 @@ harden_wordpress_db() {
   fi
   newpass=$(openssl rand -hex 24)
   esc_db=$(sql_escape "$db"); esc_user=$(sql_escape "$newuser"); esc_pass=$(sql_escape "$newpass")
+  # A WordPress site may reach MariaDB over the socket (localhost), TCP to
+  # 127.0.0.1, or IPv6 ::1.  The account used to be created at localhost only,
+  # so a config with DB_HOST=127.0.0.1 failed the connection probe below and
+  # the hardening was silently skipped.  Grant every loopback identity, like
+  # --domain does.
+  local grant_host grant_sql=""
+  for grant_host in localhost 127.0.0.1 ::1; do
+    grant_sql+="CREATE USER IF NOT EXISTS '${esc_user}'@'${grant_host}' IDENTIFIED BY '${esc_pass}';
+ALTER USER '${esc_user}'@'${grant_host}' IDENTIFIED BY '${esc_pass}';
+GRANT ALL PRIVILEGES ON \`${esc_db}\`.* TO '${esc_user}'@'${grant_host}';
+"
+  done
   if ! mariadb <<SQL
-CREATE USER IF NOT EXISTS '${esc_user}'@'localhost' IDENTIFIED BY '${esc_pass}';
-ALTER USER '${esc_user}'@'localhost' IDENTIFIED BY '${esc_pass}';
-GRANT ALL PRIVILEGES ON \`${esc_db}\`.* TO '${esc_user}'@'localhost';
+${grant_sql}
 SQL
   then
     harden_warn "  - could not create scoped database user ${newuser}"
     return 0
   fi
-  if ! MYSQL_PWD="$newpass" mariadb -u "$newuser" "$db" -e 'SELECT 1' >/dev/null 2>&1; then
+  local -a probe=(-u "$newuser" "$db" -e 'SELECT 1')
+  [[ $host == localhost ]] || probe=(-h "$host" "${probe[@]}")
+  if ! MYSQL_PWD="$newpass" mariadb "${probe[@]}" >/dev/null 2>&1; then
     harden_warn "  - scoped user ${newuser} cannot connect; ${user} left in place"
     return 0
   fi
