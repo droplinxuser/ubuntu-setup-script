@@ -559,11 +559,13 @@ tune_xf_static_assets() {
     /^[[:space:]]*### End Xenforo/ && !done {
       print "    # setup.sh: static asset cache (XenForo /js, /styles, /data)"
       print "    location ~* ^/(?:js|styles|data)/(?:.*\\.(?:js|css|png|jpe?g|gif|svg|webp|avif|woff2?|ttf|eot|ico))$ {"
-      print "        expires 30d;"
-      print "        add_header Cache-Control \"public, immutable\";"
+      print "        # One Cache-Control header: `expires` would add a second one."
+      print "        expires off;"
+      print "        add_header Cache-Control \"public, max-age=2592000, immutable\";"
       print "        # add_header and a regex location replace the inherited header set and"
       print "        # the method limits of the /data/, /js/ and /styles/ prefix blocks."
       print "        include h5bp/security/x-content-type-options.conf;"
+      print "        include h5bp/security/strict-transport-security.conf;"
       print "        limit_except GET OPTIONS { deny all; }"
       print "        access_log off;"
       print "        try_files $uri =404;"
@@ -584,6 +586,39 @@ tune_xf_static_assets() {
 # repository sync then makes `angie -t` fail with "directive is duplicate"
 # and the whole tree rolls back.  Keep the canonical definition and comment
 # the operator copy with a marker; --optimize already snapshots /etc/angie.
+# Vhosts rendered from the XenForo and Chevereto templates before
+# server-configs-nginx 1.6.26 carry an unanchored route location:
+# "^/(admin.php|install)" also claims /install.sh or /install.log and
+# "^/(dashboard|update)" claims /update.log, ahead of the file-access deny
+# rules, and serves the file.  Existing vhosts are operator-owned and are not
+# re-rendered, so anchor exactly those two generated lines in place.
+tune_vhost_route_anchors() {
+  local target=${1:-/etc/angie} file tmp
+  [[ -f $target/h5bp/location/security_leftover_files.conf ]] || return 0
+  for file in "$target"/conf.d/*.conf; do
+    [[ -f $file ]] || continue
+    grep -qF -e 'location ~ ^/(admin.php|install) {' \
+             -e 'location ~ ^/(dashboard|update) {' "$file" || continue
+    tmp=$(tmp_file) || return 1
+    awk '
+      function anchored(old, new,    at, ind) {
+        at = index($0, old)
+        if (!at) return 0
+        ind = substr($0, 1, at - 1)
+        print ind new
+        print ind "    include h5bp/location/security_leftover_files.conf;"
+        return 1
+      }
+      anchored("location ~ ^/(admin.php|install) {", "location ~ ^/(?:admin\\.php$|install(?:/|$)) {") { next }
+      anchored("location ~ ^/(dashboard|update) {", "location ~ ^/(?:dashboard|update)(?:/|$) {") { next }
+      { print }
+    ' "$file" > "$tmp"
+    commit_if_changed "$file" "$tmp" \
+      && tune_note "$(basename "$file"): route location anchored (leftover files no longer served)"
+  done
+  return 0
+}
+
 ANGIE_SINGLE_HTTP_DIRECTIVES=(limit_req_status limit_conn_status
                               limit_req_log_level limit_conn_log_level
                               limit_req_dry_run limit_conn_dry_run)
@@ -1281,6 +1316,7 @@ tune_angie_configs() {
   tune_xf_cache_vary "$target/h5bp/php_xf.conf"
   tune_xf_cache_vary "$target/h5bp/php_xf_proxy.conf"
   tune_xf_static_assets "$target/h5bp/xf2.conf"
+  tune_vhost_route_anchors "$target"
 
   tune_summary "angie summary: ${nproc} CPU / ${mem_mb}MB RAM / ${disk_class} / cache_budget=${cache_total_mb}MB"
   # The tuner may have added or rewritten an http-context directive that an
@@ -1360,19 +1396,13 @@ tune_pool_dedupe() {
 # the file itself.  Paths containing a runtime variable (for example
 # "$pool.access.log") only get their directory created.
 ensure_fpm_log_path() {
-  local path=$1 user=${2:-www-data} group=${3:-www-data} dir created=0
+  local path=$1 user=${2:-www-data} group=${3:-www-data} dir
   [[ $path == /* ]] || return 0
   dir=$(dirname -- "$path")
   mkdir -p "$dir" 2>/dev/null || return 0
   if [[ ${path##*/} != *'$'* ]]; then
-    if [[ ! -e $path ]]; then
-      : > "$path" 2>/dev/null || true
-      created=1
-    fi
-    chmod 640 "$path" 2>/dev/null || true
-    if (( created )) && getent passwd "$user" >/dev/null 2>&1; then
-      chown "$user:$group" "$path" 2>/dev/null || true
-    fi
+    # Symlink-safe; the owner is set only on a file created here.
+    secure_log_file "$path" "$user" "$group" created
   fi
   return 0
 }
@@ -2313,9 +2343,7 @@ deploy_angie_tree() {
   # Central log and cache directories.  All service logs live under
   # /var/www/logs so they can be collected as one tree.
   install -d -m 750 -o www-data -g www-data "$log_dir"
-  [[ -e "$log_dir/error.log" ]] || : > "$log_dir/error.log"
-  chown www-data:www-data "$log_dir/error.log" 2>/dev/null || true
-  chmod 640 "$log_dir/error.log"
+  secure_log_file "$log_dir/error.log" www-data www-data
 
   local cache_dir
   for cache_dir in "${ANGIE_CACHE_DIRS[@]}"; do

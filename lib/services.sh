@@ -546,6 +546,12 @@ install_php() {
     rollback_php_tree "$php_backup" "$ver"
     return 1
   fi
+  # php-common enables the session GC timer in its postinst only.  --purge
+  # disables it, and a later --php on the kept packages must switch it back
+  # on: session.gc_probability is 0, so nothing else removes old sessions.
+  if systemctl list-unit-files phpsessionclean.timer --no-legend 2>/dev/null | grep -q .; then
+    systemctl enable --now phpsessionclean.timer 2>/dev/null || true
+  fi
   systemctl status "php${ver}-fpm" --no-pager || true
   "$(php_fpm_binary "$ver")" -v || true
   if (( reapply )); then
@@ -1313,20 +1319,48 @@ install_valkey() {
 # install and --optimize write byte-identical files and an old profile with
 # "protected-mode no" or RDB saves is upgraded without contradictory
 # duplicates.  Operator directives outside the managed set survive.
+#
+# ADOPT (7th argument "adopt", passed by --optimize) protects a cache that
+# setup.sh did not install: when its configuration has AOF persistence on
+# (queues, sessions) or binds an address other than loopback (other app
+# servers), those lines are kept and marked, and stay kept on later runs.
+# Turning persistence off or rebinding such a service loses data or cuts
+# clients off on the restart that follows.
 valkey_apply_config() {
-  local conf=$1 kind=$2 max_mb=$3 policy=$4 io_threads=$5 socket=${6:-}
+  local conf=$1 kind=$2 max_mb=$3 policy=$4 io_threads=$5 socket=${6:-} adopt=${7:-}
+  local keep_persist="" keep_bind="" bind_line
   [[ -n $socket ]] || socket="/run/${kind}/${kind}.sock"
   io_threads=$(valkey_clamp_io_threads "$io_threads")
+  if [[ $adopt == adopt ]]; then
+    if grep -qx '# setup.sh kept operator persistence' "$conf" \
+       || { ! valkey_conf_managed "$conf" && [[ $(valkey_conf_get "$conf" appendonly) == yes ]]; }; then
+      keep_persist=$(grep -E '^[[:space:]]*(save|appendonly)[[:space:]]' "$conf" || true)
+    fi
+    bind_line=$(grep -E '^[[:space:]]*bind[[:space:]]' "$conf" | tail -n1 || true)
+    if [[ -n $bind_line ]] && { grep -qx '# setup.sh kept operator bind' "$conf" \
+       || { ! valkey_conf_managed "$conf" \
+            && [[ -n $(printf '%s\n' "$bind_line" | tr -s '[:space:]' '\n' | grep -vxE 'bind|-?127\.0\.0\.1|-?::1|localhost' || true) ]]; }; }; then
+      keep_bind=$bind_line
+    fi
+  fi
+  sed_in_place -E '/^# setup\.sh kept operator (persistence|bind)$/d' "$conf"
   sed_in_place -E '/^[[:space:]]*(bind|protected-mode|save|maxmemory|maxmemory-policy|maxmemory-samples|supervised|io-threads|io-threads-do-reads|tcp-backlog|tcp-keepalive|timeout|maxclients|hz|appendonly|lazyfree-[a-z-]+|unixsocket|unixsocketperm|logfile)[[:space:]]/d' "$conf"
   sed_in_place -E '/^# setup\.sh managed valkey$/d' "$conf"
   {
     printf '%s\n' '# setup.sh managed valkey' \
       'supervised systemd' \
-      "logfile ${LOG_ROOT}/${kind}/${kind}.log" \
-      'save ""' \
-      'appendonly no' \
-      'bind 127.0.0.1 -::1' \
-      'protected-mode yes' \
+      "logfile ${LOG_ROOT}/${kind}/${kind}.log"
+    if [[ -n $keep_persist ]]; then
+      printf '%s\n' '# setup.sh kept operator persistence' "$keep_persist"
+    else
+      printf '%s\n' 'save ""' 'appendonly no'
+    fi
+    if [[ -n $keep_bind ]]; then
+      printf '%s\n' '# setup.sh kept operator bind' "$keep_bind"
+    else
+      printf '%s\n' 'bind 127.0.0.1 -::1'
+    fi
+    printf '%s\n' 'protected-mode yes' \
       "unixsocket ${socket}" \
       'unixsocketperm 770'
     valkey_tuning_lines "$max_mb" "$policy" "$io_threads"
@@ -1744,6 +1778,9 @@ install_others() {
         systemctl enable --now sysstat-collect.timer sysstat-summary.timer 2>/dev/null \
           || systemctl enable --now sysstat 2>/dev/null \
           || warn "sysstat timers could not be enabled"
+        # The package enables these in its postinst only; --purge disables
+        # them and a re-install on the kept package must enable them again.
+        systemctl enable sysstat.service sysstat-rotate.timer 2>/dev/null || true
         ;;
     esac
   done

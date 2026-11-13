@@ -144,6 +144,11 @@ harden_wordpress_db() {
   [[ -n $global ]] || return 0
   newuser="wp_$(printf '%s' "$db" | tr -cd 'A-Za-z0-9_' | cut -c1-24)"
   [[ $newuser == wp_* && ${#newuser} -gt 3 ]] || newuser="wp_db"
+  # Never re-key an account that already exists: two databases can share the
+  # first 24 characters, and an unrelated wp_<db> account may be in use.
+  if [[ -n $(mariadb -N -e "SELECT 1 FROM mysql.user WHERE User='$(sql_escape "$newuser")' LIMIT 1" 2>/dev/null || true) ]]; then
+    newuser="${newuser:0:20}_$(openssl rand -hex 3)"
+  fi
   newpass=$(openssl rand -hex 24)
   esc_db=$(sql_escape "$db"); esc_user=$(sql_escape "$newuser"); esc_pass=$(sql_escape "$newpass")
   if ! mariadb <<SQL
@@ -244,7 +249,7 @@ scan_wordpress_malware() {
   mapfile -t hits < <(
     {
       find /var/www -type f \( -name 'wp-vcd.php' -o -name 'wp-tmp.php' -o -name 'wp-feed.php' -o -name 'wp-cd.php' \) 2>/dev/null || true
-      find /var/www -type d -regextype posix-extended -regex '.*/wp-content/plugins/[a-z0-9-]+-[0-9a-f]{10}$' 2>/dev/null || true
+      find /var/www -type d -regextype posix-extended -regex '.*/wp-content/plugins/[a-z0-9-]+-[0-9a-f]{10}$' -regex '.*-[0-9]*[a-f][0-9a-f]*$' 2>/dev/null || true
       grep -rIl --include='*.php' --exclude-dir=mysql_database --exclude-dir=wpvividbackups --exclude-dir=node_modules --exclude-dir=.git -E 'wputils/v1|w2s_run|WP_V_CD|plimur\.spekt\.pw' /var/www 2>/dev/null || true
     } | sort -u || true
   )

@@ -1018,7 +1018,13 @@ optimize_valkey() {
   fi
   # Same writer as the installer: base directives (persistence off, local
   # bind, log path, socket) plus the tuning block.
-  valkey_apply_config "$conf" "$kind" "$max_mb" "$policy" "$io_threads" "$socket_path"
+  valkey_apply_config "$conf" "$kind" "$max_mb" "$policy" "$io_threads" "$socket_path" adopt
+  if grep -qx '# setup.sh kept operator persistence' "$conf"; then
+    opt_report "- Kept the existing persistence settings (\`appendonly yes\`): this ${kind} holds data that must survive a restart"
+  fi
+  if grep -qx '# setup.sh kept operator bind' "$conf"; then
+    opt_report "- Kept the existing \`bind\` line: this ${kind} serves clients on a non-loopback address"
+  fi
   perm_after=$(valkey_conf_get "$conf" unixsocketperm)
   if [[ $socket_before != "$socket_path" || $perm_before != "$perm_after" || $perm_after != 770 ]]; then
     socket_changed=1
@@ -1565,7 +1571,11 @@ write_optimize_report() {
       printf '%s\n' "$line"
     done
   } > "$file"
+  # The report quotes service journals, backup and socket paths: root and
+  # its group only, like the PHP upgrade report.
+  chmod 640 "$file" 2>/dev/null || true
   cp -f "$file" /var/log/setup-optimize-latest.md
+  chmod 640 /var/log/setup-optimize-latest.md 2>/dev/null || true
   OPT_REPORT_WRITTEN=1
   printf '%s\n' "$file"
 }

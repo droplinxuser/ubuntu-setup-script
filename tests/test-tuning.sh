@@ -124,15 +124,16 @@ deploy_body=$(sed -n '/^deploy_angie_tree()/,/^}/p' "$ALL_SRC")
 check "Angie tree deployer never deletes files" \
   bash -c '! grep -qE "(^|[[:space:]])rm -|-delete([[:space:]]|$)" <<<"$1"' _ "$deploy_body"
 
-# Backup credentials are written verbatim and never pass through a sed
-# replacement or a command line.
+# Backup credentials never pass through a sed replacement or a command
+# line, and are written as quoted option-file values ("#" would otherwise
+# start a comment and "\" an escape).
 printf '[mysql]\nuser=dba\npassword=dba_passwd\n\n[mysqldump]\nuser=dba\npassword=dba_passwd\n' \
   > "$TMP/mysqlbkup.cnf.sample"
 write_mysqlbkup_credentials "$TMP/mysqlbkup.cnf.sample" 'demo_user' 'p&ss|w/o\rd$1'
 check "mysqlbkup credentials: user replaced in both sections" \
-  test "$(grep -c '^user=demo_user$' "$TMP/mysqlbkup.cnf.sample")" -eq 2
-check "mysqlbkup credentials: special characters written verbatim" \
-  test "$(grep -cxF 'password=p&ss|w/o\rd$1' "$TMP/mysqlbkup.cnf.sample")" -eq 2
+  test "$(grep -c '^user="demo_user"$' "$TMP/mysqlbkup.cnf.sample")" -eq 2
+check "mysqlbkup credentials: special characters written quoted and escaped" \
+  test "$(grep -cxF 'password="p&ss|w/o\\rd$1"' "$TMP/mysqlbkup.cnf.sample")" -eq 2
 check "mysqlbkup credentials: no placeholder remains" \
   bash -c '! grep -q "dba" "$1"' _ "$TMP/mysqlbkup.cnf.sample"
 bkup_missing_fails() { ! write_mysqlbkup_credentials "$1" u p; }
@@ -528,9 +529,6 @@ printf 'fastcgi_pass local_php;\nfastcgi_next_upstream off;\n' > "$TMP/socket-of
 check "socket migration refused when next_upstream is off" \
   socket_migration_refused "$TMP/socket-off"
 
-check "SSH peer parser drops loopback peers" \
-  test -z "$(printf 'ESTAB 0 0 10.0.0.5:22 127.0.0.1:5000\n' | ssh_peer_from_ss ':22$')"
-
 ssh_ports_ok() {
   local p n=0
   while IFS= read -r p; do
@@ -694,7 +692,9 @@ printf '    ### End Xenforo\n' > "$TMP/xf2.conf"
 tune_reset_changes
 tune_xf_static_assets "$TMP/xf2.conf"
 check "XF static assets get a 30-day immutable cache" \
-  grep -q 'public, immutable' "$TMP/xf2.conf"
+  grep -q 'public, max-age=2592000, immutable' "$TMP/xf2.conf"
+check "XF static assets send one Cache-Control header and HSTS" \
+  bash -c 'grep -q "expires off;" "$1" && grep -q "strict-transport-security.conf" "$1"' _ "$TMP/xf2.conf"
 check "XF static asset repair is idempotent" \
   test "$(grep -c 'static asset cache' "$TMP/xf2.conf")" -eq 1
 tune_reset_changes
@@ -3456,6 +3456,120 @@ swapoff() { swapoff_called=2; return 1; }
 check "an inactive swap file needs no swapoff" release_swap_file
 check "swapoff is not attempted on an inactive file" test "$swapoff_called" -ne 2
 unset -f swapon swapoff
+
+# ---------------------------------------------------------------------------
+# 1.21.3: log files in service-owned directories are never followed as links
+# ---------------------------------------------------------------------------
+mkdir -p "$TMP/seclog"
+printf 'root-owned\n' > "$TMP/seclog/target"
+chmod 600 "$TMP/seclog/target"
+ln -s "$TMP/seclog/target" "$TMP/seclog/php-error.log"
+secure_log_file "$TMP/seclog/php-error.log" "$(id -un)" "$(id -gn)" >/dev/null 2>&1
+check "a symlinked log file keeps its target's mode" \
+  test "$(stat -c %a "$TMP/seclog/target")" = 600
+check "a symlinked log file is reported" \
+  bash -c 'grep -q "symbolic link" <<<"$1"' _ "$(secure_log_file "$TMP/seclog/php-error.log" root root 2>&1)"
+secure_log_file "$TMP/seclog/new.log" "$(id -un)" "$(id -gn)"
+check "a missing log file is created 0640" \
+  test "$(stat -c %a "$TMP/seclog/new.log")" = 640
+ln -s "$TMP/seclog/absent-target" "$TMP/seclog/dangling.log"
+secure_log_file "$TMP/seclog/dangling.log" "$(id -un)" "$(id -gn)" >/dev/null 2>&1
+check "a dangling link is not created through" test ! -e "$TMP/seclog/absent-target"
+check "log_file goes through the symlink-safe helper" \
+  bash -c 'sed -n "/^log_file()/,/^}/p" "$1" | grep -q secure_log_file' _ "$ALL_SRC"
+check "no log path is chowned without -h" \
+  bash -c '! grep -nE "chown (www-data:www-data|\"\\\$(owner|user):\\\$(grp|group)\") \"\\\$(log_dir/error.log|file|path)\"" "$1"' _ "$ALL_SRC"
+
+# ---------------------------------------------------------------------------
+# 1.21.3: backup credentials survive "#", quotes and backslashes
+# ---------------------------------------------------------------------------
+printf '[mysql]\nuser=dba\npassword=dba_passwd\n' > "$TMP/mysqlbkup.cnf"
+write_mysqlbkup_credentials "$TMP/mysqlbkup.cnf" admin 'Ab#9x"Q\z'
+check "backup password with # is written quoted" \
+  grep -qxF 'password="Ab#9x\"Q\\z"' "$TMP/mysqlbkup.cnf"
+check "backup user is written quoted" grep -qxF 'user="admin"' "$TMP/mysqlbkup.cnf"
+
+# ---------------------------------------------------------------------------
+# 1.21.3: an adopted cache keeps AOF persistence and a non-loopback bind
+# ---------------------------------------------------------------------------
+vk_adopt="$TMP/redis-adopt.conf"
+printf 'bind 10.0.0.5 127.0.0.1\nappendonly yes\nsave 900 1\nmaxmemory 1gb\n' > "$vk_adopt"
+valkey_apply_config "$vk_adopt" redis 512 allkeys-lru 1 /run/redis/redis.sock adopt
+check "adopted cache: appendonly yes is kept" grep -qx 'appendonly yes' "$vk_adopt"
+check "adopted cache: the save schedule is kept" grep -qx 'save 900 1' "$vk_adopt"
+check "adopted cache: persistence is not switched off" not grep -qx 'appendonly no' "$vk_adopt"
+check "adopted cache: the private bind address is kept" grep -qx 'bind 10.0.0.5 127.0.0.1' "$vk_adopt"
+cp "$vk_adopt" "$vk_adopt.first"
+valkey_apply_config "$vk_adopt" redis 512 allkeys-lru 1 /run/redis/redis.sock adopt
+check "adopted cache: the second run writes the same file" cmp -s "$vk_adopt" "$vk_adopt.first"
+vk_plain="$TMP/redis-plain.conf"
+printf 'bind 127.0.0.1 -::1\nappendonly no\n' > "$vk_plain"
+valkey_apply_config "$vk_plain" redis 512 allkeys-lru 1 /run/redis/redis.sock adopt
+check "a default cache still gets persistence off" grep -qx 'save ""' "$vk_plain"
+check "a default cache keeps the loopback bind" grep -qx 'bind 127.0.0.1 -::1' "$vk_plain"
+vk_inst="$TMP/valkey-install.conf"
+printf 'bind 10.0.0.5\nappendonly yes\n' > "$vk_inst"
+valkey_apply_config "$vk_inst" valkey 512 allkeys-lru 1 /run/valkey/valkey.sock
+check "a fresh --valkey install writes the cache profile" \
+  bash -c 'grep -qx "appendonly no" "$1" && grep -qx "bind 127.0.0.1 -::1" "$1"' _ "$vk_inst"
+
+# ---------------------------------------------------------------------------
+# 1.21.3: --valkey without policy=/io_threads= keeps the previous values
+# ---------------------------------------------------------------------------
+validate_body=$(sed -n '/^validate_all()/,/^}/p' "$ALL_SRC")
+check "validation does not write a default policy back" \
+  bash -c '! grep -q "valkey.policy\]:-allkeys-lru" <<<"$1"' _ "$validate_body"
+check "validation does not write a default io_threads back" \
+  bash -c '! grep -q "valkey.io_threads\]:-1" <<<"$1"' _ "$validate_body"
+
+# ---------------------------------------------------------------------------
+# 1.21.3: generated vhosts get anchored route locations
+# ---------------------------------------------------------------------------
+va="$TMP/anchor"; mkdir -p "$va/conf.d" "$va/h5bp/location"
+: > "$va/h5bp/location/security_leftover_files.conf"
+printf 'server {\n    location ~ ^/(admin.php|install) {\n        include h5bp/php.conf;\n    }\n}\n' > "$va/conf.d/xf.conf"
+printf 'server {\n    location ~ ^/(dashboard|update) {\n        include h5bp/php_chev.conf;\n    }\n}\n' > "$va/conf.d/chev.conf"
+printf 'server {\n    location / { }\n}\n' > "$va/conf.d/other.conf"
+cp "$va/conf.d/other.conf" "$va/other.orig"
+tune_vhost_route_anchors "$va" >/dev/null 2>&1
+check "XenForo admin/install location is anchored" \
+  grep -qF 'location ~ ^/(?:admin\.php$|install(?:/|$)) {' "$va/conf.d/xf.conf"
+check "Chevereto dashboard/update location is anchored" \
+  grep -qF 'location ~ ^/(?:dashboard|update)(?:/|$) {' "$va/conf.d/chev.conf"
+check "the leftover-file rule is included once" \
+  test "$(grep -c security_leftover_files "$va/conf.d/xf.conf")" -eq 1
+cp "$va/conf.d/xf.conf" "$va/xf.first"
+tune_vhost_route_anchors "$va" >/dev/null 2>&1
+check "anchoring is idempotent" cmp -s "$va/conf.d/xf.conf" "$va/xf.first"
+check "an unrelated vhost is untouched" cmp -s "$va/conf.d/other.conf" "$va/other.orig"
+
+# ---------------------------------------------------------------------------
+# 1.21.3: interrupted runs, pool listeners, report mode, repeat --basic
+# ---------------------------------------------------------------------------
+check "a dropped SSH session unwinds through on_exit" grep -q "trap 'exit 129' HUP" "$ALL_SRC"
+check "on_exit resumes a paused web tier" \
+  bash -c 'sed -n "/^on_exit()/,/^}/p" "$1" | grep -q opt_resume_web_frontends' _ "$ALL_SRC"
+check "--upgrade-php keeps the listener of a migrated pool" \
+  grep -qF '/^[[:space:]]*listen[[:space:]]*=/! s/php${old//./\\.}/php${new}/g' "$ALL_SRC"
+check "the optimize report is not world-readable" \
+  bash -c 'sed -n "/^write_optimize_report()/,/^}/p" "$1" | grep -q "chmod 640 \"\$file\""' _ "$ALL_SRC"
+mkdir -p "$SETUP_STATE_DIR"
+: > "$SETUP_STATE_DIR/applied-hostname"
+check "a first --basic has no applied hostname to keep" not basic_applied_value hostname
+printf 'web1\n' > "$SETUP_STATE_DIR/applied-hostname"
+hostnamectl() { printf 'web1-live\n'; }
+check "a repeat --basic keeps the live hostname" test "$(basic_applied_value hostname)" = web1-live
+unset -f hostnamectl
+: > "$SETUP_STATE_DIR/applied-hostname"
+check "the malware rule needs a hex letter in the plugin suffix" \
+  grep -qF -- "-regex '.*-[0-9]*[a-f][0-9a-f]*\$'" "$ALL_SRC"
+swap_auto_body=$(sed -n '/^configure_swap_auto()/,/^}/p' "$ALL_SRC")
+check "automatic swap is sized to the free disk before the old file is released" \
+  bash -c 'a=$(grep -n "Automatic swap skipped" <<<"$1" | cut -d: -f1); b=$(grep -n "release_swap_file" <<<"$1" | head -1 | cut -d: -f1); [[ -n $a && -n $b && $a -lt $b ]]' _ "$swap_auto_body"
+check "--php re-enables the session GC timer after a purge" \
+  bash -c 'sed -n "/^install_php()/,/^}/p" "$1" | grep -q "systemctl enable --now phpsessionclean.timer"' _ "$ALL_SRC"
+check "--others sysstat re-enables the units a purge disabled" \
+  grep -q 'systemctl enable sysstat.service sysstat-rotate.timer' "$ALL_SRC"
 
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

@@ -463,6 +463,12 @@ on_exit() {
      && (( ! ${OPT_REPORT_WRITTEN:-0} )); then
     write_optimize_report >/dev/null 2>&1 || true
   fi
+  # A run that died (set -e, signal, dropped SSH session) between pausing
+  # the web tier for a MariaDB restart and resuming it must not leave the
+  # site down.
+  if (( ${OPT_WEB_PAUSED_ANGIE:-0} )) || (( ${#OPT_WEB_PAUSED_PHP[@]} > 0 )); then
+    opt_resume_web_frontends "an interrupted run" || true
+  fi
   cleanup_configs
   release_run_lock
   finish_run_log "$rc"
@@ -482,6 +488,9 @@ main() {
   # signal can leave the terminal/log in an inconsistent state.
   trap 'exit 130' INT
   trap 'exit 143' TERM
+  # A dropped SSH session sends HUP; a closed stdout sends PIPE.
+  trap 'exit 129' HUP
+  trap 'exit 141' PIPE
 
   # --help/--version are safe without root.
   local a

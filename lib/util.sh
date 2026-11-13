@@ -25,17 +25,41 @@ ensure_log_dir() {
   fi
 }
 
+# Create (when missing) and own one log file as root.  The log directories
+# belong to their service account, so that account (for example a compromised
+# PHP application running as www-data) can replace a log with a symbolic link
+# to /etc/passwd or /root/.ssh/authorized_keys.  chmod and chown follow
+# links, and fs.protected_symlinks does not apply to a non-sticky directory,
+# so the next root run would hand the link's target to the service account.
+# A link (or anything that is not a regular file) is therefore left alone and
+# reported, the file is created with O_EXCL (noclobber never follows a link),
+# and ownership is changed with -h.
+# MODE "created" changes the owner only of a file this call created.
+secure_log_file() {
+  local file=$1 owner=$2 grp=$3 mode=${4:-always} created=0
+  if [[ -L $file ]]; then
+    warn "Not touching ${file}: it is a symbolic link (expected a regular log file)"
+    return 0
+  fi
+  if [[ ! -e $file ]]; then
+    ( set -o noclobber; : > "$file" ) 2>/dev/null || return 0
+    created=1
+  fi
+  [[ -f $file && ! -L $file ]] || return 0
+  chmod 640 "$file" 2>/dev/null || true
+  [[ $mode == created && $created -eq 0 ]] && return 0
+  if getent passwd "$owner" >/dev/null 2>&1; then
+    chown -h "$owner:$grp" "$file" 2>/dev/null || true
+  else
+    chown -h root:root "$file" 2>/dev/null || true
+  fi
+}
+
 log_file() {
   local owner=$2 grp=$3
   local file="${LOG_ROOT}/$1"
   mkdir -p "$(dirname "$file")"
-  [[ -e $file ]] || : > "$file"
-  chmod 640 "$file"
-  if getent passwd "$owner" >/dev/null 2>&1; then
-    chown "$owner:$grp" "$file" 2>/dev/null || true
-  else
-    chown root:root "$file" 2>/dev/null || true
-  fi
+  secure_log_file "$file" "$owner" "$grp"
 }
 
 ensure_log_dirs() {
@@ -203,8 +227,19 @@ write_mysqlbkup_credentials() {
   tmp=$(tmp_file) || return 1
   MYSQLBKUP_USER=$2 MYSQLBKUP_PASS=$3 awk '
     BEGIN { u = ENVIRON["MYSQLBKUP_USER"]; p = ENVIRON["MYSQLBKUP_PASS"] }
-    /^user=dba$/ { print "user=" u; next }
-    /^password=dba_passwd$/ { print "password=" p; next }
+    # Option-file syntax: an unquoted "#" starts a comment and a backslash
+    # is an escape, so the values are written double-quoted and escaped.
+    function quoted(v,    i, c, o) {
+      o = ""
+      for (i = 1; i <= length(v); i++) {
+        c = substr(v, i, 1)
+        if (c == "\\" || c == "\"") o = o "\\"
+        o = o c
+      }
+      return "\"" o "\""
+    }
+    /^user=dba$/ { print "user=" quoted(u); next }
+    /^password=dba_passwd$/ { print "password=" quoted(p); next }
     { print }
   ' "$file" > "$tmp" || return 1
   cat -- "$tmp" > "$file"

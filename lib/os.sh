@@ -141,6 +141,8 @@ configure_hostname() {
   # keep resolving the old name from /etc/hosts after the rename.
   sed_in_place -E '/^[[:space:]]*127\.0\.1\.1[[:space:]]/d' /etc/hosts
   printf '127.0.1.1\t%s\n' "$host" >> /etc/hosts
+  # Marks the hostname as applied by --basic (see basic_applied_value).
+  printf '%s\n' "$host" > "${STATE_DIR}/applied-hostname"
   hostnamectl status || true
 }
 
@@ -157,7 +159,25 @@ configure_timezone() {
     timedatectl show -p Timezone --value > "${STATE_DIR}/original-timezone" 2>/dev/null || true
   fi
   timedatectl set-timezone "$tz"
+  printf '%s\n' "$tz" > "${STATE_DIR}/applied-timezone"
   timedatectl status || true
+}
+
+# --basic is required by every later service install, so it is re-run on
+# hosts that were named and zoned long ago.  When an earlier run applied a
+# hostname/timezone (marker under STATE_DIR, emptied by --purge basic) and
+# this run gives no host=/time=, the live value is kept instead of renaming
+# the host to a generated name or moving it to the default zone.
+# Usage: basic_applied_value hostname|timezone -> live value, or status 1.
+basic_applied_value() {
+  local what=$1 live=""
+  [[ -s "${STATE_DIR}/applied-${what}" ]] || return 1
+  case "$what" in
+    hostname) live=$(hostnamectl hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || true) ;;
+    timezone) live=$(timedatectl show -p Timezone --value 2>/dev/null || true) ;;
+  esac
+  [[ -n $live ]] || return 1
+  printf '%s' "$live"
 }
 
 swap_total_bytes() {
@@ -305,6 +325,28 @@ configure_swap_auto() {
   if (( needed < 1048576 )); then
     info "Additional swap needed is below 1 MiB; skipping"
     return 0
+  fi
+
+  # Automatic swap must never abort --basic (and with it sysctl, limits,
+  # cron and the firewall) because the disk is small, nor drop a working
+  # swap file it cannot replace.  Size the file to what fits while keeping
+  # 256 MiB free, counting the space the existing file gives back, and
+  # decide before the active file is released.
+  local avail room want credit=0 margin=268435456
+  [[ -f /swapfile ]] && credit=$(stat -c %s /swapfile 2>/dev/null || echo 0)
+  want=$needed
+  if [[ -f /swapfile ]] && swapfile_active; then want=$(( credit + needed )); fi
+  avail=$(df -B1 --output=avail / 2>/dev/null | awk 'NR==2{print $1}')
+  if [[ $avail =~ ^[0-9]+$ ]]; then
+    room=$(( (avail + credit - margin) / 1048576 * 1048576 ))
+    if (( want > room )); then
+      if (( room < 67108864 || room <= credit )); then
+        warn "Automatic swap skipped: $(numfmt --to=iec "$want") does not fit on / with 256 MiB kept free (swap is unchanged; pass swap=SIZE to choose one)"
+        return 0
+      fi
+      info "Automatic swap reduced to $(numfmt --to=iec "$room"): the 50%-of-RAM target does not fit on / with 256 MiB kept free"
+      needed=$(( needed - (want - room) ))
+    fi
   fi
 
   if [[ -f /swapfile ]]; then
@@ -1025,7 +1067,9 @@ install_basic() {
   # generated hostname, even when the kernel reserves some of it.
   install_basic_tools
 
-  if [[ -z $host ]]; then
+  if [[ -z $host ]] && host=$(basic_applied_value hostname); then
+    info "Keeping hostname ${host} (applied by an earlier run; pass host= to change it)"
+  elif [[ -z $host ]]; then
     host=$(generate_hostname)
     [[ -n $host ]] || die "Could not auto-generate a hostname"
     validate_hostname "$host" || die "Generated hostname '${host}' is invalid"
