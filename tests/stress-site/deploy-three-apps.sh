@@ -1,11 +1,28 @@
 #!/usr/bin/env bash
 # Deploy WordPress, XenForo and Chevereto from /root/work/pkg/x onto the vhosts made by --domain.
+#
+# RESET_DB=1 drops and recreates the three databases first, and flushes the
+# Valkey databases the applications use.  Without it a re-deploy on a host
+# that already ran this script fails: XenForo refuses to install over its
+# tables ("You cannot proceed unless all XenForo database tables are
+# removed"), and Chevereto answers "[ERROR] Chevereto is already installed"
+# even after a DROP DATABASE because cheveretoVersionInstalled() reads
+# chv_variables through the Redis cache first.  The audit host is disposable,
+# so a reset is the supported way to repeat a deployment.
 set -Eeuo pipefail
 X=/root/work/pkg/x
 WP=/var/www/wp.test.local/public; XF=/var/www/xf.test.local/public; CH=/var/www/chev.test.local/public
 PW_FILE=/root/audit/test-admin-pass; [ -s $PW_FILE ] || ( umask 077; echo "Audit-$(openssl rand -hex 6)" > $PW_FILE )
 PW=$(cat $PW_FILE)
 asw() { runuser -u www-data -- "$@"; }
+if [[ ${RESET_DB:-0} == 1 ]]; then
+  for db in wordpress xenforo chevereto; do
+    mariadb -e "DROP DATABASE IF EXISTS \`$db\`; CREATE DATABASE \`$db\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+  done
+  vk=$(command -v valkey-cli || command -v redis-cli)
+  "$vk" -s /run/valkey/valkey.sock -n 0 flushdb >/dev/null
+  "$vk" -s /run/valkey/valkey.sock -n 1 flushdb >/dev/null
+fi
 for d in $WP $XF $CH; do find "$d" -mindepth 1 -delete; done
 cp -a $X/wp/wordpress/. $WP/; cp -a $X/xf/upload/. $XF/; cp -a $X/chev/. $CH/
 chown -R www-data:www-data $WP $XF $CH
@@ -56,8 +73,30 @@ chown www-data:www-data $XF/src/config.php; chmod 640 $XF/src/config.php
 (cd $XF && asw php cmd.php xf:install --user=admin --password="$PW" --email=admin@example.com --title="SER8 audit forum" --url=https://xf.test.local --skip-statistics -n 2>&1 | tail -3)
 cp /root/work/ubuntu-setup-script/tests/stress-site/seed-xf.php $XF/seed-xf.php
 (cd $XF && asw php seed-xf.php 60 200 2400 2>&1 | tail -3); rm -f $XF/seed-xf.php
-mariadb xenforo -e "UPDATE xf_option SET option_value='1' WHERE option_id='useFriendlyUrls'; UPDATE xf_option SET option_value='server' WHERE option_id='jobRunTrigger';"
+# Set the options through XenForo's repository, not with SQL.  A raw UPDATE
+# leaves the option cache built during the install in place, so the board
+# kept answering GET / with a 301 to /index.php (useFriendlyUrls=0 in the
+# cached options) even though the column said 1.  The vhost then cached that
+# 301 for an hour, which made every guest request a redirect and invalidated
+# the xf-guest throughput tier.
+cat > $XF/audit-options.php <<'PHP'
+<?php
+require __DIR__ . '/src/XF.php';
+\XF::start(__DIR__);
+$app = \XF::setupApp('XF\Pub\App');
+$repo = $app->repository('XF:Option');
+$repo->updateOption('useFriendlyUrls', true);
+$repo->updateOption('jobRunTrigger', 'server');
+echo "options updated\n";
+PHP
+(cd $XF && asw php audit-options.php); rm -f $XF/audit-options.php
 (cd $XF && asw php cmd.php xf:rebuild-master-data -n >/dev/null 2>&1 || true)
+# A guest-cache entry written before the option change (a 301 to /index.php)
+# would survive for its full TTL, so drop the cache now that the app is right.
+if [[ -d /home/nginx_cache ]]; then
+  find /home/nginx_cache -mindepth 1 -delete 2>/dev/null || true
+  systemctl restart angie
+fi
 
 # ---- Chevereto
 cat > $CH/app/env.php <<PHP
@@ -74,4 +113,9 @@ return [
 PHP
 chown www-data:www-data $CH/app/env.php; chmod 640 $CH/app/env.php
 (cd $CH && asw php app/bin/legacy -C install -u admin -e admin@example.com -x "$PW" 2>&1 | tail -5)
+
+# Fixtures the guest-cache cookie test needs (WordPress mu-plugin that sets a
+# cookie on ?gc=1, and the audit passwords).  Deploying them here keeps the
+# security test a one-command run instead of eight unexplained failures.
+CHEV_PASSWORD=$PW bash "$(dirname -- "$0")/seed-guest-cache-fixtures.sh"
 echo "deploy done"

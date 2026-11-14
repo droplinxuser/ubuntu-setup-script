@@ -1,12 +1,18 @@
 #!/bin/bash
 # Guest-cache cookie safety: functional checks against a test host.
 #
-# Usage: IP=<host address> bash guest-cache-cookie-test.sh
+# Usage: IP=<host address> [PW=...] [CHEV_PW=...] bash guest-cache-cookie-test.sh
 # Expects the audit sites xf.test.local, chev.test.local and wp.test.local
 # (seeded as in tests/stress-site), a `bench5` member, the Chevereto `admin`
 # user and, for the WordPress cookie check, a mu-plugin that sets a
-# `guest_token` cookie on ?gc=1.  Read-only apart from logging in and out.
+# `guest_token` cookie on ?gc=1.  Run seed-guest-cache-fixtures.sh once after
+# deployment; without it the WordPress and Chevereto login checks cannot pass
+# on an otherwise correct host.  Read-only apart from logging in and out.
+#   PW        bench5 password in WordPress and XenForo (default BenchPass123!)
+#   CHEV_PW   Chevereto admin password (default: $PW; pass the value in
+#             /root/audit/test-admin-pass when the audit deploy created it)
 IP=${IP:?set IP to the test host address}; T=$(mktemp -d); P=0; F=0
+PW=${PW:-BenchPass123!}; CHEV_PW=${CHEV_PW:-$PW}
 ok()   { P=$((P+1)); printf 'PASS  %s\n' "$1"; }
 bad()  { F=$((F+1)); printf 'FAIL  %s   [%s]\n' "$1" "$2"; }
 chk()  { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "got '$2' want '$3'"; fi; }
@@ -59,7 +65,7 @@ chk "XF two guests get different xf_csrf cookies" "$([ "$(cookv xka xf_csrf)" !=
 req xgc -b "$T/g.jar" "$X/"
 chk "XF guest with only xf_csrf is still served from the cache" "$(hdr xgc x-5m-cache)" HIT
 # log in with the refreshed token (cached page -> keep-alive -> login)
-req xlogin -b "$T/g.jar" -c "$T/g.jar" --data-urlencode "_xfToken=$newtok" --data-urlencode 'login=bench5' --data-urlencode 'password=BenchPass123!' --data 'remember=1' "$X/login/login"
+req xlogin -b "$T/g.jar" -c "$T/g.jar" --data-urlencode "_xfToken=$newtok" --data-urlencode 'login=bench5' --data-urlencode "password=$PW" --data 'remember=1' "$X/login/login"
 chk "XF login from a cached page succeeds (303)" "$ST" 303
 chk "XF login response delivers session/user cookies" "$([ -n "$(cookv xlogin xf_user)" ] && [ -n "$(cookv xlogin xf_session)" ] && echo y)" y
 req xmem -b "$T/g.jar" "$X/"
@@ -67,7 +73,11 @@ chk "XF member page bypasses the cache" "$(hdr xmem x-5m-cache)" BYPASS
 chk "XF member page is rendered for the member" "$(grep -c 'bench5' "$T/xmem.body" | awk '{print ($1>0)?"y":"n"}')" y
 chk "XF member page keeps HSTS" "$([ -n "$(hdr xmem strict-transport-security)" ] && echo y)" y
 req xg4 "$X/"
-chk "XF member page was not stored: guests still get the guest page" "$(hdr xg4 x-5m-cache):$(grep -c 'bench5' "$T/xg4.body")" "HIT:0"
+# The visitor tabs carry an /account/ link for a logged-in member and none for
+# a guest.  The member's user name is not a marker: the "members online" block
+# on a board with recent activity lists it on cached guest pages too (that
+# assertion reported a phantom leak once the seeded bench5 had been active).
+chk "XF member page was not stored: guests still get the guest page" "$(hdr xg4 x-5m-cache):$(grep -c 'href="/account/"' "$T/xg4.body")" "HIT:0"
 # a POST by a guest is never cached and keeps its cookies
 req xpost --data 'keywords=benchmark&_xfToken=x' "$X/search/search"
 chk "XF guest POST is not cached" "$(hdr xpost x-5m-cache)" BYPASS
@@ -116,7 +126,7 @@ chk "Chevereto token is stable within one session" "$t1b" "$t1"
 # login flow
 rm -f "$T/c.jar"; req cl -c "$T/c.jar" "$C/login"
 lt=$(grep -oE 'auth_token[^a-f0-9]{1,12}[a-f0-9]{20,}' "$T/cl.body" | grep -oE '[a-f0-9]{20,}' | head -1)
-req clp -b "$T/c.jar" -c "$T/c.jar" --data-urlencode "auth_token=$lt" --data 'login-subject=admin' --data-urlencode 'password=BenchPass123!' "$C/login"
+req clp -b "$T/c.jar" -c "$T/c.jar" --data-urlencode "auth_token=$lt" --data 'login-subject=admin' --data-urlencode "password=$CHEV_PW" "$C/login"
 chk "Chevereto login succeeds (302)" "$ST" 302
 chk "Chevereto login delivers the KEEP_LOGIN cookie" "$(grep -c KEEP_LOGIN "$T/c.jar" | awk '{print ($1>0)?"y":"n"}')" y
 req cmem -b "$T/c.jar" "$C/explore"
@@ -142,7 +152,7 @@ req wk1 "$W/?gc=1"; req wk2 "$W/?gc=1"; req wk3 "$W/?gc=1"
 chk "WordPress page that sets a guest cookie is never stored" "$(hdr wk1 x-cache-status)$(hdr wk2 x-cache-status)$(hdr wk3 x-cache-status)" MISSMISSMISS
 chk "WordPress guest cookies are unique per visitor" "$([ "$(cookv wk1 guest_token)" != "$(cookv wk2 guest_token)" ] && [ "$(cookv wk2 guest_token)" != "$(cookv wk3 guest_token)" ] && [ -n "$(cookv wk1 guest_token)" ] && echo y)" y
 rm -f "$T/w.jar"; req wl -c "$T/w.jar" "$W/wp-login.php"
-req wlp -b "$T/w.jar" -c "$T/w.jar" --data 'log=bench5&testcookie=1&wp-submit=Log+In' --data-urlencode 'pwd=BenchPass123!' "$W/wp-login.php"
+req wlp -b "$T/w.jar" -c "$T/w.jar" --data 'log=bench5&testcookie=1&wp-submit=Log+In' --data-urlencode "pwd=$PW" "$W/wp-login.php"
 chk "WordPress login succeeds (302) and sets cookies" "$ST:$([ "$(ncook wlp)" -ge 2 ] && echo y)" "302:y"
 req wmem -b "$T/w.jar" "$W/"
 chk "WordPress logged-in page bypasses the cache" "$(hdr wmem x-cache-status)" BYPASS

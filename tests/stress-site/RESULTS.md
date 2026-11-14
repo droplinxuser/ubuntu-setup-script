@@ -1,5 +1,34 @@
 # Full-stack stress test reports
 
+## 1.21.7 re-audit (2026-11-15)
+
+Freshly restored 16-thread / 27 812 MiB / NVMe bare-metal host, WordPress
+7.1.4, XenForo 2.3.13 and Chevereto 4.5.9.  Full report:
+`AUDIT-20261115-1.21.7.md`.
+
+- **Distribution defaults -> shipped tuning (PHP 8.5, 100c, 8 s, Wi-Fi):**
+  XenForo member thread 269 -> 577 req/s (+114 %), WordPress member home
+  144 -> 275 (+91 %), WordPress member post 134 -> 259 (+93 %).
+- **Guest/static tiers:** XenForo guest 4 504 req/s (p50 43.7 ms), WordPress
+  guest 2 944 (p50 66.9 ms), Chevereto `/explore` 1 353, Chevereto image
+  2 993, a 30 KiB static asset 757 req/s (22 MiB/s).  The workstation is on
+  Wi-Fi (802.11ax, 80 MHz, -48 dBm), so the cache tiers are client-bound;
+  compare rows against each other, not against the wired runs in 1.21.6.
+- **PHP-FPM sweep (static, authenticated thread):** 8/12/16/20/24 workers =
+  345/440/484/482/477 req/s; 16 (one per logical CPU) is the optimum.
+- **JIT sweep:** off 519, function 457, tracing 32/64/128 MB =
+  551/559/557 req/s; tracing 64 MB stays the shipped profile.
+- **Sustained 60 s, c=64:** 559 req/s, p50 113 ms, p99 140 ms, 33 461 x 200,
+  CPU 95 % (PHP-bound), all 16 workers busy, 0 slow queries, 0 error-log
+  growth, 0 failed units.
+- **Harness fixes:** the deploy script now writes XenForo options through the
+  option repository and purges the guest cache (a raw SQL option change had
+  pinned a `301 /index.php` for an hour and the `xf-guest` tier measured
+  1 024 redirects/s); `RESET_DB=1` makes a repeat deploy possible; the
+  cookie test got its missing fixtures (61/61) and a member-page marker that
+  the members-online widget cannot fake; `security-probe.sh` adds 51
+  read-only checks (all pass).
+
 ## 1.21.6 re-audit (2026-11-14)
 
 Freshly restored 16-thread / 27 812 MiB / NVMe bare-metal host, WordPress

@@ -75,6 +75,11 @@ if [[ -z $THREAD ]]; then
   echo "FAIL  no XenForo thread could be discovered"
   FAIL=$(( FAIL + 1 ))
 else
+  # /threads/ID/ answers a 301 to the canonical slug.  A saved short URL made
+  # the benchmark measure that redirect (1024 req/s of empty 301s) instead of
+  # the thread page, so store the URL curl ends up on.
+  THREAD=$(curl -sk -o /dev/null -w '%{url_effective}' -L --resolve xf.test.local:443:127.0.0.1 "https://xf.test.local$THREAD")
+  THREAD=${THREAD#https://xf.test.local}
   echo "https://xf.test.local$THREAD" > $J/xf-thread.url
 fi
 for u in / "$THREAD" /members/ /whats-new/ /forums/-/index.rss /search/ /help/ /sitemap.xml /css.php; do st "xf guest $u" "$(q xf.test.local -L "https://xf.test.local$u")"; done

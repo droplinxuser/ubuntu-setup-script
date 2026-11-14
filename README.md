@@ -241,11 +241,12 @@ Members, POSTs and no-cache URIs stay in the uncached PHP location.
 The vhost serves guest pages from the FastCGI cache for 5 minutes with a
 map-based bypass for `xf_session`/`xf_user`/admin/login cookies, a key that
 varies on style, style variation, language and `Accept-Encoding`, background
-refresh and stampede lock, 404/301 for 24 h, never 5xx, an immutable 30-day
-location for `/js`, `/styles` and `/data`, and the server-level security
-headers re-included inside the PHP locations (a location-level `add_header`
-would otherwise drop HSTS). `--optimize` repairs or completes the same block
-on older hosts. Application-side findings from the test host: disable the
+refresh and stampede lock, 301 for 1 h and 404 for 1 min, never 5xx, an
+immutable 30-day location for `/js`, `/styles` and `/data`, and the
+server-level security headers re-included inside the PHP locations (a
+location-level `add_header` would otherwise drop HSTS). `--optimize` repairs
+or completes the same block on older hosts. Application-side findings from
+the test host: disable the
 "Members online", "Trending" and "Featured" forum-list widgets if unused
 (+39% authenticated throughput), keep sessions/registry in MariaDB on a
 single host (XF's Redis cache measured 27% slower there) and use

@@ -3,6 +3,75 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.7 (2026-11-15)
+
+Seventh audit of the 1.21 line on the Ubuntu 26.04.1 test host (16 logical
+CPUs, 27 812 MiB RAM, NVMe, bare metal) with WordPress 7.1.4, XenForo 2.3.13
+and Chevereto 4.5.9, on a freshly restored 526-package baseline.  Pair with
+server-configs-nginx 1.6.28.  The production modules again needed no
+correction; the defects were in the application-deployment and security
+harnesses, plus one Angie rate-limit gap that 1.6.28 fixes.
+
+- **The deploy harness was poisoning the XenForo guest cache.**
+  `deploy-three-apps.sh` switched `useFriendlyUrls` with a raw `UPDATE`, which
+  leaves the options XenForo cached during `xf:install` in place.  The board
+  then answered `GET /` with `301 /index.php`, the vhost cached that 301 for
+  an hour, and the `xf-guest` tier benchmarked 1 024 empty redirects a second
+  instead of the forum page (the functional suite hid it because it follows
+  redirects with curl `-L`).  Options are now written through
+  `XF\Repository\OptionRepository::updateOption()`, the guest cache is purged
+  after seeding, and the canonical thread URL is stored (a bare
+  `/threads/ID/` answers 301 to the slug, so the member tier measured a
+  redirect too).
+- **A repeat deploy is now possible.**  `RESET_DB=1` drops and recreates the
+  three databases and flushes the Valkey databases first.  Without it a
+  second run dies in XenForo ("all XenForo database tables must be removed")
+  and then in Chevereto ("already installed"), because
+  `cheveretoVersionInstalled()` reads `chv_variables` through the Redis cache
+  before touching the database.
+- **The cookie-safety test has automated fixtures.**  It needs a WordPress
+  endpoint that sets a per-visitor cookie and known passwords, which were
+  never scripted, so a correct host reported eight failures.  The new
+  `seed-guest-cache-fixtures.sh` installs the mu-plugin, resets the `bench5`
+  accounts and sets the Chevereto admin password (deploy runs it); the test
+  accepts `PW`/`CHEV_PW` and detects the member page by its `/account/` link
+  instead of the user name, which the members-online widget also shows on a
+  cached guest page.  61/61 checks pass after that, including "a response
+  that sets a cookie is never stored".
+- **`security-probe.sh` is new.**  51 read-only checks over the three vhosts:
+  hidden files, backup and dump copies, PHP in writable directories,
+  PATH_INFO, dot segments, internal XenForo trees, unknown `Host`, URL
+  override headers, and PUT/TRACE.  All 51 pass; the XenForo upgrader is
+  reachable by design (303 to its login) and is now rate-limited by the Angie
+  repo (see 1.6.28).
+- **README corrected.**  The XenForo paragraph claimed "404/301 for 24 h";
+  the shipped configuration is 301 for 1 h and 404 for 1 min.
+- **Validation.**  819 tuning checks and 192 CLI/dry-run checks pass;
+  `shellcheck -S warning -x` is clean (0.11.0, same file list as CI).  Full
+  install 3:43 with zero errors, install/`--optimize` state snapshots
+  identical, `--optimize` a byte-identical no-op on the second pass and after
+  the three applications were deployed, `--domain` repeat a no-op, PHP
+  8.5 -> 8.4 -> 8.5 round-tripped (14 and 15 extensions carried), all three
+  applications answer with zero PHP diagnostics on both versions, and the
+  deploy/cookie/security harnesses are green after a `RESET_DB=1` redeploy.
+- **Performance (workstation `oha`, Wi-Fi 802.11ax, 100/200 c, 8 s).**
+  Distribution defaults -> shipped tuning: XenForo member thread 269 -> 577
+  req/s (+114 %), WordPress member 144 -> 275 (+91 %), WordPress member post
+  134 -> 259 (+93 %).  Guest cache: XenForo 4 504 req/s (p50 43.7 ms),
+  WordPress 2 944 (p50 66.9 ms), Chevereto `/explore` 1 353, image 2 993;
+  the 30 KiB static asset ran at 757 req/s (22 MiB/s) and is client-bound on
+  the Wi-Fi link, not server-bound.  Sustained 60 s authenticated XenForo
+  (c=64): 559 req/s, p50 113 ms, p99 140 ms, 33 461 x 200, CPU 95 %, all 16
+  workers busy, 0 slow queries, 0 error-log growth, 0 failed units.
+- **Sweeps confirm the shipped optima.**  static 8/12/16/20/24 workers =
+  345/440/484/482/477 req/s (16 = one per CPU); JIT off/function/tracing
+  32/64/128 MB = 519/457/551/559/557 (tracing 64 MB).
+- **PHP ceiling re-confirmed.**  WordPress 7.1.4 bootstraps and serves on
+  8.6.0RC5 with 0 fatals (19 compile-time deprecations in bundled libraries);
+  XenForo 2.3.13 and Chevereto 4.5.9 stay on 8.5/8.4 because 8.6 publishes no
+  `redis`, `igbinary` or `imagick`, and `--upgrade-php=8.6` refuses before the
+  purge.
+
 ## 1.21.6 (2026-11-14)
 
 Sixth audit of the 1.21 line on the Ubuntu 26.04.1 test host (16 logical
