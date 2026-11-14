@@ -3,6 +3,57 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.6 (2026-11-14)
+
+Sixth audit of the 1.21 line on the Ubuntu 26.04.1 test host (16 logical
+CPUs, 27 812 MiB RAM, NVMe, bare metal) with WordPress 7.1.4, XenForo 2.3.13
+and Chevereto 4.5.9.  Pair with server-configs-nginx 1.6.27.  The production
+modules needed no correction on a freshly restored 526-package baseline; the
+two defects found were in the benchmarking harness.
+
+- **A rate-limited load test can no longer be published as throughput.**
+  Angie caps GET at 100 r/s per address, so a remote generator that is not
+  exempted answers with 429 almost immediately and `oha` reports a huge,
+  meaningless requests/s (one run showed 21k r/s with 168k 429s, and a
+  first pass in this audit measured 10k r/s of pure 429s).  A naive reader
+  sees a fast server; the number is the limiter.  `run_one` now computes the
+  429 share per scenario, warns on stderr, records a `WARNING` section in the
+  report and makes the whole run exit 3 when 5% or more of a scenario's
+  answers are 429, with the `SETUP_LIMIT_REQ_EXEMPT` remedy in the message.
+  Verified both ways: 41 204/41 614 429s -> exit 3; with the workstation
+  exempted -> exit 0 and all 200s.
+- **Server-side PHP-FPM metrics are no longer silently empty.**
+  `collect-metrics.sh` asked `cgi-fcgi` (optional, not installed) and then a
+  `/fpm-status.php` that no managed vhost serves, so every sample recorded a
+  blank FPM field during the stress runs.  Without `cgi-fcgi` it now counts
+  the pool from the process table (`workers=`, `busy~=`) and says why the
+  exact status is unavailable.  Verified idle `16/0` and under load `16/16`.
+- **Validation.**  819 tuning checks and 192 CLI/dry-run checks pass;
+  `shellcheck -S warning -x` is clean (0.11.0, same file list as CI).  A full
+  install finished in 3:07 with zero errors, install/`--optimize` state
+  snapshots are identical, the second `--optimize` is a no-op, PHP
+  8.5 -> 8.4 -> 8.5 round-tripped with 15 extensions carried, and all three
+  applications answer with zero PHP diagnostics on 8.4 and 8.5.
+- **Performance (workstation `oha`, LAN, 200/100 c, 8 s).**  Distribution
+  defaults -> shipped tuning: XenForo member thread 255 -> 552 req/s
+  (+116 %), WordPress member 141 -> 253 (+79 %), WordPress member post
+  128 -> 237 (+85 %).  Guest cache: XenForo 7 190, WordPress 5 203,
+  Chevereto explore 5 338, static 20 030 req/s.  Sustained 60 s
+  authenticated XenForo: 492 req/s, p50 117 ms, p99 347 ms, 29 455 x 200,
+  zero slow queries, zero error-log growth, 0 failed units.
+- **Sweeps confirm the shipped optima.**  static 8/12/16/20/24 workers =
+  376/480/538/424/404 req/s (16 = one per CPU); JIT off/function/tracing32/
+  tracing64/tracing128 = 395/494/543/549/534 (tracing 64 MB).
+- **PHP ceiling re-confirmed.**  WordPress 7.1.4 bootstraps on PHP 8.6 RC5
+  (0 compile fatals); XenForo 2.3.13 and Chevereto 4.5.9 are held at 8.5/8.4
+  because 8.6 publishes no `redis`, `igbinary` or `imagick`, and
+  `--upgrade-php=8.6` refuses before the purge.
+- **Tuning actually applied** (this hardware): kernel BBR/`fq`, 65k
+  backlogs, 32 MB buffers; Angie 16 workers x 32 768 connections; PHP
+  static 16, OPcache 512 MB, JIT tracing 64 MB; MariaDB pool 1 738 MB
+  (data +20 %) with redo 434 MB and pool-of-threads; Valkey 434 MiB
+  `allkeys-lru`; Elasticsearch 4 GB heap.
+
 ## 1.21.5 (2026-11-14)
 
 Fifth audit of the 1.21 line on the Ubuntu 26.04.1 test host (16 logical

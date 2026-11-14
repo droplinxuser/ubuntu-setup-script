@@ -40,6 +40,13 @@ HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd -- "$HERE/../.." && pwd)
 OHA=${OHA:-$ROOT/.tools/oha}
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/stress-remote.XXXXXX")
+# Scenarios whose answer was dominated by HTTP 429.  Angie caps GET at
+# 100 r/s per address (http.d/limit_req.conf) and a remote load generator is
+# throttled unless it is exempted with SETUP_LIMIT_REQ_EXEMPT.  A throttled
+# run answers almost instantly, so oha reports a huge, meaningless requests/s
+# (a 200-connection run measured 21k r/s with 168k 429s).  Track it and fail
+# the run instead of publishing the number.
+RATE_LIMITED_SCENARIOS=""
 
 if [[ ! -x $OHA ]]; then
   # Zero-install: fetch the static oha release for this workstation.
@@ -87,6 +94,14 @@ run_one() {
     # A transient client/link failure can leave oha's JSON unparsable.  Keep
     # one row per scenario so the report never silently loses a measurement.
     printf '| %s | no result | | | | | jq could not parse %s |\n' "$name" "$out" >> "$TMP/table.md"
+  fi
+  # Flag a rate-limited measurement (see RATE_LIMITED_SCENARIOS above).
+  local total req429
+  total=$(jq -r '(.statusCodeDistribution // {} | to_entries | map(.value) | add) // 0' "$out" 2>/dev/null || echo 0)
+  req429=$(jq -r '(.statusCodeDistribution["429"] // 0)' "$out" 2>/dev/null || echo 0)
+  if [[ $total =~ ^[0-9]+$ && $req429 =~ ^[0-9]+$ ]] && (( total > 0 && req429 * 100 / total >= 5 )); then
+    RATE_LIMITED_SCENARIOS="${RATE_LIMITED_SCENARIOS}${name}(${req429}/${total}) "
+    printf '  WARNING: %s answered %s of %s requests with 429 (rate limit)\n' "$name" "$req429" "$total" >&2
   fi
 }
 
@@ -147,5 +162,23 @@ cat "$TMP/table.md" >> "$REPORT"
   echo "  against each other and against the server-side collect-metrics.sh samples."
   echo "- Raw oha JSON per scenario: ${TMP}"
 } >> "$REPORT"
+if [[ -n $RATE_LIMITED_SCENARIOS ]]; then
+  {
+    echo
+    echo "## WARNING: rate-limited measurements"
+    echo
+    echo "These scenarios answered at least 5% of requests with 429, so their"
+    echo "requests/s is the rate limiter's throughput, not the application's:"
+    echo
+    echo '```'
+    echo "$RATE_LIMITED_SCENARIOS"
+    echo '```'
+    echo
+    echo "Exempt the load generator and re-run:"
+    echo "SETUP_LIMIT_REQ_EXEMPT=<client-ip>/32 setup.sh --optimize on the host."
+  } >> "$REPORT"
+  echo "ERROR: rate-limited by Angie; results are not valid (see the WARNING section)" >&2
+fi
 echo "Report written to ${REPORT}" >&2
 grep -E '^\|' "$REPORT" >&2 || true
+[[ -z $RATE_LIMITED_SCENARIOS ]] || exit 3

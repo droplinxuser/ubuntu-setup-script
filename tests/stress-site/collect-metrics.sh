@@ -11,12 +11,22 @@ INTERVAL=${2:-5}
 COUNT=${3:-0}
 DOMAIN=${DOMAIN:-stress.invalid}
 php_status() {
-  local sock
+  local sock total busy
   sock=$(ls /run/php/php*-fpm.sock 2>/dev/null | head -n1)
   [[ -n $sock ]] || return 0
-  SCRIPT_NAME=/fpm-status SCRIPT_FILENAME=/fpm-status QUERY_STRING='' REQUEST_METHOD=GET \
-    cgi-fcgi -bind -connect "$sock" 2>/dev/null | grep -E '^(active processes|idle processes|listen queue|max listen queue|slow requests|max children reached|total processes):' | tr '\n' ';' \
-    || curl -sk --resolve "${DOMAIN}:443:127.0.0.1" "https://${DOMAIN}/fpm-status.php" 2>/dev/null | grep -E '^(active processes|idle processes|listen queue|max listen queue|slow requests|max children reached):' | tr '\n' ';'
+  if command -v cgi-fcgi >/dev/null 2>&1; then
+    SCRIPT_NAME=/fpm-status SCRIPT_FILENAME=/fpm-status QUERY_STRING='' REQUEST_METHOD=GET \
+      cgi-fcgi -bind -connect "$sock" 2>/dev/null | grep -E '^(active processes|idle processes|listen queue|max listen queue|slow requests|max children reached|total processes):' | tr '\n' ';'
+    return 0
+  fi
+  # cgi-fcgi (libfcgi-bin) is optional and the managed pool sets no
+  # pm.status_path, so the old fallback queried a /fpm-status.php that does
+  # not exist and recorded an empty field for every sample.  Count the pool
+  # from the process table instead: total workers plus the runnable ones
+  # (an approximation, but it shows saturation during a load test).
+  total=$(pgrep -c -f 'php-fpm: pool ' 2>/dev/null || true)
+  busy=$(ps -eo stat=,args= 2>/dev/null | awk '/php-fpm: pool / && $1 ~ /^R/ {n++} END {print n+0}')
+  printf 'workers=%s busy~=%s (cgi-fcgi absent);' "${total:-0}" "${busy:-0}"
 }
 angie_status() { curl -s http://127.0.0.1/status/ 2>/dev/null | tr '\n' ' ' | cut -c1-200; }
 db_status() {
