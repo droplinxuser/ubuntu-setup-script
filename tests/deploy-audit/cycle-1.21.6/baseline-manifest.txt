@@ -1,0 +1,2855 @@
+== captured ==
+2026-11-14T21:01:06+08:00
+
+== identity ==
+ Static hostname: 16c-32g-1T
+       Icon name: computer-desktop
+         Chassis: desktop 🖥️
+      Machine ID: f654d887ecd3448abd471a0b941d5df5
+         Boot ID: ef83992af068475183a8b941ca43ceac
+    Product UUID: ec72c080-ac71-11ef-b710-6014224e5800
+Operating System: Ubuntu 26.04.1 LTS
+          Kernel: Linux 7.0.0-43-generic
+    Architecture: x86-64
+ Hardware Vendor: AZW
+  Hardware Model: SER8
+ Hardware Serial: C87454BF70202
+    Hardware SKU: 75
+Hardware Version: V10
+Firmware Version: HPT.8xxx.SER8.V035.P8C0M0C15.16.BL
+   Firmware Date: Wed 2026-06-03
+    Firmware Age: 5month 1w 5d
+virt: none
+none
+
+== cpu ==
+Architecture:                            x86_64
+CPU op-mode(s):                          32-bit, 64-bit
+Address sizes:                           48 bits physical, 48 bits virtual
+Byte Order:                              Little Endian
+CPU(s):                                  16
+On-line CPU(s) list:                     0-15
+Vendor ID:                               AuthenticAMD
+Model name:                              AMD Ryzen 7 8745HS w/ Radeon 780M Graphics
+CPU family:                              25
+Model:                                   117
+Thread(s) per core:                      2
+Core(s) per socket:                      8
+Socket(s):                               1
+Stepping:                                2
+Frequency boost:                         enabled
+CPU(s) scaling MHz:                      30%
+CPU max MHz:                             4966.6401
+CPU min MHz:                             405.4400
+BogoMIPS:                                7586.08
+Flags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good amd_lbr_v2 nopl xtopology nonstop_tsc cpuid extd_apicid aperfmperf rapl pni pclmulqdq monitor ssse3 fma cx16 sse4_1 sse4_2 x2apic movbe popcnt aes xsave avx f16c rdrand lahf_lm cmp_legacy svm extapic cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw ibs skinit wdt tce topoext perfctr_core perfctr_nb bpext perfctr_llc mwaitx cpuid_fault cpb cat_l3 cdp_l3 hw_pstate ssbd mba perfmon_v2 ibrs ibpb stibp ibrs_enhanced vmmcall fsgsbase bmi1 avx2 smep bmi2 erms invpcid cqm rdt_a avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local user_shstk avx512_bf16 clzero irperf xsaveerptr rdpru wbnoinvd cppc arat npt lbrv svm_lock nrip_save tsc_scale vmcb_clean flushbyasid decodeassists pausefilter pfthreshold vgif x2avic v_spec_ctrl vnmi avx512vbmi umip pku ospke avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid overflow_recov succor smca fsrm flush_l1d amd_lbr_pmc_freeze
+Virtualization:                          AMD-V
+L1d cache:                               256 KiB (8 instances)
+L1i cache:                               256 KiB (8 instances)
+L2 cache:                                8 MiB (8 instances)
+L3 cache:                                16 MiB (1 instance)
+NUMA node(s):                            1
+NUMA node0 CPU(s):                       0-15
+Vulnerability Gather data sampling:      Not affected
+Vulnerability Ghostwrite:                Not affected
+Vulnerability Indirect target selection: Not affected
+
+== memory ==
+               total        used        free      shared  buff/cache   available
+Mem:           27812         843       27051           1         253       26968
+Swap:          11444           0       11444
+
+== block devices ==
+NAME        ROTA   SIZE TYPE FSTYPE MOUNTPOINT MODEL
+nvme0n1        0 931.5G disk                   CT1000P3PSSD8
+|-nvme0n1p1    0   954M part ext4   /boot      
+|-nvme0n1p2    0     1G part vfat   /boot/efi  
+|-nvme0n1p3    0  11.2G part swap   [SWAP]     
+`-nvme0n1p4    0 918.4G part ext4   /          
+
+== packages ==
+3cpio	0.14.0-1ubuntu1	install ok installed
+acl	2.3.2-2	install ok installed
+adduser	3.153ubuntu1	install ok installed
+amd64-microcode	3.20251202.1ubuntu2	install ok installed
+anacron	2.3-45ubuntu1	install ok installed
+apparmor	5.0.2-0ubuntu1~26.04.1	install ok installed
+apt	3.2.1ubuntu0.1	install ok installed
+base-files	14ubuntu6.3	install ok installed
+base-passwd	3.6.8	install ok installed
+bash	5.3-2ubuntu1	install ok installed
+bash-completion	1:2.16.0-8build1	install ok installed
+bind9-dnsutils	1:9.20.24-1ubuntu0.5	install ok installed
+bind9-host	1:9.20.24-1ubuntu0.5	install ok installed
+bind9-libs	1:9.20.24-1ubuntu0.5	install ok installed
+binutils	2.46-3ubuntu2	install ok installed
+binutils-common	2.46-3ubuntu2	install ok installed
+binutils-x86-64-linux-gnu	2.46-3ubuntu2	install ok installed
+bpftool	7.7.0+7.0.0-43.43	install ok installed
+bsdextrautils	2.41.3-3ubuntu2.2	install ok installed
+bsdutils	1:2.41.3-3ubuntu2.2	install ok installed
+busybox-static	1:1.37.0-7ubuntu1	install ok installed
+ca-certificates	20260816ubuntu0.26.04.2	install ok installed
+chrony	4.8-2ubuntu1	install ok installed
+console-setup	1.237ubuntu3.1	install ok installed
+console-setup-linux	1.237ubuntu3.1	install ok installed
+coreutils	9.5-1ubuntu2+0.0.0~ubuntu25	install ok installed
+coreutils-from-uutils	0.0.0~ubuntu25	install ok installed
+cpio	2.15+dfsg-2.1ubuntu0.1	install ok installed
+cracklib-runtime	2.9.6-5.2build3	install ok installed
+cron	3.0pl1-200ubuntu1	install ok installed
+cron-daemon-common	3.0pl1-200ubuntu1	install ok installed
+dash	0.5.12-12ubuntu3	install ok installed
+dbus	1.16.2-2ubuntu4	install ok installed
+dbus-bin	1.16.2-2ubuntu4	install ok installed
+dbus-daemon	1.16.2-2ubuntu4	install ok installed
+dbus-session-bus-common	1.16.2-2ubuntu4	install ok installed
+dbus-system-bus-common	1.16.2-2ubuntu4	install ok installed
+dbus-user-session	1.16.2-2ubuntu4	install ok installed
+debconf	1.5.92	install ok installed
+debconf-i18n	1.5.92	install ok installed
+debianutils	5.23.2build1	install ok installed
+dhcpcd-base	1:10.3.0-7	install ok installed
+diffutils	1:3.12-1ubuntu0.1	install ok installed
+dirmngr	2.4.8-4ubuntu3.1	install ok installed
+distro-info	1.15ubuntu0.1	install ok installed
+distro-info-data	2026.10.12-0ubuntu0.26.04.1	install ok installed
+dmidecode	3.6-2ubuntu1	install ok installed
+dmsetup	2:1.02.205-2ubuntu3	install ok installed
+dns-root-data	2025080400build1	install ok installed
+dnsmasq-base	2.92-1ubuntu0.5	install ok installed
+dosfstools	4.2-1.2build1	install ok installed
+dpkg	1.23.7ubuntu1	install ok installed
+dracut	110-11ubuntu0.1	install ok installed
+dracut-core	110-11ubuntu0.1	install ok installed
+dracut-install	110-11ubuntu0.1	install ok installed
+e2fsprogs	1.47.2-3ubuntu4	install ok installed
+ed	1.22.4-1	install ok installed
+efibootmgr	18-4ubuntu1	install ok installed
+eject	2.41.3-3ubuntu2.2	install ok installed
+ethtool	1:6.19-1	install ok installed
+fdisk	2.41.3-3ubuntu2.2	install ok installed
+file	1:5.46-5build2	install ok installed
+findutils	4.10.0-3build2	install ok installed
+firmware-sof-signed	2025.12.2-1	install ok installed
+friendly-recovery	0.2.42build1	install ok installed
+ftp	20260211-1	install ok installed
+fuse3	3.18.2-1	install ok installed
+gcc-16-base	16-20260322-1ubuntu1	install ok installed
+gettext-base	0.23.2-1	install ok installed
+gir1.2-girepository-3.0	2.88.0-1ubuntu0.1	install ok installed
+gir1.2-glib-2.0	2.88.0-1ubuntu0.1	install ok installed
+gir1.2-packagekitglib-1.0	1.3.4-3ubuntu1.2	install ok installed
+gnu-coreutils	9.7-3ubuntu2.1	install ok installed
+gnupg	2.4.8-4ubuntu3.1	install ok installed
+gnupg-l10n	2.4.8-4ubuntu3.1	install ok installed
+gnupg-utils	2.4.8-4ubuntu3.1	install ok installed
+gpg	2.4.8-4ubuntu3.1	install ok installed
+gpg-agent	2.4.8-4ubuntu3.1	install ok installed
+gpg-wks-client	2.4.8-4ubuntu3.1	install ok installed
+gpgconf	2.4.8-4ubuntu3.1	install ok installed
+gpgsm	2.4.8-4ubuntu3.1	install ok installed
+gpgv	2.4.8-4ubuntu3.1	install ok installed
+grep	3.12-1	install ok installed
+groff-base	1.23.0-10	install ok installed
+grub-common	2.14-2ubuntu2.1	install ok installed
+grub-efi-amd64	2.14-2ubuntu1	install ok installed
+grub-efi-amd64-bin	2.14-2ubuntu1	install ok installed
+grub-efi-amd64-signed	1.215+2.14-2ubuntu1	install ok installed
+grub-efi-amd64-unsigned	2.14-2ubuntu1	install ok installed
+grub2-common	2.14-2ubuntu2.1	install ok installed
+gzip	1.14-1~exp2ubuntu1.1	install ok installed
+hdparm	9.65+ds-1.1build1	install ok installed
+hostname	3.25build1	install ok installed
+hwdata	0.394-1build1	install ok installed
+ibverbs-providers	61.0-2ubuntu3	install ok installed
+info	7.2-5ubuntu2	install ok installed
+init	1.69	install ok installed
+init-system-helpers	1.69	install ok installed
+install-info	7.2-5ubuntu2	install ok installed
+intel-microcode	3.20260210.1ubuntu2	install ok installed
+iproute2	6.19.0-1ubuntu1.1	install ok installed
+iptables	1.8.11-2ubuntu3	install ok installed
+iputils-ping	3:20250605-1ubuntu1	install ok installed
+iputils-tracepath	3:20250605-1ubuntu1	install ok installed
+iso-codes	4.20.1-1	install ok installed
+iucode-tool	2.3.1-3build2	install ok installed
+iw	6.17-1	install ok installed
+jq	1.8.1-4ubuntu2	install ok installed
+kbd	2.7.1-2ubuntu2	install ok installed
+keyboard-configuration	1.237ubuntu3.1	install ok installed
+kmod	34.2-2ubuntu2	install ok installed
+krb5-locales	1.22.1-2ubuntu4.1	install ok installed
+language-pack-en	1:26.04+20260818	install ok installed
+language-pack-en-base	1:26.04+20260818	install ok installed
+less	668-1build1	install ok installed
+libacl1	2.3.2-2	install ok installed
+libapparmor1	5.0.2-0ubuntu1~26.04.1	install ok installed
+libappstream5	1.1.2-1	install ok installed
+libapt-pkg7.0	3.2.1ubuntu0.1	install ok installed
+libarchive13t64	3.8.5-1ubuntu2.3	install ok installed
+libassuan9	3.0.2-2build1	install ok installed
+libatomic1	16-20260322-1ubuntu1	install ok installed
+libattr1	1:2.5.2-4ubuntu0.1	install ok installed
+libaudit-common	1:4.1.2-1ubuntu0.1	install ok installed
+libaudit1	1:4.1.2-1ubuntu0.1	install ok installed
+libbinutils	2.46-3ubuntu2	install ok installed
+libblkid1	2.41.3-3ubuntu2.2	install ok installed
+libbluetooth3	5.85-4ubuntu0.4	install ok installed
+libbpf1	1:1.6.3-1ubuntu1	install ok installed
+libbrotli1	1.2.0-3ubuntu0.1	install ok installed
+libbsd0	0.12.2-2build2	install ok installed
+libbz2-1.0	1.0.8-6ubuntu0.1	install ok installed
+libc-bin	2.43-2ubuntu2.7	install ok installed
+libc-gconv-modules-extra	2.43-2ubuntu2.7	install ok installed
+libc6	2.43-2ubuntu2.7	install ok installed
+libcap-ng0	0.8.5-4build5	install ok installed
+libcap2	1:2.75-10ubuntu2	install ok installed
+libcap2-bin	1:2.75-10ubuntu2	install ok installed
+libcbor0.10	0.10.2-2ubuntu3	install ok installed
+libcom-err2	1.47.2-3ubuntu4	install ok installed
+libcrack2	2.9.6-5.2build3	install ok installed
+libcrypt1	1:4.5.1-1	install ok installed
+libcryptsetup12	2:2.8.4-1ubuntu4	install ok installed
+libctf-nobfd0	2.46-3ubuntu2	install ok installed
+libctf0	2.46-3ubuntu2	install ok installed
+libcurl3t64-gnutls	8.18.0-1ubuntu2.8	install ok installed
+libcurl4t64	8.18.0-1ubuntu2.8	install ok installed
+libdb5.3t64	5.3.28+dfsg2-10ubuntu1	install ok installed
+libdbus-1-3	1.16.2-2ubuntu4	install ok installed
+libdebconfclient0	0.280ubuntu1	install ok installed
+libdebuginfod-common	0.194-4	install ok installed
+libdebuginfod1t64	0.194-4	install ok installed
+libdevmapper1.02.1	2:1.02.205-2ubuntu3	install ok installed
+libdrm-common	2.4.131-1	install ok installed
+libdrm2	2.4.131-1	install ok installed
+libduktape207	2.7.0+tests-0ubuntu4	install ok installed
+libdw1t64	0.194-4	install ok installed
+libedit2	3.1-20251016-1	install ok installed
+libefiboot1t64	39-2	install ok installed
+libefivar1t64	39-2	install ok installed
+libelf1t64	0.194-4	install ok installed
+libestr0	0.1.11-2build1	install ok installed
+libevdev2	1.13.6+dfsg-1	install ok installed
+libexpat1	2.7.4-1ubuntu0.2	install ok installed
+libext2fs2t64	1.47.2-3ubuntu4	install ok installed
+libfastjson4	1.2304.0-2build1	install ok installed
+libfdisk1	2.41.3-3ubuntu2.2	install ok installed
+libffi8	3.5.2-4	install ok installed
+libfido2-1	1.16.0-2build1	install ok installed
+libfreetype6	2.14.2+dfsg-1ubuntu0.2	install ok installed
+libfribidi0	1.0.16-5	install ok installed
+libfuse3-4	3.18.2-1	install ok installed
+libfyaml0	0.9.4-1	install ok installed
+libgcc-s1	16-20260322-1ubuntu1	install ok installed
+libgcrypt20	1.12.0-2ubuntu1.1	install ok installed
+libgdbm-compat4t64	1.26-1build1	install ok installed
+libgdbm6t64	1.26-1build1	install ok installed
+libgirepository-2.0-0	2.88.0-1ubuntu0.1	install ok installed
+libglib2.0-0t64	2.88.0-1ubuntu0.1	install ok installed
+libglib2.0-bin	2.88.0-1ubuntu0.1	install ok installed
+libglib2.0-data	2.88.0-1ubuntu0.1	install ok installed
+libgmp10	2:6.3.0+dfsg-5ubuntu2	install ok installed
+libgnutls30t64	3.8.12-2ubuntu1.1	install ok installed
+libgpg-error-l10n	1.58-2	install ok installed
+libgpg-error0	1.58-2	install ok installed
+libgpm2	1.20.7-12build1	install ok installed
+libgprofng0	2.46-3ubuntu2	install ok installed
+libgssapi-krb5-2	1.22.1-2ubuntu4.1	install ok installed
+libgstreamer1.0-0	1.28.2-1	install ok installed
+libhogweed6t64	3.10.2-1	install ok installed
+libibverbs1	61.0-2ubuntu3	install ok installed
+libidn2-0	2.3.8-4build1	install ok installed
+libip4tc2	1.8.11-2ubuntu3	install ok installed
+libip6tc2	1.8.11-2ubuntu3	install ok installed
+libjansson4	2.14-2build4	install ok installed
+libjemalloc2	5.3.0-4	install ok installed
+libjq1	1.8.1-4ubuntu2	install ok installed
+libjson-c5	0.18+ds-3	install ok installed
+libk5crypto3	1.22.1-2ubuntu4.1	install ok installed
+libkeyutils1	1.6.3-6ubuntu3	install ok installed
+libkmod2	34.2-2ubuntu2	install ok installed
+libkrb5-3	1.22.1-2ubuntu4.1	install ok installed
+libkrb5support0	1.22.1-2ubuntu4.1	install ok installed
+libksba8	1.6.7-2build1	install ok installed
+libldap-common	2.6.10+dfsg-1ubuntu5	install ok installed
+libldap2	2.6.10+dfsg-1ubuntu5	install ok installed
+liblmdb0	0.9.31-1build2	install ok installed
+liblocale-gettext-perl	1.07-8	install ok installed
+liblsof0	4.99.4+dfsg-2build2	install ok installed
+liblz4-1	1.10.0-8	install ok installed
+liblzma5	5.8.3-1ubuntu0.1	install ok installed
+liblzo2-2	2.10-3build2	install ok installed
+libmagic-mgc	1:5.46-5build2	install ok installed
+libmagic1t64	1:5.46-5build2	install ok installed
+libmaxminddb0	1.12.2-1build2	install ok installed
+libmd0	1.1.0-2build4	install ok installed
+libmm-glib0	1.25.95-1ubuntu1	install ok installed
+libmnl0	1.0.5-3build1	install ok installed
+libmount1	2.41.3-3ubuntu2.2	install ok installed
+libncurses6	6.6+20251231-1	install ok installed
+libncursesw6	6.6+20251231-1	install ok installed
+libndp0	1.9-1build1	install ok installed
+libnetfilter-conntrack3	1.1.1-1	install ok installed
+libnetplan1	1.2-1ubuntu5.1	install ok installed
+libnettle8t64	3.10.2-1	install ok installed
+libnewt0.52	0.52.25-1ubuntu3	install ok installed
+libnfnetlink0	1.0.2-3build1	install ok installed
+libnftables1	1.1.6-1	install ok installed
+libnftnl11	1.3.1-1	install ok installed
+libnghttp2-14	1.68.0-2ubuntu0.2	install ok installed
+libnl-3-200	3.12.0-2	install ok installed
+libnl-genl-3-200	3.12.0-2	install ok installed
+libnl-route-3-200	3.12.0-2	install ok installed
+libnm0	1.54.3-2ubuntu3.1	install ok installed
+libnpth0t64	1.8-3build1	install ok installed
+libnss-systemd	259.9-0ubuntu0.1	install ok installed
+libntfs-3g89t64	1:2022.10.3-5ubuntu1.1	install ok installed
+libnuma1	2.0.19-1build1	install ok installed
+libonig5	6.9.10-1build1	install ok installed
+libp11-kit0	0.26.2-2	install ok installed
+libpackagekit-glib2-18	1.3.4-3ubuntu1.2	install ok installed
+libpam-cap	1:2.75-10ubuntu2	install ok installed
+libpam-modules	1.7.0-5ubuntu3.2	install ok installed
+libpam-modules-bin	1.7.0-5ubuntu3.2	install ok installed
+libpam-pwquality	1.4.5-5build1	install ok installed
+libpam-runtime	1.7.0-5ubuntu3.2	install ok installed
+libpam-systemd	259.9-0ubuntu0.1	install ok installed
+libpam0g	1.7.0-5ubuntu3.2	install ok installed
+libparted2t64	3.6-6	install ok installed
+libpcap0.8t64	1.10.6-1ubuntu1.1	install ok installed
+libpci3	1:3.14.0-1build2	install ok installed
+libpcre2-8-0	10.46-1ubuntu0.1	install ok installed
+libpcsclite1	2.4.1-1	install ok installed
+libperl5.40	5.40.1-7ubuntu0.4	install ok installed
+libpipeline1	1.5.8-2	install ok installed
+libplymouth5	24.004.60+git20250831.4a3c171d-0ubuntu8	install ok installed
+libpng16-16t64	1.6.57-1ubuntu0.1	install ok installed
+libpolkit-agent-1-0	127-2ubuntu1.1	install ok installed
+libpolkit-gobject-1-0	127-2ubuntu1.1	install ok installed
+libpopt0	1.19+dfsg-2build1	install ok installed
+libproc2-0	2:4.0.4-9ubuntu1	install ok installed
+libpsl5t64	0.21.2-1.1build2	install ok installed
+libpwquality-common	1.4.5-5build1	install ok installed
+libpwquality1	1.4.5-5build1	install ok installed
+libpython3-stdlib	3.14.3-0ubuntu2	install ok installed
+libpython3.14	3.14.4-1ubuntu0.2	install ok installed
+libpython3.14-minimal	3.14.4-1ubuntu0.2	install ok installed
+libpython3.14-stdlib	3.14.4-1ubuntu0.2	install ok installed
+libreadline8t64	8.3-4	install ok installed
+librtmp1	2.4+20151223.gitfa8646d.1-3	install ok installed
+libsasl2-2	2.1.28+dfsg1-9ubuntu3	install ok installed
+libsasl2-modules	2.1.28+dfsg1-9ubuntu3	install ok installed
+libsasl2-modules-db	2.1.28+dfsg1-9ubuntu3	install ok installed
+libsasl2-modules-gssapi-mit	2.1.28+dfsg1-9ubuntu3	install ok installed
+libseccomp2	2.6.0-2ubuntu5	install ok installed
+libselinux1	3.9-4build1	install ok installed
+libsemanage-common	3.9-1build1	install ok installed
+libsemanage2	3.9-1build1	install ok installed
+libsepol2	3.9-2	install ok installed
+libsframe3	2.46-3ubuntu2	install ok installed
+libslang2	2.3.3-5build1	install ok installed
+libsmartcols1	2.41.3-3ubuntu2.2	install ok installed
+libsqlite3-0	3.46.1-9ubuntu0.3	install ok installed
+libss2	1.47.2-3ubuntu4	install ok installed
+libssh2-1t64	1.11.1-1ubuntu0.26.04.4	install ok installed
+libssl3t64	3.5.5-1ubuntu3.7	install ok installed
+libstdc++6	16-20260322-1ubuntu1	install ok installed
+libstemmer0d	3.0.1-1	install ok installed
+libsystemd-shared	259.9-0ubuntu0.1	install ok installed
+libsystemd0	259.9-0ubuntu0.1	install ok installed
+libtasn1-6	4.21.0-2	install ok installed
+libteamdctl0	1.31-1build4	install ok installed
+libtext-charwidth-perl	0.04-11build4	install ok installed
+libtext-iconv-perl	1.7-8.1	install ok installed
+libtext-wrapi18n-perl	0.06-10	install ok installed
+libtinfo6	6.6+20251231-1	install ok installed
+libtirpc-common	1.3.7-0.1	install ok installed
+libtirpc3t64	1.3.7-0.1	install ok installed
+libtraceevent1	1:1.8.7-1	install ok installed
+libtraceevent1-plugin	1:1.8.7-1	install ok installed
+libtracefs1	1.8.2-1ubuntu1	install ok installed
+libtss2-esys-3.0.2-0t64	4.1.3-6	install ok installed
+libtss2-mu-4.0.1-0t64	4.1.3-6	install ok installed
+libtss2-rc0t64	4.1.3-6	install ok installed
+libtss2-sys1t64	4.1.3-6	install ok installed
+libtss2-tcti-cmd0t64	4.1.3-6	install ok installed
+libtss2-tcti-device0t64	4.1.3-6	install ok installed
+libtss2-tcti-mssim0t64	4.1.3-6	install ok installed
+libtss2-tcti-swtpm0t64	4.1.3-6	install ok installed
+libuchardet0	0.0.8-2	install ok installed
+libudev1	259.9-0ubuntu0.1	install ok installed
+libunistring5	1.3-2build1	install ok installed
+libunwind8	1.8.3-0ubuntu1	install ok installed
+liburcu8t64	0.15.6-1	install ok installed
+libusb-1.0-0	2:1.0.29-2build1	install ok installed
+libuuid1	2.41.3-3ubuntu2.2	install ok installed
+libuv1t64	1.51.0-2ubuntu1	install ok installed
+libwrap0	7.6.q-36build2	install ok installed
+libxkbcommon0	1.13.1-1	install ok installed
+libxml2-16	2.15.2+dfsg-0.1ubuntu0.3	install ok installed
+libxmlb2	0.3.24-2	install ok installed
+libxtables12	1.8.11-2ubuntu3	install ok installed
+libxxhash0	0.8.3-2build1	install ok installed
+libyaml-0-2	0.2.5-2build3	install ok installed
+libzstd1	1.5.7+dfsg-3	install ok installed
+linux-base	4.15ubuntu5	install ok installed
+linux-firmware	20260319.git217ca6e4.1ubuntu	install ok installed
+linux-firmware-amd-graphics	20260319.git217ca6e4-0ubuntu3.1	install ok installed
+linux-firmware-amd-misc	20260319.git217ca6e4-0ubuntu1.1	install ok installed
+linux-firmware-broadcom-wireless	20260319.git217ca6e4-0ubuntu1.1	install ok installed
+linux-firmware-intel-graphics	20260319.git217ca6e4-0ubuntu2.1	install ok installed
+linux-firmware-intel-misc	20260319.git217ca6e4-0ubuntu1.2	install ok installed
+linux-firmware-intel-wireless	20260319.git217ca6e4-0ubuntu2.1	install ok installed
+linux-firmware-marvell-prestera	20260319.git217ca6e4-0ubuntu1.2	install ok installed
+linux-firmware-marvell-wireless	20260319.git217ca6e4-0ubuntu1.1	install ok installed
+linux-firmware-mediatek	20260319.git217ca6e4-0ubuntu1.2	install ok installed
+linux-firmware-mellanox-spectrum	20260319.git217ca6e4-0ubuntu1.1	install ok installed
+linux-firmware-misc	20260319.git217ca6e4-0ubuntu2.2	install ok installed
+linux-firmware-netronome	20260319.git217ca6e4-0ubuntu1.1	install ok installed
+linux-firmware-nvidia-graphics	20260319.git217ca6e4-0ubuntu1.1	install ok installed
+linux-firmware-qlogic	20260319.git217ca6e4-0ubuntu1.1	install ok installed
+linux-firmware-qualcomm-graphics	20260319.git217ca6e4-0ubuntu1.1	install ok installed
+linux-firmware-qualcomm-misc	20260319.git217ca6e4-0ubuntu2.1	install ok installed
+linux-firmware-qualcomm-wireless	20260319.git217ca6e4-0ubuntu1.2	install ok installed
+linux-firmware-realtek	20260319.git217ca6e4-0ubuntu1.2	install ok installed
+linux-generic-hwe-26.04	7.0.0-43.43	install ok installed
+linux-headers-7.0.0-43	7.0.0-43.43	install ok installed
+linux-headers-7.0.0-43-generic	7.0.0-43.43	install ok installed
+linux-headers-generic-hwe-26.04	7.0.0-43.43	install ok installed
+linux-image-7.0.0-43-generic	7.0.0-43.43	install ok installed
+linux-image-generic-hwe-26.04	7.0.0-43.43	install ok installed
+linux-main-modules-v4l2loopback-7.0.0-43-generic	7.0.0-43.43	install ok installed
+linux-main-modules-zfs-7.0.0-43-generic	7.0.0-43.43	install ok installed
+linux-modules-7.0.0-43-generic	7.0.0-43.43	install ok installed
+linux-perf	7.0.0-43.43	install ok installed
+linux-sysctl-defaults	4.15ubuntu5	install ok installed
+linux-tools-7.0.0-43	7.0.0-43.43	install ok installed
+linux-tools-7.0.0-43-generic	7.0.0-43.43	install ok installed
+linux-tools-common	7.0.0-43.43	install ok installed
+locales	2.43-2ubuntu2.7	install ok installed
+login	1:4.16.0-2+really2.41.3-3ubuntu2.2	install ok installed
+login.defs	1:4.17.4-2ubuntu3	install ok installed
+logrotate	3.22.0-1build1	install ok installed
+logsave	1.47.2-3ubuntu4	install ok installed
+lsb-release	12.1-2build1	install ok installed
+lshw	02.19.git.2021.06.19.996aaad9c7-2.1ubuntu3	install ok installed
+lsof	4.99.4+dfsg-2build2	install ok installed
+lz4	1.10.0-8	install ok installed
+man-db	2.13.1-1build1	install ok installed
+manpages	6.17-1	install ok installed
+mawk	1.3.4.20260129-1	install ok installed
+media-types	14.0.0build1	install ok installed
+mokutil	0.7.2-2	install ok installed
+mount	2.41.3-3ubuntu2.2	install ok installed
+mtr-tiny	0.95-1.1ubuntu2	install ok installed
+nano	8.7.1-1ubuntu0.1	install ok installed
+ncurses-base	6.6+20251231-1	install ok installed
+ncurses-bin	6.6+20251231-1	install ok installed
+ncurses-term	6.6+20251231-1	install ok installed
+netbase	6.5build1	install ok installed
+netcat-openbsd	1.234-1	install ok installed
+netplan-generator	1.2-1ubuntu5.1	install ok installed
+netplan.io	1.2-1ubuntu5.1	install ok installed
+network-manager	1.54.3-2ubuntu3.1	install ok installed
+network-manager-l10n	1.54.3-2ubuntu3.1	install ok installed
+networkd-dispatcher	2.2.4-1.1ubuntu1	install ok installed
+nftables	1.1.6-1	install ok installed
+ntfs-3g	1:2022.10.3-5ubuntu1.1	install ok installed
+numactl	2.0.19-1build1	install ok installed
+openssh-client	1:10.2p1-2ubuntu3.8	install ok installed
+openssh-server	1:10.2p1-2ubuntu3.8	install ok installed
+openssh-sftp-server	1:10.2p1-2ubuntu3.8	install ok installed
+openssl	3.5.5-1ubuntu3.7	install ok installed
+openssl-provider-legacy	3.5.5-1ubuntu3.7	install ok installed
+os-prober	1.84ubuntu1	install ok installed
+p11-kit	0.26.2-2	install ok installed
+p11-kit-modules	0.26.2-2	install ok installed
+packagekit	1.3.4-3ubuntu1.2	install ok installed
+parted	3.6-6	install ok installed
+passwd	1:4.17.4-2ubuntu3	install ok installed
+pci.ids	0.0~2026.02.12-1	install ok installed
+pciutils	1:3.14.0-1build2	install ok installed
+perl	5.40.1-7ubuntu0.4	install ok installed
+perl-base	5.40.1-7ubuntu0.4	install ok installed
+perl-modules-5.40	5.40.1-7ubuntu0.4	install ok installed
+pinentry-curses	1.3.2-3ubuntu1	install ok installed
+pkexec	127-2ubuntu1.1	install ok installed
+plymouth	24.004.60+git20250831.4a3c171d-0ubuntu8	install ok installed
+plymouth-theme-ubuntu-text	24.004.60+git20250831.4a3c171d-0ubuntu8	install ok installed
+pnp.ids	0.394-1build1	install ok installed
+polkitd	127-2ubuntu1.1	install ok installed
+powermgmt-base	1.38ubuntu2	install ok installed
+procps	2:4.0.4-9ubuntu1	install ok installed
+psmisc	23.7-2ubuntu2	install ok installed
+publicsuffix	20260129.1928-1	install ok installed
+python-apt-common	3.1.0ubuntu1.1	install ok installed
+python3	3.14.3-0ubuntu2	install ok installed
+python3-apt	3.1.0ubuntu1.1	install ok installed
+python3-autocommand	2.2.2-4	install ok installed
+python3-bcrypt	5.0.0-3build1	install ok installed
+python3-blinker	1.9.0-2build1	install ok installed
+python3-cffi-backend	2.0.0-3build1	install ok installed
+python3-cryptography	46.0.5-1ubuntu2.2	install ok installed
+python3-dbus	1.4.0-1build2	install ok installed
+python3-distro	1.9.0-1build1	install ok installed
+python3-distro-info	1.15ubuntu0.1	install ok installed
+python3-distupgrade	1:26.04.27	install ok installed
+python3-gi	3.56.2-1	install ok installed
+python3-httplib2	0.22.0-1ubuntu0.1	install ok installed
+python3-inflect	7.5.0-1build1	install ok installed
+python3-jaraco.context	6.0.1-2	install ok installed
+python3-jaraco.functools	4.1.0-1build1	install ok installed
+python3-jaraco.text	4.0.0-1build1	install ok installed
+python3-jwt	2.10.1-4ubuntu1.3	install ok installed
+python3-launchpadlib	2.1.0-1build1	install ok installed
+python3-lazr.restfulclient	0.14.6-3build1	install ok installed
+python3-lazr.uri	1.0.6-7build1	install ok installed
+python3-linkify-it	2.0.3-1ubuntu3	install ok installed
+python3-markdown-it	3.0.0-3build1	install ok installed
+python3-mdurl	0.1.2-1build1	install ok installed
+python3-minimal	3.14.3-0ubuntu2	install ok installed
+python3-more-itertools	10.8.0-1build1	install ok installed
+python3-netplan	1.2-1ubuntu5.1	install ok installed
+python3-oauthlib	3.3.1-1build1	install ok installed
+python3-pkg-resources	78.1.1-0.1build1	install ok installed
+python3-pygments	2.19.2+dfsg-1	install ok installed
+python3-pyparsing	3.3.2-2	install ok installed
+python3-rich	13.9.4-1.2	install ok installed
+python3-setuptools	78.1.1-0.1build1	install ok installed
+python3-software-properties	0.120.2	install ok installed
+python3-systemd	235-1build9	install ok installed
+python3-typeguard	4.4.4-2	install ok installed
+python3-typing-extensions	4.15.0-2	install ok installed
+python3-uc-micro	1.0.3-1build1	install ok installed
+python3-update-manager	1:26.04.5	install ok installed
+python3-wadllib	2.0.0-3	install ok installed
+python3-yaml	6.0.3-1build1	install ok installed
+python3-zipp	3.23.0-1build1	install ok installed
+python3.14	3.14.4-1ubuntu0.2	install ok installed
+python3.14-minimal	3.14.4-1ubuntu0.2	install ok installed
+readline-common	8.3-4	install ok installed
+rfkill	2.41.3-3ubuntu2.2	install ok installed
+rsync	3.4.1+ds1-7ubuntu0.3	install ok installed
+rsyslog	8.2512.0-1ubuntu4.2	install ok installed
+rust-coreutils	0.10.0-1ubuntu2~26.04.1	install ok installed
+sbsigntool	0.9.4-3.1ubuntu9	install ok installed
+screen	4.9.1-3ubuntu2	install ok installed
+secureboot-db	1.9build2	install ok installed
+sed	4.9-2ubuntu1	install ok installed
+sensible-utils	0.0.26build1	install ok installed
+sgml-base	1.31+nmu1build1	install ok installed
+shared-mime-info	2.4-5build3	install ok installed
+shim-signed	1.59+15.8-0ubuntu2	install ok installed
+software-properties-common	0.120.2	install ok installed
+squashfs-tools	1:4.7.5-1	install ok installed
+ssh-import-id	5.11-0ubuntu4	install ok installed
+ssl-cert	1.1.3ubuntu2	install ok installed
+strace	6.19+ds-0ubuntu5	install ok installed
+sudo	1.9.17p2-1ubuntu3.2	install ok installed
+sudo-common	1.2ubuntu	install ok installed
+sudo-rs	0.2.13-0ubuntu1.2	install ok installed
+systemd	259.9-0ubuntu0.1	install ok installed
+systemd-cryptsetup	259.9-0ubuntu0.1	install ok installed
+systemd-hwe-hwdb	259.5.3ubuntu	install ok installed
+systemd-oomd	259.9-0ubuntu0.1	install ok installed
+systemd-resolved	259.9-0ubuntu0.1	install ok installed
+systemd-sysv	259.9-0ubuntu0.1	install ok installed
+sysvinit-utils	3.15-5ubuntu1	install ok installed
+tar	1.35+dfsg-4ubuntu0.4	install ok installed
+tcpdump	4.99.6-1	install ok installed
+time	1.9-0.4	install ok installed
+tnftp	20260211-1	install ok installed
+tpm-udev	4.1.3-6	install ok installed
+trace-cmd	3.3.3-1ubuntu2	install ok installed
+tzdata	2026e-0ubuntu0.26.04.1	install ok installed
+ubuntu-kernel-accessories	1.570.4	install ok installed
+ubuntu-keyring	2023.11.28.1build1	install ok installed
+ubuntu-minimal	1.570.4	install ok installed
+ubuntu-pro-client	38ubuntu0~26.04	install ok installed
+ubuntu-pro-client-l10n	38ubuntu0~26.04	install ok installed
+ubuntu-release-upgrader-core	1:26.04.27	install ok installed
+ubuntu-standard	1.570.4	install ok installed
+ucf	3.0052ubuntu1	install ok installed
+udev	259.9-0ubuntu0.1	install ok installed
+ufw	0.36.2-9build1	install ok installed
+unattended-upgrades	2.12ubuntu9	install ok installed
+unzip	6.0-29ubuntu1	install ok installed
+update-manager-core	1:26.04.5	install ok installed
+usb.ids	2025.12.13-1	install ok installed
+usbutils	1:019-1	install ok installed
+util-linux	2.41.3-3ubuntu2.2	install ok installed
+uuid-runtime	2.41.3-3ubuntu2.2	install ok installed
+vim-common	2:9.1.2141-1ubuntu4.10	install ok installed
+vim-tiny	2:9.1.2141-1ubuntu4.10	install ok installed
+wamerican	2020.12.07-4build1	install ok installed
+wget	1.25.0-2ubuntu4.4	install ok installed
+whiptail	0.52.25-1ubuntu3	install ok installed
+wireless-regdb	2026.05.30-0ubuntu1~26.04.1	install ok installed
+wpasupplicant	2:2.11-0ubuntu5	install ok installed
+xkb-data	2.46-2	install ok installed
+xml-core	0.19build1	install ok installed
+xxd	2:9.1.2141-1ubuntu4.10	install ok installed
+xz-utils	5.8.3-1ubuntu0.1	install ok installed
+zip	3.0-15ubuntu3	install ok installed
+zlib1g	1:1.3.dfsg+really1.3.1-1ubuntu3.2	install ok installed
+zstd	1.5.7+dfsg-3	install ok installed
+
+== dpkg count ==
+526
+
+== enabled unit files ==
+NetworkManager-dispatcher.service enabled enabled
+NetworkManager.service            enabled enabled
+anacron.service                   enabled enabled
+anacron.timer                     enabled enabled
+apparmor.service                  enabled enabled
+apt-daily-upgrade.timer           enabled enabled
+apt-daily.timer                   enabled enabled
+chrony.service                    enabled enabled
+console-setup.service             enabled enabled
+cron.service                      enabled enabled
+dmesg.service                     enabled enabled
+dpkg-db-backup.timer              enabled enabled
+e2scrub_all.timer                 enabled enabled
+e2scrub_reap.service              enabled enabled
+fstrim.timer                      enabled enabled
+getty@.service                    enabled enabled
+grub-initrd-fallback.service      enabled enabled
+grub2-common.service              enabled enabled
+keyboard-setup.service            enabled enabled
+logrotate.timer                   enabled enabled
+man-db.timer                      enabled enabled
+motd-news.timer                   enabled enabled
+netplan-configure.service         enabled enabled
+networkd-dispatcher.service       enabled enabled
+polkit-agent-helper.socket        enabled enabled
+remote-fs.target                  enabled enabled
+rsyslog.service                   enabled enabled
+secureboot-db.service             enabled enabled
+setvtrgb.service                  enabled enabled
+ssh.socket                        enabled enabled
+sshd-keygen.service               enabled enabled
+ssl-cert.service                  enabled enabled
+systemd-oomd.service              enabled enabled
+systemd-oomd.socket               enabled enabled
+systemd-pstore.service            enabled enabled
+systemd-resolved-monitor.socket   enabled enabled
+systemd-resolved-varlink.socket   enabled enabled
+systemd-resolved.service          enabled enabled
+tpm-udev.path                     enabled enabled
+ua-reboot-cmds.service            enabled enabled
+ua-timer.timer                    enabled enabled
+ufw.service                       enabled enabled
+unattended-upgrades.service       enabled enabled
+uuidd.socket                      enabled enabled
+wpa_supplicant.service            enabled enabled
+
+== active services ==
+NetworkManager.service
+anacron.service
+chrony.service
+cron.service
+dbus.service
+getty@tty1.service
+networkd-dispatcher.service
+rsyslog.service
+ssh.service
+systemd-hostnamed.service
+systemd-journald.service
+systemd-logind.service
+systemd-oomd.service
+systemd-resolved.service
+systemd-udevd.service
+unattended-upgrades.service
+user@0.service
+wpa_supplicant.service
+
+== sysctl ==
+abi.vsyscall32 = 1
+debug.exception-trace = 1
+debug.kprobes-optimization = 1
+dev.cdrom.autoclose = 1
+dev.cdrom.autoeject = 0
+dev.cdrom.check_media = 0
+dev.cdrom.debug = 0
+dev.cdrom.info = 
+dev.cdrom.info = 
+dev.cdrom.info = 
+dev.cdrom.info = CD-ROM information, Id: cdrom.c 3.20 2003/12/17
+dev.cdrom.info = Can change speed:
+dev.cdrom.info = Can close tray:	
+dev.cdrom.info = Can lock tray:	
+dev.cdrom.info = Can open tray:	
+dev.cdrom.info = Can play audio:	
+dev.cdrom.info = Can read DVD:	
+dev.cdrom.info = Can read MCN:	
+dev.cdrom.info = Can read MRW:	
+dev.cdrom.info = Can read multisession:
+dev.cdrom.info = Can select disk:
+dev.cdrom.info = Can write CD-R:	
+dev.cdrom.info = Can write CD-RW:
+dev.cdrom.info = Can write DVD-R:
+dev.cdrom.info = Can write DVD-RAM:
+dev.cdrom.info = Can write MRW:	
+dev.cdrom.info = Can write RAM:	
+dev.cdrom.info = Reports media changed:
+dev.cdrom.info = drive # of slots:
+dev.cdrom.info = drive name:	
+dev.cdrom.info = drive speed:	
+dev.cdrom.lock = 0
+dev.hpet.max-user-freq = 64
+dev.mac_hid.mouse_button2_keycode = 97
+dev.mac_hid.mouse_button3_keycode = 100
+dev.mac_hid.mouse_button_emulation = 0
+dev.raid.speed_limit_max = 200000
+dev.raid.speed_limit_min = 1000
+dev.raid.sync_io_depth = 32
+dev.scsi.logging_level = 0
+dev.tty.ldisc_autoload = 0
+dev.tty.legacy_tiocsti = 0
+fs.aio-max-nr = 65536
+fs.aio-nr = 0
+fs.binfmt_misc.python3/14 = enabled
+fs.binfmt_misc.python3/14 = flags: 
+fs.binfmt_misc.python3/14 = interpreter /usr/bin/python3.14
+fs.binfmt_misc.python3/14 = magic 2b0e0d0a
+fs.binfmt_misc.python3/14 = offset 0
+fs.binfmt_misc.status = enabled
+fs.dentry-negative = 0
+fs.dentry-state = 22134	12252	45	0	3192	0
+fs.dir-notify-enable = 1
+fs.epoll.max_user_watches = 6330902
+fs.fanotify.max_queued_events = 16384
+fs.fanotify.max_user_groups = 128
+fs.fanotify.max_user_marks = 239491
+fs.fanotify.watchdog_timeout = 0
+fs.file-max = 9223372036854775807
+fs.file-nr = 846	0	9223372036854775807
+fs.fuse.default_request_timeout = 0
+fs.fuse.max_pages_limit = 256
+fs.fuse.max_request_timeout = 0
+fs.inode-nr = 19167	435
+fs.inode-state = 19167	435	0	0	0	0	0
+fs.inotify.max_queued_events = 16384
+fs.inotify.max_user_instances = 128
+fs.inotify.max_user_watches = 224707
+fs.lease-break-time = 45
+fs.leases-enable = 1
+fs.mount-max = 100000
+fs.mqueue.msg_default = 10
+fs.mqueue.msg_max = 10
+fs.mqueue.msgsize_default = 8192
+fs.mqueue.msgsize_max = 8192
+fs.mqueue.queues_max = 256
+fs.nr_open = 2147483584
+fs.overflowgid = 65534
+fs.overflowuid = 65534
+fs.pipe-max-size = 1048576
+fs.pipe-user-pages-hard = 0
+fs.pipe-user-pages-soft = 16384
+fs.protected_fifos = 1
+fs.protected_hardlinks = 1
+fs.protected_regular = 2
+fs.protected_symlinks = 1
+fs.quota.allocated_dquots = 2
+fs.quota.cache_hits = 12
+fs.quota.drops = 2
+fs.quota.free_dquots = 0
+fs.quota.lookups = 14
+fs.quota.reads = 0
+fs.quota.syncs = 24
+fs.quota.writes = 0
+fs.suid_dumpable = 0
+fs.verity.require_signatures = 0
+kernel.acct = 4	2	30
+kernel.acpi_video_flags = 0
+kernel.apparmor_cache_timeout = 5
+kernel.apparmor_display_secid_mode = 0
+kernel.apparmor_packet_mediation = 0
+kernel.apparmor_restrict_unprivileged_io_uring = 0
+kernel.apparmor_restrict_unprivileged_unconfined = 1
+kernel.apparmor_restrict_unprivileged_userns = 1
+kernel.apparmor_restrict_unprivileged_userns_complain = 0
+kernel.apparmor_restrict_unprivileged_userns_force = 0
+kernel.arch = x86_64
+kernel.auto_msgmni = 0
+kernel.bootloader_type = 33
+kernel.bootloader_version = 1
+kernel.bpf_stats_enabled = 0
+kernel.cad_pid = 1
+kernel.cap_last_cap = 40
+kernel.core_file_note_size_limit = 4194304
+kernel.core_modes = file
+kernel.core_modes = pipe
+kernel.core_modes = socket
+kernel.core_pattern = core
+kernel.core_pipe_limit = 0
+kernel.core_sort_vma = 0
+kernel.core_uses_pid = 1
+kernel.ctrl-alt-del = 0
+kernel.dmesg_restrict = 1
+kernel.domainname = (none)
+kernel.firmware_config.force_sysfs_fallback = 0
+kernel.firmware_config.ignore_sysfs_fallback = 0
+kernel.ftrace_dump_on_oops = 0
+kernel.ftrace_enabled = 1
+kernel.hardlockup_all_cpu_backtrace = 0
+kernel.hardlockup_panic = 0
+kernel.hardlockup_sys_info = 
+kernel.hostname = 16c-32g-1T
+kernel.hotplug = 
+kernel.hung_task_all_cpu_backtrace = 0
+kernel.hung_task_check_count = 4194304
+kernel.hung_task_check_interval_secs = 0
+kernel.hung_task_detect_count = 0
+kernel.hung_task_panic = 0
+kernel.hung_task_sys_info = 
+kernel.hung_task_timeout_secs = 120
+kernel.hung_task_warnings = 10
+kernel.io_delay_type = 1
+kernel.io_uring_disabled = 0
+kernel.io_uring_group = -1
+kernel.kernel_sys_info = 
+kernel.kexec_load_disabled = 0
+kernel.kexec_load_limit_panic = -1
+kernel.kexec_load_limit_reboot = -1
+kernel.keys.gc_delay = 300
+kernel.keys.maxbytes = 20000
+kernel.keys.maxkeys = 200
+kernel.keys.persistent_keyring_expiry = 259200
+kernel.keys.root_maxbytes = 25000000
+kernel.keys.root_maxkeys = 1000000
+kernel.kptr_restrict = 1
+kernel.latencytop = 0
+kernel.max_lock_depth = 1024
+kernel.max_rcu_stall_to_panic = 0
+kernel.modprobe = /sbin/modprobe
+kernel.modules_disabled = 0
+kernel.msg_next_id = -1
+kernel.msgmax = 8192
+kernel.msgmnb = 16384
+kernel.msgmni = 32000
+kernel.ngroups_max = 65536
+kernel.nmi_watchdog = 1
+kernel.ns_last_pid = 1304
+kernel.numa_balancing = 0
+kernel.numa_balancing_promote_rate_limit_MBps = 65536
+kernel.oops_all_cpu_backtrace = 0
+kernel.oops_limit = 10000
+kernel.osrelease = 7.0.0-43-generic
+kernel.ostype = Linux
+kernel.overflowgid = 65534
+kernel.overflowuid = 65534
+kernel.panic = 0
+kernel.panic_on_io_nmi = 0
+kernel.panic_on_oops = 0
+kernel.panic_on_rcu_stall = 0
+kernel.panic_on_unrecovered_nmi = 0
+kernel.panic_on_warn = 0
+kernel.panic_print = 0
+kernel.panic_sys_info = 
+kernel.perf_cpu_time_max_percent = 25
+kernel.perf_event_max_contexts_per_stack = 8
+kernel.perf_event_max_sample_rate = 100000
+kernel.perf_event_max_stack = 127
+kernel.perf_event_mlock_kb = 516
+kernel.perf_event_paranoid = 4
+kernel.pid_max = 4194304
+kernel.poweroff_cmd = /sbin/poweroff
+kernel.print-fatal-signals = 0
+kernel.printk = 4	4	1	7
+kernel.printk_delay = 0
+kernel.printk_devkmsg = on
+kernel.printk_ratelimit = 5
+kernel.printk_ratelimit_burst = 10
+kernel.pty.max = 4096
+kernel.pty.nr = 0
+kernel.pty.reserve = 1024
+kernel.random.boot_id = ef83992a-f068-4751-83a8-b941ca43ceac
+kernel.random.entropy_avail = 256
+kernel.random.poolsize = 256
+kernel.random.urandom_min_reseed_secs = 60
+kernel.random.uuid = 6ffc9748-681a-49b0-b3f4-8403f78e7e10
+kernel.random.write_wakeup_threshold = 256
+kernel.randomize_va_space = 2
+kernel.sched_autogroup_enabled = 1
+kernel.sched_cfs_bandwidth_slice_us = 5000
+kernel.sched_deadline_period_max_us = 4194304
+kernel.sched_deadline_period_min_us = 100
+kernel.sched_rr_timeslice_ms = 100
+kernel.sched_rt_period_us = 1000000
+kernel.sched_rt_runtime_us = 950000
+kernel.sched_schedstats = 0
+kernel.sched_util_clamp_max = 1024
+kernel.sched_util_clamp_min = 1024
+kernel.sched_util_clamp_min_rt_default = 1024
+kernel.seccomp.actions_avail = kill_process kill_thread trap errno user_notif trace log allow
+kernel.seccomp.actions_logged = kill_process kill_thread trap errno user_notif trace log
+kernel.sem = 32000	1024000000	500	32000
+kernel.sem_next_id = -1
+kernel.sg-big-buff = 32768
+kernel.shm_next_id = -1
+kernel.shm_rmid_forced = 0
+kernel.shmall = 18446744073692774399
+kernel.shmmax = 18446744073692774399
+kernel.shmmni = 4096
+kernel.soft_watchdog = 1
+kernel.softlockup_all_cpu_backtrace = 0
+kernel.softlockup_panic = 0
+kernel.softlockup_sys_info = 
+kernel.split_lock_mitigate = 1
+kernel.stack_tracer_enabled = 0
+kernel.sysctl_writes_strict = 1
+kernel.sysrq = 176
+kernel.tainted = 0
+kernel.task_delayacct = 0
+kernel.threads-max = 203037
+kernel.timer_migration = 1
+kernel.traceoff_on_warning = 0
+kernel.tracepoint_printk = 0
+kernel.unknown_nmi_panic = 0
+kernel.unprivileged_bpf_disabled = 2
+kernel.unprivileged_userns_apparmor_policy = 1
+kernel.unprivileged_userns_clone = 1
+kernel.user_events_max = 32768
+kernel.usermodehelper.bset = 4294967295	511
+kernel.usermodehelper.inheritable = 4294967295	511
+kernel.version = #43-Ubuntu SMP PREEMPT_DYNAMIC Fri Oct 23 13:25:25 UTC 2026
+kernel.warn_limit = 0
+kernel.watchdog = 1
+kernel.watchdog_cpumask = 0-15
+kernel.watchdog_thresh = 10
+kernel.yama.ptrace_scope = 1
+net.core.bpf_jit_enable = 1
+net.core.bpf_jit_harden = 0
+net.core.bpf_jit_kallsyms = 1
+net.core.bpf_jit_limit = 528482304
+net.core.busy_poll = 0
+net.core.busy_read = 0
+net.core.bypass_prot_mem = 0
+net.core.default_qdisc = fq_codel
+net.core.dev_weight = 64
+net.core.dev_weight_rx_bias = 1
+net.core.dev_weight_tx_bias = 1
+net.core.devconf_inherit_init_net = 0
+net.core.fb_tunnels_only_for_init_net = 0
+net.core.flow_limit_cpu_bitmap = 0000
+net.core.flow_limit_table_len = 4096
+net.core.gro_normal_batch = 8
+net.core.high_order_alloc_disable = 0
+net.core.max_skb_frags = 17
+net.core.mem_pcpu_rsv = 256
+net.core.message_burst = 10
+net.core.message_cost = 5
+net.core.netdev_budget = 300
+net.core.netdev_budget_usecs = 2000
+net.core.netdev_max_backlog = 1000
+net.core.netdev_rss_key = 5a:f8:90:01:2d:23:a5:c7:d1:fe:2f:e8:bd:be:5f:47:aa:f9:78:b0:b0:92:d2:78:37:83:8d:2f:a1:59:f0:0f:c2:2b:fd:8e:bd:fd:61:57:35:24:ee:18:7d:d2:4f:d7:9f:eb:82:d4:21:51:2b:83:19:76:08:5a:8f:28:b6:e2:b5:19:dd:89:6c:d4:a0:cc:d0:35:f1:50:7f:0d:f2:df:9c:50:04:f1:08:47:41:b5:97:b6:33:85:35:9f:ec:c1:a6:ed:df:4e:6a:58:8b:3d:dc:19:0d:d8:83:f8:22:87:9c:4d:f7:b2:b1:75:6b:58:e0:7e:27:14:92:23:6c:f9:02:e2:e9:31:42:9e:a1:18:76:df:59:7f:e5:89:c0:9e:0a:6d:20:4b:a9:34:b7:aa:6a:fb:82:db:72:a1:ac:fa:df:87:e9:1b:91:7b:f5:17:e4:0a:26:ca:54:4f:46:14:78:d9:64:27:56:93:0d:a3:99:8d:18:0c:31:6d:a7:40:ec:01:a3:61:70:5b:d6:67:1b:1a:58:7b:49:61:22:3c:d3:87:40:72:47:78:93:8a:79:f6:0b:17:d2:32:82:ba:f7:6a:ef:55:b0:0d:c1:f5:38:81:be:e1:40:e5:d2:dc:8a:9f:7b:32:85:ff:cd:9c:5a:d9:01:71:9d:bd:10:20
+net.core.netdev_tstamp_prequeue = 1
+net.core.netdev_unregister_timeout_secs = 10
+net.core.optmem_max = 131072
+net.core.qdisc_max_burst = 1000
+net.core.rmem_default = 212992
+net.core.rmem_max = 4194304
+net.core.rps_default_mask = 0000
+net.core.rps_sock_flow_entries = 0
+net.core.skb_defer_max = 128
+net.core.somaxconn = 4096
+net.core.tstamp_allow_data = 1
+net.core.txq_reselection_ms = 1000
+net.core.txrehash = 1
+net.core.warnings = 0
+net.core.wmem_default = 212992
+net.core.wmem_max = 4194304
+net.core.xfrm_acq_expires = 30
+net.core.xfrm_aevent_etime = 10
+net.core.xfrm_aevent_rseqth = 2
+net.core.xfrm_larval_drop = 1
+net.ipv4.cipso_cache_bucket_size = 10
+net.ipv4.cipso_cache_enable = 1
+net.ipv4.cipso_rbm_optfmt = 0
+net.ipv4.cipso_rbm_strictvalid = 1
+net.ipv4.conf.all.accept_local = 0
+net.ipv4.conf.all.accept_redirects = 1
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.all.arp_accept = 0
+net.ipv4.conf.all.arp_announce = 0
+net.ipv4.conf.all.arp_evict_nocarrier = 1
+net.ipv4.conf.all.arp_filter = 0
+net.ipv4.conf.all.arp_ignore = 0
+net.ipv4.conf.all.arp_notify = 0
+net.ipv4.conf.all.bc_forwarding = 0
+net.ipv4.conf.all.bootp_relay = 0
+net.ipv4.conf.all.disable_policy = 0
+net.ipv4.conf.all.disable_xfrm = 0
+net.ipv4.conf.all.drop_gratuitous_arp = 0
+net.ipv4.conf.all.drop_unicast_in_l2_multicast = 0
+net.ipv4.conf.all.force_igmp_version = 0
+net.ipv4.conf.all.forwarding = 0
+net.ipv4.conf.all.igmpv2_unsolicited_report_interval = 10000
+net.ipv4.conf.all.igmpv3_unsolicited_report_interval = 1000
+net.ipv4.conf.all.ignore_routes_with_linkdown = 0
+net.ipv4.conf.all.log_martians = 0
+net.ipv4.conf.all.mc_forwarding = 0
+net.ipv4.conf.all.medium_id = 0
+net.ipv4.conf.all.promote_secondaries = 0
+net.ipv4.conf.all.proxy_arp = 0
+net.ipv4.conf.all.proxy_arp_pvlan = 0
+net.ipv4.conf.all.route_localnet = 0
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.all.secure_redirects = 1
+net.ipv4.conf.all.send_redirects = 1
+net.ipv4.conf.all.shared_media = 1
+net.ipv4.conf.all.src_valid_mark = 0
+net.ipv4.conf.all.tag = 0
+net.ipv4.conf.default.accept_local = 0
+net.ipv4.conf.default.accept_redirects = 1
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv4.conf.default.arp_accept = 0
+net.ipv4.conf.default.arp_announce = 0
+net.ipv4.conf.default.arp_evict_nocarrier = 1
+net.ipv4.conf.default.arp_filter = 0
+net.ipv4.conf.default.arp_ignore = 0
+net.ipv4.conf.default.arp_notify = 0
+net.ipv4.conf.default.bc_forwarding = 0
+net.ipv4.conf.default.bootp_relay = 0
+net.ipv4.conf.default.disable_policy = 0
+net.ipv4.conf.default.disable_xfrm = 0
+net.ipv4.conf.default.drop_gratuitous_arp = 0
+net.ipv4.conf.default.drop_unicast_in_l2_multicast = 0
+net.ipv4.conf.default.force_igmp_version = 0
+net.ipv4.conf.default.forwarding = 0
+net.ipv4.conf.default.igmpv2_unsolicited_report_interval = 10000
+net.ipv4.conf.default.igmpv3_unsolicited_report_interval = 1000
+net.ipv4.conf.default.ignore_routes_with_linkdown = 0
+net.ipv4.conf.default.log_martians = 0
+net.ipv4.conf.default.mc_forwarding = 0
+net.ipv4.conf.default.medium_id = 0
+net.ipv4.conf.default.promote_secondaries = 1
+net.ipv4.conf.default.proxy_arp = 0
+net.ipv4.conf.default.proxy_arp_pvlan = 0
+net.ipv4.conf.default.route_localnet = 0
+net.ipv4.conf.default.rp_filter = 2
+net.ipv4.conf.default.secure_redirects = 1
+net.ipv4.conf.default.send_redirects = 1
+net.ipv4.conf.default.shared_media = 1
+net.ipv4.conf.default.src_valid_mark = 0
+net.ipv4.conf.default.tag = 0
+net.ipv4.conf.enp2s0.accept_local = 0
+net.ipv4.conf.enp2s0.accept_redirects = 1
+net.ipv4.conf.enp2s0.accept_source_route = 0
+net.ipv4.conf.enp2s0.arp_accept = 0
+net.ipv4.conf.enp2s0.arp_announce = 0
+net.ipv4.conf.enp2s0.arp_evict_nocarrier = 1
+net.ipv4.conf.enp2s0.arp_filter = 0
+net.ipv4.conf.enp2s0.arp_ignore = 0
+net.ipv4.conf.enp2s0.arp_notify = 0
+net.ipv4.conf.enp2s0.bc_forwarding = 0
+net.ipv4.conf.enp2s0.bootp_relay = 0
+net.ipv4.conf.enp2s0.disable_policy = 0
+net.ipv4.conf.enp2s0.disable_xfrm = 0
+net.ipv4.conf.enp2s0.drop_gratuitous_arp = 0
+net.ipv4.conf.enp2s0.drop_unicast_in_l2_multicast = 0
+net.ipv4.conf.enp2s0.force_igmp_version = 0
+net.ipv4.conf.enp2s0.forwarding = 0
+net.ipv4.conf.enp2s0.igmpv2_unsolicited_report_interval = 10000
+net.ipv4.conf.enp2s0.igmpv3_unsolicited_report_interval = 1000
+net.ipv4.conf.enp2s0.ignore_routes_with_linkdown = 0
+net.ipv4.conf.enp2s0.log_martians = 0
+net.ipv4.conf.enp2s0.mc_forwarding = 0
+net.ipv4.conf.enp2s0.medium_id = 0
+net.ipv4.conf.enp2s0.promote_secondaries = 1
+net.ipv4.conf.enp2s0.proxy_arp = 0
+net.ipv4.conf.enp2s0.proxy_arp_pvlan = 0
+net.ipv4.conf.enp2s0.route_localnet = 0
+net.ipv4.conf.enp2s0.rp_filter = 2
+net.ipv4.conf.enp2s0.secure_redirects = 1
+net.ipv4.conf.enp2s0.send_redirects = 1
+net.ipv4.conf.enp2s0.shared_media = 1
+net.ipv4.conf.enp2s0.src_valid_mark = 0
+net.ipv4.conf.enp2s0.tag = 0
+net.ipv4.conf.lo.accept_local = 0
+net.ipv4.conf.lo.accept_redirects = 1
+net.ipv4.conf.lo.accept_source_route = 0
+net.ipv4.conf.lo.arp_accept = 0
+net.ipv4.conf.lo.arp_announce = 0
+net.ipv4.conf.lo.arp_evict_nocarrier = 1
+net.ipv4.conf.lo.arp_filter = 0
+net.ipv4.conf.lo.arp_ignore = 0
+net.ipv4.conf.lo.arp_notify = 0
+net.ipv4.conf.lo.bc_forwarding = 0
+net.ipv4.conf.lo.bootp_relay = 0
+net.ipv4.conf.lo.disable_policy = 1
+net.ipv4.conf.lo.disable_xfrm = 1
+net.ipv4.conf.lo.drop_gratuitous_arp = 0
+net.ipv4.conf.lo.drop_unicast_in_l2_multicast = 0
+net.ipv4.conf.lo.force_igmp_version = 0
+net.ipv4.conf.lo.forwarding = 0
+net.ipv4.conf.lo.igmpv2_unsolicited_report_interval = 10000
+net.ipv4.conf.lo.igmpv3_unsolicited_report_interval = 1000
+net.ipv4.conf.lo.ignore_routes_with_linkdown = 0
+net.ipv4.conf.lo.log_martians = 0
+net.ipv4.conf.lo.mc_forwarding = 0
+net.ipv4.conf.lo.medium_id = 0
+net.ipv4.conf.lo.promote_secondaries = 1
+net.ipv4.conf.lo.proxy_arp = 0
+net.ipv4.conf.lo.proxy_arp_pvlan = 0
+net.ipv4.conf.lo.route_localnet = 0
+net.ipv4.conf.lo.rp_filter = 2
+net.ipv4.conf.lo.secure_redirects = 1
+net.ipv4.conf.lo.send_redirects = 1
+net.ipv4.conf.lo.shared_media = 1
+net.ipv4.conf.lo.src_valid_mark = 0
+net.ipv4.conf.lo.tag = 0
+net.ipv4.conf.wlp3s0.accept_local = 0
+net.ipv4.conf.wlp3s0.accept_redirects = 1
+net.ipv4.conf.wlp3s0.accept_source_route = 0
+net.ipv4.conf.wlp3s0.arp_accept = 0
+net.ipv4.conf.wlp3s0.arp_announce = 0
+net.ipv4.conf.wlp3s0.arp_evict_nocarrier = 1
+net.ipv4.conf.wlp3s0.arp_filter = 0
+net.ipv4.conf.wlp3s0.arp_ignore = 0
+net.ipv4.conf.wlp3s0.arp_notify = 0
+net.ipv4.conf.wlp3s0.bc_forwarding = 0
+net.ipv4.conf.wlp3s0.bootp_relay = 0
+net.ipv4.conf.wlp3s0.disable_policy = 0
+net.ipv4.conf.wlp3s0.disable_xfrm = 0
+net.ipv4.conf.wlp3s0.drop_gratuitous_arp = 0
+net.ipv4.conf.wlp3s0.drop_unicast_in_l2_multicast = 0
+net.ipv4.conf.wlp3s0.force_igmp_version = 0
+net.ipv4.conf.wlp3s0.forwarding = 0
+net.ipv4.conf.wlp3s0.igmpv2_unsolicited_report_interval = 10000
+net.ipv4.conf.wlp3s0.igmpv3_unsolicited_report_interval = 1000
+net.ipv4.conf.wlp3s0.ignore_routes_with_linkdown = 0
+net.ipv4.conf.wlp3s0.log_martians = 0
+net.ipv4.conf.wlp3s0.mc_forwarding = 0
+net.ipv4.conf.wlp3s0.medium_id = 0
+net.ipv4.conf.wlp3s0.promote_secondaries = 1
+net.ipv4.conf.wlp3s0.proxy_arp = 0
+net.ipv4.conf.wlp3s0.proxy_arp_pvlan = 0
+net.ipv4.conf.wlp3s0.route_localnet = 0
+net.ipv4.conf.wlp3s0.rp_filter = 2
+net.ipv4.conf.wlp3s0.secure_redirects = 1
+net.ipv4.conf.wlp3s0.send_redirects = 1
+net.ipv4.conf.wlp3s0.shared_media = 1
+net.ipv4.conf.wlp3s0.src_valid_mark = 0
+net.ipv4.conf.wlp3s0.tag = 0
+net.ipv4.fib_multipath_hash_fields = 7
+net.ipv4.fib_multipath_hash_policy = 0
+net.ipv4.fib_multipath_hash_seed = 0
+net.ipv4.fib_multipath_use_neigh = 0
+net.ipv4.fib_notify_on_flag_change = 0
+net.ipv4.fib_sync_mem = 524288
+net.ipv4.fwmark_reflect = 0
+net.ipv4.icmp_echo_enable_probe = 0
+net.ipv4.icmp_echo_ignore_all = 0
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_errors_extension_mask = 0
+net.ipv4.icmp_errors_use_inbound_ifaddr = 0
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+net.ipv4.icmp_msgs_burst = 50
+net.ipv4.icmp_msgs_per_sec = 1000
+net.ipv4.icmp_ratelimit = 1000
+net.ipv4.icmp_ratemask = 6168
+net.ipv4.igmp_link_local_mcast_reports = 1
+net.ipv4.igmp_max_memberships = 20
+net.ipv4.igmp_max_msf = 10
+net.ipv4.igmp_qrv = 2
+net.ipv4.inet_peer_maxttl = 600
+net.ipv4.inet_peer_minttl = 120
+net.ipv4.inet_peer_threshold = 65664
+net.ipv4.ip_autobind_reuse = 0
+net.ipv4.ip_default_ttl = 64
+net.ipv4.ip_dynaddr = 0
+net.ipv4.ip_early_demux = 1
+net.ipv4.ip_forward = 0
+net.ipv4.ip_forward_update_priority = 1
+net.ipv4.ip_forward_use_pmtu = 0
+net.ipv4.ip_local_port_range = 32768	60999
+net.ipv4.ip_local_reserved_ports = 
+net.ipv4.ip_no_pmtu_disc = 0
+net.ipv4.ip_nonlocal_bind = 0
+net.ipv4.ip_unprivileged_port_start = 1024
+net.ipv4.ipfrag_high_thresh = 4194304
+net.ipv4.ipfrag_low_thresh = 3145728
+net.ipv4.ipfrag_max_dist = 64
+net.ipv4.ipfrag_secret_interval = 0
+net.ipv4.ipfrag_time = 30
+net.ipv4.neigh.default.anycast_delay = 100
+net.ipv4.neigh.default.app_solicit = 0
+net.ipv4.neigh.default.base_reachable_time_ms = 30000
+net.ipv4.neigh.default.delay_first_probe_time = 5
+net.ipv4.neigh.default.gc_interval = 30
+net.ipv4.neigh.default.gc_stale_time = 60
+net.ipv4.neigh.default.gc_thresh1 = 128
+net.ipv4.neigh.default.gc_thresh2 = 512
+net.ipv4.neigh.default.gc_thresh3 = 1024
+net.ipv4.neigh.default.interval_probe_time_ms = 5000
+net.ipv4.neigh.default.locktime = 100
+net.ipv4.neigh.default.mcast_resolicit = 0
+net.ipv4.neigh.default.mcast_solicit = 3
+net.ipv4.neigh.default.proxy_delay = 80
+net.ipv4.neigh.default.proxy_qlen = 64
+net.ipv4.neigh.default.retrans_time_ms = 1000
+net.ipv4.neigh.default.ucast_solicit = 3
+net.ipv4.neigh.default.unres_qlen = 101
+net.ipv4.neigh.default.unres_qlen_bytes = 212992
+net.ipv4.neigh.enp2s0.anycast_delay = 100
+net.ipv4.neigh.enp2s0.app_solicit = 0
+net.ipv4.neigh.enp2s0.base_reachable_time_ms = 30000
+net.ipv4.neigh.enp2s0.delay_first_probe_time = 5
+net.ipv4.neigh.enp2s0.gc_stale_time = 60
+net.ipv4.neigh.enp2s0.interval_probe_time_ms = 5000
+net.ipv4.neigh.enp2s0.locktime = 100
+net.ipv4.neigh.enp2s0.mcast_resolicit = 0
+net.ipv4.neigh.enp2s0.mcast_solicit = 3
+net.ipv4.neigh.enp2s0.proxy_delay = 80
+net.ipv4.neigh.enp2s0.proxy_qlen = 64
+net.ipv4.neigh.enp2s0.retrans_time_ms = 1000
+net.ipv4.neigh.enp2s0.ucast_solicit = 3
+net.ipv4.neigh.enp2s0.unres_qlen = 101
+net.ipv4.neigh.enp2s0.unres_qlen_bytes = 212992
+net.ipv4.neigh.lo.anycast_delay = 100
+net.ipv4.neigh.lo.app_solicit = 0
+net.ipv4.neigh.lo.base_reachable_time_ms = 30000
+net.ipv4.neigh.lo.delay_first_probe_time = 5
+net.ipv4.neigh.lo.gc_stale_time = 60
+net.ipv4.neigh.lo.interval_probe_time_ms = 5000
+net.ipv4.neigh.lo.locktime = 100
+net.ipv4.neigh.lo.mcast_resolicit = 0
+net.ipv4.neigh.lo.mcast_solicit = 3
+net.ipv4.neigh.lo.proxy_delay = 80
+net.ipv4.neigh.lo.proxy_qlen = 64
+net.ipv4.neigh.lo.retrans_time_ms = 1000
+net.ipv4.neigh.lo.ucast_solicit = 3
+net.ipv4.neigh.lo.unres_qlen = 101
+net.ipv4.neigh.lo.unres_qlen_bytes = 212992
+net.ipv4.neigh.wlp3s0.anycast_delay = 100
+net.ipv4.neigh.wlp3s0.app_solicit = 0
+net.ipv4.neigh.wlp3s0.base_reachable_time_ms = 30000
+net.ipv4.neigh.wlp3s0.delay_first_probe_time = 5
+net.ipv4.neigh.wlp3s0.gc_stale_time = 60
+net.ipv4.neigh.wlp3s0.interval_probe_time_ms = 5000
+net.ipv4.neigh.wlp3s0.locktime = 100
+net.ipv4.neigh.wlp3s0.mcast_resolicit = 0
+net.ipv4.neigh.wlp3s0.mcast_solicit = 3
+net.ipv4.neigh.wlp3s0.proxy_delay = 80
+net.ipv4.neigh.wlp3s0.proxy_qlen = 64
+net.ipv4.neigh.wlp3s0.retrans_time_ms = 1000
+net.ipv4.neigh.wlp3s0.ucast_solicit = 3
+net.ipv4.neigh.wlp3s0.unres_qlen = 101
+net.ipv4.neigh.wlp3s0.unres_qlen_bytes = 212992
+net.ipv4.nexthop_compat_mode = 1
+net.ipv4.ping_group_range = 0	2147483647
+net.ipv4.raw_l3mdev_accept = 1
+net.ipv4.route.error_burst = 5000
+net.ipv4.route.error_cost = 1000
+net.ipv4.route.gc_elasticity = 8
+net.ipv4.route.gc_interval = 60
+net.ipv4.route.gc_min_interval = 0
+net.ipv4.route.gc_min_interval_ms = 500
+net.ipv4.route.gc_thresh = -1
+net.ipv4.route.gc_timeout = 300
+net.ipv4.route.max_size = 2147483647
+net.ipv4.route.min_adv_mss = 256
+net.ipv4.route.min_pmtu = 552
+net.ipv4.route.mtu_expires = 600
+net.ipv4.route.redirect_load = 20
+net.ipv4.route.redirect_number = 9
+net.ipv4.route.redirect_silence = 20480
+net.ipv4.tcp_abort_on_overflow = 0
+net.ipv4.tcp_adv_win_scale = 1
+net.ipv4.tcp_allowed_congestion_control = reno cubic
+net.ipv4.tcp_app_win = 31
+net.ipv4.tcp_autocorking = 1
+net.ipv4.tcp_available_congestion_control = reno cubic
+net.ipv4.tcp_available_ulp = espintcp mptcp
+net.ipv4.tcp_backlog_ack_defer = 1
+net.ipv4.tcp_base_mss = 1024
+net.ipv4.tcp_challenge_ack_limit = 2147483647
+net.ipv4.tcp_child_ehash_entries = 0
+net.ipv4.tcp_comp_sack_delay_ns = 1000000
+net.ipv4.tcp_comp_sack_nr = 44
+net.ipv4.tcp_comp_sack_rtt_percent = 33
+net.ipv4.tcp_comp_sack_slack_ns = 10000
+net.ipv4.tcp_congestion_control = cubic
+net.ipv4.tcp_dsack = 1
+net.ipv4.tcp_early_demux = 1
+net.ipv4.tcp_early_retrans = 3
+net.ipv4.tcp_ecn = 2
+net.ipv4.tcp_ecn_fallback = 1
+net.ipv4.tcp_ecn_option = 2
+net.ipv4.tcp_ecn_option_beacon = 3
+net.ipv4.tcp_ehash_entries = 262144
+net.ipv4.tcp_fack = 0
+net.ipv4.tcp_fastopen = 1
+net.ipv4.tcp_fastopen_blackhole_timeout_sec = 0
+net.ipv4.tcp_fastopen_key = 4f44f0a8-682f4b65-468a7852-9658bbad
+net.ipv4.tcp_fin_timeout = 60
+net.ipv4.tcp_frto = 2
+net.ipv4.tcp_fwmark_accept = 0
+net.ipv4.tcp_invalid_ratelimit = 500
+net.ipv4.tcp_keepalive_intvl = 75
+net.ipv4.tcp_keepalive_probes = 9
+net.ipv4.tcp_keepalive_time = 7200
+net.ipv4.tcp_l3mdev_accept = 0
+net.ipv4.tcp_limit_output_bytes = 4194304
+net.ipv4.tcp_low_latency = 0
+net.ipv4.tcp_max_orphans = 131072
+net.ipv4.tcp_max_reordering = 300
+net.ipv4.tcp_max_syn_backlog = 2048
+net.ipv4.tcp_max_tw_buckets = 131072
+net.ipv4.tcp_mem = 331875	442501	663750
+net.ipv4.tcp_migrate_req = 0
+net.ipv4.tcp_min_rtt_wlen = 300
+net.ipv4.tcp_min_snd_mss = 48
+net.ipv4.tcp_min_tso_segs = 2
+net.ipv4.tcp_moderate_rcvbuf = 1
+net.ipv4.tcp_mtu_probe_floor = 48
+net.ipv4.tcp_mtu_probing = 0
+net.ipv4.tcp_no_metrics_save = 0
+net.ipv4.tcp_no_ssthresh_metrics_save = 1
+net.ipv4.tcp_notsent_lowat = 4294967295
+net.ipv4.tcp_orphan_retries = 0
+net.ipv4.tcp_pacing_ca_ratio = 120
+net.ipv4.tcp_pacing_ss_ratio = 200
+net.ipv4.tcp_pingpong_thresh = 1
+net.ipv4.tcp_plb_cong_thresh = 128
+net.ipv4.tcp_plb_enabled = 0
+net.ipv4.tcp_plb_idle_rehash_rounds = 3
+net.ipv4.tcp_plb_rehash_rounds = 12
+net.ipv4.tcp_plb_suspend_rto_sec = 60
+net.ipv4.tcp_probe_interval = 600
+net.ipv4.tcp_probe_threshold = 8
+net.ipv4.tcp_rcvbuf_low_rtt = 1000
+net.ipv4.tcp_recovery = 1
+net.ipv4.tcp_reflect_tos = 0
+net.ipv4.tcp_reordering = 3
+net.ipv4.tcp_retrans_collapse = 1
+net.ipv4.tcp_retries1 = 3
+net.ipv4.tcp_retries2 = 15
+net.ipv4.tcp_rfc1337 = 0
+net.ipv4.tcp_rmem = 4096	131072	33554432
+net.ipv4.tcp_rto_max_ms = 120000
+net.ipv4.tcp_rto_min_us = 200000
+net.ipv4.tcp_sack = 1
+net.ipv4.tcp_shrink_window = 0
+net.ipv4.tcp_slow_start_after_idle = 1
+net.ipv4.tcp_stdurg = 0
+net.ipv4.tcp_syn_linear_timeouts = 4
+net.ipv4.tcp_syn_retries = 6
+net.ipv4.tcp_synack_retries = 5
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_thin_linear_timeouts = 0
+net.ipv4.tcp_timestamps = 1
+net.ipv4.tcp_tso_rtt_log = 9
+net.ipv4.tcp_tso_win_divisor = 3
+net.ipv4.tcp_tw_reuse = 2
+net.ipv4.tcp_tw_reuse_delay = 1000
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_wmem = 4096	16384	4194304
+net.ipv4.tcp_workaround_signed_windows = 0
+net.ipv4.udp_child_hash_entries = 0
+net.ipv4.udp_early_demux = 1
+net.ipv4.udp_hash_entries = 16384
+net.ipv4.udp_l3mdev_accept = 0
+net.ipv4.udp_mem = 663750	885003	1327500
+net.ipv4.udp_rmem_min = 4096
+net.ipv4.udp_wmem_min = 4096
+net.ipv4.xfrm4_gc_thresh = 32768
+net.ipv6.anycast_src_echo_reply = 0
+net.ipv6.auto_flowlabels = 1
+net.ipv6.bindv6only = 0
+net.ipv6.calipso_cache_bucket_size = 10
+net.ipv6.calipso_cache_enable = 1
+net.ipv6.conf.all.accept_dad = 0
+net.ipv6.conf.all.accept_ra = 1
+net.ipv6.conf.all.accept_ra_defrtr = 1
+net.ipv6.conf.all.accept_ra_from_local = 0
+net.ipv6.conf.all.accept_ra_min_hop_limit = 1
+net.ipv6.conf.all.accept_ra_min_lft = 0
+net.ipv6.conf.all.accept_ra_mtu = 1
+net.ipv6.conf.all.accept_ra_pinfo = 1
+net.ipv6.conf.all.accept_ra_rt_info_max_plen = 0
+net.ipv6.conf.all.accept_ra_rt_info_min_plen = 0
+net.ipv6.conf.all.accept_ra_rtr_pref = 1
+net.ipv6.conf.all.accept_redirects = 1
+net.ipv6.conf.all.accept_source_route = 0
+net.ipv6.conf.all.accept_untracked_na = 0
+net.ipv6.conf.all.addr_gen_mode = 0
+net.ipv6.conf.all.autoconf = 1
+net.ipv6.conf.all.dad_transmits = 1
+net.ipv6.conf.all.disable_ipv6 = 0
+net.ipv6.conf.all.disable_policy = 0
+net.ipv6.conf.all.drop_unicast_in_l2_multicast = 0
+net.ipv6.conf.all.drop_unsolicited_na = 0
+net.ipv6.conf.all.enhanced_dad = 1
+net.ipv6.conf.all.force_forwarding = 0
+net.ipv6.conf.all.force_mld_version = 0
+net.ipv6.conf.all.force_tllao = 0
+net.ipv6.conf.all.forwarding = 0
+net.ipv6.conf.all.hop_limit = 64
+net.ipv6.conf.all.ignore_routes_with_linkdown = 0
+net.ipv6.conf.all.ioam6_enabled = 0
+net.ipv6.conf.all.ioam6_id = 65535
+net.ipv6.conf.all.ioam6_id_wide = 4294967295
+net.ipv6.conf.all.keep_addr_on_down = 0
+net.ipv6.conf.all.max_addresses = 16
+net.ipv6.conf.all.max_desync_factor = 600
+net.ipv6.conf.all.mc_forwarding = 0
+net.ipv6.conf.all.mldv1_unsolicited_report_interval = 10000
+net.ipv6.conf.all.mldv2_unsolicited_report_interval = 1000
+net.ipv6.conf.all.mtu = 1280
+net.ipv6.conf.all.ndisc_evict_nocarrier = 1
+net.ipv6.conf.all.ndisc_notify = 0
+net.ipv6.conf.all.ndisc_tclass = 0
+net.ipv6.conf.all.optimistic_dad = 0
+net.ipv6.conf.all.proxy_ndp = 0
+net.ipv6.conf.all.ra_defrtr_metric = 1024
+net.ipv6.conf.all.ra_honor_pio_life = 0
+net.ipv6.conf.all.ra_honor_pio_pflag = 0
+net.ipv6.conf.all.regen_max_retry = 3
+net.ipv6.conf.all.regen_min_advance = 2
+net.ipv6.conf.all.router_probe_interval = 60
+net.ipv6.conf.all.router_solicitation_delay = 1
+net.ipv6.conf.all.router_solicitation_interval = 4
+net.ipv6.conf.all.router_solicitation_max_interval = 3600
+net.ipv6.conf.all.router_solicitations = -1
+net.ipv6.conf.all.rpl_seg_enabled = 0
+net.ipv6.conf.all.seg6_enabled = 0
+net.ipv6.conf.all.seg6_require_hmac = 0
+net.ipv6.conf.all.suppress_frag_ndisc = 1
+net.ipv6.conf.all.temp_prefered_lft = 86400
+net.ipv6.conf.all.temp_valid_lft = 172800
+net.ipv6.conf.all.use_oif_addrs_only = 0
+net.ipv6.conf.all.use_optimistic = 0
+net.ipv6.conf.all.use_tempaddr = 2
+net.ipv6.conf.default.accept_dad = 1
+net.ipv6.conf.default.accept_ra = 1
+net.ipv6.conf.default.accept_ra_defrtr = 1
+net.ipv6.conf.default.accept_ra_from_local = 0
+net.ipv6.conf.default.accept_ra_min_hop_limit = 1
+net.ipv6.conf.default.accept_ra_min_lft = 0
+net.ipv6.conf.default.accept_ra_mtu = 1
+net.ipv6.conf.default.accept_ra_pinfo = 1
+net.ipv6.conf.default.accept_ra_rt_info_max_plen = 0
+net.ipv6.conf.default.accept_ra_rt_info_min_plen = 0
+net.ipv6.conf.default.accept_ra_rtr_pref = 1
+net.ipv6.conf.default.accept_redirects = 1
+net.ipv6.conf.default.accept_source_route = 0
+net.ipv6.conf.default.accept_untracked_na = 0
+net.ipv6.conf.default.addr_gen_mode = 0
+net.ipv6.conf.default.autoconf = 1
+net.ipv6.conf.default.dad_transmits = 1
+net.ipv6.conf.default.disable_ipv6 = 0
+net.ipv6.conf.default.disable_policy = 0
+net.ipv6.conf.default.drop_unicast_in_l2_multicast = 0
+net.ipv6.conf.default.drop_unsolicited_na = 0
+net.ipv6.conf.default.enhanced_dad = 1
+net.ipv6.conf.default.force_forwarding = 0
+net.ipv6.conf.default.force_mld_version = 0
+net.ipv6.conf.default.force_tllao = 0
+net.ipv6.conf.default.forwarding = 0
+net.ipv6.conf.default.hop_limit = 64
+net.ipv6.conf.default.ignore_routes_with_linkdown = 0
+net.ipv6.conf.default.ioam6_enabled = 0
+net.ipv6.conf.default.ioam6_id = 65535
+net.ipv6.conf.default.ioam6_id_wide = 4294967295
+net.ipv6.conf.default.keep_addr_on_down = 0
+net.ipv6.conf.default.max_addresses = 16
+net.ipv6.conf.default.max_desync_factor = 600
+net.ipv6.conf.default.mc_forwarding = 0
+net.ipv6.conf.default.mldv1_unsolicited_report_interval = 10000
+net.ipv6.conf.default.mldv2_unsolicited_report_interval = 1000
+net.ipv6.conf.default.mtu = 1280
+net.ipv6.conf.default.ndisc_evict_nocarrier = 1
+net.ipv6.conf.default.ndisc_notify = 0
+net.ipv6.conf.default.ndisc_tclass = 0
+net.ipv6.conf.default.optimistic_dad = 0
+net.ipv6.conf.default.proxy_ndp = 0
+net.ipv6.conf.default.ra_defrtr_metric = 1024
+net.ipv6.conf.default.ra_honor_pio_life = 0
+net.ipv6.conf.default.ra_honor_pio_pflag = 0
+net.ipv6.conf.default.regen_max_retry = 3
+net.ipv6.conf.default.regen_min_advance = 2
+net.ipv6.conf.default.router_probe_interval = 60
+net.ipv6.conf.default.router_solicitation_delay = 1
+net.ipv6.conf.default.router_solicitation_interval = 4
+net.ipv6.conf.default.router_solicitation_max_interval = 3600
+net.ipv6.conf.default.router_solicitations = -1
+net.ipv6.conf.default.rpl_seg_enabled = 0
+net.ipv6.conf.default.seg6_enabled = 0
+net.ipv6.conf.default.seg6_require_hmac = 0
+net.ipv6.conf.default.suppress_frag_ndisc = 1
+net.ipv6.conf.default.temp_prefered_lft = 86400
+net.ipv6.conf.default.temp_valid_lft = 172800
+net.ipv6.conf.default.use_oif_addrs_only = 0
+net.ipv6.conf.default.use_optimistic = 0
+net.ipv6.conf.default.use_tempaddr = 2
+net.ipv6.conf.enp2s0.accept_dad = 1
+net.ipv6.conf.enp2s0.accept_ra = 0
+net.ipv6.conf.enp2s0.accept_ra_defrtr = 1
+net.ipv6.conf.enp2s0.accept_ra_from_local = 0
+net.ipv6.conf.enp2s0.accept_ra_min_hop_limit = 1
+net.ipv6.conf.enp2s0.accept_ra_min_lft = 0
+net.ipv6.conf.enp2s0.accept_ra_mtu = 1
+net.ipv6.conf.enp2s0.accept_ra_pinfo = 1
+net.ipv6.conf.enp2s0.accept_ra_rt_info_max_plen = 0
+net.ipv6.conf.enp2s0.accept_ra_rt_info_min_plen = 0
+net.ipv6.conf.enp2s0.accept_ra_rtr_pref = 1
+net.ipv6.conf.enp2s0.accept_redirects = 1
+net.ipv6.conf.enp2s0.accept_source_route = 0
+net.ipv6.conf.enp2s0.accept_untracked_na = 0
+net.ipv6.conf.enp2s0.addr_gen_mode = 1
+net.ipv6.conf.enp2s0.autoconf = 1
+net.ipv6.conf.enp2s0.dad_transmits = 1
+net.ipv6.conf.enp2s0.disable_ipv6 = 0
+net.ipv6.conf.enp2s0.disable_policy = 0
+net.ipv6.conf.enp2s0.drop_unicast_in_l2_multicast = 0
+net.ipv6.conf.enp2s0.drop_unsolicited_na = 0
+net.ipv6.conf.enp2s0.enhanced_dad = 1
+net.ipv6.conf.enp2s0.force_forwarding = 0
+net.ipv6.conf.enp2s0.force_mld_version = 0
+net.ipv6.conf.enp2s0.force_tllao = 0
+net.ipv6.conf.enp2s0.forwarding = 0
+net.ipv6.conf.enp2s0.hop_limit = 64
+net.ipv6.conf.enp2s0.ignore_routes_with_linkdown = 0
+net.ipv6.conf.enp2s0.ioam6_enabled = 0
+net.ipv6.conf.enp2s0.ioam6_id = 65535
+net.ipv6.conf.enp2s0.ioam6_id_wide = 4294967295
+net.ipv6.conf.enp2s0.keep_addr_on_down = 0
+net.ipv6.conf.enp2s0.max_addresses = 16
+net.ipv6.conf.enp2s0.max_desync_factor = 600
+net.ipv6.conf.enp2s0.mc_forwarding = 0
+net.ipv6.conf.enp2s0.mldv1_unsolicited_report_interval = 10000
+net.ipv6.conf.enp2s0.mldv2_unsolicited_report_interval = 1000
+net.ipv6.conf.enp2s0.mtu = 1500
+net.ipv6.conf.enp2s0.ndisc_evict_nocarrier = 1
+net.ipv6.conf.enp2s0.ndisc_notify = 0
+net.ipv6.conf.enp2s0.ndisc_tclass = 0
+net.ipv6.conf.enp2s0.optimistic_dad = 0
+net.ipv6.conf.enp2s0.proxy_ndp = 0
+net.ipv6.conf.enp2s0.ra_defrtr_metric = 1024
+net.ipv6.conf.enp2s0.ra_honor_pio_life = 0
+net.ipv6.conf.enp2s0.ra_honor_pio_pflag = 0
+net.ipv6.conf.enp2s0.regen_max_retry = 3
+net.ipv6.conf.enp2s0.regen_min_advance = 2
+net.ipv6.conf.enp2s0.router_probe_interval = 60
+net.ipv6.conf.enp2s0.router_solicitation_delay = 1
+net.ipv6.conf.enp2s0.router_solicitation_interval = 4
+net.ipv6.conf.enp2s0.router_solicitation_max_interval = 3600
+net.ipv6.conf.enp2s0.router_solicitations = -1
+net.ipv6.conf.enp2s0.rpl_seg_enabled = 0
+net.ipv6.conf.enp2s0.seg6_enabled = 0
+net.ipv6.conf.enp2s0.seg6_require_hmac = 0
+net.ipv6.conf.enp2s0.suppress_frag_ndisc = 1
+net.ipv6.conf.enp2s0.temp_prefered_lft = 86400
+net.ipv6.conf.enp2s0.temp_valid_lft = 172800
+net.ipv6.conf.enp2s0.use_oif_addrs_only = 0
+net.ipv6.conf.enp2s0.use_optimistic = 0
+net.ipv6.conf.enp2s0.use_tempaddr = 0
+net.ipv6.conf.lo.accept_dad = -1
+net.ipv6.conf.lo.accept_ra = 1
+net.ipv6.conf.lo.accept_ra_defrtr = 1
+net.ipv6.conf.lo.accept_ra_from_local = 0
+net.ipv6.conf.lo.accept_ra_min_hop_limit = 1
+net.ipv6.conf.lo.accept_ra_min_lft = 0
+net.ipv6.conf.lo.accept_ra_mtu = 1
+net.ipv6.conf.lo.accept_ra_pinfo = 1
+net.ipv6.conf.lo.accept_ra_rt_info_max_plen = 0
+net.ipv6.conf.lo.accept_ra_rt_info_min_plen = 0
+net.ipv6.conf.lo.accept_ra_rtr_pref = 1
+net.ipv6.conf.lo.accept_redirects = 1
+net.ipv6.conf.lo.accept_source_route = 0
+net.ipv6.conf.lo.accept_untracked_na = 0
+net.ipv6.conf.lo.addr_gen_mode = 0
+net.ipv6.conf.lo.autoconf = 1
+net.ipv6.conf.lo.dad_transmits = 1
+net.ipv6.conf.lo.disable_ipv6 = 0
+net.ipv6.conf.lo.disable_policy = 0
+net.ipv6.conf.lo.drop_unicast_in_l2_multicast = 0
+net.ipv6.conf.lo.drop_unsolicited_na = 0
+net.ipv6.conf.lo.enhanced_dad = 1
+net.ipv6.conf.lo.force_forwarding = 0
+net.ipv6.conf.lo.force_mld_version = 0
+net.ipv6.conf.lo.force_tllao = 0
+net.ipv6.conf.lo.forwarding = 0
+net.ipv6.conf.lo.hop_limit = 64
+net.ipv6.conf.lo.ignore_routes_with_linkdown = 0
+net.ipv6.conf.lo.ioam6_enabled = 0
+net.ipv6.conf.lo.ioam6_id = 65535
+net.ipv6.conf.lo.ioam6_id_wide = 4294967295
+net.ipv6.conf.lo.keep_addr_on_down = 0
+net.ipv6.conf.lo.max_addresses = 16
+net.ipv6.conf.lo.max_desync_factor = 600
+net.ipv6.conf.lo.mc_forwarding = 0
+net.ipv6.conf.lo.mldv1_unsolicited_report_interval = 10000
+net.ipv6.conf.lo.mldv2_unsolicited_report_interval = 1000
+net.ipv6.conf.lo.mtu = 65536
+net.ipv6.conf.lo.ndisc_evict_nocarrier = 1
+net.ipv6.conf.lo.ndisc_notify = 0
+net.ipv6.conf.lo.ndisc_tclass = 0
+net.ipv6.conf.lo.optimistic_dad = 0
+net.ipv6.conf.lo.proxy_ndp = 0
+net.ipv6.conf.lo.ra_defrtr_metric = 1024
+net.ipv6.conf.lo.ra_honor_pio_life = 0
+net.ipv6.conf.lo.ra_honor_pio_pflag = 0
+net.ipv6.conf.lo.regen_max_retry = 3
+net.ipv6.conf.lo.regen_min_advance = 2
+net.ipv6.conf.lo.router_probe_interval = 60
+net.ipv6.conf.lo.router_solicitation_delay = 1
+net.ipv6.conf.lo.router_solicitation_interval = 4
+net.ipv6.conf.lo.router_solicitation_max_interval = 3600
+net.ipv6.conf.lo.router_solicitations = -1
+net.ipv6.conf.lo.rpl_seg_enabled = 0
+net.ipv6.conf.lo.seg6_enabled = 0
+net.ipv6.conf.lo.seg6_require_hmac = 0
+net.ipv6.conf.lo.suppress_frag_ndisc = 1
+net.ipv6.conf.lo.temp_prefered_lft = 86400
+net.ipv6.conf.lo.temp_valid_lft = 172800
+net.ipv6.conf.lo.use_oif_addrs_only = 0
+net.ipv6.conf.lo.use_optimistic = 0
+net.ipv6.conf.lo.use_tempaddr = -1
+net.ipv6.conf.wlp3s0.accept_dad = 1
+net.ipv6.conf.wlp3s0.accept_ra = 0
+net.ipv6.conf.wlp3s0.accept_ra_defrtr = 1
+net.ipv6.conf.wlp3s0.accept_ra_from_local = 0
+net.ipv6.conf.wlp3s0.accept_ra_min_hop_limit = 1
+net.ipv6.conf.wlp3s0.accept_ra_min_lft = 0
+net.ipv6.conf.wlp3s0.accept_ra_mtu = 1
+net.ipv6.conf.wlp3s0.accept_ra_pinfo = 1
+net.ipv6.conf.wlp3s0.accept_ra_rt_info_max_plen = 0
+net.ipv6.conf.wlp3s0.accept_ra_rt_info_min_plen = 0
+net.ipv6.conf.wlp3s0.accept_ra_rtr_pref = 1
+net.ipv6.conf.wlp3s0.accept_redirects = 1
+net.ipv6.conf.wlp3s0.accept_source_route = 0
+net.ipv6.conf.wlp3s0.accept_untracked_na = 0
+net.ipv6.conf.wlp3s0.addr_gen_mode = 1
+net.ipv6.conf.wlp3s0.autoconf = 1
+net.ipv6.conf.wlp3s0.dad_transmits = 1
+net.ipv6.conf.wlp3s0.disable_ipv6 = 0
+net.ipv6.conf.wlp3s0.disable_policy = 0
+net.ipv6.conf.wlp3s0.drop_unicast_in_l2_multicast = 0
+net.ipv6.conf.wlp3s0.drop_unsolicited_na = 0
+net.ipv6.conf.wlp3s0.enhanced_dad = 1
+net.ipv6.conf.wlp3s0.force_forwarding = 0
+net.ipv6.conf.wlp3s0.force_mld_version = 0
+net.ipv6.conf.wlp3s0.force_tllao = 0
+net.ipv6.conf.wlp3s0.forwarding = 0
+net.ipv6.conf.wlp3s0.hop_limit = 64
+net.ipv6.conf.wlp3s0.ignore_routes_with_linkdown = 0
+net.ipv6.conf.wlp3s0.ioam6_enabled = 0
+net.ipv6.conf.wlp3s0.ioam6_id = 65535
+net.ipv6.conf.wlp3s0.ioam6_id_wide = 4294967295
+net.ipv6.conf.wlp3s0.keep_addr_on_down = 0
+net.ipv6.conf.wlp3s0.max_addresses = 16
+net.ipv6.conf.wlp3s0.max_desync_factor = 600
+net.ipv6.conf.wlp3s0.mc_forwarding = 0
+net.ipv6.conf.wlp3s0.mldv1_unsolicited_report_interval = 10000
+net.ipv6.conf.wlp3s0.mldv2_unsolicited_report_interval = 1000
+net.ipv6.conf.wlp3s0.mtu = 1500
+net.ipv6.conf.wlp3s0.ndisc_evict_nocarrier = 1
+net.ipv6.conf.wlp3s0.ndisc_notify = 0
+net.ipv6.conf.wlp3s0.ndisc_tclass = 0
+net.ipv6.conf.wlp3s0.optimistic_dad = 0
+net.ipv6.conf.wlp3s0.proxy_ndp = 0
+net.ipv6.conf.wlp3s0.ra_defrtr_metric = 1024
+net.ipv6.conf.wlp3s0.ra_honor_pio_life = 0
+net.ipv6.conf.wlp3s0.ra_honor_pio_pflag = 0
+net.ipv6.conf.wlp3s0.regen_max_retry = 3
+net.ipv6.conf.wlp3s0.regen_min_advance = 2
+net.ipv6.conf.wlp3s0.router_probe_interval = 60
+net.ipv6.conf.wlp3s0.router_solicitation_delay = 1
+net.ipv6.conf.wlp3s0.router_solicitation_interval = 4
+net.ipv6.conf.wlp3s0.router_solicitation_max_interval = 3600
+net.ipv6.conf.wlp3s0.router_solicitations = -1
+net.ipv6.conf.wlp3s0.rpl_seg_enabled = 0
+net.ipv6.conf.wlp3s0.seg6_enabled = 0
+net.ipv6.conf.wlp3s0.seg6_require_hmac = 0
+net.ipv6.conf.wlp3s0.suppress_frag_ndisc = 1
+net.ipv6.conf.wlp3s0.temp_prefered_lft = 86400
+net.ipv6.conf.wlp3s0.temp_valid_lft = 172800
+net.ipv6.conf.wlp3s0.use_oif_addrs_only = 0
+net.ipv6.conf.wlp3s0.use_optimistic = 0
+net.ipv6.conf.wlp3s0.use_tempaddr = 2
+net.ipv6.fib_multipath_hash_fields = 7
+net.ipv6.fib_multipath_hash_policy = 0
+net.ipv6.fib_notify_on_flag_change = 0
+net.ipv6.flowlabel_consistency = 1
+net.ipv6.flowlabel_reflect = 0
+net.ipv6.flowlabel_state_ranges = 0
+net.ipv6.fwmark_reflect = 0
+net.ipv6.icmp.echo_ignore_all = 0
+net.ipv6.icmp.echo_ignore_anycast = 0
+net.ipv6.icmp.echo_ignore_multicast = 0
+net.ipv6.icmp.error_anycast_as_unicast = 0
+net.ipv6.icmp.errors_extension_mask = 0
+net.ipv6.icmp.ratelimit = 100
+net.ipv6.icmp.ratemask = 0-1,3-127
+net.ipv6.idgen_delay = 1
+net.ipv6.idgen_retries = 3
+net.ipv6.ioam6_id = 16777215
+net.ipv6.ioam6_id_wide = 72057594037927935
+net.ipv6.ip6frag_high_thresh = 4194304
+net.ipv6.ip6frag_low_thresh = 3145728
+net.ipv6.ip6frag_secret_interval = 0
+net.ipv6.ip6frag_time = 60
+net.ipv6.ip_nonlocal_bind = 0
+net.ipv6.max_dst_opts_length = 2147483647
+net.ipv6.max_dst_opts_number = 8
+net.ipv6.max_hbh_length = 2147483647
+net.ipv6.max_hbh_opts_number = 8
+net.ipv6.mld_max_msf = 64
+net.ipv6.mld_qrv = 2
+net.ipv6.neigh.default.anycast_delay = 100
+net.ipv6.neigh.default.app_solicit = 0
+net.ipv6.neigh.default.base_reachable_time_ms = 30000
+net.ipv6.neigh.default.delay_first_probe_time = 5
+net.ipv6.neigh.default.gc_interval = 30
+net.ipv6.neigh.default.gc_stale_time = 60
+net.ipv6.neigh.default.gc_thresh1 = 128
+net.ipv6.neigh.default.gc_thresh2 = 512
+net.ipv6.neigh.default.gc_thresh3 = 1024
+net.ipv6.neigh.default.interval_probe_time_ms = 5000
+net.ipv6.neigh.default.locktime = 0
+net.ipv6.neigh.default.mcast_resolicit = 0
+net.ipv6.neigh.default.mcast_solicit = 3
+net.ipv6.neigh.default.proxy_delay = 80
+net.ipv6.neigh.default.proxy_qlen = 64
+net.ipv6.neigh.default.retrans_time_ms = 1000
+net.ipv6.neigh.default.ucast_solicit = 3
+net.ipv6.neigh.default.unres_qlen = 101
+net.ipv6.neigh.default.unres_qlen_bytes = 212992
+net.ipv6.neigh.enp2s0.anycast_delay = 100
+net.ipv6.neigh.enp2s0.app_solicit = 0
+net.ipv6.neigh.enp2s0.base_reachable_time_ms = 30000
+net.ipv6.neigh.enp2s0.delay_first_probe_time = 5
+net.ipv6.neigh.enp2s0.gc_stale_time = 60
+net.ipv6.neigh.enp2s0.interval_probe_time_ms = 5000
+net.ipv6.neigh.enp2s0.locktime = 0
+net.ipv6.neigh.enp2s0.mcast_resolicit = 0
+net.ipv6.neigh.enp2s0.mcast_solicit = 3
+net.ipv6.neigh.enp2s0.proxy_delay = 80
+net.ipv6.neigh.enp2s0.proxy_qlen = 64
+net.ipv6.neigh.enp2s0.retrans_time_ms = 1000
+net.ipv6.neigh.enp2s0.ucast_solicit = 3
+net.ipv6.neigh.enp2s0.unres_qlen = 101
+net.ipv6.neigh.enp2s0.unres_qlen_bytes = 212992
+net.ipv6.neigh.lo.anycast_delay = 100
+net.ipv6.neigh.lo.app_solicit = 0
+net.ipv6.neigh.lo.base_reachable_time_ms = 30000
+net.ipv6.neigh.lo.delay_first_probe_time = 5
+net.ipv6.neigh.lo.gc_stale_time = 60
+net.ipv6.neigh.lo.interval_probe_time_ms = 5000
+net.ipv6.neigh.lo.locktime = 0
+net.ipv6.neigh.lo.mcast_resolicit = 0
+net.ipv6.neigh.lo.mcast_solicit = 3
+net.ipv6.neigh.lo.proxy_delay = 80
+net.ipv6.neigh.lo.proxy_qlen = 64
+net.ipv6.neigh.lo.retrans_time_ms = 1000
+net.ipv6.neigh.lo.ucast_solicit = 3
+net.ipv6.neigh.lo.unres_qlen = 101
+net.ipv6.neigh.lo.unres_qlen_bytes = 212992
+net.ipv6.neigh.wlp3s0.anycast_delay = 100
+net.ipv6.neigh.wlp3s0.app_solicit = 0
+net.ipv6.neigh.wlp3s0.base_reachable_time_ms = 30000
+net.ipv6.neigh.wlp3s0.delay_first_probe_time = 5
+net.ipv6.neigh.wlp3s0.gc_stale_time = 60
+net.ipv6.neigh.wlp3s0.interval_probe_time_ms = 5000
+net.ipv6.neigh.wlp3s0.locktime = 0
+net.ipv6.neigh.wlp3s0.mcast_resolicit = 0
+net.ipv6.neigh.wlp3s0.mcast_solicit = 3
+net.ipv6.neigh.wlp3s0.proxy_delay = 80
+net.ipv6.neigh.wlp3s0.proxy_qlen = 64
+net.ipv6.neigh.wlp3s0.retrans_time_ms = 1000
+net.ipv6.neigh.wlp3s0.ucast_solicit = 3
+net.ipv6.neigh.wlp3s0.unres_qlen = 101
+net.ipv6.neigh.wlp3s0.unres_qlen_bytes = 212992
+net.ipv6.route.gc_elasticity = 9
+net.ipv6.route.gc_interval = 30
+net.ipv6.route.gc_min_interval = 0
+net.ipv6.route.gc_min_interval_ms = 500
+net.ipv6.route.gc_thresh = 1024
+net.ipv6.route.gc_timeout = 60
+net.ipv6.route.max_size = 2147483647
+net.ipv6.route.min_adv_mss = 1220
+net.ipv6.route.mtu_expires = 600
+net.ipv6.route.skip_notify_on_dev_down = 0
+net.ipv6.seg6_flowlabel = 0
+net.ipv6.xfrm6_gc_thresh = 32768
+net.mptcp.add_addr_timeout = 120
+net.mptcp.allow_join_initial_addr_port = 1
+net.mptcp.available_path_managers = kernel userspace
+net.mptcp.available_schedulers = default
+net.mptcp.blackhole_timeout = 3600
+net.mptcp.checksum_enabled = 0
+net.mptcp.close_timeout = 60
+net.mptcp.enabled = 1
+net.mptcp.path_manager = kernel
+net.mptcp.pm_type = 0
+net.mptcp.scheduler = default
+net.mptcp.stale_loss_cnt = 4
+net.mptcp.syn_retrans_before_tcp_fallback = 2
+net.netfilter.nf_hooks_lwtunnel = 0
+net.netfilter.nf_log.0 = NONE
+net.netfilter.nf_log.1 = NONE
+net.netfilter.nf_log.10 = NONE
+net.netfilter.nf_log.2 = NONE
+net.netfilter.nf_log.3 = NONE
+net.netfilter.nf_log.4 = NONE
+net.netfilter.nf_log.5 = NONE
+net.netfilter.nf_log.6 = NONE
+net.netfilter.nf_log.7 = NONE
+net.netfilter.nf_log.8 = NONE
+net.netfilter.nf_log.9 = NONE
+net.netfilter.nf_log_all_netns = 0
+net.unix.max_dgram_qlen = 512
+user.max_cgroup_namespaces = 101518
+user.max_fanotify_groups = 128
+user.max_fanotify_marks = 239491
+user.max_inotify_instances = 128
+user.max_inotify_watches = 224707
+user.max_ipc_namespaces = 101518
+user.max_mnt_namespaces = 101518
+user.max_net_namespaces = 101518
+user.max_pid_namespaces = 101518
+user.max_time_namespaces = 101518
+user.max_user_namespaces = 101518
+user.max_uts_namespaces = 101518
+vm.admin_reserve_kbytes = 8192
+vm.compact_unevictable_allowed = 1
+vm.compaction_proactiveness = 20
+vm.defrag_mode = 0
+vm.dirty_background_bytes = 0
+vm.dirty_background_ratio = 10
+vm.dirty_bytes = 0
+vm.dirty_expire_centisecs = 3000
+vm.dirty_ratio = 20
+vm.dirty_writeback_centisecs = 500
+vm.dirtytime_expire_seconds = 43200
+vm.enable_soft_offline = 1
+vm.extfrag_threshold = 500
+vm.hugetlb_optimize_vmemmap = 0
+vm.hugetlb_shm_group = 0
+vm.laptop_mode = 0
+vm.legacy_va_layout = 0
+vm.lowmem_reserve_ratio = 256	256	32	0	0
+vm.max_map_count = 1048576
+vm.memfd_noexec = 0
+vm.memory_failure_early_kill = 0
+vm.memory_failure_recovery = 1
+vm.min_free_kbytes = 67584
+vm.min_slab_ratio = 5
+vm.min_unmapped_ratio = 1
+vm.mmap_min_addr = 65536
+vm.mmap_rnd_bits = 32
+vm.mmap_rnd_compat_bits = 16
+vm.movable_gigantic_pages = 0
+vm.nr_hugepages = 0
+vm.nr_hugepages_mempolicy = 0
+vm.nr_overcommit_hugepages = 0
+vm.numa_stat = 1
+vm.numa_zonelist_order = Node
+vm.oom_dump_tasks = 1
+vm.oom_kill_allocating_task = 0
+vm.overcommit_kbytes = 0
+vm.overcommit_memory = 0
+vm.overcommit_ratio = 50
+vm.page-cluster = 3
+vm.page_lock_unfairness = 5
+vm.panic_on_oom = 0
+vm.percpu_pagelist_high_fraction = 0
+vm.stat_interval = 1
+vm.swappiness = 60
+vm.unprivileged_userfaultfd = 0
+vm.user_reserve_kbytes = 131072
+vm.vfs_cache_pressure = 100
+vm.vfs_cache_pressure_denom = 100
+vm.watermark_boost_factor = 15000
+vm.watermark_scale_factor = 10
+vm.zone_reclaim_mode = 0
+
+== root crontab ==
+(none)
+
+== users ==
+root:x:0:0:root:/root:/bin/bash
+daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin
+bin:x:2:2:bin:/bin:/usr/sbin/nologin
+sys:x:3:3:sys:/dev:/usr/sbin/nologin
+sync:x:4:65534:sync:/bin:/bin/sync
+games:x:5:60:games:/usr/games:/usr/sbin/nologin
+man:x:6:12:man:/var/cache/man:/usr/sbin/nologin
+lp:x:7:7:lp:/var/spool/lpd:/usr/sbin/nologin
+mail:x:8:8:mail:/var/mail:/usr/sbin/nologin
+news:x:9:9:news:/var/spool/news:/usr/sbin/nologin
+uucp:x:10:10:uucp:/var/spool/uucp:/usr/sbin/nologin
+proxy:x:13:13:proxy:/bin:/usr/sbin/nologin
+www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin
+backup:x:34:34:backup:/var/backups:/usr/sbin/nologin
+list:x:38:38:Mailing List Manager:/var/list:/usr/sbin/nologin
+irc:x:39:39:ircd:/run/ircd:/usr/sbin/nologin
+_apt:x:42:65534::/nonexistent:/usr/sbin/nologin
+nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin
+systemd-network:x:998:998:systemd Network Management:/:/usr/sbin/nologin
+dhcpcd:x:996:996:DHCP Client Daemon:/usr/lib/dhcpcd:/bin/false
+messagebus:x:995:995:System Message Bus:/nonexistent:/usr/sbin/nologin
+syslog:x:100:101::/nonexistent:/usr/sbin/nologin
+systemd-resolve:x:989:989:systemd Resolver:/:/usr/sbin/nologin
+_chrony:x:988:988:Chrony Daemon:/var/lib/chrony:/usr/sbin/nologin
+tss:x:987:987:tss user for tpm2:/:/usr/sbin/nologin
+uuidd:x:101:105::/run/uuidd:/usr/sbin/nologin
+systemd-oom:x:986:986:systemd Userspace OOM Killer:/:/usr/sbin/nologin
+dnsmasq:x:999:65534:dnsmasq:/var/lib/misc:/usr/sbin/nologin
+tcpdump:x:983:983:tcpdump:/nonexistent:/usr/sbin/nologin
+fwupd-refresh:x:982:982:Firmware update daemon:/var/lib/fwupd:/usr/sbin/nologin
+geoclue:x:109:113::/var/lib/geoclue:/usr/sbin/nologin
+pipewire:x:981:981:system user for pipewire:/nonexistent:/usr/sbin/nologin
+hplip:x:111:7:HPLIP system user:/run/hplip:/bin/false
+gnome-remote-desktop:x:980:980:GNOME Remote Desktop:/var/lib/gnome-remote-desktop:/usr/sbin/nologin
+polkitd:x:979:979:User for polkitd:/:/usr/sbin/nologin
+rt:x:1000:1000:rt:/home/rt:/bin/bash
+sshd:x:972:65534:sshd user:/run/sshd:/usr/sbin/nologin
+
+== groups ==
+root:x:0:
+daemon:x:1:
+bin:x:2:
+sys:x:3:
+adm:x:4:syslog,rt
+tty:x:5:
+disk:x:6:
+lp:x:7:
+mail:x:8:
+news:x:9:
+uucp:x:10:
+man:x:12:
+proxy:x:13:
+kmem:x:15:
+dialout:x:20:
+fax:x:21:
+voice:x:22:
+cdrom:x:24:rt
+floppy:x:25:
+tape:x:26:
+sudo:x:27:rt
+audio:x:29:
+dip:x:30:rt
+www-data:x:33:
+backup:x:34:
+operator:x:37:
+list:x:38:
+irc:x:39:
+src:x:40:
+shadow:x:42:
+utmp:x:43:
+video:x:44:
+sasl:x:45:
+plugdev:x:46:rt
+staff:x:50:
+games:x:60:
+users:x:100:rt
+nogroup:x:65534:
+systemd-journal:x:999:
+systemd-network:x:998:
+crontab:x:997:
+dhcpcd:x:996:
+messagebus:x:995:
+syslog:x:101:
+input:x:994:
+sgx:x:993:
+clock:x:992:
+kvm:x:991:
+render:x:990:
+systemd-resolve:x:989:
+_chrony:x:988:
+_ssh:x:102:
+scanner:x:103:
+tss:x:987:
+ssl-cert:x:104:
+uuidd:x:105:
+systemd-oom:x:986:
+netdev:x:106:
+bluetooth:x:985:
+rdma:x:107:
+tcpdump:x:983:
+lpadmin:x:111:rt
+fwupd-refresh:x:982:
+geoclue:x:113:
+pipewire:x:981:
+gnome-remote-desktop:x:980:
+polkitd:x:979:
+gnome-initial-setup:x:976:
+lxd:x:114:rt
+rt:x:1000:
+gamemode:x:974:
+
+== managed trees ==
+-- /etc/systemd/system
+lrwxrwxrwx root:root /etc/systemd/system/chronyd.service -> /usr/lib/systemd/system/chrony.service
+lrwxrwxrwx root:root /etc/systemd/system/dbus-fi.w1.wpa_supplicant1.service -> /usr/lib/systemd/system/wpa_supplicant.service
+lrwxrwxrwx root:root /etc/systemd/system/dbus-org.freedesktop.nm-dispatcher.service -> /usr/lib/systemd/system/NetworkManager-dispatcher.service
+lrwxrwxrwx root:root /etc/systemd/system/dbus-org.freedesktop.oom1.service -> /usr/lib/systemd/system/systemd-oomd.service
+lrwxrwxrwx root:root /etc/systemd/system/dbus-org.freedesktop.resolve1.service -> /usr/lib/systemd/system/systemd-resolved.service
+lrwxrwxrwx root:root /etc/systemd/system/default.target -> /usr/lib/systemd/system/multi-user.target
+lrwxrwxrwx root:root /etc/systemd/system/emergency.target.wants/grub-initrd-fallback.service -> /usr/lib/systemd/system/grub-initrd-fallback.service
+lrwxrwxrwx root:root /etc/systemd/system/getty.target.wants/getty@tty1.service -> /usr/lib/systemd/system/getty@.service
+lrwxrwxrwx root:root /etc/systemd/system/hibernate.target.wants/grub2-common.service -> /usr/lib/systemd/system/grub2-common.service
+lrwxrwxrwx root:root /etc/systemd/system/hybrid-sleep.target.wants/grub2-common.service -> /usr/lib/systemd/system/grub2-common.service
+lrwxrwxrwx root:root /etc/systemd/system/multi-user.target.wants/NetworkManager.service -> /usr/lib/systemd/system/NetworkManager.service
+lrwxrwxrwx root:root /etc/systemd/system/multi-user.target.wants/anacron.service -> /usr/lib/systemd/system/anacron.service
+lrwxrwxrwx root:root /etc/systemd/system/multi-user.target.wants/chrony.service -> /usr/lib/systemd/system/chrony.service
+lrwxrwxrwx root:root /etc/systemd/system/multi-user.target.wants/console-setup.service -> /usr/lib/systemd/system/console-setup.service
+lrwxrwxrwx root:root /etc/systemd/system/multi-user.target.wants/cron.service -> /usr/lib/systemd/system/cron.service
+lrwxrwxrwx root:root /etc/systemd/system/multi-user.target.wants/dmesg.service -> /usr/lib/systemd/system/dmesg.service
+lrwxrwxrwx root:root /etc/systemd/system/multi-user.target.wants/e2scrub_reap.service -> /lib/systemd/system/e2scrub_reap.service
+lrwxrwxrwx root:root /etc/systemd/system/multi-user.target.wants/grub-initrd-fallback.service -> /usr/lib/systemd/system/grub-initrd-fallback.service
+lrwxrwxrwx root:root /etc/systemd/system/multi-user.target.wants/grub2-common.service -> /usr/lib/systemd/system/grub2-common.service
+lrwxrwxrwx root:root /etc/systemd/system/multi-user.target.wants/networkd-dispatcher.service -> /usr/lib/systemd/system/networkd-dispatcher.service
+lrwxrwxrwx root:root /etc/systemd/system/multi-user.target.wants/remote-fs.target -> /usr/lib/systemd/system/remote-fs.target
+lrwxrwxrwx root:root /etc/systemd/system/multi-user.target.wants/rsyslog.service -> /usr/lib/systemd/system/rsyslog.service
+lrwxrwxrwx root:root /etc/systemd/system/multi-user.target.wants/secureboot-db.service -> /usr/lib/systemd/system/secureboot-db.service
+lrwxrwxrwx root:root /etc/systemd/system/multi-user.target.wants/ssl-cert.service -> /usr/lib/systemd/system/ssl-cert.service
+lrwxrwxrwx root:root /etc/systemd/system/multi-user.target.wants/systemd-oomd.service -> /usr/lib/systemd/system/systemd-oomd.service
+lrwxrwxrwx root:root /etc/systemd/system/multi-user.target.wants/ua-reboot-cmds.service -> /usr/lib/systemd/system/ua-reboot-cmds.service
+lrwxrwxrwx root:root /etc/systemd/system/multi-user.target.wants/ufw.service -> /usr/lib/systemd/system/ufw.service
+lrwxrwxrwx root:root /etc/systemd/system/multi-user.target.wants/unattended-upgrades.service -> /usr/lib/systemd/system/unattended-upgrades.service
+lrwxrwxrwx root:root /etc/systemd/system/multi-user.target.wants/wpa_supplicant.service -> /usr/lib/systemd/system/wpa_supplicant.service
+lrwxrwxrwx root:root /etc/systemd/system/paths.target.wants/tpm-udev.path -> /usr/lib/systemd/system/tpm-udev.path
+lrwxrwxrwx root:root /etc/systemd/system/rescue.target.wants/grub-initrd-fallback.service -> /usr/lib/systemd/system/grub-initrd-fallback.service
+lrwxrwxrwx root:root /etc/systemd/system/sleep.target.wants/grub-initrd-fallback.service -> /usr/lib/systemd/system/grub-initrd-fallback.service
+lrwxrwxrwx root:root /etc/systemd/system/sockets.target.wants/polkit-agent-helper.socket -> /usr/lib/systemd/system/polkit-agent-helper.socket
+lrwxrwxrwx root:root /etc/systemd/system/sockets.target.wants/ssh.socket -> /usr/lib/systemd/system/ssh.socket
+lrwxrwxrwx root:root /etc/systemd/system/sockets.target.wants/systemd-oomd.socket -> /usr/lib/systemd/system/systemd-oomd.socket
+lrwxrwxrwx root:root /etc/systemd/system/sockets.target.wants/systemd-resolved-monitor.socket -> /usr/lib/systemd/system/systemd-resolved-monitor.socket
+lrwxrwxrwx root:root /etc/systemd/system/sockets.target.wants/systemd-resolved-varlink.socket -> /usr/lib/systemd/system/systemd-resolved-varlink.socket
+lrwxrwxrwx root:root /etc/systemd/system/sockets.target.wants/uuidd.socket -> /usr/lib/systemd/system/uuidd.socket
+lrwxrwxrwx root:root /etc/systemd/system/ssh.service.requires/ssh.socket -> /usr/lib/systemd/system/ssh.socket
+lrwxrwxrwx root:root /etc/systemd/system/ssh.service.wants/sshd-keygen.service -> /usr/lib/systemd/system/sshd-keygen.service
+lrwxrwxrwx root:root /etc/systemd/system/ssh.socket.wants/sshd-keygen.service -> /usr/lib/systemd/system/sshd-keygen.service
+lrwxrwxrwx root:root /etc/systemd/system/sshd.service.wants/sshd-keygen.service -> /usr/lib/systemd/system/sshd-keygen.service
+lrwxrwxrwx root:root /etc/systemd/system/sshd@.service.wants/sshd-keygen.service -> /usr/lib/systemd/system/sshd-keygen.service
+lrwxrwxrwx root:root /etc/systemd/system/suspend-then-hibernate.target.wants/grub2-common.service -> /usr/lib/systemd/system/grub2-common.service
+lrwxrwxrwx root:root /etc/systemd/system/suspend.target.wants/grub2-common.service -> /usr/lib/systemd/system/grub2-common.service
+lrwxrwxrwx root:root /etc/systemd/system/sysinit.target.wants/apparmor.service -> /usr/lib/systemd/system/apparmor.service
+lrwxrwxrwx root:root /etc/systemd/system/sysinit.target.wants/keyboard-setup.service -> /usr/lib/systemd/system/keyboard-setup.service
+lrwxrwxrwx root:root /etc/systemd/system/sysinit.target.wants/netplan-configure.service -> /usr/lib/systemd/system/netplan-configure.service
+lrwxrwxrwx root:root /etc/systemd/system/sysinit.target.wants/setvtrgb.service -> /usr/lib/systemd/system/setvtrgb.service
+lrwxrwxrwx root:root /etc/systemd/system/sysinit.target.wants/systemd-pstore.service -> /usr/lib/systemd/system/systemd-pstore.service
+lrwxrwxrwx root:root /etc/systemd/system/sysinit.target.wants/systemd-resolved.service -> /usr/lib/systemd/system/systemd-resolved.service
+lrwxrwxrwx root:root /etc/systemd/system/syslog.service -> /usr/lib/systemd/system/rsyslog.service
+lrwxrwxrwx root:root /etc/systemd/system/timers.target.wants/anacron.timer -> /usr/lib/systemd/system/anacron.timer
+lrwxrwxrwx root:root /etc/systemd/system/timers.target.wants/apt-daily-upgrade.timer -> /usr/lib/systemd/system/apt-daily-upgrade.timer
+lrwxrwxrwx root:root /etc/systemd/system/timers.target.wants/apt-daily.timer -> /usr/lib/systemd/system/apt-daily.timer
+lrwxrwxrwx root:root /etc/systemd/system/timers.target.wants/dpkg-db-backup.timer -> /lib/systemd/system/dpkg-db-backup.timer
+lrwxrwxrwx root:root /etc/systemd/system/timers.target.wants/e2scrub_all.timer -> /lib/systemd/system/e2scrub_all.timer
+lrwxrwxrwx root:root /etc/systemd/system/timers.target.wants/fstrim.timer -> /lib/systemd/system/fstrim.timer
+lrwxrwxrwx root:root /etc/systemd/system/timers.target.wants/logrotate.timer -> /usr/lib/systemd/system/logrotate.timer
+lrwxrwxrwx root:root /etc/systemd/system/timers.target.wants/man-db.timer -> /usr/lib/systemd/system/man-db.timer
+lrwxrwxrwx root:root /etc/systemd/system/timers.target.wants/motd-news.timer -> /lib/systemd/system/motd-news.timer
+lrwxrwxrwx root:root /etc/systemd/system/timers.target.wants/ua-timer.timer -> /usr/lib/systemd/system/ua-timer.timer
+-- /etc/sysctl.d
+-rw-r--r-- root:root /etc/sysctl.d/README.sysctl -> 
+-- /etc/security/limits.d
+-rw-r--r-- root:root /etc/security/limits.d/10-coredump-debian.conf -> 
+-- /etc/logrotate.d
+-rw-r--r-- root:root /etc/logrotate.d/alternatives -> 
+-rw-r--r-- root:root /etc/logrotate.d/apt -> 
+-rw-r--r-- root:root /etc/logrotate.d/bootlog -> 
+-rw-r--r-- root:root /etc/logrotate.d/btmp -> 
+-rw-r--r-- root:root /etc/logrotate.d/chrony -> 
+-rw-r--r-- root:root /etc/logrotate.d/dpkg -> 
+-rw-r--r-- root:root /etc/logrotate.d/dracut-core -> 
+-rw-r--r-- root:root /etc/logrotate.d/rsyslog -> 
+-rw-r--r-- root:root /etc/logrotate.d/ubuntu-pro-client -> 
+-rw-r--r-- root:root /etc/logrotate.d/ufw -> 
+-rw-r--r-- root:root /etc/logrotate.d/unattended-upgrades -> 
+-rw-r--r-- root:root /etc/logrotate.d/wtmp -> 
+-- /etc/default
+-rw-r--r-- root:root /etc/default/amd64-microcode -> 
+-rw-r--r-- root:root /etc/default/anacron -> 
+-rw-r--r-- root:root /etc/default/chrony -> 
+-rw-r--r-- root:root /etc/default/console-setup -> 
+-rw-r--r-- root:root /etc/default/cron -> 
+-rw-r--r-- root:root /etc/default/dbus -> 
+-rw-r--r-- root:root /etc/default/grub -> 
+-rw-r--r-- root:root /etc/default/intel-microcode -> 
+-rw-r--r-- root:root /etc/default/keyboard -> 
+-rw-r--r-- root:root /etc/default/networkd-dispatcher -> 
+-rw-r--r-- root:root /etc/default/rsync -> 
+-rw-r--r-- root:root /etc/default/ssh -> 
+-rw-r--r-- root:root /etc/default/ufw -> 
+-rw-r--r-- root:root /etc/default/useradd -> 
+lrwxrwxrwx root:root /etc/default/locale -> ../locale.conf
+-- /usr/local/bin
+
+== file digests of /etc ==
+d41d8cd98f00b204e9800998ecf8427e  /etc/.pwd.lock
+b57d0d1b625a76843abd29edd85d79c0  /etc/.resolv.conf.systemd-resolved.bak
+54a28746a50990b196dea2631f8d1d3c  /etc/.updated
+ff117aea5e8fc25e075df0f18a5f7b45  /etc/NetworkManager/NetworkManager.conf
+07590947643cfa18d31ffbd1dfa016c5  /etc/NetworkManager/conf.d/default-wifi-powersave-on.conf
+71da11578968301072133d233e91cd1e  /etc/PackageKit/PackageKit.conf
+ea3d03c3310b5470d0273659815c312d  /etc/PackageKit/Vendor.conf
+f6981d4e731bf85ccf27b93e96893d2d  /etc/adduser.conf
+7be88b21f7e386c8d5a8790c2461c92b  /etc/alternatives/README
+a0bdb9b564df8f10d9f7f8fd7637d7be  /etc/anacrontab
+69c620b00306aa88615c83268d4a1c32  /etc/apparmor.d/1password
+cdabc489ab515d8c20a5405a3ef2d87b  /etc/apparmor.d/Discord
+3294f3cf480067adf413126236c32a4a  /etc/apparmor.d/MongoDB_Compass
+51295e6ba0330e27d12c4d5d157b67f1  /etc/apparmor.d/QtWebEngineProcess
+6c60b4a563ef6f46c1c3045bb2245d34  /etc/apparmor.d/Xorg
+f97e410509c5def279aa227c7de12e06  /etc/apparmor.d/abi/3.0
+f17b0a97806d733b5b884d8a1c2fea37  /etc/apparmor.d/abi/4.0
+0b55364ce25416a533e704746d1da6ca  /etc/apparmor.d/abi/4.0-ip
+dfe4bbc44b1e3ae6205b6cbcb6762d87  /etc/apparmor.d/abi/5.0
+d609462480436fcf18bb10283b8e481b  /etc/apparmor.d/abi/5.0-interface
+57b68acd4e6418fe5a06dc8c04713e3d  /etc/apparmor.d/abi/kernel-5.4-outoftree-network
+77047e6f0b014fa8bf27681998382044  /etc/apparmor.d/abi/kernel-5.4-vanilla
+9fad25517695606d6118e4d225c56a3b  /etc/apparmor.d/abstractions/X
+5b0d7eaf7a4b9bb0eeb16a659c14a7b6  /etc/apparmor.d/abstractions/alts
+ae70a0e9762158ceef247fbdf3ae2505  /etc/apparmor.d/abstractions/apache2-common
+52588d5c32279e2be3a083f5666c38d0  /etc/apparmor.d/abstractions/apparmor_api/change_profile
+57ae4be6fe34044e6f728d100758270d  /etc/apparmor.d/abstractions/apparmor_api/examine
+134b30f27cabdd42270a2f223aad0307  /etc/apparmor.d/abstractions/apparmor_api/find_mountpoint
+2988491fd56c573e711ae9353dd5e10e  /etc/apparmor.d/abstractions/apparmor_api/introspect
+27b506c0ba36dfe1a62da0a870d1f4b8  /etc/apparmor.d/abstractions/apparmor_api/is_enabled
+8456b11ca01ea3fbff62a8540b0c817d  /etc/apparmor.d/abstractions/aspell
+e5a761459204066452a2dd162dbe3b60  /etc/apparmor.d/abstractions/audio
+dee90fac8e71d8b32194b820ee116bed  /etc/apparmor.d/abstractions/authd
+23dab32cbac4ab7d9c1373594adc20a5  /etc/apparmor.d/abstractions/authentication
+5e442868d6791e6def911e82a60e1069  /etc/apparmor.d/abstractions/base
+1eb60baefe4efb03d8d01a3824c22395  /etc/apparmor.d/abstractions/bash
+5026d5e2a613da73c5fb38be1ba15308  /etc/apparmor.d/abstractions/consoles
+04e2f6c06719115c9258562d0ce3f04e  /etc/apparmor.d/abstractions/crypto
+aa0a871e8dfe096315091fd143db451d  /etc/apparmor.d/abstractions/cups-client
+76001c870c7bd7b486e10668b4b45d70  /etc/apparmor.d/abstractions/dbus
+278c5dec8c1904ebc88c02e144d069ce  /etc/apparmor.d/abstractions/dbus-accessibility
+85e4c057a435b8a6040d072dfb099d75  /etc/apparmor.d/abstractions/dbus-accessibility-strict
+64a2622a224fc00f4bcd591f6dc27615  /etc/apparmor.d/abstractions/dbus-network-manager-strict
+27a4d8b996cfdf5e33c6a6fcd95f746c  /etc/apparmor.d/abstractions/dbus-session
+86230b21834290eae982ca555982c4bd  /etc/apparmor.d/abstractions/dbus-session-strict
+4736a09e8af88771dce426a3bce7afef  /etc/apparmor.d/abstractions/dbus-strict
+bd2a0db38f5ca6fb31666cb43751f074  /etc/apparmor.d/abstractions/dconf
+6dcc9a141b8110d60ee61fc54247363b  /etc/apparmor.d/abstractions/devices-usb
+6b125e95f274d32eb6ece240afa6a1f0  /etc/apparmor.d/abstractions/devices-usb-read
+0f4dab14c37dd93f6955a02e3bd25649  /etc/apparmor.d/abstractions/dovecot-common
+6204c8b2a084dc0c55f676320e563860  /etc/apparmor.d/abstractions/dri-common
+f0f309c37d3cd8f949ae0311c35d0b92  /etc/apparmor.d/abstractions/dri-enumerate
+fe98c2cad9a19a50517532cfc93fccd0  /etc/apparmor.d/abstractions/enchant
+32d9355566977f87ce142d1645a51818  /etc/apparmor.d/abstractions/exo-open
+46e6ffbdd3ed0fbbb96f3bbae4c72ea9  /etc/apparmor.d/abstractions/fcitx
+37b87647d44f4334f54c056c22fa16a0  /etc/apparmor.d/abstractions/fcitx-strict
+49522b8b9f504489bad8bd08f1238354  /etc/apparmor.d/abstractions/fonts
+32dfc74b32aa70de454356c77bb41df6  /etc/apparmor.d/abstractions/freedesktop.org
+7ef966dc1cd72dc511ac5957ec81e497  /etc/apparmor.d/abstractions/frr
+f5c2bd9a2f5b0173514846f62694eb21  /etc/apparmor.d/abstractions/frr-snmp
+232381e37c6c558a5ab3c015a7e19ee5  /etc/apparmor.d/abstractions/gio-open
+465573e321172d0efda25f5b35eee3ef  /etc/apparmor.d/abstractions/glycin
+ae53984f570f5b6e654a234e97fc2285  /etc/apparmor.d/abstractions/gnome
+5aab7100c99c47557f986ed2e4cd68b5  /etc/apparmor.d/abstractions/gnupg
+17a8408d79efc256b5a3df31987fbd61  /etc/apparmor.d/abstractions/golang
+d6c5c58cb8658ed168952f5178db472c  /etc/apparmor.d/abstractions/groff
+d581a73b9ccfa39b2679aff6b79f136d  /etc/apparmor.d/abstractions/gtk
+093ca354a96b69e7dc9985de5840b33b  /etc/apparmor.d/abstractions/gvfs-open
+5b852b21a9a1233268c3dd290a3fa473  /etc/apparmor.d/abstractions/hosts_access
+86645c13daf8655bc83beaa554743692  /etc/apparmor.d/abstractions/ibus
+37b010e049e7d652217aa8ea411cfa32  /etc/apparmor.d/abstractions/kde
+dcbd4273d0e2b640aa8a9586b9250a4a  /etc/apparmor.d/abstractions/kde-globals-write
+5a777904139819b05afdb3d9b77e54e6  /etc/apparmor.d/abstractions/kde-icon-cache-write
+b87abaae3feda5e5895289a19f2b285b  /etc/apparmor.d/abstractions/kde-language-write
+68293e2827c2a1d29662f3c05bf4642c  /etc/apparmor.d/abstractions/kde-open5
+6ce98a673f27cd30642c4ac984802e87  /etc/apparmor.d/abstractions/kerberosclient
+979db6fe01b9548cbb22abb515c3548c  /etc/apparmor.d/abstractions/ldapclient
+08632ba03e4e1dbab969049f22b81616  /etc/apparmor.d/abstractions/libnuma
+2ce17440573bc5b3058e4637c42f294f  /etc/apparmor.d/abstractions/libpam-systemd
+e9027efc6e727e5f1812bda3e4ad76e4  /etc/apparmor.d/abstractions/likewise
+32e67fbf390d5226e01c7912a3e48cbc  /etc/apparmor.d/abstractions/mdns
+91d6d82de1937bd52218334184fa4131  /etc/apparmor.d/abstractions/mesa
+4d56f2708c0456b3f3613332fc93b068  /etc/apparmor.d/abstractions/mir
+51091b62402331cf52ea279d5e746b85  /etc/apparmor.d/abstractions/mozc
+154b8ad78943c5e06f6c5e421a280c57  /etc/apparmor.d/abstractions/mysql
+0f08126480e26b43457f0e1a448d6e82  /etc/apparmor.d/abstractions/nameservice
+a132207e834b9f5beb8ee7c6c0313806  /etc/apparmor.d/abstractions/nameservice-strict
+f4aaaf9d8a93287e8bb80ff0a0c96161  /etc/apparmor.d/abstractions/nis
+52621258c98ff0322268b9552c8012a8  /etc/apparmor.d/abstractions/nss-systemd
+6f56836bf93e114a3de2488a975fc56c  /etc/apparmor.d/abstractions/nvidia
+f7cef29ea0a00543d3db2d96a83e8763  /etc/apparmor.d/abstractions/opencl
+9c6aca11ff0749487f8ca259aa5591d6  /etc/apparmor.d/abstractions/opencl-common
+fb3555de3c3a9134a4f78a7afadb4080  /etc/apparmor.d/abstractions/opencl-intel
+dfcf79c7802a49b7537f77335d9f7f50  /etc/apparmor.d/abstractions/opencl-mesa
+99e84db91e2036a1dbac3d22b3bb680d  /etc/apparmor.d/abstractions/opencl-nvidia
+53de3e1addc46da05e417d94aed61f00  /etc/apparmor.d/abstractions/opencl-pocl
+b0bb21d3074235c19610b1efc939bff3  /etc/apparmor.d/abstractions/opengl
+0e3c9fa48f87a411e09092c0e8ee121a  /etc/apparmor.d/abstractions/openssl
+8201fd67a3e31f93d4fc01e2212c5bbc  /etc/apparmor.d/abstractions/orbit2
+22759504f241ecbf354829f9bedef83c  /etc/apparmor.d/abstractions/p11-kit
+7634988ea264825e13b925b26b473c76  /etc/apparmor.d/abstractions/perl
+4a526f89d8187f15aed8f1432c5c514c  /etc/apparmor.d/abstractions/php
+18417856895b5dfc94fa250e8fee52e6  /etc/apparmor.d/abstractions/php-worker
+98db0e932fef551cf10d1f1e9c0d7d84  /etc/apparmor.d/abstractions/php5
+b32ee318cd50895ef250a5d4d1f84ba6  /etc/apparmor.d/abstractions/postfix-common
+4054e407adda744de0ac03a507082e00  /etc/apparmor.d/abstractions/private-files
+c635fdf0a08a78f46ca4e85224e158e9  /etc/apparmor.d/abstractions/private-files-strict
+61b138c78b0620fb3746c8561c6c58fb  /etc/apparmor.d/abstractions/psi-read
+7eecc757cf3d1e69dfee0e6a17b67700  /etc/apparmor.d/abstractions/psi-read-poll
+5b1a4e4fb137ed8463b1ec55ccf5b8d8  /etc/apparmor.d/abstractions/python
+fd21339ac69ef4107824c9d8fb8fb9fe  /etc/apparmor.d/abstractions/qt5
+3a04c25dce73c21214d9cd1c157b8ebf  /etc/apparmor.d/abstractions/qt5-compose-cache-write
+363ceef1f2c421d597cec0d62f108922  /etc/apparmor.d/abstractions/qt5-settings-write
+c517b992edca91d053cb4cc4a138bbe8  /etc/apparmor.d/abstractions/qt6
+8519edf65fad2bc8e50362955ca08d98  /etc/apparmor.d/abstractions/qt6-compose-cache-write
+0b3054504c78dfb05476bad2851ae259  /etc/apparmor.d/abstractions/qt6-settings-write
+1de7d4513bb143bf9eb1cd69e10d5228  /etc/apparmor.d/abstractions/recent-documents-write
+c1d5dfdb02eb7cd81b43de9cb1b2a965  /etc/apparmor.d/abstractions/ruby
+fc8668cafc14ba943bd274bcd8bb7c9f  /etc/apparmor.d/abstractions/samba
+81ededf1de24cb7a31edafc884091cb2  /etc/apparmor.d/abstractions/samba-rpcd
+6fa4bc3e391b1c139e7ade485b537244  /etc/apparmor.d/abstractions/smbpass
+d3c67d15d89ae196864667437644f514  /etc/apparmor.d/abstractions/snap_browsers
+da91913cd3204e5b51e65cce0f451a14  /etc/apparmor.d/abstractions/ssl_certs
+4f70c3453a8acdd478f8480e1e060e65  /etc/apparmor.d/abstractions/ssl_keys
+08292e0b420a57038be2bf11273e5e36  /etc/apparmor.d/abstractions/svn-repositories
+19be85a00f2624c473eda5d7e3cd601c  /etc/apparmor.d/abstractions/terminfo
+ab0cfcab4426ce93b8ffa9d7189030b6  /etc/apparmor.d/abstractions/transmission-common
+49b50288bd463f2a47b253d131a5193e  /etc/apparmor.d/abstractions/trash
+517a6d3c9464086dc804dd940e2ae3a3  /etc/apparmor.d/abstractions/ubuntu-bittorrent-clients
+fecf8c7004b5e48ad75c7cbc80aa65ec  /etc/apparmor.d/abstractions/ubuntu-browsers
+b3ca7f5f58a60ef7c7e61022c83594c4  /etc/apparmor.d/abstractions/ubuntu-browsers.d/chromium-browser
+deb4e82a8826973ecc4cf6ae02be73f4  /etc/apparmor.d/abstractions/ubuntu-browsers.d/java
+e2be567c42018471dd819cdb991c6db7  /etc/apparmor.d/abstractions/ubuntu-browsers.d/kde
+1b8c23de1a94b825d4980778d5dba847  /etc/apparmor.d/abstractions/ubuntu-browsers.d/mailto
+6cc914ccc3b9ebfad5a08d8ea140f1df  /etc/apparmor.d/abstractions/ubuntu-browsers.d/multimedia
+7b1cc685cd454781fa15a2ff9cc38945  /etc/apparmor.d/abstractions/ubuntu-browsers.d/plugins-common
+97553f193a1f2bdb7a9a30928c2cd5d3  /etc/apparmor.d/abstractions/ubuntu-browsers.d/productivity
+75835205928dd68fc436b637f1bd5dd7  /etc/apparmor.d/abstractions/ubuntu-browsers.d/text-editors
+214990b686530bb9204929ce264c7eb4  /etc/apparmor.d/abstractions/ubuntu-browsers.d/ubuntu-integration
+6721ff97c4f7bea6a19ffa68b12bfa10  /etc/apparmor.d/abstractions/ubuntu-browsers.d/ubuntu-integration-xul
+52769e81ce81f1b3c004e7da08cca35f  /etc/apparmor.d/abstractions/ubuntu-browsers.d/user-files
+9421f62d482ecb82dfec89fc9fc4f43f  /etc/apparmor.d/abstractions/ubuntu-console-browsers
+b1385a35379490a76cc0393f7826d907  /etc/apparmor.d/abstractions/ubuntu-console-email
+1c5746b824dd64416ae0dbb4935812c4  /etc/apparmor.d/abstractions/ubuntu-email
+f9d1baf04e9532b4d8a33bc88959da2c  /etc/apparmor.d/abstractions/ubuntu-feed-readers
+c4bd1593846280307b5269b05e4446fb  /etc/apparmor.d/abstractions/ubuntu-gnome-terminal
+f7e2cf5b995cd3fe42c16935fcf89ca0  /etc/apparmor.d/abstractions/ubuntu-helpers
+f03e8e8fd3640223f0d3064a38ac7aff  /etc/apparmor.d/abstractions/ubuntu-konsole
+d9a56c15061792fc7693ec58d4bab7a1  /etc/apparmor.d/abstractions/ubuntu-media-players
+2d577f40a4238ab76b9933799348e97e  /etc/apparmor.d/abstractions/ubuntu-unity7-base
+72b931bba0faee87d60a9288a677a1dd  /etc/apparmor.d/abstractions/ubuntu-unity7-launcher
+652d2be41d0429d4dc696f7257688f86  /etc/apparmor.d/abstractions/ubuntu-unity7-messaging
+0dfbc725e41e2ca6946abd5a6c200d58  /etc/apparmor.d/abstractions/ubuntu-xterm
+140c4ad3e4bf3be5968e53d028a5b0cc  /etc/apparmor.d/abstractions/user-download
+a09b3b21b5443a826d27730d6756f90e  /etc/apparmor.d/abstractions/user-mail
+3b2f3077ad39d82b7642fd98cc9bb00a  /etc/apparmor.d/abstractions/user-manpages
+d3c823caabda793149206f5f0d0be79a  /etc/apparmor.d/abstractions/user-tmp
+47e25ce65c3c36e6902a57c3395440b8  /etc/apparmor.d/abstractions/user-write
+7da7b1ff52efaf34d4acda1b7436a5c7  /etc/apparmor.d/abstractions/video
+c5e266b02c863a5a9b8c2f16b18e0939  /etc/apparmor.d/abstractions/vulkan
+c522f829bbcc566f7e91dccfd2162b90  /etc/apparmor.d/abstractions/wayland
+6274032fbefe9d42d45a883e3d0f3ac4  /etc/apparmor.d/abstractions/web-data
+9e93d3ca2b67a1779791acba6eb991a5  /etc/apparmor.d/abstractions/winbind
+36768209e34f68b3415b2e6790c54d7a  /etc/apparmor.d/abstractions/wutmp
+af98837168f13c4a2f6727bb76af16b4  /etc/apparmor.d/abstractions/xad
+f6b13b8aebef96b740e8241234c738e5  /etc/apparmor.d/abstractions/xdg-desktop
+cc3572edc84cf09ffb9c6566b77024de  /etc/apparmor.d/abstractions/xdg-open
+46c60e4d5e7cdfb4f933a1fbdef67bc1  /etc/apparmor.d/alsamixer
+f9655e2defd6c42f94abd796469a07fa  /etc/apparmor.d/babeld
+88ca06a54d534d8fd61b5655624568df  /etc/apparmor.d/balena-etcher
+981508bfcd19b8315d446730c4601609  /etc/apparmor.d/bfdd
+1fe4dd0833c63256e7fa63d2b74c668b  /etc/apparmor.d/bgpd
+eea663f5ba95b9a66bd03588af6e0ca7  /etc/apparmor.d/brave
+3eb60dafe0570c12b60a3c9a702a2322  /etc/apparmor.d/buildah
+40739332458cc5ee6ae5dd0893d2d675  /etc/apparmor.d/bwrap-userns-restrict
+ca82b5992fb3d7cc421daa17c646ad5a  /etc/apparmor.d/cam
+b0a8c2f90f00f9993687527c9348fdad  /etc/apparmor.d/ch-checkns
+946ae86f0e172403f4cb39f68cb26adc  /etc/apparmor.d/ch-run
+6481dadcb40148a403f171a9b19291b8  /etc/apparmor.d/chrome
+5fc668141a0d390ed2e186809e98eacd  /etc/apparmor.d/chromium
+d44da0da85d5589a70633a46fc7e6ad8  /etc/apparmor.d/code
+09607ac77b7f1d85e8bb146f7f42c896  /etc/apparmor.d/crun
+63a60cb52a0d9417ad490ce0002a1b90  /etc/apparmor.d/devhelp
+5b762d7a06ad6e8fc76cd64dc119e0fa  /etc/apparmor.d/dig
+67dd60433641ab67737b380a202e32a1  /etc/apparmor.d/dnstracer
+6fb2096dcf7d9fbb7db4af82ecefde8d  /etc/apparmor.d/eigrpd
+06fee9c51f3b6ef812147de4ace17997  /etc/apparmor.d/element-desktop
+2cf5ba305635c27672cf49aba3e27000  /etc/apparmor.d/epiphany
+9a6c3c29cd8d4d5f0c90cc0ac450fba5  /etc/apparmor.d/evolution
+2ce341de6bb96de9ad9dd827c8290738  /etc/apparmor.d/fabricd
+d6a58450f02a9044f447f95bc1486a93  /etc/apparmor.d/firefox
+30e67f0b0ee048e72bd70baeea528b94  /etc/apparmor.d/flatpak
+3a2e3a34ccc7a77b82632f8a97b55ad1  /etc/apparmor.d/foliate
+761276ba02484cfdb17efe636ef68049  /etc/apparmor.d/fusermount3
+31fb0f2190d7e548b0e231e2349a45b8  /etc/apparmor.d/geary
+7c1b6c6c9af673e95a1d228d955548a9  /etc/apparmor.d/github-desktop
+85b5deb9f237588c51b3a9066f86b739  /etc/apparmor.d/glycin.bwrap
+7051c137fabc090974e3080d5381a1d2  /etc/apparmor.d/glycin.loaders
+9ad8fe8b4a0d68899b8fb772fbf5d012  /etc/apparmor.d/goldendict
+72dca39ce9fe5a5a25b08aeabebd7536  /etc/apparmor.d/gs
+2070c707412815d3433acc7ce8a3512c  /etc/apparmor.d/hostname
+60ad7622df39c9de1fb15ec7926c826b  /etc/apparmor.d/iotop-c
+59fbe303a47e3533e0f4d33782dea830  /etc/apparmor.d/ipa_verify
+144cee011ef7f84702232184233f228d  /etc/apparmor.d/irssi
+cf65e6beb65b970842c7c906a8411eb4  /etc/apparmor.d/isisd
+74d34aeb7308fe63d67bbdadc0a751c3  /etc/apparmor.d/john
+beccd1f660c71872fd5791460a304084  /etc/apparmor.d/kchmviewer
+dc89b6ff38417c474306f9a13f18af38  /etc/apparmor.d/keybase
+ad388313b8f7f8e66b2731d2c264e7f6  /etc/apparmor.d/lc-compliance
+8a982f27967847e6bcbda2331c43c3ce  /etc/apparmor.d/ldpd
+5e35c24075bca8399995ad3677edafb3  /etc/apparmor.d/libcamerify
+e81134f99ced973d56ac9e91ed7f8715  /etc/apparmor.d/linux-boot-prober
+d00f107a33dc362ba57d000f8fc97a28  /etc/apparmor.d/linux-sandbox
+923c1a5a10be39abfc70c6146b6de4d4  /etc/apparmor.d/local/README
+d41d8cd98f00b204e9800998ecf8427e  /etc/apparmor.d/local/lsb_release
+d41d8cd98f00b204e9800998ecf8427e  /etc/apparmor.d/local/nvidia_modprobe
+d41d8cd98f00b204e9800998ecf8427e  /etc/apparmor.d/local/ubuntu_pro_apt_news
+d41d8cd98f00b204e9800998ecf8427e  /etc/apparmor.d/local/ubuntu_pro_esm_cache
+d41d8cd98f00b204e9800998ecf8427e  /etc/apparmor.d/local/usr.bin.man
+d41d8cd98f00b204e9800998ecf8427e  /etc/apparmor.d/local/usr.bin.tcpdump
+d41d8cd98f00b204e9800998ecf8427e  /etc/apparmor.d/local/usr.sbin.chronyd
+d41d8cd98f00b204e9800998ecf8427e  /etc/apparmor.d/local/usr.sbin.rsyslogd
+06a82f9510503ee5868ad27b3e09e96d  /etc/apparmor.d/locale
+3d710a9a706e1552f75c3939d738d59d  /etc/apparmor.d/loupe
+a390f29d2e333d4b580a1c950c2b26b5  /etc/apparmor.d/lsb_release
+b1befd2ffaf770ed05f56efd78b09f51  /etc/apparmor.d/lsblk
+59d0f6fb4443a9f98ae6175f767e1646  /etc/apparmor.d/lsusb
+73841bdbfcd0742c5d28d0af56169c8c  /etc/apparmor.d/lxc-attach
+1f4952bcd95bbb9a2fb92dfc699d34b5  /etc/apparmor.d/lxc-create
+af70663809b7f423d92062084c19a1c2  /etc/apparmor.d/lxc-destroy
+013fbf8b920ff89a59458a0be44f404e  /etc/apparmor.d/lxc-execute
+0e228fd65e9c770f819191196d02e570  /etc/apparmor.d/lxc-stop
+5dad156e91f0e5dd8fb48467ded5dbc2  /etc/apparmor.d/lxc-unshare
+5b822269db425b5132080e4a31700248  /etc/apparmor.d/lxc-usernsexec
+27e4b3e9f6a2ee23891532cde4250554  /etc/apparmor.d/mbsync
+5c39385c87d83eadd7b3765c9438f0f1  /etc/apparmor.d/mmdebstrap
+b94464a7c6dffdbdd6fb0e635c4b6a41  /etc/apparmor.d/mosquitto
+68da856130b3ead82d7b79a2fbc6feae  /etc/apparmor.d/msedge
+a4130e0dd347782ef4c537a3fa2761bc  /etc/apparmor.d/nc.openbsd
+ebc0710a146be0614e1fb047f140458b  /etc/apparmor.d/nhrpd
+30ea4f91a9aa3b60316c3c7d0b12d953  /etc/apparmor.d/notepadqq
+76c60f7c6e56059b912e8c198c0f8114  /etc/apparmor.d/notify-send
+160884350c43b5cd4a171264e9592d39  /etc/apparmor.d/nslookup
+7d519c1409e64f79a3e6ed64b5c02788  /etc/apparmor.d/nvidia_modprobe
+aa9ee78aa0adf81b574f54a9ae9e96b4  /etc/apparmor.d/obsidian
+2b03e210129627cfe1d8ec3b0641fade  /etc/apparmor.d/opam
+1e231cfd228626d4bab82c24a89167f4  /etc/apparmor.d/opera
+e7dcccd226f99cf8dbf055317a67c98f  /etc/apparmor.d/os-prober
+5926416a5ca062c5e01b25629275d250  /etc/apparmor.d/ospf6d
+b2770a512daa2b4796e635eec1f033f1  /etc/apparmor.d/ospfd
+ee06e8111d85338acce498947c9e0c6e  /etc/apparmor.d/pageedit
+340a746699fd674daa3b2c6a466aa0e5  /etc/apparmor.d/pathd
+a48b31b6e63f17b4b4697dcc9a2cea0c  /etc/apparmor.d/pbrd
+92be210566c57d15cc7426cc8aaf86d8  /etc/apparmor.d/pim6d
+95cf591214a0a3fbe6bc8bf981403d43  /etc/apparmor.d/pimd
+a4e662e20b280ba7f54d918019b56d86  /etc/apparmor.d/plasmashell
+ee63594be1590a1a80ad24463be3aec9  /etc/apparmor.d/podman
+0ec74c106cfd270fa42da214d7ee0d86  /etc/apparmor.d/polypane
+77a0b2f0df1c778a22e125b76a341022  /etc/apparmor.d/privacybrowser
+97cb9e09622fc568e1fa9bf33f8dcad3  /etc/apparmor.d/proftpd
+93d908cd514707bed14819d52792d3a7  /etc/apparmor.d/qcam
+8d80e69cb5a3f0c7048f8c9108aed78b  /etc/apparmor.d/qmapshack
+50d81366258dc68e9a0edc6276103a8e  /etc/apparmor.d/qpdf
+5b0beb540f3829d32abf9a15576d51d8  /etc/apparmor.d/qutebrowser
+1b4ba39a250acd0615e0bf72d0f75f72  /etc/apparmor.d/ripd
+d71100d114ca12ba4676edfb6534621e  /etc/apparmor.d/ripngd
+e23f4c85dc44852d8b5468a5c2289331  /etc/apparmor.d/rootlesskit
+41568121ce3037b3140e803a59cf07e9  /etc/apparmor.d/rpm
+3a03a891493283992f18991865331cbd  /etc/apparmor.d/rssguard
+85ad3bd22e3539dff283a25c3c4e118e  /etc/apparmor.d/rsyslog.d/README
+b68c0f1912676d4999ceef57446e44d3  /etc/apparmor.d/runc
+fc695dff7675ff9856d7cbacbdf9df35  /etc/apparmor.d/sbuild
+02aaed883d0ee909dfd4ec45dd1de1d8  /etc/apparmor.d/sbuild-abort
+cdd1af1f75aacf75d0dbed90827fa363  /etc/apparmor.d/sbuild-adduser
+b6a088519029d730cca41140cf0909a0  /etc/apparmor.d/sbuild-apt
+d0aa7b483567c31e6e8879ad4b3ea546  /etc/apparmor.d/sbuild-checkpackages
+f6d477c92052f2c2ea56b1a1500917c8  /etc/apparmor.d/sbuild-clean
+c69e46a8c494f0bce3c200adb1e9e76e  /etc/apparmor.d/sbuild-createchroot
+abc887d464b5a78f2fe89130cd673dcc  /etc/apparmor.d/sbuild-destroychroot
+2352668a250f562eafb5fe1224a07f31  /etc/apparmor.d/sbuild-distupgrade
+85bbc48bd42202a9bf2fcb1caec0d6c8  /etc/apparmor.d/sbuild-hold
+c6ddb265cf503cf9e56e97b2b9f6f015  /etc/apparmor.d/sbuild-shell
+1174e36187d89026c020ee554ac1a4df  /etc/apparmor.d/sbuild-unhold
+01d66cde7dcdcd47ea0d4569201d7d7b  /etc/apparmor.d/sbuild-update
+c39f32b864e159a8ff393da9535d07d1  /etc/apparmor.d/sbuild-upgrade
+068f738f4753ad1fe46fd8dd4ce0a9de  /etc/apparmor.d/scide
+50bdcd5bee9f9df82315c5e4b5318d98  /etc/apparmor.d/signal-desktop
+af659d93d0c79b2261040f0c69bc6492  /etc/apparmor.d/slack
+525b4bab9396fe2207895e01c03dc960  /etc/apparmor.d/slirp4netns
+6cdd134a8735f62813f73f2729719710  /etc/apparmor.d/ssh-keyscan
+3f0405e03ff235cfb30f12f69f947a41  /etc/apparmor.d/staticd
+26140862dae51dce3d9458fd20bbd19c  /etc/apparmor.d/steam
+cb066d74573201e18bb4e75c9bcd56c8  /etc/apparmor.d/stress-ng
+b4ca9412197b2d6f88c0247994a36962  /etc/apparmor.d/surfshark
+ab0aad78106a8163da0dacaaf87a9b69  /etc/apparmor.d/systemd-coredump
+9646c7b2e557dd6da606b96090dae6a8  /etc/apparmor.d/systemd-detect-virt
+0cdea142068c067896751fa8d02eff45  /etc/apparmor.d/thunderbird
+5cd7e2adf0dbf4eda51d6444e996c674  /etc/apparmor.d/tinyproxy
+1899fa12cfeaf6964908163c2a5cb931  /etc/apparmor.d/tnftp
+75f3b171a2adb5a3ef89cffc928c9aa7  /etc/apparmor.d/transmission
+291f813511c40cd3047f11bff8709e38  /etc/apparmor.d/trinity
+ce1bfd4566ecf1bc60ee07f43a3aa50e  /etc/apparmor.d/tshark
+3a4f5cae71b044f38c481adbe3642b33  /etc/apparmor.d/tunables/alias
+e2074b490a25348fe38bb14a67189b50  /etc/apparmor.d/tunables/apparmorfs
+0b29e9581f5a40d1c880b760ea83608f  /etc/apparmor.d/tunables/coreutils
+70360684ca88181d6a0ed3cb3aaa40a6  /etc/apparmor.d/tunables/dovecot
+eaa7eb0aed2f57f233df1534219add7b  /etc/apparmor.d/tunables/etc
+23c9f5119d5e800f62fb1a666fcacfb1  /etc/apparmor.d/tunables/global
+5cfd4508c6ea4d0a70a91cd75484ff6c  /etc/apparmor.d/tunables/gs
+18eda20e8b1a8d45955d582cd18dd621  /etc/apparmor.d/tunables/home
+3b274206fb06833ee3e151e351dad51b  /etc/apparmor.d/tunables/home.d/site.local
+2a88811f7b763daa96c20b20269294a4  /etc/apparmor.d/tunables/home.d/ubuntu
+1e1c274b547b8946eed0eff158300e03  /etc/apparmor.d/tunables/kernelvars
+580f535cd1df7ac32d04cac4974274cd  /etc/apparmor.d/tunables/multiarch
+3c9eef1fbfb41fc452060086262e7bcb  /etc/apparmor.d/tunables/multiarch.d/site.local
+5068d52fce811d302eb201bbc5bc5774  /etc/apparmor.d/tunables/print-devices
+2065e74ad990713ead4b32002acdc82c  /etc/apparmor.d/tunables/proc
+96ac843a343694802ade445fd351e43a  /etc/apparmor.d/tunables/run
+d173f90cdd425d22001992102fbef63d  /etc/apparmor.d/tunables/rygel
+94e4dd81e625ebb7e0ceb02fbd492612  /etc/apparmor.d/tunables/securityfs
+e11aafffd58011c5d832b98bc71372a7  /etc/apparmor.d/tunables/share
+30f2fdf4695c26642ea02b5a2063cfbc  /etc/apparmor.d/tunables/sys
+dd94eef017cf91d8ea1ff5891aecab24  /etc/apparmor.d/tunables/system
+7eeab5e5987a04857db2f367b07ab4bb  /etc/apparmor.d/tunables/xdg-user-dirs
+0f99088b1e657a6583a49a52ec95eb40  /etc/apparmor.d/tunables/xdg-user-dirs.d/site.local
+822dac42185d9d21108e13758f2eb512  /etc/apparmor.d/tup
+6551612f91990a125887c9cd1149fe8b  /etc/apparmor.d/tuxedo-control-center
+fc4246c45c221d8de8d878d444aeeb64  /etc/apparmor.d/ubuntu_pro_apt_news
+d0757a05277ea4cd44cb951e7d612837  /etc/apparmor.d/ubuntu_pro_esm_cache
+6e6f0484abaa14b5f57fe90a42af827e  /etc/apparmor.d/unix-chkpwd
+2c348f573054a4fdc251884c0ded2336  /etc/apparmor.d/unprivileged_userns
+3f8f47c07be05a9bdc24d1556080a068  /etc/apparmor.d/userbindmount
+4f614d75041882370498f7fe2d43a44b  /etc/apparmor.d/usr.bin.man
+e6c5b5c0c144de30d497c7843b69ad81  /etc/apparmor.d/usr.bin.tcpdump
+2ac29a3fee167417b1df51b3511bd365  /etc/apparmor.d/usr.sbin.chronyd
+d4f7b99701fa00f74a85a5293265b427  /etc/apparmor.d/usr.sbin.rsyslogd
+d554f765a31421660f923e4babbf55ee  /etc/apparmor.d/uwsgi-core
+3b86d9ee439accd974e048d78f7e3631  /etc/apparmor.d/vdens
+b20ebccf10f9638c963b2475b029b1a0  /etc/apparmor.d/virtiofsd
+a7d0698c5da3b1d99f318acbba8bcd83  /etc/apparmor.d/vivaldi-bin
+88b964ebc273e936346bf946d66d43a6  /etc/apparmor.d/vpnns
+faf422367b6cc5eb88fffe13ea9cf5bc  /etc/apparmor.d/vrrpd
+a675ad4a23810d664c3b4b8fd69946b9  /etc/apparmor.d/wg
+033f98aeb59e633af8da22e524791fa7  /etc/apparmor.d/wg-quick
+cebfeaecc7255a2f7ef3553b900641cc  /etc/apparmor.d/who
+ad55f6d1d436f8a807f8c9948052a280  /etc/apparmor.d/wike
+49ea39c4694078b7a8d85a299f60367f  /etc/apparmor.d/wpcom
+870792cbe225392fe3bb93451f787f5c  /etc/apparmor.d/znc
+80e056a8ea3fff9620ffd026acd7fca8  /etc/apparmor/parser.conf
+c69ce53f5f0755e5ac4441702e820505  /etc/apt/apt.conf.d/01-vendor-ubuntu
+879455db9b938ce287b23383629aedce  /etc/apt/apt.conf.d/01autoremove
+ed4125e83866ccfb557850b08042b4b1  /etc/apt/apt.conf.d/20apt-esm-hook.conf
+a1a81788ea475c754ae5425bde70049b  /etc/apt/apt.conf.d/20auto-upgrades
+eb11cbdff9df647d1897b6b80eaeb801  /etc/apt/apt.conf.d/20packagekit
+3d0030023f128b0e45ce298ae41e0304  /etc/apt/apt.conf.d/50unattended-upgrades
+8c8b30c0b2b25d29a14523d250febfad  /etc/apt/apt.conf.d/52setup-unattended
+7e9d09d5801a42b4926b736b8eeabb73  /etc/apt/apt.conf.d/70debconf
+e7d1f8e2f10debcfe5eae3bfdb8c412d  /etc/apt/auth.conf.d/90ubuntu-advantage
+7e0d0e65835c9eda745c4a6d81e996e3  /etc/apt/preferences.d.save/ubuntu-pro-esm-apps
+4932ac7913fff2dadd94b9e832f636c8  /etc/apt/preferences.d.save/ubuntu-pro-esm-infra
+7e0d0e65835c9eda745c4a6d81e996e3  /etc/apt/preferences.d/ubuntu-pro-esm-apps
+4932ac7913fff2dadd94b9e832f636c8  /etc/apt/preferences.d/ubuntu-pro-esm-infra
+6a5d758cc20d3d60d1bd4f859794036a  /etc/apt/sources.list
+7b469db59e3698fa55519a7ce61e3850  /etc/apt/sources.list.d/ubuntu-esm-apps.sources
+e9b0de701257f359ad8858387db44c47  /etc/apt/sources.list.d/ubuntu-esm-infra.sources
+1d753c7f411271d17204c76bde1d74a7  /etc/apt/sources.list.d/ubuntu.sources
+64f46c75c471f35181458b380f25bf3e  /etc/apt/trusted.gpg.d/ubuntu-keyring-2012-cdimage.gpg
+2b7f905f32154af2e1ff50033f643cc5  /etc/apt/trusted.gpg.d/ubuntu-keyring-2018-archive.gpg
+a2b7735b79750a503c4265166cab2f88  /etc/bash.bashrc
+a81b3f1cb197219b815942f4fc7fa94e  /etc/bash_completion
+3834d4b9bcbc9a8bdb847f1a6727ae7a  /etc/bash_completion.d/000_bash_completion_compat.bash
+4c09213317e4e3dd3c71d74404e503c5  /etc/bindresvport.blacklist
+428113e6663ba372be3b38dd1366ea0f  /etc/ca-certificates.conf
+69dabfafcceff8920c71d41b783eb532  /etc/chrony/chrony.conf
+f1b4d934b0b1264a9c65c03b83e5e665  /etc/chrony/chrony.keys
+3c8199dc2b9ac86e131f83bbaebdd698  /etc/chrony/conf.d/README
+08142d0acbde933ea2377412e6ba9a29  /etc/chrony/conf.d/ubuntu-nts.conf
+4a484ab4ecc5d9ca31ec0ecca3e22f90  /etc/chrony/nts-bootstrap-staging-ubuntu.crt
+bf2b249441f2185879532d01ebf22162  /etc/chrony/nts-bootstrap-ubuntu.crt
+8f69d2e0dca0a28c66b2759b09b282b0  /etc/chrony/sources.d/README
+dd955b5a90f4ff1cd49d6cc6ae6b9ef5  /etc/chrony/sources.d/ubuntu-ntp-pools.sources
+cb7577dffbcb4f80c688aa42bc03c706  /etc/console-setup/ISO-8859-1.acm
+62ce30910fa53ea62ceddd3cbc1b9ded  /etc/console-setup/Uni2-Fixed16.psf.gz
+dc6f9f5ab0b464963cc411116a9ac0ee  /etc/console-setup/cached_ISO-8859-1.acm.gz
+275e7a75b65fb567795788bcb8c20641  /etc/console-setup/cached_ISO-8859-1_del.kmap.gz
+e50419dde6949ca09457171faadde52b  /etc/console-setup/cached_UTF-8_del.kmap.gz
+62ce30910fa53ea62ceddd3cbc1b9ded  /etc/console-setup/cached_Uni2-Fixed16.psf.gz
+ce0ccca65b5f522253ee935d0d4bbc8f  /etc/console-setup/cached_setup_font.sh
+e86bc148c027c8b51cea747ac082f0fe  /etc/console-setup/cached_setup_keyboard.sh
+307e4be7cb54eeec72df44a8a235506c  /etc/console-setup/cached_setup_terminal.sh
+fef36b61fb8b1cacc151ad3db127f777  /etc/console-setup/compose.ARMSCII-8.inc
+fef88d8c8dd4c726498003fd3cd84a7f  /etc/console-setup/compose.CP1251.inc
+c972a2e90938657e97b643366b98b2ed  /etc/console-setup/compose.CP1255.inc
+5ea5e4d41da7a88f742863810e86144b  /etc/console-setup/compose.CP1256.inc
+b6d80f40abff7e8af236796ebaca0247  /etc/console-setup/compose.GEORGIAN-ACADEMY.inc
+cf45272b6bf35a22223b132600dc36c3  /etc/console-setup/compose.GEORGIAN-PS.inc
+a31102602f7e7cab9738022b6c5469ae  /etc/console-setup/compose.IBM1133.inc
+5ada7fbba750192f11fa238add232ba9  /etc/console-setup/compose.ISIRI-3342.inc
+f22c32b3b801b60434016c975b5fb66e  /etc/console-setup/compose.ISO-8859-1.inc
+e5fce59617c839b56574c9e323d34686  /etc/console-setup/compose.ISO-8859-10.inc
+ad2f3cc7ee64602a790bad8a2a989243  /etc/console-setup/compose.ISO-8859-11.inc
+abbb4fb36d084295075305e33195bd4a  /etc/console-setup/compose.ISO-8859-13.inc
+3a7519688a9cee5d5f90a5f74b854490  /etc/console-setup/compose.ISO-8859-14.inc
+6fd4b1ba84bb627815f6119440e84906  /etc/console-setup/compose.ISO-8859-15.inc
+8245c19b5262d8d23ca856587739eb20  /etc/console-setup/compose.ISO-8859-16.inc
+cd59fdcc7891012d905cdafd3704144a  /etc/console-setup/compose.ISO-8859-2.inc
+904839fe56359e4822667d241c131f3a  /etc/console-setup/compose.ISO-8859-3.inc
+414ddf28bfcc94a43191b134e264dfdd  /etc/console-setup/compose.ISO-8859-4.inc
+f861a4b0403490677e6d400f2d7129da  /etc/console-setup/compose.ISO-8859-5.inc
+41ea36ea1c1a1c0c9bebdf0016395e1f  /etc/console-setup/compose.ISO-8859-6.inc
+83ee498d8b5eba5ce8ba593b3036f832  /etc/console-setup/compose.ISO-8859-7.inc
+9cceaa9f3312f89aba371d3c893f4e7b  /etc/console-setup/compose.ISO-8859-8.inc
+2df0be84482af83b9d3e124e9ea37513  /etc/console-setup/compose.ISO-8859-9.inc
+b6a49ca842c8002b4e3de916f98d180e  /etc/console-setup/compose.KOI8-R.inc
+d59865b46fcb821935da42feb335c1c5  /etc/console-setup/compose.KOI8-U.inc
+31b73af83ef3993c128e2b983b9eaf89  /etc/console-setup/compose.TIS-620.inc
+edf0e2f7abd0de5184ba5c6d27939af6  /etc/console-setup/compose.VISCII.inc
+b72cfe32ffa93987f74c5cec9ac180fd  /etc/console-setup/remap.inc
+1fb3c13c4fcfa8cc4131aba905df559e  /etc/console-setup/vtrgb
+302837772c14006c7956211e184acfbd  /etc/console-setup/vtrgb.vga
+17cc95388fe1c6600f475fc1378bc204  /etc/cracklib/cracklib.conf
+e5e12910bf011222160404d7bdb824f2  /etc/cron.d/.placeholder
+7cc246509e5c0fabdebef1160ddc1b8e  /etc/cron.d/anacron
+244b6578e16a06d6fd61269241931284  /etc/cron.d/e2scrub_all
+e5e12910bf011222160404d7bdb824f2  /etc/cron.daily/.placeholder
+a46c5cc26a2a6715d0155781ddd07a19  /etc/cron.daily/0anacron
+1400ab07a4a2905b04c33e3e93d42b7b  /etc/cron.daily/apt-compat
+94bb6c1363245e46256908a5d52ba4fb  /etc/cron.daily/dpkg
+31da718265eaaa2fdabcfb2743bda171  /etc/cron.daily/logrotate
+62423d7fa68568c9c0aefceac182d9ea  /etc/cron.daily/man-db
+e5e12910bf011222160404d7bdb824f2  /etc/cron.hourly/.placeholder
+e5e12910bf011222160404d7bdb824f2  /etc/cron.monthly/.placeholder
+402ac7af3ebd2da5dddcd3712d776ae3  /etc/cron.monthly/0anacron
+e5e12910bf011222160404d7bdb824f2  /etc/cron.weekly/.placeholder
+b2c55b2905f28b3b53bdf3e2d66e830b  /etc/cron.weekly/0anacron
+eebc5bb3e1dac973301570da3f453334  /etc/cron.weekly/man-db
+e5e12910bf011222160404d7bdb824f2  /etc/cron.yearly/.placeholder
+628759e5a97d58f69debb4474a4029ed  /etc/cron.yearly/0anacron
+85f7ff2020ac8c72212f076ddf33c0be  /etc/crontab
+cc3c01a5b5e8e05d40c9c075f44c43ea  /etc/dbus-1/system.d/com.ubuntu.SoftwareProperties.conf
+1cd82ead5651f0753b1ff6d9b31bd235  /etc/debconf.conf
+033cf14800df38511c4b7ed1552f8ee5  /etc/debian_version
+c3a3857d0ea2d1def5ed11e03abff98a  /etc/debuginfod/elfutils.urls
+eaa8a5fa3fb59af4f0f55e851a6e9b20  /etc/default/amd64-microcode
+964d39a52b30de6627ba346001730f03  /etc/default/anacron
+523a025f432d7edfe6381e5900be8772  /etc/default/chrony
+d82a3dabd53948a10de8911518c30047  /etc/default/console-setup
+bc9ab63f9e143d7338909d50494d552f  /etc/default/cron
+0d0f25a2f993509c857eb262f6e22015  /etc/default/dbus
+6c39b26d7d8884bf27923104c8f45468  /etc/default/grub
+6a68a0e6e2d2ef001f1a374ece3c8558  /etc/default/intel-microcode
+9fa2ccbdd828d7b4ed686c8ec69b5e1d  /etc/default/keyboard
+30d74108d00da7497f70395c32658a41  /etc/default/networkd-dispatcher
+b8fd9efa75e2bda2583b0d7c0892a073  /etc/default/rsync
+500e3cf069fe9a7b9936108eb9d9c035  /etc/default/ssh
+a921dd9d167380b04de4bc911915ea44  /etc/default/ufw
+e03965d134c26725cbc51a57969da6c9  /etc/default/useradd
+11a06baf8245fd8d690b99024d228c1f  /etc/deluser.conf
+7c8439ef36b12e5f226b5dbfa20b8c2d  /etc/depmod.d/ubuntu.conf
+d112a665f6d89e92a9bf7bdf1b958326  /etc/dhcp/dhclient-exit-hooks.d/chrony
+50048399a6497f68b20864046b2a81eb  /etc/dhcpcd.conf
+f4413ffb515f8f753624ae3bb365b81b  /etc/dpkg/dpkg.cfg
+c47b6815f67ad1aeccb0d4529bd0b990  /etc/dpkg/origins/debian
+ea35901c45553c3451f60476be94d2d8  /etc/dpkg/origins/ubuntu
+ba391d392aaa72d5f90d9ae2403b0b0e  /etc/dracut.conf
+df38534cc670c70a91cf9b035845d244  /etc/e2scrub.conf
+f3377ed52072acbbf4cbb59af03c7fdb  /etc/environment
+73ca398498fe517e724cc9238612e10d  /etc/ethertypes
+53bba216da53591162d1d7689dae5934  /etc/fstab
+5df72dde927a769eb88afe8e3458ac3f  /etc/fuse.conf
+28fa76ff5a9e0566eaa1e11f1ce51f09  /etc/gai.conf
+35b37ffae94733dbef25088702ac3ba3  /etc/gnutls/config
+e1194f90530fa9cb266131837f7f68ee  /etc/gprofng.rc
+0430e21404e7bde42b0e0fee0fd60c00  /etc/groff/man.local
+93e49c8bd131bfa85a469d836dd7a28a  /etc/groff/mdoc.local
+56f2753d323c80f0cab0b4a82c7f4a89  /etc/group
+885e6bbf21e917a45f808e4e5d8687c7  /etc/group-
+a2fc3d2b3816d3afd84d17eda44315f9  /etc/grub.d/00_header
+3ded25334d8120d4f0bcd1601d5dd808  /etc/grub.d/05_debian_theme
+31e80902101633483d29dd110cd7be20  /etc/grub.d/10_linux
+3e966f4f8aa1435ced225d1f3f517df9  /etc/grub.d/10_linux_zfs
+418ebd256337b519ff7b3ef599d2fe8f  /etc/grub.d/20_linux_xen
+a0f58757cc420380db47034b3a8e71fd  /etc/grub.d/30_os-prober
+2d918e14d15f40c01398a7534702870d  /etc/grub.d/30_uefi-firmware
+babe7de352fe18de5a238569cf4b8a11  /etc/grub.d/40_custom
+1d876baff8ca3841aa6ba057e881a2e4  /etc/grub.d/41_custom
+be58f42dfe74feb6eeb98c6a843c743f  /etc/grub.d/README
+c69cb4a883f26c6e96cbd1421ee04dee  /etc/gshadow
+ad00346484de027b41d089c0a343bbf3  /etc/gshadow-
+5c39a968700052a0d3fe43ca8ae9a9f0  /etc/hdparm.conf
+89408008f2585c957c031716600d5a80  /etc/host.conf
+258a8ff0ccfe62d64b5b9b498ad361a2  /etc/hostname
+bc1b9372e52b649ef01d50df45513515  /etc/hosts
+d0cfb796d371b0182cd39d589b1c1ce3  /etc/hosts.allow
+208d7a7756d6daa71111bb0296f4ce6a  /etc/hosts.deny
+cb16d990aa80ca20aee7ea2ab91ff714  /etc/init.d/anacron
+42e157dc91f6554abefa2160c2bc42db  /etc/init.d/apparmor
+f11b9c1b677cd3243d8ff346a0bd1593  /etc/init.d/chrony
+6d5b1d0c7a12da4e4f70836fe3fec827  /etc/init.d/console-setup.sh
+36fb1d99878caaafe31e6397b4519323  /etc/init.d/cron
+d78b20b35de983cf6f1475dcf8cb21a1  /etc/init.d/dbus
+5746e83ec4ca1bda09967a00fe9266fb  /etc/init.d/keyboard-setup.sh
+707674e3b5b8fa048271dfe2490a0a09  /etc/init.d/plymouth
+83b6676117e0e9b3f952e0fc625892ac  /etc/init.d/plymouth-log
+f9903aa0d9f2f10714269befb4cdba8f  /etc/init.d/procps
+59aa13cd1a70ff254a2991ad0c522ea5  /etc/init.d/rsync
+44ec7824f5ef10df73e92ad064331ea0  /etc/init.d/screen-cleanup
+3649a6fe8c18ad1d5245fd91737de507  /etc/init.d/ssh
+f68c845ae88149c45d0d938394d7832f  /etc/init.d/ufw
+290829a5efc55b7c435de0bb769f217b  /etc/init.d/unattended-upgrades
+72734842b2a488f116230d6686e84767  /etc/init.d/uuidd
+e7d81f20943fc812b66b3ee56f5f68ce  /etc/inputrc
+ef8fa0f7f7eff989042ae72c0995820b  /etc/issue
+3b5df066fc18867d53e8a2d84d5f3c77  /etc/issue.net
+e786f43234bd16b1a4c9bdfde8039e2d  /etc/kernel/postinst.d/dracut
+f296826482cb797aeef13554e093dbca  /etc/kernel/postinst.d/unattended-upgrades
+b41c8cb1275704cf344e3e87c84633b2  /etc/kernel/postinst.d/xx-update-initrd-links
+b9ccfa0ef5e49db7008b2e863b8bf633  /etc/kernel/postinst.d/zz-shim
+5a98abefbfe97dbed36db7899251e433  /etc/kernel/postinst.d/zz-update-grub
+12b88e3e5d6f2f44b4ad115bb5f3dd0a  /etc/kernel/postrm.d/dracut
+5a98abefbfe97dbed36db7899251e433  /etc/kernel/postrm.d/zz-update-grub
+4324b7d12701909b3a76bb5c6468a571  /etc/kernel/preinst.d/intel-microcode
+f83c93b71f184c217278241b82d2af17  /etc/ld.so.cache
+4317c6de8564b68d628c21efa96b37e4  /etc/ld.so.conf
+d4d833fd095fb7b90e1bb4a547f16de6  /etc/ld.so.conf.d/libc.conf
+cadc57d8e0387642c3de4bb1edff3f02  /etc/ld.so.conf.d/x86_64-linux-gnu.conf
+9d6275762648fab5505ab15ba6102d52  /etc/ldap/ldap.conf
+0110925f6e068836ef2e09356e3651d9  /etc/legal
+cdc703f9d27f0d980271a9e95d0f18b2  /etc/libaudit.conf
+dfdc62acff60833950aa76845b3dd974  /etc/libibverbs.d/bnxt_re.driver
+813a775ac8e335dc5b8a0f927f7df8ae  /etc/libibverbs.d/cxgb4.driver
+d00959c9098cf143ec040c39f2173f04  /etc/libibverbs.d/efa.driver
+af223c5ade09076518761548e2a3b35a  /etc/libibverbs.d/erdma.driver
+20cd8c1046d62aba32fa4c949a5db80b  /etc/libibverbs.d/hfi1verbs.driver
+c505e0f70fb172afd48acc33a733acde  /etc/libibverbs.d/hns.driver
+8cc53e1e7107b618efd028aad9b787af  /etc/libibverbs.d/ionic.driver
+f2710bebefa1cb4c40f96556f6919925  /etc/libibverbs.d/ipathverbs.driver
+602e763262c98fcf96a5e4fd26f57a9e  /etc/libibverbs.d/irdma.driver
+455c558f3f75a35a2cf2cb31e8cd470c  /etc/libibverbs.d/mana.driver
+6bfeea2b2666f6ffd09ce5ffa6a94b12  /etc/libibverbs.d/mlx4.driver
+3fef613081d2d483e9680be82e18e0fe  /etc/libibverbs.d/mlx5.driver
+176eb299dbf746486ea18c832b871094  /etc/libibverbs.d/mthca.driver
+28285b19f7b8044e6a5003477cc26ef5  /etc/libibverbs.d/ocrdma.driver
+181182a2b8a7dd604cdfbbcd1f873e13  /etc/libibverbs.d/qedr.driver
+98676a4e0bc992ee80998b8599039434  /etc/libibverbs.d/rxe.driver
+4cad034f720e49b931e7e05da889c919  /etc/libibverbs.d/siw.driver
+2ae063cb52092f09bbcccc7c6cafad69  /etc/libibverbs.d/vmw_pvrdma.driver
+3e07259e58674631830b152e983ca995  /etc/libnl-3/classid
+7613dbc41b2dc3258195b6b6abd0f179  /etc/libnl-3/pktloc
+e24819fd5acc025b5b307b77bb871f65  /etc/locale.conf
+f5d816d6c4e3e283e9bb4b91e9ce56a8  /etc/locale.gen
+a309e8671caa59db4127b745b516fead  /etc/logcheck/ignore.d.paranoid/cracklib-runtime
+2d0fbc91a955ba69408ca033d7ae2455  /etc/logcheck/ignore.d.server/gpg-agent
+58c2337cacd6a3296c2c9728fc3e52fd  /etc/logcheck/ignore.d.server/rsyslog
+1bf72fab10533a85f500cf665ef197df  /etc/login.defs
+9290a646a62731e8afbdfb022ca8dff9  /etc/logrotate.conf
+5fe0af6ce1505fefdc158d9e5dbf6286  /etc/logrotate.d/alternatives
+179f2ed4f85cbaca12fa3d69c2a4a1c3  /etc/logrotate.d/apt
+0f1e42d11052c238718996029ffb809b  /etc/logrotate.d/bootlog
+55631862595faf6432786dc335eb3f44  /etc/logrotate.d/btmp
+6a3178c4670de7de393d9365e2793740  /etc/logrotate.d/chrony
+9e25c8505966b5829785f34a548ae11f  /etc/logrotate.d/dpkg
+f77b2a716269e6be7da1d60420b7f1b8  /etc/logrotate.d/dracut-core
+3f26282ac0106961634fe4efb9edc3f4  /etc/logrotate.d/rsyslog
+852ec664fd0f1ecb26e726f5e801e9fd  /etc/logrotate.d/ubuntu-pro-client
+969308e0ddfb74505f0da47b49ada218  /etc/logrotate.d/ufw
+e45049ee847f069a99e3e6ec39155d4a  /etc/logrotate.d/unattended-upgrades
+46cd7ecb1810441bd450987a976f5540  /etc/logrotate.d/wtmp
+bec830c0cb189b937ded4ed61d8a8da5  /etc/lsb-release
+097527c79055a10c4d8c5dd849b29fc0  /etc/machine-id
+272913026300e7ae9b5e2d51f138e674  /etc/magic
+272913026300e7ae9b5e2d51f138e674  /etc/magic.mime
+6d70333de0a08c7a71018da458201eb6  /etc/manpath.config
+62a55361f3ce6f5a7a57c85e1e50b439  /etc/mime.types
+7ab40bb5610d41ef800837b2c31f5111  /etc/mke2fs.conf
+71327241f6583b34944e638a955aba91  /etc/modprobe.d/amd64-microcode-blacklist.conf
+436f5a12e1cd8adae7d67e2cc1ff478f  /etc/modprobe.d/blacklist-ath_pci.conf
+9cc07a17e8e64f9cd35ff59c29debe69  /etc/modprobe.d/blacklist-firewire.conf
+097e2142ae3e4dd2911eda7844ce0c18  /etc/modprobe.d/blacklist-framebuffer.conf
+8fb4b96124e461f53adceba9ca91f09a  /etc/modprobe.d/blacklist-rare-network.conf
+75f90164fe53985db48e7aa168bd5e7c  /etc/modprobe.d/blacklist.conf
+71327241f6583b34944e638a955aba91  /etc/modprobe.d/intel-microcode-blacklist.conf
+f27bc645e93e20c8e532325d190ac8ee  /etc/modprobe.d/iwlwifi.conf
+897575e9072555aed9075075e72b5acd  /etc/modules
+e095a2608d583d03eded40d709b4f219  /etc/nanorc
+ca8db53e3af4d735335c2607d21c7195  /etc/netconfig
+7b05cb29f2e1ce254ba1c052ccc185ff  /etc/netplan/00-installer-config.yaml
+9b5681f7d3fc877b018790626772c504  /etc/netplan/01-network-manager-all.yaml
+ba53860f57c54053985e5d8f194927f3  /etc/netplan/90-NM-1cf0c05f-2a6d-4dcd-94b8-9af935fff008.yaml
+977c4c750450531a288711e6000afcee  /etc/network/if-post-down.d/chrony
+09b4a447e5048a4ea0bc34732bd0278c  /etc/network/if-pre-up.d/ethtool
+977c4c750450531a288711e6000afcee  /etc/network/if-up.d/chrony
+a522a7b2b1d3e2d9a06e9690674a5d38  /etc/network/if-up.d/ethtool
+7028a4bd02c1d276aa45f0973b85fe1b  /etc/networks
+d41d8cd98f00b204e9800998ecf8427e  /etc/newt/palette.original
+ac72ec93d29d94ad06bb3180f16cefb1  /etc/newt/palette.ubuntu
+4d4241fcd44b9a69b74f69d571f35a20  /etc/nftables.conf
+c098ce8fe5f72dad3961739044aa6239  /etc/nsswitch.conf
+87fc76f18e98ee7d3848f6b81b3391e5  /etc/pam.conf
+4d466e00a348ba426130664d795e8afa  /etc/pam.d/chfn
+9900720564cb4ee98b7da29e2d183cb2  /etc/pam.d/chpasswd
+a6e9b589e90009334ffd030d819290a6  /etc/pam.d/chsh
+9d50c7dda6ba8b6a8422fd4453722324  /etc/pam.d/common-account
+fc5813ef3b294a8bcc0fc6bedfed1f94  /etc/pam.d/common-auth
+cb5143730e223e4856f10d944f3c3fb3  /etc/pam.d/common-password
+2b3a7884b41be467061c0bef6aa23e41  /etc/pam.d/common-session
+9b6806ffd5a2c24ff9bac6f2031e3183  /etc/pam.d/common-session-noninteractive
+11e788a7f7cd5477b10da2c7fd5ecdf0  /etc/pam.d/cron
+b6129a3c1af42a9977b29f490ecd057e  /etc/pam.d/login
+1454e29bfa9f2a10836563e76936cea5  /etc/pam.d/newusers
+31aa7f2181889ffb00b87df4126d1701  /etc/pam.d/other
+eaf2ad85b5ccd06cceb19a3e75f40c63  /etc/pam.d/passwd
+09fb636e2e125b3da5c5ec381d0388c5  /etc/pam.d/remote
+b8b44b045259525e0fae9e38fdb2aeeb  /etc/pam.d/runuser
+2106ea05877e8913f34b2c77fa02be45  /etc/pam.d/runuser-l
+72487a556c4f0e23fd25ce21fc294ca8  /etc/pam.d/sshd
+60fbbe65c90d741bc0d380543cefe8af  /etc/pam.d/su
+756fef5687fecc0d986e5951427b0c4f  /etc/pam.d/su-l
+b3a1b916bf62a2cc3280f7f9b94844ff  /etc/pam.d/sudo
+ce9740f66cedf7716e26950abfe556fa  /etc/pam.d/sudo-i
+e9e943b5d15c5eed56b7f67737f62f8e  /etc/papersize
+3a378a767e9dd972f494079f7b12a858  /etc/passwd
+6dfcf88c5ef95bc0446d7196916e18a4  /etc/passwd-
+fb2946cae573b8ed3d654a180d458733  /etc/perl/Net/libnet.cfg
+eed4d6f450ef6aa95199435f4acd34c8  /etc/plymouth/plymouthd.conf
+0f5d54aa2dd322c805c90e409fc2724a  /etc/pm/sleep.d/10_unattended-upgrades-hibernate
+83c004d5104eaff2300527031dbf1957  /etc/ppp/ip-down.d/chrony
+c929c3d3bebc71b1e249c3d0152b6706  /etc/ppp/ip-up.d/chrony
+0bf2a3f17474658bc3d04e36be02d8e6  /etc/profile
+870346d97b16faac4a371b04ffe4cc2f  /etc/profile.d/01-locale-fix.sh
+3593c6b58d5ede41aedc83dff04c35f7  /etc/profile.d/bash_completion.sh
+0c247591a720f534fe543401bd4844d6  /etc/protocols
+d6b276695157bde06a56ba1b2bc53670  /etc/python3.14/sitecustomize.py
+7f4739eb8858d231601a5ed144099ac8  /etc/python3/debian_config
+2d7748cd0feba2e43ee52d4d7f834188  /etc/rpc
+a14b59f17abdcfda417f99a99c030e67  /etc/rsyslog.conf
+98e2f72c9c65ca8d6299886b524e80d1  /etc/rsyslog.d/20-ufw.conf
+1b03acc84964cf70b8a584870bcdf9b3  /etc/rsyslog.d/50-default.conf
+12c245238eb8b653625bba27dc81df6a  /etc/screenrc
+55930ab185d7c100b58da36cd44f1dc5  /etc/security/access.conf
+3d0f631b115f93405b44ab139322fa93  /etc/security/capability.conf
+164da8ffb87f3074179bc60b71d0b99f  /etc/security/faillock.conf
+f1e26e8db6f7abd2d697d7dad3422c36  /etc/security/group.conf
+0b1967ff9042a716ce6b01cb999aa1f5  /etc/security/limits.conf
+bb509d1c69a68c82ecdcd22c9b1c7d04  /etc/security/limits.d/10-coredump-debian.conf
+6b3796403421d66db7defc46517711bc  /etc/security/namespace.conf
+260eb0c3368ffaaf861e003e27618476  /etc/security/namespace.init
+d41d8cd98f00b204e9800998ecf8427e  /etc/security/opasswd
+89cc8702173d5cd51abc152ae9f8d6bc  /etc/security/pam_env.conf
+46472157dab7894436c6ba3ccdfcaca6  /etc/security/pwhistory.conf
+679fa78b6ec12124527154c556af807c  /etc/security/pwquality.conf
+3d82df292d497bbeaaf8ebef18cd14f1  /etc/security/sepermit.conf
+06e05c6079e839c8833ac7c3abfde192  /etc/security/time.conf
+8e8dfac33a09c1b53ca08bf6d4201b10  /etc/selinux/semanage.conf
+c7e42bc25f943cb5e1e9e7efdbd23783  /etc/services
+055ba0bd3154c0a58b9bf8a0c9ecf2fa  /etc/sgml/xml-core.cat
+b08681b25c8d82ef828f6ccff16e0ae5  /etc/shadow
+71b27328920a57e7f0b414092e7b0deb  /etc/shadow-
+4f2db589e314cdad052e6a1cd0d4276e  /etc/shells
+22bfb8c1dd94b5f3813a2b25da67463f  /etc/skel/.bash_logout
+1f98b8f3f3c8f8927eca945d59dcc1c6  /etc/skel/.bashrc
+f4e81ade7d6f9fb342541152d08e7a97  /etc/skel/.profile
+f68f66d7933a32380885aabe5a0b23f0  /etc/ssh/moduli
+c3bfd7bdcf3d8fcb7a72646bb96d0839  /etc/ssh/ssh_config
+829007d61552c966589a2cf667128461  /etc/ssh/ssh_host_ecdsa_key
+a47a7c512464c00eeb5d09a30ddf422d  /etc/ssh/ssh_host_ecdsa_key.pub
+9b625b22e8719a5b67abad0c6d47d2fb  /etc/ssh/ssh_host_ed25519_key
+f84ba9f679be05e74040ba3d0a95bd7c  /etc/ssh/ssh_host_ed25519_key.pub
+35ea8fac7cd8e81815ca8a84fa2212e8  /etc/ssh/ssh_host_rsa_key
+04ddacde2f3b26fdabd1ce8f21c08a51  /etc/ssh/ssh_host_rsa_key.pub
+8bfa390040fbeeae70bec14f2dccaf11  /etc/ssh/ssh_import_id
+248af5af3c853076631d9e16d29df602  /etc/ssh/sshd_config
+393a8b74e0454690d10f1b32d9a9cf81  /etc/ssh/sshd_config.d/99-local-access.conf
+9f02c82e381cd0ae421d39808649a57e  /etc/ssl/certs/ca-certificates.crt
+f7c991c5906949312d015975714d3cfe  /etc/ssl/certs/ssl-cert-snakeoil.pem
+fdfc5ee0359038bcd843534a89ef4420  /etc/ssl/openssl.cnf
+9c4352814aee9d94c40440cf10b47cff  /etc/ssl/private/ssl-cert-snakeoil.key
+95737a30381287dc2789968687c54d96  /etc/subgid
+479c6b77229ad47d733f179fe887abef  /etc/subgid-
+95737a30381287dc2789968687c54d96  /etc/subuid
+479c6b77229ad47d733f179fe887abef  /etc/subuid-
+031f8305ee0c554fb2433a949bebe9be  /etc/sudo.conf
+ad0ba586da300ae3ba46312ad744a6e2  /etc/sudo_logsrvd.conf
+8c20cd717552790f2312db0981337945  /etc/sudoers
+49a1f113c4922f14af2bb32dece91df7  /etc/sudoers.d/README
+f4a36df1ac8298dc249f712026bafff8  /etc/supercat/spcrc-crontab
+ed8b59882050d7de508a1eab088734e9  /etc/supercat/spcrc-crontab-light
+d41d8cd98f00b204e9800998ecf8427e  /etc/sysctl.conf
+93eda3f215e9d29316f5597cb4551082  /etc/sysctl.d/README.sysctl
+673eb29b59f9220bcdd5c910f429d4a2  /etc/systemd/journald.conf
+14a7d5699ae49cd759760591ea0f30b4  /etc/systemd/logind.conf
+411f9e2e4341d7b9426fe02a8c153f4d  /etc/systemd/networkd.conf
+a17b86a97adcdb283e0ec34540c79841  /etc/systemd/oomd.conf
+8086c035fbf3bde72f2339a6ee50d2a4  /etc/systemd/pstore.conf
+d12c319883e2aaa3e3f71d7b752f7522  /etc/systemd/resolved.conf
+894f85ddfb666958fad7b7217b7f48c2  /etc/systemd/sleep.conf
+66e464f87088edcd1010a12b1386960b  /etc/systemd/system.conf
+c9dbd620bd7a24ffaca9f91cd7c85341  /etc/systemd/user.conf
+45b6df19fb5e21f55717482fa7a30171  /etc/terminfo/README
+9106568e568fdb4f4856293836abc77c  /etc/timezone
+bd97517139970155f1406877786bc0bc  /etc/tmpfiles.d/screen-cleanup.conf
+125da47fc2891502c18b5f4c97d09507  /etc/tpm2-tss/fapi-config.json
+29c5f74c9c4039a93a4d395482b42547  /etc/tpm2-tss/fapi-profiles/P_ECCP256SHA256.json
+10585117c5761789c6adaf35a828dfe9  /etc/tpm2-tss/fapi-profiles/P_ECCP384SHA384.json
+333ff65ef38a81dac834d8a4fd2a9a48  /etc/tpm2-tss/fapi-profiles/P_RSA2048SHA256.json
+9627d7da5e61cf7696cc3bd56c7aecca  /etc/tpm2-tss/fapi-profiles/P_RSA3072SHA384.json
+f84a9c135c3d556856f9ab6d2751e365  /etc/ubuntu-advantage/uaclient.conf
+80d388cee26f58a54338acfd8e708c7e  /etc/ucf.conf
+fad2a2c4c34d796b6802bc62c19cc4ae  /etc/udev/iocost.conf
+bf60be80a4cc51271a1618edf5a6d66f  /etc/udev/udev.conf
+26a3172f1e3d63e2fde595671faf9a90  /etc/ufw/after.init
+53e906b055d9145d03b6a2fadeca20f1  /etc/ufw/after.rules
+c70580b5cabf73080989400422349ab2  /etc/ufw/after6.rules
+486b78d54b93cc9fdc950c1d52ff479e  /etc/ufw/applications.d/openssh-server
+cd7783526a1a2b25581cecd3c2daa1a4  /etc/ufw/before.init
+554ea6948500e76ce5c1610b9c108bbf  /etc/ufw/before.rules
+601f530a9e5862345da525ec98f5a317  /etc/ufw/before6.rules
+7723079fc108eda8f57eddab3079c70a  /etc/ufw/sysctl.conf
+44eab12c7b5c683d750b83dcffb6cccb  /etc/ufw/ufw.conf
+a3fbaef910466dcc137f9037106c78f7  /etc/ufw/user.rules
+9d2810d270f5e8db6c6110f3f7fafa2a  /etc/ufw/user6.rules
+25ba16c3215bff43f0272d3d93103f15  /etc/update-manager/meta-release
+54fd85e86c6bc2db8d7cc3c18013e3aa  /etc/update-manager/release-upgrades
+5e14da4979c6c68cef22c0c09f5d8793  /etc/update-manager/release-upgrades.d/ubuntu-advantage-upgrades.cfg
+4a1e6eed7a59f200b4267085721750a3  /etc/update-motd.d/00-header
+88601f81d580e2686da6bd29d520e120  /etc/update-motd.d/10-help-text
+54567afa89b3a7983d05ff217fe4a9fd  /etc/update-motd.d/50-motd-news
+6346b049bc070e0519c621de0f636bb5  /etc/update-motd.d/91-contract-ua-esm-status
+577d0123c4365f7e920409e9e9f4828d  /etc/update-motd.d/91-release-upgrade
+afa7546d3fe561e1f5783f7b9cf72096  /etc/update-motd.d/92-unattended-upgrades
+b569475c507c6016bcd7468bbeca530a  /etc/vim/vimrc
+2eef1685cce57398be3763940dbced84  /etc/vim/vimrc.tiny
+c43064699caf6109f4b3da0405c06ebb  /etc/wgetrc
+ef3c806797e6ab9a31534e660f13a46e  /etc/wpa_supplicant/action_wpa.sh
+f9e603d861675d118b4a438216e37e18  /etc/wpa_supplicant/functions.sh
+383a0432ca7f95ef00a360eb4449d529  /etc/wpa_supplicant/ifupdown.sh
+743ca3f83ea263f1f56ad1f63f907bdb  /etc/xattr.conf
+bb582b27bfdf62d3fb6aed080a7c0a4f  /etc/xml/catalog
+2d9d34d066c21b4d98182f8281f0427c  /etc/xml/catalog.old
+0818f7b5884a653112df20e41da4b835  /etc/xml/polkitd.xml
+0a5a08d14e49977ee6daa9f10a5d81fb  /etc/xml/polkitd.xml.old
+db5eeaa43363b3f3f024b2231e1606f0  /etc/xml/xml-core.xml
+ac5a41de96b4e27963f1d91897017010  /etc/xml/xml-core.xml.old
+
+== listening sockets ==
+Netid State  Recv-Q Send-Q                      Local Address:Port Peer Address:PortProcess                                                
+udp   UNCONN 0      0                              127.0.0.54:53        0.0.0.0:*    users:(("systemd-resolve",pid=517,fd=18))             
+udp   UNCONN 0      0                           127.0.0.53%lo:53        0.0.0.0:*    users:(("systemd-resolve",pid=517,fd=16))             
+udp   UNCONN 0      0                               127.0.0.1:323       0.0.0.0:*    users:(("chronyd",pid=902,fd=4))                      
+udp   UNCONN 0      0                                   [::1]:323          [::]:*    users:(("chronyd",pid=902,fd=5))                      
+udp   UNCONN 0      0      [fe80::36cf:1ac1:fb28:6bfa]%wlp3s0:546          [::]:*    users:(("NetworkManager",pid=890,fd=28))              
+tcp   LISTEN 0      4096                        127.0.0.53%lo:53        0.0.0.0:*    users:(("systemd-resolve",pid=517,fd=17))             
+tcp   LISTEN 0      4096                              0.0.0.0:22        0.0.0.0:*    users:(("sshd",pid=1141,fd=3),("systemd",pid=1,fd=97))
+tcp   LISTEN 0      4096                           127.0.0.54:53        0.0.0.0:*    users:(("systemd-resolve",pid=517,fd=19))             
+tcp   LISTEN 0      4096                                 [::]:22           [::]:*    users:(("sshd",pid=1141,fd=4),("systemd",pid=1,fd=98))
+
+== firewall ==
+Status: inactive
+
+== swap ==
+NAME           TYPE       SIZE USED PRIO
+/dev/nvme0n1p3 partition 11.2G   0B   -1
+
+== mounted ==
+TARGET        SOURCE         FSTYPE OPTIONS
+/             /dev/nvme0n1p4 ext4   rw,relatime
+`-/boot       /dev/nvme0n1p1 ext4   rw,relatime
+  `-/boot/efi /dev/nvme0n1p2 vfat   rw,relatime,fmask=0022,dmask=0022,codepage=437,iocharset=iso8859-1,shortname=mixed,errors=remount-ro

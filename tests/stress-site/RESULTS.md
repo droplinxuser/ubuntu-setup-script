@@ -1,5 +1,28 @@
 # Full-stack stress test reports
 
+## 1.21.6 re-audit (2026-11-14)
+
+Freshly restored 16-thread / 27 812 MiB / NVMe bare-metal host, WordPress
+7.1.4, XenForo 2.3.13 and Chevereto 4.5.9.  Full report:
+`AUDIT-20261114-1.21.6.md`.
+
+- **Distribution defaults -> shipped tuning (PHP 8.5, 100c, 8 s, LAN):**
+  XenForo member thread 255 -> 552 req/s (+116 %), WordPress member home
+  141 -> 253 (+79 %), WordPress member post 128 -> 237 (+85 %).
+- **Guest/static tiers:** XenForo guest 7 190, WordPress guest 5 203,
+  Chevereto explore 5 338, Chevereto image 5 236, static CSS 20 030 req/s.
+- **PHP-FPM sweep (static, authenticated thread):** 8/12/16/20/24 workers =
+  376/480/538/424/404 req/s; 16 (one per logical CPU) is the optimum.
+- **JIT sweep:** off 395, function 494, tracing 32/64/128 MB = 543/549/534
+  req/s; tracing 64 MB stays the shipped profile.
+- **Sustained 60 s, c=64:** 492 req/s, p50 117 ms, p99 347 ms, 29 455 x 200,
+  0 slow queries, 0 error-log growth, 0 failed units.  CPU peaks at 96 %
+  (PHP-bound); every worker is busy, so the tier needs more hosts, not more
+  workers.
+- **Harness fixes:** a 429-throttled remote run now fails (exit 3) instead
+  of reporting the limiter's rate as throughput, and `collect-metrics.sh`
+  reports FPM pool occupancy without `cgi-fcgi`.
+
 ## 1.21.4 PHP version-management audit (2026-11-14)
 
 Same 16-thread / 27 812 MiB / NVMe bare-metal host, WordPress 7.1.4,
