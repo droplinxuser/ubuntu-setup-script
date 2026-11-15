@@ -3,6 +3,18 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.12 (2026-11-16)
+
+- **Every guest cache reports the same `X-Cache-Status` header.**  The Angie
+  repository used one name per application (`X-5m-Cache` for XenForo,
+  `X-30-Cache-Status` for Chevereto, `X-Guest-Cache` for Flarum,
+  `X-1h-Cache-Status`/`X-Proxy-Cache` for the XenForo proxy and `X-CDN` for
+  the CDN template); the XenForo cache repair now injects `X-Cache-Status`
+  and renames a legacy `X-5m-Cache` line before repairing, so monitoring
+  needs one name.  Pair with server-configs-nginx 1.6.30; update alerting or
+  log parsing that keys on the old names.
+- **Validation.**  839 tuning checks pass.
+
 ## 1.21.11 (2026-11-16)
 
 - **The WordPress guest cache is enabled by default.**  A WordPress vhost

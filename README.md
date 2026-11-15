@@ -431,7 +431,8 @@ suspended errexit for the whole run). Steps:
    `include h5bp/wordpress_cache.conf;` gets the include added before its
    `php_wp.conf` include (the guest cache is on by default); set
    `SETUP_WP_GUEST_CACHE=0` to keep such vhosts uncached, in which case they
-   are reported instead.
+   are reported instead. Every application's guest cache reports its result
+   in the same `X-Cache-Status` header (`HIT`, `MISS`, `BYPASS`, `EXPIRED`).
 3. PHP-FPM: every `/etc/php/<ver>/fpm` tree; a live TCP pool used through the
    `local_php` upstream is migrated to the Unix socket (graceful reload, or
    a short explicit restart when SIGUSR2 cannot open the listener).  The pool

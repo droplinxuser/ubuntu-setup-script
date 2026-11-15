@@ -34,24 +34,24 @@ echo "################ XenForo"
 X=https://xf.test.local
 req xg1 "$X/"; req xg2 "$X/"; req xg3 "$X/"
 chk "XF guest home is 200" "$ST" 200
-chk "XF guest home is served from the cache" "$(hdr xg3 x-5m-cache)" HIT
+chk "XF guest home is served from the cache" "$(hdr xg3 x-cache-status)" HIT
 chk "XF cached guest page carries no Set-Cookie (HIT)" "$(ncook xg3)" 0
 req xm "$X/whats-new/?t=$RANDOM"
-chk "XF guest MISS (the request that fills the cache) carries no Set-Cookie" "$(hdr xm x-5m-cache):$(ncook xm)" "MISS:0"
+chk "XF guest MISS (the request that fills the cache) carries no Set-Cookie" "$(hdr xm x-cache-status):$(ncook xm)" "MISS:0"
 chk "XF cached page still has HSTS" "$([ -n "$(hdr xg3 strict-transport-security)" ] && echo y)" y
 chk "XF cached page still has Referrer-Policy" "$([ -n "$(hdr xg3 referrer-policy)" ] && echo y)" y
 req xh -I "$X/"
 chk "XF guest HEAD is 200" "$ST" 200
 # no-cache URIs give every guest their own cookie
 req xl1 "$X/login/"; req xl2 "$X/login/"
-chk "XF /login/ is not cached" "$(hdr xl1 x-5m-cache)" BYPASS
+chk "XF /login/ is not cached" "$(hdr xl1 x-cache-status)" BYPASS
 a=$(cookv xl1 xf_session); b=$(cookv xl2 xf_session); c1=$(cookv xl1 xf_csrf); c2=$(cookv xl2 xf_csrf)
 chk "XF /login/ sets a cookie for each guest" "$([ -n "$a$c1" ] && [ -n "$b$c2" ] && echo y)" y
 chk "XF /login/ cookies differ between two guests" "$([ "$a$c1" != "$b$c2" ] && echo y)" y
 req xnf "$X/index.php?login/"
-chk "XF non-friendly /index.php?login/ is not cached and sets a cookie" "$(hdr xnf x-5m-cache):$([ "$(ncook xnf)" -ge 1 ] && echo y)" "BYPASS:y"
+chk "XF non-friendly /index.php?login/ is not cached and sets a cookie" "$(hdr xnf x-cache-status):$([ "$(ncook xnf)" -ge 1 ] && echo y)" "BYPASS:y"
 req xapi "$X/api/"
-chk "XF /api/ is never cached" "$(hdr xapi x-5m-cache)" BYPASS
+chk "XF /api/ is never cached" "$(hdr xapi x-cache-status)" BYPASS
 # what XenForo's JS does on a cached page: no xf_csrf cookie -> POST keep-alive with the stale page token
 tok=$(grep -oE 'data-csrf="[^"]+"' "$T/xg3.body" | head -1 | sed 's/data-csrf="//;s/"//')
 chk "XF cached page embeds a (stale) CSRF token for the JS" "$([ -n "$tok" ] && echo y)" y
@@ -70,13 +70,13 @@ req xka2 -c "$T/g2.jar" -H 'X-Requested-With: XMLHttpRequest' --data-urlencode "
 chk "XF two guests get different xf_csrf cookies" "$([ "$(cookv xka xf_csrf)" != "$(cookv xka2 xf_csrf)" ] && echo y)" y
 # the guest now has xf_csrf only: still a guest, still cached
 req xgc -b "$T/g.jar" "$X/"
-chk "XF guest with only xf_csrf is still served from the cache" "$(hdr xgc x-5m-cache)" HIT
+chk "XF guest with only xf_csrf is still served from the cache" "$(hdr xgc x-cache-status)" HIT
 # log in with the refreshed token (cached page -> keep-alive -> login)
 req xlogin -b "$T/g.jar" -c "$T/g.jar" --data-urlencode "_xfToken=$newtok" --data-urlencode 'login=bench5' --data-urlencode "password=$PW" --data 'remember=1' "$X/login/login"
 chk "XF login from a cached page succeeds (303)" "$ST" 303
 chk "XF login response delivers session/user cookies" "$([ -n "$(cookv xlogin xf_user)" ] && [ -n "$(cookv xlogin xf_session)" ] && echo y)" y
 req xmem -b "$T/g.jar" "$X/"
-chk "XF member page bypasses the cache" "$(hdr xmem x-5m-cache)" BYPASS
+chk "XF member page bypasses the cache" "$(hdr xmem x-cache-status)" BYPASS
 chk "XF member page is rendered for the member" "$(grep -c 'bench5' "$T/xmem.body" | awk '{print ($1>0)?"y":"n"}')" y
 chk "XF member page keeps HSTS" "$([ -n "$(hdr xmem strict-transport-security)" ] && echo y)" y
 req xg4 "$X/"
@@ -84,13 +84,13 @@ req xg4 "$X/"
 # a guest.  The member's user name is not a marker: the "members online" block
 # on a board with recent activity lists it on cached guest pages too (that
 # assertion reported a phantom leak once the seeded bench5 had been active).
-chk "XF member page was not stored: guests still get the guest page" "$(hdr xg4 x-5m-cache):$(grep -c 'href="/account/"' "$T/xg4.body")" "HIT:0"
+chk "XF member page was not stored: guests still get the guest page" "$(hdr xg4 x-cache-status):$(grep -c 'href="/account/"' "$T/xg4.body")" "HIT:0"
 # a POST by a guest is never cached and keeps its cookies
 req xpost --data 'keywords=benchmark&_xfToken=x' "$X/search/search"
-chk "XF guest POST is not cached" "$(hdr xpost x-5m-cache)" BYPASS
+chk "XF guest POST is not cached" "$(hdr xpost x-cache-status)" BYPASS
 # wrong password: the error response must set a session cookie (uncached branch)
 req xbad --data-urlencode "_xfToken=$newtok" -b "xf_csrf=$(cookv xka xf_csrf)" --data 'login=bench5&password=wrong' "$X/login/login"
-chk "XF failed login is answered by PHP, not the cache" "$(hdr xbad x-5m-cache)" BYPASS
+chk "XF failed login is answered by PHP, not the cache" "$(hdr xbad x-cache-status)" BYPASS
 req x404 "$X/does-not-exist.php"
 chk "XF unknown .php is 404" "$ST" 404
 req xcss "$X/css.php?css=public%3Anormalize.css&s=1&l=1&d=1&k=x"
@@ -105,23 +105,23 @@ echo "################ Chevereto"
 C=https://chev.test.local
 req cg1 "$C/explore"; req cg2 "$C/explore"; req cg3 "$C/explore"
 chk "Chevereto guest /explore is 200" "$ST" 200
-chk "Chevereto guest /explore is served from the cache" "$(hdr cg3 x-30-cache-status)" HIT
+chk "Chevereto guest /explore is served from the cache" "$(hdr cg3 x-cache-status)" HIT
 chk "Chevereto cached page carries no Set-Cookie (HIT)" "$(ncook cg3)" 0
 req cm "$C/explore/recent?t=$RANDOM"
-chk "Chevereto guest MISS carries no Set-Cookie" "$(hdr cm x-30-cache-status):$(ncook cm)" "MISS:0"
+chk "Chevereto guest MISS carries no Set-Cookie" "$(hdr cm x-cache-status):$(ncook cm)" "MISS:0"
 chk "Chevereto cached page has HSTS and X-Content-Type-Options" "$([ -n "$(hdr cg3 strict-transport-security)" ] && [ -n "$(hdr cg3 x-content-type-options)" ] && echo y)" y
 req ch1 "$C/"; req ch2 "$C/"
-chk "Chevereto home is never cached" "$(hdr ch1 x-30-cache-status)" BYPASS
+chk "Chevereto home is never cached" "$(hdr ch1 x-cache-status)" BYPASS
 s1=$(cookv ch1 PHPSESSID); s2=$(cookv ch2 PHPSESSID)
 chk "Chevereto home gives each guest a session" "$([ -n "$s1" ] && [ -n "$s2" ] && echo y)" y
 chk "Chevereto two guests get different sessions" "$([ "$s1" != "$s2" ] && echo y)" y
 req chq "$C/?random"
-chk "Chevereto /?random is not cached" "$(hdr chq x-30-cache-status)" BYPASS
+chk "Chevereto /?random is not cached" "$(hdr chq x-cache-status)" BYPASS
 req clang "$C/explore?lang=es"
-chk "Chevereto ?lang= is not cached" "$(hdr clang x-30-cache-status)" BYPASS
+chk "Chevereto ?lang= is not cached" "$(hdr clang x-cache-status)" BYPASS
 # a guest that owns a session is rendered by PHP with their own token
 req cs1 -b "PHPSESSID=$s1" "$C/explore"; req cs2 -b "PHPSESSID=$s2" "$C/explore"
-chk "Chevereto guest with a session bypasses the cache" "$(hdr cs1 x-30-cache-status)" BYPASS
+chk "Chevereto guest with a session bypasses the cache" "$(hdr cs1 x-cache-status)" BYPASS
 t1=$(grep -oE 'auth_token[^a-f0-9]{1,12}[a-f0-9]{20,}' "$T/cs1.body" | grep -oE '[a-f0-9]{20,}' | head -1)
 t2=$(grep -oE 'auth_token[^a-f0-9]{1,12}[a-f0-9]{20,}' "$T/cs2.body" | grep -oE '[a-f0-9]{20,}' | head -1)
 tc=$(grep -oE 'auth_token[^a-f0-9]{1,12}[a-f0-9]{20,}' "$T/cg3.body" | grep -oE '[a-f0-9]{20,}' | head -1)
@@ -137,15 +137,15 @@ req clp -b "$T/c.jar" -c "$T/c.jar" --data-urlencode "auth_token=$lt" --data 'lo
 chk "Chevereto login succeeds (302)" "$ST" 302
 chk "Chevereto login delivers the KEEP_LOGIN cookie" "$(grep -c KEEP_LOGIN "$T/c.jar" | awk '{print ($1>0)?"y":"n"}')" y
 req cmem -b "$T/c.jar" "$C/explore"
-chk "Chevereto logged-in page bypasses the cache" "$(hdr cmem x-30-cache-status)" BYPASS
+chk "Chevereto logged-in page bypasses the cache" "$(hdr cmem x-cache-status)" BYPASS
 req cdash -b "$T/c.jar" "$C/dashboard"
 chk "Chevereto /dashboard (nested uncached PHP location) works for the admin" "$ST" 200
 req cset -b "$T/c.jar" "$C/settings"
 chk "Chevereto /settings works for the logged-in user" "$ST" 200
 req cg4 "$C/explore"
-chk "Chevereto logged-in page was not stored: guests still get the cached guest page" "$(hdr cg4 x-30-cache-status):$(ncook cg4)" "HIT:0"
+chk "Chevereto logged-in page was not stored: guests still get the cached guest page" "$(hdr cg4 x-cache-status):$(ncook cg4)" "HIT:0"
 req cjson --data 'action=x' "$C/json"
-chk "Chevereto /json POST is not cached" "$(hdr cjson x-30-cache-status)" BYPASS
+chk "Chevereto /json POST is not cached" "$(hdr cjson x-cache-status)" BYPASS
 req c404 "$C/nope.php"
 chk "Chevereto unknown .php is 404" "$ST" 404
 

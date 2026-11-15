@@ -1624,6 +1624,13 @@ ensure_xf_guest_cache() {
   fi
   ensure_fastcgi_cache_zone "$target" || true
   local changes_before=${#TUNE_CHANGES[@]}
+  # One cache-status header name everywhere: the old include reported
+  # X-5m-Cache while WordPress used X-Cache-Status.  Rename the legacy line
+  # before the repair so the file cannot carry two different status headers.
+  if grep -qE '^[[:space:]]*add_header[[:space:]]+X-5m-Cache[[:space:]]' "$file"; then
+    sed_in_place -E 's/^([[:space:]]*add_header[[:space:]]+)X-5m-Cache([[:space:]])/\1X-Cache-Status\2/' "$file"
+    tune_note "XenForo: cache status header renamed to X-Cache-Status"
+  fi
   # The proxy include (css.php, proxy.php, sitemap.php) is repaired on both
   # paths below; php_xf.conf gets its headers with the injected block or
   # from the repair at the end.
@@ -1662,7 +1669,7 @@ ensure_xf_guest_cache() {
     $'fastcgi_cache_valid[[:space:]]+301[[:space:]]\tfastcgi_cache_valid 301 1h;'
     $'fastcgi_cache_valid[[:space:]]+([0-9]+[[:space:]]+)*404[[:space:]]\tfastcgi_cache_valid 404 1m;'
     $'fastcgi_cache_valid[[:space:]]+any[[:space:]]\tfastcgi_cache_valid any 5s;'
-    $'add_header[[:space:]]+X-5m-Cache[[:space:]]\tadd_header X-5m-Cache $upstream_cache_status always;'
+    $'add_header[[:space:]]+X-Cache-Status[[:space:]]\tadd_header X-Cache-Status $upstream_cache_status always;'
   )
   local entry pattern line
   if ! grep -qE '^[[:space:]]*fastcgi_cache[[:space:]]+fastcgicache;' "$file"; then

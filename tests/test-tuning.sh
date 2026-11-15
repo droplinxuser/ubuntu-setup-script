@@ -1885,7 +1885,7 @@ check "second XenForo conversion records no change" \
 # drops are re-included when basic_xf.conf carries them.
 mkdir -p "$TMP/xfguest/h5bp/security"
 printf 'location ~ [^/]\\.php(/|$) {\n    fastcgi_pass local_php;\n}\n' > "$TMP/xfguest/h5bp/php_xf.conf"
-printf 'location ~ [^/]\\.php(/|$) {\n    fastcgi_pass local_php;\n    add_header X-1h-Cache-Status $upstream_cache_status;\n}\n' > "$TMP/xfguest/h5bp/php_xf_proxy.conf"
+printf 'location ~ [^/]\\.php(/|$) {\n    fastcgi_pass local_php;\n    add_header X-Cache-Status $upstream_cache_status;\n}\n' > "$TMP/xfguest/h5bp/php_xf_proxy.conf"
 printf 'include h5bp/security/strict-transport-security.conf;\ninclude h5bp/security/referrer-policy.conf;\n' > "$TMP/xfguest/h5bp/basic_xf.conf"
 : > "$TMP/xfguest/h5bp/security/strict-transport-security.conf"
 : > "$TMP/xfguest/h5bp/security/referrer-policy.conf"
@@ -1896,6 +1896,15 @@ check "injected XenForo cache block stays inside the location" \
   test "$(tail -n1 "$TMP/xfguest/h5bp/php_xf.conf")" = '}'
 check "injected XenForo cache block is complete" \
   bash -c 'grep -q "^fastcgi_cache fastcgicache;" "$1" && grep -q "^fastcgi_cache_bypass" "$1"' _ "$TMP/xfguest/h5bp/php_xf.conf"
+check "the XenForo status header uses the shared X-Cache-Status name" \
+  grep -q '^add_header X-Cache-Status \$upstream_cache_status always;$' "$TMP/xfguest/h5bp/php_xf.conf"
+# Older includes used X-5m-Cache; the tuner renames it so every application
+# reports the same header.
+sed -i 's/add_header X-Cache-Status/add_header X-5m-Cache/' "$TMP/xfguest/h5bp/php_xf.conf"
+tune_reset_changes
+ensure_xf_guest_cache "$TMP/xfguest"
+check "a legacy X-5m-Cache header is renamed to X-Cache-Status" \
+  bash -c '! grep -q "X-5m-Cache" "$1" && grep -q "add_header X-Cache-Status" "$1"' _ "$TMP/xfguest/h5bp/php_xf.conf"
 check "HSTS is re-included inside the cached PHP location" \
   grep -q '^include h5bp/security/strict-transport-security.conf;' "$TMP/xfguest/h5bp/php_xf.conf"
 check "Referrer-Policy is re-included inside the proxy PHP location" \
