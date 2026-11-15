@@ -258,7 +258,7 @@ single host (XF's Redis cache measured 27% slower there) and use
 |---|---|---|
 | `user=U` | required | admin user, created for `localhost`, `127.0.0.1` and `::1` (needed with `skip_name_resolve`) |
 | `pass=P` | required | its password; also written to `/etc/mysqlbkup.cnf` (mode 600) |
-| `size=auto\|4gb` | `auto` | InnoDB buffer pool: `auto` = live data+index +20% from the shared memory plan, 128 MB minimum; an explicit size is reserved verbatim |
+| `size=auto\|4gb` | `auto` | InnoDB buffer pool: `auto` = 4% of the live data+index size (128 MB minimum), only ever increased -- a pool already at or above the target is kept; an empty database uses the RAM-proportional floor (`clamp(RAM/16, 256 MB, 4 GB)`). The redo log is 25% of the pool. An explicit size is reserved verbatim |
 | `bind=ADDR[,ADDR...]` | `127.0.0.1` | comma-separated IPv4 addresses and/or `::1`; `IPV4` resolves the public address and falls back to the local outbound IPv4 behind NAT. TCP 3306 is never opened in the firewall |
 
 Environment option:
@@ -441,11 +441,12 @@ suspended errexit for the whole run). Steps:
    resident memory it returns (a 64-thread board left on 512 static workers
    is set to 64).
 4. MariaDB, Valkey/Redis and Elasticsearch from the shared 80%-of-RAM plan:
-   live data is funded first (MariaDB data+index +20%, Valkey working set
+   live data is funded first (MariaDB 4% of data+index, Valkey working set
    +20% with the RAM floor, Elasticsearch store/4), explicit sizes are
    reserved verbatim, PHP is sized from the remainder, and targets that do not
-   fit are trimmed Elasticsearch first, then Valkey, then MariaDB. A value
-   within 2% of its target is kept. A MariaDB restart pauses Angie and PHP
+   fit are trimmed Elasticsearch first, then Valkey, then MariaDB. A MariaDB
+   pool already at or above its target is kept (only increase), and the redo
+   log is 25% of the pool. A MariaDB restart pauses Angie and PHP
    first and resumes them after `SELECT 1`; when only dynamic variables
    changed (buffer pool, redo log, `tmp_table_size`/`max_heap_table_size`,
    `innodb_io_capacity`(_max), `table_open_cache`, `max_connections`,

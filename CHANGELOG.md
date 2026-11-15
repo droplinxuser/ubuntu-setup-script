@@ -3,6 +3,35 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.9 (2026-11-15)
+
+- **The buffer pool follows the database, not RAM.**  `--optimize` (and the
+  shared installer profile) now sizes `innodb_buffer_pool_size` from the live
+  `data_length + index_length`: **4%** of the current database, with the
+  documented 128 MB operational minimum, instead of data+20% bounded by a
+  RAM floor.  A data-sized pool on a large server reserved RAM the host did
+  not need and pushed PHP, search and the page cache out of the 80% plan.
+  The value is **only ever increased**: a live pool above the target is kept
+  (`OPT_MARIADB_KEPT_MB`), because shrinking would restart the server and
+  throw away a warm buffer pool.  A fresh install with no data keeps the
+  RAM-proportional floor (`clamp(RAM/16, 256 MB, 4 GB)`); an existing empty
+  database gets the 128 MB minimum.
+- **The redo log is 25% of the pool, as mysqltuner recommends.**  The
+  previous hard cap (2 GB on SSD/HDD, 4 GB on NVMe) silently dropped large
+  pools below 25% (a 32 GB pool got 4 GB, 12.5%).  The ratio is now exact on
+  every disk class.  `innodb_log_buffer_size` follows the pool
+  (`clamp(pool/16, 16 MB, 64 MB)`) so `innodb_log_file_size >=
+  innodb_log_buffer_size` holds for small 4% pools too (a 128 MB pool gets a
+  32 MB log and a 16 MB buffer; MariaDB rejects a log smaller than the
+  buffer).
+- **Verified on a live 5 586 MB database.**  A 128 MB pool grew to the 4%
+  target (223 MB, reported as 224 MB after MariaDB's chunk rounding) with a
+  56 MB redo log and a 16 MB log buffer; a second `--optimize` was a no-op.
+  A 512 MB pool was kept against the 223 MB target (only increase) with a
+  128 MB log and a 32 MB buffer, and no restart.  The report now states the
+  4% target instead of "does not fully fit".
+- **Validation.**  830 tuning checks pass; `shellcheck -S warning` clean.
+
 ## 1.21.8 (2026-11-15)
 
 Eighth audit of the 1.21 line on the Ubuntu 26.04.1 test host (16 logical

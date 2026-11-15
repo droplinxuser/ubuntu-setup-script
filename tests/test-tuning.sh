@@ -1345,19 +1345,19 @@ check "MariaDB gets the remaining budget after the PHP floor" \
 php_pool_max_children() { printf '128'; }
 OPT_DETECTED=(angie php:8.3 mariadb redis elastic)
 
-# The buffer pool should hold the live data+index working set when possible.
+# The buffer pool is 4% of the live data+index size (a page cache, not a
+# mirror of the database): a 20 GB database gets 800 MB, not 20 GB.
 mariadb_data_size_mb() { printf '20000'; }
 plan_memory_budget
-check "buffer pool covers a 20 GB database" \
-  test "$OPT_MARIADB_BUDGET_MB" -ge 20000
+check "live pool is 4% of a 20 GB database" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 800
 check "database-fit plan stays inside the 80% budget" \
   test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
        -le $(( 65536 * 80 / 100 ))
 
-# A freshly installed database can be only a few MB.  mariadb_floor_mb gives
-# it RAM/16 (256 MB..4 GB) so the pool has room before the next --optimize;
-# the fresh-install plan uses the same floor, so the first --optimize cannot
-# shrink what the installer sized.
+# An empty database cannot be sized from data; the RAM-proportional floor
+# gives the pool room before the next --optimize.  A live database with only
+# a few MB of rows gets the 128 MB operational minimum instead.
 mem_total_mb() { printf '262144'; }
 mariadb_current_pool_mb() { printf '0'; }
 mariadb_data_size_mb() { printf '81'; }
@@ -1365,9 +1365,9 @@ elasticsearch_data_size_mb() { printf '0'; }
 php_pool_max_children() { printf '128'; }
 OPT_DETECTED=(angie php:8.4 mariadb valkey elastic)
 plan_memory_budget
-check "tiny live database uses the RAM floor (RAM/16 capped at 4 GB)" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 4096
-check "tiny live database stays far below RAM/4" \
+check "tiny live database uses the 128 MB minimum" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 128
+check "tiny database stays far below RAM/4" \
   test "$OPT_MARIADB_BUDGET_MB" -le $(( 262144 / 4 ))
 check "tiny database floor stays inside the 80% budget" \
   test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
@@ -1386,59 +1386,52 @@ effective_cpus() { printf '2'; }
 # A database larger than the remaining budget gets the largest feasible pool.
 mariadb_data_size_mb() { printf '40960'; }
 plan_memory_budget
-check "oversized database gets data+20%" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 49152
-check "oversized database covers the data within 20% headroom" \
-  test "$OPT_DB_SIZE_MB" -eq 40960 -a "$OPT_MARIADB_BUDGET_MB" -ge 40960 -a "$OPT_MARIADB_BUDGET_MB" -le 49152
+check "live pool is 4% of a 40 GB database" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 1638
+check "40 GB database pool stays proportional, not data-sized" \
+  test "$OPT_DB_SIZE_MB" -eq 40960 -a "$OPT_MARIADB_BUDGET_MB" -eq 1638
 
-# On a large host the pool follows the live working set plus 5% headroom.
+# A pool already above the 4% target is kept: --optimize only increases.
 mem_total_mb() { printf '262144'; }
 mariadb_current_pool_mb() { printf '73728'; }
 mariadb_data_size_mb() { printf '73599'; }
 elasticsearch_data_size_mb() { printf '0'; }
 OPT_DETECTED=(angie php:8.4 mariadb valkey)
 plan_memory_budget
-check "large host sizes the pool to data+20%" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 88318
-check "data-sized pool is not marked as preserved" \
-  test "$OPT_MARIADB_KEPT_MB" -eq 0
+check "large host keeps the live pool (the 4% target is lower)" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 73728
+check "an only-increased pool is marked as preserved" \
+  test "$OPT_MARIADB_KEPT_MB" -eq 73728
 check "data-sized pool keeps the plan inside the 80% budget" \
   test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
        -le $(( 262144 * 80 / 100 ))
 
-# Tiny statistics drift must not change the planned size on every run.
+# Re-running with a lower target must not shrink a live pool.
 mariadb_current_pool_mb() { printf '88300'; }
 plan_memory_budget
-check "small statistics drift keeps the live pool" \
+check "a live pool above the 4% target is kept unchanged" \
   test "$OPT_MARIADB_BUDGET_MB" -eq 88300
 
-# A live pool above the data target is kept while it still fits the budget:
-# shrinking would force a restart and a cold buffer pool for no RAM benefit.
-mariadb_current_pool_mb() { printf '120000'; }
+# A live pool that no longer fits the shared budget is still capped: the
+# 80%-of-RAM plan is the hard ceiling, not the target.
+mariadb_current_pool_mb() { printf '250000'; }
 plan_memory_budget
-check "oversized live pool is reduced to data+20%" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 88318
-check "shrunk pool is not marked as preserved" \
+check "pool above the shared budget is capped" \
+  test "$OPT_MARIADB_BUDGET_MB" -lt 209715
+check "capped pool is not marked as preserved" \
   test "$OPT_MARIADB_KEPT_MB" -eq 0
-
-# A pool that would exceed the shared budget is capped.
-mariadb_current_pool_mb() { printf '200000'; }
-plan_memory_budget
-check "pool above the target is capped to data+20%" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 88318
 
 # A database larger than the shared budget receives the capped pool.
 mariadb_current_pool_mb() { printf '0'; }
 mariadb_data_size_mb() { printf '300000'; }
 plan_memory_budget
-check "database larger than the shared budget is capped" \
-  test "$OPT_MARIADB_BUDGET_MB" -gt 200000 -a "$OPT_MARIADB_BUDGET_MB" -lt 209715
+check "4% of a database larger than the shared budget is capped" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 12000
 check "capped data-sized plan still fits the 80% budget" \
   test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
        -le $(( 262144 * 80 / 100 ))
 
-# A MariaDB-only host reserves no PHP budget; a database larger than 80% of
-# RAM can use the whole usable budget, while the data+5% target still applies.
+# A MariaDB-only host reserves no PHP budget; the 4% pool is funded first.
 mem_total_mb() { printf '65536'; }
 php_pool_max_children() { printf '0'; }
 mariadb_current_pool_mb() { printf '0'; }
@@ -1447,15 +1440,16 @@ OPT_DETECTED=(mariadb)
 plan_memory_budget
 check "MariaDB-only host reserves no PHP budget" \
   test "$OPT_PHP_BUDGET_MB" -eq 0
-check "MariaDB-only large database can use the full 80% budget" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 52428
+check "MariaDB-only host sizes a 60 GB database at 4%" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 2400
 
-# Unknown data size (query failed) falls back to the larger MariaDB-only share.
+# Unknown data size (query failed) on a live service is treated like an empty
+# database: the 128 MB minimum, never a RAM-sized guess.
 mariadb_data_size_mb() { printf ''; }
 OPT_DETECTED=(mariadb)
 plan_memory_budget
-check "MariaDB-only unknown data uses the RAM floor" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 4096
+check "MariaDB-only unknown data uses the 128 MB minimum" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 128
 
 # Valkey gets a larger share when no database/search tier shares the host.
 mariadb_data_size_mb() { printf '0'; }
@@ -2219,8 +2213,28 @@ done
 mariadb_compute_profile 2048
 check "MariaDB shared profile sizes a 2G buffer pool" \
   test "$MARIADB_PROFILE_BUFFER" = 2G
-check "MariaDB shared profile caps the log at 512M" \
+check "MariaDB redo log is 25% of the pool" \
   test "$MARIADB_PROFILE_LOG_SIZE" = 512M
+check "MariaDB log buffer follows the pool (16..64 MB)" \
+  test "$MARIADB_PROFILE_LOG_BUFFER" = 64M
+# innodb_log_file_size must be at least innodb_log_buffer_size.  A pool small
+# enough for the 4%-of-data rule (128 MB) still gets a legal pair: 32 MB log,
+# 16 MB buffer, exactly 25%.
+mariadb_compute_profile 128
+check "a 128 MB pool gets a 32 MB redo log (25%)" \
+  test "$MARIADB_PROFILE_LOG_SIZE" = 32M
+check "a 128 MB pool gets a 16 MB log buffer" \
+  test "$MARIADB_PROFILE_LOG_BUFFER" = 16M
+check "redo log is never smaller than the log buffer" \
+  test "$(size_to_mb "$MARIADB_PROFILE_LOG_SIZE")" -ge "$(size_to_mb "$MARIADB_PROFILE_LOG_BUFFER")"
+mariadb_compute_profile 2048
+# mysqltuner's 25% ratio has no upper cap: a 16 GB pool gets a 4 GB log on
+# every disk class, instead of being silently reduced to 12.5%.
+mariadb_compute_profile 16384
+check "a 16 GB pool gets a 4 GB redo log (25%, uncapped)" \
+  test "$MARIADB_PROFILE_LOG_SIZE" = 4G
+check "a 16 GB pool keeps a 64 MB log buffer" \
+  test "$MARIADB_PROFILE_LOG_BUFFER" = 64M
 check "MariaDB shared profile keeps a usable connection ceiling" \
   bash -c "(( $MARIADB_PROFILE_MAX_CONN >= 200 && $MARIADB_PROFILE_MAX_CONN <= 2000 ))"
 
@@ -2312,21 +2326,22 @@ check "fresh install full-stack plan stays inside the 80% budget" \
        -le $(( 27812 * 80 / 100 ))
 
 # A database that has just been initialised reports a few MB of system data.
-# The first --optimize must not mistake that for a populated working set and
-# shrink the installer's spare-RAM buffer pool back to the 1/16-RAM floor.
+# 4% of that is below the operational minimum, so a live database with no
+# real rows gets 128 MB; the only-increase rule keeps the installer's larger
+# pool when one is already running.
 mariadb_data_size_mb() { printf '4'; }
 OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
 OPT_INSTALL_PLAN=0
 plan_memory_budget
-check "measured-empty live database uses the RAM floor" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq "$(mariadb_floor_mb "$(mem_total_mb)")"
+check "measured-empty live database uses the 128 MB minimum" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 128
 
 # ---------------------------------------------------------------------------
 # Live-data protection
 # ---------------------------------------------------------------------------
-# Live stores are sized to data+5%.  A pool/heap that is grossly above that
-# target is reduced so the freed RAM can go to the other services; a value
-# within statistics noise is kept to avoid restart churn.
+# A live MariaDB pool is only ever increased: a pool above the 4% target is
+# kept (shrinking would restart the server and empty the warm cache), while
+# an Elasticsearch heap above store/4 is still reduced to free RAM.
 valkey_live_used_mb() { return 0; }
 mariadb_data_size_mb() { printf '2048'; }
 mariadb_current_pool_mb() { printf '4096'; }
@@ -2335,8 +2350,8 @@ elasticsearch_current_heap_mb() { printf '4096'; }
 OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
 OPT_INSTALL_PLAN=0
 plan_memory_budget
-check "live MariaDB pool is reduced to data+20%" \
-  test "$OPT_MARIADB_KEPT_MB" -eq 0 -a "$OPT_MARIADB_BUDGET_MB" -eq 2457
+check "live MariaDB pool above the 4% target is kept" \
+  test "$OPT_MARIADB_KEPT_MB" -eq 4096 -a "$OPT_MARIADB_BUDGET_MB" -eq 4096
 check "live Elasticsearch heap is reduced to the store/4 minimum" \
   test "$OPT_ES_KEPT_MB" -eq 0 -a "$OPT_ES_BUDGET_MB" -eq 512
 
@@ -2363,7 +2378,7 @@ plan_memory_budget
 check "MariaDB+Valkey host reserves no PHP or Elasticsearch budget" \
   test "$OPT_PHP_BUDGET_MB" -eq 0 -a "$OPT_ES_BUDGET_MB" -eq 0
 check "MariaDB+Valkey host fits the live database target" \
-  test "$OPT_MARIADB_BUDGET_MB" -ge 5000
+  test "$OPT_MARIADB_BUDGET_MB" -eq 200
 check "MariaDB+Valkey plan stays inside the 80% budget" \
   test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
        -le $(( 27812 * 80 / 100 ))
@@ -2375,7 +2390,7 @@ valkey_live_used_mb() { printf '1000'; }
 OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
 plan_memory_budget
 check "full stack reserves MariaDB, Valkey and Elasticsearch first" \
-  test "$OPT_MARIADB_BUDGET_MB" -ge 8000 \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 320 \
        -a "$OPT_VALKEY_BUDGET_MB" -ge 1100 \
        -a "$OPT_ES_BUDGET_MB" -ge 512
 check "full stack still gets a viable PHP pool" \
@@ -2768,20 +2783,20 @@ check "record_explicit_options clears the pin when server= is omitted" \
   test "$(host_server_type)" = dedi
 unset "OPT[basic.server]"
 
-# MariaDB profile: table caches follow max_connections, the redo cap follows
-# the disk class.
+# MariaDB profile: table caches follow max_connections, the redo log is 25%
+# of the pool on every disk class (no cap).
 php_pool_max_children() { printf 1000; }
 mariadb_storage_class() { printf nvme; }
 mariadb_io_capacity() { printf '10000 20000'; }
 mariadb_compute_profile 32768
 check "table_open_cache follows max_connections (1000 workers -> 1300 -> 20800)" \
   test "$MARIADB_PROFILE_OPEN_CACHE" -eq 20800
-check "redo log reaches 4 GB on NVMe for a 32 GB pool" \
-  test "$(size_to_mb "$MARIADB_PROFILE_LOG_SIZE")" -eq 4096
+check "redo log is 8 GB for a 32 GB pool on NVMe (25%)" \
+  test "$(size_to_mb "$MARIADB_PROFILE_LOG_SIZE")" -eq 8192
 mariadb_storage_class() { printf ssd; }
 mariadb_compute_profile 32768
-check "redo log stays at 2 GB on SSD" \
-  test "$(size_to_mb "$MARIADB_PROFILE_LOG_SIZE")" -eq 2048
+check "redo log stays at 25% on SSD (8 GB, no disk-class cap)" \
+  test "$(size_to_mb "$MARIADB_PROFILE_LOG_SIZE")" -eq 8192
 php_pool_max_children() { printf 0; }
 effective_cpus() { printf 4; }
 mariadb_compute_profile 2048

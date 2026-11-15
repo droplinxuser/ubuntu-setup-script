@@ -41,7 +41,11 @@ interactive_timeout = 600
 net_read_timeout = 120
 net_write_timeout = 120
 
-# Size these from RAM; 4G/1G is a reasonable starting point for 16-32 GB.
+# setup.sh sizes the pool from the live data+index size: 4% for a populated
+# database (never shrunk, 128 MB minimum), the RAM floor for a fresh install.
+# The redo log is 25% of the pool (mysqltuner) and the log buffer follows it
+# (16..64 MB), so the log is never smaller than the buffer.  The values below
+# are only a documentation baseline.
 innodb_log_buffer_size = 64M
 innodb_log_file_size = 1G
 innodb_buffer_pool_size = 4G

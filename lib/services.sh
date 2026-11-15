@@ -665,6 +665,7 @@ mariadb_io_capacity() {
 # one writing a larger log file or a different connection ceiling).
 MARIADB_PROFILE_BUFFER=""
 MARIADB_PROFILE_LOG_SIZE=""
+MARIADB_PROFILE_LOG_BUFFER=""
 MARIADB_PROFILE_OPEN_CACHE=""
 MARIADB_PROFILE_ARIA_MB=""
 MARIADB_PROFILE_THREADS=""
@@ -728,16 +729,22 @@ MARIADB_PROFILE_PERSISTENT_APPS=0
 
 mariadb_compute_profile() {
   local size_mb=$1 logsize open_cache aria_mb threads max_conn current_max="" kept_max=0
-  local disk_class io_read io_write io_threads lru_depth flush_neighbors tmp_mb thread_cache ram_mb log_cap
+  local disk_class io_read io_write io_threads lru_depth flush_neighbors tmp_mb thread_cache ram_mb
   disk_class=$(mariadb_storage_class)
-  # Redo log: a quarter of the pool.  2 GB is enough on SSD/HDD; NVMe absorbs
-  # the longer checkpoint window, so a pool of 16 GB or more gets up to 4 GB
-  # before write bursts stall on checkpoints.
+  # Redo log: 25% of the total buffer pool, as mysqltuner recommends.  The
+  # ratio is what bounds the checkpoint window: too small and every commit
+  # forces a flush, too large and recovery after a crash gets long.  No upper
+  # cap: the pool follows 4% of the live data (--optimize), so a large ratio
+  # stays proportional instead of silently dropping below 25%.
   logsize=$(( size_mb / 4 ))
-  (( logsize < 64 )) && logsize=64
-  log_cap=2048
-  [[ $disk_class == nvme ]] && log_cap=4096
-  (( logsize > log_cap )) && logsize=$log_cap
+  (( logsize < 16 )) && logsize=16
+  # innodb_log_file_size must be at least innodb_log_buffer_size.  The buffer
+  # follows the pool (16..64 MB) instead of a fixed 64 MB, so the 25% redo log
+  # of a small pool is still a legal configuration (a 128 MB pool gets a
+  # 32 MB log and a 16 MB buffer).
+  local log_buffer=$(( size_mb / 16 ))
+  (( log_buffer < 16 )) && log_buffer=16
+  (( log_buffer > 64 )) && log_buffer=64
   # Aria serves internal temporary tables, not the InnoDB data: size its
   # page cache from RAM (RAM/128, 16..256 MB) so it stops changing, and
   # forcing a restart, every time the buffer pool is re-planned.
@@ -819,6 +826,7 @@ mariadb_compute_profile() {
 
   MARIADB_PROFILE_BUFFER=$(mb_to_config "$size_mb")
   MARIADB_PROFILE_LOG_SIZE=$(mb_to_config "$logsize")
+  MARIADB_PROFILE_LOG_BUFFER=$(mb_to_config "$log_buffer")
   MARIADB_PROFILE_OPEN_CACHE=$open_cache
   MARIADB_PROFILE_ARIA_MB=$aria_mb
   MARIADB_PROFILE_THREADS=$threads
@@ -877,7 +885,7 @@ interactive_timeout = 600
 net_read_timeout = 120
 net_write_timeout = 120
 
-innodb_log_buffer_size = 64M
+innodb_log_buffer_size = ${MARIADB_PROFILE_LOG_BUFFER}
 innodb_log_file_size = ${MARIADB_PROFILE_LOG_SIZE}
 innodb_buffer_pool_size = ${MARIADB_PROFILE_BUFFER}
 innodb_buffer_pool_dump_at_shutdown = ON

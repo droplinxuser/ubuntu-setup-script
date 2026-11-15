@@ -58,9 +58,10 @@ Services (optional; only the ones listed are installed):
       children     PHP-FPM worker count (default: auto from RAM/CPU)
       max_requests recycle a worker after N requests (default: threads x 1024)
   --mariadb   user=demo pass=temp [size=4gb|auto] [bind=127.0.0.1[,ADDR...]|IPV4]
-      size     auto (default) = sized by the shared memory plan from the live
-               data+index size (128 MB minimum), leaving room for
-               Elasticsearch, Valkey and PHP workers.
+      size     auto (default) = 4% of the live data+index size from the
+               shared memory plan, only increased, 128 MB minimum; an empty
+               database uses a RAM floor.  The redo log is 25% of the pool.
+               Room is left for Elasticsearch, Valkey and PHP workers.
       bind     comma-separated IPv4 addresses and/or ::1 (default 127.0.0.1)
                IPV4 auto-detects the server's public IPv4; on NAT it falls
                back to the local outbound IPv4

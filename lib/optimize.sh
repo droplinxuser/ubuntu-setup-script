@@ -508,19 +508,29 @@ plan_memory_budget() {
       fi
       [[ $data =~ ^[0-9]+$ ]] || data=0
       OPT_DB_SIZE_MB=$data
-      maria_target=$(( data * 120 / 100 ))
-      # Live data +20% cannot grow faster than 20% per run and a fresh
-      # install (or a site filled through a web installer) measures nothing;
-      # a RAM-proportional floor gives the pool room before the next
-      # --optimize, like valkey_floor_mb does for the cache.
-      local maria_floor
-      maria_floor=$(mariadb_floor_mb "$total")
-      (( maria_target < maria_floor )) && maria_target=$maria_floor
+      # A live database is sized from its own data: 4% of the current
+      # data+index size, not RAM.  A database pool is a page cache; 4% keeps
+      # the hot pages without reserving memory the host may need for PHP,
+      # search and the page cache (overcommitting a live server is worse than
+      # a cold read).  A fresh install has no data at all, so it keeps the
+      # RAM-proportional operational floor; an existing but empty database
+      # gets the 128 MB operational minimum (4% of nothing is nothing, and
+      # the only-increase rule below already protects a larger live pool).
+      if (( data > 0 )); then
+        maria_target=$(( data * 4 / 100 ))
+        (( maria_target < 128 )) && maria_target=128
+      elif (( OPT_INSTALL_PLAN )); then
+        maria_target=$(mariadb_floor_mb "$total")
+      else
+        maria_target=128
+      fi
     fi
     current_pool=$(mariadb_current_pool_mb)
     if [[ $current_pool =~ ^[0-9]+$ ]] && (( current_pool > 0 )); then
-      if (( current_pool * 100 <= maria_target * 102 \
-            && current_pool * 100 >= maria_target * 98 )); then
+      # Only increase: a pool that is already above the target is kept as it
+      # is.  Lowering it would restart the server and empty the buffer pool it
+      # has spent hours warming, for no memory the run needs.
+      if (( current_pool > maria_target )); then
         maria_target=$current_pool
         kept_pool=$current_pool
       fi
@@ -627,7 +637,7 @@ plan_memory_budget() {
   (( maria_fixed ))  && fixed_sum=$(( fixed_sum + maria_target ))
   (( valkey_fixed )) && fixed_sum=$(( fixed_sum + valkey_target ))
   (( es_fixed ))     && fixed_sum=$(( fixed_sum + es_target ))
-  # Data +20% of a database larger than RAM would take the whole pool in the
+  # Data larger than the budget would take the whole pool in the
   # proportional split and push Elasticsearch and Valkey to their floors.
   (( maria_fixed == 0 && maria_target > data_pool )) && maria_target=$data_pool
   flex_pool=$(( data_pool - fixed_sum ))

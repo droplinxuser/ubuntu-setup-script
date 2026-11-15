@@ -596,12 +596,12 @@ optimize_mariadb() {
     [[ ${OPT_DB_SIZE_MB:-} =~ ^[0-9]+$ ]] || OPT_DB_SIZE_MB=0
   fi
   if (( OPT_DB_SIZE_MB > 0 )); then
-    if (( size_mb >= OPT_DB_SIZE_MB )); then
-      opt_report "- Database data+index=${OPT_DB_SIZE_MB}MB; buffer pool=${size_mb}MB (fits)"
-    elif (( ${OPT_MARIADB_KEPT_MB:-0} > 0 )); then
-      opt_report "- Database data+index=${OPT_DB_SIZE_MB}MB; buffer pool=${size_mb}MB (kept existing pool)"
+    local pct_mb=$(( OPT_DB_SIZE_MB * 4 / 100 ))
+    (( pct_mb < 128 )) && pct_mb=128
+    if (( ${OPT_MARIADB_KEPT_MB:-0} > 0 )); then
+      opt_report "- Database data+index=${OPT_DB_SIZE_MB}MB; buffer pool=${size_mb}MB (kept existing pool; the 4% target is ${pct_mb}MB)"
     else
-      opt_report "- Database data+index=${OPT_DB_SIZE_MB}MB; buffer pool=${size_mb}MB (does not fully fit; largest feasible pool)"
+      opt_report "- Database data+index=${OPT_DB_SIZE_MB}MB; buffer pool=${size_mb}MB (4% of data = ${pct_mb}MB, 128MB minimum)"
     fi
   fi
   mariadb_compute_profile "$size_mb"
@@ -697,7 +697,7 @@ optimize_mariadb() {
         # The fd drop-in still needs a restart; fall through to apply it.
       fi
     else
-      opt_report "- Online buffer-pool resize failed; falling back to a restart"
+      opt_report "- Online resize of the changed keys failed; falling back to a restart"
     fi
   fi
   if [[ -n $cnf_before && $cnf_before == "$cnf_after" ]] && (( base_changed == 0 )); then
@@ -1662,11 +1662,9 @@ optimize_plan() {
     db_size_mb=${OPT_DB_SIZE_MB:-0}
     db_fit=""
     if (( db_size_mb > 0 )); then
-      if (( size_mb >= db_size_mb )); then
-        db_fit=", database=${db_size_mb}MB (fits)"
-      else
-        db_fit=", database=${db_size_mb}MB (does not fully fit)"
-      fi
+      db_fit=", database=${db_size_mb}MB (4% of data = $(( db_size_mb * 4 / 100 ))MB, 128MB minimum"
+      (( ${OPT_MARIADB_KEPT_MB:-0} > 0 )) && db_fit+="; existing pool kept"
+      db_fit+=")"
     fi
     printf '  MariaDB: buffer_pool=%sMB max_connections=%s back_log=%s%s\n' \
       "$size_mb" "$max_conn" "$backlog" "$db_fit"
