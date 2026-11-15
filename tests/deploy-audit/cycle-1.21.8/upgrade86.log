@@ -1,0 +1,76 @@
+================================================================
+ setup.sh run log
+ Started: 2026-11-15 14:45:50 UTC
+ Script : setup.sh 1.21.7
+ Log    : /root/work/ubuntu-setup-script/setup_20261115-144550-146574.log
+================================================================
+
+--- environment ---
+Command      : setup.sh --upgrade-php=8.6
+Invocation   : setup.sh
+Directory    : /root/work/ubuntu-setup-script
+Script dir   : /root/work/ubuntu-setup-script
+PID / PPID   : 146574 / 146573
+User / EUID  : root / 0
+Umask        : 0022
+Shell        : /bin/bash (bash 5.3.9(1)-release)
+OS           : Ubuntu 26.04.1 LTS (26.04)
+Kernel       : Linux 7.0.0-43-generic x86_64 GNU/Linux
+Architecture : amd64
+Virtualization: none
+CPU          : 16 logical CPUs
+Memory       : 27812MB total, 19119MB available
+Disk         : 903G total, 851G free on /
+Addresses    : 192.168.1.139 2001:db8:355:1008:74d2:b8ae:6d3d:799c 2001:db8:355:1008:fe01:5c7b:c9d8:5ead fd2b:b17c:1393:8:c055:1133:1b57:f29c fd2b:b17c:1393:8:8126:7e8b:3bd0:a232 
+Failed units : none
+TMPDIR       : /tmp
+Log file     : /root/work/ubuntu-setup-script/setup_20261115-144550-146574.log
+--------------------
+
+
+--- selection ---
+Modes        : dry_run=0 optimize=0 purge=0 diagnostics=0 restart_all=0 upgrade_php=8.6
+Services     : none
+Domains      : none
+PHP upgrade  : target=8.6
+--------------------
+
+Ubuntu 26.04 PHP upgrade
+
+==> PHP upgrade to 8.6
+2026-11-15 14:45:50 UTC [INFO] Current PHP: 8.5 (installed: 8.5)
+2026-11-15 14:45:50 UTC [ OK ] Snapshot: /var/lib/setup.sh/php-upgrade-20261115-144550
+2026-11-15 14:45:51 UTC [INFO] Keeping PHP timezone: Asia/Manila
+Hit:1 https://deb.nodesource.com/node_26.x nodistro InRelease
+Hit:2 https://packages.sury.org/php resolute InRelease
+Hit:3 http://security.ubuntu.com/ubuntu resolute-security InRelease
+Hit:4 https://artifacts.elastic.co/packages/9.x/apt stable InRelease
+Hit:5 https://download.angie.software/angie/ubuntu/26.04 resolute InRelease
+Get:6 https://esm.ubuntu.com/apps/ubuntu resolute-apps-security InRelease [8374 B]
+Hit:7 http://archive.ubuntu.com/ubuntu resolute InRelease
+Get:8 https://esm.ubuntu.com/apps/ubuntu resolute-apps-updates InRelease [8226 B]
+Hit:9 http://archive.ubuntu.com/ubuntu resolute-updates InRelease
+Get:10 https://esm.ubuntu.com/infra/ubuntu resolute-infra-security InRelease [8250 B]
+Hit:11 http://archive.ubuntu.com/ubuntu resolute-backports InRelease
+Get:12 https://esm.ubuntu.com/infra/ubuntu resolute-infra-updates InRelease [8219 B]
+Fetched 33.1 kB in 4s (9430 B/s)
+Reading package lists...
+2026-11-15 14:45:54 UTC [WARN] PHP 8.6 candidate 8.6.0~rc5-2+0~deb.sury.org.1+ubuntu26.04 is a pre-release; packages built against the final release may need a rebuild
+2026-11-15 14:45:55 UTC [INFO] Target package candidate: 8.6.0~rc5-2+0~deb.sury.org.1+ubuntu26.04
+2026-11-15 14:45:55 UTC [WARN] Extension(s) without a 8.6 package: igbinary (php8.5-igbinary: php8.6-igbinary is not published) imagick (php8.5-imagick: php8.6-imagick is not published) redis (php8.5-redis: php8.6-redis is not published yet)
+2026-11-15 14:45:55 UTC [ERR ] command failed (exit 1) at line 749: sed -E 's/^[[:space:]]*root[[:space:]]+//; s/;.*//; s/^[[:space:]]+//; s/[[:space:]]+$//'
+2026-11-15 14:45:55 UTC [ERR ] command failed (exit 1) at line 749: root=$(grep -m1 -E '^[[:space:]]*root[[:space:]]+' "$1" 2> /dev/null | sed -E 's/^[[:space:]]*root[[:space:]]+//; s/;.*//; s/^[[:space:]]+//; s/[[:space:]]+$//')
+2026-11-15 14:45:55 UTC [ERR ] command failed (exit 1) at line 427: root=$(angie_vhost_root "$file")
+2026-11-15 14:45:55 UTC [ERR ] command failed (exit 1) at line 508: sort -u
+2026-11-15 14:45:55 UTC [WARN] PHP 8.6 cannot serve every installed application:
+2026-11-15 14:45:55 UTC [WARN]   - chevereto at /var/www/chev.test.local/public requires the redis extension (php8.6-redis is not published)
+2026-11-15 14:45:55 UTC [WARN]   - chevereto at /var/www/chev.test.local/public requires the imagick extension (php8.6-imagick is not published)
+2026-11-15 14:45:55 UTC [WARN]   - xenforo at /var/www/xf.test.local/public requires the redis extension (php8.6-redis is not published)
+2026-11-15 14:45:55 UTC [FAIL] Refusing to replace PHP 8.5 with PHP 8.6: the purge would break the site(s) above. Nothing was changed. Re-run with SETUP_PHP_ALLOW_MISSING_EXT=1 to accept the loss.
+
+--- run finished ---
+Result    : FAILURE (exit 1)
+Finished  : 2026-11-15 14:45:55 UTC
+Duration  : 00:00:05
+Full log  : /root/work/ubuntu-setup-script/setup_20261115-144550-146574.log
+--------------------

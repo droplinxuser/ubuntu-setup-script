@@ -1,0 +1,76 @@
+##### PHP 8.5.12 #####
+=== lint (php -l, E_ALL) ===
+wordpress  files=1514   deprecated=18    warning=0    fatal/parse=0
+      1 Deprecated: ParagonIE_Sodium_Core32_Curve25519_Ge_Precomp::__construct(): Implicitly marking parameter $yplusx as nullable is deprecated, the explicit nullable type must be used instead
+      1 Deprecated: ParagonIE_Sodium_Core32_Curve25519_Ge_Precomp::__construct(): Implicitly marking parameter $yminusx as nullable is deprecated, the explicit nullable type must be used instead
+      1 Deprecated: ParagonIE_Sodium_Core32_Curve25519_Ge_Precomp::__construct(): Implicitly marking parameter $xy2d as nullable is deprecated, the explicit nullable type must be used instead
+      1 Deprecated: ParagonIE_Sodium_Core32_Curve25519_Ge_P3::__construct(): Implicitly marking parameter $z as nullable is deprecated, the explicit nullable type must be used instead
+      1 Deprecated: ParagonIE_Sodium_Core32_Curve25519_Ge_P3::__construct(): Implicitly marking parameter $y as nullable is deprecated, the explicit nullable type must be used instead
+      1 Deprecated: ParagonIE_Sodium_Core32_Curve25519_Ge_P3::__construct(): Implicitly marking parameter $x as nullable is deprecated, the explicit nullable type must be used instead
+xenforo    files=9018   deprecated=60    warning=0    fatal/parse=2
+     11 Deprecated: Using ${var} in strings is deprecated, use {$var} instead
+      2 Deprecated: Non-canonical cast (double) is deprecated, use the (float) cast instead
+      1 Stack trace:
+      1 Parse error: syntax error, unexpected token "{"
+      1 Fatal error: Cannot use "Null" as a class name as it is reserved
+      1 Deprecated: The predefined locally scoped $http_response_header variable is deprecated, call http_get_last_response_headers() instead
+Fatal error: Cannot use "Null" as a class name as it is reserved in src/vendor/laminas/laminas-mail/src/Transport/Null.php on line 21
+Parse error: syntax error, unexpected token "{" in src/vendor/braintree/braintree_php/lib/Braintree/Digest.php on line 53
+chevereto  files=51628  deprecated=481   warning=0    fatal/parse=0
+      1 Deprecated: The predefined locally scoped $http_response_header variable is deprecated, call http_get_last_response_headers() instead
+      1 Deprecated: Return type of ECSPrefix202510\Nette\Iterators\Mapper::current() should either be compatible with IteratorIterator::current(): mixed, or the #[\ReturnTypeWillChange] attribute shou
+      1 Deprecated: PHP_CodeSniffer\Tests\TestSuite::run(): Implicitly marking parameter $result as nullable is deprecated, the explicit nullable type must be used instead
+      1 Deprecated: MicrosoftAzure\Storage\Table\TableRestProxy::updateEntityAsync(): Implicitly marking parameter $options as nullable is deprecated, the explicit nullable type must be used instead
+      1 Deprecated: MicrosoftAzure\Storage\Table\TableRestProxy::updateEntity(): Implicitly marking parameter $options as nullable is deprecated, the explicit nullable type must be used instead
+      1 Deprecated: MicrosoftAzure\Storage\Table\TableRestProxy::setTableAclAsync(): Implicitly marking parameter $options as nullable is deprecated, the explicit nullable type must be used instead
+=== run-time (apps in debug / E_ALL mode) ===
+wp bench1 id=2
+xf member: bench1
+wp admin /wp-admin/update-core.php 403
+xf login admin                     500
+xf login bench1                    500
+xf guest /threads/1/               500
+xf guest /sitemap.xml              404
+xf member /threads/1/              500
+xf member /account/                500
+xf member /account/preferences     500
+xf member /conversations/          500
+xf member /whats-new/posts/        500
+xf reply POST                      500
+FAIL  xf reply POST                      unexpected code 500 (expected 200)
+xf search POST                     500
+FAIL  xf search POST                     unexpected code 500 (expected 200)
+xf admin login                     500
+xf acp                             500
+xf acp ?users/list                 500
+xf acp ?options/                   500
+xf acp ?nodes/                     500
+xf acp ?add-ons/                   500
+xf acp ?styles/                    500
+xf acp ?tools/rebuild              500
+xf acp ?logs/server-error          500
+xf acp ?tools/test-email           500
+xf acp ?templates/                 500
+chev guest /signup                 404
+chev guest /api/1/upload           400
+chev guest /sitemap.xml            404
+chev admin /dashboard/images       404
+chev upload POST                   200 {"status_code":200,"success":{"message":"file uploaded","code":200},"image":{"name":"ex161ef4b820cb88f1","extension":"pn
+chev rejected dot segment          400
+xf rejected dot segment            400
+=== PHP 8.5 diagnostics (unique, by app) ===
+-- wp.test.local: deprecated=0 warning=0 notice=0 fatal=0
+-- xf.test.local: deprecated=0 warning=0 notice=0 fatal=0
+-- chev.test.local: deprecated=0 warning=0 notice=0 fatal=0
+xf_error_log rows: 77
+[E_DEPRECATED] League\\Event\\EmitterTrait::setEmitter(): Implicitly marking parameter $emitter as nullable is deprecated, the explicit nullable type must be used instead
+[E_DEPRECATED] League\\Flysystem\\EventableFilesystem\\EventableFilesystem::get(): Implicitly marking parameter $handler as nullable is deprecated, the explicit nullable type must be 
+[E_DEPRECATED] League\\Flysystem\\EventableFilesystem\\EventableFilesystem::__construct(): Implicitly marking parameter $emitter as nullable is deprecated, the explicit nullable type 
+[E_DEPRECATED] League\\Flysystem\\Filesystem::get(): Implicitly marking parameter $handler as nullable is deprecated, the explicit nullable type must be used instead
+[E_DEPRECATED] League\\Flysystem\\FilesystemInterface::get(): Implicitly marking parameter $handler as nullable is deprecated, the explicit nullable type must be used instead
+[E_DEPRECATED] League\\Flysystem\\MountManager::get(): Implicitly marking parameter $handler as nullable is deprecated, the explicit nullable type must be used instead
+=== result: 2 unexpected response(s) ===
+-- xenforo run-time, outside src/vendor:
+71	[E_DEPRECATED] Using null as an array offset is deprecated, use an empty string instead	src/XF/App.php
+-- xenforo run-time, vendor libraries: 6 distinct
+ok-status lines: 61

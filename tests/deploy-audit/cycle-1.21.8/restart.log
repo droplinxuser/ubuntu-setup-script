@@ -1,0 +1,64 @@
+================================================================
+ setup.sh run log
+ Started: 2026-11-15 14:59:07 UTC
+ Script : setup.sh 1.21.7
+ Log    : /root/work/ubuntu-setup-script/setup_20261115-145907-243533.log
+================================================================
+
+--- environment ---
+Command      : setup.sh --restart-all
+Invocation   : setup.sh
+Directory    : /root/work/ubuntu-setup-script
+Script dir   : /root/work/ubuntu-setup-script
+PID / PPID   : 243533 / 242599
+User / EUID  : root / 0
+Umask        : 0022
+Shell        : /bin/bash (bash 5.3.9(1)-release)
+OS           : Ubuntu 26.04.1 LTS (26.04)
+Kernel       : Linux 7.0.0-43-generic x86_64 GNU/Linux
+Architecture : amd64
+Virtualization: none
+CPU          : 16 logical CPUs
+Memory       : 27812MB total, 18954MB available
+Disk         : 903G total, 851G free on /
+Addresses    : 192.168.1.139 2001:db8:355:1008:74d2:b8ae:6d3d:799c 2001:db8:355:1008:fe01:5c7b:c9d8:5ead fd2b:b17c:1393:8:c055:1133:1b57:f29c fd2b:b17c:1393:8:8126:7e8b:3bd0:a232 
+Failed units : none
+TMPDIR       : /tmp
+Log file     : /root/work/ubuntu-setup-script/setup_20261115-145907-243533.log
+--------------------
+
+
+--- selection ---
+Modes        : dry_run=0 optimize=0 purge=0 diagnostics=0 restart_all=1 upgrade_php=off
+Services     : none
+Domains      : none
+--------------------
+
+Ubuntu 26.04 service restart
+
+==> Restarting all detected services
+2026-11-15 14:59:07 UTC [INFO] Detected installed services: angie php:8.5 mariadb valkey elastic
+2026-11-15 14:59:07 UTC [INFO] - Logs: /var/www/logs -> root:root (755)
+2026-11-15 14:59:07 UTC [INFO] - Logs: /var/www/logs/angie -> www-data:www-data (750/640)
+2026-11-15 14:59:07 UTC [INFO] - Logs: /var/www/logs/php -> www-data:www-data (750/640)
+2026-11-15 14:59:07 UTC [INFO] - Logs: /var/www/logs/nodejs -> www-data:www-data (750/640)
+2026-11-15 14:59:07 UTC [INFO] - Logs: /var/www/logs/gifsicle -> www-data:www-data (750/640)
+2026-11-15 14:59:07 UTC [INFO] - Logs: /var/www/logs/mariadb -> mysql:mysql (750/640)
+2026-11-15 14:59:07 UTC [INFO] - Logs: /var/www/logs/elasticsearch -> elasticsearch:elasticsearch (750/640)
+2026-11-15 14:59:08 UTC [INFO] - Logs: /var/www/logs/valkey -> valkey:valkey (750/640)
+2026-11-15 14:59:08 UTC [INFO] Paused Angie before the restart
+2026-11-15 14:59:08 UTC [INFO] Paused php8.5-fpm.service before the restart
+2026-11-15 14:59:08 UTC [INFO] Restarted valkey-server
+2026-11-15 14:59:27 UTC [INFO] Restarted elasticsearch
+2026-11-15 14:59:27 UTC [INFO] Elasticsearch is answering HTTP
+2026-11-15 14:59:28 UTC [INFO] Restarted mariadb; waiting for SELECT 1
+2026-11-15 14:59:28 UTC [INFO] MariaDB is accepting SQL
+2026-11-15 14:59:31 UTC [INFO] Resumed web frontends after the restart
+2026-11-15 14:59:31 UTC [ OK ] All detected services restarted successfully
+
+--- run finished ---
+Result    : SUCCESS (exit 0)
+Finished  : 2026-11-15 14:59:31 UTC
+Duration  : 00:00:24
+Full log  : /root/work/ubuntu-setup-script/setup_20261115-145907-243533.log
+--------------------

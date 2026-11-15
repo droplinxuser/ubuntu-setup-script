@@ -1,0 +1,1469 @@
+================================================================
+ setup.sh run log
+ Started: 2026-11-15 15:15:25 UTC
+ Script : setup.sh 1.21.8
+ Log    : /root/work/ubuntu-setup-script/setup_20261115-151525-379035.log
+================================================================
+
+--- environment ---
+Command      : setup.sh --basic server=dedi --angie --php ver=8.5 --mariadb user=demo pass=*** size=auto bind=127.0.0.1 --valkey --elastic host=localhost ram=4g --others all
+Invocation   : setup.sh
+Directory    : /root/work/ubuntu-setup-script
+Script dir   : /root/work/ubuntu-setup-script
+PID / PPID   : 379035 / 367357
+User / EUID  : root / 0
+Umask        : 0022
+Shell        : /bin/bash (bash 5.3.9(1)-release)
+OS           : Ubuntu 26.04.1 LTS (26.04)
+Kernel       : Linux 7.0.0-43-generic x86_64 GNU/Linux
+Architecture : amd64
+Virtualization: none
+CPU          : 16 logical CPUs
+Memory       : 27812MB total, 25941MB available
+Disk         : 903G total, 854G free on /
+Addresses    : 192.168.1.139 2001:db8:355:1008:74d2:b8ae:6d3d:799c 2001:db8:355:1008:fe01:5c7b:c9d8:5ead fd2b:b17c:1393:8:c055:1133:1b57:f29c fd2b:b17c:1393:8:8126:7e8b:3bd0:a232 
+Failed units : none
+TMPDIR       : /tmp
+Log file     : /root/work/ubuntu-setup-script/setup_20261115-151525-379035.log
+--------------------
+
+
+--- selection ---
+Modes        : dry_run=0 optimize=0 purge=0 diagnostics=0 restart_all=0 upgrade_php=off
+Services     : others basic valkey php mariadb elastic angie
+Domains      : none
+MariaDB      : user=demo size=auto bind=127.0.0.1
+PHP          : version=8.5 children=auto max_requests=auto
+Valkey       : ram=auto policy=allkeys-lru io_threads=1
+Elasticsearch: host=localhost ram=4g
+--------------------
+
+2026-11-15 15:15:25 UTC [INFO] Memory plan: 22249MB usable of 27812MB (PHP=1024MB MariaDB=1738MB Cache=434MB Elasticsearch=4096MB)
+Ubuntu 26.04 server setup
+Host: auto  Server type: dedi  Timezone: Asia/Manila  Swap: auto (50% of RAM)
+
+==> Installing basic
+
+==> DNS
+Global
+         Protocols: -LLMNR -mDNS -DNSOverTLS DNSSEC=no/unsupported
+  resolv.conf mode: stub
+       DNS Servers: 8.8.8.8 1.1.1.1
+        DNS Domain: ~.
+
+Link 2 (enp2s0)
+    Current Scopes: none
+         Protocols: -DefaultRoute -LLMNR -mDNS -DNSOverTLS DNSSEC=no/unsupported
+     Default Route: no
+
+Link 3 (wlp3s0)
+    Current Scopes: DNS
+         Protocols: +DefaultRoute -LLMNR -mDNS -DNSOverTLS DNSSEC=no/unsupported
+       DNS Servers: 192.168.1.1 fd2b:b17c:1393:8::1
+        DNS Domain: lan
+     Default Route: yes
+
+==> Ubuntu update
+Hit:1 http://security.ubuntu.com/ubuntu resolute-security InRelease
+Hit:2 http://archive.ubuntu.com/ubuntu resolute InRelease
+Hit:3 http://archive.ubuntu.com/ubuntu resolute-updates InRelease
+Hit:4 https://esm.ubuntu.com/apps/ubuntu resolute-apps-security InRelease
+Hit:5 http://archive.ubuntu.com/ubuntu resolute-backports InRelease
+Hit:6 https://esm.ubuntu.com/apps/ubuntu resolute-apps-updates InRelease
+Hit:7 https://esm.ubuntu.com/infra/ubuntu resolute-infra-security InRelease
+Hit:8 https://esm.ubuntu.com/infra/ubuntu resolute-infra-updates InRelease
+Reading package lists...
+Reading package lists...
+Building dependency tree...
+Reading state information...
+Calculating upgrade...
+0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.
+
+==> CPU governor (dedicated server)
+2026-11-15 15:15:29 UTC [INFO] CPU governor: performance (setup-cpu-governor.service)
+
+==> Basic tools
+Reading package lists...
+Building dependency tree...
+Reading state information...
+wget is already the newest version (1.25.0-2ubuntu4.4).
+unzip is already the newest version (6.0-29ubuntu1).
+nano is already the newest version (8.7.1-1ubuntu0.1).
+zip is already the newest version (3.0-15ubuntu3).
+software-properties-common is already the newest version (0.120.2).
+rsync is already the newest version (3.4.1+ds1-7ubuntu0.3).
+ca-certificates is already the newest version (20260816ubuntu0.26.04.2).
+gnupg is already the newest version (2.4.8-4ubuntu3.1).
+dmidecode is already the newest version (3.6-2ubuntu1).
+Solving dependencies...
+The following additional packages will be installed:
+  git-man liberror-perl
+Suggested packages:
+  git-doc git-email git-gui gitk gitweb git-cvs git-svn
+Recommended packages:
+  patch
+The following NEW packages will be installed:
+  curl git git-man liberror-perl
+0 upgraded, 4 newly installed, 0 to remove and 0 not upgraded.
+Need to get 5716 kB of archives.
+After this operation, 28.9 MB of additional disk space will be used.
+Get:1 http://archive.ubuntu.com/ubuntu resolute-updates/main amd64 curl amd64 8.18.0-1ubuntu2.8 [273 kB]
+Get:2 http://archive.ubuntu.com/ubuntu resolute/main amd64 liberror-perl all 0.17030-1 [23.5 kB]
+Get:3 http://archive.ubuntu.com/ubuntu resolute-updates/main amd64 git-man all 1:2.53.0-1ubuntu1.1 [1197 kB]
+Get:4 http://archive.ubuntu.com/ubuntu resolute-updates/main amd64 git amd64 1:2.53.0-1ubuntu1.1 [4223 kB]
+Fetched 5716 kB in 4s (1399 kB/s)
+Selecting previously unselected package curl.
+(Reading database ... 79450 files and directories currently installed.)
+Preparing to unpack .../curl_8.18.0-1ubuntu2.8_amd64.deb ...
+Unpacking curl (8.18.0-1ubuntu2.8) ...
+Selecting previously unselected package liberror-perl.
+Preparing to unpack .../liberror-perl_0.17030-1_all.deb ...
+Unpacking liberror-perl (0.17030-1) ...
+Selecting previously unselected package git-man.
+Preparing to unpack .../git-man_1%3a2.53.0-1ubuntu1.1_all.deb ...
+Unpacking git-man (1:2.53.0-1ubuntu1.1) ...
+Selecting previously unselected package git.
+Preparing to unpack .../git_1%3a2.53.0-1ubuntu1.1_amd64.deb ...
+Unpacking git (1:2.53.0-1ubuntu1.1) ...
+Setting up liberror-perl (0.17030-1) ...
+Setting up git-man (1:2.53.0-1ubuntu1.1) ...
+Setting up curl (8.18.0-1ubuntu2.8) ...
+Setting up git (1:2.53.0-1ubuntu1.1) ...
+Processing triggers for man-db (2.13.1-1build1) ...
+2026-11-15 15:15:34 UTC [INFO] Auto-generated hostname: 16c-32g-1T
+
+==> Hostname
+ Static hostname: 16c-32g-1T
+       Icon name: computer-desktop
+         Chassis: desktop 🖥️
+      Machine ID: f654d887ecd3448abd471a0b941d5df5
+         Boot ID: 32778128aae34dff9b0db558c2c093d6
+    Product UUID: ec72c080-ac71-11ef-b710-6014224e5800
+Operating System: Ubuntu 26.04.1 LTS
+          Kernel: Linux 7.0.0-43-generic
+    Architecture: x86-64
+ Hardware Vendor: AZW
+  Hardware Model: SER8
+ Hardware Serial: C87454BF70202
+    Hardware SKU: 75
+Hardware Version: V10
+Firmware Version: HPT.8xxx.SER8.V035.P8C0M0C15.16.BL
+   Firmware Date: Wed 2026-06-03
+    Firmware Age: 5month 1w 6d
+
+==> Timezone
+               Local time: Sun 2026-11-15 23:15:34 PST
+           Universal time: Sun 2026-11-15 15:15:34 UTC
+                 RTC time: Sun 2026-11-15 15:15:34
+                Time zone: Asia/Manila (PST, +0800)
+System clock synchronized: yes
+              NTP service: active
+          RTC in local TZ: no
+
+==> Swap (auto: 50% of RAM)
+2026-11-15 15:15:35 UTC [INFO] RAM: 28G; current swap: 12G; target swap: 8.0G
+2026-11-15 15:15:35 UTC [INFO] Current swap already meets or exceeds the target; leaving it unchanged
+
+==> sysctl tweaks
+2026-11-15 15:15:35 UTC [INFO] Keeping IPv6 autoconfiguration (an address or default route comes from router advertisements)
+kernel.sysrq = 0
+kernel.core_uses_pid = 1
+kernel.pid_max = 4194300
+kernel.randomize_va_space = 2
+kernel.msgmnb = 65535
+kernel.msgmax = 65535
+fs.suid_dumpable = 0
+kernel.kptr_restrict = 1
+fs.aio-max-nr = 10485760
+vm.dirty_ratio = 30
+vm.dirty_background_ratio = 5
+vm.mmap_min_addr = 4096
+vm.overcommit_ratio = 50
+vm.overcommit_memory = 1
+net.core.bpf_jit_harden = 1
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_syn_retries = 2
+net.ipv4.tcp_synack_retries = 2
+net.ipv4.ip_forward = 0
+net.ipv4.conf.all.forwarding = 0
+net.ipv4.conf.default.forwarding = 0
+net.ipv6.conf.all.forwarding = 0
+net.ipv6.conf.default.forwarding = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.default.send_redirects = 0
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.default.accept_source_route = 0
+net.ipv6.conf.all.accept_source_route = 0
+net.ipv6.conf.default.accept_source_route = 0
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.default.rp_filter = 1
+net.ipv4.conf.all.secure_redirects = 0
+net.ipv4.conf.default.secure_redirects = 0
+net.ipv4.conf.all.log_martians = 1
+net.ipv4.conf.default.log_martians = 1
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_keepalive_intvl = 15
+net.ipv4.conf.all.bootp_relay = 0
+net.ipv4.conf.all.proxy_arp = 0
+net.ipv4.tcp_timestamps = 1
+net.ipv4.icmp_echo_ignore_all = 0
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+net.ipv4.tcp_rfc1337 = 1
+net.ipv4.tcp_notsent_lowat = 16384
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.udp_rmem_min = 16384
+net.core.rmem_default = 262144
+net.ipv4.udp_wmem_min = 16384
+net.core.wmem_default = 262144
+net.core.dev_weight = 64
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_orphan_retries = 0
+net.ipv6.ip6frag_low_thresh = 196608
+net.ipv6.ip6frag_high_thresh = 262144
+net.ipv4.tcp_no_metrics_save = 1
+net.ipv4.tcp_moderate_rcvbuf = 1
+net.ipv4.neigh.default.gc_interval = 30
+net.ipv4.neigh.default.proxy_qlen = 96
+net.ipv4.neigh.default.unres_qlen = 6
+net.ipv4.tcp_ecn = 1
+net.ipv4.tcp_reordering = 3
+net.ipv4.tcp_retries2 = 15
+net.ipv4.tcp_retries1 = 3
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_fastopen = 3
+fs.inotify.max_queued_events = 32768
+fs.inotify.max_user_instances = 256
+net.netfilter.nf_conntrack_generic_timeout = 60
+net.ipv4.tcp_mtu_probing = 1
+net.unix.max_dgram_qlen = 4096
+net.core.optmem_max = 262144
+net.core.rmem_max = 33554432
+net.core.wmem_max = 33554432
+net.ipv4.tcp_rmem = 8192 262144 33554432
+net.ipv4.tcp_wmem = 8192 262144 33554432
+net.core.somaxconn = 65536
+net.core.netdev_max_backlog = 32768
+net.core.netdev_budget = 600
+net.core.netdev_budget_usecs = 8000
+net.ipv4.tcp_max_syn_backlog = 65536
+net.ipv4.tcp_max_tw_buckets = 444992
+net.ipv4.tcp_max_orphans = 55624
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.ip_local_reserved_ports = 3306,6379,9200,9300
+net.ipv4.tcp_keepalive_time = 120
+net.ipv4.neigh.default.gc_thresh1 = 32
+net.ipv4.neigh.default.gc_thresh2 = 8192
+net.ipv4.neigh.default.gc_thresh3 = 16384
+net.ipv4.ipfrag_low_thresh = 667488
+net.ipv4.ipfrag_high_thresh = 889984
+net.netfilter.nf_conntrack_max = 444992
+vm.dirty_background_bytes = 291504128
+vm.dirty_bytes = 1166016512
+fs.file-max = 10485760
+fs.nr_open = 10485760
+fs.inotify.max_user_watches = 2097152
+vm.min_free_kbytes = 262144
+vm.swappiness = 1
+kernel.shmmax = 1073741824
+kernel.shmall = 262144
+kernel.dmesg_restrict = 1
+kernel.yama.ptrace_scope = 1
+fs.protected_hardlinks = 1
+fs.protected_symlinks = 1
+fs.protected_fifos = 2
+fs.protected_regular = 2
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.default.accept_redirects = 0
+net.ipv6.conf.all.accept_redirects = 0
+net.ipv6.conf.default.accept_redirects = 0
+net.ipv4.tcp_challenge_ack_limit = 1000
+2026-11-15 15:15:35 UTC [INFO] UFW: log_martians=1 in /etc/ufw/sysctl.conf (ufw reloads this file on every start; it now matches the managed sysctl profile)
+
+==> Security limits
+# Managed by setup.sh: install as /etc/security/limits.d/99-setup.conf.
+# 1,048,576 descriptors matches the minimum fs.nr_open this script sets, so
+# PAM can always raise the hard limit. Service units that need less use a
+# smaller LimitNOFILE drop-in (Angie/PHP 524288, MariaDB 1048576).
+elasticsearch soft nofile 1048576
+elasticsearch hard nofile 1048576
+mysql         soft nofile 1048576
+mysql         hard nofile 1048576
+valkey        soft nofile 1048576
+valkey        hard nofile 1048576
+root          soft nofile 1048576
+root          hard nofile 1048576
+tinyproxy     soft nofile 1048576
+tinyproxy     hard nofile 1048576
+www-data      soft nofile 1048576
+www-data      hard nofile 1048576
+angie         soft nofile 1048576
+angie         hard nofile 1048576
+*             soft nofile 1048576
+*             hard nofile 1048576
+
+==> Storage/THP profile
+2026-11-15 15:15:36 UTC [INFO] Storage class nvme: THP=madvise, scheduler/readahead rule installed, fstrim.timer enabled
+
+==> Log rotation (/var/www/logs)
+Reading package lists...
+Building dependency tree...
+Reading state information...
+logrotate is already the newest version (3.22.0-1build1).
+Solving dependencies...
+0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.
+2026-11-15 15:15:36 UTC [ OK ] Log rotation configured
+Reading package lists...
+Building dependency tree...
+Reading state information...
+cron is already the newest version (3.0pl1-200ubuntu1).
+Solving dependencies...
+0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.
+Synchronizing state of cron.service with SysV service script with /usr/lib/systemd/systemd-sysv-install.
+Executing: /usr/lib/systemd/systemd-sysv-install enable cron
+● cron.service - Regular background program processing daemon
+     Loaded: loaded (/usr/lib/systemd/system/cron.service; enabled; preset: enabled)
+     Active: active (running) since Sun 2026-11-15 22:19:57 PST; 55min ago
+ Invocation: 0e4a69b34fed4ebab736490110c26a09
+       Docs: man:cron(8)
+   Main PID: 833 (cron)
+      Tasks: 1 (limit: 30455)
+     Memory: 512K (peak: 47.1M)
+        CPU: 2.576s
+     CGroup: /system.slice/cron.service
+             └─833 /usr/sbin/cron -f -P
+
+Nov 15 23:00:01 16c-32g-1T runuser[254280]: pam_unix(runuser:session): session closed for user www-data
+Nov 15 23:00:01 16c-32g-1T CRON[254266]: pam_unix(cron:session): session closed for user root
+Nov 15 23:00:01 16c-32g-1T runuser[254279]: pam_unix(runuser:session): session closed for user www-data
+Nov 15 23:00:01 16c-32g-1T CRON[254267]: pam_unix(cron:session): session closed for user root
+Nov 15 23:01:01 16c-32g-1T cron[833]: (root) RELOAD (crontabs/root)
+Nov 15 23:08:01 16c-32g-1T cron[833]: (root) RELOAD (crontabs/root)
+Nov 15 23:09:01 16c-32g-1T CRON[341288]: pam_unix(cron:session): session opened for user root(uid=0) by root(uid=0)
+Nov 15 23:09:01 16c-32g-1T CRON[341292]: (root) CMD (  [ -x /usr/lib/php/sessionclean ] && if [ ! -d /run/systemd/system ]; then /usr/lib/php/sessionclean; fi)
+Nov 15 23:09:01 16c-32g-1T CRON[341288]: pam_unix(cron:session): session closed for user root
+Nov 15 23:15:01 16c-32g-1T cron[833]: (root) RELOAD (crontabs/root)
+2026-11-15 15:15:37 UTC [INFO] Managed crontab entries unchanged
+Reading package lists...
+Building dependency tree...
+Reading state information...
+ufw is already the newest version (0.36.2-9build1).
+Solving dependencies...
+0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.
+
+==> UFW firewall
+Default incoming policy changed to 'deny'
+(be sure to update your rules accordingly)
+Default outgoing policy changed to 'allow'
+(be sure to update your rules accordingly)
+Rules updated
+Rules updated (v6)
+2026-11-15 15:15:38 UTC [INFO] UFW: rate-limited SSH port 22/tcp (ufw limit)
+Rules updated
+Rules updated (v6)
+Rules updated
+Rules updated (v6)
+Firewall is active and enabled on system startup
+Status: active
+Logging: on (low)
+Default: deny (incoming), allow (outgoing), disabled (routed)
+New profiles: skip
+
+To                         Action      From
+--                         ------      ----
+22/tcp                     LIMIT IN    Anywhere                  
+80                         ALLOW IN    Anywhere                  
+443                        ALLOW IN    Anywhere                  
+22/tcp (v6)                LIMIT IN    Anywhere (v6)             
+80 (v6)                    ALLOW IN    Anywhere (v6)             
+443 (v6)                   ALLOW IN    Anywhere (v6)             
+
+2026-11-15 15:15:38 UTC [ OK ] Basic server setup complete
+2026-11-15 15:15:38 UTC [ OK ] basic completed in 00:00:13
+Reading package lists...
+Building dependency tree...
+Reading state information...
+ca-certificates is already the newest version (20260816ubuntu0.26.04.2).
+curl is already the newest version (8.18.0-1ubuntu2.8).
+gnupg is already the newest version (2.4.8-4ubuntu3.1).
+lsb-release is already the newest version (12.1-2build1).
+Solving dependencies...
+The following NEW packages will be installed:
+  apt-transport-https
+0 upgraded, 1 newly installed, 0 to remove and 0 not upgraded.
+Need to get 26.0 kB of archives.
+After this operation, 36.9 kB of additional disk space will be used.
+Get:1 http://archive.ubuntu.com/ubuntu resolute-updates/universe amd64 apt-transport-https all 3.2.1ubuntu0.1 [26.0 kB]
+Fetched 26.0 kB in 1s (23.1 kB/s)
+Selecting previously unselected package apt-transport-https.
+(Reading database ... 80602 files and directories currently installed.)
+Preparing to unpack .../apt-transport-https_3.2.1ubuntu0.1_all.deb ...
+Unpacking apt-transport-https (3.2.1ubuntu0.1) ...
+Setting up apt-transport-https (3.2.1ubuntu0.1) ...
+2026-11-15 15:15:40 UTC [INFO] Refreshed embedded key: /usr/share/keyrings/angie-signing.gpg
+Selecting previously unselected package debsuryorg-archive-keyring.
+(Reading database ... 80606 files and directories currently installed.)
+Preparing to unpack /tmp/tmp.1usIyHdhpD.deb ...
+Unpacking debsuryorg-archive-keyring (2025.11.18) ...
+Setting up debsuryorg-archive-keyring (2025.11.18) ...
+2026-11-15 15:15:41 UTC [INFO] Refreshed embedded key: /usr/share/keyrings/debsuryorg-archive-keyring.gpg
+2026-11-15 15:15:41 UTC [INFO] Refreshed embedded key: /usr/share/keyrings/elasticsearch-keyring.gpg
+2026-11-15 15:15:41 UTC [INFO] Refreshed embedded key: /usr/share/keyrings/nodesource.gpg
+Get:1 https://deb.nodesource.com/node_26.x nodistro InRelease [12.1 kB]
+Get:2 https://deb.nodesource.com/node_26.x nodistro/main amd64 Packages [5676 B]
+Get:3 https://artifacts.elastic.co/packages/9.x/apt stable InRelease [3249 B]
+Get:4 https://artifacts.elastic.co/packages/9.x/apt stable/main amd64 Packages [64.3 kB]
+Get:5 https://packages.sury.org/php resolute InRelease [6051 B]
+Get:6 https://packages.sury.org/php resolute/main amd64 Packages [142 kB]
+Hit:7 http://security.ubuntu.com/ubuntu resolute-security InRelease
+Hit:8 http://archive.ubuntu.com/ubuntu resolute InRelease
+Hit:9 http://archive.ubuntu.com/ubuntu resolute-updates InRelease
+Hit:10 https://esm.ubuntu.com/apps/ubuntu resolute-apps-security InRelease
+Hit:11 http://archive.ubuntu.com/ubuntu resolute-backports InRelease
+Get:12 https://download.angie.software/angie/ubuntu/26.04 resolute InRelease [9114 B]
+Hit:13 https://esm.ubuntu.com/apps/ubuntu resolute-apps-updates InRelease
+Hit:14 https://esm.ubuntu.com/infra/ubuntu resolute-infra-security InRelease
+Get:15 https://download.angie.software/angie/ubuntu/26.04 resolute/main amd64 Packages [165 kB]
+Hit:16 https://esm.ubuntu.com/infra/ubuntu resolute-infra-updates InRelease
+Fetched 407 kB in 3s (154 kB/s)
+Reading package lists...
+2026-11-15 15:15:44 UTC [INFO] Downloading server configs: https://github.com/droplinxuser/server-configs-nginx/archive/main.tar.gz
+2026-11-15 15:15:45 UTC [INFO] Server configs ready: /tmp/tmp.ZEoTl6jQS0/server-configs-nginx-main
+
+==> Installing angie
+
+==> Angie web server
+Reading package lists...
+Building dependency tree...
+Reading state information...
+ca-certificates is already the newest version (20260816ubuntu0.26.04.2).
+curl is already the newest version (8.18.0-1ubuntu2.8).
+wget is already the newest version (1.25.0-2ubuntu4.4).
+unzip is already the newest version (6.0-29ubuntu1).
+rsync is already the newest version (3.4.1+ds1-7ubuntu0.3).
+openssl is already the newest version (3.5.5-1ubuntu3.7).
+Solving dependencies...
+0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.
+Reading package lists...
+Building dependency tree...
+Reading state information...
+Solving dependencies...
+The following NEW packages will be installed:
+  angie
+0 upgraded, 1 newly installed, 0 to remove and 0 not upgraded.
+Need to get 1342 kB of archives.
+After this operation, 4749 kB of additional disk space will be used.
+Get:1 https://download.angie.software/angie/ubuntu/26.04 resolute/main amd64 angie amd64 1.12.4-1~resolute [1342 kB]
+Fetched 1342 kB in 4s (304 kB/s)
+Selecting previously unselected package angie.
+(Reading database ... 80619 files and directories currently installed.)
+Preparing to unpack .../angie_1.12.4-1~resolute_amd64.deb ...
+Unpacking angie (1.12.4-1~resolute) ...
+Setting up angie (1.12.4-1~resolute) ...
+Created symlink '/etc/systemd/system/multi-user.target.wants/angie.service' → '/usr/lib/systemd/system/angie.service'.
+----------------------------------------------------------------------
+
+Thanks for using Angie!
+
+Please find the official documentation for Angie here:
+* https://en.angie.software/angie/docs/
+
+----------------------------------------------------------------------
+Processing triggers for man-db (2.13.1-1build1) ...
+Synchronizing state of angie.service with SysV service script with /usr/lib/systemd/systemd-sysv-install.
+Executing: /usr/lib/systemd/systemd-sysv-install enable angie
+
+==> Angie configuration (server-configs-nginx)
+2026-11-15 15:15:51 UTC [INFO] Using server configs from /tmp/tmp.ZEoTl6jQS0/server-configs-nginx-main
+angie: the configuration file /etc/angie/angie.conf syntax is ok
+angie: configuration file /etc/angie/angie.conf test is successful
+Reading package lists...
+Building dependency tree...
+Reading state information...
+Solving dependencies...
+The following NEW packages will be installed:
+  angie-module-brotli
+0 upgraded, 1 newly installed, 0 to remove and 0 not upgraded.
+Need to get 14.4 kB of archives.
+After this operation, 96.3 kB of additional disk space will be used.
+Get:1 https://download.angie.software/angie/ubuntu/26.04 resolute/main amd64 angie-module-brotli amd64 1.12.4-1~resolute [14.4 kB]
+Fetched 14.4 kB in 7s (2090 B/s)
+Selecting previously unselected package angie-module-brotli.
+(Reading database ... 80655 files and directories currently installed.)
+Preparing to unpack .../angie-module-brotli_1.12.4-1~resolute_amd64.deb ...
+Unpacking angie-module-brotli (1.12.4-1~resolute) ...
+Setting up angie-module-brotli (1.12.4-1~resolute) ...
+----------------------------------------------------------------------
+
+The Brotli dynamic module for Angie has been installed.
+To enable this module, add the following to /etc/angie/angie.conf
+and reload angie:
+
+    load_module modules/ngx_http_brotli_filter_module.so;
+or:
+    load_module modules/ngx_http_brotli_static_module.so;
+
+Please refer to the module documentation for further details:
+https://github.com/google/ngx_brotli
+
+----------------------------------------------------------------------
+2026-11-15 15:16:01 UTC [INFO] Compression: Brotli level 4 (gzip fallback)
+2026-11-15 15:16:01 UTC [INFO] tune: snippets/fastcgi-php.conf: PATH_INFO capture is optional
+2026-11-15 15:16:01 UTC [INFO] tune: wordpress.conf: index index.php index.html
+2026-11-15 15:16:01 UTC [INFO] tune: angie.conf: worker_processes=16
+2026-11-15 15:16:01 UTC [INFO] tune: angie.conf: directio=16m (nvme)
+2026-11-15 15:16:01 UTC [INFO] tune: angie.conf: worker_rlimit_nofile=131072
+2026-11-15 15:16:01 UTC [INFO] tune: angie.conf: worker_connections=32768
+2026-11-15 15:16:01 UTC [INFO] tune: http.d/fastcgi_cache.conf: 512m zone / 3456M max
+2026-11-15 15:16:01 UTC [INFO] tune: http.d/fastcgi_cache_chev.conf: 512m zone / 1728M max
+2026-11-15 15:16:01 UTC [INFO] tune: http.d/xf_proxy_cache.conf: 256m zone / 1036M max
+2026-11-15 15:16:01 UTC [INFO] tune: http.d/proxy_cache.conf: proxy=345M cdn=345M
+2026-11-15 15:16:01 UTC [INFO] tune: http.d/limit_req.conf: POST zone=8m
+2026-11-15 15:16:01 UTC [INFO] tune: http.d/limit_req.conf: GET zone=16m
+2026-11-15 15:16:01 UTC [INFO] tune: http.d/limit_req.conf: limit_req_log_level=info
+2026-11-15 15:16:01 UTC [INFO] tune: http.d/limit_req.conf: rate-limit exemptions: 192.168.1.200/32
+2026-11-15 15:16:01 UTC [INFO] tune: limit_req: exemptions persisted in /etc/default/setup-tuning
+2026-11-15 15:16:01 UTC [INFO] tune: h5bp/tls/ssl_engine.conf: SSL cache=54m
+2026-11-15 15:16:01 UTC [INFO] tune: h5bp/web_performance/cache-file-descriptors.conf: max=97280
+2026-11-15 15:16:01 UTC [INFO] tune: h5bp/web_performance/cache-file-descriptors.conf: log max=24320
+2026-11-15 15:16:01 UTC [INFO] tune: h5bp/php.conf: fastcgi_buffer_size=256k
+2026-11-15 15:16:01 UTC [INFO] tune: h5bp/php_chev.conf: fastcgi_buffer_size=256k
+2026-11-15 15:16:01 UTC [INFO] tune: h5bp/php_chev_cache.conf: fastcgi_buffer_size=256k
+2026-11-15 15:16:01 UTC [INFO] tune: h5bp/php_flarum.conf: fastcgi_buffer_size=256k
+2026-11-15 15:16:01 UTC [INFO] tune: h5bp/php_wp_handler.conf: fastcgi_buffer_size=256k
+2026-11-15 15:16:01 UTC [INFO] tune: h5bp/php_xf.conf: fastcgi_buffer_size=256k
+2026-11-15 15:16:01 UTC [INFO] tune: h5bp/php_xf_proxy.conf: fastcgi_buffer_size=256k
+2026-11-15 15:16:01 UTC [INFO] tune: XenForo: cookie bypass map installed (zz-setup-fastcgi-cache-map.conf)
+2026-11-15 15:16:01 UTC [INFO] tune: php_xf.conf: background cache update
+2026-11-15 15:16:01 UTC [INFO] tune: php_xf.conf: cache key varies on style/language/encoding
+2026-11-15 15:16:01 UTC [INFO] tune: php_xf_proxy.conf: background cache update
+2026-11-15 15:16:01 UTC [INFO] tune: php_xf_proxy.conf: cache key varies on style/language/encoding
+2026-11-15 15:16:01 UTC [INFO] tune: xf2.conf: static assets cached 30d (immutable)
+2026-11-15 15:16:01 UTC [INFO] tune: angie summary: 16 CPU / 27812MB RAM / nvme / cache_budget=6912MB
+angie: the configuration file /etc/angie/angie.conf syntax is ok
+angie: configuration file /etc/angie/angie.conf test is successful
+angie: the configuration file /etc/angie/angie.conf syntax is ok
+angie: configuration file /etc/angie/angie.conf test is successful
+● angie.service - Angie - high performance web server
+     Loaded: loaded (/usr/lib/systemd/system/angie.service; enabled; preset: enabled)
+    Drop-In: /etc/systemd/system/angie.service.d
+             └─limits.conf
+     Active: active (running) since Sun 2026-11-15 23:16:01 PST; 360ms ago
+ Invocation: 6fe8e4c527344d4dbfac896418b0c907
+       Docs: https://en.angie.software/angie/docs/
+    Process: 383463 ExecStart=/usr/sbin/angie -c /etc/angie/angie.conf (code=exited, status=0/SUCCESS)
+    Process: 384009 ExecReload=/bin/sh -c /bin/kill -s HUP $(/bin/cat /run/angie.pid) (code=exited, status=0/SUCCESS)
+   Main PID: 383464 (angie)
+      Tasks: 531 (limit: 30455)
+     Memory: 268.2M (peak: 269.2M)
+        CPU: 208ms
+     CGroup: /system.slice/angie.service
+             ├─383464 "angie: master process v1.12.4 #1 [/usr/sbin/angie -c /etc/angie/angie.conf]"
+             ├─383465 "angie: worker process #1"
+             ├─383466 "angie: worker process #1"
+             ├─383467 "angie: worker process #1"
+             ├─383468 "angie: worker process #1"
+             ├─383469 "angie: worker process #1"
+             ├─383470 "angie: worker process #1"
+             ├─383472 "angie: worker process #1"
+             ├─383473 "angie: worker process #1"
+             ├─383474 "angie: worker process #1"
+             ├─383475 "angie: worker process #1"
+             ├─383476 "angie: worker process #1"
+             ├─383478 "angie: worker process #1"
+             ├─383479 "angie: worker process #1"
+             ├─383480 "angie: worker process #1"
+             ├─383481 "angie: worker process #1"
+             ├─383482 "angie: worker process #1"
+             ├─383516 "angie: cache manager process #1"
+             └─383966 "angie: cache loader process #1"
+
+Nov 15 23:16:01 16c-32g-1T systemd[1]: Starting angie.service - Angie - high performance web server...
+Nov 15 23:16:01 16c-32g-1T systemd[1]: Started angie.service - Angie - high performance web server.
+Nov 15 23:16:01 16c-32g-1T systemd[1]: Reloading angie.service - Angie - high performance web server...
+Nov 15 23:16:01 16c-32g-1T systemd[1]: Reloaded angie.service - Angie - high performance web server.
+2026-11-15 15:16:01 UTC [ OK ] Angie installed and running
+2026-11-15 15:16:01 UTC [ OK ] angie completed in 00:00:16
+
+==> Installing php
+
+==> PHP 8.5
+2026-11-15 15:16:01 UTC [INFO] PHP 8.5 bundles OPcache in the core package; skipping php8.5-opcache
+Reading package lists...
+Building dependency tree...
+Reading state information...
+Solving dependencies...
+The following additional packages will be installed:
+  fontconfig-config fonts-dejavu-core fonts-dejavu-mono libabsl20260107
+  libaom3 libargon2-1 libavif16 libdav1d7 libdeflate0 libfontconfig1 libgav1-2
+  libgd3 libheif-plugin-aomdec libheif1 libimagequant0 libjbig0 libjpeg-turbo8
+  libjpeg8 liblerc4 libsharpyuv0 libsodium23 libtiff6 libwebp7 libx11-6
+  libx11-data libxau6 libxcb1 libxdmcp6 libxpm4 libxslt1.1 libyuv0 libzip5
+  php-common php8.5-common php8.5-readline
+Suggested packages:
+  libgd-tools libheif-plugin-libde265 libheif-plugin-x265
+  libheif-plugin-ffmpegdec libheif-plugin-jpegdec libheif-plugin-jpegenc
+  libheif-plugin-j2kdec libheif-plugin-j2kenc libheif-plugin-kvazaar
+  libheif-plugin-rav1e libheif-plugin-svtenc php-pear
+Recommended packages:
+  libheif-plugin-aomenc
+The following NEW packages will be installed:
+  fontconfig-config fonts-dejavu-core fonts-dejavu-mono libabsl20260107
+  libaom3 libargon2-1 libavif16 libdav1d7 libdeflate0 libfontconfig1 libgav1-2
+  libgd3 libheif-plugin-aomdec libheif1 libimagequant0 libjbig0 libjpeg-turbo8
+  libjpeg8 liblerc4 libsharpyuv0 libsodium23 libtiff6 libwebp7 libx11-6
+  libx11-data libxau6 libxcb1 libxdmcp6 libxpm4 libxslt1.1 libyuv0 libzip5
+  php-common php8.5-cli php8.5-common php8.5-curl php8.5-fpm php8.5-gd
+  php8.5-gmp php8.5-mbstring php8.5-mysql php8.5-readline php8.5-xml
+  php8.5-zip
+0 upgraded, 44 newly installed, 0 to remove and 0 not upgraded.
+Need to get 16.9 MB of archives.
+After this operation, 66.7 MB of additional disk space will be used.
+Get:1 https://packages.sury.org/php resolute/main amd64 libgd3 amd64 2.3.3-16+0~deb.sury.org.1+ubuntu26.04 [136 kB]
+Get:2 https://packages.sury.org/php resolute/main amd64 php-common all 2:101+0~20261021.78+ubuntu26.04~1.gbp53f25f [12.8 kB]
+Get:3 https://packages.sury.org/php resolute/main amd64 php8.5-common amd64 8.5.12-3+0~deb.sury.org.1+ubuntu26.04 [848 kB]
+Get:4 https://packages.sury.org/php resolute/main amd64 php8.5-readline amd64 8.5.12-3+0~deb.sury.org.1+ubuntu26.04 [14.3 kB]
+Get:5 https://packages.sury.org/php resolute/main amd64 php8.5-cli amd64 8.5.12-3+0~deb.sury.org.1+ubuntu26.04 [3221 kB]
+Get:6 https://packages.sury.org/php resolute/main amd64 php8.5-curl amd64 8.5.12-3+0~deb.sury.org.1+ubuntu26.04 [46.3 kB]
+Get:7 https://packages.sury.org/php resolute/main amd64 php8.5-fpm amd64 8.5.12-3+0~deb.sury.org.1+ubuntu26.04 [3231 kB]
+Get:8 http://archive.ubuntu.com/ubuntu resolute/main amd64 libxau6 amd64 1:1.0.11-1build2 [7502 B]
+Get:9 http://archive.ubuntu.com/ubuntu resolute/main amd64 libxdmcp6 amd64 1:1.1.5-2 [10.8 kB]
+Get:10 http://archive.ubuntu.com/ubuntu resolute/main amd64 libxcb1 amd64 1.17.0-2ubuntu1 [49.0 kB]
+Get:11 http://archive.ubuntu.com/ubuntu resolute-updates/main amd64 libx11-data all 2:1.8.13-1ubuntu0.1 [115 kB]
+Get:12 https://packages.sury.org/php resolute/main amd64 php8.5-gd amd64 8.5.12-3+0~deb.sury.org.1+ubuntu26.04 [41.3 kB]
+Get:13 https://packages.sury.org/php resolute/main amd64 php8.5-gmp amd64 8.5.12-3+0~deb.sury.org.1+ubuntu26.04 [21.4 kB]
+Get:14 https://packages.sury.org/php resolute/main amd64 php8.5-mbstring amd64 8.5.12-3+0~deb.sury.org.1+ubuntu26.04 [525 kB]
+Get:15 https://packages.sury.org/php resolute/main amd64 php8.5-mysql amd64 8.5.12-3+0~deb.sury.org.1+ubuntu26.04 [131 kB]
+Get:16 https://packages.sury.org/php resolute/main amd64 php8.5-xml amd64 8.5.12-3+0~deb.sury.org.1+ubuntu26.04 [216 kB]
+Get:17 https://packages.sury.org/php resolute/main amd64 php8.5-zip amd64 8.5.12-3+0~deb.sury.org.1+ubuntu26.04 [32.5 kB]
+Get:18 http://archive.ubuntu.com/ubuntu resolute-updates/main amd64 libx11-6 amd64 2:1.8.13-1ubuntu0.1 [658 kB]
+Get:19 http://archive.ubuntu.com/ubuntu resolute/main amd64 fonts-dejavu-mono all 2.37-8build1 [502 kB]
+Get:20 http://archive.ubuntu.com/ubuntu resolute/main amd64 fonts-dejavu-core all 2.37-8build1 [834 kB]
+Get:21 http://archive.ubuntu.com/ubuntu resolute/main amd64 fontconfig-config amd64 2.17.1-3ubuntu1 [38.5 kB]
+Get:22 http://archive.ubuntu.com/ubuntu resolute/main amd64 libabsl20260107 amd64 20260107.0-4 [588 kB]
+Get:23 http://archive.ubuntu.com/ubuntu resolute-updates/main amd64 libaom3 amd64 3.13.1-2ubuntu0.1 [1969 kB]
+Get:24 http://archive.ubuntu.com/ubuntu resolute/main amd64 libargon2-1 amd64 0~20190702+dfsg-5 [21.3 kB]
+Get:25 http://archive.ubuntu.com/ubuntu resolute/universe amd64 libdav1d7 amd64 1.5.3-1 [626 kB]
+Get:26 http://archive.ubuntu.com/ubuntu resolute/universe amd64 libgav1-2 amd64 0.20.0-2build1 [402 kB]
+Get:27 http://archive.ubuntu.com/ubuntu resolute/main amd64 libjpeg-turbo8 amd64 2.1.5-4ubuntu4 [153 kB]
+Get:28 http://archive.ubuntu.com/ubuntu resolute/main amd64 libjpeg8 amd64 8c-2ubuntu12 [2142 B]
+Get:29 http://archive.ubuntu.com/ubuntu resolute/main amd64 libyuv0 amd64 0.0.1922.20260106-1 [184 kB]
+Get:30 http://archive.ubuntu.com/ubuntu resolute/universe amd64 libavif16 amd64 1.3.0-1ubuntu4 [119 kB]
+Get:31 http://archive.ubuntu.com/ubuntu resolute/main amd64 libdeflate0 amd64 1.23-2ubuntu1 [51.7 kB]
+Get:32 http://archive.ubuntu.com/ubuntu resolute/main amd64 libfontconfig1 amd64 2.17.1-3ubuntu1 [144 kB]
+Get:33 http://archive.ubuntu.com/ubuntu resolute/main amd64 libsharpyuv0 amd64 1.5.0-0.1build1 [17.6 kB]
+Get:34 http://archive.ubuntu.com/ubuntu resolute-updates/main amd64 libheif-plugin-aomdec amd64 1.21.2-3ubuntu0.7 [15.6 kB]
+Get:35 http://archive.ubuntu.com/ubuntu resolute-updates/main amd64 libheif1 amd64 1.21.2-3ubuntu0.7 [551 kB]
+Get:36 http://archive.ubuntu.com/ubuntu resolute/main amd64 libimagequant0 amd64 4.4.1-1 [264 kB]
+Get:37 http://archive.ubuntu.com/ubuntu resolute/main amd64 libjbig0 amd64 2.1-6.1ubuntu3 [30.0 kB]
+Get:38 http://archive.ubuntu.com/ubuntu resolute/main amd64 liblerc4 amd64 4.0.0+ds-5ubuntu2 [207 kB]
+Get:39 http://archive.ubuntu.com/ubuntu resolute/main amd64 libwebp7 amd64 1.5.0-0.1build1 [264 kB]
+Get:40 http://archive.ubuntu.com/ubuntu resolute-updates/main amd64 libtiff6 amd64 4.7.0-3ubuntu5 [206 kB]
+Get:41 http://archive.ubuntu.com/ubuntu resolute-updates/main amd64 libxpm4 amd64 1:3.5.17-1ubuntu0.26.04.2 [37.2 kB]
+Get:42 http://archive.ubuntu.com/ubuntu resolute/main amd64 libsodium23 amd64 1.0.18-2 [165 kB]
+Get:43 http://archive.ubuntu.com/ubuntu resolute/main amd64 libxslt1.1 amd64 1.1.45-0.1 [165 kB]
+Get:44 http://archive.ubuntu.com/ubuntu resolute/universe amd64 libzip5 amd64 1.11.4-2 [63.3 kB]
+Fetched 16.9 MB in 6s (2633 kB/s)
+Selecting previously unselected package libxau6:amd64.
+(Reading database ... 80663 files and directories currently installed.)
+Preparing to unpack .../00-libxau6_1%3a1.0.11-1build2_amd64.deb ...
+Unpacking libxau6:amd64 (1:1.0.11-1build2) ...
+Selecting previously unselected package libxdmcp6:amd64.
+Preparing to unpack .../01-libxdmcp6_1%3a1.1.5-2_amd64.deb ...
+Unpacking libxdmcp6:amd64 (1:1.1.5-2) ...
+Selecting previously unselected package libxcb1:amd64.
+Preparing to unpack .../02-libxcb1_1.17.0-2ubuntu1_amd64.deb ...
+Unpacking libxcb1:amd64 (1.17.0-2ubuntu1) ...
+Selecting previously unselected package libx11-data.
+Preparing to unpack .../03-libx11-data_2%3a1.8.13-1ubuntu0.1_all.deb ...
+Unpacking libx11-data (2:1.8.13-1ubuntu0.1) ...
+Selecting previously unselected package libx11-6:amd64.
+Preparing to unpack .../04-libx11-6_2%3a1.8.13-1ubuntu0.1_amd64.deb ...
+Unpacking libx11-6:amd64 (2:1.8.13-1ubuntu0.1) ...
+Selecting previously unselected package fonts-dejavu-mono.
+Preparing to unpack .../05-fonts-dejavu-mono_2.37-8build1_all.deb ...
+Unpacking fonts-dejavu-mono (2.37-8build1) ...
+Selecting previously unselected package fonts-dejavu-core.
+Preparing to unpack .../06-fonts-dejavu-core_2.37-8build1_all.deb ...
+Unpacking fonts-dejavu-core (2.37-8build1) ...
+Selecting previously unselected package fontconfig-config.
+Preparing to unpack .../07-fontconfig-config_2.17.1-3ubuntu1_amd64.deb ...
+Unpacking fontconfig-config (2.17.1-3ubuntu1) ...
+Selecting previously unselected package libabsl20260107:amd64.
+Preparing to unpack .../08-libabsl20260107_20260107.0-4_amd64.deb ...
+Unpacking libabsl20260107:amd64 (20260107.0-4) ...
+Selecting previously unselected package libaom3:amd64.
+Preparing to unpack .../09-libaom3_3.13.1-2ubuntu0.1_amd64.deb ...
+Unpacking libaom3:amd64 (3.13.1-2ubuntu0.1) ...
+Selecting previously unselected package libargon2-1:amd64.
+Preparing to unpack .../10-libargon2-1_0~20190702+dfsg-5_amd64.deb ...
+Unpacking libargon2-1:amd64 (0~20190702+dfsg-5) ...
+Selecting previously unselected package libdav1d7:amd64.
+Preparing to unpack .../11-libdav1d7_1.5.3-1_amd64.deb ...
+Unpacking libdav1d7:amd64 (1.5.3-1) ...
+Selecting previously unselected package libgav1-2:amd64.
+Preparing to unpack .../12-libgav1-2_0.20.0-2build1_amd64.deb ...
+Unpacking libgav1-2:amd64 (0.20.0-2build1) ...
+Selecting previously unselected package libjpeg-turbo8:amd64.
+Preparing to unpack .../13-libjpeg-turbo8_2.1.5-4ubuntu4_amd64.deb ...
+Unpacking libjpeg-turbo8:amd64 (2.1.5-4ubuntu4) ...
+Selecting previously unselected package libjpeg8:amd64.
+Preparing to unpack .../14-libjpeg8_8c-2ubuntu12_amd64.deb ...
+Unpacking libjpeg8:amd64 (8c-2ubuntu12) ...
+Selecting previously unselected package libyuv0:amd64.
+Preparing to unpack .../15-libyuv0_0.0.1922.20260106-1_amd64.deb ...
+Unpacking libyuv0:amd64 (0.0.1922.20260106-1) ...
+Selecting previously unselected package libavif16:amd64.
+Preparing to unpack .../16-libavif16_1.3.0-1ubuntu4_amd64.deb ...
+Unpacking libavif16:amd64 (1.3.0-1ubuntu4) ...
+Selecting previously unselected package libdeflate0:amd64.
+Preparing to unpack .../17-libdeflate0_1.23-2ubuntu1_amd64.deb ...
+Unpacking libdeflate0:amd64 (1.23-2ubuntu1) ...
+Selecting previously unselected package libfontconfig1:amd64.
+Preparing to unpack .../18-libfontconfig1_2.17.1-3ubuntu1_amd64.deb ...
+Unpacking libfontconfig1:amd64 (2.17.1-3ubuntu1) ...
+Selecting previously unselected package libsharpyuv0:amd64.
+Preparing to unpack .../19-libsharpyuv0_1.5.0-0.1build1_amd64.deb ...
+Unpacking libsharpyuv0:amd64 (1.5.0-0.1build1) ...
+Selecting previously unselected package libheif-plugin-aomdec:amd64.
+Preparing to unpack .../20-libheif-plugin-aomdec_1.21.2-3ubuntu0.7_amd64.deb ...
+Unpacking libheif-plugin-aomdec:amd64 (1.21.2-3ubuntu0.7) ...
+Selecting previously unselected package libheif1:amd64.
+Preparing to unpack .../21-libheif1_1.21.2-3ubuntu0.7_amd64.deb ...
+Unpacking libheif1:amd64 (1.21.2-3ubuntu0.7) ...
+Selecting previously unselected package libimagequant0:amd64.
+Preparing to unpack .../22-libimagequant0_4.4.1-1_amd64.deb ...
+Unpacking libimagequant0:amd64 (4.4.1-1) ...
+Selecting previously unselected package libjbig0:amd64.
+Preparing to unpack .../23-libjbig0_2.1-6.1ubuntu3_amd64.deb ...
+Unpacking libjbig0:amd64 (2.1-6.1ubuntu3) ...
+Selecting previously unselected package liblerc4:amd64.
+Preparing to unpack .../24-liblerc4_4.0.0+ds-5ubuntu2_amd64.deb ...
+Unpacking liblerc4:amd64 (4.0.0+ds-5ubuntu2) ...
+Selecting previously unselected package libwebp7:amd64.
+Preparing to unpack .../25-libwebp7_1.5.0-0.1build1_amd64.deb ...
+Unpacking libwebp7:amd64 (1.5.0-0.1build1) ...
+Selecting previously unselected package libtiff6:amd64.
+Preparing to unpack .../26-libtiff6_4.7.0-3ubuntu5_amd64.deb ...
+Unpacking libtiff6:amd64 (4.7.0-3ubuntu5) ...
+Selecting previously unselected package libxpm4:amd64.
+Preparing to unpack .../27-libxpm4_1%3a3.5.17-1ubuntu0.26.04.2_amd64.deb ...
+Unpacking libxpm4:amd64 (1:3.5.17-1ubuntu0.26.04.2) ...
+Selecting previously unselected package libgd3:amd64.
+Preparing to unpack .../28-libgd3_2.3.3-16+0~deb.sury.org.1+ubuntu26.04_amd64.deb ...
+Unpacking libgd3:amd64 (2.3.3-16+0~deb.sury.org.1+ubuntu26.04) ...
+Selecting previously unselected package libsodium23:amd64.
+Preparing to unpack .../29-libsodium23_1.0.18-2_amd64.deb ...
+Unpacking libsodium23:amd64 (1.0.18-2) ...
+Selecting previously unselected package libxslt1.1:amd64.
+Preparing to unpack .../30-libxslt1.1_1.1.45-0.1_amd64.deb ...
+Unpacking libxslt1.1:amd64 (1.1.45-0.1) ...
+Selecting previously unselected package libzip5:amd64.
+Preparing to unpack .../31-libzip5_1.11.4-2_amd64.deb ...
+Unpacking libzip5:amd64 (1.11.4-2) ...
+Selecting previously unselected package php-common.
+Preparing to unpack .../32-php-common_2%3a101+0~20261021.78+ubuntu26.04~1.gbp53f25f_all.deb ...
+Unpacking php-common (2:101+0~20261021.78+ubuntu26.04~1.gbp53f25f) ...
+Selecting previously unselected package php8.5-common.
+Preparing to unpack .../33-php8.5-common_8.5.12-3+0~deb.sury.org.1+ubuntu26.04_amd64.deb ...
+Unpacking php8.5-common (8.5.12-3+0~deb.sury.org.1+ubuntu26.04) ...
+Selecting previously unselected package php8.5-readline.
+Preparing to unpack .../34-php8.5-readline_8.5.12-3+0~deb.sury.org.1+ubuntu26.04_amd64.deb ...
+Unpacking php8.5-readline (8.5.12-3+0~deb.sury.org.1+ubuntu26.04) ...
+Selecting previously unselected package php8.5-cli.
+Preparing to unpack .../35-php8.5-cli_8.5.12-3+0~deb.sury.org.1+ubuntu26.04_amd64.deb ...
+Unpacking php8.5-cli (8.5.12-3+0~deb.sury.org.1+ubuntu26.04) ...
+Selecting previously unselected package php8.5-curl.
+Preparing to unpack .../36-php8.5-curl_8.5.12-3+0~deb.sury.org.1+ubuntu26.04_amd64.deb ...
+Unpacking php8.5-curl (8.5.12-3+0~deb.sury.org.1+ubuntu26.04) ...
+Selecting previously unselected package php8.5-fpm.
+Preparing to unpack .../37-php8.5-fpm_8.5.12-3+0~deb.sury.org.1+ubuntu26.04_amd64.deb ...
+Unpacking php8.5-fpm (8.5.12-3+0~deb.sury.org.1+ubuntu26.04) ...
+Selecting previously unselected package php8.5-gd.
+Preparing to unpack .../38-php8.5-gd_8.5.12-3+0~deb.sury.org.1+ubuntu26.04_amd64.deb ...
+Unpacking php8.5-gd (8.5.12-3+0~deb.sury.org.1+ubuntu26.04) ...
+Selecting previously unselected package php8.5-gmp.
+Preparing to unpack .../39-php8.5-gmp_8.5.12-3+0~deb.sury.org.1+ubuntu26.04_amd64.deb ...
+Unpacking php8.5-gmp (8.5.12-3+0~deb.sury.org.1+ubuntu26.04) ...
+Selecting previously unselected package php8.5-mbstring.
+Preparing to unpack .../40-php8.5-mbstring_8.5.12-3+0~deb.sury.org.1+ubuntu26.04_amd64.deb ...
+Unpacking php8.5-mbstring (8.5.12-3+0~deb.sury.org.1+ubuntu26.04) ...
+Selecting previously unselected package php8.5-mysql.
+Preparing to unpack .../41-php8.5-mysql_8.5.12-3+0~deb.sury.org.1+ubuntu26.04_amd64.deb ...
+Unpacking php8.5-mysql (8.5.12-3+0~deb.sury.org.1+ubuntu26.04) ...
+Selecting previously unselected package php8.5-xml.
+Preparing to unpack .../42-php8.5-xml_8.5.12-3+0~deb.sury.org.1+ubuntu26.04_amd64.deb ...
+Unpacking php8.5-xml (8.5.12-3+0~deb.sury.org.1+ubuntu26.04) ...
+Selecting previously unselected package php8.5-zip.
+Preparing to unpack .../43-php8.5-zip_8.5.12-3+0~deb.sury.org.1+ubuntu26.04_amd64.deb ...
+Unpacking php8.5-zip (8.5.12-3+0~deb.sury.org.1+ubuntu26.04) ...
+Setting up libsharpyuv0:amd64 (1.5.0-0.1build1) ...
+Setting up php-common (2:101+0~20261021.78+ubuntu26.04~1.gbp53f25f) ...
+Created symlink '/etc/systemd/system/timers.target.wants/phpsessionclean.timer' → '/usr/lib/systemd/system/phpsessionclean.timer'.
+Setting up libaom3:amd64 (3.13.1-2ubuntu0.1) ...
+Setting up libxau6:amd64 (1:1.0.11-1build2) ...
+Setting up libxdmcp6:amd64 (1:1.1.5-2) ...
+Setting up libxcb1:amd64 (1.17.0-2ubuntu1) ...
+Setting up libsodium23:amd64 (1.0.18-2) ...
+Setting up liblerc4:amd64 (4.0.0+ds-5ubuntu2) ...
+Setting up libzip5:amd64 (1.11.4-2) ...
+Setting up libargon2-1:amd64 (0~20190702+dfsg-5) ...
+Setting up libdeflate0:amd64 (1.23-2ubuntu1) ...
+Setting up libjbig0:amd64 (2.1-6.1ubuntu3) ...
+Setting up libx11-data (2:1.8.13-1ubuntu0.1) ...
+Setting up libimagequant0:amd64 (4.4.1-1) ...
+Setting up fonts-dejavu-mono (2.37-8build1) ...
+Setting up fonts-dejavu-core (2.37-8build1) ...
+Setting up libjpeg-turbo8:amd64 (2.1.5-4ubuntu4) ...
+Setting up libwebp7:amd64 (1.5.0-0.1build1) ...
+Setting up libdav1d7:amd64 (1.5.3-1) ...
+Setting up libxslt1.1:amd64 (1.1.45-0.1) ...
+Setting up libx11-6:amd64 (2:1.8.13-1ubuntu0.1) ...
+Setting up libabsl20260107:amd64 (20260107.0-4) ...
+Setting up php8.5-common (8.5.12-3+0~deb.sury.org.1+ubuntu26.04) ...
+Creating config file /etc/php/8.5/mods-available/calendar.ini with new version
+Creating config file /etc/php/8.5/mods-available/ctype.ini with new version
+Creating config file /etc/php/8.5/mods-available/exif.ini with new version
+Creating config file /etc/php/8.5/mods-available/fileinfo.ini with new version
+Creating config file /etc/php/8.5/mods-available/ffi.ini with new version
+Creating config file /etc/php/8.5/mods-available/ftp.ini with new version
+Creating config file /etc/php/8.5/mods-available/gettext.ini with new version
+Creating config file /etc/php/8.5/mods-available/iconv.ini with new version
+Creating config file /etc/php/8.5/mods-available/pdo.ini with new version
+Creating config file /etc/php/8.5/mods-available/phar.ini with new version
+Creating config file /etc/php/8.5/mods-available/posix.ini with new version
+Creating config file /etc/php/8.5/mods-available/shmop.ini with new version
+Creating config file /etc/php/8.5/mods-available/sockets.ini with new version
+Creating config file /etc/php/8.5/mods-available/sysvmsg.ini with new version
+Creating config file /etc/php/8.5/mods-available/sysvsem.ini with new version
+Creating config file /etc/php/8.5/mods-available/sysvshm.ini with new version
+Creating config file /etc/php/8.5/mods-available/tokenizer.ini with new version
+Setting up libjpeg8:amd64 (8c-2ubuntu12) ...
+Setting up php8.5-curl (8.5.12-3+0~deb.sury.org.1+ubuntu26.04) ...
+Creating config file /etc/php/8.5/mods-available/curl.ini with new version
+Setting up libxpm4:amd64 (1:3.5.17-1ubuntu0.26.04.2) ...
+Setting up php8.5-xml (8.5.12-3+0~deb.sury.org.1+ubuntu26.04) ...
+Creating config file /etc/php/8.5/mods-available/dom.ini with new version
+Creating config file /etc/php/8.5/mods-available/simplexml.ini with new version
+Creating config file /etc/php/8.5/mods-available/xml.ini with new version
+Creating config file /etc/php/8.5/mods-available/xmlreader.ini with new version
+Creating config file /etc/php/8.5/mods-available/xmlwriter.ini with new version
+Creating config file /etc/php/8.5/mods-available/xsl.ini with new version
+Setting up fontconfig-config (2.17.1-3ubuntu1) ...
+Setting up php8.5-mysql (8.5.12-3+0~deb.sury.org.1+ubuntu26.04) ...
+Creating config file /etc/php/8.5/mods-available/mysqlnd.ini with new version
+Creating config file /etc/php/8.5/mods-available/mysqli.ini with new version
+Creating config file /etc/php/8.5/mods-available/pdo_mysql.ini with new version
+Setting up php8.5-mbstring (8.5.12-3+0~deb.sury.org.1+ubuntu26.04) ...
+Creating config file /etc/php/8.5/mods-available/mbstring.ini with new version
+Setting up php8.5-zip (8.5.12-3+0~deb.sury.org.1+ubuntu26.04) ...
+Creating config file /etc/php/8.5/mods-available/zip.ini with new version
+Setting up libgav1-2:amd64 (0.20.0-2build1) ...
+Setting up libtiff6:amd64 (4.7.0-3ubuntu5) ...
+Setting up php8.5-gmp (8.5.12-3+0~deb.sury.org.1+ubuntu26.04) ...
+Creating config file /etc/php/8.5/mods-available/gmp.ini with new version
+Setting up php8.5-readline (8.5.12-3+0~deb.sury.org.1+ubuntu26.04) ...
+Creating config file /etc/php/8.5/mods-available/readline.ini with new version
+Setting up libyuv0:amd64 (0.0.1922.20260106-1) ...
+Setting up libavif16:amd64 (1.3.0-1ubuntu4) ...
+Setting up php8.5-cli (8.5.12-3+0~deb.sury.org.1+ubuntu26.04) ...
+update-alternatives: using /usr/bin/php8.5 to provide /usr/bin/php (php) in auto mode
+update-alternatives: using /usr/bin/phar8.5 to provide /usr/bin/phar (phar) in auto mode
+update-alternatives: using /usr/bin/phar.phar8.5 to provide /usr/bin/phar.phar (phar.phar) in auto mode
+Creating config file /etc/php/8.5/cli/php.ini with new version
+Setting up php8.5-fpm (8.5.12-3+0~deb.sury.org.1+ubuntu26.04) ...
+Creating config file /etc/php/8.5/fpm/php.ini with new version
+Created symlink '/etc/systemd/system/multi-user.target.wants/php8.5-fpm.service' → '/usr/lib/systemd/system/php8.5-fpm.service'.
+Setting up libheif-plugin-aomdec:amd64 (1.21.2-3ubuntu0.7) ...
+Setting up libheif1:amd64 (1.21.2-3ubuntu0.7) ...
+Processing triggers for man-db (2.13.1-1build1) ...
+Processing triggers for sgml-base (1.31+nmu1build1) ...
+Setting up libfontconfig1:amd64 (2.17.1-3ubuntu1) ...
+Processing triggers for libc-bin (2.43-2ubuntu2.7) ...
+Setting up libgd3:amd64 (2.3.3-16+0~deb.sury.org.1+ubuntu26.04) ...
+Setting up php8.5-gd (8.5.12-3+0~deb.sury.org.1+ubuntu26.04) ...
+Creating config file /etc/php/8.5/mods-available/gd.ini with new version
+Processing triggers for php8.5-cli (8.5.12-3+0~deb.sury.org.1+ubuntu26.04) ...
+Processing triggers for php8.5-fpm (8.5.12-3+0~deb.sury.org.1+ubuntu26.04) ...
+Processing triggers for libc-bin (2.43-2ubuntu2.7) ...
+Reading package lists...
+Building dependency tree...
+Reading state information...
+Solving dependencies...
+The following additional packages will be installed:
+  php8.5-igbinary
+Suggested packages:
+  redis-server
+The following NEW packages will be installed:
+  php8.5-igbinary php8.5-redis
+0 upgraded, 2 newly installed, 0 to remove and 0 not upgraded.
+Need to get 240 kB of archives.
+After this operation, 800 kB of additional disk space will be used.
+Get:1 https://packages.sury.org/php resolute/main amd64 php8.5-igbinary amd64 3.2.16-6+0~20260709.60+ubuntu26.04~1.gbp1eff65 [37.1 kB]
+Get:2 https://packages.sury.org/php resolute/main amd64 php8.5-redis amd64 6.3.0-2+0~20260711.69+ubuntu26.04~1.gbpd148c3 [203 kB]
+Fetched 240 kB in 0s (1100 kB/s)
+Selecting previously unselected package php8.5-igbinary.
+(Reading database ... 81595 files and directories currently installed.)
+Preparing to unpack .../php8.5-igbinary_3.2.16-6+0~20260709.60+ubuntu26.04~1.gbp1eff65_amd64.deb ...
+Unpacking php8.5-igbinary (3.2.16-6+0~20260709.60+ubuntu26.04~1.gbp1eff65) ...
+Selecting previously unselected package php8.5-redis.
+Preparing to unpack .../php8.5-redis_6.3.0-2+0~20260711.69+ubuntu26.04~1.gbpd148c3_amd64.deb ...
+Unpacking php8.5-redis (6.3.0-2+0~20260711.69+ubuntu26.04~1.gbpd148c3) ...
+Setting up php8.5-igbinary (3.2.16-6+0~20260709.60+ubuntu26.04~1.gbp1eff65) ...
+Setting up php8.5-redis (6.3.0-2+0~20260711.69+ubuntu26.04~1.gbpd148c3) ...
+Processing triggers for php8.5-fpm (8.5.12-3+0~deb.sury.org.1+ubuntu26.04) ...
+Processing triggers for php8.5-cli (8.5.12-3+0~deb.sury.org.1+ubuntu26.04) ...
+2026-11-15 15:16:34 UTC [INFO] PHP 8.5: max_children=16 (hardware target: 1.0 workers per logical CPU; --php children= overrides)
+2026-11-15 15:16:34 UTC [INFO] PHP 8.5: max_children=16
+2026-11-15 15:16:34 UTC [INFO] PHP 8.5: max_requests=16384
+2026-11-15 15:16:34 UTC [INFO] PHP 8.5: process_control_timeout=10s
+2026-11-15 15:16:34 UTC [INFO] PHP 8.5: memory_limit=512M opcache=512M jit=tracing/64M
+Synchronizing state of php8.5-fpm.service with SysV service script with /usr/lib/systemd/systemd-sysv-install.
+Executing: /usr/lib/systemd/systemd-sysv-install enable php8.5-fpm
+● php8.5-fpm.service - The PHP 8.5 FastCGI Process Manager
+     Loaded: loaded (/usr/lib/systemd/system/php8.5-fpm.service; enabled; preset: enabled)
+    Drop-In: /etc/systemd/system/php8.5-fpm.service.d
+             └─limits.conf
+     Active: active (running) since Sun 2026-11-15 23:16:37 PST; 171ms ago
+ Invocation: a601d81eb01149c6873e95f095738f2f
+       Docs: man:php-fpm8.5(8)
+   Main PID: 395897 (php-fpm8.5)
+     Status: "Ready to handle connections"
+      Tasks: 17 (limit: 30455)
+     Memory: 37.6M (peak: 39.5M)
+        CPU: 94ms
+     CGroup: /system.slice/php8.5-fpm.service
+             ├─395897 "php-fpm: master process (/etc/php/8.5/fpm/php-fpm.conf)"
+             ├─395898 "php-fpm: pool www"
+             ├─395899 "php-fpm: pool www"
+             ├─395900 "php-fpm: pool www"
+             ├─395901 "php-fpm: pool www"
+             ├─395902 "php-fpm: pool www"
+             ├─395903 "php-fpm: pool www"
+             ├─395904 "php-fpm: pool www"
+             ├─395905 "php-fpm: pool www"
+             ├─395906 "php-fpm: pool www"
+             ├─395907 "php-fpm: pool www"
+             ├─395908 "php-fpm: pool www"
+             ├─395909 "php-fpm: pool www"
+             ├─395910 "php-fpm: pool www"
+             ├─395911 "php-fpm: pool www"
+             ├─395912 "php-fpm: pool www"
+             └─395913 "php-fpm: pool www"
+
+Nov 15 23:16:35 16c-32g-1T systemd[1]: Starting php8.5-fpm.service - The PHP 8.5 FastCGI Process Manager...
+Nov 15 23:16:37 16c-32g-1T systemd[1]: Started php8.5-fpm.service - The PHP 8.5 FastCGI Process Manager.
+PHP 8.5.12 (fpm-fcgi) (built: Nov 11 2026 06:25:57) (NTS)
+Copyright (c) The PHP Group
+Built by Ubuntu
+Zend Engine v4.5.12, Copyright (c) Zend Technologies
+    with Zend OPcache v8.5.12, Copyright (c), by Zend Technologies
+2026-11-15 15:16:39 UTC [ OK ] PHP 8.5 installed
+2026-11-15 15:16:39 UTC [ OK ] php completed in 00:00:38
+
+==> Installing mariadb
+
+==> MariaDB
+2026-11-15 15:16:39 UTC [INFO] MariaDB size=auto resolved to 1738M (shared memory plan)
+2026-11-15 15:16:39 UTC [INFO] MariaDB bind-address: 127.0.0.1
+Reading package lists...
+Building dependency tree...
+Reading state information...
+Solving dependencies...
+The following additional packages will be installed:
+  galera-4 gawk libaio1t64 libdbi-perl libmariadb3 libmpfr6 libpcre2-posix3
+  liburing2 mariadb-client-core mariadb-common mariadb-server-core
+  mysql-common socat
+Suggested packages:
+  gawk-doc libclone-perl libmldbm-perl libnet-daemon-perl
+  libsql-statement-perl libdbd-mariadb-perl | libdbd-mysql-perl
+  libterm-readkey-perl mailx mariadb-test
+Recommended packages:
+  libhtml-template-perl mariadb-plugin-provider-bzip2
+  mariadb-plugin-provider-lz4 mariadb-plugin-provider-lzma
+  mariadb-plugin-provider-lzo mariadb-plugin-provider-snappy pv
+The following NEW packages will be installed:
+  galera-4 gawk libaio1t64 libdbi-perl libmariadb3 libmpfr6 libpcre2-posix3
+  liburing2 mariadb-client mariadb-client-core mariadb-common mariadb-server
+  mariadb-server-core mysql-common socat
+0 upgraded, 15 newly installed, 0 to remove and 0 not upgraded.
+Need to get 18.1 MB of archives.
+After this operation, 128 MB of additional disk space will be used.
+Get:1 http://archive.ubuntu.com/ubuntu resolute/main amd64 galera-4 amd64 26.4.25-2 [761 kB]
+Get:2 http://archive.ubuntu.com/ubuntu resolute/main amd64 libmpfr6 amd64 4.2.2-3 [361 kB]
+Get:3 http://archive.ubuntu.com/ubuntu resolute-updates/main amd64 gawk amd64 1:5.3.2-1ubuntu1.1 [527 kB]
+Get:4 http://archive.ubuntu.com/ubuntu resolute/main amd64 mysql-common all 5.8+1.1.1ubuntu2 [7002 B]
+Get:5 http://archive.ubuntu.com/ubuntu resolute-updates/main amd64 mariadb-common all 1:11.8.6-5ubuntu0.1 [23.9 kB]
+Get:6 http://archive.ubuntu.com/ubuntu resolute-updates/main amd64 libdbi-perl amd64 1.647-1ubuntu0.26.04.4 [829 kB]
+Get:7 http://archive.ubuntu.com/ubuntu resolute-updates/main amd64 libmariadb3 amd64 1:11.8.6-5ubuntu0.1 [192 kB]
+Get:8 http://archive.ubuntu.com/ubuntu resolute-updates/main amd64 mariadb-client-core amd64 1:11.8.6-5ubuntu0.1 [1176 kB]
+Get:9 http://archive.ubuntu.com/ubuntu resolute-updates/main amd64 libpcre2-posix3 amd64 10.46-1ubuntu0.1 [7182 B]
+Get:10 http://archive.ubuntu.com/ubuntu resolute-updates/main amd64 mariadb-client amd64 1:11.8.6-5ubuntu0.1 [2190 kB]
+Get:11 http://archive.ubuntu.com/ubuntu resolute/main amd64 libaio1t64 amd64 0.3.113-8build1 [7356 B]
+Get:12 http://archive.ubuntu.com/ubuntu resolute/main amd64 liburing2 amd64 2.14-1 [25.4 kB]
+Get:13 http://archive.ubuntu.com/ubuntu resolute-updates/main amd64 mariadb-server-core amd64 1:11.8.6-5ubuntu0.1 [8149 kB]
+Get:14 http://archive.ubuntu.com/ubuntu resolute-updates/main amd64 socat amd64 1.8.1.1-1ubuntu0.1 [403 kB]
+Get:15 http://archive.ubuntu.com/ubuntu resolute-updates/main amd64 mariadb-server amd64 1:11.8.6-5ubuntu0.1 [3469 kB]
+Preconfiguring packages ...
+Fetched 18.1 MB in 11s (1720 kB/s)
+Selecting previously unselected package galera-4.
+(Reading database ... 81615 files and directories currently installed.)
+Preparing to unpack .../galera-4_26.4.25-2_amd64.deb ...
+Unpacking galera-4 (26.4.25-2) ...
+Selecting previously unselected package libmpfr6:amd64.
+Preparing to unpack .../libmpfr6_4.2.2-3_amd64.deb ...
+Unpacking libmpfr6:amd64 (4.2.2-3) ...
+Setting up libmpfr6:amd64 (4.2.2-3) ...
+Selecting previously unselected package gawk.
+(Reading database ... 81634 files and directories currently installed.)
+Preparing to unpack .../00-gawk_1%3a5.3.2-1ubuntu1.1_amd64.deb ...
+Unpacking gawk (1:5.3.2-1ubuntu1.1) ...
+Selecting previously unselected package mysql-common.
+Preparing to unpack .../01-mysql-common_5.8+1.1.1ubuntu2_all.deb ...
+Unpacking mysql-common (5.8+1.1.1ubuntu2) ...
+Selecting previously unselected package mariadb-common.
+Preparing to unpack .../02-mariadb-common_1%3a11.8.6-5ubuntu0.1_all.deb ...
+Unpacking mariadb-common (1:11.8.6-5ubuntu0.1) ...
+Selecting previously unselected package libdbi-perl:amd64.
+Preparing to unpack .../03-libdbi-perl_1.647-1ubuntu0.26.04.4_amd64.deb ...
+Unpacking libdbi-perl:amd64 (1.647-1ubuntu0.26.04.4) ...
+Selecting previously unselected package libmariadb3:amd64.
+Preparing to unpack .../04-libmariadb3_1%3a11.8.6-5ubuntu0.1_amd64.deb ...
+Unpacking libmariadb3:amd64 (1:11.8.6-5ubuntu0.1) ...
+Selecting previously unselected package mariadb-client-core.
+Preparing to unpack .../05-mariadb-client-core_1%3a11.8.6-5ubuntu0.1_amd64.deb ...
+Unpacking mariadb-client-core (1:11.8.6-5ubuntu0.1) ...
+Selecting previously unselected package libpcre2-posix3:amd64.
+Preparing to unpack .../06-libpcre2-posix3_10.46-1ubuntu0.1_amd64.deb ...
+Unpacking libpcre2-posix3:amd64 (10.46-1ubuntu0.1) ...
+Selecting previously unselected package mariadb-client.
+Preparing to unpack .../07-mariadb-client_1%3a11.8.6-5ubuntu0.1_amd64.deb ...
+Unpacking mariadb-client (1:11.8.6-5ubuntu0.1) ...
+Selecting previously unselected package libaio1t64:amd64.
+Preparing to unpack .../08-libaio1t64_0.3.113-8build1_amd64.deb ...
+Unpacking libaio1t64:amd64 (0.3.113-8build1) ...
+Selecting previously unselected package liburing2:amd64.
+Preparing to unpack .../09-liburing2_2.14-1_amd64.deb ...
+Unpacking liburing2:amd64 (2.14-1) ...
+Selecting previously unselected package mariadb-server-core.
+Preparing to unpack .../10-mariadb-server-core_1%3a11.8.6-5ubuntu0.1_amd64.deb ...
+Unpacking mariadb-server-core (1:11.8.6-5ubuntu0.1) ...
+Selecting previously unselected package socat.
+Preparing to unpack .../11-socat_1.8.1.1-1ubuntu0.1_amd64.deb ...
+Unpacking socat (1.8.1.1-1ubuntu0.1) ...
+Setting up mysql-common (5.8+1.1.1ubuntu2) ...
+update-alternatives: using /etc/mysql/my.cnf.fallback to provide /etc/mysql/my.cnf (my.cnf) in auto mode
+Setting up mariadb-common (1:11.8.6-5ubuntu0.1) ...
+update-alternatives: using /etc/mysql/mariadb.cnf to provide /etc/mysql/my.cnf (my.cnf) in auto mode
+Selecting previously unselected package mariadb-server.
+(Reading database ... 82244 files and directories currently installed.)
+Preparing to unpack .../mariadb-server_1%3a11.8.6-5ubuntu0.1_amd64.deb ...
+Unpacking mariadb-server (1:11.8.6-5ubuntu0.1) ...
+Setting up galera-4 (26.4.25-2) ...
+Setting up gawk (1:5.3.2-1ubuntu1.1) ...
+Setting up socat (1.8.1.1-1ubuntu0.1) ...
+Setting up libmariadb3:amd64 (1:11.8.6-5ubuntu0.1) ...
+Setting up libpcre2-posix3:amd64 (10.46-1ubuntu0.1) ...
+Setting up libaio1t64:amd64 (0.3.113-8build1) ...
+Setting up liburing2:amd64 (2.14-1) ...
+Setting up libdbi-perl:amd64 (1.647-1ubuntu0.26.04.4) ...
+Setting up mariadb-client-core (1:11.8.6-5ubuntu0.1) ...
+Setting up mariadb-server-core (1:11.8.6-5ubuntu0.1) ...
+Setting up mariadb-client (1:11.8.6-5ubuntu0.1) ...
+Setting up mariadb-server (1:11.8.6-5ubuntu0.1) ...
+Creating group 'mysql' with GID 978.
+Creating user 'mysql' (MariaDB Server) with UID 978 and GID 978.
+Created symlink '/etc/systemd/system/multi-user.target.wants/mariadb.service' → '/usr/lib/systemd/system/mariadb.service'.
+Processing triggers for man-db (2.13.1-1build1) ...
+Processing triggers for libc-bin (2.43-2ubuntu2.7) ...
+Synchronizing state of mariadb.service with SysV service script with /usr/lib/systemd/systemd-sysv-install.
+Executing: /usr/lib/systemd/systemd-sysv-install enable mariadb
+● mariadb.service - MariaDB 11.8.6 database server
+     Loaded: loaded (/usr/lib/systemd/system/mariadb.service; enabled; preset: enabled)
+    Drop-In: /etc/systemd/system/mariadb.service.d
+             └─limits.conf
+     Active: active (running) since Sun 2026-11-15 23:16:54 PST; 975ms ago
+ Invocation: 341dcd08c3ad429193a4957eae68e50a
+       Docs: man:mariadbd(8)
+             https://mariadb.com/kb/en/library/systemd/
+   Main PID: 396412 (mariadbd)
+     Status: "Taking your SQL requests now..."
+      Tasks: 14 (limit: 201006)
+     Memory: 94.4M (peak: 99.7M)
+        CPU: 862ms
+     CGroup: /system.slice/mariadb.service
+             └─396412 /usr/sbin/mariadbd
+
+Nov 15 23:16:54 16c-32g-1T mariadbd[396412]: 2026-11-15 23:16:54 0 [Note] InnoDB: log sequence number 45616; transaction id 14
+Nov 15 23:16:54 16c-32g-1T mariadbd[396412]: 2026-11-15 23:16:54 0 [Note] Plugin 'FEEDBACK' is disabled.
+Nov 15 23:16:54 16c-32g-1T mariadbd[396412]: 2026-11-15 23:16:54 0 [Note] Plugin 'wsrep-provider' is disabled.
+Nov 15 23:16:54 16c-32g-1T mariadbd[396412]: 2026-11-15 23:16:54 0 [Note] InnoDB: Loading buffer pool(s) from /var/lib/mariadb/ib_buffer_pool
+Nov 15 23:16:54 16c-32g-1T mariadbd[396412]: 2026-11-15 23:16:54 0 [Note] InnoDB: Buffer pool(s) load completed at 261115 23:16:54
+Nov 15 23:16:54 16c-32g-1T mariadbd[396412]: 2026-11-15 23:16:54 0 [Note] Server socket created on IP: '127.0.0.1', port: '3306'.
+Nov 15 23:16:54 16c-32g-1T mariadbd[396412]: 2026-11-15 23:16:54 0 [Note] mariadbd: Event Scheduler: Loaded 0 events
+Nov 15 23:16:54 16c-32g-1T mariadbd[396412]: 2026-11-15 23:16:54 0 [Note] /usr/sbin/mariadbd: ready for connections.
+Nov 15 23:16:54 16c-32g-1T mariadbd[396412]: Version: '11.8.6-MariaDB-5ubuntu0.1 from Ubuntu'  socket: '/run/mysqld/mysqld.sock'  port: 3306  -- Please help get to 10k stars at https://github.com/MariaDB/Server
+Nov 15 23:16:54 16c-32g-1T systemd[1]: Started mariadb.service - MariaDB 11.8.6 database server.
+2026-11-15 15:16:56 UTC [INFO] MariaDB profile: buffer_pool=1738M redo_log=434M max_connections=200 table_open_cache=4000 io_capacity=10000/20000 thread_pool=16
+Reading package lists...
+Building dependency tree...
+Reading state information...
+lz4 is already the newest version (1.10.0-8).
+Solving dependencies...
+0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.
+mysqlbkup is installed
+2026-11-15 15:16:58 UTC [INFO] MariaDB Backup Installed
+● mariadb.service - MariaDB 11.8.6 database server
+     Loaded: loaded (/usr/lib/systemd/system/mariadb.service; enabled; preset: enabled)
+    Drop-In: /etc/systemd/system/mariadb.service.d
+             └─limits.conf
+     Active: active (running) since Sun 2026-11-15 23:16:57 PST; 473ms ago
+ Invocation: 302d1660308744d4a97506e4415c2f99
+       Docs: man:mariadbd(8)
+             https://mariadb.com/kb/en/library/systemd/
+    Process: 397033 ExecStartPre=/bin/sh -c [ ! -e /usr/bin/galera_recovery ] && VAR= ||   VAR=`/usr/bin/galera_recovery`; [ $? -eq 0 ]   && echo _WSREP_START_POSITION=$VAR > /run/mysqld/wsrep-start-position || exit 1 (code=exited, status=0/SUCCESS)
+    Process: 397249 ExecStartPost=/bin/rm -f /run/mysqld/wsrep-start-position /run/mysqld/wsrep-new-cluster (code=exited, status=0/SUCCESS)
+    Process: 397251 ExecStartPost=/etc/mysql/debian-start (code=exited, status=0/SUCCESS)
+   Main PID: 397233 (mariadbd)
+     Status: "Taking your SQL requests now..."
+      Tasks: 47 (limit: 201006)
+     Memory: 239M (peak: 288.3M)
+        CPU: 1.187s
+     CGroup: /system.slice/mariadb.service
+             └─397233 /usr/sbin/mariadbd
+
+Nov 15 23:16:56 16c-32g-1T systemd[1]: Starting mariadb.service - MariaDB 11.8.6 database server...
+Nov 15 23:16:57 16c-32g-1T systemd[1]: Started mariadb.service - MariaDB 11.8.6 database server.
+mariadb-admin from 11.8.6-MariaDB, client 10.0 for debian-linux-gnu (x86_64)
+2026-11-15 15:16:58 UTC [ OK ] MariaDB installed and configured
+2026-11-15 15:16:58 UTC [ OK ] mariadb completed in 00:00:19
+
+==> Installing valkey
+
+==> Valkey
+Reading package lists...
+Building dependency tree...
+Reading state information...
+Solving dependencies...
+The following additional packages will be installed:
+  valkey-tools
+Suggested packages:
+  ruby-redis
+The following NEW packages will be installed:
+  valkey-server valkey-tools
+0 upgraded, 2 newly installed, 0 to remove and 0 not upgraded.
+Need to get 1447 kB of archives.
+After this operation, 7809 kB of additional disk space will be used.
+Get:1 http://archive.ubuntu.com/ubuntu resolute-updates/main amd64 valkey-tools amd64 9.0.4-0ubuntu0.2 [1394 kB]
+Get:2 http://archive.ubuntu.com/ubuntu resolute-updates/main amd64 valkey-server amd64 9.0.4-0ubuntu0.2 [52.9 kB]
+Fetched 1447 kB in 3s (489 kB/s)
+Selecting previously unselected package valkey-tools.
+(Reading database ... 82358 files and directories currently installed.)
+Preparing to unpack .../valkey-tools_9.0.4-0ubuntu0.2_amd64.deb ...
+Unpacking valkey-tools (9.0.4-0ubuntu0.2) ...
+Selecting previously unselected package valkey-server.
+Preparing to unpack .../valkey-server_9.0.4-0ubuntu0.2_amd64.deb ...
+Unpacking valkey-server (9.0.4-0ubuntu0.2) ...
+Setting up valkey-tools (9.0.4-0ubuntu0.2) ...
+Setting up valkey-server (9.0.4-0ubuntu0.2) ...
+Created symlink '/etc/systemd/system/valkey.service' → '/usr/lib/systemd/system/valkey-server.service'.
+Created symlink '/etc/systemd/system/multi-user.target.wants/valkey-server.service' → '/usr/lib/systemd/system/valkey-server.service'.
+Processing triggers for man-db (2.13.1-1build1) ...
+2026-11-15 15:17:02 UTC [INFO] Valkey maxmemory: 434 MB (allkeys-lru; shared memory plan)
+# setup.sh managed valkey
+supervised systemd
+logfile /var/www/logs/valkey/valkey.log
+save ""
+appendonly no
+bind 127.0.0.1 -::1
+protected-mode yes
+unixsocket /run/valkey/valkey.sock
+unixsocketperm 770
+maxmemory 434mb
+maxmemory-policy allkeys-lru
+maxmemory-samples 10
+maxclients 10000
+tcp-backlog 65535
+timeout 0
+tcp-keepalive 300
+hz 10
+io-threads 1
+io-threads-do-reads yes
+lazyfree-lazy-eviction yes
+lazyfree-lazy-expire yes
+lazyfree-lazy-server-del yes
+lazyfree-lazy-user-del yes
+lazyfree-lazy-user-flush yes
+Valkey server v=9.0.4 sha=00000000:0 malloc=jemalloc-5.3.0 bits=64 build=256ea4cb0edac842
+Synchronizing state of valkey-server.service with SysV service script with /usr/lib/systemd/systemd-sysv-install.
+Executing: /usr/lib/systemd/systemd-sysv-install enable valkey-server
+● valkey-server.service - Advanced key-value store
+     Loaded: loaded (/usr/lib/systemd/system/valkey-server.service; enabled; preset: enabled)
+    Drop-In: /etc/systemd/system/valkey-server.service.d
+             └─limits.conf
+     Active: active (running) since Sun 2026-11-15 23:17:03 PST; 6ms ago
+ Invocation: ae29dfa2bb964ce08fc4a4630899207c
+       Docs: https://valkey.io/docs/,
+             man:valkey-server(1)
+   Main PID: 397970 (valkey-server)
+     Status: "Ready to accept connections"
+      Tasks: 7 (limit: 30455)
+     Memory: 5.4M (peak: 5.4M)
+        CPU: 36ms
+     CGroup: /system.slice/valkey-server.service
+             └─397970 "/usr/bin/valkey-server 127.0.0.1:6379"
+
+Nov 15 23:17:03 16c-32g-1T systemd[1]: Starting valkey-server.service - Advanced key-value store...
+Nov 15 23:17:03 16c-32g-1T systemd[1]: Started valkey-server.service - Advanced key-value store.
+PONG
+2026-11-15 15:17:05 UTC [ OK ] Valkey installed and running
+2026-11-15 15:17:05 UTC [ OK ] valkey completed in 00:00:07
+
+==> Installing elastic
+
+==> Elasticsearch
+Reading package lists...
+Building dependency tree...
+Reading state information...
+Solving dependencies...
+The following NEW packages will be installed:
+  elasticsearch
+0 upgraded, 1 newly installed, 0 to remove and 0 not upgraded.
+Need to get 840 MB of archives.
+After this operation, 1494 MB of additional disk space will be used.
+Get:1 https://artifacts.elastic.co/packages/9.x/apt stable/main amd64 elasticsearch amd64 9.5.6 [840 MB]
+Fetched 840 MB in 45s (18.8 MB/s)
+Selecting previously unselected package elasticsearch.
+(Reading database ... 82392 files and directories currently installed.)
+Preparing to unpack .../elasticsearch_9.5.6_amd64.deb ...
+Creating elasticsearch group... OK
+Creating elasticsearch user... OK
+Unpacking elasticsearch (9.5.6) ...
+Setting up elasticsearch (9.5.6) ...
+--------------------------- Security autoconfiguration information ------------------------------
+
+Authentication and authorization are enabled.
+TLS for the transport and HTTP layers is enabled and configured.
+
+The generated password for the elastic built-in superuser is : -x0NsRL6LHkvvxG7qE_C
+
+If this node should join an existing cluster, you can reconfigure this with
+'/usr/share/elasticsearch/bin/elasticsearch-reconfigure-node --enrollment-token <token-here>'
+after creating an enrollment token on your existing cluster.
+
+You can complete the following actions at any time:
+
+Reset the password of the elastic built-in superuser with 
+'/usr/share/elasticsearch/bin/elasticsearch-reset-password -u elastic'.
+
+Generate an enrollment token for Kibana instances with 
+ '/usr/share/elasticsearch/bin/elasticsearch-create-enrollment-token -s kibana'.
+
+Generate an enrollment token for Elasticsearch nodes with 
+'/usr/share/elasticsearch/bin/elasticsearch-create-enrollment-token -s node'.
+
+-------------------------------------------------------------------------------------------------
+### NOT starting on installation, please execute the following statements to configure elasticsearch service to start automatically using systemd
+ sudo systemctl daemon-reload
+ sudo systemctl enable elasticsearch.service
+### You can start elasticsearch service by executing
+ sudo systemctl start elasticsearch.service
+Processing triggers for procps (2:4.0.4-9ubuntu1) ...
+Processing triggers for systemd (259.9-0ubuntu0.1) ...
+Created symlink '/etc/systemd/system/multi-user.target.wants/elasticsearch.service' → '/usr/lib/systemd/system/elasticsearch.service'.
+{
+  "name" : "16c-32g-1T",
+  "cluster_name" : "essearch",
+  "cluster_uuid" : "DhCTaMP9TL2G3UQbAoPwYQ",
+  "version" : {
+    "number" : "9.5.6",
+    "build_flavor" : "default",
+    "build_type" : "deb",
+    "build_hash" : "fd1e8011342a0988e432b999cea4bf884ca120ed",
+    "build_date" : "2026-10-28T22:37:54.387301573Z",
+    "build_snapshot" : false,
+    "lucene_version" : "10.5.2",
+    "minimum_wire_compatibility_version" : "8.19.0",
+    "minimum_index_compatibility_version" : "8.0.0"
+  },
+  "tagline" : "You Know, for Search"
+}
+
+2026-11-15 15:18:16 UTC [INFO] Elasticsearch: Cluster health: green
+2026-11-15 15:18:16 UTC [INFO] Elasticsearch: Single-node template ensured (priority 1, replicas=0)
+2026-11-15 15:18:16 UTC [ OK ] Elasticsearch installed and running
+2026-11-15 15:18:16 UTC [ OK ] elastic completed in 00:01:11
+
+==> Installing others
+
+==> Other packages
+2026-11-15 15:18:17 UTC [INFO] Installing smartmontools
+Reading package lists...
+Building dependency tree...
+Reading state information...
+Solving dependencies...
+Suggested packages:
+  gsmartcontrol smart-notifier mailx | mailutils
+The following NEW packages will be installed:
+  smartmontools
+0 upgraded, 1 newly installed, 0 to remove and 0 not upgraded.
+Need to get 664 kB of archives.
+After this operation, 2304 kB of additional disk space will be used.
+Get:1 http://archive.ubuntu.com/ubuntu resolute/main amd64 smartmontools amd64 7.5-2 [664 kB]
+Fetched 664 kB in 3s (262 kB/s)
+Selecting previously unselected package smartmontools.
+(Reading database ... 84364 files and directories currently installed.)
+Preparing to unpack .../smartmontools_7.5-2_amd64.deb ...
+Unpacking smartmontools (7.5-2) ...
+Setting up smartmontools (7.5-2) ...
+/var/lib/smartmontools/drivedb/drivedb.h 7.5/5706 newly installed (NOT VERIFIED)
+Created symlink '/etc/systemd/system/smartd.service' → '/usr/lib/systemd/system/smartmontools.service'.
+Created symlink '/etc/systemd/system/multi-user.target.wants/smartmontools.service' → '/usr/lib/systemd/system/smartmontools.service'.
+Processing triggers for man-db (2.13.1-1build1) ...
+smartctl 7.5 2025-04-30 r5714 [x86_64-linux-7.0.0-43-generic] (local build)
+2026-11-15 15:18:21 UTC [INFO] Installing nvme-cli (dedicated server with NVMe storage)
+Reading package lists...
+Building dependency tree...
+Reading state information...
+Solving dependencies...
+The following additional packages will be installed:
+  libnvme1t64
+The following NEW packages will be installed:
+  libnvme1t64 nvme-cli
+0 upgraded, 2 newly installed, 0 to remove and 0 not upgraded.
+Need to get 993 kB of archives.
+After this operation, 2593 kB of additional disk space will be used.
+Get:1 http://archive.ubuntu.com/ubuntu resolute/main amd64 libnvme1t64 amd64 1.16.1-4 [91.2 kB]
+Get:2 http://archive.ubuntu.com/ubuntu resolute/main amd64 nvme-cli amd64 2.16-1 [901 kB]
+Fetched 993 kB in 3s (336 kB/s)
+Selecting previously unselected package libnvme1t64:amd64.
+(Reading database ... 84409 files and directories currently installed.)
+Preparing to unpack .../libnvme1t64_1.16.1-4_amd64.deb ...
+Unpacking libnvme1t64:amd64 (1.16.1-4) ...
+Selecting previously unselected package nvme-cli.
+Preparing to unpack .../nvme-cli_2.16-1_amd64.deb ...
+Unpacking nvme-cli (2.16-1) ...
+Setting up libnvme1t64:amd64 (1.16.1-4) ...
+Setting up nvme-cli (2.16-1) ...
+Created symlink '/etc/systemd/system/default.target.wants/nvmefc-boot-connections.service' → '/usr/lib/systemd/system/nvmefc-boot-connections.service'.
+Created symlink '/etc/systemd/system/default.target.wants/nvmf-autoconnect.service' → '/usr/lib/systemd/system/nvmf-autoconnect.service'.
+nvmf-connect-nbft.service is a disabled or a static unit, not starting it.
+nvmf-connect.target is a disabled or a static unit, not starting it.
+Processing triggers for man-db (2.13.1-1build1) ...
+Processing triggers for libc-bin (2.43-2ubuntu2.7) ...
+nvme version 2.16 (git 2.16)
+libnvme version 1.16.1 (git 1.16.1)
+2026-11-15 15:18:26 UTC [INFO] Installing gifsicle
+Reading package lists...
+Building dependency tree...
+Reading state information...
+Solving dependencies...
+The following NEW packages will be installed:
+  gifsicle
+0 upgraded, 1 newly installed, 0 to remove and 0 not upgraded.
+Need to get 158 kB of archives.
+After this operation, 393 kB of additional disk space will be used.
+Get:1 http://archive.ubuntu.com/ubuntu resolute/universe amd64 gifsicle amd64 1.96-1build1 [158 kB]
+Fetched 158 kB in 2s (83.1 kB/s)
+Selecting previously unselected package gifsicle.
+(Reading database ... 84694 files and directories currently installed.)
+Preparing to unpack .../gifsicle_1.96-1build1_amd64.deb ...
+Unpacking gifsicle (1.96-1build1) ...
+Setting up gifsicle (1.96-1build1) ...
+Processing triggers for man-db (2.13.1-1build1) ...
+LCDF Gifsicle 1.96
+2026-11-15 15:18:28 UTC [INFO] Installing Node.js from the prepared NodeSource 26.x repository
+Reading package lists...
+Building dependency tree...
+Reading state information...
+Solving dependencies...
+The following NEW packages will be installed:
+  nodejs
+0 upgraded, 1 newly installed, 0 to remove and 0 not upgraded.
+Need to get 42.3 MB of archives.
+After this operation, 290 MB of additional disk space will be used.
+Get:1 https://deb.nodesource.com/node_26.x nodistro/main amd64 nodejs amd64 26.13.1-1nodesource1 [42.3 MB]
+Fetched 42.3 MB in 2s (26.7 MB/s)
+Selecting previously unselected package nodejs.
+(Reading database ... 84704 files and directories currently installed.)
+Preparing to unpack .../nodejs_26.13.1-1nodesource1_amd64.deb ...
+Unpacking nodejs (26.13.1-1nodesource1) ...
+Setting up nodejs (26.13.1-1nodesource1) ...
+Processing triggers for man-db (2.13.1-1build1) ...
+v26.13.1
+2026-11-15 15:18:32 UTC [INFO] Installing sysstat (sar/iostat history)
+Reading package lists...
+Building dependency tree...
+Reading state information...
+Solving dependencies...
+The following additional packages will be installed:
+  libsensors-config libsensors5
+Suggested packages:
+  lm-sensors isag
+The following NEW packages will be installed:
+  libsensors-config libsensors5 sysstat
+0 upgraded, 3 newly installed, 0 to remove and 0 not upgraded.
+Need to get 553 kB of archives.
+After this operation, 1683 kB of additional disk space will be used.
+Get:1 http://archive.ubuntu.com/ubuntu resolute/main amd64 libsensors-config all 1:3.6.2-2build1 [6862 B]
+Get:2 http://archive.ubuntu.com/ubuntu resolute/main amd64 libsensors5 amd64 1:3.6.2-2build1 [28.9 kB]
+Get:3 http://archive.ubuntu.com/ubuntu resolute/main amd64 sysstat amd64 12.7.7-0ubuntu2 [517 kB]
+Preconfiguring packages ...
+Fetched 553 kB in 2s (223 kB/s)
+Selecting previously unselected package libsensors-config.
+(Reading database ... 90531 files and directories currently installed.)
+Preparing to unpack .../libsensors-config_1%3a3.6.2-2build1_all.deb ...
+Unpacking libsensors-config (1:3.6.2-2build1) ...
+Selecting previously unselected package libsensors5:amd64.
+Preparing to unpack .../libsensors5_1%3a3.6.2-2build1_amd64.deb ...
+Unpacking libsensors5:amd64 (1:3.6.2-2build1) ...
+Selecting previously unselected package sysstat.
+Preparing to unpack .../sysstat_12.7.7-0ubuntu2_amd64.deb ...
+Unpacking sysstat (12.7.7-0ubuntu2) ...
+Setting up libsensors-config (1:3.6.2-2build1) ...
+Setting up libsensors5:amd64 (1:3.6.2-2build1) ...
+Setting up sysstat (12.7.7-0ubuntu2) ...
+Creating config file /etc/default/sysstat with new version
+update-alternatives: using /usr/bin/sar.sysstat to provide /usr/bin/sar (sar) in auto mode
+Created symlink '/etc/systemd/system/sysstat.service.wants/sysstat-collect.timer' → '/usr/lib/systemd/system/sysstat-collect.timer'.
+Created symlink '/etc/systemd/system/sysstat.service.wants/sysstat-rotate.timer' → '/usr/lib/systemd/system/sysstat-rotate.timer'.
+Created symlink '/etc/systemd/system/sysstat.service.wants/sysstat-summary.timer' → '/usr/lib/systemd/system/sysstat-summary.timer'.
+Created symlink '/etc/systemd/system/multi-user.target.wants/sysstat.service' → '/usr/lib/systemd/system/sysstat.service'.
+Processing triggers for man-db (2.13.1-1build1) ...
+Processing triggers for libc-bin (2.43-2ubuntu2.7) ...
+2026-11-15 15:18:37 UTC [ OK ] Other packages installed
+2026-11-15 15:18:37 UTC [ OK ] others completed in 00:00:21
+Reading package lists...
+Building dependency tree...
+Reading state information...
+unattended-upgrades is already the newest version (2.12ubuntu9).
+Solving dependencies...
+0 upgraded, 0 newly installed, 0 to remove and 0 not upgraded.
+2026-11-15 15:18:38 UTC [INFO] - OS updates: unattended-upgrades enabled
+2026-11-15 15:18:38 UTC [WARN] - SSH: password authentication is enabled; switch to keys-only access once key login is confirmed
+2026-11-15 15:18:38 UTC [WARN] - Firewall: 80/443 are open to the internet; restrict them to your CDN/proxy ranges if the origin is not meant to be reached directly
+2026-11-15 15:18:38 UTC [INFO] - WordPress: no wp-config.php found under /var/www
+2026-11-15 15:18:38 UTC [INFO]   - malware scan: no known webshell signatures found
+2026-11-15 15:18:38 UTC [INFO] Managed crontab entries updated
+
+Installation summary
+SERVICE    STATUS   TIME (HH:MM:SS)
+-------    ------   --------------
+basic      OK       00:00:13
+angie      OK       00:00:16
+php        OK       00:00:38
+mariadb    OK       00:00:19
+valkey     OK       00:00:07
+elastic    OK       00:01:11
+others     OK       00:00:21
+TOTAL               00:03:05
+
+All installations completed successfully.
+
+--- run finished ---
+Result    : SUCCESS (exit 0)
+Finished  : 2026-11-15 15:18:38 UTC
+Duration  : 00:03:13
+Full log  : /root/work/ubuntu-setup-script/setup_20261115-151525-379035.log
+--------------------

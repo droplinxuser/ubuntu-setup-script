@@ -1,0 +1,140 @@
+[22:55:52] cpu: busy=1% steal=0.0 | mem: used=8631M avail=19181M swapused=0M | load: 3.15 6.69 4.32 | timewait=23 conntrack=1058 | TcpExtListenOverflows=0 TcpExtListenDrops=0 TcpExtTCPTimeouts=790 
+[22:55:52] top: mariadbd:13%/489M java:2%/5131M valkey-server:1%/37M systemd:1%/15M angie:1%/38M 
+[22:55:52] sock: TCP: 96 (estab 1, closed 22, orphaned 0, timewait 22)
+[22:55:52] angie: 
+[22:55:52] fpm: workers=16 busy~=0 (cgi-fcgi absent);
+[22:55:52] mariadb: Aborted_connects=0 Created_tmp_disk_tables=214 Innodb_buffer_pool_read_requests=25575409 Innodb_buffer_pool_reads=169 Innodb_buffer_pool_wait_free=0 Max_used_connections=33 Questions=1965700 Slow_queries=0 Table_open_cache_misses=836 Threadpool_idle_threads=28 Threadpool_threads=29 Threads_connected=1 Threads_running=1 
+[22:55:52] valkey: connected_clients:1  used_memory_human:21.74M  total_commands_processed:878548  instantaneous_ops_per_sec:0  rejected_connections:0  evicted_keys:0  keyspace_hits:3369629  keyspace_misses:241320  
+[22:55:52] es: {"nodes":{"MuAEXVTMTiyl2FU2lfcBmw":{"indices":{"search":{"query_total":0}},"jvm":{"mem":{"heap_used_percent":16}},"thread_pool":{"search":{"queue":0,"rejected":0}}}}}
+[22:55:52] logs: chev.test.local.error.log=6 error.log=0 wp.test.local.error.log=44 xf.test.local.error.log=3 php-fpm-slow.log=0 php-fpm.log=30 error.log=41 slow.log=3 
+[22:55:52] journal-errors: 0 dmesg-oom: 0
+[22:55:58] cpu: busy=94% steal=0.0 | mem: used=8764M avail=19047M swapused=0M | load: 4.42 6.89 4.40 | timewait=23 conntrack=1125 | TcpExtListenOverflows=0 TcpExtListenDrops=0 TcpExtTCPTimeouts=814 
+[22:55:58] top: mariadbd:13%/490M php-fpm8.5:4%/61M php-fpm8.5:4%/62M php-fpm8.5:4%/61M php-fpm8.5:4%/61M 
+[22:55:58] sock: TCP: 160 (estab 65, closed 22, orphaned 0, timewait 22)
+[22:55:58] angie: 
+[22:55:58] fpm: workers=16 busy~=16 (cgi-fcgi absent);
+[22:55:58] mariadb: Aborted_connects=0 Created_tmp_disk_tables=214 Innodb_buffer_pool_read_requests=26072073 Innodb_buffer_pool_reads=169 Innodb_buffer_pool_wait_free=0 Max_used_connections=33 Questions=1995965 Slow_queries=0 Table_open_cache_misses=836 Threadpool_idle_threads=31 Threadpool_threads=33 Threads_connected=17 Threads_running=3 
+[22:55:58] valkey: connected_clients:16  used_memory_human:22.49M  total_commands_processed:887974  instantaneous_ops_per_sec:2901  rejected_connections:0  evicted_keys:0  keyspace_hits:3443376  keyspace_misses:246979  
+[22:55:58] es: {"nodes":{"MuAEXVTMTiyl2FU2lfcBmw":{"indices":{"search":{"query_total":0}},"jvm":{"mem":{"heap_used_percent":16}},"thread_pool":{"search":{"queue":0,"rejected":0}}}}}
+[22:55:58] logs: chev.test.local.error.log=6 error.log=0 wp.test.local.error.log=44 xf.test.local.error.log=3 php-fpm-slow.log=0 php-fpm.log=30 error.log=41 slow.log=3 
+[22:55:58] journal-errors: 0 dmesg-oom: 0
+[22:56:03] cpu: busy=95% steal=0.0 | mem: used=8765M avail=19046M swapused=0M | load: 6.07 7.19 4.51 | timewait=23 conntrack=1128 | TcpExtListenOverflows=0 TcpExtListenDrops=0 TcpExtTCPTimeouts=814 
+[22:56:03] top: mariadbd:13%/490M php-fpm8.5:9%/61M php-fpm8.5:9%/62M php-fpm8.5:9%/61M php-fpm8.5:9%/61M 
+[22:56:03] sock: TCP: 160 (estab 65, closed 22, orphaned 0, timewait 22)
+[22:56:03] angie: 
+[22:56:03] fpm: workers=16 busy~=16 (cgi-fcgi absent);
+[22:56:03] mariadb: Aborted_connects=0 Created_tmp_disk_tables=214 Innodb_buffer_pool_read_requests=26903626 Innodb_buffer_pool_reads=169 Innodb_buffer_pool_wait_free=0 Max_used_connections=33 Questions=2046667 Slow_queries=0 Table_open_cache_misses=836 Threadpool_idle_threads=27 Threadpool_threads=35 Threads_connected=17 Threads_running=7 
+[22:56:03] valkey: connected_clients:17  used_memory_human:23.36M  total_commands_processed:903827  instantaneous_ops_per_sec:2902  rejected_connections:0  evicted_keys:0  keyspace_hits:3567029  keyspace_misses:256491  
+[22:56:03] es: {"nodes":{"MuAEXVTMTiyl2FU2lfcBmw":{"indices":{"search":{"query_total":0}},"jvm":{"mem":{"heap_used_percent":16}},"thread_pool":{"search":{"queue":0,"rejected":0}}}}}
+[22:56:03] logs: chev.test.local.error.log=6 error.log=0 wp.test.local.error.log=44 xf.test.local.error.log=3 php-fpm-slow.log=0 php-fpm.log=30 error.log=41 slow.log=3 
+[22:56:03] journal-errors: 0 dmesg-oom: 0
+[22:56:08] cpu: busy=95% steal=0.0 | mem: used=8749M avail=19062M swapused=0M | load: 7.27 7.42 4.60 | timewait=23 conntrack=1131 | TcpExtListenOverflows=0 TcpExtListenDrops=0 TcpExtTCPTimeouts=814 
+[22:56:08] top: php-fpm8.5:14%/62M php-fpm8.5:14%/61M php-fpm8.5:14%/61M php-fpm8.5:14%/61M php-fpm8.5:14%/61M 
+[22:56:08] sock: TCP: 160 (estab 65, closed 22, orphaned 0, timewait 22)
+[22:56:08] angie: 
+[22:56:08] fpm: workers=16 busy~=16 (cgi-fcgi absent);
+[22:56:08] mariadb: Aborted_connects=0 Created_tmp_disk_tables=214 Innodb_buffer_pool_read_requests=27738280 Innodb_buffer_pool_reads=169 Innodb_buffer_pool_wait_free=0 Max_used_connections=33 Questions=2097437 Slow_queries=0 Table_open_cache_misses=836 Threadpool_idle_threads=33 Threadpool_threads=36 Threads_connected=17 Threads_running=3 
+[22:56:08] valkey: connected_clients:16  used_memory_human:24.20M  total_commands_processed:919680  instantaneous_ops_per_sec:2912  rejected_connections:0  evicted_keys:0  keyspace_hits:3690620  keyspace_misses:266002  
+[22:56:08] es: {"nodes":{"MuAEXVTMTiyl2FU2lfcBmw":{"indices":{"search":{"query_total":0}},"jvm":{"mem":{"heap_used_percent":16}},"thread_pool":{"search":{"queue":0,"rejected":0}}}}}
+[22:56:08] logs: chev.test.local.error.log=6 error.log=0 wp.test.local.error.log=44 xf.test.local.error.log=3 php-fpm-slow.log=0 php-fpm.log=30 error.log=41 slow.log=3 
+[22:56:08] journal-errors: 0 dmesg-oom: 0
+[22:56:14] cpu: busy=95% steal=0.0 | mem: used=8752M avail=19059M swapused=0M | load: 8.05 7.58 4.67 | timewait=23 conntrack=509 | TcpExtListenOverflows=0 TcpExtListenDrops=0 TcpExtTCPTimeouts=814 
+[22:56:14] top: php-fpm8.5:18%/61M php-fpm8.5:18%/62M php-fpm8.5:18%/61M php-fpm8.5:18%/61M php-fpm8.5:18%/61M 
+[22:56:14] sock: TCP: 160 (estab 65, closed 22, orphaned 0, timewait 22)
+[22:56:14] angie: 
+[22:56:14] fpm: workers=16 busy~=16 (cgi-fcgi absent);
+[22:56:14] mariadb: Aborted_connects=0 Created_tmp_disk_tables=214 Innodb_buffer_pool_read_requests=28563627 Innodb_buffer_pool_reads=169 Innodb_buffer_pool_wait_free=0 Max_used_connections=33 Questions=2147728 Slow_queries=0 Table_open_cache_misses=836 Threadpool_idle_threads=33 Threadpool_threads=36 Threads_connected=17 Threads_running=2 
+[22:56:14] valkey: connected_clients:16  used_memory_human:25.06M  total_commands_processed:935369  instantaneous_ops_per_sec:2846  rejected_connections:0  evicted_keys:0  keyspace_hits:3812965  keyspace_misses:275413  
+[22:56:14] es: {"nodes":{"MuAEXVTMTiyl2FU2lfcBmw":{"indices":{"search":{"query_total":0}},"jvm":{"mem":{"heap_used_percent":16}},"thread_pool":{"search":{"queue":0,"rejected":0}}}}}
+[22:56:14] logs: chev.test.local.error.log=6 error.log=0 wp.test.local.error.log=44 xf.test.local.error.log=3 php-fpm-slow.log=0 php-fpm.log=30 error.log=41 slow.log=3 
+[22:56:14] journal-errors: 0 dmesg-oom: 0
+[22:56:19] cpu: busy=96% steal=0.0 | mem: used=8753M avail=19058M swapused=0M | load: 8.68 7.72 4.73 | timewait=23 conntrack=512 | TcpExtListenOverflows=0 TcpExtListenDrops=0 TcpExtTCPTimeouts=814 
+[22:56:19] top: ps:100%/4M php-fpm8.5:22%/62M php-fpm8.5:22%/61M php-fpm8.5:22%/61M php-fpm8.5:22%/62M 
+[22:56:19] sock: TCP: 160 (estab 65, closed 22, orphaned 0, timewait 22)
+[22:56:19] angie: 
+[22:56:19] fpm: workers=16 busy~=16 (cgi-fcgi absent);
+[22:56:19] mariadb: Aborted_connects=0 Created_tmp_disk_tables=214 Innodb_buffer_pool_read_requests=29382282 Innodb_buffer_pool_reads=169 Innodb_buffer_pool_wait_free=0 Max_used_connections=33 Questions=2197592 Slow_queries=0 Table_open_cache_misses=836 Threadpool_idle_threads=33 Threadpool_threads=36 Threads_connected=17 Threads_running=4 
+[22:56:19] valkey: connected_clients:15  used_memory_human:25.89M  total_commands_processed:950929  instantaneous_ops_per_sec:2831  rejected_connections:0  evicted_keys:0  keyspace_hits:3934333  keyspace_misses:284749  
+[22:56:19] es: {"nodes":{"MuAEXVTMTiyl2FU2lfcBmw":{"indices":{"search":{"query_total":0}},"jvm":{"mem":{"heap_used_percent":16}},"thread_pool":{"search":{"queue":0,"rejected":0}}}}}
+[22:56:19] logs: chev.test.local.error.log=6 error.log=0 wp.test.local.error.log=44 xf.test.local.error.log=3 php-fpm-slow.log=0 php-fpm.log=30 error.log=41 slow.log=3 
+[22:56:19] journal-errors: 0 dmesg-oom: 0
+[22:56:25] cpu: busy=95% steal=0.0 | mem: used=8758M avail=19053M swapused=0M | load: 9.27 7.86 4.79 | timewait=23 conntrack=515 | TcpExtListenOverflows=0 TcpExtListenDrops=0 TcpExtTCPTimeouts=814 
+[22:56:25] top: php-fpm8.5:25%/62M php-fpm8.5:25%/62M php-fpm8.5:25%/61M php-fpm8.5:25%/61M php-fpm8.5:25%/61M 
+[22:56:25] sock: TCP: 160 (estab 65, closed 22, orphaned 0, timewait 22)
+[22:56:25] angie: 
+[22:56:25] fpm: workers=16 busy~=15 (cgi-fcgi absent);
+[22:56:25] mariadb: Aborted_connects=0 Created_tmp_disk_tables=214 Innodb_buffer_pool_read_requests=30195098 Innodb_buffer_pool_reads=169 Innodb_buffer_pool_wait_free=0 Max_used_connections=33 Questions=2247024 Slow_queries=0 Table_open_cache_misses=836 Threadpool_idle_threads=32 Threadpool_threads=36 Threads_connected=17 Threads_running=3 
+[22:56:25] valkey: connected_clients:16  used_memory_human:26.74M  total_commands_processed:966361  instantaneous_ops_per_sec:2818  rejected_connections:0  evicted_keys:0  keyspace_hits:4054727  keyspace_misses:294007  
+[22:56:25] es: {"nodes":{"MuAEXVTMTiyl2FU2lfcBmw":{"indices":{"search":{"query_total":0}},"jvm":{"mem":{"heap_used_percent":16}},"thread_pool":{"search":{"queue":0,"rejected":0}}}}}
+[22:56:25] logs: chev.test.local.error.log=6 error.log=0 wp.test.local.error.log=44 xf.test.local.error.log=3 php-fpm-slow.log=0 php-fpm.log=30 error.log=41 slow.log=3 
+[22:56:25] journal-errors: 0 dmesg-oom: 0
+[22:56:30] cpu: busy=96% steal=0.0 | mem: used=8755M avail=19056M swapused=0M | load: 10.05 8.04 4.87 | timewait=23 conntrack=517 | TcpExtListenOverflows=0 TcpExtListenDrops=0 TcpExtTCPTimeouts=814 
+[22:56:30] top: php-fpm8.5:28%/62M php-fpm8.5:28%/61M php-fpm8.5:28%/62M php-fpm8.5:28%/63M php-fpm8.5:28%/62M 
+[22:56:30] sock: TCP: 160 (estab 65, closed 22, orphaned 0, timewait 22)
+[22:56:30] angie: 
+[22:56:30] fpm: workers=16 busy~=16 (cgi-fcgi absent);
+[22:56:30] mariadb: Aborted_connects=0 Created_tmp_disk_tables=214 Innodb_buffer_pool_read_requests=31003986 Innodb_buffer_pool_reads=169 Innodb_buffer_pool_wait_free=0 Max_used_connections=33 Questions=2296321 Slow_queries=0 Table_open_cache_misses=836 Threadpool_idle_threads=32 Threadpool_threads=36 Threads_connected=17 Threads_running=4 
+[22:56:30] valkey: connected_clients:15  used_memory_human:27.57M  total_commands_processed:981769  instantaneous_ops_per_sec:2819  rejected_connections:0  evicted_keys:0  keyspace_hits:4174959  keyspace_misses:303255  
+[22:56:30] es: {"nodes":{"MuAEXVTMTiyl2FU2lfcBmw":{"indices":{"search":{"query_total":0}},"jvm":{"mem":{"heap_used_percent":16}},"thread_pool":{"search":{"queue":0,"rejected":0}}}}}
+[22:56:30] logs: chev.test.local.error.log=6 error.log=0 wp.test.local.error.log=44 xf.test.local.error.log=3 php-fpm-slow.log=0 php-fpm.log=30 error.log=41 slow.log=3 
+[22:56:30] journal-errors: 0 dmesg-oom: 0
+[22:56:36] cpu: busy=97% steal=0.0 | mem: used=8755M avail=19056M swapused=0M | load: 10.69 8.21 4.94 | timewait=21 conntrack=520 | TcpExtListenOverflows=0 TcpExtListenDrops=0 TcpExtTCPTimeouts=818 
+[22:56:36] top: ps:100%/4M php-fpm8.5:31%/62M php-fpm8.5:31%/62M php-fpm8.5:31%/61M php-fpm8.5:31%/63M 
+[22:56:36] sock: TCP: 158 (estab 65, closed 20, orphaned 0, timewait 20)
+[22:56:36] angie: 
+[22:56:36] fpm: workers=16 busy~=16 (cgi-fcgi absent);
+[22:56:36] mariadb: Aborted_connects=0 Created_tmp_disk_tables=214 Innodb_buffer_pool_read_requests=31788462 Innodb_buffer_pool_reads=169 Innodb_buffer_pool_wait_free=0 Max_used_connections=33 Questions=2344054 Slow_queries=0 Table_open_cache_misses=836 Threadpool_idle_threads=31 Threadpool_threads=36 Threads_connected=17 Threads_running=4 
+[22:56:36] valkey: connected_clients:14  used_memory_human:28.37M  total_commands_processed:996679  instantaneous_ops_per_sec:2783  rejected_connections:0  evicted_keys:0  keyspace_hits:4291218  keyspace_misses:312200  
+[22:56:36] es: {"nodes":{"MuAEXVTMTiyl2FU2lfcBmw":{"indices":{"search":{"query_total":0}},"jvm":{"mem":{"heap_used_percent":16}},"thread_pool":{"search":{"queue":0,"rejected":0}}}}}
+[22:56:36] logs: chev.test.local.error.log=6 error.log=0 wp.test.local.error.log=44 xf.test.local.error.log=3 php-fpm-slow.log=0 php-fpm.log=30 error.log=41 slow.log=3 
+[22:56:36] journal-errors: 0 dmesg-oom: 0
+[22:56:41] cpu: busy=97% steal=0.0 | mem: used=8757M avail=19054M swapused=0M | load: 12.16 8.61 5.10 | timewait=23 conntrack=523 | TcpExtListenOverflows=0 TcpExtListenDrops=0 TcpExtTCPTimeouts=818 
+[22:56:41] top: php-fpm8.5:33%/62M php-fpm8.5:33%/61M php-fpm8.5:33%/62M php-fpm8.5:33%/62M php-fpm8.5:33%/63M 
+[22:56:41] sock: TCP: 160 (estab 65, closed 22, orphaned 0, timewait 22)
+[22:56:41] angie: 
+[22:56:41] fpm: workers=16 busy~=16 (cgi-fcgi absent);
+[22:56:41] mariadb: Aborted_connects=0 Created_tmp_disk_tables=214 Innodb_buffer_pool_read_requests=32595625 Innodb_buffer_pool_reads=169 Innodb_buffer_pool_wait_free=0 Max_used_connections=33 Questions=2393239 Slow_queries=0 Table_open_cache_misses=836 Threadpool_idle_threads=34 Threadpool_threads=36 Threads_connected=17 Threads_running=2 
+[22:56:41] valkey: connected_clients:17  used_memory_human:29.26M  total_commands_processed:1012015  instantaneous_ops_per_sec:2776  rejected_connections:0  evicted_keys:0  keyspace_hits:4410835  keyspace_misses:321399  
+[22:56:41] es: {"nodes":{"MuAEXVTMTiyl2FU2lfcBmw":{"indices":{"search":{"query_total":0}},"jvm":{"mem":{"heap_used_percent":16}},"thread_pool":{"search":{"queue":0,"rejected":0}}}}}
+[22:56:41] logs: chev.test.local.error.log=6 error.log=0 wp.test.local.error.log=44 xf.test.local.error.log=3 php-fpm-slow.log=0 php-fpm.log=30 error.log=41 slow.log=3 
+[22:56:41] journal-errors: 0 dmesg-oom: 0
+[22:56:47] cpu: busy=96% steal=0.0 | mem: used=8761M avail=19050M swapused=0M | load: 12.87 8.82 5.19 | timewait=23 conntrack=528 | TcpExtListenOverflows=0 TcpExtListenDrops=0 TcpExtTCPTimeouts=818 
+[22:56:47] top: ps:100%/4M php-fpm8.5:36%/62M php-fpm8.5:36%/62M php-fpm8.5:36%/61M php-fpm8.5:36%/62M 
+[22:56:47] sock: TCP: 160 (estab 65, closed 22, orphaned 0, timewait 22)
+[22:56:47] angie: 
+[22:56:47] fpm: workers=16 busy~=15 (cgi-fcgi absent);
+[22:56:47] mariadb: Aborted_connects=0 Created_tmp_disk_tables=214 Innodb_buffer_pool_read_requests=33396487 Innodb_buffer_pool_reads=169 Innodb_buffer_pool_wait_free=0 Max_used_connections=33 Questions=2441980 Slow_queries=0 Table_open_cache_misses=836 Threadpool_idle_threads=33 Threadpool_threads=36 Threads_connected=17 Threads_running=2 
+[22:56:47] valkey: connected_clients:16  used_memory_human:30.09M  total_commands_processed:1027239  instantaneous_ops_per_sec:2787  rejected_connections:0  evicted_keys:0  keyspace_hits:4529512  keyspace_misses:330532  
+[22:56:47] es: {"nodes":{"MuAEXVTMTiyl2FU2lfcBmw":{"indices":{"search":{"query_total":0}},"jvm":{"mem":{"heap_used_percent":16}},"thread_pool":{"search":{"queue":0,"rejected":0}}}}}
+[22:56:47] logs: chev.test.local.error.log=6 error.log=0 wp.test.local.error.log=44 xf.test.local.error.log=3 php-fpm-slow.log=0 php-fpm.log=30 error.log=41 slow.log=3 
+[22:56:47] journal-errors: 0 dmesg-oom: 0
+[22:56:52] cpu: busy=96% steal=0.0 | mem: used=8760M avail=19051M swapused=0M | load: 13.52 9.02 5.27 | timewait=23 conntrack=532 | TcpExtListenOverflows=0 TcpExtListenDrops=0 TcpExtTCPTimeouts=818 
+[22:56:52] top: php-fpm8.5:38%/61M php-fpm8.5:38%/62M php-fpm8.5:38%/62M php-fpm8.5:38%/62M php-fpm8.5:38%/63M 
+[22:56:52] sock: TCP: 160 (estab 65, closed 22, orphaned 0, timewait 22)
+[22:56:52] angie: 
+[22:56:52] fpm: workers=16 busy~=15 (cgi-fcgi absent);
+[22:56:52] mariadb: Aborted_connects=0 Created_tmp_disk_tables=214 Innodb_buffer_pool_read_requests=34197495 Innodb_buffer_pool_reads=169 Innodb_buffer_pool_wait_free=0 Max_used_connections=33 Questions=2490828 Slow_queries=0 Table_open_cache_misses=836 Threadpool_idle_threads=31 Threadpool_threads=36 Threads_connected=17 Threads_running=5 
+[22:56:52] valkey: connected_clients:17  used_memory_human:30.96M  total_commands_processed:1042496  instantaneous_ops_per_sec:2764  rejected_connections:0  evicted_keys:0  keyspace_hits:4648576  keyspace_misses:339688  
+[22:56:52] es: {"nodes":{"MuAEXVTMTiyl2FU2lfcBmw":{"indices":{"search":{"query_total":0}},"jvm":{"mem":{"heap_used_percent":16}},"thread_pool":{"search":{"queue":0,"rejected":0}}}}}
+[22:56:52] logs: chev.test.local.error.log=6 error.log=0 wp.test.local.error.log=44 xf.test.local.error.log=3 php-fpm-slow.log=0 php-fpm.log=30 error.log=41 slow.log=3 
+[22:56:52] journal-errors: 0 dmesg-oom: 0
+[22:56:58] cpu: busy=1% steal=0.0 | mem: used=8761M avail=19050M swapused=0M | load: 12.44 8.87 5.24 | timewait=23 conntrack=535 | TcpExtListenOverflows=0 TcpExtListenDrops=0 TcpExtTCPTimeouts=818 
+[22:56:58] top: php-fpm8.5:37%/61M php-fpm8.5:37%/62M php-fpm8.5:37%/62M php-fpm8.5:37%/62M php-fpm8.5:37%/63M 
+[22:56:58] sock: TCP: 96 (estab 1, closed 22, orphaned 0, timewait 22)
+[22:56:58] angie: 
+[22:56:58] fpm: workers=16 busy~=0 (cgi-fcgi absent);
+[22:56:58] mariadb: Aborted_connects=0 Created_tmp_disk_tables=214 Innodb_buffer_pool_read_requests=34453778 Innodb_buffer_pool_reads=169 Innodb_buffer_pool_wait_free=0 Max_used_connections=33 Questions=2506374 Slow_queries=0 Table_open_cache_misses=836 Threadpool_idle_threads=35 Threadpool_threads=36 Threads_connected=17 Threads_running=1 
+[22:56:58] valkey: connected_clients:1  used_memory_human:30.97M  total_commands_processed:1047339  instantaneous_ops_per_sec:0  rejected_connections:0  evicted_keys:0  keyspace_hits:4686100  keyspace_misses:342587  
+[22:56:58] es: {"nodes":{"MuAEXVTMTiyl2FU2lfcBmw":{"indices":{"search":{"query_total":0}},"jvm":{"mem":{"heap_used_percent":16}},"thread_pool":{"search":{"queue":0,"rejected":0}}}}}
+[22:56:58] logs: chev.test.local.error.log=6 error.log=0 wp.test.local.error.log=44 xf.test.local.error.log=3 php-fpm-slow.log=0 php-fpm.log=30 error.log=41 slow.log=3 
+[22:56:58] journal-errors: 0 dmesg-oom: 0
+[22:57:03] cpu: busy=1% steal=0.0 | mem: used=8749M avail=19063M swapused=0M | load: 11.44 8.72 5.22 | timewait=23 conntrack=538 | TcpExtListenOverflows=0 TcpExtListenDrops=0 TcpExtTCPTimeouts=818 
+[22:57:03] top: php-fpm8.5:36%/61M php-fpm8.5:36%/62M php-fpm8.5:36%/62M php-fpm8.5:36%/62M php-fpm8.5:36%/63M 
+[22:57:03] sock: TCP: 96 (estab 1, closed 22, orphaned 0, timewait 22)
+[22:57:03] angie: 
+[22:57:03] fpm: workers=16 busy~=0 (cgi-fcgi absent);
+[22:57:03] mariadb: Aborted_connects=0 Created_tmp_disk_tables=214 Innodb_buffer_pool_read_requests=34453834 Innodb_buffer_pool_reads=169 Innodb_buffer_pool_wait_free=0 Max_used_connections=33 Questions=2506382 Slow_queries=0 Table_open_cache_misses=836 Threadpool_idle_threads=35 Threadpool_threads=36 Threads_connected=17 Threads_running=1 
+[22:57:03] valkey: connected_clients:1  used_memory_human:30.97M  total_commands_processed:1047342  instantaneous_ops_per_sec:0  rejected_connections:0  evicted_keys:0  keyspace_hits:4686125  keyspace_misses:342589  
+[22:57:03] es: {"nodes":{"MuAEXVTMTiyl2FU2lfcBmw":{"indices":{"search":{"query_total":0}},"jvm":{"mem":{"heap_used_percent":16}},"thread_pool":{"search":{"queue":0,"rejected":0}}}}}
+[22:57:03] logs: chev.test.local.error.log=6 error.log=0 wp.test.local.error.log=44 xf.test.local.error.log=3 php-fpm-slow.log=0 php-fpm.log=30 error.log=41 slow.log=3 
+[22:57:03] journal-errors: 0 dmesg-oom: 0

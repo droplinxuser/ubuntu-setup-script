@@ -1,5 +1,35 @@
 # Full-stack stress test reports
 
+## 1.21.8 re-audit (2026-11-15)
+
+Freshly restored 16-thread / 27 812 MiB / NVMe bare-metal host, WordPress
+7.1.4, XenForo 2.3.13 and Chevereto 4.5.9.  Full report:
+`AUDIT-20261115-1.21.8.md`.
+
+- **Distribution defaults -> shipped tuning (PHP 8.5, 100c, 8 s, Wi-Fi):**
+  XenForo member thread 246 -> 534 req/s (+117 %), WordPress member home
+  140 -> 292 (+109 %), WordPress member post 131 -> 269 (+105 %).
+- **Guest tiers:** XenForo guest 7 309 req/s (p50 24.8 ms), WordPress guest
+  5 368 (p50 32.3 ms), Chevereto `/explore` 5 654, image page 5 470, home
+  2 613.  A later spot check measured 4 313 / 2 533 / 3 097 req/s: the
+  workstation is on Wi-Fi and the cached tiers are link-bound, so treat
+  these as one sample of the client, not the server ceiling.
+- **PHP-FPM sweep (static, authenticated thread):** 8/12/16/20/24 =
+  388/497/575/556/556 req/s; 16 (one per logical CPU) is the optimum.
+- **JIT sweep:** off 410, function 510, tracing 32/64/128 MB =
+  572/573/571 req/s; tracing 64 MB stays the shipped profile.
+- **Sustained 60 s, c=64:** 563 req/s, p50 112 ms, p99 131 ms, 33 691 x 200,
+  CPU 94-97 % (PHP-bound), 15-16 workers busy, 0 slow queries, 0 error-log
+  growth, 0 failed units.
+- **Upgrade and purge fixes:** a distro-layout host (pool and Angie on
+  `127.0.0.1:9000`) upgraded to 8.4 and back to 8.5 now ends on the Unix
+  socket with the applications serving; `--purge` stops an adopted Redis and
+  retires the units it wrote; `--upgrade-php=8.6` names redis+imagick for
+  Chevereto and redis for XenForo before touching the host.
+- **Harness:** wp-cron is probed from the LAN (403) and loopback (200); the
+  probe covers encoded dot segments; the cookie test reads the Chevereto
+  fixture password itself (61/61).  Security probe 54/54.
+
 ## 1.21.7 re-audit (2026-11-15)
 
 Freshly restored 16-thread / 27 812 MiB / NVMe bare-metal host, WordPress
