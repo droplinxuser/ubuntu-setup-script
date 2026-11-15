@@ -603,8 +603,8 @@ Read on each run, not persisted:
 | `--restart-all [--dry-run]` | repairs `/var/www` log ownership, stops Angie and every active PHP-FPM, restarts Valkey/Redis, Elasticsearch (waits for HTTP) and MariaDB (waits for `SELECT 1`), then starts PHP-FPM and Angie | only units that were active are touched; uses the same pause/resume and readiness helpers as the `--optimize` tuners; `--dry-run` prints the plan |
 | `--purge [TARGET...]` | stops and disables the selected services and removes their managed cron entries | nothing is uninstalled or deleted; it keeps going past a file it cannot restore and reports it; there is no domain purge |
 
-Run logs (`setup_<timestamp>.log`) and `diagnostics.log` created under `sudo`
-are handed to the invoking user (`SUDO_UID`), mode 600.
+Run logs (`setup_<timestamp>-<pid>.log`) and `diagnostics.log` created under
+`sudo` are handed to the invoking user (`SUDO_UID`), mode 600.
 
 `--purge` targets (service flags and bare names combine; no target means
 everything):

@@ -16,10 +16,12 @@ T=$(mktemp -d); P=0; F=0
 ok()  { P=$((P+1)); printf 'PASS  %s\n' "$1"; }
 bad() { F=$((F+1)); printf 'FAIL  %s   [%s]\n' "$1" "$2"; }
 # probe NAME HOST PATH EXPECTED_CODES...
+# PROBE_IP can override the address that is connected to, which changes the
+# source address Angie sees (used for the loopback-only wp-cron rule).
 probe() {
   local name=$1 host=$2 path=$3; shift 3
-  local code
-  code=$(curl -sk --max-time 20 --path-as-is --resolve "$host:443:$IP" \
+  local code ip=${PROBE_IP:-$IP}
+  code=$(curl -sk --max-time 20 --path-as-is --resolve "$host:443:$ip" \
            -o "$T/body" -D "$T/hdr" -w '%{http_code}' "https://$host$path")
   local c
   for c in "$@"; do
@@ -27,6 +29,10 @@ probe() {
   done
   bad "$name" "got $code want $*"
 }
+# The host's own non-loopback address, so a request does not arrive from
+# 127.0.0.1 (curl against the LAN address of the same host sources it).
+EXT_IP=${EXT_IP:-$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' || true)}
+[[ -n $EXT_IP ]] || EXT_IP=$IP
 echo "################ WordPress ($WP)"
 # Hidden files, dumps and editor backup copies
 probe "wp .env is hidden"                 "$WP" /.env 403 404
@@ -42,11 +48,15 @@ probe "wp uploads PHP suffix is denied"   "$WP" /wp-content/uploads/audit.php.jp
 probe "wp cache directory is not PHP"     "$WP" /wp-content/cache/audit.php 403 404
 probe "wp debug.log is hidden"            "$WP" /wp-content/debug.log 403 404
 probe "wp xmlrpc.php is denied"           "$WP" /xmlrpc.php 403
-probe "wp wp-cron.php is denied"          "$WP" /wp-cron.php 403
+# WordPress's own scheduler posts to wp-cron.php from the loopback address,
+# so the endpoint must answer the server itself and nothing else.
+PROBE_IP=$EXT_IP probe "wp wp-cron.php is denied from the network" "$WP" /wp-cron.php 403
+PROBE_IP=127.0.0.1 probe "wp wp-cron.php is reachable from loopback" "$WP" /wp-cron.php 200
 probe "wp install.php is denied"          "$WP" /wp-admin/install.php 403
 probe "wp setup-config.php is denied"     "$WP" /wp-admin/setup-config.php 403 404
 probe "wp PATH_INFO is not executed"      "$WP" /index.php/foo 404
 probe "wp dot segments are rejected"      "$WP" "/%2e%2e/%2e%2e/etc/passwd" 400 404
+probe "wp encoded dot segment is rejected" "$WP" "/index.php/%2e%2e/wp-config.php" 400 404
 probe "wp login page still works"         "$WP" /wp-login.php 200
 probe "wp REST API is reachable"          "$WP" /wp-json/ 200
 probe "wp admin-ajax works"                "$WP" /wp-admin/admin-ajax.php 200 400
@@ -66,6 +76,7 @@ probe "xf upgrader redirects to its login" "$XF" /install/ 303 403 404
 probe "xf .git/config is hidden"          "$XF" /.git/config 403 404
 probe "xf PATH_INFO is not executed"      "$XF" /index.php/foo 404
 probe "xf dot segments are rejected"      "$XF" "/%2e%2e/%2e%2e/etc/passwd" 400 404
+probe "xf encoded dot segment is rejected" "$XF" "/threads/%2e%2e/login" 400 404
 probe "xf css.php works"                  "$XF" /css.php 200 400
 probe "xf sitemap.xml redirects"          "$XF" /sitemap.xml 302
 

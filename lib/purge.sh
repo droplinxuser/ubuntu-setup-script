@@ -21,6 +21,9 @@ purge_service_stop() {
 # Print the SSH port a recorded `ufw ...` rule line refers to and return 0,
 # or return 1 when the rule is not an SSH rule.  Shared by the two purge
 # passes over the recorded firewall rules.
+# Print the sshd port a firewall line protects.  Provider images usually use
+# the OpenSSH application profile ("ufw allow OpenSSH"), which expands to the
+# standard port, so recognise it when 22 is one of the sshd ports.
 ufw_rule_ssh_port() {
   local line=$1 p
   shift
@@ -30,7 +33,21 @@ ufw_rule_ssh_port() {
       return 0
     fi
   done
+  if [[ " $* " == *" 22 "* && $line =~ (^|[[:space:]])OpenSSH([[:space:]]|$) ]]; then
+    printf '22'
+    return 0
+  fi
   return 1
+}
+
+# True when `ufw status` already protects PORT, either with a numeric rule or
+# with the OpenSSH application profile (port 22).
+ufw_status_protects_port() {
+  local p=$1
+  ufw status 2>/dev/null | grep -qE "^${p}(/tcp)? \(v6\)[[:space:]]+(ALLOW|LIMIT)|^${p}(/tcp)?[[:space:]]+(ALLOW|LIMIT)" \
+    && return 0
+  [[ $p == 22 ]] || return 1
+  ufw status 2>/dev/null | grep -qE "^OpenSSH( \(v6\))?[[:space:]]+(ALLOW|LIMIT)"
 }
 
 purge_basic() {
@@ -64,7 +81,7 @@ purge_basic() {
   if ufw status 2>/dev/null | grep -q '^Status: active'; then
     local p
     for p in "${ssh_ports[@]}"; do
-      if ! ufw status 2>/dev/null | grep -qE "^${p}(/tcp)?( \(v6\))?[[:space:]]+(ALLOW|LIMIT)"; then
+      if ! ufw_status_protects_port "$p"; then
         ufw limit "${p}/tcp" || ufw allow "${p}/tcp" || true
       fi
     done
@@ -190,6 +207,10 @@ purge_basic() {
   # CPU governor: stop the unit so a reboot cannot re-apply "performance",
   # put the file back, then restore the governor that was active before.
   systemctl disable --now setup-cpu-governor.service 2>/dev/null || true
+  # Retire the unit file like the other generated oneshots; the install path
+  # records its previous state, so a host that already had a unit keeps it.
+  restore_original /etc/systemd/system/setup-cpu-governor.service setup-cpu-governor.service
+  systemctl daemon-reload 2>/dev/null || true
   # Hosts provisioned by 1.20.6 or older used the cpufrequtils package.
   systemctl disable --now cpufrequtils 2>/dev/null || true
   restore_original /etc/default/cpufrequtils cpufrequtils-default
@@ -200,7 +221,10 @@ purge_basic() {
     local orig_gov gov_file
     orig_gov=$(<"${STATE_DIR}/original-governor")
     for gov_file in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_governor; do
-      [[ -w $gov_file ]] && printf '%s\n' "$orig_gov" > "$gov_file" 2>/dev/null
+      # A recorded governor can be absent after a driver/kernel change, and
+      # the write then fails with EINVAL.  A best-effort restore must not
+      # abort the rest of purge_basic (the install path already ignores it).
+      [[ -w $gov_file ]] && printf '%s\n' "$orig_gov" > "$gov_file" 2>/dev/null || true
     done
     info "CPU governor restored to ${orig_gov}"
   fi
@@ -298,6 +322,21 @@ purge_mariadb() {
 purge_valkey() {
   step "Purge Valkey"
   purge_service_stop valkey-server
+  # --optimize and --restart-all treat an adopted Redis as a managed cache
+  # (a host that only had redis-server is tuned, restarted and reported on).
+  # Purge has to do the same, or `--purge`/`--purge all` leaves a Redis
+  # server enabled and holding memory after "stop everything this script
+  # manages".  Like every other target, the package and data stay.
+  local cache_unit
+  for cache_unit in valkey-server valkey redis-server redis; do
+    [[ $cache_unit == valkey-server ]] && continue
+    if systemctl is-active --quiet "$cache_unit" 2>/dev/null \
+       || systemctl is-enabled --quiet "$cache_unit" 2>/dev/null; then
+      purge_service_stop "$cache_unit"
+      info "Stopped adopted cache service ${cache_unit}"
+      break
+    fi
+  done
   apt_purge_pattern 'valkey-*'
   # Keep the valkey group and www-data's membership.  Removing the account
   # would break a reinstall and is an account change, not an uninstall.
@@ -320,7 +359,10 @@ purge_others() {
   # Stop and disable the units install_others enabled; like every other purge
   # no package, repository, keyring or Composer file is removed.
   local unit
-  for unit in smartmontools smartd sysstat-collect.timer sysstat-summary.timer sysstat; do
+  # install_others enables sysstat-rotate.timer as well; leaving it enabled
+  # keeps the package's rotation job running after a purge that claims to
+  # have stopped the sysstat units.
+  for unit in smartmontools smartd sysstat-collect.timer sysstat-summary.timer sysstat-rotate.timer sysstat; do
     if systemctl is-enabled --quiet "$unit" 2>/dev/null || systemctl is-active --quiet "$unit" 2>/dev/null; then
       systemctl disable --now "$unit" 2>/dev/null && info "Disabled ${unit}"
     fi

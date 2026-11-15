@@ -232,7 +232,7 @@ Restart all:
       and started again.  Use --dry-run to print the detected plan.
 
 Notes:
-  * Every run mirrors its full output to setup_<timestamp>.log in the
+  * Every run mirrors its full output to setup_<timestamp>-<pid>.log in the
     directory where setup.sh was started.  Copy that file when reporting an
     issue; it includes the host facts and the exit status.
   * Only one PHP-FPM version can own the shared Unix socket at a time.

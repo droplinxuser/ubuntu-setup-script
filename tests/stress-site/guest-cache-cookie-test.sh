@@ -12,7 +12,14 @@
 #   CHEV_PW   Chevereto admin password (default: $PW; pass the value in
 #             /root/audit/test-admin-pass when the audit deploy created it)
 IP=${IP:?set IP to the test host address}; T=$(mktemp -d); P=0; F=0
-PW=${PW:-BenchPass123!}; CHEV_PW=${CHEV_PW:-$PW}
+PW=${PW:-BenchPass123!}
+# The audit deploy writes the Chevereto admin password to test-admin-pass;
+# read it when the caller did not pass CHEV_PW (otherwise a correct host
+# reports four failures for a password that is simply different).
+if [[ -z ${CHEV_PW:-} && -r /root/audit/test-admin-pass ]]; then
+  CHEV_PW=$(cat /root/audit/test-admin-pass)
+fi
+CHEV_PW=${CHEV_PW:-$PW}
 ok()   { P=$((P+1)); printf 'PASS  %s\n' "$1"; }
 bad()  { F=$((F+1)); printf 'FAIL  %s   [%s]\n' "$1" "$2"; }
 chk()  { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "got '$2' want '$3'"; fi; }

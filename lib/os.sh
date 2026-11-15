@@ -104,6 +104,10 @@ ExecStart=/bin/sh -c 'for f in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling
 [Install]
 WantedBy=multi-user.target
 EOF
+  # Record the pre-run state so --purge retires the unit it created instead
+  # of leaving a dead file in /etc/systemd/system (the other generated
+  # oneshots, setup-network-tuning and setup-io-tuning, already do this).
+  record_original "$unit" setup-cpu-governor.service
   if commit_if_changed "$unit" "$tmp"; then
     chmod 644 "$unit"
     systemctl daemon-reload || true
@@ -1001,6 +1005,11 @@ configure_ufw() {
     if ufw show added 2>/dev/null | grep -qE "^ufw allow ${ssh_port}/tcp($| )|^ufw allow ${ssh_port}($| )"; then
       had_allow=1
     fi
+    # The OpenSSH application profile is what most images ship.  It covers
+    # port 22 only; treat it as the plain allow rule it is.
+    if [[ $ssh_port == 22 ]] && ufw show added 2>/dev/null | grep -qxF 'ufw allow OpenSSH'; then
+      had_allow=1
+    fi
 
     if ufw show added 2>/dev/null | grep -qE "^ufw limit ${ssh_port}/tcp($| )|^ufw limit ${ssh_port}($| )"; then
       ssh_limited=1
@@ -1016,6 +1025,9 @@ configure_ufw() {
         fi
         if ufw show added 2>/dev/null | grep -qxF "ufw allow ${ssh_port}"; then
           ufw delete allow "${ssh_port}" >/dev/null 2>&1 || true
+        fi
+        if [[ $ssh_port == 22 ]] && ufw show added 2>/dev/null | grep -qxF 'ufw allow OpenSSH'; then
+          ufw delete allow OpenSSH >/dev/null 2>&1 || true
         fi
       fi
       if ufw insert 1 limit "${ssh_port}/tcp" 2>/dev/null \

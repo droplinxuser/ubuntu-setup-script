@@ -3590,6 +3590,13 @@ check "app detection finds XenForo" grep -qx $'xenforo\t'"$TMP/apps/xf/public" <
 check "app detection finds Chevereto" grep -qx $'chevereto\t'"$TMP/apps/chev/public" <<<"$app_roots"
 check "app detection lists each document root once" test "$(wc -l <<<"$app_roots" | tr -d ' ')" = 3
 check "app detection ignores an unrelated directory" not grep -q plain <<<"$app_roots"
+rm -f "$TMP/apps/chev/public/app/bin/legacy"
+app_roots=$(php_upgrade_app_roots "$TMP/apps")
+check "Chevereto needs only app/env.php, like the --optimize detector" \
+  grep -qx $'chevereto\t'"$TMP/apps/chev/public" <<<"$app_roots"
+: > "$TMP/apps/chev/public/app/bin/legacy"
+check "Chevereto requirements include imagick" \
+  php_upgrade_app_required_extensions chevereto "$TMP/apps/chev/public" | grep -qx imagick
 check "Chevereto requirements include redis" \
   has_ext php_upgrade_app_required_extensions chevereto "$TMP/apps/chev/public"
 check "WordPress requirements skip redis without an object-cache drop-in" \
@@ -3623,6 +3630,17 @@ php_upgrade_plan_extensions 9.9
 check "carried extensions are de-duplicated" test "$PHP_UPGRADE_CARRIED_COUNT" -eq 1
 check "an unpublished extension still counts as skipped" \
   test "${#PHP_UPGRADE_SKIPPED[@]}" -eq 1
+# One extension is often installed twice (php-imagick and php8.5-imagick);
+# the skipped list must name it once, like the carried list and the dry run.
+printf 'imagick\t1\tphp8.5-imagick\nimagick\t0\tphp-imagick\n' \
+  > "$TMP/php-manifest/extensions.txt"
+php_upgrade_plan_extensions 9.9
+check "a duplicated skipped extension is reported once" \
+  test "${#PHP_UPGRADE_SKIPPED[@]}" -eq 1
+check "the OpenSSH application profile counts as an SSH rule for port 22" \
+  test "$(ufw_rule_ssh_port 'ufw allow OpenSSH' 22)" = 22
+check "the OpenSSH application profile is not matched for another port" \
+  not ufw_rule_ssh_port 'ufw allow OpenSSH' 2222
 
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

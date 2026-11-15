@@ -16,8 +16,8 @@ step() { printf '\n%s%s==> %s%s\n' "$C_BOLD" "$C_BLUE" "$*" "$C_RESET"; }
 # ---------------------------------------------------------------------------
 # Full run log
 # ---------------------------------------------------------------------------
-# Every run mirrors its complete stdout/stderr into setup_<timestamp>.log in
-# the directory the script was started from.  That log is the one deliberate
+# Every run mirrors its complete stdout/stderr into setup_<timestamp>-<pid>.log
+# in the directory the script was started from.  That log is the one deliberate
 # output written outside /tmp: it is meant to be copied to a debugging agent,
 # so it is neither temporary nor auto-expired.  Everything else stays in /tmp.
 RUN_LOG_FILE=""

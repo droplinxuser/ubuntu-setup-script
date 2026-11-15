@@ -486,8 +486,10 @@ install_php() {
   if (( ! reapply )) || [[ ! -f "/etc/php/${ver}/fpm/pool.d/www.conf" ]]; then
     install -m 644 "$pool_template" "/etc/php/${ver}/fpm/pool.d/www.conf"
   fi
-  # Same template writer as --optimize (timezone handling included).
-  PHP_INI_TZ="$tz" sync_php_ini_template "$ver" || die "Could not write custom_dan.ini"
+  # Same template writer as --optimize (timezone handling included).  Under
+  # --upgrade-php, PHP_INI_TZ was captured from the old tree, while tz is
+  # empty because --basic is not enabled; keep the captured zone.
+  PHP_INI_TZ="${PHP_INI_TZ:-$tz}" sync_php_ini_template "$ver" || die "Could not write custom_dan.ini"
 
   # Hardware-aware pool/ini tuning lives in tune_php_fpm_version, shared with
   # the --optimize command.  It writes the socket listener and the final

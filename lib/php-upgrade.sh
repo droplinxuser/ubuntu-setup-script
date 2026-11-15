@@ -59,6 +59,17 @@ php_upgrade_installed_versions() {
     | sort -Vu
 }
 
+# Every PHP version with an installed package.  A CLI-only host (php8.4-cli
+# and extensions, no php-fpm) has an empty FPM list although php_upgrade_purge
+# would remove all of it; the upgrade driver uses this fallback so the
+# extension inventory and the rollback point are not silently dropped.
+php_upgrade_any_versions() {
+  dpkg-query -W -f='${binary:Package}\t${db:Status-Status}\n' 2>/dev/null \
+    | awk -F'\t' '$2 == "installed" {print $1}' \
+    | sed -nE 's/^php([0-9]+\.[0-9]+)-[a-z0-9][a-z0-9.+~-]*$/\1/p' \
+    | sort -Vu
+}
+
 # Every installed package this script treats as PHP: the language packages
 # (php, php-common, phpX.Y-*), extension packages and the Apache module that
 # pins a version.  libapache2-mod-php* does not match ^php, so it needs its own
@@ -356,6 +367,11 @@ php_upgrade_plan_extensions() {
         [[ -n ${seen_ext[$ext]:-} ]] || { seen_ext[$ext]=1; carried+=("$ext"); }
         ;;
       skip:*)
+        # One extension can be installed twice (php-imagick and
+        # php8.4-imagick), so report it once like the carried set and the
+        # --dry-run plan do.
+        [[ -n ${seen_ext[$ext]:-} ]] && continue
+        seen_ext[$ext]=1
         PHP_UPGRADE_SKIPPED+=("${ext} (${pkg}: ${class#skip:})")
         ;;
     esac
@@ -385,7 +401,11 @@ php_upgrade_app_roots() {
       app=wordpress
     elif [[ -f $d/src/XF.php && -f $d/src/config.php ]]; then
       app=xenforo
-    elif [[ -f $d/app/env.php && -f $d/app/bin/legacy ]]; then
+    elif [[ -f $d/app/env.php ]]; then
+      # Same predicate as the --optimize and guest-cache detectors: a
+      # Chevereto tree is identified by app/env.php.  Requiring the legacy
+      # CLI as well made the preflight blind to a valid site, which defeats
+      # the "refuse before the purge" guarantee.
       app=chevereto
     fi
     [[ -n $app ]] || continue
@@ -395,14 +415,39 @@ php_upgrade_app_roots() {
   done
 }
 
+# The same detection for document roots declared in Angie vhosts, which may
+# live outside /var/www (a mounted or symlinked tree).  --optimize derives its
+# PHP paths from these vhosts, so the upgrade preflight must see them too.
+php_upgrade_vhost_roots() {
+  local target=${1:-/etc/angie} file root
+  local -A seen_root=()
+  [[ -d $target/conf.d ]] || return 0
+  for file in "$target"/conf.d/*.conf; do
+    [[ -f $file ]] || continue
+    root=$(angie_vhost_root "$file")
+    [[ -n $root && -d $root ]] || continue
+    [[ -n ${seen_root[$root]:-} ]] && continue
+    seen_root[$root]=1
+    if [[ -f $root/wp-config.php && -f $root/wp-includes/version.php ]]; then
+      printf 'wordpress\t%s\n' "$root"
+    elif [[ -f $root/src/XF.php && -f $root/src/config.php ]]; then
+      printf 'xenforo\t%s\n' "$root"
+    elif [[ -f $root/app/env.php ]]; then
+      printf 'chevereto\t%s\n' "$root"
+    fi
+  done
+}
+
 # Extensions an application cannot run without.  Only names that are not
 # always built into PHP or installed by the default --php set are listed, so a
 # normal target never produces a false blocker.  Optional integrations add
 # their cache extension in php_upgrade_app_required_extensions().
 php_upgrade_app_requirements() {
   case $1 in
-    # Chevereto 4.5.9 aborts at bootstrap when redis is missing.
-    chevereto) printf '%s\n' redis mysqli gd curl mbstring ;;
+    # Chevereto 4.5.9 aborts at bootstrap when redis is missing, and its
+    # installer requires imagick for image checks and thumbnails (the --php
+    # installer adds phpX.Y-imagick for exactly this reason).
+    chevereto) printf '%s\n' redis imagick mysqli gd curl mbstring ;;
     # Core WordPress runs on the default set; redis matters only when an
     # object-cache drop-in is installed.
     wordpress) printf '%s\n' mysqli gd curl mbstring ;;
@@ -469,7 +514,14 @@ php_upgrade_preflight_apps() {
       php_upgrade_extension_available "$target" "$ext" \
         || PHP_UPGRADE_BLOCKERS+=("${app}|${root}|${ext}")
     done < <(php_upgrade_app_required_extensions "$app" "$root")
-  done < <(php_upgrade_app_roots "$base")
+  done < <(
+    {
+      php_upgrade_app_roots "$base"
+      # Only the live tree is scanned for a production run; a unit test that
+      # passes a private BASE must stay hermetic.
+      [[ $base == /var/www ]] && php_upgrade_vhost_roots
+    } | sort -u
+  )
   return 0
 }
 
@@ -575,7 +627,7 @@ php_upgrade_install() {
 # back to the manifest directory with a warning instead of breaking php-fpm.
 php_upgrade_migrate_custom() {
   local old=$1 new=$2 dir=$PHP_UPGRADE_MANIFEST_DIR
-  local backup="$dir/php-config/$old" rel links base d dest migrated=0
+  local backup="$dir/php-config/$old" rel links base d dest migrated=0 rejected=0
   [[ -d $backup ]] || return 0
 
   if [[ -s "$dir/custom-inis.txt" ]]; then
@@ -643,6 +695,7 @@ php_upgrade_migrate_custom() {
       warn "PHP ${new}: migrated custom configuration failed php-fpm -t; removed from the live tree (see ${backup})"
       sed 's/^/  /' "$test_log" >&2 || true
       migrated=0
+      rejected=1
     else
       ok "PHP ${new}: migrated ${migrated} custom configuration file(s)"
       mv "$dir/custom-inis.txt" "$dir/custom-inis.applied.txt" 2>/dev/null || true
@@ -666,6 +719,10 @@ php_upgrade_migrate_custom() {
       fi
     fi
   fi
+  # A rejected pool means the operator vhost that pointed at its socket will
+  # answer 502 even though the upgrade otherwise succeeded; let the caller
+  # report ATTENTION instead of a clean pass.
+  return "$rejected"
 }
 
 # Run the shared PHP tuner on the new tree.  install_php() already applied the
@@ -684,6 +741,22 @@ php_upgrade_optimize() {
   else
     warn "PHP optimization reported a failure"
     rc=1
+  fi
+  # A host installed from distribution packages serves PHP over TCP and
+  # Angie's local_php upstream points at 127.0.0.1:9000.  install_php has
+  # already written the Unix-socket pool, so the TCP->socket migration in
+  # optimize_php_services cannot fire (it only runs while the pool is still
+  # on TCP) and Angie would be reloaded against a dead port: every site 502.
+  # Apply the shared Angie tuner so --upgrade-php reaches the same state as
+  # --optimize (it only rewrites the managed directives).
+  if [[ -n ${OPT_PHP_SOCKET:-} && -f /etc/angie/angie.conf ]]; then
+    tune_reset_changes
+    if tune_angie_configs /etc/angie; then
+      for change in "${TUNE_CHANGES[@]}"; do info "Angie: ${change}"; done
+    else
+      warn "Angie configuration could not be aligned with the PHP socket"
+      rc=1
+    fi
   fi
   verify_optimized_services || rc=1
   PHP_UPGRADE_OPTIMIZE_OK=$(( rc == 0 ? 1 : 0 ))
@@ -757,6 +830,21 @@ php_upgrade_verify() {
   if [[ -f "/etc/php/${new}/fpm/conf.d/zz-setup-optimize.ini" ]]; then
     grep -q '^opcache.jit = tracing' "/etc/php/${new}/fpm/conf.d/zz-setup-optimize.ini" \
       || { warn "Managed profile does not enable the tracing JIT"; rc=1; }
+  fi
+  # The managed ini is only a promise until the runtime loads it: phpdismod
+  # opcache, or a migrated fragment that still names the 8.4 opcache.so,
+  # leaves the JIT off while the file says tracing.
+  if ! php -d opcache.enable_cli=1 -r 'exit(extension_loaded("Zend OPcache") ? 0 : 1);' >/dev/null 2>&1; then
+    warn "The CLI does not load OPcache; the JIT is not active"
+    rc=1
+  fi
+  # Angie must not keep pointing at a TCP PHP port when the pool is on a
+  # socket (the state a distro install is in before --upgrade-php).
+  if [[ $socket == /* && -f /etc/angie/angie.conf ]] && systemctl is-active --quiet angie; then
+    if grep -rqE '^[[:space:]]*(fastcgi_pass|server)[[:space:]]+(127\.0\.0\.1|localhost):9000;' /etc/angie 2>/dev/null; then
+      warn "Angie still points at TCP port 9000 while PHP-FPM listens on ${socket}"
+      rc=1
+    fi
   fi
   PHP_UPGRADE_VERIFY_OK=$(( rc == 0 ? 1 : 0 ))
   return "$rc"
@@ -916,6 +1004,7 @@ php_upgrade_plan() {
   dir=$(mktemp -d /tmp/php-upgrade-plan.XXXXXX)
   local -a versions=()
   mapfile -t versions < <(php_upgrade_installed_versions)
+  (( ${#versions[@]} > 0 )) || mapfile -t versions < <(php_upgrade_any_versions)
   (( ${#versions[@]} > 0 )) && old=${versions[-1]}
   printf '\n%sDRY RUN%s - PHP upgrade plan, no changes will be made.\n' "$C_BOLD" "$C_RESET"
   printf 'Target PHP : %s\n' "$target"
@@ -987,6 +1076,12 @@ run_php_upgrade() {
   step "PHP upgrade to ${target}"
   mapfile -t _upgrade_versions < <(php_upgrade_installed_versions)
   if (( ${#_upgrade_versions[@]} == 0 )); then
+    # A host with PHP but no FPM (CLI-only, or mod_php) has packages the purge
+    # removes; treat it as an upgrade so its extension set and rollback point
+    # survive, and fall back to any installed version.
+    mapfile -t _upgrade_versions < <(php_upgrade_any_versions)
+  fi
+  if (( ${#_upgrade_versions[@]} == 0 )); then
     PHP_UPGRADE_MODE=install
     info "No PHP installation found; installing PHP ${target} as a fresh install"
   else
@@ -1052,11 +1147,22 @@ run_php_upgrade() {
 
   if [[ -n $old ]]; then
     step "Migrating operator configuration"
-    php_upgrade_migrate_custom "$old" "$target"
+    php_upgrade_migrate_custom "$old" "$target" || rc=1
   fi
 
   step "Applying the shared PHP profile"
   php_upgrade_optimize || rc=1
+  # Installing is not the same as serving: if the target cannot keep FPM up
+  # (a tuned tree the master rejects, a socket that never appears), put the
+  # old, working PHP back instead of leaving the host on a dead version.
+  if [[ -n $old ]] && ! systemctl is-active --quiet "php${target}-fpm"; then
+    warn "PHP ${target}-fpm is not active after tuning; rolling back"
+    php_upgrade_rollback || warn "Rollback to PHP ${old} did not complete"
+    report=$(php_upgrade_write_report "$target" 1)
+    warn "Report: ${report}"
+    handled_return 1
+    return 1
+  fi
   php_upgrade_reload_angie || rc=1
   php_upgrade_verify "$target" || rc=1
   php_upgrade_remove_stale_dropins
