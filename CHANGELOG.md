@@ -30,6 +30,13 @@ README.md; measurements in tests/stress-site/RESULTS.md.
   A 512 MB pool was kept against the 223 MB target (only increase) with a
   128 MB log and a 32 MB buffer, and no restart.  The report now states the
   4% target instead of "does not fully fit".
+- **`--optimize` no longer needs curl.**  A stock Ubuntu 26.04 image ships
+  `wget` but neither `curl` nor `git`, so a host provisioned outside this
+  script failed its Angie repository sync ("Could not download server
+  configs").  The fetch now tries curl, then wget (HTTPS-only), then git, and
+  the failure message names the missing tool.  Verified on the 526-package
+  baseline host with no curl and no git: the wget path downloads the tree and
+  `angie.conf` is present.
 - **Validation.**  830 tuning checks pass; `shellcheck -S warning` clean.
 
 ## 1.21.8 (2026-11-15)
