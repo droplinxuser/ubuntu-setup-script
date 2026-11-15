@@ -1,0 +1,856 @@
+PASS  tmp_file creates under /tmp
+PASS  tmp_dir creates under /tmp
+PASS  run-log timestamps use UTC
+PASS  sed_in_place rewrites the file
+PASS  sed_in_place leaves no sibling scratch file
+PASS  tune_clamp lower bound
+PASS  tune_clamp upper bound
+PASS  tune_size_value whole GiB
+PASS  tune_size_value MiB
+PASS  mb_to_config whole GiB
+PASS  size_to_mb 2g
+PASS  cache budget rounds to 256 MB
+PASS  cache budget is stable across small disk changes
+PASS  failed unit parser strips the systemd bullet
+PASS  failed unit parser keeps older output without a bullet
+PASS  failed unit parser strips ANSI colour
+PASS  ipfrag tuning writes the low mark first
+PASS  ipfrag tuning writes the high mark second
+PASS  normalize_app: omitted app is basic
+PASS  normalize_app: blank is an alias of basic
+PASS  normalize_app: new templates are accepted
+PASS  normalize_app: unknown app is rejected
+PASS  retire_paths moves the live file away
+PASS  retire_paths preserves the content under /tmp
+PASS  retire_paths ignores a missing path
+PASS  Angie tree deployer never deletes files
+PASS  mysqlbkup credentials: user replaced in both sections
+PASS  mysqlbkup credentials: special characters written quoted and escaped
+PASS  mysqlbkup credentials: no placeholder remains
+PASS  mysqlbkup credentials: missing file is an error
+PASS  mysqlbackup payload decodes to a plain tar with mysqlbkup.sh
+PASS  mysqlbackup payload carries the installer and both samples
+PASS  mysqlbackup payload has no AppleDouble entries
+PASS  mysqlbackup installer extracts the payload without -z
+PASS  Angie repository uses a signed-by keyring
+PASS  MariaDB account SQL is fed over stdin
+PASS  WordPress database password reaches the helper via the environment
+PASS  optimize always calls the PHP socket migration
+PASS  socket migration restarts PHP when reload cannot apply it
+PASS  safe cron chown excludes backups and log files
+PASS  safe cron chown excludes log files
+PASS  legacy mysqlcheck cron is stripped
+PASS  legacy nginx cloudflare cron is stripped
+PASS  cron strip preserves unrelated entries
+PASS  MariaDB logging helper enables the slow log
+PASS  MariaDB logging helper sets the central slow log
+PASS  MariaDB logging helper sets log_error
+PASS  MariaDB reference config disables snapshot isolation
+PASS  MariaDB base block writes snapshot isolation off
+PASS  MariaDB logging helper omits the deprecated slow-admin alias
+PASS  storage class follows the mounted NVMe parent
+PASS  storage class reports hdd for a spinning parent
+PASS  legacy bare max_connections is removed from 50-server
+PASS  legacy bare InnoDB sizes are removed from 50-server
+PASS  legacy bare tmp_table_size is removed from 50-server
+PASS  deprecated log_slow_admin_statements is removed from 50-server
+PASS  base MariaDB settings stay in 50-server
+PASS  managed base MariaDB settings stay in 50-server
+PASS  managed MariaDB markers are preserved
+PASS  MariaDB legacy-key cleanup is idempotent
+PASS  managed JVM options are detected
+PASS  custom JVM options are not treated as managed
+PASS  basic-only cron run restores installed service entries
+PASS  basic-only cron run restores the log-safe chown
+PASS  selected-but-uninstalled MariaDB gets no cron entry
+PASS  selected-but-uninstalled Angie gets no cron entry
+PASS  bare legacy chown is removed
+PASS  bare legacy cloudflare path is removed
+PASS  bare legacy mysqlcheck path is removed
+PASS  bare legacy chown is replaced by the safe managed line
+PASS  unrelated cron entry is preserved
+PASS  XenForo root gets the managed xf:run-jobs entry every minute
+PASS  managed XF cron redirects the whole loop, not just true
+PASS  stale xf:run-jobs entry is replaced, not duplicated
+PASS  XF_JOB_CRON=0 drops the xf:run-jobs entry
+PASS  no XenForo root, no xf:run-jobs entry
+PASS  CRON_XF_JOBS runs the queue as www-data with a per-run time limit
+PASS  CRON_XF_JOBS contains no percent sign (crontab newline)
+PASS  CRON_XF_JOBS skips database dumps, backups and .old copies
+PASS  managed WordPress cron redirects the whole loop
+PASS  managed XF cron redirects the whole loop (source)
+PASS  CRON_XF_JOBS no longer ends with its own || true
+PASS  stale Angie cron entry is dropped
+PASS  MariaDB cron entry is kept
+PASS  unchanged managed crontab is not reinstalled
+PASS  optimize cron repair handles an empty crontab
+PASS  empty-crontab repair still writes the managed block
+PASS  network profile honours SETUP_TCP_CC/SETUP_QDISC
+PASS  network profile falls back for unsafe values
+PASS  cnf_only_pool_changed accepts a pool-only change
+PASS  cnf_only_pool_changed accepts max_connections (dynamic)
+PASS  cnf_only_pool_changed rejects a startup-only setting
+PASS  Angie-only cache budget uses 50% RAM
+PASS  Angie+PHP cache budget uses 30% RAM
+PASS  Angie-only cache budget uses 50% RAM
+PASS  Angie+PHP cache budget uses 30% RAM
+PASS  full-stack cache budget uses 25% RAM
+PASS  no detected services uses the shared 25% default
+PASS  ensure_fpm_log_path creates the missing parent directory
+PASS  ensure_fpm_log_path creates the slowlog file
+PASS  ensure_fpm_log_path does not create a literal runtime-variable file
+PASS  socket migration allowed for the local_php upstream
+PASS  socket migration refused for a direct fastcgi_pass
+PASS  socket migration refused when next_upstream is off
+PASS  sshd port discovery always returns at least one numeric port
+PASS  UFW inserts a rate-limited SSH rule
+PASS  UFW removes a plain SSH allow rule
+PASS  CPU governor probe finds the performance governor
+PASS  embedded sysctl fallback matches configs/system/sysctl.conf
+PASS  DNS drop-in routes every query to the global servers
+PASS  optimize supports Ubuntu 22.04
+PASS  optimize supports Ubuntu 24.04
+PASS  optimize supports Ubuntu 26.04
+PASS  optimize rejects Ubuntu 20.04
+PASS  PAM nofile does not exceed the minimum fs.nr_open
+PASS  tune_replace rewrites a matching directive
+PASS  tune_replace marks configuration dirty
+PASS  tune_replace records the change
+PASS  tune_replace records a miss instead of failing silently
+PASS  a miss does not mark configuration dirty
+PASS  tune_replace records a missing file as a miss
+PASS  tune_first_file prefers the current file name
+PASS  tune_first_file falls back to the legacy _conf layout
+PASS  tune_insert_after inserts after the http block opener
+PASS  tune_insert_after leaves http2 on intact
+PASS  error policy removes http_500 from use_stale
+PASS  error policy keeps http_503 stale handling
+PASS  error policy disables caching of 5xx responses
+PASS  error policy records the change
+PASS  error policy is idempotent
+PASS  error policy keeps a single 5xx rule
+PASS  XF cache key includes the style id
+PASS  XF cache key includes the language id
+PASS  XF cache key keeps the style variation
+PASS  XF cache key varies on the normalised Accept-Encoding
+PASS  XF cache key carries no raw cookie value
+PASS  XF cache key separates the URI from the tokens
+PASS  XF cache refreshes in the background
+PASS  XF cache repair is idempotent
+PASS  XF cache repair records no second change
+PASS  XF static assets get a 30-day immutable cache
+PASS  XF static assets send one Cache-Control header and HSTS
+PASS  XF static asset repair is idempotent
+PASS  XF static asset repair records no second change
+PASS  FastCGI snippet makes PATH_INFO optional
+PASS  FastCGI snippet keeps the try_files test
+PASS  FastCGI snippet repair marks configuration dirty
+PASS  FastCGI snippet repair is idempotent
+PASS  open_basedir param in an h5bp include is commented out
+PASS  open_basedir param inlined in conf.d is commented out
+PASS  already-commented open_basedir line is left alone
+PASS  open_basedir repair leaves no active param behind
+PASS  open_basedir repair marks configuration dirty
+PASS  open_basedir repair is idempotent
+PASS  shipped custom_dan.ini leaves opcache.jit to the managed ini
+PASS  shipped custom_dan.ini ships no JIT buffer
+PASS  shipped custom_dan.ini does not duplicate the managed memory_limit
+PASS  shipped custom_dan.ini does not duplicate the managed OPcache size
+PASS  the optimizer writes the JIT mode from php_jit_settings
+PASS  the tracing JIT is always on (512M OPcache -> 64M buffer)
+PASS  the JIT buffer never drops below 32M
+PASS  the JIT buffer never exceeds 128M
+PASS  a garbage OPcache size still yields the tracing JIT
+PASS  4+ CPU hosts use PHP's default tracing thresholds
+PASS  1-2 CPU hosts use conservative tracing thresholds
+PASS  SETUP_PHP_JIT_HOT_* overrides one threshold
+PASS  the managed ini writes the thresholds
+PASS  the pool is always static
+PASS  no ondemand pool mode remains
+PASS  the OPcache file cache stays empty (restored scripts are never JIT-compiled)
+PASS  WordPress roots get a [PATH=] section with the JIT off
+PASS  the [PATH=] section turns the JIT off, not disabled
+PASS  XenForo roots get no [PATH=] section
+PASS  PHP_JIT_WORDPRESS=1 (the default) writes no [PATH=] section
+PASS  a cache key without the encoding token gets no page compression
+PASS  a Chevereto root always gets PHP session GC
+PASS  WordPress and Chevereto roots behind an encoding-aware cache compress in PHP
+PASS  each document root gets exactly one [PATH=] section
+PASS  XenForo roots get no page compression (XenForo compresses itself)
+PASS  JIT exemption and page compression share one WordPress section
+PASS  SETUP_PHP_PAGE_GZIP=0 writes no compression section
+PASS  a new drop-in is reported as changed
+PASS  an identical drop-in is reported as unchanged
+PASS  an identical drop-in keeps its mtime
+PASS  a changed drop-in is rewritten
+PASS  skipped extensions are recorded for the next upgrade
+PASS  the pending list is removed once nothing is missing
+PASS  WordPress include gains a server-level index
+PASS  index repair marks configuration dirty
+PASS  index repair is idempotent
+PASS  existing index is left untouched
+PASS  angie.conf FastCGI upstream moves to the shared socket
+PASS  angie.conf keeps exactly one client_body_buffer_size
+PASS  client_body_buffer_size is inside the http block and sized for RAM
+PASS  worker_rlimit_nofile is inserted after worker_processes
+PASS  PHP upstream keepalive cache is removed
+PASS  the report exposes keepalive as off
+PASS  fastcgi_keep_conn is forced off in every PHP include
+PASS  fastcgi_keep_conn off is present where it was on
+PASS  fastcgi_keep_conn already off is not a missed tune
+PASS  fastcgi_keep_conn already off is not reported as a change
+PASS  the Elasticsearch drop-in creates logs 0640 (UMask=0027)
+PASS  the CPU governor uses a native unit, not the SysV cpufrequtils package
+PASS  the CPU governor unit escapes the shell variable for systemd
+PASS  ufw sysctl file follows the managed log_martians value
+PASS  ufw sysctl alignment leaves unrelated keys alone
+PASS  ufw sysctl alignment is idempotent
+PASS  ufw sysctl alignment does nothing without a managed value
+PASS  http-level keepalive_timeout is preserved
+PASS  proxy_cache.conf max_size is updated on continuation lines
+PASS  proxy_cache.conf keeps both cache paths
+PASS  fastcgi_cache zone is resized
+PASS  fastcgi_cache_chev gains a max_size
+PASS  tuning preserves use_temp_path=off on the FastCGI cache
+PASS  tuning preserves use_temp_path=off on the XenForo proxy cache
+PASS  PHP fastcgi buffers are tuned
+PASS  second tune run is a no-op
+PASS  the Angie deploy test migrates nested XF includes first
+PASS  an include without fastcgi_pass is not a missed buffer tune
+PASS  the shared PHP handler fragment is still tuned
+PASS  TCP FastCGI upstream is preserved when PHP stays on TCP
+PASS  active fastcgi_cache.conf gains a max_size
+PASS  inert legacy fastcgi_cache_conf is left untouched
+PASS  legacy fastcgi_cache_conf is resized in place
+PASS  legacy limit_req_conf zones are resized in place
+PASS  legacy tuning does not create a duplicate .conf file
+PASS  custom 5G cache zone is capped
+PASS  custom unbounded cache gains a max_size
+PASS  custom proxy cache max_size is capped
+PASS  legacy layout second run is a no-op
+PASS  proxy-only host gives the whole Angie-only budget to xfproxycache
+PASS  PHP-only host gives the whole Angie+PHP budget to fastcgicache
+PASS  tune_pool_set writes the new value
+PASS  tune_pool_dedupe keeps one pm.max_children
+PASS  tune_pool_dedupe keeps the value set by tune_pool_set
+PASS  PHP optimize keeps the performance block
+PASS  default PHP tuning writes no session overrides
+PASS  default PHP tuning writes no cgi/expose hardening
+PASS  session hardening is gated behind the opt-in flag
+PASS  the shipped PHP template has no global session overrides
+PASS  PHP optimize refreshes a stale custom_dan.ini
+PASS  PHP optimize removes stale disable_functions
+PASS  PHP optimize preserves the host timezone
+PASS  custom_dan refresh marks configuration dirty
+PASS  custom_dan refresh is idempotent
+PASS  custom_dan refresh drops global cgi.fix_pathinfo
+PASS  custom_dan refresh keeps the performance block
+PASS  --optimize calls the custom_dan refresh
+PASS  default PHP template leaves cgi.fix_pathinfo unset
+PASS  PATH_TRANSLATED points at the PHP script
+PASS  PATH_TRANSLATED repair marks configuration dirty
+PASS  PATH_TRANSLATED repair is idempotent
+PASS  --optimize repairs PATH_TRANSLATED in the PHP includes
+PASS  PATH_TRANSLATED repaired in php.conf
+PASS  PATH_TRANSLATED repaired in php_xf.conf
+PASS  PATH_TRANSLATED repaired in php_xf_proxy.conf
+PASS  PATH_TRANSLATED repaired in php_wp.conf
+PASS  PATH_TRANSLATED repaired in php_future.conf
+PASS  PATH_TRANSLATED repair ignores unrelated includes
+PASS  PATH_TRANSLATED repair covers all PHP includes
+PASS  all-include PATH_TRANSLATED repair is idempotent
+PASS  opt-in hardening disables cgi.fix_pathinfo
+PASS  opt-in hardening disables expose_php
+PASS  opt-in hardening disables display_errors
+PASS  opt-in hardening enables error logging
+PASS  opt-in hardening points error_log at the central tree
+PASS  opt-in hardening enables strict sessions
+PASS  opt-in hardening restricts sessions to cookies
+PASS  opt-in hardening marks cookies HttpOnly
+PASS  opt-in hardening marks cookies Secure
+PASS  opt-in hardening sets SameSite=Lax
+PASS  opt-in hardening sets a bounded session lifetime
+PASS  opt-in hardening lengthens session IDs
+PASS  opt-in hardening uses six bits per session character
+PASS  opt-in hardening creates the central PHP error log
+PASS  PHP budget is at most 50% of RAM
+PASS  service budgets stay under 95% of RAM
+PASS  all fixed budgets are positive
+PASS  PHP budget follows 2 workers per CPU, not the live pool
+PASS  PHP budget is still capped at 50% of RAM
+PASS  Redis enables the shared cache budget
+PASS  PHP-first plan stays inside the 80% budget
+PASS  PHP budget uses the 2-per-CPU floor
+PASS  MariaDB gets the remaining budget after the PHP floor
+PASS  live pool is data+25% for a 20 GB database
+PASS  database-fit plan stays inside the 80% budget
+PASS  a 935 MB database is not under-sized
+PASS  tiny live database uses the 128 MB minimum
+PASS  tiny database stays far below RAM/4
+PASS  tiny database floor stays inside the 80% budget
+PASS  live pool for a 40 GB database is capped at half of RAM
+PASS  40 GB database pool stays proportional, not data-sized
+PASS  large host keeps the live pool (the data+25% target is lower)
+PASS  an only-increased pool is marked as preserved
+PASS  data-sized pool keeps the plan inside the 80% budget
+PASS  a live pool above the data+25% target is kept unchanged
+PASS  pool above the shared budget is capped
+PASS  capped pool is not marked as preserved
+PASS  a database larger than the shared budget is capped at half of RAM
+PASS  capped data-sized plan still fits the 80% budget
+PASS  MariaDB-only host reserves no PHP budget
+PASS  MariaDB-only host caps a 60 GB database at half of RAM
+PASS  MariaDB-only unknown data uses the 128 MB minimum
+PASS  Valkey-only empty cache uses the RAM floor (RAM/64, 128 MB..1 GB)
+PASS  Angie+PHP+Valkey empty cache uses the RAM floor
+PASS  Elasticsearch-only unknown index uses the 512 MB minimum
+PASS  measured empty Elasticsearch-only host uses the 512 MB minimum
+PASS  small Elasticsearch index uses store/4
+PASS  Elasticsearch index size is recorded
+PASS  large Elasticsearch index gets store/4 rounded to 512 MB
+PASS  Elasticsearch heap stays within 25% of RAM
+PASS  Elasticsearch plan stays inside the 80% budget
+PASS  Elasticsearch heap is capped at 31 GB
+PASS  Elasticsearch index size is recorded for huge stores
+PASS  Elasticsearch heap is capped at 25% of RAM
+PASS  oversized Elasticsearch heap is reduced to store/4
+PASS  shrunk Elasticsearch heap is not marked as preserved
+PASS  Elasticsearch statistics drift keeps the live heap
+PASS  Elasticsearch heap is capped to store/4
+2026-11-15 19:46:37 UTC [INFO] Memory plan: 22249MB usable of 27812MB (PHP=2048MB MariaDB=1738MB Cache=434MB Elasticsearch=512MB)
+PASS  install plan derives the same worker count as the tuner
+PASS  install plan reserves 64 MB per fresh worker, not 96 MB
+PASS  install and --optimize reserve the same PHP budget
+PASS  install and --optimize use the same worker count
+PASS  install and --optimize round the heap the same way
+PASS  Elasticsearch heap is a 512 MB multiple
+PASS  single-node yellow replica issue is detected
+PASS  green cluster is not treated as a replica issue
+PASS  multi-node yellow cluster is not auto-modified
+PASS  unassigned primary shard is not treated as a replica issue
+PASS  Elasticsearch HTTP URL uses a public IPv4 network.host
+PASS  Elasticsearch HTTP URL strips quotes, comments and honours http.port
+PASS  Elasticsearch HTTP URL prefers an explicit http.host
+PASS  Elasticsearch HTTP URL ignores a commented http.host
+PASS  Elasticsearch wildcard HTTP bind probes loopback
+PASS  Elasticsearch HTTP URL brackets an IPv6 host
+PASS  WordPress vhost detection finds a real installation
+PASS  WordPress vhost detection ignores a missing wp-config
+PASS  WordPress DB host parser
+PASS  WordPress Valkey path parser
+PASS  WordPress persistent flag parser
+PASS  XenForo DB host parser
+PASS  XenForo cache host parser
+PASS  XenForo cache port parser
+PASS  XenForo DB host parser keeps the last assignment
+PASS  XenForo cache host parser reads the array-literal form
+PASS  XenForo cache port parser reads the array-literal form
+PASS  XenForo cache parser reads a one-line array() with a TCP endpoint
+PASS  XenForo cache parser reads the SV RedisCache array form
+PASS  XenForo cache parser reports no backend when none is configured
+PASS  Unix socket detector accepts a Valkey socket
+PASS  Unix socket detector rejects TCP
+PASS  audit does not flag a plain WordPress DB_HOST (core has no persistent option)
+PASS  audit recognizes a persistent Valkey socket
+PASS  audit counts no WordPress issue for a plain host
+PASS  audit flags a p: WordPress DB_HOST as broken
+PASS  audit counts the broken WordPress host
+PASS  optimize_angie synchronizes the Angie repository
+PASS  the shared Angie profile enables the XenForo guest cache
+PASS  optimize_angie applies the shared Angie profile
+PASS  the installer applies the same Angie profile
+PASS  WordPress and XenForo share one FastCGI cache zone helper
+PASS  WordPress guest cache is added by default
+PASS  the default WordPress cache add is reported as a change
+PASS  SETUP_WP_GUEST_CACHE=0 keeps the include off
+PASS  the WordPress cache opt-out is reported
+PASS  an unanchorable WordPress vhost is not called an opt-out
+PASS  an unanchorable WordPress vhost is reported
+PASS  the cache include is not inserted into an unanchorable vhost
+PASS  XenForo guest cache block is injected when missing
+PASS  XenForo guest cache key varies on style and language
+PASS  XenForo guest cache bypasses session cookies
+PASS  XenForo cookie bypass is a map, not an if
+PASS  XenForo map excludes every session cookie
+PASS  XenForo guest cache bounds the 200 TTL
+PASS  XenForo guest cache repair reports a change
+PASS  XenForo guest cache repair is idempotent
+PASS  XenForo guest cache repair reports already enabled
+PASS  legacy direct-cookie bypass is replaced by the map variable
+PASS  second XenForo conversion records no change
+PASS  injected XenForo cache block stays inside the location
+PASS  injected XenForo cache block is complete
+PASS  the XenForo status header uses the shared X-Cache-Status name
+PASS  a legacy X-5m-Cache header is renamed to X-Cache-Status
+PASS  HSTS is re-included inside the cached PHP location
+PASS  Referrer-Policy is re-included inside the proxy PHP location
+PASS  the proxy include keeps its closing brace last
+PASS  single-location XenForo cache does not ignore Set-Cookie
+PASS  legacy single-location include stops ignoring Set-Cookie
+PASS  split XenForo include keeps ignoring Set-Cookie for the cache
+PASS  split XenForo include hides Set-Cookie on cached guest pages
+PASS  the repaired cache directives land in @xf_guest_cache, not the member location
+PASS  the member location still hands guests to the named location
+PASS  split XenForo include repair is idempotent
+PASS  Chevereto server-level include moves to php_chev_cache.conf
+PASS  Chevereto nested include stays on the uncached php_chev.conf
+PASS  a commented-out include is left alone
+PASS  the Chevereto migration changes exactly one line
+PASS  a nested php_xf.conf include becomes php.conf
+PASS  the server-level php_xf.conf include is kept
+PASS  the include migration reports both vhosts
+PASS  the include migration is idempotent
+PASS  a one-line nested php_xf.conf include becomes php.conf
+PASS  the server-level include beside a one-line location is kept
+PASS  guest uploads enabled: the Chevereto vhost stays uncached
+PASS  guest uploads enabled: the report explains why
+PASS  SETUP_CHEV_GUEST_CACHE=1 forces the Chevereto guest cache on
+PASS  guest uploads enabled later: the cache include is turned back off
+PASS  SETUP_CHEV_GUEST_CACHE=0 keeps the Chevereto guest cache off
+PASS  unknown guest-upload setting: the cookie-safe cache is used
+PASS  Chevereto env.php parser reads the database name and prefix
+PASS  no migration without h5bp/php_chev_cache.conf
+PASS  cache error policy leaves a non-caching include untouched
+PASS  in-location repair is idempotent
+PASS  run_optimize calls the application connection audit
+PASS  application notices are added before the report is written
+PASS  es_jvm_options_is_managed accepts the generated heap file
+PASS  es_jvm_options_is_managed ignores a minimal operator file
+PASS  es_jvm_options_is_managed ignores a file with extra JVM flags
+2026-11-15 19:46:39 UTC [INFO] Moved legacy managed /tmp/setup-test-tuning.nWwm0l/esopt/jvm.options to /tmp; /tmp/setup-test-tuning.nWwm0l/esopt/zz-setup-optimize.options owns the heap
+PASS  write_es_jvm_options writes the managed heap file
+PASS  write_es_jvm_options moves the legacy managed heap file out of the config directory
+2026-11-15 19:46:39 UTC [WARN] Operator /tmp/setup-test-tuning.nWwm0l/esopt/jvm.options also sets -Xms/-Xmx; /tmp/setup-test-tuning.nWwm0l/esopt/zz-setup-optimize.options takes precedence
+PASS  write_es_jvm_options preserves an operator heap file
+PASS  sysctl dedupe keeps the last value
+PASS  sysctl dedupe keeps one definition per key
+PASS  sysctl dedupe preserves comments
+PASS  sysctl dedupe is idempotent
+PASS  inert detection reports only non-included cache/limit files
+PASS  angie_cache_dirs returns the included cache paths
+PASS  cache report counts objects written during the run
+PASS  cache report leaves the new object in place
+PASS  cache report keeps older objects
+PASS  cache max_size is raised above live usage
+PASS  cache keep records an explanatory note
+PASS  cache max_size keeps a larger plan
+PASS  cache keep is silent when the plan is larger
+PASS  cache max_size keeps a configured value above live usage
+PASS  cache keep tolerates a missing config
+2026-11-15 19:46:40 UTC [WARN] Memory plan: service floors exceed the 819 MB budget by 1997 MB; this host is too small for the selected services
+PASS  small host keeps the cache at its 128 MB target, not above
+PASS  small host keeps the 512 MB search floor
+PASS  a host without cache/search keeps a zero budget
+PASS  ERR trap reports the failing command
+PASS  ERR trap reports the failing line
+PASS  OS tuning applies sysctl before the PAM nofile limits
+PASS  MariaDB restart pauses web frontends first
+PASS  MariaDB restart resumes web frontends afterwards
+PASS  MariaDB restart reloads systemd units before pausing web
+PASS  restart-all reloads systemd before pausing the web tiers
+PASS  restart-all pauses the web tiers before restarting cache/search
+PASS  pause helper stops Angie before PHP-FPM
+PASS  resume helper starts PHP-FPM before Angie
+PASS  restart-all restarts cache/search before MariaDB
+PASS  restart-all waits for Elasticsearch before MariaDB
+PASS  restart-all waits for MariaDB before resuming the web tiers
+PASS  embedded blob_sysctl decodes
+PASS  embedded blob_mysqltuner decodes
+PASS  embedded blob_mysqlbackup decodes
+PASS  embedded blob_angie_key decodes
+PASS  embedded blob_elastic_key decodes
+PASS  embedded blob_sury_deb decodes
+PASS  embedded blob_nodesource_key decodes
+PASS  MariaDB shared profile sizes a 2G buffer pool
+PASS  MariaDB redo log is 25% of the pool
+PASS  MariaDB log buffer follows the pool (16..64 MB)
+PASS  a 128 MB pool gets a 32 MB redo log (25%)
+PASS  a 128 MB pool gets a 16 MB log buffer
+PASS  redo log is never smaller than the log buffer
+PASS  a 16 GB pool gets a 4 GB redo log (25%, uncapped)
+PASS  a 16 GB pool keeps a 64 MB log buffer
+PASS  MariaDB shared profile keeps a usable connection ceiling
+PASS  max_connections is workers*1.25+50 without persistent applications
+PASS  one persistent application doubles the per-worker connection allowance
+PASS  Valkey shared lines keep maxmemory and policy
+PASS  Valkey shared lines keep the io-threads override
+PASS  Elasticsearch strip removes only the optimize block
+PASS  Elasticsearch strip removes the old performance key
+PASS  optimize leaves swap untouched
+PASS  Valkey takes precedence over Redis in service detection
+PASS  diagnostics reports absent Valkey/Redis as not installed
+PASS  diagnostics does not call the Redis client when none is reachable
+PASS  diagnostics skips allocation explain when no shards are unassigned
+PASS  diagnostics reports absent Elasticsearch as not installed
+PASS  diagnostics gates Elasticsearch probes on installation
+PASS  diagnostics gates MariaDB probes on installation
+PASS  diagnostics reports absent MariaDB as not installed
+PASS  fresh install sizes MariaDB from the RAM floor (RAM/16)
+PASS  fresh install uses the empty-index minimum
+PASS  fresh install keeps the empty-database floor
+PASS  fresh install full-stack plan stays inside the 80% budget
+PASS  measured-empty live database uses the 128 MB minimum
+PASS  live MariaDB pool above the data+25% target is kept
+PASS  live Elasticsearch heap is reduced to the store/4 minimum
+PASS  live Valkey working set raises the cache budget with headroom
+PASS  MariaDB+Valkey host reserves no PHP or Elasticsearch budget
+PASS  MariaDB+Valkey host fits the live database target
+PASS  MariaDB+Valkey plan stays inside the 80% budget
+PASS  full stack reserves MariaDB, Valkey and Elasticsearch first
+PASS  full stack still gets a viable PHP pool
+PASS  full stack priority plan stays inside the 80% budget
+PASS  Angie+PHP+MariaDB+Valkey+Elasticsearch: reserves only installed services
+PASS  Angie+PHP+MariaDB+Valkey+Elasticsearch: stays inside the 80% budget
+PASS  Angie+PHP+MariaDB+Elasticsearch: reserves only installed services
+PASS  Angie+PHP+MariaDB+Elasticsearch: stays inside the 80% budget
+PASS  Angie+PHP+MariaDB+Valkey: reserves only installed services
+PASS  Angie+PHP+MariaDB+Valkey: stays inside the 80% budget
+PASS  Angie+PHP+Valkey: reserves only installed services
+PASS  Angie+PHP+Valkey: stays inside the 80% budget
+PASS  Angie+PHP: reserves only installed services
+PASS  Angie+PHP: stays inside the 80% budget
+PASS  MariaDB alone: reserves only installed services
+PASS  MariaDB alone: stays inside the 80% budget
+PASS  Elasticsearch alone: reserves only installed services
+PASS  Elasticsearch alone: stays inside the 80% budget
+PASS  existing max_connections above 2000 is preserved
+PASS  database-only fresh install uses the RAM floor for an empty database
+PASS  restart-all plan lists the Valkey alias only once
+PASS  run log name is unique per process
+PASS  on_error ignores SIGPIPE from a closed pipe
+PASS  config fetch falls back to wget when curl is absent
+PASS  config fetch still prefers curl
+PASS  php_children_ceiling: 2 per core on dedicated hardware
+PASS  php_children_ceiling: the same 2-per-core floor on a VPS
+PASS  php_children_ceiling: the 2-per-CPU floor beats the RAM divisor
+PASS  php_children_floor: two workers per logical CPU
+PASS  php_children_floor: a 1-2 core VPS keeps 2 per CPU
+PASS  php_children_ceiling: a live pool is normalised to the plan
+PASS  php_children_ceiling: explicit value wins but is clamped to the floor
+PASS  php_children_ceiling: explicit value below the hardware target is kept
+PASS  upgrade parse: --upgrade-php=8.6
+PASS  upgrade parse: --upgrade-php 8.6
+PASS  upgrade parse: a second --upgrade-php fails
+PASS  upgrade extension name: versioned package
+PASS  upgrade extension name: unversioned package
+PASS  upgrade extension name: fpm
+PASS  upgrade extension name: Apache module is not an extension
+PASS  upgrade extension name: meta package is not an extension
+PASS  php_children_from_tenths: one worker per core
+PASS  php_children_from_tenths: one and a half per core rounds up
+PASS  php_children_from_tenths: two per core
+PASS  php_children_from_tenths: never fewer than two workers
+PASS  php_children_from_tenths: rejects a zero factor
+PASS  pool factor: local database on flash bare metal is 1.0/core
+PASS  pool factor: a spinning disk keeps 2.0/core of headroom
+PASS  pool factor: a remote database keeps 1.5/core
+PASS  pool factor: a shared vCPU keeps 1.5/core
+PASS  pool factor: SETUP_PHP_WORKERS_PER_CPU pins the factor
+PASS  pool factor: a local MariaDB in this install run counts as local
+PASS  sysctl_target_somaxconn scales with CPUs on dedicated hardware
+PASS  sysctl_target_somaxconn is capped on a VPS
+PASS  swap target has a 1 GiB floor
+PASS  swap target is capped at 8 GiB on dedicated hardware
+PASS  swap target is capped at 4 GiB on a VPS
+PASS  innodb_io_capacity: NVMe on dedicated hardware
+PASS  innodb_io_capacity: NVMe on a VPS is held back by provider IOPS
+PASS  innodb_io_capacity: rotational disk
+PASS  innodb_io_capacity: SETUP_MARIADB_IO_CAPACITY pins a host
+PASS  MariaDB profile: HDD flushes neighbours and keeps 4 I/O threads
+PASS  MariaDB profile: max_connections follows the PHP pool
+PASS  MariaDB profile: tmp_table_size scales with RAM and stays under pool/8
+PASS  MariaDB profile: NVMe keeps flush_neighbors=0 and 8 I/O threads
+PASS  MariaDB profile: tmp_table_size is capped at pool/8
+PASS  MariaDB profile: thread_cache_size scales with CPUs
+PASS  MariaDB profile: LRU scan depth follows io_capacity
+PASS  MariaDB profile: no PHP pool falls back to CPU x 32 connections
+PASS  valkey_maxclients has a 10000 floor
+PASS  valkey_maxclients grows with the PHP pool
+PASS  valkey_clamp_io_threads caps at 8 on both paths
+PASS  service_mem_mb mariadb fallback is the RAM/16 planner floor
+PASS  service_mem_mb valkey fallback is the RAM/64 planner floor (1 GB cap)
+PASS  service_mem_mb elastic fallback is 25% of RAM on a 512 MB step
+PASS  service_mem_mb never re-rounds a planned Elasticsearch heap
+2026-11-15 19:46:42 UTC [WARN] Memory plan: service floors exceed the 26214 MB budget by 1466 MB; this host is too small for the selected services
+PASS  explicit MariaDB size is reserved verbatim
+PASS  explicit Valkey size is reserved verbatim
+PASS  the flexible tiers absorb the squeeze
+PASS  record_explicit_options stores MariaDB size in MB
+PASS  record_explicit_options stores Valkey and Elasticsearch sizes
+PASS  record_explicit_options stores PHP children
+PASS  record_explicit_options clears a value that is now auto
+PASS  valkey_apply_config removes RDB saves and protected-mode no
+PASS  valkey_apply_config keeps operator directives
+PASS  valkey_apply_config clamps io-threads to 8
+PASS  valkey_apply_config is idempotent
+PASS  valkey_runtime_settings drops the startup-only keys
+PASS  valkey_runtime_settings keeps maxmemory
+PASS  write_service_limits_dropin reports a change
+PASS  write_service_limits_dropin is silent when identical
+PASS  tune_limit_req_exemptions adds managed entries
+PASS  tune_limit_req_exemptions ignores invalid entries
+PASS  tune_limit_req_exemptions replaces the managed set
+PASS  tune_limit_req_exemptions removes managed entries when unset
+PASS  dir_size_mb excludes the given patterns
+PASS  wait_for_cmd succeeds on the first good probe
+PASS  wait_for_cmd fails after the last attempt
+PASS  cgroup_quota_cpus rounds a fractional quota up to one CPU
+PASS  cgroup_quota_cpus rounds 1.5 CPUs up to 2
+PASS  cgroup_quota_cpus returns 0 without a numeric quota
+PASS  php_plan_max_children normalises a live pool to 2 per CPU
+PASS  php_plan_max_children lets an explicit value win over the live pool
+PASS  php_plan_max_children ignores the internal plan variable (deterministic)
+PASS  php_plan_max_children bounds a standalone budget by the hardware ceiling
+PASS  php_plan_max_children falls back to the 2-per-CPU rule
+PASS  php_plan_max_children gives a 64-thread host 128 workers
+PASS  php_plan_max_children gives a 2-core box 4 workers
+PASS  angie_brotli_level honours SETUP_BROTLI_LEVEL
+PASS  angie_brotli_level ignores an invalid SETUP_BROTLI_LEVEL
+PASS  angie_brotli_level drops to 3 on a 2 CPU host
+PASS  record_explicit_options persists --basic server=vps
+PASS  host_server_type prefers the pinned class over detection
+PASS  record_explicit_options clears the pin when server= is omitted
+PASS  table_open_cache follows max_connections (1000 workers -> 1300 -> 20800)
+PASS  redo log is 8 GB for a 32 GB pool on NVMe (25%)
+PASS  redo log stays at 25% on SSD (8 GB, no disk-class cap)
+PASS  table_open_cache keeps the 4000 floor on a small host (4 CPUs, 200 connections)
+PASS  a 1 GB host running every service reports an overcommit
+PASS  a 27 GB host reports no overcommit
+PASS  udev I/O rule matches whole disks only
+PASS  PHP memory_limit drops to 128M under 2 GB
+PASS  min_free_kbytes floor scales below 4 GB
+PASS  app_db_host_is_local: localhost
+PASS  app_db_host_is_local: persistent loopback
+PASS  app_db_host_is_local: socket path
+PASS  app_db_host_is_local rejects a remote host
+PASS  angie_vhost_root reads the root directive
+PASS  precompress_static_assets writes a gzip sibling
+PASS  precompress sibling keeps the source mtime
+PASS  precompress_static_assets skips internal_data and tiny files
+PASS  precompress_static_assets is incremental
+PASS  precompress_static_assets removes orphaned siblings
+PASS  restore_sysctl_values writes the non-zero member of each dirty pair, ratios first, ipfrag_low last
+PASS  valkey_floor_mb keeps the 128 MB minimum on a small host
+PASS  valkey_floor_mb is 1/64 of RAM (27812 MB -> 434)
+PASS  valkey_floor_mb caps at 1 GB
+PASS  valkey_floor_mb tolerates garbage
+PASS  open_file_cache follows RAM when the fd limit allows it
+PASS  open_file_cache is bounded by rlimit minus connections (4 CPU / 32 GB)
+PASS  open_file_cache keeps the 10000 floor on a small host
+PASS  ini_get reads a trimmed value
+PASS  ini_get skips commented lines
+PASS  ini_get handles dotted keys
+PASS  ini_get does not match a key prefix
+PASS  ini_get prints nothing for an absent key
+PASS  tune_ensure_in_location inserts before the closing brace
+PASS  tune_ensure_in_location keeps the brace last
+PASS  tune_ensure_in_location is idempotent
+PASS  ufw_rule_ssh_port prints the matching SSH port
+PASS  ufw_rule_ssh_port matches an alternate port
+PASS  ufw_rule_ssh_port rejects a web rule
+PASS  ufw_rule_ssh_port does not match a port substring
+PASS  config_tree_digest is stable
+PASS  config_tree_digest changes with the content
+PASS  config_tree_digest reports an absent tree
+PASS  opt_restore puts back the recorded file
+PASS  opt_restore moves a file created after the backup out of the tree
+PASS  mariadb_floor_mb keeps the 256 MB minimum on a 1 GB host
+PASS  mariadb_floor_mb is 1/16 of RAM (16384 MB -> 1024)
+PASS  mariadb_floor_mb caps at 4 GB
+PASS  mariadb_floor_mb tolerates garbage
+PASS  classify_block_device reports nvme from the device name
+PASS  classify_block_device falls back to hdd without a sysfs rotational flag
+PASS  sed_replacement_escape escapes &, | and backslash
+PASS  explicit_option_set keeps one line per key after a rewrite
+PASS  explicit_option_set stores a value containing & and | literally
+PASS  restore_snapshot_dir restores the snapshot content
+PASS  restore_snapshot_dir keeps an unchanged snapshot file
+PASS  restore_snapshot_dir moves a file absent from the snapshot out of the tree
+PASS  restore_snapshot_dir preserves the moved file
+PASS  restore_snapshot_dir reports the moved file
+PASS  restore_snapshot_dir fails on a missing snapshot
+PASS  php_ini_profile 1 GB: 128M OPcache, 128M memory_limit, 4096K realpath
+PASS  php_ini_profile 8 GB: 512M OPcache, 512M memory_limit, 16384K realpath
+PASS  php_ini_profile 4 GB: 256M OPcache, 512M memory_limit, 8192K realpath
+PASS  php_ini_profile falls back to the 1 GB profile on garbage
+PASS  angie_gzip_level honours SETUP_GZIP_LEVEL
+PASS  angie_gzip_level ignores an invalid SETUP_GZIP_LEVEL and drops to 3 on 2 CPUs
+PASS  angie_gzip_level defaults to 4 on 8 CPUs
+PASS  es_json_num reads a spaced numeric field
+PASS  es_json_str reads a spaced string field
+PASS  es_json_num reads a nested numeric field
+PASS  es_json_num prints nothing for a missing key
+PASS  es_json_str prints nothing for a missing key
+PASS  sysctl_file_keys lists each active key once, sorted
+PASS  cnf_key_bytes converts a G suffix
+PASS  cnf_key_bytes converts an M suffix without spaces
+PASS  cnf_key_bytes keeps a bare byte count
+PASS  cnf_key_bytes prints nothing for an absent key
+PASS  cnf_only_pool_changed accepts pool and redo-log changes together
+PASS  cnf_only_pool_changed accepts an innodb_io_capacity change (dynamic)
+PASS  cnf_only_pool_changed rejects a startup-only key
+PASS  cache keep leaves the plan alone for an empty first zone
+PASS  cache keep leaves the plan alone for an empty second zone
+PASS  cache keep preserves the configured 8g that covers live usage
+PASS  cache keep note names the zone's own directory
+PASS  cache keep note does not name the other zone's directory
+PASS  upstream snapshot captures the named block
+PASS  upstream snapshot does not capture host:port directives
+2026-11-15 19:46:43 UTC [INFO] Preserved upstream definition(s) still referenced by a vhost: legacy_ws
+PASS  upstream restore keeps a referenced block the new tree dropped
+PASS  upstream restore drops the old zone name
+PASS  upstream restore retains the server address
+PASS  upstream restore is idempotent on the second run
+2026-11-15 19:46:43 UTC [INFO] Preserved upstream include no longer needed -> /tmp/tmp.bJCpre0ns6/zz-setup-preserved-upstreams.conf
+PASS  upstream restore removes the managed include once the tree defines it
+PASS  world-writable fix uses a batched chmod
+PASS  world-writable fix does not fork chmod per path
+PASS  world-writable fix reports the count before fixing
+2026-11-15 19:46:43 UTC [INFO] Angie: commented duplicate limit_req_status in http.d/zz-custom.conf (kept in http.d/limit_req.conf)
+2026-11-15 19:46:43 UTC [INFO] Angie: commented duplicate limit_req_log_level in http.d/zz-custom.conf (kept in http.d/limit_req.conf)
+PASS  duplicate http directive keeps the canonical file
+PASS  duplicate http directive comments the operator copy
+PASS  duplicate http directive leaves a unique directive active
+PASS  duplicate http log level is commented in the operator copy
+PASS  5xx rule is moved in front of the any rule
+PASS  moving the 5xx rule keeps a single copy
+PASS  moving the 5xx rule keeps it inside the location
+PASS  5xx rule order repair is idempotent
+PASS  a deployed raw-cookie XF key is replaced
+PASS  the replaced XF key keeps its indentation
+PASS  the repository's validated XF key is left alone
+PASS  a QEMU SCSI disk is recognised as virtual
+PASS  a physical SATA disk is not virtual
+PASS  SETUP_STORAGE_CLASS pins the storage class
+PASS  SETUP_STORAGE_CLASS pins the data-path class too
+PASS  an invalid SETUP_STORAGE_CLASS is ignored
+PASS  an explicit worker count below the hardware target is kept
+PASS  an explicit worker count of one is raised to two
+PASS  the plan helper returns the explicit worker count
+PASS  cache guard: the plan stands when live data has its 20% headroom
+PASS  cache guard: a full evicting cache keeps its current maxmemory
+PASS  cache guard: used_memory slightly above maxmemory still counts as full
+PASS  cache guard: a full cache below the plan takes the plan, not used+20%
+PASS  cache guard: noeviction data is never dropped (used+20%)
+PASS  cache guard: data above the current maxmemory is given headroom
+PASS  cache guard: an unlimited or unknown maxmemory follows live data
+PASS  cache guard: a half-empty cache is sized to live data, not kept
+PASS  cache guard: live data beyond the host is capped
+PASS  cache guard: a maxmemory above the hard cap is not kept
+PASS  cache guard: a scaled-down share never evicts a full cache
+PASS  cache guard: a second pass keeps a full cache's size
+PASS  cache guard: a second pass keeps a raised size
+PASS  cache guard: a second pass keeps a capped size
+PASS  valkey_size_to_mb reads the writer's own unit
+PASS  valkey_size_to_mb reads gigabytes
+PASS  valkey_size_to_mb reads plain bytes
+PASS  valkey_size_to_mb treats no limit and garbage as 0
+PASS  plan: a full 512 MB cache keeps 512 MB instead of growing to 614
+PASS  plan: a second run changes nothing
+PASS  plan: a noeviction cache still gets live data +20%
+PASS  plan: a mostly empty cache gets the RAM floor
+PASS  plan: an explicit cache size ignores live data
+PASS  install plan on an installed cache matches --optimize
+PASS  install plan for a new cache uses the RAM floor without probing
+PASS  a squeezed plan never shrinks a full cache below its data
+PASS  a squeezed plan keeps live cache data +20% without overcommit
+PASS  a squeezed plan with a re-raised cache still fits the budget
+PASS  optimize_valkey writes the planned size without re-deriving it
+PASS  optimize_valkey reports a full cache and how to grow it
+PASS  the dry run prints the same planned cache size
+PASS  overcommit is measured against the real PHP reservation
+PASS  the 27 GB reference host still reports no overcommit
+PASS  a stopped PHP-FPM plans at the install value (64 MB)
+PASS  a lone master process plans at the install value (64 MB)
+PASS  a running pool is measured (1.5x the 80 MB average)
+PASS  a light pool keeps the 64 MB floor
+PASS  a pool clamped at 1744 MB of 4096 MB is short
+PASS  a pool at the target is not short
+PASS  chunk rounding within 2% is not short
+PASS  a pool above the target is not short
+PASS  an unreadable pool size is not treated as clamped
+PASS  optimize_mariadb reads the pool back before reporting an online resize
+PASS  the tuning drop-in never sets innodb_buffer_pool_size_max
+PASS  dirty thresholds: 512 MB host is capped at RAM/20 and RAM/5
+PASS  dirty thresholds: 1 GB host is capped at RAM/20 and RAM/5
+PASS  dirty thresholds: tiny host keeps 8 MB and twice the background mark
+PASS  dirty thresholds: 2 GB host keeps the 64/256 MB floors
+PASS  dirty thresholds: 27 GB NVMe reference host is unchanged (278/1112)
+PASS  dirty thresholds: large flash host keeps the 512 MB/2 GB caps
+PASS  dirty thresholds: rotational disks keep the tighter caps
+PASS  configure_sysctl takes both thresholds from the helper
+PASS  rotational readahead stays 1024 kB on an hdd-class host
+PASS  rotational readahead is the flash value on an ssd-class host
+PASS  rotational readahead is the flash value on an nvme-class host
+PASS  the rotational udev rule takes its readahead from the storage class
+PASS  no udev rule hard-codes the 1024 kB readahead
+PASS  network unit: every ExecStart tolerates failure
+PASS  network unit: one modprobe line per module
+PASS  network unit: the qdisc has its own sysctl line
+PASS  network unit: the congestion control has its own sysctl line
+PASS  network unit: still a oneshot that stays active
+PASS  network unit: rewritten and reloaded only when its content changes
+PASS  a refused mkswap/swapon is handled, not fatal
+PASS  the unusable swap file is removed
+PASS  a refused swap file is reported at INFO level
+PASS  no caller truncates the swap file after a failed swapoff
+PASS  an active swap file that cannot be released stops the re-create
+PASS  a released swap file may be re-created
+PASS  an inactive swap file needs no swapoff
+PASS  swapoff is not attempted on an inactive file
+PASS  a symlinked log file keeps its target's mode
+PASS  a symlinked log file is reported
+PASS  a missing log file is created 0640
+PASS  a dangling link is not created through
+PASS  log_file goes through the symlink-safe helper
+PASS  no log path is chowned without -h
+PASS  backup password with # is written quoted
+PASS  backup user is written quoted
+PASS  adopted cache: appendonly yes is kept
+PASS  adopted cache: the save schedule is kept
+PASS  adopted cache: persistence is not switched off
+PASS  adopted cache: the private bind address is kept
+PASS  adopted cache: the second run writes the same file
+PASS  a default cache still gets persistence off
+PASS  a default cache keeps the loopback bind
+PASS  a fresh --valkey install writes the cache profile
+PASS  validation does not write a default policy back
+PASS  validation does not write a default io_threads back
+PASS  XenForo admin/install location is anchored
+PASS  Chevereto dashboard/update location is anchored
+PASS  the leftover-file rule is included once
+PASS  anchoring is idempotent
+PASS  an unrelated vhost is untouched
+PASS  a dropped SSH session unwinds through on_exit
+PASS  on_exit resumes a paused web tier
+PASS  --upgrade-php keeps the listener of a migrated pool
+PASS  the optimize report is not world-readable
+PASS  a first --basic has no applied hostname to keep
+PASS  a repeat --basic keeps the live hostname
+PASS  the malware rule needs a hex letter in the plugin suffix
+PASS  automatic swap is sized to the free disk before the old file is released
+PASS  --php re-enables the session GC timer after a purge
+PASS  --others sysstat re-enables the units a purge disabled
+PASS  app detection finds WordPress
+PASS  app detection finds XenForo
+PASS  app detection finds Chevereto
+PASS  app detection lists each document root once
+PASS  app detection ignores an unrelated directory
+PASS  Chevereto needs only app/env.php, like the --optimize detector
+PASS  Chevereto requirements include redis
+PASS  WordPress requirements skip redis without an object-cache drop-in
+PASS  WordPress requirements add redis with an object-cache drop-in
+PASS  XenForo ignores a commented Redis example
+PASS  XenForo detects a configured Redis cache
+PASS  a core extension needs no package lookup
+PASS  an unpublished extension is reported unavailable
+PASS  the preflight blocks a target without redis
+PASS  the preflight is empty without an application
+PASS  the blocker names the site and the missing package
+PASS  carried extensions are de-duplicated
+PASS  an unpublished extension still counts as skipped
+PASS  a duplicated skipped extension is reported once
+PASS  the OpenSSH application profile counts as an SSH rule for port 22
+PASS  the OpenSSH application profile is not matched for another port
+
+TOTAL pass=845 fail=0

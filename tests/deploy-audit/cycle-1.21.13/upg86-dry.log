@@ -1,0 +1,91 @@
+================================================================
+ setup.sh run log
+ Started: 2026-11-15 19:49:22 UTC
+ Script : setup.sh 1.21.12
+ Log    : /root/audit/setup_20261115-194922-799133.log
+================================================================
+
+--- environment ---
+Command      : setup.sh --upgrade-php=8.6 --dry-run
+Invocation   : setup/setup.sh
+Directory    : /root/audit
+Script dir   : /root/audit/setup
+PID / PPID   : 799133 / 799132
+User / EUID  : root / 0
+Umask        : 0022
+Shell        : /bin/bash (bash 5.3.9(1)-release)
+OS           : Ubuntu 26.04.1 LTS (26.04)
+Kernel       : Linux 7.0.0-43-generic x86_64 GNU/Linux
+Architecture : amd64
+Virtualization: none
+CPU          : 16 logical CPUs
+Memory       : 27812MB total, 19875MB available
+Disk         : 903G total, 851G free on /
+Addresses    : 192.168.1.139 fd2b:b17c:1393:8:7ca0:22b7:a44a:38b5 fd2b:b17c:1393:8:8126:7e8b:3bd0:a232 2001:db8:355:1008:310f:1f37:3266:a2ff 2001:db8:355:1008:fe01:5c7b:c9d8:5ead 
+Failed units : none
+TMPDIR       : /tmp
+Log file     : /root/audit/setup_20261115-194922-799133.log
+--------------------
+
+
+--- selection ---
+Modes        : dry_run=1 optimize=0 purge=0 diagnostics=0 restart_all=0 upgrade_php=8.6
+Services     : none
+Domains      : none
+PHP upgrade  : target=8.6
+--------------------
+
+
+DRY RUN - PHP upgrade plan, no changes will be made.
+Target PHP : 8.6
+Current    : 8.4
+Packages   : 16 installed PHP package(s)
+
+Extensions to carry over (mapped to php8.6-*):
+  common         (core/default)
+  cli            (core/default)
+  curl           (core/default)
+  fpm            (core/default)
+  gd             (core/default)
+  gmp            (core/default)
+  igbinary       !! php8.6-igbinary is not published
+  imagick        !! php8.6-imagick is not published
+  mbstring       (core/default)
+  mysql          (core/default)
+  opcache        (bundled in PHP 8.6)
+  readline       (core/default)
+  redis          !! php8.6-redis is not published yet
+  xml            (core/default)
+  zip            (core/default)
+
+Application requirements:
+  chevereto   /var/www/chev.test.local/public
+  wordpress   /var/www/wp.test.local/public
+  xenforo     /var/www/xf.test.local/public
+2026-11-15 19:49:22 UTC [ERR ] command failed (exit 1) at line 749: sed -E 's/^[[:space:]]*root[[:space:]]+//; s/;.*//; s/^[[:space:]]+//; s/[[:space:]]+$//'
+2026-11-15 19:49:22 UTC [ERR ] command failed (exit 1) at line 749: root=$(grep -m1 -E '^[[:space:]]*root[[:space:]]+' "$1" 2> /dev/null | sed -E 's/^[[:space:]]*root[[:space:]]+//; s/;.*//; s/^[[:space:]]+//; s/[[:space:]]+$//')
+2026-11-15 19:49:22 UTC [ERR ] command failed (exit 1) at line 427: root=$(angie_vhost_root "$file")
+2026-11-15 19:49:22 UTC [ERR ] command failed (exit 1) at line 508: sort -u
+
+BLOCKED: the purge would break installed application(s):
+  - chevereto at /var/www/chev.test.local/public requires the redis extension (php8.6-redis is not published)
+  - chevereto at /var/www/chev.test.local/public requires the imagick extension (php8.6-imagick is not published)
+  - xenforo at /var/www/xf.test.local/public requires the redis extension (php8.6-redis is not published)
+  The real run refuses before purging. Override with SETUP_PHP_ALLOW_MISSING_EXT=1.
+
+Repository : 8.6.0~rc5-2+0~deb.sury.org.1+ubuntu26.04
+
+Steps:
+  1. snapshot packages, extension flags, custom .ini/pools and /etc/php
+  2. purge every PHP package and PHP-only dependencies (autoremove delta)
+  3. install php8.6-fpm/cli plus the extension list above
+  4. migrate operator-owned .ini fragments and extra FPM pools
+  5. run the shared PHP tuner (pool, OPcache, tracing JIT) and reload Angie if active
+  6. verify version/socket/extensions and write /var/log/setup-php-upgrade-*.md
+
+--- run finished ---
+Result    : SUCCESS (exit 0)
+Finished  : 2026-11-15 19:49:22 UTC
+Duration  : 00:00:00
+Full log  : /root/audit/setup_20261115-194922-799133.log
+--------------------
