@@ -2494,6 +2494,14 @@ on_error_body=$(sed -n '/^on_error()/,/^}/p' "$ALL_SRC")
 check "on_error ignores SIGPIPE from a closed pipe" \
   grep -q 'rc == 141' <<<"$on_error_body"
 
+# A stock Ubuntu image ships wget but not curl; --optimize must be able to
+# fetch its Angie tree without installing a package.
+fetch_body=$(declare -f fetch_server_configs)
+check "config fetch falls back to wget when curl is absent" \
+  grep -q 'wget -q --https-only' <<<"$fetch_body"
+check "config fetch still prefers curl" \
+  bash -c 'a=$(grep -n "curl -fsSL" <<<"$1" | cut -d: -f1); b=$(grep -n "wget -q" <<<"$1" | cut -d: -f1); [[ -n $a && -n $b && $a -lt $b ]]' _ "$fetch_body"
+
 
 # ---------------------------------------------------------------------------
 # 1.9.0: shared sizing helpers (install/optimize parity) and hardware rules

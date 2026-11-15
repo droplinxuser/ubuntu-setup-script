@@ -357,7 +357,17 @@ fetch_server_configs() {
   local src=""
 
   info "Downloading server configs: ${url}"
-  if retry 3 5 curl -fsSL --proto '=https' --tlsv1.2 "$url" -o "$archive" 2>/dev/null; then
+  local fetched=0
+  if command -v curl >/dev/null 2>&1 \
+     && retry 3 5 curl -fsSL --proto '=https' --tlsv1.2 "$url" -o "$archive" 2>/dev/null; then
+    fetched=1
+  elif command -v wget >/dev/null 2>&1 \
+       && retry 3 5 wget -q --https-only --timeout=30 -O "$archive" "$url" 2>/dev/null; then
+    # A stock Ubuntu image ships wget but not curl (26.04); --optimize must
+    # not need a package to fetch its Angie tree.
+    fetched=1
+  fi
+  if (( fetched )); then
     if ! tar -xzf "$archive" -C "$CONFIG_TEMP_DIR"; then
       warn "Could not extract server configs from ${url}"
       CONFIG_TEMP_DIR=""
@@ -369,7 +379,7 @@ fetch_server_configs() {
     src="${CONFIG_TEMP_DIR}/repo"
   else
     # Keep the failed download under /tmp for inspection; it expires on its own.
-    warn "Could not download server configs from ${CONFIG_REPO_URL} (${CONFIG_REPO_REF})"
+    warn "Could not download server configs from ${CONFIG_REPO_URL} (${CONFIG_REPO_REF}); install curl (or wget/git) and re-run"
     CONFIG_TEMP_DIR=""
     return 1
   fi
