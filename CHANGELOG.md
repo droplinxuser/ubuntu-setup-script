@@ -3,6 +3,97 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.8 (2026-11-15)
+
+Eighth audit of the 1.21 line on the Ubuntu 26.04.1 test host (16 logical
+CPUs, 27 812 MiB RAM, NVMe, bare metal) with WordPress 7.1.4, XenForo 2.3.13
+and Chevereto 4.5.9.  Pair with server-configs-nginx 1.6.29.  The defects
+were in the upgrade, purge and firewall-state paths; the install and
+`--optimize` paths again needed no correction.
+
+- **`--upgrade-php` now repoints Angie at the PHP socket.**  On a host built
+  from distribution packages, PHP-FPM listens on `127.0.0.1:9000` and
+  `angie.conf`'s `local_php` upstream points there.  `install_php` writes the
+  managed Unix-socket pool, so the TCP->socket migration in the tuner can no
+  longer fire (it only runs while the pool is still on TCP); the upgrade
+  reloaded Angie against a dead port and every site answered 502 while the
+  report said PASS.  The upgrade now applies the shared Angie tuner after the
+  PHP tuner and `php_upgrade_verify` fails when a `fastcgi_pass`/`server
+  ...:9000` remains with a socket pool.  Verified by converting the audit
+  host to the distro layout (pool `127.0.0.1:9000`, upstream TCP), then
+  `--upgrade-php=8.4`: the upstream became `unix:/run/php/php-fpm.sock` and
+  all three applications answered 200; `--upgrade-php=8.5` round-tripped
+  with 15 extensions carried and 0 skipped.
+- **The upgrade preflight saw too little, and Chevereto's imagick was not a
+  requirement.**  A Chevereto tree is now detected by `app/env.php` alone
+  (the same predicate `--optimize` and the guest-cache code use) instead of
+  requiring `app/bin/legacy`; document roots declared by Angie vhosts
+  outside `/var/www` are scanned as well; and `imagick` joins redis/mysqli/
+  gd/curl/mbstring as a hard Chevereto requirement.  `--upgrade-php=8.6`
+  now names all three blockers (redis and imagick for Chevereto, redis for
+  XenForo) and still refuses before the purge.  A skipped extension that is
+  installed twice (php-imagick and php8.5-imagick) is reported once, like the
+  dry run already did.
+- **A CLI-only PHP host is an upgrade, not a fresh install.**  With PHP
+  packages but no `phpX.Y-fpm`, the driver took the "nothing installed" path:
+  the purge still removed every PHP package but no extension inventory or
+  rollback point was taken.  The driver now falls back to any installed PHP
+  version, and a failed post-tune FPM start rolls the old version back
+  instead of leaving the host on a dead PHP.
+- **`--purge` now stops an adopted Redis and retires every unit it wrote.**
+  `--optimize` and `--restart-all` already treated Redis as a managed cache;
+  purge only stopped `valkey-server`, so `--purge`/`--purge all` left
+  `redis-server` enabled and holding memory.  `--purge others` missed
+  `sysstat-rotate.timer`, and `--purge basic` left
+  `/etc/systemd/system/setup-cpu-governor.service` behind (the install path
+  now records its previous state, so a host that already had a unit keeps
+  it).  Verified with a temporary redis-server: `--purge valkey` stopped and
+  disabled it; `--purge others` disabled all four sysstat units.
+- **UFW recognises the OpenSSH application profile.**  Provider images ship
+  `ufw allow OpenSSH`, which prints `OpenSSH ALLOW` and matched none of the
+  numeric checks: `configure_ufw` added a redundant rule and the purge
+  lockout guard added a `limit 22/tcp` to a host this script had not
+  configured.  The helpers now resolve the profile to port 22, and purge
+  removes it before restoring the original allow rule.
+- **The documented run-log name matches the file.**  `usage()` and README
+  said `setup_<timestamp>.log`; the mirror is
+  `setup_<timestamp>-<pid>.log`.
+- **Angie repository (1.6.29).**  `/wp-cron.php` is reachable from loopback
+  only (WordPress's own `spawn_cron`), instead of being denied to everyone;
+  percent-encoded dot segments are rejected like literal ones; Flarum's
+  writable `assets/` tree denies PHP; the XenForo guest cache stores an entry
+  only after two requests (`fastcgi_cache_min_uses 2`), so a single-shot
+  style-variation flood cannot fill the 16 GB zone; the CDN template no
+  longer caches the permission-checked `/media/<id>/` HTML route for 182
+  days and verifies the origin certificate; the HTTP/3 snippet no longer
+  carries `reuseport` (a second vhost made `angie -t` fail); the base
+  `example.com.conf` answers port 80 with a redirect and an ACME path; and
+  the Shlink template no longer points at a password file it does not ship.
+- **Validation.**  823 tuning checks and 193 CLI/dry-run checks pass;
+  `shellcheck -S warning -x` is clean (0.11.0, same file list as CI).
+  Install/`--optimize` state snapshots are identical (2 745 lines) and a
+  second `--optimize` changes nothing, before and after the three
+  applications were deployed.  Functional suite: 0 unexpected responses and
+  0 PHP diagnostics on 8.5; guest-cache cookie safety 61/61; security probe
+  54/54.
+- **Performance (workstation `oha`, Wi-Fi 802.11ax, 100/200 c, 8 s).**
+  Distribution defaults -> shipped tuning: XenForo member thread 246 -> 534
+  req/s (+117 %), WordPress member home 140 -> 292 (+109 %), WordPress
+  member post 131 -> 269 (+105 %).  Guest cache: XenForo 7 309 req/s
+  (p50 24.8 ms), WordPress 5 368 (p50 32.3), Chevereto `/explore` 5 654,
+  image 5 470, home 2 613.  Worker sweep 8/12/16/20/24 = 388/497/**575**/556/556,
+  JIT off/function/tracing 32/64/128 MB = 410/510/572/**573**/571.  Sustained
+  60 s authenticated XenForo (c=64): 563 req/s, p50 112 ms, p99 131 ms,
+  33 691 x 200, 0 non-2xx, CPU 94-97 %, 16/16 workers busy, 0 slow queries,
+  0 new error-log lines, 0 failed units.
+- **PHP ceiling.**  WordPress 7.1.4 bootstraps and serves on 8.6.0RC5 with 0
+  fatals (18 compile-time deprecations in bundled libraries on 8.5);
+  XenForo 2.3.13 reports 71 `null` array-offset deprecations in its own
+  `src/XF/App.php` plus vendor deprecations, and Chevereto 4.5.9 needs the
+  upstream `?ImageManager` fix; neither can move to 8.6 until `redis`,
+  `igbinary` and `imagick` are published there, and `--upgrade-php=8.6`
+  refuses before the purge.
+
 ## 1.21.7 (2026-11-15)
 
 Seventh audit of the 1.21 line on the Ubuntu 26.04.1 test host (16 logical
