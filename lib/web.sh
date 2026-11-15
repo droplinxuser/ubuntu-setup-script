@@ -1298,6 +1298,11 @@ tune_angie_configs() {
   local php_conf
   for php_conf in "$target"/h5bp/php*.conf; do
     [[ -f $php_conf ]] || continue
+    # Only an include that actually hands a request to FastCGI needs these
+    # buffers.  A file that only carries locations (and includes the handler
+    # from h5bp/php_wp_handler.conf, as h5bp/php_wp.conf does) has nothing to
+    # tune, so a missing directive is not a missed tune.
+    grep -qE '^[[:space:]]*fastcgi_pass[[:space:]]' "$php_conf" || continue
     tune_replace "$php_conf" '^([[:space:]]*fastcgi_buffer_size[[:space:]]+).*;' "\\1${body_buffer};" "${php_conf#"${target}"/}: fastcgi_buffer_size=${body_buffer}"
     tune_replace "$php_conf" '^([[:space:]]*fastcgi_buffers[[:space:]]+).*;' "\\1${fastcgi_buffers};" "${php_conf#"${target}"/}: fastcgi_buffers=${fastcgi_buffers}"
     tune_replace "$php_conf" '^([[:space:]]*fastcgi_busy_buffers_size[[:space:]]+).*;' "\\1${fastcgi_busy};" "${php_conf#"${target}"/}: fastcgi_busy_buffers_size=${fastcgi_busy}"

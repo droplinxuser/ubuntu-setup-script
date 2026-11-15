@@ -998,6 +998,22 @@ tune_reset_changes
 tune_angie_configs "$TMP/angie"
 check "second tune run is a no-op" test "$TUNE_DIRTY" -eq 0
 
+# A PHP include that only holds locations has no FastCGI buffers of its own:
+# h5bp/php_wp.conf now includes h5bp/php_wp_handler.conf for the handler, so
+# the buffer tuner must skip it instead of reporting three misses per install.
+mkdir -p "$TMP/angie-include"
+cp -a "$FIXTURES/." "$TMP/angie-include/"
+printf 'location ~ \\.php$ { include h5bp/php_wp_handler.conf; }\n' \
+  > "$TMP/angie-include/h5bp/php_wp.conf"
+printf 'fastcgi_pass local_php;\nfastcgi_buffer_size 1k;\nfastcgi_buffers 8 8k;\nfastcgi_busy_buffers_size 16k;\n' \
+  > "$TMP/angie-include/h5bp/php_wp_handler.conf"
+tune_reset_changes
+tune_angie_configs "$TMP/angie-include"
+check "an include without fastcgi_pass is not a missed buffer tune" \
+  test -z "$(printf '%s\n' "${TUNE_MISSES[@]}" | grep 'php_wp.conf' || true)"
+check "the shared PHP handler fragment is still tuned" \
+  not grep -q 'fastcgi_buffer_size 1k;' "$TMP/angie-include/h5bp/php_wp_handler.conf"
+
 # A pool that stays on TCP must leave Angie's TCP upstream alone.
 mkdir -p "$TMP/angie-tcp"
 cp -a "$FIXTURES/." "$TMP/angie-tcp/"
