@@ -508,16 +508,25 @@ plan_memory_budget() {
       fi
       [[ $data =~ ^[0-9]+$ ]] || data=0
       OPT_DB_SIZE_MB=$data
-      # A live database is sized from its own data: 4% of the current
-      # data+index size, not RAM.  A database pool is a page cache; 4% keeps
-      # the hot pages without reserving memory the host may need for PHP,
-      # search and the page cache (overcommitting a live server is worse than
-      # a cold read).  A fresh install has no data at all, so it keeps the
-      # RAM-proportional operational floor; an existing but empty database
-      # gets the 128 MB operational minimum (4% of nothing is nothing, and
-      # the only-increase rule below already protects a larger live pool).
+      # A live database is sized from its own data: the current data+index
+      # size plus 25% for growth.  The buffer pool is the database's page
+      # cache, and a pool smaller than the working set turns random reads
+      # into disk I/O; measured on this host with a 935 MB table, a 128 MB
+      # pool answered 71 k point queries/s with 92% physical reads, while a
+      # pool larger than the table answered 212 k/s with none.  A 4%-of-data
+      # rule (1.21.9-1.21.12) produced exactly that under-sized pool.  The
+      # pool is still capped at half of RAM and at the shared budget, so a
+      # huge database cannot starve PHP, search and the page cache; the
+      # scaling below trims it proportionally when the targets do not fit.
+      # A fresh install has no data at all, so it keeps the RAM-proportional
+      # operational floor; an existing but empty database gets the 128 MB
+      # operational minimum, and the only-increase rule below protects a
+      # larger live pool.
       if (( data > 0 )); then
-        maria_target=$(( data * 4 / 100 ))
+        maria_target=$(( data + data / 4 ))
+        local pool_cap=$(( total / 2 ))
+        (( pool_cap < 256 )) && pool_cap=256
+        (( maria_target > pool_cap )) && maria_target=$pool_cap
         (( maria_target < 128 )) && maria_target=128
       elif (( OPT_INSTALL_PLAN )); then
         maria_target=$(mariadb_floor_mb "$total")
@@ -1205,16 +1214,23 @@ angie_xenforo_vhosts() {
 angie_rewrite_include_at_level() {
   local file=$1 from=$2 to=$3 level=$4 tmp
   [[ -f $file ]] || return 1
-  grep -qE "^[[:space:]]*include[[:space:]]+h5bp/${from//./\\.};" "$file" || return 1
+  grep -qE "include[[:space:]]+h5bp/${from//./\\.};" "$file" || return 1
   tmp=$(tmp_file) || return 1
   awk -v from="$from" -v to="$to" -v level="$level" '
     {
       line = $0
       code = line
       sub(/#.*/, "", code)
-      if (code ~ ("^[[:space:]]*include[[:space:]]+h5bp/" from ";")) {
-        # depth 1 = server block, 2+ = inside a location
-        if ((level == "server" && depth == 1) || (level == "nested" && depth >= 2)) {
+      if (code ~ ("include[[:space:]]+h5bp/" from ";")) {
+        # depth 1 = server block, 2+ = inside a location.  A one-line
+        # `location /x/ { include ...; }` is still nested even though the
+        # brace counter has not entered the block yet, so an include that
+        # follows an opening brace on the same line counts as nested too.
+        incl = index(code, "include")
+        brace = index(code, "{")
+        nested = (depth >= 2) || (brace > 0 && brace < incl)
+        if ((level == "server" && depth == 1 && !nested) \
+            || (level == "nested" && nested)) {
           sub("h5bp/" from ";", "h5bp/" to ";", line)
         }
       }
@@ -1457,7 +1473,11 @@ optimize_wordpress_cache() {
   # Per-vhost include, on by default: inserted in the server block right
   # before the php_wp include so the cache directives precede the PHP
   # location, exactly where the template puts them.  SETUP_WP_GUEST_CACHE=0
-  # leaves the vhost uncached and reports it.
+  # leaves the vhost uncached and reports it.  A vhost with no php_wp include
+  # (a fully hand-written PHP location) has no safe anchor: the insertion is
+  # skipped and reported separately, instead of claiming the operator
+  # disabled the cache.
+  local -a wp_failed=()
   if [[ ${SETUP_WP_GUEST_CACHE:-1} == 1 ]]; then
     for vhost in "${wp_optout[@]}"; do
       if tune_insert_before "$vhost" '^[[:space:]]*include[[:space:]]+h5bp/php_wp\.conf;' \
@@ -1465,6 +1485,8 @@ optimize_wordpress_cache() {
            "${vhost#"${target}"/}: wordpress_cache include added"; then
         wp_enabled+=("$vhost")
         changed=1
+      else
+        wp_failed+=("$vhost")
       fi
     done
     wp_optout=()
@@ -1477,6 +1499,9 @@ optimize_wordpress_cache() {
   fi
   for vhost in "${wp_optout[@]}"; do
     opt_report "- WordPress: \`${vhost#"${target}"/}\` has no wordpress_cache include (guest cache disabled by SETUP_WP_GUEST_CACHE=0)"
+  done
+  for vhost in "${wp_failed[@]}"; do
+    opt_report "- WordPress: \`${vhost#"${target}"/}\` has no h5bp/php_wp.conf include to anchor the guest cache; add one (or include h5bp/wordpress_cache.conf by hand)"
   done
   return 0
 }

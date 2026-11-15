@@ -596,12 +596,15 @@ optimize_mariadb() {
     [[ ${OPT_DB_SIZE_MB:-} =~ ^[0-9]+$ ]] || OPT_DB_SIZE_MB=0
   fi
   if (( OPT_DB_SIZE_MB > 0 )); then
-    local pct_mb=$(( OPT_DB_SIZE_MB * 4 / 100 ))
+    local pct_mb=$(( OPT_DB_SIZE_MB + OPT_DB_SIZE_MB / 4 ))
+    local pool_cap=$(( $(mem_total_mb) / 2 ))
+    (( pool_cap < 256 )) && pool_cap=256
+    (( pct_mb > pool_cap )) && pct_mb=$pool_cap
     (( pct_mb < 128 )) && pct_mb=128
     if (( ${OPT_MARIADB_KEPT_MB:-0} > 0 )); then
-      opt_report "- Database data+index=${OPT_DB_SIZE_MB}MB; buffer pool=${size_mb}MB (kept existing pool; the 4% target is ${pct_mb}MB)"
+      opt_report "- Database data+index=${OPT_DB_SIZE_MB}MB; buffer pool=${size_mb}MB (kept existing pool; the data+25% target is ${pct_mb}MB)"
     else
-      opt_report "- Database data+index=${OPT_DB_SIZE_MB}MB; buffer pool=${size_mb}MB (4% of data = ${pct_mb}MB, 128MB minimum)"
+      opt_report "- Database data+index=${OPT_DB_SIZE_MB}MB; buffer pool=${size_mb}MB (data+25% = ${pct_mb}MB, 128MB minimum, RAM/2 ceiling)"
     fi
   fi
   mariadb_compute_profile "$size_mb"
@@ -1662,7 +1665,7 @@ optimize_plan() {
     db_size_mb=${OPT_DB_SIZE_MB:-0}
     db_fit=""
     if (( db_size_mb > 0 )); then
-      db_fit=", database=${db_size_mb}MB (4% of data = $(( db_size_mb * 4 / 100 ))MB, 128MB minimum"
+      db_fit=", database=${db_size_mb}MB (data+25% = $(( db_size_mb + db_size_mb / 4 ))MB, 128MB minimum, RAM/2 ceiling"
       (( ${OPT_MARIADB_KEPT_MB:-0} > 0 )) && db_fit+="; existing pool kept"
       db_fit+=")"
     fi

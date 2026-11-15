@@ -3,6 +3,36 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.13 (2026-11-16)
+
+- **The MariaDB buffer pool holds the working set again.**  1.21.9 sized
+  `innodb_buffer_pool_size` at **4%** of live data+index.  Measured on the
+  audit host with a 935 MB table, the 128 MB pool that rule produced
+  answered 71 k point queries/s with 92% physical reads, while a pool that
+  held the table (1.7 GB) answered 212 k/s with none -- a 3x regression for
+  exactly the high-concurrency member traffic the tuner exists for.  `auto`
+  is now **data+index plus 25%**, capped at half of RAM and at the shared
+  budget (the proportional trim still protects PHP, Valkey and
+  Elasticsearch), with the 128 MB operational minimum and the
+  only-increase rule unchanged.  A fresh install keeps its RAM/16 floor, so
+  this only raises an adopted host that was left at the 128 MB package
+  default.
+- **A hand-written XenForo vhost with a one-line nested include no longer
+  blocks the Angie sync.**  `location /x/ { include h5bp/php_xf.conf; }`
+  was not recognised as nested (the migration only matched an include at
+  the start of its own line), so `angie -t` rejected the canonical
+  server-level named location and the whole tree rolled back.  The
+  migration now also rewrites an include that follows an opening brace on
+  the same line.
+- **An unanchorable WordPress vhost is reported as such.**  A vhost that
+  includes `h5bp/wordpress.conf` but not `h5bp/php_wp.conf` has no safe
+  place to insert the guest-cache include; the report used to claim the
+  operator had set `SETUP_WP_GUEST_CACHE=0`.  It now names the missing
+  anchor and leaves the vhost alone.
+- **Validation.**  845 tuning checks, 193 dry-run cases, ShellCheck clean;
+  fresh install and `--optimize` parity (2 745-line state snapshot) on
+  Ubuntu 26.04.1.
+
 ## 1.21.12 (2026-11-16)
 
 - **Every guest cache reports the same `X-Cache-Status` header.**  The Angie

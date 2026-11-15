@@ -734,7 +734,7 @@ mariadb_compute_profile() {
   # Redo log: 25% of the total buffer pool, as mysqltuner recommends.  The
   # ratio is what bounds the checkpoint window: too small and every commit
   # forces a flush, too large and recovery after a crash gets long.  No upper
-  # cap: the pool follows 4% of the live data (--optimize), so a large ratio
+  # cap: the pool follows the live data (--optimize), so a large ratio
   # stays proportional instead of silently dropping below 25%.
   logsize=$(( size_mb / 4 ))
   (( logsize < 16 )) && logsize=16

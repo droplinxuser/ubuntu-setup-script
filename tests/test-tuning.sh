@@ -1353,15 +1353,29 @@ check "MariaDB gets the remaining budget after the PHP floor" \
 php_pool_max_children() { printf '128'; }
 OPT_DETECTED=(angie php:8.3 mariadb redis elastic)
 
-# The buffer pool is 4% of the live data+index size (a page cache, not a
-# mirror of the database): a 20 GB database gets 800 MB, not 20 GB.
+# The buffer pool is sized from the live data+index size plus 25% for growth
+# (a working-set cache, not a mirror of the database), capped at half of RAM.
+# A 20 GB database therefore gets 25 GB (the cap is not reached on 64 GB).
 mariadb_data_size_mb() { printf '20000'; }
 plan_memory_budget
-check "live pool is 4% of a 20 GB database" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 800
+check "live pool is data+25% for a 20 GB database" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 25000
 check "database-fit plan stays inside the 80% budget" \
   test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
        -le $(( 65536 * 80 / 100 ))
+
+# Measured regression guard: a pool smaller than the working set turns random
+# reads into disk I/O.  On the audit host a 935 MB table answered 71 k point
+# queries/s with a 128 MB pool and 92% physical reads, 212 k/s with a pool
+# that held the table (1.7 GB) and none.  A 935 MB database must therefore
+# get a pool of at least its own size.
+mem_total_mb() { printf '25600'; }
+mariadb_current_pool_mb() { printf '0'; }
+mariadb_data_size_mb() { printf '935'; }
+OPT_DETECTED=(angie php:8.5 mariadb)
+plan_memory_budget
+check "a 935 MB database is not under-sized" \
+  test "$OPT_MARIADB_BUDGET_MB" -ge 935
 
 # An empty database cannot be sized from data; the RAM-proportional floor
 # gives the pool room before the next --optimize.  A live database with only
@@ -1394,31 +1408,31 @@ effective_cpus() { printf '2'; }
 # A database larger than the remaining budget gets the largest feasible pool.
 mariadb_data_size_mb() { printf '40960'; }
 plan_memory_budget
-check "live pool is 4% of a 40 GB database" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 1638
+check "live pool for a 40 GB database is capped at half of RAM" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 32768
 check "40 GB database pool stays proportional, not data-sized" \
-  test "$OPT_DB_SIZE_MB" -eq 40960 -a "$OPT_MARIADB_BUDGET_MB" -eq 1638
+  test "$OPT_DB_SIZE_MB" -eq 40960 -a "$OPT_MARIADB_BUDGET_MB" -eq 32768
 
-# A pool already above the 4% target is kept: --optimize only increases.
+# A pool already above the data+25% target is kept: --optimize only increases.
 mem_total_mb() { printf '262144'; }
-mariadb_current_pool_mb() { printf '73728'; }
+mariadb_current_pool_mb() { printf '100000'; }
 mariadb_data_size_mb() { printf '73599'; }
 elasticsearch_data_size_mb() { printf '0'; }
 OPT_DETECTED=(angie php:8.4 mariadb valkey)
 plan_memory_budget
-check "large host keeps the live pool (the 4% target is lower)" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 73728
+check "large host keeps the live pool (the data+25% target is lower)" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 100000
 check "an only-increased pool is marked as preserved" \
-  test "$OPT_MARIADB_KEPT_MB" -eq 73728
+  test "$OPT_MARIADB_KEPT_MB" -eq 100000
 check "data-sized pool keeps the plan inside the 80% budget" \
   test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
        -le $(( 262144 * 80 / 100 ))
 
 # Re-running with a lower target must not shrink a live pool.
-mariadb_current_pool_mb() { printf '88300'; }
+mariadb_current_pool_mb() { printf '110000'; }
 plan_memory_budget
-check "a live pool above the 4% target is kept unchanged" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 88300
+check "a live pool above the data+25% target is kept unchanged" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 110000
 
 # A live pool that no longer fits the shared budget is still capped: the
 # 80%-of-RAM plan is the hard ceiling, not the target.
@@ -1433,13 +1447,13 @@ check "capped pool is not marked as preserved" \
 mariadb_current_pool_mb() { printf '0'; }
 mariadb_data_size_mb() { printf '300000'; }
 plan_memory_budget
-check "4% of a database larger than the shared budget is capped" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 12000
+check "a database larger than the shared budget is capped at half of RAM" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 131072
 check "capped data-sized plan still fits the 80% budget" \
   test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
        -le $(( 262144 * 80 / 100 ))
 
-# A MariaDB-only host reserves no PHP budget; the 4% pool is funded first.
+# A MariaDB-only host reserves no PHP budget; the database pool is funded first.
 mem_total_mb() { printf '65536'; }
 php_pool_max_children() { printf '0'; }
 mariadb_current_pool_mb() { printf '0'; }
@@ -1448,8 +1462,8 @@ OPT_DETECTED=(mariadb)
 plan_memory_budget
 check "MariaDB-only host reserves no PHP budget" \
   test "$OPT_PHP_BUDGET_MB" -eq 0
-check "MariaDB-only host sizes a 60 GB database at 4%" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 2400
+check "MariaDB-only host caps a 60 GB database at half of RAM" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 32768
 
 # Unknown data size (query failed) on a live service is treated like an empty
 # database: the 128 MB minimum, never a RAM-sized guess.
@@ -1829,6 +1843,24 @@ check "SETUP_WP_GUEST_CACHE=0 keeps the include off" \
   bash -c '! grep -q "include h5bp/wordpress_cache.conf" "$1"' _ "$TMP/wpguest/conf.d/blog.test.conf"
 check "the WordPress cache opt-out is reported" \
   grep -q 'SETUP_WP_GUEST_CACHE=0' <<<"${OPT_REPORT[*]}"
+
+# A hand-written vhost that includes only h5bp/wordpress.conf (its own PHP
+# location, no php_wp include) has no safe anchor.  It must be reported as
+# unanchored, not as an operator opt-out.
+printf '# wordpress static rules\n' > "$TMP/wpguest/h5bp/wordpress.conf"
+printf 'server {\n    root %s;\n    include h5bp/wordpress.conf;\n    location ~ [^/]\\.php(/|$) { fastcgi_pass local_php; }\n}\n' \
+  "$TMP/wpguest-root" > "$TMP/wpguest/conf.d/manual.test.conf"
+unset SETUP_WP_GUEST_CACHE
+tune_reset_changes
+OPT_REPORT=()
+optimize_wordpress_cache "$TMP/wpguest"
+check "an unanchorable WordPress vhost is not called an opt-out" \
+  bash -c '! grep -q "SETUP_WP_GUEST_CACHE=0" <<<"$1"' _ "${OPT_REPORT[*]}"
+check "an unanchorable WordPress vhost is reported" \
+  grep -q 'no h5bp/php_wp.conf include' <<<"${OPT_REPORT[*]}"
+check "the cache include is not inserted into an unanchorable vhost" \
+  bash -c '! grep -q "include h5bp/wordpress_cache.conf" "$1"' _ "$TMP/wpguest/conf.d/manual.test.conf"
+rm -f "$TMP/wpguest/conf.d/manual.test.conf" "$TMP/wpguest/h5bp/wordpress.conf"
 unset SETUP_WP_GUEST_CACHE CONFIG_SOURCE_DIR
 
 # A legacy XenForo include without any cache block must be completed by
@@ -2002,6 +2034,23 @@ tune_reset_changes
 angie_migrate_guest_cache_includes "$TMP/gcm"
 check "the include migration is idempotent" \
   test "${#TUNE_CHANGES[@]}" -eq 0
+
+# A one-line `location /x/ { include ...; }` is nested too.  Without this the
+# canonical php_xf.conf (server-level named location) makes `angie -t` fail
+# and the whole tree is rolled back.
+cat > "$TMP/gcm/conf.d/xf1line.conf" <<'EOF'
+server {
+    location /legacy/ { include h5bp/php_xf.conf; }
+    include h5bp/php_xf.conf;
+}
+EOF
+tune_reset_changes
+angie_migrate_guest_cache_includes "$TMP/gcm"
+check "a one-line nested php_xf.conf include becomes php.conf" \
+  grep -q 'location /legacy/ { include h5bp/php.conf; }' "$TMP/gcm/conf.d/xf1line.conf"
+check "the server-level include beside a one-line location is kept" \
+  grep -qx '    include h5bp/php_xf.conf;' "$TMP/gcm/conf.d/xf1line.conf"
+rm -f "$TMP/gcm/conf.d/xf1line.conf"
 # A Chevereto site with guest uploads enabled keeps (or returns to) the
 # uncached include: a cached page cannot carry the visitor's upload token.
 cp "$TMP/gcm/chev.before" "$TMP/gcm/conf.d/chev.conf"
@@ -2378,7 +2427,7 @@ check "fresh install full-stack plan stays inside the 80% budget" \
        -le $(( 27812 * 80 / 100 ))
 
 # A database that has just been initialised reports a few MB of system data.
-# 4% of that is below the operational minimum, so a live database with no
+# data+25% is below the operational minimum, so a live database with no
 # real rows gets 128 MB; the only-increase rule keeps the installer's larger
 # pool when one is already running.
 mariadb_data_size_mb() { printf '4'; }
@@ -2391,8 +2440,8 @@ check "measured-empty live database uses the 128 MB minimum" \
 # ---------------------------------------------------------------------------
 # Live-data protection
 # ---------------------------------------------------------------------------
-# A live MariaDB pool is only ever increased: a pool above the 4% target is
-# kept (shrinking would restart the server and empty the warm cache), while
+# A live MariaDB pool is only ever increased: a pool above the data+25% target
+# is kept (shrinking would restart the server and empty the warm cache), while
 # an Elasticsearch heap above store/4 is still reduced to free RAM.
 valkey_live_used_mb() { return 0; }
 mariadb_data_size_mb() { printf '2048'; }
@@ -2402,7 +2451,7 @@ elasticsearch_current_heap_mb() { printf '4096'; }
 OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
 OPT_INSTALL_PLAN=0
 plan_memory_budget
-check "live MariaDB pool above the 4% target is kept" \
+check "live MariaDB pool above the data+25% target is kept" \
   test "$OPT_MARIADB_KEPT_MB" -eq 4096 -a "$OPT_MARIADB_BUDGET_MB" -eq 4096
 check "live Elasticsearch heap is reduced to the store/4 minimum" \
   test "$OPT_ES_KEPT_MB" -eq 0 -a "$OPT_ES_BUDGET_MB" -eq 512
@@ -2430,7 +2479,7 @@ plan_memory_budget
 check "MariaDB+Valkey host reserves no PHP or Elasticsearch budget" \
   test "$OPT_PHP_BUDGET_MB" -eq 0 -a "$OPT_ES_BUDGET_MB" -eq 0
 check "MariaDB+Valkey host fits the live database target" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 200
+  test "$OPT_MARIADB_BUDGET_MB" -eq 6250
 check "MariaDB+Valkey plan stays inside the 80% budget" \
   test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
        -le $(( 27812 * 80 / 100 ))
@@ -2442,7 +2491,7 @@ valkey_live_used_mb() { printf '1000'; }
 OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
 plan_memory_budget
 check "full stack reserves MariaDB, Valkey and Elasticsearch first" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 320 \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 10000 \
        -a "$OPT_VALKEY_BUDGET_MB" -ge 1100 \
        -a "$OPT_ES_BUDGET_MB" -ge 512
 check "full stack still gets a viable PHP pool" \
