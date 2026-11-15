@@ -998,6 +998,14 @@ tune_reset_changes
 tune_angie_configs "$TMP/angie"
 check "second tune run is a no-op" test "$TUNE_DIRTY" -eq 0
 
+# The deploy path validates the synced tree before angie_apply_profile runs,
+# so it must apply the nested-include migration first (a hand-written vhost
+# may include php_xf.conf inside a location; the named location is
+# server-level only and angie -t fails otherwise).
+deploy_body=$(declare -f deploy_angie_tree)
+check "the Angie deploy test migrates nested XF includes first" \
+  bash -c 'a=$(grep -n "angie_migrate_guest_cache_includes" <<<"$1" | head -1 | cut -d: -f1); b=$(grep -n "angie -t" <<<"$1" | head -1 | cut -d: -f1); [[ -n $a && -n $b && $a -lt $b ]]' _ "$deploy_body"
+
 # A PHP include that only holds locations has no FastCGI buffers of its own:
 # h5bp/php_wp.conf now includes h5bp/php_wp_handler.conf for the handler, so
 # the buffer tuner must skip it instead of reporting three misses per install.

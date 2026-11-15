@@ -3,6 +3,23 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.10 (2026-11-16)
+
+- **A nested `php_xf.conf` include no longer blocks the Angie sync.**  A
+  hand-written XenForo vhost may include `h5bp/php_xf.conf` inside a
+  location (the old single-location snippet allowed it) as well as at server
+  level.  The canonical file defines a server-level named location
+  (`@xf_guest_cache`), which Angie rejects inside a location, so
+  `deploy_angie_tree`'s validation failed ("named location ... can occur on
+  the server level only") **before** `angie_migrate_guest_cache_includes`
+  could rewrite the nested include to `h5bp/php.conf`; the whole `/etc/angie`
+  tree was rolled back and `--optimize` exited 1 while the other services
+  still applied.  The migration now runs before the validation.  Found on a
+  live 48-CPU XenForo host (vhost included the snippet twice, once inside an
+  `auth_basic` location); after the change the sync validates, the nested
+  include becomes `php.conf`, and the server-level guest cache stays.
+- **Validation.**  833 tuning checks pass.
+
 ## 1.21.9 (2026-11-15)
 
 - **The buffer pool follows the database, not RAM.**  `--optimize` (and the

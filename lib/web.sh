@@ -2316,6 +2316,15 @@ deploy_angie_tree() {
   # Angie rejects duplicates in the http context before the tuner can run.
   tune_angie_dedupe_http "$target" || true
 
+  # A hand-written vhost may include h5bp/php_xf.conf inside a location (the
+  # old single-location snippet allowed that).  The canonical file defines a
+  # server-level named location, so the tree fails `angie -t` before the
+  # tuner's migration in angie_apply_profile would run.  Point such includes
+  # at the generic h5bp/php.conf first; the server-level include stays.
+  if declare -F angie_migrate_guest_cache_includes >/dev/null 2>&1; then
+    angie_migrate_guest_cache_includes "$target" || warn "Nested guest-cache include migration reported a problem"
+  fi
+
   # Normalise ownership/modes for everything except operator certificates and
   # stream configs.  scripts/*.sh stay executable for the Cloudflare cron job.
   find "$target" -path "$target/ssl" -prune -o \
