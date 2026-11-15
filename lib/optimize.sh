@@ -1393,10 +1393,10 @@ optimize_wordpress_cache() {
   done
 
   # Decide per vhost.  The template carries `include h5bp/wordpress_cache.conf;`
-  # in the server block and tells the operator to remove it for a site that
-  # personalises guest pages; a vhost without it is an opt-out, never silently
-  # re-enabled through the shared php_wp.conf (which every WordPress vhost
-  # includes).  SETUP_WP_GUEST_CACHE=1 adds the include to such vhosts.
+  # in the server block.  A vhost without it gets the include added by default
+  # (inserted before the php_wp include so the cache directives precede the PHP
+  # location); SETUP_WP_GUEST_CACHE=0 keeps it off and reports the vhost.
+  # The shared php_wp.conf include, when present, already covers every vhost.
   local -a wp_enabled=() wp_optout=()
   local shared_include=0 vhost
   if (( has_php_wp )) \
@@ -1416,10 +1416,10 @@ optimize_wordpress_cache() {
 
   if (( active_zone && active_map && include_ready )) \
      && [[ -f "${target}/h5bp/wordpress_cache.conf" ]] \
-     && { (( ${#wp_optout[@]} == 0 )) || [[ ${SETUP_WP_GUEST_CACHE:-0} != 1 ]]; }; then
+     && { (( ${#wp_optout[@]} == 0 )) || [[ ${SETUP_WP_GUEST_CACHE:-1} != 1 ]]; }; then
     opt_report "- WordPress: FastCGI guest cache already enabled for ${#wp_enabled[@]} vhost(s)"
     for vhost in "${wp_optout[@]}"; do
-      opt_report "- WordPress: \`${vhost#"${target}"/}\` has no wordpress_cache include (operator opt-out; SETUP_WP_GUEST_CACHE=1 adds it)"
+      opt_report "- WordPress: \`${vhost#"${target}"/}\` has no wordpress_cache include (guest cache disabled by SETUP_WP_GUEST_CACHE=0)"
     done
     return 0
   fi
@@ -1454,13 +1454,14 @@ optimize_wordpress_cache() {
       "${target}/h5bp/wordpress_cache.conf"
     changed=1
   fi
-  # Per-vhost include, only on request: inserted in the server block right
+  # Per-vhost include, on by default: inserted in the server block right
   # before the php_wp include so the cache directives precede the PHP
-  # location, exactly where the template puts them.
-  if [[ ${SETUP_WP_GUEST_CACHE:-0} == 1 ]]; then
+  # location, exactly where the template puts them.  SETUP_WP_GUEST_CACHE=0
+  # leaves the vhost uncached and reports it.
+  if [[ ${SETUP_WP_GUEST_CACHE:-1} == 1 ]]; then
     for vhost in "${wp_optout[@]}"; do
       if tune_insert_before "$vhost" '^[[:space:]]*include[[:space:]]+h5bp/php_wp\.conf;' \
-           '    include h5bp/wordpress_cache.conf; # added by setup.sh (SETUP_WP_GUEST_CACHE=1)' \
+           '    include h5bp/wordpress_cache.conf; # added by setup.sh (SETUP_WP_GUEST_CACHE=0 disables)' \
            "${vhost#"${target}"/}: wordpress_cache include added"; then
         wp_enabled+=("$vhost")
         changed=1
@@ -1475,7 +1476,7 @@ optimize_wordpress_cache() {
     opt_report "- WordPress: FastCGI guest cache already enabled for ${#wp_enabled[@]} vhost(s)"
   fi
   for vhost in "${wp_optout[@]}"; do
-    opt_report "- WordPress: \`${vhost#"${target}"/}\` has no wordpress_cache include (operator opt-out; SETUP_WP_GUEST_CACHE=1 adds it)"
+    opt_report "- WordPress: \`${vhost#"${target}"/}\` has no wordpress_cache include (guest cache disabled by SETUP_WP_GUEST_CACHE=0)"
   done
   return 0
 }

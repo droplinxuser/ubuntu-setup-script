@@ -3,6 +3,18 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.11 (2026-11-16)
+
+- **The WordPress guest cache is enabled by default.**  A WordPress vhost
+  without `include h5bp/wordpress_cache.conf;` is no longer treated as an
+  operator opt-out: `--optimize` inserts the include directly before the
+  vhost's `h5bp/php_wp.conf` include, where the template puts it, so guest
+  pages are cached without a manual vhost edit.  `SETUP_WP_GUEST_CACHE=0`
+  keeps such vhosts uncached and the report names them; an existing
+  per-vhost include, or the shared include in `php_wp.conf`, is left alone.
+  The insertion is idempotent, so a second `--optimize` changes nothing.
+- **Validation.**  837 tuning checks pass.
+
 ## 1.21.10 (2026-11-16)
 
 - **A nested `php_xf.conf` include no longer blocks the Angie sync.**  A

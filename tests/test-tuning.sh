@@ -1796,6 +1796,41 @@ check "the installer applies the same Angie profile" \
 check "WordPress and XenForo share one FastCGI cache zone helper" \
   bash -c 'grep -q "ensure_fastcgi_cache_zone" "$1" && grep -q "ensure_fastcgi_cache_zone" <<<"$(sed -n "/^optimize_wordpress_cache()/,/^}/p" "$1")"' _ "$ALL_SRC"
 
+# The WordPress guest cache is enabled by default: a vhost without the
+# include gets it added before the php_wp include; SETUP_WP_GUEST_CACHE=0
+# keeps it off and reports the vhost.
+mkdir -p "$TMP/wpguest/conf.d" "$TMP/wpguest/h5bp" "$TMP/wpguest/http.d" \
+         "$TMP/wpguest-root"
+printf 'include http.d/*.conf;\n' > "$TMP/wpguest/angie.conf"
+printf 'fastcgi_cache_path /home/nginx_cache levels=1:2 keys_zone=fastcgicache:64m max_size=1g inactive=1h use_temp_path=off;\n' \
+  > "$TMP/wpguest/http.d/fastcgi_cache.conf"
+printf 'map $request_uri $skip_cache { default 0; }\n' \
+  > "$TMP/wpguest/http.d/wordpress_cache_map.conf"
+printf '# wordpress guest cache\n' > "$TMP/wpguest/h5bp/wordpress_cache.conf"
+printf 'location ~ [^/]\\.php(/|$) { fastcgi_pass local_php; }\n' \
+  > "$TMP/wpguest/h5bp/php_wp.conf"
+printf '<?php\n' > "$TMP/wpguest-root/wp-config.php"
+printf 'server {\n    root %s;\n    include h5bp/php_wp.conf;\n}\n' \
+  "$TMP/wpguest-root" > "$TMP/wpguest/conf.d/blog.test.conf"
+CONFIG_SOURCE_DIR="$TMP/wpguest"
+tune_reset_changes
+OPT_REPORT=()
+optimize_wordpress_cache "$TMP/wpguest"
+check "WordPress guest cache is added by default" \
+  grep -q '^    include h5bp/wordpress_cache.conf;' "$TMP/wpguest/conf.d/blog.test.conf"
+check "the default WordPress cache add is reported as a change" \
+  test "${#TUNE_CHANGES[@]}" -gt 0
+sed -i '/include h5bp\/wordpress_cache.conf;/d' "$TMP/wpguest/conf.d/blog.test.conf"
+export SETUP_WP_GUEST_CACHE=0
+tune_reset_changes
+OPT_REPORT=()
+optimize_wordpress_cache "$TMP/wpguest"
+check "SETUP_WP_GUEST_CACHE=0 keeps the include off" \
+  bash -c '! grep -q "include h5bp/wordpress_cache.conf" "$1"' _ "$TMP/wpguest/conf.d/blog.test.conf"
+check "the WordPress cache opt-out is reported" \
+  grep -q 'SETUP_WP_GUEST_CACHE=0' <<<"${OPT_REPORT[*]}"
+unset SETUP_WP_GUEST_CACHE CONFIG_SOURCE_DIR
+
 # A legacy XenForo include without any cache block must be completed by
 # --optimize, and the second run must be a no-op.
 mkdir -p "$TMP/xfguest/conf.d" "$TMP/xfguest/h5bp" "$TMP/xfguest/http.d" \

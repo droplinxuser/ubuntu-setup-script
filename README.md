@@ -427,10 +427,11 @@ suspended errexit for the whole run). Steps:
    applied, `angie -t` runs, and the service is reloaded **once, and only
    when the tree digest changed**; a failed sync or test restores the previous
    tree, its unit drop-in and `/etc/default/angie`. Legacy underscore-named
-   `http.d` files are tuned in place. A WordPress vhost whose
-   `include h5bp/wordpress_cache.conf;` was removed is an opt-out: it is
-   reported, never re-enabled through the shared `php_wp.conf`
-   (`SETUP_WP_GUEST_CACHE=1` adds the include to such vhosts).
+   `http.d` files are tuned in place. A WordPress vhost without
+   `include h5bp/wordpress_cache.conf;` gets the include added before its
+   `php_wp.conf` include (the guest cache is on by default); set
+   `SETUP_WP_GUEST_CACHE=0` to keep such vhosts uncached, in which case they
+   are reported instead.
 3. PHP-FPM: every `/etc/php/<ver>/fpm` tree; a live TCP pool used through the
    `local_php` upstream is migrated to the Unix socket (graceful reload, or
    a short explicit restart when SIGUSR2 cannot open the listener).  The pool
@@ -588,7 +589,7 @@ Read on each run, not persisted:
 | `SETUP_PHP_SESSION_HARDENING` | 1 enables the opt-in session/cgi hardening |
 | `SETUP_WP_DB_SPLIT` | 0 keeps a WordPress `DB_USER` with global privileges as it is |
 | `SETUP_WP_ALLOW_FILE_MODS` | 1 keeps WordPress plugin installs enabled |
-| `SETUP_WP_GUEST_CACHE` | 1 re-adds the guest-cache include to WordPress vhosts that removed it |
+| `SETUP_WP_GUEST_CACHE` | 0 keeps the WordPress guest-cache include off; `--optimize` adds it to vhosts that lack it by default |
 | `SETUP_PURGE_MALWARE` | 1 deletes known webshells instead of quarantining them |
 | `SETUP_DOMAIN_OPTIMIZE` | 0 skips the tuning pass at the end of `--domain` |
 | `SETUP_CHEV_GUEST_CACHE` | 1 forces the Chevereto guest cache on, 0 off; by default it is on unless the site allows guest uploads |
