@@ -3871,5 +3871,21 @@ check "disabling Anubis restores the vhost byte-for-byte" \
 check "the restored vhost terminates TLS again" \
   grep -q 'listen      443 ssl;' "$TMP/anubis/conf.d/site.test.conf"
 
+# A vhost whose certificate comes from an http-level include has no
+# ssl_certificate line; the terminator must fall back to the default
+# certificate instead of leaving the site without a public listener.
+cat > "$TMP/anubis/conf.d/nocert.test.conf" <<'EOF'
+server {
+    listen 443 ssl;
+    server_name nocert.test;
+}
+EOF
+anubis_integrate_vhost "$TMP/anubis/conf.d/nocert.test.conf"
+anubis_render_terminators "$TMP/anubis/conf.d" "$TMP/anubis/terminators2.conf"
+check "a vhost without a local certificate uses the default one" \
+  grep -q 'ssl_certificate     /etc/angie/ssl/default/fullchain.pem;' "$TMP/anubis/terminators2.conf"
+check "the default-certificate fallback is reported" \
+  grep -q 'no ssl_certificate in the vhost, using the default certificate' "$TMP/anubis/terminators2.conf"
+
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

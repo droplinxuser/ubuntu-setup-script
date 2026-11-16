@@ -433,8 +433,13 @@ EOF
           n = split(names, a, " ")
           if (n == 0 || names == "" || names ~ /(^| )_($| )/) return
           if (cert == "" || key == "") {
-            printf "# skipped %s: no ssl_certificate found\n", FILENAME
-            return
+            # A vhost can inherit its certificate from an http-level include,
+            # where this parser cannot see it.  Keep the site reachable with
+            # the default certificate (the browser warns) instead of leaving
+            # a migrated vhost without a public listener.
+            cert = "/etc/angie/ssl/default/fullchain.pem"
+            key  = "/etc/angie/ssl/default/privkey.pem"
+            printf "# %s: no ssl_certificate in the vhost, using the default certificate\n", FILENAME
           }
           print ""
           print "server {"
