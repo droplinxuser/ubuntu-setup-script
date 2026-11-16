@@ -12,7 +12,7 @@ CHI=$(cat /root/audit/cookies/ch-image.url 2>/dev/null || echo https://chev.test
 one() { # label url cookiekey
   local label=$1 url=$2 key=${3:-} out cpu
   [[ $label =~ $F ]] || return 0
-  local -a h=(-H 'Accept-Encoding: gzip, br')
+  local -a h=(-H 'Accept-Encoding: gzip, br' -H 'User-Agent: setup-bench/1.0')
   [[ -n $key ]] && h+=(-H "Cookie: $(ck "$key")")
   wrk -t4 -c"$C" -d2s "${h[@]}" "$url" >/dev/null 2>&1
   bash $R/sample-cpu.sh $(( S + 1 )) /tmp/tier-cpu.txt >/dev/null 2>&1 &

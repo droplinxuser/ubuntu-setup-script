@@ -1314,8 +1314,20 @@ install_valkey() {
   fi
   [[ -n $io_threads ]] || io_threads=1
 
+  # Keep a socket path an operator already uses: application configs and
+  # remote clients point at it, and the writer below would otherwise rewrite
+  # `unixsocket` to the default on every re-install.  A stock distro file has
+  # the key commented out, so a fresh install still gets the default.
+  local socket
+  socket=$(valkey_conf_get "$conf" unixsocket)
+  [[ -n $socket ]] || socket=/run/valkey/valkey.sock
+
   # One writer for the base and tuning directives, shared with --optimize.
-  valkey_apply_config "$conf" valkey "$valkey_mb" "$policy" "$io_threads" /run/valkey/valkey.sock
+  # "adopt" is passed on install too: a re-install of an existing host must
+  # not wipe AOF persistence or rebind a cache that serves other app servers.
+  # The keep logic only fires for an unmanaged file with non-default values or
+  # for a marker a previous tune wrote, so a fresh install is unaffected.
+  valkey_apply_config "$conf" valkey "$valkey_mb" "$policy" "$io_threads" "$socket" adopt
   info "Valkey maxmemory: ${valkey_mb} MB (${policy}; shared memory plan)"
   tail -24 "$conf"
 

@@ -15,7 +15,7 @@ run() { # workers label url cookiekey
   local w=$1 label=$2 url=$3 key=${4:-} host out
   host=$(printf '%s' "$url" | awk -F/ '{print $3}')
   local -a a=(--no-tui --insecure --output-format json -z "${SECS}s" -c "$CONNS"
-    --connect-to "$host:443:127.0.0.1:443" -H 'Accept-Encoding: gzip, br')
+    --connect-to "$host:443:127.0.0.1:443" -H 'Accept-Encoding: gzip, br' -H 'User-Agent: setup-bench/1.0')
   [[ -n $key ]] && a+=(-H "Cookie: $(ck "$key")")
   "$OHA" "${a[@]}" "$url" >/dev/null 2>&1 || true
   out=$("$OHA" "${a[@]}" "$url" 2>/dev/null)

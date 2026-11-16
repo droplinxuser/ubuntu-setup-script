@@ -219,8 +219,15 @@ Notes:
   file falls back through Anubis.  `nobody` cannot traverse either socket
   directory; `www-data` can reach only the static one.
 - Anubis is a userspace proxy: cached guest pages still pass through it, so
-  compare capacity with the graph in `tests/stress-site/AUDIT-20261116-1.21.13.md`
-  before enabling it on a bandwidth-heavy origin.
+  compare capacity with the graph in `tests/stress-site/AUDIT-20261116-1.21.18.md`
+  before enabling it on a bandwidth-heavy origin.  The unit caps the Go
+  scheduler at `min(8, CPUs)`: on the 16-thread host that measured 6 871
+  cached pages/s (3.92 Anubis cores, p99 34.6 ms) against 7 203 with the
+  default 16 (4.17 cores, 35.1 ms), so throughput is unchanged while a spike
+  cannot claim every core PHP needs.
+- An empty `User-Agent` is challenged by the shipped policy, so a load test
+  must send one (`wrk` sends none by default); all loop harnesses now send
+  `User-Agent: setup-bench/1.0`.
 - `--optimize anubis=no` is safe to repeat; a host without the managed marker
   (for example an Anubis installed by hand) is left untouched.
 

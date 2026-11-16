@@ -9,7 +9,7 @@ ck() { awk -F'\t' -v k="$1" '$1 == k { print $2 }' $CK; }
 XFT=$(cat /root/audit/cookies/xf-thread.url)
 measure() { # url cookiekey -> "rps phpms"
   local url=$1 key=${2:-} out total
-  local -a h=(-H 'Accept-Encoding: gzip, br'); [[ -n $key ]] && h+=(-H "Cookie: $(ck "$key")")
+  local -a h=(-H 'Accept-Encoding: gzip, br' -H 'User-Agent: setup-bench/1.0'); [[ -n $key ]] && h+=(-H "Cookie: $(ck "$key")")
   wrk -t4 -c64 -d4s "${h[@]}" "$url" >/dev/null 2>&1
   bash $R/sample-cpu.sh 11 /tmp/sw-cpu.txt >/dev/null 2>&1 &
   out=$(wrk -t4 -c64 -d10s "${h[@]}" "$url" 2>&1); wait

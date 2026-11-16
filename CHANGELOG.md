@@ -3,6 +3,52 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.18 (2026-11-16)
+
+- **A re-install keeps Valkey's operator-owned cache settings.**  `--optimize`
+  deliberately preserves AOF persistence, a non-loopback `bind` and a custom
+  `unixsocket` when the cache holds sessions/queues or serves other app
+  servers, but `install_valkey` called the shared writer without `adopt`, so a
+  later run of the install command erased those markers and restarted the
+  service with `save ""`, `appendonly no`, a loopback bind and the default
+  socket: an AOF cache was wiped and a remote client lost its endpoint
+  (audited in 1.21.17).  The installer now passes `adopt` and the configured
+  socket, so both paths write the same file.  A fresh stock config is
+  unaffected: the keep rules only fire for a non-default or previously marked
+  file.
+- **`--upgrade-php` applies the full Angie profile.**  The upgrade called only
+  `tune_angie_configs`, while `--optimize` also runs the WordPress/XenForo
+  guest caches, the include migration, asset precompression and Brotli.  An
+  adopted host therefore kept old cache includes after a PHP upgrade and
+  reached a different state than `--optimize` (audited in 1.21.17).  It now
+  calls `angie_apply_profile`.
+- **`--optimize` recomputes the PHP `[PATH=]` sections after the Angie sync.**
+  The managed ini is derived from the Angie tree (`_cache_enc` in the cache
+  key, application roots), but PHP is tuned before Angie is synchronised.  On
+  a host whose `/etc/angie` was one repository version behind, the ini was
+  written from the old tree and changed again on the next run, and a newly
+  deployed application root never received its section.  The writer now runs
+  again after the Angie pass and reloads PHP only when it changed something;
+  two consecutive `--optimize` runs are byte-identical on the audit host.
+- **Leaner Anubis: `GOMAXPROCS` capped at 8.**  Go defaults to one P per CPU.
+  At 100 connections on the 16-thread host the default measured 7 203 cached
+  WordPress pages/s with 4.17 Anubis cores, `GOMAXPROCS=8` 6 871 req/s with
+  3.92 cores and the same p99 (4 = 5 925, 2 = 3 812).  Eight keeps the
+  throughput and bounds how much scheduler parallelism the proxy can ask for
+  when PHP needs the same cores; a host with 8 or fewer CPUs keeps its own
+  count.
+- **The benchmark harness sends a User-Agent.**  `wrk` sends none, which the
+  shipped Anubis policy correctly challenges (empty UA), so the tier and sweep
+  scripts measured challenge issuance for every tier (a flat ~37 000 req/s,
+  including the member pages) instead of the site.  All loop harnesses now
+  send `User-Agent: setup-bench/1.0`.
+- **Validation.**  894 tuning checks, 203 dry runs, 54/54 security, 61/61
+  guest-cookie, functional suite clean with Anubis on and off, install and
+  `--optimize` parity snapshot empty (230 files), two `--optimize` runs
+  byte-identical.  PHP 8.5 -> 8.4 -> 8.5 round trip: 14/15 extensions carried,
+  pool/ini/JIT identical, Angie reloaded, 0 functional errors; 8.6 is refused
+  before the purge because `php8.6-imagick`/`php8.6-redis` are unpublished.
+
 ## 1.21.17 (2026-11-16)
 
 - **Static assets no longer traverse the Anubis proxy.**  A page view asks for

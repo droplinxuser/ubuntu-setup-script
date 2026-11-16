@@ -1,5 +1,30 @@
 # Full-stack stress test reports
 
+## 1.21.18 re-audit (2026-11-16)
+
+Fresh 527-package baseline, full install, hardening and Anubis cost on the
+same host.  Full report: `AUDIT-20261116-1.21.18.md`.
+
+- **Parity:** install → `--optimize` → install snapshot diff empty (230
+  files); two `--optimize` runs byte-identical.  The PHP ini is now written
+  again after the Angie sync, so app-aware `[PATH=]` sections are stable.
+- **Hardening (Angie 1.6.34):** credential limiter covers subdirectory
+  installs and percent-encoded query routes (429 by #11 from the LAN);
+  WordPress `ai1wm-backups`/`updraft` and the generic PHP template no longer
+  execute uploads; subdirectory `wp-config.php`/`xmlrpc.php` denied; `^~`
+  static blocks regained dotfile/credential denies; cache keys delimited and
+  `min_uses 2`.  54/54 security, 61/61 cookie, functional clean.
+- **Loopback, Anubis off (100c, 8 s):** WP guest 67 590, post 60 439, member
+  287/267; XF guest 78 705/72 523, member 842/512; Chev explore 68 345, image
+  67 304, home 2 606.
+- **Anubis on:** pages 7 118 (WP), 10 742 (XF), 6 979 (Chev); members
+  -9 to -20 %; static assets 35 737 (shadow, ~unchanged).  `GOMAXPROCS=8`
+  keeps 6 871 req/s at the default's p99 with 3.92 cores (default 7 203 /
+  4.17); 4 = 5 925, 2 = 3 812.
+- **PHP:** 8.5 → 8.4 → 8.5 round trip clean (14/15 extensions carried, same
+  pool/ini, Angie reloaded); XenForo has one app-level deprecation on 8.5 and
+  none on 8.4; 8.6 refused before purge (imagick/redis unpublished).
+
 ## 1.21.15 re-audit (2026-11-16)
 
 Anubis and Angie hardening cycle on the same host.  Full report:

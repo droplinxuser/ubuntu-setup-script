@@ -733,11 +733,12 @@ php_upgrade_optimize() {
   # already written the Unix-socket pool, so the TCP->socket migration in
   # optimize_php_services cannot fire (it only runs while the pool is still
   # on TCP) and Angie would be reloaded against a dead port: every site 502.
-  # Apply the shared Angie tuner so --upgrade-php reaches the same state as
-  # --optimize (it only rewrites the managed directives).
+  # Apply the shared Angie profile so --upgrade-php reaches the same state as
+  # --optimize: guest caches, precompression, compression and the tuner, not
+  # only the tuner (an adopted host kept old cache includes otherwise).
   if [[ -n ${OPT_PHP_SOCKET:-} && -f /etc/angie/angie.conf ]]; then
     tune_reset_changes
-    if tune_angie_configs /etc/angie; then
+    if angie_apply_profile /etc/angie; then
       for change in "${TUNE_CHANGES[@]}"; do info "Angie: ${change}"; done
     else
       warn "Angie configuration could not be aligned with the PHP socket"

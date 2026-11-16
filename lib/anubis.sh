@@ -229,9 +229,18 @@ EOF
 }
 
 anubis_write_unit() {
-  local tmp
+  local tmp gomaxprocs
   tmp=$(tmp_file) || return 1
-  cat > "$tmp" <<'EOF'
+  # Go schedules one P per CPU by default.  Measured on the 16-thread audit
+  # host at 100 connections: default 7 203 cached pages/s (4.17 Anubis cores),
+  # GOMAXPROCS=8 6 871 req/s (3.92 cores, same p99), 4 = 5 925 (2.99), 2 =
+  # 3 812.  Eight keeps essentially all the throughput while bounding how much
+  # runtime parallelism the proxy can ask for when PHP needs the same cores.
+  # A small host keeps its own core count.
+  gomaxprocs=$(effective_cpus)
+  (( gomaxprocs > 8 )) && gomaxprocs=8
+  (( gomaxprocs > 0 )) || gomaxprocs=1
+  cat > "$tmp" <<EOF
 [Unit]
 Description=Anubis bot filter proxy (Angie)
 Documentation=https://anubis.techaro.lol/
@@ -256,6 +265,7 @@ LimitNOFILE=65536
 # cannot turn the relaxed collector into an OOM.
 Environment=GOGC=400
 Environment=GOMEMLIMIT=1GiB
+Environment=GOMAXPROCS=${gomaxprocs}
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

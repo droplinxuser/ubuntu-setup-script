@@ -21,7 +21,7 @@ one() { # label url cookiekey
   [[ $label =~ $F ]] || return 0
   host=$(printf '%s' "$url" | awk -F/ '{print $3}')
   args=(--no-tui --insecure --output-format json -z "${S}s" -c "$C" --connect-to "$host:443:${HOST}:443")
-  args+=(-H 'Accept-Encoding: gzip, br')
+  args+=(-H 'Accept-Encoding: gzip, br' -H 'User-Agent: setup-bench/1.0')
   [[ -n $key ]] && args+=(-H "Cookie: $(ck "$key")")
   "$OHA" "${args[@]}" "$url" >/dev/null 2>&1 || true   # warm
   local t0 p0 a0 t1 p1 a1 tot elapsed
