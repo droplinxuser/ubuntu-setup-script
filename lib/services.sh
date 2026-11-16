@@ -1625,7 +1625,7 @@ ensure_es_max_map_count() {
   ensure_state
   # --purge must be able to remove the file and put the boot value back.
   record_original "$f" sysctl.d-99-elasticsearch.conf
-  record_sysctl_originals vm.max_map_count
+  record_sysctl_values vm.max_map_count
   if [[ $(cat "$f" 2>/dev/null) != 'vm.max_map_count = 1048576' ]]; then
     printf 'vm.max_map_count = 1048576\n' > "$f"
     chmod 644 "$f"
@@ -2138,7 +2138,7 @@ create_domains() {
   fi
   for d in "${DOMAINS[@]}"; do
     [[ ${DOMAIN_APP[$d]:-basic} == xf ]] || continue
-    info "XenForo ${d}: dynamic Brotli is enabled; keep XF's Redis cache off on a single local-MariaDB host (measured slower), and disable the Members online / Trending / Featured widgets if you do not need them (measured +39% authenticated throughput)."
+    info "XenForo ${d}: dynamic Brotli is enabled; with php-redis + local Valkey keep the XF data cache on (measured +7-9% authenticated throughput; without php-redis the Credis fallback measured slower), and disable the Members online / Trending / Featured widgets if you do not need them (measured +39% authenticated throughput)."
   done
   # A new vhost changes what the tuner plans: the PHP-FPM worker cap, the
   # OPcache file budget, the FastCGI guest cache for the new root, and the

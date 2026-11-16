@@ -320,7 +320,10 @@ detect_storage() {
 }
 
 generate_hostname() {
-  printf '%sc-%sg-%s' "$(nproc)" "$(detect_ram_gb)" "$(detect_storage)"
+  # effective_cpus/mem_total_mb, not nproc/dmidecode: on a vCPU- or RAM-capped
+  # guest the name has to describe the resources the plan sizes (the same
+  # probes every tuner uses), or it advertises 16c-32g to a 2 vCPU guest.
+  printf '%sc-%sg-%s' "$(effective_cpus)" "$(( $(mem_total_mb) / 1024 ))" "$(detect_storage)"
 }
 
 is_nvme_storage() {
@@ -382,7 +385,7 @@ block_device_is_virtual() {
 classify_block_device() {
   local name=$1 rota tran
   case "$name" in nvme*) printf 'nvme'; return 0 ;; esac
-  rota=$(cat "/sys/block/${name}/queue/rotational" 2>/dev/null || echo 1)
+  rota=$(cat "${SETUP_SYS_BLOCK:-/sys/block}/${name}/queue/rotational" 2>/dev/null || echo 1)
   tran=$(lsblk -d -n -o TRAN "/dev/${name}" 2>/dev/null | tr -d '[:space:]')
   if [[ $rota == 0 || $tran == virtio || $tran == pv ]] || block_device_is_virtual "$name"; then
     printf 'ssd'

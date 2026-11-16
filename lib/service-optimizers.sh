@@ -1085,7 +1085,7 @@ optimize_valkey() {
   opt_report "- Local socket: \`${socket_path}\` (unixsocketperm 770)"
   opt_report "- Application config (not edited automatically):"
   opt_report "  XenForo: \`\$config['cache']['config']['host'] = '${socket_path}'; \$config['cache']['config']['port'] = 0;\`"
-  opt_report "  XenForo note: on a single host with local MariaDB, XF's Redis registry/session cache measured slower than MariaDB (1.33k vs 0.97k req/s in testing). Use it for multi-node or remote-DB setups, not by default."
+  opt_report "  XenForo note: with php-redis and this local socket the XF registry/session cache measured +7-9% authenticated throughput (1.21.23 audit); without php-redis the add-on's pure-PHP Credis client measured slower than local MariaDB (1.20.x audit). Keep it when \`redis\` is in \`php -m\`, disable it for Credis, and use it on multi-node or remote-DB setups."
   opt_report "  XenForo widgets: disabling Members online, Trending content and Featured content on the forum list measured +39% authenticated throughput and 13% smaller HTML; disable them in ACP > Widgets if they are not required."
   opt_report "  WordPress: \`define('WP_REDIS_PATH', '${socket_path}');\`"
   opt_report "  Laravel/phpredis: \`'host' => '${socket_path}', 'port' => 0\`"

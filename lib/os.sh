@@ -1053,6 +1053,11 @@ configure_ufw() {
   ufw allow 80 || true
   ufw allow 443 || true
   ufw --force enable
+  # ufw only exists from here on: the same align inside configure_sysctl runs
+  # before the package is installed on a pristine host, so without this call a
+  # fresh install would leave ufw's stock sysctl.conf to overwrite the managed
+  # profile on every boot while --optimize (ufw present) aligned it.
+  ufw_align_sysctl /etc/ufw/sysctl.conf /etc/sysctl.conf
   ufw status verbose || true
 
   ufw show added 2>/dev/null | sort -u > "${STATE_DIR}/ufw-added-after" || true

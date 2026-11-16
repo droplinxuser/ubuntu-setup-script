@@ -95,11 +95,14 @@ req x404 "$X/does-not-exist.php"
 chk "XF unknown .php is 404" "$ST" 404
 req xcss "$X/css.php?css=public%3Anormalize.css&s=1&l=1&d=1&k=x"
 chk "XF css.php carries no Set-Cookie" "$(ncook xcss)" 0
-# logout clears cookies -> Set-Cookie must pass
+# Logout clears cookies -> Set-Cookie must pass.  XenForo 2.3 renders the log
+# out control as a POST form (a GET to /logout/?t=... answers the form page
+# with 200 and sets nothing), so the CSRF token goes in the body.
 mt=$(grep -oE 'data-csrf="[^"]+"' "$T/xmem.body" | head -1 | sed 's/data-csrf="//;s/"//')
-req xout -b "$T/g.jar" -G --data-urlencode "t=$mt" "$X/logout/"
+chk "XF member page exposes a CSRF token for the log out form" "$([ -n "$mt" ] && echo y)" y
+req xout -b "$T/g.jar" --data-urlencode "_xfToken=$mt" "$X/logout/"
 chk "XF logout is accepted (303)" "$ST" 303
-chk "XF logout (GET, no-cache URI) passes its Set-Cookie headers" "$([ "$(ncook xout)" -ge 1 ] && echo y)" y
+chk "XF logout (POST, no-cache URI) passes its Set-Cookie headers" "$([ "$(ncook xout)" -ge 1 ] && echo y)" y
 
 echo "################ Chevereto"
 C=https://chev.test.local
