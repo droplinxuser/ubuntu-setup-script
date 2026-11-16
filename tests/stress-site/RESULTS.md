@@ -1,5 +1,20 @@
 # Full-stack stress test reports
 
+## 1.21.23 re-audit (2026-11-17)
+
+Pristine 505-package baseline, full install with Anubis, three applications,
+PHP 8.5 → 8.6 → 8.4 → 8.5, security and cookie suites, tuning sweeps,
+benchmarks against the published Host B reference, and a package-level
+restore (505 → 505).  Pair: `server-configs-nginx` 1.6.37.
+
+- Details: `AUDIT-20261117-1.21.23.md`; raw rows: `cycle-1.21.23/bench-summary.tsv`;
+  restore proof: `cycle-1.21.23/restore-delta.md`.
+- Headline: guest cache 90.2k req/s (reference 56.6k), member home 574
+  (537), thread 550 (431); with Anubis 31.3k / 557 / 570 (5.8k / 438 / 383).
+  JIT tracing +6–7 % over no JIT; 1 worker/CPU beats 24 and 32; Anubis
+  GOMAXPROCS=8 beats 16; static shadow +10.7 %; `E_ALL` costs 9 %, so the
+  shipped `E_ALL & ~E_DEPRECATED` stays.
+
 ## 1.21.20 re-audit (2026-11-16)
 
 Fresh 526-package baseline, full install with Anubis from the start, PHP
