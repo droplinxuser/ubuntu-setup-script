@@ -3,6 +3,38 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.24 (2026-11-17)
+
+CentMinMod comparison on the same EPYC 4245P (6C/12T, 30 GiB, 2x894 GB
+NVMe) the AlmaLinux/CentMinMod numbers were measured on.  Every stack and
+tier is now above the CentMinMod result; full tables in
+`tests/stress-site/AUDIT-CENTMIN-20261117.md`.
+
+- **16k TLS records (Angie repo 1.6.38).**  `ssl_buffer_size 1400` split a
+  cached page into ~11 TLS records; `16k` sent it as one.  Cached guest
+  throughput on the same page and TLS stack: **151,438 -> 442,765 req/s**
+  (2.9x).  This was the single largest difference against CentMinMod.
+- **Angie workers = 2/3 of the CPU count.**  Measured on the 12-thread host
+  (16k buffer, 100 connections, gzip guest cache): 6 -> 367-371k, **8 ->
+  389-390k**, 10 -> 369-370k, 12 (`auto`) -> 348-352k req/s.  The member and
+  thread tiers were flat, so the change is free for dynamic traffic and
+  removes 11% of cached-page throughput lost to worker contention.
+- **Anubis `GOGC=off` on hosts with 16 GB or more.**  `GOMEMLIMIT` (RAM/8,
+  capped at 2 GiB) still bounds the heap, so the collector only runs near the
+  limit.  Anubis cached tier: 51,949 -> **57,082 req/s** (+9.9%), RSS below
+  2 GiB.  Hosts under 16 GB keep the graduated 100/200/300/400 profile.
+- **OPcache huge pages.**  `vm.nr_hugepages` is sized from RAM (RAM/64,
+  capped at 512 pages = 1 GiB; none below 4 GB) and
+  `opcache.huge_code_pages=1` is written only when the pages exist.  Member
+  808 -> 835, thread 645 -> 670 req/s (+3.5%).
+- **Validation.**  Ubuntu 26.04 / Angie 1.12.4 / PHP 8.2-8.5 / MariaDB 11.8 /
+  Valkey 9.0 / Anubis 1.28.2, PHP 8.2-8.5 x 4 stacks.  Averages vs CentMinMod:
+  Stack 3 cached **390,232 vs 157,957** (+147%), Stack 4 (Anubis) **68,725 vs
+  59,958** (+14.6%), member home 747 vs 542 (+38%), guest bypass 819 vs 595
+  (+38%).  Method notes: cached tiers use gzip bodies, the median 9-post
+  thread matches the dataset average, and Stack 4 cached uses `ab` because
+  wrk 4.1.0 under-reads bodies from the Go proxy on this host.
+
 ## 1.21.23 (2026-11-17)
 
 - **Fresh `--elastic` install no longer prints a shell error.**

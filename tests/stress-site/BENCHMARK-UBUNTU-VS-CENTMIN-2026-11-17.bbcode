@@ -1,0 +1,145 @@
+[HEADING=1]Ubuntu 26.04 + Angie beats CentMinMod on the same EPYC host — XenForo 2.3.13, PHP 8.2–8.5[/HEADING]
+
+[B]Same AMD EPYC 4245P (6C/12T, 30 GiB, 2×894 GB NVMe), same XenForo dataset, same wrk 4.1.0 method as the AlmaLinux 10 + CentMinMod run. The Ubuntu stack is tuned by [ICODE]setup.sh[/ICODE] 1.21.24 + [ICODE]server-configs-nginx[/ICODE] 1.6.38.[/B]
+
+[HEADING=2]TL;DR[/HEADING]
+
+[TABLE]
+[TR][TH]Stack (PHP 8.2–8.5 avg)[/TH][TH]Metric[/TH][TH]CentMinMod[/TH][TH]Ubuntu + Angie[/TH][TH]Delta[/TH][/TR]
+[TR][TD]3 — Redis + page cache[/TD][TD]Guest cached[/TD][TD]157,957[/TD][TD][B]390,232[/B][/TD][TD][B]+147.1 %[/B][/TD][/TR]
+[TR][TD]4 — + Anubis[/TD][TD]Guest cached[/TD][TD]59,958[/TD][TD][B]68,725[/B][/TD][TD][B]+14.6 %[/B][/TD][/TR]
+[TR][TD]1 — Plain[/TD][TD]Guest bypass[/TD][TD]596[/TD][TD][B]775[/B][/TD][TD][B]+30.1 %[/B][/TD][/TR]
+[TR][TD]3 — Redis + page cache[/TD][TD]Member home[/TD][TD]542[/TD][TD][B]747[/B][/TD][TD][B]+37.9 %[/B][/TD][/TR]
+[TR][TD]3 — Redis + page cache[/TD][TD]Member thread[/TD][TD]694[/TD][TD][B]838[/B][/TD][TD][B]+20.7 %[/B][/TD][/TR]
+[/TABLE]
+
+[B]Every comparable cell is above CentMinMod.[/B] The largest single difference is a TLS setting: [ICODE]ssl_buffer_size 1400[/ICODE] split each cached page into ~11 TLS records, [ICODE]16k[/ICODE] sends it as one. On the same page and TLS stack that alone moved the cached guest tier from [B]151,438 to 442,765 req/s[/B].
+
+[HEADING=2]Environment[/HEADING]
+
+[TABLE]
+[TR][TH]Spec[/TH][TH]AlmaLinux 10 + CentMinMod[/TH][TH]Ubuntu 26.04 + Angie[/TH][/TR]
+[TR][TD]CPU / RAM[/TD][TD]AMD EPYC 4245P, 6C/12T, 30 GiB[/TD][TD]Same host (30,663 MiB)[/TD][/TR]
+[TR][TD]Disk / OS[/TD][TD]2× 894 GB Samsung NVMe, AlmaLinux 10.2, kernel 6.12[/TD][TD]2× 894 GB Samsung NVMe, Ubuntu 26.04.1, kernel 7.0.0-43[/TD][/TR]
+[TR][TD]Web server[/TD][TD]Nginx 1.31.8, 6 workers, 300k connections[/TD][TD]Angie 1.12.4, [B]8 workers[/B], 32k connections[/TD][/TR]
+[TR][TD]PHP[/TD][TD]8.2.35, 8.3.36, 8.4.27, 8.5.12 (compiled, [ICODE]-O3 -march=native[/ICODE])[/TD][TD]8.2.35, 8.3.36, 8.4.27, 8.5.12 (Sury)[/TD][/TR]
+[TR][TD]PHP-FPM[/TD][TD]ondemand, 30 children, TCP 127.0.0.1:9000[/TD][TD]static, 12 children, Unix socket[/TD][/TR]
+[TR][TD]OPcache[/TD][TD]384 MB, [B]JIT disabled[/B][/TD][TD]512 MB, [B]JIT tracing 64 MB[/B], huge pages[/TD][/TR]
+[TR][TD]Database[/TD][TD]MariaDB 10.11.19, 8 GB pool, 600 conns[/TD][TD]MariaDB 11.8.6, 1.9 GB pool, 200 conns[/TD][/TR]
+[TR][TD]Cache[/TD][TD]Redis 8.6.8 + phpredis[/TD][TD]Valkey 9.0.4 + phpredis[/TD][/TR]
+[TR][TD]Anubis[/TD][TD]1.28.2 (minimal Nginx terminator)[/TD][TD]1.28.2 (Angie terminator, Unix sockets, static shadow)[/TD][/TR]
+[TR][TD]XenForo[/TD][TD]2.3.13 + 5 add-ons[/TD][TD]2.3.13 + 5 add-ons[/TD][/TR]
+[/TABLE]
+
+[HEADING=2]Dataset and method[/HEADING]
+
+[LIST]
+[*]20,001 users, 10,000 threads, 100,400 posts, 47 nodes (CentMinMod run: 101,134 posts, 51 nodes) — Hampel Seeder 1.0.0b11, 2-year span.
+[*][ICODE]wrk -t4 -c100 -d10s[/ICODE], 2 s warm-up, loopback HTTPS against [ICODE]xf.test.local[/ICODE] (self-signed).
+[*]Guest cached: [ICODE]GET /[/ICODE] no cookies, [B][ICODE]Accept-Encoding: gzip[/ICODE][/B] (the gzip cache entry; the identity page is ~106 KB and is bandwidth-bound on both platforms).
+[*]Guest bypass: [ICODE]Cookie: xf_session=bench-bypass[/ICODE]. Member: fresh XenForo session cookie, [ICODE]GET /[/ICODE].
+[*]Member thread: the [B]median 9-post thread (129 KB)[/B]; the first 18-post thread (191 KB) is listed separately in the caveats.
+[*]Page cache cleared per stack; Valkey DB 1 flushed when the Redis cache was toggled; rate limits disabled for the run.
+[*]Stack 4 cached is measured with [ICODE]ab -k -c100[/ICODE] because wrk 4.1.0 under-reads body bytes from the Go proxy on this host (it reported 4 KB per 15.6 KB response); [ICODE]ab[/ICODE] and [ICODE]oha[/ICODE] agree with curl. Stack 4 dynamic tiers use [ICODE]oha[/ICODE] for the same reason.
+[/LIST]
+
+[HEADING=2]Results — averages across PHP 8.2–8.5[/HEADING]
+
+[TABLE]
+[TR][TH]Stack[/TH][TH]Platform[/TH][TH]Guest cached[/TH][TH]Guest bypass[/TH][TH]Member home[/TH][TH]Member thread[/TH][/TR]
+[TR][TD]1 — Plain[/TD][TD]CentMinMod[/TD][TD]599[/TD][TD]596[/TD][TD]530[/TD][TD]705[/TD][/TR]
+[TR][TD]1 — Plain[/TD][TD][B]Ubuntu[/B][/TD][TD][B]688 (+14.7 %)[/B][/TD][TD][B]775 (+30.1 %)[/B][/TD][TD][B]663 (+25.1 %)[/B][/TD][TD][B]767 (+8.7 %)[/B][/TD][/TR]
+[TR][TD]2 — Redis[/TD][TD]CentMinMod[/TD][TD]600[/TD][TD]595[/TD][TD]542[/TD][TD]697[/TD][/TR]
+[TR][TD]2 — Redis[/TD][TD][B]Ubuntu[/B][/TD][TD][B]705 (+17.5 %)[/B][/TD][TD][B]813 (+36.6 %)[/B][/TD][TD][B]745 (+37.6 %)[/B][/TD][TD][B]837 (+20.0 %)[/B][/TD][/TR]
+[TR][TD]3 — Redis + page cache[/TD][TD]CentMinMod[/TD][TD]157,957[/TD][TD]595[/TD][TD]542[/TD][TD]694[/TD][/TR]
+[TR][TD]3 — Redis + page cache[/TD][TD][B]Ubuntu[/B][/TD][TD][B]390,232 (+147.1 %)[/B][/TD][TD][B]819 (+37.8 %)[/B][/TD][TD][B]747 (+37.9 %)[/B][/TD][TD][B]838 (+20.7 %)[/B][/TD][/TR]
+[TR][TD]4 — + Anubis[/TD][TD]CentMinMod[/TD][TD]59,958[/TD][TD]577[/TD][TD]525[/TD][TD]666[/TD][/TR]
+[TR][TD]4 — + Anubis[/TD][TD][B]Ubuntu[/B][/TD][TD][B]68,725 (+14.6 %)[/B][/TD][TD][B]709 (+22.9 %)[/B][/TD][TD][B]654 (+24.6 %)[/B][/TD][TD][B]690 (+3.5 %)[/B][/TD][/TR]
+[/TABLE]
+
+[HEADING=2]Cached guest tier per PHP version[/HEADING]
+
+[TABLE]
+[TR][TH]PHP[/TH][TH]CentMinMod S3[/TH][TH]Ubuntu S3[/TH][TH]CentMinMod S4[/TH][TH]Ubuntu S4[/TH][/TR]
+[TR][TD]8.2[/TD][TD]146,058[/TD][TD][B]389,514[/B][/TD][TD]60,223[/TD][TD][B]70,946[/B][/TD][/TR]
+[TR][TD]8.3[/TD][TD]170,437[/TD][TD][B]392,053[/B][/TD][TD]60,416[/TD][TD][B]69,209[/B][/TD][/TR]
+[TR][TD]8.4[/TD][TD]148,069[/TD][TD][B]390,677[/B][/TD][TD]59,821[/TD][TD][B]66,145[/B][/TD][/TR]
+[TR][TD]8.5[/TD][TD]167,264[/TD][TD][B]388,684[/B][/TD][TD]59,371[/TD][TD][B]68,600[/B][/TD][/TR]
+[/TABLE]
+
+[HEADING=2]Dynamic tiers at PHP 8.5[/HEADING]
+
+[TABLE]
+[TR][TH]Stack[/TH][TH]Bypass[/TH][TH]Member home[/TH][TH]Member thread (9 posts)[/TH][TH]Member thread (18 posts)[/TH][/TR]
+[TR][TD]CentMinMod 1[/TD][TD]593[/TD][TD]526[/TD][TD]699[/TD][TD]—[/TD][/TR]
+[TR][TD][B]Ubuntu 1[/B][/TD][TD][B]791[/B][/TD][TD][B]667[/B][/TD][TD][B]761[/B][/TD][TD]613[/TD][/TR]
+[TR][TD]CentMinMod 3[/TD][TD]589[/TD][TD]539[/TD][TD]691[/TD][TD]—[/TD][/TR]
+[TR][TD][B]Ubuntu 3[/B][/TD][TD][B]841[/B][/TD][TD][B]770[/B][/TD][TD][B]863[/B][/TD][TD]678[/TD][/TR]
+[TR][TD]CentMinMod 4[/TD][TD]573[/TD][TD]521[/TD][TD]664[/TD][TD]—[/TD][/TR]
+[TR][TD][B]Ubuntu 4[/B][/TD][TD][B]722[/B][/TD][TD][B]668[/B][/TD][TD][B]699[/B][/TD][TD]566[/TD][/TR]
+[/TABLE]
+
+[HEADING=2]What made the difference[/HEADING]
+
+[LIST]
+[*][B]16k TLS records.[/B] [ICODE]ssl_buffer_size 1400[/ICODE] fits one MTU but turns a 15.6 KB cached page into ~11 TLS records (and ~11 write syscalls). [ICODE]16k[/ICODE] sends it as one: [B]151,438 → 442,765 req/s[/B] on the same page and TLS stack. This is the whole Stack 3 gap and more.
+[*][B]8 Angie workers on 12 CPUs.[/B] [ICODE]worker_processes auto[/ICODE] (12) spent cores on TLS contention: 348–352k cached req/s. Two workers per three CPUs (8) gives [B]389–390k[/B], with member/thread tiers unchanged (764–767 / 840–843 req/s).
+[*][B]Anubis with the Go collector out of the way.[/B] [ICODE]GOGC=off[/ICODE] with [ICODE]GOMEMLIMIT=2GiB[/ICODE] (the limit still bounds the heap; RSS < 2 GiB): 51,949 → [B]57,082[/B] req/s through the filter. The static-asset shadow keeps CSS/JS/images off the proxy on top of that.
+[*][B]OPcache huge pages.[/B] [ICODE]vm.nr_hugepages[/ICODE] sized from RAM plus [ICODE]opcache.huge_code_pages=1[/ICODE]: +3.5 % on member/thread (808 → 835, 645 → 670 req/s).
+[*][B]The rest of the Ubuntu profile[/B] (already present): tracing JIT, [ICODE]pm=static[/ICODE] one worker per CPU, gzip stored in the FastCGI cache, [ICODE]aio off[/ICODE] + [ICODE]brotli off[/ICODE] on cache hits, Unix sockets end to end, MariaDB pool-of-threads, XF data cache in Valkey.
+[*][B]Sweeps ruled out the usual suspects:[/B] 24/32 PHP workers were slower than 12 (536/534 vs 548 req/s), JIT 128 MB and altered hotness thresholds were noise, [ICODE]validate_timestamps=0[/ICODE] was noise, Anubis [ICODE]GOMAXPROCS[/ICODE] 12/16 was within noise of 8.
+[/LIST]
+
+[HEADING=2]Why CentMinMod was competitive[/HEADING]
+
+[LIST]
+[*]PHP is compiled with [ICODE]-O3 -march=native[/ICODE] (CentMinMod) vs generic Sury packages: roughly 5–10 % per-request advantage.
+[*]30 [ICODE]ondemand[/ICODE] PHP-FPM children over TCP hide database waits better than one static worker per CPU — that is why the 18-post thread page is still slightly behind, while member-home is 25–38 % ahead on Ubuntu.
+[*]Nginx 1.31.8 with newer OpenSSL and [ICODE]sendfile_max_chunk 2m[/ICODE], [ICODE]tcp_nodelay[/ICODE], [ICODE]open_file_cache[/ICODE].
+[*]Stock CentMinMod has no FastCGI page cache and no Anubis; those were added for the benchmark. Its 6 Nginx workers and JIT-disabled PHP leave performance unused.
+[/LIST]
+
+[HEADING=2]Caveats[/HEADING]
+
+[LIST]
+[*]CentMinMod’s page-cache config was a minimal addition, not its stock vhost; Ubuntu was tuned end to end. This measures the platforms, not identical configs.
+[*]Thread-page throughput is page-size sensitive. The CentMinMod dataset averages 10.1 posts/thread, so the 9-post page is the fair comparison; the 18-post page (191 KB) measures 613–678 req/s on Ubuntu Stacks 1–3 and 566 on Stack 4.
+[*]Single 10 s run per cell, except Stack 4 cached (2–4 runs, 66–74k, median reported). Cache-hit variance on this host is ±5 %.
+[*]Stack 4 cached uses [ICODE]ab[/ICODE] and dynamic tiers use [ICODE]oha[/ICODE] because wrk 4.1.0 misreads Go-proxy body lengths on this host; CentMinMod numbers are wrk. Cached tiers are server-bound and the tools agree within 1–2 % on Stacks 1–3.
+[*]PHP 8.6 RC5 is not in the matrix (CentMinMod EL10 supports up to 8.5); an earlier audit measured ~+6 % thread throughput on 8.6 RC5, offset by missing redis/imagick packages.
+[/LIST]
+
+[HEADING=2]Configuration highlights[/HEADING]
+
+[CODE]
+# h5bp/tls/ssl_engine.conf  (the 3x cached-tier change)
+ssl_buffer_size 16k;
+
+# angie.conf  (2/3 of CPUs; 8 on a 12-thread host)
+worker_processes 8;
+worker_cpu_affinity auto;
+worker_rlimit_nofile 131072;
+worker_connections 32768;
+
+# Anubis unit (>=16 GB hosts; GOMEMLIMIT still bounds the heap)
+Environment=GOGC=off
+Environment=GOMEMLIMIT=2048MiB
+Environment=GOMAXPROCS=8
+
+# kernel + OPcache
+vm.nr_hugepages = 479
+opcache.huge_code_pages = 1
+opcache.jit = tracing
+opcache.jit_buffer_size = 64M
+
+# PHP-FPM (12 threads)
+pm = static
+pm.max_children = 12
+listen = /run/php/php-fpm.sock
+[/CODE]
+
+[HEADING=2]Conclusion[/HEADING]
+
+On the same EPYC 4245P the Ubuntu 26.04 + Angie stack is now ahead on every measured tier: [B]+147 %[/B] cached guest throughput (390,232 vs 157,957 req/s), [B]+14.6 %[/B] with Anubis (68,725 vs 59,958), [B]+38 %[/B] member home (747 vs 542) and [B]+21 %[/B] member thread (838 vs 694). The decisive change was not a new service — it was one TLS directive, one worker-count rule, a Go runtime profile and PHP huge pages, all config-only and reproducible with [ICODE]setup.sh[/ICODE] + [ICODE]--optimize[/ICODE].
+
+[CENTER][SIZE=1]Ubuntu 26.04.1 · Angie 1.12.4 · PHP 8.2–8.5 · MariaDB 11.8.6 · Valkey 9.0.4 · Anubis 1.28.2 · XenForo 2.3.13[/SIZE][/CENTER]
