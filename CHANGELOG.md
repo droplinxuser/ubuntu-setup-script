@@ -3,6 +3,39 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.17 (2026-11-16)
+
+- **Static assets no longer traverse the Anubis proxy.**  A page view asks for
+  dozens of CSS/JS/image/font files, and the managed policy ALLOWs them, so
+  the Go hop filtered nothing and cost throughput: one CSS file measured
+  41 603 req/s through Anubis on the audit host (0.42 cores) and 137 090 req/s
+  on the new fast path (0.00 cores), with p99 8 ms -> 1 ms.  Every protected
+  vhost gets a **static-only shadow** server block on
+  `/run/angie-static/static.sock`: a mechanical copy of the application block
+  (same `server_name`, `root`, includes and locations) with the public
+  listeners and TLS directives removed and two guards added — a non-static URI
+  or a path that is not an existing file answers 404.  The terminator proxies
+  the asset extensions there and retries through Anubis on 404, so an
+  alias/rewrite endpoint or a missing file keeps working.
+  The shadow is what keeps the security model intact: XenForo's
+  `internal_data` stays `internal`, dotfiles/backup/archive denies still apply,
+  and `Range`/`HEAD`/conditional requests behave exactly as before (206/200/304
+  verified).  `www-data` can traverse the shadow directory, but the shadow
+  contains no PHP route: `/index.php`, `/wp-login.php`, `/wp-admin/` and a
+  writable `.php` all answer 404 there, while `nobody` cannot reach the socket
+  at all.  The real backend socket stays `0750 root:anubis`.  A server-level
+  `return`/`rewrite` block is skipped (its assets are redirected), and an
+  unknown `Host` hits a 404 `default_server` instead of the first site's root.
+  `SETUP_ANUBIS_STATIC_BYPASS=0` keeps every request on the proxy hop and is
+  persisted as `ANUBIS_STATIC_BYPASS`; `--optimize anubis=no` and
+  `--purge angie` remove the generated file with the rest.  If `angie -t`
+  rejects a shadow, the run drops the fast path, regenerates and keeps the
+  filter rather than failing the whole integration.
+- **Validation.**  894 tuning checks, 202-203 dry-run cases, 54/54 security,
+  61/61 guest-cookie, functional suite clean, cached page tiers unchanged
+  (WP 7.6 k, XF 10.7 k req/s), install/`--optimize`/disable/re-enable byte
+  stable.
+
 ## 1.21.16 (2026-11-16)
 
 - **`--upgrade-php` no longer prints false `[ERR]` lines.**  The upgrade

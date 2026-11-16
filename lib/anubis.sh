@@ -39,9 +39,39 @@ ANUBIS_STATE="${STATE_DIR}/anubis"
 ANUBIS_TERMINATORS="/etc/angie/conf.d/00-anubis-terminators.conf"
 ANUBIS_COMMON="/etc/angie/conf.d/00-anubis-common.conf"
 ANUBIS_LOCATION="/etc/angie/snippets/anubis-location.conf"
+# Static-asset fast path.  Every page view asks for dozens of CSS/JS/font/image
+# files and the managed policy ALLOWs them, so sending them through the Go
+# proxy buys no filtering and costs a hop (measured on the audit host: one CSS
+# file answered 41 603 req/s through Anubis and 137 090 req/s on this path,
+# with Anubis at 0.42 -> 0.00 cores).  The terminator proxies these extensions
+# to a *static-only shadow*
+# of the application server block on a second Unix socket, in a directory that
+# www-data may traverse.  The shadow reproduces the application's own root and
+# location rules (so /internal_data/ stays internal, dotfiles and backups stay
+# denied) and answers 404 for anything that is not an existing static file;
+# the terminator then falls back to Anubis.  A local account that reaches the
+# shadow socket therefore cannot execute PHP or reach a route that was not
+# already a public file.  SETUP_ANUBIS_STATIC_BYPASS=0 keeps every request on
+# the proxy hop.
+ANUBIS_STATIC_DIR="/run/angie-static"
+ANUBIS_STATIC_SOCKET="${ANUBIS_STATIC_DIR}/static.sock"
+ANUBIS_STATIC_BLOCKS="/etc/angie/conf.d/00-anubis-static.conf"
+# Extensions the terminator routes around the filter: no documents, archives
+# or API payloads, only the files a rendered page loads.
+ANUBIS_STATIC_ROUTE='^/(?:.*/)?[^/]+[.](?:css|js|mjs|map|png|jpe?g|gif|webp|avif|svg|ico|bmp|woff2?|ttf|otf|eot|mp4|webm|mp3|ogg|wav|wasm)$'
+# What the shadow may serve at all.  A superset of the route so the block's own
+# error_page target (.html) still resolves; it is never routed by the
+# terminator, so only the application's own rules decide these.
+ANUBIS_STATIC_GATE='^/(?:.*/)?[^/]+[.](?:css|js|mjs|map|png|jpe?g|gif|webp|avif|svg|ico|bmp|woff2?|ttf|otf|eot|mp4|webm|mp3|ogg|wav|wasm|html?)$'
+ANUBIS_STATIC_BYPASS="${SETUP_ANUBIS_STATIC_BYPASS:-${ANUBIS_STATIC_BYPASS:-1}}"
+[[ $ANUBIS_STATIC_BYPASS == 0 ]] || ANUBIS_STATIC_BYPASS=1
+ANUBIS_STATIC_PERSIST=0
+[[ -n ${SETUP_ANUBIS_STATIC_BYPASS+x} ]] && ANUBIS_STATIC_PERSIST=1
 ANUBIS_TMPFILES="/etc/tmpfiles.d/angie-anubis.conf"
 # Set when this run changed anything under /etc/angie; the caller reloads once.
 ANUBIS_ANGIE_DIRTY=0
+# 1 when a static-asset shadow server block was generated this run.
+ANUBIS_STATIC_ACTIVE=0
 ANUBIS_SUMMARY=""
 ANUBIS_FAILED=""
 ANUBIS_SERVICE_DIRTY=0
@@ -255,8 +285,12 @@ anubis_write_tmpfiles() {
   local tmp
   tmp=$(tmp_file) || return 1
   cat > "$tmp" <<'EOF'
-# setup.sh: directory for the Anubis backend Unix socket.
+# setup.sh: directories for the Anubis backend and static-shadow Unix sockets.
 d /run/angie 0750 root anubis -
+# The static shadow serves public files only; Angie workers (www-data) connect
+# to it for the asset fast path.  The application backend above stays closed
+# to www-data, so a local account cannot skip the filter for a dynamic page.
+d /run/angie-static 0750 root www-data -
 EOF
   if commit_if_changed "$ANUBIS_TMPFILES" "$tmp"; then ANUBIS_ANGIE_DIRTY=1; fi
   systemd-tmpfiles --create "$ANUBIS_TMPFILES" >/dev/null 2>&1 || true
@@ -282,6 +316,12 @@ upstream anubis {
 }
 upstream anubis_backend {
     server unix:${ANUBIS_BACKEND_SOCKET};
+    keepalive 64;
+}
+# Static-only shadow of the application blocks (see the header of
+# anubis_render_static_blocks).  Only www-data traverses its directory.
+upstream anubis_static {
+    server unix:${ANUBIS_STATIC_SOCKET};
     keepalive 64;
 }
 
@@ -455,6 +495,122 @@ anubis_integrate_vhost() {
   return 0
 }
 
+# Build the static-only shadow of every integrated application server block.
+#
+# The shadow is a mechanical copy of the block (server_name, root, every
+# include and location) on its own Unix socket, minus the public listeners and
+# TLS directives, plus two server-level guards:
+#
+#   if ($uri !~* "<static extensions>") { return 404; }
+#   if (!-f $request_filename)           { return 404; }
+#
+# Copying the block is what keeps the application's own rules in charge:
+# XenForo's `^~ /internal_data { internal; }`, the dotfile/backup denies,
+# `security_root_archives.conf`, exact-match locations and redirects all apply
+# exactly as they do on the backend socket.  The guards make every other URI
+# (and every miss) a 404, so the terminator falls back to Anubis and nothing
+# dynamic can be reached through this socket, even by a local www-data process.
+# A block with a server-level `return`/`rewrite` is skipped: its assets are
+# redirected, and pushing that redirect through the terminator would loop.
+anubis_render_static_blocks() {
+  local dir=${1:-/etc/angie/conf.d} out=${2:-$ANUBIS_STATIC_BLOCKS} tmp f moved
+  tmp=$(tmp_file) || return 1
+  {
+    cat <<EOF
+# Managed by setup.sh (ANUBIS=1).  Static-only shadow of every protected
+# application block.  Public asset files are served here without the Go proxy
+# hop; the terminator sends every other URI, and every miss, to Anubis.
+# An unknown Host must not fall through to the first shadow's root: answer 404
+# so the terminator retries through the filter and selects the right vhost.
+server {
+    listen unix:${ANUBIS_STATIC_SOCKET} default_server;
+    server_name _;
+    return 404;
+}
+EOF
+    if (( ANUBIS_STATIC_BYPASS )); then
+      for f in $(anubis_vhost_files "$dir"); do
+        anubis_vhost_integrated "$f" || continue
+        awk -v sock="unix:${ANUBIS_STATIC_SOCKET}" \
+            -v gate="${ANUBIS_STATIC_GATE}" -v file="$f" '
+          function count_braces(s,   t, n, m) {
+            t = s; n = gsub(/{/, "{", t)
+            t = s; m = gsub(/}/, "}", t)
+            return n - m
+          }
+          function reset() {
+            n = 0; names = 0; has_root = 0; has_listen = 0; redirect = 0
+          }
+          function flush(   i) {
+            if (!(names && has_root && has_listen) || redirect) return
+            print ""
+            printf "# shadow of %s\n", file
+            print "server {"
+            print "    listen " sock ";"
+            print "    # Public files only: everything else, and every miss, is"
+            print "    # a 404 here so the terminator falls back to Anubis."
+            printf "    if ($uri !~* \"%s\") { return 404; }\n", gate
+            print "    if (!-f $request_filename) { return 404; }"
+            for (i = 1; i <= n; i++) print body[i]
+            print "}"
+          }
+          BEGIN { in_block = 0; depth = 0; reset() }
+          {
+            code = $0
+            sub(/#.*/, "", code)
+            if (!in_block) {
+              if (code ~ /^[ \t]*server[ \t]*\{/) {
+                in_block = 1; reset(); depth = count_braces(code)
+              }
+              next
+            }
+            d = count_braces(code)
+            if (depth + d <= 0) { in_block = 0; depth = 0; flush(); next }
+            if (code ~ /^[ \t]*server_name[ \t]+/) {
+              v = code; sub(/^[ \t]*server_name[ \t]+/, "", v); sub(/;.*/, "", v)
+              sub(/[ \t]+$/, "", v)
+              if (v != "" && v !~ /(^| )_($| )/) names = 1
+            } else if (code ~ /^[ \t]*root[ \t]+/) {
+              has_root = 1
+            } else if (code ~ /^[ \t]*listen[ \t]+/) {
+              if (code ~ /443/ || index(code, "unix:") > 0) has_listen = 1
+            } else if (depth <= 1 && code ~ /^[ \t]*(return|rewrite)[ \t]+/) {
+              redirect = 1
+            }
+            # A public listener and its TLS state do not belong on this socket.
+            if (code ~ /^[ \t]*(listen|http2|ssl_|include[ \t]+h5bp\/tls\/)/) {
+              depth += d
+              next
+            }
+            body[++n] = $0
+            depth += d
+          }
+        ' "$f"
+      done
+    fi
+  } > "$tmp" || return 1
+  local blocks=0
+  blocks=$(grep -c '^# shadow of ' "$tmp" 2>/dev/null || true)
+  [[ $blocks =~ ^[0-9]+$ ]] || blocks=0
+  ANUBIS_STATIC_ACTIVE=0
+  if (( blocks > 0 && ANUBIS_STATIC_BYPASS )); then
+    ANUBIS_STATIC_ACTIVE=1
+  fi
+  if (( ! ANUBIS_STATIC_ACTIVE )); then
+    if [[ -e $out ]]; then
+      moved=$(preserve_to_tmp "$out" || true)
+      [[ -n $moved ]] && info "Anubis: no static shadow to serve, moved ${out} to ${moved}"
+      ANUBIS_ANGIE_DIRTY=1
+    fi
+    return 0
+  fi
+  if commit_if_changed "$out" "$tmp"; then
+    ANUBIS_ANGIE_DIRTY=1
+    tune_note "Anubis: static-asset shadow generated for ${blocks} vhost(s)"
+  fi
+  return 0
+}
+
 # Build the TLS terminators for every integrated vhost.  A terminator needs
 # the server_name and certificate of the backend block; a block without a
 # certificate is skipped with a warning (it cannot terminate TLS by itself).
@@ -471,7 +627,9 @@ EOF
       anubis_vhost_integrated "$f" || continue
       found=1
       protected=$(( protected + 1 ))
-      awk -v sock="${ANUBIS_BACKEND_SOCKET}" '
+      awk -v sock="${ANUBIS_BACKEND_SOCKET}" \
+          -v static="${ANUBIS_STATIC_ACTIVE}" \
+          -v route="${ANUBIS_STATIC_ROUTE}" '
         function flush(   n) {
           if (!integrated) return
           n = split(names, a, " ")
@@ -508,6 +666,31 @@ EOF
           print "        proxy_set_header X-Forwarded-Proto https;"
           print "    }"
           print ""
+          if (static) {
+            print "    # Static assets that exist in the application root are served by"
+            print "    # a static-only shadow of this vhost, without the Go proxy hop."
+            print "    # A miss (or an alias/rewrite endpoint) falls back to Anubis."
+            print "    location ~* " route " {"
+            print "        proxy_pass http://anubis_static;"
+            print "        proxy_http_version 1.1;"
+            print "        proxy_set_header Connection \"\";"
+            print "        proxy_set_header Host $host;"
+            print "        proxy_set_header X-Real-IP $remote_addr;"
+            print "        proxy_set_header X-Forwarded-For $remote_addr;"
+            print "        proxy_set_header X-Forwarded-Proto https;"
+            print "        proxy_set_header X-TLS-SNI-Name $ssl_server_name;"
+            print "        proxy_connect_timeout 5s;"
+            print "        proxy_read_timeout 60s;"
+            print "        # The shadow answers 404 for a miss (or an alias/rewrite"
+            print "        # endpoint); intercept it and retry through the filter."
+            print "        proxy_intercept_errors on;"
+            print "        error_page 404 = @anubis_static_miss;"
+            print "    }"
+            print "    location @anubis_static_miss {"
+            print "        include snippets/anubis-location.conf;"
+            print "    }"
+            print ""
+          }
           print "    location / {"
           print "        include snippets/anubis-location.conf;"
           print "    }"
@@ -596,7 +779,8 @@ anubis_restore_vhosts() {
 # Remove the generated Angie files (moving them to /tmp, never deleting).
 anubis_remove_angie_files() {
   local f moved
-  for f in "$ANUBIS_TERMINATORS" "$ANUBIS_COMMON" "$ANUBIS_LOCATION" "$ANUBIS_TMPFILES"; do
+  for f in "$ANUBIS_TERMINATORS" "$ANUBIS_COMMON" "$ANUBIS_LOCATION" \
+           "$ANUBIS_STATIC_BLOCKS" "$ANUBIS_TMPFILES"; do
     [[ -e $f ]] || continue
     moved=$(preserve_to_tmp "$f" || true)
     [[ -n $moved ]] && info "Anubis: moved ${f} to ${moved}"
@@ -654,6 +838,7 @@ anubis_enable() {
     fi
     anubis_integrate_vhost "$f" || rc=1
   done
+  anubis_render_static_blocks || rc=1
   anubis_render_terminators || rc=1
   if (( rc != 0 )); then
     ANUBIS_FAILED="vhost migration"
@@ -673,18 +858,39 @@ anubis_enable() {
   local t
   t=$(tmp_file) || return 1
   if ! /usr/sbin/angie -t >"$t" 2>&1; then
-    warn "Anubis: Angie rejected the integrated configuration; rolling back"
-    sed 's/^/  /' "$t" >&2 || true
-    anubis_restore_vhosts
-    anubis_remove_angie_files
-    /usr/sbin/angie -t >/dev/null 2>&1 || warn "Angie configuration is still invalid after rollback"
-    ANUBIS_FAILED="angie -t"
-    return 1
+    # A vhost construct the shadow cannot reproduce must not cost the host its
+    # bot filter: drop the fast path for this run, regenerate, and test again.
+    if (( ANUBIS_STATIC_ACTIVE )); then
+      warn "Anubis: Angie rejected the static-asset shadow; retrying without it"
+      ANUBIS_STATIC_BYPASS=0
+      ANUBIS_STATIC_ACTIVE=0
+      # Keep the operator's persisted choice: the host failed this run, not
+      # the request.  The next --optimize retries and reports again.
+      ANUBIS_STATIC_PERSIST=0
+      anubis_render_static_blocks >/dev/null 2>&1 || true
+      anubis_render_terminators >/dev/null 2>&1 || true
+    fi
+    if ! /usr/sbin/angie -t >"$t" 2>&1; then
+      warn "Anubis: Angie rejected the integrated configuration; rolling back"
+      sed 's/^/  /' "$t" >&2 || true
+      anubis_restore_vhosts
+      anubis_remove_angie_files
+      /usr/sbin/angie -t >/dev/null 2>&1 || warn "Angie configuration is still invalid after rollback"
+      ANUBIS_FAILED="angie -t"
+      return 1
+    fi
   fi
   install -d -m 700 "$ANUBIS_STATE"
   : > "$(anubis_marker)"
   persist_tuning_var ANUBIS 1
-  ANUBIS_SUMMARY="Anubis: enabled (difficulty 4, Unix sockets, policy ${ANUBIS_POLICY}; $(anubis_vhost_files | wc -l) vhost(s) protected)"
+  if (( ANUBIS_STATIC_PERSIST )); then
+    persist_tuning_var ANUBIS_STATIC_BYPASS "$ANUBIS_STATIC_BYPASS"
+  fi
+  local static_note=""
+  if (( ANUBIS_STATIC_ACTIVE )); then
+    static_note=", static assets bypass the proxy"
+  fi
+  ANUBIS_SUMMARY="Anubis: enabled (difficulty 4, Unix sockets, policy ${ANUBIS_POLICY}; $(anubis_vhost_files | wc -l) vhost(s) protected${static_note})"
   if (( changed )); then ANUBIS_ANGIE_DIRTY=1; fi
   return 0
 }
@@ -752,7 +958,7 @@ anubis_remove_all() {
   systemctl stop anubis >/dev/null 2>&1 || true
   systemctl disable anubis >/dev/null 2>&1 || true
   rm -f "$ANUBIS_UNIT" "$ANUBIS_BIN" "$ANUBIS_ENV" "$ANUBIS_POLICY" 2>/dev/null || true
-  rm -rf "$ANUBIS_ETC" "$ANUBIS_STATE" /run/anubis /var/lib/anubis /var/cache/anubis 2>/dev/null || true
+  rm -rf "$ANUBIS_ETC" "$ANUBIS_STATE" /run/anubis /run/angie-static /var/lib/anubis /var/cache/anubis 2>/dev/null || true
   if id "$ANUBIS_USER" >/dev/null 2>&1; then
     userdel "$ANUBIS_USER" >/dev/null 2>&1 || true
   fi

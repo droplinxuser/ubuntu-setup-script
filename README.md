@@ -185,6 +185,7 @@ sudo bash setup.sh --optimize anubis=no
 | Release | Anubis 1.28.2, static `linux-amd64` or `linux-arm64` binary from the official GitHub release, SHA-256 verified |
 | Service | `anubis.service`, system user `anubis`, Unix socket `/run/anubis/nginx.sock`, metrics on `127.0.0.1:8240`, sandboxed unit |
 | Angie path | `:443` TLS terminator -> Anubis (Unix socket) -> application vhost (Unix socket `/run/angie/anubis-backend.sock`) |
+| Static assets | CSS/JS/images/fonts/media are proxied to a static-only *shadow* of each application block on `/run/angie-static/static.sock`: same root, same includes and deny rules, and a 404 for every non-file URI or miss, which the terminator retries through Anubis.  Assets never enter the Go proxy; a dynamic route cannot be reached through this socket even by a local account. Measured 41 603 -> 137 090 req/s for one CSS file, Anubis 0.42 -> 0.00 cores. `SETUP_ANUBIS_STATIC_BYPASS=0` disables it |
 | Vhost migration | every `conf.d` site with a `server_name` has its 443 listeners moved to the backend socket and gets a generated terminator; the original file is kept in `/var/lib/setup.sh/anubis/vhosts/*.orig` |
 | Backend trust | `set_real_ip_from unix:` + `real_ip_header X-Real-IP`, so PHP and the per-IP limiter see the client address |
 | HTTPS flag | the application leg is HTTP; the Angie tree rebuilds PHP's `HTTPS` from `X-Forwarded-Proto` (`http.d/https_map.conf`) |
@@ -203,13 +204,20 @@ Environment options:
 | `SETUP_ANUBIS_VERSION` | `1.28.2` | another release tag; set `SETUP_ANUBIS_SHA256` with it |
 | `SETUP_ANUBIS_SHA256` | pinned per architecture | expected tarball checksum for a custom version |
 | `SETUP_ANUBIS_BRANDING=1` | off | keep Anubis's stock challenge page |
+| `SETUP_ANUBIS_STATIC_BYPASS=0` | on | keep static assets on the Anubis proxy hop (persisted as `ANUBIS_STATIC_BYPASS`) |
 
 Notes:
 
 - One Anubis instance served ~49 000 req/s on the 16-CPU audit host (about
-  0.16 ms of CPU per proxied request; ~1.1 GB/s of body copy).  On hosts with
-  a sustained rate above that, run several instances behind an Angie
-  `upstream` or bypass static assets at the terminator.
+  0.16 ms of CPU per proxied request; ~1.1 GB/s of body copy).  The static
+  fast path keeps the bulk of a real site's request volume (assets) out of it;
+  measure `tests/stress-site/AUDIT-20261116-1.21.17-static-fastpath.md` before
+  changing it.
+- The static shadow is generated from each integrated application block, so
+  `/internal_data` (XenForo) stays `internal`, dotfiles and backup archives
+  stay denied, `Range`/`HEAD`/conditional requests keep working and a missing
+  file falls back through Anubis.  `nobody` cannot traverse either socket
+  directory; `www-data` can reach only the static one.
 - Anubis is a userspace proxy: cached guest pages still pass through it, so
   compare capacity with the graph in `tests/stress-site/AUDIT-20261116-1.21.13.md`
   before enabling it on a bandwidth-heavy origin.

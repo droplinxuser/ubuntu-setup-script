@@ -3888,6 +3888,66 @@ anubis_render_terminators "$TMP/anubis/conf.d" "$TMP/anubis/terminators.conf"
 check "the terminator render is idempotent" \
   test "$terminator_md5" = "$(md5sum < "$TMP/anubis/terminators.conf")"
 
+# The static-asset fast path: a static-only shadow of the application block on
+# its own socket.  It must keep the application's root and rules, drop the
+# public TLS listener, and refuse anything that is not an existing static file.
+ANUBIS_STATIC_SOCKET="$TMP/anubis/static.sock"
+ANUBIS_STATIC_BLOCKS="$TMP/anubis/static.conf"
+ANUBIS_STATIC_BYPASS=1
+ANUBIS_STATIC_ACTIVE=0
+anubis_render_static_blocks "$TMP/anubis/conf.d" "$TMP/anubis/static.conf"
+check "the static shadow listens on its own socket" \
+  grep -qx "    listen unix:${ANUBIS_STATIC_SOCKET};" "$TMP/anubis/static.conf"
+check "the static shadow keeps the application root" \
+  grep -qx '    root /var/www/site.test/public;' "$TMP/anubis/static.conf"
+check "the static shadow keeps the application rules" \
+  grep -qx '    include h5bp/php_wp.conf;' "$TMP/anubis/static.conf"
+check "the static shadow refuses a non-static URI" \
+  grep -q 'if (\$uri !~\* ".*css|js' "$TMP/anubis/static.conf"
+check "the static shadow refuses a missing file" \
+  grep -qx '    if (!-f $request_filename) { return 404; }' "$TMP/anubis/static.conf"
+check "the static shadow drops the public TLS listener" \
+  bash -c '! grep -qE "listen +443|ssl_certificate|http2 on;" "$1"' _ "$TMP/anubis/static.conf"
+check "the static shadow has a 404 default server for an unknown Host" \
+  grep -qx "    listen unix:${ANUBIS_STATIC_SOCKET} default_server;" "$TMP/anubis/static.conf"
+check "the catch-all block itself is not copied" \
+  bash -c '! grep -q "^# shadow of .*default.conf" "$1"' _ "$TMP/anubis/static.conf"
+check "the static shadow sets the active flag" test "$ANUBIS_STATIC_ACTIVE" = 1
+anubis_render_terminators "$TMP/anubis/conf.d" "$TMP/anubis/terminators.conf"
+check "the terminator proxies assets to the static shadow" \
+  grep -q 'proxy_pass http://anubis_static;' "$TMP/anubis/terminators.conf"
+check "an asset miss falls back to Anubis" \
+  grep -qx '        error_page 404 = @anubis_static_miss;' "$TMP/anubis/terminators.conf"
+static_md5=$(md5sum < "$TMP/anubis/static.conf")
+anubis_render_static_blocks "$TMP/anubis/conf.d" "$TMP/anubis/static.conf"
+check "the static shadow render is idempotent" \
+  test "$static_md5" = "$(md5sum < "$TMP/anubis/static.conf")"
+# A server-level redirect cannot be pushed through the proxy again.
+cat > "$TMP/anubis/conf.d/redirect.test.conf" <<'EOF'
+server {
+    listen 443 ssl;
+    server_name redirect.test;
+    root /var/www/redirect.test/public;
+    return 301 https://redirect.test$request_uri;
+}
+EOF
+sed -i "s|listen 443 ssl;|listen unix:${ANUBIS_BACKEND_SOCKET};|" "$TMP/anubis/conf.d/redirect.test.conf"
+anubis_render_static_blocks "$TMP/anubis/conf.d" "$TMP/anubis/static.conf"
+check "a redirecting block gets no static shadow" \
+  bash -c '! grep -q "server_name redirect.test;" "$1"' _ "$TMP/anubis/static.conf"
+rm -f "$TMP/anubis/conf.d/redirect.test.conf"
+# The operator switch turns the fast path off completely.
+ANUBIS_STATIC_BYPASS=0
+ANUBIS_STATIC_ACTIVE=0
+anubis_render_static_blocks "$TMP/anubis/conf.d" "$TMP/anubis/static.conf" >/dev/null 2>&1 || true
+check "disabling the fast path removes the static shadow" test ! -e "$TMP/anubis/static.conf"
+check "disabling the fast path clears the active flag" test "$ANUBIS_STATIC_ACTIVE" = 0
+ANUBIS_STATIC_BYPASS=1
+anubis_render_terminators "$TMP/anubis/conf.d" "$TMP/anubis/terminators.conf"
+check "no static location without the shadow" \
+  bash -c '! grep -q "proxy_pass http://anubis_static;" "$1"' _ "$TMP/anubis/terminators.conf"
+
+
 anubis_restore_vhosts "$TMP/anubis/conf.d" "$TMP/anubis/state/vhosts"
 check "disabling Anubis restores the vhost byte-for-byte" \
   cmp -s "$TMP/anubis/site.before" "$TMP/anubis/conf.d/site.test.conf"

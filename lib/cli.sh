@@ -77,6 +77,12 @@ Services (optional; only the ones listed are installed):
                   Only valid with --angie.  The choice is persisted as
                   ANUBIS=1 so later --optimize runs keep it.  anubis=no is
                   accepted for symmetry and leaves the host unchanged.
+                  Static assets (CSS/JS/images/fonts/media) are served by a
+                  static-only shadow of each vhost instead of the Go proxy:
+                  same root and same deny rules, every other URI and every
+                  miss still goes through Anubis.  SETUP_ANUBIS_STATIC_BYPASS=0
+                  keeps them on the proxy hop (persisted as
+                  ANUBIS_STATIC_BYPASS).
   --php       [ver=8.5] [children=auto|N] [max_requests=N]
       ver          PHP version (default: latest stable in Sury)
       children     PHP-FPM worker count (default: auto from RAM/CPU)
