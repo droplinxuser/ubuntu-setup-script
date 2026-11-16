@@ -3,6 +3,41 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.19 (2026-11-16)
+
+- **The whole Anubis Go profile is hardware-derived.**  Only `GOMAXPROCS` was
+  scaled (cores, capped at 8); `GOGC`, `GOMEMLIMIT` and the unit's
+  `LimitNOFILE` were constants chosen on the 16-core/28 GB audit host, so a
+  2-core/2 GB VPS got a 1 GiB heap backstop and a 64-core/512 GB host got the
+  same 65 536 fd ceiling as a 16-core one.  Four pure helpers now share one
+  rule between the unit writer, the log line and the tests:
+
+  | Value | Rule | 2c/2 GB | 4c/4 GB | 8c/16 GB | 16c/32 GB | 64c/64 GB |
+  |---|---|---:|---:|---:|---:|---:|
+  | `GOMAXPROCS` | `clamp(cores, 1, 8)` (measured plateau) | 2 | 4 | 8 | 8 | 8 |
+  | `GOGC` | 100 ≤2 GB, 200 ≤4 GB, 300 ≤8 GB, 400 above | 100 | 200 | 400 | 400 | 400 |
+  | `GOMEMLIMIT` | `clamp(RAM/8, 256 MiB, 2 GiB)` | 256M | 512M | 2G | 2G | 2G |
+  | `LimitNOFILE` | `clamp(cores × 4096, 16k, 128k)` | 16k | 16k | 32k | 65k | 128k |
+
+  A small VPS keeps Go's default collector (a relaxed heap on 2 GB leaves no
+  headroom for PHP/MariaDB); large hosts keep the measured `GOGC=400` and a
+  backstop proportional to RAM.  The applied profile is part of the
+  `Anubis: enabled (...)` summary in the run log and the optimize report.
+- **Audit of the other services:** every remaining value is already derived
+  from the live host — Angie worker processes/connections/fd limits/open-file
+  cache/cache zones from CPU, RAM and free disk; PHP workers, memory,
+  realpath and OPcache from CPU and RAM; MariaDB pool, redo, connections and
+  I/O capacity from live data, RAM and disk class; Valkey memory and clients
+  from the working set and PHP pool; Elasticsearch heap and thread pools from
+  the index store and CPU; sysctls from CPU, RAM and host class.  The fixed
+  1 048 576/524 288 `nofile` entries are ceilings, not allocations: they grant
+  the descriptors the hardware-sized pools need and have no memory cost.
+- **Tests:** 25 new checks pin the four rules across 1/2/4/8/16/32/64 CPUs and
+  2/4/8/16/64 GB, plus two rendered-unit checks (32c/64 GB and 2c/2 GB), for
+  919 tuning checks total.  The "identical drop-in keeps its mtime" check now
+  compares epochs instead of a calendar year, which failed only because the
+  restored host timezone (UTC-8) renders the fixed 2001-01-01 instant as 2000.
+
 ## 1.21.18 (2026-11-16)
 
 - **A re-install keeps Valkey's operator-owned cache settings.**  `--optimize`

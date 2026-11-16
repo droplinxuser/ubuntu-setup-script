@@ -858,10 +858,14 @@ mkdir -p "$TMP/dropin"
 check "a new drop-in is reported as changed" \
   write_service_limits_dropin "$TMP/dropin/limits.conf" $'[Service]\nLimitNOFILE=1'
 touch -d '2001-01-01 00:00:00' "$TMP/dropin/limits.conf"
+# Compare epochs, not a calendar year: the same instant renders as 2000 or
+# 2001 depending on the host timezone (the audit host was used in UTC+8 and
+# restored to UTC-8, which made this check fail without any code change).
+dropin_mtime=$(stat -c %Y "$TMP/dropin/limits.conf")
 check "an identical drop-in is reported as unchanged" \
   not write_service_limits_dropin "$TMP/dropin/limits.conf" $'[Service]\nLimitNOFILE=1'
 check "an identical drop-in keeps its mtime" \
-  test "$(date -r "$TMP/dropin/limits.conf" +%Y)" = 2001
+  test "$(stat -c %Y "$TMP/dropin/limits.conf")" = "$dropin_mtime"
 check "a changed drop-in is rewritten" \
   write_service_limits_dropin "$TMP/dropin/limits.conf" $'[Service]\nLimitNOFILE=2'
 
@@ -4005,6 +4009,62 @@ check "a vhost without a local certificate uses the default one" \
   grep -q 'ssl_certificate     /etc/angie/ssl/default/fullchain.pem;' "$TMP/anubis/terminators2.conf"
 check "the default-certificate fallback is reported" \
   grep -q 'no ssl_certificate in the vhost, using the default certificate' "$TMP/anubis/terminators2.conf"
+
+# ---------------------------------------------------------------------------
+# Anubis runtime profile is hardware-derived
+# ---------------------------------------------------------------------------
+# The proxy must not carry values sized for one machine: GOMAXPROCS follows
+# the core count (capped at the measured plateau), GOGC/GOMEMLIMIT follow RAM,
+# and the fd ceiling follows cores.
+check "Anubis GOMAXPROCS on 1 CPU" test "$(anubis_gomaxprocs 1)" = 1
+check "Anubis GOMAXPROCS on 2 CPUs" test "$(anubis_gomaxprocs 2)" = 2
+check "Anubis GOMAXPROCS on 4 CPUs" test "$(anubis_gomaxprocs 4)" = 4
+check "Anubis GOMAXPROCS on 8 CPUs" test "$(anubis_gomaxprocs 8)" = 8
+check "Anubis GOMAXPROCS caps at 8 on 16 CPUs" test "$(anubis_gomaxprocs 16)" = 8
+check "Anubis GOMAXPROCS caps at 8 on 32 CPUs" test "$(anubis_gomaxprocs 32)" = 8
+check "Anubis GOMAXPROCS caps at 8 on 64 CPUs" test "$(anubis_gomaxprocs 64)" = 8
+check "Anubis GOGC keeps the default on 2 GB" test "$(anubis_gogc 2048)" = 100
+check "Anubis GOGC on 4 GB" test "$(anubis_gogc 4096)" = 200
+check "Anubis GOGC on 8 GB" test "$(anubis_gogc 8192)" = 300
+check "Anubis GOGC on 16 GB" test "$(anubis_gogc 16384)" = 400
+check "Anubis GOGC on 64 GB" test "$(anubis_gogc 65536)" = 400
+check "Anubis GOMEMLIMIT floors at 256 MiB on 1 GB" test "$(anubis_memlimit_mb 1024)" = 256
+check "Anubis GOMEMLIMIT on 4 GB" test "$(anubis_memlimit_mb 4096)" = 512
+check "Anubis GOMEMLIMIT on 8 GB" test "$(anubis_memlimit_mb 8192)" = 1024
+check "Anubis GOMEMLIMIT on 16 GB" test "$(anubis_memlimit_mb 16384)" = 2048
+check "Anubis GOMEMLIMIT caps at 2 GiB on 64 GB" test "$(anubis_memlimit_mb 65536)" = 2048
+check "Anubis LimitNOFILE floors on 1 CPU" test "$(anubis_nofile 1)" = 16384
+check "Anubis LimitNOFILE on 8 CPUs" test "$(anubis_nofile 8)" = 32768
+check "Anubis LimitNOFILE on 16 CPUs" test "$(anubis_nofile 16)" = 65536
+check "Anubis LimitNOFILE caps on 64 CPUs" test "$(anubis_nofile 64)" = 131072
+check "Anubis rejects a non-numeric CPU count" test "$(anubis_gomaxprocs bogus)" = 1
+check "Anubis rejects a non-numeric RAM value" test "$(anubis_gogc bogus)" = 100
+
+# The generated unit must carry the same values for a simulated host.  Run in
+# a subshell so the stubs do not leak into other checks.
+unit_profile=$( (
+  ANUBIS_UNIT="$TMP/anubis-generated.service"
+  effective_cpus() { printf '32'; }
+  mem_total_mb() { printf '65536'; }
+  # Earlier checks leave a systemctl stub that expects arguments; the writer
+  # only needs a no-op here.
+  systemctl() { :; }
+  anubis_write_unit >/dev/null 2>&1 || true
+  grep -hE '^(Environment=(GOGC|GOMEMLIMIT|GOMAXPROCS)|LimitNOFILE)=' "$ANUBIS_UNIT" 2>/dev/null | paste -sd' ' -
+) )
+check "the generated Anubis unit carries the 32 CPU / 64 GB profile" \
+  test "$unit_profile" = "LimitNOFILE=131072 Environment=GOGC=400 Environment=GOMEMLIMIT=2048MiB Environment=GOMAXPROCS=8"
+
+unit_profile_small=$( (
+  ANUBIS_UNIT="$TMP/anubis-generated-small.service"
+  effective_cpus() { printf '2'; }
+  mem_total_mb() { printf '2048'; }
+  systemctl() { :; }
+  anubis_write_unit >/dev/null 2>&1 || true
+  grep -hE '^(Environment=(GOGC|GOMEMLIMIT|GOMAXPROCS)|LimitNOFILE)=' "$ANUBIS_UNIT" 2>/dev/null | paste -sd' ' -
+) )
+check "the generated Anubis unit carries the 2 CPU / 2 GB profile" \
+  test "$unit_profile_small" = "LimitNOFILE=16384 Environment=GOGC=100 Environment=GOMEMLIMIT=256MiB Environment=GOMAXPROCS=2"
 
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

@@ -228,18 +228,78 @@ EOF
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# Anubis runtime profile (pure helpers, shared with the dry run and the tests)
+# ---------------------------------------------------------------------------
+# Go schedules one P per CPU by default.  Measured on the 16-thread audit host
+# at 100 connections: default 7 203 cached pages/s (4.17 Anubis cores),
+# GOMAXPROCS=8 6 871 req/s (3.92 cores, same p99), 4 = 5 925 (2.99), 2 = 3 812.
+# Eight keeps essentially all the throughput while bounding how much runtime
+# parallelism the proxy can ask for when PHP needs the same cores.  A host
+# with fewer cores uses them all; more than eight adds nothing measurable.
+anubis_gomaxprocs() {
+  local cpus=${1:-1}
+  [[ $cpus =~ ^[0-9]+$ ]] && (( cpus > 0 )) || cpus=1
+  printf '%s' "$(tune_clamp "$cpus" 1 8)"
+}
+
+# GOGC is the heap growth target, so it is a memory decision as much as a CPU
+# one.  400 is the measured optimum on a host with RAM to spare (1.21.16:
+# 7 100 vs 6 750 req/s at the default 100); a small VPS keeps Go's default so
+# a burst cannot turn the relaxed collector into a multi-hundred-MB heap with
+# no headroom left for PHP or MariaDB.
+anubis_gogc() {
+  local ram_mb=${1:-1024}
+  [[ $ram_mb =~ ^[0-9]+$ ]] && (( ram_mb > 0 )) || ram_mb=1024
+  if (( ram_mb <= 2048 )); then
+    printf '100'
+  elif (( ram_mb <= 4096 )); then
+    printf '200'
+  elif (( ram_mb <= 8192 )); then
+    printf '300'
+  else
+    printf '400'
+  fi
+}
+
+# GOMEMLIMIT is a backstop, not an allocation: the proxy holds ~120 MB
+# resident.  A 2 GB VPS still gets 256 MB (twice the working set), larger hosts
+# 1/8 of RAM up to 2 GiB.  Capping it matters because a heap limit far above
+# what the process can use only delays a collection that should have happened.
+anubis_memlimit_mb() {
+  local ram_mb=${1:-1024}
+  [[ $ram_mb =~ ^[0-9]+$ ]] && (( ram_mb > 0 )) || ram_mb=1024
+  printf '%s' "$(tune_clamp $(( ram_mb / 8 )) 256 2048)"
+}
+
+# Two descriptors per proxied connection (client + backend) plus listeners,
+# metrics and runtime.  Scale with cores because the proxy is CPU-bound at
+# ~7k req/s per core; floor 16k for a 1-4 CPU VPS, ceiling 128k.
+anubis_nofile() {
+  local cpus=${1:-1}
+  [[ $cpus =~ ^[0-9]+$ ]] && (( cpus > 0 )) || cpus=1
+  printf '%s' "$(tune_clamp $(( cpus * 4096 )) 16384 131072)"
+}
+
+# One line for the log/report, so the applied profile is visible.
+anubis_runtime_summary() {
+  local cpus ram_mb
+  cpus=$(effective_cpus)
+  ram_mb=$(mem_total_mb)
+  printf 'GOMAXPROCS=%s GOGC=%s GOMEMLIMIT=%sMiB LimitNOFILE=%s' \
+    "$(anubis_gomaxprocs "$cpus")" "$(anubis_gogc "$ram_mb")" \
+    "$(anubis_memlimit_mb "$ram_mb")" "$(anubis_nofile "$cpus")"
+}
+
 anubis_write_unit() {
-  local tmp gomaxprocs
+  local tmp gomaxprocs gogc memlimit_mb nofile cpus ram_mb
   tmp=$(tmp_file) || return 1
-  # Go schedules one P per CPU by default.  Measured on the 16-thread audit
-  # host at 100 connections: default 7 203 cached pages/s (4.17 Anubis cores),
-  # GOMAXPROCS=8 6 871 req/s (3.92 cores, same p99), 4 = 5 925 (2.99), 2 =
-  # 3 812.  Eight keeps essentially all the throughput while bounding how much
-  # runtime parallelism the proxy can ask for when PHP needs the same cores.
-  # A small host keeps its own core count.
-  gomaxprocs=$(effective_cpus)
-  (( gomaxprocs > 8 )) && gomaxprocs=8
-  (( gomaxprocs > 0 )) || gomaxprocs=1
+  cpus=$(effective_cpus)
+  ram_mb=$(mem_total_mb)
+  gomaxprocs=$(anubis_gomaxprocs "$cpus")
+  gogc=$(anubis_gogc "$ram_mb")
+  memlimit_mb=$(anubis_memlimit_mb "$ram_mb")
+  nofile=$(anubis_nofile "$cpus")
   cat > "$tmp" <<EOF
 [Unit]
 Description=Anubis bot filter proxy (Angie)
@@ -255,16 +315,17 @@ EnvironmentFile=/etc/anubis/anubis.env
 ExecStart=/usr/local/bin/anubis
 Restart=on-failure
 RestartSec=3
-LimitNOFILE=65536
+# Hardware-derived fd ceiling (cores x 4096, 16k..128k).
+LimitNOFILE=${nofile}
 # Go runtime tuning for a request proxy.  Anubis allocates per request (headers,
 # policy matches, proxy copy); the default GOGC=100 collects long before the
 # heap is large, and that mark/sweep work is pure overhead when the process
-# only needs ~120 MB.  GOGC=400 measured 7 100 req/s against 6 750 on the
-# 16-thread audit host (cached WordPress page through the filter, p99 35 ms vs
-# 39 ms) with RSS at 114 MB; GOMEMLIMIT is a backstop so a traffic spike
-# cannot turn the relaxed collector into an OOM.
-Environment=GOGC=400
-Environment=GOMEMLIMIT=1GiB
+# only needs ~120 MB.  GOGC grows with RAM (100 at <=2 GB, 400 above 8 GB) and
+# GOMEMLIMIT is 1/8 of RAM clamped to 256 MiB..2 GiB, so a small VPS never
+# promises the collector more heap than it can back.  Measured at 16 GB:
+# GOGC=400 7 100 req/s vs 6 750 at the default, RSS 114 MB.
+Environment=GOGC=${gogc}
+Environment=GOMEMLIMIT=${memlimit_mb}MiB
 Environment=GOMAXPROCS=${gomaxprocs}
 NoNewPrivileges=true
 PrivateTmp=true
@@ -900,7 +961,7 @@ anubis_enable() {
   if (( ANUBIS_STATIC_ACTIVE )); then
     static_note=", static assets bypass the proxy"
   fi
-  ANUBIS_SUMMARY="Anubis: enabled (difficulty 4, Unix sockets, policy ${ANUBIS_POLICY}; $(anubis_vhost_files | wc -l) vhost(s) protected${static_note})"
+  ANUBIS_SUMMARY="Anubis: enabled (difficulty 4, Unix sockets, policy ${ANUBIS_POLICY}; $(anubis_vhost_files | wc -l) vhost(s) protected${static_note}; $(anubis_runtime_summary))"
   if (( changed )); then ANUBIS_ANGIE_DIRTY=1; fi
   return 0
 }

@@ -220,11 +220,15 @@ Notes:
   directory; `www-data` can reach only the static one.
 - Anubis is a userspace proxy: cached guest pages still pass through it, so
   compare capacity with the graph in `tests/stress-site/AUDIT-20261116-1.21.18.md`
-  before enabling it on a bandwidth-heavy origin.  The unit caps the Go
-  scheduler at `min(8, CPUs)`: on the 16-thread host that measured 6 871
-  cached pages/s (3.92 Anubis cores, p99 34.6 ms) against 7 203 with the
-  default 16 (4.17 cores, 35.1 ms), so throughput is unchanged while a spike
-  cannot claim every core PHP needs.
+  before enabling it on a bandwidth-heavy origin.  The whole Go profile is
+  hardware-derived and rewritten by every install/`--optimize`:
+  `GOMAXPROCS=min(8, CPUs)` (the measured plateau: 6 871 cached pages/s with
+  3.92 cores vs 7 203 with all 16 and 4.17 cores, same p99),
+  `GOGC` 100 at ≤2 GB / 200 at ≤4 GB / 300 at ≤8 GB / 400 above,
+  `GOMEMLIMIT` 1/8 of RAM clamped to 256 MiB–2 GiB (the proxy holds ~120 MB),
+  and `LimitNOFILE` cores × 4096 clamped to 16k–128k.  On a 32-core/64 GB
+  host the unit therefore gets `GOMAXPROCS=8 GOGC=400 GOMEMLIMIT=2048MiB
+  LimitNOFILE=131072`; on a 2-core/2 GB VPS `2/100/256MiB/16384`.
 - An empty `User-Agent` is challenged by the shipped policy, so a load test
   must send one (`wrk` sends none by default); all loop harnesses now send
   `User-Agent: setup-bench/1.0`.
