@@ -389,8 +389,10 @@ elasticsearch_data_dir_size_mb() {
   return 0
 }
 
-# Current JVM heap in MB.  Prefer the live node stats, then the -Xmx value
-# from jvm.options.d, so an operator-sized heap is not shrunk.
+# Current JVM heap in MB.  Prefer the live node stats, then the last -Xmx
+# from jvm.options and its drop-ins (the JVM applies them in that order, so
+# the managed zz-setup-optimize.options wins).  The planner may still shrink
+# a heap that is grossly above the store-derived target.
 elasticsearch_current_heap_mb() {
   local bytes val file mb url
   if command -v curl >/dev/null 2>&1; then
@@ -416,9 +418,9 @@ elasticsearch_current_heap_mb() {
       g|G) mb=$(( ${val%?} * 1024 )) ;;
       *) continue ;;
     esac
-    printf '%s' "$mb"
-    return 0
   done
+  [[ -n ${mb:-} ]] && printf '%s' "$mb"
+  return 0
 }
 
 plan_memory_budget() {

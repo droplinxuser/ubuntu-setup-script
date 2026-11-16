@@ -389,7 +389,7 @@ SYSCTL_MANAGED_KEYS=(
   net.ipv4.ipfrag_low_thresh net.ipv4.ipfrag_high_thresh
   net.netfilter.nf_conntrack_max
   fs.file-max fs.nr_open fs.inotify.max_user_watches
-  vm.min_free_kbytes kernel.shmmax kernel.shmall
+  vm.min_free_kbytes kernel.shmmax kernel.shmall vm.max_map_count
   vm.dirty_background_bytes vm.dirty_bytes vm.dirty_background_ratio vm.dirty_ratio
   vm.swappiness vm.overcommit_memory vm.overcommit_ratio
   net.ipv4.ip_local_reserved_ports net.core.netdev_budget net.core.netdev_budget_usecs
@@ -695,9 +695,11 @@ configure_sysctl() {
   (( ram_mb / 4 < 1024 )) && shmmax=$(( ram_mb / 4 * 1048576 ))
   shmall=$(( shmmax / 4096 ))
   # The widened ephemeral range covers the service ports; reserve them so an
-  # outbound connection can never take 3306/6379/9200 before a restart binds.
+  # outbound connection can never take 3306/6379/9000/9200 before a restart
+  # binds.  9000 is the supported PHP-FPM TCP listener (the installer uses a
+  # Unix socket, but an adopted host may keep 127.0.0.1:9000).
   local reserved_ports
-  reserved_ports=$(printf '%s\n' 3306 6379 9200 9300 "$(sshd_listen_ports)" \
+  reserved_ports=$(printf '%s\n' 3306 6379 9000 9200 9300 "$(sshd_listen_ports)" \
     | grep -E '^[0-9]+$' | awk '$1 >= 1024' | sort -nu | paste -sd, -)
   # Busy dedicated hosts with several queues drain more packets per softirq
   # pass; a VPS shares its hypervisor queue and keeps the kernel default.
@@ -880,6 +882,9 @@ configure_io_tuning() {
 [Unit]
 Description=Apply transparent-hugepage tuning (setup.sh)
 After=local-fs.target
+# madvise only affects mappings created after the write, so it must happen
+# before the services that allocate large arenas at startup.
+Before=mariadb.service valkey-server.service redis-server.service elasticsearch.service
 [Service]
 Type=oneshot
 ExecStart=/bin/sh -c 'for f in enabled defrag; do p=/sys/kernel/mm/transparent_hugepage/$f; [ -w "$p" ] && echo madvise > "$p"; done; exit 0'

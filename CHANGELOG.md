@@ -3,6 +3,91 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.20 (2026-11-16)
+
+- **Anubis: the filter socket is no longer world-connectable.**  The service
+  wrote `SOCKET_MODE=0666` into a `0755` `/run/anubis`, so any local account
+  (including a compromised PHP process) could connect to the Go proxy
+  directly, choose the `Host` header and forge `X-Real-IP`; the backend vhosts
+  trust the unix peer (`set_real_ip_from unix:`) and use that header as
+  `$remote_addr`, so per-IP rate limits and application IP checks were
+  bypassable from the host.  The socket is now `0666` -> `0660` in a `0750`
+  directory, owned `anubis:anubis`.  `www-data` is added to the `anubis` group
+  (nginx re-runs `initgroups()` when it spawns a worker) and Angie is reloaded
+  before the socket is recreated, so the workers keep access while every other
+  account is refused.  Verified as `www-data` (connect, 500 from the policy
+  parser on a malformed probe) and `nobody` (EACCES).
+- **Anubis disable no longer opens a 502 window.**  `--optimize anubis=no`
+  stopped the service before Angie had loaded the restored direct-TLS vhosts;
+  every site answered 502 until the reload at the end of the run (and a later
+  failure left the host 502ing until an operator started the filter again).
+  The stop is deferred until the reload succeeds and waits one second for the
+  old workers to drain: a concurrent probe measured **420/420 HTTP 200**,
+  versus one 502 in 420 before the drain.  A failed tune keeps Anubis running.
+- **Anubis vhost migration matches the port, not the substring.**  `listen
+  8443 ssl;` (and any `*443*` port) was treated as the public HTTPS listener
+  and lost its only bind, while an IPv6-only `listen [::]:443 ssl;` was dropped
+  without a replacement (the block fell back to `:80`).  Migration now matches
+  `443` exactly, replaces the first TLS listener (IPv4 or IPv6) with one
+  backend socket and drops the duplicates.  The installed version check also
+  normalises the `v` prefix (`Anubis v1.28.2`) instead of assuming it.
+- **Valkey: a full `noeviction` cache is no longer grown 20% on every run.**
+  maxmemory was only recognised as "full" for an evicting policy, so a
+  `noeviction` cache (the documented choice for sessions/jobs) walked
+  512 -> 614 -> 736 MB ... up to the host cap on consecutive runs, while the
+  report claimed it was refusing to evict data.  A non-evicting cache at its
+  ceiling now keeps `CURRENT` (or takes the plan once when it is below it);
+  `--valkey ram=` is the explicit way to grow it.
+- **`--upgrade-php` is atomic around the package purge.**  A failed
+  `apt-get purge` used to `die` from inside the installer, bypassing the
+  rollback path and leaving a partially purged PHP.  The purge now returns a
+  status; the driver restores the old version and writes the failure report.
+  Optional extension packages are installed one at a time (a published but
+  uninstallable extension, e.g. a Sury build with an unresolved dependency,
+  no longer aborts the whole upgrade), and a failed autoremove *probe* is no
+  longer read as "no candidates" (which purged every post-purge orphan).
+  The driver also repeats the post-Angie PHP `[PATH=]` refresh that
+  `--optimize` performs, so both paths write the same ini in one run.
+- **Validation.**  928 tuning checks, 208 dry runs, 54/54 security probes and
+  61/61 guest-cookie checks.  Functional suite: 0 unexpected responses and 0
+  PHP diagnostics on PHP 8.5 and 8.4.  PHP round trip 8.5 -> 8.4 -> 8.5: 14/15
+  extensions carried, 0 skipped, Angie reloaded, 0 functional errors.
+- **OPcache script table counts each root once.**  The `[PATH=]` sizing walked
+  `/etc/angie/conf.d/*.conf` roots without de-duplicating; with the Anubis
+  static shadow (a copy of every root) the PHP file count was doubled and the
+  table was clamped at 128 256 on every protected host.  Roots are sorted
+  unique before `find`.
+- **Sury's global APT key is retired.**  The vendor keyring `.deb` installs
+  the same key in `/etc/apt/trusted.gpg.d/`, where it can sign **every**
+  configured repository, defeating the `signed-by` pin the script writes.
+  The identical copy is now moved to `/tmp` (the Angie key already was).
+  Verified on the audit host after an upgrade: only
+  `/usr/share/keyrings/debsuryorg-archive-keyring.gpg` remains.
+- **Smaller correctness fixes:**
+  - `--domain a.com db=... b.com app=wordpress db=...` no longer leaks
+    `app=wordpress` to `a.com`; a following `db=` clears the trailing
+    group-default flag.  A dry-run assertion pins the plan.
+  - `--php ver=` (empty variable) and `--upgrade-php --dry-run` (a flag
+    consumed as the version) are rejected instead of silently selecting
+    another mode/version.
+  - `--basic host=` enforces real DNS labels and the 64-character systemd
+    limit; `a..b` or a 100-character name no longer aborts `--basic` after
+    the hostname but before the firewall and cron are configured.
+  - `--elastic host=example.com:9200` is rejected at parse time instead of
+    installing a node that cannot bind 180 s later.
+  - Reserved ephemeral ports include `9000` (a supported PHP-FPM TCP
+    listener) alongside 3306/6379/9200/9300 and the SSH ports.
+  - The THP oneshot is ordered `Before=` MariaDB/Valkey/Redis/Elasticsearch,
+    so a host booting with `always` no longer starts InnoDB with THP before
+    the `madvise` write.
+  - `vm.max_map_count` and its Elasticsearch drop-in are recorded, so
+    `--purge elastic` restores them instead of leaving setup-owned state.
+  - The Elasticsearch heap reader uses the last `-Xmx` (the JVM's rule) and
+    its docstring no longer promises to keep a heap the planner shrinks.
+  - The audit harness takes `TARGET_IP=`; Chevereto correctly answers 403 to
+    a loopback `X-Real-IP`, so an Anubis run must use the host's LAN address
+    to exercise the same path as a real client.
+
 ## 1.21.19 (2026-11-16)
 
 - **The whole Anubis Go profile is hardware-derived.**  Only `GOMAXPROCS` was

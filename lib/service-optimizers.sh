@@ -100,6 +100,7 @@ optimize_angie() {
   # when missing; a failure moves the optional files to /tmp, gzip stays).
   if ! angie_apply_profile /etc/angie; then
     angie_restore_live
+    ANUBIS_STOP_PENDING=0
     opt_report "- **FAILED** tuning returned an error; configuration rolled back"
     return 1
   fi
@@ -119,6 +120,7 @@ optimize_angie() {
     opt_report "- **FAILED** \`angie -t\`:"
     while IFS= read -r change; do opt_report "  \`${change}\`"; done < "$angie_test_log"
     angie_restore_live
+    ANUBIS_STOP_PENDING=0
     return 1
   fi
   for change in "${TUNE_CHANGES[@]}"; do opt_report "- ${change}"; done
@@ -150,10 +152,18 @@ optimize_angie() {
     else
       opt_report "- Reload/Restart: **FAILED**; rolling back"
       angie_restore_live
+      ANUBIS_STOP_PENDING=0
       return 1
     fi
   else
     opt_report "- Restart: skipped (service was not active)"
+  fi
+  # anubis=no restored the direct-TLS vhosts; only now that Angie has loaded
+  # them is it safe to stop the filter.  A failed run keeps it running.
+  if (( rc == 0 )); then
+    anubis_finish_disable
+  else
+    ANUBIS_STOP_PENDING=0
   fi
   return "$rc"
 }
@@ -903,9 +913,20 @@ valkey_guard_maxmemory_mb() {
     return 0
   fi
   # used_memory may sit a little above maxmemory (eviction is approximate),
-  # hence the 2% window.
-  if (( evicts == 1 && current > 0 && current <= hard_cap \
+  # hence the 2% window.  A non-evicting cache is at its ceiling by
+  # definition, so "full" must not be treated as demand: this branch keeps
+  # CURRENT instead of adding 20% on every run (512 -> 614 -> 736 ... until
+  # the host cap).  Only --valkey ram= grows a noeviction cache past the plan.
+  if (( current > 0 && current <= hard_cap \
         && used * 100 <= current * 102 && needed > current )); then
+    if (( evicts == 0 )); then
+      if (( current < planned )); then
+        printf '%s plan' "$planned"
+      else
+        printf '%s full' "$current"
+      fi
+      return 0
+    fi
     if (( current >= planned )); then
       printf '%s full' "$current"
     else

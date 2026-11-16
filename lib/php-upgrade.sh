@@ -40,6 +40,9 @@ PHP_UPGRADE_CUSTOM_INIS=()
 PHP_UPGRADE_CUSTOM_POOLS=()
 PHP_UPGRADE_PECL=()
 PHP_UPGRADE_PRE_AUTOREMOVE=()
+# 1 when the pre-purge autoremove simulation succeeded.  A failed probe must
+# not be read as "no candidates", which would purge every post-purge orphan.
+PHP_UPGRADE_AUTOREMOVE_OK=0
 # Number of distinct extensions the target will keep (core + migrated +
 # bundled), and the applications whose hard requirements the target cannot
 # satisfy.  Both are filled by php_upgrade_plan_extensions/preflight so the
@@ -97,7 +100,7 @@ php_upgrade_ext_name() {
 php_upgrade_autoremove_set() {
   apt-get -s autoremove --purge 2>/dev/null \
     | awk '/^(Remv|Purg) /{print $2}' \
-    | sort -u || true
+    | sort -u
 }
 
 # Snapshot the host before anything is purged.  Everything the report and the
@@ -551,7 +554,19 @@ php_upgrade_purge() {
   # not take applications along (phpMyAdmin, Composer, ...).  Dies with PHP
   # still installed and serving.
   php_purge_preflight
-  mapfile -t PHP_UPGRADE_PRE_AUTOREMOVE < <(php_upgrade_autoremove_set)
+  local pre_out
+  PHP_UPGRADE_AUTOREMOVE_OK=0
+  if pre_out=$(php_upgrade_autoremove_set); then
+    if [[ -n $pre_out ]]; then
+      mapfile -t PHP_UPGRADE_PRE_AUTOREMOVE <<< "$pre_out"
+    else
+      PHP_UPGRADE_PRE_AUTOREMOVE=()
+    fi
+    PHP_UPGRADE_AUTOREMOVE_OK=1
+  else
+    warn "Could not compute the autoremove baseline; PHP-only dependencies will be left installed"
+    PHP_UPGRADE_PRE_AUTOREMOVE=()
+  fi
 
   # Packages outside the ^php pattern first: libapache2-mod-phpX.Y depends on
   # the PHP it pins and would otherwise be left broken.
@@ -561,17 +576,21 @@ php_upgrade_purge() {
     apt-get purge "${APT_OPTS[@]}" "${extra[@]}" >/dev/null 2>&1 || true
   fi
 
-  purge_php_installations
-
-  mapfile -t post < <(php_upgrade_autoremove_set)
-  if (( ${#PHP_UPGRADE_PRE_AUTOREMOVE[@]} > 0 )); then
-    mapfile -t newly < <(
-      comm -13 \
-        <(printf '%s\n' "${PHP_UPGRADE_PRE_AUTOREMOVE[@]}" | sort -u) \
-        <(printf '%s\n' "${post[@]}" | sort -u)
-    )
-  else
-    newly=("${post[@]}")
+  purge_php_installations || return 1
+  local post_out
+  if (( PHP_UPGRADE_AUTOREMOVE_OK )) && post_out=$(php_upgrade_autoremove_set); then
+    mapfile -t post <<< "$post_out"
+    if (( ${#PHP_UPGRADE_PRE_AUTOREMOVE[@]} > 0 )); then
+      mapfile -t newly < <(
+        comm -13 \
+          <(printf '%s\n' "${PHP_UPGRADE_PRE_AUTOREMOVE[@]}" | sort -u) \
+          <(printf '%s\n' "${post[@]}" | sort -u)
+      )
+    else
+      # The pre-probe succeeded and listed nothing: every candidate now is a
+      # dependency the purge orphaned, so removing them is the intended delta.
+      newly=("${post[@]}")
+    fi
   fi
 
   local p
@@ -740,6 +759,30 @@ php_upgrade_optimize() {
     tune_reset_changes
     if angie_apply_profile /etc/angie; then
       for change in "${TUNE_CHANGES[@]}"; do info "Angie: ${change}"; done
+      # The managed PHP ini carries [PATH=] sections derived from the Angie
+      # tree; the sync above may have changed that tree after the PHP pass.
+      # Mirror --optimize's post-Angie refresh so an upgrade reaches the same
+      # file state in one run.
+      if (( OPT_PHP_OK )); then
+        local v refresh_dirty=0
+        while IFS= read -r v; do
+          tune_reset_changes
+          if tune_php_fpm_version "$v"; then
+            (( TUNE_DIRTY )) && refresh_dirty=1
+            for change in "${TUNE_CHANGES[@]}"; do info "${change} (post-Angie refresh)"; done
+          else
+            warn "PHP ${v}: post-Angie ini refresh failed"
+            rc=1
+          fi
+        done < <(php_fpm_versions)
+        if (( refresh_dirty )); then
+          while IFS= read -r v; do
+            systemctl is-active --quiet "php${v}-fpm" 2>/dev/null || continue
+            systemctl reload "php${v}-fpm" 2>/dev/null \
+              || { warn "PHP ${v}: reload after the post-Angie ini refresh failed"; rc=1; }
+          done < <(php_fpm_versions)
+        fi
+      fi
     else
       warn "Angie configuration could not be aligned with the PHP socket"
       rc=1
@@ -1117,7 +1160,14 @@ run_php_upgrade() {
 
   if [[ -n $old ]]; then
     step "Purging PHP ${old} and its dependencies"
-    php_upgrade_purge
+    if ! php_upgrade_purge; then
+      warn "Purging PHP ${old} failed; restoring it"
+      php_upgrade_rollback || warn "Rollback did not complete; inspect /var/lib/setup.sh"
+      report=$(php_upgrade_write_report "$target" 1)
+      warn "Report: ${report}"
+      handled_return 1
+      return 1
+    fi
     ok "Old PHP packages purged (tree backup: ${PHP_UPGRADE_MANIFEST_DIR}/php-config)"
   fi
 

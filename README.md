@@ -216,8 +216,11 @@ Notes:
 - The static shadow is generated from each integrated application block, so
   `/internal_data` (XenForo) stays `internal`, dotfiles and backup archives
   stay denied, `Range`/`HEAD`/conditional requests keep working and a missing
-  file falls back through Anubis.  `nobody` cannot traverse either socket
-  directory; `www-data` can reach only the static one.
+  file falls back through Anubis.  The filter listens on a `0660`
+  `anubis:anubis` socket in a `0750` runtime directory; `www-data` is added to
+  the `anubis` group (nginx re-runs `initgroups()` for each worker) so Angie
+  can connect, while every other local account is refused.  The static shadow
+  socket is reachable only through its `root:www-data 0750` directory.
 - Anubis is a userspace proxy: cached guest pages still pass through it, so
   compare capacity with the graph in `tests/stress-site/AUDIT-20261116-1.21.18.md`
   before enabling it on a bandwidth-heavy origin.  The whole Go profile is

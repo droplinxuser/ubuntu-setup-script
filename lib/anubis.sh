@@ -75,6 +75,9 @@ ANUBIS_STATIC_ACTIVE=0
 ANUBIS_SUMMARY=""
 ANUBIS_FAILED=""
 ANUBIS_SERVICE_DIRTY=0
+# Set when anubis=no restored the vhosts but Angie still runs the in-memory
+# configuration that proxies to the filter; the stop happens after the reload.
+ANUBIS_STOP_PENDING=0
 
 anubis_marker() { printf '%s/enabled' "$ANUBIS_STATE"; }
 
@@ -92,6 +95,33 @@ anubis_create_user() {
     --shell /usr/sbin/nologin "$ANUBIS_USER" \
     || { warn "Could not create the ${ANUBIS_USER} system user"; return 1; }
   info "Created system user ${ANUBIS_USER}"
+}
+
+# Angie workers run as www-data.  nginx re-runs initgroups() when it spawns a
+# worker, so membership in the filter's group is what lets them connect to a
+# 0660 socket in a 0750 directory without opening it to every local account.
+anubis_join_www_group() {
+  id -nG www-data 2>/dev/null | tr ' ' '\n' | grep -qx "$ANUBIS_USER" && return 0
+  usermod -aG "$ANUBIS_USER" www-data \
+    || { warn "Could not add www-data to the ${ANUBIS_USER} group"; return 1; }
+  info "Added www-data to the ${ANUBIS_USER} group (Anubis socket access)"
+  # Existing workers still carry their old supplementary groups.  Reload
+  # Angie now, while it still talks to the old (open) socket, so the new
+  # workers can connect to the 0660 socket that anubis_start creates next.
+  if systemctl is-active --quiet angie 2>/dev/null; then
+    systemctl reload angie 2>/dev/null \
+      || warn "Could not reload Angie after the ${ANUBIS_USER} group change"
+  fi
+  return 0
+}
+
+# Remove the worker's membership once the filter is stopped, so a disabled
+# host does not keep an empty, setup-owned group (or a stray supplementary
+# group on www-data) that the next restore has to clean up by hand.
+anubis_leave_www_group() {
+  id -nG www-data 2>/dev/null | tr ' ' '\n' | grep -qx "$ANUBIS_USER" || return 0
+  gpasswd -d www-data "$ANUBIS_USER" >/dev/null 2>&1 || true
+  return 0
 }
 
 anubis_installed_version() {
@@ -116,7 +146,9 @@ anubis_install_binary() {
   fi
   want="v${ANUBIS_VERSION}"
   current=$(anubis_installed_version || true)
-  [[ $current == "$want" ]] && return 0
+  # Release builds print "Anubis v1.28.2"; normalise the prefix on both
+  # sides so a build that omits (or adds) it is not re-downloaded each run.
+  [[ ${current#v} == "${want#v}" ]] && return 0
 
   url="https://github.com/TecharoHQ/anubis/releases/download/v${ANUBIS_VERSION}/anubis-${ANUBIS_VERSION}-linux-${arch}.tar.gz"
   tmp=$(tmp_dir anubis.XXXXXX) || return 1
@@ -172,9 +204,11 @@ POLICY_FNAME=${ANUBIS_POLICY}
 # WARN keeps one journal line per challenge and none per proxied request;
 # INFO on a busy site fills the journal and costs CPU.
 SLOG_LEVEL=WARN
-# Anubis creates the listening socket as its own user; Angie workers run as
-# www-data and must be able to connect to it.
-SOCKET_MODE=0666
+# Anubis creates the listening socket as its own user, with the service's
+# group.  anubis_enable adds www-data to that group so Angie workers can
+# connect; the socket and its RuntimeDirectory are group-only (0660/0750), so
+# any other local account cannot reach the filter and forge X-Real-IP.
+SOCKET_MODE=0660
 HS512_SECRET=${secret}
 EOF
   if commit_if_changed "$ANUBIS_ENV" "$tmp"; then ANUBIS_SERVICE_DIRTY=1; fi
@@ -310,6 +344,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=anubis
+# The socket is group-connectable for Angie workers only: anubis_enable adds
+# www-data to the anubis group (nginx re-runs initgroups when it spawns a
+# worker), so no other local account can open the filter socket directly.
 Group=anubis
 EnvironmentFile=/etc/anubis/anubis.env
 ExecStart=/usr/local/bin/anubis
@@ -332,7 +369,7 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 RuntimeDirectory=anubis
-RuntimeDirectoryMode=0755
+RuntimeDirectoryMode=0750
 StateDirectory=anubis
 CacheDirectory=anubis
 
@@ -488,7 +525,11 @@ anubis_vhost_files() {
 # A vhost that still terminates TLS on 443 needs the migration; a vhost on
 # the backend socket is already integrated.
 anubis_vhost_needs_migration() {
-  grep -qE '^[[:space:]]*listen[[:space:]]+[^;]*443[^;]*ssl' "$1"
+  awk '
+    { code = $0; sub(/#.*/, "", code) }
+    code ~ /^[ \t]*listen[ \t]+/ && code ~ /(^|[^0-9])443([^0-9]|$)/ && code ~ /ssl/ { found = 1; exit }
+    END { exit(found ? 0 : 1) }
+  ' "$1"
 }
 
 anubis_vhost_integrated() {
@@ -531,6 +572,7 @@ anubis_integrate_vhost() {
         in_server = 1
         depth = brace_delta(code)
         added_real_ip = 0
+        replaced_listen = 0
         print line
         next
       }
@@ -539,11 +581,15 @@ anubis_integrate_vhost() {
       # client-supplied X-Forwarded-For (a file-global check used to leave a
       # real_ip_header X-Forwarded-For from any block in place for all of them).
       if (code ~ /^[ \t]*real_ip_header[ \t]+/ || code ~ /^[ \t]*set_real_ip_from[ \t]+unix/) next
-      if (code ~ /^[ \t]*listen[ \t]+/ && code ~ /443/ && code ~ /ssl/) {
-        # IPv6 listener is redundant once the public side is the terminator.
-        if (code ~ /\[::\]/) next
-        ind = indent_of(line)
-        print ind "listen " sock ";"
+      if (code ~ /^[ \t]*listen[ \t]+/ && code ~ /(^|[^0-9])443([^0-9]|$)/ && code ~ /ssl/) {
+        # One socket listener replaces every public TLS listener in the
+        # block (IPv4 and IPv6); listening on the same socket twice would
+        # make nginx bind the path twice.
+        if (!replaced_listen) {
+          ind = indent_of(line)
+          print ind "listen " sock ";"
+          replaced_listen = 1
+        }
         if (!added_real_ip) {
           print ind "set_real_ip_from unix:;"
           print ind "real_ip_header X-Real-IP;"
@@ -555,7 +601,7 @@ anubis_integrate_vhost() {
       print line
       if (in_server) {
         depth += brace_delta(code)
-        if (depth <= 0) { in_server = 0; added_real_ip = 0 }
+        if (depth <= 0) { in_server = 0; added_real_ip = 0; replaced_listen = 0 }
       }
     }
   ' "$f" > "$tmp" || return 1
@@ -877,6 +923,9 @@ anubis_install_service() {
 
 anubis_start() {
   systemctl enable anubis >/dev/null 2>&1 || true
+  # A previous failed start (bad policy/permission) leaves the unit in
+  # start-limit state; clear it or every later start is refused.
+  systemctl reset-failed anubis >/dev/null 2>&1 || true
   if systemctl is-active --quiet anubis; then
     # A plain --optimize must not drop the in-memory challenge store (and the
     # short-lived verification cookies) when nothing about the service changed.
@@ -903,6 +952,7 @@ anubis_enable() {
   local f rc=0 changed=0
   ANUBIS_SUMMARY=""
   anubis_install_service || { ANUBIS_FAILED="installation"; return 1; }
+  anubis_join_www_group || { ANUBIS_FAILED="socket group"; return 1; }
   for f in $(anubis_vhost_files); do
     if anubis_vhost_needs_migration "$f"; then
       changed=1
@@ -970,10 +1020,13 @@ anubis_disable() {
   ANUBIS_SUMMARY=""
   anubis_restore_vhosts || true
   anubis_remove_angie_files
-  if systemctl is-active --quiet anubis 2>/dev/null; then
-    systemctl stop anubis || warn "Could not stop anubis"
-  fi
-  systemctl disable anubis >/dev/null 2>&1 || true
+  # Do not stop the service yet.  Angie keeps serving its in-memory
+  # configuration (terminators proxy_pass to Anubis) until it is reloaded
+  # after this function returns, so stopping here would answer 502 for every
+  # site until the reload.  optimize_angie calls anubis_finish_disable after
+  # a successful reload; a failed tune keeps the filter running.
+  ANUBIS_STOP_PENDING=1
+  systemctl is-active --quiet angie 2>/dev/null || anubis_finish_disable
   if [[ -e $ANUBIS_STATE ]]; then
     local moved
     moved=$(preserve_to_tmp "$ANUBIS_STATE" || true)
@@ -981,7 +1034,23 @@ anubis_disable() {
   fi
   persist_tuning_var ANUBIS 0
   ANUBIS_ANGIE_DIRTY=1
-  ANUBIS_SUMMARY="Anubis: disabled; vhosts restored to direct TLS and the service stopped"
+  ANUBIS_SUMMARY="Anubis: disabled; vhosts restored to direct TLS and the service stops after the Angie reload"
+  return 0
+}
+
+# Complete a pending disable once Angie has loaded the direct-TLS vhosts.
+anubis_finish_disable() {
+  (( ANUBIS_STOP_PENDING )) || return 0
+  ANUBIS_STOP_PENDING=0
+  # reload is asynchronous: old workers may still be finishing requests that
+  # proxy to the filter.  Give them a moment so the stop cannot cut one off
+  # (one 502 in 420 requests was measured without this drain).
+  if systemctl is-active --quiet angie 2>/dev/null; then
+    sleep 1
+  fi
+  systemctl stop anubis 2>/dev/null || warn "Could not stop anubis"
+  systemctl disable anubis >/dev/null 2>&1 || true
+  anubis_leave_www_group
   return 0
 }
 
@@ -1017,6 +1086,7 @@ anubis_purge_stop() {
   anubis_remove_angie_files
   systemctl stop anubis >/dev/null 2>&1 || true
   systemctl disable anubis >/dev/null 2>&1 || true
+  anubis_leave_www_group
   info "Anubis stopped, vhosts restored (configuration kept; --optimize anubis=yes re-enables it)"
 }
 
@@ -1032,6 +1102,11 @@ anubis_remove_all() {
   rm -rf "$ANUBIS_ETC" "$ANUBIS_STATE" /run/anubis /run/angie-static /var/lib/anubis /var/cache/anubis 2>/dev/null || true
   if id "$ANUBIS_USER" >/dev/null 2>&1; then
     userdel "$ANUBIS_USER" >/dev/null 2>&1 || true
+  fi
+  anubis_leave_www_group
+  # userdel leaves a group that still has a member; drop an empty setup group.
+  if getent group "$ANUBIS_USER" >/dev/null 2>&1; then
+    groupdel "$ANUBIS_USER" >/dev/null 2>&1 || true
   fi
   systemctl daemon-reload || true
   ANUBIS_ANGIE_DIRTY=1

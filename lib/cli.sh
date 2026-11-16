@@ -309,6 +309,12 @@ kv_set() {
     elastic:host|elastic:ram) ;;
     *) die "--${ctx}: unknown option '${key}'" ;;
   esac
+  # An empty ver= (a shell variable that was not set) used to mean "auto" on
+  # install and "every installed version" on --purge; both are dangerous
+  # surprises.  It is always a mistake.
+  if [[ $ctx:$key == php:ver && -z $val ]]; then
+    die "--php ver= requires a version, e.g. 8.5 (the value is empty)"
+  fi
   OPT["${ctx}.${key}"]=$val
 }
 
@@ -435,6 +441,9 @@ parse_args() {
                 pass=*) DOMAIN_DB_PASS[$key]=${1#*=} ;;
                 sql=*)  DOMAIN_SQL[$key]=${1#*=} ;;
               esac
+              # A database option follows the app= it belongs to, so that
+              # app= is per-domain, not a trailing group default.
+              app_at_end=0
               shift
               continue
               ;;
@@ -481,7 +490,7 @@ parse_args() {
       --upgrade-php)
         (( UPGRADE_PHP_SEEN == 0 )) || die "--upgrade-php may only be given once"
         UPGRADE_PHP_SEEN=1
-        (( $# >= 2 )) && [[ -n $2 ]] \
+        (( $# >= 2 )) && [[ $2 != -* && -n $2 ]] \
           || die "--upgrade-php requires a version, e.g. --upgrade-php=8.6"
         UPGRADE_PHP=$2
         shift 2 ;;

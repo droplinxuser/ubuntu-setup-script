@@ -64,6 +64,8 @@ run ok   --dry-run --basic --php
 PHP_HOST_VER=$(bash "$SCRIPT_DIR/setup.sh" --dry-run --basic --php 2>&1 \
   | sed -nE 's/.*[[:space:]]version=([0-9]+\.[0-9]+)[[:space:]].*/\1/p' | head -n1)
 run ok   --dry-run --basic --php ver="${PHP_HOST_VER:-8.4}" children=32 max_requests=4096
+run fail --dry-run --basic --php ver=
+run fail --dry-run --upgrade-php --dry-run
 if [[ -n $PHP_HOST_VER ]]; then
   PHP_OTHER_VER=8.4
   [[ $PHP_HOST_VER == 8.4 ]] && PHP_OTHER_VER=8.5
@@ -76,6 +78,8 @@ run ok   --dry-run --basic --valkey
 run ok   --dry-run --basic --valkey ram=2g policy=noeviction io_threads=2
 run ok   --dry-run --basic --valkey ram=auto
 run ok   --dry-run --basic --elastic ram=4g host=localhost
+run fail --dry-run --basic --elastic host=localhost:9200
+run fail --dry-run --basic --elastic host=not_a_host
 run ok   --dry-run --basic --elastic
 run ok   --dry-run --basic --elastic ram=auto
 run ok   --dry-run --basic --others all
@@ -107,6 +111,17 @@ run ok   --dry-run --domain a.example.com app=basic
 run ok   --dry-run --domain blog.example.com db=blogdb
 run ok   --dry-run --domain blog.example.com app=xf db=xenforodb user=demo pass=temp sql=$TMP/dump.sql
 run ok   --dry-run --domain a.example.com db=adb user=u pass=p b.example.com app=wordpress db=bdb
+# app= belongs to the domain before it and a following db= must not turn it
+# into a trailing group default (a.example.com kept WordPress before).
+DOMAIN_PLAN=$(bash "$SCRIPT_DIR/setup.sh" --dry-run --domain a.example.com db=adb user=u pass=p \
+  b.example.com app=wordpress db=bdb 2>&1)
+if grep -qE 'a\.example\.com app=basic' <<<"$DOMAIN_PLAN" \
+   && grep -qE 'b\.example\.com app=wordpress' <<<"$DOMAIN_PLAN"; then
+  PASS=$((PASS + 1)); printf 'PASS  per-domain app= survives a following db=\n'
+else
+  FAIL=$((FAIL + 1)); printf 'FAIL  per-domain app= leaked to the whole --domain group\n'
+  printf '%s\n' "$DOMAIN_PLAN" | grep -E 'domain +[ab]\.example' | sed 's/^/      /'
+fi
 
 # Optimize-only mode.
 run ok   --dry-run --optimize

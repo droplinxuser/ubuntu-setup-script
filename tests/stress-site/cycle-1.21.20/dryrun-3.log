@@ -1,0 +1,210 @@
+PASS  rc=0  --help
+PASS  rc=0  --version
+PASS  rc=1  
+PASS  rc=0  --dry-run --basic
+PASS  rc=0  --dry-run --basic server=dedi
+PASS  rc=0  --dry-run --basic server=vps host=test.example.com swap=4G time=UTC
+PASS  rc=0  --dry-run --basic --angie
+PASS  rc=0  --dry-run --basic --php
+PASS  rc=0  --dry-run --basic --php ver=8.5 children=32 max_requests=4096
+PASS  rc=1  --dry-run --basic --php ver=
+PASS  rc=1  --dry-run --upgrade-php --dry-run
+PASS  rc=1  --dry-run --basic --php ver=8.4
+PASS  rc=0  --dry-run --basic --mariadb user=demo pass=temp size=4gb
+PASS  rc=0  --dry-run --basic --mariadb user=demo pass=temp
+PASS  rc=0  --dry-run --basic --mariadb user=demo pass=temp size=auto bind=127.0.0.1,IPV4
+PASS  rc=0  --dry-run --basic --valkey
+PASS  rc=0  --dry-run --basic --valkey ram=2g policy=noeviction io_threads=2
+PASS  rc=0  --dry-run --basic --valkey ram=auto
+PASS  rc=0  --dry-run --basic --elastic ram=4g host=localhost
+PASS  rc=1  --dry-run --basic --elastic host=localhost:9200
+PASS  rc=1  --dry-run --basic --elastic host=not_a_host
+PASS  rc=0  --dry-run --basic --elastic
+PASS  rc=0  --dry-run --basic --elastic ram=auto
+PASS  rc=0  --dry-run --basic --others all
+PASS  rc=0  --dry-run --basic --others smartmon gif nodejs sysstat
+PASS  rc=1  --dry-run --basic --others fail2ban
+PASS  rc=1  --dry-run --basic --others unattended
+PASS  rc=1  --dry-run --basic --others composer
+PASS  rc=1  --dry-run --basic --others security
+PASS  rc=0  --dry-run --basic --angie --php --mariadb user=u pass=p size=auto --valkey --elastic ram=2g --others all
+PASS  rc=0  --dry-run --domain example.com
+PASS  rc=0  --dry-run --domain example.com app=wordpress
+PASS  rc=0  --dry-run --domain a.example.com b.example.com app=xf
+PASS  rc=0  --dry-run --domain a.example.com app=xf b.example.com
+PASS  rc=0  --dry-run --domain app=xf a.example.com b.example.com
+PASS  rc=0  --dry-run --domain a.example.com app=wordpress b.example.com app=lychee
+PASS  rc=0  --dry-run --domain a.example.com app=node
+PASS  rc=0  --dry-run --domain a.example.com app=php
+PASS  rc=0  --dry-run --domain a.example.com app=blank
+PASS  rc=0  --dry-run --domain a.example.com app=pingvin
+PASS  rc=0  --dry-run --domain a.example.com app=chevereto
+PASS  rc=0  --dry-run --domain a.example.com app=polr
+PASS  rc=0  --dry-run --domain a.example.com app=lychee
+PASS  rc=0  --dry-run --domain a.example.com app=flarum
+PASS  rc=0  --dry-run --domain a.example.com app=shlink b.example.com app=sfs
+PASS  rc=0  --dry-run --domain a.example.com app=basic
+PASS  rc=0  --dry-run --domain blog.example.com db=blogdb
+PASS  rc=0  --dry-run --domain blog.example.com app=xf db=xenforodb user=demo pass=temp sql=/tmp/setup-test-matrix.Pdgarh/dump.sql
+PASS  rc=0  --dry-run --domain a.example.com db=adb user=u pass=p b.example.com app=wordpress db=bdb
+PASS  per-domain app= survives a following db=
+PASS  rc=0  --dry-run --optimize
+PASS  rc=0  —optimize --dry-run
+PASS  rc=0  –optimize --dry-run
+PASS  rc=0  --dry-run --diagnostics
+PASS  rc=1  --dry-run --diagnostics --basic
+PASS  rc=1  --dry-run --diagnostics --optimize
+PASS  rc=1  --dry-run --diagnostics --purge
+PASS  rc=0  --dry-run --restart-all
+PASS  rc=1  --dry-run --restart-all --basic
+PASS  rc=1  --dry-run --restart-all --purge
+PASS  rc=1  --dry-run --restart-all --optimize
+PASS  rc=1  --dry-run --restart-all --diagnostics
+PASS  rc=1  --dry-run --restart-all --domain example.com
+PASS  rc=1  --dry-run --restart-all --angie
+PASS  rc=1  --dry-run --optimize --basic
+PASS  rc=1  --dry-run --optimize --angie
+PASS  rc=1  --dry-run --optimize --purge
+PASS  rc=1  --dry-run --optimize --domain example.com
+PASS  rc=0  --dry-run --purge
+PASS  rc=0  --dry-run --purge all
+PASS  rc=0  --dry-run --purge basic angie php mariadb valkey elastic others
+PASS  rc=0  --dry-run --purge --angie --php
+PASS  rc=0  --dry-run --purge --php ver=8.4
+PASS  rc=0  --dry-run --purge php mariadb
+PASS  rc=1  --dry-run --basic server=cloud
+PASS  rc=1  --dry-run --basic host=-bad
+PASS  rc=1  --dry-run --basic swap=0
+PASS  rc=0  --dry-run --basic swap=8Gi
+PASS  rc=0  --dry-run --purge others
+PASS  rc=1  --dry-run --basic time=Nowhere/Nothing
+PASS  rc=1  --dry-run --basic --mariadb user=u size=4gb
+PASS  rc=1  --dry-run --basic --mariadb user=u pass=p size=0
+PASS  rc=1  --dry-run --basic --mariadb user=u pass=p size=4gb bind=bogus
+PASS  rc=1  --dry-run --basic --php ver=8
+PASS  rc=1  --dry-run --basic --php ver=8.0
+PASS  rc=1  --dry-run --basic --mariadb user=root pass=x
+PASS  rc=1  --dry-run --basic --mariadb user=ROOT pass=x
+PASS  rc=1  --dry-run --basic --mariadb user=mysql pass=x
+PASS  rc=1  --dry-run --basic --mariadb user=mariadb pass=x
+PASS  rc=0  --dry-run --basic --mariadb user=rooter pass=x
+PASS  rc=1  --dry-run --domain example.com db=mysql
+PASS  rc=1  --dry-run --domain example.com db=MySQL
+PASS  rc=1  --dry-run --domain example.com db=sys
+PASS  rc=1  --dry-run --domain example.com db=information_schema
+PASS  rc=1  --dry-run --domain example.com db=performance_schema
+PASS  rc=1  --dry-run --domain example.com db=appdb user=root pass=x
+PASS  rc=1  --dry-run --domain example.com db=appdb user=Mysql pass=x
+PASS  rc=0  --dry-run --domain example.com db=mysql_app user=sysop pass=x
+PASS  rc=1  --dry-run --basic --php children=0
+PASS  rc=1  --dry-run --basic --valkey policy=bogus
+PASS  rc=1  --dry-run --basic --valkey io_threads=0
+PASS  rc=1  --dry-run --basic --valkey ram=0
+PASS  rc=1  --dry-run --basic --elastic ram=x
+PASS  rc=1  --dry-run --basic --elastic ram=0
+PASS  rc=1  --dry-run --basic --others bogus
+PASS  rc=1  --dry-run --domain -bad.com
+PASS  rc=1  --dry-run --domain example.com app=bogus
+PASS  rc=1  --dry-run --domain example.com user=u pass=p
+PASS  rc=1  --dry-run --domain example.com db=d user=u
+PASS  rc=1  --dry-run --domain example.com db=d sql=/tmp/setup-test-matrix.Pdgarh/dump.sql user=u pass=p sql=/nonexistent/dump.sql
+PASS  rc=1  --dry-run --domain example.com sql=/tmp/setup-test-matrix.Pdgarh/dump.sql
+PASS  rc=1  --dry-run --domain example.com db=bad-name
+PASS  rc=1  --dry-run --domain db=early example.com
+PASS  rc=1  --dry-run --basic --harden-ssh
+PASS  rc=1  --dry-run --optimize --cloudflare-only
+PASS  rc=1  --dry-run --domain example.com --purge
+PASS  rc=1  --dry-run --angie
+PASS  rc=1  --dry-run --bogus
+PASS  rc=1  --dry-run --sync-angie
+PASS  rc=0  --check --basic
+PASS  rc=0  -h
+PASS  rc=1  --dry-run --basic foo=1
+PASS  rc=1  --dry-run --basic foo
+PASS  rc=1  --dry-run --basic --php foo=1
+PASS  rc=1  --dry-run --basic --valkey foo=1
+PASS  rc=1  --dry-run --basic --elastic foo=1
+PASS  rc=1  --dry-run --basic --mariadb user=a pass=b foo=1
+PASS  rc=0  --dry-run --basic --mariadb user=a pass=b bind=::1
+PASS  rc=0  --dry-run --basic --mariadb user=a pass=b bind=127.0.0.1,2.3.4.5
+PASS  rc=0  --dry-run --basic --mariadb user=a pass=b size=512m
+PASS  rc=1  --dry-run --basic --mariadb user=a pass=b bind=1.2.3
+PASS  rc=0  --dry-run --basic --php children=auto
+PASS  rc=0  --dry-run --basic --valkey ram=2G
+PASS  rc=0  --dry-run --basic --valkey ram=512m
+PASS  rc=0  --dry-run --basic --valkey policy=allkeys-lru
+PASS  rc=0  --dry-run --basic --valkey policy=allkeys-lfu
+PASS  rc=0  --dry-run --basic --valkey policy=volatile-lru
+PASS  rc=0  --dry-run --basic --valkey policy=volatile-lfu
+PASS  rc=0  --dry-run --basic --valkey policy=volatile-ttl
+PASS  rc=0  --dry-run --basic --valkey policy=allkeys-random
+PASS  rc=0  --dry-run --basic --valkey policy=volatile-random
+PASS  rc=0  --dry-run --basic --elastic host=10.0.0.5
+PASS  rc=1  --dry-run --basic --elastic host=10.0.0.999
+PASS  rc=1  --dry-run --basic --others
+PASS  rc=0  --dry-run --basic --others nvme
+PASS  rc=0  --dry-run --basic --others smartmon smartmon
+PASS  rc=0  --dry-run --domain a.example.com app=xenforo
+PASS  rc=0  --dry-run --domain a.example.com app=wp
+PASS  rc=0  --dry-run --domain a.example.com app=chev
+PASS  rc=0  --dry-run --domain a.example.com app=nodejs
+PASS  rc=0  --dry-run --domain a.example.com app=generic
+PASS  rc=0  --dry-run --domain a.example.com app=none
+PASS  rc=0  --dry-run --domain a.example.com app=plain
+PASS  rc=0  --dry-run --domain a.example.com app=static
+PASS  rc=0  --dry-run --domain EXAMPLE.COM
+PASS  rc=0  --dry-run --domain example.com.
+PASS  rc=0  --dry-run --domain example.com example.com
+PASS  rc=0  --dry-run --basic --angie --domain x.example.com
+PASS  rc=1  --dry-run --domain x.example.com --angie
+PASS  rc=1  --dry-run --diagnostics --domain x.example.com
+PASS  rc=1  --dry-run --purge bogus
+PASS  rc=1  --dry-run --purge --php ver=8
+PASS  rc=0  --dry-run --purge --basic
+PASS  rc=0  --dry-run --purge --others
+PASS  rc=0  --dry-run --purge basic
+PASS  rc=0  --dry-run --upgrade-php=8.6
+PASS  rc=0  --dry-run --upgrade-php 8.6
+PASS  rc=1  --dry-run --upgrade-php
+PASS  rc=1  --dry-run --upgrade-php=abc
+PASS  rc=1  --dry-run --upgrade-php=
+PASS  rc=1  --dry-run --upgrade-php= --purge
+PASS  rc=1  --dry-run --upgrade-php= --basic
+PASS  rc=1  --dry-run --upgrade-php 
+PASS  rc=1  --dry-run --upgrade-php --purge
+PASS  rc=1  --dry-run --upgrade-php=7.4
+PASS  rc=1  --dry-run --upgrade-php=8.6 --basic
+PASS  rc=1  --dry-run --upgrade-php=8.6 --optimize
+PASS  rc=1  --dry-run --upgrade-php=8.6 --purge
+PASS  rc=1  --dry-run --upgrade-php=8.6 --diagnostics
+PASS  rc=1  --dry-run --upgrade-php=8.6 --restart-all
+PASS  rc=1  --dry-run --upgrade-php=8.6 --domain example.com
+PASS  rc=1  --dry-run --upgrade-php=8.6 --upgrade-php=8.5
+PASS  --optimize includes the OS tuning plan
+PASS  --others all expands to the supported packages
+PASS  every run writes a complete setup_<timestamp>.log
+PASS  run log redacts pass= arguments
+PASS  rc=0  SETUP_PHP_JIT=tracing --dry-run --optimize
+PASS  rc=0  SETUP_PHP_JIT=bogus --dry-run --optimize
+PASS  rc=0  SETUP_PHP_JIT_WORDPRESS=1 --dry-run --optimize
+PASS  rc=0  SETUP_TCP_CC=cubic --dry-run --optimize
+PASS  rc=0  SETUP_QDISC=fq_codel --dry-run --optimize
+PASS  rc=0  SETUP_LIMIT_REQ_EXEMPT=10.0.0.5 --dry-run --optimize
+PASS  rc=0  SETUP_PRECOMPRESS_ASSETS=1 --dry-run --optimize
+PASS  rc=0  SETUP_NODE_MAJOR=bogus --dry-run --basic --others nodejs
+PASS  rc=0  SETUP_ANGIE_COMPRESSION=gzip --dry-run --basic --angie
+PASS  rc=0  SETUP_WP_DB_SPLIT=0 --dry-run --domain a.example.com app=wordpress
+PASS  rc=0  SETUP_PURGE_MALWARE=0 --dry-run --optimize
+PASS  rc=0  CONFIG_SOURCE_DIR=/nonexistent --dry-run --basic --angie
+PASS  rc=0  --dry-run --basic --angie anubis=yes
+PASS  rc=0  --dry-run --basic --angie anubis=no
+PASS  rc=0  --dry-run --optimize anubis=yes
+PASS  rc=0  --dry-run --optimize anubis=no
+PASS  rc=0  --dry-run --optimize anubis=1
+PASS  rc=1  --dry-run --basic anubis=yes
+PASS  rc=1  --dry-run --basic --angie anubis=maybe
+PASS  rc=1  --dry-run --basic --php anubis=yes
+PASS  rc=0  SETUP_ANUBIS=1 --dry-run --basic --angie
+PASS  rc=1  SETUP_ANUBIS=bogus --dry-run --basic --angie
+
+TOTAL pass=208 fail=0

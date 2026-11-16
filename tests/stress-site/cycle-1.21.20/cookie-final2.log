@@ -1,0 +1,66 @@
+################ XenForo
+PASS  XF guest home is 200
+PASS  XF guest home is served from the cache
+PASS  XF cached guest page carries no Set-Cookie (HIT)
+PASS  XF guest MISS (the request that fills the cache) carries no Set-Cookie
+PASS  XF cached page still has HSTS
+PASS  XF cached page still has Referrer-Policy
+PASS  XF guest HEAD is 200
+PASS  XF /login/ is not cached
+PASS  XF /login/ sets a cookie for each guest
+PASS  XF /login/ cookies differ between two guests
+PASS  XF non-friendly /index.php?login/ is not cached and sets a cookie
+PASS  XF /api/ is never cached
+PASS  XF cached page embeds a (stale) CSRF token for the JS
+PASS  XF keep-alive answers 200 without a cookie and with a stale token
+PASS  XF keep-alive returns a fresh CSRF token
+PASS  XF keep-alive sets this guest's own xf_csrf cookie
+PASS  XF keep-alive (JSON, as the stock JS sends it) returns status ok
+PASS  XF keep-alive (JSON) returns a csrf token and sets xf_csrf
+PASS  XF two guests get different xf_csrf cookies
+PASS  XF guest with only xf_csrf is still served from the cache
+PASS  XF login from a cached page succeeds (303)
+PASS  XF login response delivers session/user cookies
+PASS  XF member page bypasses the cache
+PASS  XF member page is rendered for the member
+PASS  XF member page keeps HSTS
+PASS  XF member page was not stored: guests still get the guest page
+PASS  XF guest POST is not cached
+PASS  XF failed login is answered by PHP, not the cache
+PASS  XF unknown .php is 404
+PASS  XF css.php carries no Set-Cookie
+PASS  XF logout is accepted (303)
+PASS  XF logout (GET, no-cache URI) passes its Set-Cookie headers
+################ Chevereto
+PASS  Chevereto guest /explore is 200
+PASS  Chevereto guest /explore is served from the cache
+PASS  Chevereto cached page carries no Set-Cookie (HIT)
+PASS  Chevereto guest MISS carries no Set-Cookie
+PASS  Chevereto cached page has HSTS and X-Content-Type-Options
+PASS  Chevereto home is never cached
+PASS  Chevereto home gives each guest a session
+PASS  Chevereto two guests get different sessions
+PASS  Chevereto /?random is not cached
+PASS  Chevereto ?lang= is not cached
+PASS  Chevereto guest with a session bypasses the cache
+PASS  Chevereto each session sees its own auth_token
+PASS  Chevereto session pages do not show the cached page's token
+PASS  Chevereto token is stable within one session
+PASS  Chevereto login succeeds (302)
+PASS  Chevereto login delivers the KEEP_LOGIN cookie
+PASS  Chevereto logged-in page bypasses the cache
+PASS  Chevereto /dashboard (nested uncached PHP location) works for the admin
+PASS  Chevereto /settings works for the logged-in user
+PASS  Chevereto logged-in page was not stored: guests still get the cached guest page
+PASS  Chevereto /json POST is not cached
+PASS  Chevereto unknown .php is 404
+################ WordPress
+PASS  WordPress guest home is cached
+PASS  WordPress cached page carries no Set-Cookie
+PASS  WordPress page that sets a guest cookie is never stored
+PASS  WordPress guest cookies are unique per visitor
+PASS  WordPress login succeeds (302) and sets cookies
+PASS  WordPress logged-in page bypasses the cache
+PASS  WordPress logged-in page was not stored
+
+TOTAL pass=61 fail=0

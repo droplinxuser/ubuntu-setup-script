@@ -19,6 +19,10 @@ expect() {
   fi
 }
 PW=$(cat /root/audit/test-admin-pass); V=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
+# Address used to reach the vhosts.  Anubis forwards it as X-Real-IP; some
+# applications (Chevereto) reject a loopback X-Real-IP, so an Anubis run must
+# pass TARGET_IP=<host LAN address> to exercise the same path as a client.
+TIP=${TARGET_IP:-127.0.0.1}
 J=/root/audit/cookies; mkdir -p $J; rm -f $J/*.jar
 LOG=/var/www/logs/php/php-error.log
 WP=/var/www/wp.test.local/public; XF=/var/www/xf.test.local/public; CH=/var/www/chev.test.local/public
@@ -31,7 +35,7 @@ WP=/var/www/wp.test.local/public; XF=/var/www/xf.test.local/public; CH=/var/www/
 printf 'log_errors = On\nerror_log = %s\n' "$LOG" > /etc/php/$V/fpm/conf.d/zzz-audit.ini
 printf 'log_errors = On\nerror_log = %s\n' "$LOG" > /etc/php/$V/cli/conf.d/zzz-audit.ini
 systemctl reload php$V-fpm; : > $LOG; chmod 666 $LOG
-q() { local h=$1; shift; curl -sk -o /tmp/ex.body -w '%{http_code}' --resolve $h:443:127.0.0.1 "$@"; }
+q() { local h=$1; shift; curl -sk -o /tmp/ex.body -w '%{http_code}' --resolve $h:443:${TIP} "$@"; }
 st() { printf '%-34s %s\n' "$1" "$2"; }
 # member passwords
 (cd $WP && runuser -u www-data -- php -r 'require "wp-load.php"; $u=get_user_by("login","bench1"); wp_set_password($argv[1],$u->ID); echo "wp bench1 id=$u->ID\n";' "$PW")
@@ -46,18 +50,18 @@ for who in admin bench1; do
   LOGIN=$(q wp.test.local -b $J/wp-$who.jar -c $J/wp-$who.jar --data-urlencode log=$who --data-urlencode "pwd=$PW" -d 'wp-submit=Log+In&testcookie=1&redirect_to=https%3A%2F%2Fwp.test.local%2Fwp-admin%2F' https://wp.test.local/wp-login.php)
   st "wp login $who" "$LOGIN"; expect "wp login $who" "$LOGIN" 302 303
 done
-POST=$(curl -sk --resolve wp.test.local:443:127.0.0.1 https://wp.test.local/ | grep -oE 'https://wp.test.local/benchmark-post[a-z0-9-]+/' | head -1); echo "$POST" > $J/wp-post.url
+POST=$(curl -sk --resolve wp.test.local:443:${TIP} https://wp.test.local/ | grep -oE 'https://wp.test.local/benchmark-post[a-z0-9-]+/' | head -1); echo "$POST" > $J/wp-post.url
 for u in / "${POST#https://wp.test.local}" /wp-json/wp/v2/posts '/?s=benchmark' /feed/ /wp-sitemap.xml /author/admin/ /category/uncategorized/; do st "wp guest $u" "$(q wp.test.local "https://wp.test.local$u")"; done
 for u in / "${POST#https://wp.test.local}" /wp-admin/profile.php; do st "wp member $u" "$(q wp.test.local -b $J/wp-bench1.jar "https://wp.test.local$u")"; done
 for u in /wp-admin/ /wp-admin/edit.php /wp-admin/post-new.php /wp-admin/upload.php /wp-admin/themes.php /wp-admin/plugins.php /wp-admin/users.php /wp-admin/options-general.php /wp-admin/site-health.php /wp-admin/edit-comments.php /wp-admin/site-editor.php /wp-admin/update-core.php; do st "wp admin $u" "$(q wp.test.local -b $J/wp-admin.jar "https://wp.test.local$u")"; done
-st "wp comment POST" "$(PID=$(curl -sk --resolve wp.test.local:443:127.0.0.1 "$POST" | grep -oE "comment_post_ID' value='[0-9]+" | grep -oE '[0-9]+$' | head -1); q wp.test.local -b $J/wp-bench1.jar -d "comment=audit+comment+$RANDOM&comment_post_ID=$PID&comment_parent=0" https://wp.test.local/wp-comments-post.php)"
+st "wp comment POST" "$(PID=$(curl -sk --resolve wp.test.local:443:${TIP} "$POST" | grep -oE "comment_post_ID' value='[0-9]+" | grep -oE '[0-9]+$' | head -1); q wp.test.local -b $J/wp-bench1.jar -d "comment=audit+comment+$RANDOM&comment_post_ID=$PID&comment_parent=0" https://wp.test.local/wp-comments-post.php)"
 ( cd $WP && runuser -u www-data -- php wp-cron.php ); st "wp-cron cli" $?
 # ---- XenForo
 xflogin() { local who=$1 jar=$J/xf-$2.jar t
   # Save the body to a file before grep: piping curl into `head` makes curl
   # die on SIGPIPE before it writes the cookie jar, so the following POST
   # arrives without the session cookie and the login is rejected.
-  curl -sk --resolve xf.test.local:443:127.0.0.1 -c $jar -o $J/xf-login.html https://xf.test.local/login/
+  curl -sk --resolve xf.test.local:443:${TIP} -c $jar -o $J/xf-login.html https://xf.test.local/login/
   t=$(grep -oE 'name="_xfToken" value="[^"]+' $J/xf-login.html | head -1 | sed 's/.*value="//')
   st "xf login $who" "$(q xf.test.local -b $jar -c $jar --data-urlencode "login=$who" --data-urlencode "password=$PW" --data-urlencode "_xfToken=$t" -d 'remember=1&_xfRedirect=https%3A%2F%2Fxf.test.local%2F' https://xf.test.local/login/login)"; }
 xflogin admin admin; xflogin "$XFM" member
@@ -66,7 +70,7 @@ xflogin admin admin; xflogin "$XFM" member
 # script then posted the reply to "https://xf.test.localadd-reply" (curl exit
 # 000) while the run still reported success.  Fall back to the seeded thread
 # in the database so the reply/search tests always have a real target.
-THREAD=$(curl -skL --resolve xf.test.local:443:127.0.0.1 https://xf.test.local/whats-new/posts/ | grep -oE '/threads/[a-z0-9.%-]+/' | head -1)
+THREAD=$(curl -skL --resolve xf.test.local:443:${TIP} https://xf.test.local/whats-new/posts/ | grep -oE '/threads/[a-z0-9.%-]+/' | head -1)
 if [[ -z $THREAD ]]; then
   TID=$(mariadb -N -B xenforo -e 'SELECT thread_id FROM xf_thread ORDER BY thread_id LIMIT 1' 2>/dev/null | head -1)
   [[ $TID =~ ^[0-9]+$ ]] && THREAD="/threads/${TID}/"
@@ -78,13 +82,13 @@ else
   # /threads/ID/ answers a 301 to the canonical slug.  A saved short URL made
   # the benchmark measure that redirect (1024 req/s of empty 301s) instead of
   # the thread page, so store the URL curl ends up on.
-  THREAD=$(curl -sk -o /dev/null -w '%{url_effective}' -L --resolve xf.test.local:443:127.0.0.1 "https://xf.test.local$THREAD")
+  THREAD=$(curl -sk -o /dev/null -w '%{url_effective}' -L --resolve xf.test.local:443:${TIP} "https://xf.test.local$THREAD")
   THREAD=${THREAD#https://xf.test.local}
   echo "https://xf.test.local$THREAD" > $J/xf-thread.url
 fi
 for u in / "$THREAD" /members/ /whats-new/ /forums/-/index.rss /search/ /help/ /sitemap.xml /css.php; do st "xf guest $u" "$(q xf.test.local -L "https://xf.test.local$u")"; done
 for u in / "$THREAD" /account/ /account/preferences /conversations/ /whats-new/posts/ /search/ /members/; do st "xf member $u" "$(q xf.test.local -L -b $J/xf-member.jar "https://xf.test.local$u")"; done
-t=$(curl -skL --resolve xf.test.local:443:127.0.0.1 -b $J/xf-member.jar "https://xf.test.local$THREAD" | grep -oE 'name="_xfToken" value="[^"]+' | head -1 | sed 's/.*value="//')
+t=$(curl -skL --resolve xf.test.local:443:${TIP} -b $J/xf-member.jar "https://xf.test.local$THREAD" | grep -oE 'name="_xfToken" value="[^"]+' | head -1 | sed 's/.*value="//')
 if [[ -n $THREAD ]]; then
   REPLY=$(q xf.test.local -L -b $J/xf-member.jar --data-urlencode "message=audit reply $RANDOM $RANDOM" --data-urlencode "_xfToken=$t" -d '_xfResponseType=json' "https://xf.test.local${THREAD}add-reply")
   st "xf reply POST" "$REPLY"
@@ -108,7 +112,7 @@ sleep 1
 chev_login() {
   local code
   rm -f "$J/ch-admin.jar"
-  curl -sk --resolve chev.test.local:443:127.0.0.1 -c "$J/ch-admin.jar" -o "$J/chev-login.html" https://chev.test.local/login
+  curl -sk --resolve chev.test.local:443:${TIP} -c "$J/ch-admin.jar" -o "$J/chev-login.html" https://chev.test.local/login
   local tok
   tok=$(grep -oE 'auth_token = "[a-f0-9]+' "$J/chev-login.html" | head -1 | grep -oE '[a-f0-9]+$')
   code=$(q chev.test.local -b "$J/ch-admin.jar" -c "$J/ch-admin.jar" --data-urlencode login-subject=admin --data-urlencode "password=$PW" --data-urlencode "auth_token=$tok" -d keep-login=1 https://chev.test.local/login)
@@ -118,7 +122,7 @@ chev_login() {
   if [[ $code == 403 ]]; then
     sleep 1
     rm -f "$J/ch-admin.jar"
-    curl -sk --resolve chev.test.local:443:127.0.0.1 -c "$J/ch-admin.jar" -o "$J/chev-login.html" https://chev.test.local/login
+    curl -sk --resolve chev.test.local:443:${TIP} -c "$J/ch-admin.jar" -o "$J/chev-login.html" https://chev.test.local/login
     tok=$(grep -oE 'auth_token = "[a-f0-9]+' "$J/chev-login.html" | head -1 | grep -oE '[a-f0-9]+$')
     code=$(q chev.test.local -b "$J/ch-admin.jar" -c "$J/ch-admin.jar" --data-urlencode login-subject=admin --data-urlencode "password=$PW" --data-urlencode "auth_token=$tok" -d keep-login=1 https://chev.test.local/login)
   fi
@@ -129,7 +133,7 @@ for u in / /explore /explore/recent /explore/trending /explore/albums /explore/u
 for u in / /admin /dashboard /dashboard/settings /dashboard/images /dashboard/users /dashboard/settings/system /settings /upload /explore; do st "chev admin $u" "$(q chev.test.local -L -b $J/ch-admin.jar "https://chev.test.local$u")"; done
 # upload a generated PNG through the web form endpoint
 php -r '$i=imagecreatetruecolor(640,480); imagefilledrectangle($i,0,0,639,479,imagecolorallocate($i,rand(0,255),120,200)); imagepng($i,"/tmp/ex.png");'
-t=$(curl -sk --resolve chev.test.local:443:127.0.0.1 -b $J/ch-admin.jar https://chev.test.local/upload | grep -oE 'auth_token *[=:] *"[a-f0-9]+' | head -1 | grep -oE '[a-f0-9]+$')
+t=$(curl -sk --resolve chev.test.local:443:${TIP} -b $J/ch-admin.jar https://chev.test.local/upload | grep -oE 'auth_token *[=:] *"[a-f0-9]+' | head -1 | grep -oE '[a-f0-9]+$')
 st "chev upload POST" "$(q chev.test.local -b $J/ch-admin.jar -F "source=@/tmp/ex.png" -F type=file -F action=upload -F "auth_token=$t" -F nsfw=0 https://chev.test.local/json) $(head -c 120 /tmp/ex.body | tr -d '\n')"
 IMG=$(grep -oE '"url_viewer":"[^"]+' /tmp/ex.body | head -1 | sed 's/.*:"//; s#\\/#/#g'); [ -n "$IMG" ] && { echo "$IMG" > $J/ch-image.url; st "chev image page" "$(q chev.test.local "$IMG")"; }
 (cd $CH && runuser -u www-data -- php app/bin/legacy -C cron >/dev/null 2>&1); st "chev cron cli" $?

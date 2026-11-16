@@ -21,8 +21,12 @@ validate_timezone() {
 
 validate_hostname() {
   local h=$1
-  (( ${#h} >= 1 && ${#h} <= 253 )) || return 1
-  [[ $h =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]
+  # systemd/hostnamectl accept a DNS name of up to 64 characters; every
+  # label must be 1-63 characters, start and end alphanumeric, and not be
+  # empty ("a..b", "a-.b" and a 100-character name all fail later inside
+  # --basic, after the hostname but before the firewall and cron steps).
+  (( ${#h} >= 1 && ${#h} <= 64 )) || return 1
+  [[ $h =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$ ]]
 }
 
 validate_ipv4() {
@@ -425,6 +429,10 @@ latest_sury_php() {
     upstream=${upstream%%-*}
     # Ignore alpha/beta/RC/dev packages: their upstream version has a suffix.
     [[ $upstream =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+    # Auto-selection must only pick a version this repository has a pool
+    # template for; otherwise the day Sury publishes 8.7 `--basic --php`
+    # would fail late, after --basic already changed the host.
+    [[ -f ${SCRIPT_DIR}/configs/php/www_${ver//./}.conf ]] || continue
     if [[ -z $best ]] || [[ $(printf '%s\n%s\n' "$best" "$ver" | sort -V | tail -n1) == "$ver" ]]; then
       best=$ver
     fi
@@ -755,10 +763,17 @@ validate_all() {
       || die "--elastic ram='${eram}' is invalid (use auto, 4g, 512m, ...)"
     OPT[elastic.ram]=${eram,,}
     local ehost=${OPT[elastic.host]:-localhost}
-    [[ $ehost =~ ^[A-Za-z0-9._:-]+$ ]] \
-      || die "--elastic host='${ehost}' is invalid"
-    if [[ $ehost =~ ^[0-9.]+$ ]]; then
+    # network.host is an address, never address:port (the HTTP port is a
+    # separate key).  A colon here used to install a node that could not bind
+    # and fail 180 s later; reject it at parse time.  Bracketed IPv6 is kept.
+    if [[ $ehost == \[*\] ]]; then
+      [[ ${ehost:1:${#ehost}-2} =~ ^[0-9A-Fa-f:]+$ ]] \
+        || die "--elastic host='${ehost}' is not a valid IPv6 literal"
+    elif [[ $ehost =~ ^[0-9.]+$ ]]; then
       validate_ipv4 "$ehost" || die "--elastic host='${ehost}' is not a valid IPv4 address"
+    else
+      [[ $ehost =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] \
+        || die "--elastic host='${ehost}' must be a host name or IP address (no :port)"
     fi
     OPT[elastic.host]=$ehost
   fi

@@ -203,6 +203,9 @@ install_angie() {
           return 1
         fi
       fi
+      # anubis=no in an install run restores the vhosts; stop the filter only
+      # after the reload above has put the direct-TLS config live.
+      anubis_finish_disable
       info "$ANUBIS_SUMMARY"
     else
       warn "Anubis setup failed (${ANUBIS_FAILED:-unknown}); sites stay directly exposed"
@@ -307,7 +310,8 @@ purge_php_installations() {
       systemctl start "$unit" 2>/dev/null \
         || warn "Could not restart ${unit} after the failed purge"
     done
-    die "Could not purge the existing PHP packages; the PHP-FPM units that were running were started again"
+    warn "Could not purge the existing PHP packages; the PHP-FPM units that were running were started again"
+    return 1
   fi
 
   # apt purge normally removes the tree; if conffiles survived, keep them in
@@ -396,7 +400,7 @@ install_php() {
   # then a no-op); on its fresh-install path this removes stray PHP packages
   # of a version without FPM.
   if (( upgrade_driver )); then
-    purge_php_installations
+    purge_php_installations || return 1
   fi
 
   # run_service executes installers in a subshell; persist the selected version
@@ -462,9 +466,21 @@ install_php() {
       optional_ok+=("$pkg")
     fi
   done
-  if (( ${#optional_ok[@]} > 0 )); then
-    apt_install "${optional_ok[@]}"
-  fi
+  # Install optional extensions one at a time.  A published package can still
+  # be uninstallable (missing dependency, conflict, Sury lag on a new minor);
+  # a single all-or-nothing apt transaction would then abort the whole PHP
+  # step and, on --upgrade-php, trigger a full rollback because of one optional
+  # extension.  Report the ones that failed instead.
+  local -a optional_failed=()
+  for pkg in "${optional_ok[@]}"; do
+    apt_install "$pkg" || {
+      optional_failed+=("$pkg")
+      warn "PHP ${ver}: optional package ${pkg} could not be installed; continuing without it"
+    }
+  done
+  for pkg in "${optional_failed[@]}"; do
+    PHP_UPGRADE_SKIPPED+=("${pkg#php*-} (${pkg}: install failed)")
+  done
   # Unversioned packages --upgrade-php carries over under their own name
   # (php-pear, PHP libraries).  Their dependencies are not tied to this PHP
   # version, so they get their own transaction: one that cannot be satisfied
@@ -1606,6 +1622,10 @@ EOF
 # missing persistent file).  Shared by install and --optimize.
 ensure_es_max_map_count() {
   local f=/etc/sysctl.d/99-elasticsearch.conf rc=0
+  ensure_state
+  # --purge must be able to remove the file and put the boot value back.
+  record_original "$f" sysctl.d-99-elasticsearch.conf
+  record_sysctl_originals vm.max_map_count
   if [[ $(cat "$f" 2>/dev/null) != 'vm.max_map_count = 1048576' ]]; then
     printf 'vm.max_map_count = 1048576\n' > "$f"
     chmod 644 "$f"

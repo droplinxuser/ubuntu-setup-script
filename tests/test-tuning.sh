@@ -2821,6 +2821,31 @@ check "tune_limit_req_exemptions adds managed entries" \
   bash -c "grep -qx '    192.0.2.50 1; # setup.sh exempt' '$TMP/limit_req.conf' && grep -qx '    10.0.0.0/8 1; # setup.sh exempt' '$TMP/limit_req.conf'"
 check "tune_limit_req_exemptions ignores invalid entries" \
   bash -c "! grep -q bogus '$TMP/limit_req.conf'"
+hostname_valid() {
+  validate_hostname web1 && validate_hostname web1.example.com && validate_hostname 16c-32g-1T
+}
+hostname_invalid() {
+  ! validate_hostname a..b && ! validate_hostname a-.b && ! validate_hostname .a \
+    && ! validate_hostname "$(printf 'a%.0s' {1..65})"
+}
+check "hostname validation accepts normal host and FQDN names" hostname_valid
+check "hostname validation rejects empty labels, bad labels and >64 chars" hostname_invalid
+exempt_valid() {
+  tune_valid_exempt_entry 192.0.2.50 && tune_valid_exempt_entry 10.0.0.0/8 \
+    && tune_valid_exempt_entry 2001:db8::1 && tune_valid_exempt_entry 2001:db8::/32 \
+    && tune_valid_exempt_entry ::1
+}
+exempt_invalid() {
+  ! tune_valid_exempt_entry 10.0.0.256 && ! tune_valid_exempt_entry 10.0.0.5/99 \
+    && ! tune_valid_exempt_entry 1.2.3 && ! tune_valid_exempt_entry cafe \
+    && ! tune_valid_exempt_entry 1:2:3 && ! tune_valid_exempt_entry ::: \
+    && ! tune_valid_exempt_entry 2001:db8::/129
+}
+check "rate-limit exemption: valid IPv4, IPv6 and CIDR are accepted" exempt_valid
+check "rate-limit exemption: malformed addresses/masks are rejected" exempt_invalid
+LIMIT_REQ_EXEMPT='10.0.0.256,10.0.0.5/99,cafe,2001:db8::/129,192.0.2.50' tune_limit_req_exemptions "$TMP/limit_req.conf" limit_req.conf
+check "tune_limit_req_exemptions writes only the valid subset" \
+  bash -c "grep -qx '    192.0.2.50 1; # setup.sh exempt' '$TMP/limit_req.conf' && [ \$(grep -c 'setup.sh exempt' '$TMP/limit_req.conf') -eq 1 ]"
 LIMIT_REQ_EXEMPT='192.0.2.50' tune_limit_req_exemptions "$TMP/limit_req.conf" limit_req.conf
 check "tune_limit_req_exemptions replaces the managed set" \
   test "$(grep -c 'setup.sh exempt' "$TMP/limit_req.conf")" -eq 1
@@ -3366,7 +3391,9 @@ check "cache guard: used_memory slightly above maxmemory still counts as full" \
 check "cache guard: a full cache below the plan takes the plan, not used+20%" \
   test "$(valkey_guard_maxmemory_mb 434 400 400 22249 1)" = "434 plan"
 check "cache guard: noeviction data is never dropped (used+20%)" \
-  test "$(valkey_guard_maxmemory_mb 434 512 512 22249 0)" = "614 raised"
+  test "$(valkey_guard_maxmemory_mb 434 512 512 22249 0)" = "512 full"
+check "cache guard: noeviction data above maxmemory still gets headroom" \
+  test "$(valkey_guard_maxmemory_mb 434 600 512 22249 0)" = "720 raised"
 check "cache guard: data above the current maxmemory is given headroom" \
   test "$(valkey_guard_maxmemory_mb 434 600 512 22249 1)" = "720 raised"
 check "cache guard: an unlimited or unknown maxmemory follows live data" \
@@ -3388,6 +3415,7 @@ guard_stable() {
   [[ ${second%% *} == "${first%% *}" ]]
 }
 check "cache guard: a second pass keeps a full cache's size" guard_stable 434 512 512 22249 1
+check "cache guard: a second pass keeps a full noeviction cache's size" guard_stable 434 512 512 22249 0
 check "cache guard: a second pass keeps a raised size" guard_stable 434 3000 0 22249 1
 check "cache guard: a second pass keeps a capped size" guard_stable 434 30000 0 22249 0
 
@@ -3425,8 +3453,8 @@ check "plan: a second run changes nothing" test "$OPT_VALKEY_BUDGET_MB" -eq 512
 
 valkey_policy_evicts() { printf '0'; }
 plan_memory_budget
-check "plan: a noeviction cache still gets live data +20%" \
-  test "$OPT_VALKEY_BUDGET_MB" -eq 614 -a "$OPT_VALKEY_GUARD" = live
+check "plan: a full noeviction cache keeps 512 MB instead of creeping to 614" \
+  test "$OPT_VALKEY_BUDGET_MB" -eq 512 -a "$OPT_VALKEY_GUARD" = full
 valkey_policy_evicts() { printf '1'; }
 
 valkey_live_used_mb() { printf '100'; }
@@ -3874,6 +3902,26 @@ check "the vhost migration is idempotent" \
 check "the migrated vhost is unchanged on the second pass" \
   test "$after_first" = "$(md5sum < "$TMP/anubis/conf.d/site.test.conf")"
 
+# A non-443 TLS port must not be treated as the public HTTPS listener.
+cat > "$TMP/anubis/conf.d/alt.test.conf" <<'EOF'
+server {
+    listen 8443 ssl;
+    server_name alt.test;
+}
+EOF
+check "Anubis leaves an 8443 SSL listener alone" \
+  bash -c '! anubis_vhost_needs_migration "$1"' _ "$TMP/anubis/conf.d/alt.test.conf"
+# IPv6-only TLS blocks used to lose their only listener and fall back to :80.
+cat > "$TMP/anubis/conf.d/v6.test.conf" <<'EOF'
+server {
+    listen [::]:443 ssl;
+    server_name v6.test;
+}
+EOF
+anubis_integrate_vhost "$TMP/anubis/conf.d/v6.test.conf"
+check "Anubis migrates an IPv6-only TLS listener" \
+  grep -qx '    listen unix:/run/angie/anubis-test.sock;' "$TMP/anubis/conf.d/v6.test.conf"
+
 # Terminators are generated from the integrated blocks only; the catch-all
 # (server_name _) must never become a public terminator.
 anubis_render_terminators "$TMP/anubis/conf.d" "$TMP/anubis/terminators.conf"
@@ -4065,6 +4113,10 @@ unit_profile_small=$( (
 ) )
 check "the generated Anubis unit carries the 2 CPU / 2 GB profile" \
   test "$unit_profile_small" = "LimitNOFILE=16384 Environment=GOGC=100 Environment=GOMEMLIMIT=256MiB Environment=GOMAXPROCS=2"
+
+check "the Anubis unit keeps the filter in its own group with a 0750 runtime dir" \
+  grep -qx 'Group=anubis' "$TMP/anubis-generated.service" \
+  && grep -qx 'RuntimeDirectoryMode=0750' "$TMP/anubis-generated.service"
 
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

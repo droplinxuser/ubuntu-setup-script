@@ -1,5 +1,51 @@
 # Full-stack stress test reports
 
+## 1.21.20 re-audit (2026-11-16)
+
+Fresh 526-package baseline, full install with Anubis from the start, PHP
+round trip, hardening and final restore on `16c-32g-1T` (16 vCPU, 27 812 MiB,
+NVMe).  Pair: `server-configs-nginx` 1.6.35.
+
+- **Parity:** install → `--optimize` → install snapshot diff empty; two
+  consecutive `--optimize` runs byte-identical.  Full install with Anubis,
+  three domains and every service: 3:48 (0 ERR); repeat install: 1:08.
+- **Fresh-install checks:** Anubis socket `0660 anubis:anubis` in a `0750`
+  directory, `www-data` in the `anubis` group (connect) and `nobody` refused;
+  no globally trusted Sury key; `ip_local_reserved_ports` includes 9000;
+  THP oneshot ordered before the database units; `vm.max_map_count` recorded.
+- **Anubis lifecycle:** `--optimize anubis=no` with a concurrent request probe
+  measured **420/420 HTTP 200** (one 502 without the drain); the group
+  membership is removed on disable and the empty group on purge.
+- **Loopback, Anubis off (100c, 10 s, new configs):** WP guest home 60 489,
+  post 58 347; XF guest home 74 981, thread 63 752; Chevereto explore 63 895,
+  home 2 451; WP member 261, XF member 722/456.
+- **Anubis on (same run):** WP 7 045/7 249, XF 10 507/7 430, Chevereto
+  8 424/7 399; members 704/451.  The Go hop used 5.56 cores at 8 960 req/s
+  (619 µs CPU/request, 79 MB RSS), consistent with the 1.21.18 measurement.
+- **PHP-FPM sweep (XF member thread, 100c):** 16 workers 487 req/s (p50 189
+  ms), 24 = 479, 32 = 470, 48 = 463 — 1 worker/CPU remains optimal; more
+  workers only add queueing.
+- **JIT sweep (same tier):** off 485, tracing/32M 512, tracing/64M 506,
+  aggressive 509, function 459, combined 504 req/s.  The shipped
+  tracing/64M profile keeps ~+4-5% over off with the same tail.
+- **PHP:** 8.5 → 8.4 → 8.5 round trip: 14/15 extensions carried, 0 skipped,
+  same pool/ini, Angie reloaded, functional suite clean on both versions.
+- **Validation:** 929 tuning checks, 208 dry runs, ShellCheck clean, 54/54
+  security, 61/61 guest-cookie, 0 unexpected functional responses, 0 PHP
+  diagnostics, 0 XenForo error rows.
+- **Angie 1.6.35:** `/attachments/*.php` 404 (was executable); WordPress
+  backup archives denied in subdirectories; subdirectory `wp-cron.php`
+  blocked; security headers restored on XenForo/Flarum/Chevereto PHP and
+  cached responses; proxy includes now send `$app_scheme`/
+  `$php_public_port`; proxy buffers 16 MiB → 256 KiB per request; cache keys
+  include public scheme/port; `gzip;q=0` no longer receives gzip; encoded dot
+  separators answer 400; Cloudflare refresh restores the old file on a
+  rejected list; DHE suites removed.
+- **Restore:** `--purge all` + baseline manifest: 97 packages purged,
+  **526 → 526** packages, 0 added/removed, no `/var/www`, `/etc/angie` or
+  `/etc/php`, UFW inactive, timezone/swap restored, 0 failed units, and after
+  a reboot only sshd + systemd-resolved listen.
+
 ## 1.21.18 re-audit (2026-11-16)
 
 Fresh 527-package baseline, full install, hardening and Anubis cost on the

@@ -662,6 +662,41 @@ tune_angie_dedupe_http() {
 # earlier external run that used wrk, which does not report status codes,
 # measured the rate limiter).  SETUP_LIMIT_REQ_EXEMPT="10.0.0.5,192.0.2.0/24"
 # adds managed entries to the geo whitelist; an empty value removes them.
+# True when an exemption is a real IPv4/IPv6 host or CIDR block.  Angie's geo
+# parser treats a malformed entry as NGX_LOG_EMERG ("invalid network"), which
+# makes `angie -t` fail and rolls the whole tune back, so the value must be
+# checked before it is written.
+tune_valid_exempt_entry() {
+  local e=$1 host=$1 mask="" IFS group nonempty=0
+  [[ $e == */* ]] && { host=${e%%/*}; mask=${e##*/}; }
+  if [[ $host =~ ^[0-9.]+$ ]]; then
+    validate_ipv4 "$host" || return 1
+    if [[ -n $mask ]]; then
+      [[ $mask =~ ^[0-9]{1,2}$ ]] && (( 10#$mask <= 32 )) || return 1
+    fi
+    return 0
+  fi
+  [[ $host == *:* ]] || return 1
+  [[ $host =~ ^[0-9A-Fa-f:]+$ ]] || return 1
+  [[ $host == *:::* || $host == *::*::* ]] && return 1
+  local -a parts
+  IFS=: read -r -a parts <<< "$host"
+  for group in "${parts[@]}"; do
+    [[ -z $group ]] && continue
+    [[ $group =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+    nonempty=$(( nonempty + 1 ))
+  done
+  (( nonempty <= 8 )) || return 1
+  # Without a "::" compression all eight groups must be present.
+  if [[ $host != *::* ]]; then
+    (( nonempty == 8 )) || return 1
+  fi
+  if [[ -n $mask ]]; then
+    [[ $mask =~ ^[0-9]{1,3}$ ]] && (( 10#$mask <= 128 )) || return 1
+  fi
+  return 0
+}
+
 tune_limit_req_exemptions() {
   local file=$1 label=$2 tmp entry
   local -a entries=()
@@ -669,7 +704,7 @@ tune_limit_req_exemptions() {
   local raw=${LIMIT_REQ_EXEMPT:-}
   raw=${raw//,/ }
   for entry in $raw; do
-    [[ $entry =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ || $entry =~ ^[0-9a-fA-F:]+(/[0-9]+)?$ ]] || {
+    tune_valid_exempt_entry "$entry" || {
       tune_miss "${label}: ignoring invalid SETUP_LIMIT_REQ_EXEMPT entry '${entry}'"
       continue
     }
@@ -1744,6 +1779,10 @@ php_accelerated_files_target() {
     printf '128256'
     return 0
   fi
+  # The Anubis static shadow repeats each vhost root and www/apex pairs often
+  # share one; find does not de-duplicate its operands, so count each tree
+  # once or the script table is sized 2x (and clamped at the ceiling).
+  mapfile -t roots < <(printf '%s\n' "${roots[@]}" | sort -u)
   n=$(find "${roots[@]}" -xdev -type f -name '*.php' 2>/dev/null | wc -l | tr -d ' ')
   [[ $n =~ ^[0-9]+$ ]] && count=$n
   (( count == 0 )) && { printf '128256'; return 0; }
@@ -2526,16 +2565,28 @@ refresh_blob_key_dearmor() {
 
 ensure_sury_keyring() {
   local keyring=/usr/share/keyrings/debsuryorg-archive-keyring.gpg
+  local legacy
   local deb extract embedded
+  # The vendor .deb also drops the same key in trusted.gpg.d, where it signs
+  # every configured repository.  The source line pins signed-by, so move the
+  # global copy out of the tree once it is proven identical.
+  retire_global_sury_key() {
+    for legacy in /etc/apt/trusted.gpg.d/debsuryorg-archive.gpg \
+                  /etc/apt/trusted.gpg.d/deb.sury.org-php.gpg; do
+      [[ -f $legacy ]] && cmp -s "$legacy" "$keyring" && retire_paths "$legacy"
+    done
+  }
   deb=$(tmp_file --suffix=.deb) || return 1
   blob_sury_deb > "$deb" 2>/dev/null || { warn "Could not decode Sury keyring payload"; return 1; }
   extract=$(tmp_dir) || return 1
   dpkg-deb -x "$deb" "$extract" 2>/dev/null || true
   embedded=$(find "$extract" -type f -name '*.gpg' 2>/dev/null | head -n1)
   if [[ -s $keyring && -n $embedded ]] && cmp -s "$keyring" "$embedded"; then
+    retire_global_sury_key
     return 0
   fi
   dpkg -i "$deb" || { warn "Could not install the Sury keyring package"; return 1; }
+  retire_global_sury_key
   info "Refreshed embedded key: ${keyring}"
 }
 
