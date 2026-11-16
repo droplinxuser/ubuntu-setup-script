@@ -33,7 +33,7 @@ ADDED=$(sed -n 's/^- Added: //p' "$WORK/delta.md" | head -n1 | tr ' ' '\n' | sed
 BASE_NAMES=$(awk -F'\t' '/^== packages ==/{p=1; next} /^== /{p=0} p && NF {print $1}' "$BASE")
 ADDED=$(printf '%s\n' "$ADDED" | grep -vxFf <(printf '%s\n' "$BASE_NAMES") || true)
 echo "added packages: $(printf '%s\n' "$ADDED" | sed '/^$/d' | wc -l)"
-for unit in angie mariadb valkey-server elasticsearch 'php*-fpm' sysstat smartmontools; do
+for unit in angie anubis mariadb valkey-server elasticsearch 'php*-fpm' sysstat smartmontools; do
   systemctl stop "$unit" >/dev/null 2>&1 || true
 done
 if [[ -n $ADDED ]]; then
@@ -58,6 +58,13 @@ apt-get update > "$WORK/apt-update.log" 2>&1 || true
 apt-get clean
 
 echo "== service trees, data and state"
+# Anubis is installed from a release tarball (not apt), so its binary, unit
+# and configuration are outside the package delta.
+systemctl disable anubis >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/anubis.service /usr/local/bin/anubis \
+      /etc/tmpfiles.d/angie-anubis.conf
+rm -rf /etc/anubis /run/anubis /var/lib/anubis /var/cache/anubis
+id anubis >/dev/null 2>&1 && userdel anubis >/dev/null 2>&1 || true
 rm -rf /var/www /etc/angie /etc/php /etc/mysql /etc/valkey /etc/redis /etc/elasticsearch \
        /var/lib/setup.sh /var/lib/mysql /var/lib/mariadb /var/lib/valkey /var/lib/redis /var/lib/elasticsearch \
        /var/lib/php /var/cache/php /var/cache/angie /var/log/angie /var/log/mysql /var/log/valkey \

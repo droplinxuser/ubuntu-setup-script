@@ -3,6 +3,37 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.14 (2026-11-16)
+
+- **Optional Anubis bot filter.**  `--angie anubis=yes` (fresh install) and
+  `--optimize anubis=yes` (existing host) install Anubis 1.28.2 from the
+  verified official tarball and put every site behind it:
+  `:443` TLS terminator -> Anubis (`/run/anubis/nginx.sock`) -> the
+  application vhost (`/run/angie/anubis-backend.sock`).  Both legs are Unix
+  sockets: a TCP loopback backend measured ~8 k req/s (Go's default idle pool
+  opens a connection per request), the Unix socket reaches ~49 k req/s on the
+  audit host.  The vhosts are migrated and backed up under
+  `/var/lib/setup.sh/anubis/vhosts`, terminators are generated from each
+  vhost's `server_name`/certificate, PHP sees the client address and
+  `HTTPS=on`, dot segments answer 400 at the edge, and the challenge page is
+  branding-free.  The policy allows search engines and infrastructure routes,
+  denies known AI crawlers and challenges `Mozilla` clients.  `ANUBIS=1` is
+  persisted, so a later `--domain` or plain `--optimize` protects new sites.
+  `--optimize anubis=no` restores every vhost, removes the generated Angie
+  files and stops/disables the service (the binary and `/etc/anubis` stay for
+  a quick re-enable).  Pair with server-configs-nginx 1.6.31.
+- **MariaDB pool sizing follows the data more closely.**  `auto` is now
+  data+index **plus 5%** (was 25%) with the 128 MB operational minimum and
+  the only-increase rule unchanged.  On a host where MariaDB is the only
+  data service (no PHP, Valkey or Elasticsearch) the pool may use up to
+  **80% of total RAM**; a mixed host keeps the half-of-RAM ceiling.  The
+  measured 935 MB table still gets a pool larger than the table (981 MB), and
+  a 60 GB database on a 64 GB database-only host gets 51 GB instead of 32 GB.
+- **PHP's `HTTPS` flag behind a terminator.**  `http.d/https_map.conf`
+  rebuilds it from `X-Forwarded-Proto` and `snippets/fastcgi-php.conf` passes
+  it, so applications do not emit `http://` URLs when the application leg is
+  plain HTTP.
+
 ## 1.21.13 (2026-11-16)
 
 - **The MariaDB buffer pool holds the working set again.**  1.21.9 sized

@@ -237,6 +237,11 @@ purge_basic() {
 
 purge_angie() {
   step "Purge Angie"
+  # The bot filter is part of the web tier; stop it first so nothing keeps
+  # proxying to a stopped backend.  Its configuration is kept for re-enable.
+  if declare -F anubis_purge_stop >/dev/null 2>&1; then
+    anubis_purge_stop || true
+  fi
   purge_service_stop angie
   apt_purge_pkgs angie
   # Configuration, data, caches and logs are left on disk.  Reinstalling Angie

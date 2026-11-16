@@ -473,6 +473,18 @@ php_installed_version() {
 validate_all() {
   local svc
 
+  # Anubis is only an Angie feature: on an install it must accompany --angie.
+  if [[ -n ${ANUBIS_SETTING:-} ]]; then
+    if (( ! OPTIMIZE && ! PURGE && ! DIAGNOSTICS && ! RESTART_ALL )) \
+       && (( ${ENABLED[angie]:-0} != 1 )); then
+      die "anubis= is only valid with --angie (or with --optimize on an existing host)"
+    fi
+    if (( OPTIMIZE )) && (( ANUBIS_SETTING == 1 )) && (( ! DRY_RUN )) \
+       && [[ ! -d /etc/angie/conf.d ]]; then
+      die "--optimize anubis=yes needs Angie on this host (install it with --angie first)"
+    fi
+  fi
+
   # --upgrade-php is a standalone mode like --optimize: it works on an
   # installed host, needs the Sury repository and must not be mixed with
   # install/purge/diagnostics flags that would change the same packages.

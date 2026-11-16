@@ -402,6 +402,11 @@ run_diagnostics() {
   diag "Angie http.d include status" diag_angie_include_status
   diag_sh "Angie error/access log sizes" 'du -sh /var/www/logs/angie /var/log/angie 2>/dev/null || true'
 
+  diag_sh "Anubis status" 'if [ -x /usr/local/bin/anubis ]; then /usr/local/bin/anubis --version; systemctl is-active anubis; systemctl show -p ExecMainStartTimestamp -p NRestarts anubis; else echo "Anubis is not installed"; fi'
+  diag_sh "Anubis environment (secret redacted)" 'if [ -r /etc/anubis/anubis.env ]; then sed -E "s/^(HS512_SECRET=).*/\1[redacted]/" /etc/anubis/anubis.env; else echo "no /etc/anubis/anubis.env"; fi'
+  diag_sh "Anubis sockets" 'ss -xlp 2>/dev/null | grep -E "anubis|angie" || echo "no Anubis sockets"'
+  diag_sh "Anubis policy result counters" 'curl -fsS --max-time 5 http://127.0.0.1:8240/metrics 2>/dev/null | grep -E "^anubis_(policy_results|challenges|requests)" | head -n 40 || echo "metrics endpoint not reachable"'
+
   diag_sh "PHP CLI version" 'if command -v php >/dev/null 2>&1; then php -v; else echo "php CLI is not installed"; fi'
   diag_sh "PHP CLI modules" 'if command -v php >/dev/null 2>&1; then php -m; else echo "php CLI is not installed"; fi'
   diag_sh "PHP CLI ini" 'if command -v php >/dev/null 2>&1; then php --ini; else echo "php CLI is not installed"; fi'

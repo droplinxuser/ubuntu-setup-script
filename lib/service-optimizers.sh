@@ -64,6 +64,18 @@ optimize_angie() {
   # tuning, and only when the tree actually changed.
   local digest_before digest_after
   digest_before=$(config_tree_digest /etc/angie)
+  # Optional bot filter: migrate the vhosts and write the terminators before
+  # the repository sync validates the tree, so the single reload below picks
+  # the integration up together with the rest of the tune.  Disabling
+  # (anubis=no or a persisted ANUBIS=0) restores the vhosts here as well.
+  if anubis_wanted || anubis_managed; then
+    if anubis_apply; then
+      [[ -n $ANUBIS_SUMMARY ]] && opt_report "- ${ANUBIS_SUMMARY}"
+    else
+      rc=1
+      opt_report "- **FAILED** Anubis: ${ANUBIS_FAILED:-unknown}; the previous configuration was left in place"
+    fi
+  fi
   ANGIE_SYNC_RELOAD=0
   if sync_angie_repo_configs; then
     ANGIE_SYNC_RELOAD=1
@@ -596,15 +608,22 @@ optimize_mariadb() {
     [[ ${OPT_DB_SIZE_MB:-} =~ ^[0-9]+$ ]] || OPT_DB_SIZE_MB=0
   fi
   if (( OPT_DB_SIZE_MB > 0 )); then
-    local pct_mb=$(( OPT_DB_SIZE_MB + OPT_DB_SIZE_MB / 4 ))
-    local pool_cap=$(( $(mem_total_mb) / 2 ))
+    local pct_mb=$(( OPT_DB_SIZE_MB + OPT_DB_SIZE_MB / 20 ))
+    local pool_cap
+    if [[ " ${OPT_DETECTED[*]} " != *" php:"* ]] \
+       && [[ " ${OPT_DETECTED[*]} " != *" valkey "* && " ${OPT_DETECTED[*]} " != *" redis "* ]] \
+       && [[ " ${OPT_DETECTED[*]} " != *" elastic "* ]]; then
+      pool_cap=$(( $(mem_total_mb) * 80 / 100 ))
+    else
+      pool_cap=$(( $(mem_total_mb) / 2 ))
+    fi
     (( pool_cap < 256 )) && pool_cap=256
     (( pct_mb > pool_cap )) && pct_mb=$pool_cap
     (( pct_mb < 128 )) && pct_mb=128
     if (( ${OPT_MARIADB_KEPT_MB:-0} > 0 )); then
-      opt_report "- Database data+index=${OPT_DB_SIZE_MB}MB; buffer pool=${size_mb}MB (kept existing pool; the data+25% target is ${pct_mb}MB)"
+      opt_report "- Database data+index=${OPT_DB_SIZE_MB}MB; buffer pool=${size_mb}MB (kept existing pool; the data+5% target is ${pct_mb}MB)"
     else
-      opt_report "- Database data+index=${OPT_DB_SIZE_MB}MB; buffer pool=${size_mb}MB (data+25% = ${pct_mb}MB, 128MB minimum, RAM/2 ceiling)"
+      opt_report "- Database data+index=${OPT_DB_SIZE_MB}MB; buffer pool=${size_mb}MB (data+5% = ${pct_mb}MB, 128MB minimum; cap $(( pool_cap ))MB)"
     fi
   fi
   mariadb_compute_profile "$size_mb"
@@ -1665,7 +1684,7 @@ optimize_plan() {
     db_size_mb=${OPT_DB_SIZE_MB:-0}
     db_fit=""
     if (( db_size_mb > 0 )); then
-      db_fit=", database=${db_size_mb}MB (data+25% = $(( db_size_mb + db_size_mb / 4 ))MB, 128MB minimum, RAM/2 ceiling"
+      db_fit=", database=${db_size_mb}MB (data+5% = $(( db_size_mb + db_size_mb / 20 ))MB, 128MB minimum, data-only cap 80% RAM"
       (( ${OPT_MARIADB_KEPT_MB:-0} > 0 )) && db_fit+="; existing pool kept"
       db_fit+=")"
     fi

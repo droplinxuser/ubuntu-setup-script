@@ -24,6 +24,22 @@ DRY_RUN=0
 # keeping the extension set and custom configuration.  Empty means off.
 UPGRADE_PHP=""
 UPGRADE_PHP_SEEN=0
+# Optional Anubis bot filter.  Enabled with `--angie anubis=yes` (fresh
+# install) or `--optimize anubis=yes` (existing host), disabled again with
+# `--optimize anubis=no`.  The choice is persisted as ANUBIS=1/0 in
+# /etc/default/setup-tuning, so a later plain --optimize keeps it.
+ANUBIS_ENABLED="${ANUBIS:-0}"
+[[ $ANUBIS_ENABLED == 1 ]] || ANUBIS_ENABLED=0
+# Non-empty when the operator selected a state on this command line; the
+# install/optimize paths persist it only after a successful apply.
+ANUBIS_SETTING=""
+if [[ -n ${SETUP_ANUBIS+x} ]]; then
+  case ${SETUP_ANUBIS,,} in
+    1|yes|on|true)  ANUBIS_ENABLED=1; ANUBIS_SETTING=1 ;;
+    0|no|off|false) ANUBIS_ENABLED=0; ANUBIS_SETTING=0 ;;
+    *) die "SETUP_ANUBIS='${SETUP_ANUBIS}' is invalid (use 1 or 0)" ;;
+  esac
+fi
 PURGE_TARGETS=()
 PURGE_ORDER=()
 SERVICE_ORDER=(basic angie php mariadb valkey elastic others domain)
@@ -52,17 +68,26 @@ Basic (always required for an install; all values are optional):
     time     defaults to Asia/Manila
 
 Services (optional; only the ones listed are installed):
-  --angie
+  --angie     [anubis=yes|no]
+      anubis=yes  install the Anubis bot filter (v1.28.2, static binary) and
+                  put every vhost behind it: Angie TLS terminator -> Anubis ->
+                  application vhost, both legs on Unix sockets.  Browsers get
+                  a branding-free proof-of-work challenge; search engines and
+                  infrastructure routes are allowed, AI crawlers are denied.
+                  Only valid with --angie.  The choice is persisted as
+                  ANUBIS=1 so later --optimize runs keep it.  anubis=no is
+                  accepted for symmetry and leaves the host unchanged.
   --php       [ver=8.5] [children=auto|N] [max_requests=N]
       ver          PHP version (default: latest stable in Sury)
       children     PHP-FPM worker count (default: auto from RAM/CPU)
       max_requests recycle a worker after N requests (default: threads x 1024)
   --mariadb   user=demo pass=temp [size=4gb|auto] [bind=127.0.0.1[,ADDR...]|IPV4]
-      size     auto (default) = live data+index plus 25% from the shared
-               memory plan (128 MB minimum, RAM/2 ceiling), only increased;
-               an empty database uses a RAM floor.  The redo log is 25% of
-               the pool.  Room is left for Elasticsearch, Valkey and PHP
-               workers.
+      size     auto (default) = live data+index plus 5% from the shared
+               memory plan (128 MB minimum; capped at 80% of RAM when
+               MariaDB is the only data service, otherwise at RAM/2), only
+               increased; an empty database uses a RAM floor.  The redo log
+               is 25% of the pool.  Room is left for Elasticsearch, Valkey
+               and PHP workers.
       bind     comma-separated IPv4 addresses and/or ::1 (default 127.0.0.1)
                IPV4 auto-detects the server's public IPv4; on NAT it falls
                back to the local outbound IPv4
@@ -109,7 +134,7 @@ Domain setup (standalone; Angie + MariaDB must already be installed/running):
       no --purge for domains; remove the files/database manually.
 
 Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
-  --optimize [--dry-run]
+  --optimize [anubis=yes|no] [--dry-run]
       One command for the whole host.  It synchronizes Angie's /etc/angie
       tree from server-configs-nginx (or CONFIG_SOURCE_DIR), applies the
       hardware-aware OS profile (CPU governor, PAM security limits, and
@@ -119,8 +144,13 @@ Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
       detected WordPress and XenForo vhosts, including the shared cache
       zone, style/language cache keys and session-cookie bypass.
       It never installs, purges or starts a managed service; the only package
-      it may add is angie-module-brotli when Angie is installed, so
-      install and optimize share the same compression profile.  It also never
+      it may add is angie-module-brotli when Angie is installed (and the
+      Anubis static binary when anubis=yes), so install and optimize share
+      the same compression/bot-filter profile.  `anubis=yes` enables the bot
+      filter for every site on the host and installs it when missing;
+      `anubis=no` restores the vhosts to direct TLS and stops it.  A host
+      that already has ANUBIS=1 persisted keeps it on a plain --optimize run.
+      It also never
       touches the resolver (DNS), the firewall (UFW) or swap: those are
       --basic decisions and stay as the operator left them.  Allocations
       are planned together from one
@@ -305,6 +335,15 @@ NORMALIZED_ARGS=()
 # People paste commands from documentation into shells that keep typographic
 # dashes (em dash U+2014, en dash U+2013). Accept them instead of failing with
 # "Unknown argument" and rewrite them to ASCII "--".
+# anubis=yes|no (also 1/0, on/off) belongs to --angie and --optimize.
+anubis_set() {
+  case "${1,,}" in
+    yes|1|on|true)  ANUBIS_ENABLED=1; ANUBIS_SETTING=1 ;;
+    no|0|off|false) ANUBIS_ENABLED=0; ANUBIS_SETTING=0 ;;
+    *) die "anubis= expects yes or no (got '$1')" ;;
+  esac
+}
+
 normalize_cli_args() {
   local arg
   NORMALIZED_ARGS=()
@@ -339,7 +378,13 @@ parse_args() {
         kv_consume elastic 0 "$@"
         shift "$KV_CONSUMED"
         ;;
-      --angie) ENABLED[angie]=1; shift ;;
+      --angie)
+        ENABLED[angie]=1; shift
+        while (( $# )) && [[ $1 == anubis=* ]]; do
+          anubis_set "${1#*=}"
+          shift
+        done
+        ;;
       --valkey)
         ENABLED[valkey]=1; shift
         kv_consume valkey 0 "$@"
@@ -387,6 +432,9 @@ parse_args() {
               shift
               continue
               ;;
+            anubis=*)
+              die "anubis= belongs to --angie (install) or --optimize (existing host), not --domain"
+              ;;
           esac
           d=${1,,}; d=${d%.}
           group+=("$d"); got_domain=1
@@ -408,7 +456,12 @@ parse_args() {
         done
         ;;
       --optimize)
-        OPTIMIZE=1; shift ;;
+        OPTIMIZE=1; shift
+        while (( $# )) && [[ $1 == anubis=* ]]; do
+          anubis_set "${1#*=}"
+          shift
+        done
+        ;;
       --upgrade-php=*)
         (( UPGRADE_PHP_SEEN == 0 )) || die "--upgrade-php may only be given once"
         UPGRADE_PHP_SEEN=1
@@ -437,6 +490,11 @@ parse_args() {
         done
         ;;
       --dry-run|--check) DRY_RUN=1; shift ;;
+      anubis=*)
+        # Accepted here so validate_all can explain that it belongs to
+        # --angie/--optimize instead of reporting an unknown argument.
+        anubis_set "${1#*=}"
+        shift ;;
       --version) printf '%s %s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"; exit 0 ;;
       --help|-h) usage; exit 0 ;;
       *) die "Unknown argument: '$1' (use --help)" ;;

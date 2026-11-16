@@ -73,14 +73,14 @@ bash setup.sh --upgrade-php=8.6 --dry-run
 | Command | Purpose | Details |
 |---|---|---|
 | `--basic [server=] [host=] [swap=] [time=]` | OS baseline; required for every install | [`--basic`](#--basic) |
-| `--angie` | Angie web server and its configuration tree | [Angie](#angie---angie) |
+| `--angie [anubis=yes\|no]` | Angie web server and its configuration tree; optional Anubis bot filter | [Angie](#angie---angie), [Anubis](#anubis-bot-filter---angie-anubisyes) |
 | `--php [ver=] [children=] [max_requests=]` | PHP-FPM | [PHP](#php---php) |
 | `--mariadb user= pass= [size=] [bind=]` | MariaDB | [MariaDB](#mariadb---mariadb) |
 | `--valkey [ram=] [policy=] [io_threads=]` | Valkey cache | [Valkey](#valkey---valkey) |
 | `--elastic [host=] [ram=]` | Elasticsearch | [Elasticsearch](#elasticsearch---elastic) |
 | `--others ITEM... \| all` | helper packages | [Other packages](#other-packages---others) |
 | `--domain DOMAIN [app=] [db=] [user=] [pass=] [sql=]` | vhost, certificate and optional database | [Domains](#domains---domain) |
-| `--optimize` | tune the OS and every installed service in place | [`--optimize`](#--optimize) |
+| `--optimize [anubis=yes\|no]` | tune the OS and every installed service in place; optionally enable/disable Anubis | [`--optimize`](#--optimize) |
 | `--upgrade-php=X.Y` | replace the installed PHP version in place | [`--upgrade-php`](#--upgrade-phpxy) |
 | `--diagnostics` | write a redacted `diagnostics.log`; read-only | [Maintenance](#--diagnostics---restart-all---purge) |
 | `--restart-all` | ordered restart of every active service | [Maintenance](#--diagnostics---restart-all---purge) |
@@ -127,7 +127,7 @@ denies, no PHP from upload directories, security headers) comes from
 
 ### Angie (`--angie`)
 
-`--angie` takes no arguments. What it does:
+`--angie [anubis=yes|no]`. What it does:
 
 | Step | Detail |
 |---|---|
@@ -161,6 +161,60 @@ Notes:
   making `angie -t` fail with *host not found in upstream*. The include is
   regenerated on each install/`--optimize` and retired once the repository
   defines the name again.
+
+### Anubis bot filter (`--angie anubis=yes`)
+
+An optional, lean bot filter in front of every site on the host.  It is
+installed only when asked for and works on both a fresh install and an
+existing server:
+
+```sh
+# fresh install
+sudo bash setup.sh --basic --angie anubis=yes --php --mariadb user=... pass=...
+sudo bash setup.sh --domain example.com app=wordpress
+
+# an existing server (installs Anubis when missing; every vhost is migrated)
+sudo bash setup.sh --optimize anubis=yes
+
+# turn it off again: vhosts return to direct TLS, the service is stopped
+sudo bash setup.sh --optimize anubis=no
+```
+
+| Piece | Detail |
+|---|---|
+| Release | Anubis 1.28.2, static `linux-amd64` or `linux-arm64` binary from the official GitHub release, SHA-256 verified |
+| Service | `anubis.service`, system user `anubis`, Unix socket `/run/anubis/nginx.sock`, metrics on `127.0.0.1:8240`, sandboxed unit |
+| Angie path | `:443` TLS terminator -> Anubis (Unix socket) -> application vhost (Unix socket `/run/angie/anubis-backend.sock`) |
+| Vhost migration | every `conf.d` site with a `server_name` has its 443 listeners moved to the backend socket and gets a generated terminator; the original file is kept in `/var/lib/setup.sh/anubis/vhosts/*.orig` |
+| Backend trust | `set_real_ip_from unix:` + `real_ip_header X-Real-IP`, so PHP and the per-IP limiter see the client address |
+| HTTPS flag | the application leg is HTTP; the Angie tree rebuilds PHP's `HTTPS` from `X-Forwarded-Proto` (`http.d/https_map.conf`) |
+| Challenge page | branding-free (title, mascot, footer and version removed) with `sub_filter`; `SETUP_ANUBIS_BRANDING=1` keeps the stock page |
+| Cache safety | application responses keep their gzip/Brotli end to end; `Accept-Encoding` is stripped only for cookie-less visitors so the challenge page can be filtered |
+| Dot segments | answered `400` at the edge (Anubis itself answers `500` before its policy check) |
+| Policy | `allow-good-crawlers`, `deny-ai-crawlers`, infrastructure routes allowed, `Mozilla` challenged; unmatched clients are allowed so API/CLI clients keep working |
+| Persistence | `ANUBIS=1` in `/etc/default/setup-tuning`; a later plain `--optimize` (or `--domain`) keeps it and protects new vhosts |
+| Disable | `--optimize anubis=no` restores every vhost, removes the generated Angie files and stops/disables the service; the binary and `/etc/anubis` stay for a fast re-enable. `--purge angie` stops it too |
+
+Environment options:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `SETUP_ANUBIS=1\|0` | unset | one-off equivalent of `anubis=yes\|no` |
+| `SETUP_ANUBIS_VERSION` | `1.28.2` | another release tag; set `SETUP_ANUBIS_SHA256` with it |
+| `SETUP_ANUBIS_SHA256` | pinned per architecture | expected tarball checksum for a custom version |
+| `SETUP_ANUBIS_BRANDING=1` | off | keep Anubis's stock challenge page |
+
+Notes:
+
+- One Anubis instance served ~49 000 req/s on the 16-CPU audit host (about
+  0.16 ms of CPU per proxied request; ~1.1 GB/s of body copy).  On hosts with
+  a sustained rate above that, run several instances behind an Angie
+  `upstream` or bypass static assets at the terminator.
+- Anubis is a userspace proxy: cached guest pages still pass through it, so
+  compare capacity with the graph in `tests/stress-site/AUDIT-20261116-1.21.13.md`
+  before enabling it on a bandwidth-heavy origin.
+- `--optimize anubis=no` is safe to repeat; a host without the managed marker
+  (for example an Anubis installed by hand) is left untouched.
 
 ### PHP (`--php`)
 
@@ -258,7 +312,7 @@ single host (XF's Redis cache measured 27% slower there) and use
 |---|---|---|
 | `user=U` | required | admin user, created for `localhost`, `127.0.0.1` and `::1` (needed with `skip_name_resolve`) |
 | `pass=P` | required | its password; also written to `/etc/mysqlbkup.cnf` (mode 600) |
-| `size=auto\|4gb` | `auto` | InnoDB buffer pool: `auto` = live data+index plus 25% (128 MB minimum, half of RAM ceiling), only ever increased -- a pool already at or above the target is kept; an empty database uses the RAM-proportional floor (`clamp(RAM/16, 256 MB, 4 GB)`). The redo log is 25% of the pool. An explicit size is reserved verbatim |
+| `size=auto\|4gb` | `auto` | InnoDB buffer pool: `auto` = live data+index plus 5% (128 MB minimum; capped at 80% of RAM when MariaDB is the only data service, otherwise at half of RAM), only ever increased -- a pool already at or above the target is kept; an empty database uses the RAM-proportional floor (`clamp(RAM/16, 256 MB, 4 GB)`). The redo log is 25% of the pool. An explicit size is reserved verbatim |
 | `bind=ADDR[,ADDR...]` | `127.0.0.1` | comma-separated IPv4 addresses and/or `::1`; `IPV4` resolves the public address and falls back to the local outbound IPv4 behind NAT. TCP 3306 is never opened in the firewall |
 
 Environment option:
@@ -409,13 +463,16 @@ the application files afterwards and tunes separately.
 | Option | Effect |
 |---|---|
 | `--optimize` | tune the OS and every installed service in place (Ubuntu 22.04, 24.04, 26.04) |
+| `--optimize anubis=yes` | also install/update the Anubis bot filter and put every existing site behind it |
+| `--optimize anubis=no` | restore the vhosts to direct TLS, remove the generated Anubis Angie files and stop/disable the service |
 | `--optimize --dry-run` | print the planned OS and service values only; runs as a normal user |
 
 Tunes the OS and every installed service in place. It never installs, starts
 or purges a managed service and never
 touches swap, the resolver (DNS) or the firewall (UFW), which stay as
 `--basic` or the operator left them; the only package it may add is
-`angie-module-brotli`. The drivers run with `set -e`
+`angie-module-brotli` (and the Anubis static binary when `anubis=yes`). The
+drivers run with `set -e`
 live, so a failed write inside a tuner aborts the run with its line number
 instead of being skipped (before 1.13.0 the `if ! run_optimize` call had
 suspended errexit for the whole run). Steps:
@@ -443,7 +500,7 @@ suspended errexit for the whole run). Steps:
    resident memory it returns (a 64-thread board left on 512 static workers
    is set to 64).
 4. MariaDB, Valkey/Redis and Elasticsearch from the shared 80%-of-RAM plan:
-   live data is funded first (MariaDB data+index plus 25%, Valkey working set
+   live data is funded first (MariaDB data+index plus 5%, Valkey working set
    +20% with the RAM floor, Elasticsearch store/4), explicit sizes are
    reserved verbatim, PHP is sized from the remainder, and targets that do not
    fit are trimmed Elasticsearch first, then Valkey, then MariaDB. A MariaDB

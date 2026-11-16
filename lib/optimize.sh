@@ -509,22 +509,27 @@ plan_memory_budget() {
       [[ $data =~ ^[0-9]+$ ]] || data=0
       OPT_DB_SIZE_MB=$data
       # A live database is sized from its own data: the current data+index
-      # size plus 25% for growth.  The buffer pool is the database's page
+      # size plus 5% for growth.  The buffer pool is the database's page
       # cache, and a pool smaller than the working set turns random reads
       # into disk I/O; measured on this host with a 935 MB table, a 128 MB
       # pool answered 71 k point queries/s with 92% physical reads, while a
-      # pool larger than the table answered 212 k/s with none.  A 4%-of-data
-      # rule (1.21.9-1.21.12) produced exactly that under-sized pool.  The
-      # pool is still capped at half of RAM and at the shared budget, so a
-      # huge database cannot starve PHP, search and the page cache; the
-      # scaling below trims it proportionally when the targets do not fit.
-      # A fresh install has no data at all, so it keeps the RAM-proportional
-      # operational floor; an existing but empty database gets the 128 MB
-      # operational minimum, and the only-increase rule below protects a
-      # larger live pool.
+      # pool larger than the table answered 212 k/s with none.  A
+      # database-only host may use up to 80% of total RAM (the same ceiling
+      # as the shared budget); a host that also runs PHP, Valkey or
+      # Elasticsearch caps the pool at half of RAM so those tiers and the
+      # page cache keep room.  The scaling below trims it proportionally when
+      # the targets do not fit.  A fresh install has no data at all, so it
+      # keeps the RAM-proportional operational floor; an existing but empty
+      # database gets the 128 MB operational minimum, and the only-increase
+      # rule below protects a larger live pool.
       if (( data > 0 )); then
-        maria_target=$(( data + data / 4 ))
-        local pool_cap=$(( total / 2 ))
+        maria_target=$(( data + data / 20 ))
+        local pool_cap
+        if (( ! has_php && ! has_cache && ! has_es )); then
+          pool_cap=$(( total * 80 / 100 ))
+        else
+          pool_cap=$(( total / 2 ))
+        fi
         (( pool_cap < 256 )) && pool_cap=256
         (( maria_target > pool_cap )) && maria_target=$pool_cap
         (( maria_target < 128 )) && maria_target=128

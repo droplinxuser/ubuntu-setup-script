@@ -1353,13 +1353,14 @@ check "MariaDB gets the remaining budget after the PHP floor" \
 php_pool_max_children() { printf '128'; }
 OPT_DETECTED=(angie php:8.3 mariadb redis elastic)
 
-# The buffer pool is sized from the live data+index size plus 25% for growth
-# (a working-set cache, not a mirror of the database), capped at half of RAM.
-# A 20 GB database therefore gets 25 GB (the cap is not reached on 64 GB).
+# The buffer pool is sized from the live data+index size plus 5% for growth
+# (a working-set cache, not a mirror of the database).  A mixed host caps it
+# at half of RAM; a database-only host may use 80% of RAM.
+# A 20 GB database therefore gets 21 GB (the cap is not reached on 64 GB).
 mariadb_data_size_mb() { printf '20000'; }
 plan_memory_budget
-check "live pool is data+25% for a 20 GB database" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 25000
+check "live pool is data+5% for a 20 GB database" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 21000
 check "database-fit plan stays inside the 80% budget" \
   test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
        -le $(( 65536 * 80 / 100 ))
@@ -1375,7 +1376,7 @@ mariadb_data_size_mb() { printf '935'; }
 OPT_DETECTED=(angie php:8.5 mariadb)
 plan_memory_budget
 check "a 935 MB database is not under-sized" \
-  test "$OPT_MARIADB_BUDGET_MB" -ge 935
+  test "$OPT_MARIADB_BUDGET_MB" -eq 981
 
 # An empty database cannot be sized from data; the RAM-proportional floor
 # gives the pool room before the next --optimize.  A live database with only
@@ -1413,14 +1414,14 @@ check "live pool for a 40 GB database is capped at half of RAM" \
 check "40 GB database pool stays proportional, not data-sized" \
   test "$OPT_DB_SIZE_MB" -eq 40960 -a "$OPT_MARIADB_BUDGET_MB" -eq 32768
 
-# A pool already above the data+25% target is kept: --optimize only increases.
+# A pool already above the data+5% target is kept: --optimize only increases.
 mem_total_mb() { printf '262144'; }
 mariadb_current_pool_mb() { printf '100000'; }
 mariadb_data_size_mb() { printf '73599'; }
 elasticsearch_data_size_mb() { printf '0'; }
 OPT_DETECTED=(angie php:8.4 mariadb valkey)
 plan_memory_budget
-check "large host keeps the live pool (the data+25% target is lower)" \
+check "large host keeps the live pool (the data+5% target is lower)" \
   test "$OPT_MARIADB_BUDGET_MB" -eq 100000
 check "an only-increased pool is marked as preserved" \
   test "$OPT_MARIADB_KEPT_MB" -eq 100000
@@ -1431,7 +1432,7 @@ check "data-sized pool keeps the plan inside the 80% budget" \
 # Re-running with a lower target must not shrink a live pool.
 mariadb_current_pool_mb() { printf '110000'; }
 plan_memory_budget
-check "a live pool above the data+25% target is kept unchanged" \
+check "a live pool above the data+5% target is kept unchanged" \
   test "$OPT_MARIADB_BUDGET_MB" -eq 110000
 
 # A live pool that no longer fits the shared budget is still capped: the
@@ -1462,8 +1463,9 @@ OPT_DETECTED=(mariadb)
 plan_memory_budget
 check "MariaDB-only host reserves no PHP budget" \
   test "$OPT_PHP_BUDGET_MB" -eq 0
-check "MariaDB-only host caps a 60 GB database at half of RAM" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 32768
+# 60 GB + 5% = 63 GB, above the 80%-of-64-GB cap (52 428 MB).
+check "MariaDB-only host caps a 60 GB database at 80% of RAM" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 52428
 
 # Unknown data size (query failed) on a live service is treated like an empty
 # database: the 128 MB minimum, never a RAM-sized guess.
@@ -2427,7 +2429,7 @@ check "fresh install full-stack plan stays inside the 80% budget" \
        -le $(( 27812 * 80 / 100 ))
 
 # A database that has just been initialised reports a few MB of system data.
-# data+25% is below the operational minimum, so a live database with no
+# data+5% is below the operational minimum, so a live database with no
 # real rows gets 128 MB; the only-increase rule keeps the installer's larger
 # pool when one is already running.
 mariadb_data_size_mb() { printf '4'; }
@@ -2440,7 +2442,7 @@ check "measured-empty live database uses the 128 MB minimum" \
 # ---------------------------------------------------------------------------
 # Live-data protection
 # ---------------------------------------------------------------------------
-# A live MariaDB pool is only ever increased: a pool above the data+25% target
+# A live MariaDB pool is only ever increased: a pool above the data+5% target
 # is kept (shrinking would restart the server and empty the warm cache), while
 # an Elasticsearch heap above store/4 is still reduced to free RAM.
 valkey_live_used_mb() { return 0; }
@@ -2451,7 +2453,7 @@ elasticsearch_current_heap_mb() { printf '4096'; }
 OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
 OPT_INSTALL_PLAN=0
 plan_memory_budget
-check "live MariaDB pool above the data+25% target is kept" \
+check "live MariaDB pool above the data+5% target is kept" \
   test "$OPT_MARIADB_KEPT_MB" -eq 4096 -a "$OPT_MARIADB_BUDGET_MB" -eq 4096
 check "live Elasticsearch heap is reduced to the store/4 minimum" \
   test "$OPT_ES_KEPT_MB" -eq 0 -a "$OPT_ES_BUDGET_MB" -eq 512
@@ -2479,7 +2481,7 @@ plan_memory_budget
 check "MariaDB+Valkey host reserves no PHP or Elasticsearch budget" \
   test "$OPT_PHP_BUDGET_MB" -eq 0 -a "$OPT_ES_BUDGET_MB" -eq 0
 check "MariaDB+Valkey host fits the live database target" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 6250
+  test "$OPT_MARIADB_BUDGET_MB" -eq 5250
 check "MariaDB+Valkey plan stays inside the 80% budget" \
   test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
        -le $(( 27812 * 80 / 100 ))
@@ -2491,7 +2493,7 @@ valkey_live_used_mb() { printf '1000'; }
 OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
 plan_memory_budget
 check "full stack reserves MariaDB, Valkey and Elasticsearch first" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 10000 \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 8400 \
        -a "$OPT_VALKEY_BUDGET_MB" -ge 1100 \
        -a "$OPT_ES_BUDGET_MB" -ge 512
 check "full stack still gets a viable PHP pool" \
@@ -3781,6 +3783,93 @@ check "the OpenSSH application profile counts as an SSH rule for port 22" \
   test "$(ufw_rule_ssh_port 'ufw allow OpenSSH' 22)" = 22
 check "the OpenSSH application profile is not matched for another port" \
   not ufw_rule_ssh_port 'ufw allow OpenSSH' 2222
+
+# ---------------------------------------------------------------------------
+# Anubis vhost migration
+# ---------------------------------------------------------------------------
+mkdir -p "$TMP/anubis/conf.d" "$TMP/anubis/state"
+cat > "$TMP/anubis/conf.d/site.test.conf" <<'EOF'
+server {
+    listen      80;
+    server_name site.test www.site.test;
+    return 301 https://site.test$request_uri;
+}
+
+server {
+    listen      443 ssl;
+    listen [::]:443 ssl;
+    server_name site.test;
+    http2 on;
+
+    include h5bp/tls/ssl_engine.conf;
+    ssl_certificate     /etc/angie/ssl/site.test/fullchain.pem;
+    ssl_certificate_key /etc/angie/ssl/site.test/privkey.pem;
+
+    root /var/www/site.test/public;
+    include h5bp/php_wp.conf;
+}
+EOF
+cat > "$TMP/anubis/conf.d/default.conf" <<'EOF'
+server {
+    listen 443 ssl default_server;
+    server_name _;
+    ssl_certificate     /etc/angie/ssl/default/fullchain.pem;
+    ssl_certificate_key /etc/angie/ssl/default/privkey.pem;
+    return 444;
+}
+EOF
+cp "$TMP/anubis/conf.d/site.test.conf" "$TMP/anubis/site.before"
+ANUBIS_STATE="$TMP/anubis/state"
+ANUBIS_BACKEND_SOCKET="/run/angie/anubis-test.sock"
+tune_reset_changes
+anubis_integrate_vhost "$TMP/anubis/conf.d/site.test.conf"
+check "Anubis moves the 443 listener to the backend socket" \
+  grep -qx '    listen unix:/run/angie/anubis-test.sock;' "$TMP/anubis/conf.d/site.test.conf"
+check "Anubis drops the IPv6 443 listener" \
+  bash -c '! grep -q "listen \[::\]:443" "$1"' _ "$TMP/anubis/conf.d/site.test.conf"
+check "Anubis removes http2 from the backend block" \
+  bash -c '! grep -q "http2 on;" "$1"' _ "$TMP/anubis/conf.d/site.test.conf"
+check "Anubis trusts the Unix peer for the real client address" \
+  grep -qx '    set_real_ip_from unix:;' "$TMP/anubis/conf.d/site.test.conf"
+check "Anubis reads X-Real-IP" \
+  grep -qx '    real_ip_header X-Real-IP;' "$TMP/anubis/conf.d/site.test.conf"
+check "the port 80 server keeps its public listener" \
+  grep -qx '    listen      80;' "$TMP/anubis/conf.d/site.test.conf"
+check "the pre-integration vhost is backed up" \
+  test -f "$TMP/anubis/state/vhosts/site.test.conf.orig"
+check "the backup is byte-identical to the original" \
+  cmp -s "$TMP/anubis/site.before" "$TMP/anubis/state/vhosts/site.test.conf.orig"
+after_first=$(md5sum < "$TMP/anubis/conf.d/site.test.conf")
+tune_reset_changes
+anubis_integrate_vhost "$TMP/anubis/conf.d/site.test.conf"
+check "the vhost migration is idempotent" \
+  test "${#TUNE_CHANGES[@]}" -eq 0
+check "the migrated vhost is unchanged on the second pass" \
+  test "$after_first" = "$(md5sum < "$TMP/anubis/conf.d/site.test.conf")"
+
+# Terminators are generated from the integrated blocks only; the catch-all
+# (server_name _) must never become a public terminator.
+anubis_render_terminators "$TMP/anubis/conf.d" "$TMP/anubis/terminators.conf"
+check "the terminator carries the site's server_name" \
+  grep -qx '    server_name site.test;' "$TMP/anubis/terminators.conf"
+check "the terminator reuses the vhost certificate" \
+  grep -q 'ssl_certificate     /etc/angie/ssl/site.test/fullchain.pem;' "$TMP/anubis/terminators.conf"
+check "the terminator includes the Anubis location" \
+  grep -q 'include snippets/anubis-location.conf;' "$TMP/anubis/terminators.conf"
+check "the terminator bypasses Anubis for the XenForo socket" \
+  grep -q 'proxy_pass http://anubis_backend;' "$TMP/anubis/terminators.conf"
+check "the catch-all vhost gets no terminator" \
+  bash -c '! grep -q "server_name _;" "$1"' _ "$TMP/anubis/terminators.conf"
+terminator_md5=$(md5sum < "$TMP/anubis/terminators.conf")
+anubis_render_terminators "$TMP/anubis/conf.d" "$TMP/anubis/terminators.conf"
+check "the terminator render is idempotent" \
+  test "$terminator_md5" = "$(md5sum < "$TMP/anubis/terminators.conf")"
+
+anubis_restore_vhosts "$TMP/anubis/conf.d" "$TMP/anubis/state/vhosts"
+check "disabling Anubis restores the vhost byte-for-byte" \
+  cmp -s "$TMP/anubis/site.before" "$TMP/anubis/conf.d/site.test.conf"
+check "the restored vhost terminates TLS again" \
+  grep -q 'listen      443 ssl;' "$TMP/anubis/conf.d/site.test.conf"
 
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
