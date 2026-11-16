@@ -68,7 +68,7 @@ run_restart_all() {
   if (( ${#OPT_DETECTED[@]} > 0 )); then
     info "Detected installed services: ${OPT_DETECTED[*]}"
   else
-    warn "No supported installed services were detected from configuration paths"
+    info "No supported installed services were detected from configuration paths"
   fi
 
   # Repair old /var/www/logs ownership before touching any service.  A

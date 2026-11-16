@@ -47,10 +47,18 @@ README.md; measurements in tests/stress-site/RESULTS.md.
   re-downloads on every run without restarting the service; the live env file
   is created mode 600 before it holds the cookie secret; and the temporary
   `angie -t` file uses `tmp_file` instead of a predictable `/tmp` name.
+- **`--diagnostics` and `--restart-all` are clean on an empty host.**  The
+  log-tail discovery piped `find` into `head`; with no `/var/www/logs` the
+  SIGPIPE surfaced through the ERR trap as a false
+  `[ERR] command failed ... head -n 120` even though the report was written.
+  It now maps the file list and slices it.  `--restart-all` reports "no
+  supported services detected" as INFO instead of WARN on a host that has
+  none.  Verified on the restored 526-package baseline: both exit 0 with
+  0 ERR/WARN.
 - **Pair with server-configs-nginx 1.6.32**, which closes the encoded
   login-limiter bypass and gives PHP the public `SERVER_PORT`/`REQUEST_SCHEME`
   on the Unix-socket leg (Chevereto emitted `https://host:/image/...`).
-- **Validation.**  871 tuning checks, 203 dry-run cases; fresh install and
+- **Validation.**  871 tuning checks, 202-203 dry-run cases (one case depends on a detected application); fresh install and
   `--optimize` parity; three applications; Anubis on/off/rollback; 61/61
   guest-cookie and 54/54 security checks; encoded login POSTs limited
   (429 after 11) where they were 14/14 accepted before.

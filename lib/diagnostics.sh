@@ -535,10 +535,8 @@ run_diagnostics() {
   diag_tail_file /var/www/logs/nodejs/nodejs.log 500
   diag_tail_file /var/www/logs/gifsicle/gifsicle.log 200
 
-  while IFS= read -r f; do
-    [[ -n $f ]] || continue
-    diag_tail_file "$f" 200
-  done < <(find /var/www/logs -type f \( -name '*.log' -o -name '*.json' \) 2>/dev/null | sort | head -n 120)
+  mapfile -t log_files < <(find /var/www/logs -type f \( -name '*.log' -o -name '*.json' \) 2>/dev/null | sort)
+  diag_tail_files 200 "${log_files[@]:0:120}"
 
   diag_sh "log sizes" 'du -sh /var/www/logs/* /var/log/angie /var/log/php* /var/log/mysql /var/log/redis* /var/www/*/error.log /var/www/*/access.log 2>/dev/null | sort -h || true'
   diag_sh "web root ownership" 'ls -ld /var/www /var/www/logs /var/www/logs/* /var/www/mysql_database 2>/dev/null || true'
