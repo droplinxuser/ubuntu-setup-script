@@ -282,10 +282,19 @@ anubis_gomaxprocs() {
 # 7 100 vs 6 750 req/s at the default 100); a small VPS keeps Go's default so
 # a burst cannot turn the relaxed collector into a multi-hundred-MB heap with
 # no headroom left for PHP or MariaDB.
+#
+# On a host with 16 GB or more, GOGC=off is safe *because* GOMEMLIMIT is set:
+# the collector only runs as the heap approaches the limit (RAM/8, capped at
+# 2 GiB), so a quiet filter still holds ~120 MB and a saturated one stops at
+# 2 GiB instead of growing unbounded.  Measured on the 12-thread EPYC audit
+# host through Anubis: 51 949 req/s at GOGC=400, 57 082 at GOGC=off (+9.9%),
+# RSS < 2 GiB.  A host below 16 GB keeps the graduated values above.
 anubis_gogc() {
   local ram_mb=${1:-1024}
   [[ $ram_mb =~ ^[0-9]+$ ]] && (( ram_mb > 0 )) || ram_mb=1024
-  if (( ram_mb <= 2048 )); then
+  if (( ram_mb >= 16384 )); then
+    printf 'off'
+  elif (( ram_mb <= 2048 )); then
     printf '100'
   elif (( ram_mb <= 4096 )); then
     printf '200'

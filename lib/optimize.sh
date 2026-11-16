@@ -899,11 +899,20 @@ php_plan_max_children() {
 }
 
 # Angie worker limits shared by tune_angie_configs and the dry run.
-# worker_processes follows the effective CPU count (Angie's "auto" counts the
-# affinity mask, not a cgroup quota).
+# worker_processes is two thirds of the effective CPU count (Angie's "auto"
+# counts the affinity mask, not a cgroup quota; see the measurements below).
 angie_worker_limits() {
   local nproc=$1 per_core_conn=2048 per_core_fds=8192
-  ANGIE_WORKER_PROCESSES=$nproc
+  # Two workers per three CPUs, floor 2.  A worker's only job on a cached
+  # guest hit is TLS termination, and every extra worker competes with PHP
+  # and MariaDB for the same cores.  Measured on the 12-thread EPYC audit
+  # host (16k TLS buffer, 100 connections, gzip guest cache):
+  #   6 -> 367-371k, 8 -> 389-390k, 10 -> 369-370k, 12 -> 348-352k req/s,
+  # with the member/thread tiers flat (764-767 / 840-843 req/s).  Eight
+  # workers on twelve CPUs is the optimum; `auto` (= nproc) cost ~11% of
+  # cached throughput.
+  ANGIE_WORKER_PROCESSES=$(( nproc * 2 / 3 ))
+  (( ANGIE_WORKER_PROCESSES < 2 )) && ANGIE_WORKER_PROCESSES=2
   # A VPS shares its NIC queue and hypervisor with neighbours; the kernel
   # backlogs are already halved there (sysctl_target_somaxconn), so the
   # per-worker connection table follows (1024/core, 4096 fds/core).

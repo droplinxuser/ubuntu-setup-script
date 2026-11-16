@@ -712,6 +712,14 @@ configure_sysctl() {
   sed_in_place -E '/^[[:space:]]*net\.nf_conntrack_max[[:space:]]*=/d' /etc/sysctl.conf
   ipfrag_high=$(( ram_mb * 32 ));       (( ipfrag_high < 262144 )) && ipfrag_high=262144;      (( ipfrag_high > 4194304 )) && ipfrag_high=4194304
   ipfrag_low=$(( ipfrag_high * 3 / 4 ))
+  # Two 2 MB huge pages per 128 MB of RAM (1 GB on a 30 GB host, 64 MB on a
+  # 4 GB one), used by OPcache through opcache.huge_code_pages.  Huge pages
+  # are reserved at boot and never swapped, so small hosts get none.
+  local hugepages=0
+  if (( ram_mb >= 4096 )); then
+    hugepages=$(( ram_mb / 64 ))
+    (( hugepages > 512 )) && hugepages=512
+  fi
   arp_thresh3=$(( cpu * 1024 ));        (( arp_thresh3 < 2048 )) && arp_thresh3=2048;          (( arp_thresh3 > 262144 )) && arp_thresh3=262144
   arp_thresh2=$(( arp_thresh3 / 2 ))
   cat >> /etc/sysctl.conf <<EOF
@@ -747,6 +755,8 @@ fs.nr_open = ${file_max}
 fs.inotify.max_user_watches = ${inotify_watches}
 vm.min_free_kbytes = ${min_free}
 vm.swappiness = ${swappiness}
+# OPcache huge pages (2 MB each); 0 on a host below 4 GB of RAM.
+vm.nr_hugepages = ${hugepages}
 kernel.shmmax = ${shmmax}
 kernel.shmall = ${shmall}
 

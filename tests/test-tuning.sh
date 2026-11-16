@@ -4085,8 +4085,8 @@ check "Anubis GOMAXPROCS caps at 8 on 64 CPUs" test "$(anubis_gomaxprocs 64)" = 
 check "Anubis GOGC keeps the default on 2 GB" test "$(anubis_gogc 2048)" = 100
 check "Anubis GOGC on 4 GB" test "$(anubis_gogc 4096)" = 200
 check "Anubis GOGC on 8 GB" test "$(anubis_gogc 8192)" = 300
-check "Anubis GOGC on 16 GB" test "$(anubis_gogc 16384)" = 400
-check "Anubis GOGC on 64 GB" test "$(anubis_gogc 65536)" = 400
+check "Anubis GOGC on 16 GB" test "$(anubis_gogc 16384)" = off
+check "Anubis GOGC on 64 GB" test "$(anubis_gogc 65536)" = off
 check "Anubis GOMEMLIMIT floors at 256 MiB on 1 GB" test "$(anubis_memlimit_mb 1024)" = 256
 check "Anubis GOMEMLIMIT on 4 GB" test "$(anubis_memlimit_mb 4096)" = 512
 check "Anubis GOMEMLIMIT on 8 GB" test "$(anubis_memlimit_mb 8192)" = 1024
@@ -4112,7 +4112,7 @@ unit_profile=$( (
   grep -hE '^(Environment=(GOGC|GOMEMLIMIT|GOMAXPROCS)|LimitNOFILE)=' "$ANUBIS_UNIT" 2>/dev/null | paste -sd' ' -
 ) )
 check "the generated Anubis unit carries the 32 CPU / 64 GB profile" \
-  test "$unit_profile" = "LimitNOFILE=131072 Environment=GOGC=400 Environment=GOMEMLIMIT=2048MiB Environment=GOMAXPROCS=8"
+  test "$unit_profile" = "LimitNOFILE=131072 Environment=GOGC=off Environment=GOMEMLIMIT=2048MiB Environment=GOMAXPROCS=8"
 
 unit_profile_small=$( (
   ANUBIS_UNIT="$TMP/anubis-generated-small.service"
