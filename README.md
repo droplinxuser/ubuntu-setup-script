@@ -333,9 +333,15 @@ location-level `add_header` would otherwise drop HSTS). `--optimize` repairs
 or completes the same block on older hosts. Application-side findings from
 the test host: disable the
 "Members online", "Trending" and "Featured" forum-list widgets if unused
-(+39% authenticated throughput), keep sessions/registry in MariaDB on a
-single host (XF's Redis cache measured 27% slower there) and use
+(+39% authenticated throughput) and use
 `$config['db']['host'] = 'p:localhost'` for persistent connections.
+
+The XF data cache is a host-specific decision. With **php-redis** loaded and
+Valkey on the local Unix socket it measured **+7–9 %** authenticated
+throughput on the 1.21.23 audit (PHP 8.5, Ubuntu 26.04); with the add-on's
+pure-PHP Credis fallback (php-redis absent) it measured ~27 % slower than
+MariaDB on the same host class. Keep the cache when `redis` is in `php -m`,
+disable it for Credis, and re-measure on the actual stack.
 
 ### MariaDB (`--mariadb`)
 
@@ -418,8 +424,9 @@ Notes:
   tunes Redis with the same profile. Valkey wins when both exist.
 - Runtime values are applied with `CONFIG SET`; a restart (which empties the
   cache) happens only for startup-only keys.
-- On a single host with local MariaDB, XenForo measured faster without the
-  Redis cache (see the XenForo section).
+- With php-redis and this Unix socket, XenForo's data cache measured +7–9 %
+  authenticated throughput; without php-redis (the add-on's pure-PHP Credis
+  client) it measured slower than local MariaDB. See the XenForo section.
 
 ### Elasticsearch (`--elastic`)
 

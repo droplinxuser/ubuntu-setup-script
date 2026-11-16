@@ -3,6 +3,56 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.23 (2026-11-17)
+
+- **Fresh `--elastic` install no longer prints a shell error.**
+  `ensure_es_max_map_count` called `record_sysctl_originals`, a function that
+  does not exist, so every Elasticsearch install (and `--optimize` on an
+  existing ES host) logged `command not found` and never recorded the boot
+  value of `vm.max_map_count`; `--purge basic` could not restore it. It now
+  calls `record_sysctl_values vm.max_map_count`. The call site is inside a
+  `|| warn`, which is why the install continued with exit 0.
+- **UFW and the managed sysctl profile agree after a fresh install.**
+  `configure_ufw` now re-runs `ufw_align_sysctl` after `ufw --force enable`.
+  On a pristine host the align inside `configure_sysctl` runs before ufw is
+  installed and is a silent no-op, so ufw's own `/etc/ufw/sysctl.conf` stayed
+  unaligned until the first `--optimize` — an install/optimize divergence in
+  the kernel state that survived every boot.
+- **Hostname and disk probes match the tuners.** `generate_hostname` uses
+  `effective_cpus` and `mem_total_mb` (cgroup quota/limit aware, the same
+  probes every sizing path uses) instead of `nproc` and `dmidecode`, so a
+  vCPU- or RAM-capped guest is no longer named `16c-32g-...` while its plan
+  sizes 2 CPUs. `classify_block_device` reads the rotational flag through
+  `${SETUP_SYS_BLOCK:-/sys/block}`, like `block_device_is_virtual`.
+- **XenForo data-cache guidance corrected.** With `php-redis` loaded and
+  Valkey on the local Unix socket, XF's registry/session cache measured
+  **+7–9 %** authenticated throughput (member home 563 vs 516 req/s, thread
+  571 vs 531) in the 1.21.23 audit on PHP 8.5 / Ubuntu 26.04. The old "27 %
+  slower" note came from the add-on's pure-PHP Credis fallback (php-redis
+  absent). README, the `--domain app=xf` hint and the `--optimize` report now
+  say which case applies. The "Members online / Trending / Featured" widget
+  advice (+39 %) is unchanged.
+- **`error_reporting` has a measurable cost.** Temporarily enabling `E_ALL`
+  for a deprecation scan lowered XF member throughput from 577 to 529 req/s
+  (−9 %); the shipped `E_ALL & ~E_DEPRECATED` is the production value, and a
+  compatibility scan should enable `E_ALL`, scan, then remove the drop-in.
+- **XenForo logout test follows 2.3.** XF 2.3 renders log out as a POST form;
+  the cookie-safety suite sent the pre-2.3 GET and reported two false
+  failures. It now posts `_xfToken` (62/62 pass).
+- **Validation.** Fresh install on a pristine Ubuntu 26.04 host: exit 0 in
+  3 m 43 s, zero failed units, `angie -t` clean, 932 tuning checks, 207 dry
+  runs, ShellCheck clean. `--optimize` twice: 0 configuration diffs.
+  `--upgrade-php` 8.5 → 8.6 → 8.4 → 8.5 (8.6 refused before the purge
+  without `SETUP_PHP_ALLOW_MISSING_EXT=1`, installed and serving with it;
+  0 deprecations under 8.4 and 8.6). Security probe 54/54, cookie suite
+  62/62. Benchmarks vs the public Host B reference (PHP 8.5): guest cache
+  90.2k vs 56.6k, member home 574 vs 537, thread 550 vs 431; with Anubis
+  31.3k / 557 / 570 vs 5.8k / 438 / 383. JIT tracing is +6–7 % over no JIT;
+  the shipped 64 MB buffer and default thresholds are optimal; 1 worker/CPU
+  beats 1.5× and 2×; Anubis GOMAXPROCS=8 beats 16; the static-asset shadow
+  is +10.7 % on real assets. Full data in
+  `tests/stress-site/AUDIT-20261117-1.21.23.md`.
+
 ## 1.21.22 (2026-11-17)
 
 - **Anubis no longer uses `sub_filter` at all.**  The branding rewrite was
