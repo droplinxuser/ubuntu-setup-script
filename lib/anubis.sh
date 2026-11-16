@@ -442,9 +442,27 @@ map \$http_cookie \$anubis_pass {
     default 0;
     "~*anubis-cookie-verification[^=]*=[^;]*\.[^;]*\.[^;]*" 1;
 }
-map \$anubis_pass \$anubis_upstream_accept_encoding {
-    default "";
-    1       \$http_accept_encoding;
+# 1 when the request is likely to receive the Anubis challenge page.  The
+# default policy challenges Mozilla and empty user agents; allowed crawlers,
+# API clients and the benchmark UA are not challenged.
+map \$http_user_agent \$anubis_challenge_ua {
+    default 0;
+    "" 1;
+    "~*Mozilla" 1;
+}
+# Strip Accept-Encoding only when sub_filter has to rewrite the challenge
+# page.  An allowed non-Mozilla client without a pass cookie keeps gzip, so
+# the FastCGI cache serves the compressed body and sub_filter skips it.
+# Previously every no-cookie request was forced to identity: a 115 KB page
+# was copied through Anubis and scanned by six sub_filter rules, while the
+# gzip body is 15.7 KB.  That cost ~90% of the cached-page ceiling.
+map "\$anubis_pass:\$anubis_challenge_ua" \$anubis_strip_encoding {
+    default 0;
+    "0:1" 1;
+}
+map \$anubis_strip_encoding \$anubis_upstream_accept_encoding {
+    default \$http_accept_encoding;
+    1       "";
 }
 EOF
   if commit_if_changed "$ANUBIS_COMMON" "$tmp"; then ANUBIS_ANGIE_DIRTY=1; fi

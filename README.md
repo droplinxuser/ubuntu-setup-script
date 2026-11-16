@@ -151,6 +151,11 @@ Environment options:
 
 Notes:
 
+- Guest-cache locations disable per-hit AIO and Brotli (`aio off; brotli off;`).
+  The cached body is already compressed (XenForo/WordPress gzip), so re-running
+  either filter only costs CPU; static assets keep the global AIO/Brotli path.
+  On the CentMinMod/Nginx audit, `aio threads` cost 16 % of cached-page
+  throughput; on Angie the scoped change was neutral.
 - With the XenForo job entry in place, switch *Options > Performance > Job
   run trigger* to server-based in the admin CP so member page requests stop
   running the queue. Never run the queue as root: the data directories it
@@ -190,7 +195,7 @@ sudo bash setup.sh --optimize anubis=no
 | Backend trust | `set_real_ip_from unix:` + `real_ip_header X-Real-IP`, so PHP and the per-IP limiter see the client address |
 | HTTPS flag | the application leg is HTTP; the Angie tree rebuilds PHP's `HTTPS` from `X-Forwarded-Proto` (`http.d/https_map.conf`) |
 | Challenge page | branding-free (title, mascot, footer and version removed) with `sub_filter`; `SETUP_ANUBIS_BRANDING=1` keeps the stock page |
-| Cache safety | application responses keep their gzip/Brotli end to end; `Accept-Encoding` is stripped only for cookie-less visitors so the challenge page can be filtered |
+| Cache safety | application responses keep their gzip/Brotli end to end; `Accept-Encoding` is stripped only for challenge-bound requests (no pass cookie, `Mozilla`/empty UA), so `sub_filter` can rewrite the challenge page without inflating every guest page |
 | Dot segments | answered `400` at the edge (Anubis itself answers `500` before its policy check) |
 | Policy | `allow-good-crawlers`, `deny-ai-crawlers`, infrastructure routes allowed, `Mozilla` challenged; unmatched clients are allowed so API/CLI clients keep working |
 | Persistence | `ANUBIS=1` in `/etc/default/setup-tuning`; a later plain `--optimize` (or `--domain`) keeps it and protects new vhosts |
@@ -223,7 +228,13 @@ Notes:
   socket is reachable only through its `root:www-data 0750` directory.
 - Anubis is a userspace proxy: cached guest pages still pass through it, so
   compare capacity with the graph in `tests/stress-site/AUDIT-20261116-1.21.18.md`
-  before enabling it on a bandwidth-heavy origin.  The whole Go profile is
+  before enabling it on a bandwidth-heavy origin.  Only challenge-bound
+  requests lose compression; an allowed crawler/API client with no pass cookie
+  keeps the cached gzip body, so Anubis copies ~16 KB instead of ~115 KB and
+  skips the six `sub_filter` rules.  On the Ubuntu test host this moved the
+  no-pass cached guest tier from 5.8k to 30.5k req/s (the 12-thread EPYC's
+  7.9k baseline is recorded separately); a browser challenge still gets the
+  branded page, compressed by the terminator after filtering.  The whole Go profile is
   hardware-derived and rewritten by every install/`--optimize`:
   `GOMAXPROCS=min(8, CPUs)` (the measured plateau: 6 871 cached pages/s with
   3.92 cores vs 7 203 with all 16 and 4.17 cores, same p99),
@@ -342,6 +353,13 @@ Environment option:
 | Variable | Default | Effect |
 |---|---|---|
 | `SETUP_MARIADB_IO_CAPACITY="r m"` | by disk and host class | pins `innodb_io_capacity` and `innodb_io_capacity_max` |
+
+After a large `--domain ... sql=` import or an application-level bulk seed, run
+`--optimize` again (or pass `--mariadb size=...`) so the buffer pool is
+re-planned against the new data size.  `--diagnostics` warns when the live
+data is above 80 % of the current pool; the pool is only ever increased, so a
+host that was sized while the database was empty keeps the small value until
+the next optimize run.
 
 Installed:
 

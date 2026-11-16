@@ -433,6 +433,16 @@ run_diagnostics() {
     diag "MariaDB processlist" mariadb -e 'SHOW FULL PROCESSLIST'
     diag "MariaDB InnoDB status" mariadb -e 'SHOW ENGINE INNODB STATUS\G'
     diag_sh "MariaDB database sizes" "mariadb -N -B -e \"SELECT table_schema, ROUND(SUM(data_length+index_length)/1024/1024,1) AS mb, COUNT(*) AS tables FROM information_schema.tables WHERE table_schema NOT IN ('mysql','information_schema','performance_schema','sys') GROUP BY table_schema ORDER BY mb DESC;\""
+    local db_mb pool_mb
+    db_mb=$(mariadb -N -B -e "SELECT COALESCE(ROUND(SUM(data_length+index_length)/1024/1024),0) FROM information_schema.tables WHERE table_schema NOT IN ('mysql','information_schema','performance_schema','sys')" 2>/dev/null || true)
+    pool_mb=$(mariadb -N -B -e 'SELECT ROUND(@@innodb_buffer_pool_size/1024/1024)' 2>/dev/null || true)
+    if [[ $db_mb =~ ^[0-9]+$ && $pool_mb =~ ^[0-9]+$ ]]; then
+      if (( db_mb * 100 > pool_mb * 80 )); then
+        diag "MariaDB buffer pool" printf '%s\n' "WARNING: live data ${db_mb}MB is above 80% of the ${pool_mb}MB pool; run --optimize to re-plan it after the import"
+      else
+        diag "MariaDB buffer pool" printf '%s\n' "${pool_mb}MB for ${db_mb}MB of live data (ok)"
+      fi
+    fi
     diag_sh "MariaDB replication" "mariadb -e 'SHOW REPLICA STATUS\\G' 2>&1 || mariadb -e 'SHOW SLAVE STATUS\\G' 2>&1 || true"
     diag_sh "MariaDB extended status" 'mariadb-admin ext 2>&1 | head -300'
     diag_sh "MariaDB error log size" 'du -sh /var/www/logs/mariadb /var/log/mysql 2>/dev/null || true'

@@ -3,6 +3,39 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.21 (2026-11-17)
+
+- **Anubis no longer inflates allowed guest pages.**  The old map stripped
+  `Accept-Encoding` from every request without the Anubis pass cookie, not
+  just from a challenge.  An allowed crawler/API client therefore fetched the
+  **identity** page (115 KB) through Anubis and triggered all six `sub_filter`
+  rules, while the cached gzip body is only 15.7 KB.  The map now strips
+  encoding only when the request is challenge-bound (`Mozilla` or empty
+  user-agent, no pass cookie); allowed non-Mozilla clients and pass-cookie
+  browsers keep gzip, so `sub_filter` skips the application response.  A
+  browser challenge still receives the branded page (the terminator compresses
+  it after filtering).  On the Ubuntu test host the no-pass cached guest tier
+  moved from **5.8k to 30.5k req/s**; the 12-thread EPYC's 7.9k baseline is
+  recorded separately.
+- **FastCGI cache hits skip per-hit AIO and Brotli.**  Cached locations in
+  `server-configs-nginx` now set `aio off; brotli off;`: the stored body is
+  already gzip and re-running either filter only costs CPU.  Static assets
+  keep the global AIO/Brotli path.  On CentMinMod/Nginx, `aio threads` cost
+  16 % of cached-page throughput (167k -> 140k); on Angie the scoped change
+  was neutral.  The checks are in `php_xf.conf`, `php_xf_proxy.conf`,
+  `wordpress_cache.conf`, `php_chev_cache.conf` and `php_flarum.conf`.
+- **MariaDB growth is visible before it hurts.**  `--diagnostics` now reports
+  live data versus the InnoDB buffer pool and warns when data is above 80 % of
+  the pool.  README documents re-running `--optimize` (or `--mariadb size=`)
+  after a large `sql=` import or application bulk seed; the pool is only ever
+  increased, so a host sized while empty keeps the small value until the next
+  optimize run.
+- **Validation.**  934 tuning checks (5 new Anubis map checks), 208 dry runs,
+  `angie -t` clean on the updated tree.  Ubuntu SER8: Stack 4 no-pass cached
+  guest **5.8k -> 30.5k**, Stack 3 unchanged at ~59k, browser challenge still
+  branded, functional tiers 200.  The benchmark harnesses document the
+  CentMinMod/Nginx A/B (`aio threads` off is faster there).
+
 ## 1.21.20 (2026-11-16)
 
 - **Anubis: the filter socket is no longer world-connectable.**  The service
