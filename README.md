@@ -194,8 +194,8 @@ sudo bash setup.sh --optimize anubis=no
 | Vhost migration | every `conf.d` site with a `server_name` has its 443 listeners moved to the backend socket and gets a generated terminator; the original file is kept in `/var/lib/setup.sh/anubis/vhosts/*.orig` |
 | Backend trust | `set_real_ip_from unix:` + `real_ip_header X-Real-IP`, so PHP and the per-IP limiter see the client address |
 | HTTPS flag | the application leg is HTTP; the Angie tree rebuilds PHP's `HTTPS` from `X-Forwarded-Proto` (`http.d/https_map.conf`) |
-| Challenge page | branding-free (title, mascot, footer and version removed) with `sub_filter`; `SETUP_ANUBIS_BRANDING=1` keeps the stock page |
-| Cache safety | application responses keep their gzip/Brotli end to end; `Accept-Encoding` is stripped only for challenge-bound requests (no pass cookie, `Mozilla`/empty UA), so `sub_filter` can rewrite the challenge page without inflating every guest page |
+| Challenge page | stock Anubis page; no Nginx `sub_filter` and no response rewriting |
+| Cache safety | the client `Accept-Encoding` is passed through end to end; cached gzip bodies stay compressed and no `sub_filter` runs |
 | Dot segments | answered `400` at the edge (Anubis itself answers `500` before its policy check) |
 | Policy | `allow-good-crawlers`, `deny-ai-crawlers`, infrastructure routes allowed, `Mozilla` challenged; unmatched clients are allowed so API/CLI clients keep working |
 | Persistence | `ANUBIS=1` in `/etc/default/setup-tuning`; a later plain `--optimize` (or `--domain`) keeps it and protects new vhosts |
@@ -208,7 +208,6 @@ Environment options:
 | `SETUP_ANUBIS=1\|0` | unset | one-off equivalent of `anubis=yes\|no` |
 | `SETUP_ANUBIS_VERSION` | `1.28.2` | another release tag; set `SETUP_ANUBIS_SHA256` with it |
 | `SETUP_ANUBIS_SHA256` | pinned per architecture | expected tarball checksum for a custom version |
-| `SETUP_ANUBIS_BRANDING=1` | off | keep Anubis's stock challenge page |
 | `SETUP_ANUBIS_STATIC_BYPASS=0` | on | keep static assets on the Anubis proxy hop (persisted as `ANUBIS_STATIC_BYPASS`) |
 
 Notes:
@@ -228,13 +227,12 @@ Notes:
   socket is reachable only through its `root:www-data 0750` directory.
 - Anubis is a userspace proxy: cached guest pages still pass through it, so
   compare capacity with the graph in `tests/stress-site/AUDIT-20261116-1.21.18.md`
-  before enabling it on a bandwidth-heavy origin.  Only challenge-bound
-  requests lose compression; an allowed crawler/API client with no pass cookie
-  keeps the cached gzip body, so Anubis copies ~16 KB instead of ~115 KB and
-  skips the six `sub_filter` rules.  On the Ubuntu test host this moved the
-  no-pass cached guest tier from 5.8k to 30.5k req/s (the 12-thread EPYC's
-  7.9k baseline is recorded separately); a browser challenge still gets the
-  branded page, compressed by the terminator after filtering.  The whole Go profile is
+  before enabling it on a bandwidth-heavy origin.  It does not rewrite
+  responses: the client `Accept-Encoding` is passed through, cached gzip bodies
+  stay compressed (~16 KB instead of the ~115 KB identity page), and no
+  `sub_filter` runs.  On the Ubuntu test host this moved the no-pass cached
+  guest tier from 5.8k to 30.5k req/s (the 12-thread EPYC's 7.9k baseline is
+  recorded separately); the stock Anubis challenge page is served as-is.  The whole Go profile is
   hardware-derived and rewritten by every install/`--optimize`:
   `GOMAXPROCS=min(8, CPUs)` (the measured plateau: 6 871 cached pages/s with
   3.92 cores vs 7 203 with all 16 and 4.17 cores, same p99),

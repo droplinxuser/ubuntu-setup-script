@@ -3,6 +3,25 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.22 (2026-11-17)
+
+- **Anubis no longer uses `sub_filter` at all.**  The branding rewrite was
+  removed from the terminator, together with the `anubis_pass`,
+  `anubis_challenge_ua`, `anubis_strip_encoding` and
+  `anubis_upstream_accept_encoding` maps.  The client's `Accept-Encoding` is
+  passed through unchanged and the stock Anubis challenge page is served
+  as-is.  This is simpler and removes a response filter from the edge; the
+  measured no-pass cached guest throughput was unchanged on the Ubuntu SER8
+  host (~30.5k with the old conditional map, ~30.9k without it), because the
+  previous fix already kept gzip for allowed clients.  Browser challenges are
+  now stock pages instead of the branded variants.  `SETUP_ANUBIS_BRANDING`
+  is gone; it has no effect.
+- **Validation.**  932 tuning checks (the map-specific checks were replaced
+  by pass-through/no-`sub_filter` checks), 208 dry runs,
+  ShellCheck clean, `angie -t` clean.  Ubuntu SER8 Stack 4 remains ~30k
+  req/s; cache hits still carry `Content-Encoding: gzip`; stock challenge
+  page verified.
+
 ## 1.21.21 (2026-11-17)
 
 - **Anubis no longer inflates allowed guest pages.**  The old map stripped

@@ -4033,23 +4033,17 @@ check "the terminator does not cap uploads at the http-level body size" \
   grep -qx 'client_max_body_size 0;' "$TMP/anubis/anubis-location.conf"
 check "the terminator replaces X-Forwarded-For" \
   grep -qx 'proxy_set_header X-Forwarded-For \$remote_addr;' "$TMP/anubis/anubis-location.conf"
-check "the terminator keeps the conditional upstream Accept-Encoding map" \
-  grep -qx 'proxy_set_header Accept-Encoding \$anubis_upstream_accept_encoding;' "$TMP/anubis/anubis-location.conf"
+check "the terminator passes the client Accept-Encoding through" \
+  grep -qx 'proxy_set_header Accept-Encoding \$http_accept_encoding;' "$TMP/anubis/anubis-location.conf"
+check "the terminator no longer rewrites responses with sub_filter" \
+  bash -c '! grep -q "^sub_filter" "$1"' _ "$TMP/anubis/anubis-location.conf"
 ANUBIS_LOCATION=/etc/angie/snippets/anubis-location.conf
 
-# Only challenge-bound requests may be forced to identity for sub_filter.
-# An allowed crawler/API client without a pass cookie must keep gzip, or the
-# FastCGI cache sends a 115 KB page through Anubis instead of 16 KB.
+# No response-rewrite maps remain in the shared file.
 ANUBIS_COMMON="$TMP/anubis/anubis-common.conf"
 anubis_write_common
-check "the Anubis encoding map keys on the challenge user agent" \
-  grep -q 'map \$http_user_agent \$anubis_challenge_ua' "$TMP/anubis/anubis-common.conf"
-check "a no-cookie browser request is stripped for the challenge page" \
-  grep -qx '    "0:1" 1;' "$TMP/anubis/anubis-common.conf"
-check "an allowed no-cookie client keeps its Accept-Encoding" \
-  grep -q 'default \$http_accept_encoding;' "$TMP/anubis/anubis-common.conf"
-check "the old unconditional no-cookie strip is gone" \
-  bash -c '! grep -q "^map \$anubis_pass \$anubis_upstream_accept_encoding" "$1"' _ "$TMP/anubis/anubis-common.conf"
+check "the Anubis common file has no encoding-strip map" \
+  bash -c '! grep -q "anubis_strip_encoding\|anubis_upstream_accept_encoding" "$1"' _ "$TMP/anubis/anubis-common.conf"
 ANUBIS_COMMON=/etc/angie/conf.d/00-anubis-common.conf
 
 # The backend socket is created 0777, so the directory is the access control.

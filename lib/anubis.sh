@@ -433,37 +433,10 @@ upstream anubis_static {
     keepalive 64;
 }
 
-# 1 when the request carries Anubis's signed pass token.  The cookie holds a
-# ULID (no dots) before the challenge is solved and a three-part JWT after,
-# so the value shape separates the two states without knowing the per-host
-# cookie name.  Used only to keep the challenge page unfiltered/uncompressed;
-# Anubis itself validates the token on every request.
-map \$http_cookie \$anubis_pass {
-    default 0;
-    "~*anubis-cookie-verification[^=]*=[^;]*\.[^;]*\.[^;]*" 1;
-}
-# 1 when the request is likely to receive the Anubis challenge page.  The
-# default policy challenges Mozilla and empty user agents; allowed crawlers,
-# API clients and the benchmark UA are not challenged.
-map \$http_user_agent \$anubis_challenge_ua {
-    default 0;
-    "" 1;
-    "~*Mozilla" 1;
-}
-# Strip Accept-Encoding only when sub_filter has to rewrite the challenge
-# page.  An allowed non-Mozilla client without a pass cookie keeps gzip, so
-# the FastCGI cache serves the compressed body and sub_filter skips it.
-# Previously every no-cookie request was forced to identity: a 115 KB page
-# was copied through Anubis and scanned by six sub_filter rules, while the
-# gzip body is 15.7 KB.  That cost ~90% of the cached-page ceiling.
-map "\$anubis_pass:\$anubis_challenge_ua" \$anubis_strip_encoding {
-    default 0;
-    "0:1" 1;
-}
-map \$anubis_strip_encoding \$anubis_upstream_accept_encoding {
-    default \$http_accept_encoding;
-    1       "";
-}
+# Anubis is a pure proxy: it does not rewrite application responses.  The
+# challenge page keeps Anubis's stock branding and the client's
+# Accept-Encoding is passed through, so cached gzip bodies are never inflated
+# and no sub_filter runs on the hot path.
 EOF
   if commit_if_changed "$ANUBIS_COMMON" "$tmp"; then ANUBIS_ANGIE_DIRTY=1; fi
   return 0
@@ -496,33 +469,16 @@ proxy_set_header X-TLS-SNI-Name $ssl_server_name;
 # avoids buffering a big upload to disk here.
 client_max_body_size 0;
 proxy_request_buffering off;
-# The challenge page must reach sub_filter uncompressed.  A visitor that
-# already holds the pass cookie keeps its own Accept-Encoding, so application
-# responses (including the gzip stored by the FastCGI guest cache) pass
-# through untouched.
-proxy_set_header Accept-Encoding $anubis_upstream_accept_encoding;
+# Pass the client encoding through.  No sub_filter runs: cached gzip bodies
+# stay compressed and the stock Anubis challenge page is served as-is.
+proxy_set_header Accept-Encoding $http_accept_encoding;
 proxy_connect_timeout 10s;
 proxy_send_timeout 360s;
 proxy_read_timeout 360s;
 proxy_buffering on;
 proxy_buffers 32 16k;
 proxy_busy_buffers_size 64k;
-
-# Branding-free challenge page.  Every literal below exists only in Anubis
-# HTML, so an application page (or its own <footer>/<details>) is never
-# touched.  SETUP_ANUBIS_BRANDING=1 keeps the stock page.
-sub_filter_once on;
-sub_filter "<title>Making sure you&#39;re not a bot!</title>" "<title>Verifying your browser</title>";
-sub_filter "<h1 id=\"title\" class=\"centered-div\">Making sure you&#39;re not a bot!</h1>" "<h1 id=\"title\" class=\"centered-div\">Verifying your browser</h1>";
-sub_filter "<p id=\"status\">Loading...</p>" "<p id=\"status\">Checking your connection...</p>";
-sub_filter "<img id=\"image\" style=\"width:100%;max-width:256px;\"" "<img id=\"image\" hidden style=\"width:100%;max-width:256px;\"";
-sub_filter "<details><p>This is a measure" "<details hidden><p>This is a measure";
-sub_filter "<footer><div class=\"centered-div\">" "<footer hidden><div class=\"centered-div\">";
 EOF
-  if [[ ${SETUP_ANUBIS_BRANDING:-0} == 1 ]]; then
-    # Drop the sub_filter block, keeping the proxy directives above it.
-    sed -i '/^# Branding-free challenge page/,$d' "$tmp"
-  fi
   if commit_if_changed "$ANUBIS_LOCATION" "$tmp"; then ANUBIS_ANGIE_DIRTY=1; fi
   return 0
 }
