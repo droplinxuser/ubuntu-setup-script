@@ -1,5 +1,35 @@
 # Full-stack stress test reports
 
+## 1.21.15 re-audit (2026-11-16)
+
+Anubis and Angie hardening cycle on the same host.  Full report:
+`AUDIT-20261116-1.21.15.md`.
+
+- **Findings:** an encoded login POST bypassed the credential rate limiter
+  (14/14 accepted; 429 after 11 now); PHP executed from writable upload/data
+  trees on hand-written vhosts; XenForo's proxy locations were shadowed by
+  the generic PHP handler; upstream TLS was unverified; `X-Forwarded-Proto`
+  was trusted from any client; Chevereto built `https://host:/image/...` on
+  the Unix-socket leg.  Anubis: local users could reach the backend socket,
+  uploads >11 MB got 413, a failed start left dead sockets, and a file-global
+  real-IP check could trust a client's XFF.
+- **Tuned, Anubis off (loopback, 100c, 8 s):** WordPress guest 77 482 req/s,
+  XenForo guest 91 440, Chevereto explore 74 503; member XenForo home 821 /
+  thread 442, WordPress member 285.
+- **Tuned, Anubis on:** cached pages 6 364-9 783 req/s (Anubis is the new
+  ceiling for large pages; static assets reach 36 275), member pages -7 to
+  -11%.  A solved pass cookie measures the same as the allowed-UA path.
+- **FPM sweep:** 8/12/16/20/24 = 377/470/544/526/513 (XF thread);
+  16 remains the plateau.  **JIT:** tracing 64 MB 543 vs off 503; function
+  JIT costs 7% and a 4x WordPress p99.
+- **PHP matrix:** WordPress clean on 8.5, XenForo cleanest on 8.4 (a null
+  array-offset E_DEPRECATED in `src/XF/App.php` on 8.5), Chevereto on 8.4;
+  8.6 adds app-level deprecations to WordPress and XenForo and lacks
+  redis/imagick.
+- **Validation:** 871 tuning checks, 203 dry runs, install/optimize parity
+  (2 746-line snapshot, empty diff), 61/61 cookie, 54/54 security, Anubis
+  on/off/failure/purge paths, baseline restored to 526 packages.
+
 ## 1.21.8 re-audit (2026-11-15)
 
 Freshly restored 16-thread / 27 812 MiB / NVMe bare-metal host, WordPress

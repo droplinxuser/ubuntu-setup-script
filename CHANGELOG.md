@@ -3,6 +3,58 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.15 (2026-11-16)
+
+- **Anubis cannot be bypassed by a local account.**  The backend socket is
+  created 0777 (Angie daemonises with umask 0), so any local user could
+  connect to `/run/angie/anubis-backend.sock` with `X-Real-IP: 127.0.0.1`
+  and skip the bot filter, every IP ACL and the audit log.  `/run/angie` is
+  now `0750 root:anubis`; only Angie (binder) and Anubis (client) traverse
+  it.  Verified: `nobody` gets `000`, the Anubis user gets `200`.
+- **Enabling Anubis no longer caps every upload at 11 MB.**  The generated
+  terminator inherited the http-level `client_max_body_size 11m` and
+  buffered the body before the backend's own limit applied; XenForo
+  attachments, Chevereto uploads and WordPress plugin installs answered 413.
+  The terminator now sets `client_max_body_size 0` and streams the request
+  (`proxy_request_buffering off`), leaving the per-vhost limit in charge.
+  Verified with a 15 MB POST through Anubis (200, not 413).
+- **A failed Anubis start rolls back instead of leaving dead sockets.**
+  `anubis_enable` rewrote every vhost to the backend socket and then returned
+  without undoing it when the service did not create its socket; the running
+  Angie kept working until the next reload or reboot, after which every site
+  answered 502.  It now restores the vhosts, removes the generated files and
+  re-tests Angie, like the `angie -t` failure path.
+- **Per-block real-IP migration.**  The old migration decided whether a vhost
+  already had `real_ip_header` with a file-global grep; a CDN block's
+  `real_ip_header X-Forwarded-For` therefore suppressed the fix in every
+  block, leaving the backend trusting a client-supplied header from the Unix
+  peer.  Each block now drops its own header and gets
+  `set_real_ip_from unix:` + `real_ip_header X-Real-IP`; other trusted ranges
+  are kept.
+- **The terminator replaces `X-Forwarded-For`.**  It appended with
+  `$proxy_add_x_forwarded_for`, so the client's own entries survived and
+  applications behind the trusted terminator read the left-most (forged)
+  address.  It now sets `$remote_addr`, on the HTTP and WebSocket legs.
+- **`--purge angie` restores the vhosts before stopping Anubis.**  Stopping
+  the service while the vhosts still listened on its socket made a later
+  `systemctl start angie` answer 502 for every site.  The binary, unit,
+  policy and `.orig` backups stay, so `--optimize anubis=yes` re-enables.
+- **Leaner Anubis.**  Static assets are allowed without a challenge (a
+  challenged CSS/JS request used to return HTML on the first visit, and
+  assets are most of the request volume), an empty User-Agent is challenged,
+  and `SLOG_LEVEL=WARN` stops one journal line per proxied request.  A pinned
+  `SETUP_ANUBIS_VERSION` is compared after the override, so it no longer
+  re-downloads on every run without restarting the service; the live env file
+  is created mode 600 before it holds the cookie secret; and the temporary
+  `angie -t` file uses `tmp_file` instead of a predictable `/tmp` name.
+- **Pair with server-configs-nginx 1.6.32**, which closes the encoded
+  login-limiter bypass and gives PHP the public `SERVER_PORT`/`REQUEST_SCHEME`
+  on the Unix-socket leg (Chevereto emitted `https://host:/image/...`).
+- **Validation.**  871 tuning checks, 203 dry-run cases; fresh install and
+  `--optimize` parity; three applications; Anubis on/off/rollback; 61/61
+  guest-cookie and 54/54 security checks; encoded login POSTs limited
+  (429 after 11) where they were 14/14 accepted before.
+
 ## 1.21.14 (2026-11-16)
 
 - **Optional Anubis bot filter.**  `--angie anubis=yes` (fresh install) and

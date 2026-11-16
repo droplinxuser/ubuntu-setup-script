@@ -10,8 +10,18 @@
 # chv_variables through the Redis cache first.  The audit host is disposable,
 # so a reset is the supported way to repeat a deployment.
 set -Eeuo pipefail
-X=/root/work/pkg/x
-WP=/var/www/wp.test.local/public; XF=/var/www/xf.test.local/public; CH=/var/www/chev.test.local/public
+HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# Domains created by `--domain` (app=wordpress / app=xf / app=chevereto).
+# Override them for a run against different names; the defaults are the ones
+# the audit host uses when no override is given.
+WP_DOMAIN=${WP_DOMAIN:-wp.test.local}
+XF_DOMAIN=${XF_DOMAIN:-xf.test.local}
+CHV_DOMAIN=${CHV_DOMAIN:-chev.test.local}
+X=${X:-/root/work/pkg/x}
+WP=/var/www/$WP_DOMAIN/public; XF=/var/www/$XF_DOMAIN/public; CH=/var/www/$CHV_DOMAIN/public
+for d in "$WP" "$XF" "$CH"; do
+  [[ -d $d ]] || { echo "missing web root $d (create the --domain vhost first, or set WP_DOMAIN/XF_DOMAIN/CHV_DOMAIN)" >&2; exit 1; }
+done
 PW_FILE=/root/audit/test-admin-pass; [ -s $PW_FILE ] || ( umask 077; echo "Audit-$(openssl rand -hex 6)" > $PW_FILE )
 PW=$(cat $PW_FILE)
 asw() { runuser -u www-data -- "$@"; }
@@ -43,16 +53,16 @@ chown www-data:www-data $WP/wp-config.php; chmod 640 $WP/wp-config.php
 cat > /tmp/wp-install.php <<'PHP'
 <?php
 define('WP_INSTALLING', true);
-$_SERVER['HTTP_HOST'] = 'wp.test.local'; $_SERVER['HTTPS'] = 'on';
+$_SERVER['HTTP_HOST'] = $argv[3]; $_SERVER['HTTPS'] = 'on';
 require $argv[1] . '/wp-load.php';
 require_once ABSPATH . 'wp-admin/includes/upgrade.php';
 if (is_blog_installed()) { echo "already installed\n"; exit; }
-define('WP_SITEURL', 'https://wp.test.local');
+define('WP_SITEURL', 'https://' . $argv[3]);
 $r = wp_install('SER8 audit', 'admin', 'admin@example.com', true, '', $argv[2]);
 echo "wp installed, admin id {$r['user_id']}\n";
 PHP
-asw php /tmp/wp-install.php $WP "$PW"
-cp /root/work/ubuntu-setup-script/tests/stress-site/seed-wp.php $WP/seed-wp.php
+asw php /tmp/wp-install.php "$WP" "$PW" "$WP_DOMAIN"
+cp "$HERE/seed-wp.php" $WP/seed-wp.php
 (cd $WP && asw php seed-wp.php 100 400 300 | tail -3); rm -f $WP/seed-wp.php
 
 # ---- XenForo
@@ -70,8 +80,8 @@ $config['cache']['config'] = ['host' => '/run/valkey/valkey.sock', 'port' => 0, 
 $config['cache']['sessions'] = true;
 PHP
 chown www-data:www-data $XF/src/config.php; chmod 640 $XF/src/config.php
-(cd $XF && asw php cmd.php xf:install --user=admin --password="$PW" --email=admin@example.com --title="SER8 audit forum" --url=https://xf.test.local --skip-statistics -n 2>&1 | tail -3)
-cp /root/work/ubuntu-setup-script/tests/stress-site/seed-xf.php $XF/seed-xf.php
+(cd $XF && asw php cmd.php xf:install --user=admin --password="$PW" --email=admin@example.com --title="SER8 audit forum" --url="https://$XF_DOMAIN" --skip-statistics -n 2>&1 | tail -3)
+cp "$HERE/seed-xf.php" $XF/seed-xf.php
 (cd $XF && asw php seed-xf.php 60 200 2400 2>&1 | tail -3); rm -f $XF/seed-xf.php
 # Set the options through XenForo's repository, not with SQL.  A raw UPDATE
 # leaves the option cache built during the install in place, so the board
@@ -104,7 +114,7 @@ cat > $CH/app/env.php <<PHP
 return [
   'CHEVERETO_DB_HOST' => 'localhost', 'CHEVERETO_DB_NAME' => 'chevereto', 'CHEVERETO_DB_USER' => 'chevuser',
   'CHEVERETO_DB_PASS' => 'temp', 'CHEVERETO_DB_PORT' => '3306', 'CHEVERETO_DB_TABLE_PREFIX' => 'chv_',
-  'CHEVERETO_DB_DRIVER' => 'mysql', 'CHEVERETO_HOSTNAME' => 'chev.test.local', 'CHEVERETO_HOSTNAME_PATH' => '/',
+  'CHEVERETO_DB_DRIVER' => 'mysql', 'CHEVERETO_HOSTNAME' => '$CHV_DOMAIN', 'CHEVERETO_HOSTNAME_PATH' => '/',
   'CHEVERETO_HTTPS' => '1', 'CHEVERETO_ENCRYPTION_KEY' => '$(openssl rand -base64 32)',
   'CHEVERETO_CACHE_DRIVER' => 'redis', 'CHEVERETO_CACHE_HOST' => '${CHEV_CACHE_HOST:-/run/valkey/valkey.sock}', 'CHEVERETO_CACHE_PORT' => '${CHEV_CACHE_PORT:-0}',
   'CHEVERETO_ENABLE_DEBUG' => '1', 'CHEVERETO_DEBUG_LEVEL' => '1',

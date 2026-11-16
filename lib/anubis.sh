@@ -70,21 +70,24 @@ anubis_installed_version() {
 }
 
 anubis_install_binary() {
-  local current want="v${ANUBIS_VERSION}" tmp url got want_sha arch
+  local current want tmp url got want_sha arch
   case $(uname -m) in
     x86_64|amd64)  arch=amd64; want_sha=$ANUBIS_SHA256_AMD64 ;;
     aarch64|arm64) arch=arm64; want_sha=$ANUBIS_SHA256_ARM64 ;;
     *) warn "Anubis has no release build for $(uname -m); install it by hand"; return 1 ;;
   esac
-  current=$(anubis_installed_version || true)
-  [[ $current == "$want" ]] && return 0
-
+  # Apply the version override before comparing: a pinned version used to be
+  # compared against the default, so every run re-downloaded it and replaced
+  # the binary while the running service kept the old inode.
   want_sha=${SETUP_ANUBIS_SHA256:-$want_sha}
   if [[ ${SETUP_ANUBIS_VERSION:-} =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     ANUBIS_VERSION=$SETUP_ANUBIS_VERSION
-    want="v${ANUBIS_VERSION}"
     [[ -z ${SETUP_ANUBIS_SHA256:-} ]] && want_sha=""
   fi
+  want="v${ANUBIS_VERSION}"
+  current=$(anubis_installed_version || true)
+  [[ $current == "$want" ]] && return 0
+
   url="https://github.com/TecharoHQ/anubis/releases/download/v${ANUBIS_VERSION}/anubis-${ANUBIS_VERSION}-linux-${arch}.tar.gz"
   tmp=$(tmp_dir anubis.XXXXXX) || return 1
   info "Downloading Anubis ${ANUBIS_VERSION} (${arch} static binary)"
@@ -105,6 +108,8 @@ anubis_install_binary() {
   tar -xzf "${tmp}/anubis.tar.gz" -C "$tmp" || return 1
   install -m 755 "${tmp}/anubis-${ANUBIS_VERSION}-linux-${arch}/bin/anubis" "$ANUBIS_BIN" \
     || return 1
+  # The running service keeps the old inode until it is restarted.
+  ANUBIS_SERVICE_DIRTY=1
   info "Installed ${ANUBIS_BIN} (Anubis ${ANUBIS_VERSION}, ${arch})"
   return 0
 }
@@ -113,6 +118,9 @@ anubis_write_env() {
   local secret tmp
   install -d -m 750 -o "$ANUBIS_USER" -g "$ANUBIS_USER" "$ANUBIS_ETC" \
     /var/lib/anubis /var/cache/anubis || return 1
+  # Create the live file with mode 600 before it holds the cookie secret:
+  # commit_if_changed writes with the caller's umask (022).
+  [[ -e $ANUBIS_ENV ]] || ( umask 077; : > "$ANUBIS_ENV" ) || return 1
   secret=$(sed -n 's/^HS512_SECRET=//p' "$ANUBIS_ENV" 2>/dev/null | head -n1 || true)
   [[ -n $secret ]] || secret=$(openssl rand -hex 64)
   tmp=$(tmp_file) || return 1
@@ -131,7 +139,9 @@ CUSTOM_REAL_IP_HEADER=X-Real-IP
 METRICS_BIND=${ANUBIS_METRICS}
 METRICS_BIND_NETWORK=tcp
 POLICY_FNAME=${ANUBIS_POLICY}
-SLOG_LEVEL=INFO
+# WARN keeps one journal line per challenge and none per proxied request;
+# INFO on a busy site fills the journal and costs CPU.
+SLOG_LEVEL=WARN
 # Anubis creates the listening socket as its own user; Angie workers run as
 # www-data and must be able to connect to it.
 SOCKET_MODE=0666
@@ -168,6 +178,16 @@ bots:
   - name: robots-txt
     path_regex: ^/robots\.txt$
     action: ALLOW
+  # Static assets are not a scraping target and every page load asks for
+  # dozens of them.  Proxying them without a challenge keeps the first visit
+  # renderable (a challenged CSS/JS request returns HTML) and removes most of
+  # Anubis's request volume on a real site.
+  - name: static-assets
+    path_regex: (?i)\.(?:css|js|mjs|map|json|webmanifest|png|jpe?g|gif|webp|avif|svg|ico|bmp|woff2?|ttf|otf|eot|mp4|webm|mp3|ogg|wav|pdf|txt|xml|zip|gz|br|wasm)$
+    action: ALLOW
+  - name: empty-user-agent
+    user_agent_regex: ^$
+    action: CHALLENGE
   - name: generic-browser
     user_agent_regex: Mozilla
     action: CHALLENGE
@@ -217,13 +237,17 @@ EOF
 }
 
 # /run is a tmpfs; Angie creates the backend socket there on every start, so
-# the directory must exist before Angie starts at boot.
+# the directory must exist before Angie starts at boot.  The socket itself is
+# created 0777 (Angie daemonises with umask 0), so the directory is what keeps
+# other local accounts out: only root and the Anubis user may traverse it.
+# Without that, any local user could connect to the backend vhosts directly
+# with "X-Real-IP: 127.0.0.1" and skip the bot filter and every IP ACL.
 anubis_write_tmpfiles() {
   local tmp
   tmp=$(tmp_file) || return 1
   cat > "$tmp" <<'EOF'
 # setup.sh: directory for the Anubis backend Unix socket.
-d /run/angie 0755 root root -
+d /run/angie 0750 root anubis -
 EOF
   if commit_if_changed "$ANUBIS_TMPFILES" "$tmp"; then ANUBIS_ANGIE_DIRTY=1; fi
   systemd-tmpfiles --create "$ANUBIS_TMPFILES" >/dev/null 2>&1 || true
@@ -285,9 +309,18 @@ proxy_http_version 1.1;
 proxy_set_header Connection "";
 proxy_set_header Host $host;
 proxy_set_header X-Real-IP $remote_addr;
-proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+# Replace, do not append: $proxy_add_x_forwarded_for keeps whatever the
+# client sent, and applications behind a trusted terminator read the
+# left-most entry as the visitor address.
+proxy_set_header X-Forwarded-For $remote_addr;
 proxy_set_header X-Forwarded-Proto https;
 proxy_set_header X-TLS-SNI-Name $ssl_server_name;
+# The backend vhost enforces its own client_max_body_size; the edge must not
+# cap every upload at the http-level 11m (XenForo attachments, Chevereto
+# uploads and WordPress plugin installs are larger).  Streaming the body
+# avoids buffering a big upload to disk here.
+client_max_body_size 0;
+proxy_request_buffering off;
 # The challenge page must reach sub_filter uncompressed.  A visitor that
 # already holds the pass cookie keeps its own Accept-Encoding, so application
 # responses (including the gzip stored by the FastCGI guest cache) pass
@@ -356,14 +389,11 @@ anubis_backup_vhost() {
 # manual rollback trivial), and teach the backend to trust Anubis's
 # X-Real-IP.  One `set_real_ip_from`/`real_ip_header` pair per server block.
 anubis_integrate_vhost() {
-  local f=$1 tmp have_header=0 have_from=0
+  local f=$1 tmp
   anubis_vhost_needs_migration "$f" || return 0
   anubis_backup_vhost "$f" || return 1
-  grep -qE '^[[:space:]]*real_ip_header[[:space:]]' "$f" && have_header=1
-  grep -qE '^[[:space:]]*set_real_ip_from[[:space:]]+unix:' "$f" && have_from=1
   tmp=$(tmp_file) || return 1
-  awk -v sock="unix:${ANUBIS_BACKEND_SOCKET}" \
-      -v have_header="$have_header" -v have_from="$have_from" '
+  awk -v sock="unix:${ANUBIS_BACKEND_SOCKET}" '
     function indent_of(s) { if (match(s, /^[ \t]*/)) return substr(s, 1, RLENGTH); return "" }
     function brace_delta(s,   t, n, m) {
       t = s
@@ -384,14 +414,19 @@ anubis_integrate_vhost() {
         print line
         next
       }
+      # Drop an existing real-IP configuration: the peer is now the Anubis
+      # socket, so the backend must read X-Real-IP from it and never trust a
+      # client-supplied X-Forwarded-For (a file-global check used to leave a
+      # real_ip_header X-Forwarded-For from any block in place for all of them).
+      if (code ~ /^[ \t]*real_ip_header[ \t]+/ || code ~ /^[ \t]*set_real_ip_from[ \t]+unix/) next
       if (code ~ /^[ \t]*listen[ \t]+/ && code ~ /443/ && code ~ /ssl/) {
         # IPv6 listener is redundant once the public side is the terminator.
         if (code ~ /\[::\]/) next
         ind = indent_of(line)
         print ind "listen " sock ";"
         if (!added_real_ip) {
-          if (!have_from) print ind "set_real_ip_from unix:;"
-          if (!have_header) print ind "real_ip_header X-Real-IP;"
+          print ind "set_real_ip_from unix:;"
+          print ind "real_ip_header X-Real-IP;"
           added_real_ip = 1
         }
         next
@@ -460,6 +495,7 @@ EOF
           print "        proxy_pass http://anubis_backend;"
           print "        proxy_set_header Host $host;"
           print "        proxy_set_header X-Real-IP $remote_addr;"
+          print "        proxy_set_header X-Forwarded-For $remote_addr;"
           print "        proxy_set_header X-Forwarded-Proto https;"
           print "    }"
           print ""
@@ -614,10 +650,22 @@ anubis_enable() {
     ANUBIS_FAILED="vhost migration"
     return 1
   fi
-  anubis_start || { ANUBIS_FAILED="service start"; return 1; }
-  if ! /usr/sbin/angie -t >/tmp/anubis-angie-test.$$ 2>&1; then
+  if ! anubis_start; then
+    # The vhosts are already pointing at a socket that has no listener; a
+    # later reload or reboot would answer 502 for every site.  Put the
+    # original tree back before returning, as the angie -t failure does.
+    warn "Anubis did not start; restoring the direct-TLS vhosts"
+    anubis_restore_vhosts
+    anubis_remove_angie_files
+    /usr/sbin/angie -t >/dev/null 2>&1 || warn "Angie configuration is invalid after rollback"
+    ANUBIS_FAILED="service start"
+    return 1
+  fi
+  local t
+  t=$(tmp_file) || return 1
+  if ! /usr/sbin/angie -t >"$t" 2>&1; then
     warn "Anubis: Angie rejected the integrated configuration; rolling back"
-    sed 's/^/  /' /tmp/anubis-angie-test.$$ >&2 || true
+    sed 's/^/  /' "$t" >&2 || true
     anubis_restore_vhosts
     anubis_remove_angie_files
     /usr/sbin/angie -t >/dev/null 2>&1 || warn "Angie configuration is still invalid after rollback"
@@ -672,13 +720,18 @@ anubis_apply() {
 # ---------------------------------------------------------------------------
 # Lifecycle for purge / restore / diagnostics
 # ---------------------------------------------------------------------------
-# --purge angie: stop and disable Anubis but keep its configuration so a later
-# `--optimize anubis=yes` starts from the same state.
+# --purge angie: restore the vhosts and remove the generated Angie files
+# before stopping Anubis.  Leaving the vhosts on a socket whose service is
+# stopped makes a later `systemctl start angie` (boot, manual start) answer
+# 502 for every site.  The binary, unit, policy and state (including the
+# .orig vhost backups) stay, so `--optimize anubis=yes` re-enables it.
 anubis_purge_stop() {
   anubis_managed || return 0
+  anubis_restore_vhosts || true
+  anubis_remove_angie_files
   systemctl stop anubis >/dev/null 2>&1 || true
   systemctl disable anubis >/dev/null 2>&1 || true
-  info "Anubis stopped (configuration kept; --optimize anubis=yes re-enables it)"
+  info "Anubis stopped, vhosts restored (configuration kept; --optimize anubis=yes re-enables it)"
 }
 
 # Return the host to a state without Anubis: restore the vhosts, remove the

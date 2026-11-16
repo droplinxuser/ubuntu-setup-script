@@ -3871,6 +3871,42 @@ check "disabling Anubis restores the vhost byte-for-byte" \
 check "the restored vhost terminates TLS again" \
   grep -q 'listen      443 ssl;' "$TMP/anubis/conf.d/site.test.conf"
 
+# A vhost that already carried a real-IP configuration must not keep reading
+# a client-supplied X-Forwarded-For: the backend peer is the Anubis socket.
+cat > "$TMP/anubis/conf.d/realip.test.conf" <<'EOF'
+server {
+    listen 443 ssl;
+    server_name realip.test;
+    real_ip_header X-Forwarded-For;
+    set_real_ip_from 10.0.0.0/8;
+}
+EOF
+anubis_integrate_vhost "$TMP/anubis/conf.d/realip.test.conf"
+check "the migration drops a pre-existing real_ip_header" \
+  bash -c '! grep -q "real_ip_header X-Forwarded-For" "$1"' _ "$TMP/anubis/conf.d/realip.test.conf"
+check "the migrated block reads X-Real-IP only" \
+  test "$(grep -c '^    real_ip_header X-Real-IP;' "$TMP/anubis/conf.d/realip.test.conf")" -eq 1
+check "the migration keeps an operator's other trusted ranges" \
+  grep -q 'set_real_ip_from 10.0.0.0/8;' "$TMP/anubis/conf.d/realip.test.conf"
+anubis_restore_vhosts "$TMP/anubis/conf.d" "$TMP/anubis/state/vhosts"
+
+# The generated terminator snippet: uploads are bounded by the backend vhost,
+# not by the http-level 11m, and the client's X-Forwarded-For is replaced.
+ANUBIS_LOCATION="$TMP/anubis/anubis-location.conf"
+anubis_write_location
+check "the terminator does not cap uploads at the http-level body size" \
+  grep -qx 'client_max_body_size 0;' "$TMP/anubis/anubis-location.conf"
+check "the terminator replaces X-Forwarded-For" \
+  grep -qx 'proxy_set_header X-Forwarded-For \$remote_addr;' "$TMP/anubis/anubis-location.conf"
+ANUBIS_LOCATION=/etc/angie/snippets/anubis-location.conf
+
+# The backend socket is created 0777, so the directory is the access control.
+ANUBIS_TMPFILES="$TMP/anubis/tmpfiles.conf"
+anubis_write_tmpfiles
+check "the backend socket directory is private to root and anubis" \
+  grep -qx 'd /run/angie 0750 root anubis -' "$TMP/anubis/tmpfiles.conf"
+ANUBIS_TMPFILES=/etc/tmpfiles.d/angie-anubis.conf
+
 # A vhost whose certificate comes from an http-level include has no
 # ssl_certificate line; the terminator must fall back to the default
 # certificate instead of leaving the site without a public listener.
