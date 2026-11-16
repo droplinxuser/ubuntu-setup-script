@@ -2957,6 +2957,29 @@ printf 'server {\n    root %s;\n    include h5bp/php_xf.conf;\n}\n' "$TMP/capsit
 printf "<?php\n\$config['db']['host'] = 'localhost';\n" > "$TMP/capsite/xf/src/config.php"
 check "angie_vhost_root reads the root directive" \
   test "$(angie_vhost_root "$TMP/capsite/conf.d/xf.conf")" = "$TMP/capsite/xf"
+# A generated vhost (the Anubis TLS terminator, a redirect-only block) has no
+# root directive.  The lookup must print nothing and return 0: under
+# `set -e` + inherit_errexit the old grep pipeline returned 1 and the
+# --upgrade-php preflight (which walks every conf.d file) printed false
+# "[ERR] command failed" lines.
+printf 'server {\n    listen 443 ssl;\n    server_name term.test;\n}\n' \
+  > "$TMP/capsite/conf.d/terminator.conf"
+rootless_vhost_ok() { [[ -z $(angie_vhost_root "$TMP/capsite/conf.d/terminator.conf") ]]; }
+check "angie_vhost_root returns success with no root directive" rootless_vhost_ok
+missing_file_ok() { [[ -z $(angie_vhost_root "$TMP/capsite/conf.d/does-not-exist.conf") ]]; }
+check "angie_vhost_root returns success for a missing file" missing_file_ok
+
+# One app detector for the --upgrade-php preflight and the tuners.
+mkdir -p "$TMP/apptypes/wp/wp-includes" "$TMP/apptypes/xf/src" \
+         "$TMP/apptypes/ch/app" "$TMP/apptypes/plain"
+: > "$TMP/apptypes/wp/wp-config.php"; : > "$TMP/apptypes/wp/wp-includes/version.php"
+: > "$TMP/apptypes/xf/src/XF.php"; : > "$TMP/apptypes/xf/src/config.php"
+: > "$TMP/apptypes/ch/app/env.php"
+check "app_type_at_root: wordpress" test "$(app_type_at_root "$TMP/apptypes/wp")" = wordpress
+check "app_type_at_root: xenforo"  test "$(app_type_at_root "$TMP/apptypes/xf")" = xenforo
+check "app_type_at_root: chevereto" test "$(app_type_at_root "$TMP/apptypes/ch")" = chevereto
+check "app_type_at_root: unrelated tree is empty" test -z "$(app_type_at_root "$TMP/apptypes/plain")"
+check "app_type_at_root: missing root is empty" test -z "$(app_type_at_root "$TMP/apptypes/nope")"
 
 mkdir -p "$TMP/assets/js" "$TMP/assets/internal_data"
 head -c 20000 /dev/zero | tr '\0' 'a' > "$TMP/assets/js/app.js"

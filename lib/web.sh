@@ -743,10 +743,27 @@ persist_xf_job_cron() {
 
 # Document root of an Angie vhost file ("" when none).  Shared by the
 # WordPress/XenForo vhost scanners, the worker cap and asset precompression.
+# A generated vhost can legitimately have no root directive (the Anubis TLS
+# terminators, a redirect-only block).  Under `set -e` with inherit_errexit a
+# failing `grep -m1` inside the command substitution aborted the callers and
+# printed false "[ERR] command failed ... sed" lines during --upgrade-php (the
+# preflight walks every conf.d file, including those terminators), so the
+# lookup is an awk that always succeeds.
 angie_vhost_root() {
-  local root
-  root=$(grep -m1 -E '^[[:space:]]*root[[:space:]]+' "$1" 2>/dev/null \
-    | sed -E 's/^[[:space:]]*root[[:space:]]+//; s/;.*//; s/^[[:space:]]+//; s/[[:space:]]+$//')
+  local root=""
+  if [[ -r ${1:-} ]]; then
+    root=$(awk '
+      /^[[:space:]]*root[[:space:]]+/ {
+        line = $0
+        sub(/^[[:space:]]*root[[:space:]]+/, "", line)
+        sub(/;.*/, "", line)
+        sub(/^[[:space:]]+/, "", line)
+        sub(/[[:space:]]+$/, "", line)
+        print line
+        exit
+      }
+    ' "$1" 2>/dev/null)
+  fi
   root=${root%\"}; root=${root#\"}
   printf '%s' "${root%/}"
 }

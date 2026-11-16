@@ -396,18 +396,7 @@ php_upgrade_app_roots() {
   local -A seen_root=()
   for d in "$base"/* "$base"/*/public; do
     [[ -d $d ]] || continue
-    app=""
-    if [[ -f $d/wp-config.php && -f $d/wp-includes/version.php ]]; then
-      app=wordpress
-    elif [[ -f $d/src/XF.php && -f $d/src/config.php ]]; then
-      app=xenforo
-    elif [[ -f $d/app/env.php ]]; then
-      # Same predicate as the --optimize and guest-cache detectors: a
-      # Chevereto tree is identified by app/env.php.  Requiring the legacy
-      # CLI as well made the preflight blind to a valid site, which defeats
-      # the "refuse before the purge" guarantee.
-      app=chevereto
-    fi
+    app=$(app_type_at_root "$d")
     [[ -n $app ]] || continue
     [[ -n ${seen_root[$d]:-} ]] && continue
     seen_root[$d]=1
@@ -418,8 +407,10 @@ php_upgrade_app_roots() {
 # The same detection for document roots declared in Angie vhosts, which may
 # live outside /var/www (a mounted or symlinked tree).  --optimize derives its
 # PHP paths from these vhosts, so the upgrade preflight must see them too.
+# Both walks call app_type_at_root so a site can never be recognized by one
+# path and missed by the other (a Chevereto tree needs only app/env.php).
 php_upgrade_vhost_roots() {
-  local target=${1:-/etc/angie} file root
+  local target=${1:-/etc/angie} file root app
   local -A seen_root=()
   [[ -d $target/conf.d ]] || return 0
   for file in "$target"/conf.d/*.conf; do
@@ -428,13 +419,8 @@ php_upgrade_vhost_roots() {
     [[ -n $root && -d $root ]] || continue
     [[ -n ${seen_root[$root]:-} ]] && continue
     seen_root[$root]=1
-    if [[ -f $root/wp-config.php && -f $root/wp-includes/version.php ]]; then
-      printf 'wordpress\t%s\n' "$root"
-    elif [[ -f $root/src/XF.php && -f $root/src/config.php ]]; then
-      printf 'xenforo\t%s\n' "$root"
-    elif [[ -f $root/app/env.php ]]; then
-      printf 'chevereto\t%s\n' "$root"
-    fi
+    app=$(app_type_at_root "$root")
+    [[ -n $app ]] && printf '%s\t%s\n' "$app" "$root"
   done
 }
 

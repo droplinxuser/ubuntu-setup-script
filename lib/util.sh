@@ -331,6 +331,28 @@ host_server_type() {
 host_is_vps() { [[ $(host_server_type) == vps ]]; }
 
 # ---------------------------------------------------------------------------
+# Application detection
+# ---------------------------------------------------------------------------
+# The supported application at a document root: wordpress, xenforo,
+# chevereto, or "" for an unrelated tree.  One predicate for the --upgrade-php
+# extension preflight (directory walk and vhost walk), the cache tuner and the
+# report, so a site can never be recognized on one path and missed on another.
+# A Chevereto tree is identified by app/env.php alone: requiring the legacy
+# CLI as well made the preflight blind to a valid site, which defeats the
+# "refuse before the purge" guarantee.
+app_type_at_root() {
+  local root=${1:-}
+  [[ -n $root && -d $root ]] || return 0
+  if [[ -f $root/wp-config.php && -f $root/wp-includes/version.php ]]; then
+    printf 'wordpress'
+  elif [[ -f $root/src/XF.php && -f $root/src/config.php ]]; then
+    printf 'xenforo'
+  elif [[ -f $root/app/env.php ]]; then
+    printf 'chevereto'
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Server configuration repository
 # ---------------------------------------------------------------------------
 cleanup_configs() {

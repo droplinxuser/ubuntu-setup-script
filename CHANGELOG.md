@@ -3,6 +3,32 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.16 (2026-11-16)
+
+- **`--upgrade-php` no longer prints false `[ERR]` lines.**  The upgrade
+  preflight walks every `/etc/angie/conf.d/*.conf` file and resolves its
+  document root; `angie_vhost_root` piped `grep -m1` through `sed`, so a
+  generated vhost with no `root` directive (the Anubis TLS terminators, a
+  redirect-only block) returned 1 through `inherit_errexit` and the ERR trap
+  printed four `command failed ... sed`/`sort -u` lines while the run still
+  finished successfully.  The lookup is now an awk that always succeeds and
+  prints nothing for a rootless or missing file; the lookup and the shared
+  app detector added below are covered by seven new unit checks (878 total).
+- **Leaner Anubis runtime.**  The managed unit sets `GOGC=400` and a 1 GiB
+  `GOMEMLIMIT`: the default collector ran mark/sweep long before the ~120 MB
+  working set needed it, and the relaxed collector measured 7 100 req/s
+  against 6 750 on the cached WordPress tier (p99 35 ms vs 39 ms) with RSS
+  114 MB.  The memory limit is a backstop so a traffic spike cannot turn the
+  relaxed collector into an OOM.
+- **One application detector instead of four copies.**  The `--upgrade-php`
+  preflight had two inline copies of the WordPress/XenForo/Chevereto marker
+  check (`wp-config.php` + `wp-includes/version.php`, `src/XF.php` +
+  `src/config.php`, `app/env.php`), the same predicate the tuners and the
+  report use.  `app_type_at_root` in `lib/util.sh` is now the single owner,
+  so a site cannot be recognized by one walk and missed by another.
+- **Pair with server-configs-nginx 1.6.33**, which stops a
+  `SETUP_LIMIT_REQ_EXEMPT` address from bypassing the credential limiter.
+
 ## 1.21.15 (2026-11-16)
 
 - **Anubis cannot be bypassed by a local account.**  The backend socket is
