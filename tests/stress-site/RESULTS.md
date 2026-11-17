@@ -20,6 +20,10 @@ Anubis on/off A/B and a package-level restore.  Pair:
 - Validation: 955 tuning checks, 213 dry runs, ShellCheck clean, 54/54
   security, 62/62 guest-cookie, 0 unexpected functional responses, 0 PHP
   diagnostics, 0 XenForo error rows.
+- Restore: `--purge all` + purge of the 107 added packages, **505 → 505**
+  packages, 0 version changes, 0 failed units, only `:22` and resolved
+  listening, UFW inactive, baseline hostname/timezone/swap.  Manifest:
+  `AUDIT-20261117-1.21.30-MANIFEST.txt`.
 
 ## 1.21.23 re-audit (2026-11-17)
 

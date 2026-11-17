@@ -763,7 +763,6 @@ them:
 | `SETUP_PHP_PAGE_GZIP` | `0\|1` | 0 stops PHP from gzipping WordPress/Chevereto pages for the guest cache (default 1: the cache stores the compressed page) |
 | `SETUP_STORAGE_CLASS` | `nvme\|ssd\|hdd` | pins the storage class when the kernel cannot see the medium (read on each run; persist it as `STORAGE_CLASS=` in `/etc/default/setup-tuning`) |
 | `SETUP_NODE_MAJOR` | major number | Node.js major installed by `--others nodejs` |
-| `SETUP_UFW_SSH_LIMIT` | `0\|1` | 1 (default) rate-limits the SSH port with `ufw limit` (6 new connections per 30 s per address); 0 writes a plain `ufw allow` rule. See the troubleshooting row for the lockout this prevents |
 
 Read on each run, not persisted:
 
@@ -783,6 +782,7 @@ Read on each run, not persisted:
 | `SETUP_DOMAIN_OPTIMIZE` | 0 skips the tuning pass at the end of `--domain` |
 | `SETUP_CHEV_GUEST_CACHE` | 1 forces the Chevereto guest cache on, 0 off; by default it is on unless the site allows guest uploads |
 | `SETUP_NODE_ALLOW_MAJOR_UPGRADE` | 1 allows a one-off Node.js major switch |
+| `SETUP_UFW_SSH_LIMIT` | 1 (default) rate-limits the SSH port with `ufw limit` (6 new connections per 30 s per address); 0 writes a plain `ufw allow` rule for automation hosts (see troubleshooting) |
 | `CONFIG_REPO_URL`, `CONFIG_REPO_REF`, `CONFIG_SOURCE_DIR` | source of the Angie configuration tree |
 | `SETUP_STATE_DIR` | private state directory for tests and image builds |
 

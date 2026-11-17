@@ -1,0 +1,79 @@
+# Audit 1.21.30 — package and restore manifest (lab.local, 2026-11-17)
+
+Host: `16c-32g-1T` / 192.168.1.139, Ubuntu 26.04.1 LTS, kernel 7.0.0-43-generic,
+16 vCPU (Ryzen 7 8745HS), 27,812 MiB, 903 GB NVMe.
+Baseline recorded before the install: **505 packages**, 11.2 GB swap
+partition, UFW inactive, timezone `America/Los_Angeles`, no Angie/PHP/MariaDB,
+no `/var/www`.
+
+## Installed stack (audit)
+
+Angie 1.12.4 + brotli, PHP 8.5.12 (8.4.27 and 8.6.0RC5 during the matrix),
+MariaDB 11.8.6, Valkey 9.0.4, Elasticsearch 9.5.6, Anubis 1.28.2, Node.js,
+nvme-cli, smartmontools, gifsicle, sysstat, git, curl, ImageMagick 7.
+
+## Packages added by the audit (107; all purged at restore)
+
+angie angie-module-brotli apt-transport-https curl debsuryorg-archive-keyring
+elasticsearch fontconfig-config fonts-dejavu-core fonts-dejavu-mono galera-4
+gawk gifsicle gir1.2-packagekitglib-1.0 git git-man imagemagick-7-common
+libabsl20260107 libaio1t64 libaom3 libappstream5 libargon2-1 libavif16
+libdav1d7 libdbi-perl libdeflate0 liberror-perl libfftw3-double3 libfontconfig1
+libfyaml0 libgav1-2 libgd3 libglib2.0-bin libgomp1 libgstreamer1.0-0
+libheif-plugin-aomdec libheif1 libimagequant0 libjbig0 libjpeg-turbo8 libjpeg8
+liblcms2-2 liblerc4 liblqr-1-0 libltdl7 libmagickcore-7.q16-10
+libmagickwand-7.q16-10 libmariadb3 libmpfr6 libnvme1t64 libopenjp2-7
+libpackagekit-glib2-18 libpcre2-posix3 libraw23t64 libsensors-config libsensors5
+libsharpyuv0 libsodium23 libstemmer0d libtiff6 liburing2 libwebp7 libwebpdemux2
+libwebpmux3 libx11-6 libx11-data libxau6 libxcb1 libxdmcp6 libxext6 libxmlb2
+libxpm4 libxslt1.1 libyuv0 libzip5 mariadb-client mariadb-client-core
+mariadb-common mariadb-server mariadb-server-core mysql-common nodejs nvme-cli
+packagekit php-common php8.5-cli php8.5-common php8.5-curl php8.5-fpm php8.5-gd
+php8.5-gmp php8.5-igbinary php8.5-imagick php8.5-mbstring php8.5-mysql
+php8.5-readline php8.5-redis php8.5-xml php8.5-zip python3-distro-info
+python3-software-properties smartmontools socat software-properties-common sysstat
+unattended-upgrades valkey-server valkey-tools
+
+PHP 8.4/8.6 packages installed during the version matrix were purged by the
+upgrade path itself; the 107 above are relative to the 505-package baseline.
+
+## Restore sequence
+
+1. `setup.sh --purge all` — stop/disable services, restore recorded basic
+   settings (hostname, timezone, DNS, sysctl, PAM limits, governor, UFW,
+   unattended-upgrades, cron).  Exit 0, 11 s, nothing deleted by the script.
+2. `apt-get purge` of the 107 added packages.
+3. Removal of test artifacts the purge intentionally preserves:
+   `/var/www`, `/etc/angie`, `/etc/php`, `/etc/anubis`, `/etc/mysql`,
+   `/var/lib/elasticsearch`, `/var/lib/setup.sh`, `/home/nginx_cache*`,
+   `/etc/default/setup-tuning`, `/usr/local/bin/anubis`,
+   `/etc/systemd/system/anubis.service`, the service drop-in directories,
+   `/var/log/angie`, `/var/log/php8.*`, Angie/Sury/Elastic/NodeSource APT
+   sources and keyrings, the 8 GB `/swapfile` and its fstab line, and the
+   audit scratch trees.
+4. Reboot.
+
+## Restore proof
+
+| Check | Result |
+|---|---|
+| Package count | **505 → 505** |
+| Packages added / removed | 0 / 0 |
+| Package version changes (common 505) | **0** |
+| Failed units | 0 |
+| Listening sockets | `:22`, `127.0.0.53:53`, `127.0.0.54:53` only |
+| Enabled unit files | identical to the baseline list |
+| `/var/www`, `/etc/angie`, `/etc/php`, `/etc/mysql`, `/var/lib/setup.sh` | absent |
+| UFW | inactive |
+| Hostname / timezone | `16c-32g-1T` / `America/Los_Angeles` |
+| Swap | 11.2 GB partition only (no `/swapfile`) |
+| Root crontab / `/etc/cron.d` | empty / stock only |
+| `net.ipv4.tcp_congestion_control`, `net.core.default_qdisc`, `vm.swappiness` | cubic, fq_codel, 60 (stock) |
+| sysctl vs baseline | only module-runtime keys differ: `net.netfilter.nf_conntrack_*` absent because the modules are not loaded after reboot, `tcp_allowed_congestion_control` without `bbr` for the same reason, and the computed `net.ipv4.neigh.*.unres_qlen_bytes` default (±1902 bytes) |
+
+The `/etc` digests recorded in earlier cycles are not repeated here because
+every file added by the stack was removed with its package or the test tree.
+`dpkg --verify` reports only the pre-existing `/etc/X11` conffiles of
+`x11-common` (state `un`, not in the baseline package list; `/etc` was last
+modified 2026-11-16 21:53, before the audit began) — no file from the audit
+remains modified.
