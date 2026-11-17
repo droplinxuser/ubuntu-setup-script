@@ -761,28 +761,10 @@ php_upgrade_optimize() {
       for change in "${TUNE_CHANGES[@]}"; do info "Angie: ${change}"; done
       # The managed PHP ini carries [PATH=] sections derived from the Angie
       # tree; the sync above may have changed that tree after the PHP pass.
-      # Mirror --optimize's post-Angie refresh so an upgrade reaches the same
-      # file state in one run.
-      if (( OPT_PHP_OK )); then
-        local v refresh_dirty=0
-        while IFS= read -r v; do
-          tune_reset_changes
-          if tune_php_fpm_version "$v"; then
-            (( TUNE_DIRTY )) && refresh_dirty=1
-            for change in "${TUNE_CHANGES[@]}"; do info "${change} (post-Angie refresh)"; done
-          else
-            warn "PHP ${v}: post-Angie ini refresh failed"
-            rc=1
-          fi
-        done < <(php_fpm_versions)
-        if (( refresh_dirty )); then
-          while IFS= read -r v; do
-            systemctl is-active --quiet "php${v}-fpm" 2>/dev/null || continue
-            systemctl reload "php${v}-fpm" 2>/dev/null \
-              || { warn "PHP ${v}: reload after the post-Angie ini refresh failed"; rc=1; }
-          done < <(php_fpm_versions)
-        fi
-      fi
+      # The shared helper mirrors --optimize's post-Angie refresh (including
+      # the cache-cutover accounting) so an upgrade reaches the same file
+      # state in one run.
+      php_refresh_after_angie info "" || rc=1
     else
       warn "Angie configuration could not be aligned with the PHP socket"
       rc=1

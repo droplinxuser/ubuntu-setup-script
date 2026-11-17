@@ -449,30 +449,8 @@ run_optimize() {
   # computed from a tree one version behind would be rewritten by the next run
   # (and a freshly deployed app root would never get its section).  Re-run the
   # writer after Angie and reload only when it changed something.
-  if (( OPT_PHP_OK )) && [[ " ${OPT_DETECTED[*]} " == *" angie "* ]]; then
-    local v php_refresh_dirty=0 change
-    while IFS= read -r v; do
-      tune_reset_changes
-      if tune_php_fpm_version "$v"; then
-        (( TUNE_DIRTY )) && php_refresh_dirty=1
-        for change in "${TUNE_CHANGES[@]}"; do opt_report "- ${change} (post-Angie refresh)"; done
-      else
-        opt_report "- **FAILED** PHP ${v}: post-Angie ini refresh"
-        rc=1
-      fi
-    done < <(php_fpm_versions)
-    if (( php_refresh_dirty )); then
-      while IFS= read -r v; do
-        systemctl is-active --quiet "php${v}-fpm" 2>/dev/null || continue
-        if systemctl reload "php${v}-fpm" 2>/dev/null; then
-          opt_report "- PHP ${v}: reloaded after the post-Angie ini refresh"
-          OPT_CUTOVER=1
-        else
-          opt_report "- **FAILED** PHP ${v}: reload after the post-Angie ini refresh"
-          rc=1
-        fi
-      done < <(php_fpm_versions)
-    fi
+  if [[ " ${OPT_DETECTED[*]} " == *" angie "* ]]; then
+    php_refresh_after_angie opt_report "- " || rc=1
   fi
 
   verify_optimized_services || rc=1

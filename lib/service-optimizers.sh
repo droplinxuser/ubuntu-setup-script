@@ -39,6 +39,53 @@ ensure_angie_limits() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# Shared post-Angie PHP refresh
+# ---------------------------------------------------------------------------
+# The managed PHP ini carries [PATH=] sections derived from the Angie tree the
+# PHP pass saw (the guest-cache encoding token and the WordPress/Chevereto
+# document roots).  optimize_angie / angie_apply_profile have just synced that
+# tree from the repository, so the ini must be rewritten afterwards or the next
+# run rewrites sections computed from a tree one version behind (and a newly
+# deployed root never gets its section).  Shared by --optimize and
+# --upgrade-php: the two copies had already drifted (the upgrade path did not
+# mark the cache cutover).
+#   $1 reporter function for normal lines (opt_report or info)
+#   $2 line prefix ("- " for the Markdown report, "" for the console)
+# Returns non-zero when a write or a reload failed; sets OPT_CUTOVER=1 when a
+# pool was reloaded.
+php_refresh_after_angie() {
+  local reporter=${1:-opt_report} prefix=${2:-- }
+  [[ ${OPT_PHP_OK:-0} -eq 1 ]] || return 0
+  local v dirty=0 rc=0
+  while IFS= read -r v; do
+    tune_reset_changes
+    if tune_php_fpm_version "$v"; then
+      (( TUNE_DIRTY )) && dirty=1
+      for change in "${TUNE_CHANGES[@]}"; do
+        "$reporter" "${prefix}${change} (post-Angie refresh)"
+      done
+    else
+      warn "PHP ${v}: post-Angie ini refresh failed"
+      opt_report "- **FAILED** PHP ${v}: post-Angie ini refresh"
+      rc=1
+    fi
+  done < <(php_fpm_versions)
+  (( dirty )) || return "$rc"
+  while IFS= read -r v; do
+    systemctl is-active --quiet "php${v}-fpm" 2>/dev/null || continue
+    if systemctl reload "php${v}-fpm" 2>/dev/null; then
+      "$reporter" "${prefix}PHP ${v}: reloaded after the post-Angie ini refresh"
+      OPT_CUTOVER=1
+    else
+      warn "PHP ${v}: reload after the post-Angie ini refresh failed"
+      opt_report "- **FAILED** PHP ${v}: reload after the post-Angie ini refresh"
+      rc=1
+    fi
+  done < <(php_fpm_versions)
+  return "$rc"
+}
+
 optimize_angie() {
   local active=0 change version rc=0 unit_changed=0
   local limit_file=/etc/systemd/system/angie.service.d/limits.conf
