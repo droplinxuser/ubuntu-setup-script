@@ -660,7 +660,7 @@ done
 `tools/fleet-update.sh` packages the whole rollout for one host: non-interactive
 APT (confold, lock timeout, `NEEDRESTART_MODE=l`), a snapd guard, a timestamped
 backup of the previous checkout, a verified tarball extraction, the dry run and
-the real run with separate logs, and a reboot notice. `REF=`, `SKIP_APT=1`,
+the real run with separate logs, and a reboot notice. `REF=`, `SKIP_APT=1`, `DRY_RUN_ONLY=1`,
 `FORCE_SNAPD_PURGE=1` and `REBOOT=1` are the supported switches.
 
 ```bash
