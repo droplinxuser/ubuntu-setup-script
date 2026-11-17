@@ -1614,6 +1614,19 @@ php_jit_settings() {
   printf 'tracing %s\n' "$buf"
 }
 
+# True when the reserved 2 MB huge pages can hold the OPcache code arena plus
+# the JIT buffer.  A kernel that allocated only part of vm.nr_hugepages (87 of
+# 512 pages on a fragmented provider image) is not a failure, but enabling
+# opcache.huge_code_pages with too few pages makes OPcache fall back anyway;
+# keeping the ini at 0 is the honest, warning-free setting.
+php_hugepages_ok() {
+  local pages=${1:-0} opcache_mb=${2:-128} jit_mb=${3:-0}
+  [[ $pages =~ ^[0-9]+$ ]] || return 1
+  [[ $opcache_mb =~ ^[0-9]+$ ]] || opcache_mb=128
+  [[ $jit_mb =~ ^[0-9]+$ ]] || jit_mb=0
+  (( pages * 2 >= opcache_mb + jit_mb ))
+}
+
 # Tracing-JIT hotness thresholds.  Higher values compile later (less CPU
 # spent in the JIT, more in the interpreter); lower values compile sooner.
 # PHP's defaults are used on every host with four or more effective CPUs: an
@@ -1868,13 +1881,18 @@ tune_php_fpm_version() {
   # Map OPcache code into the 2 MB huge pages the kernel reserved in
   # vm.nr_hugepages (configure_sysctl): fewer TLB misses on a code-heavy
   # application.  Measured +3.5% on the XenForo member/thread tiers
-  # (808 -> 835, 645 -> 670 req/s).  Only enabled when the pages actually
-  # exist, so a host where the reservation failed silently falls back.
+  # (808 -> 835, 645 -> 670 req/s).  Only enabled when the reservation covers
+  # OPcache plus the JIT buffer: a kernel that could allocate only part of
+  # the request (common on a fragmented provider image) would otherwise leave
+  # OPcache trying to use huge pages it does not have.  With too few pages it
+  # falls back to normal pages (the safe default), not a partial mapping.
   local opcache_hugepages=0
   if [[ -r /proc/meminfo ]]; then
     local hp_total
     hp_total=$(awk '/^HugePages_Total:/{print $2}' /proc/meminfo 2>/dev/null || echo 0)
-    [[ $hp_total =~ ^[0-9]+$ ]] && (( hp_total > 0 )) && opcache_hugepages=1
+    if php_hugepages_ok "$hp_total" "$opcache_mb" "$jit_buffer_mb"; then
+      opcache_hugepages=1
+    fi
   fi
   # Scripts restored from the OPcache file cache are never JIT-compiled
   # (measured: with the file cache in place the JIT buffer stayed at 2.5 KB

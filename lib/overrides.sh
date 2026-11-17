@@ -28,11 +28,30 @@ RESET_KEEP_PINS=(
   ANUBIS ANUBIS_STATIC_BYPASS NODE_MAJOR NODE_ALLOW_MAJOR_UPGRADE
 )
 
-# Every sysctl key this script manages: the hardware/network list plus every
-# key the base profile defines (ip_forward, rp_filter, sysrq, ...).
+# Every sysctl key this host's managed profile actually defines.  A key this
+# script *may* set only for a service that is not installed (vm.max_map_count
+# without Elasticsearch) is not managed here: a provider file that sets it is
+# not a conflict, and reporting it with "ours=unset" was noise.
 tuning_managed_keys() {
-  { printf '%s\n' "${SYSCTL_MANAGED_KEYS[@]}"; sysctl_file_keys /etc/sysctl.conf 2>/dev/null; } \
-    | sed '/^$/d' | sort -u
+  local file
+  {
+    for file in /etc/sysctl.conf /etc/sysctl.d/90-setup-network.conf \
+                /etc/sysctl.d/99-elasticsearch.conf; do
+      [[ -r $file ]] || continue
+      sysctl_file_keys "$file" || true
+    done
+  } | sed '/^$/d' | sort -u
+}
+
+# Value the managed profile assigns to KEY, across every file it owns.
+tuning_ours_value() {
+  local key=$1 file value
+  for file in /etc/sysctl.conf /etc/sysctl.d/90-setup-network.conf \
+              /etc/sysctl.d/99-elasticsearch.conf; do
+    value=$(sysctl_file_value "$file" "$key")
+    if [[ -n $value ]]; then printf '%s' "$value"; return 0; fi
+  done
+  return 1
 }
 
 tuning_key_is_managed() {
@@ -100,7 +119,7 @@ tuning_override_sources() {
       while IFS= read -r key; do
         [[ -n $key ]] || continue
         if grep -qxF -- "$key" <<<"$managed"; then
-          ours=$(sysctl_file_value /etc/sysctl.conf "$key")
+          ours=$(tuning_ours_value "$key" || true)
           theirs=$(sysctl_file_value "$file" "$key")
           if [[ -n $ours && $theirs == "$ours" ]]; then
             hits+=("$key(file=$theirs ours=$ours same)")
@@ -150,6 +169,14 @@ tuning_drift_lines() {
     live=$(sysctl -n "$key" 2>/dev/null) || continue
     live=$(printf '%s' "$live" | tr -s '[:space:]' ' ' | sed -E 's/^ //; s/ $//')
     [[ $live == "$want" ]] && continue
+    # Huge pages are a best-effort reservation: the kernel allocates what it
+    # can find and leaves the sysctl at the allocated count.  A partial count
+    # is not a misconfiguration; OPcache falls back when it is too small.
+    if [[ $key == vm.nr_hugepages ]]; then
+      printf '%s allocated=%s requested=%s (best-effort: the kernel could not reserve every page; OPcache falls back to normal pages when the reservation is too small)\n' \
+        "$key" "$live" "$want"
+      continue
+    fi
     if src=$(sysctl_foreign_source "$key"); then
       printf '%s live=%s want=%s source=%s\n' "$key" "$live" "$want" "$src"
     else

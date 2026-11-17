@@ -783,6 +783,12 @@ check "the JIT buffer never exceeds 128M" \
   test "$(php_jit_settings 4096)" = "tracing 128"
 check "a garbage OPcache size still yields the tracing JIT" \
   test "$(php_jit_settings garbage)" = "tracing 32"
+check "a huge-page reservation covers OPcache plus the JIT buffer" \
+  php_hugepages_ok 479 512 64
+check "an exact huge-page reservation is accepted" php_hugepages_ok 288 512 64
+check "a partial huge-page reservation does not enable huge_code_pages" \
+  not php_hugepages_ok 87 512 64
+check "a non-numeric huge-page count is refused" not php_hugepages_ok bogus 512 64
 check "4+ CPU hosts use PHP's default tracing thresholds" \
   test "$(php_jit_threshold_lines 16)" = "opcache.jit_hot_loop = 64
 opcache.jit_hot_func = 127

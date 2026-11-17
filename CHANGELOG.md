@@ -3,6 +3,34 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.27 (2026-11-17)
+
+Make the drift report distinguish "our profile is stricter/conservative" from
+a real misconfiguration.
+
+- **Only keys the host's profile actually defines are audited.**  The audit
+  used to include every key the script *may* set, so `vm.max_map_count`
+  appeared as `ours=unset` on a host without Elasticsearch even though the
+  provider's `10-map-count.conf` was the only writer.  That line is gone; a
+  key we do not set is not a conflict.  Our own drop-ins
+  (`90-setup-network.conf`, `99-elasticsearch.conf`) are included when they
+  exist.
+- **Partial huge-page allocation is reported as best-effort, not drift.**
+  A kernel can allocate only part of `vm.nr_hugepages` on a fragmented
+  provider image (e.g. `allocated=87 requested=512`).  The report now says so
+  explicitly instead of "a unit or the kernel set it".
+- **`opcache.huge_code_pages` needs a full reservation.**  It is enabled only
+  when the allocated 2 MB pages cover `opcache.memory_consumption` plus the
+  JIT buffer (`php_hugepages_ok`); with 87 of 512 pages it stays `0` and
+  OPcache uses normal pages instead of a partial huge-page mapping.
+- **Value-aware source lines remain the answer to "safe or conflict?"**, e.g.
+  `10-network-security.conf: rp_filter(file=2 ours=1)`: the provider ships
+  loose mode (2), the managed profile uses strict mode (1).  Strict is safe on
+  a single-homed web server; use 2 if the host does asymmetric routing
+  (multiple NICs, policy routing, tunnels) and the strict value drops traffic.
+  `10-magic-sysrq.conf: kernel.sysrq(file=176 ours=0)` is the profile being
+  stricter by design; `99-hetzner.conf` keys all report `same`.
+
 ## 1.21.26 (2026-11-17)
 
 Clarify the drift report and stop lowering one stock hardening value.
