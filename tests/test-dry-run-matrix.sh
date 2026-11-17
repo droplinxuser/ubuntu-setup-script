@@ -127,6 +127,11 @@ fi
 run ok   --dry-run --optimize
 run ok   $'—optimize' --dry-run
 run ok   $'–optimize' --dry-run
+run ok   --dry-run --optimize --reset-overrides
+run ok   --dry-run --optimize --reset-overrides anubis=yes
+run fail --reset-overrides
+run fail --dry-run --basic --reset-overrides
+run fail --dry-run --diagnostics --reset-overrides
 run ok   --dry-run --diagnostics
 run fail --dry-run --diagnostics --basic
 run fail --dry-run --diagnostics --optimize

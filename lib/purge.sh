@@ -156,6 +156,9 @@ purge_basic() {
   # location; one daemon-reload after both so systemd forgets them.
   systemctl disable --now setup-network-tuning.service 2>/dev/null || true
   restore_original /etc/systemd/system/setup-network-tuning.service setup-network-tuning.service
+  systemctl disable --now setup-sysctl-final.timer 2>/dev/null || true
+  restore_original /etc/systemd/system/setup-sysctl-final.timer setup-sysctl-final.timer
+  restore_original /etc/systemd/system/setup-sysctl-final.service setup-sysctl-final.service
   restore_original /etc/systemd/resolved.conf.d/dns_servers.conf dns_servers.conf
   systemctl disable --now setup-io-tuning.service 2>/dev/null || true
   restore_original /etc/systemd/system/setup-io-tuning.service setup-io-tuning.service

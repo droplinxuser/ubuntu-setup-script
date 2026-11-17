@@ -358,6 +358,15 @@ run_optimize() {
   # Rollback copies live under /tmp and are allowed to expire there; older
   # releases pruned them, which permanently deleted operator-recoverable data.
   OPT_REPORT=()
+  if (( RESET_OVERRIDES )); then
+    step "Resetting operator overrides"
+    reset_operator_overrides
+    opt_report "## Override reset"
+    local reset_action
+    for reset_action in "${RESET_ACTIONS[@]}"; do
+      opt_report "- ${reset_action}"
+    done
+  fi
   detect_installed_services
   if (( ${#OPT_DETECTED[@]} > 0 )); then
     OPT_BACKUP_DIR=$(tmp_dir setup-optimize.XXXXXX) \
@@ -394,6 +403,7 @@ run_optimize() {
     # No service configuration was touched, so there is nothing to roll back.
     OPT_BACKUP_DIR=""
     local report
+    opt_report_tuning_drift
     report=$(write_optimize_report)
     # write_optimize_report runs in a command substitution (subshell), so its
     # OPT_REPORT_WRITTEN flag does not reach this shell.  Set it here so the
@@ -486,6 +496,7 @@ run_optimize() {
   fi
 
   local report
+  opt_report_tuning_drift
   report=$(write_optimize_report)
   OPT_REPORT_WRITTEN=1
   printf '\n%sOptimization report: %s%s\n' "$C_BOLD" "$report" "$C_RESET"

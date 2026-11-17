@@ -598,19 +598,61 @@ network_tuning_unit_text() {
   cat <<'EOF'
 [Unit]
 Description=Apply network qdisc/congestion-control tuning after kernel modules load
-After=systemd-modules-load.service
+After=systemd-modules-load.service systemd-sysctl.service
 [Service]
 Type=oneshot
 EOF
   for mod in "$@"; do
     printf 'ExecStart=-/sbin/modprobe %s\n' "$mod"
   done
+  # Re-apply the managed profile after systemd-sysctl has processed every
+  # /etc/sysctl.d file: a foreign drop-in (an old hand fix, tuned, Docker)
+  # must lose to the hardware profile this script owns.
+  printf 'ExecStart=-/sbin/sysctl -e -p /etc/sysctl.conf\n'
   printf 'ExecStart=-/sbin/sysctl -w net.core.default_qdisc=%s\n' "$QDISC"
   printf 'ExecStart=-/sbin/sysctl -w net.ipv4.tcp_congestion_control=%s\n' "$TCP_CC"
   cat <<'EOF'
 RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
+EOF
+}
+
+# A second, late pass: 90 s after boot, after multi-user services (including
+# a hand-written tcp-bbr.service or rc.local) have run.  The managed profile
+# is idempotent, so re-applying it costs a few milliseconds and guarantees
+# that every server converges on the same values even when a foreign unit
+# writes a managed key at startup.  The files are recorded for --purge.
+sysctl_final_unit_text() {
+  local mod
+  cat <<'EOF'
+[Unit]
+Description=Re-apply the setup.sh managed sysctl profile after late boot units
+After=multi-user.target
+[Service]
+Type=oneshot
+EOF
+  for mod in "$@"; do
+    printf 'ExecStart=-/sbin/modprobe %s\n' "$mod"
+  done
+  printf 'ExecStart=-/sbin/sysctl -e -p /etc/sysctl.conf\n'
+  printf 'ExecStart=-/sbin/sysctl -w net.core.default_qdisc=%s\n' "$QDISC"
+  printf 'ExecStart=-/sbin/sysctl -w net.ipv4.tcp_congestion_control=%s\n' "$TCP_CC"
+  cat <<'EOF'
+RemainAfterExit=yes
+EOF
+}
+
+sysctl_final_timer_text() {
+  cat <<'EOF'
+[Unit]
+Description=Re-apply the setup.sh sysctl profile 90 s after boot
+[Timer]
+OnBootSec=90s
+AccuracySec=5s
+Unit=setup-sysctl-final.service
+[Install]
+WantedBy=timers.target
 EOF
 }
 
@@ -860,6 +902,30 @@ EOF
   # start would not re-apply a changed qdisc/congestion-control value.
   systemctl restart setup-network-tuning.service \
     || warn "Could not apply ${TCP_CC}/${QDISC} tuning"
+
+  # Late enforcement pass.  Foreign units (an old hand-written tcp-bbr
+  # service, rc.local, a provider agent) can write a managed key after
+  # systemd-sysctl; this timer re-applies the profile 90 s after boot so every
+  # host ends in the same state without deleting the foreign files.
+  local final_unit=/etc/systemd/system/setup-sysctl-final.service
+  local final_timer=/etc/systemd/system/setup-sysctl-final.timer
+  record_original "$final_unit" setup-sysctl-final.service
+  record_original "$final_timer" setup-sysctl-final.timer
+  local final_unit_tmp final_timer_tmp
+  final_unit_tmp=$(tmp_file) || die "Could not stage setup-sysctl-final.service"
+  final_timer_tmp=$(tmp_file) || die "Could not stage setup-sysctl-final.timer"
+  sysctl_final_unit_text "${net_mods[@]}" > "$final_unit_tmp"
+  sysctl_final_timer_text > "$final_timer_tmp"
+  if commit_if_changed "$final_unit" "$final_unit_tmp"; then
+    chmod 644 "$final_unit"
+    systemctl daemon-reload || true
+  fi
+  if commit_if_changed "$final_timer" "$final_timer_tmp"; then
+    chmod 644 "$final_timer"
+    systemctl daemon-reload || true
+  fi
+  systemctl enable --now setup-sysctl-final.timer >/dev/null 2>&1 \
+    || warn "Could not enable the late sysctl enforcement timer"
 }
 
 # Readahead (kB) for disks whose queue/rotational flag is 1.  The storage

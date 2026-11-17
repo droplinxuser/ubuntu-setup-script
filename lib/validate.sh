@@ -484,6 +484,10 @@ php_installed_version() {
 validate_all() {
   local svc
 
+  if (( RESET_OVERRIDES )) && (( ! OPTIMIZE )); then
+    die "--reset-overrides is only valid with --optimize (add it to the optimize command)"
+  fi
+
   # Anubis is only an Angie feature: on an install it must accompany --angie.
   if [[ -n ${ANUBIS_SETTING:-} ]]; then
     if (( ! OPTIMIZE && ! PURGE && ! DIAGNOSTICS && ! RESTART_ALL )) \

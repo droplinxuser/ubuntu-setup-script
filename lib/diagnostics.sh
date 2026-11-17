@@ -367,6 +367,10 @@ run_diagnostics() {
   diag "sysctl all" sysctl -a
   diag "sysctl.conf" cat /etc/sysctl.conf
   diag_sh "sysctl drop-ins" 'find /etc/sysctl.d -maxdepth 1 -type f -print -exec sh -c "echo --- \$1; sed -n \"1,300p\" \"\$1\"" _ {} \;'
+  diag_section "tuning override sources and live drift"
+  tuning_overrides_report >> "$DIAG_FILE" 2>&1 || true
+  diag "setup-tuning pins" cat /etc/default/setup-tuning
+  diag "explicit sizes" cat /var/lib/setup.sh/explicit-options.conf
   diag "PAM limits" cat /etc/security/limits.conf
   diag_sh "PAM limit drop-ins" 'find /etc/security/limits.d -maxdepth 1 -type f -print -exec sh -c "echo --- \$1; cat \"\$1\"" _ {} \;'
   diag "modules-load" bash -c 'find /etc/modules-load.d -maxdepth 1 -type f -print -exec cat {} \;'

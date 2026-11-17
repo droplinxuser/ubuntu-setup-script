@@ -3628,6 +3628,31 @@ check "network unit: still a oneshot that stays active" \
   bash -c 'grep -qx "Type=oneshot" <<< "$1" && grep -qx "RemainAfterExit=yes" <<< "$1"' _ "$net_unit"
 check "network unit: rewritten and reloaded only when its content changes" \
   grep -q 'if commit_if_changed "\$net_unit" "\$net_unit_tmp"; then' <<<"$sysctl_body"
+check "network unit: re-applies the managed profile after systemd-sysctl" \
+  grep -qx 'ExecStart=-/sbin/sysctl -e -p /etc/sysctl.conf' <<<"$net_unit"
+check "network unit: ordered after systemd-sysctl" \
+  grep -q 'After=.*systemd-sysctl.service' <<<"$net_unit"
+
+# Late enforcement pass against old hand fixes that write a managed key
+# after systemd-sysctl (tcp-bbr.service, rc.local, provider agents).
+final_unit=$(QDISC=fq TCP_CC=bbr sysctl_final_unit_text tcp_bbr sch_fq)
+check "late sysctl unit: runs after multi-user services" \
+  grep -qx 'After=multi-user.target' <<<"$final_unit"
+check "late sysctl unit: re-applies the full profile" \
+  grep -qx 'ExecStart=-/sbin/sysctl -e -p /etc/sysctl.conf' <<<"$final_unit"
+check "late sysctl unit: keeps the selected congestion control" \
+  grep -qx 'ExecStart=-/sbin/sysctl -w net.ipv4.tcp_congestion_control=bbr' <<<"$final_unit"
+final_timer=$(sysctl_final_timer_text)
+check "late sysctl timer: fires 90 s after boot" \
+  grep -qx 'OnBootSec=90s' <<<"$final_timer"
+check "late sysctl timer: triggers the oneshot" \
+  grep -qx 'Unit=setup-sysctl-final.service' <<<"$final_timer"
+check "the managed sysctl.conf is not reported as a foreign source" \
+  tuning_is_own_sysctl_file /etc/sysctl.conf
+check "an unrelated sysctl drop-in is reported as foreign" \
+  not tuning_is_own_sysctl_file /etc/sysctl.d/50-custom-performance.conf
+check "reset keeps the Anubis and Node pins" \
+  test "$(printf '%s\n' "${RESET_KEEP_PINS[@]}" | grep -cE '^(ANUBIS|NODE_MAJOR)$')" -eq 2
 
 # ---------------------------------------------------------------------------
 # Swap file: containers and btrfs/ZFS must not abort --basic

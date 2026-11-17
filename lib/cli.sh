@@ -20,6 +20,10 @@ OPTIMIZE=0
 DIAGNOSTICS=0
 RESTART_ALL=0
 DRY_RUN=0
+# --optimize --reset-overrides: ignore every value an older run or an
+# operator recorded (pins in /etc/default/setup-tuning, explicit sizes in
+# explicit-options.conf) for this run, then recompute the whole profile.
+RESET_OVERRIDES=0
 # --upgrade-php=X.Y: replace the installed PHP with another version while
 # keeping the extension set and custom configuration.  Empty means off.
 UPGRADE_PHP=""
@@ -140,7 +144,7 @@ Domain setup (standalone; Angie + MariaDB must already be installed/running):
       no --purge for domains; remove the files/database manually.
 
 Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
-  --optimize [anubis=yes|no] [--dry-run]
+  --optimize [anubis=yes|no] [--reset-overrides] [--dry-run]
       One command for the whole host.  It synchronizes Angie's /etc/angie
       tree from server-configs-nginx (or CONFIG_SOURCE_DIR), applies the
       hardware-aware OS profile (CPU governor, PAM security limits, and
@@ -179,6 +183,29 @@ Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
       and a Markdown report is written to /var/log/setup-optimize-*.md.
       Existing application vhosts and credentials are preserved.
       --dry-run only prints the planned OS and service values.
+
+  --reset-overrides   (with --optimize; add --dry-run to preview)
+      Use this when rolling a new tuning profile out to servers that were
+      tuned by an older release or fixed by hand.  For this run it ignores
+      every recorded operator value and recomputes everything from the
+      current hardware:
+        - moves /etc/default/setup-tuning to /tmp and keeps only the host
+          facts/feature state that must survive (ANUBIS,
+          ANUBIS_STATIC_BYPASS, NODE_MAJOR, NODE_ALLOW_MAJOR_UPGRADE).
+          TCP_CC, QDISC, STORAGE_CLASS and the PHP/cron/rate-limit toggles
+          are cleared and go back to the current defaults (bbr/fq, etc.),
+          so an old TCP_CC=cubic pin no longer survives;
+        - moves /var/lib/setup.sh/explicit-options.conf to /tmp, dropping
+          explicit php_children/max_requests, mariadb/valkey/elastic sizes
+          and the dedi/vps pin so the shared memory plan recomputes them;
+        - re-applies the OS profile and every service tuner (Angie workers,
+          TLS buffer, PHP OPcache/huge pages/JIT, MariaDB/Valkey/ES,
+          Anubis runtime).
+      Third-party sysctl files and units are never deleted; the managed
+      profile is re-applied after systemd-sysctl at boot by
+      setup-sysctl-final.timer (90 s after boot), and the run report plus
+      --diagnostics list every file that still defines a managed key.
+      Original files are moved to /tmp (the script never unlinks them).
 
 PHP upgrade (standalone):
   --upgrade-php=VERSION        e.g. --upgrade-php=8.6
@@ -505,6 +532,7 @@ parse_args() {
         done
         ;;
       --dry-run|--check) DRY_RUN=1; shift ;;
+      --reset-overrides) RESET_OVERRIDES=1; shift ;;
       anubis=*)
         # Accepted here so validate_all can explain that it belongs to
         # --angie/--optimize instead of reporting an unknown argument.
