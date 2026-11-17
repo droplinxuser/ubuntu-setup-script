@@ -54,12 +54,39 @@ tuning_is_own_sysctl_file() {
   return 1
 }
 
+# Last value of KEY in a sysctl file, normalized to single spaces.
+sysctl_file_value() {
+  local file=$1 key=$2 re
+  [[ -r $file ]] || return 0
+  re=${key//./\\.}
+  sed -n -E "s/^[[:space:]]*${re}[[:space:]]*=[[:space:]]*//p" "$file" 2>/dev/null \
+    | tail -n1 | tr -s '[:space:]' ' ' | sed -E 's/^ //; s/ $//'
+}
+
+# First non-managed sysctl file that defines KEY (operator space and vendor
+# dirs), or nothing when only the managed profile defines it.
+sysctl_foreign_source() {
+  local key=$1 file
+  for file in /etc/sysctl.d/*.conf /run/sysctl.d/*.conf \
+              /usr/local/lib/sysctl.d/*.conf /usr/lib/sysctl.d/*.conf /lib/sysctl.d/*.conf; do
+    [[ -f $file ]] || continue
+    if tuning_is_own_sysctl_file "$file"; then continue; fi
+    if [[ -n $(sysctl_file_value "$file" "$key") ]]; then
+      printf '%s' "$file"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # Print "<file>: <keys>" for every non-managed sysctl file that defines at
 # least one key this script owns.  Only the operator-writable directories are
 # scanned: a file shipped by a package in /usr/lib/sysctl.d (vm.max_map_count,
 # ...) is not an old hand fix, and the managed profile overrides it anyway.
+# Each key carries the file's value next to ours so the report answers
+# "does this conflict?" without another command.
 tuning_override_sources() {
-  local dir file key
+  local dir file key ours theirs
   local -a dirs=(/etc/sysctl.d /run/sysctl.d)
   local -a hits=()
   local managed
@@ -72,7 +99,15 @@ tuning_override_sources() {
       hits=()
       while IFS= read -r key; do
         [[ -n $key ]] || continue
-        if grep -qxF -- "$key" <<<"$managed"; then hits+=("$key"); fi
+        if grep -qxF -- "$key" <<<"$managed"; then
+          ours=$(sysctl_file_value /etc/sysctl.conf "$key")
+          theirs=$(sysctl_file_value "$file" "$key")
+          if [[ -n $ours && $theirs == "$ours" ]]; then
+            hits+=("$key(file=$theirs ours=$ours same)")
+          else
+            hits+=("$key(file=${theirs:-unset} ours=${ours:-unset})")
+          fi
+        fi
       done < <(sysctl_file_keys "$file")
       if (( ${#hits[@]} > 0 )); then
         printf '%s: %s\n' "$file" "${hits[*]}"
@@ -93,7 +128,7 @@ tuning_override_sources() {
 # Live managed keys whose value differs from the last definition in
 # /etc/sysctl.conf.  Read-only; used by --diagnostics and the optimize report.
 tuning_drift_lines() {
-  local line key want live bytes_key bytes_want
+  local line key want live bytes_key bytes_want src
   local -a managed=()
   mapfile -t managed < <(tuning_managed_keys)
   while IFS= read -r line; do
@@ -115,7 +150,12 @@ tuning_drift_lines() {
     live=$(sysctl -n "$key" 2>/dev/null) || continue
     live=$(printf '%s' "$live" | tr -s '[:space:]' ' ' | sed -E 's/^ //; s/ $//')
     [[ $live == "$want" ]] && continue
-    printf '%s live=%s want=%s\n' "$key" "$live" "$want"
+    if src=$(sysctl_foreign_source "$key"); then
+      printf '%s live=%s want=%s source=%s\n' "$key" "$live" "$want" "$src"
+    else
+      printf '%s live=%s want=%s source=(no sysctl file; a unit or the kernel set it)\n' \
+        "$key" "$live" "$want"
+    fi
   done < /etc/sysctl.conf
 }
 

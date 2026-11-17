@@ -3,6 +3,35 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.26 (2026-11-17)
+
+Clarify the drift report and stop lowering one stock hardening value.
+
+- **`vm.mmap_min_addr` is 65536, not 4096.**  Ubuntu and the major
+  distributions ship 64 KiB; the profile was lowering it to the older 4 KiB
+  kernel default.  Both block the NULL page, but 64 KiB leaves a smaller
+  low-address window for a kernel/VM null-dereference to become a mapping.
+  No normal server workload maps below 64 KiB; the audit on a stock Ubuntu
+  host now reports the value as `same` instead of a silent downgrade.
+- **The override audit shows values, not just names.**  A foreign sysctl
+  file is printed as
+  `key(file=<value in that file> ours=<value in /etc/sysctl.conf>)`, with
+  `same` appended when the two agree.  A live drift line now names the
+  non-managed file that defines the key, or states that no sysctl file did
+  (a unit or the kernel set it).  This answers “is this safe or a conflict?”
+  without opening every file:
+  - `10-kernel-hardening.conf: kernel.kptr_restrict(file=1 ours=1 same)`
+  - `10-magic-sysrq.conf: kernel.sysrq(file=176 ours=0)` — the managed
+    profile disables Magic SysRq (stricter; reconsider only if you need
+    serial-console recovery);
+  - `10-zeropage.conf: vm.mmap_min_addr(file=65536 ours=65536 same)`.
+- **`vm.min_free_kbytes` drift is not a safety issue when live > want.**
+  On a small host the profile asks for ~1% of RAM (e.g. 39 065 KiB on
+  3.8 GiB); a live 67 584 KiB (66 MiB) reserves more for the kernel and
+  simply leaves a little less page cache.  The new `source=` suffix tells
+  whether a non-managed file keeps re-raising it; if none does, a unit or the
+  kernel did, and the 90 s enforcement pass re-applies the profile.
+
 ## 1.21.25 (2026-11-17)
 
 Fleet rollout: make sure a server tuned by an older release, or fixed by
