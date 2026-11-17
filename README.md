@@ -26,6 +26,7 @@ Elasticsearch, Node.js and helper tools, plus per-domain vhosts.
 | `tests/test-tuning.sh`, `tests/test-dry-run-matrix.sh` | Unit tests for the tuning helpers; CLI/dry-run matrix (both run in CI) |
 | `tests/stress-site/` | Synthetic full-stack test site, local and remote load harness, results |
 | `tools/diff_configs.sh` | Compare the canonical configs of both repos with the live `/etc` |
+| `tools/fleet-update.sh` | Safe, logged host update: non-interactive APT, snapd guard, fresh setup.sh checkout, `--optimize --reset-overrides` dry run then apply, reboot notice |
 | `SECURITY-PERFORMANCE.md` | What the script hardens, what it leaves to the operator, and the large-site checklist |
 
 ## Requirements
@@ -654,6 +655,17 @@ Fleet example:
 for h in web1 web2 web3; do
   ssh root@"$h" 'bash /root/ubuntu-setup-script/setup.sh --optimize --reset-overrides anubis=yes'
 done
+```
+
+`tools/fleet-update.sh` packages the whole rollout for one host: non-interactive
+APT (confold, lock timeout, `NEEDRESTART_MODE=l`), a snapd guard, a timestamped
+backup of the previous checkout, a verified tarball extraction, the dry run and
+the real run with separate logs, and a reboot notice. `REF=`, `SKIP_APT=1`,
+`FORCE_SNAPD_PURGE=1` and `REBOOT=1` are the supported switches.
+
+```bash
+scp tools/fleet-update.sh root@web1:/root/
+ssh root@web1 'bash /root/fleet-update.sh'
 ```
 
 ## `--upgrade-php=X.Y`

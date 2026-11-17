@@ -3,6 +3,21 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.29 (2026-11-17)
+
+- **`tools/fleet-update.sh`.**  A safe replacement for the hand-written
+  `apt … && wget … && setup.sh …` chain: non-interactive APT with
+  `--force-confold`, a 300 s lock timeout and retries; `NEEDRESTART_MODE=l`
+  so an unattended upgrade cannot restart the web stack mid-run; a guard that
+  refuses to purge snapd while snaps are installed (`FORCE_SNAPD_PURGE=1`
+  overrides); a timestamped backup of the previous checkout instead of
+  `rm -rf`; a `curl`/`wget` download verified to contain `setup.sh`; separate
+  dry-run and optimize logs; a failed-unit, disk and reboot summary; and
+  `REBOOT=1` for an explicit reboot.  `SKIP_APT=1` retries only the setup
+  phase, `REF=` pins another branch/tag.
+- Validation: ShellCheck clean, `bash -n` clean; used on the four-host
+  fleet run (24.04/26.04, 2–64 vCPU).
+
 ## 1.21.28 (2026-11-17)
 
 Fleet-run fixes (four production Angie hosts: 24.04/26.04, 2–64 vCPU).
