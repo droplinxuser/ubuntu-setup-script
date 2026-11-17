@@ -80,7 +80,7 @@ bash setup.sh --upgrade-php=8.6 --dry-run
 | `--elastic [host=] [ram=]` | Elasticsearch | [Elasticsearch](#elasticsearch---elastic) |
 | `--others ITEM... \| all` | helper packages | [Other packages](#other-packages---others) |
 | `--domain DOMAIN [app=] [db=] [user=] [pass=] [sql=]` | vhost, certificate and optional database | [Domains](#domains---domain) |
-| `--optimize [anubis=yes\|no]` | tune the OS and every installed service in place; optionally enable/disable Anubis | [`--optimize`](#--optimize) |
+| `--optimize [anubis=yes\|no] [--reset-overrides]` | tune the OS and every installed service in place; optionally enable/disable Anubis and ignore recorded overrides | [`--optimize`](#--optimize) |
 | `--upgrade-php=X.Y` | replace the installed PHP version in place | [`--upgrade-php`](#--upgrade-phpxy) |
 | `--diagnostics` | write a redacted `diagnostics.log`; read-only | [Maintenance](#--diagnostics---restart-all---purge) |
 | `--restart-all` | ordered restart of every active service | [Maintenance](#--diagnostics---restart-all---purge) |
@@ -586,6 +586,75 @@ one documented difference is timing: `--domain app=xf|wordpress` creates an
 empty document root, so the application-aware PHP worker cap and the
 per-root OPcache JIT sections can only apply once the application files
 exist, on the first `--optimize` after the upload (or after a `sql=` import).
+
+## Rolling a new profile out to existing servers (`--reset-overrides`)
+
+A plain `--optimize` re-applies everything the script owns: the Angie tree
+(including `ssl_buffer_size`, the worker ratio and cache locations), the PHP
+pool/ini (OPcache, huge pages, tracing JIT), MariaDB/Valkey/Elasticsearch and
+the Anubis unit. What it deliberately does **not** overwrite is anything an
+operator recorded or fixed by hand:
+
+| Preserved by a plain `--optimize` | Why | Where |
+|---|---|---|
+| `TCP_CC`, `QDISC`, `STORAGE_CLASS` pins | an operator choice for a lossy link or a slow disk | `/etc/default/setup-tuning` |
+| `PHP_JIT_WORDPRESS`, `PHP_PAGE_GZIP`, `PRECOMPRESS_ASSETS`, `XF_JOB_CRON`, `LIMIT_REQ_EXEMPT` | feature toggles a site may depend on | `/etc/default/setup-tuning` |
+| explicit `php_children`/`max_requests`, MariaDB/Valkey/ES sizes, `server_type` | recorded `--php children=`/`--mariadb size=` choices | `/var/lib/setup.sh/explicit-options.conf` |
+| extra PHP `.ini` files, extra FPM pools, `custom.d/*.conf` | operator application config | `/etc/php`, `/etc/angie/custom.d` |
+| third-party sysctl drop-ins/units | Docker, cloud-init, a host agent | `/etc/sysctl.d`, `/etc/systemd/system` |
+| application config (`wp-config.php`, XF `config.php`, `.env`) | never edited by the tuner | `/var/www` |
+
+When a fleet must adopt a new profile, run one command per host:
+
+```bash
+# preview exactly what would be cleared and which foreign sources remain
+sudo bash setup.sh --optimize --reset-overrides --dry-run
+
+# apply: ignore every recorded override for this run and recompute the profile
+sudo bash setup.sh --optimize --reset-overrides anubis=yes
+```
+
+`--reset-overrides`:
+
+- moves `/etc/default/setup-tuning` to `/tmp` and writes back only the host
+  facts/feature state that must survive: `ANUBIS`, `ANUBIS_STATIC_BYPASS`,
+  `NODE_MAJOR`, `NODE_ALLOW_MAJOR_UPGRADE`. An old `TCP_CC=cubic` or
+  `QDISC=fq_codel` pin no longer survives; the run uses `bbr`/`fq` (or
+  `SETUP_TCP_CC`/`SETUP_QDISC` from the environment if you pass them);
+- moves `/var/lib/setup.sh/explicit-options.conf` to `/tmp`, so the hardware
+  plan recomputes workers, pool sizes and the dedi/vps class;
+- re-applies the OS profile and every service tuner;
+- never deletes a file (the originals are in `/tmp`, as with every managed
+  change), and never touches application config.
+
+Third-party sysctl files are left in place. To guarantee they cannot win
+after the next reboot, `configure_sysctl` installs
+`setup-sysctl-final.timer`: 90 s after boot, `setup-sysctl-final.service`
+re-applies `/etc/sysctl.conf` and the selected qdisc/congestion control after
+`multi-user.target`, i.e. after a hand-written `tcp-bbr.service`, `rc.local`
+or a provider agent. `--purge basic` disables and removes both units.
+
+Verify a host after the run:
+
+```bash
+# optimize report: "## Tuning drift" lists live-vs-profile mismatches and
+# every non-managed file that still defines a managed key
+sudo bash setup.sh --diagnostics
+# then search the diagnostics log
+grep -A40 'tuning override sources and live drift' /path/to/diagnostics.log
+```
+
+The audit is read-only. A file listed under “non-managed files that still
+define a managed sysctl” is informational: the managed profile wins at boot;
+move or edit the file only if you want its other keys to stop applying.
+
+Fleet example:
+
+```bash
+for h in web1 web2 web3; do
+  ssh root@"$h" 'bash /root/ubuntu-setup-script/setup.sh --optimize --reset-overrides anubis=yes'
+done
+```
 
 ## `--upgrade-php=X.Y`
 

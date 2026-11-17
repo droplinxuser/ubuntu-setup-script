@@ -3,6 +3,54 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.25 (2026-11-17)
+
+Fleet rollout: make sure a server tuned by an older release, or fixed by
+hand, actually receives the current profile.
+
+- **`--optimize --reset-overrides`.**  A plain `--optimize` honours operator
+  pins and recorded sizes by design; this flag ignores them for one run and
+  recomputes everything from the current hardware:
+
+  | Cleared (moved to `/tmp`) | Kept |
+  |---|---|
+  | `TCP_CC`, `QDISC`, `STORAGE_CLASS`, `PHP_JIT_WORDPRESS`, `PHP_PAGE_GZIP`, `PRECOMPRESS_ASSETS`, `XF_JOB_CRON`, `LIMIT_REQ_EXEMPT` in `/etc/default/setup-tuning` | `ANUBIS`, `ANUBIS_STATIC_BYPASS`, `NODE_MAJOR`, `NODE_ALLOW_MAJOR_UPGRADE` (host facts/feature state) |
+  | every key in `/var/lib/setup.sh/explicit-options.conf` (`php_children`, `max_requests`, MariaDB/Valkey/ES sizes, `server_type`) | application config, extra PHP pools, operator `.ini` files, third-party sysctl files |
+
+  `--dry-run` previews the reset and the foreign sources without moving a
+  file.  Deleted nothing: the originals are in `/tmp`, like every managed
+  change.
+
+- **Late sysctl enforcement.**  `configure_sysctl` now also installs
+  `setup-sysctl-final.service` plus a `.timer` (`OnBootSec=90s`): after
+  `multi-user.target` the full managed profile and the selected qdisc/
+  congestion control are applied again.  A hand-written `tcp-bbr.service`,
+  `rc.local` or a provider agent that writes `tcp_congestion_control` at
+  startup therefore loses at boot without deleting its file.
+  `setup-network-tuning.service` also re-applies `/etc/sysctl.conf` after
+  `systemd-sysctl`, so an early `/etc/sysctl.d` drop-in cannot win either.
+  `--purge basic` disables and removes both units.
+
+- **Drift audit.**  `--diagnostics` gained a “tuning override sources and
+  live drift” section, and every `--optimize` report ends with “Tuning
+  drift”: live values that differ from `/etc/sysctl.conf`, non-managed files
+  under `/etc/sysctl.d` or `/run/sysctl.d` that still define a managed key,
+  boot units that write sysctls, `/etc/default/setup-tuning` pins, explicit
+  sizes, and PHP/Angie fragments that can override the managed profile
+  (`.ini` sorting after `zz-setup-optimize.ini`, extra FPM pools,
+  `/etc/angie/custom.d`).  The audit is read-only.
+
+- **Validation.**  941 tuning checks and 212 dry runs pass; ShellCheck clean.
+  End-to-end on a host seeded with `TCP_CC=cubic`, `QDISC=fq_codel`,
+  `PHP_JIT_WORDPRESS=0`, `LIMIT_REQ_EXEMPT`, explicit `php_children=64`/
+  `valkey_mb=2048` and a foreign `/etc/sysctl.d/50-old-fix.conf`:
+  the preview listed exactly those, the run kept `ANUBIS`/`NODE_MAJOR`,
+  removed the pins and the explicit file to `/tmp`, live values became
+  `bbr`/`fq`, the report listed the foreign file, and
+  `systemctl restart setup-sysctl-final.service` reverted a manual
+  `cubic` change back to `bbr`.  `--purge basic` restored `cubic`/`fq_codel`
+  and removed the units.
+
 ## 1.21.24 (2026-11-17)
 
 CentMinMod comparison on the same EPYC 4245P (6C/12T, 30 GiB, 2x894 GB
