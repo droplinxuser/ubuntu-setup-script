@@ -1844,7 +1844,12 @@ tune_php_fpm_version() {
   # An explicit --php children=/max_requests= written at install time is an
   # operator decision, not a hardware guess: keep it across --optimize runs.
   explicit_value=$(explicit_option php_children 2>/dev/null || true)
-  max_children=$(php_plan_max_children "$nproc" "$ram_mb" "$live_children" "$explicit_value" "$php_budget")
+  # The plan reserved `children x allowance`, so the budget must be divided by
+  # the same allowance, not the 64 MB install floor.
+  local plan_allowance
+  plan_allowance=$(php_worker_allowance_mb "$ver" 2>/dev/null || true)
+  [[ $plan_allowance =~ ^[0-9]+$ ]] && (( plan_allowance > 0 )) || plan_allowance=64
+  max_children=$(php_plan_max_children "$nproc" "$ram_mb" "$live_children" "$explicit_value" "$php_budget" "$plan_allowance")
   if [[ -z $explicit_value ]]; then
     # Informational: the note must not mark the pool dirty, or every
     # --optimize on a host already at the target reloads an unchanged PHP-FPM.

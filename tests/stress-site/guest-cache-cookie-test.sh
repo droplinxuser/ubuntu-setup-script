@@ -95,14 +95,16 @@ req x404 "$X/does-not-exist.php"
 chk "XF unknown .php is 404" "$ST" 404
 req xcss "$X/css.php?css=public%3Anormalize.css&s=1&l=1&d=1&k=x"
 chk "XF css.php carries no Set-Cookie" "$(ncook xcss)" 0
-# Logout clears cookies -> Set-Cookie must pass.  XenForo 2.3 renders the log
-# out control as a POST form (a GET to /logout/?t=... answers the form page
-# with 200 and sets nothing), so the CSRF token goes in the body.
-mt=$(grep -oE 'data-csrf="[^"]+"' "$T/xmem.body" | head -1 | sed 's/data-csrf="//;s/"//')
-chk "XF member page exposes a CSRF token for the log out form" "$([ -n "$mt" ] && echo y)" y
-req xout -b "$T/g.jar" --data-urlencode "_xfToken=$mt" "$X/logout/"
+# Logout clears cookies -> Set-Cookie must pass.  XenForo 2.3's log out
+# control is a GET link carrying a user-bound token (?t=...), rendered by the
+# visitor-menu endpoint (not data-csrf, which is the page token: posting that
+# to /logout/ answers 400).  Follow the real UI path.
+req xmenu -b "$T/g.jar" "$X/account/visitor-menu"
+mt=$(grep -oE 'href="/logout/\?t=[^"]+"' "$T/xmenu.body" | head -1 | sed 's/^href="//;s/"$//;s/&amp;/\&/g')
+chk "XF member page exposes a log out token" "$([ -n "$mt" ] && echo y)" y
+req xout -b "$T/g.jar" "$X$mt"
 chk "XF logout is accepted (303)" "$ST" 303
-chk "XF logout (POST, no-cache URI) passes its Set-Cookie headers" "$([ "$(ncook xout)" -ge 1 ] && echo y)" y
+chk "XF logout (GET with token, no-cache URI) passes its Set-Cookie headers" "$([ "$(ncook xout)" -ge 1 ] && echo y)" y
 
 echo "################ Chevereto"
 C=https://chev.test.local

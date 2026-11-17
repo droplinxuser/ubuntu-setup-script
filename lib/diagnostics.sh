@@ -301,16 +301,19 @@ redact_diagnostics() {
 
 run_diagnostics() {
   local out="${SCRIPT_DIR}/diagnostics.log"
-  local u ver fpm_bin f es_url redis_unit redis_bin redis_cli redis_label
+  local u ver fpm_bin f es_url redis_unit redis_bin redis_cli redis_label DIAG_TMP
   local -a units=(angie mariadb valkey-server redis-server elasticsearch)
 
   umask 077
-  if ! : > "$out" 2>/dev/null; then
-    die "Could not write ${out}; run diagnostics from a writable checkout"
-  fi
-  chmod 600 "$out"
-  give_to_invoking_user "$out"
-  DIAG_FILE=$out
+  # Build the report in a private temp file and move it into place at the end.
+  # Writing directly to diagnostics.log meant root appended to (and later
+  # truncated) a file that had already been chowned to the invoking sudo user:
+  # that user could replace it with a symlink between two writes and receive
+  # every root dump, or corrupt the report.  mktemp also creates with O_EXCL.
+  DIAG_TMP=$(mktemp "${out}.XXXXXX" 2>/dev/null) \
+    || die "Could not write ${out}; run diagnostics from a writable checkout"
+  chmod 600 "$DIAG_TMP"
+  DIAG_FILE=$DIAG_TMP
 
   {
     printf '================================================================\n'
@@ -576,6 +579,11 @@ run_diagnostics() {
   } >> "$DIAG_FILE"
 
   chmod 600 "$DIAG_FILE"
-  printf '%s\n' "$DIAG_FILE"
+  # Replace diagnostics.log atomically; a symlink planted at that path is
+  # replaced (mv does not follow it), never written through.
+  mv -f "$DIAG_FILE" "$out" || die "Could not publish ${out}"
+  DIAG_FILE=""
+  give_to_invoking_user "$out"
+  printf '%s\n' "$out"
 }
 

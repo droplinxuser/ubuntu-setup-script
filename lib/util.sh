@@ -581,7 +581,10 @@ write_cron() {
   local wp_conf
   while IFS= read -r wp_conf; do
     [[ -n $wp_conf ]] || continue
-    if grep -q 'DISABLE_WP_CRON' "$wp_conf" 2>/dev/null; then
+    # Only an active define counts.  A commented-out `// define('DISABLE_WP_CRON',
+    # true)` used to match and added the managed job while WordPress still ran
+    # its own pseudo-cron, so every scheduled task fired twice.
+    if grep -qE "^[[:space:]]*define\([[:space:]]*['\"]DISABLE_WP_CRON['\"]" "$wp_conf" 2>/dev/null; then
       wp_cron=1
       break
     fi

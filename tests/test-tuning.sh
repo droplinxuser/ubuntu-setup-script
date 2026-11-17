@@ -2739,6 +2739,12 @@ check "MariaDB profile: NVMe keeps flush_neighbors=0 and 8 I/O threads" \
   test "$MARIADB_PROFILE_FLUSH_NEIGHBORS" -eq 0 -a "$MARIADB_PROFILE_IO_THREADS" -eq 8
 check "MariaDB profile: tmp_table_size is capped at pool/8" \
   test "$MARIADB_PROFILE_TMP_MB" -eq 128
+# A 128 MB pool is smaller than the RAM/256 figure (256 MB on this 64 GB
+# stub); the cap must still win, with 32 MB as the legal floor.
+mariadb_compute_profile 128
+check "MariaDB profile: tmp_table_size never exceeds a tiny pool" \
+  test "$MARIADB_PROFILE_TMP_MB" -eq 32
+mariadb_compute_profile 1024
 check "MariaDB profile: thread_cache_size scales with CPUs" \
   test "$MARIADB_PROFILE_THREAD_CACHE" -eq 128
 check "MariaDB profile: LRU scan depth follows io_capacity" \
@@ -3674,12 +3680,21 @@ check "reset keeps the Anubis and Node pins" \
 # ---------------------------------------------------------------------------
 swap_body=$(sed -n '/^create_swap_file()/,/^}/p' "$ALL_SRC")
 check "a refused mkswap/swapon is handled, not fatal" \
-  grep -q 'if ! mkswap /swapfile >/dev/null 2>&1 || ! swapon /swapfile 2>/dev/null; then' <<<"$swap_body"
-check "the unusable swap file is removed" grep -q 'rm -f /swapfile' <<<"$swap_body"
+  grep -q 'if ! mkswap "\$new" >/dev/null 2>&1 || ! swapon "\$new" 2>/dev/null; then' <<<"$swap_body"
+check "the unusable swap file is removed" grep -q 'rm -f "\$new"' <<<"$swap_body"
 check "a refused swap file is reported at INFO level" \
   grep -q 'info "Swap file not enabled' <<<"$swap_body"
 check "no caller truncates the swap file after a failed swapoff" \
   bash -c '! grep -q "swapoff /swapfile 2>/dev/null || true" "$1"' _ "$ALL_SRC"
+# The replacement is built and activated beside the live file, then moved into
+# place: a failed download/fallocate can no longer leave the host without swap.
+check "the new swap file is built beside the live one" \
+  grep -q 'new=/swapfile.new' <<<"$swap_body"
+check "the live swap file is never truncated in place" \
+  not bash -c 'grep -qE "^[[:space:]]*: > /swapfile" "$1"' _ <(printf '%s\n' "$swap_body")
+check "the new swap file is live before the old one is released" \
+  test "$(grep -n 'swapon "\$new"' <<<"$swap_body" | cut -d: -f1)" \
+     -lt "$(grep -n 'swapoff /swapfile' <<<"$swap_body" | cut -d: -f1)"
 # release_swap_file with stubbed swapon/swapoff (functions shadow the tools).
 release_quiet() { release_swap_file 2>/dev/null; }
 swapoff_called=0

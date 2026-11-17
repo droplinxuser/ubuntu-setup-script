@@ -29,7 +29,6 @@ ensure_angie_limits() {
     # it succeeds.
     if write_service_limits_dropin "$angie_dropin" $'[Service]\nLimitNOFILE=524288\nUMask=0027'; then
       systemctl daemon-reload || true
-      changed=1
       ANGIE_UNIT_CHANGED=1
       tune_summary "Angie: systemd LimitNOFILE=524288 (applies on next restart)"
     fi
@@ -1695,7 +1694,10 @@ optimize_plan() {
     live_children=$(php_pool_max_children)
     explicit_children=$(explicit_option php_children 2>/dev/null || true)
     explicit_requests=$(explicit_option php_max_requests 2>/dev/null || true)
-    max_children=$(php_plan_max_children "$nproc" "$ram_mb" "$live_children" "$explicit_children" "${OPT_PHP_BUDGET_MB:-0}")
+    local plan_allowance
+    plan_allowance=$(php_worker_allowance_mb "$(php_primary_version 2>/dev/null || true)" 2>/dev/null || true)
+    [[ $plan_allowance =~ ^[0-9]+$ ]] && (( plan_allowance > 0 )) || plan_allowance=64
+    max_children=$(php_plan_max_children "$nproc" "$ram_mb" "$live_children" "$explicit_children" "${OPT_PHP_BUDGET_MB:-0}" "$plan_allowance")
     [[ $explicit_requests =~ ^[0-9]+$ ]] || explicit_requests=$(( nproc * 1024 ))
     printf '  PHP-FPM:  max_children=%s max_requests=%s backlog=%s\n' \
       "$max_children" "$explicit_requests" "$backlog"

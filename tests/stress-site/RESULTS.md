@@ -1,5 +1,26 @@
 # Full-stack stress test reports
 
+## 1.21.30 re-audit (2026-11-17)
+
+Fresh 505-package baseline, full install with Anubis, three applications,
+PHP 8.4 → 8.5 → 8.6 matrix, security and cookie suites, JIT/FPM sweeps,
+Anubis on/off A/B and a package-level restore.  Pair:
+`server-configs-nginx` 1.6.43.
+
+- Details: `AUDIT-20261117-1.21.30.md`.
+- Parity: install → `--optimize` and `--optimize` ×2 are byte-identical
+  (only volatile kernel counters and directory mtimes differ).
+- Guest cache, Anubis off: WP 138k req/s, XF 216k, Chevereto 191k.  With
+  Anubis: 40k / 47k / 41k.  Members: WP 288, XF 729 home / 439 thread.
+- JIT tracing 32 MB 554 vs 64 MB 550 vs off 517 req/s; 32 and 64 are equal
+  when interleaved.  FPM 16 workers 541 vs 20 = 524, 24 = 517, 32 = 508.
+- PHP: WordPress clean on 8.5, XenForo cleanest on 8.4 (two debug-mode 500s on
+  8.5), Chevereto 8.4/8.5 functional but ~480 vendor deprecations; 8.6
+  refused (redis/imagick/igbinary unpublished).
+- Validation: 955 tuning checks, 213 dry runs, ShellCheck clean, 54/54
+  security, 62/62 guest-cookie, 0 unexpected functional responses, 0 PHP
+  diagnostics, 0 XenForo error rows.
+
 ## 1.21.23 re-audit (2026-11-17)
 
 Pristine 505-package baseline, full install with Anubis, three applications,

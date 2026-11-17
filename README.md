@@ -763,6 +763,7 @@ them:
 | `SETUP_PHP_PAGE_GZIP` | `0\|1` | 0 stops PHP from gzipping WordPress/Chevereto pages for the guest cache (default 1: the cache stores the compressed page) |
 | `SETUP_STORAGE_CLASS` | `nvme\|ssd\|hdd` | pins the storage class when the kernel cannot see the medium (read on each run; persist it as `STORAGE_CLASS=` in `/etc/default/setup-tuning`) |
 | `SETUP_NODE_MAJOR` | major number | Node.js major installed by `--others nodejs` |
+| `SETUP_UFW_SSH_LIMIT` | `0\|1` | 1 (default) rate-limits the SSH port with `ufw limit` (6 new connections per 30 s per address); 0 writes a plain `ufw allow` rule. See the troubleshooting row for the lockout this prevents |
 
 Read on each run, not persisted:
 
@@ -885,6 +886,7 @@ tests. Angie configuration and Cloudflare IP ranges are downloaded.
 | PHP-FPM slow log full of queued requests | `request_slowlog_timeout` counts from accept; check `listen queue` in `/fpm-status.php`, add workers or cache the endpoint |
 | "upstream prematurely closed connection" during a load test | worker recycling at `pm.max_requests` or an FPM reload; set `pm.max_requests = 0` for a benchmark |
 | `--domain` says Angie or MariaDB is missing | it only creates the vhost/database; install the stack first or combine the flags |
+| SSH suddenly answers "Connection refused" or drops for a minute after several rapid connections | `ufw limit` on the SSH port (6 new connections per 30 s from one address); retrying refreshes the window. Wait ~1-2 minutes, reuse one connection (`ssh -M -S … -o ControlPersist=1h`), or install with `SETUP_UFW_SSH_LIMIT=0` for an automation host. `ufw status numbered` shows the rule |
 
 ## Files and state
 

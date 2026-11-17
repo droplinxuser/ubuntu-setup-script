@@ -877,9 +877,12 @@ php_children_floor() {
 # shape, but it never overrides the plan (that is what keeps install and
 # --optimize byte-identical on a host whose pool was sized by hand).  A
 # standalone call without a plan uses the same rule; the PHP budget only
-# caps when it is below the hardware value.
+# caps when it is below the hardware value.  `allowance` is the per-worker
+# reservation the plan used (php_worker_allowance_mb); dividing the budget by
+# the 64 MB install floor instead of it let a host whose workers measure
+# 96-192 MB write a pool two to three times the RAM the plan reserved.
 php_plan_max_children() {
-  local nproc=$1 ram_mb=$2 live=${3:-} explicit=${4:-} php_budget=${5:-0}
+  local nproc=$1 ram_mb=$2 live=${3:-} explicit=${4:-} php_budget=${5:-0} allowance=${6:-64}
   local cap
   if [[ $explicit =~ ^[0-9]+$ ]] && (( explicit > 0 )); then
     php_children_ceiling "$nproc" "$ram_mb" "" "$explicit"
@@ -889,8 +892,9 @@ php_plan_max_children() {
   if [[ $php_budget =~ ^[0-9]+$ ]] && (( php_budget > 0 )); then
     # The budget can only lower the pool to what its RAM reservation allows,
     # never below the hardware floor.
+    [[ $allowance =~ ^[0-9]+$ ]] && (( allowance > 0 )) || allowance=64
     local by_budget floor
-    by_budget=$(( php_budget / 64 ))
+    by_budget=$(( php_budget / allowance ))
     floor=$(php_children_floor "$ram_mb" "$nproc")
     (( by_budget < floor )) && by_budget=$floor
     (( by_budget < cap )) && cap=$by_budget

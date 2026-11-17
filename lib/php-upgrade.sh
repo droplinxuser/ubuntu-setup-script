@@ -901,7 +901,12 @@ php_upgrade_rollback() {
       apt-get purge "${APT_OPTS[@]}" "${target_pkgs[@]}" >/dev/null 2>&1 \
         || warn "Could not purge the partial PHP ${target} packages"
     fi
-    rm -rf "/etc/php/${target}"
+    # Keep the partial tree instead of deleting it (repo-wide file-safety
+    # policy: every retirement moves to /tmp, never unlinks).
+    local retired
+    if retired=$(preserve_to_tmp "/etc/php/${target}" 2>/dev/null) && [[ -n $retired ]]; then
+      info "Moved the partial PHP ${target} configuration to ${retired}"
+    fi
   fi
   if (( ${#PHP_UPGRADE_OLD_PACKAGE_VERSIONS[@]} > 0 )); then
     # One pkg=version the archive no longer serves fails the whole
@@ -917,7 +922,12 @@ php_upgrade_rollback() {
     fi
   fi
   if [[ -d "$dir/php-config/$old" ]]; then
-    rm -rf "/etc/php/${old}"
+    # Move the live tree aside instead of deleting it; the snapshot is already
+    # preserved, and an operator file created after the snapshot survives too.
+    local retired
+    if retired=$(preserve_to_tmp "/etc/php/${old}" 2>/dev/null) && [[ -n $retired ]]; then
+      info "Moved the superseded PHP ${old} configuration to ${retired}"
+    fi
     mkdir -p /etc/php
     cp -a "$dir/php-config/$old" "/etc/php/${old}" 2>/dev/null \
       || warn "Could not restore /etc/php/${old}"

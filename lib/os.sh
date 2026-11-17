@@ -214,35 +214,52 @@ ensure_swap_fstab() {
 
 create_swap_file() {
   local bytes=$1
-  local avail margin=268435456
-  # Never fill the filesystem: keep 256 MiB free after the swap file.  A
-  # 50%-of-RAM auto target on a 5 GB VPS used to consume the whole root
-  # filesystem (dd has no free-space check of its own).
+  local avail margin=268435456 new=/swapfile.new
+  # Never fill the filesystem: keep 256 MiB free after the swap file.
   avail=$(df -B1 --output=avail / 2>/dev/null | awk 'NR==2{print $1}')
   if [[ $avail =~ ^[0-9]+$ ]] && (( avail < bytes + margin )); then
     die "Not enough free disk for a $(( bytes / 1048576 )) MiB swap file (${avail} bytes available; 256 MiB must stay free)"
   fi
-  # Reuse the path in place.  Unlinking a valid /swapfile is unnecessary and
-  # would make a failed re-create leave the host with no swap at all.
-  : > /swapfile
-  if ! fallocate -l "$bytes" /swapfile 2>/dev/null; then
+  # Build and activate the replacement beside the live file, then swap over.
+  # The old code truncated /swapfile in place, so a full disk or an I/O error
+  # left the host with swap off, a zero-length file and an fstab entry that
+  # still pointed at it.
+  rm -f "$new"
+  if ! fallocate -l "$bytes" "$new" 2>/dev/null; then
     warn "fallocate failed; falling back to dd"
     local count=$(( (bytes + 1048575) / 1048576 ))
-    dd if=/dev/zero of=/swapfile bs=1M count="$count" status=none
+    dd if=/dev/zero of="$new" bs=1M count="$count" status=none || {
+      rm -f "$new"
+      die "Could not create a ${bytes}-byte swap file; the existing swap (if any) is untouched"
+    }
   fi
-  chmod 600 /swapfile
+  chmod 600 "$new"
   # LXC/OpenVZ containers may not manage swap at all and btrfs/ZFS reject a
   # plain swap file; there mkswap/swapon failing is the expected outcome, not
   # an error.  Aborting here used to skip the rest of --basic (sysctl, limits,
   # cron, firewall) and leave a multi-GB file behind, so drop the unusable
   # file and its fstab entry and carry on without swap.
-  if ! mkswap /swapfile >/dev/null 2>&1 || ! swapon /swapfile 2>/dev/null; then
-    rm -f /swapfile
-    if grep -qE '^[[:space:]]*/swapfile[[:space:]]' /etc/fstab 2>/dev/null; then
-      sed_in_place -E '/^[[:space:]]*\/swapfile[[:space:]]/d' /etc/fstab
+  if ! mkswap "$new" >/dev/null 2>&1 || ! swapon "$new" 2>/dev/null; then
+    rm -f "$new"
+    # Keep the fstab entry when an older /swapfile is still active; removing
+    # it would make the working swap vanish on the next boot.
+    if ! swapfile_active; then
+      if grep -qE '^[[:space:]]*/swapfile[[:space:]]' /etc/fstab 2>/dev/null; then
+        sed_in_place -E '/^[[:space:]]*\/swapfile[[:space:]]/d' /etc/fstab
+      fi
     fi
-    info "Swap file not enabled: this system refused /swapfile (normal in LXC/OpenVZ containers and on btrfs/ZFS); continuing without it"
+    info "Swap file not enabled: this system refused a swap file (normal in LXC/OpenVZ containers and on btrfs/ZFS); continuing without it"
     return 0
+  fi
+  # The new file is live, so releasing the old one cannot leave the host
+  # without swap; if the kernel refuses (pages do not fit in RAM), two files
+  # are active and the old one keeps its path until the next run.
+  if swapfile_active; then
+    swapoff /swapfile 2>/dev/null || warn "Old /swapfile is still active; keeping both until the next run"
+  fi
+  if ! mv -f "$new" /swapfile; then
+    swapoff "$new" 2>/dev/null || true
+    die "Could not move the new swap file into place; the existing swap is untouched"
   fi
   ensure_swap_fstab
   mark_swap_managed
@@ -288,10 +305,9 @@ configure_swap() {
       swapon --show
       return 0
     fi
-    if ! release_swap_file; then
-      swapon --show
-      return 0
-    fi
+    # Do not release the live file first: create_swap_file builds and activates
+    # the replacement beside it and only then swaps the old one out, so a
+    # failed write can never leave the host with no swap.
   fi
 
   create_swap_file "$desired"
@@ -1106,6 +1122,24 @@ configure_ufw() {
   # host moved to a custom port would otherwise lose remote access the moment
   # UFW is enabled.
   local ssh_port ssh_limited had_allow
+  # ufw limit allows six new connections per 30 s from one address and then
+  # drops further attempts until the window clears.  If the caller keeps
+  # retrying, each attempt refreshes the window: an operator or an automation
+  # host that runs many short ssh/scp commands is locked out for minutes and,
+  # on some kernels, the reject surfaces as "Connection refused".  A human
+  # never hits it; a provisioning/CI address does.  SETUP_UFW_SSH_LIMIT=0
+  # writes a plain ALLOW rule for this run (documented in the README).
+  local ssh_limit=${SETUP_UFW_SSH_LIMIT:-1}
+  [[ $ssh_limit == 0 ]] || ssh_limit=1
+  if (( ! ssh_limit )); then
+    while IFS= read -r ssh_port; do
+      [[ $ssh_port =~ ^[0-9]+$ ]] || continue
+      ufw delete limit "${ssh_port}/tcp" >/dev/null 2>&1 || true
+      ufw insert 1 allow "${ssh_port}/tcp" >/dev/null 2>&1 \
+        || ufw allow "${ssh_port}/tcp" >/dev/null 2>&1 || true
+      info "UFW: SSH port ${ssh_port}/tcp is a plain ALLOW rule (SETUP_UFW_SSH_LIMIT=0)"
+    done < <(sshd_listen_ports)
+  else
   while IFS= read -r ssh_port; do
     [[ $ssh_port =~ ^[0-9]+$ ]] || continue
     ssh_limited=0
@@ -1153,6 +1187,7 @@ configure_ufw() {
         || ufw allow "${ssh_port}/tcp" 2>/dev/null || true
     fi
   done < <(sshd_listen_ports)
+  fi
   ufw allow 80 || true
   ufw allow 443 || true
   ufw --force enable

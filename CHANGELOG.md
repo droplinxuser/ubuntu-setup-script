@@ -3,6 +3,66 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.30 (2026-11-17)
+
+Full lifecycle on a reinstalled `lab.local` (Ryzen 7 8745HS, 16 threads,
+27 812 MB, NVMe, Ubuntu 26.04.1, 505-package baseline).  Pair:
+`server-configs-nginx` 1.6.43.  Audit report:
+`tests/stress-site/AUDIT-20261117-1.21.30.md`.
+
+- **PHP-FPM pool sizing uses the measured worker allowance.**  The planner
+  reserves `children x php_worker_allowance_mb` (64–192 MB) but the writer
+  divided the budget by a hard-coded 64 MB when clamping, so a host whose
+  workers measure 96–192 MB could derive a pool up to 3x its reservation.
+  `php_plan_max_children` takes the allowance as its sixth argument; both
+  callers pass `php_worker_allowance_mb` for the pool version.  The
+  hardware floor still wins by design (a small host is not under-provisioned;
+  overcommit is reported), so this is a correctness guard, not a resize.
+- **MariaDB `tmp_table_size` is clamped to the pool on every size.**  The old
+  test only clamped when `pool/8 >= 32`, so a pool below 256 MB kept the
+  RAM/256 value (up to twice the whole pool).  The cap is now always applied
+  with 32 MB as the floor.
+- **Swap files are built beside the live one.**  `create_swap_file` used to
+  truncate `/swapfile` in place after `swapoff`; a full disk or an I/O error
+  left the host with swap off, a zero-length file and a stale fstab entry.
+  The replacement is written to `/swapfile.new`, `mkswap`ed and `swapon`ed
+  first, then the old file is released and the new one moved into place.  A
+  refused mkswap keeps an older active file's fstab entry.
+- **`--diagnostics` is written to a private temp file and moved into place.**
+  The report used to be chowned to the invoking sudo user before root
+  appended the rest; that user could swap it for a symlink and receive every
+  root dump.  `mktemp` (O_EXCL) + `mv` replaces (never follows) the target.
+- **`--upgrade-php` no longer deletes configuration trees.**  The partial
+  target tree and the superseded old tree are moved to `/tmp` like every other
+  retirement path.
+- **A pinned Anubis version is verified.**  `SETUP_ANUBIS_VERSION` without
+  `SETUP_ANUBIS_SHA256` is refused (the built-in hashes only cover the tested
+  release) and the download uses `--proto '=https' --tlsv1.2`.
+- **Chevereto Imagick uses the FPM version**, not the alternatives CLI, so a
+  multi-version host installs the extension the pool loads.
+- **SQL imports raise the session packet limit** (`max_allowed_packet` 1 GiB)
+  as well as the client flag, so a dump with a >64 MB row no longer fails
+  halfway through.
+- **A commented `DISABLE_WP_CRON` no longer enables the managed wp-cron
+  entry** (the grep matched `// define(...)` and every task ran twice).
+- **`SETUP_UFW_SSH_LIMIT=0`** writes a plain SSH ALLOW rule instead of
+  `ufw limit`.  The rate limit (6 new connections/30 s per address) is right
+  for a human but locked an automation host out for minutes, which surfaced as
+  "Connection refused" because retries refresh the window.  Documented in the
+  README troubleshooting table.
+- **`ensure_angie_limits` no longer writes a stray global `changed`.**
+- Validation: `tests/test-tuning.sh` **955 pass / 0 fail**, dry-run matrix
+  **213 pass / 0 fail**, ShellCheck clean, install/optimize parity and
+  `--optimize` idempotency byte-identical, 54/54 security, 62/62 guest-cookie
+  (XenForo 2.3's log out is a GET link from `/account/visitor-menu`, not a
+  POST of `data-csrf`), 0 unexpected functional responses, 0 PHP diagnostics,
+  0 XF error rows.
+- Measured (loopback, oha 1.16, c=100, 8 s): guest cache 138k req/s WordPress,
+  216k XenForo, 191k Chevereto explore without Anubis; 40k / 47k / 41k with
+  Anubis.  Members 288 (WP home), 729/439 (XF home/thread).  JIT tracing
+  32 MB 554 vs 64 MB 550 vs off 517 req/s on the XF thread tier; PHP-FPM
+  16 workers 541 vs 20 = 524, 24 = 517, 32 = 508, 12 = 465, 8 = 361.
+
 ## 1.21.29 (2026-11-17)
 
 - **`tools/fleet-update.sh`.**  A safe replacement for the hand-written

@@ -831,11 +831,15 @@ mariadb_compute_profile() {
   (( thread_cache < 32 )) && thread_cache=32
   (( thread_cache > 256 )) && thread_cache=256
   # In-memory temp tables: forum GROUP BY/ORDER BY queries spill to disk at a
-  # fixed 64M on large sites; scale with RAM but never above pool/8.
+  # fixed 64M on large sites; scale with RAM but never above pool/8 (32M is
+  # the floor, so even a 128 MB pool gets a legal, bounded value instead of
+  # the RAM/256 figure that could exceed the whole pool on a tiny host).
   tmp_mb=$(( ram_mb / 256 ))
   (( tmp_mb < 32 )) && tmp_mb=32
   (( tmp_mb > 256 )) && tmp_mb=256
-  (( tmp_mb > size_mb / 8 && size_mb / 8 >= 32 )) && tmp_mb=$(( size_mb / 8 ))
+  local tmp_cap=$(( size_mb / 8 ))
+  (( tmp_cap < 32 )) && tmp_cap=32
+  (( tmp_mb > tmp_cap )) && tmp_mb=$tmp_cap
   # Never lower an existing, larger ceiling: a busy application may already
   # allow more than threads*32 connections, and a tune must not turn into
   # "Too many connections" during a traffic peak.
@@ -1982,7 +1986,7 @@ domain_provision_database() {
   # COMMIT (the open transaction is rolled back when the client disconnects)
   # and fails the pipeline.
   if ! {
-       printf 'SET autocommit=0; SET unique_checks=0; SET foreign_key_checks=0; SET SESSION sql_log_bin=0;\n' \
+       printf 'SET autocommit=0; SET unique_checks=0; SET foreign_key_checks=0; SET SESSION sql_log_bin=0; SET SESSION max_allowed_packet=1073741824;\n' \
          && "${reader[@]}" "$sql" \
          && printf '\nCOMMIT;\n'
      } | mariadb --max-allowed-packet=1G "$db"; then
@@ -2058,8 +2062,15 @@ create_domains() {
     # Imagick is required by Chevereto, but it is not part of the
     # XenForo/WordPress default PHP profile.  Install it only when a
     # Chevereto vhost is explicitly requested (including an existing one).
-    if [[ $app == chevereto ]] && ! php -m 2>/dev/null | grep -qix imagick; then
-      pv=$(php -r 'echo PHP_MAJOR_VERSION, ".", PHP_MINOR_VERSION;' 2>/dev/null || true)
+    # Use the FPM version Angie talks to, not the alternatives CLI: on a host
+    # with 8.4 and 8.5 installed, `php -m` could name the other version and
+    # install an extension the pool never loads.
+    local chev_php
+    chev_php=$(php_primary_version 2>/dev/null || true)
+    [[ -n $chev_php ]] || chev_php=$(php -r 'echo PHP_MAJOR_VERSION, ".", PHP_MINOR_VERSION;' 2>/dev/null || true)
+    if [[ $app == chevereto && -n $chev_php ]] \
+       && ! "/usr/bin/php${chev_php}" -m 2>/dev/null | grep -qix imagick; then
+      pv=$chev_php
       if [[ -n $pv ]]; then
         info "Chevereto requires Imagick; installing php${pv}-imagick (Chevereto only)"
         apt_install "php${pv}-imagick" \

@@ -142,7 +142,14 @@ anubis_install_binary() {
   want_sha=${SETUP_ANUBIS_SHA256:-$want_sha}
   if [[ ${SETUP_ANUBIS_VERSION:-} =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     ANUBIS_VERSION=$SETUP_ANUBIS_VERSION
-    [[ -z ${SETUP_ANUBIS_SHA256:-} ]] && want_sha=""
+    # A pinned version has no built-in hash (the loader only ships hashes for
+    # the release this script was tested with).  Installing a root-owned
+    # binary from an unverified download is not worth the convenience: fail
+    # closed and name the variable that makes the pin verifiable.
+    if [[ -z ${SETUP_ANUBIS_SHA256:-} ]]; then
+      die "SETUP_ANUBIS_VERSION=${ANUBIS_VERSION} needs SETUP_ANUBIS_SHA256=<sha256 of the release tarball>; refusing an unverified download"
+    fi
+    want_sha=$SETUP_ANUBIS_SHA256
   fi
   want="v${ANUBIS_VERSION}"
   current=$(anubis_installed_version || true)
@@ -154,9 +161,9 @@ anubis_install_binary() {
   tmp=$(tmp_dir anubis.XXXXXX) || return 1
   info "Downloading Anubis ${ANUBIS_VERSION} (${arch} static binary)"
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --retry 3 -o "${tmp}/anubis.tar.gz" "$url" || return 1
+    curl -fsSL --proto '=https' --tlsv1.2 --retry 3 -o "${tmp}/anubis.tar.gz" "$url" || return 1
   else
-    wget -q -O "${tmp}/anubis.tar.gz" "$url" || return 1
+    wget --https-only -q -O "${tmp}/anubis.tar.gz" "$url" || return 1
   fi
   if [[ -n $want_sha ]]; then
     got=$(sha256sum "${tmp}/anubis.tar.gz" | awk '{print $1}')
