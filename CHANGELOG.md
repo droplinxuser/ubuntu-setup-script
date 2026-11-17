@@ -3,6 +3,34 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.28 (2026-11-17)
+
+Fleet-run fixes (four production Angie hosts: 24.04/26.04, 2–64 vCPU).
+
+- **Retire stale `http.d/*__conf` files.**  A botched `.conf` rename from an
+  old layout leaves e.g. `proxy_cache__conf` in `/etc/angie/http.d`; the
+  tree includes `*.conf`, so the file is never loaded and only produced a
+  warning about a cache zone that is "not included".  `sync_angie_repo_configs`
+  now moves these to `/tmp` (nothing deleted) before the tuner runs.
+- **Never lower a kernel-raised `vm.min_free_kbytes`.**  Small KVM guests
+  raise it above the 1%-of-RAM target (67,584 KiB vs 40,038 KiB on the 4 GB
+  host) and raise it again after the profile is applied, which showed as
+  permanent drift and re-triggered the boot pass.  If the live value is
+  higher and within the 256 MB cap it is kept in the profile.
+- **Huge pages are sized for OPcache, not for RAM.**  The old `RAM/64`
+  formula reserved 186 pages on a 12 GB host while the 512 MB OPcache + 64 MB
+  JIT need 288, so `opcache.huge_code_pages` stayed off and the reservation
+  was wasted.  `sysctl_hugepages_target` reserves
+  `(opcache + jit)/2 + 8` pages when PHP is installed (296 on 8–128 GB hosts,
+  152 on a 4 GB host, 0 without PHP), capped at 512.
+- **Validation.**  951 tuning checks, 212 dry runs, ShellCheck clean; four
+  production hosts optimized in 21–38 s each with no errors.
+- **Proxy TLS.**  The Angie repo (1.6.39) now defaults
+  `proxy_ssl_verify off`: setup.sh origins use self-signed certificates, and
+  a verifying proxy answered 502 for the whole site (`site-a.example` on the
+  proxy edge).  The hop stays encrypted; verification can be re-enabled when
+  every origin has a publicly trusted certificate.
+
 ## 1.21.27 (2026-11-17)
 
 Make the drift report distinguish "our profile is stricter/conservative" from

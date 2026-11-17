@@ -2476,6 +2476,24 @@ deploy_angie_tree() {
   return 0
 }
 
+# Files named with a double underscore are a botched `.conf` rename from an
+# old layout.  angie.conf includes `http.d/*.conf`, so they are never loaded
+# and only make the tuner warn about a stale cache zone (e.g.
+# `proxy_cache__conf`).  Move them to /tmp; never delete.
+retire_angie_double_underscore() {
+  local target=${1:-/etc/angie} file moved
+  for file in "$target"/http.d/*__conf; do
+    [[ -f $file ]] || continue
+    moved=$(preserve_to_tmp "$file" 2>/dev/null || true)
+    if [[ -n $moved ]]; then
+      info "Retired legacy Angie file ${file} -> ${moved} (not deleted)"
+    else
+      warn "Could not move legacy Angie file ${file}; leaving it in place"
+    fi
+  done
+  return 0
+}
+
 sync_angie_repo_configs() {
   fetch_server_configs || return 1
   local limit_src="${CONFIG_SOURCE_DIR}/scripts/limit_nofile.conf"
@@ -2494,6 +2512,7 @@ sync_angie_repo_configs() {
   systemctl daemon-reload || true
 
   deploy_angie_tree || return 1
+  retire_angie_double_underscore /etc/angie
   return 0
 }
 

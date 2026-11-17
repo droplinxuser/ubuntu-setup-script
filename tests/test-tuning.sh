@@ -789,6 +789,15 @@ check "an exact huge-page reservation is accepted" php_hugepages_ok 288 512 64
 check "a partial huge-page reservation does not enable huge_code_pages" \
   not php_hugepages_ok 87 512 64
 check "a non-numeric huge-page count is refused" not php_hugepages_ok bogus 512 64
+check "huge pages: 12 GB PHP host covers OPcache plus JIT" \
+  test "$(sysctl_hugepages_target 11955 1)" = 296
+check "huge pages: 4 GB PHP host gets a smaller reservation" \
+  test "$(sysctl_hugepages_target 4096 1)" = 152
+check "huge pages: no reservation on a host without PHP" \
+  test "$(sysctl_hugepages_target 31775 0)" = 0
+check "huge pages: none below 4 GB" test "$(sysctl_hugepages_target 3910 1)" = 0
+check "huge pages: capped for a 128 GB host" \
+  test "$(sysctl_hugepages_target 131072 1)" = 296
 check "4+ CPU hosts use PHP's default tracing thresholds" \
   test "$(php_jit_threshold_lines 16)" = "opcache.jit_hot_loop = 64
 opcache.jit_hot_func = 127

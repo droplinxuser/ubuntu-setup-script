@@ -656,6 +656,27 @@ WantedBy=timers.target
 EOF
 }
 
+# Huge pages for OPcache, in 2 MB pages.  Only meaningful when PHP is
+# installed and the host has at least 4 GB: size the reservation to OPcache
+# plus the JIT buffer, not to a fixed fraction of RAM.  The old RAM/64 formula
+# reserved 186 pages on a 12 GB host, which is less than the 288 pages the
+# 512 MB OPcache + 64 MB JIT need, so huge_code_pages stayed off and the
+# reservation was wasted.  No PHP -> 0 (no reservation at all).
+sysctl_hugepages_target() {
+  local ram_mb=${1:-0} has_php=${2:-0} opcache_mb jit_mb pages
+  [[ $ram_mb =~ ^[0-9]+$ ]] || { printf 0; return 0; }
+  (( ram_mb >= 4096 )) || { printf 0; return 0; }
+  (( has_php )) || { printf 0; return 0; }
+  php_ini_profile "$ram_mb"
+  opcache_mb=$PHP_PROFILE_OPCACHE_MB
+  read -r _ jit_mb < <(php_jit_settings "$opcache_mb")
+  [[ $jit_mb =~ ^[0-9]+$ ]] || jit_mb=0
+  pages=$(( (opcache_mb + jit_mb + 1) / 2 + 8 ))
+  (( pages > 512 )) && pages=512
+  (( pages < 8 )) && pages=8
+  printf '%s' "$pages"
+}
+
 configure_sysctl() {
   step "sysctl tweaks"
   record_sysctl_values
@@ -690,6 +711,14 @@ configure_sysctl() {
     (( min_free < 16384 ))  && min_free=16384
   fi
   (( min_free > 262144 )) && min_free=262144
+  # The kernel or the provider may already keep a higher value (KVM memory
+  # ballooning raises min_free_kbytes on small guests).  Never lower it: the
+  # kernel would raise it again and the report would show drift every run.
+  local live_min_free
+  live_min_free=$(sysctl -n vm.min_free_kbytes 2>/dev/null || echo 0)
+  if [[ $live_min_free =~ ^[0-9]+$ ]] && (( live_min_free > min_free && live_min_free <= 262144 )); then
+    min_free=$live_min_free
+  fi
   shmall=$(( 1073741824 / 4096 ))
   # Scale listener/connection limits with CPU count and RAM.  The clamps keep
   # a 1 GB VPS conservative and stop a 256-core host from reserving absurd
@@ -757,11 +786,9 @@ configure_sysctl() {
   # Two 2 MB huge pages per 128 MB of RAM (1 GB on a 30 GB host, 64 MB on a
   # 4 GB one), used by OPcache through opcache.huge_code_pages.  Huge pages
   # are reserved at boot and never swapped, so small hosts get none.
-  local hugepages=0
-  if (( ram_mb >= 4096 )); then
-    hugepages=$(( ram_mb / 64 ))
-    (( hugepages > 512 )) && hugepages=512
-  fi
+  local has_php=0
+  if [[ -d /etc/php ]] || (( ${ENABLED[php]:-0} == 1 )); then has_php=1; fi
+  hugepages=$(sysctl_hugepages_target "$ram_mb" "$has_php")
   arp_thresh3=$(( cpu * 1024 ));        (( arp_thresh3 < 2048 )) && arp_thresh3=2048;          (( arp_thresh3 > 262144 )) && arp_thresh3=262144
   arp_thresh2=$(( arp_thresh3 / 2 ))
   cat >> /etc/sysctl.conf <<EOF
