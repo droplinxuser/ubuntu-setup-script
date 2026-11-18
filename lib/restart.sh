@@ -358,14 +358,21 @@ run_optimize() {
   # Rollback copies live under /tmp and are allowed to expire there; older
   # releases pruned them, which permanently deleted operator-recoverable data.
   OPT_REPORT=()
-  if (( RESET_OVERRIDES )); then
-    step "Resetting operator overrides"
-    reset_operator_overrides
-    opt_report "## Override reset"
-    local reset_action
-    for reset_action in "${RESET_ACTIONS[@]}"; do
-      opt_report "- ${reset_action}"
-    done
+  # The profile is always recomputed from the current hardware: recorded pins
+  # and explicit sizes are moved to /tmp before the tuners run, and tuning
+  # environment variables are ignored.  This keeps --optimize identical
+  # across servers with the same hardware instead of inheriting old host
+  # settings.
+  step "Recomputing the hardware profile"
+  optimize_ignore_tuning_env
+  reset_operator_overrides
+  opt_report "## Profile reset"
+  local reset_action
+  for reset_action in "${RESET_ACTIONS[@]}"; do
+    opt_report "- ${reset_action}"
+  done
+  if (( ${#OPTIMIZE_IGNORED_ENV[@]} > 0 )); then
+    opt_report "- Ignored tuning environment: \`${OPTIMIZE_IGNORED_ENV[*]}\`"
   fi
   detect_installed_services
   if (( ${#OPT_DETECTED[@]} > 0 )); then

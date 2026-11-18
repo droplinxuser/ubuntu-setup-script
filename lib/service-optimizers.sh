@@ -1674,17 +1674,20 @@ write_optimize_report() {
 optimize_plan() {
   local nproc ram_mb size_mb max_children max_mb heap_mb backlog max_conn db_fit db_size_mb es_fit es_size_mb
   local governor_desc=performance disk_free_mb cache_mb
-  if (( RESET_OVERRIDES )); then
-    printf '\n%sOverride reset preview%s (no file is moved):\n' "$C_BOLD" "$C_RESET"
-    reset_operator_overrides 2
-    local foreign
-    foreign=$(tuning_override_sources)
-    if [[ -n $foreign ]]; then
-      printf '  Foreign sources that the boot profile will override:\n'
-      printf '%s\n' "$foreign" | sed 's/^/    /'
-    else
-      printf '  No foreign sysctl source found.\n'
-    fi
+  # Always show what the run will drop: the profile is hardware-derived.
+  optimize_ignore_tuning_env
+  printf '\n%sProfile reset preview%s (no file is moved):\n' "$C_BOLD" "$C_RESET"
+  reset_operator_overrides 2
+  if (( ${#OPTIMIZE_IGNORED_ENV[@]} > 0 )); then
+    printf '  Ignored tuning environment: %s\n' "${OPTIMIZE_IGNORED_ENV[*]}"
+  fi
+  local foreign
+  foreign=$(tuning_override_sources)
+  if [[ -n $foreign ]]; then
+    printf '  Foreign sources that the boot profile will override:\n'
+    printf '%s\n' "$foreign" | sed 's/^/    /'
+  else
+    printf '  No foreign sysctl source found.\n'
   fi
   nproc=$(effective_cpus)
   ram_mb=$(mem_total_mb)

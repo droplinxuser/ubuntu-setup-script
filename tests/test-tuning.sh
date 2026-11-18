@@ -3675,6 +3675,33 @@ check "an unrelated sysctl drop-in is reported as foreign" \
 check "reset keeps the Anubis and Node pins" \
   test "$(printf '%s\n' "${RESET_KEEP_PINS[@]}" | grep -cE '^(ANUBIS|NODE_MAJOR)$')" -eq 2
 
+# --optimize always recomputes the profile: recorded pins/sizes are cleared
+# and tuning environment variables are ignored, while feature choices stay.
+reset_body=$(sed -n '/^reset_operator_overrides()/,/^}/p' "$ALL_SRC")
+check "the profile reset sets bbr without honouring SETUP_TCP_CC" \
+  bash -c '! grep -q "SETUP_TCP_CC+x" <<< "$1"' _ "$reset_body"
+check "the profile reset sets fq without honouring SETUP_QDISC" \
+  bash -c '! grep -q "SETUP_QDISC+x" <<< "$1"' _ "$reset_body"
+ignored_env=$( (
+  export SETUP_TCP_CC=cubic SETUP_PHP_WORKERS_PER_CPU=2.0 SETUP_LIMIT_REQ_EXEMPT=10.0.0.1 \
+         SETUP_ANUBIS=1 SETUP_XF_JOB_CRON=0 SETUP_PHP_JIT_WORDPRESS=0
+  optimize_ignore_tuning_env >/dev/null 2>&1
+  printf '%s;%s;%s;%s;%s;%s;%s\n' \
+    "${SETUP_TCP_CC-none}" "${SETUP_PHP_WORKERS_PER_CPU-none}" \
+    "${SETUP_LIMIT_REQ_EXEMPT-none}" "${SETUP_ANUBIS-none}" \
+    "${SETUP_XF_JOB_CRON-none}" "${SETUP_PHP_JIT_WORDPRESS-none}" \
+    "${OPTIMIZE_IGNORED_ENV[*]}"
+) )
+check "optimize ignores tuning environment overrides but keeps feature choices" \
+  test "$ignored_env" = "none;none;none;1;0;none;SETUP_TCP_CC=cubic SETUP_PHP_WORKERS_PER_CPU=2.0 SETUP_PHP_JIT_WORDPRESS=0 SETUP_LIMIT_REQ_EXEMPT=10.0.0.1"
+optimize_body=$(sed -n '/^run_optimize()/,/^}/p' "$ALL_SRC")
+check "run_optimize always resets recorded overrides" \
+  grep -q '^  reset_operator_overrides$' <<<"$optimize_body"
+check "run_optimize always ignores tuning environment overrides" \
+  grep -q '^  optimize_ignore_tuning_env$' <<<"$optimize_body"
+check "the dry run previews the profile reset" \
+  grep -q 'reset_operator_overrides 2' "$ALL_SRC"
+
 # ---------------------------------------------------------------------------
 # Swap file: containers and btrfs/ZFS must not abort --basic
 # ---------------------------------------------------------------------------

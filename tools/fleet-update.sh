@@ -119,14 +119,14 @@ echo "Deployed: $(grep -m1 '^readonly SCRIPT_VERSION=' "${WORKDIR}/setup.sh" || 
 cd "$WORKDIR"
 
 say "Optimize dry run"
-bash setup.sh --optimize --reset-overrides --dry-run 2>&1 | tee "$DRY_LOG"
+bash setup.sh --optimize --dry-run 2>&1 | tee "$DRY_LOG"
 if (( DRY_RUN_ONLY == 1 )); then
   say "DRY_RUN_ONLY=1: stopping after the dry run"
   echo "Review ${DRY_LOG}, then run again without DRY_RUN_ONLY (SKIP_APT=1)."
   exit 0
 fi
 say "Optimize"
-bash setup.sh --optimize --reset-overrides 2>&1 | tee "$OPT_LOG"
+bash setup.sh --optimize 2>&1 | tee "$OPT_LOG"
 
 say "Summary"
 systemctl --failed --no-legend || true

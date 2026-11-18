@@ -15,17 +15,18 @@
 #   * third-party sysctl drop-ins or units that write the same keys after
 #     systemd-sysctl (tcp_congestion_control, default_qdisc, ...).
 #
-# `--optimize --reset-overrides` clears the first two for this run (originals
-# move to /tmp, never deleted) and re-applies every tuner.  Third-party files
-# are left in place: configure_sysctl installs setup-sysctl-final.timer, which
-# re-applies the managed profile 90 s after boot, so they lose at boot without
-# breaking a Docker/cloud-init setting.  The audit below prints every source
-# that still defines a managed key so an operator can see what remains.
+# `--optimize` clears the first two before every run (originals move to /tmp,
+# never deleted) and re-applies every tuner; the profile is hardware-derived.
+# Third-party files are left in place: configure_sysctl installs
+# setup-sysctl-final.timer, which re-applies the managed profile 90 s after
+# boot, so they lose at boot without breaking a Docker/cloud-init setting.
+# The audit below prints every source that still defines a managed key so an
+# operator can see what remains.
 RESET_ACTIONS=()
 # Pins that describe a host fact or a feature choice, not a performance
 # override: a reset must not silently flip them.
 RESET_KEEP_PINS=(
-  ANUBIS ANUBIS_STATIC_BYPASS NODE_MAJOR NODE_ALLOW_MAJOR_UPGRADE
+  ANUBIS ANUBIS_STATIC_BYPASS XF_JOB_CRON NODE_MAJOR NODE_ALLOW_MAJOR_UPGRADE
 )
 
 # Every sysctl key this host's managed profile actually defines.  A key this
@@ -213,7 +214,7 @@ tuning_overrides_report() {
   drift=$(tuning_drift_lines | head -n 60)
   if [[ -n $drift ]]; then printf '%s\n' "$drift"; else printf '(none)\n'; fi
 
-  # Operator PHP/Angie fragments are preserved by --reset-overrides, so list
+  # Operator PHP/Angie fragments are preserved by --optimize, so list
   # the ones that can win over the managed profile instead of silently
   # leaving them out of the report.
   printf '\n== PHP/Angie fragments that can override the managed profile ==\n'
@@ -258,6 +259,39 @@ opt_report_tuning_drift() {
 
 # Clear recorded operator overrides for this run.  With dry=1 only prints
 # what would happen.  The original files are moved to /tmp, never deleted.
+# Clear recorded operator overrides before every --optimize run.  With dry=1
+# only prints what would happen; dry=2 previews without moving a file.  The
+# original files are moved to /tmp, never deleted.  The profile is always
+# hardware-derived: persisted pins/sizes and tuning environment variables do
+# not change it.
+OPTIMIZE_IGNORED_ENV=()
+
+# Remove tuning overrides from the environment for this run and remember them
+# so the report can say what was ignored.  Feature choices (ANUBIS, Node
+# major, application cache/security toggles) and CONFIG_* are not listed.
+optimize_ignore_tuning_env() {
+  local v
+  OPTIMIZE_IGNORED_ENV=()
+  for v in \
+    SETUP_TCP_CC SETUP_QDISC SETUP_STORAGE_CLASS \
+    SETUP_PHP_WORKERS_PER_CPU \
+    SETUP_PHP_JIT SETUP_PHP_JIT_WORDPRESS \
+    SETUP_PHP_JIT_HOT_LOOP SETUP_PHP_JIT_HOT_FUNC \
+    SETUP_PHP_JIT_HOT_RETURN SETUP_PHP_JIT_HOT_SIDE_EXIT \
+    SETUP_GZIP_LEVEL SETUP_BROTLI_LEVEL SETUP_ANGIE_COMPRESSION \
+    SETUP_MARIADB_IO_CAPACITY SETUP_LIMIT_REQ_EXEMPT \
+    SETUP_PRECOMPRESS_ASSETS SETUP_PHP_PAGE_GZIP; do
+    if [[ -n ${!v+x} ]]; then
+      OPTIMIZE_IGNORED_ENV+=("$v=${!v}")
+      unset "$v"
+    fi
+  done
+  if (( ${#OPTIMIZE_IGNORED_ENV[@]} > 0 )); then
+    warn "Ignoring tuning overrides for --optimize (the profile is hardware-derived): ${OPTIMIZE_IGNORED_ENV[*]}"
+  fi
+  return 0
+}
+
 reset_operator_overrides() {
   local dry=${1:-0}
   local f=/etc/default/setup-tuning ex="${STATE_DIR}/explicit-options.conf"
@@ -293,7 +327,7 @@ reset_operator_overrides() {
         if [[ -n $moved ]]; then
           if (( ${#kept[@]} > 0 )); then
             {
-              printf '# Managed by setup.sh: host facts kept by --reset-overrides\n'
+              printf '# Managed by setup.sh: host facts kept by the managed profile reset\n'
               printf '%s\n' "${kept[@]}"
             } > "$f"
             chmod 644 "$f"
@@ -330,20 +364,18 @@ reset_operator_overrides() {
 
   if (( dry != 1 )); then
     # The setup.sh process sourced /etc/default/setup-tuning before parsing
-    # the command line, so the removed pins are still in memory.  Reset the
-    # ones that are not explicitly overridden in this run's environment.
-    # dry=2 (the --dry-run preview) does the same without moving any file, so
-    # the printed memory plan matches the real run.
-    [[ -n ${SETUP_TCP_CC+x} ]] || TCP_CC=bbr
-    [[ -n ${SETUP_QDISC+x} ]] || QDISC=fq
-    [[ $TCP_CC =~ ^[a-z0-9_]+$ ]] || TCP_CC=bbr
-    [[ $QDISC =~ ^[a-z0-9_]+$ ]] || QDISC=fq
-    [[ -n ${SETUP_PHP_JIT_WORDPRESS+x} ]] || PHP_JIT_WORDPRESS=1
-    [[ -n ${SETUP_PHP_PAGE_GZIP+x} ]] || PHP_PAGE_GZIP=1
-    [[ -n ${SETUP_PRECOMPRESS_ASSETS+x} ]] || PRECOMPRESS_ASSETS=0
-    [[ -n ${SETUP_XF_JOB_CRON+x} ]] || XF_JOB_CRON=1
-    [[ -n ${SETUP_LIMIT_REQ_EXEMPT+x} ]] || LIMIT_REQ_EXEMPT=""
-    [[ -n ${SETUP_STORAGE_CLASS+x} ]] || unset STORAGE_CLASS 2>/dev/null || true
+    # the command line, so the removed pins are still in memory.  Reset them
+    # to the profile defaults unconditionally: --optimize must not inherit a
+    # per-host tuning pin from the file or the environment.  dry=2 (the
+    # --dry-run preview) does the same without moving any file, so the printed
+    # memory plan matches the real run.
+    TCP_CC=bbr
+    QDISC=fq
+    PHP_JIT_WORDPRESS=1
+    PHP_PAGE_GZIP=1
+    PRECOMPRESS_ASSETS=0
+    LIMIT_REQ_EXEMPT=""
+    unset STORAGE_CLASS 2>/dev/null || true
     if [[ -f $anubis_marker && -z ${ANUBIS_SETTING:-} ]] \
        && ! printf '%s\n' "${kept[@]}" | grep -qE '^ANUBIS=0$'; then
       ANUBIS_ENABLED=1
@@ -353,7 +385,7 @@ reset_operator_overrides() {
 
   local a
   for a in "${RESET_ACTIONS[@]}"; do
-    if (( dry )); then printf '  - %s\n' "$a"; else info "reset-overrides: $a"; fi
+    if (( dry )); then printf '  - %s\n' "$a"; else info "profile reset: $a"; fi
   done
   if (( dry )); then
     if (( dry == 1 )); then

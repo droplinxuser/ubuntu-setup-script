@@ -26,7 +26,7 @@ Elasticsearch, Node.js and helper tools, plus per-domain vhosts.
 | `tests/test-tuning.sh`, `tests/test-dry-run-matrix.sh` | Unit tests for the tuning helpers; CLI/dry-run matrix (both run in CI) |
 | `tests/stress-site/` | Synthetic full-stack test site, local and remote load harness, results |
 | `tools/diff_configs.sh` | Compare the canonical configs of both repos with the live `/etc` |
-| `tools/fleet-update.sh` | Safe, logged host update: non-interactive APT, snapd guard, fresh setup.sh checkout, `--optimize --reset-overrides` dry run then apply, reboot notice |
+| `tools/fleet-update.sh` | Safe, logged host update: non-interactive APT, snapd guard, fresh setup.sh checkout, `--optimize` dry run then apply, reboot notice |
 | `SECURITY-PERFORMANCE.md` | What the script hardens, what it leaves to the operator, and the large-site checklist |
 
 ## Requirements
@@ -81,7 +81,7 @@ bash setup.sh --upgrade-php=8.6 --dry-run
 | `--elastic [host=] [ram=]` | Elasticsearch | [Elasticsearch](#elasticsearch---elastic) |
 | `--others ITEM... \| all` | helper packages | [Other packages](#other-packages---others) |
 | `--domain DOMAIN [app=] [db=] [user=] [pass=] [sql=]` | vhost, certificate and optional database | [Domains](#domains---domain) |
-| `--optimize [anubis=yes\|no] [--reset-overrides]` | tune the OS and every installed service in place; optionally enable/disable Anubis and ignore recorded overrides | [`--optimize`](#--optimize) |
+| `--optimize [anubis=yes\|no]` | tune the OS and every installed service in place; optionally enable/disable Anubis. Recorded tuning overrides are always ignored | [`--optimize`](#--optimize) |
 | `--upgrade-php=X.Y` | replace the installed PHP version in place | [`--upgrade-php`](#--upgrade-phpxy) |
 | `--diagnostics` | write a redacted `diagnostics.log`; read-only | [Maintenance](#--diagnostics---restart-all---purge) |
 | `--restart-all` | ordered restart of every active service | [Maintenance](#--diagnostics---restart-all---purge) |
@@ -93,7 +93,7 @@ bash setup.sh --upgrade-php=8.6 --dry-run
 
 | Option | Default | Effect |
 |---|---|---|
-| `server=dedi\|vps` | auto (`systemd-detect-virt`, DMI, cgroups) | `dedi` sets the `performance` CPU governor; the pin is recorded so `--optimize` keeps the host class |
+| `server=dedi\|vps` | auto (`systemd-detect-virt`, DMI, cgroups) | `dedi` sets the `performance` CPU governor; this is an install-time hint, `--optimize` re-detects the class from the hardware |
 | `host=FQDN` | `<threads>c-<RAM_GB>g-<storage>` (e.g. `8c-32g-1T`) | hostname via `hostnamectl`; a repeat `--basic` without `host=` keeps the current name |
 | `swap=SIZE` | add swap only when total swap is 0 or below 50% of RAM, up to 50% of RAM (1-8 GiB, 4 GiB on a VPS) | `/swapfile` of exactly that size (`8G`, `8Gi`, `512M`) |
 | `time=REGION/CITY` | `Asia/Manila` | timezone; a repeat `--basic` without `time=` keeps the current zone |
@@ -145,7 +145,7 @@ Environment options:
 |---|---|---|
 | `SETUP_BROTLI_LEVEL=1..11` | 4 (3 on 1-2 CPU hosts) | dynamic Brotli level; gzip is the fallback |
 | `SETUP_ANGIE_COMPRESSION=0` | on | turns the managed compression profile off |
-| `SETUP_PRECOMPRESS_ASSETS=1` | off (a CDN normally serves assets) | writes `.br`/`.gz` siblings for the static assets of every XenForo/WordPress root and keeps them fresh from cron; persisted as `PRECOMPRESS_ASSETS` in `/etc/default/setup-tuning` |
+| `SETUP_PRECOMPRESS_ASSETS=1` | off (a CDN normally serves assets) | writes `.br`/`.gz` siblings for the static assets of every XenForo/WordPress root and keeps them fresh from cron.  Install-time only: `--optimize` ignores the tuning override and uses the default (off) |
 | `SETUP_XF_JOB_CRON=0` | on | removes the managed crontab entry that runs `cmd.php xf:run-jobs` once a minute as www-data for every XenForo root; persisted as `XF_JOB_CRON` |
 | `CONFIG_REPO_URL`, `CONFIG_REPO_REF` | `droplinxuser/server-configs-nginx`, `main` | select a fork or branch of the configuration tree |
 | `CONFIG_SOURCE_DIR=/path` | unset | use a local checkout instead of downloading |
@@ -263,10 +263,10 @@ Environment options:
 
 | Variable | Default | Effect |
 |---|---|---|
-| `SETUP_PHP_WORKERS_PER_CPU` | by host class (see the pool table) | pins the workers-per-CPU factor |
+| `SETUP_PHP_WORKERS_PER_CPU` | by host class (see the pool table) | pins the workers-per-CPU factor for an install/one run; `--optimize` ignores it |
 | `SETUP_PHP_JIT_HOT_LOOP`, `_FUNC`, `_RETURN`, `_SIDE_EXIT` | PHP defaults on 4+ CPU hosts; a conservative set on 1-2 CPUs | JIT hotness thresholds |
-| `SETUP_PHP_JIT_WORDPRESS=0` | 1 (WordPress uses the JIT) | keeps `opcache.jit = off` for every WordPress document root through a `[PATH=<root>]` section of the managed ini, for a site that misbehaves with the JIT; persisted as `PHP_JIT_WORDPRESS` |
-| `SETUP_PHP_PAGE_GZIP=0` | 1 | by default the managed ini turns `zlib.output_compression` (level 4) on in a `[PATH=<root>]` section for every WordPress and Chevereto document root whose guest cache key carries the encoding token, so the FastCGI cache stores the gzip page (0.12 ms of Angie CPU per hit instead of about 1 ms to compress each hit); Chevereto roots also get PHP session GC (`session.gc_probability = 1`, divisor 1000) because no timer cleans its session directory; persisted as `PHP_PAGE_GZIP` |
+| `SETUP_PHP_JIT_WORDPRESS=0` | 1 (WordPress uses the JIT) | keeps `opcache.jit = off` for every WordPress document root through a `[PATH=<root>]` section of the managed ini, for a site that misbehaves with the JIT.  Tuning override: ignored by `--optimize` |
+| `SETUP_PHP_PAGE_GZIP=0` | 1 | by default the managed ini turns `zlib.output_compression` (level 4) on in a `[PATH=<root>]` section for every WordPress and Chevereto document root whose guest cache key carries the encoding token, so the FastCGI cache stores the gzip page (0.12 ms of Angie CPU per hit instead of about 1 ms to compress each hit); Chevereto roots also get PHP session GC (`session.gc_probability = 1`, divisor 1000) because no timer cleans its session directory; tuning override: ignored by `--optimize` (profile default 1) |
 | `SETUP_PHP_SESSION_HARDENING=1` | off | opt-in `session.*` strict settings, `cgi.fix_pathinfo=0`, `display_errors=Off` and a central `error_log`; it broke Joomla/Polr logins on a mixed host |
 
 Install behaviour:
@@ -360,7 +360,7 @@ Environment option:
 
 | Variable | Default | Effect |
 |---|---|---|
-| `SETUP_MARIADB_IO_CAPACITY="r m"` | by disk and host class | pins `innodb_io_capacity` and `innodb_io_capacity_max` |
+| `SETUP_MARIADB_IO_CAPACITY="r m"` | by disk and host class | pins `innodb_io_capacity` and `innodb_io_capacity_max` for an install/one run; `--optimize` ignores it |
 
 After a large `--domain ... sql=` import or an application-level bulk seed, run
 `--optimize` again (or pass `--mariadb size=...`) so the buffer pool is
@@ -578,9 +578,12 @@ suspended errexit for the whole run). Steps:
 
 Explicit values (`--basic server=`, `--php children=`/`max_requests=`,
 `--mariadb size=`, `--valkey ram=`, `--elastic ram=`) are recorded in
-`/var/lib/setup.sh/explicit-options.conf` and kept by later runs; a
-`--mariadb size=`/`--valkey ram=` under the 128 MB planner floor is raised
-to 128m with a warning so install and the first `--optimize` agree.
+`/var/lib/setup.sh/explicit-options.conf` for the installation run. They are
+not a permanent override: `--optimize` always moves that file to `/tmp` and
+recomputes workers, pool sizes and the dedi/vps class from the current
+hardware, so a fleet with the same hardware converges on one profile. An
+under-floor `--mariadb size=`/`--valkey ram=` is still raised to 128m with a
+warning so install and the first `--optimize` agree.
 
 Install and `--optimize` write the same files from the same functions. The
 one documented difference is timing: `--domain app=xf|wordpress` creates an
@@ -588,45 +591,33 @@ empty document root, so the application-aware PHP worker cap and the
 per-root OPcache JIT sections can only apply once the application files
 exist, on the first `--optimize` after the upload (or after a `sql=` import).
 
-## Rolling a new profile out to existing servers (`--reset-overrides`)
+## Profile pins and tuning overrides
 
-A plain `--optimize` re-applies everything the script owns: the Angie tree
-(including `ssl_buffer_size`, the worker ratio and cache locations), the PHP
-pool/ini (OPcache, huge pages, tracing JIT), MariaDB/Valkey/Elasticsearch and
-the Anubis unit. What it deliberately does **not** overwrite is anything an
-operator recorded or fixed by hand:
+`--optimize` always recomputes the whole profile from the current hardware.
+It no longer has an opt-in reset flag: every recorded tuning override is
+ignored and moved to `/tmp` (never deleted) before the tuners run, and tuning
+environment variables are ignored with a warning. Two servers with the same
+hardware therefore get the same profile.
 
-| Preserved by a plain `--optimize` | Why | Where |
-|---|---|---|
-| `TCP_CC`, `QDISC`, `STORAGE_CLASS` pins | an operator choice for a lossy link or a slow disk | `/etc/default/setup-tuning` |
-| `PHP_JIT_WORDPRESS`, `PHP_PAGE_GZIP`, `PRECOMPRESS_ASSETS`, `XF_JOB_CRON`, `LIMIT_REQ_EXEMPT` | feature toggles a site may depend on | `/etc/default/setup-tuning` |
-| explicit `php_children`/`max_requests`, MariaDB/Valkey/ES sizes, `server_type` | recorded `--php children=`/`--mariadb size=` choices | `/var/lib/setup.sh/explicit-options.conf` |
-| extra PHP `.ini` files, extra FPM pools, `custom.d/*.conf` | operator application config | `/etc/php`, `/etc/angie/custom.d` |
-| third-party sysctl drop-ins/units | Docker, cloud-init, a host agent | `/etc/sysctl.d`, `/etc/systemd/system` |
-| application config (`wp-config.php`, XF `config.php`, `.env`) | never edited by the tuner | `/var/www` |
+What the reset does on every `--optimize`:
 
-When a fleet must adopt a new profile, run one command per host:
+| Moved/ignored | Detail |
+|---|---|
+| `/etc/default/setup-tuning` | rewritten with only host facts/feature choices: `ANUBIS`, `ANUBIS_STATIC_BYPASS`, `XF_JOB_CRON`, `NODE_MAJOR`, `NODE_ALLOW_MAJOR_UPGRADE`. Old `TCP_CC`, `QDISC`, `STORAGE_CLASS`, compression/JIT/page-cache and rate-limit pins no longer survive |
+| `/var/lib/setup.sh/explicit-options.conf` | moved to `/tmp`; recorded `php_children`/`max_requests`, MariaDB/Valkey/ES sizes and the dedi/vps pin are dropped and the shared memory plan recomputes them |
+| tuning environment | `SETUP_TCP_CC`, `SETUP_QDISC`, `SETUP_STORAGE_CLASS`, `SETUP_PHP_WORKERS_PER_CPU`, `SETUP_PHP_JIT_HOT_*`, `SETUP_GZIP_LEVEL`, `SETUP_BROTLI_LEVEL`, `SETUP_ANGIE_COMPRESSION`, `SETUP_MARIADB_IO_CAPACITY`, `SETUP_LIMIT_REQ_EXEMPT`, `SETUP_PRECOMPRESS_ASSETS`, `SETUP_PHP_PAGE_GZIP`, `SETUP_PHP_JIT_WORDPRESS` are unset for the run and listed in the report/warning |
 
-```bash
-# preview exactly what would be cleared and which foreign sources remain
-sudo bash setup.sh --optimize --reset-overrides --dry-run
+Feature choices are not performance overrides and still apply: `anubis=yes|no`
+(and `SETUP_ANUBIS*`), `NODE_MAJOR`, the WordPress/Chevereto cache and security
+toggles, and the `CONFIG_*` source knobs.
 
-# apply: ignore every recorded override for this run and recompute the profile
-sudo bash setup.sh --optimize --reset-overrides anubis=yes
-```
+What is still **preserved** (never moved or edited by the reset):
 
-`--reset-overrides`:
-
-- moves `/etc/default/setup-tuning` to `/tmp` and writes back only the host
-  facts/feature state that must survive: `ANUBIS`, `ANUBIS_STATIC_BYPASS`,
-  `NODE_MAJOR`, `NODE_ALLOW_MAJOR_UPGRADE`. An old `TCP_CC=cubic` or
-  `QDISC=fq_codel` pin no longer survives; the run uses `bbr`/`fq` (or
-  `SETUP_TCP_CC`/`SETUP_QDISC` from the environment if you pass them);
-- moves `/var/lib/setup.sh/explicit-options.conf` to `/tmp`, so the hardware
-  plan recomputes workers, pool sizes and the dedi/vps class;
-- re-applies the OS profile and every service tuner;
-- never deletes a file (the originals are in `/tmp`, as with every managed
-  change), and never touches application config.
+| Preserved | Where |
+|---|---|
+| extra PHP `.ini` files, extra FPM pools, Angie `custom.d/*.conf` | `/etc/php`, `/etc/angie/custom.d` |
+| third-party sysctl drop-ins/units | `/etc/sysctl.d`, `/etc/systemd/system` |
+| application config (`wp-config.php`, XF `config.php`, `.env`) | `/var/www` |
 
 Third-party sysctl files are left in place. To guarantee they cannot win
 after the next reboot, `configure_sysctl` installs
@@ -653,7 +644,7 @@ Fleet example:
 
 ```bash
 for h in web1 web2 web3; do
-  ssh root@"$h" 'bash /root/ubuntu-setup-script/setup.sh --optimize --reset-overrides anubis=yes'
+  ssh root@"$h" 'bash /root/ubuntu-setup-script/setup.sh --optimize anubis=yes'
 done
 ```
 
@@ -740,7 +731,7 @@ data directory (NVMe / SSD / HDD) and the host class (`dedi`/`vps`).
 
 | Area | Rule |
 |---|---|
-| PHP-FPM | `pm = static`, `pm.max_children` = logical CPUs x the host's blocking factor (1.0 for a local database on flash, 1.5 for a shared/virtual CPU or a remote database, 2.0 for spinning disks), bounded by the RAM plan; a pool sized by hand is normalised to the same count, so a fresh install and `--optimize` write the same value (a 64-thread board left on 512 static workers is set to 64). `SETUP_PHP_WORKERS_PER_CPU` pins the factor; an explicit `--php children=` wins and is clamped to floor..max(512, 2 x CPUs). `pm.max_requests = threads x 1024`, `request_terminate_timeout 300s`, slow log at 10 s, `rlimit_files 524288`, systemd `LimitNOFILE=524288`/`UMask=0027`. `opcache.max_accelerated_files` = PHP files under the vhost roots x 1.5 (16384..128256; the ceiling when no root is found); `memory_limit`, OPcache, JIT buffer and realpath sizes from one RAM profile shared with the dry run |
+| PHP-FPM | `pm = static`, `pm.max_children` = logical CPUs x the host's blocking factor (1.0 for a local database on flash, 1.5 for a shared/virtual CPU or a remote database, 2.0 for spinning disks), bounded by the RAM plan; a pool sized by hand is normalised to the same count, so a fresh install and `--optimize` write the same value (a 64-thread board left on 512 static workers is set to 64). `SETUP_PHP_WORKERS_PER_CPU` pins the factor for an install/one run; an explicit `--php children=` wins during that run and is clamped to floor..max(512, 2 x CPUs); `--optimize` ignores both and uses the hardware count. `pm.max_requests = threads x 1024`, `request_terminate_timeout 300s`, slow log at 10 s, `rlimit_files 524288`, systemd `LimitNOFILE=524288`/`UMask=0027`. `opcache.max_accelerated_files` = PHP files under the vhost roots x 1.5 (16384..128256; the ceiling when no root is found); `memory_limit`, OPcache, JIT buffer and realpath sizes from one RAM profile shared with the dry run |
 | MariaDB | see the service section: pool from live data with floor `clamp(RAM/16, 256 MB, 4 GB)` for an empty or unmeasured database, io_capacity by disk x host, thread pool, connections from the PHP pool, table caches from connections, Aria page cache `clamp(RAM/128, 16, 256) MB` |
 | Elasticsearch | heap = store/4 (512 MB..25% RAM..31 GB); `node.processors` = effective CPUs; search threads cpus/2 (max 16), write threads cpus/4 (max 8) |
 | Valkey / Redis | maxmemory = live +20% with floor `clamp(RAM/64, 128 MB, 1 GB)`; maxclients from the PHP pool; io_threads 1..8 (a larger `io_threads=` is clamped with a warning) |
@@ -751,41 +742,46 @@ data directory (NVMe / SSD / HDD) and the host class (`dedi`/`vps`).
 
 ### Environment overrides
 
-Persisted in `/etc/default/setup-tuning`, so a later plain `--optimize` keeps
-them:
+Feature choices are persisted in `/etc/default/setup-tuning` and still apply
+to a later `--optimize`. Tuning variables are **not** overrides for
+`--optimize`: it unsets them for the run and recomputes the profile from the
+hardware (with a warning), see
+[Profile pins and tuning overrides](#profile-pins-and-tuning-overrides).
+
+Feature choices (persisted, honoured by `--optimize`):
 
 | Variable | Values | Effect |
 |---|---|---|
-| `SETUP_LIMIT_REQ_EXEMPT` | `"ip,cidr,..."` | rate-limit exemptions for a load generator or monitor; an empty value clears them |
-| `SETUP_PRECOMPRESS_ASSETS` | `0\|1` | static-asset precompression |
 | `SETUP_XF_JOB_CRON` | `0\|1` | managed XenForo job-runner crontab entry |
-| `SETUP_PHP_JIT_WORDPRESS` | `0\|1` | 0 exempts WordPress roots from the always-on tracing JIT |
-| `SETUP_PHP_PAGE_GZIP` | `0\|1` | 0 stops PHP from gzipping WordPress/Chevereto pages for the guest cache (default 1: the cache stores the compressed page) |
-| `SETUP_STORAGE_CLASS` | `nvme\|ssd\|hdd` | pins the storage class when the kernel cannot see the medium (read on each run; persist it as `STORAGE_CLASS=` in `/etc/default/setup-tuning`) |
 | `SETUP_NODE_MAJOR` | major number | Node.js major installed by `--others nodejs` |
-
-Read on each run, not persisted:
-
-| Variable | Effect |
-|---|---|
-| `SETUP_TCP_CC`, `SETUP_QDISC` | congestion control and qdisc for one run (default BBR + fq); to pin a host, set `TCP_CC=`/`QDISC=` in `/etc/default/setup-tuning` |
-| `SETUP_MARIADB_IO_CAPACITY` | pins `innodb_io_capacity`/`_max` |
-| `SETUP_BROTLI_LEVEL`, `SETUP_GZIP_LEVEL` | dynamic compression levels |
-| `SETUP_ANGIE_COMPRESSION` | 0 turns the managed compression profile off |
-| `SETUP_PHP_WORKERS_PER_CPU` | pins the PHP-FPM workers-per-CPU factor |
-| `SETUP_PHP_JIT_HOT_LOOP`, `_FUNC`, `_RETURN`, `_SIDE_EXIT` | JIT hotness thresholds |
-| `SETUP_PHP_SESSION_HARDENING` | 1 enables the opt-in session/cgi hardening |
-| `SETUP_WP_DB_SPLIT` | 0 keeps a WordPress `DB_USER` with global privileges as it is |
-| `SETUP_WP_ALLOW_FILE_MODS` | 1 keeps WordPress plugin installs enabled |
-| `SETUP_WP_GUEST_CACHE` | 0 keeps the WordPress guest-cache include off; `--optimize` adds it to vhosts that lack it by default |
-| `SETUP_PURGE_MALWARE` | 1 deletes known webshells instead of quarantining them |
-| `SETUP_DOMAIN_OPTIMIZE` | 0 skips the tuning pass at the end of `--domain` |
-| `SETUP_CHEV_GUEST_CACHE` | 1 forces the Chevereto guest cache on, 0 off; by default it is on unless the site allows guest uploads |
-| `SETUP_NODE_ALLOW_MAJOR_UPGRADE` | 1 allows a one-off Node.js major switch |
-| `SETUP_ANUBIS_LANGUAGE` | language Anubis uses for its own challenge/error pages (default `en`, the only catalogue complete in every shipped release; `th` currently panics upstream). The application still gets the visitor's `Accept-Language` |
-| `SETUP_UFW_SSH_LIMIT` | 1 (default) rate-limits the SSH port with `ufw limit` (6 new connections per 30 s per address); 0 writes a plain `ufw allow` rule for automation hosts (see troubleshooting) |
+| `SETUP_NODE_ALLOW_MAJOR_UPGRADE` | `1` | allows a one-off Node.js major switch |
+| `SETUP_ANUBIS_LANGUAGE` | language | Anubis UI language (default `en`, the only catalogue complete in every shipped release; `th` currently panics upstream). The application still gets the visitor's `Accept-Language` |
+| `SETUP_UFW_SSH_LIMIT` | `0\|1` | 1 (default) rate-limits the SSH port with `ufw limit` (6 new connections per 30 s per address); 0 writes a plain `ufw allow` rule for automation hosts (see troubleshooting) |
+| `SETUP_PHP_SESSION_HARDENING` | `1` | opt-in session/cgi hardening |
+| `SETUP_WP_DB_SPLIT` | `0` | keeps a WordPress `DB_USER` with global privileges as it is |
+| `SETUP_WP_ALLOW_FILE_MODS` | `1` | keeps WordPress plugin installs enabled |
+| `SETUP_WP_GUEST_CACHE` | `0` | keeps the WordPress guest-cache include off |
+| `SETUP_CHEV_GUEST_CACHE` | `1\|0` | forces the Chevereto guest cache on/off |
+| `SETUP_PURGE_MALWARE` | `1` | deletes known webshells instead of quarantining them |
+| `SETUP_DOMAIN_OPTIMIZE` | `0` | skips the tuning pass at the end of `--domain` |
 | `CONFIG_REPO_URL`, `CONFIG_REPO_REF`, `CONFIG_SOURCE_DIR` | source of the Angie configuration tree |
 | `SETUP_STATE_DIR` | private state directory for tests and image builds |
+
+Tuning overrides (ignored by `--optimize`, which uses the hardware profile):
+
+| Variable | Effect when set |
+|---|---|
+| `SETUP_TCP_CC`, `SETUP_QDISC` | congestion control and qdisc (profile default BBR + fq) |
+| `SETUP_STORAGE_CLASS` | `nvme\|ssd\|hdd` pin when the kernel cannot see the medium |
+| `SETUP_PHP_WORKERS_PER_CPU` | PHP-FPM workers-per-CPU factor |
+| `SETUP_PHP_JIT_HOT_LOOP`, `_FUNC`, `_RETURN`, `_SIDE_EXIT` | JIT hotness thresholds |
+| `SETUP_GZIP_LEVEL`, `SETUP_BROTLI_LEVEL` | dynamic compression levels |
+| `SETUP_ANGIE_COMPRESSION` | 0 turns the managed compression profile off |
+| `SETUP_MARIADB_IO_CAPACITY` | `innodb_io_capacity`/`_max` |
+| `SETUP_LIMIT_REQ_EXEMPT` | rate-limit exemptions for a load generator or monitor |
+| `SETUP_PRECOMPRESS_ASSETS` | static-asset precompression (profile default 0) |
+| `SETUP_PHP_PAGE_GZIP` | PHP page gzip for the guest cache (profile default 1) |
+| `SETUP_PHP_JIT_WORDPRESS` | 0 exempts WordPress roots from the tracing JIT (profile default 1) |
 
 ## `--diagnostics`, `--restart-all`, `--purge`
 
@@ -896,8 +892,8 @@ tests. Angie configuration and Cloudflare IP ranges are downloaded.
 | Path | Purpose |
 |---|---|
 | `/run/setup.sh.lock`, `/tmp/setup-optimize.*` | run lock; `--optimize` rollback backups |
-| `/var/lib/setup.sh/` | originals for `--purge basic`, UFW/swap state, package-origin markers, `explicit-options.conf` |
-| `/etc/default/setup-tuning` | persisted overrides (`TCP_CC`, `QDISC`, `LIMIT_REQ_EXEMPT`, `PRECOMPRESS_ASSETS`, `PHP_JIT_WORDPRESS`, `NODE_MAJOR`) |
+| `/var/lib/setup.sh/` | originals for `--purge basic`, UFW/swap state, package-origin markers, and `explicit-options.conf` (moved to `/tmp` by every `--optimize`) |
+| `/etc/default/setup-tuning` | host facts/feature choices kept by `--optimize` (`ANUBIS`, `NODE_MAJOR`, ...); tuning pins are cleared on each run |
 | `/etc/angie/` | Angie tree (`conf.d/<domain>.conf`, `ssl/<domain>/`, `http.d/zz-setup-*.conf` managed maps/zones) |
 | `/home/nginx_cache*`, `/home/xf_proxy_cache`, `/home/proxy_cache*` | Angie cache directories |
 | `/etc/php/<ver>/fpm/conf.d/zz-setup-optimize.ini`, `custom_dan.ini`, `pool.d/www.conf` | PHP tuning |

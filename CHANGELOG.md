@@ -3,6 +3,42 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.32 (2026-11-18)
+
+- **`--optimize` always recomputes the hardware profile; the
+  `--reset-overrides` option is removed.**  The reset used to be an opt-in
+  flag, so a host tuned by an older release or fixed by hand kept its old
+  values.  It now runs on every `--optimize` before the tuners:
+  `/etc/default/setup-tuning` is rewritten with only host facts/feature
+  choices (`ANUBIS`, `ANUBIS_STATIC_BYPASS`, `XF_JOB_CRON`, `NODE_MAJOR`,
+  `NODE_ALLOW_MAJOR_UPGRADE`), and
+  `/var/lib/setup.sh/explicit-options.conf` is moved to `/tmp` (never
+  deleted), dropping recorded `php_children`/`max_requests`,
+  MariaDB/Valkey/Elasticsearch sizes and the dedi/vps pin.  `--reset-overrides`
+  is now an unknown argument; `tools/fleet-update.sh` no longer passes it.
+- **Tuning overrides are ignored and disallowed for `--optimize`.**  The
+  tuning environment variables (`SETUP_TCP_CC`, `SETUP_QDISC`,
+  `SETUP_STORAGE_CLASS`, `SETUP_PHP_WORKERS_PER_CPU`, `SETUP_PHP_JIT_HOT_*`,
+  `SETUP_GZIP_LEVEL`, `SETUP_BROTLI_LEVEL`, `SETUP_ANGIE_COMPRESSION`,
+  `SETUP_MARIADB_IO_CAPACITY`, `SETUP_LIMIT_REQ_EXEMPT`,
+  `SETUP_PRECOMPRESS_ASSETS`, `SETUP_PHP_PAGE_GZIP`,
+  `SETUP_PHP_JIT_WORDPRESS`) are unset for the run, listed in the report and
+  in a warning, and `bbr`/`fq` plus the profile defaults are restored in
+  memory even when the persisted file or the environment pinned them.  Two
+  servers with the same hardware therefore get the same profile.  Feature
+  choices (`ANUBIS`/`anubis=`, Node major, application cache and security
+  toggles) and the `CONFIG_*` source knobs still apply; explicit
+  `--php children=`, `--mariadb size=`, etc. remain install-time values and
+  are recomputed on the next `--optimize`.  Application config, extra PHP
+  ini/pools, Angie `custom.d` and third-party sysctl files are still never
+  touched.
+- `--dry-run --optimize` always prints the profile reset preview and the
+  ignored environment overrides.
+- Validation: 970 tuning checks (6 new), 212 dry-run matrix cases, ShellCheck
+  clean.  On the production host the dry run prints `TCP_CC=bbr QDISC=fq`,
+  the ignored `SETUP_*` overrides and the recomputed plan; the removed flag
+  exits 1 with `Unknown argument`.
+
 ## 1.21.31 (2026-11-18)
 
 Anubis fixes from the `origin-host` production host (Ubuntu 24.04,
