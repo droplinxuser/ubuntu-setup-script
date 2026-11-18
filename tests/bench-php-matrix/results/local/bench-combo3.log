@@ -1,0 +1,23 @@
+== combo 3 setup
+== writing /root/audit/combo3.tsv
+  guest_cached   8.2     58896 req/s  p50 1.35ms    p99 4.85ms   
+  guest_uncached 8.2       652 req/s  p50 147.56ms  p99 170.49ms 
+  member_home    8.2       528 req/s  p50 181.31ms  p99 213.25ms 
+  member_thread  8.2       432 req/s  p50 217.96ms  p99 297.99ms 
+  guest_cached   8.3     58631 req/s  p50 1.38ms    p99 4.90ms   
+  guest_uncached 8.3       650 req/s  p50 147.76ms  p99 169.03ms 
+  member_home    8.3       533 req/s  p50 178.07ms  p99 224.68ms 
+  member_thread  8.3       434 req/s  p50 217.45ms  p99 291.89ms 
+  guest_cached   8.4     59549 req/s  p50 1.36ms    p99 4.93ms   
+  guest_uncached 8.4       650 req/s  p50 149.01ms  p99 169.58ms 
+  member_home    8.4       538 req/s  p50 177.33ms  p99 205.10ms 
+  member_thread  8.4       431 req/s  p50 221.10ms  p99 255.15ms 
+  guest_cached   8.5     56574 req/s  p50 1.49ms    p99 4.93ms   
+  guest_uncached 8.5       656 req/s  p50 146.97ms  p99 167.58ms 
+  member_home    8.5       537 req/s  p50 176.93ms  p99 225.47ms 
+  member_thread  8.5       432 req/s  p50 217.87ms  p99 297.20ms 
+  guest_cached   8.6     57760 req/s  p50 1.43ms    p99 4.91ms   
+  guest_uncached 8.6       660 req/s  p50 146.80ms  p99 166.70ms 
+  member_home    8.6       536 req/s  p50 181.43ms  p99 227.56ms 
+  member_thread  8.6       434 req/s  p50 218.90ms  p99 296.14ms 
+== combo 3 complete

@@ -1,0 +1,24 @@
+== disable Anubis and page cache, disable Valkey data cache
+angie: the configuration file /etc/angie/angie.conf syntax is ok
+angie: configuration file /etc/angie/angie.conf test is successful
+  8.2  guest_uncached    582 req/s p50/p99 13.79ms/15.54ms
+  8.2  member_home       521 req/s p50/p99 15.37ms/17.24ms
+angie: the configuration file /etc/angie/angie.conf syntax is ok
+angie: configuration file /etc/angie/angie.conf test is successful
+  8.3  guest_uncached    577 req/s p50/p99 13.89ms/15.77ms
+  8.3  member_home       517 req/s p50/p99 15.49ms/17.45ms
+angie: the configuration file /etc/angie/angie.conf syntax is ok
+angie: configuration file /etc/angie/angie.conf test is successful
+  8.4  guest_uncached    580 req/s p50/p99 13.79ms/15.60ms
+  8.4  member_home       525 req/s p50/p99 15.25ms/17.15ms
+angie: the configuration file /etc/angie/angie.conf syntax is ok
+angie: configuration file /etc/angie/angie.conf test is successful
+  8.5  guest_uncached    588 req/s p50/p99 13.60ms/15.40ms
+  8.5  member_home       530 req/s p50/p99 15.10ms/16.99ms
+angie: the configuration file /etc/angie/angie.conf syntax is ok
+angie: configuration file /etc/angie/angie.conf test is successful
+  8.6  guest_uncached    593 req/s p50/p99 13.50ms/15.27ms
+  8.6  member_home       534 req/s p50/p99 14.98ms/16.79ms
+angie: the configuration file /etc/angie/angie.conf syntax is ok
+angie: configuration file /etc/angie/angie.conf test is successful
+== efficiency done: /root/audit/efficiency.tsv

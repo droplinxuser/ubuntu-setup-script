@@ -1,0 +1,6 @@
+== combo 3 for PHP 8.4
+  guest_cached   8.4    148069 req/s p50 696.00us  p99 1.10ms   
+  guest_uncached 8.4       592 req/s p50 164.95ms  p99 205.16ms 
+  member_home    8.4       540 req/s p50 179.63ms  p99 245.09ms 
+  member_thread  8.4       691 req/s p50 141.71ms  p99 167.82ms 
+== combo 3 done

@@ -1,0 +1,5 @@
+tier	run	rps	p50	p99
+guest_uncached	1	623	155.48ms	184.51ms
+member_home	1	547	175.55ms	201.09ms
+guest_uncached	2	616	156.38ms	179.27ms
+member_home	2	541	176.26ms	203.61ms

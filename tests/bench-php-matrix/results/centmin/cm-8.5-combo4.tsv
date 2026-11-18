@@ -1,0 +1,5 @@
+combo	php	tier	rps	p50	p99	non2xx	errors	nginx_cores	php_cores	mariadb_cores	redis_cores	anubis_cores
+4	8.5	guest_cached	59371	1.59ms	4.83ms	0		2.47	0.00	0.00	0.00	6.41
+4	8.5	guest_uncached	573	170.95ms	210.53ms	0		0.15	10.08	1.38	0.08	0.18
+4	8.5	member_home	521	185.58ms	243.54ms	0		0.14	10.20	1.36	0.08	0.17
+4	8.5	member_thread	664	146.93ms	191.29ms	0		0.17	10.22	1.11	0.08	0.20

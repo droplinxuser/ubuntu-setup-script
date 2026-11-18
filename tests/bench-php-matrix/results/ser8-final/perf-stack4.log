@@ -1,0 +1,7 @@
+== combo 4 setup
+== writing /root/audit/combo4.tsv
+  guest_cached   8.5     30524 req/s  p50 2.97ms    p99 9.56ms   
+  guest_uncached 8.5       628 req/s  p50 157.12ms  p99 171.64ms 
+  member_home    8.5       534 req/s  p50 184.91ms  p99 221.27ms 
+  member_thread  8.5       470 req/s  p50 205.58ms  p99 234.61ms 
+== combo 4 complete

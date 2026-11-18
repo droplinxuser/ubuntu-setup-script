@@ -1,0 +1,23 @@
+== combo 2 setup
+== writing /root/audit/combo2.tsv
+  guest_cached   8.2       685 req/s  p50 141.76ms  p99 160.49ms 
+  guest_uncached 8.2       665 req/s  p50 144.93ms  p99 164.23ms 
+  member_home    8.2       538 req/s  p50 178.96ms  p99 219.49ms 
+  member_thread  8.2       440 req/s  p50 214.44ms  p99 288.82ms 
+  guest_cached   8.3       657 req/s  p50 146.78ms  p99 166.26ms 
+  guest_uncached 8.3       651 req/s  p50 147.59ms  p99 171.99ms 
+  member_home    8.3       530 req/s  p50 179.02ms  p99 226.94ms 
+  member_thread  8.3       430 req/s  p50 218.31ms  p99 307.40ms 
+  guest_cached   8.4       658 req/s  p50 146.68ms  p99 166.38ms 
+  guest_uncached 8.4       654 req/s  p50 147.16ms  p99 166.82ms 
+  member_home    8.4       534 req/s  p50 178.21ms  p99 216.62ms 
+  member_thread  8.4       432 req/s  p50 218.13ms  p99 306.93ms 
+  guest_cached   8.5       663 req/s  p50 145.46ms  p99 166.07ms 
+  guest_uncached 8.5       659 req/s  p50 146.35ms  p99 167.53ms 
+  member_home    8.5       537 req/s  p50 176.77ms  p99 209.91ms 
+  member_thread  8.5       434 req/s  p50 217.90ms  p99 277.89ms 
+  guest_cached   8.6       650 req/s  p50 150.05ms  p99 167.15ms 
+  guest_uncached 8.6       651 req/s  p50 147.30ms  p99 169.71ms 
+  member_home    8.6       536 req/s  p50 177.17ms  p99 205.66ms 
+  member_thread  8.6       432 req/s  p50 220.32ms  p99 255.94ms 
+== combo 2 complete

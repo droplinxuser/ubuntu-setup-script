@@ -1,0 +1,6 @@
+== combo 1 for PHP 8.2
+  guest_cached   8.2       598 req/s p50 164.73ms  p99 197.87ms 
+  guest_uncached 8.2       594 req/s p50 164.27ms  p99 199.68ms 
+  member_home    8.2       532 req/s p50 182.07ms  p99 221.26ms 
+  member_thread  8.2       710 req/s p50 140.53ms  p99 168.66ms 
+== combo 1 done
