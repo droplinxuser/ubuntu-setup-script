@@ -782,6 +782,7 @@ Read on each run, not persisted:
 | `SETUP_DOMAIN_OPTIMIZE` | 0 skips the tuning pass at the end of `--domain` |
 | `SETUP_CHEV_GUEST_CACHE` | 1 forces the Chevereto guest cache on, 0 off; by default it is on unless the site allows guest uploads |
 | `SETUP_NODE_ALLOW_MAJOR_UPGRADE` | 1 allows a one-off Node.js major switch |
+| `SETUP_ANUBIS_LANGUAGE` | language Anubis uses for its own challenge/error pages (default `en`, the only catalogue complete in every shipped release; `th` currently panics upstream). The application still gets the visitor's `Accept-Language` |
 | `SETUP_UFW_SSH_LIMIT` | 1 (default) rate-limits the SSH port with `ufw limit` (6 new connections per 30 s per address); 0 writes a plain `ufw allow` rule for automation hosts (see troubleshooting) |
 | `CONFIG_REPO_URL`, `CONFIG_REPO_REF`, `CONFIG_SOURCE_DIR` | source of the Angie configuration tree |
 | `SETUP_STATE_DIR` | private state directory for tests and image builds |
@@ -886,6 +887,8 @@ tests. Angie configuration and Cloudflare IP ranges are downloaded.
 | PHP-FPM slow log full of queued requests | `request_slowlog_timeout` counts from accept; check `listen queue` in `/fpm-status.php`, add workers or cache the endpoint |
 | "upstream prematurely closed connection" during a load test | worker recycling at `pm.max_requests` or an FPM reload; set `pm.max_requests = 0` for a benchmark |
 | `--domain` says Angie or MariaDB is missing | it only creates the vhost/database; install the stack first or combine the flags |
+| Every page (and every image) answers 502 right after `anubis=yes` on a host that only accepts traffic from its CDN | the vhost had `if ($realip_remote_addr != "<edge IP>") { return 444; }`; behind Anubis the direct peer is the local Unix socket, so the guard always fired.  1.21.31 comments the guard out on integration (and for already-integrated vhosts); re-run `--optimize anubis=yes`.  The app still only listens on the filter's socket |
+| Anubis 502s only for one language (`th` on 1.28.2) | upstream incomplete catalogue: `MustLocalize` panics on `simplified_explanation`.  The managed env pins `FORCED_LANGUAGE=en`; set `SETUP_ANUBIS_LANGUAGE=th` once the catalogue is fixed |
 | SSH suddenly answers "Connection refused" or drops for a minute after several rapid connections | `ufw limit` on the SSH port (6 new connections per 30 s from one address); retrying refreshes the window. Wait ~1-2 minutes, reuse one connection (`ssh -M -S … -o ControlPersist=1h`), or install with `SETUP_UFW_SSH_LIMIT=0` for an automation host. `ufw status numbered` shows the rule |
 
 ## Files and state

@@ -3,6 +3,40 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.31 (2026-11-18)
+
+Anubis fixes from the `origin-host` production host (Ubuntu 24.04,
+8 vCPU / 32 GB, Angie + PHP/Chevereto + XenForo behind a CDN at
+203.0.113.23).
+
+- **Anubis own-page language is pinned to a complete catalogue.**
+  `FORCED_LANGUAGE=en` is written to `anubis.env`.  Anubis localises its
+  challenge page from `Accept-Language` with go-i18n's `MustLocalize`, which
+  panics on a missing message; the bundled Thai catalogue has no
+  `simplified_explanation`, so every Thai browser made the handler panic and
+  Angie answered **502** (`th` reproduced deterministically; en/ja/de/fr/zh/
+  ru/ar/hi/id/vi/tr/ko/pt/es/it/pl were fine).  English is the only catalogue
+  complete in every shipped release.  `SETUP_ANUBIS_LANGUAGE=th` (or any
+  locale) overrides it once the upstream catalogue is fixed.  The application
+  still receives the visitor's own `Accept-Language`.
+- **Outer `$realip_remote_addr` guards are disabled when a vhost moves behind
+  Anubis.**  A vhost that only accepts traffic from its CDN
+  (`if ($realip_remote_addr != "<edge IP>") { return 444; }`) cannot work over
+  the Anubis socket: `$realip_remote_addr` is the *direct peer* (the socket),
+  so the guard always fired.  On the production host the two vhosts with that
+  rule answered 444 for every request (502 through the filter) and the static
+  shadow returned an empty reply for every asset, while the vhost without the
+  rule worked.  The integrator now comments the guard (single- or multi-line)
+  in the moved copy, notes it in the `--optimize` report, and does the same
+  for vhosts integrated by an older release.  The socket (0660 in a 0750
+  runtime directory, no public listener left on the vhost) is the new
+  perimeter; disabling Anubis restores the original vhost and its guard.
+- Validation: 964 tuning checks (9 new), ShellCheck clean; on the production
+  host `--optimize --reset-overrides anubis=yes` exits 0, both vhosts and
+  their static assets answer 200 through the filter, the Thai challenge
+  renders (200, valid challenge JSON), 0 panics and 0
+  "upstream prematurely closed" entries after the fix.
+
 ## 1.21.30 (2026-11-17)
 
 Full lifecycle on a reinstalled `lab.local` (Ryzen 7 8745HS, 16 threads,

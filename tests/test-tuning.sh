@@ -4184,5 +4184,58 @@ check "the Anubis unit keeps the filter in its own group with a 0750 runtime dir
   grep -qx 'Group=anubis' "$TMP/anubis-generated.service" \
   && grep -qx 'RuntimeDirectoryMode=0750' "$TMP/anubis-generated.service"
 
+# ---------------------------------------------------------------------------
+# Anubis own-page language (Thai catalogue panics -> 502)
+# ---------------------------------------------------------------------------
+unset SETUP_ANUBIS_LANGUAGE
+check "Anubis forces English when no language is requested" \
+  test "$(anubis_forced_language)" = en
+check "Anubis accepts a complete locale override" \
+  test "$(SETUP_ANUBIS_LANGUAGE=pt-BR anubis_forced_language)" = pt-BR
+check "Anubis rejects an invalid language override" \
+  test "$(SETUP_ANUBIS_LANGUAGE='th;rm -rf /' anubis_forced_language)" = en
+en_body=$(sed -n '/^anubis_write_env()/,/^}/p' "$ALL_SRC")
+check "the managed Anubis env pins FORCED_LANGUAGE" \
+  grep -q '^FORCED_LANGUAGE=$(anubis_forced_language)$' <<<"$en_body"
+
+# An outer-perimeter guard cannot pass over the Anubis socket: disable it.
+guard_vhost="$TMP/vhost-guard.conf"
+cat > "$guard_vhost" <<'EOF'
+server {
+    listen unix:/run/angie/anubis-backend.sock;
+    set_real_ip_from unix:;
+    real_ip_header X-Real-IP;
+    server_name site-e.example;
+    root /var/www/site-e.example/public;
+    set_real_ip_from 203.0.113.23;
+    real_ip_recursive on;
+    if ($realip_remote_addr != "203.0.113.23") { return 444; }
+    location / { index index.php; }
+}
+EOF
+anubis_disable_realip_guards "$guard_vhost" >/dev/null 2>&1
+check "an outer realip 444 guard is commented out" \
+  grep -q '^#    if ($realip_remote_addr' "$guard_vhost"
+check "the rest of the vhost is preserved" \
+  grep -q '^    root /var/www/site-e.example/public;' "$guard_vhost"
+check "a commented guard is not re-commented" \
+  test "$(grep -c 'realip_remote_addr' "$guard_vhost")" -eq 1
+
+multiline_vhost="$TMP/vhost-guard-multi.conf"
+cat > "$multiline_vhost" <<'EOF'
+server {
+    server_name site-f.example;
+    if ($realip_remote_addr != "203.0.113.23") {
+        return 444;
+    }
+    location / { return 200; }
+}
+EOF
+anubis_disable_realip_guards "$multiline_vhost" >/dev/null 2>&1
+check "a multi-line realip guard is disabled as a block" \
+  bash -c '! grep -qE "^(if|[[:space:]]*return 444)" "$1"' _ "$multiline_vhost"
+check "the directive after a multi-line guard survives" \
+  grep -q 'location / { return 200; }' "$multiline_vhost"
+
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

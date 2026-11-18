@@ -205,6 +205,15 @@ COOKIE_HTTP_ONLY=true
 COOKIE_SAME_SITE=Lax
 COOKIE_EXPIRATION_TIME=168h
 CUSTOM_REAL_IP_HEADER=X-Real-IP
+# Anubis localises its own challenge/error pages from Accept-Language with
+# go-i18n's MustLocalize, which panics on a missing message.  The bundled Thai
+# catalogue is incomplete (no "simplified_explanation"), so every Thai browser
+# rendered the challenge as a panic: the handler closed the connection and
+# Angie answered 502 (reproduced on 1.28.2, 2026-11-18).  Pin a complete
+# catalogue for the interstitital only; the application still receives the
+# visitor's own Accept-Language.  SETUP_ANUBIS_LANGUAGE overrides the choice
+# (e.g. th after the upstream catalogue is fixed).
+FORCED_LANGUAGE=$(anubis_forced_language)
 METRICS_BIND=${ANUBIS_METRICS}
 METRICS_BIND_NETWORK=tcp
 POLICY_FNAME=${ANUBIS_POLICY}
@@ -221,6 +230,16 @@ EOF
   if commit_if_changed "$ANUBIS_ENV" "$tmp"; then ANUBIS_SERVICE_DIRTY=1; fi
   chmod 600 "$ANUBIS_ENV"; chown root:"$ANUBIS_USER" "$ANUBIS_ENV"
   return 0
+}
+
+# Language Anubis uses for its own pages.  English is the only catalogue that
+# is complete in every release this script has shipped; an incomplete one
+# turns the challenge into a panic (502) for that locale.  The value goes into
+# an env file, so it is validated like one.
+anubis_forced_language() {
+  local lang=${SETUP_ANUBIS_LANGUAGE:-en}
+  [[ $lang =~ ^[a-z]{2,3}(-[A-Za-z0-9]{2,8})*$ ]] || lang=en
+  printf '%s' "$lang"
 }
 
 # A lean policy: allow search engines and infrastructure routes, deny the
@@ -602,6 +621,50 @@ anubis_integrate_vhost() {
   return 0
 }
 
+# Comment out an outer-perimeter guard such as
+#   if ($realip_remote_addr != "<edge proxy>") { return 444; }
+# in a vhost that is already behind Anubis.  $realip_remote_addr is the
+# *direct peer* (before real_ip), so behind the filter it is "unix:" and the
+# guard can never pass: every request, including a static-shadow request,
+# answers 444 and the terminator reports 502.  The socket is the new
+# perimeter (it is 0660 in a 0750 runtime directory and the vhost no longer
+# has a public listener), so disabling the guard is safe.  Idempotent: a
+# guard that is already commented is skipped.
+anubis_disable_realip_guards() {
+  local f=$1 tmp
+  grep -qE '^[[:space:]]*if[[:space:]]*\(.*\$realip_remote_addr' "$f" 2>/dev/null || return 0
+  tmp=$(tmp_file) || return 1
+  awk '
+    function brace_delta(s,   t, n, m) {
+      t = s; n = gsub(/{/, "{", t)
+      t = s; m = gsub(/}/, "}", t)
+      return n - m
+    }
+    {
+      code = $0
+      sub(/#.*/, "", code)
+      if (skipping) {
+        print "#" $0
+        depth += brace_delta(code)
+        if (depth <= 0) skipping = 0
+        next
+      }
+      if (code ~ /^[ \t]*if[ \t]*\(.*\$realip_remote_addr/) {
+        print "#" $0
+        depth = brace_delta(code)
+        if (depth > 0) skipping = 1
+        next
+      }
+      print
+    }
+  ' "$f" > "$tmp" || return 1
+  if commit_if_changed "$f" "$tmp"; then
+    ANUBIS_ANGIE_DIRTY=1
+    tune_note "${f##*/}: outer \$realip_remote_addr 444 guard disabled (the Anubis socket is the perimeter; every request still arrives through the filter)"
+  fi
+  return 0
+}
+
 # Build the static-only shadow of every integrated application server block.
 #
 # The shadow is a mechanical copy of the block (server_name, root, every
@@ -948,6 +1011,10 @@ anubis_enable() {
       changed=1
     fi
     anubis_integrate_vhost "$f" || rc=1
+    # Also for a vhost integrated by an older release: an outer-perimeter
+    # `if ($realip_remote_addr ...) { return 444; }` cannot pass over the
+    # Unix socket and turned every page into a 502 through the filter.
+    anubis_vhost_integrated "$f" && { anubis_disable_realip_guards "$f" || rc=1; }
   done
   anubis_render_static_blocks || rc=1
   anubis_render_terminators || rc=1
