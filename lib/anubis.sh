@@ -444,7 +444,8 @@ EOF
 # Angie configuration
 # ---------------------------------------------------------------------------
 anubis_write_common() {
-  local tmp
+  local tmp backlog
+  backlog=$(effective_backlog)
   tmp=$(tmp_file) || return 1
   cat > "$tmp" <<EOF
 # Managed by setup.sh (ANUBIS=1).  Anubis listens on a Unix socket; the
@@ -466,6 +467,18 @@ upstream anubis_backend {
 upstream anubis_static {
     server unix:${ANUBIS_STATIC_SOCKET};
     keepalive 64;
+}
+
+# Catch-all on the backend socket.  It carries the listen options for every
+# vhost moved behind Anubis (nginx takes options from one listen line per
+# address): without it the socket kept the 511 default backlog while every
+# TCP listener uses somaxconn, and a Unix socket refuses (EAGAIN) instead of
+# queueing when the backlog is full, so a burst of new Anubis connections
+# turned into 502s.  A Host no protected vhost serves is dropped.
+server {
+    listen unix:${ANUBIS_BACKEND_SOCKET} default_server backlog=${backlog};
+    server_name _;
+    return 444;
 }
 
 # Anubis is a pure proxy: it does not rewrite application responses.  The
@@ -513,6 +526,9 @@ proxy_read_timeout 360s;
 proxy_buffering on;
 proxy_buffers 32 16k;
 proxy_busy_buffers_size 64k;
+# Never spool a large response to proxy_temp: the client side drains the
+# buffers instead of a disk write and re-read per download.
+proxy_max_temp_file_size 0;
 EOF
   if commit_if_changed "$ANUBIS_LOCATION" "$tmp"; then ANUBIS_ANGIE_DIRTY=1; fi
   return 0
@@ -693,7 +709,7 @@ anubis_render_static_blocks() {
 # An unknown Host must not fall through to the first shadow's root: answer 404
 # so the terminator retries through the filter and selects the right vhost.
 server {
-    listen unix:${ANUBIS_STATIC_SOCKET} default_server;
+    listen unix:${ANUBIS_STATIC_SOCKET} default_server backlog=$(effective_backlog);
     server_name _;
     return 404;
 }
@@ -851,6 +867,9 @@ EOF
             print "        proxy_set_header X-TLS-SNI-Name $ssl_server_name;"
             print "        proxy_connect_timeout 5s;"
             print "        proxy_read_timeout 60s;"
+            print "        # Large media (Chevereto originals, video) streams through the"
+            print "        # buffers instead of being spooled to proxy_temp on disk."
+            print "        proxy_max_temp_file_size 0;"
             print "        # The shadow answers 404 for a miss (or an alias/rewrite"
             print "        # endpoint); intercept it and retry through the filter."
             print "        proxy_intercept_errors on;"

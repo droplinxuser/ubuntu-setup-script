@@ -85,6 +85,9 @@ rm -f /usr/local/bin/wp /usr/local/bin/mysqlbkup.sh /usr/local/bin/setup-*.sh \
       /etc/apparmor.d/local/usr.sbin.mariadbd /etc/udev/rules.d/*setup*.rules \
       /etc/tmpfiles.d/setup-*.conf /etc/cron.d/setup-*
 rm -f /etc/mysqlbkup.cnf /etc/mysqlbkup.config
+# Written by the angie package's maintainer script (needrestart override),
+# not owned by the package, so a purge leaves it.
+rm -f /etc/needrestart/conf.d/angie.conf
 rm -rf /root/mysqltuner.pl /root/tools/mysqlbackup-master
 rmdir /root/tools 2>/dev/null || true
 rm -rf /tmp/php-config.* /tmp/php-install.* /tmp/hsperfdata_root /tmp/node-compile-cache

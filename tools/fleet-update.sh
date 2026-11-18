@@ -86,7 +86,7 @@ if (( ! SKIP_APT )); then
   fi
 
   say "APT update"
-  apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
+  apt-get -o DPkg::Lock::Timeout=300 -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update
   say "APT upgrade"
   apt-get "${APT_OPTS[@]}" upgrade
   say "APT dist-upgrade"
@@ -94,9 +94,9 @@ if (( ! SKIP_APT )); then
   say "APT autoremove --purge"
   apt-get "${APT_OPTS[@]}" autoremove --purge
   say "APT autoclean"
-  apt-get autoclean
+  apt-get -o DPkg::Lock::Timeout=300 autoclean
   say "APT clean"
-  apt-get clean
+  apt-get -o DPkg::Lock::Timeout=300 clean
   say "systemd daemon-reload"
   systemctl daemon-reload
 else
@@ -104,17 +104,26 @@ else
 fi
 
 say "Fetching setup.sh (${REF})"
+# Download and unpack into a staging directory first: the previous checkout
+# is moved aside only once the new one is complete, so a failed or truncated
+# fetch never leaves $WORKDIR empty or half-extracted.
+STAGE=$(mktemp -d "${WORKDIR}.new.XXXXXX")
+ARCHIVE=$(mktemp /tmp/setup-sh-src.XXXXXX.tgz)
+if command -v curl >/dev/null 2>&1; then
+  curl -fsSL --retry 3 --connect-timeout 15 --max-time 300 -o "$ARCHIVE" "$ARCHIVE_URL"
+else
+  wget -q --tries=3 --timeout=30 -O "$ARCHIVE" "$ARCHIVE_URL"
+fi
+tar -tzf "$ARCHIVE" >/dev/null || { echo "downloaded archive is not a valid tar.gz: $ARCHIVE" >&2; exit 1; }
+tar -xzf "$ARCHIVE" --strip-components=1 -C "$STAGE"
+[[ -f ${STAGE}/setup.sh && -f ${STAGE}/lib/common.sh ]] \
+  || { echo "archive did not contain setup.sh and lib/ (staged at $STAGE)" >&2; exit 1; }
 if [[ -e $WORKDIR ]]; then
   mv -- "$WORKDIR" "${WORKDIR}.${STAMP}"
   echo "Previous checkout kept at ${WORKDIR}.${STAMP}"
 fi
-mkdir -p "$WORKDIR"
-if command -v curl >/dev/null 2>&1; then
-  curl -fsSL "$ARCHIVE_URL" | tar -xz --strip-components=1 -C "$WORKDIR"
-else
-  wget -qO- "$ARCHIVE_URL" | tar -xz --strip-components=1 -C "$WORKDIR"
-fi
-[[ -f ${WORKDIR}/setup.sh ]] || { echo "archive did not contain setup.sh" >&2; exit 1; }
+mv -- "$STAGE" "$WORKDIR"
+chmod 755 "$WORKDIR"
 echo "Deployed: $(grep -m1 '^readonly SCRIPT_VERSION=' "${WORKDIR}/setup.sh" || true)"
 cd "$WORKDIR"
 

@@ -35,13 +35,41 @@ update_system() {
   # postinst is interrupted by a full disk or a provider console reset).
   # Repair the package state once and retry, instead of continuing a
   # provisioning run on top of a broken dpkg database.
-  if ! apt-get upgrade "${APT_OPTS[@]}"; then
+  #
+  # needrestart's APT hook is suspended for the upgrade itself: when the
+  # batch contains systemd, its trigger re-executes PID 1 and the hook's
+  # immediate `systemctl restart <16 units>` fails as a whole with "Failed to
+  # connect to system scope bus via local transport", leaving every daemon
+  # on the old libc.  The restart pass runs once systemd answers again.
+  if ! NEEDRESTART_SUSPEND=1 apt-get upgrade "${APT_OPTS[@]}"; then
     warn "apt upgrade failed; repairing dpkg state and retrying once"
     dpkg --configure -a || warn "dpkg --configure -a reported an issue"
     apt-get -f install --no-remove "${APT_OPTS[@]}" || warn "apt-get -f install reported an issue"
-    apt-get upgrade "${APT_OPTS[@]}" \
+    NEEDRESTART_SUSPEND=1 apt-get upgrade "${APT_OPTS[@]}" \
       || warn "apt upgrade still failing; continuing with a partially upgraded system"
   fi
+  restart_outdated_services
+}
+
+# Wait (up to ~30 s) until PID 1 accepts systemctl calls again, e.g. after a
+# systemd package trigger re-executed it.
+wait_for_systemd() {
+  local i
+  for (( i = 0; i < 30; i++ )); do
+    systemctl show -p Version --value >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# Restart the daemons still mapping replaced libraries (needrestart batch
+# mode, automatic).  Deferred units (dbus, logind, getty) stay deferred as
+# needrestart decides; a kernel/microcode notice is left to the report.
+restart_outdated_services() {
+  command -v needrestart >/dev/null 2>&1 || return 0
+  wait_for_systemd || { warn "systemd did not answer after the upgrade; service restarts skipped (run needrestart -r a)"; return 0; }
+  NEEDRESTART_MODE=a needrestart -r a -q >/dev/null 2>&1 \
+    || warn "needrestart reported an issue restarting upgraded services (run needrestart -r a)"
 }
 
 # True when this CPU exposes frequency scaling and actually offers the
@@ -1031,12 +1059,34 @@ ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", KERNEL!="nvme*",
 # rotational=1, and 1024 kB suits only real sequential HDD scans.
 ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", KERNEL!="nvme*", KERNEL!="dm-*", KERNEL!="md*", KERNEL!="loop*", KERNEL!="zram*", KERNEL!="ram*", KERNEL!="sr*", ATTR{queue/rotational}=="1", ATTR{queue/scheduler}="mq-deadline", ATTR{bdi/read_ahead_kb}="${rot_ra_kb}"
 EOF
+  # md/dm arrays on flash: readahead only (no scheduler on a stacked device).
+  # The filesystem reads through the array's own bdi, which the kernel sizes
+  # from the stripe (a 2 x 512K RAID0 over NVMe gets 2048 kB), so the member
+  # disks' 128 kB never applied to the data path.  HDD arrays keep the
+  # stripe-derived value: a wide spinning array benefits from it.
+  case $class in
+    nvme|ssd)
+      cat >> "$rule" <<'EOF'
+# md/dm on flash: small readahead on the array the filesystem actually uses.
+ACTION=="add|change", SUBSYSTEM=="block", ENV{DEVTYPE}=="disk", KERNEL=="md*|dm-*", ATTR{bdi/read_ahead_kb}="128"
+EOF
+      ;;
+  esac
   chmod 644 "$rule"
   systemctl daemon-reload || true
   systemctl enable setup-io-tuning.service >/dev/null 2>&1 || true
   systemctl restart setup-io-tuning.service 2>/dev/null || warn "Could not apply the THP setting"
   udevadm control --reload-rules 2>/dev/null || true
-  udevadm trigger --subsystem-match=block --action=change 2>/dev/null || true
+  # Re-trigger only what the rules above can match: whole, non-empty disks
+  # (sysname patterns OR together; the other filters AND).  A blanket trigger
+  # replays every block device through the distribution's rules too, and on
+  # BMC hosts sg3-utils-udev logged "SCSI device sdX has no device ID" for
+  # each empty virtual floppy/CD-ROM on every --optimize.
+  udevadm trigger --action=change --subsystem-match=block \
+    --property-match=DEVTYPE=disk --attr-nomatch=size=0 \
+    --sysname-match='nvme*' --sysname-match='sd*' --sysname-match='vd*' \
+    --sysname-match='xvd*' --sysname-match='hd*' --sysname-match='mmcblk*' \
+    --sysname-match='md*' --sysname-match='dm-*' 2>/dev/null || true
   case $class in
     nvme|ssd)
       if systemctl list-unit-files fstrim.timer >/dev/null 2>&1; then

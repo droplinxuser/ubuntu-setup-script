@@ -371,6 +371,11 @@ purge_others() {
   # keeps the package's rotation job running after a purge that claims to
   # have stopped the sysstat units.
   for unit in smartmontools smartd sysstat-collect.timer sysstat-summary.timer sysstat-rotate.timer sysstat; do
+    # Enabled before setup.sh first touched it: the operator's, not ours.
+    if unit_preenabled "$unit"; then
+      info "Leaving ${unit} enabled (it was enabled before setup.sh)"
+      continue
+    fi
     if systemctl is-enabled --quiet "$unit" 2>/dev/null || systemctl is-active --quiet "$unit" 2>/dev/null; then
       systemctl disable --now "$unit" 2>/dev/null && info "Disabled ${unit}"
     fi

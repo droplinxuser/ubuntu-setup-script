@@ -471,13 +471,30 @@ install_php() {
   # a single all-or-nothing apt transaction would then abort the whole PHP
   # step and, on --upgrade-php, trigger a full rollback because of one optional
   # extension.  Report the ones that failed instead.
+  #
+  # They are first tried as ONE transaction: every extension package
+  # re-runs php${ver}-fpm's maintainer trigger, which restarts the service,
+  # and one transaction per package (redis, igbinary, imagick, ...) on top of
+  # the start/stop of --upgrade-php exceeded systemd's start limit (5 in 10 s).
+  # The third restart then failed with start-limit-hit, php${ver}-fpm's
+  # postinst exited 1 and apt rolled back php8.4-imagick, so a Chevereto host
+  # silently lost a hard requirement.  Only when the batch fails is each
+  # package retried on its own, with the start limit cleared and any
+  # half-configured package finished first.
   local -a optional_failed=()
-  for pkg in "${optional_ok[@]}"; do
-    apt_install "$pkg" || {
-      optional_failed+=("$pkg")
-      warn "PHP ${ver}: optional package ${pkg} could not be installed; continuing without it"
-    }
-  done
+  systemctl reset-failed "php${ver}-fpm" 2>/dev/null || true
+  if (( ${#optional_ok[@]} > 0 )) && ! apt_install "${optional_ok[@]}"; then
+    for pkg in "${optional_ok[@]}"; do
+      dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q ' installed$' && continue
+      systemctl reset-failed "php${ver}-fpm" 2>/dev/null || true
+      dpkg --configure -a >/dev/null 2>&1 || true
+      apt_install "$pkg" || {
+        optional_failed+=("$pkg")
+        warn "PHP ${ver}: optional package ${pkg} could not be installed; continuing without it"
+      }
+    done
+  fi
+  systemctl reset-failed "php${ver}-fpm" 2>/dev/null || true
   for pkg in "${optional_failed[@]}"; do
     PHP_UPGRADE_SKIPPED+=("${pkg#php*-} (${pkg}: install failed)")
   done
@@ -634,6 +651,10 @@ configure_mariadb_apparmor() {
     printf '# Central log tree (/var/www/logs).\n'
     printf '/var/www/logs/mariadb/ r,\n'
     printf '/var/www/logs/mariadb/** rw,\n'
+    printf '# MariaDB 11.8 reads the dev number of each block device at startup (SSD\n'
+    printf '# detection; NVMe namespaces have no block/ path component); the stock\n'
+    printf '# profile denies it and logs one DENIED per disk.  dev holds major:minor only.\n'
+    printf '/sys/devices/**/dev r,\n'
     printf '%s\n' "$end"
   } >> "$localfile"
 
@@ -1791,6 +1812,7 @@ install_others() {
       smartmon)
         info "Installing smartmontools"
         pkg_record_origin smartmontools
+        unit_record_preenabled smartmontools smartd
         apt_install smartmontools
         # Ubuntu ships the unit as smartmontools.service; smartd.service is
         # only an alias on some releases.  Try both before reporting a real
@@ -1834,6 +1856,7 @@ install_others() {
       sysstat)
         info "Installing sysstat (sar/iostat history)"
         pkg_record_origin sysstat
+        unit_record_preenabled sysstat sysstat-collect.timer sysstat-summary.timer sysstat-rotate.timer
         apt_install sysstat
         if [[ -f /etc/default/sysstat ]]; then
           sed_in_place -E 's/^ENABLED=.*/ENABLED="true"/' /etc/default/sysstat

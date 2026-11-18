@@ -215,12 +215,19 @@ check "MariaDB logging helper omits the deprecated slow-admin alias" \
 # Disk classification must follow the device that actually backs /var/www.
 findmnt() { printf '%s\n' "${FINDMNT_SRC:-/dev/null}"; }
 lsblk() { printf '%s\n' "${LSBLK_OUT:-}"; }
-LSBLK_OUT=$'nvme0n1p4 part\n└─nvme0n1 disk'
+# Real `lsblk -l` output: flat names, no tree glyphs.
+LSBLK_OUT=$'nvme0n1p4 part\nnvme0n1   disk'
 check "storage class follows the mounted NVMe parent" \
   test "$(storage_backing_class /var/www)" = nvme
-LSBLK_OUT=$'sdzz1 part\n└─sdzz disk'
+LSBLK_OUT=$'sdzz1 part\nsdzz  disk'
 check "storage class reports hdd for a spinning parent" \
   test "$(storage_backing_class /var/www)" = hdd
+# md RAID: every member is classified, not only the last line of the tree.
+LSBLK_OUT=$'md3       raid0\nnvme0n1p3 part\nnvme0n1   disk\nsdzz3     part\nsdzz      disk'
+check "storage class sees every md member (NVMe listed first)" \
+  test "$(storage_backing_class /var/www)" = nvme
+check "storage_backing_class asks lsblk for list output" \
+  grep -q 'lsblk -s -n -l -o NAME,TYPE' "$ROOT/lib/validate.sh"
 unset -f findmnt lsblk
 
 # Older releases wrote performance directives bare in 50-server.cnf, without
@@ -2213,8 +2220,8 @@ touch -d '1 hour ago' "$TMP/cache/old"
 now=$(date +%s)
 sleep 1
 : > "$TMP/cache/sub/new"
-removed=$(count_optimize_cache_entries "$now" "$TMP/cachetree")
-check "cache report counts objects written during the run" test "$removed" -eq 1
+cache_removed=$(count_optimize_cache_entries "$now" "$TMP/cachetree")
+check "cache report counts objects written during the run" test "$cache_removed" -eq 1
 check "cache report leaves the new object in place" test -f "$TMP/cache/sub/new"
 check "cache report keeps older objects" test -f "$TMP/cache/old"
 
@@ -2986,7 +2993,15 @@ check "a 27 GB host reports no overcommit" \
 # Source-level guards for rules that need root or /sys to exercise.
 io_body=$(sed -n '/^configure_io_tuning()/,/^}/p' "$ALL_SRC")
 check "udev I/O rule matches whole disks only" \
-  bash -c "[[ \$(grep -c 'ENV{DEVTYPE}==\"disk\"' <<<\"\$0\") -eq 3 ]]" "$io_body"
+  bash -c "[[ \$(grep -c 'ENV{DEVTYPE}==\"disk\"' <<<\"\$0\") -eq 4 ]]" "$io_body"
+check "md/dm arrays on flash get a readahead-only rule" \
+  bash -c 'grep -q "KERNEL==\"md\*|dm-\*\", ATTR{bdi/read_ahead_kb}=\"128\"$" <<<"$1" && ! grep "KERNEL==\"md\*|dm-\*\"" <<<"$1" | grep -q scheduler' _ "$io_body"
+check "the md/dm readahead rule is written only for nvme/ssd hosts" \
+  bash -c 'grep -B4 "md\\*|dm-" <<<"$1" | grep -q "nvme|ssd)"' _ "$io_body"
+check "udev re-trigger skips empty devices (BMC virtual floppies)" \
+  grep -q -- "--attr-nomatch=size=0" <<<"$io_body"
+check "udev re-trigger is limited to whole disks of the matched names" \
+  bash -c 'grep -q -- "--property-match=DEVTYPE=disk" <<<"$1" && ! grep -q "udevadm trigger --subsystem-match=block --action=change" <<<"$1"' _ "$io_body"
 check "PHP memory_limit drops to 128M under 2 GB" \
   grep -q '(( ram_mb < 2048 )) && PHP_PROFILE_MEMORY_MB=128' <<<"$(sed -n '/^php_ini_profile()/,/^}/p' "$ALL_SRC")"
 sysctl_body=$(sed -n '/^configure_sysctl()/,/^}/p' "$ALL_SRC")
@@ -4043,7 +4058,7 @@ check "the static shadow refuses a missing file" \
 check "the static shadow drops the public TLS listener" \
   bash -c '! grep -qE "listen +443|ssl_certificate|http2 on;" "$1"' _ "$TMP/anubis/static.conf"
 check "the static shadow has a 404 default server for an unknown Host" \
-  grep -qx "    listen unix:${ANUBIS_STATIC_SOCKET} default_server;" "$TMP/anubis/static.conf"
+  grep -qx "    listen unix:${ANUBIS_STATIC_SOCKET} default_server backlog=$(effective_backlog);" "$TMP/anubis/static.conf"
 check "the catch-all block itself is not copied" \
   bash -c '! grep -q "^# shadow of .*default.conf" "$1"' _ "$TMP/anubis/static.conf"
 check "the static shadow sets the active flag" test "$ANUBIS_STATIC_ACTIVE" = 1
@@ -4126,6 +4141,14 @@ ANUBIS_COMMON="$TMP/anubis/anubis-common.conf"
 anubis_write_common
 check "the Anubis common file has no encoding-strip map" \
   bash -c '! grep -q "anubis_strip_encoding\|anubis_upstream_accept_encoding" "$1"' _ "$TMP/anubis/anubis-common.conf"
+check "the backend socket catch-all carries the somaxconn backlog" \
+  grep -qx "    listen unix:${ANUBIS_BACKEND_SOCKET} default_server backlog=$(effective_backlog);" "$TMP/anubis/anubis-common.conf"
+check "the backend socket catch-all drops an unknown Host" \
+  bash -c 'grep -A3 "default_server backlog=" "$1" | grep -qx "    return 444;"' _ "$TMP/anubis/anubis-common.conf"
+check "the terminator never spools a response to proxy_temp" \
+  grep -qx 'proxy_max_temp_file_size 0;' "$TMP/anubis/anubis-location.conf"
+check "the static shadow default server carries the backlog" \
+  grep -q 'listen unix:${ANUBIS_STATIC_SOCKET} default_server backlog=$(effective_backlog);' "$ROOT/lib/anubis.sh"
 ANUBIS_COMMON=/etc/angie/conf.d/00-anubis-common.conf
 
 # The backend socket is created 0777, so the directory is the access control.
@@ -4263,6 +4286,132 @@ check "a multi-line realip guard is disabled as a block" \
   bash -c '! grep -qE "^(if|[[:space:]]*return 444)" "$1"' _ "$multiline_vhost"
 check "the directive after a multi-line guard survives" \
   grep -q 'location / { return 200; }' "$multiline_vhost"
+
+# ---------------------------------------------------------------------------
+# --basic upgrade: needrestart runs after the upgrade, not from its APT hook
+# ---------------------------------------------------------------------------
+check "apt upgrade suspends the needrestart hook" \
+  bash -c '[[ $(grep -c "NEEDRESTART_SUSPEND=1 apt-get upgrade" "$1") -eq 2 ]]' _ "$ROOT/lib/os.sh"
+check "update_system restarts outdated services after the upgrade" \
+  bash -c 'sed -n "/^update_system()/,/^}/p" "$1" | grep -q "^  restart_outdated_services$"' _ "$ROOT/lib/os.sh"
+nr_log="$TMP/needrestart.calls"
+: > "$nr_log"
+(
+  systemctl() { echo "systemctl $*" >> "$nr_log"; return 0; }
+  needrestart() { echo "needrestart $*" >> "$nr_log"; return 0; }
+  restart_outdated_services
+)
+check "restart pass waits for systemd then runs needrestart in auto mode" \
+  bash -c 'head -n1 "$1" | grep -q "^systemctl show -p Version" && grep -q "^needrestart -r a -q$" "$1"' _ "$nr_log"
+: > "$nr_log"
+(
+  systemctl() { return 1; }
+  sleep() { :; }
+  needrestart() { echo "needrestart $*" >> "$nr_log"; }
+  warn() { echo "warn $*" >> "$nr_log"; }
+  restart_outdated_services
+)
+check "restart pass is skipped with a warning while systemd is unreachable" \
+  bash -c 'grep -q "^warn systemd did not answer" "$1" && ! grep -q "^needrestart" "$1"' _ "$nr_log"
+
+# ---------------------------------------------------------------------------
+# OPcache script table: written as the prime PHP rounds the value up to
+# ---------------------------------------------------------------------------
+check "OPcache table: the 16384 floor is written as 32531" test "$(php_opcache_table_size 16384)" = 32531
+check "OPcache table: 19512 and 19518 files*1.5 give the same text" \
+  test "$(php_opcache_table_size 19512)" = "$(php_opcache_table_size 19518)"
+check "OPcache table: an exact prime is kept" test "$(php_opcache_table_size 65407)" = 65407
+check "OPcache table: the 128256 ceiling is written as 130987" test "$(php_opcache_table_size 128256)" = 130987
+
+# ---------------------------------------------------------------------------
+# Flarum guest-cache gate migration (server-configs-nginx 1.6.43-1.6.45)
+# ---------------------------------------------------------------------------
+fl="$TMP/flarum-tree"
+mkdir -p "$fl/h5bp" "$fl/http.d"
+cat > "$fl/h5bp/php_flarum.conf" <<'EOF'
+location ~ [^/]\.php(/|$) {
+if ($flarum_guest_cacheable$req_encoded_path) { return 418; }
+}
+location @flarum_guest_cache {
+fastcgi_cache_lock      on;
+}
+EOF
+cat > "$fl/http.d/fastcgi_cache_flarum.conf" <<'EOF'
+map "$guest_cache_method:$flarum_guest_cookie:$flarum_nocache_uri:$http_authorization" $flarum_guest_cacheable {
+    default 0;
+    "1:0:0:" 1;
+}
+EOF
+tune_flarum_cache_gate "$fl"
+check "Flarum gate: the if tests one variable" \
+  grep -qx 'if ($flarum_guest_cacheable) { return 418; }' "$fl/h5bp/php_flarum.conf"
+check "Flarum gate: the map carries the encoded-path flag" \
+  grep -qF ':$flarum_nocache_uri:$req_encoded_path:$http_authorization" $flarum_guest_cacheable {' "$fl/http.d/fastcgi_cache_flarum.conf"
+check "Flarum gate: the cacheable key gains the extra 0" \
+  grep -qx '    "1:0:0:0:" 1;' "$fl/http.d/fastcgi_cache_flarum.conf"
+check "Flarum gate: background cache update is added after the lock" \
+  bash -c 'grep -A1 "fastcgi_cache_lock      on;" "$1" | grep -qx "fastcgi_cache_background_update on;"' _ "$fl/h5bp/php_flarum.conf"
+fl_sum=$(cat "$fl/h5bp/php_flarum.conf" "$fl/http.d/fastcgi_cache_flarum.conf" | cksum)
+tune_flarum_cache_gate "$fl"
+check "Flarum gate: a second pass changes nothing" \
+  test "$fl_sum" = "$(cat "$fl/h5bp/php_flarum.conf" "$fl/http.d/fastcgi_cache_flarum.conf" | cksum)"
+printf 'map "$x" $flarum_guest_cacheable {\n    default 0;\n}\n' > "$fl/http.d/fastcgi_cache_flarum.conf"
+printf 'if ($flarum_guest_cacheable$req_encoded_path) { return 418; }\n' > "$fl/h5bp/php_flarum.conf"
+tune_flarum_cache_gate "$fl"
+check "Flarum gate: an operator-edited map leaves the include untouched" \
+  grep -qF 'if ($flarum_guest_cacheable$req_encoded_path)' "$fl/h5bp/php_flarum.conf"
+check "Flarum gate: the shipped tree has no joined-variable if" \
+  bash -c '! grep -rqF "\$flarum_guest_cacheable\$req_encoded_path" "$1/h5bp" "$1/http.d"' _ "$ROOT/../server-configs-nginx"
+
+# Catch-all 443: unknown/missing SNI is refused before a certificate is sent.
+tl="$TMP/tls-tree"
+mkdir -p "$tl/conf.d"
+cat > "$tl/conf.d/1.https.default.conf" <<'EOF'
+server {
+  listen      443 ssl default_server deferred backlog=16383 reuseport fastopen=256;
+  server_name _;
+  include h5bp/default_ssl.conf;
+  return 444;
+}
+EOF
+tune_default_tls_reject "$tl"
+check "default TLS server: reject handshake inserted before the cert include" \
+  bash -c 'grep -B1 "include h5bp/default_ssl.conf;" "$1" | grep -qx "  ssl_reject_handshake on;"' _ "$tl/conf.d/1.https.default.conf"
+tl_sum=$(cksum < "$tl/conf.d/1.https.default.conf")
+tune_default_tls_reject "$tl"
+check "default TLS server: a second pass changes nothing" test "$tl_sum" = "$(cksum < "$tl/conf.d/1.https.default.conf")"
+check "default TLS server: the shipped tree already rejects" \
+  grep -qx '  ssl_reject_handshake on;' "$ROOT/../server-configs-nginx/conf.d/1.https.default.conf"
+
+# PHP optional extensions: one transaction first (one php-fpm restart),
+# per-package fallback with the systemd start limit cleared.
+php_install_body=$(sed -n '/^install_php()/,/^}/p' "$ALL_SRC")
+check "optional PHP extensions are installed in one transaction first" \
+  grep -qF 'apt_install "${optional_ok[@]}"' <<<"$php_install_body"
+check "the per-package fallback clears the php-fpm start limit" \
+  bash -c 'grep -A4 "for pkg in \"\${optional_ok\[@\]}\"" <<<"$1" | grep -q "reset-failed"' _ "$php_install_body"
+
+# --purge others leaves units that were enabled before setup.sh touched them.
+unit_state_dir=$STATE_DIR
+mkdir -p "$unit_state_dir"
+rm -f "$unit_state_dir"/preenabled-unit-* "$unit_state_dir"/unit-state-recorded-*
+(
+  ensure_state() { :; }
+  systemctl() { [[ $1 == is-enabled && $3 == sysstat-collect.timer ]]; }
+  unit_record_preenabled sysstat-collect.timer smartd
+  # a later run (after setup.sh enabled smartd) must not rewrite the record
+  systemctl() { [[ $1 == is-enabled ]]; }
+  unit_record_preenabled smartd
+)
+check "a unit enabled before setup.sh is recorded as the operator's" \
+  test -f "$unit_state_dir/preenabled-unit-sysstat-collect.timer"
+check "a unit setup.sh enabled is not recorded as pre-enabled on a re-run" \
+  test ! -f "$unit_state_dir/preenabled-unit-smartd"
+check "purge_others skips pre-enabled units" \
+  bash -c 'sed -n "/^purge_others()/,/^}/p" "$1" | grep -q "unit_preenabled"' _ "$ROOT/lib/purge.sh"
+
+check "MariaDB AppArmor block allows the sysfs dev reads (NVMe paths too)" \
+  bash -c 'sed -n "/^configure_mariadb_apparmor()/,/^}/p" "$1" | grep -qF "/sys/devices/**/dev r,"' _ "$ROOT/lib/services.sh"
 
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

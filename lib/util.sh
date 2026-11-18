@@ -443,6 +443,27 @@ pkg_record_origin() {
   fi
 }
 
+# Units --others enables (smartmontools, sysstat timers).  The first run that
+# touches a unit records whether it was already enabled, so --purge disables
+# only what setup.sh turned on: Ubuntu 26.04 images ship sysstat enabled,
+# and a purge used to switch the operator's own sar collection off.
+# Later runs never rewrite the record (by then setup.sh enabled the unit).
+unit_record_preenabled() {
+  local unit
+  ensure_state
+  for unit in "$@"; do
+    [[ -f "${STATE_DIR}/unit-state-recorded-${unit}" ]] && continue
+    if systemctl is-enabled --quiet "$unit" 2>/dev/null; then
+      touch "${STATE_DIR}/preenabled-unit-${unit}"
+    fi
+    touch "${STATE_DIR}/unit-state-recorded-${unit}"
+  done
+}
+
+unit_preenabled() {
+  [[ -f "${STATE_DIR}/preenabled-unit-${1}" ]]
+}
+
 pkg_preexisting() {
   [[ -f "${STATE_DIR}/preexisting-pkg-${1}" ]]
 }

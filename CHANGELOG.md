@@ -3,6 +3,96 @@
 Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.
 
+## 1.21.33 (2026-11-19)
+
+Audit cycle on a new hardware class: bare-metal Intel Xeon E-2236 (6C/12T,
+Coffee Lake), 62 GB RAM, root on md RAID0 over two Samsung PM983 NVMe, BMC
+virtual floppy/CD-ROM devices, public IPv4/IPv6, Ubuntu 26.04.1 (705-package
+baseline).  Pair: `server-configs-nginx` 1.6.46.  Report:
+`tests/stress-site/AUDIT-20261119-1.21.33.md`.
+
+- **`--basic` restarts upgraded daemons after the upgrade, not from the APT
+  hook.**  When the upgrade batch contains systemd, its trigger re-executes
+  PID 1 and needrestart's immediate `systemctl restart chrony ssh journald
+  resolved …` failed as a whole ("Failed to connect to system scope bus via
+  local transport"), leaving 16 services on the old libc.  The hook is
+  suspended (`NEEDRESTART_SUSPEND=1`) and `needrestart -r a` runs once
+  `systemctl` answers again (`restart_outdated_services`).
+- **`--upgrade-php` no longer loses an extension to systemd's start limit.**
+  Every extension package restarts `phpX.Y-fpm` from its trigger; one apt
+  transaction per optional extension plus the upgrade's own start/stop hit
+  `start-limit-hit`, the fpm postinst failed and apt rolled back
+  `php8.4-imagick` (a Chevereto hard requirement) with only a warning.  The
+  optional set is now installed in one transaction (one restart); the
+  per-package fallback clears the start limit and finishes half-configured
+  packages first.  8.5 → 8.4 → 8.5 now completes with zero warnings and
+  imagick/redis/igbinary loaded on both.
+- **md/dm arrays on flash get the profile readahead.**  The udev rules
+  skipped stacked devices, but the filesystem reads through the array's own
+  bdi, which the kernel sizes from the stripe: md3 (RAID0, 2 × 512K) kept
+  2048 kB instead of the 128 kB the NVMe profile intends.  A readahead-only
+  rule now covers `md*|dm-*` on nvme/ssd hosts; HDD arrays keep the
+  stripe-derived value.
+- **Storage classification sees every RAID member.**  `lsblk -s` tree output
+  put nested members on lines like `│ └─nvme0n1 disk` (three awk fields), so
+  only the last member was classified; list output (`-l`) is used now.
+- **The udev re-trigger is limited to the devices the rules match**
+  (non-empty whole disks by name).  The blanket trigger replayed the BMC's
+  empty virtual floppies and CD-ROM through sg3-utils-udev, which logged
+  "SCSI device sdX has no device ID" five times per `--optimize`.
+- **Anubis Unix listeners use the somaxconn backlog.**  The backend and
+  static-shadow sockets kept the 511 default while every TCP listener is
+  sized to somaxconn; a full Unix-socket backlog refuses with EAGAIN instead
+  of queueing.  A catch-all `default_server` on the backend socket in
+  `00-anubis-common.conf` carries `backlog=` and answers 444 for an unknown
+  Host; the terminator and the static fast path no longer spool large
+  responses to `proxy_temp` (`proxy_max_temp_file_size 0`).
+- **`opcache.max_accelerated_files` is written as the prime OPcache rounds it
+  to** (32531/65407/130987).  The exact file count changed whenever XenForo
+  compiled templates or an add-on was installed, so a second `--optimize`
+  rewrote the ini and reloaded PHP-FPM (resetting OPcache) for an identical
+  hash table.
+- **Flarum guest cache works again on hosts deployed with
+  server-configs-nginx 1.6.43–1.6.45**: `tune_flarum_cache_gate` rewrites the
+  joined-variable `if ($flarum_guest_cacheable$req_encoded_path)` (which made
+  `angie -t` fail for every Flarum vhost) into one map variable and adds
+  `fastcgi_cache_background_update`.
+- **The catch-all TLS server refuses unknown/missing SNI** on existing hosts
+  too (`tune_default_tls_reject` inserts `ssl_reject_handshake on;`): the
+  self-signed default certificate's CN/SAN is `hostname -f`, which tied a
+  CDN-fronted origin IP to its name for any scanner.  Verified: no-SNI and
+  bogus-SNI handshakes end with `unrecognized_name`, vhost sessions are still
+  resumed.
+- **Ubuntu 26.04 AppArmor: MariaDB starts without denials.**  MariaDB 11.8
+  reads `/sys/devices/.../dev` for every disk at startup (SSD detection) and
+  the new stock `mariadbd` profile denied it (21 `DENIED` lines per install
+  on this host, NVMe paths included).  The managed `local/mariadbd` block
+  allows these read-only `major:minor` files.  The 94 `who` denials during an
+  install come from needrestart running `who` under Ubuntu's own `who`
+  profile (it lacks the nameservice abstraction) and are left to the
+  distribution.
+- **`--purge others` leaves units that were enabled before setup.sh.**
+  Ubuntu 26.04 images ship sysstat enabled; the purge disabled its timers
+  unconditionally.  `--others` now records, on the first run that touches a
+  unit, whether it was already enabled, and the purge only disables what
+  setup.sh turned on.
+- The embedded Sury keyring is installed through apt (waits on the dpkg lock,
+  read as root so apt prints no sandbox warning) instead of bare `dpkg -i`.
+- `tools/fleet-update.sh` downloads and unpacks into a staging directory and
+  only then moves the old checkout aside (a failed fetch used to leave an
+  empty `/root/ubuntu-setup-script`); `update`/`autoclean`/`clean` wait on
+  the dpkg lock.
+- Tests: `bench-thread-tiers.sh` reproduces the five tiers of the published
+  XenForo 2.3.13 web-stack benchmark; `seed-xf.sh` drops the unused
+  `authors=` seeder parameter (it made the seeder exit 1 after seeding);
+  `guest-cache-cookie-test.sh` follows SV/StandardLib's POST log-out
+  interstitial.  `restore-baseline.sh` also removes the needrestart override the
+  angie package's maintainer script leaves in `/etc/needrestart/conf.d`.
+- Validation: 1,004 tuning checks (34 new), 212 dry-run matrix cases,
+  ShellCheck clean; fresh install 2:25, `--optimize` ×2 idempotent (0 diffs),
+  functional suite 0 unexpected responses, security probe 54/54, guest-cache
+  cookie suite 62/62, zero warnings in setup logs and the journal.
+
 ## 1.21.32 (2026-11-18)
 
 - **`--optimize` always recomputes the hardware profile; the

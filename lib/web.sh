@@ -513,6 +513,63 @@ tune_ensure_index() {
 # xf_style_variation=threads/x.1/ stored the forum index under the thread's
 # key for every guest.
 XF_CACHE_KEY='"$request_method|$scheme|$host|$request_uri|$setup_xf_key_variation|$setup_xf_key_style|$setup_xf_key_language|$setup_cache_enc"'
+# The catch-all 443 server (conf.d/1.https.default.conf) used to finish the
+# handshake with the self-signed default certificate, whose CN/SAN is
+# `hostname -f`; a scanner hitting the bare IP learned the host name.  Hosts
+# deployed before server-configs-nginx 1.6.46 gain `ssl_reject_handshake on;`
+# (the default_ssl include stays: it carries the TLS session cache that
+# SNI vhosts resume from).  Only the shipped catch-all shape is touched.
+tune_default_tls_reject() {
+  local f="$1/conf.d/1.https.default.conf"
+  [[ -f $f ]] || return 0
+  grep -qE '^[[:space:]]*ssl_reject_handshake[[:space:]]' "$f" && return 0
+  grep -qE '^[[:space:]]*listen[[:space:]].*443.*default_server' "$f" || return 0
+  grep -qE '^[[:space:]]*server_name[[:space:]]+_;' "$f" || return 0
+  grep -qE '^[[:space:]]*return[[:space:]]+444;' "$f" || return 0
+  tune_insert_before "$f" '^[[:space:]]*include[[:space:]]+h5bp/default_ssl\.conf;' \
+    '  ssl_reject_handshake on;' \
+    "1.https.default.conf: unknown/missing SNI refused before a certificate is sent" || true
+  return 0
+}
+
+# server-configs-nginx 1.6.43-1.6.45 shipped
+# `if ($flarum_guest_cacheable$req_encoded_path)` in h5bp/php_flarum.conf.
+# An `if` reads a lone variable, so Angie looks up a variable literally named
+# "flarum_guest_cacheable$req_encoded_path" and `angie -t` fails for every
+# Flarum vhost.  The encoded-path flag moves into the map (one 0/1 variable,
+# as XenForo/Chevereto do) and a missing background cache update is added.
+tune_flarum_cache_gate() {
+  local target=$1 inc map before_inc tmp
+  inc="$target/h5bp/php_flarum.conf"
+  map="$target/http.d/fastcgi_cache_flarum.conf"
+  [[ -f $inc ]] || return 0
+  before_inc=$(file_md5 "$inc")
+  if grep -qF 'if ($flarum_guest_cacheable$req_encoded_path)' "$inc" && [[ -f $map ]]; then
+    # Rewrite the map on a copy; both files change only when the copy has
+    # the shipped layout (an operator-edited map is left alone).
+    tmp=$(tmp_file)
+    sed -e 's/^map "\$guest_cache_method:\$flarum_guest_cookie:\$flarum_nocache_uri:\$http_authorization" \$flarum_guest_cacheable {$/map "$guest_cache_method:$flarum_guest_cookie:$flarum_nocache_uri:$req_encoded_path:$http_authorization" $flarum_guest_cacheable {/' \
+        -e 's/^\([[:space:]]*\)"1:0:0:" 1;$/\1"1:0:0:0:" 1;/' "$map" > "$tmp"
+    if grep -qF ':$req_encoded_path:$http_authorization" $flarum_guest_cacheable' "$tmp" \
+       && grep -qF '"1:0:0:0:" 1;' "$tmp"; then
+      cat "$tmp" > "$map"
+      sed_in_place 's/if (\$flarum_guest_cacheable\$req_encoded_path)/if ($flarum_guest_cacheable)/' "$inc"
+    else
+      tune_miss "Flarum guest-cache map not recognised; fix the if (\$flarum_guest_cacheable...) line in h5bp/php_flarum.conf by hand"
+    fi
+  fi
+  if grep -qE '^[[:space:]]*fastcgi_cache_lock[[:space:]]+on;' "$inc" \
+     && ! grep -qE '^[[:space:]]*fastcgi_cache_background_update' "$inc"; then
+    tune_insert_after "$inc" '^[[:space:]]*fastcgi_cache_lock[[:space:]]+on;' \
+      'fastcgi_cache_background_update on;' \
+      "php_flarum.conf: background cache update"
+  fi
+  if [[ $(file_md5 "$inc") != "$before_inc" ]]; then
+    tune_note "php_flarum.conf: guest-cache gate is one 0/1 variable; background cache update"
+  fi
+  return 0
+}
+
 tune_xf_cache_vary() {
   local file=$1
   [[ -f $file ]] || return 0
@@ -1370,6 +1427,8 @@ tune_angie_configs() {
   # must exist before the first XenForo vhost is tested (a fresh install
   # tunes the include long before --domain app=xf runs).
   ensure_xf_cookie_bypass_map "$target" || true
+  tune_flarum_cache_gate "$target"
+  tune_default_tls_reject "$target"
   tune_xf_cache_vary "$target/h5bp/php_xf.conf"
   tune_xf_cache_vary "$target/h5bp/php_xf_proxy.conf"
   tune_xf_static_assets "$target/h5bp/xf2.conf"
@@ -1774,7 +1833,20 @@ PHP_PROFILE_REALPATH_KB=4096
 
 # opcache.max_accelerated_files for the PHP files under the Angie vhost
 # roots (plus /var/www/*/public without Angie): count * 1.5, clamped to
-# 16384..128256; the old 128256 ceiling when no root can be found.
+# 16384..128256, then written as the prime PHP itself rounds the value up to
+# (OPcache sizes its hash table from a fixed prime list).  The effective
+# table is unchanged, but the ini text only moves when the file count
+# crosses a table step: an exact count rewrote zz-setup-optimize.ini and
+# reloaded PHP-FPM (resetting OPcache) whenever a template or add-on was
+# compiled between two --optimize runs.  130987 when no root is found.
+php_opcache_table_size() {
+  local want=$1 p
+  for p in 223 463 983 1979 3907 7963 16229 32531 65407 130987 262237 524521 1048793; do
+    (( p >= want )) && { printf '%s' "$p"; return 0; }
+  done
+  printf '1048793'
+}
+
 php_accelerated_files_target() {
   local file root count=0 n
   local -a roots=()
@@ -1789,7 +1861,7 @@ php_accelerated_files_target() {
     done
   fi
   if (( ${#roots[@]} == 0 )); then
-    printf '128256'
+    printf '130987'
     return 0
   fi
   # The Anubis static shadow repeats each vhost root and www/apex pairs often
@@ -1798,8 +1870,8 @@ php_accelerated_files_target() {
   mapfile -t roots < <(printf '%s\n' "${roots[@]}" | sort -u)
   n=$(find "${roots[@]}" -xdev -type f -name '*.php' 2>/dev/null | wc -l | tr -d ' ')
   [[ $n =~ ^[0-9]+$ ]] && count=$n
-  (( count == 0 )) && { printf '128256'; return 0; }
-  printf '%s' "$(tune_clamp $(( count * 3 / 2 )) 16384 128256)"
+  (( count == 0 )) && { printf '130987'; return 0; }
+  php_opcache_table_size "$(tune_clamp $(( count * 3 / 2 )) 16384 128256)"
 }
 
 tune_php_fpm_version() {
@@ -2639,7 +2711,14 @@ ensure_sury_keyring() {
     retire_global_sury_key
     return 0
   fi
-  dpkg -i "$deb" || { warn "Could not install the Sury keyring package"; return 1; }
+  # Through apt, not bare dpkg -i: apt waits on the dpkg lock
+  # (DPkg::Lock::Timeout in APT_OPTS) while unattended-upgrades or a
+  # package postinst still holds it; dpkg -i fails at once.  The .deb is
+  # the embedded payload in a root-only temp file, so apt reads it as root
+  # (no "unsandboxed download" warning for the _apt user).
+  apt-get install "${APT_OPTS[@]}" -o APT::Sandbox::User=root \
+    --no-install-recommends "$deb" \
+    || { warn "Could not install the Sury keyring package"; return 1; }
   retire_global_sury_key
   info "Refreshed embedded key: ${keyring}"
 }

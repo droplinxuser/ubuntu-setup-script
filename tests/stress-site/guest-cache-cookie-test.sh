@@ -103,6 +103,14 @@ req xmenu -b "$T/g.jar" "$X/account/visitor-menu"
 mt=$(grep -oE 'href="/logout/\?t=[^"]+"' "$T/xmenu.body" | head -1 | sed 's/^href="//;s/"$//;s/&amp;/\&/g')
 chk "XF member page exposes a log out token" "$([ -n "$mt" ] && echo y)" y
 req xout -b "$T/g.jar" "$X$mt"
+# SV/StandardLib (bundled with the SV Redis add-ons) turns the GET log out
+# into an auto-submitting POST interstitial (200, template
+# svStandardLib_redirect_interstitial); a browser posts the token back to
+# /logout/.  Follow it the same way.
+if [ "$ST" = 200 ] && grep -q 'svStandardLib_redirect_interstitial' "$T/xout.body"; then
+  lt=$(printf '%s' "$mt" | sed -E 's/.*[?&]t=([^&]+).*/\1/')
+  req xout -b "$T/g.jar" --data "_xfToken=$lt" "$X/logout/"
+fi
 chk "XF logout is accepted (303)" "$ST" 303
 chk "XF logout (GET with token, no-cache URI) passes its Set-Cookie headers" "$([ "$(ncook xout)" -ge 1 ] && echo y)" y
 

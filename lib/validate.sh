@@ -359,9 +359,11 @@ storage_backing_class() {
   dev=${src%%[*}
   [[ -e $dev ]] || return 1
   local -a names=()
-  # lsblk -s prints a tree ("└─nvme0n1"); strip the prefix before matching.
-  mapfile -t names < <(lsblk -s -n -o NAME,TYPE "$dev" 2>/dev/null \
-    | awk '{ gsub(/^[^A-Za-z0-9]+/, "", $1); if ($2 == "disk") print $1 }')
+  # List output (-l), not the tree: in the tree a nested member line reads
+  # "│ └─nvme0n1 disk", so awk sees three fields and every RAID member but
+  # the last was dropped (a mixed NVMe+HDD array was classified by one disk).
+  mapfile -t names < <(lsblk -s -n -l -o NAME,TYPE "$dev" 2>/dev/null \
+    | awk '$2 == "disk" { print $1 }' | sort -u)
   (( ${#names[@]} > 0 )) || return 1
   for name in "${names[@]}"; do
     case "$(classify_block_device "$name")" in
