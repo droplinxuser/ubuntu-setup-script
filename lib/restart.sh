@@ -210,6 +210,7 @@ run_os_tuning() {
   configure_sysctl
   configure_limits
   configure_io_tuning
+  configure_who_apparmor
 }
 
 # Repair legacy cron jobs written by older releases.  It is deliberately a

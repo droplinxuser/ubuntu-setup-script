@@ -7,7 +7,32 @@ manifests, sweep tables and run logs these sections cite (`AUDIT-*.md`,
 removed from the tree on 2026-11-19 to keep the repository lean; every one
 is still in git history, for example
 `git show 84b0db5:tests/stress-site/AUDIT-20261117-1.21.30.md`.  The current
-cycle report is `AUDIT-20261119-1.21.33.md`.
+cycle report is `AUDIT-20261119-1.21.34.md`.
+
+## 1.21.34 audit — same Xeon E-2236 host, second cycle (2026-11-19)
+
+Pair: `server-configs-nginx` 1.6.47.  Details: `AUDIT-20261119-1.21.34.md`.
+
+- 12 fixes from two reviewed code audits and the host run.  The two highest:
+  Anubis static-miss and `/socket/` challenge bypasses (WordPress REST API
+  readable by a browser UA without a challenge), and the XenForo WebSocket
+  route answering 400 behind Anubis.  Also: Chevereto/Flarum credential
+  limit, Chevereto `app/` disclosure, `REDIRECT_DOMAINS`,
+  `--upgrade-php` listener and skipped-extension reporting, MariaDB
+  restart-free pool resize, cache-budget parity, IP fragment floor, the
+  `who` AppArmor denials.
+- Fresh install on the restored host: 2:54, 0 warnings, 0 AppArmor denials;
+  install → `--optimize` and `--optimize` ×2: 0 differences; 1,009 unit
+  checks, 212 dry runs, ShellCheck clean.
+- Apps on PHP 8.5: 0 unexpected responses, 0 diagnostics, 54/54 security,
+  62/62 guest-cookie.  `--upgrade-php` 8.5 → 8.4 → 8.5: 44 s each, 0
+  warnings; listener carry-over verified on a simulated adopted host.
+- Tiers: cached 95–103k, +Anubis 27.7k, bypass 335–356, home 288, thread
+  329–335.  Same-session A/B against 1.21.33: no regression.  JIT tracing
+  64 MB +13–16 % over off (128 MB equal); 12 FPM workers (one per thread)
+  beat 9, 16 and 24.
+- Restore + reboot: 705 → 705 packages, 0 `/etc` files added/removed, 0 failed
+  units, only `:22` and resolved listening.
 
 ## 1.21.33 audit — Intel Xeon E-2236, md RAID0 (2026-11-19)
 

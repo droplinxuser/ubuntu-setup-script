@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Solve the Anubis proof-of-work for one host and print the auth cookie header.
 # Usage: anubis-solve.sh HOST [IP]   (default IP 127.0.0.1, the audit host)
-# Writes the full cookie jar to /root/audit/cookies/anubis-$HOST.jar and the
-# Cookie header to /root/audit/cookies/anubis-$HOST.cookie.  Requires node.
+# Writes the full cookie jar to /root/audit/anubis-cookies/anubis-$HOST.jar and the
+# Cookie header to anubis-$HOST.cookie in the same directory (and stdout).
+# Requires node.
 set -Eeuo pipefail
 HOST=${1:?host}
 IP=${2:-127.0.0.1}

@@ -21,7 +21,7 @@ for d in /etc/angie /etc/php /etc/mysql /etc/valkey /etc/redis /etc/elasticsearc
          /etc/sysctl.d /etc/security/limits.d /etc/systemd/system /etc/systemd/journald.conf.d \
          /etc/systemd/resolved.conf.d /etc/default /etc/logrotate.d /etc/apt/sources.list.d \
          /etc/apt/keyrings /etc/apt/preferences.d /etc/apt/apt.conf.d /etc/cron.d /etc/ssh \
-         /etc/modules-load.d /etc/tmpfiles.d /etc/udev/rules.d /etc/ufw /usr/local/bin \
+         /etc/modules-load.d /etc/apparmor.d/local /etc/tmpfiles.d /etc/udev/rules.d /etc/ufw /usr/local/bin \
          /var/lib/setup.sh; do
   [[ -d $d ]] || continue
   find "$d" \( -path /var/lib/setup.sh/backup -o -name '*.keystore' -o -name '*.tmp' \

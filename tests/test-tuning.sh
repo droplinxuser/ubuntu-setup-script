@@ -2344,16 +2344,21 @@ check "MariaDB shared profile sizes a 2G buffer pool" \
   test "$MARIADB_PROFILE_BUFFER" = 2G
 check "MariaDB redo log is 25% of the pool" \
   test "$MARIADB_PROFILE_LOG_SIZE" = 512M
-check "MariaDB log buffer follows the pool (16..64 MB)" \
-  test "$MARIADB_PROFILE_LOG_BUFFER" = 64M
+lb_2g=$MARIADB_PROFILE_LOG_BUFFER
+check "MariaDB log buffer is RAM-sized (16..64 MB)" \
+  bash -c "(( $(size_to_mb "$lb_2g") >= 16 && $(size_to_mb "$lb_2g") <= 64 ))"
+# innodb_log_buffer_size is not dynamic: an online pool resize (300 MB -> 600
+# MB) must not change it, or --optimize falls back to a full restart.
+mariadb_compute_profile 512; lb_512=$MARIADB_PROFILE_LOG_BUFFER
+mariadb_compute_profile 1024
+check "the log buffer does not follow a 512 MB -> 1 GB pool resize" \
+  test "$lb_512" = "$MARIADB_PROFILE_LOG_BUFFER"
 # innodb_log_file_size must be at least innodb_log_buffer_size.  A pool small
-# enough for the 4%-of-data rule (128 MB) still gets a legal pair: 32 MB log,
-# 16 MB buffer, exactly 25%.
+# enough for the 4%-of-data rule (128 MB) still gets a legal pair: a 32 MB
+# log (exactly 25%) and a buffer no larger than it.
 mariadb_compute_profile 128
 check "a 128 MB pool gets a 32 MB redo log (25%)" \
   test "$MARIADB_PROFILE_LOG_SIZE" = 32M
-check "a 128 MB pool gets a 16 MB log buffer" \
-  test "$MARIADB_PROFILE_LOG_BUFFER" = 16M
 check "redo log is never smaller than the log buffer" \
   test "$(size_to_mb "$MARIADB_PROFILE_LOG_SIZE")" -ge "$(size_to_mb "$MARIADB_PROFILE_LOG_BUFFER")"
 mariadb_compute_profile 2048
@@ -2362,8 +2367,8 @@ mariadb_compute_profile 2048
 mariadb_compute_profile 16384
 check "a 16 GB pool gets a 4 GB redo log (25%, uncapped)" \
   test "$MARIADB_PROFILE_LOG_SIZE" = 4G
-check "a 16 GB pool keeps a 64 MB log buffer" \
-  test "$MARIADB_PROFILE_LOG_BUFFER" = 64M
+check "a 16 GB pool keeps the same RAM-sized log buffer" \
+  test "$MARIADB_PROFILE_LOG_BUFFER" = "$lb_2g"
 check "MariaDB shared profile keeps a usable connection ceiling" \
   bash -c "(( $MARIADB_PROFILE_MAX_CONN >= 200 && $MARIADB_PROFILE_MAX_CONN <= 2000 ))"
 
@@ -3065,7 +3070,7 @@ check "precompress_static_assets removes orphaned siblings" test ! -e "$TMP/asse
 # --purge restores paired sysctls in an order the kernel accepts: the
 # foreground dirty keys before the background ones, ipfrag low last.
 mkdir -p "$SETUP_STATE_DIR"
-for k in vm.dirty_background_bytes:0 vm.dirty_bytes:0 vm.dirty_background_ratio:10 vm.dirty_ratio:20 net.ipv4.ipfrag_low_thresh:3145728 net.ipv4.ipfrag_high_thresh:4194304; do
+for k in vm.dirty_background_bytes:0 vm.dirty_bytes:0 vm.dirty_background_ratio:10 vm.dirty_ratio:20 net.ipv4.ipfrag_low_thresh:3145728 net.ipv4.ipfrag_high_thresh:4194304 net.ipv6.ip6frag_low_thresh:3145728 net.ipv6.ip6frag_high_thresh:4194304; do
   printf '%s\n' "${k#*:}" > "$SETUP_STATE_DIR/sysctl-orig-${k%%:*}"
 done
 : > "$TMP/sysctl-order"
@@ -3075,7 +3080,8 @@ unset -f sysctl
 order_ok() {
   local o; o=$(tr '\n' ' ' < "$TMP/sysctl-order")
   [[ $o == *"vm.dirty_ratio "*"vm.dirty_background_ratio "* && $o != *"vm.dirty_bytes "* && $o != *"vm.dirty_background_bytes "* \
-     && $o == *"net.ipv4.ipfrag_high_thresh "*"net.ipv4.ipfrag_low_thresh "* ]]
+     && $o == *"net.ipv4.ipfrag_high_thresh "*"net.ipv4.ipfrag_low_thresh "* \
+     && $o == *"net.ipv6.ip6frag_high_thresh "*"net.ipv6.ip6frag_low_thresh "* ]]
 }
 check "restore_sysctl_values writes the non-zero member of each dirty pair, ratios first, ipfrag_low last" order_ok
 
@@ -4028,8 +4034,21 @@ check "the terminator reuses the vhost certificate" \
   grep -q 'ssl_certificate     /etc/angie/ssl/site.test/fullchain.pem;' "$TMP/anubis/terminators.conf"
 check "the terminator includes the Anubis location" \
   grep -q 'include snippets/anubis-location.conf;' "$TMP/anubis/terminators.conf"
-check "the terminator bypasses Anubis for the XenForo socket" \
-  grep -q 'proxy_pass http://anubis_backend;' "$TMP/anubis/terminators.conf"
+check "a vhost without a /socket/ location gets no socket route" \
+  bash -c '! grep -q "/socket/" "$1"' _ "$TMP/anubis/terminators.conf"
+# A XenForo vhost with push: only the WebSocket upgrade skips the filter, and
+# the route sets each proxy header once (h5bp/proxy_ws.conf repeated Host,
+# which made the backend answer 400 to every handshake).
+mkdir -p "$TMP/anubis/ws"
+sed 's|^    root /var/www/site.test/public;|&\n    location /socket/ { proxy_pass http://xf_websocket; }|' \
+  "$TMP/anubis/conf.d/site.test.conf" > "$TMP/anubis/ws/xf.test.conf"
+anubis_render_terminators "$TMP/anubis/ws" "$TMP/anubis/ws-terminators.conf"
+check "the XenForo socket route passes only WebSocket upgrades to the backend" \
+  bash -c 'grep -qF "location ^~ /socket/ {" "$1" && grep -qF "if (\$http_upgrade !~* ^websocket\$) { return 418; }" "$1" && grep -qF "proxy_pass http://anubis_backend;" "$1"' \
+  _ "$TMP/anubis/ws-terminators.conf"
+check "the socket route sets Host once (no h5bp/proxy_ws.conf include)" \
+  bash -c '! grep -q "proxy_ws.conf" "$1" && test "$(sed -n "/location ^~ \/socket\//,/^    }/p" "$1" | grep -c "proxy_set_header Host ")" = 1' \
+  _ "$TMP/anubis/ws-terminators.conf"
 check "the catch-all vhost gets no terminator" \
   bash -c '! grep -q "server_name _;" "$1"' _ "$TMP/anubis/terminators.conf"
 terminator_md5=$(md5sum < "$TMP/anubis/terminators.conf")
@@ -4412,6 +4431,21 @@ check "purge_others skips pre-enabled units" \
 
 check "MariaDB AppArmor block allows the sysfs dev reads (NVMe paths too)" \
   bash -c 'sed -n "/^configure_mariadb_apparmor()/,/^}/p" "$1" | grep -qF "/sys/devices/**/dev r,"' _ "$ROOT/lib/services.sh"
+
+aa_tmp=$(mktemp)
+printf "%s\n" "# operator rule" "/srv/x r," "# BEGIN setup.sh who nameservice" "include <abstractions/nameservice-strict>" "# END setup.sh who nameservice" > "$aa_tmp"
+check "apparmor_local_strip drops only the managed block" \
+  test "$(apparmor_local_strip "$aa_tmp" "who nameservice")" = "$(printf "%s\n" "# operator rule" "/srv/x r,")"
+rm -f "$aa_tmp"
+check "who(1) AppArmor override is written by --basic and --optimize and removed by --purge basic" \
+  bash -c 'sed -n "/^install_basic()/,/^}/p" "$1" | grep -q configure_who_apparmor \
+    && sed -n "/^run_os_tuning()/,/^}/p" "$2" | grep -q configure_who_apparmor \
+    && sed -n "/^purge_basic()/,/^}/p" "$3" | grep -qF "apparmor_local_clear who"' \
+  _ "$ROOT/lib/os.sh" "$ROOT/lib/restart.sh" "$ROOT/lib/purge.sh"
+
+check "IPv4 fragment reassembly never goes below the kernel default (4 MB)" \
+  bash -c 'grep -qF "(( ipfrag_high < 4194304 )) && ipfrag_high=4194304" "$1" && grep -qE "^net\.ipv6\.ip6frag_high_thresh = 4194304$" "$2"' \
+  _ "$ROOT/lib/os.sh" "$ROOT/configs/system/sysctl.conf"
 
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

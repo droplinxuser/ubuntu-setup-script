@@ -36,6 +36,10 @@ PHP_UPGRADE_OLD_PACKAGE_VERSIONS=()
 PHP_UPGRADE_MODE=""
 PHP_UPGRADE_TARGET_PKGS=()
 PHP_UPGRADE_SKIPPED=()
+# Listener of the old version's www pool.  The new www.conf comes from the
+# template, so without this an operator socket path (an adopted host on
+# /run/php/php8.4-fpm.sock) would change and Angie would answer 502.
+PHP_UPGRADE_WWW_LISTEN=""
 PHP_UPGRADE_CUSTOM_INIS=()
 PHP_UPGRADE_CUSTOM_POOLS=()
 PHP_UPGRADE_PECL=()
@@ -111,6 +115,7 @@ php_upgrade_snapshot() {
   local old=$1 dir=$PHP_UPGRADE_MANIFEST_DIR manual=" " pkg ext flag
   mkdir -p "$dir"
   PHP_UPGRADE_OLD_VERSION=$old
+  PHP_UPGRADE_WWW_LISTEN=$(php_pool_listen "$old" 2>/dev/null || true)
   local -a pkgs=()
   mapfile -t pkgs < <(php_upgrade_installed_packages)
   PHP_UPGRADE_OLD_PACKAGES=("${pkgs[@]}")
@@ -622,8 +627,19 @@ php_upgrade_install() {
   ENABLED[php]=1
   PHP_EXTRA_PACKAGES=("${PHP_UPGRADE_TARGET_PKGS[@]}")
   PHP_FRESH_INSTALL=1
+  rm -f "${STATE_DIR}/php-optional-failed"
   run_service php install_php
   PHP_FRESH_INSTALL=0
+  # install_php runs in run_service's subshell; optional packages that
+  # could not be installed come back through a state file, so they are
+  # reported and recorded as pending instead of silently dropped.
+  local failed
+  if [[ -s "${STATE_DIR}/php-optional-failed" ]]; then
+    while IFS= read -r failed; do
+      [[ -n $failed ]] && PHP_UPGRADE_SKIPPED+=("$failed")
+    done < "${STATE_DIR}/php-optional-failed"
+    rm -f "${STATE_DIR}/php-optional-failed"
+  fi
   [[ ${SVC_STATUS[php]:-} == OK ]]
 }
 

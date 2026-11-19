@@ -420,6 +420,62 @@ fetch_server_configs() {
 }
 
 # ---------------------------------------------------------------------------
+# AppArmor local overrides
+# ---------------------------------------------------------------------------
+# Ubuntu profiles end with `include if exists <local/NAME>`.  setup.sh keeps
+# its rules there between "# BEGIN setup.sh TAG" / "# END setup.sh TAG"
+# markers, so operator rules in the same file survive every rewrite.
+
+# Print FILE without the managed TAG block.
+apparmor_local_strip() {
+  awk -v b="# BEGIN setup.sh ${2}" -v e="# END setup.sh ${2}" '
+    $0 == b { skip = 1; next }
+    $0 == e { skip = 0; next }
+    !skip { print }
+  ' "$1"
+}
+
+apparmor_reload_profile() {
+  local profile=/etc/apparmor.d/$1
+  [[ -f $profile ]] && command -v apparmor_parser >/dev/null 2>&1 || return 0
+  apparmor_parser -r "$profile" 2>/dev/null || true
+}
+
+# apparmor_local_set NAME TAG < RULES
+# Write the managed TAG block of /etc/apparmor.d/local/NAME (appended after
+# any other content) and reload profile NAME.  An unchanged file is left
+# alone, so a repeated --optimize does not touch it.
+apparmor_local_set() {
+  local name=$1 tag=$2 file=/etc/apparmor.d/local/$1 tmp rules
+  rules=$(cat)
+  [[ -d /etc/apparmor.d ]] || return 0
+  mkdir -p /etc/apparmor.d/local
+  tmp=$(tmp_file) || return 1
+  {
+    if [[ -f $file ]]; then apparmor_local_strip "$file" "$tag"; fi
+    printf '# BEGIN setup.sh %s\n%s\n# END setup.sh %s\n' "$tag" "$rules" "$tag"
+  } > "$tmp"
+  [[ -f $file ]] && cmp -s "$tmp" "$file" && return 0
+  install -m 644 "$tmp" "$file" || return 1
+  apparmor_reload_profile "$name"
+}
+
+# Remove the managed TAG block; delete the file when nothing else is left
+# (setup.sh created it) and reload profile NAME.
+apparmor_local_clear() {
+  local name=$1 tag=$2 file=/etc/apparmor.d/local/$1 tmp
+  [[ -f $file ]] && grep -qxF "# BEGIN setup.sh ${tag}" "$file" || return 0
+  tmp=$(tmp_file) || return 1
+  apparmor_local_strip "$file" "$tag" > "$tmp"
+  if grep -q '[^[:space:]]' "$tmp"; then
+    cat "$tmp" > "$file"
+  else
+    rm -f "$file"
+  fi
+  apparmor_reload_profile "$name"
+}
+
+# ---------------------------------------------------------------------------
 # Cron management
 # ---------------------------------------------------------------------------
 pkg_ok() {

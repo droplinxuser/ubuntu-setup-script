@@ -29,6 +29,11 @@ rm -f "$ROOT/bench-options.php"
 
 echo "== seeding (this takes a while)"
 cd "$ROOT"
+# Hampel Seeder 1.0.0b11 refuses to run unless the forum opts in; the flag is
+# removed again right after the run so the benchmark forum is not left with
+# seeding switched on.
+SEED_FLAG="\$config['hampelSeeder']['enabled'] = true; // audit seeding"
+grep -qF "$SEED_FLAG" src/config.php || printf '%s\n' "$SEED_FLAG" >> src/config.php
 set +e
 runuser -u www-data -- "$PHP" -d memory_limit=4G -d max_execution_time=0 \
   cmd.php seeder:run Default \
@@ -38,6 +43,7 @@ runuser -u www-data -- "$PHP" -d memory_limit=4G -d max_execution_time=0 \
   > /root/audit/seed.json 2> /root/audit/seed.err
 rc=$?
 set -e
+grep -vF "$SEED_FLAG" src/config.php > src/config.php.tmp && cat src/config.php.tmp > src/config.php && rm -f src/config.php.tmp
 echo "seeder exit=$rc"
 tail -5 /root/audit/seed.err || true
 (( rc == 0 )) || { echo "seeding failed" >&2; exit 1; }

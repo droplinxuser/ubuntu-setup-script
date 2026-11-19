@@ -495,9 +495,14 @@ install_php() {
     done
   fi
   systemctl reset-failed "php${ver}-fpm" 2>/dev/null || true
-  for pkg in "${optional_failed[@]}"; do
-    PHP_UPGRADE_SKIPPED+=("${pkg#php*-} (${pkg}: install failed)")
-  done
+  # This runs in run_service's subshell: hand the failures to the parent
+  # (php_upgrade_install) through the state directory.
+  if (( ${#optional_failed[@]} > 0 )); then
+    ensure_state
+    for pkg in "${optional_failed[@]}"; do
+      printf '%s (%s: install failed)\n' "${pkg#php*-}" "$pkg"
+    done >> "${STATE_DIR}/php-optional-failed"
+  fi
   # Unversioned packages --upgrade-php carries over under their own name
   # (php-pear, PHP libraries).  Their dependencies are not tied to this PHP
   # version, so they get their own transaction: one that cannot be satisfied
@@ -553,7 +558,9 @@ install_php() {
   else
     PHP_FRESH_INSTALL=1
   fi
-  if ! tune_php_fpm_version "$ver"; then
+  # --upgrade-php passes the old www listener (empty on a first install:
+  # the tuner then keeps what the pool listens on).
+  if ! tune_php_fpm_version "$ver" "${PHP_UPGRADE_WWW_LISTEN:-}"; then
     PHP_FRESH_INSTALL=0
     rollback_php_tree "$php_backup" "$ver"
     return 1
@@ -624,39 +631,22 @@ configure_mariadb_apparmor() {
   # mysql system tables.
   [[ -d /etc/apparmor.d ]] || return 0
 
-  local localfile=/etc/apparmor.d/local/mariadbd
-  local begin='# BEGIN setup.sh mariadb apparmor'
-  local end='# END setup.sh mariadb apparmor'
-  local tmp
-
-  mkdir -p /etc/apparmor.d/local
-  # Always refresh the managed block so new log paths are picked up on
-  # upgrades; keep any unrelated operator rules outside the markers.
-  if [[ -f $localfile ]]; then
-    tmp=$(tmp_file)
-    awk -v b="$begin" -v e="$end" '
-      $0 == b { skip = 1; next }
-      $0 == e { skip = 0; next }
-      !skip { print }
-    ' "$localfile" > "$tmp"
-    cat "$tmp" > "$localfile"
-  fi
-  {
-    printf '%s\n' "$begin"
-    printf '# Allow mariadb-install-db to bootstrap the server as root.\n'
-    printf 'capability dac_override,\n'
-    printf 'capability dac_read_search,\n'
-    printf 'capability setuid,\n'
-    printf 'capability setgid,\n'
-    printf '# Central log tree (/var/www/logs).\n'
-    printf '/var/www/logs/mariadb/ r,\n'
-    printf '/var/www/logs/mariadb/** rw,\n'
-    printf '# MariaDB 11.8 reads the dev number of each block device at startup (SSD\n'
-    printf '# detection; NVMe namespaces have no block/ path component); the stock\n'
-    printf '# profile denies it and logs one DENIED per disk.  dev holds major:minor only.\n'
-    printf '/sys/devices/**/dev r,\n'
-    printf '%s\n' "$end"
-  } >> "$localfile"
+  # The managed block is refreshed on every run so new log paths reach
+  # upgraded hosts; operator rules outside the markers are kept.
+  apparmor_local_set mariadbd 'mariadb apparmor' <<'EOF'
+# Allow mariadb-install-db to bootstrap the server as root.
+capability dac_override,
+capability dac_read_search,
+capability setuid,
+capability setgid,
+# Central log tree (/var/www/logs).
+/var/www/logs/mariadb/ r,
+/var/www/logs/mariadb/** rw,
+# MariaDB 11.8 reads the dev number of each block device at startup (SSD
+# detection; NVMe namespaces have no block/ path component); the stock
+# profile denies it and logs one DENIED per disk.  dev holds major:minor only.
+/sys/devices/**/dev r,
+EOF
 
   # If a previous install was purged, the profile file is gone but the old
   # profile can still be loaded in the kernel.  That stale profile is what
@@ -670,9 +660,9 @@ configure_mariadb_apparmor() {
     apparmor_parser -R "$tmp" 2>/dev/null || true
   fi
 
-  if [[ -f /etc/apparmor.d/mariadbd ]] && command -v apparmor_parser >/dev/null 2>&1; then
-    apparmor_parser -r /etc/apparmor.d/mariadbd 2>/dev/null || true
-  fi
+  # The package may have (re)installed the profile after the block was
+  # written; loading it again is cheap and makes the override effective.
+  apparmor_reload_profile mariadbd
 }
 
 # Storage class of the MariaDB data directory (not /var/www: a separate data
@@ -792,17 +782,19 @@ mariadb_compute_profile() {
   # stays proportional instead of silently dropping below 25%.
   logsize=$(( size_mb / 4 ))
   (( logsize < 16 )) && logsize=16
-  # innodb_log_file_size must be at least innodb_log_buffer_size.  The buffer
-  # follows the pool (16..64 MB) instead of a fixed 64 MB, so the 25% redo log
-  # of a small pool is still a legal configuration (a 128 MB pool gets a
-  # 32 MB log and a 16 MB buffer).
-  local log_buffer=$(( size_mb / 16 ))
+  ram_mb=$(mem_total_mb)
+  # innodb_log_buffer_size is not dynamic.  Sized from RAM (RAM/256,
+  # 16..64 MB) it stays put when --optimize grows the pool online; it used to
+  # be pool/16, so every resize of a 256 MB-1 GB pool forced a full restart.
+  # innodb_log_file_size must be at least the buffer, so a small pool's 25%
+  # redo log caps it (a 128 MB pool: 32 MB log, buffer <= 32 MB).
+  local log_buffer=$(( ram_mb / 256 ))
   (( log_buffer < 16 )) && log_buffer=16
   (( log_buffer > 64 )) && log_buffer=64
+  (( log_buffer > logsize )) && log_buffer=$logsize
   # Aria serves internal temporary tables, not the InnoDB data: size its
   # page cache from RAM (RAM/128, 16..256 MB) so it stops changing, and
   # forcing a restart, every time the buffer pool is re-planned.
-  ram_mb=$(mem_total_mb)
   aria_mb=$(( ram_mb / 128 ))
   (( aria_mb < 16 )) && aria_mb=16
   (( aria_mb > 256 )) && aria_mb=256

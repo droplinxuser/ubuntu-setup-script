@@ -165,6 +165,7 @@ purge_basic() {
   restore_original /etc/udev/rules.d/60-setup-io.rules udev-60-setup-io.rules
   udevadm control --reload-rules 2>/dev/null || true
   systemctl daemon-reload || true
+  apparmor_local_clear who 'who nameservice'
   # unattended-upgrades: put the APT periodic file back and disable the unit
   # only when it was not enabled before setup.sh enabled it.
   restore_original /etc/apt/apt.conf.d/20auto-upgrades apt-20auto-upgrades
@@ -304,20 +305,7 @@ purge_mariadb() {
 
   # Drop the AppArmor override added for mariadb-install-db, while keeping any
   # operator rules outside the managed markers.
-  local aflocal=/etc/apparmor.d/local/mariadbd
-  if [[ -f $aflocal ]]; then
-    local tmp
-    tmp=$(tmp_file)
-    awk -v b='# BEGIN setup.sh mariadb apparmor' -v e='# END setup.sh mariadb apparmor' '
-      $0 == b { skip = 1; next }
-      $0 == e { skip = 0; next }
-      !skip { print }
-    ' "$aflocal" > "$tmp"
-    cat "$tmp" > "$aflocal"
-    if [[ -f /etc/apparmor.d/mariadbd ]] && command -v apparmor_parser >/dev/null 2>&1; then
-      apparmor_parser -r /etc/apparmor.d/mariadbd 2>/dev/null || true
-    fi
-  fi
+  apparmor_local_clear mariadbd 'mariadb apparmor'
   if [[ -f "${STATE_DIR}/lz4-installed" ]]; then
     apt_purge_pkgs lz4
   fi

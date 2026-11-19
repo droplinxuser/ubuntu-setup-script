@@ -55,9 +55,10 @@ tune_cache_total_mb() {
 }
 
 # Angie cache budget for the current service set.  A dedicated Angie proxy
-# gets 50% of RAM (10% of free disk); Angie+PHP gets 30%; a host with a data
-# or search tier gets 25% (5% of free disk).  Callers pass the live RAM and
-# free disk so --dry-run and the real tuner report the same number.
+# gets 50% of RAM (10% of the cache disk); Angie+PHP gets 30%; a host with a
+# data or search tier gets 25% (5% of the cache disk, see angie_disk_free_mb).
+# Callers pass the live RAM and disk basis so --dry-run and the real tuner
+# report the same number.
 angie_cache_budget_mb() {
   local ram_mb=$1 disk_free_mb=$2 pct=25 disk_pct=5 svc
   local has_php=0 has_maria=0 has_cache=0 has_es=0

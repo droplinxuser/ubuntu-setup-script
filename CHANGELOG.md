@@ -5,6 +5,70 @@ README.md; measurements in tests/stress-site/RESULTS.md.  Per-cycle
 reports and raw test logs cited by entries up to 1.21.32 were removed from
 the tree on 2026-11-19; retrieve them with `git show 84b0db5:<path>`.
 
+## 1.21.34 (2026-11-19)
+
+Second audit cycle on the Xeon E-2236 / md RAID0 host (Ubuntu 26.04.1,
+705-package baseline).  Pair: `server-configs-nginx` 1.6.47.  Report:
+`tests/stress-site/AUDIT-20261119-1.21.34.md`.
+
+- **Anubis: two challenge bypasses closed.**  A static-looking path that is
+  not a file (the static shadow answers 404) went back into Anubis, where
+  the `static-assets` rule ALLOWed it on its extension, and on to PHP:
+  `GET /x.css?rest_route=/wp/v2/users` returned the WordPress REST API to a
+  browser with no challenge.  The terminator now tags that fallback
+  (`X-Anubis-Static-Miss`) and a `static-miss` policy rule challenges
+  browsers there; non-browser clients still get the plain 404.  The
+  `/socket/` route is generated only for vhosts that have a `/socket/`
+  location and passes only WebSocket upgrades straight to the backend;
+  anything else under `/socket/` is filtered like a page (WordPress served
+  `/socket/?rest_route=` from `index.php`).
+- **Anubis: the XenForo WebSocket route answered 400.**  It included
+  `h5bp/proxy_ws.conf` and then set Host, X-Real-IP, X-Forwarded-For and
+  X-Forwarded-Proto again; Angie sends both, and the backend rejected the
+  duplicate Host on every handshake.  The route now sets each header once.
+- **Anubis: `REDIRECT_DOMAINS` is set** to the server names of the sites
+  behind the filter.  Without it the post-challenge redirect went to any
+  domain (`?redir=https://evil.example/` was followed) and Anubis warned
+  at every start.  A regex `server_name` leaves the variable out.
+- **`--upgrade-php` keeps the www pool's listener.**  The new `www.conf`
+  comes from the template, so an adopted host whose pool listened on
+  `/run/php/php8.4-fpm.sock` moved to `/run/php/php-fpm.sock` and Angie
+  answered 502 while the upgrade reported success.  The old listener is
+  passed to the tuner, as for the extra pools.
+- **`--upgrade-php` reports optional packages that failed to install.**
+  `install_php` runs in `run_service`'s subshell, so its failures never
+  reached `PHP_UPGRADE_SKIPPED`; the pending list was deleted and the
+  summary said "skipped 0".  They now come back through
+  `${STATE_DIR}/php-optional-failed`.
+- **MariaDB: an online buffer-pool resize no longer forces a restart.**
+  `innodb_log_buffer_size` (not dynamic) was pool/16, so growing a
+  256 MB-1 GB pool changed it and `--optimize` restarted MariaDB with the
+  web tier paused.  It is now RAM/256 (16-64 MB), capped at the redo log.
+- **Angie cache budget no longer moves with the install.**  The disk cap
+  was 5% of *free* space, measured before PHP, MariaDB and Elasticsearch
+  took ~2 GB; on small disks the first `--optimize` rewrote every
+  `max_size`/`keys_zone`.  The basis is now the filesystem size, capped at
+  half of what is free.
+- **IP fragment reassembly is never below the kernel default.**  IPv4 was
+  RAM x 32 clamped to 256 KB-4 MB (2 MB on a 62 GB host) and the base
+  profile set IPv6 to 256 KB, the obsolete CVE-2018-5391 workaround; large
+  fragmented UDP/IPv6 packets were dropped.  IPv4 is now 4-16 MB, IPv6 the
+  kernel's 4 MB/3 MB; the live pair is pre-adjusted and restored
+  high-before-low for both families.
+- **Zero-warning install:** a managed `/etc/apparmor.d/local/who` block
+  (`abstractions/nameservice-strict`) stops the 95 AppArmor `DENIED` lines
+  needrestart's `who` call logged per install on Ubuntu 26.04; it is
+  written before the first apt run, kept by `--optimize` and removed by
+  `--purge basic`.  The public-80/443 advisory is a note, not a `[WARN]`
+  (the firewall opens them on purpose).
+- **Refactor:** `apparmor_local_set`/`apparmor_local_clear`
+  (`lib/util.sh`) manage marker blocks in `/etc/apparmor.d/local/*` for
+  MariaDB and `who`; the duplicated awk in `services.sh` and `purge.sh` is
+  gone.  `state-snapshot.sh` covers `/etc/apparmor.d/local`.
+- Tests: `seed-xf.sh` opts the forum into Hampel Seeder 1.0.0b11 (which now
+  refuses to run without `$config['hampelSeeder']['enabled']`) and removes
+  the flag afterwards.
+
 ## 1.21.33 (2026-11-19)
 
 Audit cycle on a new hardware class: bare-metal Intel Xeon E-2236 (6C/12T,

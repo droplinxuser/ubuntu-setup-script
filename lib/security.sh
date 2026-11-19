@@ -392,7 +392,9 @@ EOF
     harden_warn "- SSH: password authentication is enabled; switch to keys-only access once key login is confirmed"
   fi
   if ufw status 2>/dev/null | grep -qE '^(80|443)(/tcp)?[[:space:]]+ALLOW[[:space:]]+Anywhere'; then
-    harden_warn "- Firewall: 80/443 are open to the internet; restrict them to your CDN/proxy ranges if the origin is not meant to be reached directly"
+    # configure_ufw opens 80/443 on purpose (a public web server); this is
+    # advice for CDN-fronted origins, not a fault, so it is not a warning.
+    harden_note "- Firewall: 80/443 are open to the internet; restrict them to your CDN/proxy ranges if the origin is not meant to be reached directly"
   fi
   if systemctl is-active --quiet elasticsearch 2>/dev/null; then
     # The installer writes network.host: "localhost" (quoted); ::1 and the

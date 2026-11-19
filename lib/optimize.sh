@@ -974,15 +974,21 @@ ANGIE_WORKER_RLIMIT=""
 ANGIE_WORKER_CONNECTIONS=""
 ANGIE_PHP_KEEPALIVE=""
 
-# Free disk under the web root (fallback /) in MB, for the cache budget.
+# Disk basis of the cache budget in MB: the size of the cache filesystem,
+# capped at 10x its free space (so a 5% share never exceeds half of what is
+# free).  Free space alone moved with the install itself: Angie is tuned
+# before PHP, MariaDB and Elasticsearch take ~2 GB, so on a small disk the
+# first --optimize rewrote every max_size/keys_zone and broke
+# install/optimize parity.
 angie_disk_free_mb() {
   local mb
   # The cache zones live under /home (angie_cache_dirs), which can be its
   # own filesystem; measure that one, not the web root.
   local dir=/home
   [[ -d $dir ]] || dir=/var/www
-  mb=$(df -Pm "$dir" 2>/dev/null | awk 'NR==2{print $4}' || true)
-  [[ $mb =~ ^[0-9]+$ ]] || mb=$(df -Pm / 2>/dev/null | awk 'NR==2{print $4}' || true)
+  local basis='NR==2{s=$2; f=$4*10; print (f < s ? f : s)}'
+  mb=$(df -Pm "$dir" 2>/dev/null | awk "$basis" || true)
+  [[ $mb =~ ^[0-9]+$ ]] || mb=$(df -Pm / 2>/dev/null | awk "$basis" || true)
   [[ $mb =~ ^[0-9]+$ ]] || mb=10240
   printf '%s' "$mb"
 }

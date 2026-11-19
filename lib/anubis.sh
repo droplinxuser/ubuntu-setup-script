@@ -227,9 +227,48 @@ SLOG_LEVEL=WARN
 SOCKET_MODE=0660
 HS512_SECRET=${secret}
 EOF
+  # After a challenge Anubis redirects to the ?redir= URL.  Without an
+  # allow-list it redirects anywhere (an open redirect on every protected
+  # site) and warns at every start.  The list is the server names of the
+  # sites behind the filter; a regex server_name cannot be expressed, so then
+  # the variable is left out rather than locking visitors out.
+  local domains
+  if domains=$(anubis_redirect_domains) && [[ -n $domains ]]; then
+    printf 'REDIRECT_DOMAINS=%s\n' "$domains" >> "$tmp"
+  fi
   if commit_if_changed "$ANUBIS_ENV" "$tmp"; then ANUBIS_SERVICE_DIRTY=1; fi
   chmod 600 "$ANUBIS_ENV"; chown root:"$ANUBIS_USER" "$ANUBIS_ENV"
   return 0
+}
+
+# Comma-separated server names of every site Anubis fronts (all vhosts
+# anubis_vhost_files selects; each is integrated in the same run).  Nginx's
+# ".example.com" becomes "example.com,*.example.com".  Fails (status 1) when a
+# regex server_name makes the set impossible to list.
+anubis_redirect_domains() {
+  local dir=${1:-/etc/angie/conf.d} f
+  local -a files=()
+  for f in $(anubis_vhost_files "$dir"); do files+=("$f"); done
+  (( ${#files[@]} > 0 )) || return 0
+  awk '
+    {
+      code = $0
+      sub(/#.*/, "", code)
+      if (code !~ /^[ \t]*server_name[ \t]+/) next
+      sub(/^[ \t]*server_name[ \t]+/, "", code)
+      sub(/;.*/, "", code)
+      n = split(code, a, /[ \t]+/)
+      for (i = 1; i <= n; i++) {
+        d = tolower(a[i])
+        if (d == "" || d == "_" || d == "\"\"") continue
+        if (d ~ /^~/) { bad = 1; continue }
+        if (d ~ /^\./) { add(substr(d, 2)); add("*" d); continue }
+        add(d)
+      }
+    }
+    function add(x) { if (!(x in seen)) { seen[x] = 1; out = (out == "" ? x : out "," x) } }
+    END { if (bad) exit 1; print out }
+  ' "${files[@]}"
 }
 
 # Language Anubis uses for its own pages.  English is the only catalogue that
@@ -272,6 +311,16 @@ bots:
   # dozens of them.  Proxying them without a challenge keeps the first visit
   # renderable (a challenged CSS/JS request returns HTML) and removes most of
   # Anubis's request volume on a real site.
+  # A static-looking path that is not a file in the application root (the
+  # static shadow answered 404) goes on to PHP.  Browsers get the same
+  # challenge as for a page: /x.css?rest_route=/wp/v2/users used to return
+  # the WordPress REST API with no challenge.  The terminator sets the header
+  # only on that fallback; a client sending it just gets challenged.
+  - name: static-miss
+    user_agent_regex: Mozilla
+    headers_regex:
+      X-Anubis-Static-Miss: ^1$
+    action: CHALLENGE
   - name: static-assets
     path_regex: (?i)\.(?:css|js|mjs|map|json|webmanifest|png|jpe?g|gif|webp|avif|svg|ico|bmp|woff2?|ttf|otf|eot|mp4|webm|mp3|ogg|wav|pdf|txt|xml|zip|gz|br|wasm)$
     action: ALLOW
@@ -841,17 +890,36 @@ EOF
           print "    ssl_certificate     " cert ";"
           print "    ssl_certificate_key " key ";"
           print ""
-          print "    # XenForo push transport: keep the WebSocket upgrade out of"
-          print "    # the HTTP bot filter."
-          print "    location /socket/ {"
-          print "        include h5bp/proxy_ws.conf;"
-          print "        proxy_pass http://anubis_backend;"
-          print "        proxy_set_header Host $host;"
-          print "        proxy_set_header X-Real-IP $remote_addr;"
-          print "        proxy_set_header X-Forwarded-For $remote_addr;"
-          print "        proxy_set_header X-Forwarded-Proto https;"
-          print "    }"
-          print ""
+          if (ws) {
+            # Only for a vhost that has a /socket/ location (XenForo push).
+            # The upgrade itself skips the HTTP bot filter; any other request
+            # under /socket/ is filtered like a page, or the prefix would be
+            # an unchallenged way into the application (WordPress serves
+            # /socket/?rest_route= from index.php).  The headers are set here
+            # once: h5bp/proxy_ws.conf repeated them, and the duplicate Host
+            # made the backend answer 400 to every WebSocket handshake.
+            print "    # XenForo push transport: only the WebSocket upgrade skips"
+            print "    # the HTTP bot filter."
+            print "    location ^~ /socket/ {"
+            print "        error_page 418 = @anubis_filter;"
+            print "        if ($http_upgrade !~* ^websocket$) { return 418; }"
+            print "        proxy_pass http://anubis_backend;"
+            print "        proxy_http_version 1.1;"
+            print "        proxy_set_header Upgrade $http_upgrade;"
+            print "        proxy_set_header Connection $connection_upgrade;"
+            print "        proxy_set_header Host $host;"
+            print "        proxy_set_header X-Real-IP $remote_addr;"
+            print "        proxy_set_header X-Forwarded-For $remote_addr;"
+            print "        proxy_set_header X-Forwarded-Proto https;"
+            print "        proxy_buffering off;"
+            print "        proxy_read_timeout 1h;"
+            print "        proxy_send_timeout 1h;"
+            print "    }"
+            print "    location @anubis_filter {"
+            print "        include snippets/anubis-location.conf;"
+            print "    }"
+            print ""
+          }
           if (static) {
             print "    # Static assets that exist in the application root are served by"
             print "    # a static-only shadow of this vhost, without the Go proxy hop."
@@ -877,6 +945,9 @@ EOF
             print "    }"
             print "    location @anubis_static_miss {"
             print "        include snippets/anubis-location.conf;"
+            print "        # Not a file: the policy challenges browsers here instead"
+            print "        # of the static-assets ALLOW (/x.css?rest_route= reached PHP)."
+            print "        proxy_set_header X-Anubis-Static-Miss 1;"
             print "    }"
             print ""
           }
@@ -896,7 +967,7 @@ EOF
           sub(/#.*/, "", code)
           if (code ~ /^[ \t]*server[ \t]*{/) {
             in_block = 1; depth = count_braces(code)
-            names = ""; cert = ""; key = ""; integrated = 0
+            names = ""; cert = ""; key = ""; integrated = 0; ws = 0
             next
           }
           if (in_block) {
@@ -918,6 +989,7 @@ EOF
               key = v
             }
             if (index(code, "unix:" sock) > 0) integrated = 1
+            if (code ~ /^[ \t]*location[ \t]+(\^~[ \t]+)?\/socket\//) ws = 1
             depth += count_braces(code)
             if (depth <= 0) { flush(); in_block = 0 }
           }

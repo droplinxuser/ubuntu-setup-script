@@ -28,6 +28,21 @@ EOF
   resolvectl status || true
 }
 
+# Ubuntu 26.04's `who` profile lacks the nameservice abstraction.
+# needrestart runs who(1) after every apt operation, and each run logs
+# AppArmor DENIED lines for /etc/passwd and /etc/nsswitch.conf (95 per full
+# install).  Read-only name lookups are all it needs.
+configure_who_apparmor() {
+  [[ -f /etc/apparmor.d/who ]] || return 0
+  grep -q 'include if exists <local/who>' /etc/apparmor.d/who || return 0
+  local abs=nameservice-strict
+  [[ -f /etc/apparmor.d/abstractions/${abs} ]] || abs=nameservice
+  apparmor_local_set who 'who nameservice' <<EOF
+# needrestart runs who(1) after apt operations; allow user name lookups.
+include <abstractions/${abs}>
+EOF
+}
+
 update_system() {
   step "Ubuntu update"
   apt_update
@@ -431,6 +446,7 @@ SYSCTL_MANAGED_KEYS=(
   net.ipv4.neigh.default.gc_thresh1 net.ipv4.neigh.default.gc_thresh2
   net.ipv4.neigh.default.gc_thresh3
   net.ipv4.ipfrag_low_thresh net.ipv4.ipfrag_high_thresh
+  net.ipv6.ip6frag_low_thresh net.ipv6.ip6frag_high_thresh
   net.netfilter.nf_conntrack_max
   fs.file-max fs.nr_open fs.inotify.max_user_watches
   vm.min_free_kbytes kernel.shmmax kernel.shmall vm.max_map_count
@@ -506,8 +522,8 @@ restore_sysctl_values() {
   # (the tune wrote bytes, which zeroed the live ratio; restoring bytes=0 then
   # left no threshold and --purge logged "Could not restore vm.dirty_bytes=0").
   # Each pair restores whichever recorded value is non-zero, foreground pair
-  # first.  ipfrag_low_thresh is written after ipfrag_high_thresh (the kernel
-  # rejects a low mark above the live high mark).
+  # first.  ipfrag_low_thresh is written after ipfrag_high_thresh, for IPv4
+  # and IPv6 (the kernel rejects a low mark above the live high mark).
   restore_sysctl_pair vm.dirty_ratio vm.dirty_bytes
   restore_sysctl_pair vm.dirty_background_ratio vm.dirty_background_bytes
   local -a all=("${SYSCTL_MANAGED_KEYS[@]}") ordered=()
@@ -519,11 +535,11 @@ restore_sysctl_values() {
     [[ -n $key && $seen != *" ${key} "* ]] || continue
     seen+="${key} "
     case $key in
-      vm.dirty_bytes|vm.dirty_ratio|vm.dirty_background_bytes|vm.dirty_background_ratio|net.ipv4.ipfrag_low_thresh) continue ;;
+      vm.dirty_bytes|vm.dirty_ratio|vm.dirty_background_bytes|vm.dirty_background_ratio|net.ipv4.ipfrag_low_thresh|net.ipv6.ip6frag_low_thresh) continue ;;
     esac
     ordered+=("$key")
   done
-  ordered+=(net.ipv4.ipfrag_low_thresh)
+  ordered+=(net.ipv4.ipfrag_low_thresh net.ipv6.ip6frag_low_thresh)
   for key in "${ordered[@]}"; do
     file="${STATE_DIR}/sysctl-orig-${key//\//_}"
     [[ -f $file ]] || continue
@@ -825,7 +841,13 @@ configure_sysctl() {
   # The base profile also sets the net.nf_conntrack_max alias, which the
   # de-duplication cannot match against net.netfilter.nf_conntrack_max.
   sed_in_place -E '/^[[:space:]]*net\.nf_conntrack_max[[:space:]]*=/d' /etc/sysctl.conf
-  ipfrag_high=$(( ram_mb * 32 ));       (( ipfrag_high < 262144 )) && ipfrag_high=262144;      (( ipfrag_high > 4194304 )) && ipfrag_high=4194304
+  # Fragment reassembly memory: never below the kernel default (4 MB high /
+  # 3 MB low since 4.17, when the CVE-2018-5391 rb-tree fix made larger
+  # queues safe).  The old 256 KB-4 MB range (RAM x 32) put every host under
+  # 128 GB below the default and dropped large fragmented UDP/IPv6 packets.
+  ipfrag_high=$(( ram_mb * 64 ))
+  (( ipfrag_high < 4194304 )) && ipfrag_high=4194304
+  (( ipfrag_high > 16777216 )) && ipfrag_high=16777216
   ipfrag_low=$(( ipfrag_high * 3 / 4 ))
   # Two 2 MB huge pages per 128 MB of RAM (1 GB on a 30 GB host, 64 MB on a
   # 4 GB one), used by OPcache through opcache.huge_code_pages.  Huge pages
@@ -935,16 +957,27 @@ EOF
 
   # A live kernel can still have the old low mark above the new high mark.
   # Make room before the file is applied; the file itself writes low first.
-  if [[ -r /proc/sys/net/ipv4/ipfrag_low_thresh && -r /proc/sys/net/ipv4/ipfrag_high_thresh ]]; then
-    local cur_low cur_high
-    cur_low=$(< /proc/sys/net/ipv4/ipfrag_low_thresh)
-    cur_high=$(< /proc/sys/net/ipv4/ipfrag_high_thresh)
-    if [[ $cur_low =~ ^[0-9]+$ ]] && (( cur_low > ipfrag_high )); then
-      sysctl -w "net.ipv4.ipfrag_low_thresh=${ipfrag_low}" >/dev/null 2>&1 || true
-    elif [[ $cur_high =~ ^[0-9]+$ ]] && (( cur_high < ipfrag_low )); then
-      sysctl -w "net.ipv4.ipfrag_high_thresh=${ipfrag_high}" >/dev/null 2>&1 || true
+  # IPv6 takes its pair from the base template (the kernel default); a host
+  # tuned by an older release still runs 192/256 KB there.
+  local fam pfx cur_low cur_high want_low want_high
+  for fam in 4 6; do
+    if [[ $fam == 4 ]]; then
+      pfx=net/ipv4/ipfrag; want_low=$ipfrag_low; want_high=$ipfrag_high
+    else
+      pfx=net/ipv6/ip6frag
+      want_low=$(sed -nE 's/^[[:space:]]*net\.ipv6\.ip6frag_low_thresh[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' /etc/sysctl.conf | tail -n1)
+      want_high=$(sed -nE 's/^[[:space:]]*net\.ipv6\.ip6frag_high_thresh[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' /etc/sysctl.conf | tail -n1)
+      [[ $want_low =~ ^[0-9]+$ && $want_high =~ ^[0-9]+$ ]] || continue
     fi
-  fi
+    [[ -r /proc/sys/${pfx}_low_thresh && -r /proc/sys/${pfx}_high_thresh ]] || continue
+    cur_low=$(< "/proc/sys/${pfx}_low_thresh")
+    cur_high=$(< "/proc/sys/${pfx}_high_thresh")
+    if [[ $cur_low =~ ^[0-9]+$ ]] && (( cur_low > want_high )); then
+      sysctl -w "${pfx//\//.}_low_thresh=${want_low}" >/dev/null 2>&1 || true
+    elif [[ $cur_high =~ ^[0-9]+$ ]] && (( cur_high < want_low )); then
+      sysctl -w "${pfx//\//.}_high_thresh=${want_high}" >/dev/null 2>&1 || true
+    fi
+  done
 
   # Record the base template's own keys too (first run only), so --purge can
   # put every live value back, not just the hardware block.
@@ -1266,6 +1299,8 @@ install_basic() {
   fi
 
   configure_dns
+  # Before the first apt run: needrestart's who(1) call follows every one.
+  configure_who_apparmor
   update_system
 
   # Let the tuner decide from the actual cpufreq interface.  --optimize calls
