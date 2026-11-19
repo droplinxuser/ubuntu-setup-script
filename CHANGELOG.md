@@ -1,7 +1,9 @@
 # Changelog
 
 Release notes for ubuntu-setup-script. Current behaviour is documented in
-README.md; measurements in tests/stress-site/RESULTS.md.
+README.md; measurements in tests/stress-site/RESULTS.md.  Per-cycle
+reports and raw test logs cited by entries up to 1.21.32 were removed from
+the tree on 2026-11-19; retrieve them with `git show 84b0db5:<path>`.
 
 ## 1.21.33 (2026-11-19)
 

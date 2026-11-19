@@ -1,5 +1,36 @@
 # Full-stack stress test reports
 
+One section per audit cycle, newest first.  The per-cycle reports, raw
+manifests, sweep tables and run logs these sections cite (`AUDIT-*.md`,
+`*-MANIFEST.txt`, `JIT-SWEEP-*`, `FPM-SWEEP-*`, `FINAL-*`, `TUNING-*`,
+`cycle-*/`, `tests/deploy-audit/RESTORE-*`, `tests/upgrade-php/`) were
+removed from the tree on 2026-11-19 to keep the repository lean; every one
+is still in git history, for example
+`git show 84b0db5:tests/stress-site/AUDIT-20261117-1.21.30.md`.  The current
+cycle report is `AUDIT-20261119-1.21.33.md`.
+
+## 1.21.33 audit — Intel Xeon E-2236, md RAID0 (2026-11-19)
+
+First Intel and md-RAID host: bare-metal OVH Xeon E-2236 (6C/12T), 62 GB,
+md RAID0 over two NVMe, BMC virtual devices, 705-package baseline.  Pair:
+`server-configs-nginx` 1.6.46.
+
+- Details: `AUDIT-20261119-1.21.33.md`; benchmark rows:
+  `tests/bench-php-matrix/results/xeon-e2236/thread-bench.tsv`.
+- 17 fixes (11 from a reviewed code audit, 6 found on the host): needrestart
+  after a systemd upgrade, `--upgrade-php` start-limit loss of imagick, md/dm
+  readahead, RAID member classification, Anubis socket backlog, Flarum gate,
+  TLS catch-all, Ubuntu 26.04 AppArmor/udev/sysstat noise.
+- Install 2:24 with zero warnings; install → `--optimize` 0 config diffs;
+  `--optimize` ×2 0 diffs; 54/54 security, 62/62 guest-cookie, 0 unexpected
+  functional responses.
+- Published XenForo tiers on this CPU: cached 104k steady (128k burst), +Anubis
+  27.8k, bypass/home/thread 374/317/341–368 — below the EPYC 4245P reference
+  (390k / 68.7k / 819 / 747 / 838) because of Coffee Lake per-core speed and
+  PTI/IBRS syscall cost.  kTLS −8 %; Angie 8 workers best; XenForo's
+  level-9 gzip is 15 % of member PHP CPU.
+- Restore: 705 → 705 packages, 0 `/etc` files added/removed, 0 failed units.
+
 ## 1.21.30 re-audit (2026-11-17)
 
 Fresh 505-package baseline, full install with Anubis, three applications,

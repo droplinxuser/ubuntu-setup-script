@@ -217,8 +217,8 @@ Notes:
 - One Anubis instance served ~49 000 req/s on the 16-CPU audit host (about
   0.16 ms of CPU per proxied request; ~1.1 GB/s of body copy).  The static
   fast path keeps the bulk of a real site's request volume (assets) out of it;
-  measure `tests/stress-site/AUDIT-20261116-1.21.17-static-fastpath.md` before
-  changing it.
+  measure it (see the 1.21.15+ Anubis sections of `tests/stress-site/RESULTS.md`)
+  before changing it.
 - The static shadow is generated from each integrated application block, so
   `/internal_data` (XenForo) stays `internal`, dotfiles and backup archives
   stay denied, `Range`/`HEAD`/conditional requests keep working and a missing
@@ -228,7 +228,7 @@ Notes:
   can connect, while every other local account is refused.  The static shadow
   socket is reachable only through its `root:www-data 0750` directory.
 - Anubis is a userspace proxy: cached guest pages still pass through it, so
-  compare capacity with the graph in `tests/stress-site/AUDIT-20261116-1.21.18.md`
+  compare capacity with the Anubis on/off tables in `tests/stress-site/RESULTS.md`
   before enabling it on a bandwidth-heavy origin.  It does not rewrite
   responses: the client `Accept-Encoding` is passed through, cached gzip bodies
   stay compressed (~16 KB instead of the ~115 KB identity page), and no
@@ -847,8 +847,18 @@ tests. Angie configuration and Cloudflare IP ranges are downloaded.
   the load tiers on the host with `wrk`, and `sweep-php.sh jit|fpm|stock`
   A/Bs JIT profiles, worker counts and the distribution defaults.  Run the install or `--optimize` with
   `SETUP_LIMIT_REQ_EXEMPT=<generator IP>` first, or every remote PHP request
-  is answered `429`. Results and findings: `tests/stress-site/RESULTS.md`;
-  per-sweep tables: `JIT-SWEEP-*.md`, `FPM-SWEEP-*.md`, `FINAL-*.md`.
+  is answered `429`. Results and findings: `tests/stress-site/RESULTS.md` (one
+  section per audit cycle) and the current cycle report
+  `tests/stress-site/AUDIT-20261119-1.21.33.md`.
+- `tests/deploy-audit/`: `host-manifest.sh` and `state-snapshot.sh` capture a
+  host or the managed configuration for diffing (install/`--optimize`
+  parity), `restore-baseline.sh` returns a disposable test host to a
+  pre-install manifest (`compare-manifest.sh` reports the delta).
+- `tests/bench-php-matrix/`: the XenForo 2.3.13 four-stack / PHP 8.2-8.6
+  benchmark harness (`install-php-versions.sh`, `deploy-xf.sh`,
+  `install-addons.sh`, `seed-xf.sh`, `bench-combo.sh`), the published tier
+  reproduction `bench-thread-tiers.sh`, the published reports and their
+  result tables.
 
 ## Production checklist
 

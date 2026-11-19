@@ -1,6 +1,0 @@
-== combo 4 for PHP 8.5
-  guest_cached   8.5     59371 req/s p50 1.59ms    p99 4.83ms   
-  guest_uncached 8.5       573 req/s p50 170.95ms  p99 210.53ms 
-  member_home    8.5       521 req/s p50 185.58ms  p99 243.54ms 
-  member_thread  8.5       664 req/s p50 146.93ms  p99 191.29ms 
-== combo 4 done

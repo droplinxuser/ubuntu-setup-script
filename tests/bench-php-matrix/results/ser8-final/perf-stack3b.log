@@ -1,7 +1,0 @@
-== combo 3 setup
-== writing /root/audit/combo3.tsv
-  guest_cached   8.5     60938 req/s  p50 1.28ms    p99 4.83ms   
-  guest_uncached 8.5       644 req/s  p50 151.13ms  p99 172.22ms 
-  member_home    8.5       542 req/s  p50 176.16ms  p99 209.68ms 
-  member_thread  8.5       463 req/s  p50 206.41ms  p99 285.88ms 
-== combo 3 complete
