@@ -557,7 +557,15 @@ suspended errexit for the whole run). Steps:
    reserved verbatim, PHP is sized from the remainder, and targets that do not
    fit are trimmed Elasticsearch first, then Valkey, then MariaDB. A MariaDB
    pool already at or above its target is kept (only increase), and the redo
-   log is 25% of the pool. A MariaDB restart pauses Angie and PHP
+   log is 25% of the pool. The plan also books memory no setting names:
+   the Elasticsearch direct (off-heap) ceiling -- heap/2 by JVM ergonomics,
+   or an operator `-XX:MaxDirectMemorySize` from `jvm.options` or
+   `jvm.options.d` (below 4 GB part of it may sit in the OS headroom above a
+   10% floor) -- and the OPcache huge-page reservation.  Neither is written
+   to any configuration; the summary line shows them as `ES-direct=` and
+   `HugePages=`.  A kept MariaDB pool that no longer fits gives up its
+   surplus over the data target first (never below 256 MB), so one run
+   settles it.  A MariaDB restart pauses Angie and PHP
    first and resumes them after `SELECT 1`; when only dynamic variables
    changed (buffer pool, redo log, `tmp_table_size`/`max_heap_table_size`,
    `innodb_io_capacity`(_max), `table_open_cache`, `max_connections`,
@@ -739,7 +747,7 @@ data directory (NVMe / SSD / HDD) and the host class (`dedi`/`vps`).
 | Elasticsearch | heap = store/4 (512 MB..25% RAM..31 GB); `node.processors` = effective CPUs; search threads cpus/2 (max 16), write threads cpus/4 (max 8) |
 | Valkey / Redis | maxmemory = live +20% with floor `clamp(RAM/64, 128 MB, 1 GB)`; maxclients from the PHP pool; io_threads 1..8 (a larger `io_threads=` is clamped with a warning) |
 | Angie | `worker_processes` = **2/3 of CPUs** (`worker_cpu_affinity auto` commented out under a cgroup CPU quota; measured on the 12-thread EPYC: 8 workers 389-390k cached req/s vs 348-352k at `auto`/12), `worker_connections = clamp(cpus x 2048, 8192, 65535)` and `worker_rlimit_nofile = clamp(cpus x 8192, 65536, 524288)` (VPS: 1024 and 4096 per core), **no PHP upstream keepalive cache** (an idle FastCGI connection pins one PHP-FPM worker; see the live-origin.example audit in `tests/stress-site/RESULTS.md`), `open_file_cache max = clamp(RAM_MB x 8, 10000, 200000)` bounded by `rlimit - connections`, FastCGI buffers and cache zones by RAM, cache disk budget by RAM/cache filesystem size (capped at half its free space)/installed services (50% RAM Angie-only, 30% Angie+PHP, 25% full stack; a populated FastCGI, proxy or CDN cache is never shrunk below its live size), `directio 16m` on NVMe/SSD (4m on HDD), Brotli and gzip 4 (3 on 1-2 CPUs; `SETUP_BROTLI_LEVEL`, `SETUP_GZIP_LEVEL`) |
-| Kernel / PHP | `vm.nr_hugepages = clamp(RAM_MB/64, 0..512)` on hosts with 4 GB+ and `opcache.huge_code_pages=1` when the pages exist (measured +3.5 % on the XenForo member/thread tiers) |
+| Kernel / PHP | `vm.nr_hugepages = (OPcache MB + JIT MB + 1)/2 + 8` (8..512; 296 pages = 592 MB on 8 GB+) on hosts with 4 GB+ and PHP, and `opcache.huge_code_pages=1` when the pages exist (measured +3.5 % on the XenForo member/thread tiers); the reservation is booked in the memory plan |
 | Kernel | `somaxconn`/SYN backlog `cpus x 4096` (VPS x 2048, max 65536), conntrack `RAM_MB x 16` (VPS x 8), `tcp_rmem`/`tcp_wmem` default 85 KB under 4 GB, 128 KB under 16 GB, 256 KB above, `netdev_budget 600/8000 us` on dedicated hosts with 8+ CPUs, `vm.dirty_background_bytes = clamp(RAM/100, 64 MB, 512 MB)` and `vm.dirty_bytes = 4x` (tighter on HDD), `vm.min_free_kbytes` 1% of RAM (16 MB floor under 4 GB, 256 MB cap), `vm.swappiness` 1 on NVMe/SSD (10 on HDD), `kernel.shmmax = min(1 GiB, RAM/4)`, `ip_local_reserved_ports` = 3306, 6379, 9200, 9300 and the sshd ports (the ephemeral range is 1024-65535), BBR + fq (`SETUP_TCP_CC`, `SETUP_QDISC`), 1M-nofile PAM limits. The base profile's `ip_forward`/`forwarding = 0` lines are dropped on a host that already forwards (bridge, Docker/LXD, WireGuard/Tailscale interfaces) and its IPv6 `autoconf`/`accept_ra = 0` lines on a host whose address or default route comes from router advertisements |
 | Host | swap RAM/2 clamped 1..8 GiB (VPS 4); governor on dedicated hardware only (the previous governor is recorded for `--purge`); THP `madvise`; `fstrim.timer` on SSD/NVMe; I/O scheduler and readahead per device class for every whole disk by its rotational flag (NVMe `none`, flash `mq-deadline`/128k, rotational `mq-deadline`/1024k; md/dm arrays on flash get readahead 128k only, since the kernel sizes an array's readahead from its stripe and the filesystem reads through the array, not its members; HDD arrays and loop/zram are left alone; the rules are re-triggered only for non-empty whole disks, so BMC virtual floppies and CD-ROMs are not replayed through other packages' udev rules) |
 

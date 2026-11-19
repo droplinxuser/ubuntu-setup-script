@@ -1314,6 +1314,80 @@ check "opt-in hardening creates the central PHP error log" \
   grep -qF 'ensure_fpm_log_path "$php_error_log"' <<<"$php_tune_hardening"
 
 # ---------------------------------------------------------------------------
+# Memory booked outside the service settings: ES direct memory, huge pages
+# ---------------------------------------------------------------------------
+esd=$TMP/esd; mkdir -p "$esd"
+check "no jvm.options.d drop-in: no operator direct memory" \
+  test -z "$(elasticsearch_operator_direct_mb "$esd" "$esd/no-main" 21)"
+printf '%s\n' '-XX:MaxDirectMemorySize=768m' > "$esd/a.options"
+printf '%s\n' '-XX:MaxDirectMemorySize=1g' > "$esd/b.options"
+check "operator direct memory: the last drop-in wins (1g = 1024 MB)" \
+  test "$(elasticsearch_operator_direct_mb "$esd" "$esd/no-main" 21)" = 1024
+rm -f "$esd"/*.options
+printf '%s\n' '17-:-XX:MaxDirectMemorySize=1048576k' > "$esd/a.options"
+check "operator direct memory accepts a version prefix and k units" \
+  test "$(elasticsearch_operator_direct_mb "$esd" "$esd/no-main" 21)" = 1024
+printf '%s\n' '-XX:MaxDirectMemorySize=536870912' > "$esd/a.options"
+check "operator direct memory in bytes is converted to MB" \
+  test "$(elasticsearch_operator_direct_mb "$esd" "$esd/no-main" 21)" = 512
+printf '%s\n' '# -XX:MaxDirectMemorySize=2g' > "$esd/a.options"
+check "a commented MaxDirectMemorySize is ignored" \
+  test -z "$(elasticsearch_operator_direct_mb "$esd" "$esd/no-main" 21)"
+rm -f "$esd"/*.options
+printf '%s\n' '-XX:MaxDirectMemorySize=4g' > "$esd/zz-setup-optimize.options"
+check "the managed zz-setup-optimize.options is never an operator input" \
+  test -z "$(elasticsearch_operator_direct_mb "$esd" "$esd/no-main" 21)"
+rm -f "$esd"/*.options
+printf '%s\n' '-XX:MaxDirectMemorySize=08m' > "$esd/a.options"
+check "a leading zero is decimal (08m = 8 MB), never an octal or an abort" \
+  test "$(elasticsearch_operator_direct_mb "$esd" "$esd/no-main" 21)" = 8
+printf '%s\n' '-XX:MaxDirectMemorySize=1g' '9-16:-XX:MaxDirectMemorySize=4g' '8:-XX:MaxDirectMemorySize=6g' > "$esd/a.options"
+check "a JDK-version line for another JDK is skipped (JDK 21: 1 GB stays)" \
+  test "$(elasticsearch_operator_direct_mb "$esd" "$esd/no-main" 21)" = 1024
+printf '%s\n' '17-:-XX:MaxDirectMemorySize=2g' >> "$esd/a.options"
+check "an open JDK range that includes the running JDK applies (17-:)" \
+  test "$(elasticsearch_operator_direct_mb "$esd" "$esd/no-main" 21)" = 2048
+rm -f "$esd"/*.options
+printf '%s\n' '-Xms2g' '-XX:MaxDirectMemorySize=4g' > "$esd/main.jvm"
+check "the main jvm.options is read (an ES 7-era host keeps its ceiling there)" \
+  test "$(elasticsearch_operator_direct_mb "$esd" "$esd/main.jvm" 21)" = 4096
+printf '%s' '-XX:MaxDirectMemorySize=512m' > "$esd/b.options"
+check "a drop-in overrides the main file, even without a final newline" \
+  test "$(elasticsearch_operator_direct_mb "$esd" "$esd/main.jvm" 21)" = 512
+rm -f "$esd"/*.options "$esd/main.jvm"
+printf 'JAVA_VERSION="23.0.2"\n' > "$esd/release"
+check "the bundled JDK major is read from its release file" \
+  test "$(elasticsearch_jdk_major "$esd/release")" = 23
+check "an unknown JDK counts as 21" test "$(elasticsearch_jdk_major "$esd/none")" = 21
+for args in '512 0 0:256' '913 0 0:457' '1000 0 0:500' '512 0 206:50' '512 0 300:0' '2048 1024 0:1024'; do
+  # shellcheck disable=SC2086
+  check "es_direct_booked_mb ${args%%:*} = ${args##*:}" \
+    test "$(es_direct_booked_mb ${args%%:*})" = "${args##*:}"
+done
+hp_case() { # ram predicate container -> MB
+  (
+    hp_php=$2 hp_ct=$3
+    hugepages_php_present() { (( hp_php )); }
+    host_is_container() { (( hp_ct )); }
+    hugepages_reserved_mb "$1"
+  ) 2>/dev/null
+}
+check "huge pages booked on a 128 GB host with PHP: 592 MB" test "$(hp_case 131072 1 0)" = 592
+check "huge pages booked on a 62 GB host with PHP: 592 MB" test "$(hp_case 63488 1 0)" = 592
+check "huge pages booked on a 4 GB host with PHP: 304 MB" test "$(hp_case 4096 1 0)" = 304
+check "no huge pages below 4 GB" test "$(hp_case 3910 1 0)" = 0
+check "no huge pages without PHP" test "$(hp_case 131072 0 0)" = 0
+check "no huge pages booked in a container" test "$(hp_case 131072 1 1)" = 0
+check "the booking is the sysctl reservation (pages x 2 MB)" \
+  test "$(hp_case 27812 1 0)" -eq $(( $(sysctl_hugepages_target 27812 1) * 2 ))
+check "configure_sysctl and the plan share one PHP predicate" \
+  bash -c 'b=$(sed -n "/^configure_sysctl()/,/^}/p" "$1"); grep -q hugepages_php_present <<<"$b" && ! grep -qF -- "-d /etc/php" <<<"$b"' _ "$ROOT/lib/os.sh"
+check "the plan books from the helpers, never the live HugePages count" \
+  bash -c 'b=$(sed -n "/^plan_memory_budget()/,/^}/p" "$1"); grep -q hugepages_reserved_mb <<<"$b" && grep -q es_direct_booked_mb <<<"$b" && ! grep -qE "nr_hugepages|HugePages_Total" <<<"$b"' _ "$ROOT/lib/optimize.sh"
+check "write_es_jvm_options never writes MaxDirectMemorySize (booked, not capped)" \
+  bash -c '! sed -n "/^write_es_jvm_options()/,/^}/p" "$1" | grep -q MaxDirectMemorySize' _ "$ROOT/lib/service-optimizers.sh"
+
+# ---------------------------------------------------------------------------
 # Shared memory budget
 # ---------------------------------------------------------------------------
 # Keep these tests independent of any PHP-FPM pool that happens to run on the
@@ -1337,12 +1411,17 @@ valkey_policy_evicts() { printf '1'; }
 valkey_active_conf() { :; }
 elasticsearch_data_dir_size_mb() { printf '0'; }
 valkey_data_size_mb() { printf '0'; }
+# The suite runs on servers that have /etc/php and Elasticsearch drop-ins:
+# no huge pages and no operator direct memory unless a case sets them.
+hugepages_php_present() { return 1; }
+host_is_container() { return 1; }
+elasticsearch_operator_direct_mb() { :; }
 OPT_DETECTED=(angie php:8.4 mariadb valkey elastic)
 plan_memory_budget
 check "PHP budget is at most 50% of RAM" \
   test "$OPT_PHP_BUDGET_MB" -le $(( 131072 * 50 / 100 ))
 check "service budgets stay under 95% of RAM" \
-  test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
+  test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB + OPT_ES_DIRECT_BOOKED_MB + OPT_HUGEPAGES_MB )) \
        -le $(( 131072 * 95 / 100 ))
 check "all fixed budgets are positive" \
   test "$OPT_MARIADB_BUDGET_MB" -gt 0 -a "$OPT_VALKEY_BUDGET_MB" -gt 0 -a "$OPT_ES_BUDGET_MB" -gt 0
@@ -1361,7 +1440,7 @@ check "PHP budget is still capped at 50% of RAM" \
 check "Redis enables the shared cache budget" \
   test "$OPT_VALKEY_BUDGET_MB" -gt 0
 check "PHP-first plan stays inside the 80% budget" \
-  test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
+  test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB + OPT_ES_DIRECT_BOOKED_MB + OPT_HUGEPAGES_MB )) \
        -le $(( 65536 * 80 / 100 ))
 
 # The planner uses the same 2-per-CPU floor as tune_php_fpm_version().
@@ -1388,7 +1467,7 @@ plan_memory_budget
 check "live pool is data+5% for a 20 GB database" \
   test "$OPT_MARIADB_BUDGET_MB" -eq 21000
 check "database-fit plan stays inside the 80% budget" \
-  test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
+  test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB + OPT_ES_DIRECT_BOOKED_MB + OPT_HUGEPAGES_MB )) \
        -le $(( 65536 * 80 / 100 ))
 
 # Measured regression guard: a pool smaller than the working set turns random
@@ -1419,7 +1498,7 @@ check "tiny live database uses the 128 MB minimum" \
 check "tiny database stays far below RAM/4" \
   test "$OPT_MARIADB_BUDGET_MB" -le $(( 262144 / 4 ))
 check "tiny database floor stays inside the 80% budget" \
-  test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
+  test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB + OPT_ES_DIRECT_BOOKED_MB + OPT_HUGEPAGES_MB )) \
        -le $(( 262144 * 80 / 100 ))
 
 # Restore the 64 GB context for the oversized-database cases below.
@@ -1452,7 +1531,7 @@ check "large host keeps the live pool (the data+5% target is lower)" \
 check "an only-increased pool is marked as preserved" \
   test "$OPT_MARIADB_KEPT_MB" -eq 100000
 check "data-sized pool keeps the plan inside the 80% budget" \
-  test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
+  test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB + OPT_ES_DIRECT_BOOKED_MB + OPT_HUGEPAGES_MB )) \
        -le $(( 262144 * 80 / 100 ))
 
 # Re-running with a lower target must not shrink a live pool.
@@ -1477,7 +1556,7 @@ plan_memory_budget
 check "a database larger than the shared budget is capped at half of RAM" \
   test "$OPT_MARIADB_BUDGET_MB" -eq 131072
 check "capped data-sized plan still fits the 80% budget" \
-  test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
+  test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB + OPT_ES_DIRECT_BOOKED_MB + OPT_HUGEPAGES_MB )) \
        -le $(( 262144 * 80 / 100 ))
 
 # A MariaDB-only host reserves no PHP budget; the database pool is funded first.
@@ -1554,7 +1633,7 @@ check "large Elasticsearch index gets store/4 rounded to 512 MB" \
 check "Elasticsearch heap stays within 25% of RAM" \
   test "$OPT_ES_BUDGET_MB" -le $(( 65536 * 25 / 100 ))
 check "Elasticsearch plan stays inside the 80% budget" \
-  test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
+  test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB + OPT_ES_DIRECT_BOOKED_MB + OPT_HUGEPAGES_MB )) \
        -le $(( 65536 * 80 / 100 ))
 
 # A huge index is capped at the 31 GB compressed-oops ceiling.
@@ -2456,7 +2535,7 @@ check "fresh install uses the empty-index minimum" \
 check "fresh install keeps the empty-database floor" \
   test "$OPT_MARIADB_BUDGET_MB" -eq "$(mariadb_floor_mb "$(mem_total_mb)")"
 check "fresh install full-stack plan stays inside the 80% budget" \
-  test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
+  test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB + OPT_ES_DIRECT_BOOKED_MB + OPT_HUGEPAGES_MB )) \
        -le $(( 27812 * 80 / 100 ))
 
 # A database that has just been initialised reports a few MB of system data.
@@ -2514,7 +2593,7 @@ check "MariaDB+Valkey host reserves no PHP or Elasticsearch budget" \
 check "MariaDB+Valkey host fits the live database target" \
   test "$OPT_MARIADB_BUDGET_MB" -eq 5250
 check "MariaDB+Valkey plan stays inside the 80% budget" \
-  test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
+  test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB + OPT_ES_DIRECT_BOOKED_MB + OPT_HUGEPAGES_MB )) \
        -le $(( 27812 * 80 / 100 ))
 
 # Full stack: the data targets are reserved and PHP receives the remainder.
@@ -2530,7 +2609,7 @@ check "full stack reserves MariaDB, Valkey and Elasticsearch first" \
 check "full stack still gets a viable PHP pool" \
   test "$OPT_PHP_BUDGET_MB" -ge 512 -a "$OPT_PHP_CHILDREN" -ge 8
 check "full stack priority plan stays inside the 80% budget" \
-  test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
+  test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB + OPT_ES_DIRECT_BOOKED_MB + OPT_HUGEPAGES_MB )) \
        -le $(( 27812 * 80 / 100 ))
 valkey_live_used_mb() { return 0; }
 
@@ -2557,7 +2636,7 @@ check_combo() {
   read -r -a OPT_DETECTED <<< "$spec"
   OPT_INSTALL_PLAN=0
   plan_memory_budget
-  local total=$(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB ))
+  local total=$(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB + OPT_ES_DIRECT_BOOKED_MB + OPT_HUGEPAGES_MB ))
   if (( want_php )); then (( OPT_PHP_BUDGET_MB > 0 )) || ok=0; else (( OPT_PHP_BUDGET_MB == 0 )) || ok=0; fi
   if (( want_maria )); then (( OPT_MARIADB_BUDGET_MB > 0 )) || ok=0; else (( OPT_MARIADB_BUDGET_MB == 0 )) || ok=0; fi
   if (( want_cache )); then (( OPT_VALKEY_BUDGET_MB > 0 )) || ok=0; else (( OPT_VALKEY_BUDGET_MB == 0 )) || ok=0; fi
@@ -2795,7 +2874,10 @@ elasticsearch_current_heap_mb() { printf '0'; }
 mariadb_current_pool_mb() { printf '0'; }
 valkey_live_used_mb() { return 0; }
 OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
-plan_memory_budget
+# 20000 + 4096 + the 512 MB heap and its 256 MB direct share no longer fit
+# beside the PHP floor: the plan says so (stderr) instead of hiding it.
+plan_memory_budget 2>/dev/null
+check "explicit sizes that crowd out the ES direct share report an overcommit" test "$OPT_MEM_OVERCOMMIT_MB" -gt 0
 check "explicit MariaDB size is reserved verbatim" test "$OPT_MARIADB_BUDGET_MB" -eq 20000
 check "explicit Valkey size is reserved verbatim" test "$OPT_VALKEY_BUDGET_MB" -eq 4096
 check "the flexible tiers absorb the squeeze" test "$OPT_ES_BUDGET_MB" -eq 512
@@ -3549,7 +3631,7 @@ plan_memory_budget
 check "a squeezed plan keeps live cache data +20% without overcommit" \
   test "$OPT_VALKEY_BUDGET_MB" -eq 480 -a "$OPT_MEM_OVERCOMMIT_MB" -eq 0
 check "a squeezed plan with a re-raised cache still fits the budget" \
-  test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB )) \
+  test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB + OPT_ES_DIRECT_BOOKED_MB + OPT_HUGEPAGES_MB )) \
        -le 22249
 valkey_live_used_mb() { return 0; }
 valkey_current_maxmemory_mb() { printf '0'; }
@@ -4446,6 +4528,205 @@ check "who(1) AppArmor override is written by --basic and --optimize and removed
 check "IPv4 fragment reassembly never goes below the kernel default (4 MB)" \
   bash -c 'grep -qF "(( ipfrag_high < 4194304 )) && ipfrag_high=4194304" "$1" && grep -qE "^net\.ipv6\.ip6frag_high_thresh = 4194304$" "$2"' \
   _ "$ROOT/lib/os.sh" "$ROOT/configs/system/sysctl.conf"
+
+# ---------------------------------------------------------------------------
+# Memory plan books Elasticsearch direct memory and OPcache huge pages
+# ---------------------------------------------------------------------------
+mem_plan_reset() {
+  php_primary_version() { printf '8.4'; }
+  php_worker_allowance_mb() { printf '64'; }
+  mariadb_data_size_mb() { printf '0'; }
+  mariadb_current_pool_mb() { printf '0'; }
+  mariadb_data_dir_size_mb() { printf '0'; }
+  elasticsearch_data_size_mb() { printf '0'; }
+  elasticsearch_data_dir_size_mb() { printf '0'; }
+  elasticsearch_current_heap_mb() { printf '0'; }
+  valkey_live_used_mb() { return 0; }
+  valkey_current_maxmemory_mb() { printf '0'; }
+  valkey_policy_evicts() { printf '1'; }
+  valkey_active_conf() { :; }
+  valkey_data_size_mb() { printf '0'; }
+  hugepages_php_present() { return 1; }
+  host_is_container() { return 1; }
+  elasticsearch_operator_direct_mb() { :; }
+  rm -f "$SETUP_STATE_DIR/explicit-options.conf"
+  OPT_INSTALL_PLAN=0
+}
+plan_snapshot() {
+  printf '%s ' "$OPT_PHP_CHILDREN" "$OPT_PHP_BUDGET_MB" "$OPT_MARIADB_BUDGET_MB" \
+    "$OPT_VALKEY_BUDGET_MB" "$OPT_ES_BUDGET_MB" "$OPT_ES_DIRECT_MB" \
+    "$OPT_ES_DIRECT_BOOKED_MB" "$OPT_HUGEPAGES_MB" "$OPT_MEM_OVERCOMMIT_MB"
+}
+
+# (a) Huge pages come off the services' share; on a roomy host nothing moves.
+mem_plan_reset
+mem_total_mb() { printf '131072'; }
+effective_cpus() { printf '16'; }
+OPT_DETECTED=(angie php:8.4 mariadb valkey elastic)
+plan_memory_budget
+hp_off=$(printf '%s ' "$OPT_PHP_CHILDREN" "$OPT_MARIADB_BUDGET_MB" "$OPT_VALKEY_BUDGET_MB" "$OPT_ES_BUDGET_MB")
+hugepages_php_present() { return 0; }
+plan_memory_budget
+check "a 128 GB PHP host books 592 MB of OPcache huge pages" test "$OPT_HUGEPAGES_MB" -eq 592
+check "booking the huge pages leaves a roomy host's allocations unchanged" \
+  test "$(printf '%s ' "$OPT_PHP_CHILDREN" "$OPT_MARIADB_BUDGET_MB" "$OPT_VALKEY_BUDGET_MB" "$OPT_ES_BUDGET_MB")" = "$hp_off"
+check "the 512 MB heap books its 256 MB direct ceiling" \
+  test "$OPT_ES_DIRECT_MB:$OPT_ES_DIRECT_BOOKED_MB" = 256:256
+check "the summary names ES direct memory and huge pages" \
+  bash -c '[[ $1 == *" ES-direct=256MB HugePages=592MB)" ]]' _ "$(memory_plan_summary)"
+OPT_DETECTED=(angie php:8.4 mariadb valkey)
+hugepages_php_present() { return 1; }
+plan_memory_budget
+check "without ES or huge pages the summary keeps its old form" \
+  bash -c '[[ $1 == *" Elasticsearch=0MB)" && $1 != *ES-direct* && $1 != *HugePages* ]]' _ "$(memory_plan_summary)"
+
+# (b) Direct memory follows the heap that is written, or the operator value.
+mem_plan_reset
+mem_total_mb() { printf '65536'; }
+OPT_DETECTED=(angie php:8.4 mariadb valkey elastic)
+elasticsearch_data_size_mb() { printf '4096'; }
+plan_memory_budget
+check "a 1 GB heap books a 512 MB direct ceiling" \
+  test "$OPT_ES_BUDGET_MB:$OPT_ES_DIRECT_MB:$OPT_ES_DIRECT_BOOKED_MB" = 1024:512:512
+elasticsearch_operator_direct_mb() { printf '1024'; }
+plan_memory_budget
+check "an operator MaxDirectMemorySize is booked verbatim" \
+  test "$OPT_ES_DIRECT_MB:$OPT_ES_DIRECT_BOOKED_MB:$OPT_ES_DIRECT_OPERATOR" = 1024:1024:1
+elasticsearch_operator_direct_mb() { :; }
+mkdir -p "$SETUP_STATE_DIR"
+printf 'elastic_mb=1000\n' > "$SETUP_STATE_DIR/explicit-options.conf"
+plan_memory_budget
+check "an explicit heap books half of the heap that is written" \
+  test "$OPT_ES_DIRECT_MB" -eq $(( (OPT_ES_BUDGET_MB + 1) / 2 ))
+rm -f "$SETUP_STATE_DIR/explicit-options.conf"
+# A tight host with an explicit heap: heap + heap/2 must fit beside MariaDB,
+# so MariaDB gets 3225 MB (it got 4096 when the direct share was not booked
+# at all).  The reservation (fixed_sum) or the trim pass may take the share;
+# either way the plan must fit.
+mem_total_mb() { printf '8192'; }
+effective_cpus() { printf '2'; }
+OPT_DETECTED=(angie php:8.4 mariadb elastic)
+mariadb_data_size_mb() { printf '8000'; }
+elasticsearch_data_size_mb() { printf '0'; }
+printf 'elastic_mb=2048\n' > "$SETUP_STATE_DIR/explicit-options.conf"
+plan_memory_budget
+check "explicit 2 GB heap on 8 GB: 1 GB direct booked beside it" \
+  test "$OPT_ES_BUDGET_MB:$OPT_ES_DIRECT_BOOKED_MB" = 2048:1024
+check "explicit 2 GB heap on 8 GB: MariaDB leaves room for the direct share (3225)" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 3225
+check "explicit 2 GB heap on 8 GB: everything booked fits, no overcommit" \
+  test "$OPT_MEM_OVERCOMMIT_MB" -eq 0
+rm -f "$SETUP_STATE_DIR/explicit-options.conf"
+
+# (c) Below 4 GB the direct ceiling first uses the OS headroom above 10%.
+#     2 GB all-in-one with a 1 GB database: usable 1638, credit 206, so a
+#     512 MB heap books 50 MB; MariaDB 692 (742 before, 486 without credit).
+mem_plan_reset
+mem_total_mb() { printf '2048'; }
+effective_cpus() { printf '2'; }
+OPT_DETECTED=(angie php:8.4 mariadb valkey elastic)
+mariadb_data_size_mb() { printf '1000'; }
+plan_memory_budget
+small_first=$(plan_snapshot)
+check "2 GB host: the 512 MB heap books 50 of its 256 MB direct ceiling" \
+  test "$OPT_ES_DIRECT_MB:$OPT_ES_DIRECT_BOOKED_MB" = 256:50
+check "2 GB host: MariaDB gives up 50 MB to the booked direct memory (692)" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 692
+check "2 GB host: the plan still fits (no overcommit)" test "$OPT_MEM_OVERCOMMIT_MB" -eq 0
+mariadb_current_pool_mb() { printf '692'; }
+plan_memory_budget
+check "2 GB host: the next --optimize writes the same plan" test "$(plan_snapshot)" = "$small_first"
+mem_plan_reset
+mem_total_mb() { printf '1536'; }
+plan_memory_budget 2>/dev/null
+check "1.5 GB all-in-one does not newly report an overcommit" test "$OPT_MEM_OVERCOMMIT_MB" -eq 0
+# The install writes the 256 MB RAM-floor pool; the first --optimize sees an
+# empty database (target 128) and keeps that pool.  The kept-pool trim must
+# not go below the split's 256 MB floor, or 1-1.5 GB all-in-ones would drop
+# to 231/128 MB and restart MariaDB right after the install.
+for small in 1024 1536; do
+  mem_plan_reset
+  # shellcheck disable=SC2329  # stub called by plan_memory_budget
+  mem_total_mb() { printf '%s' "$small"; }
+  effective_cpus() { printf '2'; }
+  OPT_DETECTED=(angie php:8.4 mariadb valkey elastic)
+  OPT_INSTALL_PLAN=1
+  plan_memory_budget 2>/dev/null
+  small_install=$(plan_snapshot)
+  small_pool=$OPT_MARIADB_BUDGET_MB
+  OPT_INSTALL_PLAN=0
+  # shellcheck disable=SC2329  # stub called by plan_memory_budget
+  mariadb_current_pool_mb() { printf '%s' "$small_pool"; }
+  plan_memory_budget 2>/dev/null
+  check "${small} MB all-in-one: install and --optimize write the same plan (pool ${small_pool} MB)" \
+    test "$(plan_snapshot)" = "$small_install"
+done
+mem_plan_reset
+
+# (d) 8 GB host where the booking changes values: PHP + MariaDB (4 GB of
+#     data) + Elasticsearch (8 GB index), 592 MB of huge pages.  Before:
+#     MariaDB 4096 + heap 2048, a true footprint of ~7.9 GB against 6.5 GB.
+mem_plan_reset
+mem_total_mb() { printf '8192'; }
+effective_cpus() { printf '2'; }
+hugepages_php_present() { return 0; }
+OPT_DETECTED=(angie php:8.4 mariadb elastic)
+mariadb_data_size_mb() { printf '4000'; }
+elasticsearch_data_size_mb() { printf '8000'; }
+plan_memory_budget
+mid_first=$(plan_snapshot)
+check "8 GB host: MariaDB is scaled to 3260 MB" test "$OPT_MARIADB_BUDGET_MB" -eq 3260
+check "8 GB host: the heap is 1536 MB with 768 MB direct" \
+  test "$OPT_ES_BUDGET_MB:$OPT_ES_DIRECT_MB:$OPT_ES_DIRECT_BOOKED_MB" = 1536:768:768
+check "8 GB host: huge pages booked, no overcommit" \
+  test "$OPT_HUGEPAGES_MB:$OPT_MEM_OVERCOMMIT_MB" = 592:0
+check "8 GB host: everything booked stays inside the 80% budget" \
+  test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_ES_BUDGET_MB + OPT_ES_DIRECT_BOOKED_MB + OPT_HUGEPAGES_MB )) -le $(( 8192 * 80 / 100 ))
+mariadb_current_pool_mb() { printf '3260'; }
+elasticsearch_current_heap_mb() { printf '1536'; }
+plan_memory_budget
+check "8 GB host: the next --optimize writes the same plan" test "$(plan_snapshot)" = "$mid_first"
+
+# (e) A kept pool above its data target that no longer fits gives up its
+#     surplus first, so one run settles the value (5000 -> 3260, not
+#     5000 -> 3533 -> 3260).
+mariadb_current_pool_mb() { printf '5000'; }
+elasticsearch_current_heap_mb() { printf '0'; }
+plan_memory_budget
+check "kept 5000 MB pool settles at 3260 MB in one run" \
+  test "$OPT_MARIADB_BUDGET_MB:$OPT_MARIADB_KEPT_MB" = 3260:0
+elasticsearch_data_size_mb() { printf '0'; }
+mariadb_current_pool_mb() { printf '5500'; }
+plan_memory_budget
+check "kept 5500 MB pool gives up only what does not fit (4937 MB)" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 4937
+mariadb_current_pool_mb() { printf '4937'; }
+plan_memory_budget
+check "the trimmed pool is kept by the next run" \
+  test "$OPT_MARIADB_BUDGET_MB:$OPT_MARIADB_KEPT_MB" = 4937:4937
+
+# (f) Install/--optimize parity: the install plan sees PHP through ENABLED,
+#     --optimize through /etc/php; both book the same pages and direct share.
+mem_plan_reset
+mem_total_mb() { printf '27812'; }
+effective_cpus() { printf '16'; }
+OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
+ENABLED[php]=1
+hugepages_php_present() { (( ${ENABLED[php]:-0} == 1 )); }
+OPT_INSTALL_PLAN=1
+plan_memory_budget
+install_view="$OPT_HUGEPAGES_MB $OPT_ES_DIRECT_MB $OPT_ES_BUDGET_MB $OPT_PHP_CHILDREN"
+unset 'ENABLED[php]'
+OPT_INSTALL_PLAN=0
+hugepages_php_present() { return 0; }
+plan_memory_budget
+check "install and --optimize book the same huge pages, direct share, heap and pool" \
+  test "$OPT_HUGEPAGES_MB $OPT_ES_DIRECT_MB $OPT_ES_BUDGET_MB $OPT_PHP_CHILDREN" = "$install_view"
+check "the parity host books 592 MB of huge pages and 256 MB direct" \
+  test "$OPT_HUGEPAGES_MB:$OPT_ES_DIRECT_MB" = 592:256
+mem_plan_reset
+OPT_DETECTED=()
+
 
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

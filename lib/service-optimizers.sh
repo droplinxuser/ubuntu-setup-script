@@ -1485,6 +1485,13 @@ optimize_elastic() {
   else
     opt_report "- Heap=${heap_mb}m; configuration already optimized"
   fi
+  if (( ${OPT_ES_DIRECT_MB:-0} > 0 )); then
+    if (( ${OPT_ES_DIRECT_OPERATOR:-0} )); then
+      opt_report "- Off-heap: operator MaxDirectMemorySize=${OPT_ES_DIRECT_MB}MB (jvm.options.d), ${OPT_ES_DIRECT_BOOKED_MB}MB booked in the memory plan"
+    else
+      opt_report "- Off-heap: MaxDirectMemorySize left to JVM ergonomics (heap/2 = ${OPT_ES_DIRECT_MB}MB), ${OPT_ES_DIRECT_BOOKED_MB}MB booked in the memory plan"
+    fi
+  fi
 
   if (( active )); then
     if (( changed == 0 )); then
@@ -1716,11 +1723,9 @@ optimize_plan() {
     return 0
   fi
   printf 'Detected: %s\n' "${OPT_DETECTED[*]}"
-  printf '  Memory: %sMB usable of %sMB (PHP=%sMB MariaDB=%sMB Cache=%sMB Elasticsearch=%sMB)\n' \
-    "$OPT_MEM_BUDGET_MB" "$OPT_MEM_TOTAL_MB" "$OPT_PHP_BUDGET_MB" \
-    "$OPT_MARIADB_BUDGET_MB" "$OPT_VALKEY_BUDGET_MB" "$OPT_ES_BUDGET_MB"
+  printf '  %s\n' "$(memory_plan_summary Memory)"
   if (( ${OPT_MEM_OVERCOMMIT_MB:-0} > 0 )); then
-    printf '  WARNING: service floors exceed the budget by %sMB; this host is too small for the selected services\n' \
+    printf '  WARNING: service floors and reserved memory exceed the budget by %sMB; this host is too small for the selected services\n' \
       "$OPT_MEM_OVERCOMMIT_MB"
   fi
   if [[ " ${OPT_DETECTED[*]} " == *" angie "* ]]; then

@@ -737,6 +737,27 @@ sysctl_hugepages_target() {
   printf '%s' "$pages"
 }
 
+# One PHP predicate for the sysctl writer and the memory plan: the pages are
+# reserved whenever configure_sysctl believes PHP exists (a leftover /etc/php
+# included), so the plan must book them under the same test.
+hugepages_php_present() {
+  [[ -d /etc/php ]] || (( ${ENABLED[php]:-0} == 1 ))
+}
+
+# MB the kernel pins for OPcache: vm.nr_hugepages x 2 MB, from the same
+# formula and inputs configure_sysctl uses.  The target is booked, never the
+# live HugePages_Total: a partial allocation (87 of 296) varies per boot and
+# would break install/--optimize parity, and the requested count is the
+# conservative side.  0 in a container (see host_is_container).
+hugepages_reserved_mb() {
+  local ram_mb=${1:-0} pages
+  hugepages_php_present || { printf 0; return 0; }
+  host_is_container && { printf 0; return 0; }
+  pages=$(sysctl_hugepages_target "$ram_mb" 1)
+  [[ $pages =~ ^[0-9]+$ ]] || pages=0
+  printf '%s' $(( pages * 2 ))
+}
+
 configure_sysctl() {
   step "sysctl tweaks"
   record_sysctl_values
@@ -849,11 +870,12 @@ configure_sysctl() {
   (( ipfrag_high < 4194304 )) && ipfrag_high=4194304
   (( ipfrag_high > 16777216 )) && ipfrag_high=16777216
   ipfrag_low=$(( ipfrag_high * 3 / 4 ))
-  # Two 2 MB huge pages per 128 MB of RAM (1 GB on a 30 GB host, 64 MB on a
-  # 4 GB one), used by OPcache through opcache.huge_code_pages.  Huge pages
-  # are reserved at boot and never swapped, so small hosts get none.
+  # Huge pages for opcache.huge_code_pages: (OPcache + JIT buffer)/2 + 8
+  # pages, on 4 GB+ hosts with PHP only (sysctl_hugepages_target).  Reserved
+  # at boot and never swapped; plan_memory_budget books the same count
+  # through hugepages_reserved_mb.
   local has_php=0
-  if [[ -d /etc/php ]] || (( ${ENABLED[php]:-0} == 1 )); then has_php=1; fi
+  hugepages_php_present && has_php=1
   hugepages=$(sysctl_hugepages_target "$ram_mb" "$has_php")
   arp_thresh3=$(( cpu * 1024 ));        (( arp_thresh3 < 2048 )) && arp_thresh3=2048;          (( arp_thresh3 > 262144 )) && arp_thresh3=262144
   arp_thresh2=$(( arp_thresh3 / 2 ))

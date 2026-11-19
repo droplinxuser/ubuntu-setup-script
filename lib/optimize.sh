@@ -213,6 +213,16 @@ OPT_VALKEY_LIVE_MB=0
 OPT_VALKEY_GUARD=""
 OPT_ES_BUDGET_MB=0
 OPT_ES_KEPT_MB=0
+# Memory booked inside OPT_MEM_BUDGET_MB that no service setting names.
+# OPT_ES_DIRECT_MB: the Elasticsearch direct (off-heap) ceiling, an operator
+# -XX:MaxDirectMemorySize or the JVM's own heap/2; OPT_ES_DIRECT_BOOKED_MB:
+# the part of it booked in the budget (less than the ceiling only below
+# 4 GB, where part sits in the OS headroom); OPT_HUGEPAGES_MB: the OPcache
+# huge-page reservation.
+OPT_ES_DIRECT_MB=0
+OPT_ES_DIRECT_BOOKED_MB=0
+OPT_ES_DIRECT_OPERATOR=0
+OPT_HUGEPAGES_MB=0
 # Set while plan_install_budget() runs.  A fresh install has no live database
 # or index to measure, so the planner must use the same empty-data floors that
 # --optimize applies instead of the larger "unmeasured" fallbacks.
@@ -423,6 +433,63 @@ elasticsearch_current_heap_mb() {
   return 0
 }
 
+# Major version of the JDK bundled with Elasticsearch (21 when unknown: every
+# supported 8.x/9.x release bundles 21 or newer).
+elasticsearch_jdk_major() {
+  local v
+  v=$(sed -nE 's/^JAVA_VERSION="?([0-9]+).*/\1/p' "${1:-/usr/share/elasticsearch/jdk/release}" 2>/dev/null | head -n1 || true)
+  [[ $v =~ ^[0-9]+$ ]] || v=21
+  printf '%s' "$((10#$v))"
+}
+
+# An operator's -XX:MaxDirectMemorySize in MB, or nothing.  Reads the main
+# jvm.options, then the jvm.options.d drop-ins, in the order the JVM applies
+# them (the last active line wins).  The stock jvm.options never sets the
+# flag, so a fresh install (no file yet) and the next --optimize read the
+# same nothing.  zz-setup-optimize.options is ours and never sets it.  A JDK
+# version prefix ("17:", "17-:", "9-16:") is honoured against the bundled
+# JDK, as the JVM options parser does; commented lines are ignored.  Sizes
+# are decimal (HotSpot reads "08m" as 8 MB), so bash never sees an octal.
+elasticsearch_operator_direct_mb() {
+  local dir=${1:-/etc/elasticsearch/jvm.options.d} main=${2:-/etc/elasticsearch/jvm.options}
+  local jdk=${3:-} file line pre num unit lo hi mb=""
+  [[ -n $jdk ]] || jdk=$(elasticsearch_jdk_major)
+  for file in "$main" "$dir"/*.options; do
+    [[ -f $file ]] || continue
+    [[ ${file##*/} == zz-setup-optimize.options ]] && continue
+    while IFS= read -r line; do
+      [[ $line =~ ^(([0-9]+)(-([0-9]*))?:)?-XX:MaxDirectMemorySize=([0-9]+)([kKmMgG]?)[[:space:]]*$ ]] || continue
+      pre=${BASH_REMATCH[1]}; num=$((10#${BASH_REMATCH[5]})); unit=${BASH_REMATCH[6]}
+      if [[ -n $pre ]]; then
+        lo=$((10#${BASH_REMATCH[2]}))
+        if [[ -z ${BASH_REMATCH[3]} ]]; then hi=$lo          # "N:"   exactly N
+        elif [[ -z ${BASH_REMATCH[4]} ]]; then hi=999        # "N-:"  N or newer
+        else hi=$((10#${BASH_REMATCH[4]})); fi               # "N-M:" N..M
+        (( jdk >= lo && jdk <= hi )) || continue
+      fi
+      case $unit in
+        k|K) mb=$(( (num + 1023) / 1024 )) ;;
+        m|M) mb=$num ;;
+        g|G) mb=$(( num * 1024 )) ;;
+        *)   mb=$(( (num + 1048575) / 1048576 )) ;;
+      esac
+    done < <(cat "$file"; [[ -z $(tail -c1 "$file") ]] || echo)
+  done
+  [[ -n $mb ]] && printf '%s' "$mb"
+  return 0
+}
+
+# Direct memory booked for a heap: the operator value, or the JVM ergonomic
+# heap/2 rounded up (an odd 913 MB heap gets 457, never 456), minus the OS
+# headroom credit (non-zero only below 4 GB), never below 0.
+es_direct_booked_mb() {
+  local heap=${1:-0} op=${2:-0} credit=${3:-0} d
+  [[ $op =~ ^[0-9]+$ ]] || op=0
+  if (( op > 0 )); then d=$op; else d=$(( (heap + 1) / 2 )); fi
+  d=$(( d - credit )); (( d < 0 )) && d=0
+  printf '%s' "$d"
+}
+
 plan_memory_budget() {
   local total usable
   local has_php=0 has_maria=0 has_cache=0 has_es=0
@@ -438,12 +505,35 @@ plan_memory_budget() {
   local es_store="" es_kept=0 current_heap=0
   local remaining data_pool targets_sum alloc_total excess dec
   local explicit=""
+  local hp_mb=0 svc_usable=0 es_credit=0 es_op_direct=0 es_book=0
+  local es_book_target=0 es_fp_target=0 maria_plan_target=0 over=0 booked=0
 
   total=$(mem_total_mb)
   (( total > 0 )) || total=1024
   OPT_MEM_TOTAL_MB=$total
   usable=$(( total * 80 / 100 ))
   OPT_MEM_BUDGET_MB=$usable
+  OPT_ES_DIRECT_MB=0
+  OPT_ES_DIRECT_BOOKED_MB=0
+  OPT_ES_DIRECT_OPERATOR=0
+  OPT_HUGEPAGES_MB=0
+  # Memory pinned outside every service setting.  OPcache huge pages are
+  # reserved at boot inside MemTotal, never swapped and not in worker RSS,
+  # so they come off the services' share; OPT_MEM_BUDGET_MB, the cache cap
+  # and the only-increase rules keep the plain 80% figure.
+  hp_mb=$(hugepages_reserved_mb "$total")
+  [[ $hp_mb =~ ^[0-9]+$ ]] || hp_mb=0
+  OPT_HUGEPAGES_MB=$hp_mb
+  svc_usable=$(( usable - hp_mb ))
+  (( svc_usable < 0 )) && svc_usable=0
+  # Below 4 GB (no huge pages) the Elasticsearch direct ceiling first uses
+  # the headroom above a 10% OS floor.  It is a ceiling that a small forum
+  # index rarely touches, and booking all of it cut a 2 GB all-in-one's
+  # buffer pool by 256 MB.  At 4 GB and above it is booked in full.
+  if (( total < 4096 )); then
+    es_credit=$(( total - usable - total / 10 ))
+    (( es_credit < 0 )) && es_credit=0
+  fi
   OPT_PHP_BUDGET_MB=0
   OPT_PHP_CHILDREN=0
   OPT_MARIADB_BUDGET_MB=0
@@ -489,7 +579,7 @@ plan_memory_budget() {
     fi
     php_floor=$(( php_floor_children * allowance ))
     (( php_floor < 256 )) && php_floor=256
-    (( php_floor > usable / 2 )) && php_floor=$(( usable / 2 ))
+    (( php_floor > svc_usable / 2 )) && php_floor=$(( svc_usable / 2 ))
   fi
 
   # MariaDB target: live data+index plus at most 20% headroom.  Nothing is
@@ -541,6 +631,8 @@ plan_memory_budget() {
         maria_target=128
       fi
     fi
+    # The data/floor target before the only-increase rule (kept-pool trim).
+    maria_plan_target=$maria_target
     current_pool=$(mariadb_current_pool_mb)
     if [[ $current_pool =~ ^[0-9]+$ ]] && (( current_pool > 0 )); then
       # Only increase: a pool that is already above the target is kept as it
@@ -638,31 +730,61 @@ plan_memory_budget() {
         es_kept=$current_heap
       fi
     fi
+    es_op_direct=$(elasticsearch_operator_direct_mb 2>/dev/null || true)
+    [[ $es_op_direct =~ ^[0-9]+$ ]] || es_op_direct=0
+    (( es_op_direct > 0 )) && OPT_ES_DIRECT_OPERATOR=1
+    # Direct (off-heap) memory: Elasticsearch sets MaxDirectMemorySize to
+    # heap/2 when no operator file sets it, so the node can use ~1.5x the
+    # heap.  It is booked, not capped: write_es_jvm_options never writes the
+    # flag.  Metaspace, code cache and thread stacks (~100-300 MB) are not
+    # booked; they stay inside the 20% OS margin.
+    es_book_target=$(es_direct_booked_mb "$es_target" "$es_op_direct" "$es_credit")
+    es_fp_target=$(( es_target + es_book_target ))
   fi
 
   # Reserve the live data services first.  PHP keeps only its 8-worker floor
   # during this pass so the data tier can fit; the remainder goes to PHP and
   # finally to the OS page cache.  If all targets cannot fit, scale them
   # proportionally and trim Elasticsearch first, then Valkey, then MariaDB.
-  data_pool=$(( usable - php_floor ))
+  data_pool=$(( svc_usable - php_floor ))
   (( data_pool < 0 )) && data_pool=0
   # Explicit operator sizes are never scaled: the installer writes them
   # verbatim, so the plan reserves them verbatim too; otherwise the next
-  # --optimize would shrink what the operator asked for.
+  # --optimize would shrink what the operator asked for.  An explicit heap
+  # still carries its direct share.
   local fixed_sum=0 flex_pool flex_sum
   (( maria_fixed ))  && fixed_sum=$(( fixed_sum + maria_target ))
   (( valkey_fixed )) && fixed_sum=$(( fixed_sum + valkey_target ))
-  (( es_fixed ))     && fixed_sum=$(( fixed_sum + es_target ))
+  (( es_fixed ))     && fixed_sum=$(( fixed_sum + es_fp_target ))
+  # A kept live pool (only-increase) that no longer fits gives up its
+  # surplus over the data target first, and only as much as the plan is
+  # over.  Splitting from the kept value instead lands on a pool that the
+  # next run keeps and splits again (two or more restarts for one input);
+  # this way the result either fits and is kept next time, or equals the
+  # data target, which is where the next run splits from too.  It never goes
+  # below the 256 MB operational floor the split itself lifts to: a small
+  # all-in-one keeps the install's 256 MB pool when an empty database makes
+  # the data target 128 MB.
+  if (( kept_pool > 0 && ! maria_fixed && maria_plan_target > 0 )); then
+    over=$(( maria_target + valkey_target + es_fp_target - data_pool ))
+    if (( over > 0 )); then
+      local trim_floor=$maria_plan_target
+      (( trim_floor < 256 )) && trim_floor=$(( maria_target < 256 ? maria_target : 256 ))
+      dec=$(( maria_target - trim_floor )); (( dec > over )) && dec=$over
+      (( dec > 0 )) && maria_target=$(( maria_target - dec ))
+    fi
+  fi
   # Data larger than the budget would take the whole pool in the
   # proportional split and push Elasticsearch and Valkey to their floors.
   (( maria_fixed == 0 && maria_target > data_pool )) && maria_target=$data_pool
   flex_pool=$(( data_pool - fixed_sum ))
   (( flex_pool < 0 )) && flex_pool=0
-  targets_sum=$(( maria_target + valkey_target + es_target ))
+  targets_sum=$(( maria_target + valkey_target + es_fp_target ))
   if (( targets_sum <= data_pool )); then
     maria_alloc=$maria_target
     valkey_alloc=$valkey_target
     es_alloc=$es_target
+    es_book=$es_book_target
   elif (( targets_sum > 0 )); then
     flex_sum=$(( targets_sum - fixed_sum ))
     (( flex_sum > 0 )) || flex_sum=1
@@ -679,12 +801,19 @@ plan_memory_budget() {
     (( has_cache && ! valkey_fixed && valkey_alloc < 256 && valkey_alloc < valkey_target )) \
       && valkey_alloc=$(( valkey_target < 256 ? valkey_target : 256 ))
     (( has_es && es_alloc < 512 )) && es_alloc=512
-    alloc_total=$(( maria_alloc + valkey_alloc + es_alloc ))
+    (( has_es )) && es_book=$(es_direct_booked_mb "$es_alloc" "$es_op_direct" "$es_credit")
+    alloc_total=$(( maria_alloc + valkey_alloc + es_alloc + es_book ))
     excess=$(( alloc_total - data_pool ))
     while (( excess > 0 )); do
       if (( has_es && ! es_fixed && es_alloc > 512 )); then
-        dec=$(( es_alloc - 512 )); (( dec > excess )) && dec=$excess
-        es_alloc=$(( es_alloc - dec )); excess=$(( excess - dec ))
+        # Each heap MB frees up to 1.5 MB (heap + heap/2 direct); take 2/3
+        # of the excess and recompute.  With an operator or credited direct
+        # share the next pass takes the rest.  Over-frees at most 1 MB,
+        # which goes to PHP.
+        dec=$(( (2 * excess + 2) / 3 )); (( dec > es_alloc - 512 )) && dec=$(( es_alloc - 512 ))
+        es_alloc=$(( es_alloc - dec ))
+        es_book=$(es_direct_booked_mb "$es_alloc" "$es_op_direct" "$es_credit")
+        excess=$(( maria_alloc + valkey_alloc + es_alloc + es_book - data_pool ))
       elif (( has_cache && ! valkey_fixed && valkey_alloc > 256 )); then
         dec=$(( valkey_alloc - 256 )); (( dec > excess )) && dec=$excess
         valkey_alloc=$(( valkey_alloc - dec )); excess=$(( excess - dec ))
@@ -708,11 +837,13 @@ plan_memory_budget() {
     cache_plan=$(valkey_guard_maxmemory_mb "$valkey_alloc" "$cache_used" "$cache_current" "$cache_cap" "$cache_evicts")
     valkey_alloc=${cache_plan%% *}
     OPT_VALKEY_GUARD=${cache_plan##* }
-    excess=$(( maria_alloc + valkey_alloc + es_alloc - data_pool ))
-    if (( excess > 0 && has_es && ! es_fixed && es_alloc > 512 )); then
-      dec=$(( es_alloc - 512 )); (( dec > excess )) && dec=$excess
-      es_alloc=$(( es_alloc - dec )); excess=$(( excess - dec ))
-    fi
+    excess=$(( maria_alloc + valkey_alloc + es_alloc + es_book - data_pool ))
+    while (( excess > 0 && has_es && ! es_fixed && es_alloc > 512 )); do
+      dec=$(( (2 * excess + 2) / 3 )); (( dec > es_alloc - 512 )) && dec=$(( es_alloc - 512 ))
+      es_alloc=$(( es_alloc - dec ))
+      es_book=$(es_direct_booked_mb "$es_alloc" "$es_op_direct" "$es_credit")
+      excess=$(( maria_alloc + valkey_alloc + es_alloc + es_book - data_pool ))
+    done
     if (( excess > 0 && has_maria && ! maria_fixed && maria_alloc > 256 )); then
       dec=$(( maria_alloc - 256 )); (( dec > excess )) && dec=$excess
       maria_alloc=$(( maria_alloc - dec )); excess=$(( excess - dec ))
@@ -725,7 +856,7 @@ plan_memory_budget() {
   (( kept_pool != 0 && maria_alloc != kept_pool )) && kept_pool=0
   # PHP gets what the data tier did not need, bounded by CPU and the 50%-RAM
   # ceiling.  Eight workers are always kept when PHP is installed.
-  remaining=$(( usable - maria_alloc - valkey_alloc - es_alloc ))
+  remaining=$(( svc_usable - maria_alloc - valkey_alloc - es_alloc - es_book ))
   (( remaining < 0 )) && remaining=0
   if (( has_php )); then
     local floor_children=$php_floor_children
@@ -747,18 +878,29 @@ plan_memory_budget() {
     es_alloc=$(( es_alloc / 512 * 512 ))
     (( es_alloc < 512 )) && es_alloc=512
   fi
+  # The direct share follows the heap that is written.
+  if (( has_es )); then
+    if (( es_op_direct > 0 )); then
+      OPT_ES_DIRECT_MB=$es_op_direct
+    else
+      OPT_ES_DIRECT_MB=$(( (es_alloc + 1) / 2 ))
+    fi
+    es_book=$(es_direct_booked_mb "$es_alloc" "$es_op_direct" "$es_credit")
+    OPT_ES_DIRECT_BOOKED_MB=$es_book
+  fi
 
   # The operational floors (256 MB MariaDB/Valkey, 512 MB Elasticsearch, the
   # PHP worker floor) cannot be trimmed; on a 1 GB host running every service
   # they exceed the budget.  Record the overcommit so the plan and the report
   # say so instead of printing allocations that look as if they fit.  The
-  # comparison uses the PHP budget that is actually reserved: the earlier
-  # php_floor is capped at half the budget for the data-tier split, so it
-  # under-reported a pool whose floor workers need more than that.
+  # comparison uses the PHP budget that is actually reserved (the earlier
+  # php_floor is capped at half the budget for the data-tier split) and
+  # includes the booked Elasticsearch direct memory and OPcache huge pages.
   OPT_MEM_OVERCOMMIT_MB=0
-  if (( maria_alloc + valkey_alloc + es_alloc + php_budget > usable )); then
-    OPT_MEM_OVERCOMMIT_MB=$(( maria_alloc + valkey_alloc + es_alloc + php_budget - usable ))
-    warn "Memory plan: service floors exceed the ${usable} MB budget by ${OPT_MEM_OVERCOMMIT_MB} MB; this host is too small for the selected services"
+  booked=$(( maria_alloc + valkey_alloc + es_alloc + es_book + php_budget + hp_mb ))
+  if (( booked > usable )); then
+    OPT_MEM_OVERCOMMIT_MB=$(( booked - usable ))
+    warn "Memory plan: service floors and reserved memory (Elasticsearch direct ${es_book} MB, huge pages ${hp_mb} MB) exceed the ${usable} MB budget by ${OPT_MEM_OVERCOMMIT_MB} MB; this host is too small for the selected services"
   fi
 
   OPT_MARIADB_BUDGET_MB=$maria_alloc
@@ -1098,11 +1240,24 @@ plan_install_budget() {
 # shellcheck disable=SC2120
 memory_plan_summary() {
   local label=${1:-Memory plan}
-  printf '%s: %sMB usable of %sMB (PHP=%sMB MariaDB=%sMB Cache=%sMB Elasticsearch=%sMB)' \
+  printf '%s: %sMB usable of %sMB (PHP=%sMB MariaDB=%sMB Cache=%sMB Elasticsearch=%sMB' \
     "$label" \
     "${OPT_MEM_BUDGET_MB:-0}" "${OPT_MEM_TOTAL_MB:-0}" \
     "${OPT_PHP_BUDGET_MB:-0}" "${OPT_MARIADB_BUDGET_MB:-0}" \
     "${OPT_VALKEY_BUDGET_MB:-0}" "${OPT_ES_BUDGET_MB:-0}"
+  # Booked memory no service setting names; a host without either prints
+  # the old string byte for byte.
+  if (( ${OPT_ES_DIRECT_MB:-0} > 0 )); then
+    printf ' ES-direct=%sMB' "$OPT_ES_DIRECT_MB"
+    if (( ${OPT_ES_DIRECT_BOOKED_MB:-0} != OPT_ES_DIRECT_MB )); then
+      printf ' (%sMB booked)' "${OPT_ES_DIRECT_BOOKED_MB:-0}"
+    fi
+  fi
+  if (( ${OPT_HUGEPAGES_MB:-0} > 0 )); then
+    printf ' HugePages=%sMB' "$OPT_HUGEPAGES_MB"
+  fi
+  printf ')'
+  return 0
 }
 
 php_fpm_versions() {  local d ver

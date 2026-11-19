@@ -330,6 +330,15 @@ host_server_type() {
 }
 host_is_vps() { [[ $(host_server_type) == vps ]]; }
 
+# True inside a container (LXC, Docker, systemd-nspawn).  Stable for the life
+# of the guest, so the install plan and --optimize agree.  Huge pages set from
+# a container are reserved in the host kernel (or refused) and are never
+# charged to this guest's memory limit.
+host_is_container() {
+  command -v systemd-detect-virt >/dev/null 2>&1 || return 1
+  systemd-detect-virt --container --quiet 2>/dev/null
+}
+
 # ---------------------------------------------------------------------------
 # Application detection
 # ---------------------------------------------------------------------------

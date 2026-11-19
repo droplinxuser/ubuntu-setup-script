@@ -5,6 +5,48 @@ README.md; measurements in tests/stress-site/RESULTS.md.  Per-cycle
 reports and raw test logs cited by entries up to 1.21.32 were removed from
 the tree on 2026-11-19; retrieve them with `git show 84b0db5:<path>`.
 
+## 1.21.35 (2026-11-19)
+
+The open item from the 1.21.34 audit: the memory plan books Elasticsearch
+direct memory and the OPcache huge pages.  Designed by a three-way panel
+(book / cap / headroom-first), judged on arithmetic, parity and operational
+risk, then reviewed adversarially; verified on the Xeon E-2236 host.
+
+- **Elasticsearch direct (off-heap) memory is booked.**  The plan booked
+  only `-Xmx`, but Elasticsearch sets `-XX:MaxDirectMemorySize` to heap/2
+  when nobody else does (confirmed on the host: `MaxDirectMemorySize=
+  268435456` beside `-Xmx512m`), so a node could use ~1.5x its booking.
+  The plan now books that ceiling, or an operator value from
+  `/etc/elasticsearch/jvm.options` or `jvm.options.d` (decimal sizes, JDK
+  version prefixes honoured against the bundled JDK).  Nothing is written
+  to the JVM options, so no Elasticsearch restarts on upgrade.  Below 4 GB
+  part of the ceiling is credited against the OS headroom above 10%: a
+  2 GB all-in-one with a 1 GB database gets a 692 MB pool instead of 742
+  (486 without the credit), and a 1.5 GB all-in-one still fits.
+- **OPcache huge pages are booked.**  `vm.nr_hugepages` (296 pages = 592 MB
+  on 8 GB+ hosts with PHP) is pinned inside MemTotal and missing from the
+  worker RSS the PHP allowance measures.  It now comes off the services'
+  share through `hugepages_reserved_mb`, which uses the same formula and
+  the same PHP predicate as `configure_sysctl` (`hugepages_php_present`);
+  0 in a container.  The budget figure, the Valkey cap and the
+  only-increase rules keep the plain 80%.
+- **A kept MariaDB pool that no longer fits settles in one run.**  It gives
+  up its surplus over the data target before the split (never below the
+  256 MB floor), instead of 5000 -> 3533 -> 3260 over two restarts.
+- **Effect on existing hosts:** none where the plan fits (the audit host:
+  identical files, no restarts; install -> `--optimize` and `--optimize` x2
+  0 differences).  Hosts that were silently over-subscribed are re-split
+  once: an 8 GB PHP + MariaDB (4 GB data) + Elasticsearch (8 GB index) host
+  moves from MariaDB 4096 + heap 2048 (a true ~7.9 GB against 6.5 GB) to
+  3260 + 1536.  Explicit sizes that crowd out the direct share now report
+  the overcommit (20000 + 4096 MB on 32 GB: about 186 MB).
+- The memory summary (install, `--optimize`, dry run) appends
+  `ES-direct=NMB` and `HugePages=NMB` when non-zero; the Elasticsearch
+  report names the off-heap ceiling and where it comes from.
+- Tests: 1,067 checks (helpers, small-host credit, install/`--optimize`
+  parity at 1, 1.5, 2 and 27 GB, the kept-pool trim, operator values);
+  a mutation of the 256 MB trim floor is caught.
+
 ## 1.21.34 (2026-11-19)
 
 Second audit cycle on the Xeon E-2236 / md RAID0 host (Ubuntu 26.04.1,
