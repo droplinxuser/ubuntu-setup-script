@@ -1498,6 +1498,15 @@ angie_migrate_guest_cache_includes() {
        && angie_rewrite_include_at_level "$vhost" php_xf.conf php.conf nested; then
       tune_note "${rel}: nested h5bp/php_xf.conf include replaced by h5bp/php.conf (the guest cache is server-level only)"
     fi
+    # server-configs-nginx 1.6.48: php_wp.conf has exact `= /index.php` and
+    # `= /wp-cron.php` locations, which Angie refuses inside another
+    # location ("/index.php is outside location /blog/").  A subdirectory
+    # install that nested it gets the generic, nestable php.conf, which
+    # keeps its own deny rules.
+    if grep -qE '^[[:space:]]*location[[:space:]]+=[[:space:]]*/index\.php' "${target}/h5bp/php_wp.conf" 2>/dev/null \
+       && angie_rewrite_include_at_level "$vhost" php_wp.conf php.conf nested; then
+      tune_note "${rel}: nested h5bp/php_wp.conf include replaced by h5bp/php.conf (php_wp.conf is server-level only)"
+    fi
   done
   return 0
 }

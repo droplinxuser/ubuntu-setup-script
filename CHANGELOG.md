@@ -5,6 +5,74 @@ README.md; measurements in tests/stress-site/RESULTS.md.  Per-cycle
 reports and raw test logs cited by entries up to 1.21.32 were removed from
 the tree on 2026-11-19; retrieve them with `git show 84b0db5:<path>`.
 
+## 1.21.36 (2026-11-20)
+
+Performance cycle on the Xeon E-2236 host.  Pair: `server-configs-nginx`
+1.6.48.  Report: `tests/stress-site/AUDIT-20261120-1.21.36.md`.
+
+- **CPU vulnerability mitigations can be switched off.**  `--basic
+  mitigations=off`, `--optimize mitigations=off` or
+  `SETUP_CPU_MITIGATIONS=off` add `mitigations=off` to the kernel command
+  line through a managed `/etc/default/grub.d/99-setup-mitigations.cfg`
+  (the provider's own options are kept), run `update-grub` and persist
+  `CPU_MITIGATIONS=off` in `/etc/default/setup-tuning`, so every later
+  `--optimize` keeps it; `mitigations=on` removes the drop-in and
+  `--purge basic` does too.  It applies at the next reboot (the run says
+  so); containers and non-GRUB boot loaders are reported, not touched; a
+  host where nobody chose is never touched.  Measured after fresh boots on
+  the Xeon E-2236 (PTI + IBRS + MDS): guest-cache hits +19% (XenForo),
+  +25% (WordPress), +14% (Chevereto); PHP tiers +5-7%.  It weakens the
+  isolation between local processes; for a single-administrator,
+  key-only, CDN-fronted host the operator accepts that.  `--diagnostics`
+  shows the command line and every vulnerability state.
+- **XenForo: members' pages are compressed by Angie, guests' by
+  XenForo.**  XenForo gzips every page at level 9 (15% of member-page PHP
+  CPU).  A managed block at the end of each XenForo `src/config.php` sets
+  `$config['enableGzip'] = !isset($_COOKIE[<prefix>session])`: the guest
+  cache still stores XenForo's compressed body (a hit costs no
+  compression), and session visitors get plain HTML that Angie compresses
+  at level 4.  Measured: member thread +4% (344/348 -> 360/360 req/s),
+  guest cache unchanged; turning XenForo's gzip off for everyone instead
+  dropped guest-cache hits from 104k to 6.8k req/s.  The block wins over
+  an operator's own `enableGzip` line (left in place), honours a custom
+  cookie prefix, is linted before it is written, and
+  `SETUP_XF_MEMBER_GZIP=xenforo` removes it again (persisted as
+  `XF_MEMBER_GZIP`).
+- **Existing vhosts move onto the lean location chain**
+  (`tune_vhost_lean_locations`, server-configs-nginx 1.6.48).  A vhost that
+  includes its application's PHP file at server level gets the header-only
+  `basic*_headers.conf` (the deny regex lives in that PHP include now); the
+  XenForo template's `admin.php|install` block, the Chevereto template's
+  app/importing/composer lines, `dashboard|update` and
+  `CHEVERETO_LICENSE_KEY` blocks are folded, and Chevereto's `/images/`
+  nested denies become one allowlist regex -- each only in its shipped
+  shape.  A vhost with a nested or rewritten PHP include keeps the full
+  `basic*.conf` set and is reported; an active `auth_basic` block or an
+  edited `/images/` block is kept.  The test host's four vhosts converted
+  with `angie -t` passing, 54/54 security probes, 62/62 cookie checks and
+  0 functional regressions; guest-cache hits +3 % (XenForo), ~+1.5-3.5 %
+  (WordPress, Chevereto) on top of the lean maps.
+- **PHP 8.6.0 is not production-ready for this stack yet.**  Sury
+  publishes 8.6.0 itself, but not `php8.6-redis`, `-igbinary`, `-imagick`,
+  `-apcu` or `-msgpack`, and the PECL sources do not compile against 8.6.0
+  (removed `XtOffsetOf`, `INI_INT`/`INI_STR`, `zval_dtor`; changed
+  `php_error_docref` types).  `--upgrade-php=8.6` therefore refuses before
+  purging and names the affected sites (Chevereto: redis, imagick;
+  XenForo: redis).  Tested anyway with `SETUP_PHP_ALLOW_MISSING_EXT=1`:
+  WordPress 7.1.4 clean; XenForo 2.3.13 core clean in production mode only
+  with its Redis cache off (debug mode: the same two POST 500s as on 8.5);
+  Chevereto 4.5.9 cannot run (Imagick).  The run back to 8.5 is blocked by
+  the collateral-removal guard while test-only `php8.6-dev` is installed --
+  the guard working as intended.
+- Tests: GRUB drop-in text and idempotency, CLI validation (8 dry-run
+  cases), the XenForo block (parse, guests vs members, custom prefix,
+  `?>` endings, byte-for-byte removal, unparsable files left alone), the
+  vhost migration (template shapes, one-line blocks, auth_basic kept, nested
+  include kept and reported, /images/ fold scoped and shape-checked,
+  idempotent), update-grub retry and failure, `?>` after code, a block
+  without its END marker.  An adversarial review confirmed 16 findings in
+  the new code; all are fixed (see the cycle report).
+
 ## 1.21.35 (2026-11-19)
 
 The open item from the 1.21.34 audit: the memory plan books Elasticsearch

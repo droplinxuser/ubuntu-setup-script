@@ -60,12 +60,18 @@ Usage:
 
 Basic (always required for an install; all values are optional):
   --basic [server=dedi|vps] [host=custom.host] [swap=8G] [time=Asia/Manila]
+          [mitigations=on|off]
     server   auto-detected when omitted (systemd-detect-virt/DMI/cgroup)
     host     auto-generated when omitted: <threads>c-<RAM>g-<storage>
              e.g. 8c-32g-1T (8 threads, 32 GB RAM, 1 TB storage)
     swap     auto when omitted: only adds swap if current swap is 0 or
              below 50% of RAM; target total is 50% of RAM
     time     defaults to Asia/Manila
+    mitigations  off = boot with mitigations=off (no PTI/IBRS/MDS clearing:
+             faster syscalls and context switches, weaker isolation
+             between local processes); on = remove it again.  GRUB only,
+             applied at the next reboot, persisted as CPU_MITIGATIONS so
+             every --optimize keeps it.  Omitted = never touched.
 
 Services (optional; only the ones listed are installed):
   --angie     [anubis=yes|no]
@@ -140,7 +146,7 @@ Domain setup (standalone; Angie + MariaDB must already be installed/running):
       no --purge for domains; remove the files/database manually.
 
 Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
-  --optimize [anubis=yes|no] [--dry-run]
+  --optimize [anubis=yes|no] [mitigations=on|off] [--dry-run]
       One command for the whole host.  It synchronizes Angie's /etc/angie
       tree from server-configs-nginx (or CONFIG_SOURCE_DIR), applies the
       hardware-aware OS profile (CPU governor, PAM security limits, and
@@ -329,7 +335,7 @@ EOF
 kv_set() {
   local ctx=$1 key=$2 val=$3
   case "${ctx}:${key}" in
-    basic:server|basic:host|basic:time|basic:swap) ;;
+    basic:server|basic:host|basic:time|basic:swap|basic:mitigations) ;;
     php:ver|php:children|php:max_requests) ;;
     mariadb:user|mariadb:pass|mariadb:size|mariadb:bind) ;;
     valkey:ram|valkey:policy|valkey:io_threads) ;;
@@ -383,6 +389,13 @@ anubis_set() {
   esac
 }
 
+# mitigations=on|off belongs to --basic and --optimize (CPU_MITIGATIONS).
+# Normalised to on/off; validate_all rejects anything else.
+mitigations_set() {
+  [[ -n $1 ]] || die "mitigations= requires on or off (the value is empty)"
+  CPU_MITIGATIONS_SETTING=$1
+}
+
 normalize_cli_args() {
   local arg
   NORMALIZED_ARGS=()
@@ -401,6 +414,9 @@ parse_args() {
         ENABLED[basic]=1; shift
         kv_consume basic 0 "$@"
         shift "$KV_CONSUMED"
+        if [[ -n ${OPT[basic.mitigations]+x} ]]; then
+          mitigations_set "${OPT[basic.mitigations]}"
+        fi
         ;;
       --php)
         ENABLED[php]=1; shift
@@ -499,8 +515,11 @@ parse_args() {
         ;;
       --optimize)
         OPTIMIZE=1; shift
-        while (( $# )) && [[ $1 == anubis=* ]]; do
-          anubis_set "${1#*=}"
+        while (( $# )) && [[ $1 == anubis=* || $1 == mitigations=* ]]; do
+          case $1 in
+            anubis=*) anubis_set "${1#*=}" ;;
+            *)        mitigations_set "${1#*=}" ;;
+          esac
           shift
         done
         ;;

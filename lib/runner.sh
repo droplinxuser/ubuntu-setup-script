@@ -77,6 +77,9 @@ print_plan() {
         # The host-wide side effects the real run performs, so the preview is
         # not only the tunables.
         printf '  %-10s apt update/upgrade, cron/logrotate installed, automatic security updates enabled\n' ""
+        if [[ -n ${CPU_MITIGATIONS:-} ]]; then
+          printf '  %-10s CPU mitigations: %s\n' "" "$(cpu_mitigations_plan_text)"
+        fi
         printf '  %-10s DNS resolvers 8.8.8.8/1.1.1.1, UFW default deny with SSH/80/443 allowed\n' ""
         printf '  %-10s OS profile (sysctl, PAM limits, governor, udev I/O rules) and the managed root crontab\n' ""
         ;;

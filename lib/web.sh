@@ -677,6 +677,167 @@ tune_vhost_route_anchors() {
   return 0
 }
 
+# server-configs-nginx 1.6.48 moved every deny rule of the four application
+# includes into one regex location per application
+# (h5bp/location/security_{xf,wp,chev,flarum}.conf, included by
+# php_xf.conf, php_wp.conf, php_chev_cache.conf/php_chev.conf and
+# php_flarum.conf).  Existing vhosts were rendered from the older templates
+# and still include the full basic*.conf (about twenty more regex locations
+# per request, tried twice) plus template blocks that only repeat what the
+# new rule does.  Bring a vhost onto the lean chain only where that is
+# provably safe:
+#   * basic_xf.conf / basic_flarum.conf / basic.conf become their
+#     header-only twins only when the same server block includes the app's
+#     PHP file directly (depth 1), so the new deny regex is in force there;
+#     a vhost whose PHP include was nested or rewritten to php.conf keeps
+#     the full set and is reported.
+#   * the XenForo template's admin.php|install block and the Chevereto
+#     template's app/importing/composer lines, dashboard|update block and
+#     CHEVERETO_LICENSE_KEY block are removed only in their shipped shape
+#     (comments, the security_* includes and php.conf/php_chev.conf only);
+#     a block with active auth_basic or other directives is kept.
+#   * the Chevereto /images/ nested denies are folded into one allowlist
+#     regex (a media extension on a path without "/."), which refuses
+#     everything the two deny lines refused.
+# Unchanged vhosts keep working and keep every deny rule; they only pay the
+# extra regex calls.  Every change is behind the caller's angie -t gate.
+tune_vhost_lean_locations() {
+  local target=${1:-/etc/angie} file tmp name counts switched removed kept
+  [[ -f $target/h5bp/location/security_xf.conf && -f $target/h5bp/basic_headers.conf ]] || return 0
+  for file in "$target"/conf.d/*.conf; do
+    [[ -f $file ]] || continue
+    name=${file##*/}
+    case $name in 00-anubis-*) continue ;; esac
+    grep -qE '^[[:space:]]*include[[:space:]]+h5bp/(basic(_xf|_flarum)?\.conf|php_(xf|wp|chev_cache|chev|flarum)\.conf);' "$file" || continue
+    tmp=$(tmp_file) || return 1
+    awk '
+      function strip(s) { sub(/#.*/, "", s); return s }
+      function braces(s,   t, a, b) { t = s; a = gsub(/{/, "{", t); t = s; b = gsub(/}/, "}", t); return a - b }
+      function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+      # 1 when every directive of a removable route block is one the new
+      # deny location already covers (no auth_basic, no nested location).
+      function body_allowed(b,   parts, np, p, x) {
+        if (index(b, "{") || index(b, "}")) return 0
+        np = split(b, parts, ";")
+        for (p = 1; p <= np; p++) {
+          x = trim(parts[p])
+          if (x == "") continue
+          if (x ~ /^include[ \t]+h5bp\/(location\/security_(root_archives|leftover_files|backup_files)|php|php_chev)\.conf$/) continue
+          if (x ~ /^try_files[ \t]/ || x == "internal") continue
+          return 0
+        }
+        return 1
+      }
+      function route_opener(c) {
+        return index(c, "location ~ ^/(?:admin\\.php$|install(?:/|$)) {") || index(c, "location ~ ^/(?:dashboard|update)(?:/|$) {") || index(c, "location /app/CHEVERETO_LICENSE_KEY {")
+      }
+      function flush(   i, j, k, line, code, depth, end, body, ok, inimg, imgopen, shape, imgstart, rest) {
+        # Pass 1: what the block includes at depth 1, nested PHP includes, and
+        # whether ^~ /images/ has exactly the shipped shape (deny, deny, media,
+        # return 403).
+        app = ""; nested = 0; depth = 0; imgopen = 0; imgok = 0; shape = ""
+        for (i = 1; i <= n; i++) {
+          code = strip(buf[i])
+          if (depth == 1 && code ~ /^[ \t]*include[ \t]+h5bp\/php_xf\.conf;/) app = app " xf"
+          if (depth == 1 && code ~ /^[ \t]*include[ \t]+h5bp\/php_flarum\.conf;/) app = app " flarum"
+          if (depth == 1 && code ~ /^[ \t]*include[ \t]+h5bp\/php_(wp|chev_cache|chev)\.conf;/) app = app " generic"
+          if (depth > 1 && code ~ /^[ \t]*include[ \t]+h5bp\/php(_xf|_wp|_chev_cache|_chev|_flarum)?\.conf;/) nested = 1
+          if (depth == 1 && index(code, "location ^~ /images/ {")) { imgopen = 1; shape = ""; imgstart = i }
+          else if (imgopen && depth == 2) {
+            if (index(code, DENY1)) shape = shape "1"
+            else if (index(code, DENY2)) shape = shape "2"
+            else if (index(code, MEDIA)) shape = shape "3"
+            else if (code ~ /^[ \t]*return[ \t]+403;[ \t]*$/) shape = shape "R"
+            else if (code ~ /^[ \t]*location[ \t]/) shape = shape "X"
+          }
+          depth += braces(code)
+          if (imgopen && i > imgstart && depth <= 1) { imgopen = 0; if (shape == "123R") imgok = 1 }
+        }
+        # Pass 2: emit with the edits.
+        depth = 0; inimg = 0
+        for (i = 1; i <= n; i++) {
+          line = buf[i]; code = strip(line)
+          if (depth == 1 && route_opener(code) && ((app ~ /xf/ && index(code, "admin")) || (app ~ /generic/ && !index(code, "admin")))) {
+            if (braces(code) == 0) {
+              # One-line block: its body is between the braces.
+              rest = code; sub(/^[^{]*{/, "", rest); sub(/}[^}]*$/, "", rest)
+              if (body_allowed(rest)) { removed++; continue }
+            } else {
+              k = depth + braces(code); body = ""; end = 0
+              for (j = i + 1; j <= n; j++) {
+                k += braces(strip(buf[j]))
+                if (k <= depth) { end = j; break }
+                body = body " " strip(buf[j])
+              }
+              if (end && body_allowed(body)) {
+                print "    # setup.sh: route block removed (h5bp/location/security_*.conf covers it)"
+                removed++
+                i = end
+                continue
+              }
+            }
+          }
+          if (depth == 1 && app ~ /generic/ && (index(code, "location ~ /(?:app|importing)/ { internal; }") || index(code, "location ~* /(app|content|lib)/.*\\.(po|php|lock|sql)$  { internal; }") || index(code, "location ~* /(?:composer\\.(?:json|lock)|\\.gitignore)$ { internal; }"))) {
+            removed++
+            continue
+          }
+          if (depth == 1 && app ~ /generic/ && index(line, "# app/ and importing/ are \"Require all denied\" upstream (.htaccess).")) continue
+          if (depth == 1 && index(code, "location ^~ /images/ {")) inimg = 1
+          if (inimg && imgok && app ~ /generic/ && depth == 2) {
+            if (index(code, DENY1) || index(code, DENY2)) continue
+            if (index(line, "# Nested deny: ^~ skips the server-level regex locations") || index(line, "# such as /images/.env or /images/x.sql would otherwise be served.")) continue
+            if (index(code, MEDIA)) {
+              match(line, /^[ \t]*/)
+              print substr(line, 1, RLENGTH) "location ~* \"(?s)^(?!.*/\\.).*\\.(?:gif|jpg|jpe|jpeg|png|ico|webp|avif|avifs|jxl|heic|heif|apng|bmp|svg|mov|mp4|webm|mkv|m4v|avi|mp3|ogg|oga|opus|m4a|wav)$\" {"
+              depth += braces(code)
+              continue
+            }
+          }
+          # basic*.conf -> header-only twin when the deny regex is in force.
+          if (depth == 1 && code ~ /^[ \t]*include[ \t]+h5bp\/basic_xf\.conf;/ && app ~ /xf/) { sub(/basic_xf\.conf;/, "basic_xf_headers.conf;", line); switched++ }
+          else if (depth == 1 && code ~ /^[ \t]*include[ \t]+h5bp\/basic_flarum\.conf;/ && app ~ /flarum/) { sub(/basic_flarum\.conf;/, "basic_flarum_headers.conf;", line); switched++ }
+          else if (depth == 1 && code ~ /^[ \t]*include[ \t]+h5bp\/basic\.conf;/ && app ~ /generic/) { sub(/basic\.conf;/, "basic_headers.conf;", line); switched++ }
+          else if (depth == 1 && code ~ /^[ \t]*include[ \t]+h5bp\/basic(_xf|_flarum)?\.conf;/ && nested) kept++
+          print line
+          depth += braces(code)
+          if (inimg && depth <= 1) inimg = 0
+        }
+        n = 0
+      }
+      BEGIN {
+        n = 0; inb = 0
+        DENY1 = "location ~* /\\.(?!well-known/) { deny all; }"
+        DENY2 = "location ~* \\.(?:env|bak|old|orig|sql|sql\\.gz|log|ini|conf|sh|php|phtml|phar)$ { deny all; }"
+        MEDIA = "location ~* \\.(gif|jpg|jpe|jpeg|png|ico|webp|avif|avifs|jxl|heic|heif|apng|bmp|svg|mov|mp4|webm|mkv|m4v|avi|mp3|ogg|oga|opus|m4a|wav)$ {"
+      }
+      {
+        code = strip($0)
+        if (!inb && code ~ /^[ \t]*server[ \t]*{/) { inb = 1; d = 0; n = 0 }
+        if (inb) {
+          buf[++n] = $0
+          d += braces(code)
+          if (d <= 0) { flush(); inb = 0 }
+          next
+        }
+        print
+      }
+      END {
+        if (inb) flush()
+        printf "%d %d %d\n", switched + 0, removed + 0, kept + 0 > "/dev/stderr"
+      }
+    ' "$file" > "$tmp" 2> "${tmp}.counts"
+    counts=$(cat "${tmp}.counts" 2>/dev/null); rm -f "${tmp}.counts"
+    read -r switched removed kept <<<"${counts:-0 0 0}"
+    if commit_if_changed "$file" "$tmp"; then
+      tune_note "${name}: lean deny chain (${switched} basic include(s) switched, ${removed} template rule(s) folded)"
+    fi
+    if (( kept > 0 )); then
+      tune_miss "${name}: deny rules kept server-wide (the application PHP include is nested); only the per-request cost differs"
+    fi
+  done
+  return 0
+}
+
 ANGIE_SINGLE_HTTP_DIRECTIVES=(limit_req_status limit_conn_status
                               limit_req_log_level limit_conn_log_level
                               limit_req_dry_run limit_conn_dry_run)
@@ -1434,6 +1595,7 @@ tune_angie_configs() {
   tune_xf_cache_vary "$target/h5bp/php_xf_proxy.conf"
   tune_xf_static_assets "$target/h5bp/xf2.conf"
   tune_vhost_route_anchors "$target"
+  tune_vhost_lean_locations "$target"
 
   tune_summary "angie summary: ${nproc} CPU / ${mem_mb}MB RAM / ${disk_class} / cache_budget=${cache_total_mb}MB"
   # The tuner may have added or rewritten an http-context directive that an

@@ -166,6 +166,15 @@ purge_basic() {
   udevadm control --reload-rules 2>/dev/null || true
   systemctl daemon-reload || true
   apparmor_local_clear who 'who nameservice'
+  # mitigations=off drop-in: back to the kernel default at the next boot.
+  if [[ -e $CPU_MITIGATIONS_DROPIN ]]; then
+    rm -f "$CPU_MITIGATIONS_DROPIN"
+    if command -v update-grub >/dev/null 2>&1 && update-grub >/dev/null 2>&1; then
+      info "CPU mitigations drop-in removed; the kernel default applies after the next reboot"
+    else
+      warn "CPU mitigations drop-in removed, but update-grub failed; run it before rebooting"
+    fi
+  fi
   # unattended-upgrades: put the APT periodic file back and disable the unit
   # only when it was not enabled before setup.sh enabled it.
   restore_original /etc/apt/apt.conf.d/20auto-upgrades apt-20auto-upgrades

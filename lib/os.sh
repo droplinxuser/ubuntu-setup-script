@@ -99,6 +99,106 @@ cpu_performance_governor_available() {
   return 0
 }
 
+# CPU vulnerability mitigations through a managed GRUB drop-in.  Ubuntu's
+# grub-mkconfig sources /etc/default/grub.d/*.cfg after /etc/default/grub, so
+# appending to GRUB_CMDLINE_LINUX_DEFAULT keeps the provider's own options
+# (console, iommu, nomodeset).  CPU_MITIGATIONS: off = add mitigations=off,
+# on = remove the drop-in, empty = never touched.  The kernel applies the
+# change at the next boot; the run says so instead of rebooting.
+CPU_MITIGATIONS_DROPIN=/etc/default/grub.d/99-setup-mitigations.cfg
+cpu_mitigations_dropin_text() {
+  cat <<'EOF'
+# Managed by setup.sh (CPU_MITIGATIONS=off in /etc/default/setup-tuning).
+# Turns off the kernel's CPU vulnerability mitigations (PTI, IBRS, MDS buffer
+# clearing, ...) for throughput.  Remove with `setup.sh --optimize
+# mitigations=on` (or --purge basic), then reboot.
+GRUB_CMDLINE_LINUX_DEFAULT="${GRUB_CMDLINE_LINUX_DEFAULT:+$GRUB_CMDLINE_LINUX_DEFAULT }mitigations=off"
+EOF
+}
+
+cpu_mitigations_live_off() {
+  grep -qw 'mitigations=off' /proc/cmdline 2>/dev/null
+}
+
+# One dry-run line for the planned boot-loader change.
+cpu_mitigations_plan_text() {
+  if host_is_container; then
+    printf 'CPU_MITIGATIONS=%s ignored (container)' "$CPU_MITIGATIONS"
+  elif [[ ! -f /etc/default/grub ]] || ! command -v update-grub >/dev/null 2>&1; then
+    printf 'CPU_MITIGATIONS=%s not applied (no GRUB)' "$CPU_MITIGATIONS"
+  elif [[ $CPU_MITIGATIONS == off ]]; then
+    printf 'would add mitigations=off (%s + update-grub; reboot to apply)' "$CPU_MITIGATIONS_DROPIN"
+  else
+    printf 'would remove %s if present (update-grub; reboot to apply)' "$CPU_MITIGATIONS_DROPIN"
+  fi
+}
+
+# 1 when the generated boot menu carries mitigations=off on a kernel line
+# (what the next boot will use; the drop-in alone proves nothing if
+# update-grub failed).
+cpu_mitigations_grubcfg_off() {
+  local cfg=${CPU_MITIGATIONS_GRUBCFG:-/boot/grub/grub.cfg}
+  [[ -r $cfg ]] && grep -qE '^[[:space:]]*linux[[:space:]].*[[:space:]]mitigations=off([[:space:]]|$)' "$cfg"
+}
+
+# Never fails the run: a boot loader problem is a warning in the report, and
+# the next run retries update-grub (it compares the boot menu, not only the
+# drop-in).
+configure_cpu_mitigations() {
+  local want=${CPU_MITIGATIONS:-} tmp changed=0 state regen=0
+  [[ -n $want ]] || return 0
+  if host_is_container; then
+    harden_note "- CPU mitigations: CPU_MITIGATIONS=${want} ignored in a container (the host kernel decides)"
+    return 0
+  fi
+  if [[ ! -f /etc/default/grub ]] || ! command -v update-grub >/dev/null 2>&1; then
+    harden_warn "- CPU mitigations: CPU_MITIGATIONS=${want} needs GRUB (/etc/default/grub and update-grub); this boot loader is not managed"
+    return 0
+  fi
+  if [[ $want == off ]]; then
+    tmp=$(tmp_file) || return 0
+    cpu_mitigations_dropin_text > "$tmp"
+    if ! cmp -s "$tmp" "$CPU_MITIGATIONS_DROPIN" 2>/dev/null; then
+      mkdir -p "${CPU_MITIGATIONS_DROPIN%/*}"
+      if ! install -m 644 "$tmp" "$CPU_MITIGATIONS_DROPIN"; then
+        harden_warn "- CPU mitigations: could not write ${CPU_MITIGATIONS_DROPIN}"
+        return 0
+      fi
+      changed=1
+    fi
+    cpu_mitigations_grubcfg_off || regen=1
+  elif [[ -e $CPU_MITIGATIONS_DROPIN ]]; then
+    rm -f "$CPU_MITIGATIONS_DROPIN"
+    changed=1
+  fi
+  if (( changed || regen )); then
+    if ! update-grub >/dev/null 2>&1; then
+      harden_warn "- CPU mitigations: update-grub failed; the boot menu does not have CPU_MITIGATIONS=${want} yet (the next run retries)"
+      [[ -n ${CPU_MITIGATIONS_SETTING:-} ]] && persist_tuning_var CPU_MITIGATIONS "$want"
+      return 0
+    fi
+  fi
+  if [[ $want == off ]]; then
+    if cpu_mitigations_live_off; then state="off (active)"; else state="off at the next reboot"; fi
+  elif (( changed )); then
+    state="on at the next reboot"
+  elif cpu_mitigations_live_off; then
+    # The running kernel has mitigations=off from a boot setting setup.sh
+    # does not manage (the operator's /etc/default/grub or another drop-in).
+    state="on requested, but mitigations=off comes from a boot setting setup.sh does not manage"
+  else
+    state="on (kernel default)"
+  fi
+  harden_note "- CPU mitigations: ${state} (CPU_MITIGATIONS=${want})"
+  if [[ $state == *"at the next reboot"* ]]; then
+    info "CPU mitigations: reboot to apply CPU_MITIGATIONS=${want}"
+  fi
+  if [[ -n ${CPU_MITIGATIONS_SETTING:-} ]]; then
+    persist_tuning_var CPU_MITIGATIONS "$want"
+  fi
+  return 0
+}
+
 configure_cpu_governor() {
   step "CPU governor (dedicated server)"
   # A guest's governor is the hypervisor's business; a VPS that exposes a
@@ -1329,6 +1429,7 @@ install_basic() {
   # the same function, so a host with a usable performance governor gets it
   # from either command.
   configure_cpu_governor
+  configure_cpu_mitigations
 
   # dmidecode (installed here) gives the nominal installed RAM for the
   # generated hostname, even when the kernel reserves some of it.

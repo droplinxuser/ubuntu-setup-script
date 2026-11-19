@@ -290,6 +290,91 @@ scan_wordpress_malware() {
   return 0
 }
 
+# XenForo page compression handover (XF_MEMBER_GZIP, see setup.sh).  The
+# block is appended to src/config.php, so it wins over an earlier
+# $config['enableGzip'] line the operator already has; that line is left as
+# it is.  The cookie prefix follows a $config['cookie']['prefix'] set
+# earlier in the same file (XenForo's default is "xf_").  Every write is
+# linted with the CLI PHP and rolled back if the file no longer parses.
+XF_GZIP_BEGIN='// BEGIN setup.sh enableGzip'
+XF_GZIP_END='// END setup.sh enableGzip'
+xf_gzip_block() {
+  cat <<'EOF'
+// BEGIN setup.sh enableGzip (XF_MEMBER_GZIP=angie in /etc/default/setup-tuning)
+// Guests: XenForo compresses (level 9) and the guest cache stores that body.
+// Logged-in visitors: XenForo sends plain HTML and Angie compresses it
+// (Brotli/gzip level 4), which costs far less PHP CPU per page.
+$config['enableGzip'] = !isset($_COOKIE[($config['cookie']['prefix'] ?? 'xf_') . 'session']);
+// END setup.sh enableGzip
+EOF
+}
+
+tune_xenforo_gzip() {
+  local conf tmp changed=0 kept=0 php_bin
+  php_bin=$(command -v php 2>/dev/null || true)
+  persist_xf_member_gzip
+  while IFS= read -r conf; do
+    [[ -n $conf && -f $conf ]] || continue
+    # An edited block without its END marker would make the filter below
+    # drop every line after BEGIN: leave such a file alone.
+    if [[ $(grep -cF "$XF_GZIP_BEGIN" "$conf") != "$(grep -cF "$XF_GZIP_END" "$conf")" ]]; then
+      harden_warn "- XenForo gzip: ${conf} has an incomplete setup.sh enableGzip block (BEGIN/END markers); left as it is"
+      continue
+    fi
+    tmp=$(tmp_file) || return 1
+    # Everything except an earlier managed block (BEGIN line .. END line).
+    awk -v b="$XF_GZIP_BEGIN" -v e="$XF_GZIP_END" '
+      index($0, b) == 1 { skip = 1; next }
+      skip && index($0, e) == 1 { skip = 0; next }
+      !skip { print }
+    ' "$conf" > "$tmp"
+    # The block is appended after one blank line; removing it (or writing
+    # it again) first drops the trailing blank lines, so a round trip
+    # restores the original file byte for byte.
+    if [[ $XF_MEMBER_GZIP == angie ]] || grep -qF "$XF_GZIP_BEGIN" "$conf"; then
+      sed -i -e ':a' -e '/^[[:space:]]*$/{$d;N;ba' -e '}' "$tmp"
+    fi
+    # A closing "?>" would print the block as text, so a final "?>" goes
+    # and the appended PHP stays inside the file's opening tag.
+    if [[ $XF_MEMBER_GZIP == angie ]]; then
+      if [[ $(tail -n1 "$tmp") =~ ^[[:space:]]*\?\>[[:space:]]*$ ]]; then
+        sed -i '$d' "$tmp"
+      elif [[ $(tail -n1 "$tmp") =~ \?\>[[:space:]]*$ ]]; then
+        # "...; ?>" on the last code line: drop only the closing tag.
+        sed -i '$ s/?>[[:space:]]*$//' "$tmp"
+      fi
+      { printf '\n'; xf_gzip_block; } >> "$tmp"
+    fi
+    if cmp -s "$tmp" "$conf"; then
+      kept=$(( kept + 1 ))
+      continue
+    fi
+    if [[ -n $php_bin ]] && ! "$php_bin" -l "$tmp" >/dev/null 2>&1; then
+      harden_warn "- XenForo gzip: ${conf} would not parse after the change; left as it is"
+      continue
+    fi
+    cat "$tmp" > "$conf" || { harden_warn "- XenForo gzip: could not write ${conf}"; continue; }
+    changed=$(( changed + 1 ))
+  done < <(app_find_xenforo_configs)
+  if (( changed > 0 )); then
+    if [[ $XF_MEMBER_GZIP == angie ]]; then
+      harden_note "- XenForo gzip: ${changed} config.php updated (guests: XenForo level 9 for the cache; members: Angie)"
+    else
+      harden_note "- XenForo gzip: managed block removed from ${changed} config.php (XenForo compresses every page)"
+    fi
+  elif (( kept > 0 )); then
+    harden_note "- XenForo gzip: ${kept} config.php already as configured (XF_MEMBER_GZIP=${XF_MEMBER_GZIP})"
+  fi
+  return 0
+}
+
+persist_xf_member_gzip() {
+  (( XF_MEMBER_GZIP_PERSIST )) || return 0
+  [[ ${EUID} -eq 0 ]] || return 0
+  persist_tuning_var XF_MEMBER_GZIP "$XF_MEMBER_GZIP"
+  XF_MEMBER_GZIP_PERSIST=0
+}
+
 harden_wordpress() {
   local conf helper rc=0 kv
   local -a configs

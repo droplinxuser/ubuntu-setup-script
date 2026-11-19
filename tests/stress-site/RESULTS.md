@@ -7,7 +7,29 @@ manifests, sweep tables and run logs these sections cite (`AUDIT-*.md`,
 removed from the tree on 2026-11-19 to keep the repository lean; every one
 is still in git history, for example
 `git show 84b0db5:tests/stress-site/AUDIT-20261117-1.21.30.md`.  The current
-cycle report is `AUDIT-20261119-1.21.34.md`.
+cycle report is `AUDIT-20261120-1.21.36.md`.
+
+## 1.21.36 performance cycle — Xeon E-2236 (2026-11-20)
+
+Pair: `server-configs-nginx` 1.6.48.  Details: `AUDIT-20261120-1.21.36.md`.
+
+- CPU mitigations off (fresh boots): guest-cache hits +19 % XenForo, +25 %
+  WordPress, +14 % Chevereto; PHP tiers +5-7 %.  Opt-in
+  (`mitigations=off`), persisted, GRUB drop-in.
+- XenForo gzip split (guests XenForo, members Angie): member thread +4 %,
+  guest cache unchanged; Angie-for-everyone collapses the guest cache to
+  6.8k req/s.
+- Lean maps + lean location chain: regex+map share of Angie CPU 6.35 % ->
+  2.89 %; cached tiers +3 % (maps) and +1.5-3.5 % (locations).  Three
+  exposure fixes (/css.php/x, /proxy.php.bak, /data/.x.png); WordPress
+  fingerprint files no longer refused.
+- Tracking parameters out of the guest-cache key (utm_*, fbclid, gclid ...).
+- PHP 8.6.0: not production-ready (php8.6-redis/-igbinary/-imagick
+  unpublished and do not compile); WordPress clean, XenForo core clean
+  without Redis, Chevereto cannot run.
+- Clean host: install 2:04, 0 warnings; install -> `--optimize` and
+  `--optimize` x2: 0 differences; 1,106 unit checks, 220 dry runs; restore
+  705 -> 705, default kernel mitigations back after reboot.
 
 ## 1.21.34 audit — same Xeon E-2236 host, second cycle (2026-11-19)
 

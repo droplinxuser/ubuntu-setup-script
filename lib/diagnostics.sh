@@ -366,6 +366,7 @@ run_diagnostics() {
   diag "unix sockets" ss -lxnp
   diag "DNS" resolvectl status
   diag "qdisc" tc qdisc show
+  diag_sh "CPU vulnerability mitigations" 'cat /proc/cmdline; grep -H . /sys/devices/system/cpu/vulnerabilities/* 2>/dev/null | sed "s|.*/vulnerabilities/||"'
   diag_sh "ethtool statistics" 'for i in $(ls /sys/class/net); do [ "$i" = lo ] && continue; echo "--- $i"; ethtool -S "$i" 2>/dev/null | head -40; done'
   diag "sysctl all" sysctl -a
   diag "sysctl.conf" cat /etc/sysctl.conf

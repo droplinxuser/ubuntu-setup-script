@@ -1724,6 +1724,9 @@ optimize_plan() {
   fi
   printf 'Detected: %s\n' "${OPT_DETECTED[*]}"
   printf '  %s\n' "$(memory_plan_summary Memory)"
+  if [[ -n ${CPU_MITIGATIONS:-} ]]; then
+    printf '  CPU mitigations: %s\n' "$(cpu_mitigations_plan_text)"
+  fi
   if (( ${OPT_MEM_OVERCOMMIT_MB:-0} > 0 )); then
     printf '  WARNING: service floors and reserved memory exceed the budget by %sMB; this host is too small for the selected services\n' \
       "$OPT_MEM_OVERCOMMIT_MB"

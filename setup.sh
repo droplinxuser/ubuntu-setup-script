@@ -36,7 +36,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.21.35"
+readonly SCRIPT_VERSION="1.21.36"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -126,6 +126,33 @@ if [[ -n ${SETUP_XF_JOB_CRON+x} ]]; then
   XF_JOB_CRON_PERSIST=1
 fi
 [[ $XF_JOB_CRON == 0 ]] || XF_JOB_CRON=1
+# XenForo page compression.  XenForo gzips every page itself at level 9
+# (15% of member-page PHP CPU on the audit host).  With XF_MEMBER_GZIP=angie
+# (default) a managed block at the end of each XenForo src/config.php keeps
+# XenForo's gzip for guests -- the FastCGI guest cache stores that compressed
+# body, so a hit costs no compression -- and turns it off for visitors with a
+# session cookie, whose pages Angie compresses (Brotli/gzip level 4).
+# SETUP_XF_MEMBER_GZIP=xenforo removes the block (XenForo compresses
+# everything again); the choice is persisted in /etc/default/setup-tuning.
+XF_MEMBER_GZIP="${XF_MEMBER_GZIP:-angie}"
+XF_MEMBER_GZIP_PERSIST=0
+if [[ -n ${SETUP_XF_MEMBER_GZIP+x} ]]; then
+  XF_MEMBER_GZIP=$SETUP_XF_MEMBER_GZIP
+  XF_MEMBER_GZIP_PERSIST=1
+fi
+[[ $XF_MEMBER_GZIP == xenforo ]] || XF_MEMBER_GZIP=angie
+# CPU vulnerability mitigations (Spectre/Meltdown/MDS/Retbleed...).  Empty =
+# never touched (the kernel default, on).  `--basic mitigations=off`,
+# `--optimize mitigations=off` or SETUP_CPU_MITIGATIONS=off add
+# `mitigations=off` to the kernel command line through a managed GRUB
+# drop-in (effective after the next reboot) and persist CPU_MITIGATIONS=off
+# here, so every later --optimize keeps it; `=on` removes the drop-in again.
+# Measured on the Xeon E-2236 (PTI + IBRS): see tests/stress-site/RESULTS.md.
+CPU_MITIGATIONS="${CPU_MITIGATIONS:-}"
+CPU_MITIGATIONS_SETTING=""
+if [[ -n ${SETUP_CPU_MITIGATIONS+x} ]]; then
+  CPU_MITIGATIONS_SETTING=$SETUP_CPU_MITIGATIONS
+fi
 # Node.js major installed by --others nodejs.  NodeSource publishes one APT
 # line per major, so this value decides what `apt-get install nodejs` resolves
 # to.  A major change swaps NODE_MODULE_VERSION (the native-addon ABI), so a

@@ -200,6 +200,7 @@ run_os_tuning() {
   # same hardware-aware profile as a fresh build.  Each tuner is idempotent
   # and records the original files for a later --purge.
   configure_cpu_governor
+  configure_cpu_mitigations
   # Swap is deliberately not touched by --optimize.  Resizing a live swap
   # file can swapoff/rewrite under memory pressure, and creating a 50%-of-RAM
   # file on a large host is a destructive disk change rather than tuning.
@@ -388,6 +389,7 @@ run_optimize() {
   # present in the same run that disables DISABLE_WP_CRON.
   opt_report "## Security hardening"
   harden_wordpress || rc=1
+  tune_xenforo_gzip || rc=1
   harden_system 0 || rc=1
   # Old hosts can still carry the pre-1.8.34 nightly chown that flattened the
   # log tree to www-data.  Migrate that cron entry and repair the resulting
@@ -681,9 +683,11 @@ main() {
   if [[ ${ENABLED[basic]:-0} -eq 1 ]]; then
     harden_system 1 || warn "Security hardening reported an issue (see the run log)"
     harden_wordpress || warn "WordPress hardening reported an issue (see the run log)"
+    tune_xenforo_gzip || warn "XenForo gzip handover reported an issue (see the run log)"
   elif [[ ${ENABLED[domain]:-0} -eq 1 ]]; then
     harden_system 0 || true
     harden_wordpress || warn "WordPress hardening reported an issue (see the run log)"
+    tune_xenforo_gzip || warn "XenForo gzip handover reported an issue (see the run log)"
   fi
   # The managed crontab depends on what the security pass found (the wp-cron
   # entry is added only once DISABLE_WP_CRON exists), so regenerate it after

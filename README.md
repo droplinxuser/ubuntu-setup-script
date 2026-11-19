@@ -97,6 +97,7 @@ bash setup.sh --upgrade-php=8.6 --dry-run
 | `host=FQDN` | `<threads>c-<RAM_GB>g-<storage>` (e.g. `8c-32g-1T`) | hostname via `hostnamectl`; a repeat `--basic` without `host=` keeps the current name |
 | `swap=SIZE` | add swap only when total swap is 0 or below 50% of RAM, up to 50% of RAM (1-8 GiB, 4 GiB on a VPS) | `/swapfile` of exactly that size (`8G`, `8Gi`, `512M`) |
 | `time=REGION/CITY` | `Asia/Manila` | timezone; a repeat `--basic` without `time=` keeps the current zone |
+| `mitigations=off|on` | not touched | `off` adds `mitigations=off` to the kernel command line (managed `/etc/default/grub.d/99-setup-mitigations.cfg`, the provider's options kept, `update-grub`), effective at the next reboot; `on` removes it.  Persisted as `CPU_MITIGATIONS`, so every `--optimize` keeps it (also `--optimize mitigations=off`, or `SETUP_CPU_MITIGATIONS`).  Measured on a Xeon E-2236: guest-cache hits +14-25 %, PHP tiers +5-7 %.  It removes the kernel's protection between local processes (Spectre/Meltdown/MDS class), so use it on hosts where only you run code: one key-only administrator, no shared hosting, no untrusted local users |
 
 What `--basic` does:
 
@@ -121,7 +122,12 @@ What `--basic` does:
 SSH hardening, brute-force protection and origin-only firewalling are left to
 the operator. The web-server side (dotfile/`wp-config.php`/`xmlrpc.php`
 denies, no PHP from upload directories, security headers) comes from
-`server-configs-nginx`. Angie access logging is off by default; only
+`server-configs-nginx`.  Since server-configs-nginx 1.6.48 each application has one deny
+location (`h5bp/location/security_<app>.conf`, a single regex) ahead of an
+exact `location = /index.php`, so a guest-cache hit runs 2-4 location
+regexes instead of 25-39; `--optimize` moves vhosts rendered from older
+templates onto it where their PHP include is at server level, and leaves
+(and reports) any other vhost with the full set. Angie access logging is off by default; only
 `error_log` is written.
 
 ## Services
@@ -329,6 +335,18 @@ Cacheable guest requests are served from a named location
 `xf_csrf` cookie is not replayed to the next; XenForo's own JavaScript
 fetches a fresh token from `/login/keep-alive` when the cookie is missing.
 Members, POSTs and no-cache URIs stay in the uncached PHP location.
+
+Compression is split (`XF_MEMBER_GZIP=angie`, the default): every XenForo
+`src/config.php` gets a managed block at its end,
+`$config['enableGzip'] = !isset($_COOKIE[<prefix>session]);`.  Guests keep
+XenForo's own level-9 gzip, which the guest cache stores once, and a hit
+costs no compression; visitors with a session get plain HTML that Angie
+compresses at level 4 (XenForo's gzip was 15 % of member-page PHP CPU).
+Measured: member thread +4 %, guest cache unchanged; turning XenForo's gzip
+off for everyone dropped guest-cache hits from 104k to 6.8k req/s (Angie
+then compresses every hit).  The block is linted before it is written and
+wins over an earlier `enableGzip` line, which is left in place;
+`SETUP_XF_MEMBER_GZIP=xenforo` removes it.
 
 The vhost serves guest pages from the FastCGI cache for 5 minutes with a
 map-based bypass for `xf_session`/`xf_user`/admin/login cookies, a key that
@@ -859,7 +877,7 @@ tests. Angie configuration and Cloudflare IP ranges are downloaded.
   `SETUP_LIMIT_REQ_EXEMPT=<generator IP>` first, or every remote PHP request
   is answered `429`. Results and findings: `tests/stress-site/RESULTS.md` (one
   section per audit cycle) and the current cycle report
-  `tests/stress-site/AUDIT-20261119-1.21.34.md`.
+  `tests/stress-site/AUDIT-20261120-1.21.36.md`.
 - `tests/deploy-audit/`: `host-manifest.sh` and `state-snapshot.sh` capture a
   host or the managed configuration for diffing (install/`--optimize`
   parity), `restore-baseline.sh` returns a disposable test host to a

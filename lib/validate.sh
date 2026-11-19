@@ -486,6 +486,20 @@ php_installed_version() {
 validate_all() {
   local svc
 
+  # mitigations=on|off (--basic, --optimize or SETUP_CPU_MITIGATIONS).
+  if [[ -n ${CPU_MITIGATIONS_SETTING:-} ]]; then
+    case ${CPU_MITIGATIONS_SETTING,,} in
+      off|no|0|false) CPU_MITIGATIONS_SETTING=off ;;
+      on|yes|1|true|auto) CPU_MITIGATIONS_SETTING=on ;;
+      *) die "mitigations= expects on or off (got '${CPU_MITIGATIONS_SETTING}')" ;;
+    esac
+    CPU_MITIGATIONS=$CPU_MITIGATIONS_SETTING
+  fi
+  case ${CPU_MITIGATIONS:-} in
+    ''|on|off) ;;
+    *) CPU_MITIGATIONS="" ;;
+  esac
+
   # Anubis is only an Angie feature: on an install it must accompany --angie.
   if [[ -n ${ANUBIS_SETTING:-} ]]; then
     if (( ! OPTIMIZE && ! PURGE && ! DIAGNOSTICS && ! RESTART_ALL )) \

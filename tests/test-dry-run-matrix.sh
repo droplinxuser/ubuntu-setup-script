@@ -372,6 +372,15 @@ run ok --dry-run --basic --angie anubis=yes
 run ok --dry-run --basic --angie anubis=no
 run ok --dry-run --optimize anubis=yes
 run ok --dry-run --optimize anubis=no
+# CPU mitigations switch (--basic and --optimize, or SETUP_CPU_MITIGATIONS).
+run ok   --dry-run --basic mitigations=off
+run ok   --dry-run --basic mitigations=on
+run ok   --dry-run --optimize mitigations=off
+run ok   --dry-run --optimize anubis=yes mitigations=off
+run fail --dry-run --basic mitigations=maybe
+run fail --dry-run --optimize mitigations=
+run_env ok   SETUP_CPU_MITIGATIONS=off --dry-run --optimize
+run_env fail SETUP_CPU_MITIGATIONS=sometimes --dry-run --optimize
 run ok --dry-run --optimize anubis=1
 run fail --dry-run --basic anubis=yes
 run fail --dry-run --basic --angie anubis=maybe

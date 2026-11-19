@@ -4728,5 +4728,272 @@ mem_plan_reset
 OPT_DETECTED=()
 
 
+# ---------------------------------------------------------------------------
+# CPU mitigations switch (GRUB drop-in)
+# ---------------------------------------------------------------------------
+check "the mitigations drop-in keeps the provider's kernel options" \
+  bash -c 'GRUB_CMDLINE_LINUX_DEFAULT="quiet splash"; eval "$(grep "^GRUB_CMDLINE_LINUX_DEFAULT=" <<<"$1")"; [[ $GRUB_CMDLINE_LINUX_DEFAULT == "quiet splash mitigations=off" ]]' \
+  _ "$(cpu_mitigations_dropin_text)"
+check "the mitigations drop-in works on an empty default line" \
+  bash -c 'GRUB_CMDLINE_LINUX_DEFAULT=""; eval "$(grep "^GRUB_CMDLINE_LINUX_DEFAULT=" <<<"$1")"; [[ $GRUB_CMDLINE_LINUX_DEFAULT == "mitigations=off" ]]' \
+  _ "$(cpu_mitigations_dropin_text)"
+mit_run() { # want -> "<file present 0/1> <update-grub calls>"
+  (
+    CPU_MITIGATIONS_DROPIN=$TMP/mit/grub.d/99-setup-mitigations.cfg
+    CPU_MITIGATIONS=$1 CPU_MITIGATIONS_SETTING=""
+    host_is_container() { return 1; }
+    harden_note() { :; }
+    info() { :; }
+    CPU_MITIGATIONS_GRUBCFG=$TMP/mit/grub.cfg
+    # A fake update-grub: count the calls and write the boot menu the drop-in
+    # would produce (MIT_GRUB_FAIL=1 simulates a failing regeneration).
+    update-grub() {
+      printf x >> "$TMP/mit/calls"
+      [[ ${MIT_GRUB_FAIL:-0} == 1 ]] && return 1
+      if [[ -f $CPU_MITIGATIONS_DROPIN ]]; then
+        echo "	linux /vmlinuz root=x ro mitigations=off" > "$CPU_MITIGATIONS_GRUBCFG"
+      else
+        echo "	linux /vmlinuz root=x ro" > "$CPU_MITIGATIONS_GRUBCFG"
+      fi
+    }
+    harden_warn() { :; }
+    [[ -f /etc/default/grub ]] || exit 3
+    configure_cpu_mitigations >/dev/null 2>&1
+    printf '%s %s' "$([[ -f $CPU_MITIGATIONS_DROPIN ]] && echo 1 || echo 0)" "$(wc -c < "$TMP/mit/calls")"
+  )
+}
+if [[ -f /etc/default/grub ]]; then
+  mkdir -p "$TMP/mit"; : > "$TMP/mit/calls"
+  check "mitigations=off writes the drop-in and runs update-grub once" test "$(mit_run off)" = "1 1"
+  check "a second mitigations=off changes nothing (no update-grub)" test "$(mit_run off)" = "1 1"
+  check "mitigations=on removes the drop-in and runs update-grub" test "$(mit_run on)" = "0 2"
+  check "an unset choice never touches the boot loader" test "$(mit_run '')" = "0 2"
+  # The drop-in is present but the boot menu lacks mitigations=off (an earlier
+  # update-grub failed): the next run regenerates it.
+  mit_run off >/dev/null; echo "	linux /vmlinuz root=x ro" > "$TMP/mit/grub.cfg"
+  : > "$TMP/mit/calls"
+  check "a boot menu without mitigations=off is regenerated on the next run" test "$(mit_run off)" = "1 1"
+  rm -f "$TMP/mit/grub.d/99-setup-mitigations.cfg"; : > "$TMP/mit/calls"
+  check "a failing update-grub never fails the run" test "$(MIT_GRUB_FAIL=1 mit_run off)" = "1 1"
+fi
+check "CPU_MITIGATIONS and XF_MEMBER_GZIP survive the --optimize pin reset" \
+  bash -c 'printf "%s\n" "${@}" | grep -qx CPU_MITIGATIONS && printf "%s\n" "${@}" | grep -qx XF_MEMBER_GZIP' _ "${RESET_KEEP_PINS[@]}"
+check "--purge basic removes the mitigations drop-in" \
+  bash -c 'sed -n "/^purge_basic()/,/^}/p" "$1" | grep -qF "CPU_MITIGATIONS_DROPIN"' _ "$ROOT/lib/purge.sh"
+check "--basic and --optimize both apply the mitigations choice" \
+  bash -c 'sed -n "/^install_basic()/,/^}/p" "$1" | grep -q configure_cpu_mitigations && sed -n "/^run_os_tuning()/,/^}/p" "$2" | grep -q configure_cpu_mitigations' \
+  _ "$ROOT/lib/os.sh" "$ROOT/lib/restart.sh"
+
+# ---------------------------------------------------------------------------
+# XenForo gzip handover (src/config.php managed block)
+# ---------------------------------------------------------------------------
+if command -v php >/dev/null 2>&1; then
+  xfg=$TMP/xfgzip/src; mkdir -p "$xfg"; : > "$xfg/XF.php"
+  printf '%s\n' '<?php' "\$config['db']['host'] = 'localhost';" "\$config['enableGzip'] = true;" > "$xfg/config.php"
+  cp "$xfg/config.php" "$TMP/xfgzip/orig.php"
+  xfg_run() { # mode -> md5 of config.php
+    (
+      XF_MEMBER_GZIP=$1 XF_MEMBER_GZIP_PERSIST=0
+      app_find_xenforo_configs() { printf '%s\n' "$xfg/config.php"; }
+      harden_note() { :; }
+      harden_warn() { printf 'WARN %s\n' "$*" >&2; }
+      tune_xenforo_gzip
+    ) 2>/dev/null
+    md5sum < "$xfg/config.php" | cut -d' ' -f1
+  }
+  first=$(xfg_run angie)
+  check "XenForo gzip: the managed block is appended after the operator's line" \
+    bash -c 'tail -n1 "$1" | grep -qF "// END setup.sh enableGzip" && grep -qF "$2" "$1" && grep -qF "$3" "$1"' \
+    _ "$xfg/config.php" "\$config['enableGzip'] = !isset(\$_COOKIE[" "\$config['enableGzip'] = true;"
+  check "XenForo gzip: the result parses" php -l "$xfg/config.php"
+  check "XenForo gzip: a second run changes nothing" test "$(xfg_run angie)" = "$first"
+  check "XenForo gzip: a guest renders with XenForo gzip on" \
+    test "$(php -r '$config=[]; include $argv[1]; echo $config["enableGzip"] ? 1 : 0;' "$xfg/config.php")" = 1
+  check "XenForo gzip: a session cookie turns XenForo gzip off" \
+    test "$(php -r '$_COOKIE=["xf_session"=>"x"]; $config=[]; include $argv[1]; echo $config["enableGzip"] ? 1 : 0;' "$xfg/config.php")" = 0
+  check "XenForo gzip: a custom cookie prefix is honoured" \
+    test "$(php -r '$_COOKIE=["forum_session"=>"x"]; $config=["cookie"=>["prefix"=>"forum_"]]; include $argv[1]; echo $config["enableGzip"] ? 1 : 0;' "$xfg/config.php")" = 0
+  xfg_run xenforo >/dev/null
+  check "XenForo gzip: XF_MEMBER_GZIP=xenforo restores the file byte for byte" \
+    cmp -s "$xfg/config.php" "$TMP/xfgzip/orig.php"
+  printf '%s\n' '<?php' "\$config['db']['host'] = 'localhost';" '?>' '' > "$xfg/config.php"
+  xfg_run angie >/dev/null
+  check "XenForo gzip: a closing ?> is removed so the block stays PHP" \
+    bash -c '! grep -q "^?>" "$1" && php -l "$1" >/dev/null' _ "$xfg/config.php"
+  printf '%s\n' '<?php' '$config = [' > "$xfg/config.php"
+  cp "$xfg/config.php" "$TMP/xfgzip/broken.php"
+  xfg_run angie >/dev/null
+  check "XenForo gzip: a config.php that would not parse is left untouched" \
+    cmp -s "$xfg/config.php" "$TMP/xfgzip/broken.php"
+fi
+
+
+# ---------------------------------------------------------------------------
+# Lean deny chain: vhost migration (server-configs-nginx 1.6.48)
+# ---------------------------------------------------------------------------
+lv=$TMP/leanvhost; mkdir -p "$lv/conf.d" "$lv/h5bp/location"
+: > "$lv/h5bp/location/security_xf.conf"; : > "$lv/h5bp/basic_headers.conf"
+cat > "$lv/conf.d/xf.conf" <<'EOF'
+server {
+    listen 443 ssl;
+    server_name xf.test;
+    include h5bp/xf2.conf;
+
+    location ~ ^/(?:admin\.php$|install(?:/|$)) {
+        #auth_basic "Private";
+        #auth_basic_user_file htpasswd/xfadmin;
+        include              h5bp/location/security_root_archives.conf;
+        include              h5bp/location/security_leftover_files.conf;
+        include              h5bp/php.conf;
+    }
+
+    include h5bp/php_xf.conf;
+    include h5bp/basic_xf.conf;
+}
+EOF
+cat > "$lv/conf.d/xfauth.conf" <<'EOF'
+server {
+    server_name xfauth.test;
+    location ~ ^/(?:admin\.php$|install(?:/|$)) {
+        auth_basic "Private";
+        auth_basic_user_file htpasswd/xfadmin;
+        include              h5bp/php.conf;
+    }
+    include h5bp/php_xf.conf;
+    include h5bp/basic_xf.conf;
+}
+EOF
+cat > "$lv/conf.d/nested.conf" <<'EOF'
+server {
+    server_name nested.test;
+    location /forum/ {
+        include h5bp/php.conf;
+    }
+    include h5bp/basic_xf.conf;
+}
+EOF
+cat > "$lv/conf.d/chev.conf" <<'EOF'
+server {
+    server_name chev.test;
+    # app/ and importing/ are "Require all denied" upstream (.htaccess).
+    location ~ /(?:app|importing)/ { internal; }
+    location ~* /(app|content|lib)/.*\.(po|php|lock|sql)$  { internal; }
+    location ~* /(?:composer\.(?:json|lock)|\.gitignore)$ { internal; }
+
+    location ^~ /images/ {
+        # Nested deny: ^~ skips the server-level regex locations, so a file
+        # such as /images/.env or /images/x.sql would otherwise be served.
+        location ~* /\.(?!well-known/) { deny all; }
+        location ~* \.(?:env|bak|old|orig|sql|sql\.gz|log|ini|conf|sh|php|phtml|phar)$ { deny all; }
+        location ~* \.(gif|jpg|jpe|jpeg|png|ico|webp|avif|avifs|jxl|heic|heif|apng|bmp|svg|mov|mp4|webm|mkv|m4v|avi|mp3|ogg|oga|opus|m4a|wav)$ {
+        break;
+        }
+    return 403;
+    }
+    location ~ ^/(?:dashboard|update)(?:/|$) {
+        try_files $uri $uri/ /index.php$is_args$query_string;
+        include h5bp/location/security_leftover_files.conf;
+        #auth_basic "Private";
+        include h5bp/php_chev.conf;
+    }
+    location /app/CHEVERETO_LICENSE_KEY {
+      internal;
+    }
+    include h5bp/php_chev_cache.conf;
+    include h5bp/basic.conf;
+}
+EOF
+sed -e 's/chev.test/chevedit.test/' -e 's|location ~\* /\\.(?!well-known/) { deny all; }|location ~* /\\.(?!well-known/) { return 404; }|' "$lv/conf.d/chev.conf" > "$lv/conf.d/chevedit.conf"
+TUNE_MISSES=()
+tune_vhost_lean_locations "$lv" >/dev/null 2>&1
+check "lean chain: a template XenForo vhost switches to basic_xf_headers.conf" \
+  grep -qx '    include h5bp/basic_xf_headers.conf;' "$lv/conf.d/xf.conf"
+check "lean chain: the template admin.php|install block is folded" \
+  bash -c '! grep -q "admin\\\\.php" "$1"' _ "$lv/conf.d/xf.conf"
+check "lean chain: an active auth_basic admin block is kept" \
+  grep -q 'auth_basic "Private";' "$lv/conf.d/xfauth.conf"
+check "lean chain: a vhost without a server-level app PHP include keeps basic_xf.conf" \
+  grep -qx '    include h5bp/basic_xf.conf;' "$lv/conf.d/nested.conf"
+check "lean chain: the kept vhost is reported" \
+  bash -c 'printf "%s\n" "$@" | grep -q "nested.conf: deny rules kept server-wide"' _ "${TUNE_MISSES[@]}"
+check "lean chain: Chevereto switches to basic_headers.conf and folds its template rules" \
+  bash -c 'grep -qx "    include h5bp/basic_headers.conf;" "$1" && ! grep -qE "app\|importing|CHEVERETO_LICENSE_KEY|dashboard\|update" "$1"' _ "$lv/conf.d/chev.conf"
+check "lean chain: Chevereto /images/ becomes one allowlist that refuses dot paths" \
+  bash -c 'grep -qF "location ~* \"(?s)^(?!.*/\\.).*\\.(?:gif|" "$1" && ! grep -q "deny all; }" "$1"' _ "$lv/conf.d/chev.conf"
+check "lean chain: an edited /images/ block keeps its nested denies" \
+  bash -c 'grep -qF "{ return 404; }" "$1" && grep -qF "|sh|php|phtml|phar)\$ { deny all; }" "$1"' _ "$lv/conf.d/chevedit.conf"
+lv_md5=$(cat "$lv"/conf.d/*.conf | md5sum)
+tune_vhost_lean_locations "$lv" >/dev/null 2>&1
+check "lean chain: a second run changes nothing" test "$(cat "$lv"/conf.d/*.conf | md5sum)" = "$lv_md5"
+
+
+# Review findings: one-line blocks, the /images/ scope, non-app vhosts.
+cat > "$lv/conf.d/oneline.conf" <<'EOF'
+server {
+    server_name oneline.test;
+    location ~ ^/(?:admin\.php$|install(?:/|$)) { auth_basic "Private"; auth_basic_user_file htpasswd/xfadmin; include h5bp/php.conf; }
+    client_max_body_size 20m;
+    include h5bp/php_xf.conf;
+    include h5bp/basic_xf.conf;
+}
+EOF
+cat > "$lv/conf.d/chevone.conf" <<'EOF'
+server {
+    server_name chevone.test;
+    location /app/CHEVERETO_LICENSE_KEY { internal; }
+    include h5bp/php_chev_cache.conf;
+    location ^~ /content/ {
+        location ~* /\.(?!well-known/) { deny all; }
+        location ~* \.(?:env|bak|old|orig|sql|sql\.gz|log|ini|conf|sh|php|phtml|phar)$ { deny all; }
+    }
+    location ^~ /images/ {
+        location ~* /\.(?!well-known/) { deny all; }
+        location ~* \.(?:env|bak|old|orig|sql|sql\.gz|log|ini|conf|sh|php|phtml|phar)$ { deny all; }
+        location ~* \.(gif|jpg|jpe|jpeg|png|ico|webp|avif|avifs|jxl|heic|heif|apng|bmp|svg|mov|mp4|webm|mkv|m4v|avi|mp3|ogg|oga|opus|m4a|wav)$ {
+        break;
+        }
+        location ~* \.pdf$ { break; }
+    return 403;
+    }
+    include h5bp/basic.conf;
+}
+EOF
+cat > "$lv/conf.d/plain.conf" <<'EOF'
+server {
+    server_name plain.test;
+    location / { proxy_pass http://127.0.0.1:3000; }
+    include h5bp/basic.conf;
+}
+EOF
+TUNE_MISSES=()
+tune_vhost_lean_locations "$lv" >/dev/null 2>&1
+check "lean chain: a one-line admin block with auth_basic is kept" \
+  grep -qF 'auth_basic "Private"; auth_basic_user_file' "$lv/conf.d/oneline.conf"
+check "lean chain: the line after a one-line block is never dropped" \
+  bash -c 'grep -qx "    client_max_body_size 20m;" "$1" && grep -qx "    include h5bp/php_chev_cache.conf;" "$2"' _ "$lv/conf.d/oneline.conf" "$lv/conf.d/chevone.conf"
+check "lean chain: a one-line CHEVERETO_LICENSE_KEY block is folded" \
+  bash -c '! grep -q CHEVERETO_LICENSE_KEY "$1"' _ "$lv/conf.d/chevone.conf"
+check "lean chain: nested denies outside ^~ /images/ are never touched" \
+  test "$(sed -n '/location ^~ \/content\//,/^    }/p' "$lv/conf.d/chevone.conf" | grep -c 'deny all; }')" = 2
+check "lean chain: an /images/ block with an extra nested location is not folded" \
+  test "$(sed -n '/location ^~ \/images\//,/^    }/p' "$lv/conf.d/chevone.conf" | grep -c 'deny all; }')" = 2
+check "lean chain: a vhost without an application PHP include is not reported" \
+  bash -c '! printf "%s\n" "$@" | grep -q "plain.conf"' _ "${TUNE_MISSES[@]}"
+check "lean chain: a plain vhost keeps basic.conf" grep -qx '    include h5bp/basic.conf;' "$lv/conf.d/plain.conf"
+check "a nested php_wp.conf is rewritten before the tree test (exact locations cannot nest)" \
+  bash -c 'sed -n "/^angie_migrate_guest_cache_includes()/,/^}/p" "$1" | grep -qF "angie_rewrite_include_at_level \"\$vhost\" php_wp.conf php.conf nested"' _ "$ROOT/lib/optimize.sh"
+if command -v php >/dev/null 2>&1; then
+  printf '%s\n' '<?php' "\$config['cookie']['prefix'] = 'forum_'; ?>" > "$xfg/config.php"
+  xfg_run angie >/dev/null
+  check "XenForo gzip: a ?> after code on the last line is removed (no text output)" \
+    bash -c '! grep -q "?>" "$1" && [[ -z $(php -r "ob_start(); \$config=[]; include \$argv[1]; echo ob_get_clean();" "$1") ]]' _ "$xfg/config.php"
+  printf '%s\n' '<?php' '// BEGIN setup.sh enableGzip (edited)' "\$config['db']['host'] = 'x';" > "$xfg/config.php"
+  cp "$xfg/config.php" "$TMP/xfgzip/nobegin.php"
+  xfg_run angie >/dev/null
+  check "XenForo gzip: a block without its END marker is left untouched" \
+    cmp -s "$xfg/config.php" "$TMP/xfgzip/nobegin.php"
+fi
+
+
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]
