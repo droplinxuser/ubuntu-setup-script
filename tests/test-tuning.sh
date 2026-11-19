@@ -4107,6 +4107,48 @@ anubis_integrate_vhost "$TMP/anubis/conf.d/v6.test.conf"
 check "Anubis migrates an IPv6-only TLS listener" \
   grep -qx '    listen unix:/run/angie/anubis-test.sock;' "$TMP/anubis/conf.d/v6.test.conf"
 
+# Losing the state directory (it also holds the marker) used to make
+# `anubis=no` a silent no-op: the vhosts stayed on the backend socket and,
+# once the filter was stopped, every site answered 502.  The integrated form
+# is reversible, so the disable rebuilds the public listener instead.
+mkdir -p "$TMP/anubis2/conf.d"
+cp "$TMP/anubis/conf.d/site.test.conf" "$TMP/anubis2/conf.d/site.test.conf"
+check "the copied vhost is still integrated" \
+  anubis_vhost_integrated "$TMP/anubis2/conf.d/site.test.conf"
+check "no pre-integration copy exists for it" \
+  not test -e "$TMP/anubis2/state/vhosts/site.test.conf.orig"
+# The marker lives in the state directory, so the artifacts must speak for it.
+ANUBIS_TERMINATORS="$TMP/anubis2/none.conf"
+ANUBIS_COMMON="$TMP/anubis2/none-common.conf"
+ANUBIS_LOCATION="$TMP/anubis2/none-location.conf"
+ANUBIS_STATIC_BLOCKS="$TMP/anubis2/none-static.conf"
+check "a missing marker is detected from an integrated vhost" \
+  anubis_artifacts_present "$TMP/anubis2/conf.d"
+check "restore without a backup succeeds" \
+  anubis_restore_vhosts "$TMP/anubis2/conf.d" "$TMP/anubis2/state"
+check "the rebuilt vhost listens on 443 again" \
+  grep -qx '    listen 443 ssl;' "$TMP/anubis2/conf.d/site.test.conf"
+check "the rebuilt vhost listens on IPv6 443 again" \
+  grep -qx '    listen \[::\]:443 ssl;' "$TMP/anubis2/conf.d/site.test.conf"
+check "the rebuilt vhost carries http2 again" \
+  grep -qx '    http2 on;' "$TMP/anubis2/conf.d/site.test.conf"
+check "the rebuilt vhost no longer trusts the Unix peer" \
+  bash -c '! grep -q "set_real_ip_from unix:;" "$1"' _ "$TMP/anubis2/conf.d/site.test.conf"
+check "the rebuilt vhost no longer reads the proxy's X-Real-IP" \
+  bash -c '! grep -q "real_ip_header X-Real-IP;" "$1"' _ "$TMP/anubis2/conf.d/site.test.conf"
+check "the rebuilt vhost keeps its port 80 redirect" \
+  grep -qx '    listen      80;' "$TMP/anubis2/conf.d/site.test.conf"
+check "the rebuilt vhost keeps its TLS certificate" \
+  grep -qE 'ssl_certificate_key[[:space:]]+/etc/angie/ssl/site.test/privkey.pem;' \
+  "$TMP/anubis2/conf.d/site.test.conf"
+check "de-integration is idempotent" \
+  bash -c '! grep -q "listen unix:/run/angie/anubis-test.sock;" "$1"' _ \
+  "$TMP/anubis2/conf.d/site.test.conf"
+tune_reset_changes
+anubis_deintegrate_vhost "$TMP/anubis2/conf.d/site.test.conf"
+check "de-integrating an already public vhost changes nothing" \
+  test "${#TUNE_CHANGES[@]}" -eq 0
+
 # Terminators are generated from the integrated blocks only; the catch-all
 # (server_name _) must never become a public terminator.
 anubis_render_terminators "$TMP/anubis/conf.d" "$TMP/anubis/terminators.conf"

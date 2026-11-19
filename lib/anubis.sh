@@ -81,7 +81,27 @@ ANUBIS_STOP_PENDING=0
 
 anubis_marker() { printf '%s/enabled' "$ANUBIS_STATE"; }
 
-anubis_managed() { [[ -f "$(anubis_marker)" ]]; }
+# This module's own Angie-side artifacts: the terminators/common snippets, a
+# static shadow file, or a vhost still listening on the backend socket.  They
+# outlive the state directory if an operator moves or deletes it (the state
+# directory also holds the marker, so `anubis=no` used to do nothing while the
+# vhosts stayed behind a filter that was then stopped: every site answered
+# 502 until the file was restored by hand).  An Anubis an operator installed
+# and integrated by hand matches none of these names and is still left alone.
+anubis_artifacts_present() {
+  local live_dir=${1:-/etc/angie/conf.d}
+  [[ -f $ANUBIS_TERMINATORS || -f $ANUBIS_COMMON || -f $ANUBIS_LOCATION \
+     || -f $ANUBIS_STATIC_BLOCKS ]] && return 0
+  local f
+  for f in "$live_dir"/*.conf; do
+    [[ -f $f ]] || continue
+    case ${f##*/} in 00-anubis-*) continue ;; esac
+    anubis_vhost_integrated "$f" && return 0
+  done
+  return 1
+}
+
+anubis_managed() { [[ -f "$(anubis_marker)" ]] || anubis_artifacts_present; }
 
 # Whether this run should leave the host with Anubis enabled.
 anubis_wanted() { (( ${ANUBIS_ENABLED:-0} )); }
@@ -1014,27 +1034,92 @@ EOF
   return 0
 }
 
+# Rebuild the public TLS listener of a vhost that is still behind the filter
+# but whose pre-integration copy is gone (the state directory was moved or
+# removed by hand, or a release before this one enabled the filter over a
+# vhost it had already migrated).  Without this, anubis=no reported success
+# while the vhost kept listening on the backend socket: with Anubis stopped
+# every site answered 502 until someone restored the file by hand (found on
+# the 1.21.37 audit host).
+# The inverse of anubis_integrate_vhost: the backend listen becomes the two
+# public TLS listeners plus http2, and the two real-IP lines the integration
+# added are dropped.  Every other directive is left exactly as it is.
+#   $1 vhost file.  Returns 0 when the file is no longer integrated.
+anubis_deintegrate_vhost() {
+  local f=$1 sock="unix:${ANUBIS_BACKEND_SOCKET}" tmp
+  anubis_vhost_integrated "$f" || return 0
+  tmp=$(tmp_file) || return 1
+  awk -v sock="$sock" '
+    function indent_of(s) { if (match(s, /^[ \t]*/)) return substr(s, 1, RLENGTH); return "" }
+    {
+      code = $0
+      sub(/#.*/, "", code)
+      if (code ~ /^[ \t]*listen[ \t]+/ && index(code, sock) > 0) {
+        ind = indent_of($0)
+        print ind "listen 443 ssl;"
+        print ind "listen [::]:443 ssl;"
+        print ind "http2 on;"
+        next
+      }
+      if (code ~ /^[ \t]*set_real_ip_from[ \t]+unix:;[ \t]*$/) next
+      if (code ~ /^[ \t]*real_ip_header[ \t]+X-Real-IP;[ \t]*$/) next
+      print
+    }
+  ' "$f" >"$tmp" || { rm -f "$tmp"; return 1; }
+  if ! commit_if_changed "$f" "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  ANUBIS_ANGIE_DIRTY=1
+  tune_note "${f##*/}: rebuilt the public TLS listener (pre-integration copy was missing)"
+  return 0
+}
+
 # Restore every vhost this module migrated.  The live file is moved to /tmp
 # first, so an operator edit made while Anubis was enabled is not lost.
 anubis_restore_vhosts() {
-  local live_dir=${1:-/etc/angie/conf.d} dir=${2:-${ANUBIS_STATE}/vhosts} orig name live moved restored=0
-  [[ -d $dir ]] || return 0
-  for orig in "$dir"/*.orig; do
-    [[ -f $orig ]] || continue
-    name=${orig##*/}; name=${name%.orig}
-    live="${live_dir}/${name}"
-    if [[ -f $live ]]; then
-      moved=$(preserve_to_tmp "$live" || true)
-      [[ -n $moved ]] && info "Anubis: moved the integrated ${name} to ${moved}"
-    fi
-    cp -a "$orig" "$live" || { warn "Could not restore ${live}"; continue; }
-    restored=$(( restored + 1 ))
-    ANUBIS_ANGIE_DIRTY=1
-  done
+  local live_dir=${1:-/etc/angie/conf.d} dir=${2:-${ANUBIS_STATE}/vhosts} orig name live moved restored=0 rebuilt=0 rc=0
+  local -a originals=()
+  if [[ -d $dir ]]; then
+    for orig in "$dir"/*.orig; do
+      [[ -f $orig ]] || continue
+      name=${orig##*/}; name=${name%.orig}
+      live="${live_dir}/${name}"
+      if [[ -f $live ]]; then
+        moved=$(preserve_to_tmp "$live" || true)
+        [[ -n $moved ]] && info "Anubis: moved the integrated ${name} to ${moved}"
+      fi
+      cp -a "$orig" "$live" || { warn "Could not restore ${live}"; rc=1; continue; }
+      restored=$(( restored + 1 ))
+      ANUBIS_ANGIE_DIRTY=1
+      originals+=("$name")
+    done
+  fi
   if (( restored > 0 )); then
     info "Anubis: restored ${restored} vhost(s) to their pre-integration form"
   fi
-  return 0
+  # A vhost can still be integrated after the loop above: its .orig file was
+  # lost with the state directory.  Leaving it on the backend socket while
+  # the filter stops makes the site unreachable, so rebuild the public
+  # listener instead of reporting a disable that did not happen.
+  for live in "$live_dir"/*.conf; do
+    [[ -f $live ]] || continue
+    case ${live##*/} in 00-anubis-*) continue ;; esac
+    anubis_vhost_integrated "$live" || continue
+    name=${live##*/}
+    [[ " ${originals[*]} " == *" ${name} "* ]] && continue
+    warn "Anubis: ${name} is still behind the filter but its pre-integration copy is missing; rebuilding the public listener"
+    if anubis_deintegrate_vhost "$live"; then
+      rebuilt=$(( rebuilt + 1 ))
+    else
+      warn "Anubis: could not rebuild ${live}; restore it from /tmp before stopping the filter"
+      rc=1
+    fi
+  done
+  if (( rebuilt > 0 )); then
+    info "Anubis: rebuilt ${rebuilt} vhost listener(s) from the integrated form"
+  fi
+  return "$rc"
 }
 
 # Remove the generated Angie files (moving them to /tmp, never deleting).
@@ -1166,7 +1251,14 @@ anubis_enable() {
 
 anubis_disable() {
   ANUBIS_SUMMARY=""
-  anubis_restore_vhosts || true
+  if ! anubis_restore_vhosts; then
+    # A vhost is still behind the filter and could not be rebuilt: removing
+    # the terminators now would answer 502 for that site, so leave the whole
+    # integration in place and report the failure instead of a false success.
+    ANUBIS_FAILED="the pre-integration copy of a vhost is missing and its public listener could not be rebuilt"
+    ANUBIS_SUMMARY="Anubis: disable failed; the filter was left running"
+    return 1
+  fi
   anubis_remove_angie_files
   # Do not stop the service yet.  Angie keeps serving its in-memory
   # configuration (terminators proxy_pass to Anubis) until it is reloaded
@@ -1230,7 +1322,7 @@ anubis_apply() {
 # .orig vhost backups) stay, so `--optimize anubis=yes` re-enables it.
 anubis_purge_stop() {
   anubis_managed || return 0
-  anubis_restore_vhosts || true
+  anubis_restore_vhosts || warn "Anubis: a vhost could not be restored; check the site before starting Angie"
   anubis_remove_angie_files
   systemctl stop anubis >/dev/null 2>&1 || true
   systemctl disable anubis >/dev/null 2>&1 || true
@@ -1242,7 +1334,7 @@ anubis_purge_stop() {
 # managed files and the binary.  Used by the audit baseline restore and by
 # `--optimize anubis=no` when the operator wants it gone entirely.
 anubis_remove_all() {
-  anubis_restore_vhosts || true
+  anubis_restore_vhosts || warn "Anubis: a vhost could not be restored; check the site before starting Angie"
   anubis_remove_angie_files
   systemctl stop anubis >/dev/null 2>&1 || true
   systemctl disable anubis >/dev/null 2>&1 || true

@@ -192,6 +192,16 @@ sudo bash setup.sh --optimize anubis=yes
 sudo bash setup.sh --optimize anubis=no
 ```
 
+Measured cost of the filter on a cached guest page: 80.5k req/s without it
+and 27.7k through it (XenForo home page, browser user agent with a valid
+challenge cookie, 12-thread Xeon E-2236 at 94 % CPU; `c=400` does not
+raise it).  Anubis is CPU-bound at roughly 180 µs per proxied request, so a
+host that needs more than ~30k guest cache hits per second should leave it
+off or front only its dynamic locations.  Subrequest (`auth_request`) mode
+was measured at 28.5k and is not faster.  The challenge location, when a
+custom integration is built, needs `^~ /.within.website/`: the
+application's dotfile deny regex otherwise answers 403.
+
 | Piece | Detail |
 |---|---|
 | Release | Anubis 1.28.2, static `linux-amd64` or `linux-arm64` binary from the official GitHub release, SHA-256 verified |
@@ -877,7 +887,7 @@ tests. Angie configuration and Cloudflare IP ranges are downloaded.
   `SETUP_LIMIT_REQ_EXEMPT=<generator IP>` first, or every remote PHP request
   is answered `429`. Results and findings: `tests/stress-site/RESULTS.md` (one
   section per audit cycle) and the current cycle report
-  `tests/stress-site/AUDIT-20261120-1.21.36.md`.
+  `tests/stress-site/AUDIT-20261120-1.21.37.md`.
 - `tests/deploy-audit/`: `host-manifest.sh` and `state-snapshot.sh` capture a
   host or the managed configuration for diffing (install/`--optimize`
   parity), `restore-baseline.sh` returns a disposable test host to a

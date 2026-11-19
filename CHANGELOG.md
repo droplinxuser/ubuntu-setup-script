@@ -5,6 +5,53 @@ README.md; measurements in tests/stress-site/RESULTS.md.  Per-cycle
 reports and raw test logs cited by entries up to 1.21.32 were removed from
 the tree on 2026-11-19; retrieve them with `git show 84b0db5:<path>`.
 
+## 1.21.37 (2026-11-20)
+
+Audit cycle on a freshly reinstalled Xeon E-2236 host (62 GB, md RAID0
+NVMe, 695-package baseline).  Pair: `server-configs-nginx` 1.6.48 (no
+changes).  Report: `tests/stress-site/AUDIT-20261120-1.21.37.md`.
+
+- **Anubis no longer leaves the sites on a dead socket when its state is
+  missing.**  `anubis=no` restored the vhosts from
+  `$STATE_DIR/anubis/vhosts/*.orig` and recognized "managed" only by the
+  marker inside that same directory.  An operator who moved or deleted the
+  directory lost both: the disable did nothing, and once the filter stopped
+  every vhost kept listening on
+  `unix:/run/angie/anubis-backend.sock` and answered 502.  The integration
+  is now also detected from this module's own terminators/snippets/static
+  shadow and from any vhost still on the backend socket
+  (`anubis_artifacts_present`), and a vhost without an `.orig` copy is
+  rebuilt in place from the integrated form
+  (`anubis_deintegrate_vhost`: two public `listen 443 ssl`, `http2 on`, the
+  proxy real-IP lines removed, everything else kept).  A restore that cannot
+  rebuild a vhost returns non-zero, `anubis_disable` keeps the filter
+  running and the run reports the failure instead of a false success.  Test
+  host: enabled, state directory moved away, `--optimize anubis=no` rebuilt
+  three vhosts, `angie -t` clean, service stopped, HTTP 200.  Thirteen unit
+  checks added (1,119 total).
+- **Anubis cost measured and its runtime re-checked.**  With a valid
+  challenge cookie and a browser user agent, the cached XenForo home page
+  does 27.7k req/s through the filter and 80.5k without it (94 % host CPU at
+  the filter's ~5.2 cores): the filter is CPU-bound, and `c=400` does not
+  raise the number.  `GOGC=100/400/800/off` on the check endpoint measured
+  66.5k/73.0k/74.5k/74.7k, so the shipped `GOGC=off GOMEMLIMIT=2048MiB`
+  is at the ceiling (8 GiB only inflates RSS to 7.9 GB).  Subrequest-auth
+  mode (Anubis `TARGET=" "` + `auth_request`) was prototyped: 19.8k without
+  upstream keepalive, 28.5k with it — no win over the 27.7-28.5k proxy
+  mode — so the architecture stays.  The prototype also showed that the
+  challenge location needs `^~` (the application's dotfile deny regex
+  answers 403 otherwise).
+- **Remaining Angie/PHP knobs re-measured and rejected** (details and
+  numbers in the report): removing `worker_cpu_affinity auto` +
+  `timer_resolution 100ms` (-5-8 %), `ssl_buffer_size 4k` (0 to -8 %),
+  `multi_accept off` (0 to -8 %), dropping `aio threads`/`directio`
+  (-6-7 %), `opcache.validate_timestamps=0` (inside run-to-run noise) and
+  `pm.max_children` 16/24 (no gain over 12).  The shipped values stay.
+- **Zero-error cycle on the clean host**: install 2:20 with 0 warnings,
+  1,119 unit checks, 220 dry runs, security 54/54 and cookie 62/62 and the
+  functional exercise with 0 unexpected responses, each with Anubis off and
+  on, and `--optimize` idempotent (0 differences).
+
 ## 1.21.36 (2026-11-20)
 
 Performance cycle on the Xeon E-2236 host.  Pair: `server-configs-nginx`

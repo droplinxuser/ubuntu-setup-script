@@ -7,7 +7,31 @@ manifests, sweep tables and run logs these sections cite (`AUDIT-*.md`,
 removed from the tree on 2026-11-19 to keep the repository lean; every one
 is still in git history, for example
 `git show 84b0db5:tests/stress-site/AUDIT-20261117-1.21.30.md`.  The current
-cycle report is `AUDIT-20261120-1.21.36.md`.
+cycle report is `AUDIT-20261120-1.21.37.md`.
+
+## 1.21.37 audit cycle — Xeon E-2236, fresh baseline (2026-11-20)
+
+Pair: `server-configs-nginx` 1.6.48.  Details: `AUDIT-20261120-1.21.37.md`.
+
+- Anubis state-loss fix: enable/disable is now detected from the module's
+  own artifacts, and a vhost whose pre-integration copy is missing is
+  rebuilt in place.  Before the fix, losing the state directory made
+  `anubis=no` a silent no-op and every site answered 502 once the filter
+  stopped.
+- Anubis is the dominant cost on a cache-hit-heavy host: cached XenForo
+  27.7k req/s through the filter vs 80.5k without (browser UA, valid
+  challenge cookie, `c=100`; 94 % host CPU, ~5.2 cores in Anubis).
+  `c=400` does not improve it.  Subrequest-auth mode measured 28.5k with
+  upstream keepalive, so the proxy architecture stays.
+- `GOGC=100/400/800/off` on the Anubis check endpoint: 66.5k/73.0k/74.5k/
+  74.7k.  The shipped `GOGC=off GOMEMLIMIT=2048MiB` is at the ceiling.
+- Angie/PHP knobs re-measured and rejected: no CPU affinity/timer
+  resolution (-5-8 %), `ssl_buffer_size 4k` (0 to -8 %), `multi_accept off`
+  (0 to -8 %), no `aio`/`directio` (-6-7 %), `validate_timestamps=0`
+  (noise), `pm.max_children` 16/24 (no gain over 12).
+- Zero-error cycle: install 2:20 / 0 warnings, 1,119 unit checks, 220 dry
+  runs, security 54/54, cookie 62/62, functional 0 unexpected (Anubis off
+  and on), `--optimize` idempotent (0 differences).
 
 ## 1.21.36 performance cycle — Xeon E-2236 (2026-11-20)
 
