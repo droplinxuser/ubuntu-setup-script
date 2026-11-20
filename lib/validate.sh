@@ -487,6 +487,9 @@ validate_all() {
   local svc
 
   # mitigations=on|off (--basic, --optimize or SETUP_CPU_MITIGATIONS).
+  if (( ${CPU_MITIGATIONS_LOOSE:-0} )) && (( ! OPTIMIZE )) && (( ${ENABLED[basic]:-0} != 1 )); then
+    die "mitigations= is only valid with --basic or --optimize"
+  fi
   if [[ -n ${CPU_MITIGATIONS_SETTING:-} ]]; then
     case ${CPU_MITIGATIONS_SETTING,,} in
       off|no|0|false) CPU_MITIGATIONS_SETTING=off ;;

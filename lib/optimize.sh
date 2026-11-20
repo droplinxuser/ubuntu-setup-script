@@ -2023,10 +2023,41 @@ xf_cache_port_from_config() {
   printf '%s' "$value"
 }
 
+# One /var/www walk per --optimize run.  Every finder used to walk to depth
+# 6 on its own, and XenForo attachment trees sit at depth 5-6: on a forum
+# with 3.7M entries at that depth each walk took 4-5 s and a run made about
+# eight of them, a silent ~45 s pause between the sysctl and cron steps.
+# app_config_scan_prime records both lists once in the main shell; the
+# finders, usually called inside a process substitution, read the copy.
+# Only --optimize primes it (it never creates or removes a site); the dry
+# run makes no such walk, and the install path keeps walking live, since it
+# adds sites as it runs.
+APP_CONFIG_SCAN_PRIMED=0
+APP_CONFIG_SCAN_LIST=""
+app_config_scan_walk() {
+  find "${SETUP_WWW_ROOT:-/var/www}" -maxdepth 6 -type f \( -name wp-config.php -o -path '*/src/config.php' \) \
+    2>/dev/null | sort -u || true
+}
+app_config_scan_prime() {
+  APP_CONFIG_SCAN_LIST=$(app_config_scan_walk)
+  APP_CONFIG_SCAN_PRIMED=1
+}
+app_config_scan_reset() {
+  APP_CONFIG_SCAN_LIST=""
+  APP_CONFIG_SCAN_PRIMED=0
+}
+app_config_scan() {
+  if (( APP_CONFIG_SCAN_PRIMED )); then
+    [[ -z $APP_CONFIG_SCAN_LIST ]] || printf '%s\n' "$APP_CONFIG_SCAN_LIST"
+  else
+    app_config_scan_walk
+  fi
+}
+
 # Same depth as the managed wp-cron entry and the XenForo finder, so a site
 # that is hardened here is also the site whose wp-cron.php the cron runs.
 app_find_wordpress_configs() {
-  find /var/www -maxdepth 6 -type f -name wp-config.php 2>/dev/null | sort -u || true
+  app_config_scan | grep -E '(^|/)wp-config\.php$' || true
 }
 
 app_find_xenforo_configs() {
@@ -2035,7 +2066,7 @@ app_find_xenforo_configs() {
     if [[ -f "${conf%/config.php}/XF.php" ]]; then
       printf '%s\n' "$conf"
     fi
-  done < <(find /var/www -maxdepth 6 -type f -path '*/src/config.php' 2>/dev/null | sort -u || true)
+  done < <(app_config_scan | grep -E '/src/config\.php$' || true)
 }
 
 

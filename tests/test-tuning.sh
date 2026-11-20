@@ -5339,6 +5339,74 @@ if command -v php >/dev/null 2>&1; then
     cmp -s "$xfg/config.php" "$TMP/xfgzip/nobegin.php"
 fi
 
+# --- One /var/www walk per --optimize run (app_config_scan) ---
+# Each WordPress/XenForo finder used to walk /var/www to depth 6 itself; a
+# 3.7M-entry forum tree paid 4-5 s per walk, about eight times per run.
+# Earlier sections stub the finders, so the real ones run in a subshell.
+aw="$TMP/appscan"
+mkdir -p "$aw/www/wp.test/public" "$aw/www/xf.test/public/src" "$aw/www/nox.test/src"
+: > "$aw/www/wp.test/public/wp-config.php"
+: > "$aw/www/xf.test/public/src/config.php"
+: > "$aw/www/xf.test/public/src/XF.php"
+: > "$aw/www/nox.test/src/config.php"
+appscan_run() {
+  (
+    eval "$(sed -n '/^app_config_scan_walk()/,/^}/p;/^app_config_scan_prime()/,/^}/p;/^app_config_scan_reset()/,/^}/p;/^app_config_scan()/,/^}/p;/^app_find_wordpress_configs()/,/^}/p;/^app_find_xenforo_configs()/,/^}/p' "$ROOT/lib/optimize.sh")"
+    eval "$(declare -f app_config_scan_walk | sed '1s/app_config_scan_walk/appscan_real_walk/')"
+    app_config_scan_walk() { printf 'x\n' >> "$aw/walks"; appscan_real_walk; }
+    SETUP_WWW_ROOT="$aw/www"; APP_CONFIG_SCAN_PRIMED=0; APP_CONFIG_SCAN_LIST=""
+    rm -f "$aw/walks"
+    "$@"
+  )
+}
+appscan_primed() {
+  app_config_scan_prime
+  app_find_wordpress_configs; app_find_xenforo_configs
+  mapfile -t _ < <(app_find_wordpress_configs)
+  while IFS= read -r _; do :; done < <(app_find_xenforo_configs)
+  printf 'walks=%s\n' "$(wc -l < "$aw/walks")"
+}
+appscan_unprimed() {
+  app_find_wordpress_configs >/dev/null; app_find_xenforo_configs >/dev/null
+  printf 'walks=%s\n' "$(wc -l < "$aw/walks")"
+}
+appscan_reset() {
+  app_config_scan_prime
+  mkdir -p "$aw/www/wp2.test"; : > "$aw/www/wp2.test/wp-config.php"
+  printf 'before=%s\n' "$(app_find_wordpress_configs | wc -l)"
+  app_config_scan_reset
+  printf 'after=%s\n' "$(app_find_wordpress_configs | wc -l)"
+  rm -rf "$aw/www/wp2.test"
+}
+appscan_empty() {
+  SETUP_WWW_ROOT="$aw/none"; app_config_scan_prime
+  printf 'wp=[%s] xf=[%s] walks=%s\n' "$(app_find_wordpress_configs)" "$(app_find_xenforo_configs)" "$(wc -l < "$aw/walks")"
+}
+out=$(appscan_run appscan_primed)
+check "app scan: a primed run walks /var/www once for every finder call" grep -qx 'walks=1' <<<"$out"
+check "app scan: the WordPress finder returns only wp-config.php" \
+  grep -qx "$aw/www/wp.test/public/wp-config.php" <<<"$out"
+check "app scan: the XenForo finder returns a src/config.php with XF.php beside it" \
+  grep -qx "$aw/www/xf.test/public/src/config.php" <<<"$out"
+check "app scan: a src/config.php without XF.php is not XenForo" \
+  bash -c '! grep -q nox.test <<<"$1"' _ "$out"
+check "app scan: the WordPress list holds no XenForo config (and back)" \
+  test "$(grep -c '/' <<<"$out")" = 2
+out=$(appscan_run appscan_unprimed)
+check "app scan: unprimed (install path) still walks live on every call" grep -qx 'walks=2' <<<"$out"
+out=$(appscan_run appscan_reset)
+check "app scan: reset drops the primed list so a new site is found" \
+  bash -c 'grep -qx before=1 <<<"$1" && grep -qx after=2 <<<"$1"' _ "$out"
+out=$(appscan_run appscan_empty)
+check "app scan: a missing web root primes an empty list (no blank entries)" \
+  grep -qx 'wp=\[\] xf=\[\] walks=1' <<<"$out"
+check "app scan: --optimize primes the scan right after service detection" \
+  bash -c 'grep -A3 "^  detect_installed_services$" "$1" | grep -q app_config_scan_prime' _ "$ROOT/lib/restart.sh"
+# The dry run makes no depth-6 finder call (measured: 0 walks), so a prime
+# there would add a walk; the install path adds sites while it runs.
+check "app scan: neither the dry run nor the install path primes it" \
+  bash -c '! grep -q app_config_scan_prime "$@"' _ "$ROOT/lib/service-optimizers.sh" "$ROOT/lib/services.sh" "$ROOT/lib/web.sh" "$ROOT/lib/runner.sh" "$ROOT/setup.sh"
+
 
 printf '\nTOTAL pass=%d fail=%d skip=%d\n' "$PASS" "$FAIL" "$SKIP"
 [[ $FAIL -eq 0 ]]

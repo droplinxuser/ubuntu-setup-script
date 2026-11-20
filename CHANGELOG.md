@@ -5,6 +5,32 @@ README.md; measurements in tests/stress-site/RESULTS.md.  Per-cycle
 reports and raw test logs cited by entries up to 1.21.32 were removed from
 the tree on 2026-11-19; retrieve them with `git show 84b0db5:<path>`.
 
+## 1.21.46 (2026-11-20)
+
+- **One WordPress/XenForo config scan per `--optimize` run.**  The JF dev
+  host (XenForo, 3.7M entries within depth 6 of /var/www) still paused
+  57 s between the sysctl and cron steps after 1.21.45: every app finder
+  (`app_find_wordpress_configs`, `app_find_xenforo_configs`) walked
+  /var/www to depth 6 on its own, 4-5 s each, about eight times per run
+  (WordPress hardening, malware roots, XenForo gzip, cron, MariaDB
+  persistent-connection count, application notices).  `--optimize` now
+  primes one combined walk right after service detection
+  (`app_config_scan_prime`) and the finders read that list; the dry run
+  (which makes no such walk) and the install path (which adds sites while
+  it runs) do not prime it.  The walk honours `SETUP_WWW_ROOT`.  Ten unit
+  checks.
+- `mitigations=on|off` is accepted after any flag (`--optimize --dry-run
+  mitigations=off` was rejected as an unknown argument); it still needs
+  `--basic` or `--optimize`.  Five dry-run matrix cases.
+- The MariaDB report line no longer calls the capped target "data+5%": it
+  now prints `target 64388MB (data+5% = 77586MB, 128MB minimum, cap
+  64388MB)`, and the dry-run line names both caps (50% beside PHP/cache/
+  search, 80% on a database-only host).
+- Live run on the JF dev host (Hetzner, EPYC 7401P, 48 threads, 126 GB,
+  Ubuntu 26.04, PHP 8.6): optimize clean, `enableGzip` line superseded,
+  Hetzner `hetzner.cfg` no longer drops `mitigations=off` after reboot,
+  ipfrag/rp_filter/BBR/hugepages applied at boot, no failed units.
+
 ## 1.21.45 (2026-11-20)
 
 - **Security hardening no longer walks a large web root eight times.**  On

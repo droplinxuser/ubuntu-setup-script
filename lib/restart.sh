@@ -377,6 +377,8 @@ run_optimize() {
     opt_report "- Ignored tuning environment: \`${OPTIMIZE_IGNORED_ENV[*]}\`"
   fi
   detect_installed_services
+  # One /var/www walk for every WordPress/XenForo finder in this run.
+  app_config_scan_prime
   if (( ${#OPT_DETECTED[@]} > 0 )); then
     OPT_BACKUP_DIR=$(tmp_dir setup-optimize.XXXXXX) \
       || die "Could not create an optimize backup directory"

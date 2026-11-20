@@ -404,6 +404,12 @@ run ok   --dry-run --optimize mitigations=off
 run ok   --dry-run --optimize anubis=yes mitigations=off
 run fail --dry-run --basic mitigations=maybe
 run fail --dry-run --optimize mitigations=
+# Any order: mitigations= after --dry-run used to be an unknown argument.
+run ok   --optimize --dry-run mitigations=off
+run ok   --basic --dry-run mitigations=on
+run fail --optimize --dry-run mitigations=sometimes
+run fail --dry-run --php mitigations=off
+run fail --dry-run mitigations=off
 run_env ok   SETUP_CPU_MITIGATIONS=off --dry-run --optimize
 run_env fail SETUP_CPU_MITIGATIONS=sometimes --dry-run --optimize
 run ok --dry-run --optimize anubis=1

@@ -665,7 +665,7 @@ optimize_mariadb() {
   fi
   if (( OPT_DB_SIZE_MB > 0 )); then
     local pct_mb=$(( OPT_DB_SIZE_MB + OPT_DB_SIZE_MB / 20 ))
-    local pool_cap
+    local raw_mb=$pct_mb pool_cap
     if [[ " ${OPT_DETECTED[*]} " != *" php:"* ]] \
        && [[ " ${OPT_DETECTED[*]} " != *" valkey "* && " ${OPT_DETECTED[*]} " != *" redis "* ]] \
        && [[ " ${OPT_DETECTED[*]} " != *" elastic "* ]]; then
@@ -676,10 +676,14 @@ optimize_mariadb() {
     (( pool_cap < 256 )) && pool_cap=256
     (( pct_mb > pool_cap )) && pct_mb=$pool_cap
     (( pct_mb < 128 )) && pct_mb=128
+    # pct_mb is the capped target; raw_mb is data+5% before the cap.  The
+    # report used to call the capped figure "data+5%", which on a 74 GB
+    # database next to PHP read as 64388MB = 73892MB + 5%.
+    local target="target ${pct_mb}MB (data+5% = ${raw_mb}MB, 128MB minimum, cap ${pool_cap}MB)"
     if (( ${OPT_MARIADB_KEPT_MB:-0} > 0 )); then
-      opt_report "- Database data+index=${OPT_DB_SIZE_MB}MB; buffer pool=${size_mb}MB (kept existing pool; the data+5% target is ${pct_mb}MB)"
+      opt_report "- Database data+index=${OPT_DB_SIZE_MB}MB; buffer pool=${size_mb}MB (kept existing pool; ${target})"
     else
-      opt_report "- Database data+index=${OPT_DB_SIZE_MB}MB; buffer pool=${size_mb}MB (data+5% = ${pct_mb}MB, 128MB minimum; cap $(( pool_cap ))MB)"
+      opt_report "- Database data+index=${OPT_DB_SIZE_MB}MB; buffer pool=${size_mb}MB; ${target}"
     fi
   fi
   mariadb_compute_profile "$size_mb"
@@ -1787,7 +1791,7 @@ optimize_plan() {
     db_size_mb=${OPT_DB_SIZE_MB:-0}
     db_fit=""
     if (( db_size_mb > 0 )); then
-      db_fit=", database=${db_size_mb}MB (data+5% = $(( db_size_mb + db_size_mb / 20 ))MB, 128MB minimum, data-only cap 80% RAM"
+      db_fit=", database=${db_size_mb}MB (data+5% = $(( db_size_mb + db_size_mb / 20 ))MB, 128MB minimum, cap 50% RAM beside PHP/cache/search, 80% on a database-only host"
       (( ${OPT_MARIADB_KEPT_MB:-0} > 0 )) && db_fit+="; existing pool kept"
       db_fit+=")"
     fi

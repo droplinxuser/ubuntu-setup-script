@@ -556,6 +556,14 @@ parse_args() {
         # --angie/--optimize instead of reporting an unknown argument.
         anubis_set "${1#*=}"
         shift ;;
+      mitigations=*)
+        # Same for mitigations= after another flag: `--optimize --dry-run
+        # mitigations=off` used to die as an unknown argument although the
+        # same words in the documented order work.  validate_all checks
+        # that --basic or --optimize is present.
+        mitigations_set "${1#*=}"
+        CPU_MITIGATIONS_LOOSE=1
+        shift ;;
       --version) printf '%s %s\n' "$SCRIPT_NAME" "$SCRIPT_VERSION"; exit 0 ;;
       --help|-h) usage; exit 0 ;;
       *) die "Unknown argument: '$1' (use --help)" ;;
