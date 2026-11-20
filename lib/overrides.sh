@@ -27,7 +27,7 @@ RESET_ACTIONS=()
 # override: a reset must not silently flip them.
 RESET_KEEP_PINS=(
   ANUBIS ANUBIS_STATIC_BYPASS XF_JOB_CRON NODE_MAJOR NODE_ALLOW_MAJOR_UPGRADE
-  CPU_MITIGATIONS XF_MEMBER_GZIP CF_SELF_SIGNED
+  CPU_MITIGATIONS XF_MEMBER_GZIP CF_SELF_SIGNED SSL_REJECT_UNKNOWN_SNI
 )
 
 # Every sysctl key this host's managed profile actually defines.  A key this

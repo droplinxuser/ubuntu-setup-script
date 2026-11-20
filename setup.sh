@@ -36,7 +36,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.21.51"
+readonly SCRIPT_VERSION="1.21.52"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -136,6 +136,11 @@ fi
 # CF_SELF_SIGNED=0 in /etc/default/setup-tuning leaves certificates alone.
 CF_SELF_SIGNED="${SETUP_CF_SELF_SIGNED:-${CF_SELF_SIGNED:-1}}"
 [[ $CF_SELF_SIGNED == 0 ]] || CF_SELF_SIGNED=1
+# Unknown-SNI rejection on the catch-all HTTPS server (lib/web.sh,
+# tune_default_tls_reject): auto (default) skips it when a vhost trusts a
+# reverse proxy outside Cloudflare, 1 forces it on, 0 off.
+SSL_REJECT_UNKNOWN_SNI="${SETUP_SSL_REJECT_UNKNOWN_SNI:-${SSL_REJECT_UNKNOWN_SNI:-auto}}"
+[[ $SSL_REJECT_UNKNOWN_SNI =~ ^(auto|0|1)$ ]] || SSL_REJECT_UNKNOWN_SNI=auto
 # XenForo page compression.  XenForo gzips every page itself at level 9
 # (15% of member-page PHP CPU on the audit host).  With XF_MEMBER_GZIP=angie
 # (default) a managed block at the end of each XenForo src/config.php keeps

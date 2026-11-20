@@ -520,11 +520,129 @@ XF_CACHE_KEY='"$request_method|$scheme|$host|$request_uri|$setup_xf_key_variatio
 # deployed before server-configs-nginx 1.6.46 gain `ssl_reject_handshake on;`
 # (the default_ssl include stays: it carries the TLS session cache that
 # SNI vhosts resume from).  Only the shipped catch-all shape is touched.
+#
+# A reverse proxy in front of the origin must send the site name as SNI, or
+# every handshake it makes is refused and the site answers 502 through it.
+# Cloudflare always does; a self-run proxy often does not (nginx/Angie
+# default to proxy_ssl_server_name off, and proxy_ssl_name defaults to the
+# proxy_pass address).  This took site-a.example (2026-11-20) and site-d.example
+# (2026-11-21) down.  SSL_REJECT_UNKNOWN_SNI (/etc/default/setup-tuning,
+# SETUP_SSL_REJECT_UNKNOWN_SNI for one run):
+#   auto (default)  on, unless a loaded vhost trusts a reverse proxy outside
+#                   the Cloudflare ranges (tls_reject_front_proxies)
+#   1               on: every proxy in front sends SNI (proxy_ssl_server_name
+#                   on; proxy_ssl_name $host)
+#   0               off
+# "Off" comments the directive out with a marker; "on" restores a line this
+# function commented out, or inserts one into a pre-1.6.46 catch-all.
+TLS_REJECT_OFF_MARK='# setup.sh: off, a reverse proxy in front may connect without SNI (SSL_REJECT_UNKNOWN_SNI)'
+
+# Reverse proxies the loaded configuration trusts or admits, one
+# "file:address" per line.  Read from conf.d/*.conf, http.d/*.conf and every
+# file they include (globs expanded, a few levels deep):
+#   set_real_ip_from ADDR             the proxy's X-Forwarded-For is trusted
+#   allow ADDR                        origin locked down to the proxy
+#   $realip_remote_addr != "ADDR"     the Pingvin-template 444 gate
+#   ADDR 1; # setup.sh exempt         rate-limit exemption (LIMIT_REQ_EXEMPT)
+#   ADDR:https on;                    custom.d/https_trusted_peers.map
+# Directives sharing a line are split on ';' first.  Skipped: unix: sources
+# (Anubis, local sockets never make a TLS handshake), loopback, `all`, and
+# addresses inside a Cloudflare range of http.d/cloudflare.conf (a CIDR only
+# when it fits inside the range).  A source that is not an IP literal, or any
+# source when the ranges file is missing, counts as a proxy: a missed proxy
+# is an outage, an extra one only leaves the catch-all as before 1.6.46.
+# Not detectable here: a proxy the origin configuration never mentions (an
+# application that reads X-Forwarded-For itself); SSL_REJECT_UNKNOWN_SNI=0
+# covers that.
+tls_reject_addr_is_cf() {
+  local src=$1 ip bits r rbits
+  shift
+  ip=${src%/*}
+  if [[ $ip == *:* ]]; then bits=128; else bits=32; fi
+  [[ $src == */* ]] && bits=${src#*/}
+  [[ $bits =~ ^[0-9]+$ ]] || return 1
+  for r in "$@"; do
+    if [[ $ip == *:* ]]; then
+      [[ $r == *:* ]] || continue
+      rbits=128; [[ $r == */* ]] && rbits=${r#*/}
+      ipv6_in_cidr "$ip" "$r" && (( bits >= rbits )) && return 0
+    else
+      [[ $r == *:* ]] && continue
+      rbits=32; [[ $r == */* ]] && rbits=${r#*/}
+      ipv4_in_cidr "$ip" "$r" && (( bits >= rbits )) && return 0
+    fi
+  done
+  return 1
+}
+
+tls_reject_front_proxies() {
+  local target=$1 ranges="$1/http.d/cloudflare.conf" f g inc src depth=0
+  local -a cf=() queue=() next=() globbed=()
+  local -A seen=()
+  mapfile -t cf < <(cf_tls_ranges "$ranges" 4; cf_tls_ranges "$ranges" 6)
+  queue=("$target"/conf.d/*.conf "$target"/http.d/*.conf)
+  while (( ${#queue[@]} > 0 && depth < 4 )); do
+    next=()
+    for f in "${queue[@]}"; do
+      [[ -f $f && $f != "$ranges" && -z ${seen[$f]:-} ]] || continue
+      seen[$f]=1
+      # One directive per line, comments gone (the exempt marker is a
+      # comment, so it is read from the raw file below).
+      while IFS= read -r src; do
+        [[ -z $src || $src == unix:* || $src == all ]] && continue
+        [[ $src =~ ^(127\.|::1(/|$)) ]] && continue
+        tls_reject_addr_is_cf "$src" "${cf[@]}" || printf '%s:%s\n' "${f##*/}" "$src"
+      done < <(
+        {
+          sed -E 's/#.*//' "$f" | tr ';{}' '\n\n\n' | sed -nE \
+            -e 's/^[[:space:]]*(set_real_ip_from|allow)[[:space:]]+"?([^"[:space:]]+)"?[[:space:]]*$/\2/p' \
+            -e 's/.*\$realip_remote_addr[[:space:]]*!?[=~][[:space:]]*"?([0-9A-Fa-f.:\/]+)"?.*/\1/p' \
+            -e 's/^[[:space:]]*"?([0-9A-Fa-f.:]+):https"?[[:space:]]+on[[:space:]]*$/\1/p'
+          sed -nE 's/^[[:space:]]*([0-9A-Fa-f.:\/]+)[[:space:]]+1[[:space:]]*;[[:space:]]*# setup\.sh exempt.*/\1/p' "$f"
+        } 2>/dev/null)
+      while IFS= read -r inc; do
+        [[ $inc == /* ]] || inc="$target/$inc"
+        # Intended pathname expansion (include globs); nullglob keeps an
+        # unmatched pattern out.
+        mapfile -t globbed < <(shopt -s nullglob; for g in $inc; do printf '%s\n' "$g"; done)
+        next+=("${globbed[@]}")
+      done < <(sed -E 's/#.*//' "$f" | tr ';{}' '\n\n\n' \
+                 | sed -nE 's/^[[:space:]]*include[[:space:]]+"?([^"[:space:]]+)"?[[:space:]]*$/\1/p')
+    done
+    queue=("${next[@]}")
+    depth=$(( depth + 1 ))
+  done
+  return 0
+}
+
 tune_default_tls_reject() {
-  local f="$1/conf.d/1.https.default.conf"
+  local target=$1 f="$1/conf.d/1.https.default.conf" mode=${SSL_REJECT_UNKNOWN_SNI:-auto} proxies=""
   [[ -f $f ]] || return 0
-  grep -qE '^[[:space:]]*ssl_reject_handshake[[:space:]]' "$f" && return 0
   grep -qE '^[[:space:]]*listen[[:space:]].*443.*default_server' "$f" || return 0
+  # The off path needs only the directive: an operator-edited catch-all
+  # (another return code, no `server_name _;`) is still switched off.  The
+  # insert path below keeps the strict shipped-shape checks.
+  [[ $mode =~ ^(auto|0|1)$ ]] || mode=auto
+  if [[ $mode == auto ]]; then
+    proxies=$(tls_reject_front_proxies "$target" | sort -u | head -n 5 | paste -sd' ' -)
+  fi
+  if [[ $mode == 0 || -n $proxies ]]; then
+    local why="SSL_REJECT_UNKNOWN_SNI=0"
+    [[ -n $proxies ]] && why="a vhost trusts a reverse proxy outside Cloudflare (${proxies}); set SSL_REJECT_UNKNOWN_SNI=1 in /etc/default/setup-tuning once every proxy sends the site name as SNI (proxy_ssl_server_name on; proxy_ssl_name \$host)"
+    if grep -qE '^[[:space:]]*ssl_reject_handshake[[:space:]]+on[[:space:]]*;' "$f"; then
+      sed_in_place -E "s|^([[:space:]]*)ssl_reject_handshake[[:space:]]+on[[:space:]]*;.*|\1# ssl_reject_handshake on;  $(sed_replacement_escape "$TLS_REJECT_OFF_MARK")|" "$f"
+      tune_note "1.https.default.conf: unknown/missing SNI is not refused: ${why}"
+    else
+      tune_summary "1.https.default.conf: unknown/missing SNI is not refused: ${why}"
+    fi
+    return 0
+  fi
+  if grep -qF "$TLS_REJECT_OFF_MARK" "$f"; then
+    sed_in_place -E "s|^([[:space:]]*)# ssl_reject_handshake on;  # setup\.sh: off,.*|\1ssl_reject_handshake on;|" "$f"
+    tune_note "1.https.default.conf: unknown/missing SNI refused again (no reverse proxy outside Cloudflare, or SSL_REJECT_UNKNOWN_SNI=1)"
+    return 0
+  fi
+  grep -qE '^[[:space:]]*ssl_reject_handshake[[:space:]]' "$f" && return 0
   grep -qE '^[[:space:]]*server_name[[:space:]]+_;' "$f" || return 0
   grep -qE '^[[:space:]]*return[[:space:]]+444;' "$f" || return 0
   tune_insert_before "$f" '^[[:space:]]*include[[:space:]]+h5bp/default_ssl\.conf;' \

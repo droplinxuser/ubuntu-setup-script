@@ -5,6 +5,43 @@ README.md; measurements in tests/stress-site/RESULTS.md.  Per-cycle
 reports and raw test logs cited by entries up to 1.21.32 were removed from
 the tree on 2026-11-19; retrieve them with `git show 84b0db5:<path>`.
 
+## 1.21.52 (2026-11-21)
+
+- **An origin behind its own reverse proxy no longer goes down when the
+  catch-all refuses unknown SNI.**  server-configs-nginx 1.6.49 added
+  `ssl_reject_handshake on` to `conf.d/1.https.default.conf`.  A proxy that
+  connects without the site name as SNI (nginx/Angie default:
+  `proxy_ssl_server_name off`) then has every handshake refused: site-d.example
+  answered 502 through its front proxy 203.0.113.23 from the `--optimize`
+  run until the previous Angie tree was put back (site-a.example had the same
+  failure on 2026-11-20).  New `SSL_REJECT_UNKNOWN_SNI` (`auto`|`1`|`0`,
+  `/etc/default/setup-tuning`, `SETUP_SSL_REJECT_UNKNOWN_SNI` for one run,
+  kept across a profile reset):
+  - `auto` (default) comments the directive out, with a marker and a report
+    line naming the proxy, when the loaded configuration trusts or admits an
+    address outside the Cloudflare ranges: `set_real_ip_from`, `allow`, a
+    `$realip_remote_addr` comparison (the Pingvin template's 444 gate), a
+    `# setup.sh exempt` rate-limit exemption or a
+    `custom.d/https_trusted_peers.map` peer, in conf.d/http.d and every
+    file they include.  Loopback, `unix:` (Anubis) and Cloudflare sources do
+    not count; a CIDR counts as Cloudflare only inside a Cloudflare range.
+    A Cloudflare-only host keeps the rejection.
+  - `1` keeps it on (every proxy sends SNI: `proxy_ssl_server_name on;
+    proxy_ssl_name $host;`), `0` turns it off, also on an operator-edited
+    catch-all.
+  - Not detectable: a proxy the origin configuration never mentions; use `0`.
+  - Reviewed by three independent passes before the live runs; findings on
+    include files, access-control gates, exemptions and CIDR breadth adopted.
+- **systemd-sysctl.service no longer fails on the first boot after a
+  kernel update on dracut hosts (Ubuntu 26.04).**  dracut copies
+  `/etc/sysctl.conf` into the initrd, so an initrd built before an
+  `--optimize` still applies the old 192/256 KB fragment limits; the base
+  profile then wrote `ip6frag_low_thresh = 3145728` before the high mark and
+  the kernel refused it ("Couldn't write '3145728' to
+  'net/ipv6/ip6frag_low_thresh': Invalid argument", seen on 203.0.113.23;
+  the 90 s re-apply fixed the values).  The base template now writes both
+  high marks first, like the generated IPv4 block.
+
 ## 1.21.51 (2026-11-20)
 
 - **The `--optimize` report no longer repeats PHP lines under the last

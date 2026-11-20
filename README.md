@@ -825,6 +825,7 @@ Feature choices (persisted, honoured by `--optimize`):
 |---|---|---|
 | `SETUP_XF_JOB_CRON` | `0\|1` | managed XenForo job-runner crontab entry |
 | `SETUP_CF_SELF_SIGNED` | `0\|1` | Cloudflare-proxied vhosts on the self-signed origin certificate and certbot retirement (`--optimize`); persisted as `CF_SELF_SIGNED` |
+| `SETUP_SSL_REJECT_UNKNOWN_SNI` | `auto\|0\|1` | catch-all HTTPS server refuses handshakes with an unknown or missing SNI (`ssl_reject_handshake on`, hides the origin host name from IP scanners). `auto` (default) leaves it off while a loaded vhost trusts a reverse proxy outside the Cloudflare ranges (`set_real_ip_from`), since such a proxy may connect without the site name as SNI and every request would answer 502; `1` once every proxy in front sends it (`proxy_ssl_server_name on; proxy_ssl_name $host;`); read from `SSL_REJECT_UNKNOWN_SNI` in `/etc/default/setup-tuning` |
 | `SETUP_NODE_MAJOR` | major number | Node.js major installed by `--others nodejs` |
 | `SETUP_NODE_ALLOW_MAJOR_UPGRADE` | `1` | allows a one-off Node.js major switch |
 | `SETUP_ANUBIS_LANGUAGE` | language | Anubis UI language (default `en`, the only catalogue complete in every shipped release; `th` currently panics upstream). The application still gets the visitor's `Accept-Language` |

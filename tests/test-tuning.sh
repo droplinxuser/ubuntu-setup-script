@@ -4973,6 +4973,109 @@ check "default TLS server: a second pass changes nothing" test "$tl_sum" = "$(ck
 check_tree "default TLS server: the shipped tree already rejects" \
   grep -qx '  ssl_reject_handshake on;' "$ANGIE_TREE/conf.d/1.https.default.conf"
 
+# A reverse proxy outside Cloudflare that connects without the site's SNI
+# had every handshake refused (site-d.example 502 behind 203.0.113.23).
+mkdir -p "$tl/http.d"
+printf 'set_real_ip_from 173.245.48.0/20;\nset_real_ip_from 2400:cb00::/32;\nreal_ip_header CF-Connecting-IP;\n' \
+  > "$tl/http.d/cloudflare.conf"
+printf 'server {\n  server_name cf.example;\n  set_real_ip_from 173.245.48.10;\n  set_real_ip_from 2400:cb00::1;\n  set_real_ip_from unix:;\n  # set_real_ip_from 9.9.9.9;\n}\n' \
+  > "$tl/conf.d/cf.example.conf"
+frag_high_first() {
+  local fam=$1 hi lo
+  hi=$(grep -nE "^net\.${fam}_high_thresh" "$ROOT/configs/system/sysctl.conf" | cut -d: -f1)
+  lo=$(grep -nE "^net\.${fam}_low_thresh" "$ROOT/configs/system/sysctl.conf" | cut -d: -f1)
+  [[ -n $hi && -n $lo ]] && (( hi < lo ))
+}
+check "sysctl template: IPv4 fragment high mark precedes the low mark (boot raises them)" \
+  frag_high_first ipv4.ipfrag
+check "sysctl template: IPv6 fragment high mark precedes the low mark (boot raises them)" \
+  frag_high_first ipv6.ip6frag
+check "TLS reject guard: Cloudflare sources, unix: and comments are not proxies" \
+  test -z "$(tls_reject_front_proxies "$tl")"
+tl_sum=$(cksum < "$tl/conf.d/1.https.default.conf")
+tune_default_tls_reject "$tl"
+check "TLS reject guard: a Cloudflare-only host keeps the rejection" \
+  test "$tl_sum" = "$(cksum < "$tl/conf.d/1.https.default.conf")"
+printf 'server {\n  server_name site-d.example;\n  set_real_ip_from 203.0.113.23;\n  real_ip_header X-Forwarded-For;\n}\n' \
+  > "$tl/conf.d/site-d.example.conf"
+check "TLS reject guard: a vhost trusting a non-Cloudflare proxy is found" \
+  test "$(tls_reject_front_proxies "$tl")" = "site-d.example.conf:203.0.113.23"
+TUNE_CHANGES=(); TUNE_DIRTY=0
+tune_default_tls_reject "$tl"
+check "TLS reject guard: behind such a proxy the rejection is commented out" \
+  bash -c '! grep -qE "^[[:space:]]*ssl_reject_handshake[[:space:]]+on" "$1" && grep -qF "# ssl_reject_handshake on;  # setup.sh: off" "$1"' _ "$tl/conf.d/1.https.default.conf"
+check "TLS reject guard: the report names the proxy and the override" \
+  bash -c 'printf "%s\n" "${@}" | grep -q "203.0.113.23.*SSL_REJECT_UNKNOWN_SNI=1"' _ "${TUNE_CHANGES[@]}"
+tl_sum=$(cksum < "$tl/conf.d/1.https.default.conf")
+TUNE_DIRTY=0
+tune_default_tls_reject "$tl"
+check "TLS reject guard: a second pass changes nothing and is not dirty" \
+  bash -c '[[ $1 == "$2" && $3 == 0 ]]' _ "$tl_sum" "$(cksum < "$tl/conf.d/1.https.default.conf")" "$TUNE_DIRTY"
+SSL_REJECT_UNKNOWN_SNI=1 tune_default_tls_reject "$tl"
+check "TLS reject guard: SSL_REJECT_UNKNOWN_SNI=1 restores the directive" \
+  grep -qx '  ssl_reject_handshake on;' "$tl/conf.d/1.https.default.conf"
+rm -f "$tl/conf.d/site-d.example.conf"
+SSL_REJECT_UNKNOWN_SNI=0 tune_default_tls_reject "$tl"
+check "TLS reject guard: SSL_REJECT_UNKNOWN_SNI=0 turns it off without a proxy" \
+  grep -qF "# ssl_reject_handshake on;  # setup.sh: off" "$tl/conf.d/1.https.default.conf"
+tune_default_tls_reject "$tl"
+check "TLS reject guard: back on automatically once the proxy is gone" \
+  grep -qx '  ssl_reject_handshake on;' "$tl/conf.d/1.https.default.conf"
+rm -f "$tl/http.d/cloudflare.conf"
+printf 'server {\n  set_real_ip_from 173.245.48.10;\n}\n' > "$tl/conf.d/cf.example.conf"
+check "TLS reject guard: without the ranges file every source counts (fail safe)" \
+  test -n "$(tls_reject_front_proxies "$tl")"
+# Every other way a vhost names the proxy in front (review of 1.21.52).
+tp="$TMP/tls-proxy-forms"
+mkdir -p "$tp/conf.d" "$tp/http.d" "$tp/snippets" "$tp/custom.d"
+printf 'set_real_ip_from 173.245.48.0/20;\nset_real_ip_from 2400:cb00::/32;\n' > "$tp/http.d/cloudflare.conf"
+tls_proxies_for() { printf '%s\n' "$1" > "$tp/conf.d/site.conf"; tls_reject_front_proxies "$tp" | sort -u | paste -sd' ' -; }
+check "TLS reject guard: allow ADDR (origin locked to the proxy) counts" \
+  test "$(tls_proxies_for 'server { allow 203.0.113.23; deny all; }')" = "site.conf:203.0.113.23"
+check "TLS reject guard: the Pingvin-style realip 444 gate counts" \
+  test "$(tls_proxies_for 'server { if ($realip_remote_addr != "203.0.113.23") { return 444; } }')" = "site.conf:203.0.113.23"
+check "TLS reject guard: set_real_ip_from after another directive on one line counts" \
+  test "$(tls_proxies_for 'server { real_ip_header X-Forwarded-For; set_real_ip_from 10.0.0.5; }')" = "site.conf:10.0.0.5"
+printf 'set_real_ip_from 198.51.100.7;\n' > "$tp/snippets/front-proxy.conf"
+check "TLS reject guard: set_real_ip_from in an included snippet counts" \
+  test "$(tls_proxies_for 'server { include snippets/front-*.conf; }')" = "front-proxy.conf:198.51.100.7"
+rm -f "$tp/snippets/front-proxy.conf"
+printf '"203.0.113.9:https" on;\n' > "$tp/custom.d/https_trusted_peers.map"
+check "TLS reject guard: a trusted HTTPS peer in custom.d counts" \
+  test "$(tls_proxies_for 'map "$realip_remote_addr:$http_x_forwarded_proto" $app_https { default ""; include custom.d/https_trusted_peers[.]map; }')" = "https_trusted_peers.map:203.0.113.9"
+rm -f "$tp/custom.d/https_trusted_peers.map"
+check "TLS reject guard: the shipped https_map key is not an address comparison" \
+  test -z "$(tls_proxies_for 'map "$realip_remote_addr:$http_x_forwarded_proto" $app_https { default ""; }')"
+printf 'geo $limit_req_whitelist {\n  default 0;\n  127.0.0.1 1;\n  203.0.113.23 1; # setup.sh exempt\n}\n' > "$tp/http.d/limit_req.conf"
+check "TLS reject guard: a rate-limit exemption (LIMIT_REQ_EXEMPT) counts, loopback does not" \
+  test "$(tls_proxies_for 'server { }')" = "limit_req.conf:203.0.113.23"
+rm -f "$tp/http.d/limit_req.conf"
+check "TLS reject guard: loopback and allow all are not proxies" \
+  test -z "$(tls_proxies_for 'server { allow 127.0.0.1; allow ::1; set_real_ip_from 127.0.0.1; allow all; }')"
+check "TLS reject guard: a CIDR wider than the Cloudflare range it starts in counts" \
+  test "$(tls_proxies_for 'server { set_real_ip_from 173.245.48.0/16; }')" = "site.conf:173.245.48.0/16"
+check "TLS reject guard: a CIDR inside a Cloudflare range does not count" \
+  test -z "$(tls_proxies_for 'server { set_real_ip_from 173.245.49.0/24; set_real_ip_from 2400:cb00:1::/48; }')"
+# The sync re-copies the shipped (uncommented) catch-all before every run:
+# the guard must land on the same file each time.
+tlr="$TMP/tls-resync"
+mkdir -p "$tlr/conf.d" "$tlr/http.d"
+printf 'server {\n  listen 443 ssl default_server;\n  server_name _;\n  ssl_reject_handshake on;\n  include h5bp/default_ssl.conf;\n  return 444;\n}\n' > "$tlr/shipped.conf"
+printf 'server { set_real_ip_from 203.0.113.23; }\n' > "$tlr/conf.d/site.conf"
+cp "$tlr/shipped.conf" "$tlr/conf.d/1.https.default.conf"; tune_default_tls_reject "$tlr"
+tl_sum=$(cksum < "$tlr/conf.d/1.https.default.conf")
+cp "$tlr/shipped.conf" "$tlr/conf.d/1.https.default.conf"; tune_default_tls_reject "$tlr"
+check "TLS reject guard: a re-synced catch-all ends identical to the first run" \
+  test "$tl_sum" = "$(cksum < "$tlr/conf.d/1.https.default.conf")"
+printf 'server {\n  listen 443 ssl default_server;\n  ssl_reject_handshake on;\n  return 403;\n}\n' > "$tlr/conf.d/1.https.default.conf"
+SSL_REJECT_UNKNOWN_SNI=0 tune_default_tls_reject "$tlr"
+check "TLS reject guard: an operator-edited catch-all is still switched off" \
+  grep -qF "# ssl_reject_handshake on;  # setup.sh: off" "$tlr/conf.d/1.https.default.conf"
+check_tree "TLS reject guard: the shipped tree names no front proxy (every plain host keeps the rejection)" \
+  bash -c 'test -z "$1"' _ "$(tls_reject_front_proxies "$ANGIE_TREE")"
+check "SSL_REJECT_UNKNOWN_SNI survives a profile reset" \
+  grep -qE '^  CPU_MITIGATIONS .*SSL_REJECT_UNKNOWN_SNI' "$ROOT/lib/overrides.sh"
+
 # PHP optional extensions: one transaction first (one php-fpm restart),
 # per-package fallback with the systemd start limit cleared.
 php_install_body=$(sed -n '/^install_php()/,/^}/p' "$ALL_SRC")
