@@ -195,7 +195,11 @@ sudo bash setup.sh --optimize anubis=no
 Measured cost of the filter on a cached guest page: 80.5k req/s without it
 and 27.7k through it (XenForo home page, browser user agent with a valid
 challenge cookie, 12-thread Xeon E-2236 at 94 % CPU; `c=400` does not
-raise it).  Anubis is CPU-bound at roughly 180 µs per proxied request, so a
+raise it).  Since 1.21.55 only requests that need a decision take that hop:
+a non-browser client or a search-engine crawler goes straight to the
+backend (XenForo cached page 29.5k -> 73.2k req/s for a non-browser
+User-Agent), while browsers with a pass cookie still pay it (17.7k).
+Anubis is CPU-bound at roughly 180 µs per proxied request, so a
 host that needs more than ~30k guest cache hits per second should leave it
 off or front only its dynamic locations.  Subrequest (`auth_request`) mode
 was measured at 28.5k and is not faster.  The challenge location, when a
@@ -216,6 +220,7 @@ application's dotfile deny regex otherwise answers 403.
 | Cache safety | the client `Accept-Encoding` is passed through end to end; cached gzip bodies stay compressed and no `sub_filter` runs |
 | Dot segments | answered `400` at the edge (Anubis itself answers `500` before its policy check) |
 | Policy | `allow-good-crawlers`, `deny-ai-crawlers`, infrastructure routes allowed, `static-miss` and `Mozilla` challenged; unmatched clients are allowed so API/CLI clients keep working |
+| Edge route | requests the policy allows without a cookie skip the Go hop: the terminator's `proxy_pass http://$anubis_route` picks the backend socket for a search-engine User-Agent (`allow-good-crawlers`) and for any non-browser, non-empty, non-AI User-Agent (the policy's default-allow), with the same headers Anubis forwards.  Browsers (`Mozilla`), an empty User-Agent, AI crawlers and `/.within.website/` always reach Anubis.  The two maps in `00-anubis-common.conf` and `botPolicies.yaml` are generated from the same patterns |
 | Redirects | `REDIRECT_DOMAINS` lists the protected server names, so the post-challenge `?redir=` cannot leave the site (left out when a vhost uses a regex `server_name`) |
 | WebSocket | a terminator gets `location ^~ /socket/` only when its vhost has a `/socket/` location (XenForo push); only a WebSocket upgrade skips the filter, any other request under `/socket/` is challenged like a page |
 | Persistence | `ANUBIS=1` in `/etc/default/setup-tuning`; a later plain `--optimize` (or `--domain`) keeps it and protects new vhosts |

@@ -5,6 +5,48 @@ README.md; measurements in tests/stress-site/RESULTS.md.  Per-cycle
 reports and raw test logs cited by entries up to 1.21.32 were removed from
 the tree on 2026-11-19; retrieve them with `git show 84b0db5:<path>`.
 
+## 1.21.55 (2026-11-21)
+
+- **Anubis: requests the policy allows without a cookie skip the Go hop.**
+  Every request on a protected site used to pass through the Anubis
+  process, including the ones its own policy lets through on the
+  User-Agent alone: search-engine crawlers (`allow-good-crawlers`) and
+  every client that is not a browser (the policy's default-allow: API
+  clients, monitors, feed readers, cron).  For those Anubis checks nothing
+  and only adds a proxy hop.  The terminator now picks the upstream with
+  `proxy_pass http://$anubis_route`. Two maps in `00-anubis-common.conf`
+  send those requests straight to the backend socket, with the headers
+  Anubis would forward.  Browsers (`Mozilla`), an empty User-Agent, the
+  `deny-ai-crawlers` list and `/.within.website/` still reach Anubis.  The
+  maps and `botPolicies.yaml` are generated from the same patterns
+  (`ANUBIS_GOOD_UA_RE`, `ANUBIS_AI_UA_RE`), so they cannot drift.
+  Measured on the Xeon E-2236 test host (loopback, c=100, cached guest
+  page through the filter): XenForo non-browser 29.5k -> 73.2k req/s,
+  Googlebot 31.3k -> 72.2k, WordPress non-browser 26.7k -> 59.4k.
+  Browsers with a pass cookie take the Go hop as before (17.7k XenForo).
+  Verified by response body: curl and Googlebot get the page; GPTBot, a
+  browser and an empty User-Agent get the challenge.
+- **`--upgrade-php` and `--purge php` run without dpkg warnings.**  Each
+  upgrade printed two `dpkg: warning: ... directory '/etc/php/X.Y/...' not
+  empty so not removed` lines.  The managed `zz-setup-optimize.ini` and
+  `custom_dan.ini` kept `fpm/conf.d` non-empty, and apt removed
+  `phpX.Y-common` before the extensions that share `mods-available`.
+  After the existing `/etc/php` backup, `purge_php_installations` now
+  removes the conf.d fragments no package owns (and puts them back if the
+  purge fails), then purges the extensions first and the `-common`
+  packages in a second transaction.  8.5 -> 8.4 -> 8.5: 0 warnings
+  (2 + 2 before), the state after the round trip matches the state before it.
+- **Real server addresses are kept out of the repositories.**  Every
+  real server address, host name and site domain was replaced with RFC
+  5737 addresses and `example` names, in the current tree and in the
+  history of both repositories.  CI now runs `tools/check-public-ips.sh`
+  on both: a public IPv4 address that is not a published third-party
+  address in `tools/public-ip-allowlist.txt` fails the build.
+- Tests: the web-root hygiene checks no longer read the host's
+  `/etc/angie` (they failed on a machine with Angie installed).
+  `deploy-xf.sh` finds the XenForo package by pattern (`XF_ZIP` overrides
+  it).
+
 ## 1.21.54 (2026-11-21)
 
 - **The Valkey report says why a maxmemory was kept.**  A cache started

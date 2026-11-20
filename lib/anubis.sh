@@ -67,6 +67,11 @@ ANUBIS_STATIC_BYPASS="${SETUP_ANUBIS_STATIC_BYPASS:-${ANUBIS_STATIC_BYPASS:-1}}"
 [[ $ANUBIS_STATIC_BYPASS == 0 ]] || ANUBIS_STATIC_BYPASS=1
 ANUBIS_STATIC_PERSIST=0
 [[ -n ${SETUP_ANUBIS_STATIC_BYPASS+x} ]] && ANUBIS_STATIC_PERSIST=1
+# User-Agent patterns of the managed policy (anubis_write_policy).  The same
+# strings feed the edge route in 00-anubis-common.conf, so Angie and Anubis
+# cannot disagree about which client a rule matches.
+ANUBIS_GOOD_UA_RE='Googlebot|Google-InspectionTool|bingbot|DuckDuckBot|Applebot|Baiduspider|YandexBot|Qwantbot|Kagi|Marginalia|MojeekBot|InternetArchive|Arquivo'
+ANUBIS_AI_UA_RE='GPTBot|ChatGPT-User|OAI-SearchBot|ClaudeBot|Claude-Web|anthropic-ai|CCBot|Google-Extended|Bytespider|Amazonbot|Applebot-Extended|meta-externalagent|PerplexityBot|Diffbot|Omgili|ImagesiftBot|YouBot|cohere-ai|AI2Bot'
 ANUBIS_TMPFILES="/etc/tmpfiles.d/angie-anubis.conf"
 # Set when this run changed anything under /etc/angie; the caller reloads once.
 ANUBIS_ANGIE_DIRTY=0
@@ -309,15 +314,17 @@ anubis_forced_language() {
 anubis_write_policy() {
   local tmp
   tmp=$(tmp_file) || return 1
-  cat > "$tmp" <<'EOF'
-# Managed by setup.sh (ANUBIS=1).  Rules are evaluated in order.
-bots:
-  - name: allow-good-crawlers
-    user_agent_regex: (?i)(Googlebot|Google-InspectionTool|bingbot|DuckDuckBot|Applebot|Baiduspider|YandexBot|Qwantbot|Kagi|Marginalia|MojeekBot|InternetArchive|Arquivo)
-    action: ALLOW
-  - name: deny-ai-crawlers
-    user_agent_regex: (?i)(GPTBot|ChatGPT-User|OAI-SearchBot|ClaudeBot|Claude-Web|anthropic-ai|CCBot|Google-Extended|Bytespider|Amazonbot|Applebot-Extended|meta-externalagent|PerplexityBot|Diffbot|Omgili|ImagesiftBot|YouBot|cohere-ai|AI2Bot)
-    action: DENY
+  {
+    printf '%s\n' '# Managed by setup.sh (ANUBIS=1).  Rules are evaluated in order.' \
+      '# The edge route in 00-anubis-common.conf mirrors the ALLOW decisions' \
+      '# that need no cookie; edit both together.' 'bots:' \
+      '  - name: allow-good-crawlers' \
+      "    user_agent_regex: (?i)(${ANUBIS_GOOD_UA_RE})" \
+      '    action: ALLOW' \
+      '  - name: deny-ai-crawlers' \
+      "    user_agent_regex: (?i)(${ANUBIS_AI_UA_RE})" \
+      '    action: DENY'
+    cat <<'EOF'
   - name: well-known
     path_regex: ^/\.well-known/.*$
     action: ALLOW
@@ -351,6 +358,7 @@ bots:
     user_agent_regex: Mozilla
     action: CHALLENGE
 EOF
+  } > "$tmp" || return 1
   if commit_if_changed "$ANUBIS_POLICY" "$tmp"; then ANUBIS_SERVICE_DIRTY=1; fi
   chown root:"$ANUBIS_USER" "$ANUBIS_POLICY"
   chmod 640 "$ANUBIS_POLICY"
@@ -554,6 +562,31 @@ server {
 # challenge page keeps Anubis's stock branding and the client's
 # Accept-Encoding is passed through, so cached gzip bodies are never inflated
 # and no sub_filter runs on the hot path.
+
+# Edge route.  A request the managed policy (botPolicies.yaml) ALLOWs without
+# looking at a cookie gains nothing from the Go hop: it goes straight to the
+# backend socket with the same headers Anubis would forward.  Mirrors, in
+# policy order:
+#   allow-good-crawlers  -> backend (first rule, wins over everything below)
+#   deny-ai-crawlers     -> Anubis (it answers the denial)
+#   empty User-Agent     -> Anubis (challenge)
+#   Mozilla              -> Anubis (challenge or pass-cookie check)
+#   anything else        -> backend (Anubis default-allow: API clients, cron,
+#                           monitors, CLI tools)
+# Anubis's own endpoints (/.within.website/) always reach Anubis.  The
+# robots/favicon/.well-known ALLOW rules are left to Anubis for browsers:
+# they are a handful of requests per visit.
+map \$http_user_agent \$anubis_ua_route {
+    default                      anubis_backend;
+    ""                           anubis;
+    "~*(?:${ANUBIS_GOOD_UA_RE})" anubis_backend;
+    "~*(?:${ANUBIS_AI_UA_RE})"   anubis;
+    "~Mozilla"                   anubis;
+}
+map \$uri \$anubis_route {
+    "~^/\\.within\\.website/"    anubis;
+    default                      \$anubis_ua_route;
+}
 EOF
   if commit_if_changed "$ANUBIS_COMMON" "$tmp"; then ANUBIS_ANGIE_DIRTY=1; fi
   return 0
@@ -569,7 +602,10 @@ anubis_write_location() {
 # preserves the documented behaviour and keeps the Anubis log quiet.
 if ($request_uri ~* "(?:^|/)(?:\.|%2e){1,2}(?:/|$|%2f)") { return 400; }
 
-proxy_pass http://anubis;
+# anubis or anubis_backend (upstream names, so no resolver is involved): the
+# requests the policy allows without a cookie skip the Go hop (see the edge
+# route maps in conf.d/00-anubis-common.conf).
+proxy_pass http://$anubis_route;
 proxy_http_version 1.1;
 proxy_set_header Connection "";
 proxy_set_header Host $host;

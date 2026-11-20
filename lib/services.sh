@@ -269,6 +269,17 @@ php_purge_preflight() {
   return 0
 }
 
+# Regular files in /etc/php/*/*/conf.d that no package owns (symlinks are the
+# phpenmod links, which the packages remove themselves).
+php_unowned_confd_files() {
+  local f
+  for f in /etc/php/*/*/conf.d/*; do
+    [[ -f $f && ! -L $f ]] || continue
+    dpkg-query -S "$f" >/dev/null 2>&1 && continue
+    printf '%s\n' "$f"
+  done
+}
+
 purge_php_installations() {
   local -a pkgs=() units=() was_enabled=() was_active=()
   local unit
@@ -298,8 +309,30 @@ purge_php_installations() {
     info "Backed up the existing /etc/php tree to ${backup}"
   fi
 
+  # Fragments no package owns (zz-setup-optimize.ini, custom_dan.ini, an
+  # operator's own .ini) kept each conf.d directory non-empty, so dpkg warned
+  # "directory ... not empty so not removed" for every SAPI.  They are in the
+  # backup above; they go back if the purge fails.
+  local -a loose=()
+  local f
+  if [[ -n $backup && -d $backup/php ]]; then
+    mapfile -t loose < <(php_unowned_confd_files)
+    for f in "${loose[@]}"; do rm -f -- "$f"; done
+  fi
+  # Extensions first, the -common packages last: the shared mods-available
+  # directory then still has an owner while each extension is removed (one
+  # transaction let apt drop phpX.Y-common first, and every later extension
+  # removal warned that the directory was not empty).
+  local -a first=() last=() p
+  for p in "${pkgs[@]}"; do
+    if [[ $p =~ ^php([0-9]+\.[0-9]+)?-common$ ]]; then last+=("$p"); else first+=("$p"); fi
+  done
   info "Purging existing PHP packages for a clean installation: ${pkgs[*]}"
-  if ! apt-get purge "${APT_OPTS[@]}" "${pkgs[@]}"; then
+  if ! { (( ${#first[@]} == 0 )) || apt-get purge "${APT_OPTS[@]}" "${first[@]}"; } \
+     || ! { (( ${#last[@]} == 0 )) || apt-get purge "${APT_OPTS[@]}" "${last[@]}"; }; then
+    for f in "${loose[@]}"; do
+      [[ -d ${f%/*} && ! -e $f ]] && cp -a -- "$backup/php/${f#/etc/php/}" "$f" 2>/dev/null
+    done
     # Put back exactly what was serving.  A unit whose package the failed
     # transaction did remove cannot start; that is reported, not hidden.
     for unit in "${was_enabled[@]}"; do

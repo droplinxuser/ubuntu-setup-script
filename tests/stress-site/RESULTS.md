@@ -7,7 +7,26 @@ manifests, sweep tables and run logs these sections cite (`AUDIT-*.md`,
 removed from the tree on 2026-11-19 to keep the repository lean; every one
 is still in git history, for example
 `git show 84b0db5:tests/stress-site/AUDIT-20261117-1.21.30.md`.  The current
-cycle report is `AUDIT-20261120-1.21.50.md`.
+cycle report is `AUDIT-20261121-1.21.55.md`.
+
+## 1.21.55 audit cycle — Xeon E-2236 (2026-11-21)
+
+Pair: `server-configs-nginx` 1.6.50.  Details: `AUDIT-20261121-1.21.55.md`.
+
+- Anubis edge route: requests the policy allows on the User-Agent alone
+  skip the Go hop.  Cached XenForo through the filter, non-browser UA
+  29.5k -> 73.2k req/s, Googlebot 31.3k -> 72.2k, WordPress 26.7k -> 59.4k;
+  browsers with a pass cookie unchanged (17.7k).
+- `--upgrade-php` / `--purge php`: 2 dpkg warnings per upgrade -> 0.
+- Zero-error cycle: install 2:12 / 0 warnings, parity 0 of 3,030 facts,
+  1,374 unit checks, 225 dry runs, security 65/65, cookie 62/62 (8.5, 8.4,
+  Anubis on), functional 0 unexpected, `--upgrade-php` 8.5 -> 8.4 -> 8.5
+  clean.  XenForo 2.3.13 is deprecation-clean on 8.4; on 8.5 one
+  `XF/App.php` deprecation shows in debug mode only.  PHP 8.6 still lacks
+  redis/igbinary/imagick.
+- Tiers unchanged from 1.21.50: WP guest 93k, XF guest 97k, Chevereto
+  cached 129k, XF member 259, WP member 169 req/s.  JIT: shipped tracing
+  profile kept.
 
 ## 1.21.50 audit cycle — Xeon E-2236 (2026-11-20)
 

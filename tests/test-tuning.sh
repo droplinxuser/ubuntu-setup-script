@@ -641,6 +641,28 @@ hosts_set_loopback_line "$hf" ""
 check "hosts: an empty line removes the entry (the original had none)" \
   not grep -q '127\.0\.1\.1' "$hf"
 
+# PHP purge (--upgrade-php, --purge php): dpkg warned "directory not empty"
+# for every conf.d holding our own fragments and for mods-available when
+# apt removed phpX.Y-common before the extensions.
+pp_body=$(sed -n '/^purge_php_installations() {/,/^}/p' "$ALL_SRC")
+check "PHP purge removes unowned conf.d fragments only after the /etc/php backup" \
+  bash -c 'b=$(grep -n "cp -a /etc/php" <<<"$1" | cut -d: -f1); r=$(grep -n "php_unowned_confd_files" <<<"$1" | cut -d: -f1); [[ -n $b && -n $r && $b -lt $r ]]' _ "$pp_body"
+check "PHP purge removes the -common packages in a second, last transaction" \
+  bash -c 'grep -qF "^php([0-9]+\.[0-9]+)?-common\$ ]]; then last+=" <<<"$1" && grep -qF "apt-get purge \"\${APT_OPTS[@]}\" \"\${last[@]}\"" <<<"$1"' _ "$pp_body"
+check "a failed PHP purge puts the removed conf.d fragments back" \
+  bash -c 'grep -qF "cp -a -- \"\$backup/php/\${f#/etc/php/}\" \"\$f\"" <<<"$1"' _ "$pp_body"
+pt=$TMP/phpconf; mkdir -p "$pt/8.5/fpm/conf.d" "$pt/8.5/cli/conf.d"
+: > "$pt/8.5/fpm/conf.d/zz-setup-optimize.ini"; : > "$pt/8.5/fpm/conf.d/10-opcache.ini"
+ln -s ../../mods-available/redis.ini "$pt/8.5/cli/conf.d/20-redis.ini"
+check "unowned conf.d fragments: regular files dpkg does not own, never the phpenmod links" \
+  test "$(
+    dpkg-query() { [[ $2 == */10-opcache.ini ]]; }
+    php_unowned_confd_files_t() { local f; for f in "$pt"/*/*/conf.d/*; do [[ -f $f && ! -L $f ]] || continue; dpkg-query -S "$f" >/dev/null 2>&1 && continue; printf '%s\n' "${f##*/}"; done; }
+    php_unowned_confd_files_t
+  )" = zz-setup-optimize.ini
+check "unowned conf.d scan uses the same rules as the test above" \
+  bash -c 'sed -n "/^php_unowned_confd_files() {/,/^}/p" "$1" | grep -qF "[[ -f \$f && ! -L \$f ]] || continue"' _ "$ALL_SRC"
+
 # Web-root hygiene: one walk of the tree (a 7.7M-file XenForo host spent
 # ~95 s in five separate walks plus a WordPress-only malware scan).
 hw=$TMP/hygiene; mkdir -p "$hw/site/public/data" "$hw/site/mysql_database" "$hw/opendir"
@@ -651,6 +673,9 @@ truncate -s 101M "$hw/site/mysql_database/db.sql"
 hw_run() {
   (
     SETUP_WWW_ROOT=$hw
+    # Never the host's /etc/angie: on a machine with Angie installed the
+    # served-root filter turned the WARNINGs below into notes.
+    HARDEN_ANGIE_DIR=${HARDEN_ANGIE_DIR:-$hw/no-angie}
     : > "$TMP/hygiene.calls"; : > "$TMP/hygiene.report"
     find() { printf 'x' >> "$TMP/hygiene.calls"; command find "$@"; }
     harden_note() { printf 'NOTE %s\n' "$*" >> "$TMP/hygiene.report"; }
@@ -4759,6 +4784,31 @@ check "the terminator never spools a response to proxy_temp" \
   grep -qx 'proxy_max_temp_file_size 0;' "$TMP/anubis/anubis-location.conf"
 check "the static shadow default server carries the backlog" \
   grep -q 'listen unix:${ANUBIS_STATIC_SOCKET} default_server backlog=$(effective_backlog);' "$ROOT/lib/anubis.sh"
+# Edge route: what the policy allows without a cookie skips the Go hop, and
+# the route is built from the same User-Agent patterns as the policy.
+check "the terminator proxies to the edge route, not always to Anubis" \
+  grep -qx 'proxy_pass http://\$anubis_route;' "$TMP/anubis/anubis-location.conf"
+check "the edge route sends allowed crawlers straight to the backend" \
+  grep -qxF "    \"~*(?:${ANUBIS_GOOD_UA_RE})\" anubis_backend;" "$TMP/anubis/anubis-common.conf"
+check "the edge route leaves AI crawlers to Anubis (DENY)" \
+  grep -qxF "    \"~*(?:${ANUBIS_AI_UA_RE})\"   anubis;" "$TMP/anubis/anubis-common.conf"
+check "the edge route leaves browsers and an empty User-Agent to Anubis" \
+  bash -c 'grep -qxF "    \"~Mozilla\"                   anubis;" "$1" && grep -qxF "    \"\"                           anubis;" "$1"' _ "$TMP/anubis/anubis-common.conf"
+check "the edge route keeps the default-allow of the policy" \
+  grep -qxF '    default                      anubis_backend;' "$TMP/anubis/anubis-common.conf"
+check "Anubis endpoints always reach Anubis" \
+  grep -qxF '    "~^/\.within\.website/"    anubis;' "$TMP/anubis/anubis-common.conf"
+check "the good-crawler rule precedes the AI rule in the edge route (policy order)" \
+  test "$(grep -n 'anubis_backend;$' "$TMP/anubis/anubis-common.conf" | sed -n 2p | cut -d: -f1)" -lt \
+       "$(grep -n '~\*(?:GPTBot' "$TMP/anubis/anubis-common.conf" | cut -d: -f1)"
+ANUBIS_POLICY="$TMP/anubis/botPolicies.yaml"
+anubis_write_policy >/dev/null 2>&1 || true
+check "the policy uses the same crawler patterns as the edge route" \
+  bash -c 'grep -qxF "    user_agent_regex: (?i)($2)" "$1" && grep -qxF "    user_agent_regex: (?i)($3)" "$1"' \
+  _ "$TMP/anubis/botPolicies.yaml" "$ANUBIS_GOOD_UA_RE" "$ANUBIS_AI_UA_RE"
+check "the policy still ends with the browser challenge" \
+  bash -c 'tail -n 3 "$1" | grep -qx "    user_agent_regex: Mozilla"' _ "$TMP/anubis/botPolicies.yaml"
+ANUBIS_POLICY=/etc/anubis/botPolicies.yaml
 ANUBIS_COMMON=/etc/angie/conf.d/00-anubis-common.conf
 
 # The backend socket is created 0777, so the directory is the access control.
