@@ -710,6 +710,7 @@ mariadb_io_capacity() {
 MARIADB_PROFILE_BUFFER=""
 MARIADB_PROFILE_LOG_SIZE=""
 MARIADB_PROFILE_LOG_BUFFER=""
+MARIADB_PROFILE_BUFFER_MAX=""
 MARIADB_PROFILE_OPEN_CACHE=""
 MARIADB_PROFILE_ARIA_MB=""
 MARIADB_PROFILE_THREADS=""
@@ -786,12 +787,15 @@ mariadb_compute_profile() {
   # innodb_log_buffer_size is not dynamic.  Sized from RAM (RAM/256,
   # 16..64 MB) it stays put when --optimize grows the pool online; it used to
   # be pool/16, so every resize of a 256 MB-1 GB pool forced a full restart.
-  # innodb_log_file_size must be at least the buffer, so a small pool's 25%
-  # redo log caps it (a 128 MB pool: 32 MB log, buffer <= 32 MB).
+  # innodb_log_file_size must be at least the buffer, so a small pool's
+  # redo log is lifted to the buffer instead of the buffer being capped by
+  # it: capping made the buffer follow the pool again, and since 1.21.49
+  # shrinks pools to data+5%, a 4 GB -> 128 MB shrink would have forced a
+  # full restart instead of an online resize.
   local log_buffer=$(( ram_mb / 256 ))
   (( log_buffer < 16 )) && log_buffer=16
   (( log_buffer > 64 )) && log_buffer=64
-  (( log_buffer > logsize )) && log_buffer=$logsize
+  (( logsize < log_buffer )) && logsize=$log_buffer
   # Aria serves internal temporary tables, not the InnoDB data: size its
   # page cache from RAM (RAM/128, 16..256 MB) so it stops changing, and
   # forcing a restart, every time the buffer pool is re-planned.
@@ -877,6 +881,15 @@ mariadb_compute_profile() {
   MARIADB_PROFILE_BUFFER=$(mb_to_config "$size_mb")
   MARIADB_PROFILE_LOG_SIZE=$(mb_to_config "$logsize")
   MARIADB_PROFILE_LOG_BUFFER=$(mb_to_config "$log_buffer")
+  # innodb_buffer_pool_size_max (10.11.12+, 11.4.6+, 11.8): the ceiling an
+  # online resize may reach.  It defaults to the pool at startup, so after
+  # any restart of a pool sized to data+5% the next growth step was clamped
+  # and fell back to a full restart.  80% of RAM (the plan's own ceiling)
+  # reserves address space only, not memory.  Written as loose- so a release
+  # without the variable ignores it instead of refusing to start.
+  local pool_max=$(( ram_mb * 80 / 100 ))
+  (( pool_max < size_mb )) && pool_max=$size_mb
+  MARIADB_PROFILE_BUFFER_MAX=$(mb_to_config "$pool_max")
   MARIADB_PROFILE_OPEN_CACHE=$open_cache
   MARIADB_PROFILE_ARIA_MB=$aria_mb
   MARIADB_PROFILE_THREADS=$threads
@@ -938,6 +951,7 @@ net_write_timeout = 120
 innodb_log_buffer_size = ${MARIADB_PROFILE_LOG_BUFFER}
 innodb_log_file_size = ${MARIADB_PROFILE_LOG_SIZE}
 innodb_buffer_pool_size = ${MARIADB_PROFILE_BUFFER}
+loose-innodb_buffer_pool_size_max = ${MARIADB_PROFILE_BUFFER_MAX}
 innodb_buffer_pool_dump_at_shutdown = ON
 innodb_buffer_pool_load_at_startup = ON
 innodb_buffer_pool_dump_pct = 25

@@ -1747,29 +1747,40 @@ check "live pool for a 40 GB database is capped at half of RAM" \
 check "40 GB database pool stays proportional, not data-sized" \
   test "$OPT_DB_SIZE_MB" -eq 40960 -a "$OPT_MARIADB_BUDGET_MB" -eq 32768
 
-# A pool already above the data+5% target is kept: --optimize only increases.
+# A pool far above the data+5% target is shrunk to it (online, no restart):
+# the RAM it held beyond the data was booked for nothing.
 mem_total_mb() { printf '262144'; }
 mariadb_current_pool_mb() { printf '100000'; }
 mariadb_data_size_mb() { printf '73599'; }
 elasticsearch_data_size_mb() { printf '0'; }
 OPT_DETECTED=(angie php:8.4 mariadb valkey)
 plan_memory_budget
-check "large host keeps the live pool (the data+5% target is lower)" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 100000
-check "an only-increased pool is marked as preserved" \
-  test "$OPT_MARIADB_KEPT_MB" -eq 100000
+check "a live pool far above data+5% shrinks to it (73599 MB + 5% = 77278 MB)" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 77278
+check "a shrunk pool is not marked as preserved" \
+  test "$OPT_MARIADB_KEPT_MB" -eq 0
 check "data-sized pool keeps the plan inside the 80% budget" \
   test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB + OPT_ES_DIRECT_BOOKED_MB + OPT_HUGEPAGES_MB )) \
        -le $(( 262144 * 80 / 100 ))
 
-# Re-running with a lower target must not shrink a live pool.
-mariadb_current_pool_mb() { printf '110000'; }
+# A pool within one 5% step plus one 128 MB chunk of the target is kept, so
+# a few MB of data growth does not resize the pool on every run.
+mariadb_current_pool_mb() { printf '81000'; }
 plan_memory_budget
-check "a live pool above the data+5% target is kept unchanged" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 110000
+check "a live pool inside the keep band (81000 <= 77278 + 3863 + 128) is kept" \
+  test "$OPT_MARIADB_BUDGET_MB:$OPT_MARIADB_KEPT_MB" = 81000:81000
+mariadb_current_pool_mb() { printf '81300'; }
+plan_memory_budget
+check "a live pool just above the keep band shrinks to data+5%" \
+  test "$OPT_MARIADB_BUDGET_MB:$OPT_MARIADB_KEPT_MB" = 77278:0
+mariadb_current_chunk_mb() { printf '1024'; }
+plan_memory_budget
+check "a 1 GB live chunk widens the keep band (81300 MB is kept, no resize every run)" \
+  test "$OPT_MARIADB_BUDGET_MB:$OPT_MARIADB_KEPT_MB" = 81300:81300
+mariadb_current_chunk_mb() { printf '0'; }
 
-# A live pool that no longer fits the shared budget is still capped: the
-# 80%-of-RAM plan is the hard ceiling, not the target.
+# A live pool far above the plan is reduced (here by the data+5% rule; the
+# 80%-of-RAM plan stays the hard ceiling either way).
 mariadb_current_pool_mb() { printf '250000'; }
 plan_memory_budget
 check "pool above the shared budget is capped" \
@@ -2702,12 +2713,36 @@ mariadb_compute_profile 512; lb_512=$MARIADB_PROFILE_LOG_BUFFER
 mariadb_compute_profile 1024
 check "the log buffer does not follow a 512 MB -> 1 GB pool resize" \
   test "$lb_512" = "$MARIADB_PROFILE_LOG_BUFFER"
-# innodb_log_file_size must be at least innodb_log_buffer_size.  A pool small
-# enough for the 4%-of-data rule (128 MB) still gets a legal pair: a 32 MB
-# log (exactly 25%) and a buffer no larger than it.
+# innodb_log_file_size must be at least innodb_log_buffer_size.  A small pool
+# (128 MB, the data+5% minimum) lifts its redo log to the buffer instead of
+# capping the buffer, so shrinking a 4 GB pool to 128 MB keeps the
+# non-dynamic buffer and stays an online resize.
+# A 64 GB host (64 MB buffer) is where the old cap bit: 128 MB / 4 = 32 MB
+# redo log would have cut the buffer to 32 MB and forced a restart.
+mem_total_mb() { printf '65536'; }
+mariadb_compute_profile 4096; lb_4g=$MARIADB_PROFILE_LOG_BUFFER
 mariadb_compute_profile 128
-check "a 128 MB pool gets a 32 MB redo log (25%)" \
+check "64 GB host: the 64 MB log buffer does not follow a 4 GB -> 128 MB shrink" \
+  test "$lb_4g:$MARIADB_PROFILE_LOG_BUFFER" = 64M:64M
+check "64 GB host: a 128 MB pool's redo log is lifted to the 64 MB buffer" \
+  test "$MARIADB_PROFILE_LOG_SIZE" = 64M
+mem_total_mb() { printf '1024'; }
+mariadb_compute_profile 128
+check "1 GB host: a 128 MB pool keeps its 25% (32 MB) redo log" \
   test "$MARIADB_PROFILE_LOG_SIZE" = 32M
+# The online ceiling: 80% of RAM, written as loose- (older 10.11 lacks it),
+# and ignored when deciding whether a restart is needed.
+check "innodb_buffer_pool_size_max is 80% of RAM, never below the pool" \
+  test "$(size_to_mb "$MARIADB_PROFILE_BUFFER_MAX")" -eq "$(( $(mem_total_mb) * 80 / 100 > 128 ? $(mem_total_mb) * 80 / 100 : 128 ))"
+check "the pool ceiling is written as a loose- option" \
+  grep -q '^loose-innodb_buffer_pool_size_max = ' "$ROOT/lib/services.sh"
+cnf_a=$(mktemp); cnf_b=$(mktemp)
+printf 'innodb_buffer_pool_size = 4011M\nthread_pool_size = 8\n' > "$cnf_a"
+printf 'innodb_buffer_pool_size = 128M\nloose-innodb_buffer_pool_size_max = 51349M\nthread_pool_size = 8\n' > "$cnf_b"
+check "adding the pool ceiling alone does not force a restart" cnf_only_pool_changed "$cnf_a" "$cnf_b"
+printf 'innodb_buffer_pool_size = 128M\nloose-innodb_buffer_pool_size_max = 51349M\nthread_pool_size = 9\ninnodb_log_buffer_size = 32M\n' > "$cnf_b"
+check "a non-dynamic key still forces the restart path" not cnf_only_pool_changed "$cnf_a" "$cnf_b"
+rm -f "$cnf_a" "$cnf_b"
 check "redo log is never smaller than the log buffer" \
   test "$(size_to_mb "$MARIADB_PROFILE_LOG_SIZE")" -ge "$(size_to_mb "$MARIADB_PROFILE_LOG_BUFFER")"
 mariadb_compute_profile 2048
@@ -2794,6 +2829,8 @@ mariadb_data_size_mb() { return 0; }
 mariadb_current_pool_mb() { return 0; }
 elasticsearch_data_size_mb() { return 0; }
 elasticsearch_current_heap_mb() { return 0; }
+eval "$(declare -f pkg_ok | sed '1s/^pkg_ok/pkg_ok_saved/')"
+pkg_ok() { return 1; }
 OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
 OPT_INSTALL_PLAN=1
 plan_memory_budget
@@ -2807,11 +2844,27 @@ check "fresh install keeps the empty-database floor" \
 check "fresh install full-stack plan stays inside the 80% budget" \
   test $(( OPT_PHP_BUDGET_MB + OPT_MARIADB_BUDGET_MB + OPT_VALKEY_BUDGET_MB + OPT_ES_BUDGET_MB + OPT_ES_DIRECT_BOOKED_MB + OPT_HUGEPAGES_MB )) \
        -le $(( 27812 * 80 / 100 ))
+# An installer re-run on a host where MariaDB is installed measures the
+# (empty) database like --optimize does: both plan 128 MB, so neither path
+# reverses the other (RAM/16 vs 128 MB on every alternate run).
+pkg_ok() { [[ $1 == mariadb-server ]]; }
+mariadb_data_size_mb() { printf '0'; }
+OPT_INSTALL_PLAN=1
+plan_memory_budget
+OPT_INSTALL_PLAN=0
+check "installer re-run on an installed empty database plans 128 MB, like --optimize" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 128
+plan_memory_budget
+check "--optimize on the same empty database plans the same 128 MB" \
+  test "$OPT_MARIADB_BUDGET_MB" -eq 128
+# From here on the planner must not depend on whether the machine running
+# the suite has MariaDB installed: report it absent, delegate the rest.
+pkg_ok() { [[ $1 == mariadb-server ]] && return 1; pkg_ok_saved "$@"; }
+mariadb_data_size_mb() { return 0; }
 
 # A database that has just been initialised reports a few MB of system data.
 # data+5% is below the operational minimum, so a live database with no
-# real rows gets 128 MB; the only-increase rule keeps the installer's larger
-# pool when one is already running.
+# real rows gets 128 MB.
 mariadb_data_size_mb() { printf '4'; }
 OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
 OPT_INSTALL_PLAN=0
@@ -2822,9 +2875,8 @@ check "measured-empty live database uses the 128 MB minimum" \
 # ---------------------------------------------------------------------------
 # Live-data protection
 # ---------------------------------------------------------------------------
-# A live MariaDB pool is only ever increased: a pool above the data+5% target
-# is kept (shrinking would restart the server and empty the warm cache), while
-# an Elasticsearch heap above store/4 is still reduced to free RAM.
+# A live MariaDB pool far above the data+5% target is shrunk to it (online),
+# and an Elasticsearch heap above store/4 is reduced to free RAM.
 valkey_live_used_mb() { return 0; }
 mariadb_data_size_mb() { printf '2048'; }
 mariadb_current_pool_mb() { printf '4096'; }
@@ -2833,8 +2885,8 @@ elasticsearch_current_heap_mb() { printf '4096'; }
 OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
 OPT_INSTALL_PLAN=0
 plan_memory_budget
-check "live MariaDB pool above the data+5% target is kept" \
-  test "$OPT_MARIADB_KEPT_MB" -eq 4096 -a "$OPT_MARIADB_BUDGET_MB" -eq 4096
+check "live MariaDB pool far above the data+5% target is shrunk" \
+  test "$OPT_MARIADB_KEPT_MB" -eq 0 -a "$OPT_MARIADB_BUDGET_MB" -le 2150
 check "live Elasticsearch heap is reduced to the store/4 minimum" \
   test "$OPT_ES_KEPT_MB" -eq 0 -a "$OPT_ES_BUDGET_MB" -eq 512
 
@@ -3790,7 +3842,8 @@ check "the plan helper returns the explicit worker count" \
 # ---------------------------------------------------------------------------
 # Valkey maxmemory: a full cache keeps its size, the guard never ratchets
 # ---------------------------------------------------------------------------
-# Arguments: planned, used, current maxmemory, hard cap, evicting policy.
+# Arguments: planned, used, current maxmemory, hard cap, evicting policy
+# (allkeys-*), optional keep band.
 check "cache guard: the plan stands when live data has its 20% headroom" \
   test "$(valkey_guard_maxmemory_mb 434 100 434 22249 1)" = "434 plan"
 check "cache guard: a full evicting cache keeps its current maxmemory" \
@@ -3799,8 +3852,8 @@ check "cache guard: used_memory slightly above maxmemory still counts as full" \
   test "$(valkey_guard_maxmemory_mb 434 520 512 22249 1)" = "512 full"
 check "cache guard: a full cache below the plan takes the plan, not used+20%" \
   test "$(valkey_guard_maxmemory_mb 434 400 400 22249 1)" = "434 plan"
-check "cache guard: noeviction data is never dropped (used+20%)" \
-  test "$(valkey_guard_maxmemory_mb 434 512 512 22249 0)" = "512 full"
+check "cache guard: a full noeviction cache follows its data (keys cannot be evicted)" \
+  test "$(valkey_guard_maxmemory_mb 434 512 512 22249 0)" = "614 raised"
 check "cache guard: noeviction data above maxmemory still gets headroom" \
   test "$(valkey_guard_maxmemory_mb 434 600 512 22249 0)" = "720 raised"
 check "cache guard: data above the current maxmemory is given headroom" \
@@ -3815,6 +3868,24 @@ check "cache guard: a maxmemory above the hard cap is not kept" \
   test "$(valkey_guard_maxmemory_mb 434 30000 30000 22249 1)" = "22249 capped"
 check "cache guard: a scaled-down share never evicts a full cache" \
   test "$(valkey_guard_maxmemory_mb 300 1000 1000 1638 1)" = "1000 full"
+check "cache guard: a maxmemory up to 10% above data+20% is kept (no drift rewrite)" \
+  test "$(valkey_guard_maxmemory_mb 128 500 640 22249 1)" = "640 raised"
+check "cache guard: a maxmemory up to 10% above the 128 MB minimum is kept" \
+  test "$(valkey_guard_maxmemory_mb 128 10 140 22249 1)" = "140 plan"
+check "cache guard: just above the keep band shrinks to data+20%" \
+  test "$(valkey_guard_maxmemory_mb 128 500 661 22249 1)" = "600 raised"
+check "cache guard: the scaled second pass (band off) never keeps a larger current" \
+  test "$(valkey_guard_maxmemory_mb 128 500 640 22249 1 0)" = "600 raised"
+check "cache guard: an evicting cache at 83%+ of maxmemory is full: kept, never raised" \
+  test "$(valkey_guard_maxmemory_mb 128 115 128 22249 1)" = "128 full"
+check "cache guard: noeviction growth past data+10% headroom is raised to data+20%" \
+  test "$(valkey_guard_maxmemory_mb 128 120 128 22249 0)" = "144 raised"
+check "cache guard: noeviction drift with 10%+ headroom left is not rewritten" \
+  test "$(valkey_guard_maxmemory_mb 128 540 600 22249 0)" = "600 raised"
+check "cache guard: an evicting cache sampled at 90% is not ratcheted up" \
+  test "$(valkey_guard_maxmemory_mb 128 460 512 22249 1)" = "512 full"
+check "cache guard: a cache at 98% of maxmemory is full" \
+  test "$(valkey_guard_maxmemory_mb 128 490 500 22249 1)" = "500 full"
 # Feeding the result back in must not move it: that is the "second run
 # changes nothing" property (the old code grew 512 -> 614 -> 737 ...).
 guard_stable() {
@@ -3824,7 +3895,7 @@ guard_stable() {
   [[ ${second%% *} == "${first%% *}" ]]
 }
 check "cache guard: a second pass keeps a full cache's size" guard_stable 434 512 512 22249 1
-check "cache guard: a second pass keeps a full noeviction cache's size" guard_stable 434 512 512 22249 0
+check "cache guard: a second pass keeps a noeviction cache's data+20%" guard_stable 434 512 512 22249 0
 check "cache guard: a second pass keeps a raised size" guard_stable 434 3000 0 22249 1
 check "cache guard: a second pass keeps a capped size" guard_stable 434 30000 0 22249 0
 
@@ -3851,6 +3922,8 @@ elasticsearch_current_heap_mb() { printf '0'; }
 valkey_data_size_mb() { printf '0'; }
 valkey_live_used_mb() { printf '512'; }
 valkey_current_maxmemory_mb() { printf '512'; }
+valkey_live_uptime_s() { printf '86400'; }
+valkey_live_peak_mb() { printf '0'; }
 valkey_policy_evicts() { printf '1'; }
 OPT_DETECTED=(angie php:8.4 mariadb valkey elastic)
 OPT_INSTALL_PLAN=0
@@ -3862,14 +3935,73 @@ check "plan: a second run changes nothing" test "$OPT_VALKEY_BUDGET_MB" -eq 512
 
 valkey_policy_evicts() { printf '0'; }
 plan_memory_budget
-check "plan: a full noeviction cache keeps 512 MB instead of creeping to 614" \
-  test "$OPT_VALKEY_BUDGET_MB" -eq 512 -a "$OPT_VALKEY_GUARD" = full
+check "plan: a full noeviction cache follows its data (512 -> 614 MB)" \
+  test "$OPT_VALKEY_BUDGET_MB" -eq 614
 valkey_policy_evicts() { printf '1'; }
 
 valkey_live_used_mb() { printf '100'; }
 plan_memory_budget
-check "plan: a mostly empty cache gets the RAM floor" \
-  test "$OPT_VALKEY_BUDGET_MB" -eq 434 -a "$OPT_VALKEY_GUARD" = plan
+check "plan: a mostly empty cache shrinks to data+20% (128 MB minimum), not the RAM floor" \
+  test "$OPT_VALKEY_BUDGET_MB" -eq 128 -a "$OPT_VALKEY_GUARD" = shrunk
+valkey_live_used_mb() { printf '400'; }
+valkey_current_maxmemory_mb() { printf '900'; }
+plan_memory_budget
+check "plan: a half-empty 900 MB cache shrinks to 400 MB + 20% = 480 MB" \
+  test "$OPT_VALKEY_BUDGET_MB:$OPT_VALKEY_GUARD:$OPT_VALKEY_PREV_MB" = 480:shrunk:900
+valkey_live_uptime_s() { printf '600'; }
+plan_memory_budget
+check "plan: a cache restarted 10 minutes ago keeps its 900 MB (cold, not small)" \
+  test "$OPT_VALKEY_BUDGET_MB" -eq 900
+valkey_live_uptime_s() { printf '86400'; }
+valkey_live_used_mb() { return 1; }
+plan_memory_budget
+check "plan: a stopped cache keeps its configured 900 MB (no RAM-floor flip)" \
+  test "$OPT_VALKEY_BUDGET_MB" -eq 900
+valkey_data_size_mb() { printf '1000'; }
+plan_memory_budget
+check "plan: a stopped cache whose snapshot needs more is raised (1000 MB + 20%)" \
+  test "$OPT_VALKEY_BUDGET_MB" -eq 1200
+valkey_data_size_mb() { printf '0'; }
+# After a shrink to data+20%, a noeviction cache follows its growth; an
+# evicting one fills its size and is kept (no ratchet).
+valkey_live_used_mb() { printf '460'; }
+valkey_current_maxmemory_mb() { printf '480'; }
+plan_memory_budget
+check "plan: an evicting cache refilled to 96% keeps its 480 MB" \
+  test "$OPT_VALKEY_BUDGET_MB:$OPT_VALKEY_GUARD" = 480:full
+valkey_policy_evicts() { printf '0'; }
+plan_memory_budget
+check "plan: a noeviction cache sized to data+20% follows growth (460 MB -> 552 MB)" \
+  test "$OPT_VALKEY_BUDGET_MB" -eq 552
+valkey_policy_evicts() { printf '1'; }
+# The peak since start is the data: a quiet-hour sample does not cut a cache
+# below its busy-hour need.
+valkey_live_used_mb() { printf '100'; }
+valkey_live_peak_mb() { printf '400'; }
+valkey_current_maxmemory_mb() { printf '900'; }
+plan_memory_budget
+check "plan: data is the peak (400 MB), so 900 MB shrinks to 480 MB, not 128" \
+  test "$OPT_VALKEY_BUDGET_MB" -eq 480
+valkey_live_peak_mb() { printf '0'; }
+valkey_live_used_mb() { printf '400'; }
+valkey_current_maxmemory_mb() { printf '520'; }
+plan_memory_budget
+check "plan: 520 MB is inside the keep band (480 + 10%) and stays" \
+  test "$OPT_VALKEY_BUDGET_MB" -eq 520
+valkey_live_used_mb() { printf '0'; }
+valkey_current_maxmemory_mb() { printf '0'; }
+plan_memory_budget
+check "plan: a running but empty cache gets the 128 MB minimum" \
+  test "$OPT_VALKEY_BUDGET_MB" -eq 128
+valkey_live_uptime_s() { printf '600'; }
+plan_memory_budget
+check "plan: a just-restarted cache with no maxmemory gets the RAM floor, not 128 MB" \
+  test "$OPT_VALKEY_BUDGET_MB" -eq 434
+valkey_live_uptime_s() { printf '86400'; }
+valkey_live_used_mb() { return 1; }
+plan_memory_budget
+check "plan: a cache with nothing to measure keeps the RAM floor" \
+  test "$OPT_VALKEY_BUDGET_MB" -eq 434
 
 # An explicit --valkey ram= is never touched by the live-data guard.
 valkey_live_used_mb() { printf '5000'; }
@@ -5014,23 +5146,31 @@ elasticsearch_current_heap_mb() { printf '1536'; }
 plan_memory_budget
 check "8 GB host: the next --optimize writes the same plan" test "$(plan_snapshot)" = "$mid_first"
 
-# (e) A kept pool above its data target that no longer fits gives up its
-#     surplus first, so one run settles the value (5000 -> 3260, not
-#     5000 -> 3533 -> 3260).
+# (e) A pool far above its data target is shrunk to the target and then
+#     scaled with the others in one run (5000 -> 3260, not via 3533).
 mariadb_current_pool_mb() { printf '5000'; }
 elasticsearch_current_heap_mb() { printf '0'; }
 plan_memory_budget
-check "kept 5000 MB pool settles at 3260 MB in one run" \
+check "a 5000 MB pool settles at 3260 MB in one run" \
   test "$OPT_MARIADB_BUDGET_MB:$OPT_MARIADB_KEPT_MB" = 3260:0
 elasticsearch_data_size_mb() { printf '0'; }
 mariadb_current_pool_mb() { printf '5500'; }
 plan_memory_budget
-check "kept 5500 MB pool gives up only what does not fit (4937 MB)" \
-  test "$OPT_MARIADB_BUDGET_MB" -eq 4937
-mariadb_current_pool_mb() { printf '4937'; }
+check "a 5500 MB pool for 4000 MB of data shrinks to its target (data+5%, capped at half of RAM: 4096 MB)" \
+  test "$OPT_MARIADB_BUDGET_MB:$OPT_MARIADB_KEPT_MB" = 4096:0
+mariadb_current_pool_mb() { printf '4300'; }
 plan_memory_budget
-check "the trimmed pool is kept by the next run" \
-  test "$OPT_MARIADB_BUDGET_MB:$OPT_MARIADB_KEPT_MB" = 4937:4937
+check "a 4300 MB pool above the 4096 MB RAM cap is not kept by the band" \
+  test "$OPT_MARIADB_BUDGET_MB:$OPT_MARIADB_KEPT_MB" = 4096:0
+mariadb_data_size_mb() { printf '3000'; }
+mariadb_current_pool_mb() { printf '3400'; }
+plan_memory_budget
+check "a 3400 MB pool inside the keep band (3150 + 157 + 128) is kept" \
+  test "$OPT_MARIADB_BUDGET_MB:$OPT_MARIADB_KEPT_MB" = 3400:3400
+plan_memory_budget
+check "the kept pool is kept by the next run" \
+  test "$OPT_MARIADB_BUDGET_MB:$OPT_MARIADB_KEPT_MB" = 3400:3400
+mariadb_data_size_mb() { printf '4000'; }
 
 # (f) Install/--optimize parity: the install plan sees PHP through ENABLED,
 #     --optimize through /etc/php; both book the same pages and direct share.
@@ -5844,8 +5984,9 @@ check "ES credit: only the unbooked direct share is counted (heap 512, credit 40
   test "$(es_direct_credit_used_mb 512 0 0 400)" = 256
 check "ES credit: never more than the credit" test "$(es_direct_credit_used_mb 2048 0 0 400)" = 400
 check "ES credit: fully booked direct uses none of it" test "$(es_direct_credit_used_mb 2048 0 1024 400)" = 0
-# Hysteresis: 10% growth room to switch on, the index alone to stay on.
-check "ES preload: off, 9500 of 10000 free is not switched on (needs +10%)" not es_preload_fits 9500 10000 0
+# Hysteresis: 5% growth room to switch on, the index alone to stay on.
+check "ES preload: off, 9600 of 10000 free is not switched on (needs +5%)" not es_preload_fits 9600 10000 0
+check "ES preload: off, 9500 of 10000 free is switched on (+5% fits)" es_preload_fits 9500 10000 0
 check "ES preload: on, 9500 of 10000 free stays on (no restart flip)" es_preload_fits 9500 10000 1
 check "ES preload: off, 9000 of 10000 free is switched on" es_preload_fits 9000 10000 0
 check "ES preload: on, 10001 of 10000 free is switched off" not es_preload_fits 10001 10000 1

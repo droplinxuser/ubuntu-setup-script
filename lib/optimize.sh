@@ -206,8 +206,12 @@ OPT_PHP_BUDGET_MB=0
 OPT_PHP_CHILDREN=0
 OPT_MARIADB_BUDGET_MB=0
 OPT_MARIADB_KEPT_MB=0
+# The pool live before this run (0 = unknown); the report names a shrink.
+OPT_MARIADB_LIVE_MB=0
 OPT_VALKEY_BUDGET_MB=0
 OPT_VALKEY_LIVE_MB=0
+# maxmemory in force before this run when the plan lowers it (else 0).
+OPT_VALKEY_PREV_MB=0
 # Why the plan chose the cache size (valkey_guard_maxmemory_mb): plan, live,
 # full, raised, capped or explicit.  Read by the report and the dry run.
 OPT_VALKEY_GUARD=""
@@ -230,8 +234,8 @@ OPT_ES_CACHE_FREE_MB=0
 OPT_ES_PRELOAD=0
 
 # Preload decision with hysteresis: STORE MB of index, FREE MB of RAM left,
-# ON=1 when the managed block preloads already.  Switching on needs 10%
-# growth room; staying on only needs the index itself to fit.
+# ON=1 when the managed block preloads already.  Switching on needs 5%
+# growth room (the same data+5% rule as MariaDB); staying on only needs the index itself to fit.
 es_direct_credit_used_mb() {
   # The part of the sub-4 GB direct-memory credit the ceiling really uses:
   # direct (operator value, else heap/2) minus what is booked, within the
@@ -250,7 +254,7 @@ es_preload_fits() {
   if (( on )); then
     (( store <= free ))
   else
-    (( store + store / 10 <= free ))
+    (( store + store / 20 <= free ))
   fi
 }
 OPT_HUGEPAGES_MB=0
@@ -333,6 +337,16 @@ mariadb_current_pool_mb() {
   local bytes
   command -v mariadb >/dev/null 2>&1 || return 0
   bytes=$(mariadb -N -B -e 'SELECT @@innodb_buffer_pool_size' 2>/dev/null || true)
+  [[ $bytes =~ ^[0-9]+$ ]] || return 0
+  printf '%s' $(( bytes / 1024 / 1024 ))
+}
+
+# innodb_buffer_pool_chunk_size in MB: an online resize rounds the pool up
+# to whole chunks.  0 or unknown (10.11.12+ and 11.8 have no chunks) -> 0.
+mariadb_current_chunk_mb() {
+  local bytes
+  command -v mariadb >/dev/null 2>&1 || return 0
+  bytes=$(mariadb -N -B -e 'SELECT @@innodb_buffer_pool_chunk_size' 2>/dev/null || true)
   [[ $bytes =~ ^[0-9]+$ ]] || return 0
   printf '%s' $(( bytes / 1024 / 1024 ))
 }
@@ -531,8 +545,8 @@ plan_memory_budget() {
   local maria_target=0 valkey_target=0 es_target=0
   local maria_alloc=0 valkey_alloc=0 es_alloc=0
   local maria_fixed=0 valkey_fixed=0 es_fixed=0
-  local data="" current_pool=0 kept_pool=0
-  local cache_used="" cache_current=0 cache_evicts=1 cache_cap=0 cache_plan=""
+  local data="" current_pool=0 kept_pool=0 maria_capped=0
+  local cache_used="" cache_current=0 cache_evicts=1 cache_cap=0 cache_plan="" cache_keep_mb=0
   local es_store="" es_kept=0 current_heap=0
   local remaining data_pool targets_sum alloc_total excess dec
   local explicit=""
@@ -550,8 +564,8 @@ plan_memory_budget() {
   OPT_HUGEPAGES_MB=0
   # Memory pinned outside every service setting.  OPcache huge pages are
   # reserved at boot inside MemTotal, never swapped and not in worker RSS,
-  # so they come off the services' share; OPT_MEM_BUDGET_MB, the cache cap
-  # and the only-increase rules keep the plain 80% figure.
+  # so they come off the services' share; OPT_MEM_BUDGET_MB and the cache
+  # cap keep the plain 80% figure.
   hp_mb=$(hugepages_reserved_mb "$total")
   [[ $hp_mb =~ ^[0-9]+$ ]] || hp_mb=0
   OPT_HUGEPAGES_MB=$hp_mb
@@ -569,8 +583,10 @@ plan_memory_budget() {
   OPT_PHP_CHILDREN=0
   OPT_MARIADB_BUDGET_MB=0
   OPT_MARIADB_KEPT_MB=0
+  OPT_MARIADB_LIVE_MB=0
   OPT_VALKEY_BUDGET_MB=0
   OPT_VALKEY_LIVE_MB=0
+  OPT_VALKEY_PREV_MB=0
   OPT_VALKEY_GUARD=""
   OPT_ES_BUDGET_MB=0
   OPT_ES_KEPT_MB=0
@@ -618,9 +634,9 @@ plan_memory_budget() {
     (( php_floor > svc_usable / 2 )) && php_floor=$(( svc_usable / 2 ))
   fi
 
-  # MariaDB target: live data+index plus at most 20% headroom.  Nothing is
-  # added for an empty database beyond a small operational minimum, so spare
-  # RAM is not wasted on an idle buffer pool.
+  # MariaDB target: live data+index plus 5%.  Nothing is added for an empty
+  # database beyond a small operational minimum, so spare RAM is not wasted
+  # on an idle buffer pool.
   if (( has_maria )); then
     explicit=$(explicit_option mariadb_size_mb 2>/dev/null || true)
     if [[ $explicit =~ ^[0-9]+$ ]] && (( explicit >= 128 )); then
@@ -630,7 +646,12 @@ plan_memory_budget() {
       data=""
       # A service that is not installed yet has nothing to measure; the
       # directory fallback would count a previous installation's files.
+      # An installed one is measured on the install path too, so a re-run
+      # of the installer and --optimize plan the same pool for the same data
+      # (an empty database: 128 MB on both, not RAM/16 on one of them).
+      local maria_measured=0
       if (( ! OPT_INSTALL_PLAN )) || pkg_ok mariadb-server; then
+        maria_measured=1
         data=$(mariadb_data_size_mb)
         [[ $data =~ ^[0-9]+$ ]] || data=$(mariadb_data_dir_size_mb)
       fi
@@ -648,8 +669,7 @@ plan_memory_budget() {
       # page cache keep room.  The scaling below trims it proportionally when
       # the targets do not fit.  A fresh install has no data at all, so it
       # keeps the RAM-proportional operational floor; an existing but empty
-      # database gets the 128 MB operational minimum, and the only-increase
-      # rule below protects a larger live pool.
+      # database gets the 128 MB operational minimum.
       if (( data > 0 )); then
         maria_target=$(( data + data / 20 ))
         local pool_cap
@@ -659,31 +679,43 @@ plan_memory_budget() {
           pool_cap=$(( total / 2 ))
         fi
         (( pool_cap < 256 )) && pool_cap=256
-        (( maria_target > pool_cap )) && maria_target=$pool_cap
+        (( maria_target > pool_cap )) && maria_target=$pool_cap maria_capped=1
         (( maria_target < 128 )) && maria_target=128
-      elif (( OPT_INSTALL_PLAN )); then
+      elif (( OPT_INSTALL_PLAN && ! maria_measured )); then
         maria_target=$(mariadb_floor_mb "$total")
       else
         maria_target=128
       fi
     fi
-    # The data/floor target before the only-increase rule (kept-pool trim).
+    # The data/floor target before the keep band (kept-pool trim).
     maria_plan_target=$maria_target
     current_pool=$(mariadb_current_pool_mb)
-    if [[ $current_pool =~ ^[0-9]+$ ]] && (( current_pool > 0 )); then
-      # Only increase: a pool that is already above the target is kept as it
-      # is.  Lowering it would restart the server and empty the buffer pool it
-      # has spent hours warming, for no memory the run needs.
-      if (( current_pool > maria_target )); then
+    [[ $current_pool =~ ^[0-9]+$ ]] && OPT_MARIADB_LIVE_MB=$current_pool
+    # A target clamped to the RAM cap has no band: the cap is the ceiling.
+    if (( ! maria_fixed && ! maria_capped )) && [[ $current_pool =~ ^[0-9]+$ ]] && (( current_pool > 0 )); then
+      # A live pool a little above the target is kept: up to one more 5% step
+      # plus one chunk (an online resize rounds the pool up to whole chunks;
+      # 128 MB, or the live chunk when larger: 10.11 before .12 sizes it
+      # pool/64 for a large startup pool, 1 GB on a 64 GB one).
+      local chunk_mb
+      chunk_mb=$(mariadb_current_chunk_mb)
+      [[ $chunk_mb =~ ^[0-9]+$ ]] && (( chunk_mb >= 128 )) || chunk_mb=128
+      # Without the band every run would resize the pool by a few MB as the
+      # data grows.  A larger pool is shrunk to data+5%: the RAM it held
+      # beyond the data was booked for nothing and squeezed PHP and the page
+      # cache.  The resize is online (SET GLOBAL), so it costs no restart.
+      if (( current_pool > maria_target \
+            && current_pool <= maria_target + maria_target / 20 + chunk_mb )); then
         maria_target=$current_pool
         kept_pool=$current_pool
       fi
     fi
   fi
 
-  # Valkey target: the RAM-proportional floor, or live used_memory plus 20%
-  # headroom when the data already stored needs more.  A cache that merely
-  # fills its current maxmemory keeps that size (valkey_guard_maxmemory_mb).
+  # Valkey target: its data (used_memory, or the peak since start) plus 20%,
+  # 128 MB minimum; see valkey_guard_maxmemory_mb for full and
+  # non-evicting caches.  The RAM-proportional floor only when no maxmemory
+  # is in force and nothing can be measured.
   if (( has_cache )); then
     explicit=$(explicit_option valkey_mb 2>/dev/null || true)
     if [[ $explicit =~ ^[0-9]+$ ]] && (( explicit >= 1 )); then
@@ -696,11 +728,28 @@ plan_memory_budget() {
       # A cache that is not installed yet has nothing to measure.  One that
       # is installed is measured on the install path too, so a re-run of
       # --valkey and the next --optimize write the same maxmemory.
+      # cache_measured: the running cache answered, so there is existing data
+      # to size from.  Its data is max(used_memory, used_memory_peak): the
+      # peak since start covers the busy hours, so a quiet-hour sample never
+      # cuts a cache below what its daily load needs.  cache_young: it
+      # started less than a day ago, so that peak has not seen a full day yet
+      # (or the cache is still refilling); it may grow but not shrink.
+      local cache_measured=0 cache_young=0 cache_uptime cache_peak
       if (( ! OPT_INSTALL_PLAN )) || [[ -n $(valkey_active_conf) ]]; then
         cache_used=$(valkey_live_used_mb 2>/dev/null || true)
         cache_current=$(valkey_current_maxmemory_mb 2>/dev/null || true)
         cache_evicts=$(valkey_policy_evicts 2>/dev/null || true)
+        if [[ $cache_used =~ ^[0-9]+$ ]]; then
+          cache_measured=1
+          cache_peak=$(valkey_live_peak_mb 2>/dev/null || true)
+          [[ $cache_peak =~ ^[0-9]+$ ]] && (( cache_peak > cache_used )) && cache_used=$cache_peak
+          cache_uptime=$(valkey_live_uptime_s 2>/dev/null || true)
+          [[ $cache_uptime =~ ^[0-9]+$ ]] && (( cache_uptime < 86400 )) && cache_young=1
+        fi
       fi
+      # A stopped cache falls back to its snapshot.  dump.rdb is compressed
+      # and smaller than the loaded data, so it may raise maxmemory (guard)
+      # but never shrinks it: the floor below keeps the current size.
       [[ $cache_used =~ ^[0-9]+$ ]] || cache_used=$(valkey_data_size_mb)
       [[ $cache_used =~ ^[0-9]+$ ]] || cache_used=0
       [[ $cache_current =~ ^[0-9]+$ ]] || cache_current=0
@@ -711,10 +760,24 @@ plan_memory_budget() {
       # The most the host can give the cache: the whole usable budget.
       cache_cap=$usable
       (( cache_cap < 256 )) && cache_cap=256
-      # A fresh install has no data at all, so the floor is RAM-proportional:
-      # it gives the cache room before the operator has to size it.
-      local floor_mb
-      floor_mb=$(valkey_floor_mb "$total")
+      # Existing data is sized as data+20% (the guard below) with a 128 MB
+      # minimum, so an idle cache no longer holds RAM/64 it does not use.
+      # A cache that cannot be measured, or started less than a day ago,
+      # keeps its current maxmemory (it may still be raised); with no
+      # maxmemory in force (nothing installed yet, or an unlimited Redis) it
+      # gets the RAM-proportional floor, which gives it room before the
+      # operator has to size it.
+      local floor_mb=128
+      if (( ! cache_measured || cache_young )); then
+        if (( cache_current > 0 )); then
+          floor_mb=$cache_current
+          (( floor_mb > cache_cap )) && floor_mb=$cache_cap
+          (( floor_mb < 128 )) && floor_mb=128
+          cache_keep_mb=$floor_mb
+        else
+          floor_mb=$(valkey_floor_mb "$total")
+        fi
+      fi
       cache_plan=$(valkey_guard_maxmemory_mb "$floor_mb" "$cache_used" "$cache_current" "$cache_cap" "$cache_evicts")
       valkey_target=${cache_plan%% *}
       OPT_VALKEY_GUARD=${cache_plan##* }
@@ -726,8 +789,9 @@ plan_memory_budget() {
     (( valkey_target < 128 )) && valkey_target=128
   fi
 
-  # Elasticsearch target: live index store plus at most 20% headroom, with a
-  # 512 MB operational minimum for an empty index; no RAM-percentage fallback.
+  # Elasticsearch heap: a quarter of the live index store, with a 512 MB
+  # operational minimum; the store itself (+5%) is reserved as page cache
+  # further down.
   if (( has_es )); then
     explicit=$(explicit_option elastic_mb 2>/dev/null || true)
     if [[ $explicit =~ ^[0-9]+$ ]] && (( explicit >= 1 )); then
@@ -800,7 +864,7 @@ plan_memory_budget() {
   (( maria_fixed ))  && fixed_sum=$(( fixed_sum + maria_target ))
   (( valkey_fixed )) && fixed_sum=$(( fixed_sum + valkey_target ))
   (( es_fixed ))     && fixed_sum=$(( fixed_sum + es_fp_target ))
-  # A kept live pool (only-increase) that no longer fits gives up its
+  # A kept live pool (keep band) that no longer fits gives up its
   # surplus over the data target first, and only as much as the plan is
   # over.  Splitting from the kept value instead lands on a pool that the
   # next run keeps and splits again (two or more restarts for one input);
@@ -878,7 +942,11 @@ plan_memory_budget() {
   # (Elasticsearch, then MariaDB); only what their floors cannot give up is
   # left for the overcommit check below.
   if (( has_cache && ! valkey_fixed && valkey_alloc < valkey_target )); then
-    cache_plan=$(valkey_guard_maxmemory_mb "$valkey_alloc" "$cache_used" "$cache_current" "$cache_cap" "$cache_evicts")
+    # A stopped or just-started cache keeps its size here too (cache_keep_mb):
+    # its reading cannot justify a cut, whatever the split took.
+    local second_floor=$valkey_alloc
+    (( cache_keep_mb > second_floor )) && second_floor=$cache_keep_mb
+    cache_plan=$(valkey_guard_maxmemory_mb "$second_floor" "$cache_used" "$cache_current" "$cache_cap" "$cache_evicts" 0)
     valkey_alloc=${cache_plan%% *}
     OPT_VALKEY_GUARD=${cache_plan##* }
     excess=$(( maria_alloc + valkey_alloc + es_alloc + es_book - data_pool ))
@@ -906,7 +974,7 @@ plan_memory_budget() {
   # data, the OS page cache does, and index.store.preload loads every file
   # into it when the index opens (after each restart and boot).  The 20%
   # outside the service budget is page cache already; above a 10% kernel/OS
-  # floor that leaves 10% of RAM.  Only the part of the index (plus 10%
+  # floor that leaves 10% of RAM.  Only the part of the index (plus 5%
   # growth room) that does not fit there comes off PHP's share, never off the
   # data services, and PHP keeps its worker floor below.
   local es_cache_room es_cache_need
@@ -914,8 +982,8 @@ plan_memory_budget() {
   OPT_ES_CACHE_FREE_MB=0
   OPT_ES_PRELOAD=0
   if (( has_es && OPT_ES_SIZE_MB > 0 )); then
-    es_cache_need=$(( OPT_ES_SIZE_MB + OPT_ES_SIZE_MB / 10 ))
-    # Below 4 GB part of that 10% is already credited to the direct-memory
+    es_cache_need=$(( OPT_ES_SIZE_MB + OPT_ES_SIZE_MB / 20 ))
+    # Below 4 GB part of the 10% OS share is already credited to the direct-memory
     # ceiling (the unbooked part of it); it must not be counted twice.
     es_cache_room=$(( total - usable - total / 10 - $(es_direct_credit_used_mb "$es_alloc" "$es_op_direct" "$es_book" "$es_credit") ))
     (( es_cache_room < 0 )) && es_cache_room=0
@@ -965,15 +1033,15 @@ plan_memory_budget() {
   # includes the booked Elasticsearch direct memory and OPcache huge pages.
   OPT_MEM_OVERCOMMIT_MB=0
   booked=$(( maria_alloc + valkey_alloc + es_alloc + es_book + php_budget + hp_mb ))
-  # Preload only when the index (plus 10% growth) fits the RAM left after
+  # Preload only when the index (plus 5% growth) fits the RAM left after
   # every booked service and the 10% kernel/OS floor; preloading an index
   # that cannot stay resident would only evict MariaDB's and PHP's pages.
-  # Hysteresis: switching preload on needs the 10% growth room, staying on
+  # Hysteresis: switching preload on needs the 5% growth room, staying on
   # only needs the index itself to fit, so a store hovering at the edge does
   # not flip the static setting (an Elasticsearch restart) on every run.
   # PHP is counted at the 64 MB-per-worker floor here, not at the live
   # allowance: the allowance swings between cold and warm pools (64-192 MB
-  # per worker), far more than the 10% band, and page cache is reclaimable,
+  # per worker), far more than the 5% band, and page cache is reclaimable,
   # so an optimistic PHP figure costs a few cache misses, not an OOM.
   if (( OPT_ES_CACHE_MB > 0 )); then
     local php_floor_mb=$(( (children > php_explicit_children ? children : php_explicit_children) * 64 ))
@@ -993,6 +1061,14 @@ plan_memory_budget() {
   OPT_MARIADB_BUDGET_MB=$maria_alloc
   OPT_MARIADB_KEPT_MB=$kept_pool
   OPT_VALKEY_BUDGET_MB=$valkey_alloc
+  # A computed size below the maxmemory in force is a shrink, whichever
+  # guard branch produced it (the scaled second pass reports "raised" for
+  # a value that is still lower than today's); name it for the report.
+  if (( has_cache && ! valkey_fixed && cache_current > 0 && valkey_alloc < cache_current )) \
+     && [[ $OPT_VALKEY_GUARD != capped ]]; then
+    OPT_VALKEY_GUARD=shrunk
+    OPT_VALKEY_PREV_MB=$cache_current
+  fi
   OPT_ES_BUDGET_MB=$es_alloc
   OPT_ES_KEPT_MB=$es_kept
   OPT_PHP_CHILDREN=$children

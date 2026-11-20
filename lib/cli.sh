@@ -96,9 +96,10 @@ Services (optional; only the ones listed are installed):
   --mariadb   user=demo pass=temp [size=4gb|auto] [bind=127.0.0.1[,ADDR...]|IPV4]
       size     auto (default) = live data+index plus 5% from the shared
                memory plan (128 MB minimum; capped at 80% of RAM when
-               MariaDB is the only data service, otherwise at RAM/2), only
-               increased; an empty database uses a RAM floor.  The redo log
-               is 25% of the pool.  Room is left for Elasticsearch, Valkey
+               MariaDB is the only data service, otherwise at RAM/2); a
+               larger live pool is shrunk to it online.  A fresh install
+               with nothing to measure uses a RAM floor.  The redo log is
+               25% of the pool.  Room is left for Elasticsearch, Valkey
                and PHP workers.
       bind     comma-separated IPv4 addresses and/or ::1 (default 127.0.0.1)
                IPV4 auto-detects the server's public IPv4; on NAT it falls

@@ -387,7 +387,7 @@ disable it for Credis, and re-measure on the actual stack.
 |---|---|---|
 | `user=U` | required | admin user, created for `localhost`, `127.0.0.1` and `::1` (needed with `skip_name_resolve`) |
 | `pass=P` | required | its password; also written to `/etc/mysqlbkup.cnf` (mode 600) |
-| `size=auto\|4gb` | `auto` | InnoDB buffer pool: `auto` = live data+index plus 5% (128 MB minimum; capped at 80% of RAM when MariaDB is the only data service, otherwise at half of RAM), only ever increased -- a pool already at or above the target is kept; an empty database uses the RAM-proportional floor (`clamp(RAM/16, 256 MB, 4 GB)`). The redo log is 25% of the pool. An explicit size is reserved verbatim |
+| `size=auto\|4gb` | `auto` | InnoDB buffer pool: `auto` = live data+index plus 5% (128 MB minimum; capped at 80% of RAM when MariaDB is the only data service, otherwise at half of RAM). A live pool more than one 5% step plus one InnoDB chunk (128 MB, or the live `innodb_buffer_pool_chunk_size` when larger) above the target is shrunk to it online (no restart on MariaDB 10.9+, where the redo log resizes online too; the first 1.21.49 run restarts once where a small pool had capped the redo log buffer), so the pool never holds RAM the data does not use; a live empty database gets 128 MB, and only a fresh install with nothing to measure uses the RAM-proportional floor (`clamp(RAM/16, 256 MB, 4 GB)`). The redo log is 25% of the pool (at least the log buffer, so a shrink stays online). `loose-innodb_buffer_pool_size_max` = 80% of RAM lets a pool grow online after a restart (address space only; ignored by releases without it, and never itself a reason to restart). An explicit size is reserved verbatim |
 | `bind=ADDR[,ADDR...]` | `127.0.0.1` | comma-separated IPv4 addresses and/or `::1`; `IPV4` resolves the public address and falls back to the local outbound IPv4 behind NAT. TCP 3306 is never opened in the firewall |
 
 Environment option:
@@ -399,9 +399,9 @@ Environment option:
 After a large `--domain ... sql=` import or an application-level bulk seed, run
 `--optimize` again (or pass `--mariadb size=...`) so the buffer pool is
 re-planned against the new data size.  `--diagnostics` warns when the live
-data is above 80 % of the current pool; the pool is only ever increased, so a
-host that was sized while the database was empty keeps the small value until
-the next optimize run.
+data is larger than the current pool; a host that was sized while the
+database was empty keeps the small value until the next optimize run, which
+sizes the pool to data+5% in either direction.
 
 Installed:
 
@@ -442,7 +442,7 @@ Hardware profile (`99-setup-optimize.cnf`):
 
 | Option | Default | Effect |
 |---|---|---|
-| `ram=SIZE` | live working set +20%, with a floor of RAM/64 clamped to 128 MB..1 GB | `maxmemory`; an explicit value is used verbatim |
+| `ram=SIZE` | data +20% (128 MB minimum), data = the larger of `used_memory` and its peak since start. A maxmemory more than 10% above that shrinks to it online. An `allkeys-*` cache that fills 83-102% of its maxmemory keeps it (an LRU cache fills any size; `ram=` grows it); `noeviction`/`volatile-*` caches follow their data both ways. A stopped cache, or one started less than a day ago, never shrinks; the floor RAM/64 clamped to 128 MB..1 GB only when no maxmemory is in force and the cache is not measured or started less than a day ago | `maxmemory`; an explicit value is used verbatim |
 | `policy=NAME` | `allkeys-lru` | `maxmemory-policy`; use `noeviction` or `volatile-lru` when Valkey stores sessions or jobs that must survive |
 | `io_threads=N` | 1 | extra socket I/O threads; 8 threads cost 430% CPU and lowered full-page throughput, so raise it only after `valkey-benchmark` shows the main thread is saturated |
 
@@ -479,7 +479,7 @@ Installed and configured:
 |---|---|
 | Repository | Elastic 9.x |
 | `elasticsearch.yml` managed block | `network.host`, single-node discovery, X-Pack security off, `bootstrap.memory_lock`, bool clause/bucket limits, index buffer and fielddata 20%, compression, 200 MB content limit |
-| Index in RAM | the memory plan reserves the whole index store (+10% growth) as page cache, taking only from PHP's share; when it fits, `index.store.preload: ["*"]` loads every index file at open (after each restart and boot). Hysteresis: switching on needs the growth room, staying on only the index itself, so a store at the edge does not restart Elasticsearch on every run |
+| Index in RAM | the memory plan reserves the whole index store (+5% growth) as page cache, taking only from PHP's share; when it fits, `index.store.preload: ["*"]` loads every index file at open (after each restart and boot). Hysteresis: switching on needs the growth room, staying on only the index itself, so a store at the edge does not restart Elasticsearch on every run |
 | Thread pools | search `clamp(cpus/2, 1, 16)`, write `clamp(cpus/4, 1, 8)` |
 | Heap file | `jvm.options.d/zz-setup-optimize.options`; an operator-owned `jvm.options` is kept |
 | System | systemd `LimitMEMLOCK=infinity`, `UMask=0027`, `vm.max_map_count` |
@@ -611,11 +611,12 @@ suspended errexit for the whole run). Steps:
    is set to 64).
 4. MariaDB, Valkey/Redis and Elasticsearch from the shared 80%-of-RAM plan:
    live data is funded first (MariaDB data+index plus 5%, Valkey working set
-   +20% with the RAM floor, Elasticsearch store/4), explicit sizes are
+   +20%, Elasticsearch heap store/4 plus the store +5% as page cache), explicit sizes are
    reserved verbatim, PHP is sized from the remainder, and targets that do not
    fit are trimmed Elasticsearch first, then Valkey, then MariaDB. A MariaDB
-   pool already at or above its target is kept (only increase), and the redo
-   log is 25% of the pool. The plan also books memory no setting names:
+   pool or Valkey maxmemory well above data+5% / data+20% is shrunk online,
+   so no service holds RAM its data does not use, and the redo log is 25% of
+   the pool. The plan also books memory no setting names:
    the Elasticsearch direct (off-heap) ceiling -- heap/2 by JVM ergonomics,
    or an operator `-XX:MaxDirectMemorySize` from `jvm.options` or
    `jvm.options.d` (below 4 GB part of it may sit in the OS headroom above a
@@ -801,9 +802,9 @@ data directory (NVMe / SSD / HDD) and the host class (`dedi`/`vps`).
 | Area | Rule |
 |---|---|
 | PHP-FPM | `pm = static`, `pm.max_children` = logical CPUs x the host's blocking factor (1.0 for a local database on flash, 1.5 for a shared/virtual CPU or a remote database, 2.0 for spinning disks), bounded by the RAM plan; a pool sized by hand is normalised to the same count, so a fresh install and `--optimize` write the same value (a 64-thread board left on 512 static workers is set to 64). `SETUP_PHP_WORKERS_PER_CPU` pins the factor for an install/one run; an explicit `--php children=` wins during that run and is clamped to floor..max(512, 2 x CPUs); `--optimize` ignores both and uses the hardware count. `pm.max_requests = threads x 1024`, `request_terminate_timeout 300s`, slow log at 10 s, `rlimit_files 524288`, systemd `LimitNOFILE=524288`/`UMask=0027`. `opcache.max_accelerated_files` = PHP files under the vhost roots x 1.5 (16384..128256), written as the OPcache hash-table prime PHP rounds it up to (32531, 65407 or 130987), so the ini only changes when the file count crosses a step; 130987 when no root is found; `memory_limit`, OPcache, JIT buffer and realpath sizes from one RAM profile shared with the dry run |
-| MariaDB | see the service section: pool from live data with floor `clamp(RAM/16, 256 MB, 4 GB)` for an empty or unmeasured database, io_capacity by disk x host, thread pool, connections from the PHP pool, table caches from connections, Aria page cache `clamp(RAM/128, 16, 256) MB` |
+| MariaDB | see the service section: pool = live data +5% (128 MB minimum, shrunk online when larger), floor `clamp(RAM/16, 256 MB, 4 GB)` only for a fresh install with nothing to measure, io_capacity by disk x host, thread pool, connections from the PHP pool, table caches from connections, Aria page cache `clamp(RAM/128, 16, 256) MB` |
 | Elasticsearch | heap = store/4 (512 MB..25% RAM..31 GB); `node.processors` = effective CPUs; search threads cpus/2 (max 16), write threads cpus/4 (max 8) |
-| Valkey / Redis | maxmemory = live +20% with floor `clamp(RAM/64, 128 MB, 1 GB)`; maxclients from the PHP pool; io_threads 1..8 (a larger `io_threads=` is clamped with a warning) |
+| Valkey / Redis | maxmemory = live +20% (128 MB minimum, shrunk online when more than 10% larger), floor `clamp(RAM/64, 128 MB, 1 GB)` only on a fresh install with nothing to measure; maxclients from the PHP pool; io_threads 1..8 (a larger `io_threads=` is clamped with a warning) |
 | Angie | `worker_processes` = **2/3 of CPUs** (`worker_cpu_affinity auto` commented out under a cgroup CPU quota; measured on the 12-thread EPYC: 8 workers 389-390k cached req/s vs 348-352k at `auto`/12), `worker_connections = clamp(cpus x 2048, 8192, 65535)` and `worker_rlimit_nofile = clamp(cpus x 8192, 65536, 524288)` (VPS: 1024 and 4096 per core), **no PHP upstream keepalive cache** (an idle FastCGI connection pins one PHP-FPM worker; see the live-origin.example audit in `tests/stress-site/RESULTS.md`), `open_file_cache max = clamp(RAM_MB x 8, 10000, 200000)` bounded by `rlimit - connections`, FastCGI buffers and cache zones by RAM, cache disk budget by RAM/cache filesystem size (capped at half its free space)/installed services (50% RAM Angie-only, 30% Angie+PHP, 25% full stack; a populated FastCGI, proxy or CDN cache is never shrunk below its live size), `directio 16m` on NVMe/SSD (4m on HDD), Brotli and gzip 4 (3 on 1-2 CPUs; `SETUP_BROTLI_LEVEL`, `SETUP_GZIP_LEVEL`) |
 | Kernel / PHP | `vm.nr_hugepages = (OPcache MB + JIT MB + 1)/2 + 8` (8..512; 296 pages = 592 MB on 8 GB+) on hosts with 4 GB+ and PHP, and `opcache.huge_code_pages=1` when the pages exist (measured +3.5 % on the XenForo member/thread tiers); the reservation is booked in the memory plan |
 | Kernel | `somaxconn`/SYN backlog `cpus x 4096` (VPS x 2048, max 65536), conntrack `RAM_MB x 16` (VPS x 8), `tcp_rmem`/`tcp_wmem` default 85 KB under 4 GB, 128 KB under 16 GB, 256 KB above, `netdev_budget 600/8000 us` on dedicated hosts with 8+ CPUs, `vm.dirty_background_bytes = clamp(RAM/100, 64 MB, 512 MB)` and `vm.dirty_bytes = 4x` (tighter on HDD), `vm.min_free_kbytes` 1% of RAM (16 MB floor under 4 GB, 256 MB cap), `vm.swappiness` 1 on NVMe/SSD (10 on HDD), `kernel.shmmax = min(1 GiB, RAM/4)`, `ip_local_reserved_ports` = 3306, 6379, 9200, 9300 and the sshd ports (the ephemeral range is 1024-65535), BBR + fq (`SETUP_TCP_CC`, `SETUP_QDISC`), 1M-nofile PAM limits. The base profile's `ip_forward`/`forwarding = 0` lines are dropped on a host that already forwards (bridge, Docker/LXD, WireGuard/Tailscale interfaces) and its IPv6 `autoconf`/`accept_ra = 0` lines on a host whose address or default route comes from router advertisements |

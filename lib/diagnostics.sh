@@ -445,8 +445,20 @@ run_diagnostics() {
     db_mb=$(mariadb -N -B -e "SELECT COALESCE(ROUND(SUM(data_length+index_length)/1024/1024),0) FROM information_schema.tables WHERE table_schema NOT IN ('mysql','information_schema','performance_schema','sys')" 2>/dev/null || true)
     pool_mb=$(mariadb -N -B -e 'SELECT ROUND(@@innodb_buffer_pool_size/1024/1024)' 2>/dev/null || true)
     if [[ $db_mb =~ ^[0-9]+$ && $pool_mb =~ ^[0-9]+$ ]]; then
-      if (( db_mb * 100 > pool_mb * 80 )); then
-        diag "MariaDB buffer pool" printf '%s\n' "WARNING: live data ${db_mb}MB is above 80% of the ${pool_mb}MB pool; run --optimize to re-plan it after the import"
+      # --optimize sizes the pool to data+5%, so data at ~95% of the pool is
+      # the plan, not a problem; only data beyond the pool is.
+      # A pool below the data is deliberate when it is an explicit size or the
+      # plan's RAM cap (half of RAM beside other services); only a pool below
+      # both is something --optimize would change.
+      local pool_explicit="" pool_cap_mb
+      pool_explicit=$(explicit_option mariadb_size_mb 2>/dev/null || true)
+      pool_cap_mb=$(( $(mem_total_mb) / 2 ))
+      if (( db_mb > pool_mb )) && [[ $pool_explicit =~ ^[0-9]+$ ]]; then
+        diag "MariaDB buffer pool" printf '%s\n' "${pool_mb}MB (explicit --mariadb size=) for ${db_mb}MB of live data"
+      elif (( db_mb > pool_mb && pool_mb * 100 >= pool_cap_mb * 98 )); then
+        diag "MariaDB buffer pool" printf '%s\n' "${pool_mb}MB for ${db_mb}MB of live data: at the plan's RAM cap; add RAM to hold it all"
+      elif (( db_mb > pool_mb )); then
+        diag "MariaDB buffer pool" printf '%s\n' "WARNING: live data ${db_mb}MB is larger than the ${pool_mb}MB pool; run --optimize to re-plan it (data+5%)"
       else
         diag "MariaDB buffer pool" printf '%s\n' "${pool_mb}MB for ${db_mb}MB of live data (ok)"
       fi

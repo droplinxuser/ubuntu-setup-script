@@ -5,6 +5,64 @@ README.md; measurements in tests/stress-site/RESULTS.md.  Per-cycle
 reports and raw test logs cited by entries up to 1.21.32 were removed from
 the tree on 2026-11-19; retrieve them with `git show 84b0db5:<path>`.
 
+## 1.21.49 (2026-11-20)
+
+- **MariaDB, Valkey and Elasticsearch are sized from their existing data,
+  in both directions** (operator decision), so no service books RAM its data
+  does not use.  On 203.0.113.24 the buffer pool was 4011 MB for 62 MB of
+  data: the old only-increase rule had kept the installer's pool forever.
+  - MariaDB: `innodb_buffer_pool_size` = data+index +5% (128 MB minimum,
+    caps unchanged).  The only-increase rule is gone: a live pool more than
+    one 5% step plus one InnoDB chunk (128 MB, or the live chunk size)
+    above the target is shrunk to it online (`SET GLOBAL`); a pool inside
+    that band is kept, so a few MB of growth does not resize it every run.
+  - Valkey/Redis: `maxmemory` = data +20% (128 MB minimum).  A larger
+    maxmemory shrinks online (`CONFIG SET`); one kept between data+10% and
+    10% above the target is not rewritten.  The RAM/64 floor (128 MB..1 GB)
+    applies only when no maxmemory is in force and the cache cannot be
+    measured or started less than a day ago.  An explicit `--valkey ram=`
+    is still written verbatim.  Details per eviction policy below.
+  - Elasticsearch: the page-cache reservation for the index, and the
+    preload switch-on threshold (and its warning), are the store +5% (was
+    +10%).  The heap stays at store/4.
+- Safeguards found in review:
+  - `innodb_log_buffer_size` (not dynamic) no longer drops with a small
+    pool; the redo log is lifted to it instead, so a 4 GB -> 128 MB shrink
+    is an online resize, not a restart with the web tiers paused.  A pool
+    clamped to the RAM cap gets no keep band.
+  - An installer re-run measures an installed MariaDB like `--optimize`
+    (an empty database: 128 MB on both, not RAM/16 on one), so the two
+    paths no longer undo each other.
+  - MariaDB 10.11.12+/11.4.6+/11.8 cap online growth at the pool the server
+    started with, so after any restart of a pool sized to data+5% the next
+    growth step fell back to a full restart.  The drop-in now writes
+    `loose-innodb_buffer_pool_size_max` = 80% of RAM (address space only;
+    `loose-` so older releases ignore it).  Adding it never forces a
+    restart: it applies at the next natural one.  Checked on MariaDB
+    11.8.6: 1 GB -> 128 MB shrink and redo-log resize online, then 128 MB
+    -> 1 GB online after a restart; without the ceiling the grow is
+    silently clamped at 128 MB.
+  - The pool is set once per online resize (a second identical `SET`
+    while 10.11/11.4 still resize in the background is rejected and turned
+    the resize into a restart).  The keep band allows for the live
+    `innodb_buffer_pool_chunk_size` (older 10.11 autosizes it to pool/64).
+  - Valkey data is the larger of `used_memory` and `used_memory_peak`
+    since start, so a quiet-hour sample never cuts a cache below its
+    busy-hour need; a cache started less than a day ago, or stopped, never
+    shrinks (a cold or compressed-snapshot reading).  An `allkeys-*` cache
+    that fills 83-102% of its maxmemory keeps it: an LRU cache fills any
+    size, so raising it on each run would ratchet without end.
+    `noeviction` and `volatile-*` caches (keys without a TTL cannot be
+    evicted) follow their data +20% both ways, a full one included.
+  - `--diagnostics` warns only when the data is larger than the pool (the
+    80% threshold fired on every pool sized to data+5%).
+  - The report names each shrink ("Buffer pool lowered from ...",
+    "maxmemory lowered from ...").
+  - Upgrading: hosts whose redo log buffer was capped by a small pool get
+    one MariaDB restart on the first 1.21.49 run (the buffer is not
+    dynamic); on 10.6 (Ubuntu 22.04) a redo-log resize is not online, so a
+    pool resize there restarts as before.
+
 ## 1.21.48 (2026-11-20)
 
 - **Cloudflare-proxied sites use the host's self-signed certificate;
