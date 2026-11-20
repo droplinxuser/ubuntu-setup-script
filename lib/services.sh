@@ -1569,6 +1569,7 @@ php_fpm_write_systemd_limits() {
     content='[Service]
 LimitNOFILE=524288
 LimitCORE=0
+KillSignal=SIGQUIT
 TimeoutStopSec=15
 UMask=0027'
   fi

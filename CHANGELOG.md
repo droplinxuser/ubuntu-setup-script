@@ -5,6 +5,45 @@ README.md; measurements in tests/stress-site/RESULTS.md.  Per-cycle
 reports and raw test logs cited by entries up to 1.21.32 were removed from
 the tree on 2026-11-19; retrieve them with `git show 84b0db5:<path>`.
 
+## 1.21.50 (2026-11-20)
+
+Audit cycle on the Xeon E-2236 host; report in
+`tests/stress-site/AUDIT-20261120-1.21.50.md`.
+
+- **certbot is retired on fleet hosts again.**  The 1.21.48 consumer scan
+  greps `/root`, where `tools/fleet-update.sh` keeps this project's checkout,
+  its dated previous checkout and its run logs; `lib/web.sh`, the changelog
+  and every "certbot: kept ..." report line quote `/etc/letsencrypt`, so the
+  scan always found the project itself and certbot was never purged.  The
+  scan now skips copies of this project (`setup.sh` next to `lib/web.sh`),
+  Angie configuration trees outside `/etc/angie` (`angie.conf` next to
+  `conf.d/templates`: a `server-configs-nginx` checkout; the loaded
+  configuration is still read through `angie -T`) and `*.log` files.
+  Verified live: certbot purged with both checkouts and a report log under
+  `/root`.
+- **A full `volatile-*` Valkey/Redis cache no longer grows 20% per run.**
+  Since 1.21.49 such caches followed their data, but a TTL-heavy
+  `volatile-lru` cache fills its maxmemory like an LRU cache, so every
+  `--optimize` raised it (512 -> 614 -> 736 ... up to the service budget).
+  A `volatile-*` cache that has evicted keys since it started
+  (`evicted_keys` > 0) now keeps its size like an `allkeys-*` one; one that
+  has evicted nothing still follows its data.
+- **PHP-FPM restarts no longer log MariaDB warnings.**  systemd stopped
+  php-fpm with SIGTERM, killing workers that held persistent connections
+  (XenForo's `p:localhost`): 12-13 `Aborted connection ... (Got an error
+  reading communication packets)` warnings per restart.  The unit drop-in
+  now sets `KillSignal=SIGQUIT` (graceful; `TimeoutStopSec=15` still bounds
+  a stuck worker): 0 warnings, same 244 ms restart.  The first run after
+  upgrading rewrites the drop-in (applies at the next PHP restart).
+- Cloudflare TLS move: server names are split with `read -ra`, so a
+  wildcard name is never glob-expanded against files in the current
+  directory.
+- Measured, no change: the shipped OPcache JIT profile (tracing, 64 MB)
+  is best or tied on every PHP tier (`function` +5-9 % XenForo, up to -18 %
+  WordPress; `off` -9-17 % WordPress); PHP 8.6 still lacks
+  redis/igbinary/imagick in Sury, so 8.5 stays the newest version all three
+  applications run on (0 deprecations on 8.5 and 8.4).
+
 ## 1.21.49 (2026-11-20)
 
 - **MariaDB, Valkey and Elasticsearch are sized from their existing data,

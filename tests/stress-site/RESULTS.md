@@ -7,7 +7,25 @@ manifests, sweep tables and run logs these sections cite (`AUDIT-*.md`,
 removed from the tree on 2026-11-19 to keep the repository lean; every one
 is still in git history, for example
 `git show 84b0db5:tests/stress-site/AUDIT-20261117-1.21.30.md`.  The current
-cycle report is `AUDIT-20261120-1.21.38.md`.
+cycle report is `AUDIT-20261120-1.21.50.md`.
+
+## 1.21.50 audit cycle — Xeon E-2236 (2026-11-20)
+
+Pair: `server-configs-nginx` 1.6.50.  Details: `AUDIT-20261120-1.21.50.md`.
+
+- certbot retirement (1.21.48) never ran on fleet hosts: the consumer scan
+  found the project's own checkout, a `server-configs-nginx` checkout and
+  run logs under `/root`.  Fixed and verified live (certbot purged).
+- A full `volatile-*` Valkey cache no longer grows maxmemory 20% per run;
+  wildcard server names are no longer glob-expanded.
+- PHP-FPM stops with SIGQUIT: 12 MariaDB "Aborted connection" warnings per
+  restart -> 0, same 244 ms restart.
+- Zero-error cycle: install 2:22 / 0 warnings, parity 0 of 3,029 facts,
+  1,326 unit checks, 225 dry runs, security 65/65, cookie 62/62, 0 PHP
+  diagnostics on 8.5 and 8.4, `--upgrade-php` 8.5 -> 8.4 -> 8.5 clean.
+- JIT sweep: the shipped tracing profile stays (function +5-9 % XF, up to
+  -18 % WP).  Stock-kernel tiers: WP guest 93k, XF guest 99k, Chevereto
+  cached 130k, XF member 258, WP member 169 req/s.
 
 ## 1.21.38 audit cycle — Xeon E-2236 (2026-11-20)
 

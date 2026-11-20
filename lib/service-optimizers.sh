@@ -428,7 +428,7 @@ optimize_php_services() {
     if php_fpm_write_systemd_limits "$ver"; then
       systemctl daemon-reload || true
       limits_changed=1
-      tune_note "PHP ${ver}: systemd LimitNOFILE=524288"
+      tune_note "PHP ${ver}: systemd drop-in updated (LimitNOFILE=524288, graceful SIGQUIT stop)"
     fi
     if ! tune_php_fpm_version "$ver"; then
       opt_restore "/etc/php/${ver}" "php-${ver}"
@@ -970,15 +970,26 @@ valkey_current_maxmemory_mb() {
 # sessions or queues stored without one behave as under noeviction: their
 # used_memory is real data and a maxmemory below it fails writes.  A config
 # without the directive gets allkeys-lru from the shared writer, so it counts
-# as evicting.
+# as evicting.  A volatile-* cache that has already evicted keys since it
+# started (INFO stats evicted_keys > 0) is full of TTL keys, not of data it
+# cannot drop: it fills any size like an LRU cache, so it counts as evicting
+# too.  Otherwise each run would read used == maxmemory and raise it by 20%.
 valkey_policy_evicts() {
-  local conf policy=""
+  local conf policy="" evicted
   conf=$(valkey_active_conf)
   if [[ -n $conf ]]; then
     policy=$(valkey_conf_get "$conf" maxmemory-policy)
   fi
   if [[ -z $policy || $policy == allkeys-* ]]; then
     printf '1'
+  elif [[ $policy == volatile-* ]]; then
+    evicted=$(valkey_live_cli info stats 2>/dev/null \
+      | awk -F: '/^evicted_keys:/{gsub(/\r/, "", $2); print int($2); exit}' || true)
+    if [[ $evicted =~ ^[0-9]+$ ]] && (( evicted > 0 )); then
+      printf '1'
+    else
+      printf '0'
+    fi
   else
     printf '0'
   fi

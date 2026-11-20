@@ -881,7 +881,11 @@ cloudflare_tls_migrate() {
       IFS=$'\t' read -r idx el names <<<"$b"
       [[ $el == 1 ]] || continue
       ok=1; checked=()
-      for name in $names; do
+      # read -a: no pathname expansion, so a wildcard name such as
+      # *.example.com is never matched against files in the current directory.
+      local -a name_list=()
+      read -ra name_list <<<"$names"
+      for name in "${name_list[@]}"; do
         case $name in
           _|localhost|'""') continue ;;
         esac
@@ -1016,11 +1020,32 @@ certbot_letsencrypt_users() {
       [[ -n $hit ]] && { printf '%s\n' "$hit"; return 0; }
     fi
   fi
+  # Copies of this project (the running checkout, fleet-update's dated
+  # previous checkouts) quote /etc/letsencrypt in lib/web.sh and the
+  # changelog, and run logs quote it in report lines: none of them reads the
+  # tree, and counting them kept certbot on every fleet host.  A project
+  # copy is a directory holding both setup.sh and lib/web.sh.  An Angie
+  # configuration tree outside /etc/angie (a server-configs-nginx checkout:
+  # angie.conf next to conf.d/templates, whose samples name certbot paths)
+  # is not loaded; the loaded configuration is read through `angie -T` above.
+  local -a own=() own_prune=()
+  local d
+  for root in "${roots[@]}"; do
+    [[ -d $root ]] || continue
+    while IFS= read -r -d '' d; do
+      case $d in
+        */lib/web.sh) d=${d%/lib/web.sh}; [[ -f $d/setup.sh ]] && own+=("$d") ;;
+        */conf.d/templates) d=${d%/conf.d/templates}; [[ -f $d/angie.conf ]] && own+=("$d") ;;
+      esac
+    done < <(find "$root" -xdev -maxdepth 4 \( -path '*/lib/web.sh' -type f \
+               -o -path '*/conf.d/templates' -type d \) -print0 2>/dev/null || true)
+  done
+  for d in "${own[@]}"; do own_prune+=(-o -path "$d"); done
   for root in "${roots[@]}"; do
     [[ -d $root ]] || continue
     hit=$(find "$root" -xdev \( -path "$le" -o -path "$etc/angie" -o -path "$etc/apparmor.d" \
-              -o -name node_modules -o -name .git -o -name vendor \) -prune \
-            -o -type f -size -1024k ! -name '*.dpkg-*' ! -name '*.bak' ! -name '*~' -print0 2>/dev/null \
+              -o -name node_modules -o -name .git -o -name vendor "${own_prune[@]}" \) -prune \
+            -o -type f -size -1024k ! -name '*.dpkg-*' ! -name '*.bak' ! -name '*~' ! -name '*.log' -print0 2>/dev/null \
           | xargs -0 -r grep -lIE "$CF_TLS_LE_ERE" 2>/dev/null | head -n 1 || true)
     [[ -n $hit ]] && { printf '%s\n' "$hit"; return 0; }
     while IFS= read -r lnk; do

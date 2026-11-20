@@ -995,6 +995,12 @@ check "open_basedir repair is idempotent" test "$TUNE_DIRTY" -eq 0
 # ---------------------------------------------------------------------------
 # OPcache JIT: always the tracing JIT; the pool is always static
 # ---------------------------------------------------------------------------
+# SIGTERM killed workers mid-connection: one MariaDB "Aborted connection"
+# warning per persistent connection on every restart.
+check "PHP-FPM unit drop-in stops gracefully (KillSignal=SIGQUIT)" \
+  grep -qx 'KillSignal=SIGQUIT' "$ROOT/configs/php/php-fpm-limits.conf"
+check "PHP-FPM unit drop-in fallback matches the shipped file's directives" \
+  bash -c 'diff <(grep -v "^#" "$1") <(sed -n "/^php_fpm_write_systemd_limits() {/,/^}/p" "$2" | sed -n "/content=.\[Service\]/,/UMask=0027./p" | sed -E "s/^ *content=.//; s/^(UMask=0027).$/\1/")' _ "$ROOT/configs/php/php-fpm-limits.conf" "$ROOT/lib/services.sh"
 check "shipped custom_dan.ini leaves opcache.jit to the managed ini" \
   test "$(grep -cE '^[[:space:]]*opcache\.jit[[:space:]]*=' "$ROOT/configs/php/custom_dan.ini")" -eq 0
 check "shipped custom_dan.ini ships no JIT buffer" \
@@ -3899,6 +3905,30 @@ check "cache guard: a second pass keeps a noeviction cache's data+20%" guard_sta
 check "cache guard: a second pass keeps a raised size" guard_stable 434 3000 0 22249 1
 check "cache guard: a second pass keeps a capped size" guard_stable 434 30000 0 22249 0
 
+# The real valkey_policy_evicts (the suite stubs it globally above), with the
+# configuration and INFO stats stubbed: a volatile-* cache that has evicted
+# TTL keys is an LRU-like cache and must not ratchet 512 -> 614 -> 736 ...
+policy_evicts_case() {
+  local stub_policy=$1 stub_evicted=$2
+  (
+    eval "$(sed -n '/^valkey_policy_evicts() {/,/^}/p' "$ROOT/lib/service-optimizers.sh")"
+    valkey_active_conf() { printf '/stub/valkey.conf'; }
+    valkey_conf_get() { printf "%s" "$stub_policy"; }
+    valkey_live_cli() { [[ $stub_evicted == none ]] && return 1; printf "evicted_keys:%s\r\n" "$stub_evicted"; }
+    valkey_policy_evicts
+  )
+}
+check "cache policy: allkeys-lru evicts" test "$(policy_evicts_case allkeys-lru 0)" = 1
+check "cache policy: noeviction does not evict" test "$(policy_evicts_case noeviction 5)" = 0
+check "cache policy: volatile-lru that evicted keys counts as evicting" \
+  test "$(policy_evicts_case volatile-lru 1234)" = 1
+check "cache policy: volatile-lru with no evictions follows its data" \
+  test "$(policy_evicts_case volatile-lru 0)" = 0
+check "cache policy: volatile-ttl on a cache that does not answer follows its data" \
+  test "$(policy_evicts_case volatile-ttl none)" = 0
+check "cache guard: a full volatile cache that evicts keeps its size on a second pass" \
+  guard_stable 434 512 512 22249 "$(policy_evicts_case volatile-lru 99)"
+
 check "valkey_size_to_mb reads the writer's own unit" test "$(valkey_size_to_mb 512mb)" -eq 512
 check "valkey_size_to_mb reads gigabytes" test "$(valkey_size_to_mb 2GB)" -eq 2048
 check "valkey_size_to_mb reads plain bytes" test "$(valkey_size_to_mb 536870912)" -eq 512
@@ -5907,6 +5937,30 @@ check "certbot users: an Anubis vhost backup in the state tree counts" \
 CERTBOT_EXTRA_ROOTS=""
 check "certbot users: the setup.sh state tree is a default root" \
   grep -qF '"${STATE_DIR:-/var/lib/setup.sh}")' "$ROOT/lib/web.sh"
+# fleet-update.sh keeps the checkout (and a dated previous one) and its run
+# logs in /root: lib/web.sh, the changelog and the report lines all quote
+# /etc/letsencrypt, and counting them kept certbot on every fleet host.
+mkdir -p "$cft/home/ubuntu-setup-script/lib" "$cft/home/ubuntu-setup-script.20261120-1200/lib"
+for d in "$cft/home/ubuntu-setup-script" "$cft/home/ubuntu-setup-script.20261120-1200"; do
+  printf '#!/bin/bash\n' > "$d/setup.sh"
+  printf 'le=/etc/letsencrypt/live\n' > "$d/lib/web.sh"
+  printf 'certbot uses /etc/letsencrypt/renewal\n' > "$d/CHANGELOG.md"
+done
+printf 'certbot: kept; /etc/letsencrypt is still used by x\n' > "$cft/home/setup-optimize-20261120.log"
+mkdir -p "$cft/home/server-configs-nginx/conf.d/templates"
+printf 'events {}\n' > "$cft/home/server-configs-nginx/angie.conf"
+printf 'ssl_certificate /etc/letsencrypt/live/example.com/fullchain.pem;\n' \
+  > "$cft/home/server-configs-nginx/conf.d/templates/sample_php.conf"
+CERTBOT_EXTRA_ROOTS="$cft/home"
+check "certbot users: project checkouts, Angie template trees and run logs are not consumers" \
+  test -z "$(certbot_letsencrypt_users)"
+# Only a directory with both setup.sh and lib/web.sh is a project copy.
+mkdir -p "$cft/home/app/lib"
+printf 'cert=/etc/letsencrypt/live/a/fullchain.pem\n' > "$cft/home/app/lib/web.sh"
+check "certbot users: a lib/web.sh outside a project copy still counts" \
+  certbot_users_contains app/lib/web.sh
+CERTBOT_EXTRA_ROOTS=""
+rm -rf "${cft:?}/home"
 rm -rf "$cft/state"
 out=$(CF_TLS_DRY_FULL=(); certbot_retire_if_unused 1)
 check "certbot dry run: would purge and changes nothing" \

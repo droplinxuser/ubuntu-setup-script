@@ -309,7 +309,7 @@ Pool (`pool.d/www.conf`):
 | `pm.max_requests` | threads x 1024 |
 | `request_terminate_timeout` | 300s |
 | Slow log | 10 s |
-| `rlimit_files`, systemd | 524288; `LimitNOFILE=524288`, `UMask=0027` |
+| `rlimit_files`, systemd | 524288; `LimitNOFILE=524288`, `UMask=0027`, `KillSignal=SIGQUIT` (graceful stop: workers close their persistent MariaDB connections, so a restart logs no "Aborted connection" warnings) |
 
 Measured on the 16-thread audit host (XenForo member page, loopback, 64
 connections): 16 workers 834 req/s at 14.38 ms PHP CPU/request, 32 workers
@@ -442,7 +442,7 @@ Hardware profile (`99-setup-optimize.cnf`):
 
 | Option | Default | Effect |
 |---|---|---|
-| `ram=SIZE` | data +20% (128 MB minimum), data = the larger of `used_memory` and its peak since start. A maxmemory more than 10% above that shrinks to it online. An `allkeys-*` cache that fills 83-102% of its maxmemory keeps it (an LRU cache fills any size; `ram=` grows it); `noeviction`/`volatile-*` caches follow their data both ways. A stopped cache, or one started less than a day ago, never shrinks; the floor RAM/64 clamped to 128 MB..1 GB only when no maxmemory is in force and the cache is not measured or started less than a day ago | `maxmemory`; an explicit value is used verbatim |
+| `ram=SIZE` | data +20% (128 MB minimum), data = the larger of `used_memory` and its peak since start. A maxmemory more than 10% above that shrinks to it online. An `allkeys-*` cache that fills 83-102% of its maxmemory keeps it (an LRU cache fills any size; `ram=` grows it); `noeviction`/`volatile-*` caches follow their data both ways, except a `volatile-*` cache that has already evicted keys (`evicted_keys` > 0), which is kept like an `allkeys-*` one. A stopped cache, or one started less than a day ago, never shrinks; the floor RAM/64 clamped to 128 MB..1 GB only when no maxmemory is in force and the cache is not measured or started less than a day ago | `maxmemory`; an explicit value is used verbatim |
 | `policy=NAME` | `allkeys-lru` | `maxmemory-policy`; use `noeviction` or `volatile-lru` when Valkey stores sessions or jobs that must survive |
 | `io_threads=N` | 1 | extra socket I/O threads; 8 threads cost 430% CPU and lowered full-page throughput, so raise it only after `valkey-benchmark` shows the main thread is saturated |
 
@@ -594,7 +594,8 @@ suspended errexit for the whole run). Steps:
    - certbot is then purged when the loaded Angie configuration (`angie -T`)
      and every hook, container mount, symlink and non-comment reference under
      `/etc`, `/opt`, `/srv`, `/usr/local`, `/root`, `/home`, the crontabs
-     and the web-root app configs leave it unused. `/etc/letsencrypt` moves
+     and the web-root app configs leave it unused (copies of this project, Angie
+     config trees outside `/etc/angie` and `*.log` files are not consumers). `/etc/letsencrypt` moves
      to `/var/backups/setup-letsencrypt-*` (0700).
    - A kept certbot whose renewals use the missing nginx plugin is reported
      as a warning.
@@ -801,7 +802,7 @@ data directory (NVMe / SSD / HDD) and the host class (`dedi`/`vps`).
 
 | Area | Rule |
 |---|---|
-| PHP-FPM | `pm = static`, `pm.max_children` = logical CPUs x the host's blocking factor (1.0 for a local database on flash, 1.5 for a shared/virtual CPU or a remote database, 2.0 for spinning disks), bounded by the RAM plan; a pool sized by hand is normalised to the same count, so a fresh install and `--optimize` write the same value (a 64-thread board left on 512 static workers is set to 64). `SETUP_PHP_WORKERS_PER_CPU` pins the factor for an install/one run; an explicit `--php children=` wins during that run and is clamped to floor..max(512, 2 x CPUs); `--optimize` ignores both and uses the hardware count. `pm.max_requests = threads x 1024`, `request_terminate_timeout 300s`, slow log at 10 s, `rlimit_files 524288`, systemd `LimitNOFILE=524288`/`UMask=0027`. `opcache.max_accelerated_files` = PHP files under the vhost roots x 1.5 (16384..128256), written as the OPcache hash-table prime PHP rounds it up to (32531, 65407 or 130987), so the ini only changes when the file count crosses a step; 130987 when no root is found; `memory_limit`, OPcache, JIT buffer and realpath sizes from one RAM profile shared with the dry run |
+| PHP-FPM | `pm = static`, `pm.max_children` = logical CPUs x the host's blocking factor (1.0 for a local database on flash, 1.5 for a shared/virtual CPU or a remote database, 2.0 for spinning disks), bounded by the RAM plan; a pool sized by hand is normalised to the same count, so a fresh install and `--optimize` write the same value (a 64-thread board left on 512 static workers is set to 64). `SETUP_PHP_WORKERS_PER_CPU` pins the factor for an install/one run; an explicit `--php children=` wins during that run and is clamped to floor..max(512, 2 x CPUs); `--optimize` ignores both and uses the hardware count. `pm.max_requests = threads x 1024`, `request_terminate_timeout 300s`, slow log at 10 s, `rlimit_files 524288`, systemd `LimitNOFILE=524288`/`UMask=0027`/`KillSignal=SIGQUIT`. `opcache.max_accelerated_files` = PHP files under the vhost roots x 1.5 (16384..128256), written as the OPcache hash-table prime PHP rounds it up to (32531, 65407 or 130987), so the ini only changes when the file count crosses a step; 130987 when no root is found; `memory_limit`, OPcache, JIT buffer and realpath sizes from one RAM profile shared with the dry run |
 | MariaDB | see the service section: pool = live data +5% (128 MB minimum, shrunk online when larger), floor `clamp(RAM/16, 256 MB, 4 GB)` only for a fresh install with nothing to measure, io_capacity by disk x host, thread pool, connections from the PHP pool, table caches from connections, Aria page cache `clamp(RAM/128, 16, 256) MB` |
 | Elasticsearch | heap = store/4 (512 MB..25% RAM..31 GB); `node.processors` = effective CPUs; search threads cpus/2 (max 16), write threads cpus/4 (max 8) |
 | Valkey / Redis | maxmemory = live +20% (128 MB minimum, shrunk online when more than 10% larger), floor `clamp(RAM/64, 128 MB, 1 GB)` only on a fresh install with nothing to measure; maxclients from the PHP pool; io_threads 1..8 (a larger `io_threads=` is clamped with a warning) |
