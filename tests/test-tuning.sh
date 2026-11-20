@@ -9,9 +9,17 @@ set -Eeuo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 FIXTURES="$ROOT/tests/fixtures/angie"
+# The paired server-configs-nginx checkout.  A few checks assert what the
+# shipped Angie tree contains; they need a real tree, not the fixtures.  CI
+# checks the pair out inside the workspace and sets ANGIE_TREE; a developer
+# keeps it next to this repository.  Without a tree those checks are skipped
+# and counted, never passed: a negated grep over a missing directory used to
+# pass, and a plain one failed every CI run.
+ANGIE_TREE=${ANGIE_TREE:-$ROOT/../server-configs-nginx}
 
 PASS=0
 FAIL=0
+SKIP=0
 TMP=$(mktemp -d /tmp/setup-test-tuning.XXXXXX)
 # Scratch data stays under /tmp and is allowed to expire there; the tests do
 # not remove it, so a failed run remains inspectable.
@@ -40,6 +48,15 @@ source "$ROOT/setup.sh"
 trap - ERR
 
 t_pass() { PASS=$((PASS + 1)); printf 'PASS  %s\n' "$*"; }
+t_skip() { SKIP=$((SKIP + 1)); printf 'SKIP  %s\n' "$*"; }
+# check_tree DESC CMD...: run a check against ANGIE_TREE, or skip it when the
+# paired tree is not checked out.
+check_tree() {
+  local desc=$1
+  shift
+  if [[ -d $ANGIE_TREE/h5bp && -d $ANGIE_TREE/conf.d ]]; then check "$desc" "$@"
+  else t_skip "$desc (no server-configs-nginx tree at $ANGIE_TREE; set ANGIE_TREE)"; fi
+}
 t_fail() {
   FAIL=$((FAIL + 1))
   printf 'FAIL  %s\n' "$*"
@@ -1113,10 +1130,12 @@ tune_angie_configs "$TMP/legacy"
 check "legacy layout second run is a no-op" test "$TUNE_DIRTY" -eq 0
 
 # A host with only one active cache type gets the whole cache budget.
-cache_mem_mb=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo)
-cache_disk_mb=$(df -Pm /var/www 2>/dev/null | awk 'NR==2{print $4}' || true)
-[[ $cache_disk_mb =~ ^[0-9]+$ ]] || cache_disk_mb=$(df -Pm / 2>/dev/null | awk 'NR==2{print $4}')
-[[ $cache_disk_mb =~ ^[0-9]+$ ]] || cache_disk_mb=10240
+cache_mem_mb=$(mem_total_mb)
+# Same RAM (cgroup-capped) and disk basis as the tuner (cache filesystem size,
+# capped at 10x its free space).  The test used plain free space on /var/www: equal to the tuner's
+# number only while RAM is the binding cap, so a CI runner with a small,
+# fuller disk failed this check on every push.
+cache_disk_mb=$(angie_disk_free_mb)
 expected_cache_angie=$(tune_cache_total_mb "$cache_mem_mb" "$cache_disk_mb" 50 10)
 expected_cache_php=$(tune_cache_total_mb "$cache_mem_mb" "$cache_disk_mb" 30 5)
 
@@ -1705,6 +1724,9 @@ mariadb_current_pool_mb() { printf '0'; }
 elasticsearch_data_size_mb() { printf '0'; }
 elasticsearch_current_heap_mb() { printf '0'; }
 
+# ENABLED is "declare -A" in lib/cli.sh (sourced at run time): the keys are
+# strings, not arithmetic variables (ShellCheck 0.11 reads them as such).
+# shellcheck disable=SC2154
 ENABLED=([angie]=1 [php]=1 [mariadb]=1 [valkey]=1 [elastic]=1)
 plan_install_budget
 install_php_budget=$OPT_PHP_BUDGET_MB
@@ -3021,6 +3043,9 @@ check "angie_brotli_level drops to 3 on a 2 CPU host" \
 effective_cpus() { printf 16; }
 
 # --basic server= is persisted and honoured by host_server_type.
+# ENABLED is "declare -A" in lib/cli.sh (sourced at run time): the keys are
+# strings, not arithmetic variables (ShellCheck 0.11 reads them as such).
+# shellcheck disable=SC2154
 ENABLED=([basic]=1)
 OPT[basic.server]=vps
 record_explicit_options
@@ -4503,8 +4528,8 @@ printf 'if ($flarum_guest_cacheable$req_encoded_path) { return 418; }\n' > "$fl/
 tune_flarum_cache_gate "$fl"
 check "Flarum gate: an operator-edited map leaves the include untouched" \
   grep -qF 'if ($flarum_guest_cacheable$req_encoded_path)' "$fl/h5bp/php_flarum.conf"
-check "Flarum gate: the shipped tree has no joined-variable if" \
-  bash -c '! grep -rqF "\$flarum_guest_cacheable\$req_encoded_path" "$1/h5bp" "$1/http.d"' _ "$ROOT/../server-configs-nginx"
+check_tree "Flarum gate: the shipped tree has no joined-variable if" \
+  bash -c '! grep -rqF "\$flarum_guest_cacheable\$req_encoded_path" "$1/h5bp" "$1/http.d"' _ "$ANGIE_TREE"
 
 # Catch-all 443: unknown/missing SNI is refused before a certificate is sent.
 tl="$TMP/tls-tree"
@@ -4523,8 +4548,8 @@ check "default TLS server: reject handshake inserted before the cert include" \
 tl_sum=$(cksum < "$tl/conf.d/1.https.default.conf")
 tune_default_tls_reject "$tl"
 check "default TLS server: a second pass changes nothing" test "$tl_sum" = "$(cksum < "$tl/conf.d/1.https.default.conf")"
-check "default TLS server: the shipped tree already rejects" \
-  grep -qx '  ssl_reject_handshake on;' "$ROOT/../server-configs-nginx/conf.d/1.https.default.conf"
+check_tree "default TLS server: the shipped tree already rejects" \
+  grep -qx '  ssl_reject_handshake on;' "$ANGIE_TREE/conf.d/1.https.default.conf"
 
 # PHP optional extensions: one transaction first (one php-fpm restart),
 # per-package fallback with the systemd start limit cleared.
@@ -5037,5 +5062,5 @@ if command -v php >/dev/null 2>&1; then
 fi
 
 
-printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
+printf '\nTOTAL pass=%d fail=%d skip=%d\n' "$PASS" "$FAIL" "$SKIP"
 [[ $FAIL -eq 0 ]]

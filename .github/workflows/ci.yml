@@ -9,7 +9,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+
+      # The paired Angie tree: tests/test-tuning.sh asserts what it ships
+      # (ANGIE_TREE).  Checked out inside the workspace because actions/checkout
+      # cannot write next to it.
+      - name: Checkout server-configs-nginx
+        uses: actions/checkout@v5
+        with:
+          repository: droplinxuser/server-configs-nginx
+          path: server-configs-nginx
 
       - name: Bash syntax
         run: |
@@ -35,4 +44,6 @@ jobs:
         run: bash tests/test-dry-run-matrix.sh
 
       - name: Tuning tests
+        env:
+          ANGIE_TREE: ${{ github.workspace }}/server-configs-nginx
         run: bash tests/test-tuning.sh
