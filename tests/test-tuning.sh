@@ -5687,6 +5687,7 @@ check "no ranges file: skipped with the refresh hint" grep -q 'no Cloudflare ran
 mv "$cft/cf.ranges" "$cft/angie/http.d/cloudflare.conf"
 
 # certbot retirement.  Only fixture roots are scanned.
+cf_tls_docker() { :; }   # never the host's Docker daemon
 apt_calls="$cft/apt.calls"
 apt-get() { printf '%s\n' "$*" >> "$apt_calls"; }
 dpkg-query() {
@@ -5748,7 +5749,9 @@ check "certbot users: a running docker that does not answer keeps certbot" certb
 systemctl() { return 3; }
 check "certbot users: docker installed but stopped is not a consumer" not certbot_users_contains docker:
 systemctl() { :; }
-unset -f docker cf_tls_docker
+# The rest never asks the host's own Docker (CI runners have one): no containers.
+unset -f docker
+cf_tls_docker() { :; }
 printf 'services:\n  mail:\n    volumes:\n      - /etc/letsencrypt:/etc/letsencrypt:ro\n' > "$cft/etc/postfix/compose.yml"
 check "certbot users: a bind mount of the bare tree counts" certbot_users_contains postfix/compose.yml
 printf 'LE_DIR=/etc/letsencrypt\n' > "$cft/etc/postfix/compose.yml"
@@ -5797,7 +5800,7 @@ angie_dump() { printf '# configuration file %s:\n' "$cft/angie/conf.d/site.conf"
 out=$(cloudflare_tls_migrate "$cft/angie" 1; certbot_retire_if_unused 1)
 check "dry run: a file that keeps a certbot block still keeps certbot" \
   grep -q 'certbot: kept; .*site.conf' <<<"$out"
-unset -f apt-get dpkg-query systemctl angie_dump angie_fail cf_tls_resolve cf_tls_probe certbot_users_contains
+unset -f apt-get dpkg-query systemctl angie_dump angie_fail cf_tls_resolve cf_tls_probe certbot_users_contains cf_tls_docker
 unset ANGIE_BIN CERTBOT_DIR CERTBOT_ETC CERTBOT_EXTRA_ROOTS CERTBOT_WWW CERTBOT_BACKUP_ROOT CF_TEST_CODE
 check "CF_SELF_SIGNED survives the --optimize pin reset" \
   bash -c 'printf "%s\n" "$@" | grep -qx CF_SELF_SIGNED' _ "${RESET_KEEP_PINS[@]}"
