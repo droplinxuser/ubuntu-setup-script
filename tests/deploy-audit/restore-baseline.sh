@@ -90,6 +90,13 @@ rm -f /etc/mysqlbkup.cnf /etc/mysqlbkup.config
 rm -f /etc/needrestart/conf.d/angie.conf
 rm -rf /root/mysqltuner.pl /root/tools/mysqlbackup-master
 rmdir /root/tools 2>/dev/null || true
+# Audit-only leftovers: perf(1) symbol cache and the load generator the
+# benchmark scripts install.
+rm -rf /root/.debug /usr/local/bin/oha /usr/local/bin/wrk
+# top(1) creates ~/.config/procps; MariaDB's postinst creates
+# /var/lib/mysql-files (secure_file_priv), which the package purge leaves.
+rmdir /root/.config/procps /root/.config 2>/dev/null || true
+rm -rf /var/lib/mysql-files
 rm -rf /tmp/php-config.* /tmp/php-install.* /tmp/hsperfdata_root /tmp/node-compile-cache
 find /tmp -maxdepth 1 \( -name 'sess_*' -o -name 'setup-optimize*' -o -name 'angie-*' -o -name 'php-upgrade*' \) \
   -exec rm -rf {} + 2>/dev/null || true

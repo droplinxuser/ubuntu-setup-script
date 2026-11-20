@@ -52,6 +52,19 @@ for d in /etc/angie /etc/php /etc/mysql /etc/valkey /etc/redis /etc/elasticsearc
     find "$d" -xdev \( -type f -o -type l \) -printf '%M %u:%g %p -> %l\n' 2>/dev/null | sort
   fi
 done
+# Data directories and root's home are not configuration, but a restore that
+# misses them leaves the next "clean" install running on an old datadir (the
+# MariaDB postinst then logs "mysql.user table already exists").  List their
+# top level only: names, not contents, so the manifest stays stable.
+for d in /root /var/lib/mariadb /var/lib/mysql /var/lib/mysql-files /var/lib/valkey /var/lib/redis \
+         /var/lib/elasticsearch /var/lib/anubis /var/cache/angie /var/log/angie; do
+  if [ -e "$d" ]; then
+    echo "-- $d (top level)"
+    find "$d" -xdev -mindepth 1 -maxdepth 1 ! -name .ssh ! -name .cache ! -name .bash_history \
+      ! -name .lesshst ! -name .viminfo ! -name .sudo_as_admin_successful \
+      -printf '%M %u:%g %p\n' 2>/dev/null | sort
+  fi
+done
 echo
 echo "== file digests of /etc =="
 find /etc -xdev -type f -print0 2>/dev/null | sort -z | xargs -0 md5sum 2>/dev/null | sort -k2

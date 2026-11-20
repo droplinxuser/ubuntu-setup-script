@@ -116,6 +116,46 @@ if grep -qi '^set-cookie:' "$T/p1" && grep -qi '^set-cookie:' "$T/p2"; then
   bad "wordpress does not replay a Set-Cookie from the cache" "both responses set a cookie"
 else ok "wordpress does not replay a Set-Cookie from the cache"; fi
 
+# Each security header exactly once.  The applications send some of these
+# themselves (XenForo X-Content-Type-Options, WordPress X-Frame-Options and
+# Referrer-Policy on wp-login.php and the REST API, Chevereto
+# Permissions-Policy); the vhost hides the upstream copy so only its own
+# `always` header remains.  Two copies were shipped up to 1.6.48.
+once() {
+  local host=$1 path=$2 dup
+  curl -sk --max-time 20 --resolve "$host:443:$IP" -o /dev/null -D "$T/h" "https://$host$path"
+  dup=$(tr -d '\r' < "$T/h" | cut -d: -f1 | tr '[:upper:]' '[:lower:]' \
+        | grep -xE 'x-content-type-options|x-frame-options|referrer-policy|permissions-policy|strict-transport-security|content-security-policy' \
+        | sort | uniq -d | tr '\n' ' ')
+  if [[ -z $dup ]]; then ok "$host$path sends each security header once"
+  else bad "$host$path sends each security header once" "duplicated: $dup"; fi
+}
+once "$XF" /
+once "$XF" '/index.php?login/'
+once "$XF" '/css.php?css=public:normalize.css'
+once "$WP" /
+once "$WP" /wp-login.php
+once "$WP" /wp-json/
+once "$CH" /explore
+once "$CH" /login
+
+# Passkeys: XenForo 2.3 login and two-step call navigator.credentials.get().
+# `publickey-credentials-get=()` in Permissions-Policy denies WebAuthn to the
+# page itself and the "Use passkey or security key" button silently does
+# nothing (server-configs-nginx 1.6.35 to 1.6.48).
+passkeys() {
+  local host=$1 path=$2 pp
+  pp=$(curl -sk --max-time 20 --resolve "$host:443:$IP" -o /dev/null -D - "https://$host$path" \
+       | tr -d '\r' | sed -n 's/^[Pp]ermissions-[Pp]olicy: *//p')
+  if [[ -z $pp || $pp == *'publickey-credentials-get=(self)'* || $pp == *'publickey-credentials-get=*'* ]] \
+     && [[ $pp != *'publickey-credentials-get=()'* ]]; then
+    ok "$host$path allows passkeys (WebAuthn get) for the site"
+  else bad "$host$path allows passkeys (WebAuthn get) for the site" "${pp:-no header}"; fi
+}
+passkeys "$XF" /login/
+passkeys "$WP" /wp-login.php
+passkeys "$CH" /login
+
 echo
 echo "TOTAL pass=$P fail=$F"
 rm -rf "$T"

@@ -5,6 +5,49 @@ README.md; measurements in tests/stress-site/RESULTS.md.  Per-cycle
 reports and raw test logs cited by entries up to 1.21.32 were removed from
 the tree on 2026-11-19; retrieve them with `git show 84b0db5:<path>`.
 
+## 1.21.38 (2026-11-20)
+
+Audit cycle on the Xeon E-2236 host (62 GB, md RAID0 NVMe).  Pair:
+`server-configs-nginx` 1.6.49.  Report:
+`tests/stress-site/AUDIT-20261120-1.21.38.md`.
+
+- **XenForo passkeys work again (Angie 1.6.49).**  Since
+  server-configs-nginx 1.6.35 the XenForo PHP handlers re-include
+  `Permissions-Policy`, whose value carried `publickey-credentials-get=()`:
+  WebAuthn was denied to the site itself and "Use passkey or security key"
+  (login and two-step) did nothing.  The token is now `(self)`; a
+  `--optimize` run syncs it.  The security probe checks it on all three
+  applications.
+- **Each security header once (Angie 1.6.49).**  XenForo
+  (`X-Content-Type-Options`), WordPress (`X-Frame-Options` and
+  `Referrer-Policy` on wp-login.php, `X-Content-Type-Options` on the REST
+  API) and Chevereto (`Permissions-Policy: interest-cohort=()`) sent their
+  own copy next to the vhost's.  The PHP handlers hide the upstream copy.
+  Eight new probe checks; security probe 65/65.
+- **The audit restore missed data directories.**  The previous cycle's
+  "pristine" host still had `/var/lib/mariadb` (with a `chevereto`
+  database), the `angie`/`mysql` accounts, `mysqlbkup` files and `/root`
+  tooling, so the next install ran on an old datadir (the MariaDB postinst
+  logged "mysql.user table already exists").  `host-manifest.sh` now lists
+  the top level of `/root` and every service data directory, so a leftover
+  shows up in the restore delta; `restore-baseline.sh` also removes
+  `/root/.debug`, `/root/.config/procps`, `/var/lib/mysql-files` and the
+  benchmark binaries.
+- **Anubis validated-pass cache investigated and rejected.**  In proxy mode
+  the 1.28.2 check endpoint is not an auth oracle (valid cookie 401,
+  default-allowed client 403 because the check URI itself is proxied to the
+  origin, DENY answers 200), so caching its answer would need a second
+  auth-mode instance; not lean, not shipped.
+- **CPU mitigations:** `mitigations=off` re-measured (+8-50 % cached, +15 %
+  XenForo member and Chevereto uncached).  `init_on_alloc=0` and
+  `randomize_kstack_offset=off` on top were inside noise and are not
+  offered; `preempt=none` is not supported by the 7.0 kernel.
+- **Zero-error cycle**: clean install 3:08 with 0 warnings, 0 journal
+  warnings, 0 AppArmor denials; 1,119 unit checks, 220 dry runs; security
+  65/65, cookie 62/62, functional 0 unexpected with Anubis on and off; PHP
+  8.5 diagnostics 0 in all three applications; `--optimize` idempotent
+  (3,042 facts).
+
 ## 1.21.37 (2026-11-20)
 
 Audit cycle on a freshly reinstalled Xeon E-2236 host (62 GB, md RAID0

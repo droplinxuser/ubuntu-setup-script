@@ -7,7 +7,26 @@ manifests, sweep tables and run logs these sections cite (`AUDIT-*.md`,
 removed from the tree on 2026-11-19 to keep the repository lean; every one
 is still in git history, for example
 `git show 84b0db5:tests/stress-site/AUDIT-20261117-1.21.30.md`.  The current
-cycle report is `AUDIT-20261120-1.21.37.md`.
+cycle report is `AUDIT-20261120-1.21.38.md`.
+
+## 1.21.38 audit cycle — Xeon E-2236 (2026-11-20)
+
+Pair: `server-configs-nginx` 1.6.49.  Details: `AUDIT-20261120-1.21.38.md`.
+
+- XenForo passkeys fixed: `Permissions-Policy` sent
+  `publickey-credentials-get=()` (WebAuthn denied to the site) on every
+  XenForo PHP response since 1.6.35; now `(self)`.
+- One copy of each security header: XenForo, WordPress and Chevereto sent
+  their own `X-Content-Type-Options` / `X-Frame-Options` /
+  `Referrer-Policy` / `Permissions-Policy` next to the vhost's; the PHP
+  handlers hide the upstream copy.  Security probe 65/65.
+- The previous restore left the MariaDB datadir, two accounts and `/root`
+  tooling behind; the manifest now lists data directories and `/root`.
+- `mitigations=off`: WP guest 79.5k -> 111-122k, Chevereto 123.9k -> 133.6k,
+  XF member 256 -> 295, Chevereto uncached 1,554 -> 1,788.
+  `init_on_alloc=0` + `randomize_kstack_offset=off` on top: inside noise.
+- Anubis check endpoint is not an auth oracle in proxy mode (DENY answers
+  200); a validated-pass cache was rejected.
 
 ## 1.21.37 audit cycle — Xeon E-2236, fresh baseline (2026-11-20)
 
