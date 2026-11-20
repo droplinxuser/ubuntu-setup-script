@@ -3998,11 +3998,15 @@ valkey_live_uptime_s() { printf '600'; }
 plan_memory_budget
 check "plan: a cache restarted 10 minutes ago keeps its 900 MB (cold, not small)" \
   test "$OPT_VALKEY_BUDGET_MB" -eq 900
+check "plan: the kept size of a young cache is reported as young, not as data+20%" \
+  test "$OPT_VALKEY_GUARD" = young
 valkey_live_uptime_s() { printf '86400'; }
 valkey_live_used_mb() { return 1; }
 plan_memory_budget
 check "plan: a stopped cache keeps its configured 900 MB (no RAM-floor flip)" \
   test "$OPT_VALKEY_BUDGET_MB" -eq 900
+check "plan: the kept size of an unmeasurable cache is reported as unmeasured" \
+  test "$OPT_VALKEY_GUARD" = unmeasured
 valkey_data_size_mb() { printf '1000'; }
 plan_memory_budget
 check "plan: a stopped cache whose snapshot needs more is raised (1000 MB + 20%)" \

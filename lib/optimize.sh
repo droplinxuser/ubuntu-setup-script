@@ -785,6 +785,17 @@ plan_memory_budget() {
       if [[ $OPT_VALKEY_GUARD == raised ]]; then
         OPT_VALKEY_GUARD=live
       fi
+      # The current size was kept because the cache is young or could not
+      # be measured, not because data+20% asked for it: name that, or the
+      # report says "data+20% ... up to 10% above that is kept" next to a
+      # 998 MB maxmemory holding 20 MB (a cache apt had just restarted).
+      if [[ $OPT_VALKEY_GUARD == plan ]] && (( cache_keep_mb > 0 && valkey_target == cache_keep_mb )); then
+        if (( ! cache_measured )); then
+          OPT_VALKEY_GUARD=unmeasured
+        elif (( cache_young )); then
+          OPT_VALKEY_GUARD=young
+        fi
+      fi
     fi
     (( valkey_target < 128 )) && valkey_target=128
   fi

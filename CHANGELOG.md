@@ -5,6 +5,16 @@ README.md; measurements in tests/stress-site/RESULTS.md.  Per-cycle
 reports and raw test logs cited by entries up to 1.21.32 were removed from
 the tree on 2026-11-19; retrieve them with `git show 84b0db5:<path>`.
 
+## 1.21.54 (2026-11-21)
+
+- **The Valkey report says why a maxmemory was kept.**  A cache started
+  less than a day ago (or one that cannot be measured) keeps its size by
+  design, but the report then fell through to "Live working set=20mb;
+  maxmemory=998mb (data+20%, 128 MB minimum; a size up to 10% above that is
+  kept)", which contradicts the numbers (seen on site-c.example right after apt
+  restarted Valkey).  The plan now names those cases (`young`,
+  `unmeasured`); the report and the dry-run summary print the real reason.
+
 ## 1.21.53 (2026-11-21)
 
 - **The "large archives inside web-accessible paths" WARNING lists only

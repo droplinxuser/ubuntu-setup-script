@@ -1142,6 +1142,12 @@ optimize_valkey() {
     shrunk)
       opt_report "- maxmemory lowered from ${OPT_VALKEY_PREV_MB:-0}mb to ${max_mb}mb (data=${used_mb}mb, the larger of used_memory and its peak; target data+20%, 128 MB minimum, within the memory plan)"
       ;;
+    young)
+      opt_report "- maxmemory kept at ${max_mb}mb (in use=${used_mb}mb): the cache started less than a day ago, so its peak has not seen a full day; a run after a day sizes it to data+20% (128 MB minimum)"
+      ;;
+    unmeasured)
+      opt_report "- maxmemory kept at ${max_mb}mb: the cache could not be measured (stopped or not answering); a run with it up sizes it to data+20% (128 MB minimum)"
+      ;;
     explicit)
       # An operator size is written verbatim; say so when it is below the
       # data already stored, because the eviction policy will trim the cache.
@@ -1913,6 +1919,8 @@ optimize_plan() {
       raised) cache_note=" (raised to keep live data)" ;;
       shrunk) cache_note=" (lowered from ${OPT_VALKEY_PREV_MB:-0}MB)" ;;
       capped) cache_note=" (capped; live data needs more)" ;;
+      young)  cache_note=" (kept: started less than a day ago)" ;;
+      unmeasured) cache_note=" (kept: not measurable)" ;;
     esac
     printf '  %s: maxmemory=%sMB backlog=%s%s\n' "$cache_label" "$max_mb" "$backlog" "$cache_note"
   fi
