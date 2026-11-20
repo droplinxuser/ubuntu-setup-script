@@ -14,13 +14,17 @@ set -Euo pipefail
 export LC_ALL=C DEBIAN_FRONTEND=noninteractive
 BASE=${1:?baseline manifest}
 SETUP=${2:-}
+# Absolute: the purge below runs from $WORK.
+[[ -n $SETUP && $SETUP != /* ]] && SETUP=$PWD/$SETUP
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 WORK=$(mktemp -d /tmp/restore-baseline.XXXXXX)
 [[ -r $BASE ]] || { echo "baseline manifest not readable: $BASE" >&2; exit 1; }
 
 if [[ -n $SETUP && -r $SETUP ]]; then
   echo "== setup.sh --purge all"
-  bash "$SETUP" --purge all > "$WORK/purge.log" 2>&1 || echo "purge exited $? (see $WORK/purge.log)"
+  # From $WORK: setup.sh writes its setup_<stamp>.log run log to the current
+  # directory, and the caller's home kept one per restore.
+  ( cd "$WORK" && bash "$SETUP" --purge all ) > "$WORK/purge.log" 2>&1 || echo "purge exited $? (see $WORK/purge.log)"
 fi
 
 echo "== packages"
@@ -95,7 +99,7 @@ rmdir /root/tools 2>/dev/null || true
 rm -rf /root/.debug /usr/local/bin/oha /usr/local/bin/wrk
 # top(1) creates ~/.config/procps; MariaDB's postinst creates
 # /var/lib/mysql-files (secure_file_priv), which the package purge leaves.
-rmdir /root/.config/procps /root/.config 2>/dev/null || true
+for h in /root /home/*; do rmdir "$h/.config/procps" "$h/.config" 2>/dev/null || true; done
 rm -rf /var/lib/mysql-files
 rm -rf /tmp/php-config.* /tmp/php-install.* /tmp/hsperfdata_root /tmp/node-compile-cache
 find /tmp -maxdepth 1 \( -name 'sess_*' -o -name 'setup-optimize*' -o -name 'angie-*' -o -name 'php-upgrade*' \) \

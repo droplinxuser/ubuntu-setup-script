@@ -56,7 +56,7 @@ done
 # misses them leaves the next "clean" install running on an old datadir (the
 # MariaDB postinst then logs "mysql.user table already exists").  List their
 # top level only: names, not contents, so the manifest stays stable.
-for d in /root /var/lib/mariadb /var/lib/mysql /var/lib/mysql-files /var/lib/valkey /var/lib/redis \
+for d in /root /home/* /var/lib/mariadb /var/lib/mysql /var/lib/mysql-files /var/lib/valkey /var/lib/redis \
          /var/lib/elasticsearch /var/lib/anubis /var/cache/angie /var/log/angie; do
   if [ -e "$d" ]; then
     echo "-- $d (top level)"

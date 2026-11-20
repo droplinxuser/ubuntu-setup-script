@@ -90,8 +90,10 @@ restart_outdated_services() {
 # True when this CPU exposes frequency scaling and actually offers the
 # performance governor.  Some VMs expose a cpufreq directory but only list
 # powersave/schedutil; claiming "governor=performance" there is misleading.
+# SETUP_SYS_CPUFREQ points the probe at another tree (unit-test fixtures, as
+# SETUP_SYS_BLOCK does for the disk classifier).
 cpu_performance_governor_available() {
-  local dir=/sys/devices/system/cpu/cpu0/cpufreq
+  local dir=${SETUP_SYS_CPUFREQ:-/sys/devices/system/cpu/cpu0/cpufreq}
   [[ -d $dir ]] || return 1
   if [[ -r $dir/scaling_available_governors ]]; then
     grep -qw performance "$dir/scaling_available_governors" || return 1

@@ -47,6 +47,30 @@ run_env() {
   fi
 }
 
+# run_msg TEXT ARGS...: the call must fail AND print TEXT, so a row cannot
+# pass because an unrelated, earlier check refused it.  It runs with a
+# dpkg-query that reports no packages: on a host that already has PHP, --php
+# ver=X stops at "already installed" before the version-specific checks.
+NOPKG="$TMP/nopkg"
+mkdir -p "$NOPKG"
+printf '#!/bin/sh\nexit 1\n' > "$NOPKG/dpkg-query"
+chmod +x "$NOPKG/dpkg-query"
+run_msg() {
+  local text=$1
+  shift
+  local out rc
+  out=$(PATH="$NOPKG:$PATH" bash "$SCRIPT_DIR/setup.sh" "$@" 2>&1)
+  rc=$?
+  if (( rc != 0 )) && grep -qF -- "$text" <<<"$out"; then
+    PASS=$((PASS + 1))
+    printf 'PASS  rc=%d  %s  [%s]\n' "$rc" "$*" "$text"
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL  rc=%d expected failure with "%s"  %s\n' "$rc" "$text" "$*"
+    printf '%s\n' "$out" | sed 's/^/      /' | head -6
+  fi
+}
+
 # Basic CLI.
 run ok   --help
 run ok   --version
@@ -167,8 +191,9 @@ run fail --dry-run --basic --mariadb user=u pass=p size=0
 run fail --dry-run --basic --mariadb user=u pass=p size=4gb bind=bogus
 run fail --dry-run --basic --php ver=8
 # A version without a pool template (configs/php/www_<XY>.conf) is rejected
-# before anything is installed.
-run fail --dry-run --basic --php ver=8.0
+# before anything is installed.  The message is asserted: on a host with
+# PHP installed the plain `run fail` row passed on "already installed".
+run_msg 'No FPM pool template for PHP 8.0' --dry-run --basic --php ver=8.0
 # Reserved MariaDB accounts and system schemas, in any letter case.
 run fail --dry-run --basic --mariadb user=root pass=x
 run fail --dry-run --basic --mariadb user=ROOT pass=x

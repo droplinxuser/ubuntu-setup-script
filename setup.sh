@@ -36,7 +36,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.21.38"
+readonly SCRIPT_VERSION="1.21.39"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -45,7 +45,10 @@ readonly SCRIPT_VERSION="1.21.38"
 #   QDISC="fq_codel"
 TCP_CC=bbr
 QDISC=fq
-if [[ -r /etc/default/setup-tuning ]]; then
+# Unit tests (SETUP_TEST_SOURCE_ONLY=1) never read the host's pins: a
+# provisioned test host with STORAGE_CLASS=, TCP_CC= ... recorded made the
+# stubbed classification checks report the pin instead of the stub.
+if [[ ${SETUP_TEST_SOURCE_ONLY:-0} != 1 && -r /etc/default/setup-tuning ]]; then
   # shellcheck disable=SC1091
   . /etc/default/setup-tuning
   TCP_CC="${TCP_CC:-bbr}"

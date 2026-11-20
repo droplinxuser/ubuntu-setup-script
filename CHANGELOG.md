@@ -5,6 +5,41 @@ README.md; measurements in tests/stress-site/RESULTS.md.  Per-cycle
 reports and raw test logs cited by entries up to 1.21.32 were removed from
 the tree on 2026-11-19; retrieve them with `git show 84b0db5:<path>`.
 
+## 1.21.39 (2026-11-20)
+
+Test-suite hardening.  CI had failed on every push since 3e781fb; that was
+fixed in 55586a4 (the shipped-tree checks now run against a checkout of the
+pair repo, the cache-budget check uses the tuner's own basis).  A multi-agent
+sweep then looked for checks whose result depends on the machine rather than
+the code; seven survived adversarial verification and are fixed here.  Each
+fix was proven by mutation on the Xeon host: the broken code now fails its
+check, where the old check passed.
+
+- **Four checks that could pass without testing anything:**
+  `valkey_runtime_settings keeps maxmemory` ran `bash -c true` with the real
+  assertion outside `check`; `valkey_maxclients grows with the PHP pool`
+  used 512 children, which stays under the 10000 floor (now 3000 -> 14000,
+  plus the 100000 cap); the CPU governor probes read the live `/sys`, so a
+  VM only ever ran the "no interface" branch (now three fixture trees via
+  `SETUP_SYS_CPUFREQ`, like `SETUP_SYS_BLOCK`); the dry-run row for
+  `--php ver=8.0` passed on any host with PHP installed because "already
+  installed" refused it first (new `run_msg` asserts the "No FPM pool
+  template" message, with a `dpkg-query` shim that hides installed PHP).
+- **Three checks that depended on the host:** unit tests no longer read the
+  host's `/etc/default/setup-tuning` (a provisioned host's `STORAGE_CLASS=`
+  overrode the stubbed disk classification) or a `SETUP_STORAGE_CLASS` in
+  the caller's shell; `client_body_buffer_size` expects the value from the
+  cgroup-capped `mem_total_mb` the tuner uses; the fastcgi `max_size` check
+  accepts the `G` unit a whole-GiB budget is written with.
+- **Restore residue:** `restore-baseline.sh` runs `--purge all` from its
+  work directory (setup.sh writes its run log to the current directory, so
+  every restore left a `setup_*.log` in the caller's home), removes
+  `~/.config/procps` for every home, and the manifest lists `/home/*`.
+
+Suites on the Xeon host: unit 1,113/1,113 (non-root, root, with operator
+pins in the environment and with a `STORAGE_CLASS=hdd` pin file), dry-run
+matrix 219/219 (the 220th row needs an installed PHP).
+
 ## 1.21.38 (2026-11-20)
 
 Audit cycle on the Xeon E-2236 host (62 GB, md RAID0 NVMe).  Pair:

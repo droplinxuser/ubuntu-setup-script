@@ -36,6 +36,10 @@ export SETUP_TEST_SOURCE_ONLY=1
 # Never read the live host state (/var/lib/setup.sh): a recorded explicit
 # --mariadb size= or --valkey ram= would silently change the planner results.
 export SETUP_STATE_DIR="$TMP/state"
+# Same for an operator pin in the calling shell: SETUP_STORAGE_CLASS would
+# override every stubbed lsblk classification below.  (setup.sh skips
+# /etc/default/setup-tuning itself in source-only mode.)
+unset SETUP_STORAGE_CLASS STORAGE_CLASS
 # Pin the PHP-FPM pool factor for the sizing arithmetic.  The default is
 # hardware-derived (1.0 worker per core on a local-DB flash host); the tests
 # that exercise the derivation clear this variable themselves.
@@ -228,6 +232,14 @@ check "MariaDB base block writes snapshot isolation off" \
 no_slow_admin_alias() { ! mariadb_logging_settings | grep -q '^log_slow_admin_statements[[:space:]]*='; }
 check "MariaDB logging helper omits the deprecated slow-admin alias" \
   no_slow_admin_alias
+
+# The host's recorded pins must not reach the unit tests: STORAGE_CLASS= in
+# /etc/default/setup-tuning on a provisioned host overrode every stubbed
+# lsblk classification below.
+check "source-only test mode does not read /etc/default/setup-tuning" \
+  grep -qF 'if [[ ${SETUP_TEST_SOURCE_ONLY:-0} != 1 && -r /etc/default/setup-tuning ]]; then' "$ROOT/setup.sh"
+check "a pin in the environment is cleared for the tests" \
+  test -z "${SETUP_STORAGE_CLASS:-}${STORAGE_CLASS:-}"
 
 # Disk classification must follow the device that actually backs /var/www.
 findmnt() { printf '%s\n' "${FINDMNT_SRC:-/dev/null}"; }
@@ -572,24 +584,18 @@ check "UFW removes a plain SSH allow rule" \
   grep -q 'delete allow' <<<"$ufw_body"
 
 # The probe must agree with sysfs; a VM that only offers powersave/schedutil
-# must not make --optimize claim it set the performance governor.
-gov_dir=/sys/devices/system/cpu/cpu0/cpufreq
-if [[ -d $gov_dir ]] && grep -qw performance "$gov_dir/scaling_available_governors" 2>/dev/null; then
-  check "CPU governor probe finds the performance governor" \
-    cpu_performance_governor_available
-elif [[ -d $gov_dir ]]; then
-  if cpu_performance_governor_available; then
-    t_fail "CPU governor probe ignores an unavailable performance governor"
-  else
-    t_pass "CPU governor probe ignores an unavailable performance governor"
-  fi
-else
-  if cpu_performance_governor_available; then
-    t_fail "CPU governor probe reports performance without a cpufreq interface"
-  else
-    t_pass "CPU governor probe reports no cpufreq interface"
-  fi
-fi
+# must not make --optimize claim it set the performance governor.  Fixture
+# trees, not the live /sys: a CI VM without cpufreq only ever ran the "no
+# interface" branch and a bare-metal host only the "found" one.
+gov=$TMP/cpufreq
+mkdir -p "$gov/perf" "$gov/noperf"
+echo "performance powersave" > "$gov/perf/scaling_available_governors"
+echo "powersave schedutil" > "$gov/noperf/scaling_available_governors"
+gov_probe() { SETUP_SYS_CPUFREQ=$1 cpu_performance_governor_available; }
+check "CPU governor probe finds the performance governor" gov_probe "$gov/perf"
+check "CPU governor probe ignores an unavailable performance governor" \
+  not gov_probe "$gov/noperf"
+check "CPU governor probe reports no cpufreq interface" not gov_probe "$gov/missing"
 
 # The single-file fallback must stay byte-identical to the canonical profile,
 # otherwise a run without configs/ silently writes values we already removed
@@ -955,7 +961,9 @@ check "angie.conf FastCGI upstream moves to the shared socket" \
   grep -q 'server unix:/run/php/php-fpm.sock;' "$TMP/angie/angie.conf"
 check "angie.conf keeps exactly one client_body_buffer_size" \
   test "$(grep -c '^[[:space:]]*client_body_buffer_size' "$TMP/angie/angie.conf")" -eq 1
-mem_kb=$(awk '/^MemTotal:/{print $2}' /proc/meminfo)
+# Same basis as tune_angie_configs: mem_total_mb is capped by a cgroup
+# memory limit, which raw MemTotal is not (docker --memory=4g on a big host).
+mem_kb=$(( $(mem_total_mb) * 1024 ))
 if (( mem_kb < 2048 * 1024 )); then
   exp_body_buffer=64k
 elif (( mem_kb < 8192 * 1024 )); then
@@ -1086,8 +1094,9 @@ EOF
 OPT_PHP_SOCKET=""
 tune_reset_changes
 tune_angie_configs "$TMP/active"
+# mb_to_config writes a whole GiB as G (a 4096 MB budget gives max_size=2G).
 check "active fastcgi_cache.conf gains a max_size" \
-  grep -qE 'keys_zone=fastcgicache:[0-9]+m max_size=[0-9]+M' \
+  grep -qE 'keys_zone=fastcgicache:[0-9]+m max_size=[0-9]+[MG]' \
   "$TMP/active/http.d/fastcgi_cache.conf"
 check "inert legacy fastcgi_cache_conf is left untouched" \
   grep -q 'max_size=16g' "$TMP/active/http.d/fastcgi_cache_conf"
@@ -2869,9 +2878,14 @@ check "MariaDB profile: no PHP pool falls back to CPU x 32 connections" \
 
 check "valkey_maxclients has a 10000 floor" \
   test "$(valkey_maxclients)" -eq 10000
-php_pool_max_children() { printf '512'; }
-check "valkey_maxclients grows with the PHP pool" \
-  test "$(valkey_maxclients)" -eq 4048 -o "$(valkey_maxclients)" -eq 10000
+# 512 children (4048 clients) stays under the 10000 floor, so the old
+# "-eq 4048 -o -eq 10000" assertion could not see the growth it named.
+php_pool_max_children() { printf '3000'; }
+check "valkey_maxclients grows with the PHP pool (3000 x 4 + 2000)" \
+  test "$(valkey_maxclients)" -eq 14000
+php_pool_max_children() { printf '30000'; }
+check "valkey_maxclients is capped at 100000" \
+  test "$(valkey_maxclients)" -eq 100000
 php_pool_max_children() { printf '0'; }
 check "valkey_clamp_io_threads caps at 8 on both paths" \
   test "$(valkey_clamp_io_threads 16)" -eq 8 -a "$(valkey_clamp_io_threads x)" -eq 1
@@ -2935,8 +2949,10 @@ valkey_apply_config "$TMP/valkey.conf" valkey 512 allkeys-lru 16 /run/valkey/val
 check "valkey_apply_config is idempotent" test "$valkey_hash" = "$(md5sum "$TMP/valkey.conf" | awk '{print $1}')"
 no_startup_keys() { ! valkey_runtime_settings 512 allkeys-lru 1 | grep -qE '^(tcp-backlog|io-threads) '; }
 check "valkey_runtime_settings drops the startup-only keys" no_startup_keys
-check "valkey_runtime_settings keeps maxmemory" \
-  bash -c "true" && valkey_runtime_settings 512 allkeys-lru 1 | grep -q '^maxmemory 512mb'
+keeps_maxmemory() { valkey_runtime_settings 512 allkeys-lru 1 | grep -qx 'maxmemory 512mb'; }
+# The assertion used to sit outside check() (`check ... bash -c "true" && ...`),
+# so the check always passed and a failure only tripped set -e.
+check "valkey_runtime_settings keeps maxmemory" keeps_maxmemory
 
 check "write_service_limits_dropin reports a change" \
   write_service_limits_dropin "$TMP/dropin/limits.conf" $'[Service]\nLimitNOFILE=1'
