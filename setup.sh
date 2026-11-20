@@ -36,7 +36,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.21.47"
+readonly SCRIPT_VERSION="1.21.48"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -129,6 +129,13 @@ if [[ -n ${SETUP_XF_JOB_CRON+x} ]]; then
   XF_JOB_CRON_PERSIST=1
 fi
 [[ $XF_JOB_CRON == 0 ]] || XF_JOB_CRON=1
+# Cloudflare-proxied sites (DNS only at Cloudflare, SSL mode "Full") use the
+# host's self-signed certificate; --optimize moves their vhosts off certbot,
+# checks them through Cloudflare and purges certbot when nothing else uses
+# it (lib/web.sh, cloudflare_tls_migrate).  SETUP_CF_SELF_SIGNED=0 or
+# CF_SELF_SIGNED=0 in /etc/default/setup-tuning leaves certificates alone.
+CF_SELF_SIGNED="${SETUP_CF_SELF_SIGNED:-${CF_SELF_SIGNED:-1}}"
+[[ $CF_SELF_SIGNED == 0 ]] || CF_SELF_SIGNED=1
 # XenForo page compression.  XenForo gzips every page itself at level 9
 # (15% of member-page PHP CPU on the audit host).  With XF_MEMBER_GZIP=angie
 # (default) a managed block at the end of each XenForo src/config.php keeps

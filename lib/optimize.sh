@@ -222,6 +222,37 @@ OPT_ES_KEPT_MB=0
 OPT_ES_DIRECT_MB=0
 OPT_ES_DIRECT_BOOKED_MB=0
 OPT_ES_DIRECT_OPERATOR=0
+# OPT_ES_CACHE_MB: index store kept in the page cache; OPT_ES_CACHE_FREE_MB:
+# RAM left for it after the booked services and the OS floor;
+# OPT_ES_PRELOAD=1 when it fits (index.store.preload: ["*"]).
+OPT_ES_CACHE_MB=0
+OPT_ES_CACHE_FREE_MB=0
+OPT_ES_PRELOAD=0
+
+# Preload decision with hysteresis: STORE MB of index, FREE MB of RAM left,
+# ON=1 when the managed block preloads already.  Switching on needs 10%
+# growth room; staying on only needs the index itself to fit.
+es_direct_credit_used_mb() {
+  # The part of the sub-4 GB direct-memory credit the ceiling really uses:
+  # direct (operator value, else heap/2) minus what is booked, within the
+  # credit.  Arguments: heap op_direct booked credit.
+  local heap=$1 op=$2 booked=$3 credit=$4 dir used
+  if (( op > 0 )); then dir=$op; else dir=$(( (heap + 1) / 2 )); fi
+  used=$(( dir - booked ))
+  (( used < 0 )) && used=0
+  (( used > credit )) && used=$credit
+  printf '%s' "$used"
+}
+
+es_preload_fits() {
+  local store=$1 free=$2 on=${3:-0}
+  (( store > 0 )) || return 1
+  if (( on )); then
+    (( store <= free ))
+  else
+    (( store + store / 10 <= free ))
+  fi
+}
 OPT_HUGEPAGES_MB=0
 # Set while plan_install_budget() runs.  A fresh install has no live database
 # or index to measure, so the planner must use the same empty-data floors that
@@ -496,7 +527,7 @@ plan_memory_budget() {
   # A fresh install has no pool to measure.  It plans at the 64 MB floor that
   # php_worker_allowance_mb measures for a freshly started, idle pool, so the
   # first --optimize after the install reserves the same PHP budget.
-  local cpu=1 allowance=64 php_capacity=0 php_floor=0 php_budget=0 children=0
+  local cpu=1 allowance=64 php_capacity=0 php_floor=0 php_budget=0 children=0 php_explicit_children=0
   local maria_target=0 valkey_target=0 es_target=0
   local maria_alloc=0 valkey_alloc=0 es_alloc=0
   local maria_fixed=0 valkey_fixed=0 es_fixed=0
@@ -572,6 +603,11 @@ plan_memory_budget() {
     explicit=$(explicit_option php_children 2>/dev/null || true)
     php_capacity=$(php_children_ceiling "$cpu" "$total" "$live_children" "$explicit")
     php_floor_children=$(php_children_floor "$total" "$cpu")
+    # The pool writer always writes an explicit --php children= count; the
+    # Elasticsearch page-cache step below must neither shrink it on paper
+    # nor count a smaller pool.
+    php_explicit_children=0
+    [[ $explicit =~ ^[0-9]+$ ]] && (( explicit > 0 )) && php_explicit_children=$explicit
     # An explicit --php children= below the hardware target lowers the floor
     # too; otherwise the plan lifts the pool straight back to the target.
     if [[ $explicit =~ ^[0-9]+$ ]] && (( explicit > 0 && php_capacity < php_floor_children )); then
@@ -716,6 +752,14 @@ plan_memory_budget() {
       (( es_cap < 512 )) && es_cap=512
       (( es_target > es_cap )) && es_target=$es_cap
     fi
+    # The page-cache reservation below needs the store size with an explicit
+    # heap too.
+    if [[ -z $es_store ]] && { (( ! OPT_INSTALL_PLAN )) || pkg_ok elasticsearch; }; then
+      es_store=$(elasticsearch_data_size_mb)
+      [[ $es_store =~ ^[0-9]+$ ]] || es_store=$(elasticsearch_data_dir_size_mb)
+      [[ $es_store =~ ^[0-9]+$ ]] || es_store=0
+      OPT_ES_SIZE_MB=$es_store
+    fi
     (( es_target < 512 )) && es_target=512
     (( es_target > 31744 )) && es_target=31744
     # Round the target up once, before the live-heap comparison, so the 2%
@@ -858,6 +902,29 @@ plan_memory_budget() {
   # ceiling.  Eight workers are always kept when PHP is installed.
   remaining=$(( svc_usable - maria_alloc - valkey_alloc - es_alloc - es_book ))
   (( remaining < 0 )) && remaining=0
+  # The whole Elasticsearch index should sit in RAM: the heap holds no index
+  # data, the OS page cache does, and index.store.preload loads every file
+  # into it when the index opens (after each restart and boot).  The 20%
+  # outside the service budget is page cache already; above a 10% kernel/OS
+  # floor that leaves 10% of RAM.  Only the part of the index (plus 10%
+  # growth room) that does not fit there comes off PHP's share, never off the
+  # data services, and PHP keeps its worker floor below.
+  local es_cache_room es_cache_need
+  OPT_ES_CACHE_MB=0
+  OPT_ES_CACHE_FREE_MB=0
+  OPT_ES_PRELOAD=0
+  if (( has_es && OPT_ES_SIZE_MB > 0 )); then
+    es_cache_need=$(( OPT_ES_SIZE_MB + OPT_ES_SIZE_MB / 10 ))
+    # Below 4 GB part of that 10% is already credited to the direct-memory
+    # ceiling (the unbooked part of it); it must not be counted twice.
+    es_cache_room=$(( total - usable - total / 10 - $(es_direct_credit_used_mb "$es_alloc" "$es_op_direct" "$es_book" "$es_credit") ))
+    (( es_cache_room < 0 )) && es_cache_room=0
+    if (( es_cache_need > es_cache_room && php_explicit_children == 0 )); then
+      remaining=$(( remaining - (es_cache_need - es_cache_room) ))
+      (( remaining < 0 )) && remaining=0
+    fi
+    OPT_ES_CACHE_MB=$OPT_ES_SIZE_MB
+  fi
   if (( has_php )); then
     local floor_children=$php_floor_children
     children=$(( remaining / allowance ))
@@ -898,6 +965,26 @@ plan_memory_budget() {
   # includes the booked Elasticsearch direct memory and OPcache huge pages.
   OPT_MEM_OVERCOMMIT_MB=0
   booked=$(( maria_alloc + valkey_alloc + es_alloc + es_book + php_budget + hp_mb ))
+  # Preload only when the index (plus 10% growth) fits the RAM left after
+  # every booked service and the 10% kernel/OS floor; preloading an index
+  # that cannot stay resident would only evict MariaDB's and PHP's pages.
+  # Hysteresis: switching preload on needs the 10% growth room, staying on
+  # only needs the index itself to fit, so a store hovering at the edge does
+  # not flip the static setting (an Elasticsearch restart) on every run.
+  # PHP is counted at the 64 MB-per-worker floor here, not at the live
+  # allowance: the allowance swings between cold and warm pools (64-192 MB
+  # per worker), far more than the 10% band, and page cache is reclaimable,
+  # so an optimistic PHP figure costs a few cache misses, not an OOM.
+  if (( OPT_ES_CACHE_MB > 0 )); then
+    local php_floor_mb=$(( (children > php_explicit_children ? children : php_explicit_children) * 64 ))
+    (( php_floor_mb > php_budget )) && php_floor_mb=$php_budget
+    OPT_ES_CACHE_FREE_MB=$(( total - (booked - php_budget + php_floor_mb) - total / 10 \
+      - $(es_direct_credit_used_mb "$es_alloc" "$es_op_direct" "$es_book" "$es_credit") ))
+    (( OPT_ES_CACHE_FREE_MB < 0 )) && OPT_ES_CACHE_FREE_MB=0
+    local es_on=0
+    elasticsearch_preload_active && es_on=1
+    es_preload_fits "$OPT_ES_CACHE_MB" "$OPT_ES_CACHE_FREE_MB" "$es_on" && OPT_ES_PRELOAD=1
+  fi
   if (( booked > usable )); then
     OPT_MEM_OVERCOMMIT_MB=$(( booked - usable ))
     warn "Memory plan: service floors and reserved memory (Elasticsearch direct ${es_book} MB, huge pages ${hp_mb} MB) exceed the ${usable} MB budget by ${OPT_MEM_OVERCOMMIT_MB} MB; this host is too small for the selected services"

@@ -5,6 +5,77 @@ README.md; measurements in tests/stress-site/RESULTS.md.  Per-cycle
 reports and raw test logs cited by entries up to 1.21.32 were removed from
 the tree on 2026-11-19; retrieve them with `git show 84b0db5:<path>`.
 
+## 1.21.48 (2026-11-20)
+
+- **Cloudflare-proxied sites use the host's self-signed certificate;
+  certbot is retired when nothing needs it** (operator decision: every
+  Cloudflare zone runs SSL mode "Full").  On the 203.0.113.24 host
+  certbot's renewals had failed since September (`authenticator = nginx`,
+  no nginx plugin on Angie) and the origin served expired certificates.
+  `--optimize` now:
+  - moves a server block to `/etc/angie/ssl/default` only when it sets its
+    own certbot `ssl_certificate` and `ssl_certificate_key` and every name it
+    serves is an exact host name resolving solely to Cloudflare (ranges from
+    `http.d/cloudflare.conf`, IPv4 and IPv6); wildcard, regex and `.suffix`
+    names keep the block, since a proxied wildcard proves nothing about
+    grey-cloud records below it.  Only the two paths change (whole-word
+    matches: `proxy_ssl_*` are never touched); certbot's options include,
+    dhparam and trusted chain go;
+  - proves each moved name after the reload: a probe location added to the
+    block (`/.setup-cf-tls-probe-<digits>`, 204, digits echoed in
+    `X-Setup-CF-Probe`; checked on Angie 1.12.4, non-digit/CRLF input falls
+    through to a 403) must echo a fresh nonce through Cloudflare.  Only a
+    worker started after the reload has that location, and it does the TLS
+    handshake of its own connection, so a cached answer, a challenge/WAF
+    response, a redirect, an old worker or a 526 is no proof; the vhost is
+    then put back byte for byte under a `# setup-cf-tls: keep` first line
+    that later runs respect.  Runs only when Angie is active and the run is
+    healthy, so a rewrite never goes live unchecked;
+  - purges certbot only when `angie -T` succeeds and neither the loaded
+    configuration nor any renewal hook, container mount, symlink or
+    non-comment `/etc/letsencrypt/` reference (dhparam counts) under `/etc`,
+    `/opt`, `/srv`, `/usr/local`, `/root`, `/home`, the crontabs or the web
+    roots' app configs uses it (AppArmor rules, node_modules, .git and
+    vendor skipped; one filesystem, files up to 1 MB, first hit stops the
+    scan).  `/etc/letsencrypt` moves to `/var/backups/setup-letsencrypt-*`
+    (0700, survives reboots) and returns if apt fails.  A kept certbot whose
+    renewals use the missing nginx plugin is a warning with the end date.
+  - skips hosts where Anubis manages the vhosts (its terminators are
+    regenerated each run and its one-time vhost copies still name certbot;
+    the setup.sh state tree is scanned as a consumer as well), generated
+    `00-anubis-*` files, blocks with directives on the `server {` line and
+    blocks that already carry a probe; a running Docker daemon that does
+    not answer within 20 s keeps certbot; a bare `/etc/letsencrypt` (bind
+    mount, `LE_DIR=`) counts as a reference;
+  - `SETUP_CF_SELF_SIGNED=0` (persisted as `CF_SELF_SIGNED`) skips it all;
+    the dry run, gated on a running Angie like the real run, lists the
+    planned moves and tells the truth about certbot (the rewrite is
+    simulated on a copy).
+- **The whole Elasticsearch index stays in RAM.**  The memory plan reserves
+  the index store (+10% growth) as page cache, taking only from PHP's share
+  beyond the RAM already free outside the service budget, and writes
+  `index.store.preload: ["*"]` (static; applies at the next start) when it
+  fits.  Hysteresis: on needs the growth room, staying on only the index
+  itself; PHP is counted at its 64 MB-per-worker floor there, so a warm or
+  cold pool does not flip the setting (an Elasticsearch restart).  Below
+  4 GB only the direct-memory credit in use is subtracted; an explicit
+  `--php children=` pool is never shrunk for the index nor undercounted.
+  A preload kept on only by the band is reported as a warning (no growth
+  room left).  An operator's own preload line is commented out only when
+  ours replaces it.  On the
+  203.0.113.24 host: 7166 MB index, 49582 MB free, preload on.
+- Same host, by hand (operator request): the two red system data streams
+  (`ilm-history-7`, `.logs-deprecation.elasticsearch-default`, no copy
+  left) were deleted, replicas set to 0 (green), and the operator
+  `jvm.options` (8 GB heap) removed in favour of the managed 2 GB.
+- Three adversarial review rounds: 32 distinct defects confirmed and fixed
+  before release (among them the edge-response and reload-race holes in the
+  first proof design, a cert/key mismatch on one-line directives, the
+  Anubis interactions and an unanchored removal that cut
+  `proxy_ssl_trusted_certificate`).  The tests caught two more on the way:
+  CRLF in curl's status line and `awk -v` eating the probe's backslash.
+  1266 + 224 checks; ShellCheck clean.
+
 ## 1.21.47 (2026-11-20)
 
 - **A red Elasticsearch cluster now names its cause.**  On a live OVH host

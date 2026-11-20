@@ -558,6 +558,566 @@ tune_retire_unused_acme_client() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# Cloudflare-proxied vhosts: the host's self-signed certificate, not certbot
+# ---------------------------------------------------------------------------
+# A site whose DNS points only at Cloudflare is reached through Cloudflare's
+# edge, and in SSL mode "Full" Cloudflare accepts any origin certificate,
+# self-signed or expired.  certbot then only adds failure modes: on a live
+# Angie host its renewals had failed since September (`authenticator =
+# nginx`, no nginx plugin on Angie) and the origin served an expired
+# certificate.  --optimize points such server blocks at the host's
+# self-signed /etc/angie/ssl/default pair (only the two certificate paths
+# change; the TLS policy includes stay), proves through Cloudflare after
+# the reload that the edge still reaches the origin (otherwise the vhost is
+# put back and marked so later runs leave it alone), and purges certbot
+# once nothing can still depend on /etc/letsencrypt.
+#
+# Every decision fails closed.  A block moves only when it carries its own
+# certbot certificate and key and every name it serves is an exact host
+# name resolving solely to Cloudflare; a wildcard, regex or `.suffix` name
+# keeps the block where it is (a proxied wildcard record does not prove that
+# explicit grey-cloud records below it are proxied).  certbot stays while
+# the loaded Angie configuration cannot be read, while any file, hook or
+# symlink outside its tree refers to it, or while a vhost was put back.
+# CF_SELF_SIGNED=0 (SETUP_CF_SELF_SIGNED=0) skips all of it.
+CF_TLS_DEFAULT_CERT=/etc/angie/ssl/default/fullchain.pem
+CF_TLS_DEFAULT_KEY=/etc/angie/ssl/default/privkey.pem
+# First line written into a vhost that had to be put back; the migration
+# never touches a file carrying it.  Deleting the line allows another try.
+CF_TLS_KEEP_MARKER='# setup-cf-tls: keep'
+# Origin probe added to each migrated block (see cf_tls_probe): digits only,
+# so the echoed header can carry nothing but a number.  It stays in place so
+# a later run can prove the block again; it answers 204 with no body.
+# shellcheck disable=SC2016
+CF_TLS_PROBE_LOCATION='location ~ "^/\.setup-cf-tls-probe-(?<setup_cf_probe>[0-9]{1,40})$" { access_log off; add_header X-Setup-CF-Probe $setup_cf_probe always; return 204; } # setup-cf-tls probe'
+CF_TLS_FILES=()      # vhosts rewritten this run
+CF_TLS_ORIG=()       # copy of each file before the rewrite (same index)
+CF_TLS_NAMES=()      # names proved through Cloudflare (same index)
+CF_TLS_DRY_FULL=()   # dry run: files left with no /etc/letsencrypt reference
+# A non-comment reference to the certbot tree as a whole path component:
+# `/etc/letsencrypt/live/...`, a bind mount `/etc/letsencrypt:/...` or a
+# bare `LE_DIR=/etc/letsencrypt` all count.
+# shellcheck disable=SC2016
+CF_TLS_LE_ERE='^[^#]*/etc/letsencrypt([/:"'"'"'[:space:];]|$)'
+
+# CIDRs from the generated Cloudflare real-IP file, one per line; $2 = 4|6.
+cf_tls_ranges() {
+  local file=$1 fam=$2
+  [[ -r $file ]] || return 0
+  sed -nE 's/^[[:space:]]*set_real_ip_from[[:space:]]+([^;[:space:]]+)[[:space:]]*;.*/\1/p' "$file" \
+    | if [[ $fam == 6 ]]; then grep ':' || true; else grep -v ':' || true; fi
+}
+
+ipv4_to_int() {
+  local a b c d
+  [[ $1 =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+  IFS=. read -r a b c d <<<"$1"
+  (( 10#$a < 256 && 10#$b < 256 && 10#$c < 256 && 10#$d < 256 )) || return 1
+  printf '%s' $(( (10#$a << 24) | (10#$b << 16) | (10#$c << 8) | 10#$d ))
+}
+
+ipv4_in_cidr() {
+  local ip net bits mask
+  ip=$(ipv4_to_int "$1") || return 1
+  bits=32; [[ $2 == */* ]] && bits=${2#*/}
+  [[ $bits =~ ^[0-9]+$ ]] && (( bits <= 32 )) || return 1
+  net=$(ipv4_to_int "${2%/*}") || return 1
+  (( bits == 0 )) && return 0
+  mask=$(( (0xFFFFFFFF << (32 - bits)) & 0xFFFFFFFF ))
+  (( (ip & mask) == (net & mask) ))
+}
+
+# 32 lowercase hex digits for an IPv6 address.  Zone ids and the embedded
+# IPv4 form are refused (never a Cloudflare edge address).
+ipv6_expand() {
+  local a=${1,,} head tail out="" g fill
+  local -a hs=() ts=()
+  [[ $a =~ ^[0-9a-f:]+$ && $a == *:* ]] || return 1
+  if [[ $a == *::* ]]; then
+    head=${a%%::*}; tail=${a#*::}
+    [[ $tail != *::* ]] || return 1
+    [[ -n $head ]] && IFS=: read -ra hs <<<"$head"
+    [[ -n $tail ]] && IFS=: read -ra ts <<<"$tail"
+    (( ${#hs[@]} + ${#ts[@]} <= 7 )) || return 1
+    fill=$(( 8 - ${#hs[@]} - ${#ts[@]} ))
+    for g in "${hs[@]}"; do [[ $g =~ ^[0-9a-f]{1,4}$ ]] || return 1; out+=$(printf '%04x' "0x$g"); done
+    for (( ; fill > 0; fill-- )); do out+='0000'; done
+    for g in "${ts[@]}"; do [[ $g =~ ^[0-9a-f]{1,4}$ ]] || return 1; out+=$(printf '%04x' "0x$g"); done
+  else
+    IFS=: read -ra hs <<<"$a"
+    (( ${#hs[@]} == 8 )) || return 1
+    for g in "${hs[@]}"; do [[ $g =~ ^[0-9a-f]{1,4}$ ]] || return 1; out+=$(printf '%04x' "0x$g"); done
+  fi
+  [[ ${#out} -eq 32 ]] || return 1
+  printf '%s' "$out"
+}
+
+ipv6_in_cidr() {
+  local ip net bits full rem a b mask
+  ip=$(ipv6_expand "$1") || return 1
+  bits=128; [[ $2 == */* ]] && bits=${2#*/}
+  [[ $bits =~ ^[0-9]+$ ]] && (( bits <= 128 )) || return 1
+  net=$(ipv6_expand "${2%/*}") || return 1
+  full=$(( bits / 4 )); rem=$(( bits % 4 ))
+  [[ ${ip:0:full} == "${net:0:full}" ]] || return 1
+  (( rem == 0 )) && return 0
+  a=$(( 0x${ip:full:1} )); b=$(( 0x${net:full:1} ))
+  mask=$(( (0xF << (4 - rem)) & 0xF ))
+  (( (a & mask) == (b & mask) ))
+}
+
+# Addresses a name resolves to, one per line (tests replace this function).
+cf_tls_resolve() {
+  getent ahosts "$1" 2>/dev/null | awk '{print $1}' | sort -u || true
+}
+
+# 0 when NAME resolves and every address is inside a Cloudflare range.
+cf_tls_name_behind_cloudflare() {
+  local name=$1 ranges_file=$2 addr cidr ok any=0
+  local -a v4 v6
+  mapfile -t v4 < <(cf_tls_ranges "$ranges_file" 4)
+  mapfile -t v6 < <(cf_tls_ranges "$ranges_file" 6)
+  (( ${#v4[@]} > 0 )) || return 1
+  while IFS= read -r addr; do
+    [[ -n $addr ]] || continue
+    any=1; ok=0
+    if [[ ${addr,,} == ::ffff:*.* ]]; then addr=${addr:7}; fi
+    if [[ $addr == *:* ]]; then
+      for cidr in "${v6[@]}"; do ipv6_in_cidr "$addr" "$cidr" && { ok=1; break; }; done
+    else
+      for cidr in "${v4[@]}"; do ipv4_in_cidr "$addr" "$cidr" && { ok=1; break; }; done
+    fi
+    (( ok )) || return 1
+  done < <(cf_tls_resolve "$name")
+  (( any ))
+}
+
+# Server blocks of a vhost file, one line each:
+#   <index> TAB <eligible> TAB <names>
+# eligible=1 only when the block (not a nested location, not an include)
+# sets exactly one ssl_certificate and one ssl_certificate_key and both are
+# under /etc/letsencrypt; any other certificate/key directive, or a cert
+# without its key here, makes it 0.  Directives are matched as whole words
+# (proxy_ssl_certificate is not ssl_certificate).  Comments are stripped
+# before parsing; conf.d files are http context, so only top-level
+# `server {` blocks count.
+cf_tls_server_blocks() {
+  awk '
+    function strip(s) { sub(/#.*/, "", s); return s }
+    function count(s, re,   n) { n = 0; while (match(s, re)) { n++; s = substr(s, RSTART + RLENGTH) } return n }
+    {
+      code = strip($0)
+      if (depth == 0 && code ~ /^[ \t]*server[ \t]*\{/) {
+        idx++; inblk = 1; names = ""; collecting = 0; lec = 0; lek = 0; tc = 0; tk = 0; other = 0
+        # Directives on the `server {` line itself are not rewritten: such a
+        # block is left alone rather than half-migrated.
+        tail = code; sub(/^[ \t]*server[ \t]*\{/, "", tail)
+        if (tail ~ /[^ \t]/) other++
+      }
+      if (inblk) {
+        lec += count(code, "(^|[ \t;{])ssl_certificate[ \t]+/etc/letsencrypt/[^;]*;")
+        lek += count(code, "(^|[ \t;{])ssl_certificate_key[ \t]+/etc/letsencrypt/[^;]*;")
+        tc  += count(code, "(^|[ \t;{])ssl_certificate[ \t]+[^;]*;")
+        tk  += count(code, "(^|[ \t;{])ssl_certificate_key[ \t]+[^;]*;")
+        # An include that brings its own certificate pair (h5bp hostname_ssl).
+        other += count(code, "(^|[ \t;{])include[ \t]+[^;]*hostname_ssl[^;]*;")
+        # Already carries a probe (migrated by hand, or edited back).
+        if ($0 ~ /setup-cf-tls probe/) other++
+        if (depth == 1 && code ~ /(^|[ \t;{])server_name[ \t]/) {
+          collecting = 1; s = code; sub(/.*server_name[ \t]+/, "", s); rest = s
+        } else if (collecting) { rest = code }
+        if (collecting) {
+          s = rest; fin = (s ~ /;/); sub(/;.*/, "", s)
+          n = split(s, parts, /[ \t]+/)
+          for (i = 1; i <= n; i++) if (parts[i] != "") names = names (names == "" ? "" : " ") parts[i]
+          if (fin) collecting = 0
+        }
+      }
+      o = gsub(/\{/, "{", code); c = gsub(/\}/, "}", code)
+      depth += o - c
+      if (inblk && depth == 0 && (o > 0 || c > 0)) {
+        printf "%d\t%d\t%s\n", idx, (lec == 1 && lek == 1 && tc == 1 && tk == 1 && other == 0) ? 1 : 0, names
+        inblk = 0
+      }
+    }' "$1"
+}
+
+# Rewrite the listed server blocks (comma-separated indexes) of FILE to the
+# self-signed pair.  certbot-only directives (its options include, dhparam,
+# trusted chain) are removed; everything else is left byte for byte.  Every
+# directive is matched as a whole word, so proxy_ssl_certificate and
+# proxy_ssl_trusted_certificate are never touched, and a one-line
+# `ssl_certificate ...; ssl_certificate_key ...;` is rewritten together.
+# Right after the block's `server {` line goes the origin probe location
+# (CF_TLS_PROBE_LOCATION): placed first, so no other regex location wins.
+cf_tls_rewrite_blocks() {
+  local file=$1 list=$2 out
+  out=$(tmp_file) || return 1
+  # The probe arrives through ENVIRON: awk -v would eat its backslashes.
+  CF_TLS_AWK_PROBE=$CF_TLS_PROBE_LOCATION \
+  awk -v want=",${list}," -v crt="$CF_TLS_DEFAULT_CERT" -v key="$CF_TLS_DEFAULT_KEY" '
+    BEGIN { probe = ENVIRON["CF_TLS_AWK_PROBE"] }
+    function strip(s) { sub(/#.*/, "", s); return s }
+    # Replace (val != "") or remove (val == "") every whole-word
+    # DIR /etc/letsencrypt/...; in s.  mawk has no capture groups, so the
+    # line is rebuilt around match(), keeping the boundary character.
+    function edit(s, dir, val,   re, out, st, piece) {
+      re = "(^|[ \t;{])" dir "[ \t]+/etc/letsencrypt/[^;]*;"
+      out = ""
+      while (match(s, re)) {
+        st = RSTART
+        if (substr(s, st, 1) != substr(dir, 1, 1)) { out = out substr(s, 1, st); st++ } else out = out substr(s, 1, st - 1)
+        piece = (val == "") ? "" : dir " " val ";"
+        out = out piece
+        s = substr(s, RSTART + RLENGTH)
+      }
+      return out s
+    }
+    {
+      line = $0; code = strip(line)
+      opening = 0
+      if (depth == 0 && code ~ /^[ \t]*server[ \t]*\{/) { idx++; hit = (index(want, "," idx ",") > 0); opening = hit }
+      o = gsub(/\{/, "{", code); c = gsub(/\}/, "}", code)
+      if (hit && !opening) {
+        before = line
+        if (code ~ /(^|[ \t;{])ssl_certificate_key[ \t]+\/etc\/letsencrypt\//) line = edit(line, "ssl_certificate_key", key)
+        if (code ~ /(^|[ \t;{])ssl_certificate[ \t]+\/etc\/letsencrypt\//)     line = edit(line, "ssl_certificate", crt)
+        line = edit(line, "include", "")
+        line = edit(line, "ssl_dhparam", "")
+        line = edit(line, "ssl_trusted_certificate", "")
+        if (line != before) {
+          sub(/[ \t]*#[ \t]*managed by Certbot[ \t]*$/, "", line)
+          rest = line; sub(/#.*/, "", rest)
+          if (rest ~ /^[ \t]*$/) { depth += o - c; if (depth == 0) hit = 0; next }
+        }
+      }
+      print line
+      if (opening && probe != "") print "    " probe
+      depth += o - c
+      if (depth == 0) hit = 0
+    }' "$file" > "$out" || { rm -f "$out"; return 1; }
+  cat -- "$out" > "$file"
+  rm -f "$out"
+}
+
+# Proof that Cloudflare reaches the origin with the self-signed certificate:
+# the migrated block answers /.setup-cf-tls-probe-<digits> itself with 204
+# and echoes the digits in X-Setup-CF-Probe.  Only a worker started after
+# the reload has that location, and the TLS handshake of a connection is
+# done by the worker that serves it, so the echo through public DNS proves
+# that Cloudflare connected to a new worker and accepted its certificate.
+# A cached answer, a Cloudflare challenge/WAF/redirect/Worker response, an
+# old worker or a 52x carries no echo.  A few attempts cover the reload.
+# Prints the last status; returns 0 only with the echo (tests replace it).
+cf_tls_probe() {
+  local name=$1 hdr status="000" nonce try
+  command -v curl >/dev/null 2>&1 || { printf 'no-curl'; return 1; }
+  for try in 1 2 3 4 5; do
+    nonce="${RANDOM}${RANDOM}${try}$$"
+    hdr=$(curl -s -o /dev/null -D - --max-time 15 -H 'Cache-Control: no-cache' \
+          "https://${name}/.setup-cf-tls-probe-${nonce}" 2>/dev/null) || hdr=""
+    hdr=$(printf '%s\n' "$hdr" | tr -d '\r')
+    status=$(printf '%s\n' "$hdr" | awk 'toupper($1) ~ /^HTTP\// { s = $2 } END { print s }')
+    [[ $status =~ ^[0-9]{3}$ ]] || status=000
+    if printf '%s\n' "$hdr" | grep -qix "x-setup-cf-probe: ${nonce}"; then
+      printf '%s' "$status"
+      return 0
+    fi
+    (( try < 5 )) && sleep 2
+  done
+  printf '%s' "$status"
+  return 1
+}
+
+# One report line: printed in a dry run, collected for the report otherwise.
+cf_tls_say() {
+  if (( $1 )); then printf '  %s\n' "${2#- }"; else opt_report "$2"; fi
+}
+
+# 0 when FILE still has an active (non-comment) /etc/letsencrypt reference.
+cf_tls_file_uses_letsencrypt() {
+  awk '{ s = $0; sub(/#.*/, "", s); if (s ~ /\/etc\/letsencrypt([\/:" \t;]|$)/) { f = 1; exit } } END { exit !f }' "$1"
+}
+
+# Plan or apply the migration for every vhost under TARGET/conf.d.
+#   $2 = 1 for a dry run (prints the plan, changes nothing).
+# Applied changes are recorded in CF_TLS_* for cloudflare_tls_finish.
+cloudflare_tls_migrate() {
+  local target=${1:-/etc/angie} dry=${2:-0} ranges f b idx el names name list orig ok copy
+  local -a blocks=() keep_names=() checked=() vhosts=()
+  CF_TLS_FILES=(); CF_TLS_ORIG=(); CF_TLS_NAMES=(); CF_TLS_DRY_FULL=()
+  [[ ${CF_SELF_SIGNED:-1} != 0 ]] || return 0
+  # Anubis owns the TLS terminators (regenerated from the vhosts each run,
+  # which would drop the keep marker) and keeps one-time copies of the
+  # vhosts it integrated; leave certificates alone while it is in place.
+  if declare -F anubis_managed >/dev/null && anubis_managed; then
+    cf_tls_say "$dry" "- Cloudflare TLS: skipped (the Anubis integration owns the TLS terminators and vhost backups)"
+    return 0
+  fi
+  ranges="$target/http.d/cloudflare.conf"
+  shopt -s nullglob
+  vhosts=("$target"/conf.d/*.conf)
+  shopt -u nullglob
+  for f in "${vhosts[@]}"; do
+    [[ -f $f && ! -L $f ]] || continue
+    case ${f##*/} in 00-anubis-*) continue ;; esac
+    cf_tls_file_uses_letsencrypt "$f" || continue
+    if head -n 1 -- "$f" | grep -qF -- "$CF_TLS_KEEP_MARKER"; then
+      cf_tls_say "$dry" "- Cloudflare TLS: \`${f}\` kept on its certificate (${CF_TLS_KEEP_MARKER} marker; delete that line to retry)"
+      continue
+    fi
+    if [[ ! -s $target/ssl/default/fullchain.pem || ! -s $target/ssl/default/privkey.pem ]]; then
+      cf_tls_say "$dry" "- Cloudflare TLS: skipped (no self-signed pair in ${target}/ssl/default)"
+      return 0
+    fi
+    if [[ -z $(cf_tls_ranges "$ranges" 4) ]]; then
+      cf_tls_say "$dry" "- Cloudflare TLS: skipped (no Cloudflare ranges in ${ranges}; run /etc/angie/scripts/cloudflare.sh)"
+      return 0
+    fi
+    list=""; keep_names=()
+    mapfile -t blocks < <(cf_tls_server_blocks "$f")
+    for b in "${blocks[@]}"; do
+      IFS=$'\t' read -r idx el names <<<"$b"
+      [[ $el == 1 ]] || continue
+      ok=1; checked=()
+      for name in $names; do
+        case $name in
+          _|localhost|'""') continue ;;
+        esac
+        # Exact host names only: a wildcard, regex, `.suffix`, variable or
+        # IP literal cannot be proved to sit behind Cloudflare.
+        if [[ ! ${name,,} =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ \
+              || $name =~ ^[0-9.]+$ ]]; then
+          ok=0; break
+        fi
+        cf_tls_name_behind_cloudflare "$name" "$ranges" || { ok=0; break; }
+        checked+=("$name")
+      done
+      (( ok && ${#checked[@]} > 0 )) || continue
+      list+="${list:+,}${idx}"
+      keep_names+=("${checked[@]}")
+    done
+    [[ -n $list ]] || continue
+    if (( dry )); then
+      # Simulate on a copy so the certbot line below tells the truth.
+      copy=$(tmp_file) || return 1
+      cp -p -- "$f" "$copy"
+      if cf_tls_rewrite_blocks "$copy" "$list" && ! cf_tls_file_uses_letsencrypt "$copy"; then
+        CF_TLS_DRY_FULL+=("$f")
+      fi
+      rm -f -- "$copy"
+      printf '  Cloudflare TLS: would point %s (%s) at the host self-signed certificate\n' \
+        "${f#"$target"/}" "${keep_names[*]}"
+      continue
+    fi
+    orig=$(tmp_file) || return 1
+    cp -p -- "$f" "$orig"
+    if cf_tls_rewrite_blocks "$f" "$list"; then
+      CF_TLS_FILES+=("$f"); CF_TLS_ORIG+=("$orig"); CF_TLS_NAMES+=("${keep_names[*]}")
+    else
+      cat -- "$orig" > "$f"
+      rm -f -- "$orig"
+      opt_report "- Cloudflare TLS: could not rewrite \`${f}\`; left unchanged"
+    fi
+  done
+  return 0
+}
+
+# After the reload: prove each migrated name through Cloudflare
+# (cf_tls_probe).  Any name without the proof puts its vhost back byte for
+# byte, with the keep marker on top so later runs leave it alone, and
+# reloads.  Then certbot is retired when nothing needs it.
+cloudflare_tls_finish() {
+  local dry=${1:-0} i name status restored=0 bad
+  if (( ! dry )); then
+    for i in "${!CF_TLS_FILES[@]}"; do
+      bad=""
+      for name in ${CF_TLS_NAMES[i]}; do
+        status=$(cf_tls_probe "$name") || bad+="${bad:+ }${name}(${status:-000})"
+      done
+      if [[ -n $bad ]]; then
+        {
+          printf '%s (no proof through Cloudflare that the origin answered with the self-signed certificate: %s; "Full (strict)", a challenge/WAF rule or a redirect on the probe path? Delete this line to let --optimize retry)\n' \
+            "$CF_TLS_KEEP_MARKER" "$bad"
+          cat -- "${CF_TLS_ORIG[i]}"
+        } > "${CF_TLS_FILES[i]}"
+        restored=1
+        opt_report "- **FAILED** Cloudflare TLS: \`${CF_TLS_FILES[i]}\` put back on its certificate and marked to keep it; no proof through Cloudflare for ${bad} (a 526 means SSL mode \"Full (strict)\": set \"Full\", or keep a trusted certificate)"
+      else
+        opt_report "- Cloudflare TLS: \`${CF_TLS_FILES[i]}\` (${CF_TLS_NAMES[i]}) now uses the host self-signed certificate; Cloudflare reached the origin with it (probe location /.setup-cf-tls-probe-* added)"
+      fi
+      rm -f -- "${CF_TLS_ORIG[i]}"
+    done
+    if (( restored )); then
+      if "${ANGIE_BIN:-/usr/sbin/angie}" -t >/dev/null 2>&1 && systemctl reload angie 2>/dev/null; then
+        opt_report "- Cloudflare TLS: restored vhost(s) reloaded"
+      else
+        opt_report "- **FAILED** Cloudflare TLS: reload after the restore failed; check \`angie -t\`"
+      fi
+    fi
+  fi
+  certbot_retire_if_unused "$dry"
+}
+
+# docker with a time limit (tests replace this function).
+cf_tls_docker() { timeout 20 docker "$@"; }
+
+# Everything outside the certbot tree that may depend on it, one per line;
+# it stops at the first one found (one is enough to keep certbot).  Returns
+# 2 (fail closed) when the loaded Angie configuration cannot be read.
+#   - the loaded Angie configuration (angie -T; comments dropped)
+#   - renewal hooks (scripts, or hook settings in renewal/*.conf): certbot
+#     then feeds another service
+#   - containers with a mount from the tree (docker inspect)
+#   - any non-comment /etc/letsencrypt/ reference (dhparam files count, not
+#     only certificates) in text files up to 1 MB under /etc, /opt, /srv,
+#     /usr/local, /root, /home and the crontabs, plus config-like files near
+#     the top of /var/www; one filesystem each, no node_modules/.git/vendor,
+#     AppArmor policy skipped (read rules there are not consumers)
+#   - symlinks into the tree under the same roots
+certbot_letsencrypt_users() {
+  local etc=${CERTBOT_ETC:-/etc} le=${CERTBOT_DIR:-/etc/letsencrypt}
+  local angie_bin=${ANGIE_BIN:-/usr/sbin/angie} dump root lnk hit hook
+  # The setup.sh state tree holds vhost copies (Anubis .orig backups) that
+  # are put back live later; they count as consumers too.
+  local -a roots=("$etc") extra=(/opt /srv /usr/local /root /home /var/spool/cron "${STATE_DIR:-/var/lib/setup.sh}")
+  [[ -n ${CERTBOT_EXTRA_ROOTS+x} ]] && read -ra extra <<<"$CERTBOT_EXTRA_ROOTS"
+  roots+=("${extra[@]}")
+  if [[ -x $angie_bin ]] || declare -F "$angie_bin" >/dev/null; then
+    dump=$("$angie_bin" -T 2>/dev/null) || return 2
+    grep -q '^# configuration file ' <<<"$dump" || return 2
+    hit=$(awk '
+      /^# configuration file / { f = $4; sub(/:$/, "", f); next }
+      { s = $0; sub(/#.*/, "", s); if (s ~ /\/etc\/letsencrypt([\/:" \t;]|$)/) { print f; exit } }' <<<"$dump")
+    [[ -n $hit ]] && { printf '%s\n' "$hit"; return 0; }
+  fi
+  for hook in "$le"/renewal-hooks/pre/* "$le"/renewal-hooks/deploy/* "$le"/renewal-hooks/post/*; do
+    [[ -e $hook || -L $hook ]] && { printf '%s\n' "$hook"; return 0; }
+  done
+  hit=$(grep -lsE '^[[:space:]]*(renew_hook|deploy_hook|pre_hook|post_hook)[[:space:]]*=' \
+          "$le"/renewal/*.conf 2>/dev/null | head -n 1 || true)
+  [[ -n $hit ]] && { printf '%s\n' "$hit"; return 0; }
+  if command -v docker >/dev/null 2>&1; then
+    # Bounded: a wedged daemon must not stall --optimize.  A daemon that
+    # does not answer keeps certbot (its containers cannot be checked).
+    local -a cids=()
+    local ids
+    if ! ids=$(cf_tls_docker ps -aq 2>/dev/null); then
+      if systemctl is-active --quiet docker 2>/dev/null; then
+        printf '%s\n' "docker:unreachable"; return 0
+      fi
+      ids=""
+    fi
+    mapfile -t cids < <(printf '%s\n' "$ids" | sed '/^$/d')
+    if (( ${#cids[@]} > 0 )); then
+      hit=$(cf_tls_docker inspect -f '{{.Name}} {{range .Mounts}}{{.Source}} {{end}}' "${cids[@]}" 2>/dev/null \
+              | awk -v le="$le" '{ for (i = 2; i <= NF; i++) if ($i == le || index($i, le "/") == 1) { print "docker:" $1; exit } }' || true)
+      [[ -n $hit ]] && { printf '%s\n' "$hit"; return 0; }
+    fi
+  fi
+  for root in "${roots[@]}"; do
+    [[ -d $root ]] || continue
+    hit=$(find "$root" -xdev \( -path "$le" -o -path "$etc/angie" -o -path "$etc/apparmor.d" \
+              -o -name node_modules -o -name .git -o -name vendor \) -prune \
+            -o -type f -size -1024k ! -name '*.dpkg-*' ! -name '*.bak' ! -name '*~' -print0 2>/dev/null \
+          | xargs -0 -r grep -lIE "$CF_TLS_LE_ERE" 2>/dev/null | head -n 1 || true)
+    [[ -n $hit ]] && { printf '%s\n' "$hit"; return 0; }
+    while IFS= read -r lnk; do
+      case $(readlink -f -- "$lnk" 2>/dev/null || true) in
+        "$le"|"$le"/*) printf '%s\n' "$lnk"; return 0 ;;
+      esac
+    done < <(find "$root" -xdev \( -path "$le" -o -name node_modules -o -name .git \) -prune \
+               -o -type l -print 2>/dev/null || true)
+  done
+  if [[ -d ${CERTBOT_WWW:-/var/www} ]]; then
+    hit=$(find "${CERTBOT_WWW:-/var/www}" -xdev -maxdepth 3 -type f \
+            \( -name '.env' -o -name '*.env' -o -name '*.json' -o -name '*.yml' -o -name '*.yaml' \
+               -o -name '*.conf' -o -name '*.ini' -o -name '*.toml' -o -name '*.config.js' \) \
+            -size -1024k -print0 2>/dev/null \
+          | xargs -0 -r grep -lIE "$CF_TLS_LE_ERE" 2>/dev/null | head -n 1 || true)
+    [[ -n $hit ]] && { printf '%s\n' "$hit"; return 0; }
+  fi
+  return 0
+}
+
+# Purge certbot when it is installed and nothing can still depend on it.
+# The tree moves to a dated directory under /var/backups (mode 0700; /tmp
+# is emptied at boot and would lose the account and private keys) and
+# comes back if the purge fails.  Otherwise say why certbot stays, and warn
+# when its renewals cannot run.
+certbot_retire_if_unused() {
+  local dry=${1:-0} pkg moved="" le=${CERTBOT_DIR:-/etc/letsencrypt} out u k dest
+  local -a pkgs=() users=() left=()
+  [[ ${CF_SELF_SIGNED:-1} != 0 ]] || return 0
+  while IFS= read -r pkg; do [[ -n $pkg ]] && pkgs+=("$pkg"); done < <(
+    dpkg-query -W -f='${Package} ${Status}\n' 'certbot' 'python3-certbot*' 2>/dev/null \
+      | awk '$NF == "installed" { print $1 }' || true)
+  (( ${#pkgs[@]} > 0 )) || return 0
+  if ! out=$(certbot_letsencrypt_users); then
+    cf_tls_say "$dry" "- certbot: kept; the loaded Angie configuration could not be read (angie -T failed)"
+    return 0
+  fi
+  mapfile -t users < <(printf '%s\n' "$out" | sed '/^$/d' | sort -u)
+  if (( dry && ${#CF_TLS_DRY_FULL[@]} > 0 )); then
+    for u in "${users[@]}"; do
+      for k in "${CF_TLS_DRY_FULL[@]}"; do [[ $u == "$k" ]] && continue 2; done
+      left+=("$u")
+    done
+    users=("${left[@]}")
+    # The scan stops at its first hit; with that hit planned away, look
+    # again past it in the real run instead of promising a purge here.
+    if (( ${#users[@]} == 0 )) && [[ -n $out ]]; then
+      printf '  certbot: purged after the move if nothing else uses %s (checked again after the reload)\n' "$le"
+      return 0
+    fi
+  fi
+  if (( ${#users[@]} > 0 )); then
+    cf_tls_say "$dry" "- certbot: kept; ${le} is still used by ${users[*]}"
+    certbot_renewal_health "$dry"
+    return 0
+  fi
+  if (( dry )); then
+    printf '  certbot: would be purged (%s); nothing uses %s\n' "${pkgs[*]}" "$le"
+    return 0
+  fi
+  if [[ -d $le ]]; then
+    # mktemp -d: unique even for two runs in one second, and mode 0700.
+    dest=$(mktemp -d "${CERTBOT_BACKUP_ROOT:-/var/backups}/setup-letsencrypt-$(date +%Y%m%d-%H%M%S)-XXXX" 2>/dev/null) || dest=""
+    if [[ -n $dest ]] && mv -- "$le" "$dest/" 2>/dev/null; then
+      moved="$dest/$(basename -- "$le")"
+    else
+      opt_report "- certbot: kept; could not move ${le} under ${CERTBOT_BACKUP_ROOT:-/var/backups}"
+      return 0
+    fi
+  fi
+  if DEBIAN_FRONTEND=noninteractive apt-get purge -y "${pkgs[@]}" >/dev/null 2>&1; then
+    systemctl reset-failed certbot.service certbot.timer >/dev/null 2>&1 || true
+    opt_report "- certbot: purged (${pkgs[*]}); nothing uses ${le}${moved:+; the old tree (account and keys) is kept in \`${moved}\`}. Leftover libraries go with the next \`apt autoremove\`"
+  else
+    if [[ -n $moved ]]; then mv -- "$moved" "$le" 2>/dev/null || true; fi
+    opt_report "- **FAILED** certbot purge (apt-get); ${le} put back"
+  fi
+  return 0
+}
+
+# A renewal that names the nginx plugin cannot run on an Angie host without
+# python3-certbot-nginx: say so, with the certificate end date.
+certbot_renewal_health() {
+  local dry=${1:-0} conf name end le=${CERTBOT_DIR:-/etc/letsencrypt}
+  if dpkg-query -W -f='${Status}' python3-certbot-nginx 2>/dev/null | grep -q 'ok installed'; then
+    return 0
+  fi
+  for conf in "$le"/renewal/*.conf; do
+    [[ -f $conf ]] || continue
+    grep -qE '^[[:space:]]*(authenticator|installer)[[:space:]]*=[[:space:]]*nginx' "$conf" || continue
+    name=$(basename -- "$conf" .conf)
+    end=$(openssl x509 -noout -enddate -in "${le}/live/${name}/cert.pem" 2>/dev/null | cut -d= -f2 || true)
+    cf_tls_say "$dry" "- **WARNING** certbot: \`${name}\` renews with the nginx plugin, which is not installed (Angie host); renewal fails${end:+, the certificate ends ${end}}. Put the site behind Cloudflare (self-signed origin) or use Angie's ACME client"
+  done
+  return 0
+}
+
 # Names a file defines that would clash if it were loaded next to another
 # one: cache zones, limit_req zones and map target variables, one per line.
 angie_http_defined_names() {

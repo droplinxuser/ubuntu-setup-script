@@ -151,6 +151,13 @@ optimize_angie() {
     return 1
   fi
   opt_report "- ${ANGIE_COMPRESSION_SUMMARY}"
+  # Cloudflare-proxied vhosts move off certbot certificates before the tree
+  # digest and the angie -t below, so a broken rewrite is rolled back with
+  # the rest of the tune (cloudflare_tls_finish checks them after the reload).
+  # Same condition as the finish step: a rewrite never goes live unchecked.
+  if (( rc == 0 && active )); then
+    cloudflare_tls_migrate /etc/angie 0 || true
+  fi
   # The sync restores every repository file before the tuner re-applies the
   # same values, so TUNE_DIRTY is set on every run; compare the tree instead
   # so an already-optimized host is not reloaded.
@@ -210,6 +217,11 @@ optimize_angie() {
     anubis_finish_disable
   else
     ANUBIS_STOP_PENDING=0
+  fi
+  # Through-Cloudflare check of the migrated vhosts, then certbot retirement.
+  # Both need the reloaded, running Angie; a stopped one keeps certbot.
+  if (( rc == 0 && active )); then
+    cloudflare_tls_finish 0 || true
   fi
   return "$rc"
 }
@@ -1449,6 +1461,14 @@ optimize_elastic() {
     else
       opt_report "- Index store=${OPT_ES_SIZE_MB}MB; heap=${heap_mb}MB (store/4, 512 MB minimum; the page cache serves the index)"
     fi
+    if (( ${OPT_ES_PRELOAD:-0} )) \
+       && (( OPT_ES_SIZE_MB + OPT_ES_SIZE_MB / 10 > ${OPT_ES_CACHE_FREE_MB:-0} )); then
+      opt_report "- **WARNING** Index in RAM: ${OPT_ES_SIZE_MB}MB still fits the ${OPT_ES_CACHE_FREE_MB}MB left after the services, but the 10% growth room is gone; preload kept on for now (it turns off, with an Elasticsearch restart, once the index outgrows the free RAM)"
+    elif (( ${OPT_ES_PRELOAD:-0} )); then
+      opt_report "- Index in RAM: ${OPT_ES_SIZE_MB}MB (+10% growth) fits the ${OPT_ES_CACHE_FREE_MB}MB left after the services; index.store.preload: [\"*\"] loads every index file at open (applies at the next Elasticsearch start)"
+    elif (( ${OPT_ES_CACHE_MB:-0} > 0 )); then
+      opt_report "- **WARNING** Index in RAM: ${OPT_ES_SIZE_MB}MB (+10% growth) does not fit the ${OPT_ES_CACHE_FREE_MB}MB left after the services; preload off, search reads part of the index from disk (add RAM or reduce the other services)"
+    fi
   fi
 
   es_before=$(file_md5 "$yml")
@@ -1776,6 +1796,13 @@ optimize_plan() {
       "$( (( XF_JOB_CRON )) && printf on || printf off )"
     printf '  Angie repository: sync %s (%s), then apply the hardware profile\n' \
       "${CONFIG_REPO_URL}" "${CONFIG_REPO_REF}"
+    # Same gate as the real run: both steps need a running Angie.
+    if systemctl is-active --quiet angie 2>/dev/null; then
+      cloudflare_tls_migrate /etc/angie 1 || true
+      certbot_retire_if_unused 1 || true
+    elif [[ ${CF_SELF_SIGNED:-1} != 0 ]]; then
+      printf '  Cloudflare TLS / certbot: skipped (Angie is not active)\n'
+    fi
   fi
   printf '  Applications: audit WordPress/XenForo persistent MariaDB and Valkey socket settings\n'
   if [[ ${OPT_DETECTED[*]} == *php:* ]]; then
@@ -1837,7 +1864,12 @@ optimize_plan() {
     es_size_mb=${OPT_ES_SIZE_MB:-0}
     es_fit=""
     if (( es_size_mb > 0 )); then
-      es_fit=", index=${es_size_mb}MB (heap=store/4, page cache serves the index)"
+      es_fit=", index=${es_size_mb}MB (heap=store/4, page cache serves the index"
+      if (( ${OPT_ES_PRELOAD:-0} )); then
+        es_fit+="; fits in RAM, ${OPT_ES_CACHE_FREE_MB:-0}MB free: preload on)"
+      else
+        es_fit+="; does not fit the ${OPT_ES_CACHE_FREE_MB:-0}MB free: preload off)"
+      fi
     fi
     printf '  Elasticsearch: heap=%sMB%s\n' "$heap_mb" "$es_fit"
   fi

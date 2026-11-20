@@ -1589,6 +1589,15 @@ elasticsearch_comment_keys() {
   done
 }
 
+# 0 when the managed block already preloads the whole index (the memory
+# plan's hysteresis keeps it on while the index itself still fits).
+elasticsearch_preload_active() {
+  local yml=${ES_YML:-/etc/elasticsearch/elasticsearch.yml}
+  [[ -r $yml ]] || return 1
+  sed -n '/^# BEGIN setup.sh optimize$/,/^# END setup.sh optimize$/p' "$yml" 2>/dev/null \
+    | grep -qxF 'index.store.preload: ["*"]'
+}
+
 elasticsearch_write_performance_block() {
   local file=$1 cpus search_threads write_threads
   cpus=$(effective_cpus 2>/dev/null || echo 1)
@@ -1611,12 +1620,23 @@ elasticsearch_write_performance_block() {
   # older files so no stale line remains.  node.processors tells every other
   # thread pool (get, management, refresh, flush, merge) about the cgroup
   # quota the two sized pools already follow.
-  elasticsearch_comment_keys "$file" \
-    bootstrap.memory_lock indices.query.bool.max_clause_count \
-    indices.memory.index_buffer_size indices.fielddata.cache.size \
-    search.max_buckets action.destructive_requires_name \
-    http.compression http.max_content_length http.host transport.host \
-    thread_pool.search.size thread_pool.write.size node.processors
+  # Every index file is loaded into the page cache when the index opens, so
+  # search never reads the store from disk after a restart or boot.  Only
+  # written when the memory plan found room for the whole index
+  # (OPT_ES_PRELOAD); a static setting, so it applies at the next start.
+  # An operator's own preload line is commented out only when ours replaces
+  # it (two keys would stop Elasticsearch); otherwise it is left alone.
+  local preload=""
+  local -a keys=(bootstrap.memory_lock indices.query.bool.max_clause_count
+    indices.memory.index_buffer_size indices.fielddata.cache.size
+    search.max_buckets action.destructive_requires_name
+    http.compression http.max_content_length http.host transport.host
+    thread_pool.search.size thread_pool.write.size node.processors)
+  if (( ${OPT_ES_PRELOAD:-0} )); then
+    preload=$'index.store.preload: ["*"]\n'
+    keys+=(index.store.preload)
+  fi
+  elasticsearch_comment_keys "$file" "${keys[@]}"
   cat >> "$file" <<EOF
 # BEGIN setup.sh optimize
 bootstrap.memory_lock: true
@@ -1628,7 +1648,7 @@ http.compression: true
 http.max_content_length: 200mb
 thread_pool.search.size: ${search_threads}
 thread_pool.write.size: ${write_threads}
-# END setup.sh optimize
+${preload}# END setup.sh optimize
 EOF
   chmod 644 "$file"
 }

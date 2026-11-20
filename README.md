@@ -479,6 +479,7 @@ Installed and configured:
 |---|---|
 | Repository | Elastic 9.x |
 | `elasticsearch.yml` managed block | `network.host`, single-node discovery, X-Pack security off, `bootstrap.memory_lock`, bool clause/bucket limits, index buffer and fielddata 20%, compression, 200 MB content limit |
+| Index in RAM | the memory plan reserves the whole index store (+10% growth) as page cache, taking only from PHP's share; when it fits, `index.store.preload: ["*"]` loads every index file at open (after each restart and boot). Hysteresis: switching on needs the growth room, staying on only the index itself, so a store at the edge does not restart Elasticsearch on every run |
 | Thread pools | search `clamp(cpus/2, 1, 16)`, write `clamp(cpus/4, 1, 8)` |
 | Heap file | `jvm.options.d/zz-setup-optimize.options`; an operator-owned `jvm.options` is kept |
 | System | systemd `LimitMEMLOCK=infinity`, `UMask=0027`, `vm.max_map_count` |
@@ -554,7 +555,9 @@ Tunes the OS and every installed service in place. It never installs, starts
 or purges a managed service and never
 touches swap, the resolver (DNS) or the firewall (UFW), which stay as
 `--basic` or the operator left them; the only package it may add is
-`angie-module-brotli` (and the Anubis static binary when `anubis=yes`). The
+`angie-module-brotli` (and the Anubis static binary when `anubis=yes`), and
+the only one it may remove is certbot, once nothing uses it (see
+Cloudflare-proxied sites below). The
 drivers run with `set -e`
 live, so a failed write inside a tuner aborts the run with its line number
 instead of being skipped (before 1.13.0 the `if ! run_optimize` call had
@@ -573,6 +576,30 @@ suspended errexit for the whole run). Steps:
    `SETUP_WP_GUEST_CACHE=0` to keep such vhosts uncached, in which case they
    are reported instead. Every application's guest cache reports its result
    in the same `X-Cache-Status` header (`HIT`, `MISS`, `BYPASS`, `EXPIRED`).
+   **Cloudflare-proxied sites** (SSL mode "Full") move off certbot to the
+   host's self-signed `/etc/angie/ssl/default` pair:
+   - A server block qualifies only when it sets its own certbot
+     `ssl_certificate` and `ssl_certificate_key`, and every name it serves is
+     an exact host name resolving solely to Cloudflare (ranges from
+     `http.d/cloudflare.conf`). A wildcard, regex or `.suffix` name keeps the
+     block where it is.
+   - Only the two certificate paths change. certbot's options include,
+     dhparam and trusted chain are removed, and a probe location
+     (`/.setup-cf-tls-probe-<digits>`, 204 with the digits echoed) is added.
+   - After the reload, each name must echo a fresh probe through Cloudflare.
+     Only a new worker with the new certificate can answer it, so a cached
+     answer, a challenge, a redirect or a 526 ("Full (strict)") is not
+     proof. Without the proof the vhost is put back byte for byte, with a
+     `# setup-cf-tls: keep` first line that later runs respect.
+   - certbot is then purged when the loaded Angie configuration (`angie -T`)
+     and every hook, container mount, symlink and non-comment reference under
+     `/etc`, `/opt`, `/srv`, `/usr/local`, `/root`, `/home`, the crontabs
+     and the web-root app configs leave it unused. `/etc/letsencrypt` moves
+     to `/var/backups/setup-letsencrypt-*` (0700).
+   - A kept certbot whose renewals use the missing nginx plugin is reported
+     as a warning.
+   - `SETUP_CF_SELF_SIGNED=0` (persisted as `CF_SELF_SIGNED=0`) skips all
+     of it.
 3. PHP-FPM: every `/etc/php/<ver>/fpm` tree; a live TCP pool used through the
    `local_php` upstream is migrated to the Unix socket (graceful reload, or
    a short explicit restart when SIGUSR2 cannot open the listener).  The pool
@@ -795,6 +822,7 @@ Feature choices (persisted, honoured by `--optimize`):
 | Variable | Values | Effect |
 |---|---|---|
 | `SETUP_XF_JOB_CRON` | `0\|1` | managed XenForo job-runner crontab entry |
+| `SETUP_CF_SELF_SIGNED` | `0\|1` | Cloudflare-proxied vhosts on the self-signed origin certificate and certbot retirement (`--optimize`); persisted as `CF_SELF_SIGNED` |
 | `SETUP_NODE_MAJOR` | major number | Node.js major installed by `--others nodejs` |
 | `SETUP_NODE_ALLOW_MAJOR_UPGRADE` | `1` | allows a one-off Node.js major switch |
 | `SETUP_ANUBIS_LANGUAGE` | language | Anubis UI language (default `en`, the only catalogue complete in every shipped release; `th` currently panics upstream). The application still gets the visitor's `Accept-Language` |
