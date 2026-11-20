@@ -277,6 +277,24 @@ EOF
   fi
 }
 
+# Set the 127.0.1.1 line of a hosts file in place: the first such line is
+# replaced where it stands and any further ones are dropped; with no such line
+# the new one is appended.  An empty LINE removes them.  Deleting and
+# appending (the old way) moved the line to the end, so --purge basic could
+# never give back the provider's file byte for byte.
+#   hosts_set_loopback_line FILE LINE
+hosts_set_loopback_line() {
+  local file=$1 line=$2 tmp
+  tmp=$(tmp_file) || return 1
+  awk -v l="$line" '
+    /^[[:space:]]*127\.0\.1\.1[[:space:]]/ { if (!done && l != "") print l; done = 1; next }
+    { print }
+    END { if (!done && l != "") print l }
+  ' "$file" > "$tmp" || return 1
+  # Rewrite through the existing inode: mode, owner and any symlink stay.
+  cat "$tmp" > "$file"
+}
+
 configure_hostname() {
   local host=$1
   step "Hostname"
@@ -288,8 +306,7 @@ configure_hostname() {
   hostnamectl set-hostname "$host"
   # Keep the local 127.0.1.1 entry in sync; otherwise sudo and hostname -f
   # keep resolving the old name from /etc/hosts after the rename.
-  sed_in_place -E '/^[[:space:]]*127\.0\.1\.1[[:space:]]/d' /etc/hosts
-  printf '127.0.1.1\t%s\n' "$host" >> /etc/hosts
+  hosts_set_loopback_line /etc/hosts "$(printf '127.0.1.1\t%s' "$host")"
   # Marks the hostname as applied by --basic (see basic_applied_value).
   printf '%s\n' "$host" > "${STATE_DIR}/applied-hostname"
   hostnamectl status || true

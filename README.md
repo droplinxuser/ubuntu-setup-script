@@ -354,9 +354,12 @@ costs no compression; visitors with a session get plain HTML that Angie
 compresses at level 4 (XenForo's gzip was 15 % of member-page PHP CPU).
 Measured: member thread +4 %, guest cache unchanged; turning XenForo's gzip
 off for everyone dropped guest-cache hits from 104k to 6.8k req/s (Angie
-then compresses every hit).  The block is linted before it is written and
-wins over an earlier `enableGzip` line, which is left in place;
-`SETUP_XF_MEMBER_GZIP=xenforo` removes it.
+then compresses every hit).  The block is linted before it is written.  An
+earlier one-statement `$config['enableGzip'] = ...;` line (older installs
+carry `= false;`) is a duplicate next to it and is commented out with a
+`// setup.sh superseded (enableGzip block below): ` prefix;
+`SETUP_XF_MEMBER_GZIP=xenforo` removes the block and restores that line
+exactly.
 
 The vhost serves guest pages from the FastCGI cache for 5 minutes with a
 map-based bypass for `xf_session`/`xf_user`/admin/login cookies, a key that

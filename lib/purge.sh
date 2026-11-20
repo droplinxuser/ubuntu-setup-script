@@ -202,8 +202,7 @@ purge_basic() {
   if [[ -f "${BACKUP_DIR}/hosts.recorded" && -f "${BACKUP_DIR}/hosts" ]]; then
     local orig_line
     orig_line=$(grep -E '^[[:space:]]*127\.0\.1\.1[[:space:]]' "${BACKUP_DIR}/hosts" | head -n1 || true)
-    sed_in_place -E '/^[[:space:]]*127\.0\.1\.1[[:space:]]/d' /etc/hosts
-    [[ -n $orig_line ]] && printf '%s\n' "$orig_line" >> /etc/hosts
+    hosts_set_loopback_line /etc/hosts "$orig_line"
     info "Restored the 127.0.1.1 line of /etc/hosts (other entries untouched)"
   fi
   if [[ -f "${STATE_DIR}/original-timezone" ]]; then

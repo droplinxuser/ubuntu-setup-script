@@ -5,6 +5,39 @@ README.md; measurements in tests/stress-site/RESULTS.md.  Per-cycle
 reports and raw test logs cited by entries up to 1.21.32 were removed from
 the tree on 2026-11-19; retrieve them with `git show 84b0db5:<path>`.
 
+## 1.21.40 (2026-11-20)
+
+Findings from the first `--optimize mitigations=off` on a live XenForo host
+(Xeon E3-1230 v6, kernel 7.0.0-44): optimize and the reboot were clean
+(0 warnings, 0 failed units, mitigations off, governor/sysctl/huge pages
+applied); these three items came out of the review.
+
+- **Old XenForo `enableGzip` lines are commented out.**  Next to the managed
+  `XF_MEMBER_GZIP=angie` block, an earlier `$config['enableGzip'] = false;`
+  (older installs; the live host had it column-aligned) is a duplicate.
+  `--optimize` now prefixes each one-statement `enableGzip` line with
+  `// setup.sh superseded (enableGzip block below): `, keeping the original
+  text; `XF_MEMBER_GZIP=xenforo` removes the block and un-comments the line
+  byte for byte.  A line holding another statement is left alone; every
+  write is still linted.  Seven unit checks (indented, double-quoted,
+  trailing comment, idempotence, round trip).
+- **Reverse-path filtering matches Ubuntu (loose, 2).**  The profile set
+  `rp_filter = 1` for `all`/`default`, but systemd's `50-default.conf`
+  sets `net.ipv4.conf.*.rp_filter = 2` on every interface and the kernel
+  enforces the higher value, so every NIC already ran loose mode while the
+  profile claimed strict.  Now `2`, which also stays safe with asymmetric
+  routing (vRack, failover IPs, several NICs).  The drift report shows the
+  provider files as `same`.  Test host: 2 on all/default/eno1/lo at runtime
+  and after a reboot.
+- **`/etc/hosts` keeps its line order.**  `--basic` and `--purge basic`
+  deleted the `127.0.1.1` line and appended the new one, so a purge never
+  restored the provider's file byte for byte (the remaining `/etc/hosts`
+  delta of every audit restore).  `hosts_set_loopback_line` replaces the
+  line where it stands; five unit checks.
+
+Suites on the Xeon test host: unit 1,135/1,135 (root and non-root, PHP
+installed for the XenForo checks), dry-run matrix 219/219.
+
 ## 1.21.39 (2026-11-20)
 
 Test-suite hardening.  CI had failed on every push since 3e781fb; that was

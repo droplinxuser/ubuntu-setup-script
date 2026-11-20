@@ -597,6 +597,30 @@ check "CPU governor probe ignores an unavailable performance governor" \
   not gov_probe "$gov/noperf"
 check "CPU governor probe reports no cpufreq interface" not gov_probe "$gov/missing"
 
+# /etc/hosts: the 127.0.1.1 line is replaced where it stands, so --basic
+# followed by --purge basic gives back the provider's file byte for byte (the
+# old delete-and-append moved it to the end; found on the OVH audit host).
+hf=$TMP/hosts
+printf '127.0.0.1\tlocalhost\n127.0.1.1\torig orig\n\n::1\tip6-localhost\n' > "$hf"
+cp "$hf" "$TMP/hosts.orig"
+hosts_set_loopback_line "$hf" "$(printf '127.0.1.1\tnew-host')"
+check "hosts: the 127.0.1.1 line is replaced in place" \
+  test "$(sed -n 2p "$hf")" = "$(printf '127.0.1.1\tnew-host')"
+hosts_set_loopback_line "$hf" "$(printf '127.0.1.1\torig orig')"
+check "hosts: setting the original line back restores the file byte for byte" \
+  cmp -s "$hf" "$TMP/hosts.orig"
+printf '127.0.0.1\tlocalhost\n' > "$hf"
+hosts_set_loopback_line "$hf" "$(printf '127.0.1.1\tnew-host')"
+check "hosts: a file without the line gets it appended" \
+  test "$(tail -n 1 "$hf")" = "$(printf '127.0.1.1\tnew-host')"
+printf '127.0.1.1\ta\n127.0.0.1\tlocalhost\n 127.0.1.1\tb\n' > "$hf"
+hosts_set_loopback_line "$hf" "$(printf '127.0.1.1\tc')"
+check "hosts: duplicate 127.0.1.1 lines collapse into the first position" \
+  test "$(cat "$hf")" = "$(printf '127.0.1.1\tc\n127.0.0.1\tlocalhost')"
+hosts_set_loopback_line "$hf" ""
+check "hosts: an empty line removes the entry (the original had none)" \
+  not grep -q '127\.0\.1\.1' "$hf"
+
 # The single-file fallback must stay byte-identical to the canonical profile,
 # otherwise a run without configs/ silently writes values we already removed
 # (for example the boot-time route.flush errors).
@@ -4885,9 +4909,9 @@ if command -v php >/dev/null 2>&1; then
     md5sum < "$xfg/config.php" | cut -d' ' -f1
   }
   first=$(xfg_run angie)
-  check "XenForo gzip: the managed block is appended after the operator's line" \
-    bash -c 'tail -n1 "$1" | grep -qF "// END setup.sh enableGzip" && grep -qF "$2" "$1" && grep -qF "$3" "$1"' \
-    _ "$xfg/config.php" "\$config['enableGzip'] = !isset(\$_COOKIE[" "\$config['enableGzip'] = true;"
+  check "XenForo gzip: the managed block is appended and the operator's line commented out" \
+    bash -c 'tail -n1 "$1" | grep -qF "// END setup.sh enableGzip" && grep -qF "$2" "$1" && grep -qxF "$3" "$1"' \
+    _ "$xfg/config.php" "\$config['enableGzip'] = !isset(\$_COOKIE[" "${XF_GZIP_SUPERSEDED}\$config['enableGzip'] = true;"
   check "XenForo gzip: the result parses" php -l "$xfg/config.php"
   check "XenForo gzip: a second run changes nothing" test "$(xfg_run angie)" = "$first"
   check "XenForo gzip: a guest renders with XenForo gzip on" \
@@ -4899,6 +4923,25 @@ if command -v php >/dev/null 2>&1; then
   xfg_run xenforo >/dev/null
   check "XenForo gzip: XF_MEMBER_GZIP=xenforo restores the file byte for byte" \
     cmp -s "$xfg/config.php" "$TMP/xfgzip/orig.php"
+  # Older installs: `$config['enableGzip'] = false;` (often with a comment,
+  # sometimes indented).  A line holding a second statement is left alone.
+  printf '%s\n' '<?php' "\$config['enableGzip'] = false; // off for the CDN" \
+    "  \$config [ \"enableGzip\" ]=0;" "\$config['debug'] = false; \$config['enableGzip'] = false;" > "$xfg/config.php"
+  cp "$xfg/config.php" "$TMP/xfgzip/old.php"
+  xfg_run angie >/dev/null
+  check "XenForo gzip: an old enableGzip = false line is commented out" \
+    grep -qxF "${XF_GZIP_SUPERSEDED}\$config['enableGzip'] = false; // off for the CDN" "$xfg/config.php"
+  check "XenForo gzip: an indented, double-quoted line is commented out too" \
+    grep -qxF "${XF_GZIP_SUPERSEDED}  \$config [ \"enableGzip\" ]=0;" "$xfg/config.php"
+  check "XenForo gzip: a line with a second statement is left as it is" \
+    grep -qxF "\$config['debug'] = false; \$config['enableGzip'] = false;" "$xfg/config.php"
+  check "XenForo gzip: with the old lines commented out a guest still gets gzip" \
+    test "$(php -r '$config=[]; include $argv[1]; echo $config["enableGzip"] ? 1 : 0;' "$xfg/config.php")" = 1
+  old_sum=$(xfg_run angie)
+  check "XenForo gzip: commenting out is idempotent" test "$(xfg_run angie)" = "$old_sum"
+  xfg_run xenforo >/dev/null
+  check "XenForo gzip: XF_MEMBER_GZIP=xenforo un-comments the old lines byte for byte" \
+    cmp -s "$xfg/config.php" "$TMP/xfgzip/old.php"
   printf '%s\n' '<?php' "\$config['db']['host'] = 'localhost';" '?>' '' > "$xfg/config.php"
   xfg_run angie >/dev/null
   check "XenForo gzip: a closing ?> is removed so the block stays PHP" \

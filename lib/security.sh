@@ -292,12 +292,21 @@ scan_wordpress_malware() {
 
 # XenForo page compression handover (XF_MEMBER_GZIP, see setup.sh).  The
 # block is appended to src/config.php, so it wins over an earlier
-# $config['enableGzip'] line the operator already has; that line is left as
-# it is.  The cookie prefix follows a $config['cookie']['prefix'] set
-# earlier in the same file (XenForo's default is "xf_").  Every write is
-# linted with the CLI PHP and rolled back if the file no longer parses.
+# $config['enableGzip'] line.  That earlier line (older installs carry
+# `$config['enableGzip'] = false;`) is dead code next to the block, so it is
+# commented out with XF_GZIP_SUPERSEDED in front of the unchanged line, and
+# un-commented again when the block is removed (XF_MEMBER_GZIP=xenforo): the
+# round trip still restores the file byte for byte.  Only a line holding that
+# one statement is touched (optional trailing comment).  The cookie prefix
+# follows a $config['cookie']['prefix'] set earlier in the same file
+# (XenForo's default is "xf_").  Every write is linted with the CLI PHP and
+# rolled back if the file no longer parses.
 XF_GZIP_BEGIN='// BEGIN setup.sh enableGzip'
 XF_GZIP_END='// END setup.sh enableGzip'
+XF_GZIP_SUPERSEDED='// setup.sh superseded (enableGzip block below): '
+# awk ERE for a line that is only `$config['enableGzip'] = <value>;`.
+# Bracket expressions instead of backslashes: awk -v expands escapes.
+XF_GZIP_LINE_RE='^[[:space:]]*[$]config[[:space:]]*[[][[:space:]]*["'"'"']enableGzip["'"'"'][[:space:]]*[]][[:space:]]*=[^;]*;[[:space:]]*((//|#).*)?$'
 xf_gzip_block() {
   cat <<'EOF'
 // BEGIN setup.sh enableGzip (XF_MEMBER_GZIP=angie in /etc/default/setup-tuning)
@@ -310,7 +319,7 @@ EOF
 }
 
 tune_xenforo_gzip() {
-  local conf tmp changed=0 kept=0 php_bin
+  local conf tmp tmp2 changed=0 kept=0 php_bin delta superseded=0 restored=0
   php_bin=$(command -v php 2>/dev/null || true)
   persist_xf_member_gzip
   while IFS= read -r conf; do
@@ -334,6 +343,18 @@ tune_xenforo_gzip() {
     if [[ $XF_MEMBER_GZIP == angie ]] || grep -qF "$XF_GZIP_BEGIN" "$conf"; then
       sed -i -e ':a' -e '/^[[:space:]]*$/{$d;N;ba' -e '}' "$tmp"
     fi
+    # Earlier enableGzip lines: commented out while the block manages the
+    # setting, given back (prefix stripped) when it does not.
+    tmp2=$(tmp_file) || return 1
+    if [[ $XF_MEMBER_GZIP == angie ]]; then
+      awk -v re="$XF_GZIP_LINE_RE" -v p="$XF_GZIP_SUPERSEDED" \
+        '$0 ~ re { print p $0; next } { print }' "$tmp" > "$tmp2"
+    else
+      awk -v p="$XF_GZIP_SUPERSEDED" \
+        'index($0, p) == 1 { print substr($0, length(p) + 1); next } { print }' "$tmp" > "$tmp2"
+    fi
+    cat "$tmp2" > "$tmp"
+    delta=$(( $(grep -cF "$XF_GZIP_SUPERSEDED" "$tmp" || true) - $(grep -cF "$XF_GZIP_SUPERSEDED" "$conf" || true) ))
     # A closing "?>" would print the block as text, so a final "?>" goes
     # and the appended PHP stays inside the file's opening tag.
     if [[ $XF_MEMBER_GZIP == angie ]]; then
@@ -355,6 +376,8 @@ tune_xenforo_gzip() {
     fi
     cat "$tmp" > "$conf" || { harden_warn "- XenForo gzip: could not write ${conf}"; continue; }
     changed=$(( changed + 1 ))
+    if (( delta > 0 )); then superseded=$(( superseded + delta )); fi
+    if (( delta < 0 )); then restored=$(( restored - delta )); fi
   done < <(app_find_xenforo_configs)
   if (( changed > 0 )); then
     if [[ $XF_MEMBER_GZIP == angie ]]; then
@@ -364,6 +387,12 @@ tune_xenforo_gzip() {
     fi
   elif (( kept > 0 )); then
     harden_note "- XenForo gzip: ${kept} config.php already as configured (XF_MEMBER_GZIP=${XF_MEMBER_GZIP})"
+  fi
+  if (( superseded > 0 )); then
+    harden_note "- XenForo gzip: commented out ${superseded} earlier \$config['enableGzip'] line(s) the managed block supersedes (restored by XF_MEMBER_GZIP=xenforo)"
+  fi
+  if (( restored > 0 )); then
+    harden_note "- XenForo gzip: restored ${restored} earlier \$config['enableGzip'] line(s)"
   fi
   return 0
 }
