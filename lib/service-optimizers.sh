@@ -61,7 +61,12 @@ php_refresh_after_angie() {
   while IFS= read -r v; do
     tune_reset_changes
     if tune_php_fpm_version "$v"; then
-      (( TUNE_DIRTY )) && dirty=1
+      # A clean pass only repeats the informational tune_summary lines
+      # (max_children ...) already in the PHP section; printing them here put
+      # a PHP line under whichever section ran last (Elasticsearch).
+      (( TUNE_DIRTY )) || continue
+      dirty=1
+      [[ $reporter == opt_report ]] && opt_report "## PHP ${v} (post-Angie refresh)"
       for change in "${TUNE_CHANGES[@]}"; do
         "$reporter" "${prefix}${change} (post-Angie refresh)"
       done

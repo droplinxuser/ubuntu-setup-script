@@ -6065,5 +6065,35 @@ check "ES yml: the operator preload line is commented out when ours replaces it"
   grep -qxF '#index.store.preload: ["nvd"]' "$esyml"
 
 
+# ---------------------------------------------------------------------------
+# Post-Angie PHP refresh: a clean pass reports nothing (the max_children
+# summary used to repeat under the Elasticsearch section of a live report)
+# ---------------------------------------------------------------------------
+refresh_case() {
+  local stub_dirty=$1
+  (
+    eval "$(sed -n '/^php_refresh_after_angie() {/,/^}/p' "$ROOT/lib/service-optimizers.sh")"
+    REPORT_LINES=()
+    opt_report() { REPORT_LINES+=("$*"); }
+    warn() { :; }
+    php_fpm_versions() { printf '8.5\n'; }
+    tune_reset_changes() { TUNE_CHANGES=(); TUNE_DIRTY=0; }
+    tune_php_fpm_version() {
+      TUNE_CHANGES+=("PHP 8.5: max_children=8 (hardware target)")
+      if (( stub_dirty )); then TUNE_CHANGES+=("PHP 8.5: ini [PATH=] section rewritten"); TUNE_DIRTY=1; fi
+      return 0
+    }
+    systemctl() { return 0; }
+    OPT_PHP_OK=1
+    php_refresh_after_angie opt_report "- " 2>&1
+    printf '%s\n' "${REPORT_LINES[@]}"
+  )
+}
+check "post-Angie refresh: a clean pass prints nothing and reloads nothing" \
+  test -z "$(refresh_case 0 | sed '/^$/d')"
+out=$(refresh_case 1)
+check "post-Angie refresh: a changing pass reports under its own PHP heading and reloads" \
+  bash -c 'grep -qx "## PHP 8.5 (post-Angie refresh)" <<<"$1" && grep -q "section rewritten (post-Angie refresh)" <<<"$1" && grep -q "PHP 8.5: reloaded after the post-Angie ini refresh" <<<"$1"' _ "$out"
+
 printf '\nTOTAL pass=%d fail=%d skip=%d\n' "$PASS" "$FAIL" "$SKIP"
 [[ $FAIL -eq 0 ]]

@@ -5,6 +5,21 @@ README.md; measurements in tests/stress-site/RESULTS.md.  Per-cycle
 reports and raw test logs cited by entries up to 1.21.32 were removed from
 the tree on 2026-11-19; retrieve them with `git show 84b0db5:<path>`.
 
+## 1.21.51 (2026-11-20)
+
+- **The `--optimize` report no longer repeats PHP lines under the last
+  section.**  The post-Angie PHP refresh re-printed every line of the PHP
+  pass, including informational ones (`max_children=8 (hardware target
+  ...)`), even when it changed nothing, so on 203.0.113.24 a PHP line
+  appeared under `## Elasticsearch`.  A clean refresh now prints nothing;
+  one that changes the ini reports under its own `## PHP X.Y (post-Angie
+  refresh)` heading, as before followed by a reload.
+- Live run on 203.0.113.24 (Ubuntu 24.04.5, `--optimize mitigations=off`
+  with 1.21.50, then a reboot): exit 0, 0 warnings, the MariaDB buffer pool
+  lowered online 4011 -> 128 MB (62 MB of data), PHP-FPM `KillSignal=SIGQUIT`,
+  `kernel.sysrq` 0 and `mitigations=off` in force after the boot, every site
+  and WebSocket endpoint answering as before.
+
 ## 1.21.50 (2026-11-20)
 
 Audit cycle on the Xeon E-2236 host; report in
