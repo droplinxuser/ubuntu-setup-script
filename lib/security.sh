@@ -515,10 +515,67 @@ EOF
     # _local_ special value are loopback as well.
     if grep -qE '^[[:space:]]*network\.host:' /etc/elasticsearch/elasticsearch.yml 2>/dev/null \
        && ! grep -qE '^[[:space:]]*network\.host:[[:space:]]*["'"'"']?(127\.0\.0\.1|localhost|::1|\[::1\]|_local_)["'"'"']?[[:space:]]*(#.*)?$' /etc/elasticsearch/elasticsearch.yml 2>/dev/null; then
-      harden_warn "- Elasticsearch: network.host is not loopback; bind it to 127.0.0.1 or enable xpack security"
+      # A node bound to a public address for a remote client (XenForo on
+      # another host) is fine when the firewall admits only that client:
+      # that is exactly what the advice asks for, so it is a note, not a
+      # warning that fires on every correctly secured host.
+      local es_exposure
+      es_exposure=$(es_ufw_exposure)
+      case $es_exposure in
+        restricted:*)
+          harden_note "- Elasticsearch: network.host is not loopback; UFW admits 9200/9300 only from ${es_exposure#restricted:}" ;;
+        *)
+          harden_warn "- Elasticsearch: network.host is not loopback and 9200/9300 are not restricted by UFW; bind it to 127.0.0.1, allow only the remote client(s) in UFW, or enable X-Pack security" ;;
+      esac
     fi
   fi
   return 0
+}
+
+# Sources a `ufw status` listing (stdin) admits to TCP port PORT, one per
+# line ("Anywhere" for an open rule).  Columns are separated by 2+ spaces;
+# a To of "Anywhere" covers every port, otherwise a comma list of ports and
+# a:b ranges with an optional /tcp or /udp.
+ufw_status_port_sources() {
+  local port=$1
+  awk -v port="$port" '
+    /^--/ { rules = 1; next }
+    !rules || NF == 0 { next }
+    {
+      n = split($0, c, /  +/)
+      if (n < 3) next
+      to = c[1]; act = c[2]; from = c[3]
+      if (act !~ /^(ALLOW|LIMIT)/) next
+      sub(/ \(v6\)$/, "", to); sub(/ \(v6\)$/, "", from)
+      hit = 0
+      if (to == "Anywhere") hit = 1
+      else {
+        sub(/\/(tcp|udp)$/, "", to)
+        m = split(to, parts, ",")
+        for (i = 1; i <= m; i++) {
+          if (parts[i] ~ /:/) { split(parts[i], r, ":"); if (port + 0 >= r[1] + 0 && port + 0 <= r[2] + 0) hit = 1 }
+          else if (parts[i] == port) hit = 1
+        }
+      }
+      if (hit && !(from in seen)) { seen[from] = 1; print from }
+    }
+  '
+}
+
+# Elasticsearch exposure through UFW: "restricted:<sources>" when UFW is
+# active, denies incoming by default and admits 9200/9300 only from named
+# sources; "open" when a rule admits them from anywhere; "unknown" otherwise
+# (no UFW, inactive, or a permissive default).
+es_ufw_exposure() {
+  local st sources
+  command -v ufw >/dev/null 2>&1 || { printf 'unknown'; return 0; }
+  st=$(ufw status verbose 2>/dev/null) || { printf 'unknown'; return 0; }
+  grep -q '^Status: active' <<<"$st" || { printf 'unknown'; return 0; }
+  grep -qE '^Default: (deny|reject) \(incoming\)' <<<"$st" || { printf 'unknown'; return 0; }
+  sources=$( { ufw_status_port_sources 9200 <<<"$st"; ufw_status_port_sources 9300 <<<"$st"; } | sort -u)
+  if grep -qx 'Anywhere' <<<"$sources"; then printf 'open'; return 0; fi
+  [[ -n $sources ]] || sources="no source"
+  printf 'restricted:%s' "$(paste -sd' ' - <<<"$sources")"
 }
 
 audit_app_persistent_connections() {

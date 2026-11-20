@@ -700,6 +700,50 @@ acme_before_test() {
 }
 check "ACME: the sync retires the stale file before its first angie -t" acme_before_test
 
+# Superseded legacy zz-setup-*_conf files (live host: zz-setup-wordpress-
+# cache_conf redefined keys_zone=fastcgicache and map $nocacheuri).
+ls_t=$TMP/legacy-zz; mkdir -p "$ls_t/http.d"
+printf 'http {\n  include http.d/*.conf;\n}\n' > "$ls_t/angie.conf"
+printf 'map $request_uri $nocacheuri {\n  default 0;\n}\nfastcgi_cache_path /home/c levels=1:2 keys_zone=fastcgicache:512m max_size=1G;\n' > "$ls_t/http.d/fastcgi_cache.conf"
+printf 'map $request_uri $nocacheuri {\n  default 0;\n}\n\nfastcgi_cache_path /home/c levels=1:2 keys_zone=fastcgicache:512m max_size=2G;\n' > "$ls_t/http.d/zz-setup-wordpress-cache_conf"
+printf 'fastcgi_cache_path /home/o levels=1:2 keys_zone=onlyhere:16m;\n' > "$ls_t/http.d/zz-setup-unique_conf"
+printf 'fastcgi_cache_path /home/c levels=1:2 keys_zone=fastcgicache:16m;\n' > "$ls_t/http.d/operator_conf"
+( tune_reset_changes; tune_retire_superseded_setup_files "$ls_t" ) >/dev/null 2>&1
+check "legacy zz-setup file whose zones/maps are all loaded elsewhere is retired" \
+  test ! -e "$ls_t/http.d/zz-setup-wordpress-cache_conf"
+check "legacy zz-setup file with a zone nothing else defines is kept" test -f "$ls_t/http.d/zz-setup-unique_conf"
+check "an inactive file without the zz-setup- prefix (operator's) is kept" test -f "$ls_t/http.d/operator_conf"
+check "loaded files are never touched by the legacy retirement" test -f "$ls_t/http.d/fastcgi_cache.conf"
+legacy_before_test() {
+  sed -n '/^deploy_angie_tree()/,/^}/p' "$ROOT/lib/web.sh" \
+    | grep -nE 'tune_retire_superseded_setup_files|/usr/sbin/angie -t' | head -n 1 \
+    | grep -q tune_retire_superseded_setup_files
+}
+check "the sync retires superseded legacy files before its first angie -t" legacy_before_test
+
+# Elasticsearch exposure through UFW (live host: network.host = public IP,
+# X-Pack off, UFW admitting only the forum server).  The warning fired twice
+# on that correctly firewalled host.
+ufw_sample_restricted=$'Status: active\nLogging: on (low)\nDefault: deny (incoming), allow (outgoing), disabled (routed)\nNew profiles: skip\n\nTo                         Action      From\n--                         ------      ----\n22                         LIMIT IN    Anywhere\n80                         ALLOW IN    Anywhere\n443                        ALLOW IN    Anywhere\nAnywhere                   ALLOW IN    198.51.100.36\n22 (v6)                    LIMIT IN    Anywhere (v6)\n80 (v6)                    ALLOW IN    Anywhere (v6)'
+check "ufw parser: 9200 admitted only from the remote client" \
+  test "$(ufw_status_port_sources 9200 <<<"$ufw_sample_restricted")" = "198.51.100.36"
+# "Anywhere ALLOW 198.51.100.36" admits that host on every port, 443 too.
+check "ufw parser: 443 admitted from anywhere (and the all-ports host)" \
+  test "$(ufw_status_port_sources 443 <<<"$ufw_sample_restricted" | paste -sd' ' -)" = "Anywhere 198.51.100.36"
+check "ufw parser: a port range and comma list are honoured" \
+  test "$(printf 'To                         Action      From\n--                         ------      ----\n9000:9400/tcp              ALLOW IN    10.0.0.5\n80,9300/tcp                ALLOW IN    Anywhere\n' | ufw_status_port_sources 9300 | paste -sd' ' -)" = "10.0.0.5 Anywhere"
+es_exp() { ( ufw() { printf '%s\n' "$UFW_OUT"; }; es_ufw_exposure ); }
+check "ES exposure: restricted to the remote client" \
+  test "$(UFW_OUT=$ufw_sample_restricted es_exp)" = "restricted:198.51.100.36"
+check "ES exposure: a rule opening 9200 to anywhere is open" \
+  test "$(UFW_OUT="${ufw_sample_restricted}"$'\n9200/tcp                   ALLOW IN    Anywhere' es_exp)" = "open"
+check "ES exposure: inactive UFW is unknown (warning stays)" \
+  test "$(UFW_OUT='Status: inactive' es_exp)" = "unknown"
+check "ES exposure: an allow-all default is unknown (warning stays)" \
+  test "$(UFW_OUT="${ufw_sample_restricted/deny (incoming)/allow (incoming)}" es_exp)" = "unknown"
+check "the Elasticsearch section no longer prints its own WARNING" \
+  not grep -q 'WARNING\*\*: Elasticsearch network.host' "$ROOT/lib/service-optimizers.sh"
+
 # The single-file fallback must stay byte-identical to the canonical profile,
 # otherwise a run without configs/ silently writes values we already removed
 # (for example the boot-time route.flush errors).
@@ -4925,24 +4969,26 @@ check "the mitigations drop-in works on an empty default line" \
   _ "$(cpu_mitigations_dropin_text)"
 mit_run() { # want -> "<file present 0/1> <update-grub calls>"
   (
-    CPU_MITIGATIONS_DROPIN=$TMP/mit/grub.d/99-setup-mitigations.cfg
+    CPU_MITIGATIONS_DROPIN=$TMP/mit/grub.d/zz-setup-mitigations.cfg
+    CPU_MITIGATIONS_LEGACY_DROPIN=$TMP/mit/grub.d/99-setup-mitigations.cfg
     CPU_MITIGATIONS=$1 CPU_MITIGATIONS_SETTING=""
     host_is_container() { return 1; }
-    harden_note() { :; }
-    info() { :; }
+    harden_note() { printf 'NOTE %s\n' "$*" >> "$TMP/mit/report"; }
+    info() { printf 'INFO %s\n' "$*" >> "$TMP/mit/report"; }
     CPU_MITIGATIONS_GRUBCFG=$TMP/mit/grub.cfg
     # A fake update-grub: count the calls and write the boot menu the drop-in
-    # would produce (MIT_GRUB_FAIL=1 simulates a failing regeneration).
+    # would produce (MIT_GRUB_FAIL=1 simulates a failing regeneration,
+    # MIT_OVERRIDE=1 a provider drop-in that erases the option).
     update-grub() {
       printf x >> "$TMP/mit/calls"
       [[ ${MIT_GRUB_FAIL:-0} == 1 ]] && return 1
-      if [[ -f $CPU_MITIGATIONS_DROPIN ]]; then
+      if [[ -f $CPU_MITIGATIONS_DROPIN && ${MIT_OVERRIDE:-0} != 1 ]]; then
         echo "	linux /vmlinuz root=x ro mitigations=off" > "$CPU_MITIGATIONS_GRUBCFG"
       else
         echo "	linux /vmlinuz root=x ro" > "$CPU_MITIGATIONS_GRUBCFG"
       fi
     }
-    harden_warn() { :; }
+    harden_warn() { printf 'WARN %s\n' "$*" >> "$TMP/mit/report"; }
     [[ -f /etc/default/grub ]] || exit 3
     configure_cpu_mitigations >/dev/null 2>&1
     printf '%s %s' "$([[ -f $CPU_MITIGATIONS_DROPIN ]] && echo 1 || echo 0)" "$(wc -c < "$TMP/mit/calls")"
@@ -4959,9 +5005,45 @@ if [[ -f /etc/default/grub ]]; then
   mit_run off >/dev/null; echo "	linux /vmlinuz root=x ro" > "$TMP/mit/grub.cfg"
   : > "$TMP/mit/calls"
   check "a boot menu without mitigations=off is regenerated on the next run" test "$(mit_run off)" = "1 1"
-  rm -f "$TMP/mit/grub.d/99-setup-mitigations.cfg"; : > "$TMP/mit/calls"
+  rm -f "$TMP/mit/grub.d/zz-setup-mitigations.cfg"; : > "$TMP/mit/calls"
   check "a failing update-grub never fails the run" test "$(MIT_GRUB_FAIL=1 mit_run off)" = "1 1"
+  # Pre-1.21.44 name: retired, the new drop-in written, the menu regenerated.
+  rm -f "$TMP/mit/grub.d/"*; echo 'GRUB_CMDLINE_LINUX_DEFAULT="x mitigations=off"' > "$TMP/mit/grub.d/99-setup-mitigations.cfg"
+  : > "$TMP/mit/calls"
+  mit_legacy_out=$(mit_run off)
+  check "the old 99-setup-mitigations.cfg is replaced by zz-setup-mitigations.cfg" \
+    bash -c 'test "$1" = "1 1" && test ! -e "$2/99-setup-mitigations.cfg" && test -f "$2/zz-setup-mitigations.cfg"' _ "$mit_legacy_out" "$TMP/mit/grub.d"
+  # A provider drop-in sorted after ours erases the option: the run warns
+  # and names it instead of reporting "off at the next reboot" (Hetzner).
+  printf 'GRUB_CMDLINE_LINUX_DEFAULT="consoleblank=0"\n' > "$TMP/mit/grub.d/zzz-provider.cfg"
+  # The menu update-grub generated with that provider file lacks the option.
+  echo "	linux /vmlinuz root=x ro consoleblank=0" > "$TMP/mit/grub.cfg"
+  : > "$TMP/mit/report"
+  MIT_OVERRIDE=1 mit_run off >/dev/null
+  check "an overridden boot menu is reported, naming the overriding drop-in" \
+    grep -q "^WARN .*no mitigations=off.*zzz-provider.cfg" "$TMP/mit/report"
+  check "an overridden boot menu is never reported as 'off at the next reboot'" \
+    not grep -q "at the next reboot" "$TMP/mit/report"
+  rm -f "$TMP/mit/grub.d/zzz-provider.cfg"
 fi
+# Drop-in order is what grub-mkconfig's glob gives: ours must come after the
+# provider names seen on live hosts, in the C and the UTF-8 collation.
+mit_sorts_last() {
+  local loc first
+  for loc in C C.UTF-8 en_US.UTF-8; do
+    first=$(printf '%s\n' zz-setup-mitigations.cfg hetzner.cfg init-select.cfg 50-cloudimg-settings.cfg 99-setup-mitigations.cfg \
+            | LC_ALL=$loc sort 2>/dev/null | tail -n 1)
+    [[ $first == zz-setup-mitigations.cfg ]] || return 1
+  done
+}
+check "the mitigations drop-in sorts after hetzner.cfg, init-select.cfg and 50-cloudimg-settings.cfg" mit_sorts_last
+check "the drop-in path is zz-setup-mitigations.cfg" test "${CPU_MITIGATIONS_DROPIN##*/}" = zz-setup-mitigations.cfg
+mo=$TMP/mit-over/grub.d; mkdir -p "$mo"
+printf 'GRUB_CMDLINE_LINUX_DEFAULT="consoleblank=0"\n' > "$mo/hetzner.cfg"
+printf 'GRUB_CMDLINE_LINUX_DEFAULT="${GRUB_CMDLINE_LINUX_DEFAULT} quiet"\n' > "$mo/zzz-extends.cfg"
+printf 'GRUB_CMDLINE_LINUX_DEFAULT="nosplash"\n' > "$mo/zzzz-assigns.cfg"
+check "overrider scan: only plain assignments sorted after ours are listed" \
+  test "$(CPU_MITIGATIONS_DROPIN=$mo/zz-setup-mitigations.cfg cpu_mitigations_overriders)" = "$mo/zzzz-assigns.cfg"
 check "CPU_MITIGATIONS and XF_MEMBER_GZIP survive the --optimize pin reset" \
   bash -c 'printf "%s\n" "${@}" | grep -qx CPU_MITIGATIONS && printf "%s\n" "${@}" | grep -qx XF_MEMBER_GZIP' _ "${RESET_KEEP_PINS[@]}"
 check "--purge basic removes the mitigations drop-in" \

@@ -558,6 +558,51 @@ tune_retire_unused_acme_client() {
   return 0
 }
 
+# Names a file defines that would clash if it were loaded next to another
+# one: cache zones, limit_req zones and map target variables, one per line.
+angie_http_defined_names() {
+  sed -E 's/#.*//' "$@" 2>/dev/null | awk '
+    { for (i = 1; i <= NF; i++) {
+        if ($i ~ /^keys_zone=/) { v = $i; sub(/^keys_zone=/, "", v); sub(/:.*/, "", v); print "zone:" v }
+        else if ($i ~ /^zone=/ && $0 ~ /limit_req_zone/) { v = $i; sub(/^zone=/, "", v); sub(/:.*/, "", v); print "zone:" v }
+      }
+      if ($1 == "map" && $3 ~ /^\$/) { v = $3; sub(/[{;].*/, "", v); print "var:" v }
+    }' | sort -u
+}
+
+# Old setup.sh releases generated http.d/zz-setup-*_conf files (inactive:
+# angie.conf includes only *.conf) whose content later moved into active
+# files.  --optimize then reported them as "not included" with the advice to
+# re-run the deployment, which never changed anything; activating one would
+# even break `angie -t` with a duplicate zone (zz-setup-wordpress-cache_conf
+# redefines keys_zone=fastcgicache, live host 2026-11-20).  An inactive
+# zz-setup-* file is retired (moved to /tmp, never deleted) only when every
+# zone and map variable it defines is already defined by a loaded file.
+tune_retire_superseded_setup_files() {
+  local target=$1 f name moved
+  local -a active=()
+  mapfile -t active < <(angie_active_http_files "$target")
+  (( ${#active[@]} > 0 )) || return 0
+  local defined
+  defined=$(angie_http_defined_names "${active[@]}")
+  for f in "$target"/http.d/zz-setup-*; do
+    [[ -f $f && $f != *.conf ]] || continue
+    local -a mine=()
+    mapfile -t mine < <(angie_http_defined_names "$f")
+    (( ${#mine[@]} > 0 )) || continue
+    local superseded=1
+    for name in "${mine[@]}"; do
+      grep -qxF -- "$name" <<<"$defined" || { superseded=0; break; }
+    done
+    (( superseded )) || continue
+    moved=$(preserve_to_tmp "$f") || continue
+    [[ -n $moved ]] || continue
+    info "Retired superseded ${f#"$target"/} -> ${moved} (not deleted; its zones/maps are defined by loaded files)"
+    tune_note "${f#"$target"/}: superseded legacy file retired to ${moved}"
+  done
+  return 0
+}
+
 # server-configs-nginx 1.6.43-1.6.45 shipped
 # `if ($flarum_guest_cacheable$req_encoded_path)` in h5bp/php_flarum.conf.
 # An `if` reads a lone variable, so Angie looks up a variable literally named
@@ -2721,6 +2766,7 @@ deploy_angie_tree() {
   # Before the first test of the synced tree: otherwise the run that retires
   # the stale file still prints Angie's "defined but not used" warning.
   tune_retire_unused_acme_client "$target"
+  tune_retire_superseded_setup_files "$target"
 
   # Validate before anything reloads.  A stopped service is valid (the tree is
   # applied at the next start); reload only when the unit is active.

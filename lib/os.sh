@@ -107,7 +107,15 @@ cpu_performance_governor_available() {
 # (console, iommu, nomodeset).  CPU_MITIGATIONS: off = add mitigations=off,
 # on = remove the drop-in, empty = never touched.  The kernel applies the
 # change at the next boot; the run says so instead of rebooting.
-CPU_MITIGATIONS_DROPIN=/etc/default/grub.d/99-setup-mitigations.cfg
+#
+# The drop-in must be sourced last.  The *.cfg glob sorts letters after
+# digits, so the old 99-setup-mitigations.cfg ran BEFORE a provider file such
+# as Hetzner's hetzner.cfg, whose plain GRUB_CMDLINE_LINUX_DEFAULT="..."
+# assignment then erased mitigations=off while the run reported "off at the
+# next reboot" (live host, 2026-11-20).  zz- sorts after both; the old name
+# is migrated, and the boot menu is checked after update-grub.
+CPU_MITIGATIONS_DROPIN=/etc/default/grub.d/zz-setup-mitigations.cfg
+CPU_MITIGATIONS_LEGACY_DROPIN=/etc/default/grub.d/99-setup-mitigations.cfg
 cpu_mitigations_dropin_text() {
   cat <<'EOF'
 # Managed by setup.sh (CPU_MITIGATIONS=off in /etc/default/setup-tuning).
@@ -143,6 +151,22 @@ cpu_mitigations_grubcfg_off() {
   [[ -r $cfg ]] && grep -qE '^[[:space:]]*linux[[:space:]].*[[:space:]]mitigations=off([[:space:]]|$)' "$cfg"
 }
 
+# GRUB drop-ins sourced after ours (glob order) that assign
+# GRUB_CMDLINE_LINUX_DEFAULT without extending the current value: each one
+# erases mitigations=off.  Printed one per line, for the warning.
+cpu_mitigations_overriders() {
+  local dir=${CPU_MITIGATIONS_DROPIN%/*} ours=${CPU_MITIGATIONS_DROPIN##*/} f
+  for f in "$dir"/*.cfg; do
+    [[ -f $f ]] || continue
+    # By name, as the glob orders them: the drop-in itself may be missing.
+    [[ ${f##*/} > $ours ]] || continue
+    if grep -qE '^[[:space:]]*GRUB_CMDLINE_LINUX_DEFAULT=' "$f" \
+       && ! grep -qE '^[[:space:]]*GRUB_CMDLINE_LINUX_DEFAULT=.*\$\{?GRUB_CMDLINE_LINUX_DEFAULT' "$f"; then
+      printf '%s\n' "$f"
+    fi
+  done
+}
+
 # Never fails the run: a boot loader problem is a warning in the report, and
 # the next run retries update-grub (it compares the boot menu, not only the
 # drop-in).
@@ -156,6 +180,12 @@ configure_cpu_mitigations() {
   if [[ ! -f /etc/default/grub ]] || ! command -v update-grub >/dev/null 2>&1; then
     harden_warn "- CPU mitigations: CPU_MITIGATIONS=${want} needs GRUB (/etc/default/grub and update-grub); this boot loader is not managed"
     return 0
+  fi
+  # Releases 1.21.36-1.21.43 wrote the drop-in under a name a provider file
+  # can override (see CPU_MITIGATIONS_DROPIN); either choice retires it.
+  if [[ -e $CPU_MITIGATIONS_LEGACY_DROPIN && $CPU_MITIGATIONS_LEGACY_DROPIN != "$CPU_MITIGATIONS_DROPIN" ]]; then
+    rm -f "$CPU_MITIGATIONS_LEGACY_DROPIN"
+    changed=1
   fi
   if [[ $want == off ]]; then
     tmp=$(tmp_file) || return 0
@@ -179,6 +209,16 @@ configure_cpu_mitigations() {
       [[ -n ${CPU_MITIGATIONS_SETTING:-} ]] && persist_tuning_var CPU_MITIGATIONS "$want"
       return 0
     fi
+  fi
+  if [[ $want == off ]] && ! cpu_mitigations_grubcfg_off; then
+    # update-grub succeeded but the generated menu still lacks the option:
+    # another drop-in or a custom grub.cfg wins.  Say so instead of
+    # reporting a reboot that would not apply it.
+    local over
+    over=$(cpu_mitigations_overriders | paste -sd' ' -)
+    harden_warn "- CPU mitigations: CPU_MITIGATIONS=off is set but the generated boot menu has no mitigations=off${over:+; ${over} assigns GRUB_CMDLINE_LINUX_DEFAULT after ${CPU_MITIGATIONS_DROPIN} (extend it with \"\${GRUB_CMDLINE_LINUX_DEFAULT} ...\" instead)}"
+    [[ -n ${CPU_MITIGATIONS_SETTING:-} ]] && persist_tuning_var CPU_MITIGATIONS "$want"
+    return 0
   fi
   if [[ $want == off ]]; then
     if cpu_mitigations_live_off; then state="off (active)"; else state="off at the next reboot"; fi

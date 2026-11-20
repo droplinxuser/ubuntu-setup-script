@@ -5,6 +5,45 @@ README.md; measurements in tests/stress-site/RESULTS.md.  Per-cycle
 reports and raw test logs cited by entries up to 1.21.32 were removed from
 the tree on 2026-11-19; retrieve them with `git show 84b0db5:<path>`.
 
+## 1.21.44 (2026-11-20)
+
+From `--optimize mitigations=off` on a Hetzner bare-metal host (Xeon
+E-2276G, Ubuntu 24.04.5, six WordPress sites, Polr, Elasticsearch serving a
+remote XenForo).
+
+- **`mitigations=off` is no longer silently lost on Hetzner (and similar)
+  hosts.**  The drop-in was `/etc/default/grub.d/99-setup-mitigations.cfg`.
+  grub-mkconfig sources `grub.d/*.cfg` in glob order, where letters sort
+  after digits, so Hetzner's `hetzner.cfg` ran after it and its plain
+  `GRUB_CMDLINE_LINUX_DEFAULT="consoleblank=0"` erased `mitigations=off`.
+  The run still reported "off at the next reboot".  The drop-in is now
+  `zz-setup-mitigations.cfg` (sorted after `hetzner.cfg`, `init-select.cfg`
+  and `50-cloudimg-settings.cfg` in the C and UTF-8 collations); the old file
+  is removed and the menu regenerated.  After `update-grub` the generated
+  boot menu is checked: when it still lacks the option, the run warns and
+  names the drop-in that assigns `GRUB_CMDLINE_LINUX_DEFAULT` after ours
+  instead of claiming a reboot will apply it.  `--purge basic` removes both
+  names.  Six unit checks.
+- **Elasticsearch on a public address behind UFW is no longer a double false
+  warning.**  The security audit and the Elasticsearch section both warned
+  "restrict TCP 9200/9300 to the remote client(s)" on a host whose UFW
+  already admitted only the remote XenForo server.  `es_ufw_exposure` parses
+  `ufw status verbose` (active, incoming denied, sources admitted to
+  9200/9300 including "Anywhere" all-port rules and port ranges): restricted
+  hosts get a note naming the sources, an open or unverifiable firewall gets
+  one warning, and the Elasticsearch section prints a status line only.
+  Eight unit checks.
+- **Superseded legacy `http.d/zz-setup-*_conf` files are retired.**  An old
+  release generated `zz-setup-wordpress-cache_conf` (inactive: only `*.conf`
+  is included); its zone and map moved into loaded files, so `--optimize`
+  reported it as "not included" on every run with advice to re-run the
+  deployment, which changed nothing, while activating it would have broken
+  `angie -t` with a duplicate `keys_zone=fastcgicache`.  The sync now moves
+  such a file to /tmp when every zone and map variable it defines is already
+  defined by a loaded file (operator files and files with unique zones are
+  kept), and the remaining "not included" advice says to rename only when
+  nothing loaded defines the same names.  Five unit checks.
+
 ## 1.21.43 (2026-11-20)
 
 - **The stale ACME client is retired before the sync tests the tree.**  On

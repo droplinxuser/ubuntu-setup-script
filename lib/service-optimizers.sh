@@ -177,7 +177,7 @@ optimize_angie() {
     local inert_file
     opt_report "- Warning: ${#inert[@]} cache/limit file(s) under http.d are not included by angie.conf:"
     for inert_file in "${inert[@]}"; do opt_report "  \`${inert_file}\`"; done
-    opt_report "  Re-run the Angie config deployment (install or --optimize) to activate the current file names."
+    opt_report "  They are not loaded (angie.conf includes only *.conf).  Rename one to .conf only if no loaded file defines its zones or maps already (otherwise angie -t fails on a duplicate); remove it if it is obsolete."
   fi
   if (( active )); then
     if (( TUNE_DIRTY == 0 )); then
@@ -1463,7 +1463,14 @@ optimize_elastic() {
   if [[ -n $net_host && $net_host != localhost && $net_host != 127.0.0.1 \
         && $net_host != "::1" && $net_host != "[::1]" ]] \
      && grep -qE '^[[:space:]]*xpack\.security\.enabled[[:space:]]*:[[:space:]]*false' "$yml" 2>/dev/null; then
-    opt_report "- **WARNING**: Elasticsearch network.host=${net_host} with X-Pack security disabled; restrict TCP 9200/9300 to the remote client(s) or enable X-Pack security/TLS"
+    # Status only: the security audit raises the single warning when the
+    # ports are not restricted (it used to be printed here as well).
+    local es_exposure
+    es_exposure=$(es_ufw_exposure)
+    case $es_exposure in
+      restricted:*) opt_report "- Remote bind: network.host=${net_host}, X-Pack security off; UFW admits 9200/9300 only from ${es_exposure#restricted:}" ;;
+      *)            opt_report "- Remote bind: network.host=${net_host}, X-Pack security off; 9200/9300 not restricted by UFW (see the security audit)" ;;
+    esac
   fi
 
   elasticsearch_write_systemd_limits || true
