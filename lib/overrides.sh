@@ -105,10 +105,13 @@ sysctl_foreign_source() {
 # scanned: a file shipped by a package in /usr/lib/sysctl.d (vm.max_map_count,
 # ...) is not an old hand fix, and the managed profile overrides it anyway.
 # Each key carries the file's value next to ours so the report answers
-# "does this conflict?" without another command.
+# "does this conflict?" without another command.  With "conflicts", keys whose
+# value equals ours are left out (and so are files left with none).
 tuning_override_sources() {
-  local dir file key ours theirs
+  local mode=${1:-all} dir file key ours theirs
   local -a dirs=(/etc/sysctl.d /run/sysctl.d)
+  # Unit tests point the scan at fixture directories.
+  [[ -n ${SETUP_SYSCTL_SCAN_DIRS:-} ]] && read -r -a dirs <<<"$SETUP_SYSCTL_SCAN_DIRS"
   local -a hits=()
   local managed
   managed=$(tuning_managed_keys)
@@ -124,6 +127,7 @@ tuning_override_sources() {
           ours=$(tuning_ours_value "$key" || true)
           theirs=$(sysctl_file_value "$file" "$key")
           if [[ -n $ours && $theirs == "$ours" ]]; then
+            [[ $mode == conflicts ]] && continue
             hits+=("$key(file=$theirs ours=$ours same)")
           else
             hits+=("$key(file=${theirs:-unset} ours=${ours:-unset})")
@@ -396,14 +400,26 @@ reset_operator_overrides() {
     return 0
   fi
 
-  # Report remaining foreign sources in the run log.  They are not removed:
-  # setup-sysctl-final.timer re-applies the managed profile after boot.
+  # Foreign sysctl sources are reported by report_foreign_sysctl_sources,
+  # after run_os_tuning has written this run's profile: here "ours" would
+  # still be the previous /etc/sysctl.conf.
+  return 0
+}
+
+# Run-log note for sysctl files outside the managed set that define a managed
+# key with a different value.  Called after run_os_tuning, so "ours" is the
+# profile this run wrote: a default that changed between releases (rp_filter
+# 1 -> 2 in 1.21.40) is not reported as a conflict by the run that fixes it.
+# Informational, not a warning: the files stay, and setup-sysctl-final.timer
+# re-applies the managed profile after boot, so the managed value is the one
+# that runs.  Ubuntu 24.04 keeps its 10-*.conf files in /etc/sysctl.d, so the
+# old warning fired on every --optimize there.  Equal values are left out.
+report_foreign_sysctl_sources() {
   local sources
-  sources=$(tuning_override_sources)
-  if [[ -n $sources ]]; then
-    warn "Still-defined foreign sysctl sources (the managed profile wins at boot via setup-sysctl-final.timer):"
-    printf '  %s\n' "$sources"
-    RESET_ACTIONS+=("foreign sysctl sources kept (managed profile re-applied at boot): ${sources//$'\n'/; }")
-  fi
+  sources=$(tuning_override_sources conflicts)
+  [[ -n $sources ]] || return 0
+  info "Foreign sysctl sources with a different value (kept; the managed profile is re-applied at boot):"
+  printf '  %s\n' "$sources"
+  opt_report "- Foreign sysctl sources kept (managed profile re-applied at boot): ${sources//$'\n'/; }"
   return 0
 }

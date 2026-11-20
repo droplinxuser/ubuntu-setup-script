@@ -5,6 +5,33 @@ README.md; measurements in tests/stress-site/RESULTS.md.  Per-cycle
 reports and raw test logs cited by entries up to 1.21.32 were removed from
 the tree on 2026-11-19; retrieve them with `git show 84b0db5:<path>`.
 
+## 1.21.41 (2026-11-20)
+
+From `--optimize mitigations=off` plus a reboot on a second live host (KVM
+VPS, Ubuntu 24.04.5, kernel 7.0.0-43, XenForo + WordPress): the run, the
+reboot and both sites were clean; two report defects are fixed.
+
+- **No more false "foreign sysctl sources" warning on Ubuntu 24.04.**  The
+  report ran in the profile reset, before `run_os_tuning` wrote this run's
+  `/etc/sysctl.conf`, so a default that changed between releases showed as a
+  conflict in the very run that applied it (`rp_filter(file=2 ours=1)` while
+  the run wrote 2).  It also listed files whose keys all matched.  24.04
+  keeps its `10-*.conf` files in `/etc/sysctl.d`, so every `--optimize` there
+  raised a WARN.  `report_foreign_sysctl_sources` now runs after
+  `run_os_tuning`, lists only differing keys (`tuning_override_sources
+  conflicts`, also used by the dry run) and logs them as information: the
+  managed profile is re-applied at boot and is the value that runs
+  (`kernel.sysrq` 0 at runtime on the host).  Four unit checks.
+- The CPU governor step is titled "CPU governor"; it said "(dedicated
+  server)" on a VPS before reporting that it leaves the governor to the
+  hypervisor.
+
+Seen on the host and not ours: Angie's `ACME client "letsencrypt" is defined
+but not used` (an operator-enabled `http.d/letsencrypt.conf`; the repository
+ships it disabled as `letsencrypt_conf`), Ubuntu's `/etc/pam.d/login` loading
+the absent optional `pam_lastlog.so`, GRUB's serial-console notice, and ten
+`martian source` lines in the boot second before the default route existed.
+
 ## 1.21.40 (2026-11-20)
 
 Findings from the first `--optimize mitigations=off` on a live XenForo host

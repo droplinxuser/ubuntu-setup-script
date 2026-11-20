@@ -202,7 +202,7 @@ configure_cpu_mitigations() {
 }
 
 configure_cpu_governor() {
-  step "CPU governor (dedicated server)"
+  step "CPU governor"
   # A guest's governor is the hypervisor's business; a VPS that exposes a
   # cpufreq interface (nested virtualisation, some LXC hosts) must not fight
   # it.  Many dedicated hosts expose no cpufreq interface either; treat both

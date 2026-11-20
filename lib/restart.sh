@@ -383,6 +383,7 @@ run_optimize() {
   fi
   plan_memory_budget
   run_os_tuning
+  report_foreign_sysctl_sources
   # Security first: fix wp-config.php, scoped database users, malware and the
   # OS-level controls before the cron/managed blocks are regenerated.  The
   # WordPress step runs before write_cron so the managed wp-cron entry is

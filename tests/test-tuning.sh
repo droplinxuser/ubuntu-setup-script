@@ -621,6 +621,29 @@ hosts_set_loopback_line "$hf" ""
 check "hosts: an empty line removes the entry (the original had none)" \
   not grep -q '127\.0\.1\.1' "$hf"
 
+# Foreign sysctl sources (Ubuntu 24.04 keeps 10-*.conf in /etc/sysctl.d): the
+# run log lists only keys whose value differs from the profile this run
+# wrote.  The old warning ran before the profile was written and listed
+# equal keys too, so it fired on every --optimize of a 24.04 host.
+fs=$TMP/foreign-sysctl; mkdir -p "$fs"
+printf 'kernel.sysrq = 176\nkernel.kptr_restrict = 1\n' > "$fs/10-mixed.conf"
+printf 'kernel.yama.ptrace_scope = 1\n' > "$fs/10-same.conf"
+fs_run() {
+  (
+    tuning_managed_keys() { printf '%s\n' kernel.sysrq kernel.kptr_restrict kernel.yama.ptrace_scope; }
+    tuning_ours_value() { case $1 in kernel.sysrq) printf 0 ;; *) printf 1 ;; esac; }
+    SETUP_SYSCTL_SCAN_DIRS=$fs tuning_override_sources "$@"
+  )
+}
+check "foreign sysctl report: conflicts mode lists only the differing key" \
+  test "$(fs_run conflicts)" = "$fs/10-mixed.conf: kernel.sysrq(file=176 ours=0)"
+check "foreign sysctl report: the full listing still shows equal keys" \
+  test "$(fs_run | grep -c same)" -eq 2
+check "foreign sysctl report runs after the profile is written" \
+  bash -c 'grep -A1 "^  run_os_tuning$" "$1" | grep -qx "  report_foreign_sysctl_sources"' _ "$ROOT/lib/restart.sh"
+check "the profile reset no longer warns about foreign sysctl sources" \
+  not grep -q 'Still-defined foreign sysctl sources' "$ROOT/lib/overrides.sh"
+
 # The single-file fallback must stay byte-identical to the canonical profile,
 # otherwise a run without configs/ silently writes values we already removed
 # (for example the boot-time route.flush errors).
