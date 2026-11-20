@@ -5,6 +5,22 @@ README.md; measurements in tests/stress-site/RESULTS.md.  Per-cycle
 reports and raw test logs cited by entries up to 1.21.32 were removed from
 the tree on 2026-11-19; retrieve them with `git show 84b0db5:<path>`.
 
+## 1.21.43 (2026-11-20)
+
+- **The stale ACME client is retired before the sync tests the tree.**  On
+  the live host the 1.21.42 run retired `http.d/letsencrypt.conf`, but
+  `deploy_angie_tree` runs a visible `angie -t` before the tuning pass, so
+  that same run still printed "ACME client \"letsencrypt\" is defined but not
+  used" once.  The sync now calls `tune_retire_unused_acme_client` before its
+  test (the tuner call stays as a no-op) and logs the move as info.  One
+  unit check.
+- Verified on the 128 GB live host: `/etc/sysctl.conf` now writes
+  `ipfrag_high_thresh` before `ipfrag_low_thresh` and replays cleanly from
+  the kernel defaults, `angie -t` is clean after the retirement, and the
+  foreign-sysctl note lists only the intentional `kernel.sysrq` difference.
+  Hosts with more than 64 GB of RAM need one `--optimize` with 1.21.42+
+  before their next reboot to rewrite the old low-first order.
+
 ## 1.21.42 (2026-11-20)
 
 From `--optimize mitigations=off` plus a reboot on a fourth live host

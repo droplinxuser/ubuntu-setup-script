@@ -552,6 +552,8 @@ tune_retire_unused_acme_client() {
   fi
   moved=$(preserve_to_tmp "$f") || return 0
   [[ -n $moved ]] || return 0
+  # info as well: the sync calls this before the tuner, which resets its notes.
+  info "Retired unused ACME client http.d/letsencrypt.conf -> ${moved} (not deleted)"
   tune_note "http.d/letsencrypt.conf: unused ACME client retired to ${moved} (the repository ships it inactive as letsencrypt_conf)"
   return 0
 }
@@ -2715,6 +2717,10 @@ deploy_angie_tree() {
     chown www-data:www-data "$cache_dir" 2>/dev/null || true
     chmod 750 "$cache_dir"
   done
+
+  # Before the first test of the synced tree: otherwise the run that retires
+  # the stale file still prints Angie's "defined but not used" warning.
+  tune_retire_unused_acme_client "$target"
 
   # Validate before anything reloads.  A stopped service is valid (the tree is
   # applied at the next start); reload only when the unit is active.

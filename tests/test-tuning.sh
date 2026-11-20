@@ -691,6 +691,14 @@ check "ACME: a vhost with 'acme letsencrypt' keeps it" test "$(acme_case used)" 
 check "ACME: an operator-edited file is kept" test "$(acme_case edited)" = kept
 check "ACME: the inactive letsencrypt_conf template stays" \
   test -f "$TMP/acme-unused/http.d/letsencrypt_conf"
+# The sync tests the tree before the tuner runs; the retirement must come
+# first or the run that retires it still prints the warning (live host).
+acme_before_test() {
+  sed -n '/^deploy_angie_tree()/,/^}/p' "$ROOT/lib/web.sh" \
+    | grep -nE 'tune_retire_unused_acme_client|/usr/sbin/angie -t' | head -n 1 \
+    | grep -q tune_retire_unused_acme_client
+}
+check "ACME: the sync retires the stale file before its first angie -t" acme_before_test
 
 # The single-file fallback must stay byte-identical to the canonical profile,
 # otherwise a run without configs/ silently writes values we already removed
