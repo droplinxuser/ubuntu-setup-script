@@ -641,6 +641,59 @@ hosts_set_loopback_line "$hf" ""
 check "hosts: an empty line removes the entry (the original had none)" \
   not grep -q '127\.0\.1\.1' "$hf"
 
+# Web-root hygiene: one walk of the tree (a 7.7M-file XenForo host spent
+# ~95 s in five separate walks plus a WordPress-only malware scan).
+hw=$TMP/hygiene; mkdir -p "$hw/site/public/data" "$hw/site/mysql_database" "$hw/opendir"
+: > "$hw/site/public/ww.txt"; chmod 666 "$hw/site/public/ww.txt"; chmod 777 "$hw/opendir"
+truncate -s 101M "$hw/site/public/dump.sql"
+truncate -s 101M "$hw/site/public/data/ww-backup.zip"; chmod 666 "$hw/site/public/data/ww-backup.zip"
+truncate -s 101M "$hw/site/mysql_database/db.sql"
+hw_run() {
+  (
+    SETUP_WWW_ROOT=$hw
+    : > "$TMP/hygiene.calls"; : > "$TMP/hygiene.report"
+    find() { printf 'x' >> "$TMP/hygiene.calls"; command find "$@"; }
+    harden_note() { printf 'NOTE %s\n' "$*" >> "$TMP/hygiene.report"; }
+    harden_warn() { printf 'WARN %s\n' "$*" >> "$TMP/hygiene.report"; }
+    harden_wordpress_files
+  ) >/dev/null 2>&1
+}
+hw_run
+check "hygiene walks the web root once (plus the depth-limited plugin check)" \
+  test "$(wc -c < "$TMP/hygiene.calls")" -eq 2
+check "hygiene fixes world-writable files and directories" \
+  bash -c '! find "$1" -perm -0002 \( -type f -o -type d \) | grep -q .' _ "$hw"
+check "hygiene counts every world-writable entry (file, dir, archive)" \
+  grep -q 'NOTE .*world-writable entries fixed: 3' "$TMP/hygiene.report"
+check "hygiene reports large archives, including a world-writable one" \
+  bash -c 'grep -q "WARN .*public/dump.sql" "$1" && grep -q "WARN .*ww-backup.zip" "$1"' _ "$TMP/hygiene.report"
+check "hygiene keeps mysql_database out of the archive report" \
+  not grep -q 'mysql_database/db.sql' "$TMP/hygiene.report"
+
+# The webshell signatures are WordPress dropper families: no WordPress, no
+# walk; with WordPress, only its roots (never a XenForo tree beside it).
+mw=$TMP/mal; mkdir -p "$mw/wp/public/wp-content/plugins/seo-tools-0a1b2c3d4e" "$mw/xf/public/data"
+: > "$mw/wp/public/wp-config.php"; : > "$mw/wp/public/wp-vcd.php"; : > "$mw/xf/public/data/wp-vcd.php"
+mw_run() { # configs... -> report
+  (
+    SETUP_WWW_ROOT=$mw SETUP_PURGE_MALWARE=1
+    local -a cfgs=("$@")
+    app_find_wordpress_configs() { printf '%s\n' "${cfgs[@]}"; }
+    harden_note() { printf 'NOTE %s\n' "$*"; }
+    harden_warn() { printf 'WARN %s\n' "$*"; }
+    scan_wordpress_malware
+  ) 2>/dev/null
+}
+check "malware scan is skipped on a host without WordPress" \
+  bash -c 'grep -q "malware scan: skipped (no WordPress install" <<<"$1"' _ "$(mw_run)"
+check "malware scan without WordPress leaves every file alone" \
+  bash -c 'test -f "$1/wp/public/wp-vcd.php" && test -f "$1/xf/public/data/wp-vcd.php"' _ "$mw"
+mw_report=$(mw_run "$mw/wp/public/wp-config.php")
+check "malware scan removes the dropper and the hex-suffixed plugin inside the WordPress root" \
+  bash -c 'test ! -e "$1/wp/public/wp-vcd.php" && test ! -e "$1/wp/public/wp-content/plugins/seo-tools-0a1b2c3d4e" && grep -q "deleted 2" <<<"$2"' _ "$mw" "$mw_report"
+check "malware scan never touches a same-named file outside the WordPress roots" \
+  test -f "$mw/xf/public/data/wp-vcd.php"
+
 # Foreign sysctl sources (Ubuntu 24.04 keeps 10-*.conf in /etc/sysctl.d): the
 # run log lists only keys whose value differs from the profile this run
 # wrote.  The old warning ran before the profile was written and listed
@@ -3601,12 +3654,17 @@ check "upstream restore removes the managed include once the tree defines it" \
 # XenForo host had 598 757 of them and --optimize spent ~9 minutes in this
 # loop, which looked like a hang; find now batches paths per chmod.
 harden_files_body=$(sed -n '/^harden_wordpress_files()/,/^}/p' "$ALL_SRC")
-check "world-writable fix uses a batched chmod" \
-  grep -q -- '-exec chmod o-w {} +' <<<"$harden_files_body"
+check "world-writable fix uses a batched chmod (xargs -0 from the single walk)" \
+  grep -q -- 'xargs -0 -r chmod o-w --' <<<"$harden_files_body"
 check "world-writable fix does not fork chmod per path" \
   bash -c '! grep -q "chmod o-w \"\$f\"" <<< "$1"' _ "$harden_files_body"
-check "world-writable fix reports the count before fixing" \
-  grep -q 'world-writable files: ${count}' <<<"$harden_files_body"
+ww_count_before_fix() {
+  local n x
+  n=$(grep -nF 'world-writable entries: ${count}' <<<"$harden_files_body" | head -n 1 | cut -d: -f1)
+  x=$(grep -nF 'xargs -0 -r chmod o-w' <<<"$harden_files_body" | head -n 1 | cut -d: -f1)
+  [[ -n $n && -n $x ]] && (( n < x ))
+}
+check "world-writable fix reports the count before fixing" ww_count_before_fix
 
 
 # A custom http.d limit file can duplicate an http-context directive that the

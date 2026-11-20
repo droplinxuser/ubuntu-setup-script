@@ -5,6 +5,28 @@ README.md; measurements in tests/stress-site/RESULTS.md.  Per-cycle
 reports and raw test logs cited by entries up to 1.21.32 were removed from
 the tree on 2026-11-19; retrieve them with `git show 84b0db5:<path>`.
 
+## 1.21.45 (2026-11-20)
+
+- **Security hardening no longer walks a large web root eight times.**  On
+  the JamiiForums host (XenForo, no WordPress, 7.7M files / 1.3 TB under
+  /var/www) `--optimize` paused silently for 95 seconds: the generic
+  hygiene checks walked the whole tree five times (world-writable files,
+  then directories, each counted and then fixed, plus the large-archive
+  search), and the WordPress webshell scan walked it twice more and grepped
+  every `*.php` file, even with no WordPress installed.
+  - `harden_wordpress_files` does one walk: GNU find's `,` operator writes
+    world-writable entries and large archives to separate NUL lists
+    (`-fprint0`), the world-writable fix is a batched `xargs -0 chmod`, and
+    `SETUP_WWW_ROOT` lets the tests use a fixture tree.
+  - `scan_wordpress_malware` walks only WordPress roots (the directory of
+    each wp-config.php), with one combined find; with no WordPress it is
+    skipped and says so.  A same-named file in a XenForo tree beside a
+    WordPress site is no longer a candidate.
+  - Measured on 500,000 files without WordPress (warm caches): 3.02 s ->
+    1.09 s; the malware scan 1.70 s -> 0.00 s.  Nine unit checks (one walk,
+    counts, archive list, mysql_database exclusion, skip, WordPress-only
+    removal, outside-root safety).
+
 ## 1.21.44 (2026-11-20)
 
 From `--optimize mitigations=off` on a Hetzner bare-metal host (Xeon

@@ -216,34 +216,39 @@ harden_wordpress_audit_db() {
 }
 
 harden_wordpress_files() {
-  local n=0 f count
-  [[ -d /var/www ]] || return 0
+  local f count root=${SETUP_WWW_ROOT:-/var/www} ww big_list
+  [[ -d $root ]] || return 0
+  # One walk of the tree for every generic check.  It used to be five full
+  # walks (world-writable files, then directories, each counted and fixed
+  # separately, plus the archive search): on a 7.7M-file forum tree that was
+  # most of a 95-second silent pause in --optimize.  GNU find's "," operator
+  # evaluates both branches for every entry and -fprint0 writes each branch
+  # to its own list, so a world-writable archive lands in both.
+  ww=$(tmp_file) || return 0
+  big_list=$(tmp_file) || return 0
+  find "$root" -xdev \
+    \( \( -type f -o -type d \) -perm -0002 -fprint0 "$ww" \) , \
+    \( -type f \( -name '*.zip' -o -name '*.sql' -o -name '*.sql.gz' -o -name '*.lz4' -o -name '*.tar.gz' \) \
+       -size +100M ! -path '*/mysql_database/*' ! -path '*/wpvividbackups/*' -fprint0 "$big_list" \) \
+    2>/dev/null || true
   # Fix world-writable entries in batches, not one chmod process per file.
   # A large forum tree had ~1.6M 0666 attachment files; the per-file loop
   # forked 1.6M chmod processes and made --optimize look stuck for ~10
-  # minutes at the "Security hardening" step.  Count without forking, then
-  # let find pass as many paths per chmod as ARG_MAX allows.
-  count=$(find /var/www -xdev -type f -perm -0002 -print0 2>/dev/null \
-    | tr -cd '\0' | wc -c)
+  # minutes at the "Security hardening" step.
+  count=$(tr -cd '\0' < "$ww" | wc -c)
   if (( count > 0 )); then
-    harden_note "  - world-writable files: ${count} under /var/www; fixing in batches"
-    find /var/www -xdev -type f -perm -0002 -exec chmod o-w {} + 2>/dev/null || true
-    n=$(( n + count ))
+    harden_note "  - world-writable entries: ${count} under ${root}; fixing in batches"
+    xargs -0 -r chmod o-w -- < "$ww" 2>/dev/null || true
+    harden_note "  - world-writable entries fixed: ${count}"
   fi
-  count=$(find /var/www -xdev -type d -perm -0002 -print0 2>/dev/null \
-    | tr -cd '\0' | wc -c)
-  if (( count > 0 )); then
-    find /var/www -xdev -type d -perm -0002 -exec chmod o-w {} + 2>/dev/null || true
-    n=$(( n + count ))
-  fi
-  (( n > 0 )) && harden_note "  - world-writable entries fixed: ${n}"
   local -a big risky
-  mapfile -t big < <(find /var/www -type f \( -name '*.zip' -o -name '*.sql' -o -name '*.sql.gz' -o -name '*.lz4' -o -name '*.tar.gz' \) -size +100M ! -path '*/mysql_database/*' ! -path '*/wpvividbackups/*' 2>/dev/null | head -20 || true)
+  mapfile -t -d '' -n 20 big < "$big_list"
+  rm -f "$ww" "$big_list"
   if (( ${#big[@]} > 0 )); then
     harden_warn "  - large archives inside web-accessible paths:"
     for f in "${big[@]}"; do harden_warn "      ${f}"; done
   fi
-  mapfile -t risky < <(find /var/www -maxdepth 5 -type d \( -name 'wp-file-manager' -o -name 'file-manager-advanced' -o -name 'duplicator' -o -name 'wpcoderpro' -o -name 'insert-headers-and-footers' \) 2>/dev/null | head -20 || true)
+  mapfile -t risky < <(find "$root" -maxdepth 5 -type d \( -name 'wp-file-manager' -o -name 'file-manager-advanced' -o -name 'duplicator' -o -name 'wpcoderpro' -o -name 'insert-headers-and-footers' \) 2>/dev/null | head -20 || true)
   if (( ${#risky[@]} > 0 )); then
     harden_warn "  - high-risk code/upload plugins installed (review or remove):"
     for f in "${risky[@]}"; do harden_warn "      ${f}"; done
@@ -255,14 +260,29 @@ harden_wordpress_files() {
 # WP2SHELL/SEO-spam droppers.  Quarantine by default so a false positive can
 # be restored; SETUP_PURGE_MALWARE=1 removes the files instead.
 scan_wordpress_malware() {
-  local ts q f rel count=0
-  local -a hits
-  [[ -d /var/www ]] || return 0
+  local ts q f rel count=0 conf
+  local -a hits roots=()
+  [[ -d ${SETUP_WWW_ROOT:-/var/www} ]] || return 0
+  # The signatures are WordPress dropper families, so only WordPress roots
+  # are walked: the directory of each wp-config.php (it may sit one level
+  # above the public root; the walk then covers both).  It used to walk all
+  # of /var/www three times even with no WordPress at all - on a XenForo
+  # host with 7.7M attachment files that was most of a 95-second pause.
+  while IFS= read -r conf; do
+    [[ -n $conf ]] && roots+=("${conf%/wp-config.php}")
+  done < <(app_find_wordpress_configs)
+  if (( ${#roots[@]} == 0 )); then
+    harden_note "  - malware scan: skipped (no WordPress install; the signatures are WordPress droppers)"
+    return 0
+  fi
   mapfile -t hits < <(
     {
-      find /var/www -type f \( -name 'wp-vcd.php' -o -name 'wp-tmp.php' -o -name 'wp-feed.php' -o -name 'wp-cd.php' \) 2>/dev/null || true
-      find /var/www -type d -regextype posix-extended -regex '.*/wp-content/plugins/[a-z0-9-]+-[0-9a-f]{10}$' -regex '.*-[0-9]*[a-f][0-9a-f]*$' 2>/dev/null || true
-      grep -rIl --include='*.php' --exclude-dir=mysql_database --exclude-dir=wpvividbackups --exclude-dir=node_modules --exclude-dir=.git -E 'wputils/v1|w2s_run|WP_V_CD|plimur\.spekt\.pw' /var/www 2>/dev/null || true
+      # One walk for both name-based families.
+      find "${roots[@]}" -xdev -regextype posix-extended \
+        \( -type f \( -name 'wp-vcd.php' -o -name 'wp-tmp.php' -o -name 'wp-feed.php' -o -name 'wp-cd.php' \) -print \) -o \
+        \( -type d -regex '.*/wp-content/plugins/[a-z0-9-]+-[0-9a-f]{10}$' -regex '.*-[0-9]*[a-f][0-9a-f]*$' -print \) \
+        2>/dev/null || true
+      grep -rIl --include='*.php' --exclude-dir=mysql_database --exclude-dir=wpvividbackups --exclude-dir=node_modules --exclude-dir=.git -E 'wputils/v1|w2s_run|WP_V_CD|plimur\.spekt\.pw' "${roots[@]}" 2>/dev/null || true
     } | sort -u || true
   )
   if (( ${#hits[@]} == 0 )); then
