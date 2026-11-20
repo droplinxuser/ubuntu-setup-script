@@ -1350,6 +1350,12 @@ elasticsearch_wait_primaries() {
 # A single-node cluster cannot assign replicas.  Yellow health with only
 # unassigned replicas is expected there; set replicas=0 on existing indices
 # and keep a low-priority template for future indices.
+# Index names with an unassigned primary, from `_cat/shards?h=index,prirep,state`
+# on stdin, one per line, sorted and unique.
+elasticsearch_unassigned_primary_indices() {
+  awk '$2 == "p" && $3 == "UNASSIGNED" { print $1 }' | sort -u
+}
+
 elasticsearch_fix_single_node_replicas() {
   local health status nodes unassigned primary resp i es_url
   command -v curl >/dev/null 2>&1 || return 0
@@ -1371,7 +1377,20 @@ elasticsearch_fix_single_node_replicas() {
     return 0
   fi
   if ! elasticsearch_single_node_replica_issue "$health"; then
-    opt_report "- Cluster health: ${status:-unknown} (not a single-node replica issue; left unchanged)"
+    # Name the indices whose primary is unassigned: "red ... left unchanged"
+    # alone hid that a live host's red came from two 2024 system data
+    # streams with no copy left, while every application index was usable.
+    local -a lost
+    mapfile -t lost < <(curl -fsS --max-time 5 "${es_url}/_cat/shards?h=index,prirep,state" 2>/dev/null \
+      | elasticsearch_unassigned_primary_indices)
+    if (( ${#lost[@]} > 0 )); then
+      local shown
+      shown=$(printf '%s, ' "${lost[@]:0:5}"); shown=${shown%, }
+      (( ${#lost[@]} > 5 )) && shown+=" (+$(( ${#lost[@]} - 5 )) more)"
+      opt_report "- Cluster health: ${status:-unknown}; unassigned primary shard(s) in: ${shown}.\`GET _cluster/allocation/explain\` gives the cause; an index with no copy left must be restored from a snapshot or deleted (left unchanged)"
+    else
+      opt_report "- Cluster health: ${status:-unknown} (not a single-node replica issue; left unchanged)"
+    fi
     return 0
   fi
 

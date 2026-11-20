@@ -1984,6 +1984,45 @@ else
   t_pass "unassigned primary shard is not treated as a replica issue"
 fi
 
+# Red health names the indices whose primary is unassigned (a live host's
+# red came from two 2024 system data streams, every application index fine).
+esred_shards='site_f_example                                  0 r UNASSIGNED
+.ds-ilm-history-7-2024.12.03-000002           0 p UNASSIGNED
+site_b_net                                  0 p STARTED
+.ds-.logs-deprecation.elasticsearch-default-2024.11.26-000001 0 p UNASSIGNED
+.ds-ilm-history-7-2024.12.03-000002           1 p UNASSIGNED'
+check "unassigned primaries: only primaries, de-duplicated, sorted" \
+  test "$(awk '{print $1, $3, $4}' <<<"$esred_shards" | elasticsearch_unassigned_primary_indices | tr '\n' ' ')" \
+       = ".ds-.logs-deprecation.elasticsearch-default-2024.11.26-000001 .ds-ilm-history-7-2024.12.03-000002 "
+esred_run() {
+  (
+    ESRED_SHARDS=$1
+    elasticsearch_http_url() { printf 'http://127.0.0.1:9200'; }
+    elasticsearch_wait_primaries() { :; }
+    curl() {
+      case "$*" in
+        *_cluster/health*) printf '%s' '{"status":"red","number_of_nodes":1,"unassigned_shards":6,"unassigned_primary_shards":2}' ;;
+        *_cat/shards*) printf '%s\n' "$ESRED_SHARDS" ;;
+        *) return 22 ;;
+      esac
+    }
+    OPT_REPORT=()
+    elasticsearch_fix_single_node_replicas
+    printf '%s\n' "${OPT_REPORT[@]}"
+  )
+}
+out=$(esred_run "$(awk '{print $1, $3, $4}' <<<"$esred_shards")")
+check "red health report names the indices with an unassigned primary" \
+  grep -qF 'Cluster health: red; unassigned primary shard(s) in: .ds-.logs-deprecation.elasticsearch-default-2024.11.26-000001, .ds-ilm-history-7-2024.12.03-000002.' <<<"$out"
+check "red health report leaves the cluster unchanged and points at allocation/explain" \
+  bash -c 'grep -q "_cluster/allocation/explain" <<<"$1" && grep -q "(left unchanged)" <<<"$1"' _ "$out"
+out=$(esred_run "$(for i in 1 2 3 4 5 6 7; do printf 'idx%s p UNASSIGNED\n' "$i"; done)")
+check "red health report caps the list at five and counts the rest" \
+  grep -qF 'idx1, idx2, idx3, idx4, idx5 (+2 more).' <<<"$out"
+out=$(esred_run "")
+check "red health without a shard list keeps the generic line" \
+  grep -qF 'Cluster health: red (not a single-node replica issue; left unchanged)' <<<"$out"
+
 # ---------------------------------------------------------------------------
 # Elasticsearch HTTP endpoint resolution
 # ---------------------------------------------------------------------------

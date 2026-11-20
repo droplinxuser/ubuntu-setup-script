@@ -5,6 +5,25 @@ README.md; measurements in tests/stress-site/RESULTS.md.  Per-cycle
 reports and raw test logs cited by entries up to 1.21.32 were removed from
 the tree on 2026-11-19; retrieve them with `git show 84b0db5:<path>`.
 
+## 1.21.47 (2026-11-20)
+
+- **A red Elasticsearch cluster now names its cause.**  On a live OVH host
+  (Xeon E5-1630 v4, Ubuntu 24.04, four XenForo search indices) the report
+  said only `Cluster health: red (not a single-node replica issue; left
+  unchanged)`.  The red came from two 2024 system data streams
+  (`.ds-ilm-history-7-*`, `.ds-.logs-deprecation.*`) whose primaries had no
+  copy left, while every application index was usable.  The line now lists
+  the indices with an unassigned primary (first five, then a count), points
+  at `GET _cluster/allocation/explain`, and still changes nothing.  Five
+  unit checks.
+- Same host, outside the script: certbot renewals had failed since
+  September (`authenticator = nginx` with no nginx plugin on an Angie host)
+  and the origin served an expired certificate.  The sites are behind
+  Cloudflare in Full (not strict) mode, so the vhosts now include
+  `h5bp/hostname_ssl.conf` (the host's self-signed certificate) and certbot
+  was purged; responses were identical at the origin and through
+  Cloudflare before and after the reboot.
+
 ## 1.21.46 (2026-11-20)
 
 - **One WordPress/XenForo config scan per `--optimize` run.**  The JF dev
