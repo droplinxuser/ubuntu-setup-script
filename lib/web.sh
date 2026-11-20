@@ -533,6 +533,29 @@ tune_default_tls_reject() {
   return 0
 }
 
+# server-configs-nginx shipped http.d/letsencrypt.conf as an active file for a
+# few hours on 2026-07-22 (d2bf9ac..6b0ac3a) before renaming it to the
+# inactive letsencrypt_conf.  The sync never removes a file that left the
+# repository, so hosts synced that day kept an `acme_client letsencrypt` that
+# no vhost uses, and every `angie -t` warns 'ACME client "letsencrypt" is
+# defined but not used' (two live hosts, 2026-11-20).  The file is retired
+# (moved to /tmp, never deleted) only while it is byte-identical to the
+# shipped letsencrypt_conf and no vhost has an `acme letsencrypt` directive:
+# a host that uses Angie's built-in ACME keeps it.
+tune_retire_unused_acme_client() {
+  local target=$1 f="$1/http.d/letsencrypt.conf" shipped="$1/http.d/letsencrypt_conf" moved
+  [[ -f $f && -f $shipped ]] || return 0
+  cmp -s "$f" "$shipped" || return 0
+  if grep -rqsE '^[[:space:]]*acme[[:space:]]+letsencrypt[[:space:]]*;' \
+       "$target/conf.d" "$target/http.d" "$target/snippets" 2>/dev/null; then
+    return 0
+  fi
+  moved=$(preserve_to_tmp "$f") || return 0
+  [[ -n $moved ]] || return 0
+  tune_note "http.d/letsencrypt.conf: unused ACME client retired to ${moved} (the repository ships it inactive as letsencrypt_conf)"
+  return 0
+}
+
 # server-configs-nginx 1.6.43-1.6.45 shipped
 # `if ($flarum_guest_cacheable$req_encoded_path)` in h5bp/php_flarum.conf.
 # An `if` reads a lone variable, so Angie looks up a variable literally named
@@ -1591,6 +1614,7 @@ tune_angie_configs() {
   ensure_xf_cookie_bypass_map "$target" || true
   tune_flarum_cache_gate "$target"
   tune_default_tls_reject "$target"
+  tune_retire_unused_acme_client "$target"
   tune_xf_cache_vary "$target/h5bp/php_xf.conf"
   tune_xf_cache_vary "$target/h5bp/php_xf_proxy.conf"
   tune_xf_static_assets "$target/h5bp/xf2.conf"

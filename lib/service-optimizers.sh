@@ -1688,8 +1688,11 @@ optimize_plan() {
   if (( ${#OPTIMIZE_IGNORED_ENV[@]} > 0 )); then
     printf '  Ignored tuning environment: %s\n' "${OPTIMIZE_IGNORED_ENV[*]}"
   fi
-  local foreign
-  foreign=$(tuning_override_sources conflicts)
+  local foreign profile="${SCRIPT_DIR}/configs/system/sysctl.conf"
+  if [[ ! -r $profile ]]; then
+    profile=$(tmp_file) && blob_sysctl > "$profile" || profile=""
+  fi
+  foreign=$(TUNING_OURS_PROFILE=$profile tuning_override_sources conflicts)
   if [[ -n $foreign ]]; then
     printf '  Foreign sources that the boot profile will override:\n'
     printf '%s\n' "$foreign" | sed 's/^/    /'

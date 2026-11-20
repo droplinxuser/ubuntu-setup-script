@@ -706,13 +706,20 @@ sysctl_dedupe_keys() {
   return 0
 }
 
-# The kernel rejects ipfrag_high_thresh when the new value is below the
-# current low threshold (EINVAL).  Writing the low mark first keeps a lower
-# high mark valid; only low <= high is required.
+# The kernel requires low <= high at the moment of every write (EINVAL
+# otherwise).  At boot systemd-sysctl starts from the kernel defaults
+# (3 MB low, 4 MB high) and the profile never goes below them (the RAM-sized
+# high mark is clamped to >= 4 MB), so the boot transition is always upward:
+# the high mark must be written first.  Low-first made systemd-sysctl.service
+# fail on every boot of a host large enough to scale the pair (a 128 GB host:
+# "Couldn't write '6178656' to 'net/ipv4/ipfrag_low_thresh': Invalid
+# argument"; setup-sysctl-final re-applied the values later).  A downward
+# change at --optimize time is prepared by the make-room step in
+# configure_sysctl before this file is applied.
 ipfrag_sysctl_lines() {
   local high=$1 low=$2
-  printf 'net.ipv4.ipfrag_low_thresh = %s\n' "$low"
   printf 'net.ipv4.ipfrag_high_thresh = %s\n' "$high"
+  printf 'net.ipv4.ipfrag_low_thresh = %s\n' "$low"
 }
 
 # ufw loads its own /etc/ufw/sysctl.conf (IPT_SYSCTL in /etc/default/ufw)
@@ -1097,7 +1104,9 @@ EOF
     || warn "Could not set net.core.default_qdisc=${QDISC}"
 
   # A live kernel can still have the old low mark above the new high mark.
-  # Make room before the file is applied; the file itself writes low first.
+  # Make room before the file is applied; the file itself writes high first
+  # (the boot order, see ipfrag_sysctl_lines), so a downward change needs the
+  # low mark lowered here.
   # IPv6 takes its pair from the base template (the kernel default); a host
   # tuned by an older release still runs 192/256 KB there.
   local fam pfx cur_low cur_high want_low want_high

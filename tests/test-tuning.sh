@@ -116,13 +116,33 @@ check "failed unit parser keeps older output without a bullet" \
 check "failed unit parser strips ANSI colour" \
   test "$(printf '\033[1;31m●\033[0m logrotate.service loaded failed failed Rotate log files\n' | failed_unit_names)" = "logrotate.service"
 
-# A lower ipfrag high mark is rejected while the old low mark is above it.
-# The generated block must write the low mark first.
-ipfrag_block=$(ipfrag_sysctl_lines 2047616 1535712)
-check "ipfrag tuning writes the low mark first" \
-  test "$(printf '%s\n' "$ipfrag_block" | head -n1)" = "net.ipv4.ipfrag_low_thresh = 1535712"
-check "ipfrag tuning writes the high mark second" \
-  test "$(printf '%s\n' "$ipfrag_block" | tail -n1)" = "net.ipv4.ipfrag_high_thresh = 2047616"
+# The kernel needs low <= high after every single write.  systemd-sysctl
+# starts from the kernel defaults (3 MB / 4 MB) and the profile never goes
+# below them, so the high mark goes first; low-first failed
+# systemd-sysctl.service on every boot of a 128 GB host (6178656 > 4194304).
+ipfrag_block=$(ipfrag_sysctl_lines 8238208 6178656)
+check "ipfrag tuning writes the high mark first" \
+  test "$(printf '%s\n' "$ipfrag_block" | head -n1)" = "net.ipv4.ipfrag_high_thresh = 8238208"
+check "ipfrag tuning writes the low mark second" \
+  test "$(printf '%s\n' "$ipfrag_block" | tail -n1)" = "net.ipv4.ipfrag_low_thresh = 6178656"
+# Boot simulation: kernel defaults, then the block in file order, for RAM
+# sizes from the 4 MB clamp to the 16 MB cap.  Every write must be valid.
+ipfrag_boot_ok() {
+  local ram high low line key val cur_low=3145728 cur_high=4194304
+  for ram in 2048 32768 65536 128722 262144 1048576; do
+    high=$(( ram * 64 )); (( high < 4194304 )) && high=4194304; (( high > 16777216 )) && high=16777216
+    low=$(( high * 3 / 4 ))
+    cur_low=3145728; cur_high=4194304
+    while IFS= read -r line; do
+      key=${line%% =*}; val=${line##*= }
+      case $key in
+        *high_thresh) (( val >= cur_low )) || return 1; cur_high=$val ;;
+        *low_thresh)  (( val <= cur_high )) || return 1; cur_low=$val ;;
+      esac
+    done < <(ipfrag_sysctl_lines "$high" "$low")
+  done
+}
+check "ipfrag block applies cleanly from the kernel defaults at boot (2 GB-1 TB RAM)" ipfrag_boot_ok
 
 # --domain app= names: aliases normalise, the default is the basic template.
 check "normalize_app: omitted app is basic" test "$(normalize_app '')" = basic
@@ -643,6 +663,34 @@ check "foreign sysctl report runs after the profile is written" \
   bash -c 'grep -A1 "^  run_os_tuning$" "$1" | grep -qx "  report_foreign_sysctl_sources"' _ "$ROOT/lib/restart.sh"
 check "the profile reset no longer warns about foreign sysctl sources" \
   not grep -q 'Still-defined foreign sysctl sources' "$ROOT/lib/overrides.sh"
+# The dry run previews against the template it would install, not the
+# current /etc/sysctl.conf (live host: rp_filter previewed as ours=1).
+printf 'net.ipv4.conf.all.rp_filter = 2\n' > "$fs/profile.conf"
+check "dry-run preview reads ours from the profile it would write" \
+  test "$(TUNING_OURS_PROFILE=$fs/profile.conf tuning_ours_value net.ipv4.conf.all.rp_filter)" = 2
+check "the shipped profile sets rp_filter 2 (Ubuntu's own value)" \
+  test "$(sysctl_file_value "$ROOT/configs/system/sysctl.conf" net.ipv4.conf.all.rp_filter)" = 2
+
+# Stale active http.d/letsencrypt.conf (shipped for a few hours on
+# 2026-07-22): retired when it is the shipped file and no vhost uses it.
+acme_case() { # setup -> "kept" or "retired"
+  local t=$TMP/acme-$1
+  rm -rf "$t"; mkdir -p "$t/http.d" "$t/conf.d" "$t/snippets"
+  printf 'acme_client letsencrypt https://acme-v02.api.letsencrypt.org/directory;\n' > "$t/http.d/letsencrypt_conf"
+  cp "$t/http.d/letsencrypt_conf" "$t/http.d/letsencrypt.conf"
+  printf 'server {\n    server_name a.test;\n}\n' > "$t/conf.d/a.test.conf"
+  case $1 in
+    used)   printf 'server {\n    acme letsencrypt;\n}\n' > "$t/conf.d/b.test.conf" ;;
+    edited) printf '# operator\n' >> "$t/http.d/letsencrypt.conf" ;;
+  esac
+  ( tune_reset_changes; tune_retire_unused_acme_client "$t" ) >/dev/null 2>&1
+  [[ -f $t/http.d/letsencrypt.conf ]] && echo kept || echo retired
+}
+check "ACME: an unused, as-shipped letsencrypt.conf is retired" test "$(acme_case unused)" = retired
+check "ACME: a vhost with 'acme letsencrypt' keeps it" test "$(acme_case used)" = kept
+check "ACME: an operator-edited file is kept" test "$(acme_case edited)" = kept
+check "ACME: the inactive letsencrypt_conf template stays" \
+  test -f "$TMP/acme-unused/http.d/letsencrypt_conf"
 
 # The single-file fallback must stay byte-identical to the canonical profile,
 # otherwise a run without configs/ silently writes values we already removed

@@ -48,6 +48,14 @@ tuning_managed_keys() {
 # Value the managed profile assigns to KEY, across every file it owns.
 tuning_ours_value() {
   local key=$1 file value
+  # The dry run previews the profile it would write: TUNING_OURS_PROFILE is
+  # the base template configure_sysctl installs, consulted first, so a
+  # default changed since the last run (rp_filter 1 -> 2) is not previewed
+  # as a conflict the real run resolves.
+  if [[ -n ${TUNING_OURS_PROFILE:-} && -r $TUNING_OURS_PROFILE ]]; then
+    value=$(sysctl_file_value "$TUNING_OURS_PROFILE" "$key")
+    if [[ -n $value ]]; then printf '%s' "$value"; return 0; fi
+  fi
   for file in /etc/sysctl.conf /etc/sysctl.d/90-setup-network.conf \
               /etc/sysctl.d/99-elasticsearch.conf; do
     value=$(sysctl_file_value "$file" "$key")

@@ -5,6 +5,44 @@ README.md; measurements in tests/stress-site/RESULTS.md.  Per-cycle
 reports and raw test logs cited by entries up to 1.21.32 were removed from
 the tree on 2026-11-19; retrieve them with `git show 84b0db5:<path>`.
 
+## 1.21.42 (2026-11-20)
+
+From `--optimize mitigations=off` plus a reboot on a fourth live host
+(2x AMD EPYC 7313, 64 threads, 128 GB, md RAID, Ubuntu 24.04.5, XenForo on
+PHP 8.0): the run, the reboot and the site were clean apart from these.
+
+- **`systemd-sysctl.service` no longer fails at boot on large hosts.**  The
+  RAM-sized IP fragment pair was written low mark first.  At boot the kernel
+  starts from its defaults (3 MB / 4 MB) and requires low <= high at every
+  write, so on a host where the pair scales above the defaults (128 GB:
+  8238208 / 6178656) `systemd-sysctl` failed with "Couldn't write '6178656'
+  to 'net/ipv4/ipfrag_low_thresh': Invalid argument" on every boot;
+  `setup-sysctl-final` re-applied the values later, so they were right but
+  the unit stayed failed.  The 62 GB audit host lands exactly on the
+  defaults, which is why no audit saw it.  `ipfrag_sysctl_lines` now writes
+  the high mark first (the profile never goes below the defaults, so boot is
+  always upward; a downward change at --optimize time is still prepared by
+  the make-room step).  A boot simulation from the kernel defaults checks
+  2 GB to 1 TB of RAM.
+- **The stale `http.d/letsencrypt.conf` is retired.**  server-configs-nginx
+  shipped it active for a few hours on 2026-07-22 before renaming it to
+  `letsencrypt_conf`; the sync never removes files that left the
+  repository, so hosts synced that day kept an `acme_client letsencrypt` no
+  vhost uses and every `angie -t` warned "defined but not used" (two live
+  hosts).  `tune_retire_unused_acme_client` moves it to /tmp only while it is
+  byte-identical to the shipped `letsencrypt_conf` and no vhost has an
+  `acme letsencrypt` directive, so a host using Angie ACME keeps it.
+- **The dry-run sysctl preview matches the real run.**  It read "ours" from
+  the current `/etc/sysctl.conf` and previewed `rp_filter(file=2 ours=1)` as
+  a conflict the run resolves; it now reads the template the run installs
+  (`TUNING_OURS_PROFILE`).
+
+Also verified: `--optimize` tunes an existing PHP 8.0 pool (no install
+template needed; `php-fpm -t` passed, graceful reload) and the XenForo gzip
+block parses on PHP 8.0.  Not ours: `systemd-networkd-wait-online` fails
+after a 2-minute timeout on every boot because netplan configures `lan0`
+with no cable (mark it `optional: true`).
+
 ## 1.21.41 (2026-11-20)
 
 From `--optimize mitigations=off` plus a reboot on a second live host (KVM
