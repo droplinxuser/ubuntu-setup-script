@@ -7,7 +7,7 @@ export LC_ALL=C.UTF-8 DEBIAN_FRONTEND=noninteractive
 
 ROOT=/var/www/xf.test.local/public
 PKG=/root/work/pkg
-XF_ZIP=$PKG/xenforo_2.3.13_full.zip
+XF_ZIP=${XF_ZIP:-$(ls "$PKG"/xenforo_*_full.zip 2>/dev/null | head -n1)}
 ADMIN_PW=${ADMIN_PW:-BenchAdmin123!}
 MEMBER_PW=${MEMBER_PW:-BenchPass123!}
 WORK=$(mktemp -d /tmp/xf-deploy.XXXXXX)

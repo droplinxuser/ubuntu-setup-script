@@ -1,0 +1,18 @@
+# Published third-party IPv4 addresses that may appear in this repository.
+# Never add a server you operate: use 192.0.2.0/24, 198.51.100.0/24 or
+# 203.0.113.0/24 (RFC 5737) in documentation, tests and examples instead.
+1.1.1.1        # Cloudflare public DNS
+8.8.8.8        # Google public DNS
+9.9.9.9        # Quad9 public DNS
+173.245.       # Cloudflare published ranges (test fixtures)
+104.16.        # Cloudflare
+104.21.        # Cloudflare anycast (test fixtures)
+104.016.0.9    # malformed-address test fixture
+172.64.        # Cloudflare
+172.67.        # Cloudflare anycast (test fixtures)
+1.2.0.0        # CIDR parser test fixture
+1.2.3.4        # placeholder in sample configs
+2.2.2.2        # placeholder in sample configs
+2.3.4.5        # placeholder in --help text
+5.2.2.4        # RFC section number in a comment (h5bp)
+6.2.2.3        # RFC section number in a comment (h5bp)

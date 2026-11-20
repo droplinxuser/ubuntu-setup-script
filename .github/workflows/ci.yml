@@ -20,6 +20,13 @@ jobs:
           repository: droplinxuser/server-configs-nginx
           path: server-configs-nginx
 
+      # Real server addresses must never be committed (see
+      # tools/check-public-ips.sh); checked in both repositories.
+      - name: No public server addresses
+        run: |
+          bash tools/check-public-ips.sh
+          bash tools/check-public-ips.sh server-configs-nginx
+
       - name: Bash syntax
         run: |
           bash -n setup.sh
