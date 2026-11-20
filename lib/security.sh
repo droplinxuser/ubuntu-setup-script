@@ -215,6 +215,24 @@ harden_wordpress_audit_db() {
   return 0
 }
 
+# Directories Angie serves files from: every root and alias in the conf.d
+# vhosts (a variable suffix such as `root /srv/$host` is cut at the `$`).
+# Empty when Angie is not configured.
+harden_served_roots() {
+  local target=${HARDEN_ANGIE_DIR:-/etc/angie} f p
+  [[ -d $target/conf.d ]] || return 0
+  for f in "$target"/conf.d/*.conf; do
+    [[ -f $f ]] || continue
+    sed -E 's/#.*//' "$f" | tr ';{}' '\n\n\n' \
+      | sed -nE 's/^[[:space:]]*(root|alias)[[:space:]]+"?([^"[:space:]]+)"?[[:space:]]*$/\2/p'
+  done | while IFS= read -r p; do
+    p=${p%%\$*}
+    [[ $p == / ]] || p=${p%/}
+    [[ $p == /* ]] && printf '%s\n' "$p"
+  done | sort -u
+  return 0
+}
+
 harden_wordpress_files() {
   local f count root=${SETUP_WWW_ROOT:-/var/www} ww big_list
   [[ -d $root ]] || return 0
@@ -241,13 +259,33 @@ harden_wordpress_files() {
     xargs -0 -r chmod o-w -- < "$ww" 2>/dev/null || true
     harden_note "  - world-writable entries fixed: ${count}"
   fi
-  local -a big risky
-  mapfile -t -d '' -n 20 big < "$big_list"
+  local -a big risky served=() exposed=() roots=()
+  local r unserved=0
+  mapfile -t -d '' big < "$big_list"
   rm -f "$ww" "$big_list"
-  if (( ${#big[@]} > 0 )); then
-    harden_warn "  - large archives inside web-accessible paths:"
-    for f in "${big[@]}"; do harden_warn "      ${f}"; done
+  # Only an archive below a directory Angie serves can be downloaded.  An
+  # application's private store next to its public root (Pingvin Share's
+  # pingvin_data/uploads/shares/*/archive.zip, a backup directory) is not,
+  # and listing it as web-accessible was a false WARNING on a live host.
+  # Without an Angie configuration every archive is reported, as before.
+  mapfile -t roots < <(harden_served_roots)
+  if (( ${#roots[@]} > 0 )); then
+    for f in "${big[@]}"; do
+      for r in "${roots[@]}"; do
+        if [[ $f == "$r" || $f == "$r"/* || $r == / ]]; then served+=("$f"); continue 2; fi
+      done
+      unserved=$(( unserved + 1 ))
+    done
+  else
+    served=("${big[@]}")
   fi
+  exposed=("${served[@]:0:20}")
+  if (( ${#exposed[@]} > 0 )); then
+    harden_warn "  - large archives inside web-accessible paths (below an Angie root/alias):"
+    for f in "${exposed[@]}"; do harden_warn "      ${f}"; done
+    (( ${#served[@]} > 20 )) && harden_warn "      ... and $(( ${#served[@]} - 20 )) more"
+  fi
+  (( unserved > 0 )) && harden_note "  - large archives outside every served root (not web-accessible): ${unserved}"
   mapfile -t risky < <(find "$root" -maxdepth 5 -type d \( -name 'wp-file-manager' -o -name 'file-manager-advanced' -o -name 'duplicator' -o -name 'wpcoderpro' -o -name 'insert-headers-and-footers' \) 2>/dev/null | head -20 || true)
   if (( ${#risky[@]} > 0 )); then
     harden_warn "  - high-risk code/upload plugins installed (review or remove):"

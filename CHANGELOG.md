@@ -5,6 +5,19 @@ README.md; measurements in tests/stress-site/RESULTS.md.  Per-cycle
 reports and raw test logs cited by entries up to 1.21.32 were removed from
 the tree on 2026-11-19; retrieve them with `git show 84b0db5:<path>`.
 
+## 1.21.53 (2026-11-21)
+
+- **The "large archives inside web-accessible paths" WARNING lists only
+  archives Angie can serve.**  The hygiene scan reported every archive over
+  100 MB under `/var/www`; on site-d.example that was a WARNING for Pingvin
+  Share's private `pingvin_data/uploads/shares/*/archive.zip` (322 files,
+  20 listed), none of them below a document root.  An archive now counts as
+  web-accessible only below a `root` or `alias` of a conf.d vhost; the rest
+  are counted in one note.  Without an Angie configuration every archive is
+  reported as before.  The 20-line cap now applies after the filter (it cut
+  the list before, so a served archive could be hidden behind 20 private
+  ones), with a "... and N more" line.  No extra tree walk.
+
 ## 1.21.52 (2026-11-21)
 
 - **An origin behind its own reverse proxy no longer goes down when the

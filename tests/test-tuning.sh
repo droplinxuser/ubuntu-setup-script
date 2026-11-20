@@ -669,6 +669,22 @@ check "hygiene reports large archives, including a world-writable one" \
   bash -c 'grep -q "WARN .*public/dump.sql" "$1" && grep -q "WARN .*ww-backup.zip" "$1"' _ "$TMP/hygiene.report"
 check "hygiene keeps mysql_database out of the archive report" \
   not grep -q 'mysql_database/db.sql' "$TMP/hygiene.report"
+# With an Angie configuration only archives below a served root/alias are
+# web-accessible (Pingvin's pingvin_data/uploads/shares/*/archive.zip was a
+# false WARNING on a live host).
+mkdir -p "$hw/angie/conf.d" "$hw/app_data/shares/a1"
+truncate -s 101M "$hw/app_data/shares/a1/archive.zip"
+printf 'server {\n  root %s/site/public;\n  location /x/ { alias %s/static/; }\n  # root %s/app_data;\n}\n' "$hw" "$hw" "$hw" > "$hw/angie/conf.d/site.conf"
+hw_run_angie() { HARDEN_ANGIE_DIR=$hw/angie hw_run; }
+hw_run_angie
+check "hygiene: served roots come from root and alias, comments ignored" \
+  test "$(HARDEN_ANGIE_DIR=$hw/angie harden_served_roots | paste -sd' ' -)" = "$hw/site/public $hw/static"
+check "hygiene: an archive below a served root is still a WARNING" \
+  grep -q "WARN .*$hw/site/public/dump.sql" "$TMP/hygiene.report"
+check "hygiene: an archive outside every served root is a note, not a WARNING" \
+  bash -c '! grep -q "WARN .*app_data" "$1" && grep -q "NOTE .*outside every served root (not web-accessible): 1" "$1"' _ "$TMP/hygiene.report"
+check "hygiene: the served-root filter adds no tree walk" \
+  test "$(wc -c < "$TMP/hygiene.calls")" -eq 2
 
 # The webshell signatures are WordPress dropper families: no WordPress, no
 # walk; with WordPress, only its roots (never a XenForo tree beside it).
