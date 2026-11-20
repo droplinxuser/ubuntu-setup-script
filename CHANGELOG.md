@@ -10,7 +10,7 @@ the tree on 2026-11-19; retrieve them with `git show 84b0db5:<path>`.
 - **The stale ACME client is retired before the sync tests the tree.**  On
   the live host the 1.21.42 run retired `http.d/letsencrypt.conf`, but
   `deploy_angie_tree` runs a visible `angie -t` before the tuning pass, so
-  that same run still printed "ACME client \"letsencrypt\" is defined but not
+  that same run still printed "ACME client "letsencrypt" is defined but not
   used" once.  The sync now calls `tune_retire_unused_acme_client` before its
   test (the tuner call stays as a no-op) and logs the move as info.  One
   unit check.
