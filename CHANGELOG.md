@@ -5,6 +5,55 @@ README.md; measurements in tests/stress-site/RESULTS.md.  Per-cycle
 reports and raw test logs cited by entries up to 1.21.32 were removed from
 the tree on 2026-11-19; retrieve them with `git show 84b0db5:<path>`.
 
+## 1.21.56 (2026-11-21)
+
+- **No php-redis / php-igbinary by default.**  The `--php` set no longer
+  installs `phpX.Y-redis` (and so not `phpX.Y-igbinary`, its dependency).
+  XenForo runs without it: the SV RedisCache add-on's bundled Credis client
+  falls back to a pure-PHP connection (`standalone =
+  !extension_loaded('redis')`), and WordPress needs it only with an
+  object-cache drop-in.  `--domain` now installs what a site cannot run
+  without through one shared helper (`php_ensure_app_extensions`, the same
+  table the upgrade preflight uses): Chevereto gets `redis` and `imagick`,
+  XenForo and WordPress nothing extra.  `--upgrade-php` carries `redis` like
+  any other extension (only when the old version had it).  Existing hosts are
+  not changed: nothing is purged.  The data-cache trade-off is unchanged:
+  php-redis + local Valkey measured +7-9 % authenticated XenForo throughput,
+  so add it by hand where the XF cache stays on.
+- **`--upgrade-php` no longer blocks on an extension the site does not
+  use.**  The XenForo rule treated any uncommented mention of Redis or Valkey
+  in `config.php` as a php-redis requirement, so a forum on SV RedisCache
+  (Credis, no php-redis loaded) was refused for `--upgrade-php=8.6` ("php8.6-redis
+  is not published").  Only XenForo's own `Redis` provider (or Doctrine's
+  `RedisCache` named directly) counts now.  And for every application, an
+  extension that no installed PHP-FPM loads cannot be lost by the upgrade:
+  it is reported as a note, never a blocker.  The module list is the union
+  over every installed version (the purge removes all of them), so the dry
+  run and the real run agree; one unreadable version, or none installed,
+  keeps every requirement.
+- **WordPress: `--domain` installs php-redis only for a drop-in that cannot
+  run without it.**  Any `wp-content/object-cache.php` used to count, which
+  with `--domain` now installing requirements would have pulled
+  php-redis/igbinary in for W3 Total Cache, LiteSpeed, APCu or Memcached
+  drop-ins and for Redis Object Cache (it bundles Predis).  The rule now has
+  two strengths: `--domain` installs redis only for a drop-in that creates
+  `\Redis` with no Predis fallback, or for Object Cache Pro (phpredis or
+  Relay).  The `--upgrade-php` preflight still counts any drop-in that
+  mentions Redis, so a loaded php-redis is never purged from under one; the
+  "no installed PHP-FPM loads it" waiver keeps that from blocking hosts
+  without redis.
+- `php -m` is read whole and only a successful run counts (a failed one could
+  leave a partial list that would waive real requirements, and an early
+  `sed q` could SIGPIPE the pipeline under `pipefail`).
+- **`apt-get update` rides out a repository mid-sync.**  Sury's CDN served
+  a `Packages.xz` that did not match its `Release` ("File has unexpected
+  size ... Mirror sync in progress?") and three tries 5 s apart all failed
+  inside the window, ending in "command failed at line 1142".  A mirror-sync
+  or hash-sum failure is now retried after 30, 60, 120 and 240 s; other
+  failures keep the three quick tries.  `--upgrade-php`, the system update
+  and the repository setup stop with a message naming the cause (and, for the
+  upgrade, that nothing was changed and the old PHP is still serving).
+
 ## 1.21.55 (2026-11-21)
 
 - **Anubis: requests the policy allows without a cookie skip the Go hop.**

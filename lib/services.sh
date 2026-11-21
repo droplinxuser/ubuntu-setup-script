@@ -146,7 +146,7 @@ prepare_repositories() {
     done
   fi
   if (( configured )); then
-    apt_update
+    apt_update || die "apt-get update failed after adding the repositories: $(apt_update_failure_hint)"
   fi
 }
 
@@ -449,8 +449,13 @@ install_php() {
   fi
 
   # XenForo-focused extension set: runtime, database, media, HTTP, XML,
-  # archives, math, multibyte, Redis, OPcache and the CLI for XenForo cmd.php.
-  # Add intl/imagick/bcmath/apcu only if a specific add-on needs them.
+  # archives, math, multibyte, OPcache and the CLI for XenForo cmd.php.
+  # No php-redis (and so no php-igbinary, its dependency) by default: XenForo
+  # runs without it (SV RedisCache uses its pure-PHP Credis client) and so
+  # does WordPress without an object-cache drop-in.  An application that
+  # cannot run without an extension gets it from php_ensure_app_extensions
+  # when its --domain is created (Chevereto: redis and imagick).  Add
+  # intl/bcmath/apcu only if a specific add-on needs them.
   #
   # PHP 8.5 made OPcache a mandatory, always-built-in extension: Sury (and
   # Ubuntu) no longer publish php8.5-opcache.  Installing the separate package
@@ -461,11 +466,11 @@ install_php() {
     "php${ver}-mysql" "php${ver}-gd" "php${ver}-curl" "php${ver}-xml"
     "php${ver}-zip" "php${ver}-gmp" "php${ver}-mbstring"
   )
-  # Redis is in the default set but is a PECL build, so a brand-new PHP
-  # release can lag it by days or weeks (PHP 8.6.0~rc5 shipped only the 30
-  # in-tree extensions).  A missing optional package must not abort the whole
+  # Optional packages (the extensions --upgrade-php carries over) are PECL
+  # builds that can lag a new PHP release by weeks (PHP 8.6.0 shipped without
+  # redis, igbinary and imagick).  A missing one must not abort the whole
   # installation; the caller and the upgrade report name it instead.
-  local -a php_optional=("php${ver}-redis")
+  local -a php_optional=()
   if apt-cache show "php${ver}-opcache" >/dev/null 2>&1; then
     php_pkgs+=("php${ver}-opcache")
   else
@@ -2135,33 +2140,28 @@ create_domains() {
   command -v openssl >/dev/null 2>&1 || apt_install openssl
   ensure_log_dirs
 
-  local dir conf app certdir tmp changed=0 imported=0 pv
+  local dir conf app certdir tmp changed=0 imported=0
   for d in "${DOMAINS[@]}"; do
     app=${DOMAIN_APP[$d]:-basic}
     dir="/var/www/${d}/public"
     conf="/etc/angie/conf.d/${d}.conf"
     certdir="/etc/angie/ssl/${d}"
 
-    # Imagick is required by Chevereto, but it is not part of the
-    # XenForo/WordPress default PHP profile.  Install it only when a
-    # Chevereto vhost is explicitly requested (including an existing one).
-    # Use the FPM version Angie talks to, not the alternatives CLI: on a host
-    # with 8.4 and 8.5 installed, `php -m` could name the other version and
-    # install an extension the pool never loads.
-    local chev_php
-    chev_php=$(php_primary_version 2>/dev/null || true)
-    [[ -n $chev_php ]] || chev_php=$(php -r 'echo PHP_MAJOR_VERSION, ".", PHP_MINOR_VERSION;' 2>/dev/null || true)
-    if [[ $app == chevereto && -n $chev_php ]] \
-       && ! "/usr/bin/php${chev_php}" -m 2>/dev/null | grep -qix imagick; then
-      pv=$chev_php
-      if [[ -n $pv ]]; then
-        info "Chevereto requires Imagick; installing php${pv}-imagick (Chevereto only)"
-        apt_install "php${pv}-imagick" \
-          || warn "Could not install php${pv}-imagick; Chevereto may fail its image checks"
-        systemctl restart "php${pv}-fpm" 2>/dev/null || true
-      else
-        warn "Chevereto requires the PHP Imagick extension, but the PHP version could not be detected"
-      fi
+    # Extensions the application cannot run without are not in the default
+    # PHP set (no php-redis/php-igbinary, no imagick): install them only for
+    # a site that needs them, including an existing one (Chevereto: redis,
+    # which pulls igbinary, and imagick; XenForo and WordPress: nothing
+    # extra).  Use the FPM version Angie talks to, not the alternatives CLI:
+    # on a host with 8.4 and 8.5 installed, `php -m` could name the other
+    # version and install an extension the pool never loads.
+    local app_php req_app
+    app_php=$(php_primary_version 2>/dev/null || true)
+    [[ -n $app_php ]] || app_php=$(php -r 'echo PHP_MAJOR_VERSION, ".", PHP_MINOR_VERSION;' 2>/dev/null || true)
+    case $app in xf) req_app=xenforo ;; *) req_app=$app ;; esac
+    if [[ -n $app_php ]]; then
+      php_ensure_app_extensions "$req_app" "$dir" "$app_php"
+    elif [[ $app == chevereto ]]; then
+      warn "Chevereto requires the PHP redis and Imagick extensions, but the PHP version could not be detected"
     fi
 
     # Only a tree this run creates is chowned recursively.  An existing site

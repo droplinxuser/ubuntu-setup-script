@@ -437,8 +437,54 @@ retry() {
   done
 }
 
-apt_update()  { retry 3 5 apt-get -o DPkg::Lock::Timeout=300 \
-  -o Acquire::Retries=3 -o Acquire::http::Timeout=30 update -y && APT_LISTS_FRESH=1; }
+# apt-get update, retried.  A repository that is publishing a new index
+# (Sury's CDN: "File has unexpected size ... Mirror sync in progress?", or a
+# "Hash Sum mismatch") serves a Release and a Packages file that disagree for
+# a few minutes; three tries 5 s apart all failed inside that window.  Such a
+# failure is retried with a growing wait (30, 60, 120, 240 s; at most ~7.5
+# minutes); any other failure keeps the three quick tries.  The last failure
+# names the reason so the caller can say what to do.
+APT_UPDATE_SYNC_DELAYS=${APT_UPDATE_SYNC_DELAYS:-"30 60 120 240"}
+APT_UPDATE_REASON=""
+apt_update() {
+  local out n=1 quick=3 rc delays=() i=0
+  read -ra delays <<<"$APT_UPDATE_SYNC_DELAYS"
+  out=$(tmp_file) || out=/dev/null
+  APT_UPDATE_REASON=""
+  while :; do
+    rc=0
+    apt-get -o DPkg::Lock::Timeout=300 -o Acquire::Retries=3 \
+      -o Acquire::http::Timeout=30 update -y 2>&1 | tee "$out" || rc=$?
+    if (( rc == 0 )); then
+      APT_LISTS_FRESH=1
+      return 0
+    fi
+    if grep -qiE 'Mirror sync in progress|Hash Sum mismatch|File has unexpected size' "$out" 2>/dev/null; then
+      APT_UPDATE_REASON="mirror-sync"
+      if (( i >= ${#delays[@]} )); then
+        return 1
+      fi
+      warn "A package repository is publishing a new index (mirror sync); retrying apt-get update in ${delays[i]}s ($((i + 1))/${#delays[@]})"
+      sleep "${delays[i]}"
+      i=$(( i + 1 ))
+      continue
+    fi
+    APT_UPDATE_REASON="failed"
+    if (( n >= quick )); then
+      return 1
+    fi
+    warn "Attempt ${n}/${quick} failed: apt-get update -- retrying in 5s"
+    sleep 5
+    n=$(( n + 1 ))
+  done
+}
+# The operator-facing explanation of the last apt_update failure.
+apt_update_failure_hint() {
+  case $APT_UPDATE_REASON in
+    mirror-sync) printf 'a package repository was still publishing a new index after ~7.5 minutes of retries (mirror sync); try again later' ;;
+    *) printf 'see the apt-get output above (network, DNS or a repository error)' ;;
+  esac
+}
 # Refresh the package lists at most once per run (update_system and the
 # repository setup already count); used by the few installs outside them.
 APT_LISTS_FRESH=0

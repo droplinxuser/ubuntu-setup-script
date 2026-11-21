@@ -224,7 +224,8 @@ PHP upgrade (standalone):
           (an explicitly requested pre-release is allowed with a warning);
         - detects WordPress/XenForo/Chevereto below /var/www and refuses,
           before purging, when the target cannot provide an extension they
-          need (PHP 8.6 publishes no redis yet).  Nothing changes on refusal;
+          need and the current PHP loads (PHP 8.6 publishes no redis,
+          igbinary or imagick yet).  Nothing changes on refusal;
           SETUP_PHP_ALLOW_MISSING_EXT=1 accepts the loss explicitly;
         - purges all PHP packages and the dependencies that only PHP kept
           installed.  Pre-existing unrelated autoremove candidates are kept,

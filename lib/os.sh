@@ -45,7 +45,7 @@ EOF
 
 update_system() {
   step "Ubuntu update"
-  apt_update
+  apt_update || die "apt-get update failed: $(apt_update_failure_hint)"
   # A failed upgrade can leave dpkg half-configured (for example when a
   # postinst is interrupted by a full disk or a provider console reset).
   # Repair the package state once and retry, instead of continuing a

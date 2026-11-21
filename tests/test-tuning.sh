@@ -4477,7 +4477,29 @@ check "WordPress requirements skip redis without an object-cache drop-in" \
   lacks_ext php_upgrade_app_required_extensions wordpress "$TMP/apps/wp/public"
 mkdir -p "$TMP/apps/wp/public/wp-content"
 : > "$TMP/apps/wp/public/wp-content/object-cache.php"
-check "WordPress requirements add redis with an object-cache drop-in" \
+check "WordPress: a drop-in that does not use Redis (W3TC, APCu, Memcached) needs no php-redis for --domain" \
+  lacks_ext php_upgrade_app_required_extensions wordpress "$TMP/apps/wp/public" install
+check "WordPress: a drop-in that does not use Redis blocks no upgrade" \
+  lacks_ext php_upgrade_app_required_extensions wordpress "$TMP/apps/wp/public"
+wpoc=$TMP/apps/wp/public/wp-content/object-cache.php
+printf '<?php\n// Redis Object Cache\n$this->redis = new Redis();\n// fallback: new Predis\\Client($p);\n' > "$wpoc"
+check "WordPress: --domain installs nothing for Redis Object Cache (bundles Predis)" \
+  lacks_ext php_upgrade_app_required_extensions wordpress "$TMP/apps/wp/public" install
+check "WordPress: the upgrade preflight still protects a loaded php-redis under Redis Object Cache" \
+  has_ext php_upgrade_app_required_extensions wordpress "$TMP/apps/wp/public"
+printf '<?php\nuse RedisCachePro\\Configuration\\Configuration;\n// Object Cache Pro\n' > "$wpoc"
+check "WordPress: Object Cache Pro (phpredis or Relay) is a hard requirement for --domain" \
+  has_ext php_upgrade_app_required_extensions wordpress "$TMP/apps/wp/public" install
+printf '<?php\n$r = new \\Redis;\n' > "$wpoc"
+check "WordPress: \`new \\Redis;\` without parentheses is a hard requirement" \
+  has_ext php_upgrade_app_required_extensions wordpress "$TMP/apps/wp/public" install
+printf '<?php\n$r = new RedisCluster();\n' > "$wpoc"
+check "WordPress: a class merely starting with Redis is not \\Redis for --domain" \
+  lacks_ext php_upgrade_app_required_extensions wordpress "$TMP/apps/wp/public" install
+printf '<?php\n$redis = new \\Redis();\n$redis->connect("/run/valkey/valkey.sock");\n' > "$wpoc"
+check "WordPress: a phpredis-only drop-in requires php-redis for --domain" \
+  has_ext php_upgrade_app_required_extensions wordpress "$TMP/apps/wp/public" install
+check "WordPress: a phpredis-only drop-in requires php-redis in the upgrade preflight" \
   has_ext php_upgrade_app_required_extensions wordpress "$TMP/apps/wp/public"
 printf "// \$config['cache']['provider'] = 'Redis';\n" > "$TMP/apps/xf/public/src/config.php"
 check "XenForo ignores a commented Redis example" \
@@ -4487,7 +4509,7 @@ check "XenForo detects a configured Redis cache" \
   has_ext php_upgrade_app_required_extensions xenforo "$TMP/apps/xf/public"
 check "a core extension needs no package lookup" php_upgrade_extension_available 9.9 gd
 check "an unpublished extension is reported unavailable" not php_upgrade_extension_available 9.9 redis
-php_upgrade_preflight_apps 9.9 "$TMP/apps"
+php_upgrade_preflight_apps 9.9 "$TMP/apps" ""
 check "the preflight blocks a target without redis" \
   test "$(printf '%s\n' "${PHP_UPGRADE_BLOCKERS[@]}" | grep -c '|redis$')" -eq 3
 php_upgrade_preflight_apps 9.9 "$TMP/apps/plain"
@@ -4495,6 +4517,123 @@ check "the preflight is empty without an application" test "${#PHP_UPGRADE_BLOCK
 blocker_desc=$(php_upgrade_describe_blocker "chevereto|/var/www/chev|redis")
 check "the blocker names the site and the missing package" \
   grep -qF 'chevereto at /var/www/chev requires the redis extension' <<<"$blocker_desc"
+
+# 1.21.56: php-redis is a hard requirement only where something needs it.
+# XenForo's own Redis provider uses the \Redis class; SV RedisCache's Credis
+# client falls back to a pure-PHP connection without the extension.
+printf "\$config['cache']['enabled'] = true;\n\$config['cache']['provider'] = 'SV\\\\RedisCache\\\\Redis';\n\$config['cache']['config'] = ['server' => '/run/valkey/valkey.sock', 'port' => 0];\n" > "$TMP/apps/xf/public/src/config.php"
+check "XenForo with SV RedisCache (Credis, Valkey socket) does not require php-redis" \
+  lacks_ext php_upgrade_app_required_extensions xenforo "$TMP/apps/xf/public"
+printf "\$config['cache'] = ['enabled' => true, 'provider' => 'Redis', 'config' => ['host' => '127.0.0.1']];\n" > "$TMP/apps/xf/public/src/config.php"
+check "XenForo's core Redis provider in array form requires php-redis" \
+  has_ext php_upgrade_app_required_extensions xenforo "$TMP/apps/xf/public"
+# The installed PHP decides what can be lost.  The module list is passed in.
+pf_run() { # loaded-modules -> blockers ; not-loaded
+  (
+    local mods
+    mods=$(tr ' ' '\n' <<<"$1" | sed '/^$/d')
+    php_upgrade_preflight_apps 9.9 "$TMP/apps" "$mods"
+    printf '%s\n' "B:${PHP_UPGRADE_BLOCKERS[*]}" "N:${PHP_UPGRADE_NOT_LOADED[*]}"
+  )
+}
+pf_out=$(pf_run "mysqli gd curl mbstring xml zip imagick")
+check "an extension the old PHP does not load never blocks the upgrade" \
+  bash -c 'grep -q "^B:" <<<"$1" && ! grep "^B:" <<<"$1" | grep -q redis' _ "$pf_out"
+check "a requirement the old PHP lacks is reported as not loaded" \
+  bash -c 'test "$(grep "^N:" <<<"$1" | grep -o "|redis" | wc -l | tr -d " ")" -eq 3' _ "$pf_out"
+pf_out=$(pf_run "mysqli gd curl mbstring xml zip imagick redis")
+check "an extension the old PHP loads still blocks when the target lacks it" \
+  bash -c 'test "$(grep "^B:" <<<"$1" | grep -o "|redis" | wc -l | tr -d " ")" -eq 3' _ "$pf_out"
+pf_out=$(pf_run "")
+check "an unknown module list keeps every requirement (conservative)" \
+  bash -c 'test "$(grep "^B:" <<<"$1" | grep -o "|redis" | wc -l | tr -d " ")" -eq 3' _ "$pf_out"
+check "the module list reads php-fpm -m up to the Zend section, lower-cased" \
+  test "$(
+    command() { [[ $2 == php-fpm8.5 ]]; }
+    php-fpm8.5() { printf '[PHP Modules]\nCore\nredis\nZend OPcache\n\n[Zend Modules]\nZend OPcache\n'; }
+    php_upgrade_loaded_modules 8.5 | paste -sd' ' -
+  )" = "core redis zend_opcache"
+check "a php -m that fails reads as unknown (empty), never as a partial list or an error" \
+  test "$(
+    command() { [[ $2 == php-fpm8.5 ]]; }
+    php-fpm8.5() { printf '[PHP Modules]\nCore\n'; return 141; }
+    out=$(php_upgrade_loaded_modules 8.5); rc=$?
+    printf '%s|%s' "$rc" "$out"
+  )" = "0|"
+# The purge removes every installed version, so the union decides.
+lm_all() { # "ver:mods,..." per version -> union
+  (
+    LM_SPEC=$1
+    php_upgrade_installed_versions() { local s; for s in $LM_SPEC; do printf '%s\n' "${s%%:*}"; done; }
+    php_upgrade_any_versions() { :; }
+    php_upgrade_loaded_modules() { local s; for s in $LM_SPEC; do [[ ${s%%:*} == "$1" ]] && tr ',' '\n' <<<"${s#*:}" | sed '/^$/d'; done; return 0; }
+    php_upgrade_loaded_modules_all | paste -sd' ' -
+  )
+}
+check "an extension loaded by any installed version counts (8.4 redis, 8.5 none)" \
+  test "$(lm_all '8.4:gd,redis 8.5:gd')" = "gd redis"
+check "one unreadable version makes the whole list unknown (conservative)" \
+  test "$(lm_all '8.4:gd,redis 8.5:')" = ""
+check "no installed PHP means an unknown list" test "$(lm_all '')" = ""
+check "the dry run and the real run read the same module union" \
+  bash -c 'test "$(grep -c "php_upgrade_preflight_apps \"\$target\"\$" "$1")" -eq 2' _ "$ROOT/lib/php-upgrade.sh"
+waived_desc=$(PHP_UPGRADE_LOADED_FROM="8.4 8.5" UPGRADE_PHP=8.6 php_upgrade_describe_waived "xenforo|/var/www/f|redis")
+check "the waiver line names the site, the extension and the versions read" \
+  grep -qF 'xenforo at /var/www/f: the redis extension is not loaded by any installed PHP-FPM (8.4 8.5) either' <<<"$waived_desc"
+check "the default --php set installs no php-redis or php-igbinary" \
+  bash -c 'b=$(sed -n "/^install_php() {/,/^}/p" "$1"); grep -qx "  local -a php_optional=()" <<<"$b" && ! grep -E "^[^#]*php\\\$\{ver\}-(redis|igbinary)" <<<"$b" | grep -q .' _ "$ALL_SRC"
+check "--upgrade-php carries redis like any other extension (not part of the core set)" \
+  bash -c '[[ $1 != *" redis "* ]]' _ "$PHP_UPGRADE_CORE_EXT"
+check "--upgrade-php skips redis when the target does not publish it" \
+  test "$( apt-cache() { return 1; }; php_upgrade_classify_package 9.9 php8.5-redis )" = "skip:php9.9-redis is not published"
+check "--upgrade-php keeps redis when the target publishes it" \
+  test "$( apt-cache() { return 0; }; php_upgrade_classify_package 9.9 php8.5-redis )" = "keep:php9.9-redis"
+# php_ensure_app_extensions installs only what the app needs and FPM lacks.
+pe_run() { # app root loaded-modules published? -> installed packages
+  (
+    php_upgrade_loaded_modules() { printf '%s\n' $PE_MODS; }
+    apt-cache() { [[ $PE_PUB == 1 ]]; }
+    apt_install() { printf '%s\n' "$@" >> "$TMP/pe.installed"; }
+    systemctl() { :; }; info() { :; }; warn() { printf 'WARN %s\n' "$*" >> "$TMP/pe.installed"; }
+    PE_MODS=$3; PE_PUB=$4; : > "$TMP/pe.installed"
+    php_ensure_app_extensions "$1" "$2" 8.5
+    paste -sd' ' - < "$TMP/pe.installed"
+  )
+}
+check "a new Chevereto site gets redis and imagick" \
+  test "$(pe_run chevereto "$TMP/apps/chev/public" "mysqli gd curl mbstring" 1)" = "php8.5-redis php8.5-imagick"
+check "a Chevereto site whose FPM already loads them gets nothing" \
+  test "$(pe_run chevereto "$TMP/apps/chev/public" "mysqli gd curl mbstring redis imagick" 1)" = ""
+printf "\$config['cache']['provider'] = 'SV\\\\RedisCache\\\\Redis';\n" > "$TMP/apps/xf/public/src/config.php"
+check "a XenForo site (SV RedisCache or no cache) gets no extension" \
+  test "$(pe_run xenforo "$TMP/apps/xf/public" "mysqli gd curl mbstring xml zip" 1)" = ""
+check "a required package that is not published is a warning, not an install" \
+  bash -c 'grep -q "^WARN chevereto at .* needs php8.5-redis, which is not published" <<<"$(tr " " "\n" <<<"$1" | paste -sd" " -)" || [[ $1 == *"needs php8.5-redis, which is not published"* ]]' _ "$(pe_run chevereto "$TMP/apps/chev/public" "mysqli gd curl mbstring" 0)"
+check "an unknown module list installs nothing (no guessing)" \
+  test "$(pe_run chevereto "$TMP/apps/chev/public" "" 1)" = ""
+check "--domain maps app=xf to the XenForo requirements" \
+  grep -qF 'case $app in xf) req_app=xenforo ;; *) req_app=$app ;; esac' "$ALL_SRC"
+
+# apt_update: a repository mid-sync gets the long waits, anything else the
+# three quick tries; the last failure names the reason.
+au_run() { # script-of-results -> "rc calls reason"
+  (
+    # apt-get runs inside `apt-get | tee`, a subshell: count in a file.
+    read -ra AU_SEQ <<<"$1"; echo 0 > "$TMP/au.calls"
+    apt-get() { local n r; n=$(( $(cat "$TMP/au.calls") + 1 )); echo "$n" > "$TMP/au.calls"; r=${AU_SEQ[n-1]:-ok}
+      case $r in ok) return 0 ;; sync) echo "E: Failed to fetch x  File has unexpected size (2 != 1). Mirror sync in progress?"; return 100 ;; *) echo "E: Could not resolve host"; return 100 ;; esac; }
+    sleep() { :; }; warn() { :; }
+    APT_UPDATE_SYNC_DELAYS="0 0 0"
+    rc=0; apt_update >/dev/null 2>&1 || rc=$?
+    printf '%s %s %s\n' "$rc" "$(cat "$TMP/au.calls")" "${APT_UPDATE_REASON:-none}"
+  )
+}
+check "apt_update rides out a mirror sync" test "$(au_run 'sync sync ok')" = "0 3 mirror-sync"
+check "apt_update gives up after the mirror-sync waits" test "$(au_run 'sync sync sync sync sync')" = "1 4 mirror-sync"
+check "apt_update keeps three quick tries for other failures" test "$(au_run 'net net net net')" = "1 3 failed"
+check "apt_update succeeds first time without waiting" test "$(au_run 'ok')" = "0 1 none"
+check "the upgrade explains an apt failure and says nothing changed" \
+  grep -qF 'apt_update || die "Could not refresh the package lists: $(apt_update_failure_hint). Nothing was changed' "$ALL_SRC"
 
 mkdir -p "$TMP/php-manifest"
 printf 'common\t0\tphp-common\ncommon\t0\tphp8.5-common\nredis\t1\tphp8.5-redis\n' \

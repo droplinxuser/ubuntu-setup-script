@@ -53,6 +53,8 @@ PHP_UPGRADE_AUTOREMOVE_OK=0
 # dry run, the real run and the summary agree.
 PHP_UPGRADE_CARRIED_COUNT=0
 PHP_UPGRADE_BLOCKERS=()
+# "app|root|ext" requirements the old PHP did not load either (not a loss).
+PHP_UPGRADE_NOT_LOADED=()
 PHP_UPGRADE_ANGIE_ACTIVE=0
 PHP_UPGRADE_OPTIMIZE_OK=0
 PHP_UPGRADE_VERIFY_OK=0
@@ -230,7 +232,7 @@ php_upgrade_snapshot() {
 }
 
 # Core extensions the default install_php() package set already installs.
-readonly PHP_UPGRADE_CORE_EXT=" fpm cli common mysql gd curl xml zip gmp mbstring redis readline opcache "
+readonly PHP_UPGRADE_CORE_EXT=" fpm cli common mysql gd curl xml zip gmp mbstring readline opcache "
 
 # Classify one installed PHP package for TARGET.  One implementation serves
 # the real plan and --dry-run, so a release that bundles an extension, or a
@@ -248,9 +250,7 @@ php_upgrade_classify_package() {
   [[ -n $ext ]] || { printf 'ignore'; return 0; }
   case $PHP_UPGRADE_CORE_EXT in
     *" $ext "*)
-      if [[ $ext == redis ]] && ! apt-cache show "php${target}-redis" >/dev/null 2>&1; then
-        printf 'skip:php%s-redis is not published yet' "$target"
-      elif [[ $ext == opcache ]]; then
+      if [[ $ext == opcache ]]; then
         # OPcache is mandatory and built in from PHP 8.5 on.
         major=${target%%.*}; minor=${target#*.}
         if (( major > 8 || (major == 8 && minor >= 5) )); then
@@ -450,23 +450,48 @@ php_upgrade_app_requirements() {
 }
 
 # Print the required extension list for one app/root pair, adding redis when
-# the site is actually configured to use it.
+# the site is configured to use it.  MODE decides how sure that must be:
+#   install    (--domain installs it): only a certain hard requirement;
+#   preflight  (default, --upgrade-php refuses to purge it): anything that may
+#              use it.  The preflight still waives an extension no installed
+#              PHP-FPM loads, so a broad rule only blocks where redis is
+#              actually in use.
 php_upgrade_app_required_extensions() {
-  local app=$1 root=$2
+  local app=$1 root=$2 mode=${3:-preflight}
   php_upgrade_app_requirements "$app"
   case $app in
     wordpress)
-      if [[ -f $root/wp-content/object-cache.php ]]; then
+      local oc=$root/wp-content/object-cache.php
+      [[ -f $oc ]] || return 0
+      if [[ $mode == install ]]; then
+        # Certain: a drop-in that creates \Redis itself with no Predis
+        # fallback, or Object Cache Pro (phpredis or Relay only).  Redis
+        # Object Cache bundles Predis, and the W3 Total Cache, LiteSpeed,
+        # Memcached and APCu drop-ins do not use Redis: none of them may pull
+        # php-redis/igbinary in.
+        if { grep -qE 'new[[:space:]]+\\?Redis([^A-Za-z0-9_]|$)' "$oc" 2>/dev/null \
+               && ! grep -qi 'predis' "$oc" 2>/dev/null; } \
+           || grep -qE 'RedisCachePro|Object Cache Pro' "$oc" 2>/dev/null; then
+          printf 'redis\n'
+        fi
+      elif grep -qi 'redis' "$oc" 2>/dev/null; then
+        # May use it (any Redis drop-in, including one that hands off to a
+        # plugin class): never purge a loaded php-redis from under it.
         printf 'redis\n'
       fi
       ;;
     xenforo)
-      # Only a configured cache counts: the stock config.php ships commented
-      # Redis examples, and treating those as a requirement would block an
-      # otherwise safe upgrade.
+      # Only XenForo's own Redis cache provider (`'provider' => 'Redis'`,
+      # Doctrine's RedisCache on the \Redis class) needs the extension.  The
+      # stock config.php ships commented examples, which do not count, and
+      # the SV RedisCache add-on (`SV\RedisCache\Redis`) talks to Redis or
+      # Valkey through its bundled Credis client, which falls back to a
+      # pure-PHP connection when the extension is absent
+      # (`standalone = !extension_loaded('redis')`): a forum running that
+      # add-on without php-redis must not be blocked.
       if [[ -f $root/src/config.php ]] \
          && awk '!/^[[:space:]]*(#|\/\/|\*)/' "$root/src/config.php" \
-            | grep -qiE '\bredis\b|\bvalkey\b'; then
+            | grep -qiE "provider[^;]*(['\"]Redis['\"]|Doctrine[\\\\]+Common[\\\\]+Cache[\\\\]+RedisCache)"; then
         printf 'redis\n'
       fi
       ;;
@@ -487,26 +512,113 @@ php_upgrade_extension_available() {
       return ;;
   esac
   case " $PHP_UPGRADE_CORE_EXT " in
-    *" $ext "*)
-      # redis is in the default set but is a PECL build and can lag a new
-      # PHP release, so it still needs a package check.
-      [[ $ext == redis ]] || return 0
-      ;;
+    *" $ext "*) return 0 ;;
   esac
   apt-cache show "php${target}-${ext}" >/dev/null 2>&1
 }
 
+# Lower-case names of the modules the PHP-FPM of VERSION loads (the SAPI the
+# sites run on), one per line; the CLI list when the FPM binary is missing.
+# Empty output means "unknown": the caller then keeps every requirement.
+php_upgrade_loaded_modules() {
+  local ver=$1 bin
+  [[ -n $ver ]] || return 0
+  for bin in "php-fpm${ver}" "php${ver}"; do
+    command -v "$bin" >/dev/null 2>&1 || continue
+    # The whole output is read first, and only a successful `-m` counts: a
+    # failed one may have printed a partial list, which would waive every
+    # extension cut off from it.  A failure means "unknown" (empty).  (No
+    # `sed q` on a live pipe either: SIGPIPE fails a pipeline under pipefail.)
+    local out
+    if out=$("$bin" -m 2>/dev/null); then
+      printf '%s\n' "$out" | sed -nE '/^\[Zend Modules\]/,$d; /^[A-Za-z]/{s/ /_/g; p;}' \
+        | tr '[:upper:]' '[:lower:]' | sort -u
+    fi
+    return 0
+  done
+  return 0
+}
+
+# Modules loaded by ANY installed PHP-FPM version (the purge removes all of
+# them, so an extension counts as "in use" when one of them loads it).
+# Empty ("unknown") when a version's list cannot be read or no PHP is
+# installed: the caller then keeps every requirement.
+PHP_UPGRADE_LOADED_FROM=""
+php_upgrade_loaded_modules_all() {
+  local v list all=""
+  local -a vers=()
+  mapfile -t vers < <(php_upgrade_installed_versions)
+  (( ${#vers[@]} > 0 )) || mapfile -t vers < <(php_upgrade_any_versions)
+  (( ${#vers[@]} > 0 )) || return 0
+  for v in "${vers[@]}"; do
+    [[ -n $v ]] || continue
+    list=$(php_upgrade_loaded_modules "$v")
+    [[ -n $list ]] || return 0
+    all+=$list$'\n'
+  done
+  printf '%s' "$all" | sed '/^$/d' | sort -u
+}
+
+# Install the extensions APP (at ROOT) cannot run without on PHP VER, when the
+# FPM of VER does not load them yet.  The default --php set leaves out
+# php-redis/php-igbinary and imagick; --domain calls this so only a site that
+# needs one gets it (Chevereto: redis, which pulls igbinary, and imagick).
+# Built-in extensions and the default set are always loaded, so XenForo and
+# WordPress add nothing.  Returns 0; a package that cannot be installed is a
+# warning naming the site.
+php_ensure_app_extensions() {
+  local app=$1 root=$2 ver=$3 loaded ext pkg
+  local -a want=()
+  [[ -n $app && -n $ver ]] || return 0
+  loaded=$(php_upgrade_loaded_modules "$ver")
+  [[ -n $loaded ]] || return 0
+  while IFS= read -r ext; do
+    [[ -n $ext ]] || continue
+    grep -qxF "$ext" <<<"$loaded" && continue
+    case $ext in mysqli|pdo_mysql|mysqlnd) pkg="php${ver}-mysql" ;; *) pkg="php${ver}-${ext}" ;; esac
+    [[ " ${want[*]} " == *" ${pkg} "* ]] || want+=("$pkg")
+  done < <(php_upgrade_app_required_extensions "$app" "$root" install)
+  (( ${#want[@]} > 0 )) || return 0
+  info "${app} requires ${want[*]}; installing (only sites that need them get them)"
+  for pkg in "${want[@]}"; do
+    if ! apt-cache show "$pkg" >/dev/null 2>&1; then
+      warn "${app} at ${root} needs ${pkg}, which is not published for PHP ${ver}; the site will fail until it is"
+    elif ! apt_install "$pkg"; then
+      warn "Could not install ${pkg}; ${app} at ${root} may not start"
+    fi
+  done
+  systemctl restart "php${ver}-fpm" 2>/dev/null || true
+  return 0
+}
+
 # Fill PHP_UPGRADE_BLOCKERS with "app|root|ext" entries when an installed
-# application would lose a hard requirement on TARGET.
+# application would lose a hard requirement on TARGET.  An extension that no
+# installed PHP-FPM loads cannot be lost by the upgrade, so it never blocks (a
+# forum that works today without php-redis keeps working without it); those
+# entries go to PHP_UPGRADE_NOT_LOADED for the report.  The module list is the
+# union over every installed version, the same in the dry run and the real
+# run, because the purge removes all of them.  The third argument is the
+# module list itself (tests); without it the live list is read.
 php_upgrade_preflight_apps() {
-  local target=$1 base=${2:-/var/www} app root ext
+  local target=$1 base=${2:-/var/www} app root ext loaded=""
   PHP_UPGRADE_BLOCKERS=()
+  PHP_UPGRADE_NOT_LOADED=()
+  if (( $# >= 3 )); then
+    loaded=$3
+  else
+    loaded=$(php_upgrade_loaded_modules_all) || loaded=""
+    PHP_UPGRADE_LOADED_FROM=$( { php_upgrade_installed_versions; php_upgrade_any_versions; } 2>/dev/null | sort -Vu | paste -sd' ' - ) || true
+  fi
   while IFS=$'\t' read -r app root; do
     [[ -n $app ]] || continue
     while IFS= read -r ext; do
       [[ -n $ext ]] || continue
-      php_upgrade_extension_available "$target" "$ext" \
-        || PHP_UPGRADE_BLOCKERS+=("${app}|${root}|${ext}")
+      php_upgrade_extension_available "$target" "$ext" && continue
+      if [[ -n $loaded ]] && ! grep -qxF "$ext" <<<"$loaded"; then
+        PHP_UPGRADE_NOT_LOADED+=("${app}|${root}|${ext}")
+        continue
+      fi
+      PHP_UPGRADE_BLOCKERS+=("${app}|${root}|${ext}")
     done < <(php_upgrade_app_required_extensions "$app" "$root")
   done < <(
     {
@@ -526,6 +638,14 @@ php_upgrade_describe_blocker() {
   IFS='|' read -r app root ext <<<"$entry"
   printf '%s at %s requires the %s extension (php%s-%s is not published)' \
     "$app" "$root" "$ext" "${UPGRADE_PHP}" "$ext"
+}
+
+# One line for a requirement the current PHP does not meet either.
+php_upgrade_describe_waived() {
+  local entry=$1 app root ext
+  IFS='|' read -r app root ext <<<"$entry"
+  printf '%s at %s: the %s extension is not loaded by any installed PHP-FPM (%s) either, so the upgrade does not take it away (php%s-%s is not published)' \
+    "$app" "$root" "$ext" "${PHP_UPGRADE_LOADED_FROM:-${PHP_UPGRADE_OLD_VERSION:-the current PHP}}" "${UPGRADE_PHP}" "$ext"
 }
 
 # Verify the requested version is a real package in the Sury repository.  A
@@ -1077,6 +1197,10 @@ php_upgrade_plan() {
     done < <(php_upgrade_app_roots)
     (( found_app )) || printf '  none detected under /var/www\n'
     php_upgrade_preflight_apps "$target"
+    local waived
+    for waived in "${PHP_UPGRADE_NOT_LOADED[@]}"; do
+      printf '  note: %s\n' "$(php_upgrade_describe_waived "$waived")"
+    done
     if (( ${#PHP_UPGRADE_BLOCKERS[@]} > 0 )); then
       printf '\nBLOCKED: the purge would break installed application(s):\n'
       local blocker
@@ -1139,7 +1263,7 @@ run_php_upgrade() {
   # The Sury repository owns phpX.Y packages on every supported Ubuntu; both
   # the purge and the install resolve from it.
   configure_php_repo || die "Could not configure the Sury APT repository"
-  apt_update
+  apt_update || die "Could not refresh the package lists: $(apt_update_failure_hint). Nothing was changed${old:+; PHP ${old} is still installed and serving}."
   local candidate
   candidate=$(php_upgrade_validate_target "$target")
   info "Target package candidate: ${candidate}"
@@ -1153,6 +1277,10 @@ run_php_upgrade() {
   # repository is configured, so "not published" means it is really absent
   # from the target the operator is about to install.
   php_upgrade_preflight_apps "$target"
+  local waived
+  for waived in "${PHP_UPGRADE_NOT_LOADED[@]}"; do
+    info "$(php_upgrade_describe_waived "$waived")"
+  done
   if (( ${#PHP_UPGRADE_BLOCKERS[@]} > 0 )); then
     local blocker
     warn "PHP ${target} cannot serve every installed application:"
