@@ -2654,25 +2654,28 @@ php_jit_threshold_lines() {
 # whose deployed cache key carries the encoding token are listed, so a gzip
 # body can never be handed to a client that did not ask for one.
 # SETUP_PHP_PAGE_GZIP=0 (persisted as PHP_PAGE_GZIP) turns it off.
+# The vhost decides, not the files in its root: a site created with --domain
+# app=wordpress|chevereto and filled afterwards (the usual order) used to get
+# no section until the next --optimize found wp-config.php / app/env.php.
+# Compressing PHP output is safe for any root behind an encoding-aware key.
 php_page_gzip_roots() {
   local target=${1:-/etc/angie} file root
   (( PHP_PAGE_GZIP )) || return 0
   [[ -d $target/conf.d ]] || return 0
-  if grep -qE '^[[:space:]]*fastcgi_cache_key[[:space:]].*_cache_enc' "$target/h5bp/wordpress_cache.conf" 2>/dev/null; then
-    while IFS= read -r file; do
-      grep -qE '^[[:space:]]*include[[:space:]]+h5bp/wordpress_cache\.conf;' "$file" || continue
-      root=$(angie_vhost_root "$file")
-      [[ -n $root ]] && printf '%s\n' "$root"
-    done < <(angie_wordpress_vhosts "$target")
-  fi
-  if grep -qE '^[[:space:]]*fastcgi_cache_key[[:space:]].*_cache_enc' "$target/h5bp/php_chev_cache.conf" 2>/dev/null; then
-    for file in "$target"/conf.d/*.conf; do
-      [[ -f $file ]] || continue
-      grep -qE '^[[:space:]]*include[[:space:]]+h5bp/php_chev_cache\.conf;' "$file" || continue
-      root=$(angie_vhost_root "$file")
-      [[ -n $root && -f "${root}/app/env.php" ]] && printf '%s\n' "$root"
-    done
-  fi
+  local -a incs=()
+  grep -qE '^[[:space:]]*fastcgi_cache_key[[:space:]].*_cache_enc' "$target/h5bp/wordpress_cache.conf" 2>/dev/null \
+    && incs+=(wordpress_cache)
+  grep -qE '^[[:space:]]*fastcgi_cache_key[[:space:]].*_cache_enc' "$target/h5bp/php_chev_cache.conf" 2>/dev/null \
+    && incs+=(php_chev_cache)
+  (( ${#incs[@]} )) || return 0
+  local re
+  re="^[[:space:]]*include[[:space:]]+h5bp/($(IFS='|'; printf '%s' "${incs[*]}"))\\.conf;"
+  for file in "$target"/conf.d/*.conf; do
+    [[ -f $file ]] || continue
+    grep -qE "$re" "$file" || continue
+    root=$(angie_vhost_root "$file")
+    [[ -n $root ]] && printf '%s\n' "$root"
+  done
   return 0
 }
 

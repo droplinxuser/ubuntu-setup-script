@@ -83,6 +83,21 @@ ANUBIS_SERVICE_DIRTY=0
 # Set when anubis=no restored the vhosts but Angie still runs the in-memory
 # configuration that proxies to the filter; the stop happens after the reload.
 ANUBIS_STOP_PENDING=0
+# Pass-cookie edge check.  A browser that already solved the challenge used
+# to pay the Go hop on every request (cached XenForo 17.7k req/s with a pass
+# cookie vs 73k on the edge route).  With angie-module-njs, Angie validates
+# the HS512 pass cookie itself (anubis_pass.js: signature, exp/nbf, action,
+# restriction claim, issued after the policy last changed) and sends a valid
+# one straight to the backend; anything else still reaches Anubis.
+# SETUP_ANUBIS_PASS_EDGE=0 keeps every browser request on the Go hop.
+ANUBIS_NJS_DIR="/etc/angie/njs"
+ANUBIS_PASS_JS="${ANUBIS_NJS_DIR}/anubis_pass.js"
+# Under ssl/: the Angie tree normaliser resets every other file to 0644.
+ANUBIS_PASS_KEY="/etc/angie/ssl/anubis/pass-key.conf"
+ANUBIS_NJS_LOAD="/etc/angie/modules-enabled/60-anubis-njs.conf"
+ANUBIS_PASS_EDGE="${SETUP_ANUBIS_PASS_EDGE:-1}"
+[[ $ANUBIS_PASS_EDGE == 0 ]] || ANUBIS_PASS_EDGE=1
+ANUBIS_PASS_ACTIVE=0
 
 anubis_marker() { printf '%s/enabled' "$ANUBIS_STATE"; }
 
@@ -520,17 +535,167 @@ EOF
 # ---------------------------------------------------------------------------
 # Angie configuration
 # ---------------------------------------------------------------------------
+# Route for a browser User-Agent in the edge map: the njs pass-cookie check
+# when it is active, otherwise always Anubis.
+anubis_browser_route() {
+  if (( ANUBIS_PASS_ACTIVE )); then printf '%s' '$anubis_pass_route'; else printf 'anubis'; fi
+}
+
+# The pass-cookie check itself.  Kept byte-identical across runs so a plain
+# --optimize does not reload Angie.
+anubis_pass_js() {
+  cat <<'EOF'
+// Managed by setup.sh (ANUBIS=1).  Validates the Anubis pass cookie in Angie
+// so a browser that already solved the challenge skips the Go proxy hop.
+// Mirrors what Anubis 1.28 checks before it proxies a CHALLENGE-rule
+// request: HS512 signature with the shared secret, exp/nbf, action
+// CHALLENGE and, when present, the restriction claim (SHA-256 of the
+// X-Real-IP Anubis saw).  Tokens issued before the policy last changed
+// (iat < $anubis_pass_epoch) go back to Anubis, which re-checks them against
+// the current rule hash.  Anything unexpected -> Anubis.
+const crypto = require('crypto');
+
+// Anubis appends a settings-derived suffix (DynamicCookieSuffix).
+const COOKIE = /(?:^|;\s*)techaro\.lol-anubis-auth(?:-[0-9a-f]{8})?=([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)(?:;|$)/;
+
+function same(a, b) {
+    if (a.length !== b.length) { return false; }
+    let d = 0;
+    for (let i = 0; i < a.length; i++) { d |= a.charCodeAt(i) ^ b.charCodeAt(i); }
+    return d === 0;
+}
+
+function json(part) {
+    return JSON.parse(Buffer.from(part, 'base64url').toString());
+}
+
+function route(r) {
+    const v = r.variables;
+    const cookie = r.headersIn.Cookie;
+    if (!cookie || !v.anubis_pass_key) { return 'anubis'; }
+    // First request after a challenge: Anubis restores the original Referer.
+    if (cookie.indexOf('techaro.lol-anubis-original-referer') !== -1) { return 'anubis'; }
+    const m = COOKIE.exec(cookie);
+    if (!m) { return 'anubis'; }
+    // Verdict cache: a token already verified for this address (and this
+    // policy epoch and secret) skips the HMAC until its exp.  Only the route
+    // depends on it, so a cached entry grants nothing the token did not.
+    const now = Date.now() / 1000;
+    const dict = ngx.shared.anubis_pass;
+    const ck = m[3] + '|' + v.remote_addr + '|' + v.anubis_pass_epoch + '|' + v.anubis_pass_kid;
+    const hit = dict.get(ck);
+    if (hit !== undefined && hit > now) { return 'anubis_backend'; }
+    const sig = crypto.createHmac('sha512', v.anubis_pass_key)
+        .update(m[1] + '.' + m[2]).digest('base64url');
+    if (!same(sig, m[3])) { return 'anubis'; }
+    let exp;
+    try {
+        if (json(m[1]).alg !== 'HS512') { return 'anubis'; }
+        const c = json(m[2]);
+        if (typeof c.exp !== 'number' || c.exp <= now) { return 'anubis'; }
+        if (typeof c.nbf === 'number' && c.nbf > now) { return 'anubis'; }
+        if (c.action !== 'CHALLENGE') { return 'anubis'; }
+        if (!(c.iat >= Number(v.anubis_pass_epoch))) { return 'anubis'; }
+        if (c.restriction !== undefined && c.restriction !==
+            crypto.createHash('sha256').update(v.remote_addr).digest('hex')) {
+            return 'anubis';
+        }
+        exp = c.exp;
+    } catch (e) {
+        return 'anubis';
+    }
+    try { dict.set(ck, exp); } catch (e) { /* full and nothing to evict: verify next time */ }
+    return 'anubis_backend';
+}
+
+export default { route };
+EOF
+}
+
+# Remove the pass-cookie check files (disable, opt-out, or no njs module).
+anubis_remove_pass_edge() {
+  local f
+  for f in "$ANUBIS_NJS_LOAD" "$ANUBIS_PASS_KEY" "$ANUBIS_PASS_JS"; do
+    [[ -e $f ]] || continue
+    rm -f -- "$f" && ANUBIS_ANGIE_DIRTY=1
+  done
+  rmdir "$ANUBIS_NJS_DIR" "${ANUBIS_PASS_KEY%/*}" 2>/dev/null || true
+  return 0
+}
+
+# Install angie-module-njs (when missing) and write the module loader, the
+# check and its key file.  Sets ANUBIS_PASS_ACTIVE.  Never fails the caller:
+# without njs the browser route simply stays on Anubis.
+anubis_write_pass_edge() {
+  local tmp secret epoch kid
+  ANUBIS_PASS_ACTIVE=0
+  if (( ANUBIS_PASS_EDGE == 0 )); then
+    anubis_remove_pass_edge
+    return 0
+  fi
+  if ! pkg_ok angie-module-njs; then
+    apt-cache show angie-module-njs >/dev/null 2>&1 || apt_update_once
+    if ! apt_install angie-module-njs >/dev/null 2>&1; then
+      info "Anubis: angie-module-njs is not available; browsers with a pass cookie stay on the Anubis hop"
+      anubis_remove_pass_edge
+      return 0
+    fi
+  fi
+  secret=$(sed -n 's/^HS512_SECRET=//p' "$ANUBIS_ENV" 2>/dev/null | head -n1 || true)
+  if [[ ! $secret =~ ^[A-Za-z0-9]{64,}$ ]]; then
+    anubis_remove_pass_edge
+    return 0
+  fi
+  # Tokens issued before the policy file last changed may carry an old rule
+  # hash; they go to Anubis (commit_if_changed only rewrites on a change).
+  epoch=$(stat -c %Y "$ANUBIS_POLICY" 2>/dev/null || echo 0)
+  # A fingerprint of the secret keys the verdict cache: a new secret must not
+  # honour verdicts cached under the old one (the zone survives reloads).
+  kid=$(printf '%s' "$secret" | sha256sum | cut -c1-16)
+  install -d -m 755 "$ANUBIS_NJS_DIR" "${ANUBIS_NJS_LOAD%/*}" || return 0
+  tmp=$(tmp_file) || return 0
+  printf '%s\n' '# Managed by setup.sh (ANUBIS=1): njs for the Anubis pass-cookie check.' \
+    'load_module modules/ngx_http_js_module.so;' > "$tmp"
+  commit_if_changed "$ANUBIS_NJS_LOAD" "$tmp" && ANUBIS_ANGIE_DIRTY=1
+  chmod 644 "$ANUBIS_NJS_LOAD"
+  tmp=$(tmp_file) || return 0
+  anubis_pass_js > "$tmp"
+  commit_if_changed "$ANUBIS_PASS_JS" "$tmp" && ANUBIS_ANGIE_DIRTY=1
+  chmod 644 "$ANUBIS_PASS_JS"
+  # The key file holds the cookie secret: root-only, read by the master.
+  install -d -m 700 "${ANUBIS_PASS_KEY%/*}" || return 0
+  [[ -e $ANUBIS_PASS_KEY ]] || ( umask 077; : > "$ANUBIS_PASS_KEY" ) || return 0
+  tmp=$(tmp_file) || return 0
+  printf '%s\n' '# Managed by setup.sh (ANUBIS=1): Anubis HS512 secret and policy epoch.' \
+    "js_var \$anubis_pass_key ${secret};" "js_var \$anubis_pass_epoch ${epoch};" "js_var \$anubis_pass_kid ${kid};" > "$tmp"
+  commit_if_changed "$ANUBIS_PASS_KEY" "$tmp" && ANUBIS_ANGIE_DIRTY=1
+  chown root:root "$ANUBIS_PASS_KEY"; chmod 600 "$ANUBIS_PASS_KEY"
+  ANUBIS_PASS_ACTIVE=1
+  return 0
+}
+
 anubis_write_common() {
-  local tmp backlog
+  local tmp backlog pass=""
   backlog=$(effective_backlog)
   tmp=$(tmp_file) || return 1
+  if (( ANUBIS_PASS_ACTIVE )); then
+    pass="
+# Pass-cookie edge check (angie-module-njs, ${ANUBIS_PASS_JS}): a browser
+# whose Anubis cookie validates goes straight to the backend socket.
+# Verdicts cached per token, address, policy epoch and secret (~20k entries).
+js_shared_dict_zone zone=anubis_pass:4m timeout=600s evict type=number;
+js_import anubis_pass from ${ANUBIS_PASS_JS};
+include ${ANUBIS_PASS_KEY};
+js_set \$anubis_pass_route anubis_pass.route;
+"
+  fi
   cat > "$tmp" <<EOF
 # Managed by setup.sh (ANUBIS=1).  Anubis listens on a Unix socket; the
 # application vhosts listen on the second socket below (see
 # conf.d/00-anubis-terminators.conf for the public side).
 proxy_headers_hash_max_size 2048;
 proxy_headers_hash_bucket_size 128;
-
+${pass}
 upstream anubis {
     server unix:${ANUBIS_LISTEN_SOCKET};
     keepalive 64;
@@ -581,7 +746,7 @@ map \$http_user_agent \$anubis_ua_route {
     ""                           anubis;
     "~*(?:${ANUBIS_GOOD_UA_RE})" anubis_backend;
     "~*(?:${ANUBIS_AI_UA_RE})"   anubis;
-    "~Mozilla"                   anubis;
+    "~Mozilla"                   $(anubis_browser_route);
 }
 map \$uri \$anubis_route {
     "~^/\\.within\\.website/"    anubis;
@@ -1161,6 +1326,7 @@ anubis_restore_vhosts() {
 # Remove the generated Angie files (moving them to /tmp, never deleting).
 anubis_remove_angie_files() {
   local f moved
+  anubis_remove_pass_edge
   for f in "$ANUBIS_TERMINATORS" "$ANUBIS_COMMON" "$ANUBIS_LOCATION" \
            "$ANUBIS_STATIC_BLOCKS" "$ANUBIS_TMPFILES"; do
     [[ -e $f ]] || continue
@@ -1180,6 +1346,7 @@ anubis_install_service() {
   anubis_write_env || true
   anubis_write_policy || return 1
   anubis_write_unit || return 1
+  anubis_write_pass_edge
   anubis_write_common || return 1
   anubis_write_location || return 1
   anubis_write_tmpfiles || return 1
@@ -1260,6 +1427,12 @@ anubis_enable() {
       anubis_render_static_blocks >/dev/null 2>&1 || true
       anubis_render_terminators >/dev/null 2>&1 || true
     fi
+    if ! /usr/sbin/angie -t >"$t" 2>&1 && (( ANUBIS_PASS_ACTIVE )); then
+      warn "Anubis: Angie rejected the njs pass-cookie check; browsers stay on the Anubis hop"
+      anubis_remove_pass_edge
+      ANUBIS_PASS_ACTIVE=0
+      anubis_write_common >/dev/null 2>&1 || true
+    fi
     if ! /usr/sbin/angie -t >"$t" 2>&1; then
       warn "Anubis: Angie rejected the integrated configuration; rolling back"
       sed 's/^/  /' "$t" >&2 || true
@@ -1279,6 +1452,9 @@ anubis_enable() {
   local static_note=""
   if (( ANUBIS_STATIC_ACTIVE )); then
     static_note=", static assets bypass the proxy"
+  fi
+  if (( ANUBIS_PASS_ACTIVE )); then
+    static_note+=", pass cookies checked in Angie"
   fi
   ANUBIS_SUMMARY="Anubis: enabled (difficulty 4, Unix sockets, policy ${ANUBIS_POLICY}; $(anubis_vhost_files | wc -l) vhost(s) protected${static_note}; $(anubis_runtime_summary))"
   if (( changed )); then ANUBIS_ANGIE_DIRTY=1; fi

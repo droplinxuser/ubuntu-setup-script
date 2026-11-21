@@ -7,7 +7,25 @@ manifests, sweep tables and run logs these sections cite (`AUDIT-*.md`,
 removed from the tree on 2026-11-19 to keep the repository lean; every one
 is still in git history, for example
 `git show 84b0db5:tests/stress-site/AUDIT-20261117-1.21.30.md`.  The current
-cycle report is `AUDIT-20261121-1.21.55.md`.
+cycle report is `AUDIT-20261121-1.21.57.md`.
+
+## 1.21.57 audit cycle — Xeon E-2236 (2026-11-21)
+
+Pair: `server-configs-nginx` 1.6.50.  Details: `AUDIT-20261121-1.21.57.md`.
+
+- Anubis pass cookie checked in Angie (njs, verdict cache): cached pages
+  for browsers that solved the challenge, XenForo 19.3k -> 55.2k req/s,
+  WordPress 16.7k -> 50.0k (ceiling without any check 62.2k).
+- Guest-cache gzip for sites deployed after `--domain`: cached WordPress
+  6.6k -> 93.4k, Chevereto explore 9.3k -> 140k req/s.
+- A stale `InRelease` on Sury's CDN failed the install after 7.5 minutes of
+  retries; the failing repository is now refetched uncompressed (install
+  2:04, 0 warnings).
+- Zero-error cycle: parity 0 of 3,029 facts (3,049 with Anubis), 1,418 unit
+  checks, 225 dry runs, security 65/65, cookie 62/62, functional 0
+  unexpected (Anubis off and on), 0 PHP 8.5 diagnostics.  PHP 8.6 still
+  lacks redis/igbinary/imagick; XenForo 2.3.13 has one 8.6 compile
+  deprecation (`Is` class name).  JIT: shipped tracing profile kept.
 
 ## 1.21.55 audit cycle — Xeon E-2236 (2026-11-21)
 

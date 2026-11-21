@@ -5,6 +5,46 @@ README.md; measurements in tests/stress-site/RESULTS.md.  Per-cycle
 reports and raw test logs cited by entries up to 1.21.32 were removed from
 the tree on 2026-11-19; retrieve them with `git show 84b0db5:<path>`.
 
+## 1.21.57 (2026-11-21)
+
+- **Anubis: browsers with a valid pass cookie skip the Go hop.**  The edge
+  route (1.21.55) sent every `Mozilla` request to Anubis, so a visitor who
+  had already solved the challenge paid the proxy hop on every page.  With
+  `angie-module-njs` (installed with the filter from the Angie repository),
+  `/etc/angie/njs/anubis_pass.js` checks the cookie the way Anubis 1.28
+  does for a CHALLENGE rule: HS512 signature with the Anubis secret,
+  `exp`/`nbf`, `action`, and the `restriction` claim (SHA-256 of the visitor
+  address, confirmed against a real token).  A token issued before
+  `botPolicies.yaml` last changed, the first request after a challenge
+  (Referer restore), an empty User-Agent, AI crawlers and anything malformed
+  still reach Anubis.  Verified tokens are remembered in a 4 MB njs shared
+  dict until their `exp`, keyed by token, address, policy epoch and a secret
+  fingerprint.  The secret reaches Angie through
+  `/etc/angie/ssl/anubis/pass-key.conf` (0600, under `ssl/` because the tree
+  normaliser resets every other file to 0644).  Cached pages with a pass
+  cookie, c=100: XenForo 19.3k -> **55.2k req/s**, WordPress 16.7k ->
+  **50.0k**.  Without njs (module unavailable or `angie -t` rejects it)
+  browsers stay on the Anubis hop; `SETUP_ANUBIS_PASS_EDGE=0` opts out and
+  removes every piece.  `anubis=no` removes them too.
+- **WordPress/Chevereto guest cache: gzip bodies from the first deploy.**
+  The per-root `zlib.output_compression` section (so the cache stores
+  PHP's gzip output instead of Angie compressing every hit) was written only
+  for roots that already held `wp-config.php` / `app/env.php` when the tuner
+  ran.  A site created with `--domain app=wordpress|chevereto` and filled
+  afterwards, the usual order, kept the slow path until someone ran
+  `--optimize` again: cached WordPress 6.6k req/s (Angie at 800 % CPU,
+  1.2 ms per hit) instead of 93k, Chevereto 9.3k instead of 140k.  The vhost
+  now decides (an encoding-aware cache key is still required).
+- **`apt-get update`: a stale index on a repository CDN no longer costs 7.5
+  minutes and the install.**  Sury's CDN served an `InRelease` 45 minutes
+  older than the `Packages.xz` next to it, so the 1.21.56 retries (30, 60,
+  120, 240 s) all failed and the full install stopped.  The uncompressed
+  `Packages` was cached at the same age as the `InRelease`, so it matched.
+  On a size or hash mismatch the repositories named in the failure are now
+  refetched uncompressed first (only those sources, `List-Cleanup` off, so
+  the other lists stay as fetched), with an info line instead of a warning;
+  the timed retries remain the fallback.
+
 ## 1.21.56 (2026-11-21)
 
 - **No php-redis / php-igbinary by default.**  The `--php` set no longer

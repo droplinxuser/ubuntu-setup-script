@@ -446,6 +446,40 @@ retry() {
 # names the reason so the caller can say what to do.
 APT_UPDATE_SYNC_DELAYS=${APT_UPDATE_SYNC_DELAYS:-"30 60 120 240"}
 APT_UPDATE_REASON=""
+APT_SOURCES_ROOT=${APT_SOURCES_ROOT:-/etc/apt}
+# A size/hash mismatch is not always a short sync window.  Sury's CDN was
+# seen serving an InRelease 45 minutes older than the Packages.xz next to
+# it, while the uncompressed Packages was cached at the same age as the
+# InRelease, so it matched.  Refetch only the repositories named in the
+# failure, uncompressed, before waiting: the other lists stay as fetched
+# (List-Cleanup off), and the bigger download is paid only in this case.
+# Returns 0 when that refresh succeeded.
+apt_update_uncompressed_retry() {
+  local log=$1 hosts h f parts empty ulog rc=0
+  hosts=$(grep -oE 'Failed to fetch https?://[^/ ]+' "$log" 2>/dev/null \
+    | sed -E 's#.*://##' | sort -u) || true
+  [[ -n $hosts ]] || return 1
+  parts=$(tmp_dir) || return 1
+  empty=$(tmp_file) || return 1
+  ulog=$(tmp_file) || return 1
+  for h in $hosts; do
+    for f in "$APT_SOURCES_ROOT"/sources.list "$APT_SOURCES_ROOT"/sources.list.d/*.list \
+             "$APT_SOURCES_ROOT"/sources.list.d/*.sources; do
+      [[ -f $f ]] && grep -qF "$h" "$f" && cp "$f" "$parts/"
+    done
+  done
+  [[ -n $(ls -A "$parts") ]] || return 1
+  apt-get -o DPkg::Lock::Timeout=300 -o Acquire::Retries=3 -o Acquire::http::Timeout=30 \
+    -o Dir::Etc::SourceList="$empty" -o Dir::Etc::SourceParts="$parts" \
+    -o APT::Get::List-Cleanup=false \
+    -o Acquire::CompressionTypes::xz=false -o Acquire::CompressionTypes::gz=false \
+    -o Acquire::CompressionTypes::bz2=false -o Acquire::CompressionTypes::lzma=false \
+    -o Acquire::CompressionTypes::lz4=false -o Acquire::CompressionTypes::zst=false \
+    update -y >"$ulog" 2>&1 || rc=$?
+  (( rc == 0 )) || return 1
+  info "Repository index for ${hosts//$'\n'/, } was inconsistent on its CDN (compressed file newer than the signed index); fetched it uncompressed"
+  return 0
+}
 apt_update() {
   local out n=1 quick=3 rc delays=() i=0
   read -ra delays <<<"$APT_UPDATE_SYNC_DELAYS"
@@ -461,6 +495,11 @@ apt_update() {
     fi
     if grep -qiE 'Mirror sync in progress|Hash Sum mismatch|File has unexpected size' "$out" 2>/dev/null; then
       APT_UPDATE_REASON="mirror-sync"
+      if (( i == 0 )) && apt_update_uncompressed_retry "$out"; then
+        APT_UPDATE_REASON=""
+        APT_LISTS_FRESH=1
+        return 0
+      fi
       if (( i >= ${#delays[@]} )); then
         return 1
       fi

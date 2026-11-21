@@ -1131,6 +1131,14 @@ check "WordPress and Chevereto roots behind an encoding-aware cache compress in 
   test "$(php_jit_path_sections "$TMP/jit-angie" | grep -c '^zlib\.output_compression = On$')" -eq 2
 check "each document root gets exactly one [PATH=] section" \
   test "$(php_jit_path_sections "$TMP/jit-angie" | grep -c '^\[PATH=')" -eq 2
+# --domain app=wordpress|chevereto creates the vhost before the files exist:
+# the vhost alone decides (the section used to wait for the next --optimize).
+mkdir -p "$TMP/jit-wp2/public" "$TMP/jit-chev2/public"
+printf 'server {\n    root %s/jit-wp2/public;\n    include h5bp/wordpress_cache.conf;\n    include h5bp/php_wp.conf;\n}\n' "$TMP" > "$TMP/jit-angie/conf.d/wp2.conf"
+printf 'server {\n    root %s/jit-chev2/public;\n    include h5bp/php_chev_cache.conf;\n}\n' "$TMP" > "$TMP/jit-angie/conf.d/chev2.conf"
+check "an empty WordPress/Chevereto root behind an encoding-aware cache compresses in PHP" \
+  test "$(php_jit_path_sections "$TMP/jit-angie" | grep -A2 -E "^\[PATH=$TMP/jit-(wp2|chev2)/public\]" | grep -c '^zlib\.output_compression = On$')" -eq 2
+rm -f "$TMP/jit-angie/conf.d/wp2.conf" "$TMP/jit-angie/conf.d/chev2.conf"
 check "XenForo roots get no page compression (XenForo compresses itself)" \
   test "$(php_jit_path_sections "$TMP/jit-angie" | grep -c 'jit-xf')" -eq 0
 PHP_JIT_WORDPRESS=0
@@ -4632,6 +4640,37 @@ check "apt_update rides out a mirror sync" test "$(au_run 'sync sync ok')" = "0 
 check "apt_update gives up after the mirror-sync waits" test "$(au_run 'sync sync sync sync sync')" = "1 4 mirror-sync"
 check "apt_update keeps three quick tries for other failures" test "$(au_run 'net net net net')" = "1 3 failed"
 check "apt_update succeeds first time without waiting" test "$(au_run 'ok')" = "0 1 none"
+# A stale signed index on one repository's CDN: that repository alone is
+# refetched uncompressed, once, before any wait.
+auu_run() { # result-of-uncompressed-call -> "rc full-calls uncompressed-calls parts reason"
+  (
+    mkdir -p "$TMP/auu/sources.list.d"; rm -f "$TMP/auu/sources.list.d/"* "$TMP/auu.parts"
+    echo 'deb https://repo.example/php resolute main' > "$TMP/auu/sources.list.d/php.list"
+    printf 'Types: deb\nURIs: http://archive.example/ubuntu\n' > "$TMP/auu/sources.list.d/ubuntu.sources"
+    echo 0 > "$TMP/auu.full"; echo 0 > "$TMP/auu.unc"; AUU_RESULT=$1
+    apt-get() {
+      local a sp=""
+      for a in "$@"; do [[ $a == Dir::Etc::SourceParts=* ]] && sp=${a#*=}; done
+      if [[ -n $sp ]]; then
+        echo $(( $(cat "$TMP/auu.unc") + 1 )) > "$TMP/auu.unc"; ls "$sp" | paste -sd, - > "$TMP/auu.parts"
+        [[ " $* " == *" Acquire::CompressionTypes::xz=false "* && " $* " == *" APT::Get::List-Cleanup=false "* ]] || return 99
+        [[ $AUU_RESULT == ok ]]; return
+      fi
+      echo $(( $(cat "$TMP/auu.full") + 1 )) > "$TMP/auu.full"
+      (( $(cat "$TMP/auu.full") > 2 )) && return 0
+      echo "E: Failed to fetch https://repo.example/php/dists/resolute/main/binary-amd64/Packages.xz  File has unexpected size (2 != 1). Mirror sync in progress?"
+      return 100
+    }
+    sleep() { :; }; warn() { :; }; info() { :; }
+    APT_UPDATE_SYNC_DELAYS="0 0" APT_SOURCES_ROOT="$TMP/auu"
+    rc=0; apt_update >/dev/null 2>&1 || rc=$?
+    printf '%s %s %s %s %s\n' "$rc" "$(cat "$TMP/auu.full")" "$(cat "$TMP/auu.unc")" "$(cat "$TMP/auu.parts" 2>/dev/null)" "${APT_UPDATE_REASON:-none}"
+  )
+}
+check "a stale CDN index is refetched uncompressed for that repository only" \
+  test "$(auu_run ok)" = "0 1 1 php.list none"
+check "a failed uncompressed refetch falls back to the mirror-sync waits (once)" \
+  test "$(auu_run fail)" = "0 3 1 php.list mirror-sync"
 check "the upgrade explains an apt failure and says nothing changed" \
   grep -qF 'apt_update || die "Could not refresh the package lists: $(apt_update_failure_hint). Nothing was changed' "$ALL_SRC"
 
@@ -4940,6 +4979,33 @@ check "Anubis endpoints always reach Anubis" \
 check "the good-crawler rule precedes the AI rule in the edge route (policy order)" \
   test "$(grep -n 'anubis_backend;$' "$TMP/anubis/anubis-common.conf" | sed -n 2p | cut -d: -f1)" -lt \
        "$(grep -n '~\*(?:GPTBot' "$TMP/anubis/anubis-common.conf" | cut -d: -f1)"
+# Pass-cookie edge check: only when njs is active, browsers go through the
+# njs route; the key file is root-only; opting out removes every piece.
+ANUBIS_PASS_ACTIVE=1
+anubis_write_common
+check "with the njs check active, browsers take the pass-cookie route" \
+  bash -c 'grep -qxF "    \"~Mozilla\"                   \$anubis_pass_route;" "$1" && grep -qxF "js_set \$anubis_pass_route anubis_pass.route;" "$1"' _ "$TMP/anubis/anubis-common.conf"
+check "an empty User-Agent never takes the pass-cookie route" \
+  grep -qxF '    ""                           anubis;' "$TMP/anubis/anubis-common.conf"
+ANUBIS_PASS_ACTIVE=0
+(
+  ANUBIS_ENV="$TMP/anubis/pe.env" ANUBIS_POLICY="$TMP/anubis/pe.yaml"
+  ANUBIS_NJS_DIR="$TMP/anubis/njs" ANUBIS_PASS_JS="$TMP/anubis/njs/anubis_pass.js"
+  ANUBIS_PASS_KEY="$TMP/anubis/key/pass-key.conf" ANUBIS_NJS_LOAD="$TMP/anubis/me/60-anubis-njs.conf"
+  echo "HS512_SECRET=$(printf 'a%.0s' {1..128})" > "$ANUBIS_ENV"; : > "$ANUBIS_POLICY"
+  pkg_ok() { return 0; }; chown() { :; }
+  anubis_write_pass_edge
+  printf '%s %s %s\n' "$ANUBIS_PASS_ACTIVE" "$(stat -c %a "$ANUBIS_PASS_KEY")" \
+    "$(grep -c 'js_var \$anubis_pass_key a\{128\};' "$ANUBIS_PASS_KEY")" > "$TMP/anubis/pe.on"
+  ANUBIS_PASS_EDGE=0 anubis_write_pass_edge
+  printf '%s %s\n' "$ANUBIS_PASS_ACTIVE" "$(ls "$TMP/anubis/njs" "$ANUBIS_PASS_KEY" "$ANUBIS_NJS_LOAD" 2>/dev/null | wc -l)" > "$TMP/anubis/pe.off"
+)
+check "the pass-cookie key file is root-only and holds the Anubis secret" \
+  test "$(cat "$TMP/anubis/pe.on")" = "1 600 1"
+check "SETUP_ANUBIS_PASS_EDGE=0 removes the njs check" \
+  test "$(cat "$TMP/anubis/pe.off")" = "0 0"
+check "the njs check falls back to Anubis on anything unexpected" \
+  test "$(anubis_pass_js | grep -o "return 'anubis';" | wc -l)" -eq 11
 ANUBIS_POLICY="$TMP/anubis/botPolicies.yaml"
 anubis_write_policy >/dev/null 2>&1 || true
 check "the policy uses the same crawler patterns as the edge route" \

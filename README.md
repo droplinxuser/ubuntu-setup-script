@@ -220,7 +220,8 @@ application's dotfile deny regex otherwise answers 403.
 | Cache safety | the client `Accept-Encoding` is passed through end to end; cached gzip bodies stay compressed and no `sub_filter` runs |
 | Dot segments | answered `400` at the edge (Anubis itself answers `500` before its policy check) |
 | Policy | `allow-good-crawlers`, `deny-ai-crawlers`, infrastructure routes allowed, `static-miss` and `Mozilla` challenged; unmatched clients are allowed so API/CLI clients keep working |
-| Edge route | requests the policy allows without a cookie skip the Go hop: the terminator's `proxy_pass http://$anubis_route` picks the backend socket for a search-engine User-Agent (`allow-good-crawlers`) and for any non-browser, non-empty, non-AI User-Agent (the policy's default-allow), with the same headers Anubis forwards.  Browsers (`Mozilla`), an empty User-Agent, AI crawlers and `/.within.website/` always reach Anubis.  The two maps in `00-anubis-common.conf` and `botPolicies.yaml` are generated from the same patterns |
+| Edge route | requests the policy allows without a cookie skip the Go hop: the terminator's `proxy_pass http://$anubis_route` picks the backend socket for a search-engine User-Agent (`allow-good-crawlers`) and for any non-browser, non-empty, non-AI User-Agent (the policy's default-allow), with the same headers Anubis forwards.  Browsers (`Mozilla`) without a valid pass cookie, an empty User-Agent, AI crawlers and `/.within.website/` always reach Anubis.  The two maps in `00-anubis-common.conf` and `botPolicies.yaml` are generated from the same patterns |
+| Pass-cookie check | a browser whose Anubis cookie is valid skips the Go hop as well.  With `angie-module-njs` (installed with the filter), `/etc/angie/njs/anubis_pass.js` checks the cookie in Angie the way Anubis does for a CHALLENGE rule: HS512 signature with the Anubis secret, `exp`/`nbf`, `action`, and the `restriction` claim (the visitor address) when present.  A token issued before `botPolicies.yaml` last changed, the first request after a challenge (Referer restore) and anything malformed still go to Anubis.  A verified token is remembered per visitor address in a 4 MB njs shared dict until its `exp` (keyed also by the policy epoch and a secret fingerprint), so repeat requests skip the HMAC.  The secret reaches Angie through the root-only `/etc/angie/ssl/anubis/pass-key.conf` (under `ssl/`, which the tree normaliser leaves at 0600).  Without the module the browser route stays on Anubis |
 | Redirects | `REDIRECT_DOMAINS` lists the protected server names, so the post-challenge `?redir=` cannot leave the site (left out when a vhost uses a regex `server_name`) |
 | WebSocket | a terminator gets `location ^~ /socket/` only when its vhost has a `/socket/` location (XenForo push); only a WebSocket upgrade skips the filter, any other request under `/socket/` is challenged like a page |
 | Persistence | `ANUBIS=1` in `/etc/default/setup-tuning`; a later plain `--optimize` (or `--domain`) keeps it and protects new vhosts |
@@ -234,6 +235,7 @@ Environment options:
 | `SETUP_ANUBIS_VERSION` | `1.28.2` | another release tag; set `SETUP_ANUBIS_SHA256` with it |
 | `SETUP_ANUBIS_SHA256` | pinned per architecture | expected tarball checksum for a custom version |
 | `SETUP_ANUBIS_STATIC_BYPASS=0` | on | keep static assets on the Anubis proxy hop (persisted as `ANUBIS_STATIC_BYPASS`) |
+| `SETUP_ANUBIS_PASS_EDGE=0` | on | keep browsers with a pass cookie on the Anubis hop (no njs check) |
 
 Notes:
 
