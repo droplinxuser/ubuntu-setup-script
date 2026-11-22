@@ -36,7 +36,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.21.59"
+readonly SCRIPT_VERSION="1.21.60"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -136,6 +136,10 @@ fi
 # checks them through Cloudflare and purges certbot when nothing else uses
 # it (lib/web.sh, cloudflare_tls_migrate).  SETUP_CF_SELF_SIGNED=0 or
 # CF_SELF_SIGNED=0 in /etc/default/setup-tuning leaves certificates alone.
+CF_SELF_SIGNED_PERSIST=0
+if [[ -n ${SETUP_CF_SELF_SIGNED+x} ]]; then
+  CF_SELF_SIGNED_PERSIST=1
+fi
 CF_SELF_SIGNED="${SETUP_CF_SELF_SIGNED:-${CF_SELF_SIGNED:-1}}"
 [[ $CF_SELF_SIGNED == 0 ]] || CF_SELF_SIGNED=1
 # Unknown-SNI rejection on the catch-all HTTPS server (lib/web.sh,

@@ -9,6 +9,36 @@ is still in git history, for example
 `git show 84b0db5:tests/stress-site/AUDIT-20261117-1.21.30.md`.  The current
 cycle report is `AUDIT-20261123-1.21.59.md`.
 
+## 1.21.60 — Xeon E-2236 (2026-11-23)
+
+Pair: `server-configs-nginx` 1.6.53.  Details: `AUDIT-20261123-1.21.60.md`.
+
+- **Fresh installs no longer fail at swap.**  `/swapfile.new` was activated
+  and then renamed, which Linux refuses for active swap; `--basic` failed
+  and skipped sysctl, limits, cron and UFW.  Release -> rename-aside ->
+  rename-in -> `swapon` -> rollback, with a 64 MiB validation floor.
+- **Forwarded headers are trusted only from a local/declared proxy.**  A
+  direct client could set `X-Forwarded-Host/-Proto/-For` and `X-Real-IP`
+  for PHP (cache poisoning, spoofed allowlists).  Verified with a probe from
+  the public address and from loopback (Anubis keeps its header).
+- **`--optimize` keeps an adopted Elasticsearch `http.host` bind**, and
+  `SETUP_CF_SELF_SIGNED=0` is now persisted as the README promises.
+  Persisted tuning values are shell-quoted (`%q`).
+- **Media/headers:** Chevereto `/images/` no longer disables `sendfile` or
+  sends a second `Cache-Control`; Flarum/XenForo keep XFO, CORS and the
+  security set; XenForo's `/proxy.php` cache no longer stores one-shot
+  queries.
+- **Web-server shootout** (Angie, nginx, FreeNginx, OpenResty, Tengine,
+  Caddy; OLS excluded for lacking a generic cache and using LSAPI): cached
+  guest medians 108.9-140.8k req/s, all nginx-family builds inside the 4-49 %
+  run-to-run spread and no build winning all three apps.  Stock Caddy has no
+  page cache: 158 (WP), 370 (XF) and 1,203 (Chev) req/s on the same pages,
+  111-800x slower.  Caddy's static path is competitive (26-28k) and its
+  real-app uncached page is 5 % behind; its PHP-micro path is 34 % slower.
+- Suites: 1,593 unit checks, 227 dry runs, security 67/67, cookie 80/80,
+  functional 0 unexpected, `--optimize` x2 0 of 3,048 facts, PHP 8.5 -> 8.6
+  -> 8.5 clean.  Restore: RESTORE_SUMMARY.
+
 ## 1.21.59 follow-up — Xeon E-2236 (2026-11-23)
 
 Pair: `server-configs-nginx` 1.6.52.  Details: `AUDIT-20261123-1.21.59.md`.

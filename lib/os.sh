@@ -416,16 +416,15 @@ ensure_swap_fstab() {
 
 create_swap_file() {
   local bytes=$1
-  local avail margin=268435456 new=/swapfile.new
+  local avail margin=268435456 new=/swapfile.new old=
   # Never fill the filesystem: keep 256 MiB free after the swap file.
   avail=$(df -B1 --output=avail / 2>/dev/null | awk 'NR==2{print $1}')
   if [[ $avail =~ ^[0-9]+$ ]] && (( avail < bytes + margin )); then
     die "Not enough free disk for a $(( bytes / 1048576 )) MiB swap file (${avail} bytes available; 256 MiB must stay free)"
   fi
-  # Build and activate the replacement beside the live file, then swap over.
-  # The old code truncated /swapfile in place, so a full disk or an I/O error
-  # left the host with swap off, a zero-length file and an fstab entry that
-  # still pointed at it.
+  # Build the replacement beside the live file.  The old code truncated
+  # /swapfile in place, so a full disk or an I/O error left the host with
+  # swap off, a zero-length file and an fstab entry that still pointed at it.
   rm -f "$new"
   if ! fallocate -l "$bytes" "$new" 2>/dev/null; then
     warn "fallocate failed; falling back to dd"
@@ -436,33 +435,50 @@ create_swap_file() {
     }
   fi
   chmod 600 "$new"
-  # LXC/OpenVZ containers may not manage swap at all and btrfs/ZFS reject a
-  # plain swap file; there mkswap/swapon failing is the expected outcome, not
-  # an error.  Aborting here used to skip the rest of --basic (sysctl, limits,
-  # cron, firewall) and leave a multi-GB file behind, so drop the unusable
-  # file and its fstab entry and carry on without swap.
-  if ! mkswap "$new" >/dev/null 2>&1 || ! swapon "$new" 2>/dev/null; then
+  # Validate the file before it replaces anything.  LXC/OpenVZ containers
+  # may not manage swap at all and btrfs/ZFS reject a plain swap file; there
+  # mkswap/swapon failing is the expected outcome, not an error.  Aborting
+  # here used to skip the rest of --basic (sysctl, limits, cron, firewall)
+  # and leave a multi-GB file behind.
+  if ! mkswap "$new" >/dev/null 2>&1; then
     rm -f "$new"
-    # Keep the fstab entry when an older /swapfile is still active; removing
-    # it would make the working swap vanish on the next boot.
-    if ! swapfile_active; then
-      if grep -qE '^[[:space:]]*/swapfile[[:space:]]' /etc/fstab 2>/dev/null; then
-        sed_in_place -E '/^[[:space:]]*\/swapfile[[:space:]]/d' /etc/fstab
-      fi
+    info "Swap file not enabled: this system refused a swap file (normal in LXC/OpenVZ containers and on btrfs/ZFS); continuing without it"
+    return 0
+  fi
+  # rename(2) on a file that is active swap fails with EPERM, so the new
+  # file must stay inactive until it has taken the path.  A working old file
+  # is renamed aside, not deleted, and is put back if swapon then fails.
+  if swapfile_active; then
+    if ! swapoff /swapfile 2>/dev/null; then
+      rm -f "$new"
+      warn "Could not deactivate the active /swapfile (its pages do not fit in free RAM); keeping the existing swap unchanged"
+      return 0
+    fi
+  fi
+  if [[ -e /swapfile ]]; then
+    if ! mv -f /swapfile /swapfile.old; then
+      rm -f "$new"
+      die "Could not move the old swap file aside; the existing swap is unchanged"
+    fi
+    old=/swapfile.old
+  fi
+  if ! mv -f "$new" /swapfile || ! swapon /swapfile 2>/dev/null; then
+    rm -f /swapfile
+    if [[ -n $old ]]; then
+      mv -f "$old" /swapfile
+      swapon /swapfile 2>/dev/null \
+        || warn "Could not re-activate the previous /swapfile; it is kept at /swapfile for the next boot"
+      info "Swap file not enabled: this system refused the new swap file; the previous swap is unchanged"
+      return 0
+    fi
+    if ! swapfile_active \
+       && grep -qE '^[[:space:]]*/swapfile[[:space:]]' /etc/fstab 2>/dev/null; then
+      sed_in_place -E '/^[[:space:]]*\/swapfile[[:space:]]/d' /etc/fstab
     fi
     info "Swap file not enabled: this system refused a swap file (normal in LXC/OpenVZ containers and on btrfs/ZFS); continuing without it"
     return 0
   fi
-  # The new file is live, so releasing the old one cannot leave the host
-  # without swap; if the kernel refuses (pages do not fit in RAM), two files
-  # are active and the old one keeps its path until the next run.
-  if swapfile_active; then
-    swapoff /swapfile 2>/dev/null || warn "Old /swapfile is still active; keeping both until the next run"
-  fi
-  if ! mv -f "$new" /swapfile; then
-    swapoff "$new" 2>/dev/null || true
-    die "Could not move the new swap file into place; the existing swap is untouched"
-  fi
+  if [[ -n $old ]]; then rm -f "$old"; fi
   ensure_swap_fstab
   mark_swap_managed
 }

@@ -1692,12 +1692,21 @@ elasticsearch_write_performance_block() {
   # (OPT_ES_PRELOAD); a static setting, so it applies at the next start.
   # An operator's own preload line is commented out only when ours replaces
   # it (two keys would stop Elasticsearch); otherwise it is left alone.
-  local preload=""
+  local preload="" has_net=0
+  # http.host/transport.host are commented only when network.host will
+  # control the bind (the managed base block, or an adopted node that already
+  # sets network.host).  A hand-managed node that binds with http.host and
+  # has no network.host keeps its listener: commenting it would silently move
+  # the node to localhost.
+  if grep -qE '^[[:space:]]*network\.host[[:space:]]*:' "$file" 2>/dev/null; then
+    has_net=1
+  fi
   local -a keys=(bootstrap.memory_lock indices.query.bool.max_clause_count
     indices.memory.index_buffer_size indices.fielddata.cache.size
     search.max_buckets action.destructive_requires_name
-    http.compression http.max_content_length http.host transport.host
+    http.compression http.max_content_length
     thread_pool.search.size thread_pool.write.size node.processors)
+  if (( has_net )); then keys+=(http.host transport.host); fi
   if (( ${OPT_ES_PRELOAD:-0} )); then
     preload=$'index.store.preload: ["*"]\n'
     keys+=(index.store.preload)

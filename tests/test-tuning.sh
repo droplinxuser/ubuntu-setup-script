@@ -3625,6 +3625,24 @@ check "tune_limit_req_exemptions replaces the managed set" \
 LIMIT_REQ_EXEMPT='' tune_limit_req_exemptions "$TMP/limit_req.conf" limit_req.conf
 check "tune_limit_req_exemptions removes managed entries when unset" \
   bash -c "! grep -q 'setup.sh exempt' '$TMP/limit_req.conf'"
+# The host file is sourced as root: a value with a quote or a command
+# substitution must stay data.
+tune_file="$TMP/host-tuning"
+inject_marker="$TMP/inject-ran"
+SETUP_TUNING_FILE=$tune_file persist_tuning_var LIMIT_REQ_EXEMPT \
+  '192.0.2.50"; touch '"$inject_marker"'; echo "'
+check "a persisted tuning value is shell-quoted, not executed when sourced" \
+  bash -c '. "$1"; [[ ! -e $2 ]] && [[ $LIMIT_REQ_EXEMPT == *"touch "* ]]' \
+    _ "$tune_file" "$inject_marker"
+cf_file="$TMP/cf-tuning"
+( CF_SELF_SIGNED=0 CF_SELF_SIGNED_PERSIST=1 SETUP_TUNING_FILE="$cf_file" \
+    cloudflare_tls_migrate /nonexistent 0 ) >/dev/null 2>&1
+check "an explicit SETUP_CF_SELF_SIGNED is persisted for the next --optimize" \
+  grep -qx 'CF_SELF_SIGNED=0' "$cf_file"
+cf_file2="$TMP/cf-tuning-dry"
+( CF_SELF_SIGNED=0 CF_SELF_SIGNED_PERSIST=1 SETUP_TUNING_FILE="$cf_file2" \
+    cloudflare_tls_migrate /nonexistent 1 ) >/dev/null 2>&1
+check "a dry run does not persist CF_SELF_SIGNED" test ! -e "$cf_file2"
 
 mkdir -p "$TMP/datadir"
 dd if=/dev/zero of="$TMP/datadir/ib_logfile0" bs=1M count=8 status=none
@@ -4679,22 +4697,34 @@ check "the dry run previews the profile reset" \
 # Swap file: containers and btrfs/ZFS must not abort --basic
 # ---------------------------------------------------------------------------
 swap_body=$(sed -n '/^create_swap_file()/,/^}/p' "$ALL_SRC")
-check "a refused mkswap/swapon is handled, not fatal" \
-  grep -q 'if ! mkswap "\$new" >/dev/null 2>&1 || ! swapon "\$new" 2>/dev/null; then' <<<"$swap_body"
+check "a refused mkswap is handled, not fatal" \
+  grep -q 'if ! mkswap "\$new" >/dev/null 2>&1; then' <<<"$swap_body"
 check "the unusable swap file is removed" grep -q 'rm -f "\$new"' <<<"$swap_body"
 check "a refused swap file is reported at INFO level" \
   grep -q 'info "Swap file not enabled' <<<"$swap_body"
 check "no caller truncates the swap file after a failed swapoff" \
   bash -c '! grep -q "swapoff /swapfile 2>/dev/null || true" "$1"' _ "$ALL_SRC"
-# The replacement is built and activated beside the live file, then moved into
-# place: a failed download/fallocate can no longer leave the host without swap.
+# The replacement is built beside the live file and stays inactive until it
+# has taken the path: Linux refuses rename(2) on a file that is active swap.
 check "the new swap file is built beside the live one" \
   grep -q 'new=/swapfile.new' <<<"$swap_body"
 check "the live swap file is never truncated in place" \
   not bash -c 'grep -qE "^[[:space:]]*: > /swapfile" "$1"' _ <(printf '%s\n' "$swap_body")
-check "the new swap file is live before the old one is released" \
-  test "$(grep -n 'swapon "\$new"' <<<"$swap_body" | cut -d: -f1)" \
+check "the new file is never activated before it is renamed into place" \
+  not grep -q 'swapon "\$new"' <<<"$swap_body"
+check "mkswap validates the new file before the old one is released" \
+  test "$(grep -n 'mkswap "\$new"' <<<"$swap_body" | cut -d: -f1)" \
      -lt "$(grep -n 'swapoff /swapfile' <<<"$swap_body" | cut -d: -f1)"
+check "the old file is released before the new one is renamed" \
+  test "$(grep -n 'swapoff /swapfile' <<<"$swap_body" | cut -d: -f1)" \
+     -lt "$(grep -n 'mv -f "\$new" /swapfile' <<<"$swap_body" | cut -d: -f1)"
+check "the old file is renamed aside for rollback" \
+  grep -q 'mv -f /swapfile /swapfile.old' <<<"$swap_body"
+check "a failed swapon puts the old file back" \
+  grep -q 'mv -f "\$old" /swapfile' <<<"$swap_body"
+check "the previous swap file is only removed after the new one is live" \
+  test "$(grep -n 'rm -f "\$old"' <<<"$swap_body" | cut -d: -f1)" \
+     -gt "$(grep -n 'swapon /swapfile' <<<"$swap_body" | tail -n1 | cut -d: -f1)"
 # release_swap_file with stubbed swapon/swapoff (functions shadow the tools).
 release_quiet() { release_swap_file 2>/dev/null; }
 swapoff_called=0
@@ -7156,6 +7186,20 @@ check "ES yml: preload [\"*\"] is written in the managed block" \
   bash -c 'sed -n "/# BEGIN setup.sh optimize/,/# END setup.sh optimize/p" "$1" | grep -qxF "index.store.preload: [\"*\"]"' _ "$esyml"
 check "ES yml: the operator preload line is commented out when ours replaces it" \
   grep -qxF '#index.store.preload: ["nvd"]' "$esyml"
+# A hand-managed node that binds with http.host and has no network.host keeps
+# its listener; commenting it silently moved the node to localhost.
+esbind="$TMP/es-adopted-bind.yml"
+printf 'http.host: 0.0.0.0\ntransport.host: 0.0.0.0\n' > "$esbind"
+elasticsearch_write_performance_block "$esbind"
+check "ES yml: an adopted http.host bind is kept without network.host" \
+  grep -qx 'http.host: 0.0.0.0' "$esbind"
+check "ES yml: an adopted transport.host bind is kept without network.host" \
+  grep -qx 'transport.host: 0.0.0.0' "$esbind"
+esbind2="$TMP/es-managed-bind.yml"
+printf 'network.host: 0.0.0.0\nhttp.host: 0.0.0.0\n' > "$esbind2"
+elasticsearch_write_performance_block "$esbind2"
+check "ES yml: http.host is commented when network.host controls the bind" \
+  grep -qx '#http.host: 0.0.0.0' "$esbind2"
 
 
 # ---------------------------------------------------------------------------
@@ -7224,6 +7268,27 @@ if [[ -d /etc/php ]]; then
 else
   t_skip "post-Angie refresh rollback (no /etc/php on this host)"
 fi
+
+# --- audit 1.21.60: forwarded headers, security headers, cache hygiene
+
+# A direct client must not choose what PHP believes about its address or
+# scheme: the raw X-Forwarded-*/X-Real-IP headers used to pass through.
+check_tree "PHP forwarded headers: X-Forwarded-Host is the normalised host" \
+  grep -q 'fastcgi_param HTTP_X_FORWARDED_HOST  \$php_http_host;' "$ANGIE_TREE/snippets/fastcgi-php-common.conf"
+check_tree "PHP forwarded headers: X-Real-IP is set from the trusted map" \
+  grep -q 'fastcgi_param HTTP_X_REAL_IP         \$php_x_real_ip;' "$ANGIE_TREE/snippets/fastcgi-php-common.conf"
+check_tree "PHP forwarded headers: Forwarded/X-HTTP-Method-Override are blanked" \
+  bash -c 'grep -q "HTTP_FORWARDED" "$1/snippets/fastcgi-php-common.conf" && grep -q "HTTP_X_HTTP_METHOD_OVERRIDE" "$1/snippets/fastcgi-php-common.conf"' _ "$ANGIE_TREE"
+check_tree "PHP forwarded headers: only declared/local peers are trusted" \
+  grep -q 'map "\$realip_remote_addr" \$trusted_forwarder' "$ANGIE_TREE/http.d/https_map.conf"
+check_tree "Flarum: both PHP locations keep X-Frame-Options" \
+  test "$(grep -c 'security/x-frame-options.conf' "$ANGIE_TREE/h5bp/php_flarum.conf")" -ge 2
+check_tree "XenForo static assets: the location keeps CORS and the security set" \
+  bash -c 'grep -q "cross-origin/requests.conf" "$1/h5bp/location/xf_static_assets.conf" && grep -q "security/x-frame-options.conf" "$1/h5bp/location/xf_static_assets.conf"' _ "$ANGIE_TREE"
+check_tree "Chevereto media: sendfile is not disabled and expires adds no second header" \
+  bash -c '! grep -q "sendfile off" "$1/conf.d/templates/sample_chev.conf" && grep -q "expires off;" "$1/conf.d/templates/sample_chev.conf"' _ "$ANGIE_TREE"
+check_tree "XenForo proxy endpoints: a one-shot query is not stored" \
+  grep -q 'fastcgi_cache_min_uses  2;' "$ANGIE_TREE/h5bp/php_xf_proxy.conf"
 
 printf '\nTOTAL pass=%d fail=%d skip=%d\n' "$PASS" "$FAIL" "$SKIP"
 [[ $FAIL -eq 0 ]]

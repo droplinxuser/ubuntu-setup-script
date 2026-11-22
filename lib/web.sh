@@ -984,6 +984,12 @@ cloudflare_tls_migrate() {
   local target=${1:-/etc/angie} dry=${2:-0} ranges f b idx el names name list orig ok copy
   local -a blocks=() keep_names=() checked=() vhosts=()
   CF_TLS_FILES=(); CF_TLS_ORIG=(); CF_TLS_NAMES=(); CF_TLS_DRY_FULL=()
+  # Keep an explicit SETUP_CF_SELF_SIGNED=0/1 on the host so a later plain
+  # --optimize honours it (README: persisted as CF_SELF_SIGNED).  A dry run
+  # never writes.
+  if (( ${CF_SELF_SIGNED_PERSIST:-0} )) && (( dry == 0 )); then
+    persist_tuning_var CF_SELF_SIGNED "$CF_SELF_SIGNED"
+  fi
   [[ ${CF_SELF_SIGNED:-1} != 0 ]] || return 0
   # Anubis owns the TLS terminators (regenerated from the vhosts each run,
   # which would drop the keep marker) and keeps one-time copies of the
@@ -1747,9 +1753,15 @@ tune_limit_req_exemptions() {
 # --optimize: rate-limit exemptions, asset precompression, the OPcache JIT
 # mode and the Node.js major.
 persist_tuning_var() {
-  local key=$1 value=$2 f=/etc/default/setup-tuning line
-  [[ ${EUID} -eq 0 ]] || return 0
-  line="${key}=\"${value}\""
+  local key=$1 value=$2 f=${SETUP_TUNING_FILE:-/etc/default/setup-tuning} line
+  # SETUP_TUNING_FILE is a test hook (a temporary file); the production path
+  # is only written as root.
+  [[ ${EUID} -eq 0 || -n ${SETUP_TUNING_FILE:-} ]] || return 0
+  # The host file is sourced as root on every run, so the value is written
+  # shell-quoted (%q) rather than wrapped in double quotes: a value that
+  # contains a quote, $(...) or a backtick (an operator typo in
+  # SETUP_LIMIT_REQ_EXEMPT, say) must stay data, not become a command.
+  printf -v line '%s=%q' "$key" "$value"
   if [[ -f $f ]] && grep -qE "^${key}=" "$f"; then
     sed_in_place -E "s|^${key}=.*|$(sed_replacement_escape "$line")|" "$f"
   else

@@ -16,3 +16,4 @@
 2.3.4.5        # placeholder in --help text
 5.2.2.4        # RFC section number in a comment (h5bp)
 6.2.2.3        # RFC section number in a comment (h5bp)
+1.31.8.1       # OpenResty version string (benchmark section)

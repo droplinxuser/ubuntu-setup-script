@@ -5,6 +5,52 @@ README.md; measurements in tests/stress-site/RESULTS.md.  Per-cycle
 reports and raw test logs cited by entries up to 1.21.32 were removed from
 the tree on 2026-11-19; retrieve them with `git show 84b0db5:<path>`.
 
+## 1.21.60 (2026-11-23)
+
+- **A fresh install no longer fails at the swap step.**  `create_swap_file`
+  activated `/swapfile.new` with `swapon` and then tried to rename it; Linux
+  refuses `rename(2)` on active swap (`EPERM`), so every fresh
+  `--basic swap=8G` died ("Could not move the new swap file into place") and
+  skipped sysctl, PAM limits, udev, cron and UFW.  The new file is validated
+  with `mkswap` while inactive, the old file is renamed aside, the new one
+  takes `/swapfile`, and only then is it activated; a failed `swapon` puts
+  the old file back.  `Swap=` below 64 MiB is now rejected by validation
+  before hostname/timezone/DNS are touched.  Six new source-order checks and
+  two dry-run rows; verified live on a pristine host (`basic OK`, 8 GiB
+  active).
+- **A direct client can no longer choose PHP's forwarded identity**
+  (`server-configs-nginx` 1.6.53).  `X-Forwarded-Host`, `-Proto`, `-For`,
+  `X-Real-IP` and `Forwarded` used to reach PHP exactly as sent; a cache
+  MISS could render absolute URLs for an attacker's host and be stored, and
+  app-level IP allowlists could be spoofed.  The headers now come from a
+  trusted peer map (Unix socket, loopback, `custom.d/trusted_proxies.map`) or
+  from the direct peer, with the normalised host/public port/scheme.
+  Verified with a PHP probe from the public address and from loopback
+  (Anubis keeps its header).
+- **`--optimize` keeps a hand-managed Elasticsearch bind.**  `http.host` /
+  `transport.host` were commented unconditionally, so a node that binds with
+  `http.host` and has no `network.host` silently moved to localhost while
+  the health probe queried the new endpoint.  They are commented only when
+  `network.host` controls the bind.
+- **`SETUP_CF_SELF_SIGNED=0` is persisted** as `CF_SELF_SIGNED` (the README
+  already promised it), and every persisted tuning value is now written with
+  `%q`: a quote or `$(...)` in `SETUP_LIMIT_REQ_EXEMPT` used to become shell
+  code when `/etc/default/setup-tuning` was sourced as root.
+- **Media and headers** (`server-configs-nginx` 1.6.53): Chevereto's
+  `/images/` no longer disables `sendfile` on the media hot path and no
+  longer sends a second `Cache-Control` beside the inherited `expires`;
+  Flarum's PHP locations keep `X-Frame-Options`, XenForo's static locations
+  keep CORS and the security set, and the XenForo `/proxy.php` / `/css.php`
+  cache no longer stores every unique query on its first request
+  (`fastcgi_cache_min_uses 2`).
+- **Web-server shootout** (primary focus): Angie 1.12.5, nginx 1.28.3,
+  FreeNginx 1.31.5, OpenResty 1.31.8.1, Tengine 3.1.0 and Caddy 2.11.9 on
+  the same PHP-FPM pool and app roots.  The server core is not the
+  difference the marketing implies: every nginx-family build lands inside
+  the run-to-run spread, and the 100x factor is the generic FastCGI cache,
+  which stock Caddy does not have.  Verdict and numbers:
+  `tests/stress-site/AUDIT-20261123-1.21.60.md`.
+
 ## 1.21.59 (2026-11-23)
 
 - **zstd removed and purged.**  1.21.58 installed `angie-module-zstd` for

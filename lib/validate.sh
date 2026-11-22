@@ -626,6 +626,12 @@ validate_all() {
     # The value was upper-cased above, so the optional binary suffix is "I".
     [[ $swap =~ ^[1-9][0-9]*([KMGTP]I?)?$ ]] \
       || die "--basic swap='${OPT[basic.swap]}' is invalid (use e.g. 8G)"
+    # Reject what mkswap cannot use before DNS/hostname/timezone are touched;
+    # install_basic used to die on 1M only after changing the host.
+    local swap_bytes
+    swap_bytes=$(numfmt --from=iec "${swap%I}" 2>/dev/null || echo 0)
+    (( swap_bytes >= 64 * 1024 * 1024 )) \
+      || die "--basic swap='${OPT[basic.swap]}' is too small (mkswap needs at least 64M)"
     OPT[basic.swap]=$swap
   fi
   local tz=${OPT[basic.time]:-}

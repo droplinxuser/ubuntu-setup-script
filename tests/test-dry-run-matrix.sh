@@ -183,6 +183,8 @@ run ok   --dry-run --purge php mariadb
 run fail --dry-run --basic server=cloud
 run fail --dry-run --basic host=-bad
 run fail --dry-run --basic swap=0
+run_msg "too small" --dry-run --basic swap=1M
+run ok   --dry-run --basic swap=64M
 run ok   --dry-run --basic swap=8Gi
 run ok   --dry-run --purge others
 run fail --dry-run --basic time=Nowhere/Nothing
