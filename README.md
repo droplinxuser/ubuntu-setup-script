@@ -826,8 +826,16 @@ to a later `--optimize`. Tuning variables are **not** overrides for
 hardware (with a warning), see
 [Profile pins and tuning overrides](#profile-pins-and-tuning-overrides).
 
-Feature choices (persisted, honoured by `--optimize`):
+Feature choices (honoured by `--optimize`):
 
+The `SETUP_*` names in this table are environment inputs for the run that
+applies them.  `SETUP_XF_JOB_CRON`, `SETUP_CF_SELF_SIGNED`,
+`SETUP_PHP_SESSION_HARDENING`, `SETUP_PHP_JIT_WORDPRESS`, `SETUP_PHP_PAGE_GZIP`,
+`SETUP_PRECOMPRESS_ASSETS`, `SETUP_LIMIT_REQ_EXEMPT` and the XenForo gzip
+choice are written to `/etc/default/setup-tuning` and therefore survive a
+later `--optimize`.  The remaining ones are one-run inputs: they are not
+persisted, and a later install/optimize re-applies the host's recorded state
+unless the same variable is passed again.
 | Variable | Values | Effect |
 |---|---|---|
 | `SETUP_XF_JOB_CRON` | `0\|1` | managed XenForo job-runner crontab entry |

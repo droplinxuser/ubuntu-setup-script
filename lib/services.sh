@@ -1210,6 +1210,13 @@ install_mariadb() {
 
   mariadb_write_systemd_limits || true
 
+  # configure_mariadb rewrites 50-server.cnf and adds the tuning drop-in.
+  # Keep a copy of the directory so a directive this Mariadb build rejects
+  # does not leave a host that cannot restart after the next reboot (the
+  # --optimize path already rolls back).
+  local mdb_bk=""
+  mdb_bk=$(tmp_dir mariadb-install.XXXXXX || true)
+  [[ -n $mdb_bk ]] && cp -a /etc/mysql/mariadb.conf.d "$mdb_bk/" 2>/dev/null || mdb_bk=""
   configure_mariadb "$size_mb" "$bind"
   # Same audit trail as the optimizer report, so the install log records the
   # values a later --optimize would reproduce.
@@ -1226,6 +1233,11 @@ install_mariadb() {
      && ! mariadbd --defaults-file=/etc/mysql/my.cnf --help --verbose >/dev/null 2>&1; then
     warn "MariaDB rejected the generated configuration:"
     mariadbd --defaults-file=/etc/mysql/my.cnf --help --verbose 2>&1 | grep -iE 'error|unknown' | head -n 5 >&2 || true
+    if [[ -n $mdb_bk && -d $mdb_bk/mariadb.conf.d ]]; then
+      mv /etc/mysql/mariadb.conf.d "${mdb_bk}/rejected" \
+        && mv "$mdb_bk/mariadb.conf.d" /etc/mysql/mariadb.conf.d \
+        && warn "restored the previous MariaDB configuration (rejected copy kept in ${mdb_bk}/rejected)"
+    fi
     return 1
   fi
   if ! systemctl restart mariadb; then

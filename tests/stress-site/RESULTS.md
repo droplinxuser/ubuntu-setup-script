@@ -9,6 +9,40 @@ is still in git history, for example
 `git show 84b0db5:tests/stress-site/AUDIT-20261117-1.21.30.md`.  The current
 cycle report is `AUDIT-20261123-1.21.59.md`.
 
+## 1.21.61 — Xeon E-2236 (2026-11-23)
+
+Pair: `server-configs-nginx` 1.6.54.  Details: `AUDIT-20261123-1.21.61.md`.
+
+- **Guest caches default-deny unknown cookies.**  The WordPress, XenForo,
+  Chevereto and Flarum caches bypassed only a fixed session-cookie list and
+  stored any other cookie's page for every guest.  `$guest_cookie_unlisted`
+  (one PCRE pass, none without a Cookie header) accepts only page-neutral
+  cookies; every app decision and `*_no_cache` line consumes it.  The Anubis
+  pass cookie is included, found by the end-to-end run: without it every
+  Anubis-fronted request was a `BYPASS` (1.5 ms of Angie CPU and a PHP render);
+  with it the same request is a `HIT` and Anubis costs 0.0008 ms/request.
+  Cookie suite 86/86.
+- **PHP application-server shootout** (primary focus): PHP-FPM 8.5, PHP-CGI,
+  FrankenPHP 1.14 classic + worker, RoadRunner 3.0, Swoole 6.2, OpenSwoole,
+  Workerman 5.2, ReactPHP 1.12, AMPHP 3.4 and the built-in server on one
+  application-shaped workload, plus the real WordPress/XenForo/Chevereto
+  roots for FPM/CGI/FrankenPHP (no page cache, 100 connections, 3 rounds).
+  Runtime medians: Workerman 13,872 and Swoole 14,034 req/s at 0.37 ms of PHP
+  CPU per request; OpenSwoole 13,310/0.43; FrankenPHP worker 9,620/0.65;
+  PHP built-in 9,294/0.61; PHP-CGI 9,215/0.62; FPM 8,884/0.60; RoadRunner
+  7,917/0.90; FrankenPHP classic 7,633/0.92; AMPHP 6,505/0.97; ReactPHP
+  2,165/0.28.  Real apps are application-bound: WP 143-157 req/s, XF
+  324-348, and FrankenPHP is 44 % slower on Chevereto (830 vs 1,482).  Verdict:
+  keep PHP-FPM; worker runtimes need an application port.
+- **MariaDB install rolls back a rejected configuration**, `opt_backup` fails
+  closed instead of leaving a partial snapshot, every shipped cache path sets
+  `min_free=512m` (Chevereto zone default 512 MiB), and the README now says
+  which `SETUP_*` choices are persisted.
+- Suites: 1,612 unit checks, 227 dry runs, security 67/67, cookie 86/86,
+  functional 0 unexpected, `--optimize` x2 0 of 3,076 facts, `--diagnostics`
+  and `--restart-all` clean, Anubis on/off clean.  Restore: 696 -> 696
+  packages, 0 `/etc` files added or removed.
+
 ## 1.21.60 — Xeon E-2236 (2026-11-23)
 
 Pair: `server-configs-nginx` 1.6.53.  Details: `AUDIT-20261123-1.21.60.md`.

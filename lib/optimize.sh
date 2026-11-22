@@ -32,7 +32,12 @@ opt_backup() {
   install -d -m 700 "$OPT_BACKUP_DIR"
   [[ -e "$OPT_BACKUP_DIR/${name}" || -e "$OPT_BACKUP_DIR/${name}.absent" ]] && return 0
   if [[ -e $path ]]; then
-    cp -a "$path" "$OPT_BACKUP_DIR/${name}"
+    # A failed copy used to leave a partial (or missing) snapshot and the
+    # rollback then restored nothing.  Stop before the change instead.
+    if ! cp -a "$path" "$OPT_BACKUP_DIR/${name}"; then
+      rm -rf "${OPT_BACKUP_DIR:?}/${name}"
+      die "Could not back up ${path} to ${OPT_BACKUP_DIR}/${name}; nothing was changed"
+    fi
     opt_report "Backup: \`${path}\` -> \`${OPT_BACKUP_DIR}/${name}\`"
   else
     : > "$OPT_BACKUP_DIR/${name}.absent"
@@ -2070,17 +2075,32 @@ tune_xf_cache_bypass_var() {
   tmp=$(tmp_file) || return 1
   awk '
     /^[[:space:]]*fastcgi_no_cache[[:space:]]/ && /\$cookie_xf_/ {
-      print "fastcgi_no_cache $setup_xf_guest_bypass $nocacheuri $req_encoded_path $cache_uri_tracking;"
+      print "fastcgi_no_cache $setup_xf_guest_bypass $nocacheuri $req_encoded_path $cache_uri_tracking $guest_cookie_unlisted;"
       next
     }
     /^[[:space:]]*fastcgi_cache_bypass[[:space:]]/ && /\$cookie_xf_/ {
-      print "fastcgi_cache_bypass $setup_xf_guest_bypass $nocacheuri $req_encoded_path;"
+      print "fastcgi_cache_bypass $setup_xf_guest_bypass $nocacheuri $req_encoded_path $guest_cookie_unlisted;"
       next
     }
     { print }
   ' "$file" > "$tmp"
   commit_if_changed "$file" "$tmp" \
     && tune_note "XenForo: cookie bypass moved to a map"
+  return 0
+}
+
+# A host tuned by an earlier release has fastcgi_no_cache / cache_bypass
+# lines that list only the session map.  The unknown-cookie rule
+# ($guest_cookie_unlisted, http.d/fastcgi_cache.conf) must join them, or a
+# plugin/SSO cookie keeps being stored for every guest.  Idempotent: a line
+# that already names the variable is left alone.
+tune_xf_cache_default_deny() {
+  local file=$1 tmp
+  [[ -f $file ]] || return 0
+  tmp=$(tmp_file) || return 1
+  sed -E '/^[[:space:]]*fastcgi_(no_cache|cache_bypass)[[:space:]].*(\$setup_xf_guest_bypass|\$xf_guest_cookie)/ { /\$guest_cookie_unlisted/! s/;[[:space:]]*$/ $guest_cookie_unlisted;/ }' "$file" > "$tmp"
+  commit_if_changed "$file" "$tmp" \
+    && tune_note "XenForo: unknown cookies now bypass the guest cache"
   return 0
 }
 
@@ -2124,7 +2144,7 @@ ensure_xf_guest_cache() {
 
   # Same tests as the repository include: a percent-encoded route is never
   # cached, and a tracking-parameter URL (keyed on its clean URL) never stored.
-  local lock='$setup_xf_guest_bypass $nocacheuri $req_encoded_path'
+  local lock='$setup_xf_guest_bypass $nocacheuri $req_encoded_path $guest_cookie_unlisted'
   local nostore="${lock} \$cache_uri_tracking"
   # The repository include serves cacheable guests from the named location
   # @xf_guest_cache, where Set-Cookie is hidden, so the cache may ignore it.
@@ -2207,6 +2227,7 @@ ensure_xf_guest_cache() {
     tune_note "XenForo: single-location include no longer caches responses that set a cookie"
   fi
   tune_xf_cache_bypass_var "$file"
+  tune_xf_cache_default_deny "$file"
   # Run the key/background repair last: it needs the lock line above to exist
   # before it can decide whether background_update is missing.
   tune_xf_cache_vary "$file"

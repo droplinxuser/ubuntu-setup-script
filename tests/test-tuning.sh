@@ -2485,6 +2485,8 @@ check "XenForo guest cache key varies on style and language" \
   bash -c 'grep -q "setup_xf_key_style" "$1" && grep -q "setup_xf_key_language" "$1" && ! grep -q "cookie_xf_" "$1"' _ "$TMP/xfguest/h5bp/php_xf.conf"
 check "XenForo guest cache bypasses session cookies" \
   grep -q 'fastcgi_cache_bypass.*setup_xf_guest_bypass' "$TMP/xfguest/h5bp/php_xf.conf"
+check "XenForo guest cache bypasses unknown cookies" \
+  grep -q 'fastcgi_cache_bypass.*guest_cookie_unlisted' "$TMP/xfguest/h5bp/php_xf.conf"
 check "XenForo cookie bypass is a map, not an if" \
   bash -c 'grep -q "map \$http_cookie \$setup_xf_guest_bypass" "$1" && ! grep -qE "^[[:space:]]*if[[:space:]]*\(" "$2"' _ "$TMP/xfguest/http.d/zz-setup-fastcgi-cache-map.conf" "$TMP/xfguest/h5bp/php_xf.conf"
 check "XenForo map excludes every session cookie" \
@@ -2525,9 +2527,9 @@ printf 'fastcgi_cache fastcgicache;\nfastcgi_no_cache $cookie_xf_session $cookie
 tune_reset_changes
 ensure_xf_guest_cache "$TMP/xfguest"
 check "legacy direct-cookie bypass is replaced by the map variable" \
-  bash -c '! grep -q "fastcgi_no_cache.*cookie_xf_session" "$1" && grep -q "fastcgi_no_cache \$setup_xf_guest_bypass \$nocacheuri \$req_encoded_path \$cache_uri_tracking;" "$1"' _ "$TMP/xfguest/h5bp/php_xf.conf"
+  bash -c '! grep -q "fastcgi_no_cache.*cookie_xf_session" "$1" && grep -q "fastcgi_no_cache \$setup_xf_guest_bypass \$nocacheuri \$req_encoded_path \$cache_uri_tracking \$guest_cookie_unlisted;" "$1"' _ "$TMP/xfguest/h5bp/php_xf.conf"
 check "legacy bypass conversion keeps the encoded-path guard" \
-  grep -q 'fastcgi_cache_bypass \$setup_xf_guest_bypass \$nocacheuri \$req_encoded_path;' "$TMP/xfguest/h5bp/php_xf.conf"
+  grep -q 'fastcgi_cache_bypass \$setup_xf_guest_bypass \$nocacheuri \$req_encoded_path \$guest_cookie_unlisted;' "$TMP/xfguest/h5bp/php_xf.conf"
 tune_reset_changes
 ensure_xf_guest_cache "$TMP/xfguest"
 check "second XenForo conversion records no change" \
@@ -2539,9 +2541,9 @@ printf 'location @xf_guest_cache {\nfastcgi_cache fastcgicache;\nfastcgi_no_cach
 tune_reset_changes
 ensure_xf_guest_cache "$TMP/xfguest" >/dev/null 2>&1
 check "repository XenForo no_cache line keeps its tracking and encoded-path guards" \
-  grep -q '^fastcgi_no_cache        \$xf_guest_cookie \$nocacheuri \$xf_api_request \$req_encoded_path \$cache_uri_tracking;$' "$TMP/xfguest/h5bp/php_xf.conf"
+  grep -q '^fastcgi_no_cache        \$xf_guest_cookie \$nocacheuri \$xf_api_request \$req_encoded_path \$cache_uri_tracking \$guest_cookie_unlisted;$' "$TMP/xfguest/h5bp/php_xf.conf"
 check "repository XenForo bypass line keeps its encoded-path guard" \
-  grep -q '^fastcgi_cache_bypass    \$xf_guest_cookie \$nocacheuri \$xf_api_request \$req_encoded_path;$' "$TMP/xfguest/h5bp/php_xf.conf"
+  grep -q '^fastcgi_cache_bypass    \$xf_guest_cookie \$nocacheuri \$xf_api_request \$req_encoded_path \$guest_cookie_unlisted;$' "$TMP/xfguest/h5bp/php_xf.conf"
 # PHP folds ".", " " and "[" in a cookie name into "_" (and a percent sign
 # in a name bypasses as a margin): each of
 # these logs a member in, so each must bypass the guest cache.
@@ -5935,7 +5937,7 @@ check_tree "Vary guard: Accept-Encoding plus Cookie is never stored" test "$(var
 # never stored, whichever PHP location rendered it (a WordPress subdirectory
 # served by h5bp/php.conf passes the raw header).
 check_tree "guest cache: every encoding-keyed cache refuses a body that does not match its key" \
-  bash -c 'for f in $(grep -lE "_cache_key .*\\\$guest_cache_enc" "$1"/h5bp/*.conf); do grep -qE "^(fastcgi|proxy)_no_cache .*\\\$guest_cache_enc_mismatch;" "$f" || { echo "$f"; exit 1; }; done' _ "$ANGIE_TREE"
+  bash -c 'for f in $(grep -lE "_cache_key .*\\\$guest_cache_enc" "$1"/h5bp/*.conf); do grep -qE "^(fastcgi|proxy)_no_cache .*\\\$guest_cache_enc_mismatch( |;)" "$f" || { echo "$f"; exit 1; }; done' _ "$ANGIE_TREE"
 mm_map() { awk -v k="\"$1\"" '/^map "\$guest_cache_enc:\$upstream_http_content_encoding"/ {f=1; next} f && /^}/ {exit} f && ($1 == k || ($1 == "default" && d == "")) { if ($1 == "default") d = $2; else { sub(/;$/, "", $2); print $2; found = 1; exit } } END { if (!found) { sub(/;$/, "", d); print d } }' "$ANGIE_TREE/http.d/fastcgi_cache.conf"; }
 check_tree "mismatch guard: a plain body under the plain key is stored" test "$(mm_map ':')" = 0
 check_tree "mismatch guard: a gzip body under the gzip key is stored" test "$(mm_map 'gzip:gzip')" = 0
@@ -7289,6 +7291,34 @@ check_tree "Chevereto media: sendfile is not disabled and expires adds no second
   bash -c '! grep -q "sendfile off" "$1/conf.d/templates/sample_chev.conf" && grep -q "expires off;" "$1/conf.d/templates/sample_chev.conf"' _ "$ANGIE_TREE"
 check_tree "XenForo proxy endpoints: a one-shot query is not stored" \
   grep -q 'fastcgi_cache_min_uses  2;' "$ANGIE_TREE/h5bp/php_xf_proxy.conf"
+check_tree "cache paths reserve filesystem headroom (min_free)" \
+  bash -c 'for f in "$1"/http.d/*cache*.conf; do grep -q "cache_path" "$f" || continue; grep -q "min_free=" "$f" || { echo "$f"; exit 1; }; done' _ "$ANGIE_TREE"
+
+# The unknown-cookie rule (1.21.61): extract the negative-lookahead regex from
+# the map and prove both directions -- known page-neutral cookies keep the
+# cache, anything else bypasses.
+guest_cookie_re=$(awk '/map \$http_cookie \$guest_cookie_unlisted/ { f = 1; next }
+  f && /^[[:space:]]*"~/ { sub(/^[[:space:]]*"~/, ""); sub(/"[[:space:]]*1;$/, ""); print; exit }' \
+  "$ANGIE_TREE/http.d/fastcgi_cache.conf")
+check_tree "guest cache: the unknown-cookie map exists" test -n "$guest_cookie_re"
+guest_cookie_allowed() { ! perl -e 'exit(($ARGV[1] =~ /$ARGV[0]/i) ? 0 : 1)' "$guest_cookie_re" "$1"; }
+guest_cookie_unknown() { ! guest_cookie_allowed "$1"; }
+check_tree "guest cache: analytics-only cookies stay page-neutral" \
+  guest_cookie_allowed '_ga=GA1.1.1.1; _fbp=fb.1.1.1; _hjSessionUser_1=x'
+check_tree "guest cache: WordPress guest cookies stay page-neutral" \
+  guest_cookie_allowed 'wordpress_test_cookie=WP%20Cookie%20check; comment_author_abc=me'
+check_tree "guest cache: XenForo CSRF and key cookies stay page-neutral" \
+  guest_cookie_allowed 'xf_csrf=abc; xf_style_id=2; xf_language_id=1'
+check_tree "guest cache: an unknown cookie is a bypass" \
+  guest_cookie_unknown 'plugin_session=abc'
+check_tree "guest cache: an unknown cookie beside analytics is a bypass" \
+  guest_cookie_unknown '_ga=GA1.1.1.1; sso_token=abc'
+check_tree "guest cache: PHPSESSID is not a page-neutral cookie" \
+  guest_cookie_unknown 'PHPSESSID=abc'
+check_tree "guest cache: the Anubis pass cookie is page-neutral" \
+  guest_cookie_allowed 'techaro.lol-anubis-auth-5ab17f3c=eyJhbGci'
+check_tree "guest cache: an unknown cookie beside the Anubis pass still bypasses" \
+  guest_cookie_unknown 'techaro.lol-anubis-auth-5ab17f3c=x; plugin_session=1'
 
 printf '\nTOTAL pass=%d fail=%d skip=%d\n' "$PASS" "$FAIL" "$SKIP"
 [[ $FAIL -eq 0 ]]

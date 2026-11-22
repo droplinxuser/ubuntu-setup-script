@@ -34,7 +34,7 @@ echo "################ XenForo"
 X=https://xf.test.local
 req xg1 "$X/"; req xg2 "$X/"; req xg3 "$X/"
 chk "XF guest home is 200" "$ST" 200
-chk "XF guest home is served from the cache" "$(hdr xg3 x-cache-status)" HIT
+chk "XF guest home is served from the cache" "$(hdr xg3 x-cache-status | sed -E 's/^(HIT|STALE|UPDATING)$/CACHED/')" CACHED
 chk "XF cached guest page carries no Set-Cookie (HIT)" "$(ncook xg3)" 0
 req xm "$X/whats-new/?t=$RANDOM"
 chk "XF guest MISS (the request that fills the cache) carries no Set-Cookie" "$(hdr xm x-cache-status):$(ncook xm)" "MISS:0"
@@ -71,6 +71,18 @@ chk "XF two guests get different xf_csrf cookies" "$([ "$(cookv xka xf_csrf)" !=
 # the guest now has xf_csrf only: still a guest, still cached
 req xgc -b "$T/g.jar" "$X/"
 chk "XF guest with only xf_csrf is still served from the cache" "$(hdr xgc x-cache-status)" HIT
+# default-deny: an unknown cookie is not a guest page.  The allowlist covers
+# analytics and consent cookies, so those keep the cache fast; anything else
+# (a plugin session, an SSO token) must be rendered by PHP and never stored.
+u="$X/whats-new/?t=$RANDOM"
+req xu1 -H 'Cookie: xfplugin_session=abc123' "$u"
+req xu2 -H 'Cookie: my_sso_token=abc123; _ga=GA1.1.999.9991' "$u"
+chk "XF unknown cookie bypasses the guest cache" "$(hdr xu1 x-cache-status):$(hdr xu2 x-cache-status)" "BYPASS:BYPASS"
+u="$X/whats-new/?t=$RANDOM"
+req xu3 -H 'Cookie: _ga=GA1.1.999.9991; _fbp=fb.1.999.9991' "$u"
+req xu4 -H 'Cookie: _ga=GA1.1.999.9992; _fbp=fb.1.999.9992' "$u"
+req xu5 -H 'Cookie: _ga=GA1.1.999.9993; _fbp=fb.1.999.9993' "$u"
+chk "XF analytics cookies alone stay cacheable" "$(hdr xu3 x-cache-status):$(hdr xu5 x-cache-status | sed -E 's/^(HIT|STALE|UPDATING)$/CACHED/')" "MISS:CACHED"
 # log in with the refreshed token (cached page -> keep-alive -> login)
 req xlogin -b "$T/g.jar" -c "$T/g.jar" --data-urlencode "_xfToken=$newtok" --data-urlencode 'login=bench5' --data-urlencode "password=$PW" --data 'remember=1' "$X/login/login"
 chk "XF login from a cached page succeeds (303)" "$ST" 303
@@ -131,6 +143,17 @@ req cg1 "$C/explore"; req cg2 "$C/explore"; req cg3 "$C/explore"
 chk "Chevereto guest /explore is 200" "$ST" 200
 chk "Chevereto guest /explore is served from the cache" "$(hdr cg3 x-cache-status)" HIT
 chk "Chevereto cached page carries no Set-Cookie (HIT)" "$(ncook cg3)" 0
+# default-deny: Chevereto already bypasses on PHPSESSID (it starts a session
+# for every visitor), so the new rule is checked with an unknown cookie and
+# with an analytics-only cookie that must stay cacheable.
+u="$C/explore?t=$RANDOM"
+req cu1 -H 'Cookie: chevplugin_session=abc123' "$u"
+chk "Chevereto unknown cookie bypasses the guest cache" "$(hdr cu1 x-cache-status)" BYPASS
+u="$C/explore?t=$RANDOM"
+req cu2 -H 'Cookie: _ga=GA1.1.999.9991' "$u"
+req cu3 -H 'Cookie: _ga=GA1.1.999.9992' "$u"
+req cu4 -H 'Cookie: _ga=GA1.1.999.9993' "$u"
+chk "Chevereto analytics cookie alone stays cacheable" "$(hdr cu2 x-cache-status):$(hdr cu4 x-cache-status | sed -E 's/^(HIT|STALE|UPDATING)$/CACHED/')" "MISS:CACHED"
 req cm "$C/explore/recent?t=$RANDOM"
 chk "Chevereto guest MISS carries no Set-Cookie" "$(hdr cm x-cache-status):$(ncook cm)" "MISS:0"
 chk "Chevereto cached page has HSTS and X-Content-Type-Options" "$([ -n "$(hdr cg3 strict-transport-security)" ] && [ -n "$(hdr cg3 x-content-type-options)" ] && echo y)" y
@@ -200,6 +223,17 @@ req wf1 -H "Cookie: $wfold" "$u"; req wf2 -H "Cookie: $wfold" "$u"
 chk "WordPress folded cookie names bypass the guest cache" "$(hdr wf1 x-cache-status):$(hdr wf2 x-cache-status)" "BYPASS:BYPASS"
 req wfg "$u"
 chk "WordPress folded cookie names left no member page for guests" "$(grep -c 'wp-admin-bar' "$T/wfg.body")" 0
+# default-deny (1.21.61): a plugin/SSO cookie outside the neutral allowlist
+# must never fill or read the guest cache.
+u="$W/?t=$RANDOM"
+req wn1 -H 'Cookie: wpplugin_session=abc123' "$u"
+req wn2 -H 'Cookie: sso_token=abc123; _ga=GA1.1.999.9991' "$u"
+chk "WordPress unknown cookie bypasses the guest cache" "$(hdr wn1 x-cache-status):$(hdr wn2 x-cache-status)" "BYPASS:BYPASS"
+u="$W/?t=$RANDOM"
+req wn3 -H 'Cookie: wordpress_test_cookie=WP%20Cookie%20check; _ga=GA1.1.999.9991' "$u"
+req wn4 -H 'Cookie: wordpress_test_cookie=WP%20Cookie%20check; _ga=GA1.1.999.9992' "$u"
+req wn5 -H 'Cookie: wordpress_test_cookie=WP%20Cookie%20check; _ga=GA1.1.999.9993' "$u"
+chk "WordPress neutral guest cookies stay cacheable" "$(hdr wn3 x-cache-status):$(hdr wn5 x-cache-status | sed -E 's/^(HIT|STALE|UPDATING)$/CACHED/')" "MISS:CACHED"
 
 echo "################ Encoding variants (1.21.59)"
 # One cached entry per encoding, shared by every client header: with Vary

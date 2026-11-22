@@ -5,6 +5,52 @@ README.md; measurements in tests/stress-site/RESULTS.md.  Per-cycle
 reports and raw test logs cited by entries up to 1.21.32 were removed from
 the tree on 2026-11-19; retrieve them with `git show 84b0db5:<path>`.
 
+## 1.21.61 (2026-11-23)
+
+- **A guest cache could store one visitor's page for everyone** (high,
+  security; `server-configs-nginx` 1.6.54).  The WordPress, XenForo,
+  Chevereto and Flarum caches bypassed on a fixed list of session cookie
+  names and treated every other cookie as page-neutral, so a plugin session,
+  an SSO token or a language selector outside the list rendered a
+  personalised page that was then stored for every guest.  The rule is now
+  default-deny: one map (`$guest_cookie_unlisted`, one PCRE pass per request,
+  none without a Cookie header) accepts only analytics/consent cookies,
+  CDN/bot-management cookies, the Anubis pass cookie and the apps' own
+  page-neutral guest cookies; every cache decision and `*_no_cache` line
+  consumes it.  A language selector keeps bypassing because it changes the
+  page.  `--optimize` adds the variable to XenForo lines written by older
+  releases.  The Anubis case was found by the end-to-end run: its
+  `techaro.lol-anubis-auth-*` cookie is now neutral (before the fix every
+  Anubis-fronted request was a cache `BYPASS`).  Cookie suite 86/86.
+- **PHP application-server shootout** (primary focus):
+  `tests/stress-site/php-server-shootout.sh` and `php-appsim/` compare
+  PHP-FPM, PHP-CGI, FrankenPHP (classic and worker), RoadRunner,
+  Swoole/OpenSwoole, Workerman, ReactPHP, AMPHP and PHP's built-in server on
+  one application-shaped workload, then FPM/CGI/FrankenPHP on the real
+  WordPress/XenForo/Chevereto roots without a page cache.  Verdict: keep
+  PHP-FPM.  Workerman/Swoole are 1.4-1.6x faster but need the application to
+  be ported to a persistent worker; FrankenPHP worker is 26 % faster than
+  its classic mode but does not beat FPM and is 44 % slower on Chevereto;
+  RoadRunner and AMPHP are slower than FPM.  Numbers:
+  `tests/stress-site/AUDIT-20261123-1.21.61.md`.
+- **A rejected MariaDB configuration no longer stays on disk.**  The install
+  path now snapshots `/etc/mysql/mariadb.conf.d` before the rewrite and puts
+  the old tree back when `mariadbd` rejects a directive, instead of leaving a
+  host that cannot restart after the next reboot.
+- **`opt_backup` fails closed.**  A failed `cp -a` used to leave a partial
+  snapshot and turn a later rollback into a no-op; it now removes the partial
+  copy and stops before any change.
+- **Cache paths reserve filesystem headroom.**  Every shipped `cache_path`
+  sets `min_free=512m`, and the Chevereto zone default drops from 1 GiB to
+  512 MiB for a host that deploys the tree without setup.sh (which still sizes
+  every zone from RAM).
+- **README persistence drift corrected.**  The feature-choice table now says
+  which `SETUP_*` names are written to `/etc/default/setup-tuning` and which
+  are one-run inputs.  Making the rest persistent is an open item.
+- Suites: 1,612 unit checks, 227 dry runs, security 67/67, cookie 86/86,
+  functional 0 unexpected, `--optimize` x2 0 of 3,076 facts, Anubis on/off
+  clean, restore 696 -> 696 packages.
+
 ## 1.21.60 (2026-11-23)
 
 - **A fresh install no longer fails at the swap step.**  `create_swap_file`
