@@ -37,7 +37,9 @@ Pair: `server-configs-nginx` 1.6.53.  Details: `AUDIT-20261123-1.21.60.md`.
   real-app uncached page is 5 % behind; its PHP-micro path is 34 % slower.
 - Suites: 1,593 unit checks, 227 dry runs, security 67/67, cookie 80/80,
   functional 0 unexpected, `--optimize` x2 0 of 3,048 facts, PHP 8.5 -> 8.6
-  -> 8.5 clean.  Restore: RESTORE_SUMMARY.
+  -> 8.5 clean.  Restore: 696 -> 696 packages, 0 `/etc` files added or
+  removed after the reboot (4 shadow-backup files changed by the OLS
+  `lsadm` account removal; active account files match).
 
 ## 1.21.59 follow-up — Xeon E-2236 (2026-11-23)
 
