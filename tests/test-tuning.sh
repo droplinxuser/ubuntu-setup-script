@@ -1396,10 +1396,16 @@ angie_local_php_follow_pool "$lp/angie.conf" /run/php/php-fpm.sock
 angie_local_php_follow_pool "$lp/angie.conf" ""
 angie_local_php_follow_pool "$lp/angie.conf" 'not a listener'
 check "an unchanged, empty or unknown listener is a no-op" test "$TUNE_DIRTY" -eq 0
+# No pipeline with an early-exiting reader: under `set -o pipefail` a writer
+# killed by SIGPIPE after `awk ... exit` / `grep -q` fails the check even
+# though the text is there (it failed once on CI with identical code).
 local_php_live_gate() {
-  sed -n '/^tune_angie_configs()/,/^}/p' "$ROOT/lib/web.sh" \
-    | awk '/elif \[\[ \$target == \/etc\/angie \]\]; then/{f=1} f&&/^  fi$/{exit} f' \
-    | grep -qF 'angie_local_php_follow_pool "$nginx_conf" "$live_listen"'
+  local body seg
+  body=$(sed -n '/^tune_angie_configs()/,/^}/p' "$ROOT/lib/web.sh")
+  seg=${body#*'elif [[ $target == /etc/angie ]]; then'}
+  [[ $seg != "$body" ]] || return 1
+  seg=${seg%%$'\n  fi\n'*}
+  [[ $seg == *'angie_local_php_follow_pool "$nginx_conf" "$live_listen"'* ]]
 }
 check "the tuner follows the live pool only for the live tree without a socket handover" local_php_live_gate
 
@@ -3710,14 +3716,14 @@ check "the zstd module is kept when apt would remove anything else" \
   bash -c '[[ $1 == "purged=0 "*"would also remove angie"* ]]' _ "$(zt_purge 1 $'Purg angie-module-zstd [1.12.5]\nRemv angie [1.12.5]')"
 check "nothing happens when the zstd module is not installed" \
   test "$(zt_purge 0 '')" = 'purged=0 '
-zt_no_install() { ! declare -f ensure_angie_compression | grep -q 'apt_install angie-module-zstd'; }
+zt_no_install() { local b; b=$(declare -f ensure_angie_compression); [[ $b != *'apt_install angie-module-zstd'* ]]; }
 check "ensure_angie_compression installs no zstd module any more" zt_no_install
 # The purge waits until the Angie pass commits (a rollback must not restore a
 # tree that loads a purged module): ensure_angie_compression only marks it.
 zt_deferred() {
-  ! declare -f ensure_angie_compression | grep -q 'angie_purge_zstd_module' \
-    && declare -f optimize_angie | grep -q 'angie_purge_zstd_module' \
-    && declare -f install_angie | grep -q 'angie_purge_zstd_module'
+  local e o i
+  e=$(declare -f ensure_angie_compression); o=$(declare -f optimize_angie); i=$(declare -f install_angie)
+  [[ $e != *angie_purge_zstd_module* && $o == *angie_purge_zstd_module* && $i == *angie_purge_zstd_module* ]]
 }
 check "the zstd purge runs only after the Angie pass commits" zt_deferred
 # An operator file that uses zstd relies on the managed load_module: nothing
@@ -3893,7 +3899,7 @@ check "precompress_remove_siblings keeps a hand-made sibling" test -e "$TMP/asse
 check "precompress_remove_siblings keeps the sources" test -s "$TMP/assets/js/roll.js"
 # The cron helper (CRON_PRECOMPRESS is readonly, so read the generator)
 # carries the remove function and its --remove mode.
-pc_helper_has() { declare -f write_precompress_helper | grep -q -- "$1"; }
+pc_helper_has() { local b; b=$(declare -f write_precompress_helper); [[ $b == *"$1"* ]]; }
 check "the precompress helper embeds precompress_remove_siblings" \
   pc_helper_has "precompress_static_assets precompress_remove_siblings"
 check "the precompress helper has a --remove mode" pc_helper_has "--remove"
