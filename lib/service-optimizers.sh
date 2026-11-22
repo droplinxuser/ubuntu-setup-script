@@ -57,8 +57,20 @@ ensure_angie_limits() {
 php_refresh_after_angie() {
   local reporter=${1:-opt_report} prefix=${2:-- }
   [[ ${OPT_PHP_OK:-0} -eq 1 ]] || return 0
-  local v dirty=0 rc=0
+  local v dirty=0 rc=0 snap
   while IFS= read -r v; do
+    # tune_php_fpm_version writes the pool and ini before php-fpm -t; a
+    # rejected pair left on disk fails the next restart.  Snapshot the tree
+    # as the first PHP pass left it (not the pre-run opt_backup copy, which
+    # would also undo that pass, its socket listener included) and restore
+    # it on failure.  Quiet: a clean refresh must add no report line.
+    snap=""
+    if [[ -d /etc/php/${v} ]]; then
+      snap=$(tmp_dir 2>/dev/null || true)
+      if [[ -n $snap ]] && ! cp -a "/etc/php/${v}/." "${snap}/" 2>/dev/null; then
+        snap=""
+      fi
+    fi
     tune_reset_changes
     if tune_php_fpm_version "$v"; then
       # A clean pass only repeats the informational tune_summary lines
@@ -71,8 +83,13 @@ php_refresh_after_angie() {
         "$reporter" "${prefix}${change} (post-Angie refresh)"
       done
     else
-      warn "PHP ${v}: post-Angie ini refresh failed"
-      opt_report "- **FAILED** PHP ${v}: post-Angie ini refresh"
+      if [[ -n $snap ]] && restore_tree "$snap" "/etc/php/${v}"; then
+        warn "PHP ${v}: post-Angie ini refresh failed; restored the configuration the PHP pass wrote"
+        opt_report "- **FAILED** PHP ${v}: post-Angie ini refresh; rolled back to the PHP pass result"
+      else
+        warn "PHP ${v}: post-Angie ini refresh failed and could not be rolled back; check php-fpm${v} -t before the next restart"
+        opt_report "- **FAILED** PHP ${v}: post-Angie ini refresh (no rollback; check \`php-fpm${v} -t\`)"
+      fi
       rc=1
     fi
   done < <(php_fpm_versions)
@@ -1797,6 +1814,20 @@ optimize_plan() {
   optimize_ignore_tuning_env
   printf '\n%sProfile reset preview%s (no file is moved):\n' "$C_BOLD" "$C_RESET"
   reset_operator_overrides 2
+  # The run moves explicit-options.conf away before planning; plan without
+  # it here too (the dry run exits after the preview, so it is never reset).
+  OPT_PLAN_RESET_PENDING=1
+  # host_server_type (util.sh) reads the recorded server_type pin directly
+  # and caches its answer for the run.  The real run resolves it only after
+  # the pin is moved, so it detects the class; a preview that kept a pinned
+  # vps/dedi would show other workers per CPU, backlogs, io_capacity and
+  # governor.  Resolve the cache once here through the same function with the
+  # pin hidden, so every later caller gets the post-reset class.
+  HOST_SERVER_TYPE=$(
+    explicit_option() { return 1; }
+    HOST_SERVER_TYPE=""
+    host_server_type
+  )
   if (( ${#OPTIMIZE_IGNORED_ENV[@]} > 0 )); then
     printf '  Ignored tuning environment: %s\n' "${OPTIMIZE_IGNORED_ENV[*]}"
   fi
@@ -1850,8 +1881,13 @@ optimize_plan() {
     printf '  Angie: workers=%s connections=%s rlimit=%s keepalive=%s cache_budget=%sMB\n' \
       "$ANGIE_WORKER_PROCESSES" "$ANGIE_WORKER_CONNECTIONS" "$ANGIE_WORKER_RLIMIT" \
       "$ANGIE_PHP_KEEPALIVE" "$cache_mb"
-    printf '  Angie compression: Brotli level %s dynamic, gzip fallback (module installed on apply)\n' \
-      "$(angie_brotli_level)"
+    if (( $(angie_zstd_level) > 0 )); then
+      printf '  Angie compression: zstd level %s, then Brotli level %s, then gzip, first the client accepts (modules installed on apply)\n' \
+        "$(angie_zstd_level)" "$(angie_brotli_level)"
+    else
+      printf '  Angie compression: Brotli level %s dynamic, gzip fallback (SETUP_ZSTD_LEVEL=0; module installed on apply)\n' \
+        "$(angie_brotli_level)"
+    fi
     printf '  Angie static assets: precompressed .br/.gz siblings %s (SETUP_PRECOMPRESS_ASSETS)\n' \
       "$( (( PRECOMPRESS_ASSETS )) && printf on || printf off )"
     printf '  XenForo jobs: managed xf:run-jobs crontab %s for every XenForo root (SETUP_XF_JOB_CRON)\n' \
@@ -1868,12 +1904,13 @@ optimize_plan() {
   fi
   printf '  Applications: audit WordPress/XenForo persistent MariaDB and Valkey socket settings\n'
   if [[ ${OPT_DETECTED[*]} == *php:* ]]; then
-    # Same inputs as tune_php_fpm_version: a live pool keeps its count, an
-    # explicit --php children=/max_requests= wins.
+    # Same inputs as tune_php_fpm_version after the profile reset: a live
+    # pool keeps its count; the explicit --php children=/max_requests= the
+    # run moves away are not read (plan_explicit_option).
     local live_children explicit_children explicit_requests
     live_children=$(php_pool_max_children)
-    explicit_children=$(explicit_option php_children 2>/dev/null || true)
-    explicit_requests=$(explicit_option php_max_requests 2>/dev/null || true)
+    explicit_children=$(plan_explicit_option php_children 2>/dev/null || true)
+    explicit_requests=$(plan_explicit_option php_max_requests 2>/dev/null || true)
     local plan_allowance
     plan_allowance=$(php_worker_allowance_mb "$(php_primary_version 2>/dev/null || true)" 2>/dev/null || true)
     [[ $plan_allowance =~ ^[0-9]+$ ]] && (( plan_allowance > 0 )) || plan_allowance=64

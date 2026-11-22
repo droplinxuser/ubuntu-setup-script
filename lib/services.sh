@@ -908,8 +908,15 @@ mariadb_compute_profile() {
   fi
   # The 2000 cap applies only to our computed value.  Capping a kept live
   # ceiling would lower a genuinely busy server (and reintroduce "Too many
-  # connections"); keep a very high safety bound instead.
-  (( kept_max == 0 && max_conn > 2000 )) && max_conn=2000
+  # connections"); keep a very high safety bound instead.  Nor may the cap
+  # drop below what the pool holds open by itself: every worker keeps one
+  # connection per persistent application plus one transient one, so three
+  # persistent apps on a 600-worker pool need 2400 before any cron or admin
+  # session, and a flat 2000 would refuse the last workers.  The 50 is the
+  # same admin/backup/cron headroom as the formula above.
+  local conn_cap=2000 conn_need=$(( php_total * (persistent_apps + 1) + 50 ))
+  (( conn_need > conn_cap )) && conn_cap=$conn_need
+  (( kept_max == 0 && max_conn > conn_cap )) && max_conn=$conn_cap
   (( max_conn > 100000 )) && max_conn=100000
   (( max_conn < 200 )) && max_conn=200
   # Table caches follow the connection ceiling (every session can hold a
@@ -2230,9 +2237,15 @@ create_domains() {
   if (( imported )); then
     reoptimize_mariadb_after_import
   fi
+  local xf_php
+  xf_php=$(php_installed_version 2>/dev/null || true)
   for d in "${DOMAINS[@]}"; do
     [[ ${DOMAIN_APP[$d]:-basic} == xf ]] || continue
-    info "XenForo ${d}: dynamic Brotli is enabled; with php-redis + local Valkey keep the XF data cache on (measured +7-9% authenticated throughput; without php-redis the Credis fallback measured slower), and disable the Members online / Trending / Featured widgets if you do not need them (measured +39% authenticated throughput)."
+    # 1.21.58 audit, XenForo 2.3.13 on PHP 8.6.0 (see php_upgrade_app_cautions).
+    if [[ -n $xf_php && $(printf '%s\n8.6\n' "$xf_php" | sort -V | head -n 1) == 8.6 ]]; then
+      warn "XenForo ${d}: PHP ${xf_php} runs XenForo 2.3.13's production pages, but debug mode answers 500 on every page and the bundled Braintree (payment profiles) and laminas-mail null transport do not compile; use --upgrade-php=8.5 for a forum until XenForo ships a fix"
+    fi
+    info "XenForo ${d}: dynamic zstd/Brotli compression is enabled; with php-redis + local Valkey keep the XF data cache on (measured +7-9% authenticated throughput; without php-redis the Credis fallback measured slower), and disable the Members online / Trending / Featured widgets if you do not need them (measured +39% authenticated throughput)."
   done
   # A new vhost changes what the tuner plans: the PHP-FPM worker cap, the
   # OPcache file budget, the FastCGI guest cache for the new root, and the

@@ -109,6 +109,165 @@ php_upgrade_autoremove_set() {
     | sort -u
 }
 
+# Operator .ini fragments of one version tree (ROOT=/etc/php/X.Y), printed as
+# "SAPI/conf.d/name.ini<TAB>other-conf.d-dirs-that-symlink-it".  dpkg cannot
+# help here: Sury creates mods-available/*.ini and php.ini from postinst, so
+# dpkg-query -S reports "no path found" even for package files.  Package-owned
+# conf.d entries are symlinks, so a *regular* .ini dropped into a conf.d
+# directory is operator configuration.  The managed files are regenerated and
+# are skipped.  One scan serves the snapshot of the version being upgraded and
+# the check of the other versions the purge removes with it.
+php_upgrade_custom_inis() {
+  local root=$1 base d f d2 links
+  [[ -d $root ]] || return 0
+  for d in fpm/conf.d cli/conf.d apache2/conf.d; do
+    [[ -d "$root/$d" ]] || continue
+    for f in "$root/$d"/*.ini; do
+      [[ -f $f && ! -L $f ]] || continue
+      base=${f##*/}
+      case $base in
+        custom_dan.ini|zz-setup-optimize.ini|zzz-audit.ini) continue ;;
+      esac
+      links=""
+      for d2 in fpm/conf.d cli/conf.d apache2/conf.d; do
+        [[ $d2 == "$d" ]] && continue
+        [[ -L "$root/$d2/$base" ]] && links+="${links:+,}$d2"
+      done
+      printf '%s/%s\t%s\n' "$d" "$base" "$links"
+    done
+  done
+  return 0
+}
+
+# Extra FPM pools of one version tree (every pool.d/*.conf except www.conf),
+# one file name per line.
+php_upgrade_custom_pools() {
+  local root=$1
+  [[ -d "$root/fpm/pool.d" ]] || return 0
+  find "$root/fpm/pool.d" -maxdepth 1 -type f -name '*.conf' ! -name 'www.conf' \
+    -printf '%f\n' 2>/dev/null | sort
+  return 0
+}
+
+# What the purge would destroy on the PHP versions other than OLD.  The
+# snapshot and migration carry over only OLD's operator configuration, but
+# purge_php_installations removes every version and moves all of /etc/php
+# aside: on a host with 8.3 next to 8.5, the 8.3 extra pools (and the sockets
+# their vhosts point at) vanished without a word.  Prints one
+# "version<TAB>kind<TAB>detail" line per loss (kind: ini, pool, listener).  A
+# stock second version's www pool is only a loss when an Angie file actually
+# references its listener, so a merely installed, unused FPM does not block.
+# The listener the target's www pool takes over is not a loss either: the
+# snapshot hands OLD's www listen to the new pool (PHP_UPGRADE_WWW_LISTEN), and
+# with no OLD pool the template default /run/php/php-fpm.sock applies.  Every
+# setup template and Angie's upstream use that shared path, so a stale second
+# version on the same socket (the state the purge exists to clean up) would
+# otherwise always look like a loss and push the operator to the blanket
+# override.  Pools and listeners only count while that version's FPM package
+# is installed: a removed-not-purged FPM leaves pool.d behind but serves
+# nothing.  Custom inis count regardless (the CLI reads them too).
+# ETC and ANGIE default to the live trees (arguments for unit tests).
+php_upgrade_other_version_losses() {
+  local old=$1 etc=${2:-/etc/php} angie=${3:-/etc/angie} ver rel links pool listen ref kept
+  kept=$(ini_get "$etc/$old/fpm/pool.d/www.conf" listen 2>/dev/null || true)
+  kept=${kept:-/run/php/php-fpm.sock}
+  while IFS= read -r ver; do
+    [[ -n $ver && $ver != "$old" && -d "$etc/$ver" ]] || continue
+    while IFS=$'\t' read -r rel links; do
+      [[ -n $rel ]] && printf '%s\tini\t%s\n' "$ver" "$rel"
+    done < <(php_upgrade_custom_inis "$etc/$ver")
+    php_upgrade_fpm_installed "$ver" || continue
+    while IFS= read -r pool; do
+      [[ -n $pool ]] || continue
+      listen=$(ini_get "$etc/$ver/fpm/pool.d/$pool" listen 2>/dev/null || true)
+      printf '%s\tpool\t%s%s\n' "$ver" "$pool" "${listen:+ (listen = ${listen})}"
+    done < <(php_upgrade_custom_pools "$etc/$ver")
+    listen=$(ini_get "$etc/$ver/fpm/pool.d/www.conf" listen 2>/dev/null || true)
+    if [[ -n $listen && $listen != "$kept" && -d $angie ]]; then
+      ref=$(grep -rlsF -- "$listen" "$angie" 2>/dev/null | head -n 1 || true)
+      [[ -n $ref ]] && printf '%s\tlistener\t%s (used by %s)\n' "$ver" "$listen" "$ref"
+    fi
+  done < <(php_upgrade_any_versions)
+  return 0
+}
+
+# One readable line for a php_upgrade_other_version_losses entry.
+php_upgrade_describe_other_loss() {
+  local ver kind detail
+  IFS=$'\t' read -r ver kind detail <<<"$1"
+  case $kind in
+    ini)      printf 'PHP %s custom ini %s would be deleted (not migrated)' "$ver" "$detail" ;;
+    pool)     printf 'PHP %s extra FPM pool %s would be deleted (not migrated)' "$ver" "$detail" ;;
+    listener) printf 'PHP %s www pool socket %s would disappear' "$ver" "$detail" ;;
+    *)        printf 'PHP %s: %s' "$ver" "$detail" ;;
+  esac
+}
+
+# True when the FPM package of VER is installed.
+php_upgrade_fpm_installed() {
+  local ver=$1 v
+  while IFS= read -r v; do
+    [[ $v == "$ver" ]] && return 0
+  done < <(php_upgrade_installed_versions)
+  return 1
+}
+
+# --upgrade-php=X.Y when X.Y is already the serving version.  The full path
+# purges every PHP package and reinstalls: every PHP site is down for the
+# duration, only to end where it started.  The one useful thing a same-version
+# run can do is pick up extensions an earlier upgrade had to leave out (the
+# pending list), so it installs exactly those, through the same classifier the
+# carry-over uses, and reloads FPM.  Nothing is purged.
+php_upgrade_same_version() {
+  local target=$1 ext pkg class installed=0 rc=0
+  local -a want=()
+  PHP_UPGRADE_SKIPPED=()
+  while IFS= read -r ext; do
+    [[ $ext =~ ^[a-z0-9]+$ ]] && want+=("$ext")
+  done < <(cat -- "$PHP_UPGRADE_PENDING_FILE" 2>/dev/null || true)
+  if (( ${#want[@]} == 0 )); then
+    ok "PHP ${target} is already installed and serving, and no extension is pending; nothing to do (use --optimize to re-apply the PHP profile)"
+    return 0
+  fi
+  info "PHP ${target} is already installed; installing only the pending extension(s) without purging: ${want[*]}"
+  configure_php_repo || die "Could not configure the Sury APT repository"
+  apt_update || die "Could not refresh the package lists: $(apt_update_failure_hint). Nothing was changed; PHP ${target} is still installed and serving."
+  for ext in "${want[@]}"; do
+    # Same mapping as the snapshot: an unversioned-only package keeps its
+    # own name (php-pear), everything else is phpX.Y-EXT.
+    if php_upgrade_unversioned_only "$ext"; then pkg="php-${ext}"; else pkg="php${target}-${ext}"; fi
+    [[ $(dpkg-query -W -f='${db:Status-Status}' "$pkg" 2>/dev/null) == installed ]] && continue
+    class=$(php_upgrade_classify_package "$target" "$pkg")
+    case $class in
+      keep:*)
+        if apt_install "${class#keep:}"; then
+          installed=1
+          ok "Installed ${class#keep:}"
+        else
+          PHP_UPGRADE_SKIPPED+=("${ext} (${pkg}: installation failed)")
+        fi
+        ;;
+      skip:*) PHP_UPGRADE_SKIPPED+=("${ext} (${pkg}: ${class#skip:})") ;;
+    esac
+  done
+  if (( installed )) && systemctl is-active --quiet "php${target}-fpm"; then
+    # A reload re-reads conf.d so the workers load the new module without
+    # dropping the requests in flight; restart only if the reload fails.
+    systemctl reload "php${target}-fpm" 2>/dev/null \
+      || systemctl restart "php${target}-fpm" 2>/dev/null || true
+    if ! systemctl is-active --quiet "php${target}-fpm"; then
+      warn "php${target}-fpm is not active after loading the new extension(s)"
+      rc=1
+    fi
+  fi
+  php_upgrade_record_pending
+  if (( ${#PHP_UPGRADE_SKIPPED[@]} > 0 )); then
+    warn "Extension(s) still unavailable for PHP ${target}: ${PHP_UPGRADE_SKIPPED[*]}; re-run --upgrade-php=${target} once they are published"
+    rc=1
+  fi
+  return "$rc"
+}
+
 # Snapshot the host before anything is purged.  Everything the report and the
 # rollback need is written below PHP_UPGRADE_MANIFEST_DIR: the package list,
 # exact versions, the extension classification, custom configuration and the
@@ -180,37 +339,8 @@ php_upgrade_snapshot() {
   # next to it for the audit trail.
 
   # Custom configuration is identified while the packages are still installed.
-  # dpkg cannot help here: Sury creates mods-available/*.ini and php.ini from
-  # postinst, so dpkg-query -S reports "no path found" even for package files.
-  # Package-owned conf.d entries are symlinks, so a *regular* .ini dropped into
-  # a conf.d directory is operator configuration.  The managed files are
-  # regenerated and are skipped.
-  : > "$dir/custom-inis.txt"
-  local root="/etc/php/$old" rel base d f d2 links
-  if [[ -d $root ]]; then
-    for d in fpm/conf.d cli/conf.d apache2/conf.d; do
-      [[ -d "$root/$d" ]] || continue
-      for f in "$root/$d"/*.ini; do
-        [[ -f $f && ! -L $f ]] || continue
-        base=${f##*/}
-        case $base in
-          custom_dan.ini|zz-setup-optimize.ini|zzz-audit.ini) continue ;;
-        esac
-        links=""
-        for d2 in fpm/conf.d cli/conf.d apache2/conf.d; do
-          [[ $d2 == "$d" ]] && continue
-          [[ -L "$root/$d2/$base" ]] && links+="${links:+,}$d2"
-        done
-        printf '%s/%s\t%s\n' "$d" "$base" "$links" >> "$dir/custom-inis.txt"
-      done
-    done
-  fi
-
-  : > "$dir/custom-pools.txt"
-  if [[ -d "$root/fpm/pool.d" ]]; then
-    find "$root/fpm/pool.d" -maxdepth 1 -type f -name '*.conf' ! -name 'www.conf' \
-      -printf '%f\n' 2>/dev/null | sort > "$dir/custom-pools.txt"
-  fi
+  php_upgrade_custom_inis "/etc/php/$old" > "$dir/custom-inis.txt"
+  php_upgrade_custom_pools "/etc/php/$old" > "$dir/custom-pools.txt"
 
   if command -v php >/dev/null 2>&1; then
     php -v 2>/dev/null | head -n 1 > "$dir/php-version.txt" || true
@@ -631,6 +761,32 @@ php_upgrade_preflight_apps() {
   return 0
 }
 
+# Known upstream incompatibilities that do not block the upgrade (the
+# production pages work) but that the operator must hear about first.
+# Measured in the 1.21.58 audit (XenForo 2.3.13, PHP 8.6.0): production mode
+# clean, but debug mode answers 500 on every page (XenForo raises the
+# "Using null as an array offset" deprecation in src/XF/App.php as an
+# exception), and two bundled libraries no longer compile: Braintree's
+# Digest.php (payment profiles) and laminas-mail's Transport/Null.php ("Null"
+# is a reserved class name).  Fills PHP_UPGRADE_CAUTIONS with app|root.
+PHP_UPGRADE_CAUTIONS=()
+php_upgrade_app_cautions() {
+  local target=$1 base=${2:-/var/www} app root
+  PHP_UPGRADE_CAUTIONS=()
+  [[ $(printf '%s\n8.6\n' "$target" | sort -V | head -n 1) == 8.6 ]] || return 0
+  while IFS=$'\t' read -r app root; do
+    [[ $app == xenforo ]] && PHP_UPGRADE_CAUTIONS+=("${app}|${root}")
+  done < <(php_upgrade_app_roots "$base" | sort -u)
+  return 0
+}
+
+php_upgrade_describe_caution() {
+  local entry=$1 app root
+  IFS='|' read -r app root <<<"$entry"
+  printf '%s at %s on PHP %s: production pages work, but debug mode answers 500 on every page and the bundled Braintree (payment profiles) and laminas-mail null transport do not compile; keep 8.5 for this forum until XenForo ships a fix' \
+    "$app" "$root" "${UPGRADE_PHP:-8.6}"
+}
+
 # Human-readable reason for one blocker: which site needs what, and why the
 # target cannot provide it.
 php_upgrade_describe_blocker() {
@@ -766,16 +922,22 @@ php_upgrade_install() {
 # Copy operator-owned .ini fragments and extra FPM pools into the new tree.
 # Both are validated before they are kept: an incompatible fragment is moved
 # back to the manifest directory with a warning instead of breaking php-fpm.
+# ETC defaults to the live /etc/php (an argument so the rollback can be unit
+# tested against a scratch tree).
 php_upgrade_migrate_custom() {
-  local old=$1 new=$2 dir=$PHP_UPGRADE_MANIFEST_DIR
+  local old=$1 new=$2 etc=${3:-/etc/php} dir=$PHP_UPGRADE_MANIFEST_DIR
   local backup="$dir/php-config/$old" rel links base d dest migrated=0 rejected=0
+  # Only what this run wrote may be rolled back: an entry skipped because the
+  # target already had it (a package-owned conf.d/20-redis.ini symlink) must
+  # survive a rejected migration, or the rollback breaks the new install.
+  local -a migrated_inis=() migrated_pools=()
   [[ -d $backup ]] || return 0
 
   if [[ -s "$dir/custom-inis.txt" ]]; then
     while IFS=$'\t' read -r rel links; do
       [[ -n $rel ]] || continue
       base=${rel##*/}
-      dest="/etc/php/$new/$rel"
+      dest="$etc/$new/$rel"
       if [[ -e $dest ]]; then
         warn "PHP ${new}: kept the package's ${rel}; the old fragment is in ${backup}/${rel}"
         continue
@@ -783,11 +945,12 @@ php_upgrade_migrate_custom() {
       mkdir -p "$(dirname "$dest")"
       if sed -E "s/php${old//./\\.}/php${new}/g" "$backup/$rel" > "$dest" 2>/dev/null; then
         migrated=$(( migrated + 1 ))
+        migrated_inis+=("${rel}"$'\t'"${links}")
         local -a linkdirs=()
         IFS=, read -r -a linkdirs <<< "$links"
         for d in "${linkdirs[@]}"; do
-          [[ -n $d && -d "/etc/php/$new/$d" ]] || continue
-          ln -sfn "$dest" "/etc/php/$new/$d/$base"
+          [[ -n $d && -d "$etc/$new/$d" ]] || continue
+          ln -sfn "$dest" "$etc/$new/$d/$base"
         done
       else
         rm -f "$dest"
@@ -799,7 +962,7 @@ php_upgrade_migrate_custom() {
   if [[ -s "$dir/custom-pools.txt" ]]; then
     while IFS= read -r rel; do
       [[ -n $rel ]] || continue
-      dest="/etc/php/$new/fpm/pool.d/$rel"
+      dest="$etc/$new/fpm/pool.d/$rel"
       [[ -e $dest ]] && continue
       # The listener keeps its path, as tune_php_fpm_version does for
       # www.conf: an operator vhost points at exactly this socket
@@ -810,6 +973,7 @@ php_upgrade_migrate_custom() {
         warn "PHP ${new}: could not migrate pool ${rel}"
         continue
       }
+      migrated_pools+=("$rel")
       migrated=$(( migrated + 1 ))
     done < "$dir/custom-pools.txt"
   fi
@@ -821,18 +985,20 @@ php_upgrade_migrate_custom() {
     if [[ -n $fpm_bin ]] && ! "$fpm_bin" -t >"$test_log" 2>&1; then
       # Move the migrated pools and ini links out of the live tree, keep the
       # package-managed configuration, and say exactly what was rejected.
-      while IFS= read -r rel; do
-        [[ -n $rel ]] && rm -f "/etc/php/$new/fpm/pool.d/$rel"
-      done < "$dir/custom-pools.txt"
-      while IFS=$'\t' read -r rel links; do
+      local entry
+      for rel in "${migrated_pools[@]}"; do
+        [[ -n $rel ]] && rm -f "$etc/$new/fpm/pool.d/$rel"
+      done
+      for entry in "${migrated_inis[@]}"; do
+        IFS=$'\t' read -r rel links <<< "$entry"
         [[ -n $rel ]] || continue
-        rm -f "/etc/php/$new/$rel"
+        rm -f "$etc/$new/$rel"
         local -a linkdirs=()
         IFS=, read -r -a linkdirs <<< "$links"
         for d in "${linkdirs[@]}"; do
-          [[ -n $d ]] && rm -f "/etc/php/$new/$d/${rel##*/}"
+          [[ -n $d ]] && rm -f "$etc/$new/$d/${rel##*/}"
         done
-      done < "$dir/custom-inis.txt"
+      done
       warn "PHP ${new}: migrated custom configuration failed php-fpm -t; removed from the live tree (see ${backup})"
       sed 's/^/  /' "$test_log" >&2 || true
       migrated=0
@@ -1163,11 +1329,40 @@ php_upgrade_plan() {
   local -a versions=()
   mapfile -t versions < <(php_upgrade_installed_versions)
   (( ${#versions[@]} > 0 )) || mapfile -t versions < <(php_upgrade_any_versions)
-  (( ${#versions[@]} > 0 )) && old=${versions[-1]}
+  # The same source version the real run picks (the pool that owns Angie's
+  # socket), not simply the newest FPM: on a host with 8.3 serving and 8.5
+  # installed beside it, the plan used to name 8.5 while the run upgraded 8.3.
+  if (( ${#versions[@]} > 0 )); then
+    old=$(php_primary_version 2>/dev/null || true)
+    [[ -n $old ]] || old=${versions[-1]}
+  fi
   printf '\n%sDRY RUN%s - PHP upgrade plan, no changes will be made.\n' "$C_BOLD" "$C_RESET"
   printf 'Target PHP : %s\n' "$target"
+  if [[ -n $old && $old == "$target" ]] && php_upgrade_fpm_installed "$target"; then
+    printf 'Current    : %s (already the serving version)\n' "$old"
+    local pending
+    pending=$(grep -E '^[a-z0-9]+$' -- "$PHP_UPGRADE_PENDING_FILE" 2>/dev/null | paste -sd' ' - || true)
+    printf '\nNo purge and no reinstall: PHP %s keeps serving.\n' "$target"
+    if [[ -n $pending ]]; then
+      printf 'Steps:\n  1. install the pending extension(s) once published: %s\n  2. reload php%s-fpm\n' "$pending" "$target"
+    else
+      printf 'No extension is pending; nothing to do (use --optimize to re-apply the PHP profile).\n'
+    fi
+    rm -rf "$dir"
+    return 0
+  fi
   if [[ -n $old ]]; then
-    printf 'Current    : %s\n' "$old"
+    printf 'Current    : %s (installed: %s)\n' "$old" "${versions[*]}"
+    local -a other_losses=()
+    mapfile -t other_losses < <(php_upgrade_other_version_losses "$old")
+    if (( ${#other_losses[@]} > 0 )); then
+      printf '\nBLOCKED: the purge removes every PHP version; only %s is migrated:\n' "$old"
+      local loss
+      for loss in "${other_losses[@]}"; do
+        printf '  - %s\n' "$(php_upgrade_describe_other_loss "$loss")"
+      done
+      printf '  The real run refuses before purging. Override with SETUP_PHP_PURGE_OTHER_VERSIONS=1.\n'
+    fi
     printf 'Packages   : %s installed PHP package(s)\n' "$(php_upgrade_installed_packages | wc -l | tr -d ' ')"
     printf '\nExtensions to carry over (mapped to php%s-*):\n' "$target"
     php_upgrade_installed_packages > "$dir/pkgs.txt"
@@ -1200,6 +1395,11 @@ php_upgrade_plan() {
     local waived
     for waived in "${PHP_UPGRADE_NOT_LOADED[@]}"; do
       printf '  note: %s\n' "$(php_upgrade_describe_waived "$waived")"
+    done
+    local caution
+    php_upgrade_app_cautions "$target"
+    for caution in "${PHP_UPGRADE_CAUTIONS[@]}"; do
+      printf '  caution: %s\n' "$(php_upgrade_describe_caution "$caution")"
     done
     if (( ${#PHP_UPGRADE_BLOCKERS[@]} > 0 )); then
       printf '\nBLOCKED: the purge would break installed application(s):\n'
@@ -1250,6 +1450,28 @@ run_php_upgrade() {
     old=$(php_primary_version 2>/dev/null || true)
     [[ -n $old ]] || old=${_upgrade_versions[-1]}
     info "Current PHP: ${old} (installed: ${_upgrade_versions[*]})"
+    if [[ $old == "$target" ]] && php_upgrade_fpm_installed "$target"; then
+      # Nothing to replace: never purge the serving version to reinstall it.
+      rmdir "$PHP_UPGRADE_MANIFEST_DIR" 2>/dev/null || true
+      php_upgrade_same_version "$target" || rc=1
+      handled_return "$rc"
+      return "$rc"
+    fi
+    local -a other_losses=()
+    mapfile -t other_losses < <(php_upgrade_other_version_losses "$old")
+    if (( ${#other_losses[@]} > 0 )); then
+      local loss
+      warn "The purge removes every installed PHP version, but only PHP ${old}'s configuration is migrated to ${target}:"
+      for loss in "${other_losses[@]}"; do
+        warn "  - $(php_upgrade_describe_other_loss "$loss")"
+      done
+      if [[ ${SETUP_PHP_PURGE_OTHER_VERSIONS:-0} == 1 ]]; then
+        warn "SETUP_PHP_PURGE_OTHER_VERSIONS=1: continuing; the files above stay recoverable in the snapshot's php-config copy"
+      else
+        rmdir "$PHP_UPGRADE_MANIFEST_DIR" 2>/dev/null || true
+        die "Refusing to replace PHP ${old} with PHP ${target}: the site(s) using the items above would break. Nothing was changed. Move them to PHP ${old} first, or re-run with SETUP_PHP_PURGE_OTHER_VERSIONS=1 to accept the loss."
+      fi
+    fi
     php_upgrade_snapshot "$old"
     ok "Snapshot: ${PHP_UPGRADE_MANIFEST_DIR}"
     # Keep the PHP timezone the old tree used.  --upgrade-php has no --basic
@@ -1280,6 +1502,11 @@ run_php_upgrade() {
   local waived
   for waived in "${PHP_UPGRADE_NOT_LOADED[@]}"; do
     info "$(php_upgrade_describe_waived "$waived")"
+  done
+  local caution
+  php_upgrade_app_cautions "$target"
+  for caution in "${PHP_UPGRADE_CAUTIONS[@]}"; do
+    warn "$(php_upgrade_describe_caution "$caution")"
   done
   if (( ${#PHP_UPGRADE_BLOCKERS[@]} > 0 )); then
     local blocker
@@ -1362,7 +1589,7 @@ run_php_upgrade() {
   if (( rc == 0 )); then
     ok "PHP ${target} is installed, tuned and serving"
   elif (( PHP_UPGRADE_VERIFY_OK == 1 && PHP_UPGRADE_OPTIMIZE_OK == 1 )); then
-    warn "PHP ${target} is installed and tuned, but ${#PHP_UPGRADE_SKIPPED[@]} extension(s) are not published for it yet; re-run --upgrade-php=${target} once they appear"
+    warn "PHP ${target} is installed and tuned, but ${#PHP_UPGRADE_SKIPPED[@]} extension(s) are not published for it yet; re-run --upgrade-php=${target} once they appear (it installs only those, without purging)"
   else
     warn "PHP ${target} is installed but one or more checks failed; see the report"
   fi

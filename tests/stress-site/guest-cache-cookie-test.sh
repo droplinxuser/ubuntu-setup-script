@@ -85,6 +85,17 @@ req xg4 "$X/"
 # on a board with recent activity lists it on cached guest pages too (that
 # assertion reported a phantom leak once the seeded bench5 had been active).
 chk "XF member page was not stored: guests still get the guest page" "$(hdr xg4 x-cache-status):$(grep -c 'href="/account/"' "$T/xg4.body")" "HIT:0"
+# PHP folds "." in a cookie name into "_": xf.session=<sid> logs the member
+# in.  Before 1.21.58 the bypass map saw a guest and the member's page was
+# stored for every guest (reproduced on the audit host).
+xsid=$(awk '$6 == "xf_session" { print $7 }' "$T/g.jar" | tail -n 1)
+u="$X/whats-new/?fold=$RANDOM"
+req xfold1 -H "Cookie: xf.session=$xsid" "$u"; req xfold2 -H "Cookie: xf.session=$xsid" "$u"
+chk "XF folded cookie name (xf.session) bypasses the guest cache" "$(hdr xfold1 x-cache-status):$(hdr xfold2 x-cache-status)" "BYPASS:BYPASS"
+req xfoldg "$u"
+chk "XF folded cookie name left no member page for guests" "$(grep -c 'href="/account/"' "$T/xfoldg.body")" 0
+req xpct -H "Cookie: xf%5Fsession=$xsid" "$u"
+chk "XF percent-encoded cookie name bypasses the guest cache" "$(hdr xpct x-cache-status)" BYPASS
 # a POST by a guest is never cached and keeps its cookies
 req xpost --data 'keywords=benchmark&_xfToken=x' "$X/search/search"
 chk "XF guest POST is not cached" "$(hdr xpost x-cache-status)" BYPASS
@@ -178,5 +189,12 @@ req wmem -b "$T/w.jar" "$W/"
 chk "WordPress logged-in page bypasses the cache" "$(hdr wmem x-cache-status)" BYPASS
 req wd "$W/"
 chk "WordPress logged-in page was not stored" "$(grep -c 'wp-admin-bar' "$T/wd.body")" 0
+# The same cookies with "." for "_" in the name: PHP folds them back.
+wfold=$(awk '$6 ~ /^wordpress_(logged_in|sec)_/ { n = $6; gsub(/_/, ".", n); printf "%s%s=%s", s, n, $7; s = "; " }' "$T/w.jar")
+u="$W/?fold=$RANDOM"
+req wf1 -H "Cookie: $wfold" "$u"; req wf2 -H "Cookie: $wfold" "$u"
+chk "WordPress folded cookie names bypass the guest cache" "$(hdr wf1 x-cache-status):$(hdr wf2 x-cache-status)" "BYPASS:BYPASS"
+req wfg "$u"
+chk "WordPress folded cookie names left no member page for guests" "$(grep -c 'wp-admin-bar' "$T/wfg.body")" 0
 
 echo; echo "TOTAL pass=$P fail=$F"; rm -rf "$T"

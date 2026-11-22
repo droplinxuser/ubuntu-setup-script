@@ -50,6 +50,27 @@ ufw_status_protects_port() {
   ufw status 2>/dev/null | grep -qE "^OpenSSH( \(v6\))?[[:space:]]+(ALLOW|LIMIT)"
 }
 
+# Drop the CPU_MITIGATIONS pin from the host tuning file.  The pin is on the
+# --optimize reset keep-list, and setup.sh sources the file at the start of
+# every run, so leaving CPU_MITIGATIONS=off behind made the next --optimize or
+# --basic (configure_cpu_mitigations) write the drop-in again that --purge
+# basic had just removed while promising the kernel default.  Without the pin
+# the choice is "never touched" again.  Only that line goes; host facts and
+# feature choices in the same file stay.
+purge_cpu_mitigations_pin() {
+  local f=${1:-/etc/default/setup-tuning}
+  [[ -f $f ]] || return 0
+  grep -qE '^[[:space:]]*(export[[:space:]]+)?CPU_MITIGATIONS=' "$f" || return 0
+  if sed_in_place -E '/^[[:space:]]*(export[[:space:]]+)?CPU_MITIGATIONS=/d' "$f"; then
+    # This process sourced the pin at startup; forget it here too.
+    # shellcheck disable=SC2034  # read by configure_cpu_mitigations (lib/os.sh)
+    CPU_MITIGATIONS=""
+    info "CPU_MITIGATIONS pin removed from ${f}; later runs leave the boot loader alone"
+  else
+    warn "Could not remove CPU_MITIGATIONS from ${f}; the next --optimize would re-apply it"
+  fi
+}
+
 purge_basic() {
   step "Purge basic setup"
   if [[ -f "${STATE_DIR}/swapfile-managed" ]]; then
@@ -176,6 +197,7 @@ purge_basic() {
       warn "CPU mitigations drop-in removed, but update-grub failed; run it before rebooting"
     fi
   fi
+  purge_cpu_mitigations_pin
   # unattended-upgrades: put the APT periodic file back and disable the unit
   # only when it was not enabled before setup.sh enabled it.
   restore_original /etc/apt/apt.conf.d/20auto-upgrades apt-20auto-upgrades

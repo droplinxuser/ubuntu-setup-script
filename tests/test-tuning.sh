@@ -104,6 +104,13 @@ check "tune_size_value MiB"       test "$(tune_size_value 1536)" = 1536M
 check "mb_to_config whole GiB"    test "$(mb_to_config 4096)" = 4G
 check "size_to_mb 2g"             test "$(size_to_mb 2g)" = 2048
 check "cache budget rounds to 256 MB" test "$(tune_cache_total_mb 7747 19000)" = 768
+# Half the free space is a hard ceiling, also over the 256 MB floor.
+check "cache budget never exceeds half the free space" \
+  test "$(tune_cache_total_mb 7747 59000 50 10 1000)" = 960
+check "cache budget ceiling beats the 256 MB floor on a full disk" \
+  test "$(tune_cache_total_mb 7747 900 25 5 90)" = 64
+check "an absent ceiling leaves the budget unchanged" \
+  test "$(tune_cache_total_mb 7747 59000 50 10 '')" = 3840
 check "cache budget is stable across small disk changes" \
   test "$(tune_cache_total_mb 7747 19000)" = "$(tune_cache_total_mb 7747 17700)"
 
@@ -164,6 +171,53 @@ check "retire_paths ignores a missing path" retire_paths "$TMP/retire/missing.co
 deploy_body=$(sed -n '/^deploy_angie_tree()/,/^}/p' "$ALL_SRC")
 check "Angie tree deployer never deletes files" \
   bash -c '! grep -qE "(^|[[:space:]])rm -|-delete([[:space:]]|$)" <<<"$1"' _ "$deploy_body"
+# --- audit 1.21.58: web-robustness
+
+# Basic-auth password files the templates tell operators to keep in the tree
+# came back root:root 0644 (world-readable) after every sync.  They get
+# 0640 root:<Angie user group>; ordinary config files stay 0644.
+au=$TMP/auth-tree
+mkdir -p "$au/htpasswd" "$au/basic_auth" "$au/conf.d" "$au/custom"
+printf 'user www-data;\n' > "$au/angie.conf"
+for f in htpasswd/xfadmin basic_auth/wp_auth conf.d/r3f_auth custom/pw custom/plain; do
+  printf 'u:x\n' > "$au/$f"; chmod 644 "$au/$f"
+done
+printf 'u:x\n' > "$TMP/outside"; chmod 644 "$TMP/outside"
+printf 'server {\n  auth_basic_user_file custom/pw;\n  #auth_basic_user_file custom/plain;\n  auth_basic_user_file ../outside;\n}\n' > "$au/conf.d/site.conf"
+chmod 644 "$au/conf.d/site.conf"
+: > "$TMP/auth-chown.log"
+( chown() { printf '%s %s\n' "$1" "$2" >> "$TMP/auth-chown.log"; }
+  angie_secure_auth_files "$au" )
+check "htpasswd/ password file is 0640" test "$(stat -c %a "$au/htpasswd/xfadmin")" = 640
+check "basic_auth/ password file is 0640" test "$(stat -c %a "$au/basic_auth/wp_auth")" = 640
+check "*_auth password file is 0640" test "$(stat -c %a "$au/conf.d/r3f_auth")" = 640
+check "auth_basic_user_file target is 0640" test "$(stat -c %a "$au/custom/pw")" = 640
+check "a commented auth_basic_user_file reference is ignored" test "$(stat -c %a "$au/custom/plain")" = 644
+check "ordinary config files stay 0644" test "$(stat -c %a "$au/conf.d/site.conf")" = 644
+check "a reference that leaves the tree is never touched" test "$(stat -c %a "$TMP/outside")" = 644
+check "password files go to the Angie worker group" \
+  test "$(cut -d' ' -f1 "$TMP/auth-chown.log" | sort -u)" = root:www-data
+check "the worker group comes from the angie.conf user directive" \
+  test "$(angie_auth_group "$au")" = www-data
+printf 'user angie nginxgrp;\n' > "$TMP/auth-grp.conf"; mkdir -p "$TMP/auth-grp"; mv "$TMP/auth-grp.conf" "$TMP/auth-grp/angie.conf"
+check "an explicit user group in angie.conf is used" \
+  test "$(angie_auth_group "$TMP/auth-grp")" = nginxgrp
+printf 'u:x\n' > "$au/htpasswd/new"; chmod 644 "$au/htpasswd/new"
+( chown() { return 1; }; angie_secure_auth_files "$au" )
+check "a failed group change keeps the file readable (no root:root 0640)" \
+  test "$(stat -c %a "$au/htpasswd/new")" = 644
+# Securing after the 0644 normaliser left each password file world-readable
+# for the length of the scan on every run.  They are secured first and the
+# chown/chmod passes skip files already root:<group> 0640.
+auth_before_normaliser() {
+  local body s n
+  body=$(sed -n '/^deploy_angie_tree()/,/^}/p' "$ROOT/lib/web.sh")
+  s=$(grep -n 'angie_secure_auth_files "\$target"' <<<"$body" | head -1 | cut -d: -f1)
+  n=$(grep -n 'exec chown root:root' <<<"$body" | head -1 | cut -d: -f1)
+  [[ -n $s && -n $n && $s -lt $n ]] || return 1
+  test "$(grep -B1 -E 'exec chown root:root|type f -exec chmod 644' <<<"$body" | grep -c keep_secured)" -eq 2
+}
+check "the deployer secures password files before the normaliser, which skips them" auth_before_normaliser
 
 # Backup credentials never pass through a sed replacement or a command
 # line, and are written as quoted option-file values ("#" would otherwise
@@ -594,6 +648,12 @@ ssh_ports_ok() {
   (( n > 0 ))
 }
 check "sshd port discovery always returns at least one numeric port" ssh_ports_ok
+# --- audit 1.21.58: os-purge
+# The widened ephemeral range (1024-65535) must not hand the Anubis metrics
+# listener's port to an outbound connection before anubis.service rebinds it.
+check "ANUBIS_METRICS listens on 8240" test "${ANUBIS_METRICS##*:}" = 8240
+check "ip_local_reserved_ports includes the Anubis metrics port" \
+  bash -c 'sed -n "/^configure_sysctl()/,/^}/p" "$1" | grep -E "^[[:space:]]*reserved_ports=" | grep -qF "\${ANUBIS_METRICS##*:}"' _ "$ROOT/lib/os.sh"
 
 # SSH must be rate-limited by UFW, and an older plain ALLOW rule must be
 # removed so it cannot shadow the LIMIT rule.
@@ -1131,6 +1191,10 @@ check "WordPress and Chevereto roots behind an encoding-aware cache compress in 
   test "$(php_jit_path_sections "$TMP/jit-angie" | grep -c '^zlib\.output_compression = On$')" -eq 2
 check "each document root gets exactly one [PATH=] section" \
   test "$(php_jit_path_sections "$TMP/jit-angie" | grep -c '^\[PATH=')" -eq 2
+# The stored page is compressed once per MISS and sent on every hit: level 6
+# (5 % smaller than 4, 9 adds 0.5 %).
+check "PHP page gzip for the guest cache uses level 6" \
+  test "$(php_jit_path_sections "$TMP/jit-angie" | grep -c '^zlib\.output_compression_level = 6$')" -eq 2
 # --domain app=wordpress|chevereto creates the vhost before the files exist:
 # the vhost alone decides (the section used to wait for the next --optimize).
 mkdir -p "$TMP/jit-wp2/public" "$TMP/jit-chev2/public"
@@ -1303,6 +1367,41 @@ check "PHP fastcgi buffers are tuned" \
 tune_reset_changes
 tune_angie_configs "$TMP/angie"
 check "second tune run is a no-op" test "$TUNE_DIRTY" -eq 0
+# --- audit 1.21.58: web-robustness
+
+# --optimize that leaves the live pool on TCP (migration skipped or rolled
+# back): the repository sync rewrote local_php to the Unix socket and nothing
+# pointed it back, so every PHP site returned 502.  The helper follows the
+# live listener in both directions and only inside `upstream local_php`.
+lp=$TMP/local-php; mkdir -p "$lp"
+printf 'upstream other {\n  server unix:/run/other.sock;\n}\nupstream local_php {\n  zone localphp_zone 256k;\n  server unix:/run/php/php-fpm.sock;\n}\n' > "$lp/angie.conf"
+tune_reset_changes
+angie_local_php_follow_pool "$lp/angie.conf" 127.0.0.1:9000
+check "local_php follows a live TCP pool after the sync" \
+  grep -qx '  server 127.0.0.1:9000;' "$lp/angie.conf"
+check "local_php repoint leaves another upstream's socket alone" \
+  grep -qx '  server unix:/run/other.sock;' "$lp/angie.conf"
+check "local_php TCP repoint is reported as a change" test "$TUNE_DIRTY" -eq 1
+angie_local_php_follow_pool "$lp/angie.conf" 9001
+check "a bare-port pool is dialled on loopback" \
+  grep -qx '  server 127.0.0.1:9001;' "$lp/angie.conf"
+angie_local_php_follow_pool "$lp/angie.conf" '[::]:9002'
+check "a wildcard IPv6 pool is dialled on ::1" \
+  grep -qx '  server \[::1\]:9002;' "$lp/angie.conf"
+angie_local_php_follow_pool "$lp/angie.conf" /run/php/php-fpm.sock
+check "local_php follows a socket pool back from TCP" \
+  grep -qx '  server unix:/run/php/php-fpm.sock;' "$lp/angie.conf"
+tune_reset_changes
+angie_local_php_follow_pool "$lp/angie.conf" /run/php/php-fpm.sock
+angie_local_php_follow_pool "$lp/angie.conf" ""
+angie_local_php_follow_pool "$lp/angie.conf" 'not a listener'
+check "an unchanged, empty or unknown listener is a no-op" test "$TUNE_DIRTY" -eq 0
+local_php_live_gate() {
+  sed -n '/^tune_angie_configs()/,/^}/p' "$ROOT/lib/web.sh" \
+    | awk '/elif \[\[ \$target == \/etc\/angie \]\]; then/{f=1} f&&/^  fi$/{exit} f' \
+    | grep -qF 'angie_local_php_follow_pool "$nginx_conf" "$live_listen"'
+}
+check "the tuner follows the live pool only for the live tree without a socket handover" local_php_live_gate
 
 # The deploy path validates the synced tree before angie_apply_profile runs,
 # so it must apply the nested-include migration first (a hand-written vhost
@@ -1467,6 +1566,34 @@ check "session hardening is gated behind the opt-in flag" \
   grep -qF 'SETUP_PHP_SESSION_HARDENING:-0} == 1' <<<"$php_tune_body"
 check "the shipped PHP template has no global session overrides" \
   test -z "$(grep '^session\.' "$ROOT/configs/php/custom_dan.ini")"
+# --- audit 1.21.58: web-robustness
+
+# SETUP_PHP_SESSION_HARDENING=1 used to vanish on the next plain --optimize
+# (never persisted).  It is now persisted as PHP_SESSION_HARDENING, read back
+# into the single gate flag, and kept by the --optimize profile reset.
+hard_load() (
+  unset SETUP_PHP_SESSION_HARDENING PHP_SESSION_HARDENING
+  PHP_SESSION_HARDENING_PERSIST=0
+  if [[ -n $1 ]]; then PHP_SESSION_HARDENING=$1; fi
+  if [[ -n $2 ]]; then SETUP_PHP_SESSION_HARDENING=$2; fi
+  php_session_hardening_load
+  printf '%s %s' "${SETUP_PHP_SESSION_HARDENING:-unset}" "$PHP_SESSION_HARDENING_PERSIST"
+)
+check "persisted session hardening is read back without the env" test "$(hard_load 1 '')" = '1 0'
+check "env session hardening is honoured and marked for persistence" test "$(hard_load '' 1)" = '1 1'
+check "env SETUP_PHP_SESSION_HARDENING=0 overrides a persisted 1" test "$(hard_load 1 0)" = '0 1'
+check "a non-1 env value is normalised to 0" test "$(hard_load '' yes)" = '0 1'
+check "no pin and no env leaves session hardening off" test "$(hard_load '' '')" = 'unset 0'
+hard_persist_out=$(
+  persist_tuning_var() { printf '%s=%s\n' "$1" "$2"; }
+  PHP_SESSION_HARDENING_PERSIST=1 SETUP_PHP_SESSION_HARDENING=1
+  PHP_JIT_WORDPRESS_PERSIST=0 PHP_PAGE_GZIP_PERSIST=0
+  persist_php_jit
+)
+check "env session hardening is written to the host file" \
+  grep -qx 'PHP_SESSION_HARDENING=1' <<<"$hard_persist_out"
+check "the --optimize profile reset keeps PHP_SESSION_HARDENING" \
+  bash -c 'printf "%s\n" "$@" | grep -qx PHP_SESSION_HARDENING' _ "${RESET_KEEP_PINS[@]}"
 
 # --optimize refreshes a stale managed php.ini from the repo template while
 # keeping the host's existing timezone.
@@ -2011,6 +2138,32 @@ check "install plan derives the same worker count as the tuner" \
   test "$install_children" -eq 32
 check "install plan reserves 64 MB per fresh worker, not 96 MB" \
   test "$install_php_budget" -eq $(( 32 * 64 ))
+# --- audit 1.21.58: planner
+
+# Adding PHP/MariaDB to an installed Angie without --angie leaves the
+# Angie-only cache budget in place until --optimize: the run says so (c10).
+angie_gap_case() {
+  (
+    detect_installed_services() { OPT_DETECTED=(angie); }
+    plan_memory_budget() { :; }
+    memory_plan_summary() { :; }
+    info() { :; }
+    warn() { printf 'WARN %s\n' "$*"; }
+    mem_total_mb() { printf '32768'; }
+    angie_disk_free_mb() { printf '400000'; }
+    ENABLED=()
+    ENABLED[php]=1
+    ENABLED[mariadb]=1
+    [[ ${1:-0} == 1 ]] && ENABLED[angie]=1
+    plan_install_budget 2>&1
+    printf '\n'
+  )
+}
+check "install: adding PHP/MariaDB to an Angie host warns that the cache keeps its Angie-only size" \
+  bash -c 'grep -q "Angie cache budget stays at" <<<"$1"' _ "$(angie_gap_case 0)"
+check "install: no cache warning when --angie is part of the run" \
+  bash -c '! grep -q "Angie cache budget stays at" <<<"$1"' _ "$(angie_gap_case 1)"
+unset -f angie_gap_case
 
 # The same host, now sized by --optimize after the install ran (live pool of
 # 32 workers measured at the 64 MB floor).
@@ -2329,7 +2482,25 @@ check "XenForo guest cache bypasses session cookies" \
 check "XenForo cookie bypass is a map, not an if" \
   bash -c 'grep -q "map \$http_cookie \$setup_xf_guest_bypass" "$1" && ! grep -qE "^[[:space:]]*if[[:space:]]*\(" "$2"' _ "$TMP/xfguest/http.d/zz-setup-fastcgi-cache-map.conf" "$TMP/xfguest/h5bp/php_xf.conf"
 check "XenForo map excludes every session cookie" \
-  bash -c 'for c in xf_session xf_user xf_session_admin xf_tfa_trust; do grep -q "$c" "$1" || exit 1; done' _ "$TMP/xfguest/http.d/zz-setup-fastcgi-cache-map.conf"
+  bash -c 're=$(sed -n "s/^[[:space:]]*\"~\\*\\(.*\\)\"[[:space:]]*1;$/\\1/p" "$1" | head -n 1); [[ -n $re ]] || exit 1; for c in xf_session xf_user xf_session_admin xf_tfa_trust; do perl -e "exit((\$ARGV[1] =~ /\$ARGV[0]/i) ? 0 : 1)" "$re" "$c=1" || exit 1; done' _ "$TMP/xfguest/http.d/zz-setup-fastcgi-cache-map.conf"
+# The encoding token of the key: "gzip;q=0" refuses gzip and must get the
+# plain entry (the unanchored ~*gzip handed it a stored gzip body).
+xf_enc_re=$(sed -n 's/^[[:space:]]*"~\*\(.*\)"[[:space:]]*gzip;$/\1/p' "$TMP/xfguest/http.d/zz-setup-fastcgi-cache-map.conf" | head -n 1)
+check "XenForo encoding map has no unanchored ~*gzip" \
+  bash -c '! grep -qE "^[[:space:]]*~\*gzip[[:space:]]" "$1" && [[ -n $2 ]]' _ "$TMP/xfguest/http.d/zz-setup-fastcgi-cache-map.conf" "$xf_enc_re"
+check "XenForo encoding map: gzip;q=0 is not a gzip client" \
+  bash -c '! perl -e "exit((\$ARGV[1] =~ /\$ARGV[0]/i) ? 0 : 1)" "$1" "gzip;q=0"' _ "$xf_enc_re"
+check "XenForo encoding map: br;q=1, gzip;q=0 is not a gzip client" \
+  bash -c '! perl -e "exit((\$ARGV[1] =~ /\$ARGV[0]/i) ? 0 : 1)" "$1" "br;q=1, gzip;q=0"' _ "$xf_enc_re"
+check "XenForo encoding map: deflate, gzip is a gzip client" \
+  bash -c 'perl -e "exit((\$ARGV[1] =~ /\$ARGV[0]/i) ? 0 : 1)" "$1" "deflate, gzip"' _ "$xf_enc_re"
+# A map written by 1.21.57 or older (unanchored ~*gzip) is replaced.
+printf 'map $http_cookie $setup_xf_guest_bypass { default 0; }\nmap $http_accept_encoding $setup_cache_enc {\n    default "";\n    ~*gzip  gzip;\n}\nmap $cookie_xf_language_id $setup_xf_key_language { default ""; }\n' \
+  > "$TMP/xfguest/http.d/zz-setup-fastcgi-cache-map.conf"
+ensure_xf_cookie_bypass_map "$TMP/xfguest" >/dev/null 2>&1
+check "an old unanchored encoding map is rewritten" \
+  bash -c '! grep -qE "^[[:space:]]*~\*gzip[[:space:]]" "$1" && grep -q "setup_xf_key_variation" "$1"' _ "$TMP/xfguest/http.d/zz-setup-fastcgi-cache-map.conf"
+unset xf_enc_re
 check "XenForo guest cache bounds the 200 TTL" \
   grep -q '^fastcgi_cache_valid 200 5m;' "$TMP/xfguest/h5bp/php_xf.conf"
 check "XenForo guest cache repair reports a change" \
@@ -2348,11 +2519,44 @@ printf 'fastcgi_cache fastcgicache;\nfastcgi_no_cache $cookie_xf_session $cookie
 tune_reset_changes
 ensure_xf_guest_cache "$TMP/xfguest"
 check "legacy direct-cookie bypass is replaced by the map variable" \
-  bash -c '! grep -q "fastcgi_no_cache.*cookie_xf_session" "$1" && grep -q "fastcgi_no_cache \$setup_xf_guest_bypass \$nocacheuri;" "$1"' _ "$TMP/xfguest/h5bp/php_xf.conf"
+  bash -c '! grep -q "fastcgi_no_cache.*cookie_xf_session" "$1" && grep -q "fastcgi_no_cache \$setup_xf_guest_bypass \$nocacheuri \$req_encoded_path \$cache_uri_tracking;" "$1"' _ "$TMP/xfguest/h5bp/php_xf.conf"
+check "legacy bypass conversion keeps the encoded-path guard" \
+  grep -q 'fastcgi_cache_bypass \$setup_xf_guest_bypass \$nocacheuri \$req_encoded_path;' "$TMP/xfguest/h5bp/php_xf.conf"
 tune_reset_changes
 ensure_xf_guest_cache "$TMP/xfguest"
 check "second XenForo conversion records no change" \
   test "${#TUNE_CHANGES[@]}" -eq 0
+# The repository's own lines carry the encoded-path and tracking-parameter
+# guards; --optimize used to rewrite them to the bare map on every run.
+printf 'location @xf_guest_cache {\nfastcgi_cache fastcgicache;\nfastcgi_no_cache        $xf_guest_cookie $nocacheuri $xf_api_request $req_encoded_path $cache_uri_tracking;\nfastcgi_cache_bypass    $xf_guest_cookie $nocacheuri $xf_api_request $req_encoded_path;\n}\n' \
+  > "$TMP/xfguest/h5bp/php_xf.conf"
+tune_reset_changes
+ensure_xf_guest_cache "$TMP/xfguest" >/dev/null 2>&1
+check "repository XenForo no_cache line keeps its tracking and encoded-path guards" \
+  grep -q '^fastcgi_no_cache        \$xf_guest_cookie \$nocacheuri \$xf_api_request \$req_encoded_path \$cache_uri_tracking;$' "$TMP/xfguest/h5bp/php_xf.conf"
+check "repository XenForo bypass line keeps its encoded-path guard" \
+  grep -q '^fastcgi_cache_bypass    \$xf_guest_cookie \$nocacheuri \$xf_api_request \$req_encoded_path;$' "$TMP/xfguest/h5bp/php_xf.conf"
+# PHP folds ".", " " and "[" in a cookie name into "_" (and a percent sign
+# in a name bypasses as a margin): each of
+# these logs a member in, so each must bypass the guest cache.
+xf_ck_res=$(sed -n 's/^[[:space:]]*"~\*\{0,1\}\(.*\)"[[:space:]]*1;$/\1/p' "$TMP/xfguest/http.d/zz-setup-fastcgi-cache-map.conf")
+xf_ck_match() { # cookie header -> 0 when any bypass pattern matches
+  local re
+  while IFS= read -r re; do
+    [[ -n $re ]] || continue
+    perl -e 'exit(($ARGV[1] =~ /$ARGV[0]/i) ? 0 : 1)' "$re" "$1" && return 0
+  done <<<"$xf_ck_res"
+  return 1
+}
+xf_ck_guest() { ! xf_ck_match "$1"; }
+for ck in 'xf_session=abc' 'xf.session=abc' 'xf session=abc' 'xf[session=abc' 'xf%5Fsession=abc' 'forum_session=abc' 'forum.user=1' \
+          'a=1; xf.user=1,tok' 'xf_session_admin=x' 'xf.tfa.trust=t' 'xf.session.admin=s' 'x%66_session=abc'; do
+  check "XenForo bypass map treats '${ck}' as a member" xf_ck_match "$ck"
+done
+for ck in 'xf_csrf=abc' 'consent=a%2Cb; xf_csrf=x' '_hjSessionUser_12=x' 'ajs_user_id=7' '_pk_id.1.1fff=abc' 'xf_style_id=2; xf_language_id=1' '_ga=GA1.2.3'; do
+  check "XenForo bypass map keeps '${ck}' a cacheable guest" xf_ck_guest "$ck"
+done
+unset -f xf_ck_match xf_ck_guest; unset xf_ck_res ck
 
 # A real include is one `location ~ \.php` block: the injected block must land
 # inside the braces (server-context directives would also cache the admin and
@@ -2828,6 +3032,22 @@ app_persistent_db_configs() { printf '1'; }
 mariadb_compute_profile 2048
 check "one persistent application doubles the per-worker connection allowance" \
   test "$MARIADB_PROFILE_MAX_CONN" -eq 410 -a "$MARIADB_PROFILE_PERSISTENT_APPS" -eq 1
+# --- audit 1.21.58: planner
+# The 2000 cap never falls below the connections persistent applications
+# hold open by themselves (c14): 600 workers x (3 persistent + 1) + 50.
+php_pool_max_children() { printf '600'; }
+app_persistent_db_configs() { printf '3'; }
+mariadb_compute_profile 2048
+check "max_connections cap rises to the persistent connection need" \
+  test "$MARIADB_PROFILE_MAX_CONN" -eq $(( 600 * 4 + 50 ))
+# Without persistent applications the flat 2000 cap still applies.
+php_pool_max_children() { printf '1600'; }
+app_persistent_db_configs() { printf '0'; }
+mariadb_compute_profile 2048
+check "max_connections keeps the 2000 cap without persistent applications" \
+  test "$MARIADB_PROFILE_MAX_CONN" -eq 2000
+php_pool_max_children() { printf '144'; }
+app_persistent_db_configs() { printf '1'; }
 unset -f mariadb
 app_persistent_db_configs() { printf '0'; }  # keep the stub: unset -f would drop the real function too
 php_pool_max_children() { printf '128'; }
@@ -3263,6 +3483,52 @@ check "explicit sizes that crowd out the ES direct share report an overcommit" t
 check "explicit MariaDB size is reserved verbatim" test "$OPT_MARIADB_BUDGET_MB" -eq 20000
 check "explicit Valkey size is reserved verbatim" test "$OPT_VALKEY_BUDGET_MB" -eq 4096
 check "the flexible tiers absorb the squeeze" test "$OPT_ES_BUDGET_MB" -eq 512
+# --- audit 1.21.58: planner
+
+# An explicit --php children= is booked as written: the pool writer starts N
+# workers, so the data tier must not be sized into their RAM (c12).
+# Arguments: reset pending (0/1), live MariaDB data MB.
+explicit_php_plan() {
+  (
+    effective_cpus() { printf '8'; }
+    hugepages_reserved_mb() { printf '0'; }
+    php_primary_version() { printf '8.5'; }
+    php_worker_allowance_mb() { printf '100'; }
+    php_pool_max_children() { printf '0'; }
+    maria_data_stub=${2:-0}
+    mariadb_data_size_mb() { printf '%s' "$maria_data_stub"; }
+    OPT_DETECTED=(php:8.5 mariadb)
+    OPT_PLAN_RESET_PENDING=${1:-0}
+    plan_memory_budget 2>/dev/null
+    printf '%s %s %s %s' "$OPT_PHP_CHILDREN" "$OPT_PHP_BUDGET_MB" "$OPT_MEM_OVERCOMMIT_MB" "$OPT_MARIADB_BUDGET_MB"
+  )
+}
+rm -f "$SETUP_STATE_DIR/explicit-options.conf"
+read -r base_kids _ _ _ <<<"$(explicit_php_plan 0)"
+printf 'php_children=200\nmariadb_size_mb=20000\n' > "$SETUP_STATE_DIR/explicit-options.conf"
+read -r ex_kids ex_budget ex_over _ <<<"$(explicit_php_plan 0)"
+check "plan: an explicit --php children= is booked in full (children and budget)" \
+  test "$ex_kids" -eq 200 -a "$ex_budget" -eq 20000
+check "plan: an explicit pool that does not fit is reported as an overcommit" \
+  test "$ex_over" -gt 0
+# More than half the 26214 MB service budget: a flexible (measured, 15000 MB)
+# MariaDB is trimmed to what the 200 x 100 MB pool leaves, not handed the
+# half-budget split, so nothing overcommits.
+printf 'php_children=200\n' > "$SETUP_STATE_DIR/explicit-options.conf"
+read -r fx_kids _ fx_over fx_maria <<<"$(explicit_php_plan 0 15000)"
+check "plan: a large explicit pool trims a flexible MariaDB instead of overcommitting" \
+  test "$fx_kids" -eq 200 -a "$fx_maria" -le $(( 32768 * 80 / 100 - 20000 )) -a "$fx_over" -eq 0
+# --optimize --dry-run: the real run moves explicit-options.conf away before
+# planning, so the preview must plan without it (c8).
+read -r dry_kids _ _ _ <<<"$(explicit_php_plan 1)"
+check "plan: a pending profile reset hides explicit sizes from the preview" \
+  test "$dry_kids" -eq "$base_kids" -a "$dry_kids" -ne 200
+check "plan_explicit_option returns nothing while a reset is pending" \
+  test -z "$(OPT_PLAN_RESET_PENDING=1 plan_explicit_option php_children 2>/dev/null || true)"
+check "plan_explicit_option reads the file when no reset is pending" \
+  test "$(OPT_PLAN_RESET_PENDING=0 plan_explicit_option php_children)" = 200
+rm -f "$SETUP_STATE_DIR/explicit-options.conf"
+unset -f explicit_php_plan
 rm -f "$SETUP_STATE_DIR/explicit-options.conf"
 
 # record_explicit_options writes the sizes the installers used to record.
@@ -3403,6 +3669,24 @@ effective_cpus() { printf 2; }
 check "angie_brotli_level drops to 3 on a 2 CPU host" \
   test "$(angie_brotli_level)" = 3
 effective_cpus() { printf 16; }
+# zstd level: explicit (0 = off), else 3.
+check "angie_zstd_level defaults to 3" test "$(angie_zstd_level)" = 3
+check "angie_zstd_level honours SETUP_ZSTD_LEVEL" test "$(SETUP_ZSTD_LEVEL=6 angie_zstd_level)" = 6
+check "angie_zstd_level 0 turns zstd off" test "$(SETUP_ZSTD_LEVEL=0 angie_zstd_level)" = 0
+check "angie_zstd_level ignores an invalid value" test "$(SETUP_ZSTD_LEVEL=22 angie_zstd_level)" = 3
+check "angie_zstd_level never offers an --ultra level" test "$(SETUP_ZSTD_LEVEL=20 angie_zstd_level)" = 3
+# The filter loaded last runs first: zstd must load after Brotli or Brotli
+# answers every client (measured: 40-zstd.conf never sent zstd).
+zstd_after_brotli() {
+  local body; body=$(declare -f ensure_angie_compression)
+  grep -q '60-zstd.conf' <<<"$body" && grep -q '50-brotli.conf' <<<"$body" \
+    && ! grep -q 'commit_if_changed "${enabled}/40-zstd.conf"' <<<"$body"
+}
+check "the zstd module stanza sorts after the Brotli one" zstd_after_brotli
+check "a 40-zstd.conf left by an older release is moved away" \
+  bash -c 'grep -q "zstd_drop=(\"\${enabled}/40-zstd.conf\")" "$1"' _ "$ROOT/lib/web.sh"
+unset -f zstd_after_brotli
+check "asset precompression is on by default" test "$PRECOMPRESS_ASSETS" = 1
 
 # --basic server= is persisted and honoured by host_server_type.
 # ENABLED is "declare -A" in lib/cli.sh (sourced at run time): the keys are
@@ -3534,6 +3818,41 @@ check "precompress_static_assets is incremental" \
 rm "$TMP/assets/js/app.js"
 precompress_static_assets "$TMP/assets" >/dev/null
 check "precompress_static_assets removes orphaned siblings" test ! -e "$TMP/assets/js/app.js.gz"
+# A source that shrinks to 1 KiB or less loses its sibling: the old pass
+# skipped small files, so the stale .gz of the larger version stayed served.
+head -c 3000 /dev/zero | tr '\0' 'c' > "$TMP/assets/js/shrink.js"
+precompress_static_assets "$TMP/assets" >/dev/null
+head -c 900 /dev/zero | tr '\0' 'd' > "$TMP/assets/js/shrink.js"
+touch -d '+1 minute' "$TMP/assets/js/shrink.js"
+precompress_static_assets "$TMP/assets" >/dev/null
+check "a source that shrank below 1 KiB loses its stale sibling" test ! -e "$TMP/assets/js/shrink.js.gz"
+# A rollback restores an older mtime: the sibling must be rebuilt, not kept.
+head -c 4000 /dev/zero | tr '\0' 'e' > "$TMP/assets/js/roll.js"
+precompress_static_assets "$TMP/assets" >/dev/null
+head -c 4000 /dev/zero | tr '\0' 'f' > "$TMP/assets/js/roll.js"
+touch -d '2001-01-01' "$TMP/assets/js/roll.js"
+precompress_static_assets "$TMP/assets" >/dev/null
+check "a source restored with an older mtime is recompressed" \
+  test "$(gzip -dc "$TMP/assets/js/roll.js.gz" | head -c 1)" = f
+check "the rebuilt sibling carries the restored mtime" \
+  bash -c '[[ ! $1 -nt $2 && ! $1 -ot $2 ]]' _ "$TMP/assets/js/roll.js" "$TMP/assets/js/roll.js.gz"
+# Turning precompression off removes the siblings the helper made (same
+# mtime as the source) and keeps a hand-made one.
+head -c 4000 /dev/zero | tr '\0' 'g' > "$TMP/assets/js/hand.js"
+gzip -9 -n -c "$TMP/assets/js/hand.js" > "$TMP/assets/js/hand.js.gz"
+touch -d '2002-02-02' "$TMP/assets/js/hand.js.gz"
+check "precompress_remove_siblings reports what it removed" \
+  test "$(precompress_remove_siblings "$TMP/assets")" -ge 1
+check "precompress_remove_siblings removes managed siblings" test ! -e "$TMP/assets/js/roll.js.gz"
+check "precompress_remove_siblings keeps a hand-made sibling" test -e "$TMP/assets/js/hand.js.gz"
+check "precompress_remove_siblings keeps the sources" test -s "$TMP/assets/js/roll.js"
+# The cron helper (CRON_PRECOMPRESS is readonly, so read the generator)
+# carries the remove function and its --remove mode.
+pc_helper_has() { declare -f write_precompress_helper | grep -q -- "$1"; }
+check "the precompress helper embeds precompress_remove_siblings" \
+  pc_helper_has "precompress_static_assets precompress_remove_siblings"
+check "the precompress helper has a --remove mode" pc_helper_has "--remove"
+unset -f pc_helper_has
 
 
 # --purge restores paired sysctls in an order the kernel accepts: the
@@ -4472,6 +4791,19 @@ check "app detection finds XenForo" grep -qx $'xenforo\t'"$TMP/apps/xf/public" <
 check "app detection finds Chevereto" grep -qx $'chevereto\t'"$TMP/apps/chev/public" <<<"$app_roots"
 check "app detection lists each document root once" test "$(wc -l <<<"$app_roots" | tr -d ' ')" = 3
 check "app detection ignores an unrelated directory" not grep -q plain <<<"$app_roots"
+# PHP 8.6 cautions (1.21.58 audit: XenForo 2.3.13 debug mode 500s, Braintree
+# and laminas-mail do not compile): XenForo only, 8.6 and later, never a block.
+php_upgrade_app_cautions 8.6 "$TMP/apps"
+check "a XenForo root gets a PHP 8.6 caution" \
+  test "${#PHP_UPGRADE_CAUTIONS[@]}" -eq 1 -a "${PHP_UPGRADE_CAUTIONS[0]:-}" = "xenforo|$TMP/apps/xf/public"
+php_upgrade_app_cautions 8.7 "$TMP/apps"
+check "the XenForo caution also applies above 8.6" test "${#PHP_UPGRADE_CAUTIONS[@]}" -eq 1
+php_upgrade_app_cautions 8.5 "$TMP/apps"
+check "PHP 8.5 carries no XenForo caution" test "${#PHP_UPGRADE_CAUTIONS[@]}" -eq 0
+check "the caution names debug mode and the vendor libraries" \
+  bash -c '[[ $1 == *"debug mode answers 500"* && $1 == *Braintree* && $1 == *laminas-mail* ]]' _ \
+  "$(UPGRADE_PHP=8.6 php_upgrade_describe_caution "xenforo|$TMP/apps/xf/public")"
+PHP_UPGRADE_CAUTIONS=()
 rm -f "$TMP/apps/chev/public/app/bin/legacy"
 app_roots=$(php_upgrade_app_roots "$TMP/apps")
 check "Chevereto needs only app/env.php, like the --optimize detector" \
@@ -4621,6 +4953,113 @@ check "an unknown module list installs nothing (no guessing)" \
   test "$(pe_run chevereto "$TMP/apps/chev/public" "" 1)" = ""
 check "--domain maps app=xf to the XenForo requirements" \
   grep -qF 'case $app in xf) req_app=xenforo ;; *) req_app=$app ;; esac' "$ALL_SRC"
+# --- audit 1.21.58: php-upgrade
+
+# --upgrade-php on multi-version hosts, same-version runs, rejected migrations
+mkdir -p "$TMP/ovl/php/8.3/fpm/conf.d" "$TMP/ovl/php/8.3/fpm/pool.d" \
+         "$TMP/ovl/php/8.5/fpm/conf.d" "$TMP/ovl/php/8.5/fpm/pool.d" "$TMP/ovl/angie/sites"
+printf 'memory_limit = 512M\n' > "$TMP/ovl/php/8.3/fpm/conf.d/90-local.ini"
+printf 'date.timezone = UTC\n' > "$TMP/ovl/php/8.3/fpm/conf.d/custom_dan.ini"
+ln -sf ../../mods-available/redis.ini "$TMP/ovl/php/8.3/fpm/conf.d/20-redis.ini"
+printf '[www]\nlisten = /run/php/php8.3-fpm.sock\n' > "$TMP/ovl/php/8.3/fpm/pool.d/www.conf"
+printf '[shop]\nlisten = /run/php/php8.3-fpm-shop.sock\n' > "$TMP/ovl/php/8.3/fpm/pool.d/shop.conf"
+printf '[www]\nlisten = /run/php/php-fpm.sock\n' > "$TMP/ovl/php/8.5/fpm/pool.d/www.conf"
+printf '[api]\nlisten = /run/php/php8.5-fpm-api.sock\n' > "$TMP/ovl/php/8.5/fpm/pool.d/api.conf"
+printf 'location ~ \\.php$ { fastcgi_pass unix:/run/php/php8.3-fpm.sock; }\n' > "$TMP/ovl/angie/sites/legacy.conf"
+ovl_run() { # old [fpm-installed-versions] -> loss lines joined by |
+  ( OVL_FPM=${2:-8.3 8.5}
+    php_upgrade_any_versions() { printf '8.3\n8.5\n'; }
+    php_upgrade_installed_versions() { printf '%s\n' $OVL_FPM; }
+    php_upgrade_other_version_losses "$1" "$TMP/ovl/php" "$TMP/ovl/angie" | paste -sd'|' - )
+}
+ovl_out=$(ovl_run 8.5)
+check "--upgrade-php names another version's custom ini" \
+  grep -qF $'8.3\tini\tfpm/conf.d/90-local.ini' <<<"$ovl_out"
+check "--upgrade-php names another version's extra pool and its socket" \
+  grep -qF $'8.3\tpool\tshop.conf (listen = /run/php/php8.3-fpm-shop.sock)' <<<"$ovl_out"
+check "--upgrade-php names another version's www socket a vhost uses" \
+  grep -qF $'8.3\tlistener\t/run/php/php8.3-fpm.sock (used by '"$TMP/ovl/angie/sites/legacy.conf)" <<<"$ovl_out"
+check "managed and package-owned fragments are not reported as losses" \
+  not grep -qE 'custom_dan|20-redis' <<<"$ovl_out"
+check "the version being upgraded is not reported (it is migrated)" \
+  test "$(tr '|' '\n' <<<"$ovl_out" | grep -c .)" -eq 3
+check "upgrading the other version reports this one's extra pool" \
+  grep -qF $'8.5\tpool\tapi.conf' <<<"$(ovl_run 8.3)"
+check "a removed-not-purged FPM's pools and listener are not losses, its custom ini is" \
+  test "$(ovl_run 8.5 8.5)" = $'8.3\tini\tfpm/conf.d/90-local.ini'
+rm -f "$TMP/ovl/php/8.3/fpm/pool.d/shop.conf" "$TMP/ovl/php/8.3/fpm/conf.d/90-local.ini" "$TMP/ovl/angie/sites/legacy.conf"
+check "an unused stock second PHP-FPM does not block the upgrade" test -z "$(ovl_run 8.5)"
+# Every setup template and Angie's upstream use the shared socket; the target's
+# www pool keeps it, so a stale second version on it is not a loss.
+printf '[www]\nlisten = /run/php/php-fpm.sock\n' > "$TMP/ovl/php/8.3/fpm/pool.d/www.conf"
+printf 'upstream php { server unix:/run/php/php-fpm.sock; }\n' > "$TMP/ovl/angie/angie.conf"
+check "a second version on the shared socket the target keeps does not block" \
+  test -z "$(ovl_run 8.5)"
+mv "$TMP/ovl/php/8.5/fpm/pool.d/www.conf" "$TMP/ovl/php/8.5/fpm/pool.d/www.conf.off"
+check "with no old www pool the target's template socket is still kept" \
+  test -z "$(ovl_run 8.5)"
+printf '[www]\nlisten = /run/php/php8.5-fpm.sock\n' > "$TMP/ovl/php/8.5/fpm/pool.d/www.conf"
+check "the shared socket is a loss when the old version listens elsewhere" \
+  grep -qF $'8.3\tlistener\t/run/php/php-fpm.sock (used by '"$TMP/ovl/angie/angie.conf)" <<<"$(ovl_run 8.5)"
+check "a loss line names the version, the pool and the consequence" \
+  grep -qF 'PHP 8.3 extra FPM pool shop.conf would be deleted' <<<"$(php_upgrade_describe_other_loss $'8.3\tpool\tshop.conf')"
+
+sv_run() { # pending-list published-exts -> "rc installed|pending|repo-calls"
+  (
+    mkdir -p "$TMP/sv"; printf '%s\n' $1 > "$TMP/sv/pending"; : > "$TMP/sv/installed"; : > "$TMP/sv/repo"
+    PHP_UPGRADE_PENDING_FILE="$TMP/sv/pending"; SV_PUB=" $2 "
+    configure_php_repo() { echo repo >> "$TMP/sv/repo"; }; apt_update() { :; }
+    php_upgrade_unversioned_only() { return 1; }
+    dpkg-query() { :; }
+    apt-cache() { [[ $SV_PUB == *" ${2#php8.6-} "* ]]; }
+    apt_install() { printf '%s\n' "$@" >> "$TMP/sv/installed"; }
+    systemctl() { :; }; ok() { :; }; info() { :; }; warn() { :; }
+    rc=0; php_upgrade_same_version 8.6 >/dev/null 2>&1 || rc=$?
+    printf '%s %s|%s|%s\n' "$rc" "$(paste -sd, - < "$TMP/sv/installed")" \
+      "$(cat "$TMP/sv/pending" 2>/dev/null | paste -sd, -)" "$(grep -c . "$TMP/sv/repo")"
+  )
+}
+check "a same-version run installs only the newly published pending extension" \
+  test "$(sv_run 'imagick redis' imagick)" = "1 php8.6-imagick|redis|1"
+check "a same-version run clears the pending list once everything is installed" \
+  test "$(sv_run imagick imagick)" = "0 php8.6-imagick||1"
+check "a same-version run with nothing pending touches nothing" \
+  test "$(sv_run '' imagick)" = "0 ||0"
+upg_body=$(sed -n '/^run_php_upgrade()/,/^}/p' "$ALL_SRC")
+check "--upgrade-php to the serving version never reaches the snapshot or purge" \
+  bash -c 'a=$(grep -n "php_upgrade_same_version \"\$target\"" <<<"$1" | cut -d: -f1); b=$(grep -n "php_upgrade_snapshot \"\$old\"" <<<"$1" | cut -d: -f1); [[ -n $a && -n $b && $a -lt $b ]]' _ "$upg_body"
+check "--upgrade-php refuses other versions' losses before the snapshot" \
+  bash -c 'a=$(grep -n "SETUP_PHP_PURGE_OTHER_VERSIONS:-0" <<<"$1" | cut -d: -f1); b=$(grep -n "php_upgrade_snapshot \"\$old\"" <<<"$1" | cut -d: -f1); [[ -n $a && -n $b && $a -lt $b ]]' _ "$upg_body"
+check "the dry run names the same source version as the real run" \
+  bash -c 'sed -n "/^php_upgrade_plan()/,/^}/p" "$1" | grep -q "old=\$(php_primary_version"' _ "$ALL_SRC"
+
+mc_run() { # fpm-test-binary -> "rc redis bad-ini bad-cli-link bad-pool list"
+  (
+    M="$TMP/mc"; rm -rf "$M"
+    mkdir -p "$M/man/php-config/8.4/fpm/conf.d" "$M/man/php-config/8.4/fpm/pool.d" \
+             "$M/etc/8.6/fpm/conf.d" "$M/etc/8.6/fpm/pool.d" "$M/etc/8.6/cli/conf.d" "$M/etc/8.6/mods-available"
+    PHP_UPGRADE_MANIFEST_DIR="$M/man"; MC_BIN=$1
+    printf 'extension=redis.so\n' > "$M/man/php-config/8.4/fpm/conf.d/20-redis.ini"
+    printf 'zend_extension=/nonexistent/x.so\n' > "$M/man/php-config/8.4/fpm/conf.d/99-bad.ini"
+    printf '[bad]\nlisten = /run/php/bad.sock\n' > "$M/man/php-config/8.4/fpm/pool.d/bad.conf"
+    printf 'fpm/conf.d/20-redis.ini\t\nfpm/conf.d/99-bad.ini\tcli/conf.d\n' > "$M/man/custom-inis.txt"
+    printf 'bad.conf\n' > "$M/man/custom-pools.txt"
+    printf 'extension=redis.so\n' > "$M/etc/8.6/mods-available/redis.ini"
+    ln -s ../../mods-available/redis.ini "$M/etc/8.6/fpm/conf.d/20-redis.ini"
+    php_fpm_binary() { printf '%s\n' "$MC_BIN"; }
+    systemctl() { return 1; }; ok() { :; }; warn() { :; }
+    has() { if [[ -e $1 || -L $1 ]]; then printf yes; else printf no; fi; }
+    rc=0; php_upgrade_migrate_custom 8.4 8.6 "$M/etc" >/dev/null 2>&1 || rc=$?
+    printf '%s %s %s %s %s %s\n' "$rc" \
+      "$([[ -L $M/etc/8.6/fpm/conf.d/20-redis.ini ]] && printf kept || printf lost)" \
+      "$(has "$M/etc/8.6/fpm/conf.d/99-bad.ini")" "$(has "$M/etc/8.6/cli/conf.d/99-bad.ini")" \
+      "$(has "$M/etc/8.6/fpm/pool.d/bad.conf")" "$(has "$M/man/custom-inis.applied.txt")"
+  )
+}
+check "a rejected migration removes what it migrated and keeps the package's 20-redis.ini" \
+  test "$(mc_run false)" = "1 kept no no no no"
+check "an accepted migration keeps the migrated ini, its link, the pool and the package's ini" \
+  test "$(mc_run true)" = "0 kept yes yes yes yes"
 
 # apt_update: a repository mid-sync gets the long waits, anything else the
 # three quick tries; the last failure names the reason.
@@ -5151,6 +5590,139 @@ check "a multi-line realip guard is disabled as a block" \
   bash -c '! grep -qE "^(if|[[:space:]]*return 444)" "$1"' _ "$multiline_vhost"
 check "the directive after a multi-line guard survives" \
   grep -q 'location / { return 200; }' "$multiline_vhost"
+# --- audit 1.21.58: anubis
+
+# The origin lockdown commented out of the socket-side vhost must come back on
+# the public terminator, or an origin that only accepts its edge proxy answers
+# anyone on 443 once Anubis is on.  Only guards this module commented (marked,
+# or live in the pre-integration copy) are carried; a guard the operator
+# commented by hand, a location-level guard, and a commented block whose
+# braces never close are not.
+mkdir -p "$TMP/anubis/lock" "$ANUBIS_STATE/vhosts"
+cat > "$TMP/anubis/lock/lock.test.conf" <<EOF2
+server {
+    listen unix:${ANUBIS_BACKEND_SOCKET};
+    server_name site-g.example;
+    ssl_certificate     /etc/angie/ssl/site-g.example/fullchain.pem;
+    ssl_certificate_key /etc/angie/ssl/site-g.example/privkey.pem;
+    if (\$realip_remote_addr != "203.0.113.23") {
+        return 444;
+    }
+    location /admin {
+        if (\$realip_remote_addr != "203.0.113.7") { return 403; }
+    }
+    root /var/www/site-g.example/public;
+}
+EOF2
+cat > "$TMP/anubis/lock/open.test.conf" <<EOF2
+server {
+    listen unix:${ANUBIS_BACKEND_SOCKET};
+    server_name site-h.example;
+    ssl_certificate     /etc/angie/ssl/site-h.example/fullchain.pem;
+    ssl_certificate_key /etc/angie/ssl/site-h.example/privkey.pem;
+    root /var/www/site-h.example/public;
+}
+EOF2
+anubis_disable_realip_guards "$TMP/anubis/lock/lock.test.conf" >/dev/null 2>&1
+anubis_render_terminators "$TMP/anubis/lock" "$TMP/anubis/lock-terminators.conf"
+lock_term=$(sed -n '/server_name site-g.example;/,/^}/p' "$TMP/anubis/lock-terminators.conf")
+open_term=$(sed -n '/server_name site-h.example;/,/^}/p' "$TMP/anubis/lock-terminators.conf")
+check "the socket-side vhost keeps its realip guard commented" \
+  grep -q '^#    if ($realip_remote_addr != "203.0.113.23") {' "$TMP/anubis/lock/lock.test.conf"
+check "the commented guard carries the setup.sh mark" \
+  grep -qF "#    if (\$realip_remote_addr != \"203.0.113.23\") {${ANUBIS_GUARD_MARK}" "$TMP/anubis/lock/lock.test.conf"
+check "the terminator re-applies the vhost's edge-proxy guard" \
+  bash -c 'printf "%s\n" "$1" | grep -qxF "    if (\$realip_remote_addr != \"203.0.113.23\") {" && printf "%s\n" "$1" | grep -qxF "        return 444;"' _ "$lock_term"
+check "the carried guard precedes every terminator location" \
+  bash -c 'g=$(printf "%s\n" "$1" | grep -n "realip_remote_addr" | head -1 | cut -d: -f1); l=$(printf "%s\n" "$1" | grep -n "location " | head -1 | cut -d: -f1); [[ -n $g && -n $l ]] && (( g < l ))' _ "$lock_term"
+check "a location-level realip guard is not lifted to the terminator" \
+  bash -c '! printf "%s\n" "$1" | grep -q "203.0.113.7"' _ "$lock_term"
+check "a vhost without a guard gets none on its terminator" \
+  bash -c '! printf "%s\n" "$1" | grep -q "realip_remote_addr"' _ "$open_term"
+check "every terminator server block balances its braces" \
+  awk '{ t = $0; sub(/#.*/, "", t); o = gsub(/{/, "{", t); c = gsub(/}/, "}", t); d += o - c; if (d < 0) exit 1 } END { exit d != 0 }' "$TMP/anubis/lock-terminators.conf"
+lock_md5=$(md5sum < "$TMP/anubis/lock-terminators.conf")
+anubis_render_terminators "$TMP/anubis/lock" "$TMP/anubis/lock-terminators.conf"
+check "re-rendering keeps exactly one carried guard" \
+  test "$lock_md5" = "$(md5sum < "$TMP/anubis/lock-terminators.conf")"
+
+# Turning the filter off without the pre-integration copy puts the moved
+# guard back in force on the public listener.
+cp "$TMP/anubis/lock/lock.test.conf" "$TMP/anubis/lock-deint.conf"
+anubis_deintegrate_vhost "$TMP/anubis/lock-deint.conf" >/dev/null 2>&1
+check "deintegration re-applies the moved edge-proxy guard" \
+  bash -c 'grep -qxF "    if (\$realip_remote_addr != \"203.0.113.23\") {" "$1" && grep -qx "        return 444;" "$1" && grep -qx "    }" "$1"' _ "$TMP/anubis/lock-deint.conf"
+check "deintegration re-applies the location-level guard in place" \
+  grep -qxF "        if (\$realip_remote_addr != \"203.0.113.7\") { return 403; }" "$TMP/anubis/lock-deint.conf"
+check "deintegration leaves no setup.sh guard mark behind" \
+  bash -c '! grep -qF "$2" "$1"' _ "$TMP/anubis/lock-deint.conf" "$ANUBIS_GUARD_MARK"
+
+# A guard the operator retired by hand (no mark, commented in the
+# pre-integration copy too) must stay retired: re-applying it at the public
+# listener would 444 every visitor, the current edge included.
+cat > "$TMP/anubis/lock/lock.test.conf" <<EOF2
+server {
+    listen unix:${ANUBIS_BACKEND_SOCKET};
+    server_name site-g.example;
+    ssl_certificate     /etc/angie/ssl/site-g.example/fullchain.pem;
+    ssl_certificate_key /etc/angie/ssl/site-g.example/privkey.pem;
+#if (\$realip_remote_addr != "203.0.113.9") { return 444; }
+    root /var/www/site-g.example/public;
+}
+EOF2
+sed -e "s#listen unix:${ANUBIS_BACKEND_SOCKET};#listen 443 ssl;#" \
+  "$TMP/anubis/lock/lock.test.conf" > "$ANUBIS_STATE/vhosts/lock.test.conf.orig"
+anubis_render_terminators "$TMP/anubis/lock" "$TMP/anubis/lock-terminators.conf"
+check "a guard commented by hand is not re-applied on the terminator" \
+  bash -c '! grep -q "realip_remote_addr" "$1"' _ "$TMP/anubis/lock-terminators.conf"
+cp "$TMP/anubis/lock/lock.test.conf" "$TMP/anubis/lock-deint.conf"
+anubis_deintegrate_vhost "$TMP/anubis/lock-deint.conf" >/dev/null 2>&1
+check "a guard commented by hand stays commented after deintegration" \
+  grep -qxF "#if (\$realip_remote_addr != \"203.0.113.9\") { return 444; }" "$TMP/anubis/lock-deint.conf"
+
+# A host enabled by a release that did not mark the guard: the guard that
+# was live in the pre-integration copy is still recognised and carried.
+cat > "$ANUBIS_STATE/vhosts/lock.test.conf.orig" <<EOF2
+server {
+    listen 443 ssl;
+    server_name site-g.example;
+    if (\$realip_remote_addr != "203.0.113.23") { return 444; }
+    root /var/www/site-g.example/public;
+}
+EOF2
+cat > "$TMP/anubis/lock/lock.test.conf" <<EOF2
+server {
+    listen unix:${ANUBIS_BACKEND_SOCKET};
+    server_name site-g.example;
+    ssl_certificate     /etc/angie/ssl/site-g.example/fullchain.pem;
+    ssl_certificate_key /etc/angie/ssl/site-g.example/privkey.pem;
+#    if (\$realip_remote_addr != "203.0.113.23") { return 444; }
+    root /var/www/site-g.example/public;
+}
+EOF2
+anubis_render_terminators "$TMP/anubis/lock" "$TMP/anubis/lock-terminators.conf"
+check "an unmarked guard that was live before Anubis is carried (older release)" \
+  grep -qxF "    if (\$realip_remote_addr != \"203.0.113.23\") { return 444; }" "$TMP/anubis/lock-terminators.conf"
+rm -f "$ANUBIS_STATE/vhosts/lock.test.conf.orig"
+
+cat > "$TMP/anubis/lock/lock.test.conf" <<EOF2
+server {
+    listen unix:${ANUBIS_BACKEND_SOCKET};
+    server_name site-g.example;
+    ssl_certificate     /etc/angie/ssl/site-g.example/fullchain.pem;
+    ssl_certificate_key /etc/angie/ssl/site-g.example/privkey.pem;
+#    if (\$realip_remote_addr != "203.0.113.23") {${ANUBIS_GUARD_MARK}
+#        return 444;
+    root /var/www/site-g.example/public;
+}
+EOF2
+anubis_render_terminators "$TMP/anubis/lock" "$TMP/anubis/lock-terminators.conf"
+check "a commented guard with unbalanced braces is not half-emitted" \
+  bash -c '! grep -q "realip_remote_addr" "$1"' _ "$TMP/anubis/lock-terminators.conf"
+cp "$TMP/anubis/lock/lock.test.conf" "$TMP/anubis/lock-deint.conf"
+anubis_deintegrate_vhost "$TMP/anubis/lock-deint.conf" >/dev/null 2>&1
+check "deintegration keeps an unbalanced commented guard commented" \
+  bash -c '! grep -q "^[[:space:]]*if (\$realip_remote_addr" "$1" && grep -q "^#        return 444;" "$1"' _ "$TMP/anubis/lock-deint.conf"
 
 # ---------------------------------------------------------------------------
 # --basic upgrade: needrestart runs after the upgrade, not from its APT hook
@@ -5693,6 +6265,24 @@ check "CPU_MITIGATIONS and XF_MEMBER_GZIP survive the --optimize pin reset" \
   bash -c 'printf "%s\n" "${@}" | grep -qx CPU_MITIGATIONS && printf "%s\n" "${@}" | grep -qx XF_MEMBER_GZIP' _ "${RESET_KEEP_PINS[@]}"
 check "--purge basic removes the mitigations drop-in" \
   bash -c 'sed -n "/^purge_basic()/,/^}/p" "$1" | grep -qF "CPU_MITIGATIONS_DROPIN"' _ "$ROOT/lib/purge.sh"
+# --- audit 1.21.58: os-purge
+# --purge basic must also drop the CPU_MITIGATIONS pin: setup.sh sources
+# /etc/default/setup-tuning on every run, so a leftover CPU_MITIGATIONS=off made
+# the next --optimize/--basic write the drop-in again.
+check "--purge basic clears the CPU_MITIGATIONS pin" \
+  bash -c 'sed -n "/^purge_basic()/,/^}/p" "$1" | grep -q "^[[:space:]]*purge_cpu_mitigations_pin"' _ "$ROOT/lib/purge.sh"
+mkdir -p "$TMP/mitpin"
+printf 'ANUBIS="1"\nCPU_MITIGATIONS="off"\nexport CPU_MITIGATIONS=off\nNODE_MAJOR="22"\n' > "$TMP/mitpin/setup-tuning"
+mitpin_out=$( (info() { :; }; warn() { :; }; CPU_MITIGATIONS=off; purge_cpu_mitigations_pin "$TMP/mitpin/setup-tuning"; printf '%s' "$CPU_MITIGATIONS") )
+check "the CPU_MITIGATIONS pin (plain and export form) is removed" \
+  not grep -q CPU_MITIGATIONS "$TMP/mitpin/setup-tuning"
+check "other pins survive the CPU_MITIGATIONS removal" \
+  bash -c 'grep -qx "ANUBIS=\"1\"" "$1" && grep -qx "NODE_MAJOR=\"22\"" "$1"' _ "$TMP/mitpin/setup-tuning"
+check "the running process forgets CPU_MITIGATIONS after the purge" test -z "$mitpin_out"
+# Called in this shell, not via bash -c: the lib functions are sourced, not exported.
+check "clearing the pin without a pin file is a no-op" \
+  purge_cpu_mitigations_pin "$TMP/mitpin/missing"
+check "no pin file is created when none existed" test ! -e "$TMP/mitpin/missing"
 check "--basic and --optimize both apply the mitigations choice" \
   bash -c 'sed -n "/^install_basic()/,/^}/p" "$1" | grep -q configure_cpu_mitigations && sed -n "/^run_os_tuning()/,/^}/p" "$2" | grep -q configure_cpu_mitigations' \
   _ "$ROOT/lib/os.sh" "$ROOT/lib/restart.sh"
@@ -6472,6 +7062,43 @@ check "post-Angie refresh: a clean pass prints nothing and reloads nothing" \
 out=$(refresh_case 1)
 check "post-Angie refresh: a changing pass reports under its own PHP heading and reloads" \
   bash -c 'grep -qx "## PHP 8.5 (post-Angie refresh)" <<<"$1" && grep -q "section rewritten (post-Angie refresh)" <<<"$1" && grep -q "PHP 8.5: reloaded after the post-Angie ini refresh" <<<"$1"' _ "$out"
+# --- audit 1.21.58: planner
+
+# A refresh rejected by php-fpm -t is rolled back to what the PHP pass wrote,
+# not left on disk for the next restart (s2).  The helper hard-codes
+# /etc/php/<ver>; a relative version walks out to a scratch tree, which needs
+# /etc/php to exist for path resolution.
+if [[ -d /etc/php ]]; then
+  refresh_dir="$TMP/php-refresh"
+  mkdir -p "$refresh_dir/fpm/pool.d"
+  printf 'pm.max_children = 16\n' > "$refresh_dir/fpm/pool.d/www.conf"
+  refresh_ver="../..${refresh_dir}"
+  out=$(
+    eval "$(sed -n '/^php_refresh_after_angie() {/,/^}/p' "$ROOT/lib/service-optimizers.sh")"
+    REPORT_LINES=()
+    opt_report() { REPORT_LINES+=("$*"); }
+    warn() { :; }
+    php_fpm_versions() { printf '%s\n' "$refresh_ver"; }
+    tune_reset_changes() { TUNE_CHANGES=(); TUNE_DIRTY=0; }
+    tune_php_fpm_version() {
+      printf 'pm.max_children = broken\n' > "$refresh_dir/fpm/pool.d/www.conf"
+      printf 'x\n' > "$refresh_dir/fpm/pool.d/new.conf"
+      return 1
+    }
+    systemctl() { return 0; }
+    OPT_PHP_OK=1
+    php_refresh_after_angie opt_report "- " >/dev/null 2>&1 || true
+    printf '%s\n' "${REPORT_LINES[@]}"
+  )
+  check "post-Angie refresh: a rejected pool is restored to the PHP pass result" \
+    grep -qxF 'pm.max_children = 16' "$refresh_dir/fpm/pool.d/www.conf"
+  check "post-Angie refresh: a file the failed refresh created is moved out" \
+    test ! -e "$refresh_dir/fpm/pool.d/new.conf"
+  check "post-Angie refresh: the failure is reported as rolled back" \
+    bash -c 'grep -q "rolled back to the PHP pass result" <<<"$1"' _ "$out"
+else
+  t_skip "post-Angie refresh rollback (no /etc/php on this host)"
+fi
 
 printf '\nTOTAL pass=%d fail=%d skip=%d\n' "$PASS" "$FAIL" "$SKIP"
 [[ $FAIL -eq 0 ]]

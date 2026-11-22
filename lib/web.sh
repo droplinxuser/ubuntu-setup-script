@@ -43,15 +43,34 @@ tune_size_value() { mb_to_config "$1"; }
 # Cache budget in MB: 25% of RAM, capped at 5% of free disk, then rounded
 # down to 256 MB.  The rounding keeps small free-space changes between runs
 # (backups, logs) from resizing every cache zone and forcing a restart.
+# An optional fifth argument is a hard ceiling in MB, applied after the
+# floor: angie_cache_budget_mb passes half of the space actually free, so a
+# nearly full disk never gets a max_size it cannot hold (the 10% share of an
+# Angie-only host on the 10x-free basis, or the 256 MB floor, could reach all
+# of it).  It only binds on a nearly full disk, so normal hosts keep a stable
+# budget between runs.
 tune_cache_total_mb() {
-  local ram_mb=$1 disk_free_mb=$2 ram_pct=${3:-25} disk_pct=${4:-5} total
+  local ram_mb=$1 disk_free_mb=$2 ram_pct=${3:-25} disk_pct=${4:-5} cap=${5:-} total
   total=$(( ram_mb * ram_pct / 100 ))
   (( total > 65536 )) && total=65536
   (( total > disk_free_mb * disk_pct / 100 )) && total=$(( disk_free_mb * disk_pct / 100 ))
   (( total < 256 )) && total=256
   total=$(( total / 256 * 256 ))
   (( total < 256 )) && total=256
+  if [[ $cap =~ ^[0-9]+$ ]] && (( total > cap )); then
+    total=$(( cap / 64 * 64 ))
+    (( total < 64 )) && total=64
+  fi
   printf '%s' "$total"
+}
+
+# Half of the space free on the cache filesystem, in MB (empty if unknown).
+angie_cache_disk_cap_mb() {
+  local dir=/home avail
+  [[ -d $dir ]] || dir=/var/www
+  avail=$(df -Pm "$dir" 2>/dev/null | awk 'NR==2{print $4}' || true)
+  [[ $avail =~ ^[0-9]+$ ]] && printf '%s' $(( avail / 2 ))
+  return 0
 }
 
 # Angie cache budget for the current service set.  A dedicated Angie proxy
@@ -78,7 +97,7 @@ angie_cache_budget_mb() {
       pct=30
     fi
   fi
-  tune_cache_total_mb "$ram_mb" "$disk_free_mb" "$pct" "$disk_pct"
+  tune_cache_total_mb "$ram_mb" "$disk_free_mb" "$pct" "$disk_pct" "$(angie_cache_disk_cap_mb)"
 }
 
 # Pick the first existing file from a list.  Older server-configs-nginx
@@ -1808,26 +1827,46 @@ app_db_host_is_local() {
 }
 
 # Precompress the static assets under one document root so brotli_static and
-# gzip_static serve .br/.gz siblings instead of compressing on every request
-# (serving one 177 KB XenForo script compressed per request cost 50-89% of a
-# 16-core host at 1.8k req/s).  Incremental: a sibling is (re)built only when
-# missing or older than its source, orphaned siblings are removed, a sibling
-# that is not smaller is dropped, and mtime/ownership follow the source so a
-# rerun is a no-op.  Images, woff2 and the application data directories are
-# skipped.  Prints the number of siblings written.
+# gzip_static serve .br/.gz siblings instead of
+# compressing on every request (one 177 KB XenForo script compressed per
+# request: 2,100 req/s at 3.8 ms of Angie CPU each on the Xeon E-2236 test
+# host, 22,000 req/s uncompressed).  Incremental: a sibling carries its source's
+# mtime and is (re)built whenever the two differ in either direction (a
+# rollback with tar/rsync -a/cp -p restores an older mtime), orphaned siblings
+# are removed, a sibling that is not smaller is dropped, and ownership follows
+# the source so a rerun is a no-op.  A source of 1 KiB or less is not worth a
+# sibling, and one that shrank below that loses the sibling it had: the old
+# rule skipped small files entirely, so a 3 KB script replaced by a 900-byte
+# one kept serving the old siblings to every compressing client.  The source's
+# size and mtime are read before compressing and checked again afterwards; a
+# file rewritten mid-way (an upgrade during the 5-minute cron) is left for the
+# next run instead of being stamped fresh with stale content.  Images, woff2
+# and the application data directories are skipped.  Prints the number of
+# siblings written.
 precompress_static_assets() {
-  local root=$1 f out tmp ext n=0 have_brotli=0
+  local root=$1 f out tmp ext n=0 have_brotli=0 before
   [[ -d $root ]] || { printf 0; return 0; }
   command -v brotli >/dev/null 2>&1 && have_brotli=1
   while IFS= read -r -d '' f; do
+    before=$(stat -c '%y %s' "$f" 2>/dev/null) || continue
+    if (( ${before##* } <= 1024 )); then
+      rm -f "${f}.gz" "${f}.br"
+      continue
+    fi
     for ext in gz br; do
-      [[ $ext == br && $have_brotli -eq 0 ]] && continue
       out="${f}.${ext}"
-      [[ ! -e $out || $f -nt $out ]] || continue
+      if [[ $ext == br && $have_brotli -eq 0 ]]; then
+        # No CLI to rebuild it: a sibling that no longer matches must go.
+        [[ -e $out && ( $f -nt $out || $f -ot $out ) ]] && rm -f "$out"
+        continue
+      fi
+      [[ ! -e $out || $f -nt $out || $f -ot $out ]] || continue
       tmp="${out}.tmp.$$"
       if { [[ $ext == gz ]] && gzip -9 -n -c < "$f" > "$tmp"; } \
          || { [[ $ext == br ]] && brotli -q 11 -c < "$f" > "$tmp"; }; then
-        if (( $(stat -c %s "$tmp") < $(stat -c %s "$f") )); then
+        if [[ $(stat -c '%y %s' "$f" 2>/dev/null) != "$before" ]]; then
+          rm -f "$tmp" "$out"
+        elif (( $(stat -c %s "$tmp") < ${before##* } )); then
           touch -r "$f" "$tmp"
           chown --reference="$f" "$tmp" 2>/dev/null || true
           chmod 644 "$tmp"
@@ -1841,13 +1880,33 @@ precompress_static_assets() {
       fi
     done
   done < <(find "$root" -type f -regextype posix-extended \
-             -regex '.*\.(js|mjs|css|svg|json|xml|txt|map|ico|webmanifest|ttf|otf|eot|woff)$' -size +1k \
+             -regex '.*\.(js|mjs|css|svg|json|xml|txt|map|ico|webmanifest|ttf|otf|eot|woff)$' \
              ! -path '*/internal_data/*' ! -path '*/data/*' ! -path '*/src/*' ! -path '*/install/*' \
              ! -path '*/wp-content/uploads/*' ! -path '*/wp-content/cache/*' ! -path '*/.git/*' \
              -print0 2>/dev/null)
   # Siblings whose source is gone (an upgrade removed or renamed the file).
   while IFS= read -r -d '' f; do
     [[ -e ${f%.*} ]] || rm -f "$f"
+  done < <(find "$root" -type f -regextype posix-extended \
+             -regex '.*\.(js|mjs|css|svg|json|xml|txt|map|ico|webmanifest|ttf|otf|eot|woff)\.(gz|br)$' \
+             ! -path '*/internal_data/*' ! -path '*/data/*' ! -path '*/wp-content/uploads/*' \
+             -print0 2>/dev/null)
+  printf '%s' "$n"
+}
+
+# Remove the siblings precompress_static_assets made under one root: a .gz/.br
+# next to its source with exactly the source's mtime (the helper stamps every
+# sibling that way; a hand-made one almost never matches).  Used when the
+# feature is turned off or a root leaves the list: gzip_static stays on at
+# http level, so siblings left behind would be served long after an upgrade
+# changed their sources.  Prints the number removed.
+precompress_remove_siblings() {
+  local root=$1 f src n=0
+  [[ -d $root ]] || { printf 0; return 0; }
+  while IFS= read -r -d '' f; do
+    src=${f%.*}
+    [[ -f $src && ! $src -nt $f && ! $src -ot $f ]] || continue
+    rm -f "$f" && n=$(( n + 1 ))
   done < <(find "$root" -type f -regextype posix-extended \
              -regex '.*\.(js|mjs|css|svg|json|xml|txt|map|ico|webmanifest|ttf|otf|eot|woff)\.(gz|br)$' \
              ! -path '*/internal_data/*' ! -path '*/data/*' ! -path '*/wp-content/uploads/*' \
@@ -1879,7 +1938,14 @@ write_precompress_helper() {
     # at the prompt) drops to the web user before any file is touched.
     printf '%s\n' "if [ \"\$(id -u)\" = 0 ]; then exec ${PRECOMPRESS_RUNNER} \"\$0\" \"\$@\"; fi"
     printf 'ROOTS=(%s)\n' "$(printf '%q ' "$@")"
-    declare -f precompress_static_assets
+    # One pass at a time: the first pass of a large tree runs in the
+    # background and may outlast the next 5-minute cron tick, which then
+    # skips; --remove waits for a running pass instead.
+    printf '%s\n' 'if exec 9>/run/lock/setup-precompress.lock 2>/dev/null; then' \
+      '  if [ "${1:-}" = --remove ]; then flock 9; else flock -n 9 || exit 0; fi' 'fi'
+    declare -f precompress_static_assets precompress_remove_siblings
+    # `--remove [ROOT...]` deletes the siblings it made (all ROOTS by default).
+    printf 'if [ "${1:-}" = --remove ]; then\n  shift; [ $# -gt 0 ] || set -- "${ROOTS[@]}"\n  total=0\n  for root in "$@"; do\n    n=$(precompress_remove_siblings "$root")\n    total=$(( total + ${n:-0} ))\n  done\n  printf "removed %%s precompressed files\\n" "$total"\n  exit 0\nfi\n'
     printf 'total=0\nfor root in "${ROOTS[@]}"; do\n  n=$(precompress_static_assets "$root")\n  total=$(( total + ${n:-0} ))\ndone\nprintf "precompressed %%s files\\n" "$total"\n'
   } > "$tmp"
   if commit_if_changed "$helper" "$tmp"; then
@@ -1895,9 +1961,24 @@ write_precompress_helper() {
 configure_asset_precompression() {
   local target=${1:-/etc/angie} helper=$CRON_PRECOMPRESS file root moved out
   local -a roots=() nicer=(nice -n 19)
+  local -a old_roots=()
   persist_precompress_assets
+  command -v ionice >/dev/null 2>&1 && nicer+=(ionice -c 3)
+  # Roots the current helper serves (its ROOTS line is written with %q).
+  if [[ -f $helper ]] && grep -q 'Managed by setup.sh' "$helper" 2>/dev/null; then
+    mapfile -t old_roots < <(bash -c 'eval "$(grep -m1 "^ROOTS=(" "$1")"; printf "%s\n" "${ROOTS[@]}"' _ "$helper" 2>/dev/null)
+  fi
   if (( ! PRECOMPRESS_ASSETS )); then
     if [[ -f $helper ]] && grep -q 'Managed by setup.sh' "$helper" 2>/dev/null; then
+      # gzip_static stays on at http level: siblings left behind would be
+      # served after the next upgrade changed their sources.
+      # A helper from 1.21.57 or older has no --remove mode: rewrite it for
+      # the same roots first.
+      if (( ${#old_roots[@]} )) && write_precompress_helper "${old_roots[@]}"; then
+        # shellcheck disable=SC2086
+        out=$("${nicer[@]}" $PRECOMPRESS_RUNNER "$helper" --remove 2>/dev/null || true)
+        [[ -n $out ]] && tune_note "precompress: ${out} (PRECOMPRESS_ASSETS=0)"
+      fi
       moved=$(preserve_to_tmp "$helper" 2>/dev/null || true)
       [[ -n $moved ]] && tune_note "precompress: helper moved to ${moved} (PRECOMPRESS_ASSETS=0)"
       write_cron >/dev/null 2>&1 || true
@@ -1910,7 +1991,9 @@ configure_asset_precompression() {
     [[ -n $root && -d $root ]] && roots+=("$root")
   done < <({ angie_xenforo_vhosts "$target"; angie_wordpress_vhosts "$target"; } 2>/dev/null | sort -u)
   if (( ${#roots[@]} == 0 )); then
-    tune_miss "precompress: no XenForo/WordPress vhost with files found; nothing to precompress yet"
+    # Not a fault: precompression is on by default (1.21.58) and a fresh
+    # install has no site yet; the next --domain or --optimize picks it up.
+    tune_summary "precompress: no XenForo/WordPress vhost with files yet; nothing to precompress"
     return 0
   fi
   # The brotli CLI (a 15 KB package) builds the .br siblings; without it the
@@ -1922,8 +2005,29 @@ configure_asset_precompression() {
   write_precompress_helper "${roots[@]}" || return 1
   # The managed crontab was written before the helper existed on a first run.
   write_cron >/dev/null 2>&1 || warn "Could not refresh the managed crontab for the precompress helper"
-  command -v ionice >/dev/null 2>&1 && nicer+=(ionice -c 3)
-  # Unquoted on purpose: PRECOMPRESS_RUNNER is a fixed command prefix.
+  # A root that left the list (vhost removed, application changed) keeps no
+  # siblings that nothing refreshes any more.
+  local old keep r
+  for old in "${old_roots[@]}"; do
+    keep=0
+    for r in "${roots[@]}"; do [[ $r == "$old" ]] && { keep=1; break; }; done
+    (( keep )) && continue
+    # Unquoted on purpose: PRECOMPRESS_RUNNER is a fixed command prefix.
+    # shellcheck disable=SC2086
+    out=$("${nicer[@]}" $PRECOMPRESS_RUNNER "$helper" --remove "$old" 2>/dev/null || true)
+    [[ -n $out ]] && tune_note "precompress: ${out} under ${old} (no longer listed)"
+  done
+  # The first pass over a tree without siblings is the slow one (gzip -9 and
+  # brotli -q 11 for every asset: several minutes for a XenForo + WordPress
+  # host), so it runs in the background and the run does not wait for it;
+  # Angie serves dynamic compression until each sibling exists.  Later passes
+  # only touch changed files and run in line.
+  if [[ -z $(find "${roots[@]}" -type f \( -name '*.js.gz' -o -name '*.css.gz' \) -print -quit 2>/dev/null) ]]; then
+    # shellcheck disable=SC2086
+    setsid "${nicer[@]}" $PRECOMPRESS_RUNNER "$helper" </dev/null >/dev/null 2>&1 &
+    tune_note "precompress: first pass started in the background under ${roots[*]} (brotli_static/gzip_static; refreshed every 5 min by cron)"
+    return 0
+  fi
   # shellcheck disable=SC2086
   out=$("${nicer[@]}" $PRECOMPRESS_RUNNER "$helper" 2>/dev/null || true)
   tune_note "precompress: ${out:-ran} under ${roots[*]} (brotli_static/gzip_static; refreshed every 5 min by cron)"
@@ -1970,6 +2074,42 @@ angie_disable_php_keep_conn() {
     tune_replace "$file" '^([[:space:]]*fastcgi_keep_conn[[:space:]]+)on;' '\1off;' \
       "${file#"$target"/}: fastcgi_keep_conn=off"
   done
+  return 0
+}
+
+# Point the server of `upstream local_php` in angie.conf at a PHP-FPM
+# listen value (TCP host:port, bare port, or a Unix socket path).  Only that
+# block is touched: another upstream may legitimately use a different socket.
+# PHP-FPM's `listen = 9000` and wildcard listeners accept connections on the
+# loopback address, which is what Angie must dial.  An empty or unrecognised
+# value leaves the file alone.
+angie_local_php_follow_pool() {
+  local conf=${1:-} listen=${2:-} addr tmp
+  [[ -n $conf && -f $conf ]] || return 0
+  if [[ $listen == /* ]]; then
+    addr="unix:${listen}"
+  elif [[ $listen =~ ^[0-9]+$ ]]; then
+    addr="127.0.0.1:${listen}"
+  elif [[ $listen =~ ^0\.0\.0\.0:([0-9]+)$ ]]; then
+    addr="127.0.0.1:${BASH_REMATCH[1]}"
+  elif [[ $listen =~ ^\[::\]:([0-9]+)$ ]]; then
+    addr="[::1]:${BASH_REMATCH[1]}"
+  elif [[ $listen =~ ^([0-9.]+|localhost|\[[0-9a-fA-F:]+\]):[0-9]+$ ]]; then
+    addr=$listen
+  else
+    return 0
+  fi
+  tmp=$(tmp_file) || return 1
+  awk -v addr="$addr" '
+    /^[[:space:]]*upstream[[:space:]]+local_php[[:space:]]*\{/ { in_php = 1 }
+    in_php && /^[[:space:]]*server[[:space:]]/ {
+      sub(/server[[:space:]]+[^;[:space:]]+/, "server " addr)
+    }
+    in_php && /^[[:space:]]*\}/ { in_php = 0 }
+    { print }
+  ' "$conf" > "$tmp" || return 1
+  commit_if_changed "$conf" "$tmp" \
+    && tune_note "angie.conf: local_php upstream -> ${addr} (the live PHP-FPM listener)"
   return 0
 }
 
@@ -2185,6 +2325,20 @@ tune_angie_configs() {
         '^([[:space:]]*server[[:space:]]+)(127\.0\.0\.1|localhost):9000;' \
         "\\1unix:${php_socket};" "angie.conf: local_php upstream -> Unix socket"
     fi
+  elif [[ $target == /etc/angie ]]; then
+    # No socket was handed over: the pool stayed where it was (TCP kept, the
+    # migration skipped or rolled back, PHP stopped).  The repository sync has
+    # just rewritten angie.conf to `server unix:/run/php/php-fpm.sock;`, and
+    # nothing else points it back, so a live TCP pool left every PHP site on
+    # 502.  Follow the live pool's listener instead.  Only the live tree is
+    # described by the live pool; a staged or test tree is left as synced.
+    local live_listen
+    live_listen=$(php_pool_listen "$(php_primary_version 2>/dev/null || true)" 2>/dev/null || true)
+    # A socket path is only worth following once the pool has created it.
+    if [[ $live_listen == /* && ! -S $live_listen ]]; then
+      live_listen=""
+    fi
+    angie_local_php_follow_pool "$nginx_conf" "$live_listen"
   fi
 
   if [[ -n $f_fcgi ]]; then
@@ -2721,9 +2875,14 @@ php_jit_path_sections() {
     [[ -n $root ]] || continue
     body[$root]+=$'; Chevereto session files are collected by PHP (no timer visits its save path)\nsession.gc_probability = 1\nsession.gc_divisor = 1000\n'
   done < <(angie_chevereto_roots "$target" | sort -u)
+  # Level 6: the stored page is compressed once per MISS and sent on every
+  # hit, so its size is what guests pay.  Measured (1.21.58) on the cached
+  # WordPress post / Chevereto explore pages: 14.9 / 12.7 KB at level 4,
+  # 14.2 / 12.0 KB at 6 (-5 %), 14.1 / 11.9 KB at 9, for ~0.35 ms more per
+  # MISS or member page (0.5 % of a 73 ms WordPress member page).
   while IFS= read -r root; do
     [[ -n $root ]] || continue
-    body[$root]+=$'; guest cache stores the compressed page (SETUP_PHP_PAGE_GZIP=0 turns this off)\nzlib.output_compression = On\nzlib.output_compression_level = 4\n'
+    body[$root]+=$'; guest cache stores the compressed page (SETUP_PHP_PAGE_GZIP=0 turns this off)\nzlib.output_compression = On\nzlib.output_compression_level = 6\n'
   done < <(php_page_gzip_roots "$target" | sort -u)
   (( ${#body[@]} > 0 )) || return 0
   while IFS= read -r root; do
@@ -2735,7 +2894,32 @@ php_jit_path_sections() {
 # /etc/default/setup-tuning so a plain --optimize does not silently change
 # them.  Written once per run.
 PHP_JIT_PERSISTED=0
+
+# The opt-in session/cgi hardening (SETUP_PHP_SESSION_HARDENING=1) is a
+# feature choice, not a hardware value.  It used to be read only from the
+# environment, so the next plain --optimize rewrote zz-setup-optimize.ini
+# without the block and sync_php_ini_template stripped cgi.fix_pathinfo: the
+# hardening silently disappeared.  The choice is recorded as
+# PHP_SESSION_HARDENING in /etc/default/setup-tuning (setup.sh sources it
+# before this file) and folded back into SETUP_PHP_SESSION_HARDENING, the one
+# flag every gate reads.  The environment still wins for a one-off run.
+PHP_SESSION_HARDENING_PERSIST=0
+php_session_hardening_load() {
+  if [[ -n ${SETUP_PHP_SESSION_HARDENING+x} ]]; then
+    PHP_SESSION_HARDENING_PERSIST=1
+    [[ $SETUP_PHP_SESSION_HARDENING == 1 ]] || SETUP_PHP_SESSION_HARDENING=0
+  elif [[ ${PHP_SESSION_HARDENING:-0} == 1 ]]; then
+    SETUP_PHP_SESSION_HARDENING=1
+  fi
+  return 0
+}
+php_session_hardening_load
+
 persist_php_jit() {
+  if (( PHP_SESSION_HARDENING_PERSIST )); then
+    persist_tuning_var PHP_SESSION_HARDENING "$SETUP_PHP_SESSION_HARDENING"
+    tune_note "PHP: PHP_SESSION_HARDENING=${SETUP_PHP_SESSION_HARDENING} persisted in /etc/default/setup-tuning"
+  fi
   if (( PHP_JIT_WORDPRESS_PERSIST )); then
     persist_tuning_var PHP_JIT_WORDPRESS "$PHP_JIT_WORDPRESS"
     tune_note "PHP: PHP_JIT_WORDPRESS=${PHP_JIT_WORDPRESS} persisted in /etc/default/setup-tuning"
@@ -3073,23 +3257,46 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# Angie dynamic compression (Brotli only)
+# Angie dynamic compression: zstd, then Brotli, then gzip
 # ---------------------------------------------------------------------------
-# Brotli was chosen over Zstandard after live measurements on a 16-thread
-# host.  At level 5 on a 149 KB XenForo thread page, Brotli produced 10.9 KB
-# vs 13.7 KB for gzip (-20%) and 11.9 KB for Zstandard.  Zstandard was faster
-# to produce (29k vs 16k compressed responses/s on a 34 KB page), but dynamic
-# PHP is the bottleneck on uncached pages (~1k req/s logged-in), so Brotli's
-# smaller payload wins page load time.  Gzip remains the compatibility
-# fallback.  Brotli is the only extra module loaded.
+# Measured in the 1.21.58 cycle (Xeon E-2236, loopback wrk, encodings
+# interleaved round by round, Angie CPU from its cgroup):
 #
-# Static assets are intentionally not precompressed.  A CDN normally caches
-# them and only the first request reaches the origin; the expensive work here
-# is compressing per-user dynamic HTML on every uncached request.
+#   XenForo member thread, 127 KB HTML   bytes   Angie ms/req   req/s
+#     Brotli 4 (previous default)        18.3 K      2.1         380
+#     gzip 4                             20.3 K      2.0         380
+#     zstd 3                             19.4 K      0.85        405
+#     zstd 6                             17.9 K      1.8         385
+#   XenForo core JS, 177 KB, compressed per request
+#     Brotli 4                           54.6 K      3.8       2,100
+#     zstd 3                             56.2 K      1.3       6,050
+#
+# zstd reaches Brotli's size for a fraction of the CPU, so every client that
+# offers it (current Chrome, Edge, Firefox) gets zstd; Safari and
+# Cloudflare (which asks origins for "br, gzip" only) keep Brotli; gzip is
+# the fallback.  Static assets are precompressed (.br/.gz siblings,
+# SETUP_PRECOMPRESS_ASSETS, on by default since 1.21.58), so the per-request
+# filters only see dynamic responses and assets without a sibling.  zstd_static
+# stays off: Brotli 11 beats zstd 19 on every asset measured (XenForo core JS
+# 46.4 K vs 49.1 K; 10 MB of scripts 2.67 MB vs 2.84 MB for the same build
+# time), and with it off a browser offering both gets the .br sibling.
 ANGIE_COMPRESSION_CHANGED=0
 ANGIE_COMPRESSION_SKIPPED=0
 ANGIE_BROTLI_OK=0
 ANGIE_BROTLI_LEVEL=4
+ANGIE_ZSTD_OK=0
+ANGIE_ZSTD_LEVEL=3
+
+# Dynamic zstd level: SETUP_ZSTD_LEVEL (0 turns zstd off), otherwise 3.
+# Level 3 matched Brotli 4's bytes within 6 % at 40 % of its Angie CPU per
+# request on the member pages above; levels 4-6 cost more CPU for a few
+# percent.
+# One owner for the install, --optimize and dry-run values.
+angie_zstd_level() {
+  local level=${SETUP_ZSTD_LEVEL:-}
+  [[ $level =~ ^([0-9]|1[0-9])$ ]] || level=3
+  printf '%s' "$level"
+}
 
 # Dynamic Brotli level: SETUP_BROTLI_LEVEL when valid, otherwise 5, or 4 on a
 # 1-2 CPU host where per-response compression competes with PHP for cores.
@@ -3144,11 +3351,29 @@ ensure_angie_compression() {
   fi
   pkg_ok angie-module-brotli && ANGIE_BROTLI_OK=1
 
+  local zstd_level
+  zstd_level=$(angie_zstd_level)
+  ANGIE_ZSTD_LEVEL=$zstd_level
+  ANGIE_ZSTD_OK=0
+  if (( zstd_level > 0 )); then
+    if ! pkg_ok angie-module-zstd; then
+      # Same package source as the Brotli module, part of the same profile.
+      if ! apt-cache show angie-module-zstd >/dev/null 2>&1; then
+        apt_update || true
+      fi
+      apt_install angie-module-zstd \
+        || warn "Could not install angie-module-zstd; Brotli and gzip remain active"
+    fi
+    pkg_ok angie-module-zstd && ANGIE_ZSTD_OK=1
+  fi
+
   mkdir -p "$enabled" "${target}/http.d"
   local tmp moved f
-  # Remove a managed Zstandard stanza left by an earlier test/release so only
-  # one optional compression module is active.
-  for f in "${enabled}/40-zstd.conf" "${target}/http.d/zstd.conf"; do
+  # 40-zstd.conf (an earlier test/release) loaded before Brotli, so Brotli's
+  # filter ran first and zstd never answered; the stanza is now 60-zstd.conf.
+  local -a zstd_drop=("${enabled}/40-zstd.conf")
+  (( ANGIE_ZSTD_OK )) || zstd_drop+=("${enabled}/60-zstd.conf" "${target}/http.d/zstd.conf")
+  for f in "${zstd_drop[@]}"; do
     [[ -e $f ]] || continue
     grep -q '^# Managed by setup.sh' "$f" 2>/dev/null || continue
     moved=$(preserve_to_tmp "$f" 2>/dev/null || true)
@@ -3195,11 +3420,62 @@ EOF
     warn "Angie Brotli module is not installed; keeping the existing module stanza"
   fi
 
+  if (( ANGIE_ZSTD_OK )); then
+    # Loaded after 50-brotli.conf on purpose: the output filter loaded last
+    # runs first, so zstd answers every client that offers it (current
+    # Chrome, Edge and Firefox) and Brotli the rest (Safari, and Cloudflare,
+    # which asks origins for "br, gzip" only).
+    tmp=$(tmp_file)
+    cat > "$tmp" <<'EOF'
+# Managed by setup.sh: dynamic Zstandard for clients that accept it.
+# Loaded after 50-brotli.conf so its filter runs first.
+load_module modules/ngx_http_zstd_filter_module.so;
+EOF
+    if commit_if_changed "${enabled}/60-zstd.conf" "$tmp"; then
+      chmod 644 "${enabled}/60-zstd.conf"
+      changed=1
+    fi
+    tmp=$(tmp_file)
+    if [[ -f "${target}/http.d/zstd_conf" ]]; then
+      {
+        printf '# Managed by setup.sh: dynamic Zstandard from http.d/zstd_conf.\n'
+        printf '# No zstd_static (module not loaded): the .br sibling is smaller than a .zst one.\n'
+        cat "${target}/http.d/zstd_conf"
+      } > "$tmp"
+      sed_in_place -E "s/^zstd_comp_level [0-9]+;/zstd_comp_level ${zstd_level};/" "$tmp"
+      sed_in_place -E "/^zstd_static[[:space:]]/d" "$tmp"
+    else
+      cat > "$tmp" <<EOF
+# Managed by setup.sh: dynamic Zstandard (template was missing).
+zstd on;
+zstd_comp_level ${zstd_level};
+zstd_min_length 50;
+zstd_types text/plain text/css text/xml application/json application/javascript application/xml image/svg+xml font/ttf font/otf;
+EOF
+    fi
+    if commit_if_changed "${target}/http.d/zstd.conf" "$tmp"; then
+      chmod 644 "${target}/http.d/zstd.conf"
+      changed=1
+    fi
+  fi
+
   # Never leave the service unable to start because an optional module failed
   # to load.  Move the managed files to /tmp (the script never deletes) and
-  # keep the gzip fallback.
+  # keep the gzip fallback.  zstd goes first, alone: a zstd module that does
+  # not load must not take Brotli with it.
   local testlog
   testlog=$(tmp_file)
+  if (( ANGIE_ZSTD_OK )) && ! /usr/sbin/angie -t >"$testlog" 2>&1; then
+    warn "Angie rejected the Zstandard configuration; disabling zstd (Brotli and gzip stay)"
+    sed 's/^/  /' "$testlog" >&2 || true
+    for f in "${enabled}/60-zstd.conf" "${target}/http.d/zstd.conf"; do
+      [[ -e $f ]] || continue
+      moved=$(preserve_to_tmp "$f" 2>/dev/null || true)
+      [[ -n $moved ]] && info "Moved rejected compression file to ${moved}"
+    done
+    ANGIE_ZSTD_OK=0
+    changed=1
+  fi
   if ! /usr/sbin/angie -t >"$testlog" 2>&1; then
     warn "Angie rejected the dynamic compression configuration; disabling Brotli"
     sed 's/^/  /' "$testlog" >&2 || true
@@ -3348,6 +3624,69 @@ angie_restore_upstreams() {
   return 0
 }
 
+# Basic-auth password files the repository templates tell operators to keep
+# inside the tree (htpasswd/chev, htpasswd/xfadmin, basic_auth/wp_auth,
+# conf.d/r3f_auth), plus any file an active auth_basic_user_file names.  The
+# deploy normaliser resets every file to root:root 0644, so a password file
+# the operator had tightened to 0640 came back world-readable on every run.
+# Give them 0640 root:<Angie worker group> instead: the workers read the file
+# per request, nobody else needs to.  Symlinks and paths that leave the tree
+# are skipped so a crafted reference cannot retarget the chmod.
+angie_auth_user_files() {
+  local target=$1
+  find "$target" -path "$target/ssl" -prune -o \
+       -type f \( -name '*.conf' -o -name '*_conf' \) -print0 2>/dev/null \
+    | xargs -0 -r awk '
+        {
+          line = $0
+          sub(/#.*/, "", line)
+          while (match(line, /auth_basic_user_file[[:space:]]+[^;[:space:]]+/)) {
+            v = substr(line, RSTART, RLENGTH)
+            sub(/^auth_basic_user_file[[:space:]]+/, "", v)
+            gsub(/["\047]/, "", v)
+            if (v !~ /\$/) print v
+            line = substr(line, RSTART + RLENGTH)
+          }
+        }' 2>/dev/null || true
+}
+
+# Group of the Angie workers (angie.conf `user` directive, default www-data).
+angie_auth_group() {
+  local group
+  group=$(awk '/^[[:space:]]*user[[:space:]]/ {
+      g = ($3 != "") ? $3 : $2; sub(/;.*/, "", g); print g; exit
+    }' "$1/angie.conf" 2>/dev/null || true)
+  [[ $group =~ ^[A-Za-z0-9_.-]+$ ]] || group=www-data
+  printf '%s\n' "$group"
+}
+
+angie_secure_auth_files() {
+  local target=$1 group file ref
+  local -a files=()
+  [[ -d $target ]] || return 0
+  group=$(angie_auth_group "$target")
+  while IFS= read -r -d '' file; do
+    files+=("$file")
+  done < <(find "$target" -path "$target/ssl" -prune -o \
+                -path "$target/stream.d" -prune -o \
+                -type f \( -path "$target/htpasswd/*" -o -path "$target/basic_auth/*" \
+                           -o -name '*_auth' \) -print0 2>/dev/null || true)
+  while IFS= read -r ref; do
+    [[ -n $ref ]] || continue
+    [[ $ref == /* ]] || ref="$target/$ref"
+    [[ $ref == "$target"/* && $ref != *..* && -f $ref && ! -L $ref ]] || continue
+    files+=("$ref")
+  done < <(angie_auth_user_files "$target")
+  # 0640 only after the group change worked: a root:root 0640 file is
+  # unreadable for the workers and every protected location would fail.
+  for file in "${files[@]}"; do
+    if chown "root:${group}" "$file" 2>/dev/null; then
+      chmod 640 "$file" 2>/dev/null || true
+    fi
+  done
+  return 0
+}
+
 # Sync CONFIG_SOURCE_DIR into /etc/angie and normalise what a checkout can
 # carry (ownership, modes, macOS AppleDouble files, sample keys).  The caller
 # has already run fetch_server_configs.
@@ -3430,14 +3769,30 @@ deploy_angie_tree() {
 
   # Normalise ownership/modes for everything except operator certificates and
   # stream configs.  scripts/*.sh stay executable for the Cloudflare cron job.
+  # Password files are secured first and the normaliser then skips files that
+  # are already root:<worker group> 0640.  Securing them after the 0644 pass
+  # left each one world-readable for the length of the auth_basic_user_file
+  # scan on every install/--optimize.  The skip only keeps a root-owned file
+  # that no one but root can write, so it never preserves a checkout's
+  # uid-1000 or group-writable leftovers.  It is dropped when the group does
+  # not exist: find aborts the whole pass on an unknown -group name.
+  angie_secure_auth_files "$target"
+  local auth_group
+  local -a keep_secured=()
+  auth_group=$(angie_auth_group "$target")
+  if getent group "$auth_group" >/dev/null 2>&1; then
+    keep_secured=(-type f -user root -group "$auth_group" -perm 0640 -prune -o)
+  fi
   find "$target" -path "$target/ssl" -prune -o \
        -path "$target/stream.d" -prune -o \
+       "${keep_secured[@]}" \
        -exec chown root:root {} + 2>/dev/null || true
   find "$target" -path "$target/ssl" -prune -o \
        -path "$target/stream.d" -prune -o \
        -type d -exec chmod 755 {} + 2>/dev/null || true
   find "$target" -path "$target/ssl" -prune -o \
        -path "$target/stream.d" -prune -o \
+       "${keep_secured[@]}" \
        -type f -exec chmod 644 {} + 2>/dev/null || true
   chmod 755 "$target"/scripts/*.sh 2>/dev/null || true
 
@@ -3552,16 +3907,18 @@ angie_apply_profile() {
   angie_migrate_guest_cache_includes "$target" || warn "Guest cache include migration was skipped"
   configure_asset_precompression "$target" || warn "Asset precompression was skipped"
   tune_angie_configs "$target" || return 1
-  # Dynamic Brotli compression.  The module is optional, so a failure here
-  # must not stop the run; gzip remains active.
+  # Dynamic zstd/Brotli compression.  The modules are optional, so a failure
+  # here must not stop the run; gzip remains active.
   ensure_angie_compression "$target" || warn "Angie compression setup was skipped"
   (( ANGIE_COMPRESSION_CHANGED )) && TUNE_DIRTY=1
   if (( ANGIE_COMPRESSION_SKIPPED )); then
     ANGIE_COMPRESSION_SUMMARY="Compression: unchanged (SETUP_ANGIE_COMPRESSION=0)"
-  elif (( ANGIE_BROTLI_OK )); then
-    ANGIE_COMPRESSION_SUMMARY="Compression: Brotli level ${ANGIE_BROTLI_LEVEL} (gzip fallback)"
   else
-    ANGIE_COMPRESSION_SUMMARY="Compression: gzip only (Brotli module unavailable)"
+    local -a enc=()
+    (( ANGIE_ZSTD_OK )) && enc+=("zstd level ${ANGIE_ZSTD_LEVEL}")
+    (( ANGIE_BROTLI_OK )) && enc+=("Brotli level ${ANGIE_BROTLI_LEVEL}")
+    enc+=("gzip")
+    ANGIE_COMPRESSION_SUMMARY="Compression: $(printf '%s, ' "${enc[@]}" | sed 's/, $//') (first the client accepts)"
   fi
   return 0
 }

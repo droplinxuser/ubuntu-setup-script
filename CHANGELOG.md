@@ -5,6 +5,123 @@ README.md; measurements in tests/stress-site/RESULTS.md.  Per-cycle
 reports and raw test logs cited by entries up to 1.21.32 were removed from
 the tree on 2026-11-19; retrieve them with `git show 84b0db5:<path>`.
 
+## 1.21.58 (2026-11-22)
+
+Compression cycle: gzip, Brotli and zstd measured per tier (guest cache,
+members, static) on the Xeon E-2236 test host, encodings interleaved round
+by round, Angie and PHP CPU read from their cgroups.  Details:
+`tests/stress-site/AUDIT-20261122-1.21.58.md`.
+
+- **Static assets are precompressed by default.**  Compressing an asset on
+  every request capped the 177 KB XenForo core script at 2,063 req/s
+  (3.9 ms of Angie CPU each, Brotli 4).  From its `.br` sibling (Brotli 11):
+  **62,808 req/s** at 0.11 ms, and 15 % fewer bytes (54.6 -> 46.4 KB);
+  WordPress block CSS 4,290 -> 93,204 req/s, jQuery 3,620 -> 81,741
+  (rotated A/B, `Accept-Encoding: br, gzip`; 22-30x).
+  `SETUP_PRECOMPRESS_ASSETS` now defaults to 1 (0 turns it off and removes
+  the siblings it made, which a plain off switch used to leave behind for
+  `gzip_static` to serve).  The first pass over a tree runs in the
+  background (several minutes for XenForo + WordPress: gzip -9 and brotli
+  -q 11 for every asset), so `--optimize` does not wait for it; the cron
+  helper takes a lock so the 5-minute run skips while it is busy.  The pass
+  itself: a source that shrinks to 1 KiB or less loses its sibling (it kept
+  serving the old larger version), a sibling is rebuilt when its mtime
+  differs from the source in either direction (a rollback restores an older
+  mtime), a file rewritten during compression is left for the next run, and
+  a root that leaves the list has its siblings removed.
+- **zstd for dynamic responses, ahead of Brotli.**  `angie-module-zstd`
+  (level 3) is installed with the Brotli module and loaded after it: the
+  filter loaded last runs first, so every client that offers zstd (current
+  Chrome, Edge, Firefox) gets it, Safari and Cloudflare (which asks origins
+  for `br, gzip` only) keep Brotli 4, gzip stays the fallback.  XenForo
+  member thread (127 KB HTML): Brotli 4 18.3 KB at 2.1 ms of Angie CPU,
+  zstd 3 19.4 KB at 0.84 ms (61 % less Angie CPU), member throughput 379 -> 404 req/s for a
+  browser that offers zstd (Cloudflare-fronted origins are unchanged here).  zstd 5
+  would match Brotli's bytes at 1.4 ms; level 3 is the knee.  Precompressed
+  assets stay `.br`: Brotli 11 beat zstd 19 on every asset (46.4 vs 49.1 KB
+  on the core script), so no `zstd_static`.  An earlier release's managed
+  `40-zstd.conf` (loaded before Brotli, so it never answered) is moved
+  away; if Angie rejects the zstd stanza only zstd is dropped.
+  `SETUP_ZSTD_LEVEL=0..19` (0 = off) is a tuning override like
+  `SETUP_BROTLI_LEVEL`.
+- **WordPress/Chevereto guest pages stored at gzip 6 (was 4).**  The stored
+  page is compressed once per MISS and sent on every hit: cached WordPress
+  post 14.9 -> 14.2 KB, Chevereto explore 12.7 -> 12.0 KB (-5 %), about
+  0.35 ms more per MISS or member page.  Measured and not changed: Angie
+  instead of PHP for WordPress members (browser 145 vs 144 req/s, inside
+  the spread; `br, gzip` 145 vs 141, Angie 3 % slower), storing zstd from PHP (php8.5-zstd; zstd 19 costs ~70 ms per MISS
+  and Cloudflare never asks for it).  A stored Brotli page would be 14-22 %
+  smaller than the stored gzip, but no PHP Brotli extension is packaged.
+
+Security (each with a regression test; found by this cycle's code audit,
+two independent reviewers per finding, then reproduced on the host where
+possible):
+
+- **A member's page could be stored for guests with a folded cookie name.**
+  PHP turns `.`, space and `[` in a cookie name into `_`, so
+  `xf.session=<sid>` logs a XenForo member in while the bypass map tested
+  the literal `xf_session=` and saw a guest.  Reproduced on the audit host:
+  two requests stored the logged-in thread page and the next cookie-less
+  guest received it (HIT).  The managed XenForo map now accepts every
+  folded separator and any prefix (a forum with
+  `$config['cookie']['prefix']` was treated as a guest too), and a cookie
+  name holding `%` bypasses.  Same fix for WordPress, Chevereto and Flarum
+  in `server-configs-nginx` 1.6.51.
+- **`--optimize` stripped two XenForo guest-cache guards on every run.**
+  `tune_xf_cache_bypass_var` rewrote the repository's `fastcgi_no_cache` /
+  `fastcgi_cache_bypass` lines to the bare cookie map, dropping
+  `$req_encoded_path` and `$cache_uri_tracking`: a percent-encoded route
+  became cacheable again and a tracking-parameter URL (keyed on its clean
+  URL) could store another page under that key.  Only legacy lines that
+  test raw `$cookie_xf_*` are rewritten now, and those keep both guards.
+- **The setup-managed XenForo encoding map treated `gzip;q=0` as a gzip
+  client** (unanchored `~*gzip`); it now uses the strict rule of
+  `$guest_cache_enc`.
+- **Anubis no longer opens an origin that only accepts its front proxy.**
+  The `$realip_remote_addr` 444 guard was commented out of the socket-side
+  vhost and never re-applied on the public terminator; it is now carried
+  there (only guards setup.sh commented, never one the operator retired) and
+  restored by `anubis=no`.
+- **Basic-auth password files under `/etc/angie` keep 0640.**  The tree
+  normaliser reset them to 0644 on every run; they are now set to
+  `root:<worker group> 0640` before it and skipped by it.
+
+Fixes:
+
+- `--upgrade-php`: refuses (dry run: BLOCKED) when another installed PHP
+  version has custom ini fragments, extra pools or a listener Angie uses,
+  since the purge removes every version (`SETUP_PHP_PURGE_OTHER_VERSIONS=1`
+  overrides); `--upgrade-php=X.Y` for the installed X.Y only installs the
+  pending extensions instead of purging and reinstalling; a rejected
+  migration rolls back only what it wrote (a package-owned
+  `conf.d/20-redis.ini` survived no longer); the dry run names the same
+  source version as the real run.
+- `--optimize` on a pool left on TCP points `upstream local_php` at that
+  listener after the repository sync (every PHP site answered 502).
+- `SETUP_PHP_SESSION_HARDENING=1` is persisted and kept by the profile
+  reset (it vanished on the next plain `--optimize`).
+- The PHP refresh after the Angie sync rolls `/etc/php/<ver>` back when
+  `php-fpm -t` rejects it.
+- Planner: the dry run with a pending profile reset plans like the real run;
+  an explicit `--php children=N` is booked in the memory plan; MariaDB
+  `max_connections` is never capped below the persistent connections the
+  pool holds; the Angie cache never exceeds half the free space of its
+  filesystem; a non-root `--optimize --dry-run` says its sizes are defaults;
+  an install that adds a data service to an Angie host warns that the cache
+  is re-sized on the next `--optimize`.
+- `--purge basic` drops the `CPU_MITIGATIONS` pin with the GRUB drop-in (the
+  next run recreated it); the Anubis metrics port is a reserved local port.
+
+PHP 8.6: `php8.6-redis`, `-igbinary` and `-imagick` are published now.
+`--upgrade-php` 8.5 -> 8.6 -> 8.5 ran clean with all three applications
+(1:52 each way, 0 warnings, 0 diagnostics in production mode).  WordPress
+7.1.4 and Chevereto 4.5.9 run on 8.6.  XenForo 2.3.13's production pages
+work, but in debug mode every page answers 500 (`src/XF/App.php` raises a
+deprecation as an exception) and the bundled Braintree and laminas-mail
+null transport no longer compile, so XenForo stays on 8.5:
+`--domain app=xf` on PHP 8.6 and `--upgrade-php` to 8.6+ with a XenForo root
+print that caution (not a block).  A plain `--php` already auto-selects 8.6.
+
 ## 1.21.57 (2026-11-21)
 
 - **Anubis: browsers with a valid pass cookie skip the Go hop.**  The edge

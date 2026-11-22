@@ -563,6 +563,13 @@ main() {
       exit 0
     fi
     if (( OPTIMIZE )); then
+      # The planner sizes from root-only probes (MariaDB over its unix_socket
+      # account, du on /var/lib/mysql, valkey-cli on the 0770 socket, the
+      # live max_connections).  Unprivileged they fail silently and the
+      # preview falls back to empty-data floors, so say so up front.
+      if (( ${EUID:-$(id -u)} != 0 )); then
+        printf '%sNote:%s not running as root: live MariaDB/Valkey/Elasticsearch measurements are unavailable, so the sizes below use defaults and can differ from the real run (use sudo for an exact preview).\n' "$C_BOLD" "$C_RESET"
+      fi
       optimize_plan
       exit 0
     fi

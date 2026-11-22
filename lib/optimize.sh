@@ -262,6 +262,20 @@ OPT_HUGEPAGES_MB=0
 # or index to measure, so the planner must use the same empty-data floors that
 # --optimize applies instead of the larger "unmeasured" fallbacks.
 OPT_INSTALL_PLAN=0
+# Set by optimize_plan (--optimize --dry-run).  The real --optimize moves
+# explicit-options.conf to /tmp (reset_operator_overrides) before it plans,
+# so its planner never sees --php children= or --mariadb size=; the preview
+# leaves the file in place and must plan as if it were already gone, or it
+# prints the operator sizes while the run writes the hardware profile.
+OPT_PLAN_RESET_PENDING=0
+
+# explicit_option as the planner must see it: nothing while a profile reset
+# is pending (see OPT_PLAN_RESET_PENDING).  Every planner read goes through
+# here so the preview and the run cannot diverge key by key.
+plan_explicit_option() {
+  (( ${OPT_PLAN_RESET_PENDING:-0} )) && return 1
+  explicit_option "$@"
+}
 
 # RAM available to this host in MB.  Like effective_cpus, honour a cgroup
 # memory limit: inside a container or an LXC-class VPS /proc/meminfo reports
@@ -542,6 +556,7 @@ plan_memory_budget() {
   # php_worker_allowance_mb measures for a freshly started, idle pool, so the
   # first --optimize after the install reserves the same PHP budget.
   local cpu=1 allowance=64 php_capacity=0 php_floor=0 php_budget=0 children=0 php_explicit_children=0
+  local php_explicit_over=0
   local maria_target=0 valkey_target=0 es_target=0
   local maria_alloc=0 valkey_alloc=0 es_alloc=0
   local maria_fixed=0 valkey_fixed=0 es_fixed=0
@@ -616,29 +631,40 @@ plan_memory_budget() {
       live_children=$(php_pool_max_children)
     fi
     local php_floor_children
-    explicit=$(explicit_option php_children 2>/dev/null || true)
+    explicit=$(plan_explicit_option php_children 2>/dev/null || true)
     php_capacity=$(php_children_ceiling "$cpu" "$total" "$live_children" "$explicit")
     php_floor_children=$(php_children_floor "$total" "$cpu")
     # The pool writer always writes an explicit --php children= count; the
     # Elasticsearch page-cache step below must neither shrink it on paper
     # nor count a smaller pool.
+    # php_capacity is that count after the writer's own clamp (2..max(512,
+    # 2 x CPUs)), i.e. exactly what lands in the pool.
     php_explicit_children=0
-    [[ $explicit =~ ^[0-9]+$ ]] && (( explicit > 0 )) && php_explicit_children=$explicit
-    # An explicit --php children= below the hardware target lowers the floor
-    # too; otherwise the plan lifts the pool straight back to the target.
-    if [[ $explicit =~ ^[0-9]+$ ]] && (( explicit > 0 && php_capacity < php_floor_children )); then
-      php_floor_children=$php_capacity
+    [[ $explicit =~ ^[0-9]+$ ]] && (( explicit > 0 )) && php_explicit_children=$php_capacity
+    # The floor is the explicit count in both directions.  Below the hardware
+    # target it stops the plan lifting the pool back to the target; above it,
+    # the data-tier split must reserve every worker the writer starts, or
+    # MariaDB/Valkey/Elasticsearch are sized into RAM those workers use.
+    if (( php_explicit_children > 0 )); then
+      php_floor_children=$php_explicit_children
     fi
     php_floor=$(( php_floor_children * allowance ))
     (( php_floor < 256 )) && php_floor=256
-    (( php_floor > svc_usable / 2 )) && php_floor=$(( svc_usable / 2 ))
+    # The half-budget cap keeps the hardware floor from starving the data
+    # tier.  An explicit pool is not capped: those workers start whatever the
+    # plan says, so a capped reservation would hand their RAM to the flexible
+    # data services (a 200 x 100 MB pool on a 32 GB host left a large
+    # database 13 GB that the trim loop below would otherwise reclaim).
+    if (( php_explicit_children == 0 && php_floor > svc_usable / 2 )); then
+      php_floor=$(( svc_usable / 2 ))
+    fi
   fi
 
   # MariaDB target: live data+index plus 5%.  Nothing is added for an empty
   # database beyond a small operational minimum, so spare RAM is not wasted
   # on an idle buffer pool.
   if (( has_maria )); then
-    explicit=$(explicit_option mariadb_size_mb 2>/dev/null || true)
+    explicit=$(plan_explicit_option mariadb_size_mb 2>/dev/null || true)
     if [[ $explicit =~ ^[0-9]+$ ]] && (( explicit >= 128 )); then
       maria_target=$explicit
       maria_fixed=1
@@ -717,7 +743,7 @@ plan_memory_budget() {
   # non-evicting caches.  The RAM-proportional floor only when no maxmemory
   # is in force and nothing can be measured.
   if (( has_cache )); then
-    explicit=$(explicit_option valkey_mb 2>/dev/null || true)
+    explicit=$(plan_explicit_option valkey_mb 2>/dev/null || true)
     if [[ $explicit =~ ^[0-9]+$ ]] && (( explicit >= 1 )); then
       # An explicit --valkey ram= is the operator's decision: the live-data
       # guard never changes it.
@@ -804,7 +830,7 @@ plan_memory_budget() {
   # operational minimum; the store itself (+5%) is reserved as page cache
   # further down.
   if (( has_es )); then
-    explicit=$(explicit_option elastic_mb 2>/dev/null || true)
+    explicit=$(plan_explicit_option elastic_mb 2>/dev/null || true)
     if [[ $explicit =~ ^[0-9]+$ ]] && (( explicit >= 1 )); then
       es_target=$explicit
       es_fixed=1
@@ -895,7 +921,13 @@ plan_memory_budget() {
   fi
   # Data larger than the budget would take the whole pool in the
   # proportional split and push Elasticsearch and Valkey to their floors.
-  (( maria_fixed == 0 && maria_target > data_pool )) && maria_target=$data_pool
+  # An uncapped explicit PHP reservation can leave less than MariaDB's 256 MB
+  # operational floor (or nothing); capping there would book a buffer pool
+  # below the floor the split itself enforces, so the floor wins and the
+  # overcommit check reports the difference.
+  local maria_cap=$data_pool
+  (( php_explicit_children > 0 && maria_cap < 256 )) && maria_cap=256
+  (( maria_fixed == 0 && maria_target > maria_cap )) && maria_target=$maria_cap
   flex_pool=$(( data_pool - fixed_sum ))
   (( flex_pool < 0 )) && flex_pool=0
   targets_sum=$(( maria_target + valkey_target + es_fp_target ))
@@ -1016,6 +1048,15 @@ plan_memory_budget() {
       (( children < floor_children )) && children=$floor_children
       php_budget=$(( children * allowance ))
     fi
+    # An explicit count is booked as written (the floor above is that count),
+    # even when it does not fit: the overcommit check below then reports it.
+    # Name the cause, or the warning blames the service floors.
+    # The data tier has already been trimmed toward its floors for this
+    # pool, so what is left is all the services can give up.
+    if (( php_explicit_children > 0 && php_budget > remaining )); then
+      php_explicit_over=1
+      warn "Memory plan: --php children=${php_explicit_children} needs ${php_budget} MB (${allowance} MB per worker) but only ${remaining} MB remain with the data services trimmed as far as their floors and explicit sizes allow; the pool is written as requested"
+    fi
   fi
 
   # Normalise the search heap to a 512 MB boundary unless it is a preserved
@@ -1040,7 +1081,7 @@ plan_memory_budget() {
   # they exceed the budget.  Record the overcommit so the plan and the report
   # say so instead of printing allocations that look as if they fit.  The
   # comparison uses the PHP budget that is actually reserved (the earlier
-  # php_floor is capped at half the budget for the data-tier split) and
+  # hardware php_floor is capped at half the budget for the data-tier split) and
   # includes the booked Elasticsearch direct memory and OPcache huge pages.
   OPT_MEM_OVERCOMMIT_MB=0
   booked=$(( maria_alloc + valkey_alloc + es_alloc + es_book + php_budget + hp_mb ))
@@ -1066,7 +1107,14 @@ plan_memory_budget() {
   fi
   if (( booked > usable )); then
     OPT_MEM_OVERCOMMIT_MB=$(( booked - usable ))
-    warn "Memory plan: service floors and reserved memory (Elasticsearch direct ${es_book} MB, huge pages ${hp_mb} MB) exceed the ${usable} MB budget by ${OPT_MEM_OVERCOMMIT_MB} MB; this host is too small for the selected services"
+    # When the explicit pool is the cause, the host is not "too small for the
+    # selected services": the operator's worker count is, and the note above
+    # already says so.  Record the figure without blaming the floors.
+    if (( php_explicit_over )); then
+      warn "Memory plan: the booked memory exceeds the ${usable} MB budget by ${OPT_MEM_OVERCOMMIT_MB} MB because of the explicit --php children=${php_explicit_children}"
+    else
+      warn "Memory plan: service floors and reserved memory (Elasticsearch direct ${es_book} MB, huge pages ${hp_mb} MB) exceed the ${usable} MB budget by ${OPT_MEM_OVERCOMMIT_MB} MB; this host is too small for the selected services"
+    fi
   fi
 
   OPT_MARIADB_BUDGET_MB=$maria_alloc
@@ -1391,9 +1439,12 @@ service_mem_mb() {
 # the first write instead of each claiming its own percentage of RAM.
 plan_install_budget() {
   # Start from what is already on the host, then add this run's services: a
-  # later `--php --mariadb` on an Angie host must size the Angie cache and
-  # the data tier exactly like the next --optimize will.
+  # later `--php --mariadb` on an Angie host must size the data tier exactly
+  # like the next --optimize will.  The Angie cache is only re-sized when
+  # --angie is part of the run (its tuner needs the repository sync, angie -t
+  # and a rollback); the check below names the gap instead.
   detect_installed_services
+  local -a host_services=("${OPT_DETECTED[@]}")
   [[ ${ENABLED[angie]:-0} -eq 1   && " ${OPT_DETECTED[*]} " != *" angie "*   ]] && OPT_DETECTED+=(angie)
   [[ ${ENABLED[php]:-0} -eq 1     && " ${OPT_DETECTED[*]} " != *" php:"*     ]] && OPT_DETECTED+=("php:${OPT[php.ver]:-auto}")
   [[ ${ENABLED[mariadb]:-0} -eq 1 && " ${OPT_DETECTED[*]} " != *" mariadb "* ]] && OPT_DETECTED+=(mariadb)
@@ -1406,6 +1457,23 @@ plan_install_budget() {
   plan_memory_budget
   OPT_INSTALL_PLAN=0
   info "$(memory_plan_summary)"
+  # angie_cache_budget_mb gives an Angie-only host 50% of RAM (10% of the
+  # cache disk) and a host with PHP or a data tier 30% or 25%: adding PHP or
+  # MariaDB to an installed Angie without --angie leaves the larger cache in
+  # place, and that RAM is now booked for the new services too.
+  if [[ ${ENABLED[angie]:-0} -ne 1 && " ${host_services[*]} " == *" angie "* ]]; then
+    local -a run_services=("${OPT_DETECTED[@]}")
+    local ram_mb disk_mb cache_was cache_now
+    ram_mb=$(mem_total_mb)
+    disk_mb=$(angie_disk_free_mb)
+    cache_now=$(angie_cache_budget_mb "$ram_mb" "$disk_mb")
+    OPT_DETECTED=("${host_services[@]}")
+    cache_was=$(angie_cache_budget_mb "$ram_mb" "$disk_mb")
+    OPT_DETECTED=("${run_services[@]}")
+    if (( cache_now < cache_was )); then
+      warn "Angie cache budget stays at ${cache_was} MB (sized for the previous service set) until the next --optimize or --angie run, which sets ${cache_now} MB for these services"
+    fi
+  fi
 }
 
 # The one-line memory-plan summary used by the installer, --optimize and the
@@ -1918,26 +1986,41 @@ ensure_xf_cookie_bypass_map() {
   file="${target}/http.d/zz-setup-fastcgi-cache-map${suffix}"
   if [[ ! -f $file ]] || ! grep -qE 'map[[:space:]]+\$http_cookie[[:space:]]+\$setup_xf_guest_bypass' "$file" \
      || ! grep -qE 'map[[:space:]]+\$http_accept_encoding[[:space:]]+\$setup_cache_enc' "$file" \
+     || grep -qE '^[[:space:]]*~\*gzip[[:space:]]+gzip;' "$file" \
+     || grep -qE '^[[:space:]]*~\*xf_session=' "$file" \
      || ! grep -qE 'map[[:space:]]+\$cookie_xf_language_id[[:space:]]+\$setup_xf_key_language' "$file"; then
     cat > "$file" <<'EOF'
 # BEGIN setup.sh XenForo cookie bypass map
 # Authenticated/session cookies bypass the guest cache.  This is a map (http
 # context) so no `if` is needed inside a location block in Angie.
+# PHP turns ".", " " and "[" in a cookie name into "_", so "xf.session=<sid>"
+# logs the visitor in as $_COOKIE['xf_session'] while a literal xf_session=
+# test sees a guest, and the member's page was stored for every guest
+# (reproduced on the 1.21.58 audit host).  Any separator PHP folds counts; a
+# cookie name holding a percent sign also bypasses, as a margin.
+# The xf_ prefix is not part of the test, so a forum with its own
+# $config['cookie']['prefix'] is covered too.
 map $http_cookie $setup_xf_guest_bypass {
     default 0;
-    ~*xf_session=       1;
-    ~*xf_session_admin= 1;
-    ~*xf_user=          1;
-    ~*xf_tfa_trust=     1;
+    ""      0;
+    "~*[._ \[](?:session(?:[._ \[]admin)?|user|tfa[._ \[]trust)=" 1;
+    "~(?:^|;)\s*[^=;]*%[^=;]*=" 1;
 }
 # XenForo gzips its own output when the client accepts gzip.  The cache key
 # must vary on that, otherwise the first visitor's encoding is served to
 # everyone for the TTL: an identity body is then Brotli-compressed by Angie on
 # every hit (measured 42% of 16 cores at 8k req/s), and a gzip body would
 # reach a client that did not ask for it.  Two variants only: gzip or plain.
+# The gzip token counts only without a q-value: "gzip;q=0" refuses gzip, and
+# a positive q-value falls back to the plain entry, which every client takes
+# (the same rule as $guest_cache_enc in http.d/fastcgi_cache.conf).
 map $http_accept_encoding $setup_cache_enc {
     default "";
-    ~*gzip  gzip;
+    "gzip, deflate, br, zstd" gzip;
+    "gzip, deflate, br"       gzip;
+    "gzip, br"                gzip;
+    "gzip"                    gzip;
+    "~*(?:^|,)\s*gzip\s*(?:,|$)" gzip;
 }
 # Cache-key tokens: the style, style-variation and language cookies are
 # visitor-controlled, so only a well-formed value enters the key.
@@ -1967,17 +2050,22 @@ EOF
 
 # Replace the old direct-cookie bypass with the map variable.  The URI map
 # ($nocacheuri) remains from the shared fastcgi_cache.conf.
+# Only a legacy line that tests raw $cookie_xf_* values is rewritten.  The
+# repository's own lines (h5bp/php_xf.conf) also carry $req_encoded_path and
+# $cache_uri_tracking; rewriting every line used to drop both on each run, so
+# a percent-encoded route or a tracking-parameter URL (whose key is the clean
+# URL) could store the wrong page under another URL's key.
 tune_xf_cache_bypass_var() {
   local file=$1 tmp
   [[ -f $file ]] || return 0
   tmp=$(tmp_file) || return 1
   awk '
-    /^[[:space:]]*fastcgi_no_cache[[:space:]]/ {
-      print "fastcgi_no_cache $setup_xf_guest_bypass $nocacheuri;"
+    /^[[:space:]]*fastcgi_no_cache[[:space:]]/ && /\$cookie_xf_/ {
+      print "fastcgi_no_cache $setup_xf_guest_bypass $nocacheuri $req_encoded_path $cache_uri_tracking;"
       next
     }
-    /^[[:space:]]*fastcgi_cache_bypass[[:space:]]/ {
-      print "fastcgi_cache_bypass $setup_xf_guest_bypass $nocacheuri;"
+    /^[[:space:]]*fastcgi_cache_bypass[[:space:]]/ && /\$cookie_xf_/ {
+      print "fastcgi_cache_bypass $setup_xf_guest_bypass $nocacheuri $req_encoded_path;"
       next
     }
     { print }
@@ -2025,7 +2113,10 @@ ensure_xf_guest_cache() {
   # from the repair at the end.
   tune_xf_location_security_headers "$target" "${target}/h5bp/php_xf_proxy.conf"
 
-  local lock='$setup_xf_guest_bypass $nocacheuri'
+  # Same tests as the repository include: a percent-encoded route is never
+  # cached, and a tracking-parameter URL (keyed on its clean URL) never stored.
+  local lock='$setup_xf_guest_bypass $nocacheuri $req_encoded_path'
+  local nostore="${lock} \$cache_uri_tracking"
   # The repository include serves cacheable guests from the named location
   # @xf_guest_cache, where Set-Cookie is hidden, so the cache may ignore it.
   # An older or hand-written include has one location for guests and members:
@@ -2050,7 +2141,7 @@ ensure_xf_guest_cache() {
     $'fastcgi_cache_use_stale[[:space:]]\tfastcgi_cache_use_stale error timeout invalid_header updating http_503;'
     "fastcgi_ignore_headers[[:space:]]"$'\t'"${ignore}"
     $'fastcgi_cache[[:space:]]+fastcgicache;\tfastcgi_cache fastcgicache;'
-    "fastcgi_no_cache[[:space:]]"$'\t'"fastcgi_no_cache ${lock};"
+    "fastcgi_no_cache[[:space:]]"$'\t'"fastcgi_no_cache ${nostore};"
     "fastcgi_cache_bypass[[:space:]]"$'\t'"fastcgi_cache_bypass ${lock};"
     $'fastcgi_cache_valid[[:space:]]+200[[:space:]]\tfastcgi_cache_valid 200 5m;'
     $'fastcgi_cache_valid[[:space:]]+500([[:space:]]+[0-9]+)+[[:space:]]+0s;\tfastcgi_cache_valid 500 502 503 504 0s;'

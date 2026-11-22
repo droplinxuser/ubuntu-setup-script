@@ -36,7 +36,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.21.57"
+readonly SCRIPT_VERSION="1.21.58"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -69,10 +69,12 @@ if [[ -n ${SETUP_LIMIT_REQ_EXEMPT+x} ]]; then
   LIMIT_REQ_EXEMPT_PERSIST=1
 fi
 # Static-asset precompression (.br/.gz siblings served by brotli_static and
-# gzip_static) is off by default: behind a CDN the origin rarely serves
-# assets.  SETUP_PRECOMPRESS_ASSETS=1 turns it on for an origin that serves
-# its own assets and is persisted in the same host file (0 turns it off).
-PRECOMPRESS_ASSETS="${PRECOMPRESS_ASSETS:-0}"
+# gzip_static) is on by default since 1.21.58: compressing
+# an asset per request capped a 177 KB script at 2,100 req/s (3.8 ms of Angie
+# CPU each) where the sibling is served at the uncompressed rate, and a CDN
+# still sends the origin every miss.  SETUP_PRECOMPRESS_ASSETS=0 turns it off
+# (the siblings it made are removed) and is persisted in the same host file.
+PRECOMPRESS_ASSETS="${PRECOMPRESS_ASSETS:-1}"
 PRECOMPRESS_ASSETS_PERSIST=0
 if [[ -n ${SETUP_PRECOMPRESS_ASSETS+x} ]]; then
   PRECOMPRESS_ASSETS=$SETUP_PRECOMPRESS_ASSETS
@@ -111,7 +113,7 @@ if [[ -n ${SETUP_PHP_PAGE_GZIP+x} ]]; then
   PHP_PAGE_GZIP_PERSIST=1
 fi
 [[ $PHP_PAGE_GZIP == 0 ]] || PHP_PAGE_GZIP=1
-[[ $PRECOMPRESS_ASSETS == 1 ]] || PRECOMPRESS_ASSETS=0
+[[ $PRECOMPRESS_ASSETS == 0 ]] || PRECOMPRESS_ASSETS=1
 # XenForo job runner.  XenForo runs its job queue (cron tasks, search
 # indexing, XFMG video transcoding) inside member page requests by default
 # ("Job run trigger: activity-based").  With the admin option switched to

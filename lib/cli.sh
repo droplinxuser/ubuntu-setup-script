@@ -156,9 +156,10 @@ Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
       current CPU/RAM/disk.  It also enables FastCGI guest caching for
       detected WordPress and XenForo vhosts, including the shared cache
       zone, style/language cache keys and session-cookie bypass.
-      It never installs, purges or starts a managed service; the only package
-      it may add is angie-module-brotli when Angie is installed (and the
-      Anubis static binary when anubis=yes), so install and optimize share
+      It never installs, purges or starts a managed service; the only packages
+      it may add are angie-module-brotli, angie-module-zstd and the brotli
+      CLI (asset precompression) when Angie is installed (and the Anubis
+      static binary when anubis=yes), so install and optimize share
       the same compression/bot-filter profile.  `anubis=yes` enables the bot
       filter for every site on the host and installs it when missing;
       `anubis=no` restores the vhosts to direct TLS and stops it.  A host
@@ -201,7 +202,7 @@ Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
           and the dedi/vps pin so the shared memory plan recomputes them;
         - tuning environment variables (SETUP_TCP_CC, SETUP_QDISC,
           SETUP_STORAGE_CLASS, SETUP_PHP_WORKERS_PER_CPU,
-          SETUP_PHP_JIT_HOT_*, SETUP_GZIP_LEVEL, SETUP_BROTLI_LEVEL,
+          SETUP_PHP_JIT_HOT_*, SETUP_GZIP_LEVEL, SETUP_BROTLI_LEVEL, SETUP_ZSTD_LEVEL,
           SETUP_ANGIE_COMPRESSION, SETUP_MARIADB_IO_CAPACITY,
           SETUP_LIMIT_REQ_EXEMPT, SETUP_PRECOMPRESS_ASSETS,
           SETUP_PHP_PAGE_GZIP, SETUP_PHP_JIT_WORDPRESS) are ignored with a

@@ -912,15 +912,27 @@ anubis_integrate_vhost() {
 # in a vhost that is already behind Anubis.  $realip_remote_addr is the
 # *direct peer* (before real_ip), so behind the filter it is "unix:" and the
 # guard can never pass: every request, including a static-shadow request,
-# answers 444 and the terminator reports 502.  The socket is the new
-# perimeter (it is 0660 in a 0750 runtime directory and the vhost no longer
-# has a public listener), so disabling the guard is safe.  Idempotent: a
-# guard that is already commented is skipped.
+# answers 444 and the terminator reports 502.  The guard is not dropped, it
+# moves: anubis_render_terminators copies every server-level guard this
+# function commented ("#" + the original line) into the public 443
+# terminator, where $realip_remote_addr is again the direct TCP peer.  An
+# origin that only accepts its front proxy/WAF stays locked down with Anubis
+# on (without the copy it answered anyone on 443), and anubis_deintegrate_vhost
+# puts it back when the filter is turned off.  The socket side needs no
+# guard: it is 0660 in a 0750 runtime directory.  Idempotent: a guard that is
+# already commented is skipped.
+# The first commented line carries ANUBIS_GUARD_MARK.  A guard the operator
+# commented out by hand looks the same otherwise ("#" at column 0 is what
+# nano and most editors' comment toggle write), and re-applying a lockdown
+# they retired (an old WAF address) would 444 every visitor, the new edge
+# included.  The mark adds no "realip" text, so the one-occurrence checks on
+# a disabled vhost still hold.
+ANUBIS_GUARD_MARK='  # setup.sh: guard moved to the Anubis terminator'
 anubis_disable_realip_guards() {
   local f=$1 tmp
   grep -qE '^[[:space:]]*if[[:space:]]*\(.*\$realip_remote_addr' "$f" 2>/dev/null || return 0
   tmp=$(tmp_file) || return 1
-  awk '
+  awk -v mark="$ANUBIS_GUARD_MARK" '
     function brace_delta(s,   t, n, m) {
       t = s; n = gsub(/{/, "{", t)
       t = s; m = gsub(/}/, "}", t)
@@ -936,7 +948,7 @@ anubis_disable_realip_guards() {
         next
       }
       if (code ~ /^[ \t]*if[ \t]*\(.*\$realip_remote_addr/) {
-        print "#" $0
+        print "#" $0 mark
         depth = brace_delta(code)
         if (depth > 0) skipping = 1
         next
@@ -946,7 +958,7 @@ anubis_disable_realip_guards() {
   ' "$f" > "$tmp" || return 1
   if commit_if_changed "$f" "$tmp"; then
     ANUBIS_ANGIE_DIRTY=1
-    tune_note "${f##*/}: outer \$realip_remote_addr 444 guard disabled (the Anubis socket is the perimeter; every request still arrives through the filter)"
+    tune_note "${f##*/}: outer \$realip_remote_addr 444 guard moved to the public Anubis terminator (it cannot pass over the socket)"
   fi
   return 0
 }
@@ -1085,8 +1097,10 @@ EOF
       protected=$(( protected + 1 ))
       awk -v sock="${ANUBIS_BACKEND_SOCKET}" \
           -v static="${ANUBIS_STATIC_ACTIVE}" \
-          -v route="${ANUBIS_STATIC_ROUTE}" '
-        function flush(   n) {
+          -v route="${ANUBIS_STATIC_ROUTE}" \
+          -v mark="$ANUBIS_GUARD_MARK" \
+          -v orig="${ANUBIS_STATE}/vhosts/${f##*/}.orig" '
+        function flush(   n, i) {
           if (!integrated) return
           n = split(names, a, " ")
           if (n == 0 || names == "" || names ~ /(^| )_($| )/) return
@@ -1111,6 +1125,15 @@ EOF
           print "    ssl_certificate     " cert ";"
           print "    ssl_certificate_key " key ";"
           print ""
+          if (ng > 0) {
+            # The origin lockdown anubis_disable_realip_guards took off the
+            # socket-side vhost: this is the public listener now, so the
+            # edge-proxy check runs here, before any location (static,
+            # /socket/ or the filter) can answer.
+            print "    # Origin lockdown carried over from the vhost."
+            for (i = 1; i <= ng; i++) print guard[i]
+            print ""
+          }
           if (ws) {
             # Only for a vhost that has a /socket/ location (XenForo push).
             # The upgrade itself skips the HTTP bot filter; any other request
@@ -1177,7 +1200,20 @@ EOF
           print "    }"
           print "}"
         }
-        BEGIN { in_block = 0; depth = 0 }
+        BEGIN {
+          in_block = 0; depth = 0
+          # Guards that were live before Anubis: a host enabled by a release
+          # that did not mark the guards it commented is recognised by the
+          # pre-integration copy instead (a guard commented by hand is
+          # commented there too, so it is never carried).
+          if (orig != "") {
+            while ((getline ol < orig) > 0) {
+              oc = ol; sub(/#.*/, "", oc)
+              if (oc ~ /^[ \t]*if[ \t]*\(.*\$realip_remote_addr/) orig_guard[ol] = 1
+            }
+            close(orig)
+          }
+        }
         function count_braces(s,   t, n, m) {
           t = s; n = gsub(/{/, "{", t)
           t = s; m = gsub(/}/, "}", t)
@@ -1189,9 +1225,41 @@ EOF
           if (code ~ /^[ \t]*server[ \t]*{/) {
             in_block = 1; depth = count_braces(code)
             names = ""; cert = ""; key = ""; integrated = 0; ws = 0
+            ng = 0; gcap = 0
             next
           }
           if (in_block) {
+            # Collect the server-level realip guards anubis_disable_realip_guards
+            # commented out ("#" + original line, body included): the first
+            # line carries the mark, or (older releases) was live in the
+            # pre-integration copy.  A guard inside a location is not
+            # lifted: at server level it would cover URIs the vhost never
+            # restricted.
+            g = $0
+            if (!gcap && depth == 1 && g ~ /^#[ \t]*if[ \t]*\(.*\$realip_remote_addr/) {
+              gl = substr(g, 2)
+              mi = index(gl, mark)
+              if (mi > 0) gl = substr(gl, 1, mi - 1)
+              if (mi > 0 || (gl in orig_guard)) {
+                gstart = ng + 1; gd = 0; gcap = 1
+                g = "#" gl
+              }
+            }
+            if (gcap) {
+              if (g ~ /^#/) {
+                g = substr(g, 2)
+                gc = g; sub(/#.*/, "", gc)
+                gd += count_braces(gc)
+                guard[++ng] = g
+                gcap = (gd > 0)
+              } else {
+                # The commented block ended before its braces closed (an
+                # edit by hand): emitting half an if would fail angie -t
+                # and roll the whole filter back, so drop that one guard.
+                ng = gstart - 1
+                gcap = 0
+              }
+            }
             if (code ~ /^[ \t]*server_name[ \t]+/) {
               v = code
               sub(/^[ \t]*server_name[ \t]+/, "", v)
@@ -1244,15 +1312,43 @@ EOF
 # the 1.21.37 audit host).
 # The inverse of anubis_integrate_vhost: the backend listen becomes the two
 # public TLS listeners plus http2, and the two real-IP lines the integration
-# added are dropped.  Every other directive is left exactly as it is.
+# added are dropped.  Every guard anubis_disable_realip_guards commented (the
+# ones carrying ANUBIS_GUARD_MARK) is live again: the vhost is the public
+# listener once more, and leaving the edge-proxy check commented let anyone
+# reach the origin on 443 after anubis=no.  A guard commented by hand has no
+# mark and stays commented.  Every other directive is left exactly as it is.
 #   $1 vhost file.  Returns 0 when the file is no longer integrated.
 anubis_deintegrate_vhost() {
   local f=$1 sock="unix:${ANUBIS_BACKEND_SOCKET}" tmp
   anubis_vhost_integrated "$f" || return 0
   tmp=$(tmp_file) || return 1
-  awk -v sock="$sock" '
+  awk -v sock="$sock" -v mark="$ANUBIS_GUARD_MARK" '
     function indent_of(s) { if (match(s, /^[ \t]*/)) return substr(s, 1, RLENGTH); return "" }
+    function brace_delta(s,   t, n, m) {
+      t = s; n = gsub(/{/, "{", t)
+      t = s; m = gsub(/}/, "}", t)
+      return n - m
+    }
+    # A marked block is buffered until its braces close; one that ends early
+    # (edited by hand) is written back still commented, because half an if
+    # would fail angie -t.
+    function keep_commented(   i) { for (i = 1; i <= nb; i++) print raw[i]; nb = 0 }
+    function uncomment(s,   c, i) {
+      raw[++nb] = $0; live[nb] = s
+      c = s; sub(/#.*/, "", c)
+      bd += brace_delta(c)
+      if (bd <= 0) { for (i = 1; i <= nb; i++) print live[i]; nb = 0 }
+    }
     {
+      if (nb > 0) {
+        if ($0 ~ /^#/) { uncomment(substr($0, 2)); next }
+        keep_commented()
+      }
+      if ($0 ~ /^#[ \t]*if[ \t]*\(.*\$realip_remote_addr/ && (mi = index($0, mark)) > 0) {
+        bd = 0
+        uncomment(substr($0, 2, mi - 2))
+        next
+      }
       code = $0
       sub(/#.*/, "", code)
       if (code ~ /^[ \t]*listen[ \t]+/ && index(code, sock) > 0) {
@@ -1266,6 +1362,7 @@ anubis_deintegrate_vhost() {
       if (code ~ /^[ \t]*real_ip_header[ \t]+X-Real-IP;[ \t]*$/) next
       print
     }
+    END { keep_commented() }
   ' "$f" >"$tmp" || { rm -f "$tmp"; return 1; }
   if ! commit_if_changed "$f" "$tmp"; then
     rm -f "$tmp"

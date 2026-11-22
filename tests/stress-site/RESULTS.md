@@ -7,7 +7,39 @@ manifests, sweep tables and run logs these sections cite (`AUDIT-*.md`,
 removed from the tree on 2026-11-19 to keep the repository lean; every one
 is still in git history, for example
 `git show 84b0db5:tests/stress-site/AUDIT-20261117-1.21.30.md`.  The current
-cycle report is `AUDIT-20261121-1.21.57.md`.
+cycle report is `AUDIT-20261122-1.21.58.md`.
+
+## 1.21.58 compression cycle — Xeon E-2236 (2026-11-22)
+
+Pair: `server-configs-nginx` 1.6.51.  Details: `AUDIT-20261122-1.21.58.md`.
+
+- gzip vs Brotli vs zstd per tier, encodings interleaved round by round
+  (back-to-back blocks favoured the first encoding by up to 24 % on this CPU).
+- Static assets precompressed by default (`.br` Brotli 11 + `.gz`), rotated
+  A/B: XenForo core JS 2.1k -> 62.8k req/s (Angie 3.9 -> 0.11 ms/req,
+  54.6 -> 46.4 KB), WordPress CSS 4.3k -> 93k, jQuery 3.6k -> 82k.  Brotli 11 beat zstd 19
+  on every sibling, so no `.zst`.
+- Dynamic responses: zstd 3 for clients that offer it (loaded after Brotli,
+  or Brotli answers everyone), Brotli 4 for Cloudflare/Safari, gzip last.
+  XenForo member thread: Brotli 4 18.3 KB at 2.1 ms vs zstd 3 19.4 KB at
+  0.84 ms, 379 -> 404 req/s.  WordPress members: PHP gzip vs Angie 145 vs
+  144 (browser) / 141 (`br, gzip`): no gain, no split shipped.
+- Guest cache keeps the stored gzip body; WordPress/Chevereto store level 6
+  instead of 4 (-5 % bytes per hit).  A stored Brotli page would be 14-22 %
+  smaller but needs a PHP Brotli extension (none packaged).
+- Security: member pages stored for guests via a folded cookie name
+  (`xf.session`, reproduced and fixed in both repositories); `--optimize`
+  stripping two XenForo cache guards; `gzip;q=0`; Anubis dropping an
+  origin's edge lockdown; password files reset to 0644.  21 audit findings
+  upheld by two independent reviewers each, all fixed with tests.
+- Zero-error cycle: install 2:13 / 0 warnings, install -> --optimize 0 of 3,030 facts, --optimize x2 0 of 3,034,
+  1,554 unit checks, 225 dry runs, security 67/67, cookie 67/67, functional
+  0 unexpected, 0 PHP 8.5 diagnostics.  PHP 8.6 now has redis, igbinary
+  and imagick: `--upgrade-php` 8.5 -> 8.6 -> 8.5 clean (1:52 each); WordPress
+  and Chevereto run on 8.6, XenForo 2.3.13 stays on 8.5 (debug mode 500s,
+  Braintree and laminas-mail do not compile on 8.6).  Restore: 696 -> 696
+  packages, 0 `/etc` files added or removed after the reboot.
+
 
 ## 1.21.57 audit cycle — Xeon E-2236 (2026-11-21)
 

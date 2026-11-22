@@ -106,7 +106,7 @@ What `--basic` does:
 | DNS | drop-in with `8.8.8.8`, `1.1.1.1` and `Domains=~.`, so they are the default route rather than only a fallback |
 | Packages | upgrades packages; installs the basic tools, `cron`, `logrotate` and `unattended-upgrades` |
 | OS profile | sysctl, PAM limits, governor, THP `madvise`, udev I/O rules (see [Hardware profile](#hardware-profile)) |
-| Root crontab | ownership repair of `/var/www` that skips logs and `wp-config.php`; Cloudflare IP refresh; MariaDB backup at 03:03 and monthly `mariadb-check`; `wp-cron.php` every 5 minutes; asset precompression when enabled |
+| Root crontab | ownership repair of `/var/www` that skips logs and `wp-config.php`; Cloudflare IP refresh; MariaDB backup at 03:03 and monthly `mariadb-check`; `wp-cron.php` every 5 minutes; asset precompression (on by default) |
 | Firewall (UFW) | deny in, allow out, `ufw limit` on every effective SSH port, 80/443 open |
 | State | originals are recorded under `/var/lib/setup.sh` for `--purge basic` |
 
@@ -149,9 +149,10 @@ Environment options:
 
 | Variable | Default | Effect |
 |---|---|---|
-| `SETUP_BROTLI_LEVEL=1..11` | 4 (3 on 1-2 CPU hosts) | dynamic Brotli level; gzip is the fallback |
+| `SETUP_ZSTD_LEVEL=0..19` | 3 | dynamic zstd level for clients that offer zstd (current Chrome, Edge, Firefox); 0 turns zstd off.  Measured: Brotli 4's bytes within 6 % at 40 % of its Angie CPU per request |
+| `SETUP_BROTLI_LEVEL=1..11` | 4 (3 on 1-2 CPU hosts) | dynamic Brotli level for clients without zstd (Safari, Cloudflare to origin); gzip is the fallback |
 | `SETUP_ANGIE_COMPRESSION=0` | on | turns the managed compression profile off |
-| `SETUP_PRECOMPRESS_ASSETS=1` | off (a CDN normally serves assets) | writes `.br`/`.gz` siblings for the static assets of every XenForo/WordPress root and keeps them fresh from cron.  Install-time only: `--optimize` ignores the tuning override and uses the default (off) |
+| `SETUP_PRECOMPRESS_ASSETS=0` | on (since 1.21.58) | writes `.br`/`.gz` siblings for the static assets of every XenForo/WordPress root and keeps them fresh from cron (a 177 KB script: 22,000 req/s from the sibling vs 2,100 compressed per request).  0 removes the siblings it made.  Install-time only: `--optimize` ignores the tuning override and uses the default (on) |
 | `SETUP_XF_JOB_CRON=0` | on | removes the managed crontab entry that runs `cmd.php xf:run-jobs` once a minute as www-data for every XenForo root; persisted as `XF_JOB_CRON` |
 | `CONFIG_REPO_URL`, `CONFIG_REPO_REF` | `droplinxuser/server-configs-nginx`, `main` | select a fork or branch of the configuration tree |
 | `CONFIG_SOURCE_DIR=/path` | unset | use a local checkout instead of downloading |
@@ -293,7 +294,7 @@ Environment options:
 | `SETUP_PHP_JIT_HOT_LOOP`, `_FUNC`, `_RETURN`, `_SIDE_EXIT` | PHP defaults on 4+ CPU hosts; a conservative set on 1-2 CPUs | JIT hotness thresholds |
 | `SETUP_PHP_JIT_WORDPRESS=0` | 1 (WordPress uses the JIT) | keeps `opcache.jit = off` for every WordPress document root through a `[PATH=<root>]` section of the managed ini, for a site that misbehaves with the JIT.  Tuning override: ignored by `--optimize` |
 | `SETUP_PHP_PAGE_GZIP=0` | 1 | by default the managed ini turns `zlib.output_compression` (level 4) on in a `[PATH=<root>]` section for every WordPress and Chevereto document root whose guest cache key carries the encoding token, so the FastCGI cache stores the gzip page (0.12 ms of Angie CPU per hit instead of about 1 ms to compress each hit); Chevereto roots also get PHP session GC (`session.gc_probability = 1`, divisor 1000) because no timer cleans its session directory; tuning override: ignored by `--optimize` (profile default 1) |
-| `SETUP_PHP_SESSION_HARDENING=1` | off | opt-in `session.*` strict settings, `cgi.fix_pathinfo=0`, `display_errors=Off` and a central `error_log`; it broke Joomla/Polr logins on a mixed host |
+| `SETUP_PHP_SESSION_HARDENING=1` | off | opt-in `session.*` strict settings, `cgi.fix_pathinfo=0`, `display_errors=Off` and a central `error_log`; it broke Joomla/Polr logins on a mixed host.  Persisted as `PHP_SESSION_HARDENING` (kept by `--optimize`; `=0` turns it off) |
 
 Install behaviour:
 
@@ -683,7 +684,7 @@ What the reset does on every `--optimize`:
 |---|---|
 | `/etc/default/setup-tuning` | rewritten with only host facts/feature choices: `ANUBIS`, `ANUBIS_STATIC_BYPASS`, `XF_JOB_CRON`, `NODE_MAJOR`, `NODE_ALLOW_MAJOR_UPGRADE`. Old `TCP_CC`, `QDISC`, `STORAGE_CLASS`, compression/JIT/page-cache and rate-limit pins no longer survive |
 | `/var/lib/setup.sh/explicit-options.conf` | moved to `/tmp`; recorded `php_children`/`max_requests`, MariaDB/Valkey/ES sizes and the dedi/vps pin are dropped and the shared memory plan recomputes them |
-| tuning environment | `SETUP_TCP_CC`, `SETUP_QDISC`, `SETUP_STORAGE_CLASS`, `SETUP_PHP_WORKERS_PER_CPU`, `SETUP_PHP_JIT_HOT_*`, `SETUP_GZIP_LEVEL`, `SETUP_BROTLI_LEVEL`, `SETUP_ANGIE_COMPRESSION`, `SETUP_MARIADB_IO_CAPACITY`, `SETUP_LIMIT_REQ_EXEMPT`, `SETUP_PRECOMPRESS_ASSETS`, `SETUP_PHP_PAGE_GZIP`, `SETUP_PHP_JIT_WORDPRESS` are unset for the run and listed in the report/warning |
+| tuning environment | `SETUP_TCP_CC`, `SETUP_QDISC`, `SETUP_STORAGE_CLASS`, `SETUP_PHP_WORKERS_PER_CPU`, `SETUP_PHP_JIT_HOT_*`, `SETUP_GZIP_LEVEL`, `SETUP_BROTLI_LEVEL`, `SETUP_ZSTD_LEVEL`, `SETUP_ANGIE_COMPRESSION`, `SETUP_MARIADB_IO_CAPACITY`, `SETUP_LIMIT_REQ_EXEMPT`, `SETUP_PRECOMPRESS_ASSETS`, `SETUP_PHP_PAGE_GZIP`, `SETUP_PHP_JIT_WORDPRESS` are unset for the run and listed in the report/warning |
 
 Feature choices are not performance overrides and still apply: `anubis=yes|no`
 (and `SETUP_ANUBIS*`), `NODE_MAJOR`, the WordPress/Chevereto cache and security
@@ -813,7 +814,7 @@ data directory (NVMe / SSD / HDD) and the host class (`dedi`/`vps`).
 | MariaDB | see the service section: pool = live data +5% (128 MB minimum, shrunk online when larger), floor `clamp(RAM/16, 256 MB, 4 GB)` only for a fresh install with nothing to measure, io_capacity by disk x host, thread pool, connections from the PHP pool, table caches from connections, Aria page cache `clamp(RAM/128, 16, 256) MB` |
 | Elasticsearch | heap = store/4 (512 MB..25% RAM..31 GB); `node.processors` = effective CPUs; search threads cpus/2 (max 16), write threads cpus/4 (max 8) |
 | Valkey / Redis | maxmemory = live +20% (128 MB minimum, shrunk online when more than 10% larger), floor `clamp(RAM/64, 128 MB, 1 GB)` only on a fresh install with nothing to measure; maxclients from the PHP pool; io_threads 1..8 (a larger `io_threads=` is clamped with a warning) |
-| Angie | `worker_processes` = **2/3 of CPUs** (`worker_cpu_affinity auto` commented out under a cgroup CPU quota; measured on the 12-thread EPYC: 8 workers 389-390k cached req/s vs 348-352k at `auto`/12), `worker_connections = clamp(cpus x 2048, 8192, 65535)` and `worker_rlimit_nofile = clamp(cpus x 8192, 65536, 524288)` (VPS: 1024 and 4096 per core), **no PHP upstream keepalive cache** (an idle FastCGI connection pins one PHP-FPM worker; see the live-origin.example audit in `tests/stress-site/RESULTS.md`), `open_file_cache max = clamp(RAM_MB x 8, 10000, 200000)` bounded by `rlimit - connections`, FastCGI buffers and cache zones by RAM, cache disk budget by RAM/cache filesystem size (capped at half its free space)/installed services (50% RAM Angie-only, 30% Angie+PHP, 25% full stack; a populated FastCGI, proxy or CDN cache is never shrunk below its live size), `directio 16m` on NVMe/SSD (4m on HDD), Brotli and gzip 4 (3 on 1-2 CPUs; `SETUP_BROTLI_LEVEL`, `SETUP_GZIP_LEVEL`) |
+| Angie | `worker_processes` = **2/3 of CPUs** (`worker_cpu_affinity auto` commented out under a cgroup CPU quota; measured on the 12-thread EPYC: 8 workers 389-390k cached req/s vs 348-352k at `auto`/12), `worker_connections = clamp(cpus x 2048, 8192, 65535)` and `worker_rlimit_nofile = clamp(cpus x 8192, 65536, 524288)` (VPS: 1024 and 4096 per core), **no PHP upstream keepalive cache** (an idle FastCGI connection pins one PHP-FPM worker; see the live-origin.example audit in `tests/stress-site/RESULTS.md`), `open_file_cache max = clamp(RAM_MB x 8, 10000, 200000)` bounded by `rlimit - connections`, FastCGI buffers and cache zones by RAM, cache disk budget by RAM/cache filesystem size (capped at half its free space)/installed services (50% RAM Angie-only, 30% Angie+PHP, 25% full stack; a populated FastCGI, proxy or CDN cache is never shrunk below its live size), `directio 16m` on NVMe/SSD (4m on HDD), zstd 3 for clients that offer it, then Brotli and gzip 4 (3 on 1-2 CPUs; `SETUP_ZSTD_LEVEL`, `SETUP_BROTLI_LEVEL`, `SETUP_GZIP_LEVEL`) |
 | Kernel / PHP | `vm.nr_hugepages = (OPcache MB + JIT MB + 1)/2 + 8` (8..512; 296 pages = 592 MB on 8 GB+) on hosts with 4 GB+ and PHP, and `opcache.huge_code_pages=1` when the pages exist (measured +3.5 % on the XenForo member/thread tiers); the reservation is booked in the memory plan |
 | Kernel | `somaxconn`/SYN backlog `cpus x 4096` (VPS x 2048, max 65536), conntrack `RAM_MB x 16` (VPS x 8), `tcp_rmem`/`tcp_wmem` default 85 KB under 4 GB, 128 KB under 16 GB, 256 KB above, `netdev_budget 600/8000 us` on dedicated hosts with 8+ CPUs, `vm.dirty_background_bytes = clamp(RAM/100, 64 MB, 512 MB)` and `vm.dirty_bytes = 4x` (tighter on HDD), `vm.min_free_kbytes` 1% of RAM (16 MB floor under 4 GB, 256 MB cap), `vm.swappiness` 1 on NVMe/SSD (10 on HDD), `kernel.shmmax = min(1 GiB, RAM/4)`, `ip_local_reserved_ports` = 3306, 6379, 9200, 9300 and the sshd ports (the ephemeral range is 1024-65535), BBR + fq (`SETUP_TCP_CC`, `SETUP_QDISC`), 1M-nofile PAM limits. The base profile's `ip_forward`/`forwarding = 0` lines are dropped on a host that already forwards (bridge, Docker/LXD, WireGuard/Tailscale interfaces) and its IPv6 `autoconf`/`accept_ra = 0` lines on a host whose address or default route comes from router advertisements |
 | Host | swap RAM/2 clamped 1..8 GiB (VPS 4); governor on dedicated hardware only (the previous governor is recorded for `--purge`); THP `madvise`; `fstrim.timer` on SSD/NVMe; I/O scheduler and readahead per device class for every whole disk by its rotational flag (NVMe `none`, flash `mq-deadline`/128k, rotational `mq-deadline`/1024k; md/dm arrays on flash get readahead 128k only, since the kernel sizes an array's readahead from its stripe and the filesystem reads through the array, not its members; HDD arrays and loop/zram are left alone; the rules are re-triggered only for non-empty whole disks, so BMC virtual floppies and CD-ROMs are not replayed through other packages' udev rules) |
@@ -855,11 +856,11 @@ Tuning overrides (ignored by `--optimize`, which uses the hardware profile):
 | `SETUP_STORAGE_CLASS` | `nvme\|ssd\|hdd` pin when the kernel cannot see the medium |
 | `SETUP_PHP_WORKERS_PER_CPU` | PHP-FPM workers-per-CPU factor |
 | `SETUP_PHP_JIT_HOT_LOOP`, `_FUNC`, `_RETURN`, `_SIDE_EXIT` | JIT hotness thresholds |
-| `SETUP_GZIP_LEVEL`, `SETUP_BROTLI_LEVEL` | dynamic compression levels |
+| `SETUP_GZIP_LEVEL`, `SETUP_BROTLI_LEVEL`, `SETUP_ZSTD_LEVEL` | dynamic compression levels |
 | `SETUP_ANGIE_COMPRESSION` | 0 turns the managed compression profile off |
 | `SETUP_MARIADB_IO_CAPACITY` | `innodb_io_capacity`/`_max` |
 | `SETUP_LIMIT_REQ_EXEMPT` | rate-limit exemptions for a load generator or monitor |
-| `SETUP_PRECOMPRESS_ASSETS` | static-asset precompression (profile default 0) |
+| `SETUP_PRECOMPRESS_ASSETS` | static-asset precompression (profile default 1) |
 | `SETUP_PHP_PAGE_GZIP` | PHP page gzip for the guest cache (profile default 1) |
 | `SETUP_PHP_JIT_WORDPRESS` | 0 exempts WordPress roots from the tracing JIT (profile default 1) |
 

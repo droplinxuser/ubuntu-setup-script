@@ -1015,9 +1015,11 @@ configure_sysctl() {
   # The widened ephemeral range covers the service ports; reserve them so an
   # outbound connection can never take 3306/6379/9000/9200 before a restart
   # binds.  9000 is the supported PHP-FPM TCP listener (the installer uses a
-  # Unix socket, but an adopted host may keep 127.0.0.1:9000).
+  # Unix socket, but an adopted host may keep 127.0.0.1:9000).  8240 is the
+  # Anubis metrics listener (ANUBIS_METRICS): an outbound connection holding
+  # it when anubis.service restarts makes the bind fail and the unit exit.
   local reserved_ports
-  reserved_ports=$(printf '%s\n' 3306 6379 9000 9200 9300 "$(sshd_listen_ports)" \
+  reserved_ports=$(printf '%s\n' 3306 6379 "${ANUBIS_METRICS##*:}" 9000 9200 9300 "$(sshd_listen_ports)" \
     | grep -E '^[0-9]+$' | awk '$1 >= 1024' | sort -nu | paste -sd, -)
   # Busy dedicated hosts with several queues drain more packets per softirq
   # pass; a VPS shares its hypervisor queue and keeps the kernel default.

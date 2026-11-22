@@ -156,6 +156,24 @@ passkeys "$XF" /login/
 passkeys "$WP" /wp-login.php
 passkeys "$CH" /login
 
+echo "################ Guest-cache guards after --optimize"
+# A tracking-parameter URL is keyed on its clean URL, so it must never be
+# stored (XenForo routes "index.php?utm_x=1&threads/..." to the home page);
+# a percent-encoded route is never cached at all.  Before 1.21.58 every
+# --optimize rewrote the XenForo bypass lines and dropped both guards.
+cache_status() { # HOST PATH -> X-Cache-Status of one request
+  curl -sk --max-time 20 --path-as-is --resolve "$1:443:$IP" -o /dev/null -D - "https://$1$2" \
+    | tr -d '\r' | sed -n 's/^[Xx]-[Cc]ache-[Ss]tatus: *//p'
+}
+trk="/index.php?utm_source=probe$RANDOM&threads/x.1/"
+s1=$(cache_status "$XF" "$trk"); s2=$(cache_status "$XF" "$trk"); s3=$(cache_status "$XF" "$trk")
+if [[ "$s1$s2$s3" != *HIT* ]]; then ok "xf tracking-parameter URL is never stored ($s1/$s2/$s3)"
+else bad "xf tracking-parameter URL is never stored" "$s1/$s2/$s3"; fi
+enc="/%77hats-new/?probe=$RANDOM"
+s1=$(cache_status "$XF" "$enc"); s2=$(cache_status "$XF" "$enc")
+if [[ $s1 == BYPASS && $s2 == BYPASS ]]; then ok "xf percent-encoded route bypasses the guest cache"
+else bad "xf percent-encoded route bypasses the guest cache" "$s1/$s2"; fi
+
 echo
 echo "TOTAL pass=$P fail=$F"
 rm -rf "$T"
