@@ -2575,6 +2575,8 @@ check "injected XenForo cache block stays inside the location" \
   test "$(tail -n1 "$TMP/xfguest/h5bp/php_xf.conf")" = '}'
 check "injected XenForo cache block is complete" \
   bash -c 'grep -q "^fastcgi_cache fastcgicache;" "$1" && grep -q "^fastcgi_cache_bypass" "$1"' _ "$TMP/xfguest/h5bp/php_xf.conf"
+check "injected XenForo cache block gives PHP the key's encoding" \
+  grep -qx 'fastcgi_param HTTP_ACCEPT_ENCODING $setup_cache_ae;' "$TMP/xfguest/h5bp/php_xf.conf"
 check "the XenForo status header uses the shared X-Cache-Status name" \
   grep -q '^add_header X-Cache-Status \$upstream_cache_status always;$' "$TMP/xfguest/h5bp/php_xf.conf"
 # Older includes used X-5m-Cache; the tuner renames it so every application
@@ -3669,23 +3671,66 @@ effective_cpus() { printf 2; }
 check "angie_brotli_level drops to 3 on a 2 CPU host" \
   test "$(angie_brotli_level)" = 3
 effective_cpus() { printf 16; }
-# zstd level: explicit (0 = off), else 3.
-check "angie_zstd_level defaults to 3" test "$(angie_zstd_level)" = 3
-check "angie_zstd_level honours SETUP_ZSTD_LEVEL" test "$(SETUP_ZSTD_LEVEL=6 angie_zstd_level)" = 6
-check "angie_zstd_level 0 turns zstd off" test "$(SETUP_ZSTD_LEVEL=0 angie_zstd_level)" = 0
-check "angie_zstd_level ignores an invalid value" test "$(SETUP_ZSTD_LEVEL=22 angie_zstd_level)" = 3
-check "angie_zstd_level never offers an --ultra level" test "$(SETUP_ZSTD_LEVEL=20 angie_zstd_level)" = 3
-# The filter loaded last runs first: zstd must load after Brotli or Brotli
-# answers every client (measured: 40-zstd.conf never sent zstd).
-zstd_after_brotli() {
-  local body; body=$(declare -f ensure_angie_compression)
-  grep -q '60-zstd.conf' <<<"$body" && grep -q '50-brotli.conf' <<<"$body" \
-    && ! grep -q 'commit_if_changed "${enabled}/40-zstd.conf"' <<<"$body"
+# zstd (1.21.58) is retired in 1.21.59: Cloudflare asks origins for
+# "br, gzip" only.  The managed stanzas go, an operator's own stay, and the
+# module is purged only when nothing uses it and apt removes nothing else.
+zt="$TMP/zstd-tree"
+mkdir -p "$zt/modules-enabled" "$zt/http.d"
+printf '# Managed by setup.sh: dynamic Zstandard for clients that accept it.\nload_module modules/ngx_http_zstd_filter_module.so;\n' > "$zt/modules-enabled/60-zstd.conf"
+printf '# Managed by setup.sh: dynamic Zstandard from http.d/zstd_conf.\nzstd on;\nzstd_comp_level 3;\n' > "$zt/http.d/zstd.conf"
+printf '# Managed by setup.sh: dynamic Brotli compression.\nload_module modules/ngx_http_brotli_filter_module.so;\n' > "$zt/modules-enabled/50-brotli.conf"
+printf 'zstd on;\nzstd_comp_level 9;\n' > "$zt/http.d/zstd_conf"    # repository template, never included
+angie_retire_zstd "$zt" >/dev/null 2>&1
+check "zstd retirement moves the managed module stanza" test ! -e "$zt/modules-enabled/60-zstd.conf"
+check "zstd retirement moves the managed http stanza" test ! -e "$zt/http.d/zstd.conf"
+check "zstd retirement keeps the Brotli stanza" test -e "$zt/modules-enabled/50-brotli.conf"
+check "zstd retirement reports the change" test "$ANGIE_ZSTD_RETIRED" = 1
+zt_in_use() { angie_zstd_in_use "$zt"; }
+zt_unused() { ! angie_zstd_in_use "$zt"; }
+check "after retirement nothing in the tree uses zstd (the zstd_conf template is not included)" zt_unused
+printf 'load_module modules/ngx_http_zstd_filter_module.so;\n' > "$zt/modules-enabled/70-own-zstd.conf"
+angie_retire_zstd "$zt" >/dev/null 2>&1
+check "an operator's own zstd stanza is kept" test -e "$zt/modules-enabled/70-own-zstd.conf"
+check "an operator's own zstd stanza counts as zstd in use" zt_in_use
+check "a second retirement pass changes nothing" test "$ANGIE_ZSTD_RETIRED" = 0
+# The purge, with apt and dpkg stubbed: returns what happened.
+zt_purge() { # installed(0|1) apt-sim-output -> summary of the call
+  ( stub_inst=$1 stub_sim=$2 stub_purged=0
+    pkg_ok() { [[ $1 == angie-module-zstd && $stub_inst == 1 ]]; }
+    apt-get() { if [[ $1 == -s ]]; then printf '%s\n' "$stub_sim"; else stub_purged=1; fi; return 0; }
+    angie_purge_zstd_module "$zt" >/dev/null 2>&1
+    printf 'purged=%s %s' "$stub_purged" "$ANGIE_ZSTD_PURGE_RESULT" )
 }
-check "the zstd module stanza sorts after the Brotli one" zstd_after_brotli
-check "a 40-zstd.conf left by an older release is moved away" \
-  bash -c 'grep -q "zstd_drop=(\"\${enabled}/40-zstd.conf\")" "$1"' _ "$ROOT/lib/web.sh"
-unset -f zstd_after_brotli
+check "the zstd module is kept while a configuration uses it" \
+  bash -c '[[ $1 == "purged=0 "*"still uses it"* ]]' _ "$(zt_purge 1 'Purg angie-module-zstd [1.12.5]')"
+rm -f "$zt/modules-enabled/70-own-zstd.conf"
+check "the zstd module is purged when nothing uses it" \
+  bash -c '[[ $1 == "purged=1 "*"purged"* ]]' _ "$(zt_purge 1 'Purg angie-module-zstd [1.12.5]')"
+check "the zstd module is kept when apt would remove anything else" \
+  bash -c '[[ $1 == "purged=0 "*"would also remove angie"* ]]' _ "$(zt_purge 1 $'Purg angie-module-zstd [1.12.5]\nRemv angie [1.12.5]')"
+check "nothing happens when the zstd module is not installed" \
+  test "$(zt_purge 0 '')" = 'purged=0 '
+zt_no_install() { ! declare -f ensure_angie_compression | grep -q 'apt_install angie-module-zstd'; }
+check "ensure_angie_compression installs no zstd module any more" zt_no_install
+# The purge waits until the Angie pass commits (a rollback must not restore a
+# tree that loads a purged module): ensure_angie_compression only marks it.
+zt_deferred() {
+  ! declare -f ensure_angie_compression | grep -q 'angie_purge_zstd_module' \
+    && declare -f optimize_angie | grep -q 'angie_purge_zstd_module' \
+    && declare -f install_angie | grep -q 'angie_purge_zstd_module'
+}
+check "the zstd purge runs only after the Angie pass commits" zt_deferred
+# An operator file that uses zstd relies on the managed load_module: nothing
+# is retired while it does (moving it would make angie -t fail).
+zo="$TMP/zstd-own"; mkdir -p "$zo/modules-enabled" "$zo/http.d" "$zo/conf.d"
+printf '# Managed by setup.sh: dynamic Zstandard for clients that accept it.\nload_module modules/ngx_http_zstd_filter_module.so;\n' > "$zo/modules-enabled/60-zstd.conf"
+printf 'server {\n    zstd off;\n}\n' > "$zo/conf.d/site.conf"
+angie_retire_zstd "$zo" >/dev/null 2>&1
+check "the managed zstd stanza stays while an operator file uses zstd" test -e "$zo/modules-enabled/60-zstd.conf"
+check "that case retires nothing" test "$ANGIE_ZSTD_RETIRED" = 0
+check "the operator file is named as the zstd user" test "$(angie_zstd_users "$zo" "$zo/modules-enabled/60-zstd.conf")" = "$zo/conf.d/site.conf"
+unset zo
+unset -f zt_in_use zt_unused zt_purge zt_no_install zt_deferred; unset zt
 check "asset precompression is on by default" test "$PRECOMPRESS_ASSETS" = 1
 
 # --basic server= is persisted and honoured by host_server_type.
@@ -5799,6 +5844,80 @@ check "Flarum gate: an operator-edited map leaves the include untouched" \
   grep -qF 'if ($flarum_guest_cacheable$req_encoded_path)' "$fl/h5bp/php_flarum.conf"
 check_tree "Flarum gate: the shipped tree has no joined-variable if" \
   bash -c '! grep -rqF "\$flarum_guest_cacheable\$req_encoded_path" "$1/h5bp" "$1/http.d"' _ "$ANGIE_TREE"
+
+# Guest-cache encoding (1.21.59).  With Vary honoured, Angie kept one entry
+# per exact Accept-Encoding string (three for one XenForo thread: Chrome,
+# Safari, Cloudflare).  Every encoding-keyed cache now ignores Vary, which is
+# safe only because the application is given exactly the key's encoding.
+ae_map() { # the value $guest_cache_ae gives for a $guest_cache_enc value
+  awk -v want="$2" '/^map \$guest_cache_enc \$guest_cache_ae/ {f=1; next} f && /^}/ {exit}
+    f && $1 == want { sub(/;$/, "", $2); print $2 }' "$1/http.d/fastcgi_cache.conf"
+}
+check_tree "guest cache: the application is given exactly gzip for a gzip key" \
+  test "$(ae_map "$ANGIE_TREE" gzip)" = gzip
+check_tree "guest cache: the application is given nothing for a plain key" \
+  test "$(ae_map "$ANGIE_TREE" default)" = '""'
+# Every FastCGI location that stores pages under an encoding key passes the
+# key's encoding to PHP and ignores Vary (WordPress: the param sits in the PHP
+# handler, the ignore in the server-level cache include).
+cache_ae_ok() {
+  local t=$1 f
+  for f in php_xf.conf php_xf_proxy.conf php_chev_cache.conf php_flarum.conf; do
+    grep -qE '^fastcgi_param HTTP_ACCEPT_ENCODING \$guest_cache_ae;' "$t/h5bp/$f" || { echo "no AE param: $f"; return 1; }
+    grep -qE '^fastcgi_ignore_headers .*\bVary;' "$t/h5bp/$f" || { echo "Vary honoured: $f"; return 1; }
+  done
+  grep -qE '^fastcgi_param HTTP_ACCEPT_ENCODING \$guest_cache_ae;' "$t/h5bp/php_wp_handler.conf" || return 1
+  grep -qE '^fastcgi_ignore_headers Vary;' "$t/h5bp/wordpress_cache.conf" || return 1
+  # The param must sit after the snippet that sets the defaults, in the
+  # same location (a server-level fastcgi_param would be dropped).
+  ! grep -qE '^fastcgi_param HTTP_ACCEPT_ENCODING' "$t/h5bp/wordpress_cache.conf"
+}
+check_tree "guest cache: every encoding-keyed FastCGI cache passes the key's encoding and ignores Vary" cache_ae_ok "$ANGIE_TREE"
+check_tree "guest cache: no other encoding-keyed cache honours Vary" \
+  bash -c 'for f in $(grep -lE "_cache_key .*\\\$guest_cache_enc" "$1"/h5bp/*.conf); do grep -qE "^(fastcgi|proxy)_ignore_headers .*\bVary;" "$f" || { [[ ${f##*/} == wordpress_cache.conf ]] && grep -q "^fastcgi_ignore_headers Vary;" "$f"; } || { echo "$f"; exit 1; }; done' _ "$ANGIE_TREE"
+check_tree "XenForo proxy cache: guests get the key's encoding, members keep their header" \
+  bash -c 'grep -qE "^proxy_set_header Accept-Encoding +\\\$xf_proxy_ae;" "$1/h5bp/xf_proxy_pass.conf" && awk "/^map .*\\\$xf_proxy_ae/{f=1} f" "$1/http.d/fastcgi_cache.conf" | grep -qE "^ *default +\\\$http_accept_encoding;"' _ "$ANGIE_TREE"
+# Ignoring Vary drops every header it names: a response that varies on
+# anything but Accept-Encoding (a mobile plugin's User-Agent) must not be
+# stored at all, so every guest cache lists $guest_cache_vary_other.
+check_tree "guest cache: every encoding-keyed cache refuses to store a response that varies on more than Accept-Encoding" \
+  bash -c 'for f in $(grep -lE "_cache_key .*\\\$guest_cache_enc" "$1"/h5bp/*.conf); do grep -qE "^(fastcgi|proxy)_no_cache .*\\\$guest_cache_vary_other( |;)" "$f" || { echo "$f"; exit 1; }; done' _ "$ANGIE_TREE"
+vary_map() { # the map value for an upstream Vary value
+  local v=$1 re
+  awk '/^map \$upstream_http_vary \$guest_cache_vary_other/ {f=1; next} f && /^}/ {exit} f' "$ANGIE_TREE/http.d/fastcgi_cache.conf" > "$TMP/vary-map.txt"
+  if grep -qF "\"$v\" " "$TMP/vary-map.txt"; then awk -v v="\"$v\"" '$1 == v { sub(/;$/, "", $2); print $2 }' "$TMP/vary-map.txt"; return; fi
+  while read -r re; do
+    perl -e 'exit(($ARGV[1] =~ /$ARGV[0]/i) ? 0 : 1)' "$re" "$v" && { echo 0; return; }
+  done < <(sed -n 's/^ *"~\*\(.*\)" *0;$/\1/p' "$TMP/vary-map.txt")
+  awk '$1 == "default" { sub(/;$/, "", $2); print $2 }' "$TMP/vary-map.txt"
+}
+check_tree "Vary guard: Accept-Encoding alone may be stored" test "$(vary_map 'Accept-Encoding')" = 0
+check_tree "Vary guard: no Vary may be stored" test "$(vary_map '')" = 0
+check_tree "Vary guard: User-Agent is never stored" test "$(vary_map 'User-Agent')" = 1
+check_tree "Vary guard: Accept-Encoding plus Cookie is never stored" test "$(vary_map 'Accept-Encoding, Cookie')" = 1
+# Storage-time check: a body whose Content-Encoding does not match the key is
+# never stored, whichever PHP location rendered it (a WordPress subdirectory
+# served by h5bp/php.conf passes the raw header).
+check_tree "guest cache: every encoding-keyed cache refuses a body that does not match its key" \
+  bash -c 'for f in $(grep -lE "_cache_key .*\\\$guest_cache_enc" "$1"/h5bp/*.conf); do grep -qE "^(fastcgi|proxy)_no_cache .*\\\$guest_cache_enc_mismatch;" "$f" || { echo "$f"; exit 1; }; done' _ "$ANGIE_TREE"
+mm_map() { awk -v k="\"$1\"" '/^map "\$guest_cache_enc:\$upstream_http_content_encoding"/ {f=1; next} f && /^}/ {exit} f && ($1 == k || ($1 == "default" && d == "")) { if ($1 == "default") d = $2; else { sub(/;$/, "", $2); print $2; found = 1; exit } } END { if (!found) { sub(/;$/, "", d); print d } }' "$ANGIE_TREE/http.d/fastcgi_cache.conf"; }
+check_tree "mismatch guard: a plain body under the plain key is stored" test "$(mm_map ':')" = 0
+check_tree "mismatch guard: a gzip body under the gzip key is stored" test "$(mm_map 'gzip:gzip')" = 0
+check_tree "mismatch guard: a deflate body under the plain key is refused" test "$(mm_map ':deflate')" = 1
+check_tree "mismatch guard: a gzip body under the plain key is refused" test "$(mm_map ':gzip')" = 1
+unset -f ae_map cache_ae_ok vary_map mm_map
+# The managed XenForo map (legacy includes) follows the same rule, and an
+# injected cache block passes it to PHP.
+# A managed map written by 1.21.58 (current otherwise, no $setup_cache_ae)
+# is rewritten by the new trigger alone.
+printf '%s\n' 'map $http_cookie $setup_xf_guest_bypass {' '    default 0;' '    "~*[._ \[](?:session(?:[._ \[]admin)?|user|tfa[._ \[]trust)=" 1;' '}' \
+  'map $http_accept_encoding $setup_cache_enc {' '    default "";' '    "~*(?:^|,)\s*gzip\s*(?:,|$)" gzip;' '}' \
+  'map $cookie_xf_language_id $setup_xf_key_language {' '    default "";' '}' > "$TMP/xfguest/http.d/zz-setup-fastcgi-cache-map.conf"
+ensure_xf_cookie_bypass_map "$TMP/xfguest" >/dev/null 2>&1
+check "a 1.21.58 managed map gains \$setup_cache_ae" \
+  grep -qE '^map \$setup_cache_enc \$setup_cache_ae' "$TMP/xfguest/http.d/zz-setup-fastcgi-cache-map.conf"
+check "managed XenForo map gives PHP exactly the key's encoding" \
+  bash -c 'awk "/^map \\\$setup_cache_enc \\\$setup_cache_ae/{f=1} f" "$1" | grep -qE "^ +gzip +gzip;"' _ "$TMP/xfguest/http.d/zz-setup-fastcgi-cache-map.conf"
 
 # Catch-all 443: unknown/missing SNI is refused before a certificate is sent.
 tl="$TMP/tls-tree"

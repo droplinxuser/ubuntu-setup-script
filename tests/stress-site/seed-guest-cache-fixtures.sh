@@ -50,6 +50,16 @@ add_action('init', static function (): void {
     }
     setcookie('guest_token', bin2hex(random_bytes(12)), 0, '/');
 });
+/*
+ * ?vary=ua: a page that varies on the User-Agent (as a mobile plugin does).
+ * The guest caches ignore Vary for storage, so such a response must not be
+ * stored at all ($guest_cache_vary_other).
+ */
+add_action('send_headers', static function (): void {
+    if (isset($_GET['vary'])) {
+        header('Vary: User-Agent', false);
+    }
+});
 PHP
 chown www-data:www-data "$mu/audit-guest-cookie.php"
 chmod 644 "$mu/audit-guest-cookie.php"

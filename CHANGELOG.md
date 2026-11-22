@@ -5,6 +5,50 @@ README.md; measurements in tests/stress-site/RESULTS.md.  Per-cycle
 reports and raw test logs cited by entries up to 1.21.32 were removed from
 the tree on 2026-11-19; retrieve them with `git show 84b0db5:<path>`.
 
+## 1.21.59 (2026-11-23)
+
+- **zstd removed and purged.**  1.21.58 installed `angie-module-zstd` for
+  clients that offer zstd, but Cloudflare asks origins for `br, gzip` only,
+  so on Cloudflare-fronted hosts it never answered a request.  `--optimize`
+  now moves the managed `60-zstd.conf` / `http.d/zstd.conf` (and an older
+  `40-zstd.conf`) to `/tmp` and, once `angie -t` passes without them,
+  purges `angie-module-zstd` once the Angie pass has committed (after the
+  reload, so a rollback never restores a tree that loads a purged module).
+  Nothing is retired while an operator's own file uses zstd directives (they
+  rely on the managed `load_module`), and the module stays when apt would
+  remove anything else with it.  `SETUP_ZSTD_LEVEL` is gone.  Verified on the audit host:
+  0 warnings, both stanzas moved, the package purged, compression Brotli 4
+  then gzip.
+- **Guest cache: one entry per encoding (`server-configs-nginx` 1.6.52).**
+  With `Vary: Accept-Encoding` honoured, each distinct client header kept
+  its own copy of every page (one XenForo thread stored three times:
+  Chrome, Safari, Cloudflare), each filled by its own PHP renders.  The
+  guest caches now ignore `Vary` for storage, and the application is given
+  exactly the key's encoding (`gzip` or nothing), so the stored body
+  follows the key: `deflate` or `gzip;q=0` get a plain page instead of a
+  deflate/gzip body stored per header.  After the fix every gzip-capable
+  header HITs the entry Chrome filled; the thread is stored twice (gzip,
+  plain).  Because `Vary` is ignored, two guards decide what is stored: a
+  body whose `Content-Encoding` does not match the key (a WordPress
+  subdirectory location that passes the raw header) and a response that
+  varies on more than `Accept-Encoding` are never stored.  The
+  setup-managed map for legacy XenForo includes (`$setup_cache_ae`) and the
+  injected cache block follow the same rule.
+  Cached tiers unchanged (WordPress 85-90k, XenForo 125k, Chevereto 131k
+  req/s; Angie 0.06-0.09 ms per hit).
+
+An adversarial review (three lenses, two refuting reviewers per finding)
+upheld four findings, all fixed before release: the WordPress subdirectory
+path (mismatch guard), the purge running before the Angie pass committed,
+retirement breaking an operator file that uses zstd, and an untested map
+upgrade path.
+
+Tests: 1,582 unit checks (zstd retirement and purge guards, the encoding map,
+both storage guards and every cached location in the shipped tree), 225 dry
+runs, security 67/67, guest-cache cookie suite 80/80 (13 new checks, which
+fail on 1.21.58), functional 0 unexpected, `--optimize` x2 0 of 3,032 facts.
+
+
 ## 1.21.58 (2026-11-22)
 
 Compression cycle: gzip, Brotli and zstd measured per tier (guest cache,

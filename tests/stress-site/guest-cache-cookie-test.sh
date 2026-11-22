@@ -181,6 +181,10 @@ chk "WordPress guest home is cached" "$(hdr wc x-cache-status | sed -E 's/^(HIT|
 chk "WordPress cached page carries no Set-Cookie" "$(ncook wc)" 0
 req wk1 "$W/?gc=1"; req wk2 "$W/?gc=1"; req wk3 "$W/?gc=1"
 chk "WordPress page that sets a guest cookie is never stored" "$(hdr wk1 x-cache-status)$(hdr wk2 x-cache-status)$(hdr wk3 x-cache-status)" MISSMISSMISS
+u="$W/?vary=ua&t=$RANDOM"
+req wv1 -H 'Accept-Encoding: gzip, deflate, br' "$u"; req wv2 -H 'Accept-Encoding: gzip, deflate, br' "$u"; req wv3 -H 'Accept-Encoding: gzip, deflate, br' "$u"
+chk "WordPress page that varies on User-Agent is never stored (Vary is ignored for storage)" \
+  "$(hdr wv1 x-cache-status)$(hdr wv2 x-cache-status)$(hdr wv3 x-cache-status):$(hdr wv3 vary | grep -ci user-agent)" "MISSMISSMISS:1"
 chk "WordPress guest cookies are unique per visitor" "$([ "$(cookv wk1 guest_token)" != "$(cookv wk2 guest_token)" ] && [ "$(cookv wk2 guest_token)" != "$(cookv wk3 guest_token)" ] && [ -n "$(cookv wk1 guest_token)" ] && echo y)" y
 rm -f "$T/w.jar"; req wl -c "$T/w.jar" "$W/wp-login.php"
 req wlp -b "$T/w.jar" -c "$T/w.jar" --data 'log=bench5&testcookie=1&wp-submit=Log+In' --data-urlencode "pwd=$PW" "$W/wp-login.php"
@@ -196,5 +200,24 @@ req wf1 -H "Cookie: $wfold" "$u"; req wf2 -H "Cookie: $wfold" "$u"
 chk "WordPress folded cookie names bypass the guest cache" "$(hdr wf1 x-cache-status):$(hdr wf2 x-cache-status)" "BYPASS:BYPASS"
 req wfg "$u"
 chk "WordPress folded cookie names left no member page for guests" "$(grep -c 'wp-admin-bar' "$T/wfg.body")" 0
+
+echo "################ Encoding variants (1.21.59)"
+# One cached entry per encoding, shared by every client header: with Vary
+# honoured, Chrome, Safari and Cloudflare each filled their own copy.  The
+# body must follow the key: "deflate" alone or "gzip;q=0" get a plain page.
+for u in "$X/whats-new/?enc=$RANDOM" "$W/?enc=$RANDOM" "${C:-https://chev.test.local}/explore/?enc=$RANDOM"; do
+  n=${u#https://}; n=${n%%/*}
+  for _ in 1 2; do req ec -H 'Accept-Encoding: gzip, deflate, br, zstd' "$u"; done
+  req es -H 'Accept-Encoding: gzip, deflate, br' "$u"
+  req ecf -H 'Accept-Encoding: br, gzip' "$u"
+  chk "$n: Safari and Cloudflare headers share the entry Chrome filled" \
+    "$(hdr es x-cache-status | sed -E 's/^(STALE|UPDATING)$/HIT/'):$(hdr ecf x-cache-status | sed -E 's/^(STALE|UPDATING)$/HIT/'):$(hdr es content-encoding)" "HIT:HIT:gzip"
+  for ae in deflate 'gzip;q=0'; do
+    for _ in 1 2; do req ed -H "Accept-Encoding: $ae" "$u"; done
+    chk "$n: '$ae' gets a plain page" "$(hdr ed content-encoding)" ""
+  done
+  req ei -H 'Accept-Encoding: identity' "$u"
+  chk "$n: a plain client gets the plain entry" "$(hdr ei content-encoding):$(head -c 1 "$T/ei.body")" ":<"
+done
 
 echo; echo "TOTAL pass=$P fail=$F"; rm -rf "$T"

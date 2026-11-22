@@ -1986,6 +1986,7 @@ ensure_xf_cookie_bypass_map() {
   file="${target}/http.d/zz-setup-fastcgi-cache-map${suffix}"
   if [[ ! -f $file ]] || ! grep -qE 'map[[:space:]]+\$http_cookie[[:space:]]+\$setup_xf_guest_bypass' "$file" \
      || ! grep -qE 'map[[:space:]]+\$http_accept_encoding[[:space:]]+\$setup_cache_enc' "$file" \
+     || ! grep -qE 'map[[:space:]]+\$setup_cache_enc[[:space:]]+\$setup_cache_ae' "$file" \
      || grep -qE '^[[:space:]]*~\*gzip[[:space:]]+gzip;' "$file" \
      || grep -qE '^[[:space:]]*~\*xf_session=' "$file" \
      || ! grep -qE 'map[[:space:]]+\$cookie_xf_language_id[[:space:]]+\$setup_xf_key_language' "$file"; then
@@ -2021,6 +2022,14 @@ map $http_accept_encoding $setup_cache_enc {
     "gzip, br"                gzip;
     "gzip"                    gzip;
     "~*(?:^|,)\s*gzip\s*(?:,|$)" gzip;
+}
+# The Accept-Encoding PHP is given in the cached location: exactly the key's
+# encoding, so the stored body follows the key (XenForo compresses whenever
+# the header contains "gzip", "gzip;q=0" included, which has a plain key).
+# The same rule as $guest_cache_ae in http.d/fastcgi_cache.conf.
+map $setup_cache_enc $setup_cache_ae {
+    gzip    gzip;
+    default "";
 }
 # Cache-key tokens: the style, style-variation and language cookies are
 # visitor-controlled, so only a well-formed value enters the key.
@@ -2141,6 +2150,7 @@ ensure_xf_guest_cache() {
     $'fastcgi_cache_use_stale[[:space:]]\tfastcgi_cache_use_stale error timeout invalid_header updating http_503;'
     "fastcgi_ignore_headers[[:space:]]"$'\t'"${ignore}"
     $'fastcgi_cache[[:space:]]+fastcgicache;\tfastcgi_cache fastcgicache;'
+    $'fastcgi_param[[:space:]]+HTTP_ACCEPT_ENCODING[[:space:]]\tfastcgi_param HTTP_ACCEPT_ENCODING $setup_cache_ae;'
     "fastcgi_no_cache[[:space:]]"$'\t'"fastcgi_no_cache ${nostore};"
     "fastcgi_cache_bypass[[:space:]]"$'\t'"fastcgi_cache_bypass ${lock};"
     $'fastcgi_cache_valid[[:space:]]+200[[:space:]]\tfastcgi_cache_valid 200 5m;'

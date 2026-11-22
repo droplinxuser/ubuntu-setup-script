@@ -9,7 +9,7 @@
 # interleaved round-robin across the encodings (see pass 2).
 #
 # Usage: compression-bench.sh LABEL URL [COOKIE_KEY] [ENCODINGS...]
-#   ENCODINGS default: "gzip" "br" "zstd" "gzip, deflate, br, zstd" "identity"
+#   ENCODINGS default: "gzip" "br" "gzip, deflate, br, zstd" "br, gzip" "identity"
 # Environment: C (connections, 100), D (seconds, 10), RUNS (wrk runs, 3),
 #   TTFB_N (requests for the TTFB median, 25), CK (cookie file).
 # Output: one Markdown row per encoding with the median req/s of RUNS runs and
@@ -19,7 +19,7 @@ LABEL=${1:?label}; URL=${2:?url}; KEY=${3:-}; shift 3 2>/dev/null || shift $#
 C=${C:-100}; D=${D:-10}; RUNS=${RUNS:-3}; TTFB_N=${TTFB_N:-25}
 CK=${CK:-/root/audit/cookies/cookies.tsv}
 printf "| Tier | Accept-Encoding | sent | body B | status | TTFB ms med (min-max) | req/s | spread | p50 | p99 | Angie ms/req | PHP ms/req |\n|---|---|---|---:|---:|---|---:|---:|---:|---:|---:|---:|\n" >&2
-(( $# )) || set -- "gzip" "br" "zstd" "gzip, deflate, br, zstd" "identity"
+(( $# )) || set -- "gzip" "br" "gzip, deflate, br, zstd" "br, gzip" "identity"
 CG=/sys/fs/cgroup/system.slice
 PHPU=$(cd "$CG" 2>/dev/null && ls -d php*-fpm.service 2>/dev/null | head -1)
 usec() { awk '/^usage_usec/{print $2}' "$CG/$1/cpu.stat" 2>/dev/null || echo 0; }

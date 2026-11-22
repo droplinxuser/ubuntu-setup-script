@@ -7,7 +7,28 @@ manifests, sweep tables and run logs these sections cite (`AUDIT-*.md`,
 removed from the tree on 2026-11-19 to keep the repository lean; every one
 is still in git history, for example
 `git show 84b0db5:tests/stress-site/AUDIT-20261117-1.21.30.md`.  The current
-cycle report is `AUDIT-20261122-1.21.58.md`.
+cycle report is `AUDIT-20261123-1.21.59.md`.
+
+## 1.21.59 follow-up — Xeon E-2236 (2026-11-23)
+
+Pair: `server-configs-nginx` 1.6.52.  Details: `AUDIT-20261123-1.21.59.md`.
+
+- No packaged PHP Brotli extension (Sury: zstd and lz4 only); XenForo
+  2.3.13 hard-codes gzip level 9.
+- `deflate` / `gzip;q=0` were not a leak (Angie honoured `Vary`), but the
+  same `Vary` split the guest cache per exact header: one XenForo thread
+  stored three times.  Caches now ignore `Vary` and the application is
+  given exactly the key's encoding: every gzip-capable header shares one
+  entry (2 files per page: gzip, plain).  Storage guards: a body that does
+  not match its key, or a response that varies on more than
+  Accept-Encoding, is never stored.  Cached tiers unchanged.
+- zstd removed (Cloudflare asks origins for `br, gzip` only): `--optimize`
+  moves the 1.21.58 stanzas away and, after the reload, purges
+  `angie-module-zstd`.  Adversarial review: 4 findings, all fixed.
+- 1,582 unit checks, 225 dry runs, security 67/67, cookie 80/80,
+  functional 0 unexpected, `--optimize` x2 0 of 3,032 facts.
+  Restore: 696 -> 696 packages, 0 `/etc` files added, removed or changed.
+
 
 ## 1.21.58 compression cycle — Xeon E-2236 (2026-11-22)
 

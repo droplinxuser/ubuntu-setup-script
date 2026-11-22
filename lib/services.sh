@@ -184,6 +184,12 @@ install_angie() {
     rollback_angie_tree "$angie_backup"
     return 1
   fi
+  # A reinstall over a 1.21.58 host: the zstd module goes now that the tree
+  # without it is validated and running.
+  if (( ANGIE_ZSTD_PURGE_PENDING )); then
+    angie_purge_zstd_module /etc/angie
+    ANGIE_ZSTD_PURGE_PENDING=0
+  fi
 
   if ! /etc/angie/scripts/cloudflare.sh; then
     warn "Cloudflare IP update failed; keeping the existing cloudflare.conf"
@@ -2245,7 +2251,7 @@ create_domains() {
     if [[ -n $xf_php && $(printf '%s\n8.6\n' "$xf_php" | sort -V | head -n 1) == 8.6 ]]; then
       warn "XenForo ${d}: PHP ${xf_php} runs XenForo 2.3.13's production pages, but debug mode answers 500 on every page and the bundled Braintree (payment profiles) and laminas-mail null transport do not compile; use --upgrade-php=8.5 for a forum until XenForo ships a fix"
     fi
-    info "XenForo ${d}: dynamic zstd/Brotli compression is enabled; with php-redis + local Valkey keep the XF data cache on (measured +7-9% authenticated throughput; without php-redis the Credis fallback measured slower), and disable the Members online / Trending / Featured widgets if you do not need them (measured +39% authenticated throughput)."
+    info "XenForo ${d}: dynamic Brotli compression is enabled; with php-redis + local Valkey keep the XF data cache on (measured +7-9% authenticated throughput; without php-redis the Credis fallback measured slower), and disable the Members online / Trending / Featured widgets if you do not need them (measured +39% authenticated throughput)."
   done
   # A new vhost changes what the tuner plans: the PHP-FPM worker cap, the
   # OPcache file budget, the FastCGI guest cache for the new root, and the

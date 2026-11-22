@@ -3257,45 +3257,106 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# Angie dynamic compression: zstd, then Brotli, then gzip
+# Angie dynamic compression: Brotli, then gzip
 # ---------------------------------------------------------------------------
-# Measured in the 1.21.58 cycle (Xeon E-2236, loopback wrk, encodings
-# interleaved round by round, Angie CPU from its cgroup):
+# Static assets are precompressed (.br/.gz siblings, SETUP_PRECOMPRESS_ASSETS,
+# on by default since 1.21.58), so the per-request filters only see dynamic
+# responses and assets without a sibling.
 #
-#   XenForo member thread, 127 KB HTML   bytes   Angie ms/req   req/s
-#     Brotli 4 (previous default)        18.3 K      2.1         380
-#     gzip 4                             20.3 K      2.0         380
-#     zstd 3                             19.4 K      0.85        405
-#     zstd 6                             17.9 K      1.8         385
-#   XenForo core JS, 177 KB, compressed per request
-#     Brotli 4                           54.6 K      3.8       2,100
-#     zstd 3                             56.2 K      1.3       6,050
-#
-# zstd reaches Brotli's size for a fraction of the CPU, so every client that
-# offers it (current Chrome, Edge, Firefox) gets zstd; Safari and
-# Cloudflare (which asks origins for "br, gzip" only) keep Brotli; gzip is
-# the fallback.  Static assets are precompressed (.br/.gz siblings,
-# SETUP_PRECOMPRESS_ASSETS, on by default since 1.21.58), so the per-request
-# filters only see dynamic responses and assets without a sibling.  zstd_static
-# stays off: Brotli 11 beats zstd 19 on every asset measured (XenForo core JS
-# 46.4 K vs 49.1 K; 10 MB of scripts 2.67 MB vs 2.84 MB for the same build
-# time), and with it off a browser offering both gets the .br sibling.
+# zstd was shipped in 1.21.58 and removed in 1.21.59.  It is cheaper than
+# Brotli for the same bytes (XenForo member thread: 19.4 KB at 0.84 ms of
+# Angie CPU vs Brotli 4's 18.3 KB at 2.1 ms), but Cloudflare asks origins for
+# "br, gzip" only, so on Cloudflare-fronted hosts the module never answered a
+# request.  Hosts that ran 1.21.58 have the stanzas moved away and
+# angie-module-zstd purged (angie_retire_zstd, angie_purge_zstd_module).
 ANGIE_COMPRESSION_CHANGED=0
 ANGIE_COMPRESSION_SKIPPED=0
 ANGIE_BROTLI_OK=0
 ANGIE_BROTLI_LEVEL=4
-ANGIE_ZSTD_OK=0
-ANGIE_ZSTD_LEVEL=3
+ANGIE_ZSTD_RETIRED=0
 
-# Dynamic zstd level: SETUP_ZSTD_LEVEL (0 turns zstd off), otherwise 3.
-# Level 3 matched Brotli 4's bytes within 6 % at 40 % of its Angie CPU per
-# request on the member pages above; levels 4-6 cost more CPU for a few
-# percent.
-# One owner for the install, --optimize and dry-run values.
-angie_zstd_level() {
-  local level=${SETUP_ZSTD_LEVEL:-}
-  [[ $level =~ ^([0-9]|1[0-9])$ ]] || level=3
-  printf '%s' "$level"
+# Move the managed zstd stanzas of 1.21.58 (60-zstd.conf, http.d/zstd.conf,
+# and an older 40-zstd.conf) out of the tree.  Only files that carry the
+# "Managed by setup.sh" header: an operator's own zstd stanza stays, and then
+# the module stays installed too (angie_purge_zstd_module).
+angie_retire_zstd() {
+  local target=${1:-/etc/angie} f moved
+  local -a managed=()
+  ANGIE_ZSTD_RETIRED=0
+  for f in "${target}/modules-enabled/40-zstd.conf" "${target}/modules-enabled/60-zstd.conf" \
+           "${target}/http.d/zstd.conf"; do
+    [[ -e $f ]] && grep -q '^# Managed by setup.sh' "$f" 2>/dev/null && managed+=("$f")
+  done
+  (( ${#managed[@]} )) || return 0
+  # An operator file that uses zstd directives relies on the managed
+  # load_module: moving it would make Angie reject the tree ("unknown
+  # directive"), so nothing is retired until that file stops using zstd.
+  local users
+  users=$(angie_zstd_users "$target" "${managed[@]}")
+  if [[ -n $users ]]; then
+    tune_summary "zstd: kept the managed stanzas; zstd is still used by ${users//$'\n'/ } (remove it there to retire the module)"
+    return 0
+  fi
+  for f in "${managed[@]}"; do
+    moved=$(preserve_to_tmp "$f" 2>/dev/null || true)
+    [[ -n $moved ]] && info "Moved retired Zstandard file to ${moved}"
+    ANGIE_ZSTD_RETIRED=1
+  done
+  return 0
+}
+
+# Active files under the tree that load or configure zstd, one per line,
+# leaving out the files named after the tree.  Only *.conf files are read:
+# the repository's old http.d/zstd_conf template is never included.
+angie_zstd_users() {
+  local target=${1:-/etc/angie} f x skip
+  shift
+  while IFS= read -r f; do
+    skip=0
+    for x in "$@"; do [[ $f == "$x" ]] && { skip=1; break; }; done
+    (( skip )) || printf '%s\n' "$f"
+  done < <(grep -RlsE --include='*.conf' \
+    '^[[:space:]]*(load_module[[:space:]].*ngx_http_zstd|zstd(_[a-z_]+)?[[:space:]])' "$target" 2>/dev/null | sort)
+}
+
+# True when an active file under the tree still loads or configures zstd.
+angie_zstd_in_use() {
+  [[ -n $(angie_zstd_users "${1:-/etc/angie}") ]]
+}
+
+# Purge angie-module-zstd once the Angie pass has committed (optimize_angie
+# after its reload, install_angie after its restart): a rollback after an
+# earlier purge would restore a tree that loads a module no longer on disk.
+# Kept when a configuration still uses it, or when apt would take anything
+# else with it.  The outcome is in ANGIE_ZSTD_PURGE_RESULT for the caller.
+ANGIE_ZSTD_PURGE_PENDING=0
+ANGIE_ZSTD_PURGE_RESULT=""
+angie_purge_zstd_module() {
+  local target=${1:-/etc/angie} sim others
+  ANGIE_ZSTD_PURGE_RESULT=""
+  pkg_ok angie-module-zstd || return 0
+  if angie_zstd_in_use "$target"; then
+    ANGIE_ZSTD_PURGE_RESULT="zstd: angie-module-zstd kept, a configuration under ${target} still uses it"
+    return 0
+  fi
+  if ! sim=$(apt-get -s purge angie-module-zstd 2>&1); then
+    ANGIE_ZSTD_PURGE_RESULT="zstd: angie-module-zstd kept (apt cannot purge it)"
+    return 0
+  fi
+  others=$(printf '%s\n' "$sim" | awk '/^(Purg|Remv) /{ sub(/:.*/, "", $2); print $2 }' \
+    | grep -vx 'angie-module-zstd' | paste -sd' ' - || true)
+  if [[ -n $others ]]; then
+    ANGIE_ZSTD_PURGE_RESULT="zstd: angie-module-zstd kept, apt would also remove ${others}"
+    return 0
+  fi
+  if DEBIAN_FRONTEND=noninteractive apt-get purge -y angie-module-zstd >/dev/null 2>&1; then
+    ANGIE_ZSTD_PURGE_RESULT="zstd: angie-module-zstd purged (Cloudflare asks origins for br/gzip only)"
+  else
+    ANGIE_ZSTD_PURGE_RESULT="zstd: could not purge angie-module-zstd; its stanzas are already out of the configuration"
+    warn "$ANGIE_ZSTD_PURGE_RESULT"
+  fi
+  info "$ANGIE_ZSTD_PURGE_RESULT"
+  return 0
 }
 
 # Dynamic Brotli level: SETUP_BROTLI_LEVEL when valid, otherwise 5, or 4 on a
@@ -3351,35 +3412,11 @@ ensure_angie_compression() {
   fi
   pkg_ok angie-module-brotli && ANGIE_BROTLI_OK=1
 
-  local zstd_level
-  zstd_level=$(angie_zstd_level)
-  ANGIE_ZSTD_LEVEL=$zstd_level
-  ANGIE_ZSTD_OK=0
-  if (( zstd_level > 0 )); then
-    if ! pkg_ok angie-module-zstd; then
-      # Same package source as the Brotli module, part of the same profile.
-      if ! apt-cache show angie-module-zstd >/dev/null 2>&1; then
-        apt_update || true
-      fi
-      apt_install angie-module-zstd \
-        || warn "Could not install angie-module-zstd; Brotli and gzip remain active"
-    fi
-    pkg_ok angie-module-zstd && ANGIE_ZSTD_OK=1
-  fi
-
   mkdir -p "$enabled" "${target}/http.d"
   local tmp moved f
-  # 40-zstd.conf (an earlier test/release) loaded before Brotli, so Brotli's
-  # filter ran first and zstd never answered; the stanza is now 60-zstd.conf.
-  local -a zstd_drop=("${enabled}/40-zstd.conf")
-  (( ANGIE_ZSTD_OK )) || zstd_drop+=("${enabled}/60-zstd.conf" "${target}/http.d/zstd.conf")
-  for f in "${zstd_drop[@]}"; do
-    [[ -e $f ]] || continue
-    grep -q '^# Managed by setup.sh' "$f" 2>/dev/null || continue
-    moved=$(preserve_to_tmp "$f" 2>/dev/null || true)
-    [[ -n $moved ]] && info "Moved superseded Zstandard file to ${moved}"
-    changed=1
-  done
+  # zstd (1.21.58) is retired: see the header of this section.
+  angie_retire_zstd "$target"
+  (( ANGIE_ZSTD_RETIRED )) && changed=1
 
   if (( ANGIE_BROTLI_OK )); then
     if ! grep -Rqs 'ngx_http_brotli_filter_module' "$enabled" 2>/dev/null; then
@@ -3420,62 +3457,11 @@ EOF
     warn "Angie Brotli module is not installed; keeping the existing module stanza"
   fi
 
-  if (( ANGIE_ZSTD_OK )); then
-    # Loaded after 50-brotli.conf on purpose: the output filter loaded last
-    # runs first, so zstd answers every client that offers it (current
-    # Chrome, Edge and Firefox) and Brotli the rest (Safari, and Cloudflare,
-    # which asks origins for "br, gzip" only).
-    tmp=$(tmp_file)
-    cat > "$tmp" <<'EOF'
-# Managed by setup.sh: dynamic Zstandard for clients that accept it.
-# Loaded after 50-brotli.conf so its filter runs first.
-load_module modules/ngx_http_zstd_filter_module.so;
-EOF
-    if commit_if_changed "${enabled}/60-zstd.conf" "$tmp"; then
-      chmod 644 "${enabled}/60-zstd.conf"
-      changed=1
-    fi
-    tmp=$(tmp_file)
-    if [[ -f "${target}/http.d/zstd_conf" ]]; then
-      {
-        printf '# Managed by setup.sh: dynamic Zstandard from http.d/zstd_conf.\n'
-        printf '# No zstd_static (module not loaded): the .br sibling is smaller than a .zst one.\n'
-        cat "${target}/http.d/zstd_conf"
-      } > "$tmp"
-      sed_in_place -E "s/^zstd_comp_level [0-9]+;/zstd_comp_level ${zstd_level};/" "$tmp"
-      sed_in_place -E "/^zstd_static[[:space:]]/d" "$tmp"
-    else
-      cat > "$tmp" <<EOF
-# Managed by setup.sh: dynamic Zstandard (template was missing).
-zstd on;
-zstd_comp_level ${zstd_level};
-zstd_min_length 50;
-zstd_types text/plain text/css text/xml application/json application/javascript application/xml image/svg+xml font/ttf font/otf;
-EOF
-    fi
-    if commit_if_changed "${target}/http.d/zstd.conf" "$tmp"; then
-      chmod 644 "${target}/http.d/zstd.conf"
-      changed=1
-    fi
-  fi
-
   # Never leave the service unable to start because an optional module failed
   # to load.  Move the managed files to /tmp (the script never deletes) and
-  # keep the gzip fallback.  zstd goes first, alone: a zstd module that does
-  # not load must not take Brotli with it.
+  # keep the gzip fallback.
   local testlog
   testlog=$(tmp_file)
-  if (( ANGIE_ZSTD_OK )) && ! /usr/sbin/angie -t >"$testlog" 2>&1; then
-    warn "Angie rejected the Zstandard configuration; disabling zstd (Brotli and gzip stay)"
-    sed 's/^/  /' "$testlog" >&2 || true
-    for f in "${enabled}/60-zstd.conf" "${target}/http.d/zstd.conf"; do
-      [[ -e $f ]] || continue
-      moved=$(preserve_to_tmp "$f" 2>/dev/null || true)
-      [[ -n $moved ]] && info "Moved rejected compression file to ${moved}"
-    done
-    ANGIE_ZSTD_OK=0
-    changed=1
-  fi
   if ! /usr/sbin/angie -t >"$testlog" 2>&1; then
     warn "Angie rejected the dynamic compression configuration; disabling Brotli"
     sed 's/^/  /' "$testlog" >&2 || true
@@ -3490,6 +3476,8 @@ EOF
       warn "Angie still rejects the configuration after removing compression files"
     fi
   fi
+  # The zstd module is purged by the caller once its Angie pass commits.
+  [[ $target == /etc/angie ]] && ANGIE_ZSTD_PURGE_PENDING=1
 
   ANGIE_COMPRESSION_CHANGED=$changed
   if (( changed )); then
@@ -3907,15 +3895,14 @@ angie_apply_profile() {
   angie_migrate_guest_cache_includes "$target" || warn "Guest cache include migration was skipped"
   configure_asset_precompression "$target" || warn "Asset precompression was skipped"
   tune_angie_configs "$target" || return 1
-  # Dynamic zstd/Brotli compression.  The modules are optional, so a failure
-  # here must not stop the run; gzip remains active.
+  # Dynamic Brotli compression.  The module is optional, so a failure here
+  # must not stop the run; gzip remains active.
   ensure_angie_compression "$target" || warn "Angie compression setup was skipped"
   (( ANGIE_COMPRESSION_CHANGED )) && TUNE_DIRTY=1
   if (( ANGIE_COMPRESSION_SKIPPED )); then
     ANGIE_COMPRESSION_SUMMARY="Compression: unchanged (SETUP_ANGIE_COMPRESSION=0)"
   else
     local -a enc=()
-    (( ANGIE_ZSTD_OK )) && enc+=("zstd level ${ANGIE_ZSTD_LEVEL}")
     (( ANGIE_BROTLI_OK )) && enc+=("Brotli level ${ANGIE_BROTLI_LEVEL}")
     enc+=("gzip")
     ANGIE_COMPRESSION_SUMMARY="Compression: $(printf '%s, ' "${enc[@]}" | sed 's/, $//') (first the client accepts)"

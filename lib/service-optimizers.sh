@@ -240,6 +240,13 @@ optimize_angie() {
   else
     ANUBIS_STOP_PENDING=0
   fi
+  # zstd (1.21.58) module: only after the pass committed, so a rollback above
+  # never restores a tree that loads a purged module.
+  if (( rc == 0 && ANGIE_ZSTD_PURGE_PENDING )) && /usr/sbin/angie -t >/dev/null 2>&1; then
+    angie_purge_zstd_module /etc/angie
+    [[ -n $ANGIE_ZSTD_PURGE_RESULT ]] && opt_report "- ${ANGIE_ZSTD_PURGE_RESULT}"
+  fi
+  ANGIE_ZSTD_PURGE_PENDING=0
   # Through-Cloudflare check of the migrated vhosts, then certbot retirement.
   # Both need the reloaded, running Angie; a stopped one keeps certbot.
   if (( rc == 0 && active )); then
@@ -1881,12 +1888,10 @@ optimize_plan() {
     printf '  Angie: workers=%s connections=%s rlimit=%s keepalive=%s cache_budget=%sMB\n' \
       "$ANGIE_WORKER_PROCESSES" "$ANGIE_WORKER_CONNECTIONS" "$ANGIE_WORKER_RLIMIT" \
       "$ANGIE_PHP_KEEPALIVE" "$cache_mb"
-    if (( $(angie_zstd_level) > 0 )); then
-      printf '  Angie compression: zstd level %s, then Brotli level %s, then gzip, first the client accepts (modules installed on apply)\n' \
-        "$(angie_zstd_level)" "$(angie_brotli_level)"
-    else
-      printf '  Angie compression: Brotli level %s dynamic, gzip fallback (SETUP_ZSTD_LEVEL=0; module installed on apply)\n' \
-        "$(angie_brotli_level)"
+    printf '  Angie compression: Brotli level %s dynamic, gzip fallback (module installed on apply)\n' \
+      "$(angie_brotli_level)"
+    if pkg_ok angie-module-zstd 2>/dev/null; then
+      printf '  Angie zstd: retired in 1.21.59; managed stanzas moved away and angie-module-zstd purged unless a configuration still uses it\n'
     fi
     printf '  Angie static assets: precompressed .br/.gz siblings %s (SETUP_PRECOMPRESS_ASSETS)\n' \
       "$( (( PRECOMPRESS_ASSETS )) && printf on || printf off )"
