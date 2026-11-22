@@ -7,7 +7,7 @@ manifests, sweep tables and run logs these sections cite (`AUDIT-*.md`,
 removed from the tree on 2026-11-19 to keep the repository lean; every one
 is still in git history, for example
 `git show 84b0db5:tests/stress-site/AUDIT-20261117-1.21.30.md`.  The current
-cycle report is `AUDIT-20261123-1.21.59.md`.
+cycle report is `AUDIT-20261123-1.21.61.md`.
 
 ## 1.21.61 — Xeon E-2236 (2026-11-23)
 
