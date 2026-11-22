@@ -14,7 +14,7 @@ cycle report is `AUDIT-20261121-1.21.57.md`.
 Pair: `server-configs-nginx` 1.6.50.  Details: `AUDIT-20261121-1.21.57.md`.
 
 - Anubis pass cookie checked in Angie (njs, verdict cache): cached pages
-  for browsers that solved the challenge, XenForo 19.3k -> 55.2k req/s,
+  for browsers that solved the challenge, XenForo 17.7k -> 55.2k req/s,
   WordPress 16.7k -> 50.0k (ceiling without any check 62.2k).
 - Guest-cache gzip for sites deployed after `--domain`: cached WordPress
   6.6k -> 93.4k, Chevereto explore 9.3k -> 140k req/s.

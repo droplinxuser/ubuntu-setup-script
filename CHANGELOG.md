@@ -22,8 +22,8 @@ the tree on 2026-11-19; retrieve them with `git show 84b0db5:<path>`.
   fingerprint.  The secret reaches Angie through
   `/etc/angie/ssl/anubis/pass-key.conf` (0600, under `ssl/` because the tree
   normaliser resets every other file to 0644).  Cached pages with a pass
-  cookie, c=100: XenForo 19.3k -> **55.2k req/s**, WordPress 16.7k ->
-  **50.0k**.  Without njs (module unavailable or `angie -t` rejects it)
+  cookie, c=100: XenForo 17.7k (1.21.55, through Anubis) -> **55.2k
+  req/s**, WordPress 16.7k -> **50.0k**.  Without njs (module unavailable or `angie -t` rejects it)
   browsers stay on the Anubis hop; `SETUP_ANUBIS_PASS_EDGE=0` opts out and
   removes every piece.  `anubis=no` removes them too.
 - **WordPress/Chevereto guest cache: gzip bodies from the first deploy.**
@@ -36,10 +36,11 @@ the tree on 2026-11-19; retrieve them with `git show 84b0db5:<path>`.
   1.2 ms per hit) instead of 93k, Chevereto 9.3k instead of 140k.  The vhost
   now decides (an encoding-aware cache key is still required).
 - **`apt-get update`: a stale index on a repository CDN no longer costs 7.5
-  minutes and the install.**  Sury's CDN served an `InRelease` 45 minutes
-  older than the `Packages.xz` next to it, so the 1.21.56 retries (30, 60,
-  120, 240 s) all failed and the full install stopped.  The uncompressed
-  `Packages` was cached at the same age as the `InRelease`, so it matched.
+  minutes and the install.**  Sury's CDN served an `InRelease` generated
+  at 09:01 (45 minutes in its cache) next to a `Packages.xz` from 09:31, so
+  the 1.21.56 retries (30, 60, 120, 240 s) all failed and the full install
+  stopped.  The uncompressed `Packages` was from the same build as the
+  `InRelease`, so it matched.
   On a size or hash mismatch the repositories named in the failure are now
   refetched uncompressed first (only those sources, `List-Cleanup` off, so
   the other lists stay as fetched), with an info line instead of a warning;

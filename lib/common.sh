@@ -448,9 +448,9 @@ APT_UPDATE_SYNC_DELAYS=${APT_UPDATE_SYNC_DELAYS:-"30 60 120 240"}
 APT_UPDATE_REASON=""
 APT_SOURCES_ROOT=${APT_SOURCES_ROOT:-/etc/apt}
 # A size/hash mismatch is not always a short sync window.  Sury's CDN was
-# seen serving an InRelease 45 minutes older than the Packages.xz next to
-# it, while the uncompressed Packages was cached at the same age as the
-# InRelease, so it matched.  Refetch only the repositories named in the
+# seen serving an InRelease generated at 09:01 (45 minutes in its cache)
+# next to a Packages.xz from 09:31, while the uncompressed Packages was from
+# the same build as the InRelease, so it matched.  Refetch only the repositories named in the
 # failure, uncompressed, before waiting: the other lists stay as fetched
 # (List-Cleanup off), and the bigger download is paid only in this case.
 # Returns 0 when that refresh succeeded.
