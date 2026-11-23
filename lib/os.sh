@@ -487,19 +487,6 @@ swapfile_active() {
   swapon --show=NAME --noheadings 2>/dev/null | grep -qx '/swapfile'
 }
 
-# Deactivate /swapfile before it is re-created.  Returns 1 when the file is
-# active and the kernel cannot release it (its pages do not fit in free RAM):
-# create_swap_file truncates the path, which must never happen to a swap file
-# that is still in use, so the caller keeps the existing swap instead.
-release_swap_file() {
-  swapfile_active || return 0
-  if swapoff /swapfile 2>/dev/null; then
-    return 0
-  fi
-  warn "Could not deactivate the active /swapfile (its pages do not fit in free RAM); leaving the existing swap unchanged"
-  return 1
-}
-
 configure_swap() {
   local size=$1
   local desired existing
@@ -545,8 +532,34 @@ swap_target_bytes() {
   printf '%s' "$target"
 }
 
+# Size of the automatic /swapfile.  Pure: AVAIL is the free bytes on / (empty
+# when df gave nothing), OLD the size of an existing /swapfile (0 if none),
+# ACTIVE 1 when that file is live swap, NEEDED the bytes still missing to the
+# target.  Prints the new file size and returns 0 (full) or 2 (reduced to
+# what fits); prints nothing and returns 1 when nothing useful fits.
+#
+# The new file is built beside the old one (create_swap_file swaps them only
+# once it is ready), so both are on disk at once and the old file gives no
+# space back.  Counting it used to size a file that create_swap_file then
+# refused with die(), after the old swap had already been switched off.
+swap_auto_new_size() {
+  local avail=$1 old=$2 active=$3 needed=$4 margin=268435456 want room rc=0
+  want=$needed
+  (( active )) && want=$(( old + needed ))
+  if [[ $avail =~ ^[0-9]+$ ]]; then
+    room=$(( (avail - margin) / 1048576 * 1048576 ))
+    if (( want > room )); then
+      (( room < 67108864 || room <= old )) && return 1
+      needed=$(( needed - (want - room) ))
+      rc=2
+    fi
+  fi
+  if (( active )); then printf '%s' $(( old + needed )); else printf '%s' "$needed"; fi
+  return "$rc"
+}
+
 configure_swap_auto() {
-  local ram current target needed old_size new_size
+  local ram current target needed
   step "Swap (auto: 50% of RAM)"
 
   ram=$(ram_total_bytes)
@@ -567,43 +580,20 @@ configure_swap_auto() {
 
   # Automatic swap must never abort --basic (and with it sysctl, limits,
   # cron and the firewall) because the disk is small, nor drop a working
-  # swap file it cannot replace.  Size the file to what fits while keeping
-  # 256 MiB free, counting the space the existing file gives back, and
-  # decide before the active file is released.
-  local avail room want credit=0 margin=268435456
-  [[ -f /swapfile ]] && credit=$(stat -c %s /swapfile 2>/dev/null || echo 0)
-  want=$needed
-  if [[ -f /swapfile ]] && swapfile_active; then want=$(( credit + needed )); fi
+  # swap file it cannot replace: size it to what fits with 256 MiB kept free
+  # before anything is touched, and leave the live file to create_swap_file.
+  local avail old=0 active=0 new_size rc=0
+  [[ -f /swapfile ]] && old=$(stat -c %s /swapfile 2>/dev/null || echo 0)
+  [[ -f /swapfile ]] && swapfile_active && active=1
   avail=$(df -B1 --output=avail / 2>/dev/null | awk 'NR==2{print $1}')
-  if [[ $avail =~ ^[0-9]+$ ]]; then
-    room=$(( (avail + credit - margin) / 1048576 * 1048576 ))
-    if (( want > room )); then
-      if (( room < 67108864 || room <= credit )); then
-        warn "Automatic swap skipped: $(numfmt --to=iec "$want") does not fit on / with 256 MiB kept free (swap is unchanged; pass swap=SIZE to choose one)"
-        return 0
-      fi
-      info "Automatic swap reduced to $(numfmt --to=iec "$room"): the 50%-of-RAM target does not fit on / with 256 MiB kept free"
-      needed=$(( needed - (want - room) ))
-    fi
+  new_size=$(swap_auto_new_size "$avail" "$old" "$active" "$needed") || rc=$?
+  if (( rc == 1 )); then
+    warn "Automatic swap skipped: the 50%-of-RAM target does not fit on / with 256 MiB kept free (swap is unchanged; pass swap=SIZE to choose one)"
+    return 0
   fi
+  (( rc == 2 )) && info "Automatic swap reduced to $(numfmt --to=iec "$new_size"): the 50%-of-RAM target does not fit on / with 256 MiB kept free"
 
-  if [[ -f /swapfile ]]; then
-    old_size=$(stat -c %s /swapfile 2>/dev/null || echo 0)
-    if swapfile_active; then
-      if ! release_swap_file; then
-        swapon --show
-        return 0
-      fi
-      # The old file was counted in "current", so add the difference to it.
-      new_size=$(( old_size + needed ))
-    else
-      new_size=$needed
-    fi
-  else
-    new_size=$needed
-  fi
-
-  info "Adding $(numfmt --to=iec "$new_size") to /swapfile to reach 50% of RAM"
+  info "Adding swap to reach 50% of RAM: /swapfile becomes $(numfmt --to=iec "$new_size")"
   create_swap_file "$new_size"
   swapon --show
 }

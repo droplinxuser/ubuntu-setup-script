@@ -7,7 +7,44 @@ manifests, sweep tables and run logs these sections cite (`AUDIT-*.md`,
 removed from the tree on 2026-11-19 to keep the repository lean; every one
 is still in git history, for example
 `git show 84b0db5:tests/stress-site/AUDIT-20261117-1.21.30.md`.  The current
-cycle report is `AUDIT-20261123-1.21.64.md`.
+cycle report is `AUDIT-20261123-1.21.66.md`.
+
+## 1.21.66 — Xeon E-2236 (2026-11-23)
+
+Pair: `server-configs-nginx` 1.6.57.  Details: `AUDIT-20261123-1.21.66.md`.
+Mitigations off (operator request, test host only).
+
+- **PHP build sources, last round** (primary focus).  Every module was
+  compiled from source, igbinary 3.2.17RC1 included, and five arms ran 3
+  rotated rounds at a pinned 3.6 GHz.  clang `-O3 -march=native` gained
+  +3.1 % on XenForo member home and thread, outside the spread, and +2.9 to
+  +3.4 % across all three matrices, but was flat on WordPress and Chevereto.
+  GCC with or without CentminMod's `-falign-functions=32` was −1 to −5 %.
+  PHP 8.4.28 was −2.9 to −4.3 % on every tier, and its OOP section was
+  21 % slower on the CLI probe.  **Verdict: Sury stays; no downgrade.**
+- **Harness fix:** the source builds since 1.21.64 had no zlib, so PHP's
+  page gzip (WordPress and Chevereto) never ran on them.  The earlier
+  verdicts stand, because the bias favoured the source arms.  Every number
+  above comes from builds with `--with-zlib --with-sodium` and cache parity
+  checked.
+- **Security:** the XenForo proxy cache gained the unknown-cookie
+  default-deny (a member page could be stored for guests); the catch-all
+  refuses unknown SNI over QUIC; compressed SQL dumps are denied at any
+  depth.  Tree A/B: every cached tier inside its spread, Angie CPU per hit
+  unchanged.
+- **Robustness:** an interrupted `--upgrade-php` rolls back; a rollback
+  restarts FPM on the restored tree (it used to leave every site at 502);
+  auto swap never switches the live file off first; a MariaDB install
+  restores its config when the restart fails; the Valkey install pings its
+  own socket; two running FPM versions share the planned pool.
+- Baseline (Sury, 3 runs): WP cached 93.6k, XF cached 136.7k / 125.8k,
+  Chevereto cached 130.5k / 129.7k req/s; WP member 140 / 133, XF member
+  452 / 241, Chevereto uncached 1,467, member 504.
+- Suites: install 2:07 / 0 warnings, 1,533 unit checks, 227 dry runs,
+  security 73/73, cookie 86/86, functional 0 unexpected, `--optimize` x2
+  0 of 3,043 facts, `--upgrade-php` 8.6 1:04 / 8.5 1:05.  Restore: 696 ->
+  696 packages, 0 `/etc` changes (after a one-byte `/etc/hosts` fix; open
+  item).
 
 ## 1.21.65 — Xeon E-2236 (2026-11-23)
 

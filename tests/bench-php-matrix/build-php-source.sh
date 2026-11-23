@@ -53,7 +53,7 @@ packages=(
   build-essential pkg-config autoconf bison re2c
   libxml2-dev libsqlite3-dev libssl-dev libcurl4-openssl-dev
   libpng-dev libjpeg-dev libfreetype-dev libwebp-dev
-  libzip-dev libonig-dev libgmp-dev libsodium-dev libsystemd-dev
+  libzip-dev libonig-dev libgmp-dev libsodium-dev libsystemd-dev zlib1g-dev
 )
 missing=()
 for p in "${packages[@]}"; do
@@ -96,6 +96,7 @@ export CXXFLAGS="$CFLAGS"
   --with-zip --with-libxml --enable-dom --enable-xml \
   --enable-xmlreader --enable-xmlwriter --enable-simplexml \
   --with-gmp --enable-sockets \
+  --with-zlib --with-sodium \
   --disable-cgi --disable-phpdbg \
   > "/root/work/build-$TAG-configure.log" 2>&1 \
   || { tail -30 "/root/work/build-$TAG-configure.log" >&2; exit 1; }

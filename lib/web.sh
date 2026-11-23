@@ -3049,6 +3049,18 @@ tune_php_fpm_version() {
   plan_allowance=$(php_worker_allowance_mb "$ver" 2>/dev/null || true)
   [[ $plan_allowance =~ ^[0-9]+$ ]] && (( plan_allowance > 0 )) || plan_allowance=64
   max_children=$(php_plan_max_children "$nproc" "$ram_mb" "$live_children" "$explicit_value" "$php_budget" "$plan_allowance")
+  # Two running versions (an inherited host with one site per version) each
+  # run a static pool.  The plan booked one pool's RAM, and live_children
+  # above is their sum, so split it: each version gets its share and the
+  # total stays what was planned (stable across runs, unlike writing the full
+  # pool into each).
+  local active_versions=0
+  active_versions=$(php_fpm_active_versions | grep -c . || true)
+  if [[ -z $explicit_value ]] && (( active_versions > 1 )) \
+     && systemctl is-active --quiet "php${ver}-fpm" 2>/dev/null; then
+    max_children=$(php_split_children "$max_children" "$active_versions")
+    tune_summary "PHP ${ver}: ${active_versions} PHP-FPM versions are running; the planned pool is split between them (${max_children} workers each)"
+  fi
   if [[ -z $explicit_value ]]; then
     # Informational: the note must not mark the pool dirty, or every
     # --optimize on a host already at the target reloads an unchanged PHP-FPM.

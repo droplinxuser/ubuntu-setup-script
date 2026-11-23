@@ -1222,9 +1222,22 @@ install_mariadb() {
   fi
   if ! systemctl restart mariadb; then
     journalctl -u mariadb -n 80 --no-pager || true
+    # A file can parse and still fail at start (a buffer pool or redo log
+    # the host cannot allocate, a socket path that does not exist).  Put the
+    # working directory back and bring the server up on it, so the failed
+    # install does not leave MariaDB stopped with the generated files live.
+    if [[ -n $mdb_bk && -d $mdb_bk/mariadb.conf.d ]]; then
+      mv /etc/mysql/mariadb.conf.d "${mdb_bk}/rejected" \
+        && mv "$mdb_bk/mariadb.conf.d" /etc/mysql/mariadb.conf.d \
+        && warn "MariaDB did not start with the generated configuration; restored the previous one (failed copy kept in ${mdb_bk}/rejected)"
+      systemctl restart mariadb \
+        || warn "MariaDB does not start on the restored configuration either"
+    fi
     return 1
   fi
-  mariadb_wait_ready 30 || true
+  # Same wait as mariadb_restart_probe: a large buffer pool on a slow disk
+  # needs minutes, and the grants below fail on a server that is not up yet.
+  mariadb_wait_ready 300 || true
 
   local eu ep sql host
   eu=$(sql_escape "$user")
@@ -1438,8 +1451,11 @@ install_valkey() {
     restart_php_workers_for_group valkey
   fi
 
-  wait_for_cmd 20 valkey_pong valkey-cli || true
-  valkey-cli ping
+  # Ask the socket this run just wrote: an adopted configuration may keep an
+  # operator bind/port, and then the default 127.0.0.1:6379 is not Valkey.
+  wait_for_cmd 20 valkey_pong valkey-cli -s "$socket" || true
+  valkey-cli -s "$socket" ping \
+    || warn "Valkey did not answer PING on ${socket} (a requirepass in the adopted configuration needs AUTH)"
   ok "Valkey installed and running"
 }
 
@@ -1558,7 +1574,8 @@ valkey_ensure_www_group() {
   return 1
 }
 
-valkey_pong() { "$1" ping 2>/dev/null | grep -q PONG; }
+# valkey_pong CLI [ARGS...]: e.g. valkey_pong valkey-cli -s /run/valkey/valkey.sock
+valkey_pong() { local cli=$1; shift; "$cli" "$@" ping 2>/dev/null | grep -q PONG; }
 
 # Run a probe once per second until it succeeds or N attempts are used up.
 wait_for_cmd() {

@@ -503,6 +503,13 @@ on_exit() {
   if (( ${OPT_WEB_PAUSED_ANGIE:-0} )) || (( ${#OPT_WEB_PAUSED_PHP[@]} > 0 )); then
     opt_resume_web_frontends "an interrupted run" || true
   fi
+  # An --upgrade-php run that died between purging the old version and the
+  # target serving (signal, set -e, die) would leave the host with no PHP.
+  if (( ${PHP_UPGRADE_IN_FLIGHT:-0} )) && (( rc != 0 )); then
+    PHP_UPGRADE_IN_FLIGHT=0
+    warn "PHP upgrade interrupted (exit ${rc}); restoring PHP ${PHP_UPGRADE_OLD_VERSION:-?}"
+    php_upgrade_rollback || warn "Rollback did not complete; inspect /var/lib/setup.sh"
+  fi
   cleanup_configs
   release_run_lock
   finish_run_log "$rc"

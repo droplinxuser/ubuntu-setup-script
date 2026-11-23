@@ -8,6 +8,90 @@ Reports of the 1.21.33-1.21.61 cycles that measured the removed Anubis
 filter were deleted from the tree on 2026-11-23 for the same reason;
 `git show <commit>:<path>` recovers them.
 
+## 1.21.66 (2026-11-23)
+
+- **PHP build sources, last round: clang is +3 % on XenForo, nothing else
+  wins, and PHP 8.4 is slower** (primary focus).  This round adds the
+  CentminMod levers 1.21.64/65 had not measured.  Every arm compiles every
+  module from source, igbinary included (3.2.17RC1 is the first release
+  that builds against 8.5, so no downgrade was needed for it).  Arms:
+  GCC `-O3 -march=native -falign-functions=32
+  -fno-semantic-interposition` (`GCC_FALIGN_FUNCTION=y`), the same without
+  falign, clang with the same flags (`CLANG_PHP=y`), and PHP 8.4.28 with
+  the falign flags.  Five arms, 3 rotated rounds, clock pinned at 3.6 GHz.
+  clang: XenForo member home +3.1 % and thread +3.1 % with
+  non-overlapping spreads (+2.9 to +3.4 % in all three matrices),
+  WordPress and Chevereto ±0.  GCC with or without falign: -1 % to -5 %.
+  PHP 8.4: -2.9 % to -4.3 % on every tier, and its object/method section
+  is 21 % slower on the CLI probe.  Verdict: Sury stays.  A 3 % gain on
+  one application does not pay for a compiler toolchain and manual
+  security rebuilds on every host, and 8.5 beats 8.4.
+- **Harness fix: the source builds had no zlib.**  `build-php-source.sh`
+  and `build-php-max.sh` never passed `--with-zlib`.  Every source arm since
+  1.21.64 therefore skipped PHP's own page gzip for WordPress and Chevereto
+  (`zlib.output_compression`, which this setup enables), left the
+  compression to Angie, and on a cached tier never stored the page at all
+  (the encoding guard refused it).  That bias favoured the source builds
+  on the WordPress and Chevereto tiers, so the earlier "no gain" verdicts
+  stand, but the numbers here come from builds with `--with-zlib
+  --with-sodium`.  Sury and every arm now load the same application module
+  set, and a guest page is stored and served from cache under each arm.
+  `build-php-max.sh` also takes `CC=clang`, `NO_FALIGN=1`,
+  `PHP_INI_DIR`, `IGBINARY_VER`, loads the shared OPcache of PHP 8.4 and
+  older, and stops re-downloading PECL sources on every build.
+- **Security (server-configs-nginx 1.6.57):** the XenForo front-proxy cache
+  could store one member's page for every guest.  `proxy_cache` lacked the
+  1.6.54 unknown-cookie default-deny, so an SSO or add-on login cookie
+  reached the origin as a member and the page was cached under the guest
+  key.  Unknown SNI over HTTP/3 is now refused by the catch-all (the first
+  HTTP/3 vhost used to become the QUIC default server).  Compressed dumps
+  (`.sql.zip/.bz2/.xz/.zst/.lz4/.7z`) are denied at any depth.  New
+  regression checks: three tree checks for the proxy gate and six HTTP
+  probes for the dumps (security suite 67 → 73).  The QUIC catch-all was
+  checked by hand with an OpenSSL 3.5 QUIC client: an HTTP/3 vhost serves
+  its certificate and an unknown name gets none.  A rotated A/B of the
+  1.6.56 and 1.6.57 trees left every cached tier inside its spread, with
+  Angie CPU per hit unchanged.
+- **An interrupted `--upgrade-php` no longer leaves the host without PHP.**
+  A signal, a `set -e` failure or a `die` between purging the old version
+  and the new FPM serving exited through `on_exit` with nothing installed.
+  The run now marks that window, `on_exit` rolls back while it is open, and
+  a dropped SSH session (HUP) is ignored until the target serves.
+- **A PHP rollback no longer "succeeds" into 502.**  `php_upgrade_rollback`
+  restored the managed tree, then called `systemctl enable --now`.  The
+  reinstalled package's postinst had already started FPM on the stock
+  tree (`/run/php/php<ver>-fpm.sock`), and `enable --now` leaves a running
+  unit alone, so the shared socket never came up and every site answered
+  502.  Every rollback path had this.  Found by sending a TERM in the
+  middle of a real `--upgrade-php=8.6` on the test host.  The rollback now
+  restarts FPM and checks that the restored pool's socket listens; the
+  same interruption now brings PHP 8.5 back with every site at 200.
+- **Automatic swap never switches the live file off before its
+  replacement exists.**  `configure_swap_auto` released the active
+  `/swapfile` and counted its space as free.  `create_swap_file`, which
+  builds the new file beside the old one, could then die on the disk check
+  with swap left off.  The size is now computed by a pure function,
+  `swap_auto_new_size`, that counts only real free space, and the swap
+  itself is left to `create_swap_file`.  The unused `release_swap_file`
+  is gone.
+- **A MariaDB install that cannot restart restores its previous
+  configuration**, the same as the parse-failure path, instead of leaving
+  the server stopped with the generated files live.  It also waits as long
+  as the optimizer (300 s) before creating the grants.
+- **Valkey's install check pings the socket it wrote**, not
+  127.0.0.1:6379, so an adopted configuration with an operator bind or
+  port no longer fails the install.
+- **Two running PHP-FPM versions share one planned pool.**  On an
+  inherited host with two versions on separate sockets, each received the
+  full static pool while the memory plan, MariaDB `max_connections` and
+  Valkey `maxclients` counted one.  The pool total is now the sum over
+  running versions.  Each version gets its share, which is stable across
+  runs, and the connection limits count every worker.  A single-version
+  host is unchanged.
+- Unit tests: value checks for the Angie worker table (1 to 512 CPUs,
+  dedicated and VPS) and the shared listen backlog, which had none, plus
+  tests for every fix above (1,496 → 1,530).
+
 ## 1.21.65 (2026-11-23)
 
 - **Everything on is slower: LTO is neutral, PGO costs 5-10 %**

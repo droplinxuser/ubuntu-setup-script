@@ -1538,12 +1538,51 @@ php_pool_listen() {
   ini_get "$pool" listen
 }
 
-php_pool_max_children() {
-  local ver pool cur max=0
+# Versions whose php<ver>-fpm unit is running.  A second version left on the
+# shared socket cannot bind it and is not counted.
+php_fpm_active_versions() {
+  local ver
   while IFS= read -r ver; do
-    pool="/etc/php/${ver}/fpm/pool.d/www.conf"
-    [[ -f $pool ]] || continue
-    cur=$(awk -F= '/^[[:space:]]*pm\.max_children[[:space:]]*=/{v=$2; gsub(/[^0-9]/,"",v); print v; exit}' "$pool")
+    [[ -n $ver ]] || continue
+    systemctl is-active --quiet "php${ver}-fpm" 2>/dev/null && printf '%s\n' "$ver"
+  done < <(php_fpm_versions)
+  return 0
+}
+
+php_pool_children_of() {
+  local pool="/etc/php/${1}/fpm/pool.d/www.conf" cur
+  [[ -f $pool ]] || return 0
+  cur=$(awk -F= '/^[[:space:]]*pm\.max_children[[:space:]]*=/{v=$2; gsub(/[^0-9]/,"",v); print v; exit}' "$pool")
+  [[ $cur =~ ^[0-9]+$ ]] && printf '%s' "$cur"
+  return 0
+}
+
+# One running version's share of the planned pool when N run at once.
+php_split_children() {
+  local total=$1 n=$2 each
+  (( n > 1 )) || { printf '%s' "$total"; return 0; }
+  each=$(( total / n ))
+  (( each < 2 )) && each=2
+  printf '%s' "$each"
+}
+
+# Workers the host can run at once: the sum over every running FPM version
+# (each runs its own static pool), or the largest configured pool when none is
+# running (install plan, PHP stopped).  MariaDB max_connections, Valkey
+# maxclients and the memory plan all count clients, so two running versions
+# must count twice; the largest single pool undercounted them (1.21.66).
+php_pool_max_children() {
+  local ver cur max=0 sum=0 active=0
+  while IFS= read -r ver; do
+    [[ -n $ver ]] || continue
+    cur=$(php_pool_children_of "$ver")
+    [[ $cur =~ ^[0-9]+$ ]] || continue
+    sum=$(( sum + cur )); active=1
+  done < <(php_fpm_active_versions)
+  if (( active )); then printf '%s' "$sum"; return 0; fi
+  while IFS= read -r ver; do
+    [[ -n $ver ]] || continue
+    cur=$(php_pool_children_of "$ver")
     [[ $cur =~ ^[0-9]+$ ]] || continue
     (( cur > max )) && max=$cur
   done < <(php_fpm_versions)

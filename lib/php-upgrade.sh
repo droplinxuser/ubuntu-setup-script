@@ -1217,9 +1217,21 @@ php_upgrade_rollback() {
       || warn "Could not restore /etc/php/${old}"
   fi
   systemctl daemon-reload 2>/dev/null || true
-  systemctl enable --now "php${old}-fpm" 2>/dev/null || true
+  # restart, not `enable --now`: the reinstalled package's postinst already
+  # started FPM on the stock tree (/run/php/php<ver>-fpm.sock), and
+  # `enable --now` leaves a running unit alone, so the restored pool's shared
+  # socket never came up and every site answered 502 after a "successful"
+  # rollback (reproduced with a TERM during the install, 1.21.66).
+  systemctl enable "php${old}-fpm" 2>/dev/null || true
+  systemctl restart "php${old}-fpm" 2>/dev/null || true
+  local listen
+  listen=$(php_pool_listen "$old" 2>/dev/null || true)
   if systemctl is-active --quiet "php${old}-fpm"; then
-    ok "PHP ${old} is active again"
+    if [[ $listen == /* ]] && ! wait_for_cmd 10 test -S "$listen"; then
+      warn "PHP ${old} is running but its pool socket ${listen} is missing; inspect journalctl -u php${old}-fpm"
+    else
+      ok "PHP ${old} is active again${listen:+ (pool on ${listen})}"
+    fi
   else
     warn "PHP ${old} did not start; inspect journalctl -u php${old}-fpm"
   fi
@@ -1522,10 +1534,18 @@ run_php_upgrade() {
   fi
 
   if [[ -n $old ]]; then
+    # From here until the target FPM is serving, the host has no working PHP.
+    # A signal or a dropped session in that window used to exit through
+    # on_exit with the old version purged and nothing installed; on_exit now
+    # rolls back while this flag is set, and HUP is ignored so a closed SSH
+    # session cannot stop the transaction halfway.
+    PHP_UPGRADE_IN_FLIGHT=1
+    trap "" HUP
     step "Purging PHP ${old} and its dependencies"
     if ! php_upgrade_purge; then
       warn "Purging PHP ${old} failed; restoring it"
-      php_upgrade_rollback || warn "Rollback did not complete; inspect /var/lib/setup.sh"
+      PHP_UPGRADE_IN_FLIGHT=0
+    php_upgrade_rollback || warn "Rollback did not complete; inspect /var/lib/setup.sh"
       report=$(php_upgrade_write_report "$target" 1)
       warn "Report: ${report}"
       handled_return 1
@@ -1537,6 +1557,7 @@ run_php_upgrade() {
   step "Installing PHP ${target}"
   if ! php_upgrade_install "$target"; then
     warn "PHP ${target} installation failed"
+    PHP_UPGRADE_IN_FLIGHT=0
     [[ -n $old ]] && php_upgrade_rollback
     report=$(php_upgrade_write_report "$target" 1)
     warn "Report: ${report}"
@@ -1557,11 +1578,16 @@ run_php_upgrade() {
   # old, working PHP back instead of leaving the host on a dead version.
   if [[ -n $old ]] && ! systemctl is-active --quiet "php${target}-fpm"; then
     warn "PHP ${target}-fpm is not active after tuning; rolling back"
+    PHP_UPGRADE_IN_FLIGHT=0
     php_upgrade_rollback || warn "Rollback to PHP ${old} did not complete"
     report=$(php_upgrade_write_report "$target" 1)
     warn "Report: ${report}"
     handled_return 1
     return 1
+  fi
+  if (( ${PHP_UPGRADE_IN_FLIGHT:-0} )); then
+    PHP_UPGRADE_IN_FLIGHT=0
+    trap "exit 129" HUP
   fi
   php_upgrade_reload_angie || rc=1
   php_upgrade_verify "$target" || rc=1

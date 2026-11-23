@@ -14,6 +14,17 @@
 # after "generate": switch the FPM unit to the arm, drive real traffic, stop
 # it, then run "use".
 #
+# Environment:
+#   NO_LTO=1        drop -flto (CentminMod PHP_LTO=n, the shipped default)
+#   NO_FALIGN=1     drop -falign-functions=32 (CentminMod GCC_FALIGN_FUNCTION=n,
+#                   its default)
+#   CC=clang        build PHP and the extensions with clang (CentminMod
+#                   CLANG_PHP=y); the default is the distribution GCC
+#   PHP_INI_DIR     the managed php.ini to share (default /etc/php/8.5/fpm);
+#                   an 8.4 arm reads the same file
+#   IGBINARY_VER    PECL igbinary release (default 3.2.17RC1, the first
+#                   that compiles against 8.5)
+#
 # `switch-php-arm.sh src-TAG` treats an extension directory that contains
 # .source-built-ext as authoritative and does not fall back to the
 # distribution's .so files.
@@ -30,7 +41,11 @@ PGO_DIR=/root/work/pgo-$TAG
 FPM_RUNDIR=/etc/php-src/$TAG
 CONF_DIR=$FPM_RUNDIR/conf.d
 EXT_DIR=$FPM_RUNDIR/ext
-PHP_INI_DIR=/etc/php/8.5/fpm
+PHP_INI_DIR=${PHP_INI_DIR:-/etc/php/8.5/fpm}
+IGBINARY_VER=${IGBINARY_VER:-3.2.17RC1}
+CC=${CC:-gcc}
+export CC CXX=${CC/clang/clang++}
+[[ $CXX == gcc ]] && CXX=g++
 JOBS=$(nproc)
 
 [[ $TAG =~ ^[a-z0-9-]+$ ]] || { echo "tag must be [a-z0-9-]+" >&2; exit 1; }
@@ -43,8 +58,21 @@ JOBS=$(nproc)
 BASE_FLAGS="-O3 -m64 -march=native -mtune=native -falign-functions=32 -pipe"
 BASE_FLAGS+=" -fno-semantic-interposition"
 BASE_FLAGS+=" -flto -fno-fat-lto-objects -fuse-linker-plugin"
+if [[ ${NO_FALIGN:-0} == 1 ]]; then
+  BASE_FLAGS=${BASE_FLAGS/ -falign-functions=32/}
+fi
 if [[ ${NO_LTO:-0} == 1 ]]; then
   BASE_FLAGS=${BASE_FLAGS% -flto -fno-fat-lto-objects -fuse-linker-plugin}
+elif [[ $CC == clang* ]]; then
+  # The fat-object and linker-plugin switches are GCC's; clang's equivalent is
+  # ThinLTO through lld.
+  BASE_FLAGS=${BASE_FLAGS% -flto -fno-fat-lto-objects -fuse-linker-plugin}
+  BASE_FLAGS+=" -flto=thin"
+  export LDFLAGS="-flto=thin -fuse-ld=lld"
+fi
+if [[ $CC == clang* && $STAGE != plain ]]; then
+  echo "PGO stages are written for GCC's -fprofile-generate/-use; use CC=gcc" >&2
+  exit 1
 fi
 case $STAGE in
   plain)    CFLAGS="$BASE_FLAGS" ;;
@@ -68,9 +96,10 @@ packages=(
   build-essential pkg-config autoconf bison re2c
   libxml2-dev libsqlite3-dev libssl-dev libcurl4-openssl-dev
   libpng-dev libjpeg-dev libfreetype-dev libwebp-dev
-  libzip-dev libonig-dev libgmp-dev libsodium-dev libsystemd-dev
+  libzip-dev libonig-dev libgmp-dev libsodium-dev libsystemd-dev zlib1g-dev
   libmagickwand-dev
 )
+[[ $CC == clang* ]] && packages+=(clang lld)
 missing=()
 for p in "${packages[@]}"; do
   dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q ' installed$' || missing+=("$p")
@@ -110,6 +139,7 @@ cd "$SRC"
   --with-zip --with-libxml --enable-dom --enable-xml \
   --enable-xmlreader --enable-xmlwriter --enable-simplexml \
   --with-gmp --enable-sockets \
+  --with-zlib --with-sodium \
   --disable-cgi --disable-phpdbg \
   --disable-gcc-global-regs \
   > "/root/work/build-$TAG-$STAGE-configure.log" 2>&1 \
@@ -159,7 +189,7 @@ pecl_ext() {
     make install >/dev/null 2>&1 )
 }
 built=()
-for spec in "igbinary 3.2.16" "redis 6.3.0" "imagick 3.8.1"; do
+for spec in "igbinary $IGBINARY_VER" "redis 6.3.0" "imagick 3.8.1"; do
   # shellcheck disable=SC2086
   set -- $spec
   if [[ -f $EXTDIR/$1.so ]] || pecl_ext "$1" "$2"; then
@@ -172,6 +202,13 @@ for spec in "igbinary 3.2.16" "redis 6.3.0" "imagick 3.8.1"; do
   fi
 done
 [[ -f $EXTDIR/redis.so ]] && touch "$EXT_DIR/.source-built-ext"
+# PHP 8.5 compiles OPcache into the binary; 8.4 and older build it as a
+# shared Zend extension, which the managed conf.d (written for 8.5) never
+# loads.  Without this line an 8.4 arm would run with no OPcache and no JIT.
+if [[ -f $EXTDIR/opcache.so ]]; then
+  printf 'zend_extension=%s\n' "$EXTDIR/opcache.so" > "$EXT_DIR/10-opcache.ini"
+  echo "extension: opcache (shared, PHP < 8.5)"
+fi
 
 # ---- FPM unit on the shared socket ----------------------------------------
 mkdir -p "$FPM_RUNDIR"
@@ -181,10 +218,11 @@ if [[ ! -f $FPM_RUNDIR/php-fpm.conf ]]; then
     -e "s#^error_log[[:space:]]*=.*#error_log = /var/log/php-src-$TAG.log#" \
     "$PHP_INI_DIR/php-fpm.conf" > "$FPM_RUNDIR/php-fpm.conf"
 fi
+lto="LTO"; [[ ${NO_LTO:-0} == 1 ]] && lto="no LTO"
 case $STAGE in
-  plain)    desc="LTO" ;;
-  generate) desc="LTO, PGO training build" ;;
-  use)      desc="LTO, PGO" ;;
+  plain)    desc="$CC, $lto" ;;
+  generate) desc="$CC, $lto, PGO training build" ;;
+  use)      desc="$CC, $lto, PGO" ;;
 esac
 cat > "/etc/systemd/system/php-src-$TAG.service" <<UNIT
 [Unit]

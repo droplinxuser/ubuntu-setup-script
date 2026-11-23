@@ -4728,19 +4728,34 @@ check "a failed swapon puts the old file back" \
 check "the previous swap file is only removed after the new one is live" \
   test "$(grep -n 'rm -f "\$old"' <<<"$swap_body" | cut -d: -f1)" \
      -gt "$(grep -n 'swapon /swapfile' <<<"$swap_body" | tail -n1 | cut -d: -f1)"
-# release_swap_file with stubbed swapon/swapoff (functions shadow the tools).
-release_quiet() { release_swap_file 2>/dev/null; }
-swapoff_called=0
-swapon() { printf '/swapfile\n'; }
-swapoff() { return 1; }
-check "an active swap file that cannot be released stops the re-create" not release_quiet
-swapoff() { return 0; }
-check "a released swap file may be re-created" release_swap_file
-swapon() { :; }
-swapoff() { swapoff_called=2; return 1; }
-check "an inactive swap file needs no swapoff" release_swap_file
-check "swapoff is not attempted on an inactive file" test "$swapoff_called" -ne 2
-unset -f swapon swapoff
+# Automatic swap sizing (1.21.66): the new file is built beside the live one,
+# so the old file gives no space back and a live file is never switched off
+# before its replacement exists.
+G=1073741824 M=1048576
+swap_auto_rc() { local rc=0; swap_auto_new_size "$@" >/dev/null || rc=$?; echo "$rc"; }
+check "auto swap: a target that fits is created in full" \
+  test "$(swap_auto_new_size $(( 20 * G )) 0 0 $(( 4 * G )))" = $(( 4 * G ))
+check "auto swap: an active file grows by what is missing" \
+  test "$(swap_auto_new_size $(( 20 * G )) $(( 2 * G )) 1 $(( 2 * G )))" = $(( 4 * G ))
+check "auto swap: the live file's space is not counted as free" \
+  test "$(swap_auto_new_size $(( 3 * G )) $(( 2 * G )) 1 $(( 6 * G )))" = $(( 3 * G - 256 * M ))
+check "auto swap: a reduced file is reported as reduced" \
+  test "$(swap_auto_rc $(( 3 * G )) $(( 2 * G )) 1 $(( 6 * G )))" = 2
+check "auto swap: a file no larger than the live one is skipped" \
+  test "$(swap_auto_rc $(( 2 * G )) $(( 2 * G )) 1 $(( 6 * G )))" = 1
+check "auto swap: under 64 MiB of room is skipped" \
+  test "$(swap_auto_rc $(( 300 * M )) 0 0 $(( 4 * G )))" = 1
+check "auto swap: an unreadable df keeps the full target" \
+  test "$(swap_auto_new_size "" 0 0 $(( 4 * G )))" = $(( 4 * G ))
+swap_auto_always_fits() {
+  local a s rc
+  for a in 1 2 3 5 9 17; do
+    rc=0; s=$(swap_auto_new_size $(( a * G )) $(( 2 * G )) 1 $(( 6 * G ))) || rc=$?
+    (( rc == 1 )) && continue
+    (( s + 268435456 <= a * G )) || return 1
+  done
+}
+check "auto swap: the sized file always fits beside the old one" swap_auto_always_fits
 
 # ---------------------------------------------------------------------------
 # 1.21.3: log files in service-owned directories are never followed as links
@@ -4834,6 +4849,29 @@ check "an unrelated vhost is untouched" cmp -s "$va/conf.d/other.conf" "$va/othe
 check "a dropped SSH session unwinds through on_exit" grep -q "trap 'exit 129' HUP" "$ALL_SRC"
 check "on_exit resumes a paused web tier" \
   bash -c 'sed -n "/^on_exit()/,/^}/p" "$1" | grep -q opt_resume_web_frontends' _ "$ALL_SRC"
+# 1.21.66: a signal between purging the old PHP and the target serving left
+# the host with no PHP at all; on_exit now rolls back while the flag is set.
+php_exit_probe() {
+  ( OPTIMIZE=0 PHP_UPGRADE_IN_FLIGHT=$1 PHP_UPGRADE_OLD_VERSION=8.4
+    cleanup_configs() { :; }; release_run_lock() { :; }; finish_run_log() { :; }
+    warn() { :; }; php_upgrade_rollback() { echo rolled; }
+    set +eE; trap - ERR
+    (exit "$2"); on_exit ) 2>/dev/null || true
+}
+check "on_exit rolls back an interrupted --upgrade-php" test "$(php_exit_probe 1 143)" = rolled
+check "on_exit leaves a completed --upgrade-php alone" test -z "$(php_exit_probe 0 143)"
+check "on_exit does not roll back a run that succeeded" test -z "$(php_exit_probe 1 0)"
+check "--upgrade-php raises the in-flight flag before the purge" \
+  bash -c 'sed -n "/^run_php_upgrade()/,/^}/p" "$1" | awk "/PHP_UPGRADE_IN_FLIGHT=1/{f=1} /if ! php_upgrade_purge/{exit !f}"' _ "$ALL_SRC"
+rollback_body=$(sed -n '/^php_upgrade_rollback()/,/^}/p' "$ALL_SRC")
+check "a rollback restarts FPM on the restored tree (postinst started the stock one)" \
+  grep -qF 'systemctl restart "php${old}-fpm"' <<<"$rollback_body"
+check "a rollback does not rely on enable --now for a unit that is already running" \
+  not grep -qF 'enable --now "php${old}-fpm"' <<<"$rollback_body"
+check "a rollback checks that the restored pool socket listens" \
+  grep -qF 'test -S "$listen"' <<<"$rollback_body"
+check "--upgrade-php ignores HUP while no PHP is installed" \
+  bash -c 'sed -n "/^run_php_upgrade()/,/^}/p" "$1" | grep -q "trap \"\" HUP"' _ "$ALL_SRC"
 check "--upgrade-php keeps the listener of a migrated pool" \
   grep -qF '/^[[:space:]]*listen[[:space:]]*=/! s/php${old//./\\.}/php${new}/g' "$ALL_SRC"
 check "the optimize report is not world-readable" \
@@ -4848,9 +4886,77 @@ unset -f hostnamectl
 : > "$SETUP_STATE_DIR/applied-hostname"
 check "the malware rule needs a hex letter in the plugin suffix" \
   grep -qF -- "-regex '.*-[0-9]*[a-f][0-9a-f]*\$'" "$ALL_SRC"
+# 1.21.66: two running PHP-FPM versions each ran the full static pool while
+# the plan, MariaDB max_connections and Valkey maxclients counted one.
+saved_pool_fns=$(declare -f php_fpm_versions php_pool_children_of)
+# Earlier sections leave a php_pool_max_children stub behind; test the real one.
+saved_pmc_fn=$(declare -f php_pool_max_children)
+eval "$(sed -n '/^php_pool_max_children()/,/^}/p' "$ALL_SRC")"
+saved_sys_fn=$(declare -f systemctl || true)
+stub_both=0
+  php_fpm_versions() { printf '8.4\n8.5\n'; }
+  php_pool_children_of() { case $1 in 8.4) printf 12 ;; 8.5) printf 20 ;; esac; }
+  systemctl() { [[ $1 == is-active ]] || return 0; for a; do [[ $a == php8.5-fpm || ( $a == php8.4-fpm && ${stub_both:-0} == 1 ) ]] && return 0; done; return 1; }
+  check "pool total: one running version counts only itself" test "$(php_pool_max_children)" = 20
+  stub_both=1
+  check "pool total: two running versions count both pools" test "$(php_pool_max_children)" = 32
+  check "pool total: both running versions are listed" test "$(php_fpm_active_versions | tr '\n' ' ')" = "8.4 8.5 "
+  systemctl() { return 1; }
+  check "pool total: nothing running falls back to the largest pool" test "$(php_pool_max_children)" = 20
+unset -f systemctl
+[[ -z $saved_sys_fn ]] || eval "$saved_sys_fn"
+eval "$saved_pool_fns"
+eval "$saved_pmc_fn"
+check "pool split: one version keeps the whole pool" test "$(php_split_children 24 1)" = 24
+check "pool split: two versions share the planned pool" test "$(php_split_children 24 2)" = 12
+check "pool split: a share never drops below two workers" test "$(php_split_children 3 4)" = 2
+check "pool split: the FPM writer splits only when several versions run" \
+  bash -c 'sed -n "/^tune_php_fpm_version()/,/^}/p" "$1" | grep -q "php_split_children \"\$max_children\" \"\$active_versions\""' _ "$ALL_SRC"
+# 1.21.66: the Angie worker table and the shared listen backlog had no
+# value checks; a change to the measured 2/3 ratio or the per-core constants
+# passed the suite.
+saved_wl_fns=$(declare -f host_is_vps sysctl_target_somaxconn)
+angie_wl() { stub_vps=$2; angie_worker_limits "$1"; printf '%s/%s/%s' "$ANGIE_WORKER_PROCESSES" "$ANGIE_WORKER_RLIMIT" "$ANGIE_WORKER_CONNECTIONS"; }
+host_is_vps() { (( ${stub_vps:-0} )); }
+check "angie workers: 1 CPU dedicated"   test "$(angie_wl 1 0)" = 2/65536/8192
+check "angie workers: 12 CPU dedicated"  test "$(angie_wl 12 0)" = 8/98304/24576
+check "angie workers: 256 CPU dedicated" test "$(angie_wl 256 0)" = 170/524288/65535
+check "angie workers: 2 vCPU VPS"        test "$(angie_wl 2 1)" = 2/65536/8192
+check "angie workers: 64 vCPU VPS"       test "$(angie_wl 64 1)" = 42/262144/65535
+angie_wl_invariant() {
+  local n v r rl wc
+  for v in 0 1; do for n in 1 2 3 4 6 8 12 16 24 32 48 64 96 128 256 512; do
+    r=$(angie_wl "$n" "$v")
+    IFS=/ read -r _ rl wc <<<"$r"
+    (( wc <= rl - 1024 && wc >= 1024 )) || return 1
+  done; done
+}
+check "angie workers: connections always leave 1024 fds of headroom" angie_wl_invariant
+sysctl_target_somaxconn() { printf '%s' "$stub_somax"; }
+stub_somax=512;    check "listen backlog: floor 1024"       test "$(effective_backlog)" = 1024
+stub_somax=8192;   check "listen backlog: follows somaxconn" test "$(effective_backlog)" = 8192
+stub_somax=262144; check "listen backlog: capped at 65535"  test "$(effective_backlog)" = 65535
+unset -f host_is_vps sysctl_target_somaxconn angie_wl angie_wl_invariant
+eval "$saved_wl_fns"
+# 1.21.66: a MariaDB that parsed the generated files but failed to start was
+# left stopped with them live; the install now restores the copy it took.
+mariadb_install_body=$(sed -n '/^install_mariadb()/,/^}/p' "$ALL_SRC")
+check "a MariaDB install that cannot restart restores the previous config" \
+  bash -c 'awk "/if ! systemctl restart mariadb; then/{f=1} f && /mdb_bk\/mariadb.conf.d\" \/etc\/mysql\/mariadb.conf.d/{ok=1} f && /^  fi/{exit} END{exit !ok}" <<<"$1"' _ "$mariadb_install_body"
+check "a MariaDB install waits as long as the optimizer before the grants" \
+  grep -q 'mariadb_wait_ready 300' <<<"$mariadb_install_body"
+# 1.21.66: the install health check pinged the default 127.0.0.1:6379 even
+# when an adopted configuration kept an operator bind/port.
+fake_cli() { [[ "$*" == "-s /run/test.sock ping" ]] && echo PONG; }
+check "valkey_pong passes the endpoint arguments to the client" \
+  valkey_pong fake_cli -s /run/test.sock
+check "valkey_pong fails on another endpoint" not valkey_pong fake_cli
+check "the Valkey install pings the socket it wrote" \
+  bash -c 'sed -n "/^install_valkey()/,/^}/p" "$1" | grep -q "wait_for_cmd 20 valkey_pong valkey-cli -s \"\$socket\""' _ "$ALL_SRC"
+unset -f fake_cli
 swap_auto_body=$(sed -n '/^configure_swap_auto()/,/^}/p' "$ALL_SRC")
-check "automatic swap is sized to the free disk before the old file is released" \
-  bash -c 'a=$(grep -n "Automatic swap skipped" <<<"$1" | cut -d: -f1); b=$(grep -n "release_swap_file" <<<"$1" | head -1 | cut -d: -f1); [[ -n $a && -n $b && $a -lt $b ]]' _ "$swap_auto_body"
+check "automatic swap never switches the live file off itself" \
+  bash -c '! grep -qE "swapoff|release_swap" <<<"$1"' _ "$swap_auto_body"
 check "--php re-enables the session GC timer after a purge" \
   bash -c 'sed -n "/^install_php()/,/^}/p" "$1" | grep -q "systemctl enable --now phpsessionclean.timer"' _ "$ALL_SRC"
 check "--others sysstat re-enables the units a purge disabled" \
@@ -6725,6 +6831,16 @@ check_tree "guest cache: PHPSESSID is not a page-neutral cookie" \
   guest_cookie_unknown 'PHPSESSID=abc'
 check_tree "guest cache: a folded PHPSESSID is not page-neutral either" \
   guest_cookie_unknown 'PHP.SESSID=abc'
+# The front-proxy XenForo cache (1.21.66): 1.6.54 put the default-deny rule
+# on every FastCGI cache but missed proxy_cache, so a member page fetched
+# with an SSO/add-on cookie was stored for guests.  Every proxy_cache gate
+# in the tree must carry it, on both the store and the lookup side.
+check_tree "proxy guest cache: XenForo proxy never stores an unknown-cookie request" \
+  grep -qE '^proxy_no_cache .*\$guest_cookie_unlisted' "$ANGIE_TREE/h5bp/xf_proxy_pass.conf"
+check_tree "proxy guest cache: XenForo proxy never answers an unknown-cookie request from cache" \
+  grep -qE '^proxy_cache_bypass .*\$guest_cookie_unlisted' "$ANGIE_TREE/h5bp/xf_proxy_pass.conf"
+check_tree "proxy guest cache: every proxy_no_cache/proxy_cache_bypass carries the cookie allowlist" \
+  bash -c 'bad=$(grep -rhE "^[[:space:]]*proxy_(no_cache|cache_bypass)[[:space:]]" "$1/h5bp" "$1/conf.d" | grep -v guest_cookie_unlisted || true); [[ -z $bad ]] || { printf "%s\n" "$bad"; exit 1; }' _ "$ANGIE_TREE"
 
 # ---------------------------------------------------------------------------
 # Anubis removal (1.21.62)

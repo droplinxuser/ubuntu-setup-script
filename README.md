@@ -224,7 +224,12 @@ security updates on every
 host for no measured gain.  A follow-up with LTO and two-stage PGO
 (trained on the real applications) made it 5-10 % slower, and LTO alone
 was neutral: with the tracing JIT the hot code is generated at run time,
-so compiler optimisations only reach the interpreter.  Re-run the
+so compiler optimisations only reach the interpreter.  The last round
+(1.21.66, every module from source, igbinary included) found one
+repeatable edge, and it is small.  clang `-O3 -march=native` was +3 % on
+XenForo member pages and flat on WordPress and Chevereto.  GCC with or
+without `-falign-functions=32` was 1-5 % slower, and PHP 8.4 was 3-4 %
+slower than 8.5 on every tier, so a downgrade buys nothing.  Re-run the
 measurement with `tests/bench-php-matrix/` (`build-php-source.sh`,
 `extract-php-debs.sh`, `switch-php-arm.sh`, `bench-php-sources.sh`,
 `build-php-max.sh`) when the JIT, the compiler or the workload changes.
@@ -234,7 +239,7 @@ Pool (`pool.d/www.conf`):
 | Setting | Value |
 |---|---|
 | `pm` | always `static` |
-| `pm.max_children` | logical CPUs x factor, capped by the shared memory plan (at most RAM/2 at 96 MB per worker, 512 maximum) |
+| `pm.max_children` | logical CPUs x factor, capped by the shared memory plan (at most RAM/2 at 96 MB per worker, 512 maximum).  When several PHP-FPM versions run at once (an inherited host), the planned pool is split between them, and MariaDB/Valkey connection limits count every running pool |
 | Workers-per-CPU factor | 1.0 with a local MariaDB on flash storage; 1.5 on a shared/virtual CPU or a remote database; 2.0 on spinning disks |
 | `pm.max_requests` | threads x 1024 |
 | `request_terminate_timeout` | 300s |
@@ -693,7 +698,7 @@ It is standalone and cannot be combined with install flags, `--optimize`,
 | 4. Install | `phpX.Y-fpm`/`cli` and the default set, then every old extension mapped to `phpX.Y-<ext>`. An extension the new release does not publish yet is reported and skipped; core PHP still installs. A missing optional extension makes the run exit non-zero (`ATTENTION`) without undoing the upgrade, so automation notices. The skipped names are kept in `/var/lib/setup.sh/php-pending-extensions` and installed by the next `--upgrade-php` whose target publishes them (an 8.5 -> 8.6 RC -> 8.5 round trip keeps imagick) |
 | 5. Migrate | operator `.ini` files and extra pools are copied with the version path rewritten, validated with `php-fpm -t` (rejected files are moved out of the live tree and the run reports ATTENTION), and FPM is reloaded so the workers actually load them. The PHP `date.timezone` from the old tree is preserved |
 | 6. Tune | the same shared tuner as install/`--optimize` writes the pool (`pm=static`, hardware worker count, backlog), `zz-setup-optimize.ini` (memory/realpath/OPcache/tracing JIT), systemd limits and log paths; the Angie tuner then repoints a TCP `local_php` upstream/`fastcgi_pass` at the new Unix socket (a distribution-built host would otherwise be reloaded against a dead `127.0.0.1:9000`); the systemd drop-in of a PHP-FPM version that is no longer installed is removed |
-| 7. Verify/report | CLI version, FPM unit, the primary and every extra pool socket, extension packages, that OPcache actually loads, and that Angie has no leftover `...:9000` handler while the pool is on a socket; a Markdown report with the rollback commands is written to `/var/log/setup-php-upgrade-<timestamp>.md`. If the tuned FPM does not start, the old version is rolled back |
+| 7. Verify/report | CLI version, FPM unit, the primary and every extra pool socket, extension packages, that OPcache actually loads, and that Angie has no leftover `...:9000` handler while the pool is on a socket; a Markdown report with the rollback commands is written to `/var/log/setup-php-upgrade-<timestamp>.md`. If the tuned FPM does not start, the old version is rolled back.  A run interrupted between the purge and a serving target (Ctrl-C, `kill`, `set -e`) rolls back from its exit trap too, and a dropped SSH session (HUP) is ignored for that window |
 
 The managed files produced by an upgrade are byte-identical to a
 `--basic ... --php ver=X.Y` install (verified on the audit host: pool,

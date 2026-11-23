@@ -43,6 +43,12 @@ probe "wp wp-config.php~ is denied"       "$WP" /wp-config.php~ 403 404
 probe "wp wp-config.php.swp is denied"    "$WP" /wp-config.php.swp 403 404
 probe "wp root dump is denied"            "$WP" /backup.zip 403 404
 probe "wp root sql dump is denied"        "$WP" /site.sql 403 404
+# Compressed dumps below the root (1.21.66): only .sql/.sql.gz were denied at
+# any depth, so /wp-content/x.sql.zip was served.  The deny location answers
+# 403 whether or not the file exists, so 404 would mean the rule is missing.
+probe "wp nested .sql.zip dump is denied"  "$WP" /wp-content/audit.sql.zip 403
+probe "wp nested .sql.bz2 dump is denied"  "$WP" /wp-content/uploads/audit.sql.bz2 403
+probe "wp nested .sql.zst dump is denied"  "$WP" /wp-content/audit.sql.zst 403
 probe "wp uploads are not executable"     "$WP" /wp-content/uploads/audit.php 403 404
 probe "wp uploads PHP suffix is denied"   "$WP" /wp-content/uploads/audit.php.jpg 403 404
 probe "wp cache directory is not PHP"     "$WP" /wp-content/cache/audit.php 403 404
@@ -64,6 +70,8 @@ probe "wp admin-ajax works"                "$WP" /wp-admin/admin-ajax.php 200 40
 echo "################ XenForo ($XF)"
 probe "xf internal_data is internal"      "$XF" /internal_data/attachments/1.data 403 404
 probe "xf internal_data PHP is not run"   "$XF" /internal_data/audit.php 403 404
+probe "xf nested .sql.xz dump is denied"   "$XF" /data/audit.sql.xz 403
+probe "xf nested .sql.7z dump is denied"   "$XF" /styles/audit.sql.7z 403
 probe "xf src is internal"                "$XF" /src/config.php 403 404
 probe "xf src PHP is not served"          "$XF" /src/XF.php 403 404
 probe "xf library PHP is not served"      "$XF" /library/audit.php 403 404
@@ -84,6 +92,7 @@ echo "################ Chevereto ($CH)"
 probe "chev app/env.php is denied"        "$CH" /app/env.php 403 404
 probe "chev app PHP is not served"        "$CH" /app/audit.php 403 404
 probe "chev vendor PHP is not served"     "$CH" /app/vendor/audit.php 403 404
+probe "chev nested .sql.zip dump is denied" "$CH" /images/audit.sql.zip 403
 probe "chev importing is denied"          "$CH" /importing/audit.php 403 404
 probe "chev content PHP is not executed"  "$CH" /content/audit.php 403 404
 probe "chev sdk PHP is not served"        "$CH" /sdk/audit.php 403 404
