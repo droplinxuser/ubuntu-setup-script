@@ -150,7 +150,7 @@ Environment options:
 
 | Variable | Default | Effect |
 |---|---|---|
-| `SETUP_BROTLI_LEVEL=1..11` | 4 (3 on 1-2 CPU hosts) | dynamic Brotli level; gzip is the fallback.  (zstd, shipped in 1.21.58, was removed in 1.21.59: Cloudflare asks origins for `br, gzip` only; `--optimize` moves its stanzas away and purges `angie-module-zstd`) |
+| `SETUP_BROTLI_LEVEL=1..11` | 4 (3 on 1-2 CPU hosts) | dynamic Brotli level; gzip is the fallback.  Measured on a XenForo member thread page (1.21.63, pinned clock): level 1 = 0.8 ms Angie CPU / 23.9 KB, 2 = 1.3 ms / 18.4 KB, 3 = 1.4 ms / 17.9 KB, 4 = 2.1 ms / 17.1 KB; level 1 gave +4-6 % member req/s for 40 % more bytes, levels 2-3 were inside the noise.  A CPU-bound origin whose only client is Cloudflare can take 1.  (zstd, shipped in 1.21.58, was removed in 1.21.59: Cloudflare asks origins for `br, gzip` only; `--optimize` moves its stanzas away and purges `angie-module-zstd`) |
 | `SETUP_ANGIE_COMPRESSION=0` | on | turns the managed compression profile off |
 | `SETUP_PRECOMPRESS_ASSETS=0` | on (since 1.21.58) | writes `.br`/`.gz` siblings for the static assets of every XenForo/WordPress root and keeps them fresh from cron (a 177 KB script: 22,000 req/s from the sibling vs 2,100 compressed per request).  0 removes the siblings it made.  Install-time only: `--optimize` ignores the tuning override and uses the default (on) |
 | `SETUP_XF_JOB_CRON=0` | on | removes the managed crontab entry that runs `cmd.php xf:run-jobs` once a minute as www-data for every XenForo root; persisted as `XF_JOB_CRON` |
@@ -254,6 +254,19 @@ Cacheable guest requests are served from a named location
 `xf_csrf` cookie is not replayed to the next; XenForo's own JavaScript
 fetches a fresh token from `/login/keep-alive` when the cookie is missing.
 Members, POSTs and no-cache URIs stay in the uncached PHP location.
+
+Uncached XenForo pages (members, guest bypass, `admin.php`, `job.php`) are
+compressed by Angie, not by XenForo: since server-configs-nginx 1.6.56 the
+uncached handler (`h5bp/php_xf_handler.conf`) gives PHP an empty
+`Accept-Encoding`, so XenForo's level-9 gzip never runs in a PHP worker and
+Angie applies Brotli/gzip level 4 instead.  That rule is in the Angie tree,
+so it works from the first request of a new install and reaches existing
+hosts with the next `--optimize`.  Measured on the Xeon E-2236 test host at
+a pinned clock: XenForo's gzip was 12 % of php-fpm CPU on a member thread
+page; moving it gave member home +5 % (473 -> 497 req/s) and member thread
++9 % (261 -> 285), p99 566 -> 503 ms on the thread page.  The `src/config.php` block below is kept as a second guard for
+older trees; `XF_MEMBER_GZIP=xenforo` no longer makes XenForo compress
+uncached pages.
 
 Compression is split (`XF_MEMBER_GZIP=angie`, the default): every XenForo
 `src/config.php` gets a managed block at its end,

@@ -8,6 +8,43 @@ Reports of the 1.21.33-1.21.61 cycles that measured the removed Anubis
 filter were deleted from the tree on 2026-11-23 for the same reason;
 `git show <commit>:<path>` recovers them.
 
+## 1.21.63 (2026-11-23)
+
+- **XenForo member pages: +5 % home, +9 % thread, lower p99** (primary
+  focus: logged-in throughput).  A profile of the member thread tier showed
+  zlib at 12 % of all PHP-FPM CPU: XenForo gzips every uncached page itself
+  at level 9.  The handover to Angie (1.21.36, `XF_MEMBER_GZIP=angie`) only
+  existed as a block in each forum's `src/config.php`, written by
+  `--optimize`; a forum installed after the server never had it.  The rule
+  now lives in the Angie tree (`server-configs-nginx` 1.6.56): the uncached
+  XenForo handler gives PHP an empty `Accept-Encoding`, so Angie compresses
+  (Brotli/gzip level 4) from the first request of a new install, and the
+  next `--optimize` rolls it out to running hosts (same rsync, no extra
+  code path).  Measured at a pinned 3.6 GHz, 3 rotated rounds: member home
+  473 -> 497 req/s, thread 261 -> 285, PHP CPU per thread page 41.6 ->
+  34.7 ms (whole server 45.5 -> 40.8 ms with Angie's Brotli counted), p99
+  566 -> 503 ms; guest-cache tiers unchanged.  The `src/config.php` block
+  stays as a second guard for hosts on an older tree.
+- **Measured and rejected** (numbers in the audit report): Zend heap on
+  transparent huge pages (`USE_ZEND_ALLOC_HUGE_PAGES=1`) hangs the pool under
+  load; 15 or 18 FPM workers equal 12 on 12 threads; a lower default Brotli
+  level (1 gains 4-6 % for 40 % more bytes, 2-3 inside the noise; the
+  README now gives the trade-off for `SETUP_BROTLI_LEVEL`).
+- **Benchmark method: pin the clock.**  The test host's turbo is
+  power-limited (PL2 112 W, then PL1 80 W): the clock drops from 4.5 to
+  4.1 GHz mid-run and PHP CPU per request follows it 1:1, which produced a
+  phantom +16-27 % "restart effect" this cycle and is behind the earlier
+  first-slot bias.  `tests/stress-site/set-clock.sh MHZ|restore` pins
+  `scaling_max_freq` (sysfs only); `loopback-tiers.sh` now prints compact
+  per-service ms/request, busy cores and the mean clock for every tier (the
+  old column was cut at 230 characters and lost PHP-FPM), and the Chevereto
+  member tier uses `/explore/` (it measured a 301 as 0 req/s).
+- Regression tests: a tree check that the XenForo handler withholds
+  `Accept-Encoding` after the fastcgi snippet while the guest-cache location
+  keeps the key's encoding, and an `exercise-apps.sh` check that a member
+  asking for `br, gzip` gets Brotli (only Angie produces it) on a real member
+  page.
+
 ## 1.21.62 (2026-11-23)
 
 - **Anubis is gone** (primary focus).  The optional bot filter was a Go

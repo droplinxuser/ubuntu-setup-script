@@ -105,6 +105,15 @@ rm -rf /tmp/php-config.* /tmp/php-install.* /tmp/hsperfdata_root /tmp/node-compi
 find /tmp -maxdepth 1 \( -name 'sess_*' -o -name 'setup-optimize*' -o -name 'angie-*' -o -name 'php-upgrade*' \) \
   -exec rm -rf {} + 2>/dev/null || true
 sed -i '/# audit$/d' /etc/hosts
+# `--basic swap=` creates /swapfile and `--purge` keeps it on purpose (turning
+# swap off can OOM a live host).  The disposable audit host gets it removed
+# when the baseline host had no /swapfile: swapoff, the fstab line, the file.
+if [[ -f /swapfile ]] && ! awk '/^== swap/{f=1; next} /^== /{f=0} f' "$BASE" | grep -q '/swapfile'; then
+  swapoff /swapfile 2>/dev/null || true
+  sed -i '\#^/swapfile[[:space:]]#d' /etc/fstab
+  rm -f /swapfile
+  echo "removed /swapfile and its fstab line (absent from the baseline)"
+fi
 # Drop root's crontab when only the managed block (or nothing) is left in it.
 if crontab -l >/dev/null 2>&1 \
    && ! crontab -l 2>/dev/null | sed '/# BEGIN setup.sh managed cron/,/# END setup.sh managed cron/d' | grep -q '[^[:space:]]'; then

@@ -142,6 +142,13 @@ IMG=$(grep -oE '"url_viewer":"[^"]+' /tmp/ex.body | head -1 | sed 's/.*:"//; s#\
 DOT=$(q chev.test.local --path-as-is https://chev.test.local/foo/../index.php); st "chev rejected dot segment" "$DOT"; expect "chev dot segment" "$DOT" 400
 IDX=$(q chev.test.local --path-as-is https://chev.test.local/index.php); st "chev canonical /index.php" "$IDX"; expect "chev canonical /index.php" "$IDX" 301
 XDOT=$(q xf.test.local --path-as-is https://xf.test.local/foo/../index.php); st "xf rejected dot segment" "$XDOT"; expect "xf dot segment" "$XDOT" 400
+# Uncached XenForo pages are compressed by Angie, not by XenForo's level-9
+# gzip in the PHP worker (1.21.63): a member asking for "br, gzip" (what
+# Cloudflare sends) must get Brotli, which only Angie produces, and the page
+# must still be the member's (not a guest copy).
+XENC=$(curl -sk --resolve xf.test.local:443:${TIP} -b $J/xf-member.jar -H 'Accept-Encoding: br, gzip' -D - -o /tmp/ex.xf.br "https://xf.test.local$THREAD" | awk 'tolower($1) == "content-encoding:" { gsub(/\r/, ""); print $2 }')
+XMEM=$(curl -sk --resolve xf.test.local:443:${TIP} -b $J/xf-member.jar --compressed "https://xf.test.local$THREAD" | grep -c 'data-logged-in="true"')
+st "xf member encoding (br, gzip)" "${XENC:-none} member=$XMEM"; expect "xf member compressed by Angie" "${XENC:-none}:$XMEM" br:1
 sleep 1
 echo "=== PHP $V diagnostics (unique, by app) ==="
 for app in wp.test.local xf.test.local chev.test.local; do

@@ -7,7 +7,33 @@ manifests, sweep tables and run logs these sections cite (`AUDIT-*.md`,
 removed from the tree on 2026-11-19 to keep the repository lean; every one
 is still in git history, for example
 `git show 84b0db5:tests/stress-site/AUDIT-20261117-1.21.30.md`.  The current
-cycle report is `AUDIT-20261123-1.21.62.md`.
+cycle report is `AUDIT-20261123-1.21.63.md`.
+
+## 1.21.63 — Xeon E-2236 (2026-11-23)
+
+Pair: `server-configs-nginx` 1.6.56.  Details: `AUDIT-20261123-1.21.63.md`.
+Mitigations off (operator request, test host only).
+
+- **XenForo member pages compressed by Angie, not by XenForo** (primary
+  focus).  `perf`: libz was 12 % of all PHP-FPM CPU on a member thread
+  (XenForo gzips uncached pages at level 9); the 1.21.36 handover lived only
+  in a `src/config.php` block written by `--optimize`.  The uncached handler
+  now gives PHP an empty `Accept-Encoding` (install and `--optimize` alike).
+  Pinned 3.6 GHz, 3 rotated rounds: member home 473 -> 497 req/s (+5.1 %),
+  thread 261 -> 285 (+9.2 %), PHP 41.6 -> 34.7 ms per thread page, p99
+  566 -> 503 ms; all other tiers inside the spread.
+- **Rejected:** Zend heap on THP (`USE_ZEND_ALLOC_HUGE_PAGES=1`) hangs the
+  pool under load; 15/18 FPM workers = 12; Brotli 1 for dynamic HTML +4-6 %
+  for 40 % more bytes (2-3 inside noise), default stays 4.
+- **Method:** turbo is power-limited (PL2 112 W -> PL1 80 W, 4.5 -> 4.1 GHz
+  mid-run) and PHP CPU per request follows the clock 1:1, which faked a
+  +16-27 % "restart effect".  `set-clock.sh` pins the ceiling;
+  `loopback-tiers.sh` prints per-service ms/request and the clock.
+- Suites: install 2:36 / 0 warnings, 1,496 unit checks, 227 dry runs,
+  security 67/67, cookie 86/86, functional 0 unexpected, `--optimize` x2
+  0 of 3,034 facts.  Restore: 696 -> 696 packages, 0 `/etc` files added,
+  removed or changed after the reboot (`restore-baseline.sh` now also removes
+  the `--basic swap=` file, which `--purge` keeps by design).
 
 ## 1.21.62 — Xeon E-2236 (2026-11-23)
 

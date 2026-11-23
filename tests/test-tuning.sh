@@ -5325,6 +5325,18 @@ check_tree "guest cache: no other encoding-keyed cache honours Vary" \
   bash -c 'for f in $(grep -lE "_cache_key .*\\\$guest_cache_enc" "$1"/h5bp/*.conf); do grep -qE "^(fastcgi|proxy)_ignore_headers .*\bVary;" "$f" || { [[ ${f##*/} == wordpress_cache.conf ]] && grep -q "^fastcgi_ignore_headers Vary;" "$f"; } || { echo "$f"; exit 1; }; done' _ "$ANGIE_TREE"
 check_tree "XenForo proxy cache: guests get the key's encoding, members keep their header" \
   bash -c 'grep -qE "^proxy_set_header Accept-Encoding +\\\$xf_proxy_ae;" "$1/h5bp/xf_proxy_pass.conf" && awk "/^map .*\\\$xf_proxy_ae/{f=1} f" "$1/http.d/fastcgi_cache.conf" | grep -qE "^ *default +\\\$http_accept_encoding;"' _ "$ANGIE_TREE"
+# 1.21.63: XenForo gzipped every uncached page at level 9 inside the PHP
+# worker (12 % of PHP-FPM CPU on a member thread); the uncached handler now
+# withholds Accept-Encoding so Angie compresses, on a new install too (the
+# src/config.php block is only written by --optimize).  The param must sit
+# after the fastcgi snippet, in the handler itself, and the guest cache
+# location must keep passing the key's encoding.
+xf_handler_ae_ok() {
+  local f=$1/h5bp/php_xf_handler.conf
+  awk '/^include snippets\/fastcgi-php-noinfo\.conf;/ { s = NR } /^fastcgi_param HTTP_ACCEPT_ENCODING "";$/ { p = NR } END { exit !(s && p > s) }' "$f" \
+    && grep -qE '^fastcgi_param HTTP_ACCEPT_ENCODING \$guest_cache_ae;' "$1/h5bp/php_xf.conf"
+}
+check_tree "XenForo uncached handler: PHP gets no Accept-Encoding, Angie compresses" xf_handler_ae_ok "$ANGIE_TREE"
 # Ignoring Vary drops every header it names: a response that varies on
 # anything but Accept-Encoding (a mobile plugin's User-Agent) must not be
 # stored at all, so every guest cache lists $guest_cache_vary_other.

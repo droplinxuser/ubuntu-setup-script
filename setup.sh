@@ -36,7 +36,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.21.62"
+readonly SCRIPT_VERSION="1.21.63"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -153,8 +153,11 @@ SSL_REJECT_UNKNOWN_SNI="${SETUP_SSL_REJECT_UNKNOWN_SNI:-${SSL_REJECT_UNKNOWN_SNI
 # XenForo's gzip for guests -- the FastCGI guest cache stores that compressed
 # body, so a hit costs no compression -- and turns it off for visitors with a
 # session cookie, whose pages Angie compresses (Brotli/gzip level 4).
-# SETUP_XF_MEMBER_GZIP=xenforo removes the block (XenForo compresses
-# everything again); the choice is persisted in /etc/default/setup-tuning.
+# SETUP_XF_MEMBER_GZIP=xenforo removes the block; the choice is persisted in
+# /etc/default/setup-tuning.  Since server-configs-nginx 1.6.56 the uncached
+# Angie handler withholds Accept-Encoding from PHP, so uncached pages are
+# compressed by Angie whatever the block says (new installs included); the
+# block remains a second guard for hosts on an older tree.
 XF_MEMBER_GZIP="${XF_MEMBER_GZIP:-angie}"
 XF_MEMBER_GZIP_PERSIST=0
 if [[ -n ${SETUP_XF_MEMBER_GZIP+x} ]]; then

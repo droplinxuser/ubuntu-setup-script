@@ -16,6 +16,7 @@ one() { # label url cookiekey
   [[ -n $key ]] && h+=(-H "Cookie: $(ck "$key")")
   wrk -t4 -c"$C" -d2s "${h[@]}" "$url" >/dev/null 2>&1
   bash $R/sample-cpu.sh $(( S + 1 )) /tmp/tier-cpu.txt >/dev/null 2>&1 &
+  ( sleep $(( S / 2 )); awk '/MHz/ { s += $4; n++ } END { if (n) printf "%d", s / n }' /proc/cpuinfo > /tmp/tier-mhz.txt ) &
   out=$(wrk -t4 -c"$C" -d"${S}s" --latency "${h[@]}" "$url" 2>&1)
   wait
   local rps p50 p99 non2 total errs
@@ -23,7 +24,13 @@ one() { # label url cookiekey
   p50=$(awk '$1=="50%"{print $2}' <<<"$out"); p99=$(awk '$1=="99%"{print $2}' <<<"$out")
   total=$(awk '/requests in/{print $1}' <<<"$out")
   non2=$(awk '/Non-2xx/{print $NF}' <<<"$out"); errs=$(awk '/Socket errors/{print $0}' <<<"$out" | tr -s ' ')
-  cpu=$(python3 $R/analyze-cpu.py /tmp/tier-cpu.txt "${total:-1}" 2>/dev/null | tr '\n' ';' | cut -c1-230)
+  # Compact per-service CPU (ms per request) plus host cores and the mean
+  # CPU clock: the E-2236 test host drops from 4.5 to 4.1 GHz once its
+  # PL2 turbo window expires, which moves PHP CPU per request by ~10 % and
+  # must be visible next to every number (pin scaling_max_freq for A/B runs).
+  cpu=$(python3 $R/analyze-cpu.py /tmp/tier-cpu.txt "${total:-1}" 2>/dev/null \
+    | awk '/ms\/req/ && $(NF-1) + 0 >= 0.01 { printf "%s=%s ", $1, $(NF-1) } /^host/ { sub(/^avg=/, "", $(NF-1)); printf "cores=%s ", $(NF-1) }')
+  cpu+="mhz=$(cat /tmp/tier-mhz.txt 2>/dev/null)"
   printf '| %s | %s | %s | %s | %s%s | %s |\n' "$label" "${rps:-0}" "${p50:-?}" "${p99:-?}" "${non2:-0}" "${errs:+ $errs}" "$cpu"
 }
 echo "| Tier (c=$C, ${S}s) | req/s | p50 | p99 | non-2xx | server CPU |"
@@ -39,4 +46,7 @@ one "XF member thread"            "$XFT" xf-member
 one "Chev guest explore (cached)" https://chev.test.local/explore
 one "Chev guest image (cached)"   "$CHI"
 one "Chev guest home (uncached)"  https://chev.test.local/
-one "Chev member explore"         https://chev.test.local/explore ch-admin
+# Trailing slash: Chevereto answers /explore with a 301 to /explore/, which
+# wrk counted as 0 req/s for this tier (the cached guest tier above is the
+# canonical cache key and keeps the original URL).
+one "Chev member explore"         https://chev.test.local/explore/ ch-admin
