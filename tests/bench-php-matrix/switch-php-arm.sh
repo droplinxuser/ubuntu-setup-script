@@ -31,8 +31,13 @@ stop_all() {
   # rate limit the next unit fails with "start request repeated too quickly".
   systemctl reset-failed >/dev/null 2>&1 || true
   # Wait for the socket to disappear so the next arm binds a fresh one.
+  # A crashed arm can leave the inode behind with no listener; remove it then.
   for _ in $(seq 1 50); do
     [[ -S $SOCK ]] || return 0
+    if ! ss -lx 2>/dev/null | grep -qF "$SOCK"; then
+      rm -f "$SOCK"
+      return 0
+    fi
     sleep 0.2
   done
   echo "socket $SOCK still present after stopping every pool" >&2
@@ -85,12 +90,15 @@ case $ARM in
     mapfile -t ext_ini < <(find -L "$CONF_DIR" -name '*.ini' \
       -exec grep -lE '^[[:space:]]*extension[[:space:]]*=' {} + 2>/dev/null || true)
     for f in "${ext_ini[@]}"; do rm -f "$f"; done
-    for ext in igbinary redis imagick; do
-      mods=(/usr/lib/php/*/"$ext".so)
-      [[ -f ${mods[0]:-} ]] || continue
-      prio=99; [[ $ext == igbinary ]] && prio=20
-      printf 'extension=%s\n' "${mods[0]}" > "$EXT_DIR/$prio-$ext.ini"
-    done
+    if [[ ! -f $EXT_DIR/.source-built-ext ]]; then
+      # No source-built extensions in this arm: reuse the distribution ones.
+      for ext in igbinary redis imagick; do
+        mods=(/usr/lib/php/*/"$ext".so)
+        [[ -f ${mods[0]:-} ]] || continue
+        prio=99; [[ $ext == igbinary ]] && prio=20
+        printf 'extension=%s\n' "${mods[0]}" > "$EXT_DIR/$prio-$ext.ini"
+      done
+    fi
     # The same scan path the unit uses, so the CLI checks below describe FPM.
     export PHP_INI_SCAN_DIR="$CONF_DIR:$EXT_DIR"
     PHP_ARGS=()

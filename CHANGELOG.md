@@ -8,6 +8,29 @@ Reports of the 1.21.33-1.21.61 cycles that measured the removed Anubis
 filter were deleted from the tree on 2026-11-23 for the same reason;
 `git show <commit>:<path>` recovers them.
 
+## 1.21.65 (2026-11-23)
+
+- **Everything on is slower: LTO is neutral, PGO costs 5-10 %**
+  (follow-up to 1.21.64).  The same host and method, with
+  `-O3 -m64 -march=native -mtune=native -falign-functions=32
+  -fno-semantic-interposition` and, in turn, `-flto` and a two-stage PGO
+  trained on real XenForo/WordPress traffic (779 `.gcda`, zero missing
+  profiles at rebuild).  LTO alone is a wash (-0.7 % to +0.0 %); LTO+PGO
+  is -9.7 % on the XenForo thread and -9.1 % on its home page, PGO alone
+  -5 % to -6.5 %.  The CLI probe agrees with the JIT on (+19 % C-builtin
+  time) and with it off (+25 %).  redis 6.3.0 and imagick 3.8.1 were
+  compiled from source against the tree; igbinary 3.2.16 still does not
+  compile on 8.5 and is not needed by XenForo's core cache provider.
+  Build traps: `-fno-plt` + LTO does not link with bfd, and a PGO rebuild
+  trips `-Werror=coverage-mismatch` on the reused `conftest.c` profile.
+  Verdict unchanged: keep the distribution package and leave PGO off.
+  New tools: `tests/bench-php-matrix/build-php-max.sh` and
+  `train-php-pgo.sh`; `switch-php-arm.sh` now clears a stale FastCGI
+  socket left by a crashed arm and respects source-built extensions.
+- Suites: the same applications served every measured tier with HTTP 200
+  on each arm; the host went back to its 696-package manifest with 0
+  `/etc` changes.
+
 ## 1.21.64 (2026-11-23)
 
 - **PHP install source and build flags: measured, no gain; Sury stays**

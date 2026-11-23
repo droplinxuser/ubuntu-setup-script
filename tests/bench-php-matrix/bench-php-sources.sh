@@ -105,7 +105,8 @@ awk -F'\t' -v ARMORDER="$(IFS=,; echo "${ARMS[*]}")" '
       for (j = 1; j <= na; j++) {
         arm = armorder[j]
         if (!((tier, arm) in med)) continue
-        delta = 100 * (med[tier, arm] - med[tier, armorder[1]]) / med[tier, armorder[1]]
+        basev = med[tier, armorder[1]]
+        delta = (basev > 0) ? 100 * (med[tier, arm] - basev) / basev : 0
         printf "| %s | %s | %d | %d-%d | %s | %d | %s\n", tier, arm, med[tier, arm],
                lo[tier, arm], hi[tier, arm], pmed[tier, arm], cnt[tier, arm],
                (j == 1 ? "baseline" : sprintf("%+.1f %%", delta))

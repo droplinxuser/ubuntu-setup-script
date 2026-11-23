@@ -220,10 +220,14 @@ With the tracing JIT on, hot PHP code is generated at run time and never
 sees the C compiler; the flags only reach interpreter helpers, a small
 share of a page.  Sury therefore stays: it is also 9 patch releases ahead
 of the Ubuntu archive.  A compiled PHP would put a toolchain and manual
-security updates on every host for no measured gain.  Re-run the
+security updates on every
+host for no measured gain.  A follow-up with LTO and two-stage PGO
+(trained on the real applications) made it 5-10 % slower, and LTO alone
+was neutral: with the tracing JIT the hot code is generated at run time,
+so compiler optimisations only reach the interpreter.  Re-run the
 measurement with `tests/bench-php-matrix/` (`build-php-source.sh`,
-`extract-php-debs.sh`, `switch-php-arm.sh`, `bench-php-sources.sh`) when
-the JIT, the compiler or the workload changes.
+`extract-php-debs.sh`, `switch-php-arm.sh`, `bench-php-sources.sh`,
+`build-php-max.sh`) when the JIT, the compiler or the workload changes.
 
 Pool (`pool.d/www.conf`):
 

@@ -9,6 +9,21 @@ is still in git history, for example
 `git show 84b0db5:tests/stress-site/AUDIT-20261117-1.21.30.md`.  The current
 cycle report is `AUDIT-20261123-1.21.64.md`.
 
+## 1.21.65 — Xeon E-2236 (2026-11-23)
+
+Pair: `server-configs-nginx` 1.6.56.  Details: `AUDIT-20261123-1.21.64.md`,
+section 9 (follow-up).
+
+- **Everything on: LTO neutral, PGO 5-10 % slower.**  `-O3 -march=native
+  -mtune=native -falign-functions=32 -fno-semantic-interposition`, then
+  `-flto`, then two-stage PGO trained on the real applications.  LTO alone
+  -0.7 % to +0.0 %; LTO+PGO -9.7 % (XF thread) and -9.1 % (XF home); PGO
+  alone -5 % to -6.5 %.  The CLI probe is 19-25 % slower for the PGO
+  build even with the JIT off.  redis 6.3.0 and imagick 3.8.1 built from
+  source; igbinary 3.2.16 does not compile on 8.5 and is not needed.
+  Verdict: keep the package, leave PGO off; harness in
+  `tests/bench-php-matrix/`.
+
 ## 1.21.64 — Xeon E-2236 (2026-11-23)
 
 Pair: `server-configs-nginx` 1.6.56.  Details: `AUDIT-20261123-1.21.64.md`.
