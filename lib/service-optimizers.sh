@@ -132,18 +132,6 @@ optimize_angie() {
   # tuning, and only when the tree actually changed.
   local digest_before digest_after
   digest_before=$(config_tree_digest /etc/angie)
-  # Optional bot filter: migrate the vhosts and write the terminators before
-  # the repository sync validates the tree, so the single reload below picks
-  # the integration up together with the rest of the tune.  Disabling
-  # (anubis=no or a persisted ANUBIS=0) restores the vhosts here as well.
-  if anubis_wanted || anubis_managed; then
-    if anubis_apply; then
-      [[ -n $ANUBIS_SUMMARY ]] && opt_report "- ${ANUBIS_SUMMARY}"
-    else
-      rc=1
-      opt_report "- **FAILED** Anubis: ${ANUBIS_FAILED:-unknown}; the previous configuration was left in place"
-    fi
-  fi
   ANGIE_SYNC_RELOAD=0
   if sync_angie_repo_configs; then
     ANGIE_SYNC_RELOAD=1
@@ -168,7 +156,6 @@ optimize_angie() {
   # when missing; a failure moves the optional files to /tmp, gzip stays).
   if ! angie_apply_profile /etc/angie; then
     angie_restore_live
-    ANUBIS_STOP_PENDING=0
     opt_report "- **FAILED** tuning returned an error; configuration rolled back"
     return 1
   fi
@@ -195,7 +182,6 @@ optimize_angie() {
     opt_report "- **FAILED** \`angie -t\`:"
     while IFS= read -r change; do opt_report "  \`${change}\`"; done < "$angie_test_log"
     angie_restore_live
-    ANUBIS_STOP_PENDING=0
     return 1
   fi
   for change in "${TUNE_CHANGES[@]}"; do opt_report "- ${change}"; done
@@ -227,18 +213,10 @@ optimize_angie() {
     else
       opt_report "- Reload/Restart: **FAILED**; rolling back"
       angie_restore_live
-      ANUBIS_STOP_PENDING=0
       return 1
     fi
   else
     opt_report "- Restart: skipped (service was not active)"
-  fi
-  # anubis=no restored the direct-TLS vhosts; only now that Angie has loaded
-  # them is it safe to stop the filter.  A failed run keeps it running.
-  if (( rc == 0 )); then
-    anubis_finish_disable
-  else
-    ANUBIS_STOP_PENDING=0
   fi
   # zstd (1.21.58) module: only after the pass committed, so a rollback above
   # never restores a tree that loads a purged module.

@@ -19,6 +19,24 @@ validate_timezone() {
   [[ -e "/usr/share/zoneinfo/${tz}" ]]
 }
 
+# 1 when this host was put behind the Anubis bot filter by an older release.
+# Such a host has every vhost listening on a Unix socket and a generated TLS
+# terminator in front of it; this release neither generates nor manages those
+# files, so a run must stop before it changes anything.  A hand-installed
+# Anubis that never touched the Angie tree is not detected (and needs no
+# migration).
+anubis_host_present() {
+  local f
+  for f in /etc/angie/conf.d/00-anubis-terminators.conf \
+           /etc/angie/conf.d/00-anubis-common.conf \
+           /etc/angie/snippets/anubis-location.conf \
+           /etc/systemd/system/anubis.service \
+           "${STATE_DIR:-/var/lib/setup.sh}/anubis/enabled"; do
+    [[ -e $f ]] && return 0
+  done
+  return 1
+}
+
 validate_hostname() {
   local h=$1
   # systemd/hostnamectl accept a DNS name of up to 64 characters; every
@@ -503,16 +521,21 @@ validate_all() {
     *) CPU_MITIGATIONS="" ;;
   esac
 
-  # Anubis is only an Angie feature: on an install it must accompany --angie.
-  if [[ -n ${ANUBIS_SETTING:-} ]]; then
-    if (( ! OPTIMIZE && ! PURGE && ! DIAGNOSTICS && ! RESTART_ALL )) \
-       && (( ${ENABLED[angie]:-0} != 1 )); then
-      die "anubis= is only valid with --angie (or with --optimize on an existing host)"
-    fi
-    if (( OPTIMIZE )) && (( ANUBIS_SETTING == 1 )) && (( ! DRY_RUN )) \
-       && [[ ! -d /etc/angie/conf.d ]]; then
-      die "--optimize anubis=yes needs Angie on this host (install it with --angie first)"
-    fi
+  # Anubis support was removed in 1.21.62.  A leftover SETUP_ANUBIS in the
+  # environment (a stale export, a runbook) must stop the run instead of
+  # silently deploying without the bot filter it asks for.
+  if [[ -n ${SETUP_ANUBIS+x} ]]; then
+    anubis_gone
+  fi
+
+  # A host still behind the Anubis filter cannot be migrated by this release:
+  # its vhosts listen on a Unix socket behind a terminator only the old
+  # release generates.  Stop before changing anything and point at the
+  # one-shot teardown tool.  Purging is not one of those runs: --purge must
+  # still be able to remove Angie from such a host (the tool is the supported
+  # path, but a purge that refuses is a trap).
+  if (( ! PURGE && ! DIAGNOSTICS )) && anubis_host_present; then
+    die "this host still runs the Anubis bot filter, which was removed in 1.21.62. Run 'sudo bash tools/remove-anubis.sh' first (it restores every vhost to direct TLS and removes the generated Angie files), then re-run setup.sh."
   fi
 
   # --upgrade-php is a standalone mode like --optimize: it works on an

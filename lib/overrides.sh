@@ -26,7 +26,7 @@ RESET_ACTIONS=()
 # Pins that describe a host fact or a feature choice, not a performance
 # override: a reset must not silently flip them.
 RESET_KEEP_PINS=(
-  ANUBIS ANUBIS_STATIC_BYPASS XF_JOB_CRON NODE_MAJOR NODE_ALLOW_MAJOR_UPGRADE
+  XF_JOB_CRON NODE_MAJOR NODE_ALLOW_MAJOR_UPGRADE
   CPU_MITIGATIONS XF_MEMBER_GZIP CF_SELF_SIGNED SSL_REJECT_UNKNOWN_SNI
   PHP_SESSION_HARDENING
 )
@@ -281,8 +281,8 @@ opt_report_tuning_drift() {
 OPTIMIZE_IGNORED_ENV=()
 
 # Remove tuning overrides from the environment for this run and remember them
-# so the report can say what was ignored.  Feature choices (ANUBIS, Node
-# major, application cache/security toggles) and CONFIG_* are not listed.
+# so the report can say what was ignored.  Feature choices (Node major,
+# application cache/security toggles) and CONFIG_* are not listed.
 optimize_ignore_tuning_env() {
   local v
   OPTIMIZE_IGNORED_ENV=()
@@ -309,7 +309,7 @@ optimize_ignore_tuning_env() {
 reset_operator_overrides() {
   local dry=${1:-0}
   local f=/etc/default/setup-tuning ex="${STATE_DIR}/explicit-options.conf"
-  local line key moved anubis_marker="${STATE_DIR}/anubis/enabled"
+  local line key moved
   local -a kept=() removed=()
   RESET_ACTIONS=()
 
@@ -327,12 +327,6 @@ reset_operator_overrides() {
           ;;
       esac
     done < "$f"
-    # A very old release may only have the state marker, not ANUBIS=1 in the
-    # pin file.  Keep the filter on rather than disabling it by omission.
-    if [[ -f $anubis_marker ]] \
-       && ! printf '%s\n' "${kept[@]}" | grep -qE '^ANUBIS='; then
-      kept+=("ANUBIS=1")
-    fi
     if (( ${#removed[@]} > 0 )); then
       if (( dry )); then
         RESET_ACTIONS+=("would clear /etc/default/setup-tuning: ${removed[*]}")
@@ -352,12 +346,6 @@ reset_operator_overrides() {
         fi
       fi
     fi
-  fi
-
-  if [[ ! -f $f && -f $anubis_marker ]] && (( dry == 0 )); then
-    printf 'ANUBIS=1\n' > "$f"
-    chmod 644 "$f"
-    RESET_ACTIONS+=("created ${f} with ANUBIS=1 (state marker present)")
   fi
 
   if [[ -f $ex ]]; then
@@ -390,10 +378,6 @@ reset_operator_overrides() {
     PRECOMPRESS_ASSETS=1
     LIMIT_REQ_EXEMPT=""
     unset STORAGE_CLASS 2>/dev/null || true
-    if [[ -f $anubis_marker && -z ${ANUBIS_SETTING:-} ]] \
-       && ! printf '%s\n' "${kept[@]}" | grep -qE '^ANUBIS=0$'; then
-      ANUBIS_ENABLED=1
-    fi
     RESET_ACTIONS+=("recomputed network profile: TCP_CC=${TCP_CC} QDISC=${QDISC}")
   fi
 

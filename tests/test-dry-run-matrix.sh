@@ -151,7 +151,7 @@ fi
 run ok   --dry-run --optimize
 run ok   $'—optimize' --dry-run
 run ok   $'–optimize' --dry-run
-run ok   --dry-run --optimize anubis=yes
+run fail --dry-run --optimize anubis=yes
 run fail --reset-overrides
 run fail --dry-run --optimize --reset-overrides
 run fail --dry-run --basic --reset-overrides
@@ -393,17 +393,17 @@ run_env ok SETUP_PURGE_MALWARE=0 --dry-run --optimize
 # checked and a missing directory does not fail.
 run_env ok CONFIG_SOURCE_DIR=/nonexistent --dry-run --basic --angie
 
-# Anubis is only an Angie feature, accepts yes/no/1/0, and can be toggled
-# from --optimize.  a bogus value or a missing --angie must fail the parse.
-run ok --dry-run --basic --angie anubis=yes
-run ok --dry-run --basic --angie anubis=no
-run ok --dry-run --optimize anubis=yes
-run ok --dry-run --optimize anubis=no
+# Anubis support was removed in 1.21.62: every spelling must fail the parse
+# with an explanation, and so must a leftover SETUP_ANUBIS in the environment.
+run fail --dry-run --basic --angie anubis=yes
+run fail --dry-run --basic --angie anubis=no
+run fail --dry-run --optimize anubis=yes
+run fail --dry-run --optimize anubis=no
 # CPU mitigations switch (--basic and --optimize, or SETUP_CPU_MITIGATIONS).
 run ok   --dry-run --basic mitigations=off
 run ok   --dry-run --basic mitigations=on
 run ok   --dry-run --optimize mitigations=off
-run ok   --dry-run --optimize anubis=yes mitigations=off
+run fail --dry-run --optimize anubis=yes mitigations=off
 run fail --dry-run --basic mitigations=maybe
 run fail --dry-run --optimize mitigations=
 # Any order: mitigations= after --dry-run used to be an unknown argument.
@@ -414,11 +414,11 @@ run fail --dry-run --php mitigations=off
 run fail --dry-run mitigations=off
 run_env ok   SETUP_CPU_MITIGATIONS=off --dry-run --optimize
 run_env fail SETUP_CPU_MITIGATIONS=sometimes --dry-run --optimize
-run ok --dry-run --optimize anubis=1
+run fail --dry-run --optimize anubis=1
 run fail --dry-run --basic anubis=yes
 run fail --dry-run --basic --angie anubis=maybe
 run fail --dry-run --basic --php anubis=yes
-run_env ok SETUP_ANUBIS=1 --dry-run --basic --angie
+run_env fail SETUP_ANUBIS=1 --dry-run --basic --angie
 run_env fail SETUP_ANUBIS=bogus --dry-run --basic --angie
 
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"

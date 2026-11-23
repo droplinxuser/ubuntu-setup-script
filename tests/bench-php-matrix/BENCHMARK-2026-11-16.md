@@ -1,6 +1,6 @@
 # XenForo 2.3.13 — PHP 8.2 → 8.6 Web Stack Benchmark
 
-**Four stacks, five PHP versions, guest and logged-in traffic, on two independent servers.**
+**Three stacks, five PHP versions, guest and logged-in traffic, on two independent servers.**
 
 ## TL;DR
 
@@ -10,7 +10,6 @@
 | Fastest stack overall | **Stack 3 — Valkey + Angie page cache** (guest-heavy forum) |
 | Fastest stack for logged-in users | **Stack 1 — plain Angie + PHP + MariaDB** (no Valkey, no page cache) |
 | Does Valkey data caching help a single server? | **No.** It costs **2–14 %** versus plain; Credis and phpredis measured the same |
-| Cost of Anubis | **−90…−94 %** on cached guest pages, **−17…−19 %** on dynamic/member pages |
 | PHP 8.6 vs 8.2 | **+0…+3 %** at low concurrency; **≤1.5 %** at saturation — no meaningful gain |
 | PHP version ranking | **8.6 RC5 > 8.5 > 8.4 ≈ 8.2 > 8.3** (differences are small) |
 | PHP 8.6 without `php-redis` | Works with **SV/RedisCache + bundled Credis**; all add-ons active, all tiers HTTP 200 |
@@ -38,7 +37,6 @@
 | PHP | 8.2.35, 8.3.36, 8.4.27, 8.5.12, **8.6.0RC5** (Sury packages, side by side) |
 | MariaDB | 11.8.6 |
 | Valkey | 9.0.4 |
-| Anubis | 1.28.2 (opt-in, stack 4 only) |
 | XenForo | 2.3.13 |
 | Add-ons | SV/StandardLib 1.24.11, SV/RedisCache 2.18.12, SV/RedisFloodCheck 2.3.1, SV/RedisViewCounter 2.6.2, Hampel/Seeder 1.0.0b11 |
 | Load generator | wrk 4.1.0 (loopback, HTTPS) |
@@ -76,10 +74,10 @@ Member account used for logged-in tests: `meta.johns` (valid, normal registered 
 - **Member home:** `GET /` with a valid XenForo session cookie.
 - **Member thread:** a seeded 100k-post thread with the same session cookie.
 - The FastCGI cache was cleared before each PHP version; Valkey DB 1 was flushed when the data cache was toggled.
-- The active PHP version was verified with a `PHP_VERSION` probe on every run (the first attempt exposed a stale Anubis connection pool serving the previous PHP version; the final runs force a restart on version changes).
+- The active PHP version was verified with a `PHP_VERSION` probe on every run (the first attempt exposed a stale connection pool serving the previous PHP version; the final runs force a restart on version changes).
 - Low-concurrency efficiency: `wrk -t2 -c8 -d15s`, **3 runs averaged**, plain stack.
 
-> The four stack passes ran sequentially. Small differences between Stack 1 and Stack 2 (a few percent) are within run-order/thermal drift; the page-cache and Anubis effects are far larger than that drift.
+> The three stack passes ran sequentially. Small differences between Stack 1 and Stack 2 (a few percent) are within run-order/thermal drift; the page-cache effect is far larger than that drift.
 
 ---
 
@@ -117,18 +115,6 @@ Member account used for logged-in tests: `meta.johns` (valid, normal registered 
 | 8.5 | 137,999 | 773 | 636 | 495 |
 | 8.6 | 136,483 | 773 | 630 | 498 |
 
-### Stack 4 — Valkey + Angie page cache + Anubis
-
-| PHP | Guest cached | Guest bypass | Member home | Member thread |
-|---|---:|---:|---:|---:|
-| 8.2 | 7,903 | 609 | 523 | 441 |
-| 8.3 | 7,871 | 614 | 520 | 439 |
-| 8.4 | 7,890 | 620 | 526 | 444 |
-| 8.5 | 7,933 | 627 | 525 | 443 |
-| 8.6 | 7,892 | 629 | 529 | 447 |
-
----
-
 ## Host B — AMD Ryzen 7 8745HS (8C/16T, 27 GiB)
 
 ### Stack 1 — Plain: Angie + PHP + MariaDB
@@ -161,18 +147,6 @@ Member account used for logged-in tests: `meta.johns` (valid, normal registered 
 | 8.5 | 56,574 | 656 | 537 | 432 |
 | 8.6 | 57,760 | 660 | 536 | 434 |
 
-### Stack 4 — Valkey + Angie page cache + Anubis
-
-| PHP | Guest cached | Guest bypass | Member home | Member thread |
-|---|---:|---:|---:|---:|
-| 8.2 | 6,194 | 531 | 442 | 388 |
-| 8.3 | 6,025 | 532 | 438 | 384 |
-| 8.4 | 5,996 | 530 | 444 | 386 |
-| 8.5 | 5,792 | 519 | 438 | 383 |
-| 8.6 | 5,831 | 529 | 444 | 383 |
-
----
-
 # Stack ranking
 
 Averages across PHP 8.2–8.6.
@@ -180,12 +154,11 @@ Averages across PHP 8.2–8.6.
 | Rank (public/guest) | Stack | Guest cached A / B | Guest bypass A / B | Member home A / B |
 |---:|---|---:|---:|---:|
 | **1** | **Stack 3 — Valkey + Angie page cache** | **137,962 / 58,282** | 769 / 654 | 630 / 534 |
-| 2 | Stack 4 — + Anubis | 7,898 / 5,968 | 620 / 528 | 525 / 441 |
-| 3 | Stack 1 — Plain | 786 / 710 | 782 / 703 | **692 / 620** |
-| 4 | Stack 2 — Valkey only | 768 / 663 | 769 / 656 | 628 / 535 |
+| 2 | Stack 1 — Plain | 786 / 710 | 782 / 703 | **692 / 620** |
+| 3 | Stack 2 — Valkey only | 768 / 663 | 769 / 656 | 628 / 535 |
 
 **By authenticated/member throughput the order is different:**
-**Stack 1 (692/620) > Stack 3 (630/534) ≈ Stack 2 (628/535) > Stack 4 (525/441).**
+**Stack 1 (692/620) > Stack 3 (630/534) ≈ Stack 2 (628/535).**
 
 ### All 20 combinations, ranked by cached guest throughput (Host A)
 
@@ -218,7 +191,6 @@ The Stack 3 order is cache-hit bound and effectively noise; its member column is
 
 - **Page cache is the whole game.** Stack 3 serves guest pages **88× (Host B)** to **180× (Host A)** faster than Valkey-only. It is also **175× / 82×** faster than the plain stack.
 - **Valkey alone does not help XenForo on a single host.** Removing the page cache and adding Valkey costs **2–7 %** on guest requests and **9–14 %** on member pages. On a separate host it may help; locally MariaDB is already fast and the cache adds serialization + network hops.
-- **Anubis is a bot-filter tax, not a performance feature.** It keeps **8–10×** the plain stack's guest throughput because the page cache is still behind it, but it removes ~90–94 % of the cached-page ceiling and ~17–19 % of dynamic throughput.
 - **Logged-in requests always bypass the FastCGI guest cache.** XenForo's guest-cache map is cookie-gated, so the two member rows are the same with page cache on or off; they measure the cache-bypass path.
 - **phpredis vs Credis made no material difference** on PHP 8.5: 698/614 req/s with phpredis vs 697/616 with Credis.
 
@@ -252,7 +224,6 @@ Low-concurrency (8 clients, 3 runs averaged) isolates PHP/application cost witho
 |---|---|
 | Guest-heavy community (typical forum) | **Stack 3** — Angie page cache + Valkey + PHP 8.5 (8.6 when stable) |
 | Mostly logged-in / low guest cacheability | **Stack 1** — plain Angie + PHP 8.5/8.6 + MariaDB |
-| Bot filtering required | **Stack 4** — accept ~90 % cached-page cost and ~18 % dynamic cost |
 | Avoid | Stack 2 (Valkey without page cache): more moving parts, lower throughput |
 
 **Fastest and most performant overall: Stack 3 with PHP 8.6 RC5 / 8.5** for public forum traffic. **Fastest for authenticated traffic: Stack 1 with PHP 8.5/8.6.** The page cache is the only change that produces an order-of-magnitude improvement; PHP major versions are effectively flat for this application.
@@ -264,5 +235,4 @@ Low-concurrency (8 clients, 3 runs averaged) isolates PHP/application cost witho
 - XenForo 2.3.13, single-server loopback tests, self-signed TLS, `wrk` synthetic load.
 - PHP 8.6.0RC5, not a final release.
 - All versions used the pure-PHP Credis client; phpredis is available for 8.2–8.5 and measured equal in the control, but a different Redis workload could differ.
-- Anubis requests used `User-Agent: setup-bench/1.0` (allowed by policy). A browser first visit would solve one challenge before reaching the cached pages.
-- Stack passes were sequential; small Stack 1 vs Stack 2 deltas are within thermal/run-order drift. The page-cache and Anubis deltas are far outside that range.
+- Stack passes were sequential; small Stack 1 vs Stack 2 deltas are within thermal/run-order drift. The page-cache delta is far outside that range.

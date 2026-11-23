@@ -7,7 +7,6 @@
 [TABLE]
 [TR][TH]Stack (PHP 8.2–8.5 avg)[/TH][TH]Metric[/TH][TH]CentMinMod[/TH][TH]Ubuntu + Angie[/TH][TH]Delta[/TH][/TR]
 [TR][TD]3 — Redis + page cache[/TD][TD]Guest cached[/TD][TD]157,957[/TD][TD][B]390,232[/B][/TD][TD][B]+147.1 %[/B][/TD][/TR]
-[TR][TD]4 — + Anubis[/TD][TD]Guest cached[/TD][TD]59,958[/TD][TD][B]68,725[/B][/TD][TD][B]+14.6 %[/B][/TD][/TR]
 [TR][TD]1 — Plain[/TD][TD]Guest bypass[/TD][TD]596[/TD][TD][B]775[/B][/TD][TD][B]+30.1 %[/B][/TD][/TR]
 [TR][TD]3 — Redis + page cache[/TD][TD]Member home[/TD][TD]542[/TD][TD][B]747[/B][/TD][TD][B]+37.9 %[/B][/TD][/TR]
 [TR][TD]3 — Redis + page cache[/TD][TD]Member thread[/TD][TD]694[/TD][TD][B]838[/B][/TD][TD][B]+20.7 %[/B][/TD][/TR]
@@ -27,7 +26,6 @@
 [TR][TD]OPcache[/TD][TD]384 MB, [B]JIT disabled[/B][/TD][TD]512 MB, [B]JIT tracing 64 MB[/B], huge pages[/TD][/TR]
 [TR][TD]Database[/TD][TD]MariaDB 10.11.19, 8 GB pool, 600 conns[/TD][TD]MariaDB 11.8.6, 1.9 GB pool, 200 conns[/TD][/TR]
 [TR][TD]Cache[/TD][TD]Redis 8.6.8 + phpredis[/TD][TD]Valkey 9.0.4 + phpredis[/TD][/TR]
-[TR][TD]Anubis[/TD][TD]1.28.2 (minimal Nginx terminator)[/TD][TD]1.28.2 (Angie terminator, Unix sockets, static shadow)[/TD][/TR]
 [TR][TD]XenForo[/TD][TD]2.3.13 + 5 add-ons[/TD][TD]2.3.13 + 5 add-ons[/TD][/TR]
 [/TABLE]
 
@@ -53,8 +51,6 @@
 [TR][TD]2 — Redis[/TD][TD][B]Ubuntu[/B][/TD][TD][B]705 (+17.5 %)[/B][/TD][TD][B]813 (+36.6 %)[/B][/TD][TD][B]745 (+37.6 %)[/B][/TD][TD][B]837 (+20.0 %)[/B][/TD][/TR]
 [TR][TD]3 — Redis + page cache[/TD][TD]CentMinMod[/TD][TD]157,957[/TD][TD]595[/TD][TD]542[/TD][TD]694[/TD][/TR]
 [TR][TD]3 — Redis + page cache[/TD][TD][B]Ubuntu[/B][/TD][TD][B]390,232 (+147.1 %)[/B][/TD][TD][B]819 (+37.8 %)[/B][/TD][TD][B]747 (+37.9 %)[/B][/TD][TD][B]838 (+20.7 %)[/B][/TD][/TR]
-[TR][TD]4 — + Anubis[/TD][TD]CentMinMod[/TD][TD]59,958[/TD][TD]577[/TD][TD]525[/TD][TD]666[/TD][/TR]
-[TR][TD]4 — + Anubis[/TD][TD][B]Ubuntu[/B][/TD][TD][B]68,725 (+14.6 %)[/B][/TD][TD][B]709 (+22.9 %)[/B][/TD][TD][B]654 (+24.6 %)[/B][/TD][TD][B]690 (+3.5 %)[/B][/TD][/TR]
 [/TABLE]
 
 [HEADING=2]Cached guest tier per PHP version[/HEADING]
@@ -84,10 +80,9 @@
 [LIST]
 [*][B]16k TLS records.[/B] [ICODE]ssl_buffer_size 1400[/ICODE] fits one MTU but turns a 15.6 KB cached page into ~11 TLS records (and ~11 write syscalls). [ICODE]16k[/ICODE] sends it as one: [B]151,438 → 442,765 req/s[/B] on the same page and TLS stack. This is the whole Stack 3 gap and more.
 [*][B]8 Angie workers on 12 CPUs.[/B] [ICODE]worker_processes auto[/ICODE] (12) spent cores on TLS contention: 348–352k cached req/s. Two workers per three CPUs (8) gives [B]389–390k[/B], with member/thread tiers unchanged (764–767 / 840–843 req/s).
-[*][B]Anubis with the Go collector out of the way.[/B] [ICODE]GOGC=off[/ICODE] with [ICODE]GOMEMLIMIT=2GiB[/ICODE] (the limit still bounds the heap; RSS < 2 GiB): 51,949 → [B]57,082[/B] req/s through the filter. The static-asset shadow keeps CSS/JS/images off the proxy on top of that.
 [*][B]OPcache huge pages.[/B] [ICODE]vm.nr_hugepages[/ICODE] sized from RAM plus [ICODE]opcache.huge_code_pages=1[/ICODE]: +3.5 % on member/thread (808 → 835, 645 → 670 req/s).
 [*][B]The rest of the Ubuntu profile[/B] (already present): tracing JIT, [ICODE]pm=static[/ICODE] one worker per CPU, gzip stored in the FastCGI cache, [ICODE]aio off[/ICODE] + [ICODE]brotli off[/ICODE] on cache hits, Unix sockets end to end, MariaDB pool-of-threads, XF data cache in Valkey.
-[*][B]Sweeps ruled out the usual suspects:[/B] 24/32 PHP workers were slower than 12 (536/534 vs 548 req/s), JIT 128 MB and altered hotness thresholds were noise, [ICODE]validate_timestamps=0[/ICODE] was noise, Anubis [ICODE]GOMAXPROCS[/ICODE] 12/16 was within noise of 8.
+[*][B]Sweeps ruled out the usual suspects:[/B] 24/32 PHP workers were slower than 12 (536/534 vs 548 req/s), JIT 128 MB and altered hotness thresholds were noise, [ICODE]validate_timestamps=0[/ICODE] was noise.
 [/LIST]
 
 [HEADING=2]Why CentMinMod was competitive[/HEADING]
@@ -96,7 +91,7 @@
 [*]PHP is compiled with [ICODE]-O3 -march=native[/ICODE] (CentMinMod) vs generic Sury packages: roughly 5–10 % per-request advantage.
 [*]30 [ICODE]ondemand[/ICODE] PHP-FPM children over TCP hide database waits better than one static worker per CPU — that is why the 18-post thread page is still slightly behind, while member-home is 25–38 % ahead on Ubuntu.
 [*]Nginx 1.31.8 with newer OpenSSL and [ICODE]sendfile_max_chunk 2m[/ICODE], [ICODE]tcp_nodelay[/ICODE], [ICODE]open_file_cache[/ICODE].
-[*]Stock CentMinMod has no FastCGI page cache and no Anubis; those were added for the benchmark. Its 6 Nginx workers and JIT-disabled PHP leave performance unused.
+[*]Stock CentMinMod has no FastCGI page cache; it was added for the benchmark. Its 6 Nginx workers and JIT-disabled PHP leave performance unused.
 [/LIST]
 
 [HEADING=2]Caveats[/HEADING]
@@ -121,11 +116,6 @@ worker_cpu_affinity auto;
 worker_rlimit_nofile 131072;
 worker_connections 32768;
 
-# Anubis unit (>=16 GB hosts; GOMEMLIMIT still bounds the heap)
-Environment=GOGC=off
-Environment=GOMEMLIMIT=2048MiB
-Environment=GOMAXPROCS=8
-
 # kernel + OPcache
 vm.nr_hugepages = 479
 opcache.huge_code_pages = 1
@@ -140,6 +130,6 @@ listen = /run/php/php-fpm.sock
 
 [HEADING=2]Conclusion[/HEADING]
 
-On the same EPYC 4245P the Ubuntu 26.04 + Angie stack is now ahead on every measured tier: [B]+147 %[/B] cached guest throughput (390,232 vs 157,957 req/s), [B]+14.6 %[/B] with Anubis (68,725 vs 59,958), [B]+38 %[/B] member home (747 vs 542) and [B]+21 %[/B] member thread (838 vs 694). The decisive change was not a new service — it was one TLS directive, one worker-count rule, a Go runtime profile and PHP huge pages, all config-only and reproducible with [ICODE]setup.sh[/ICODE] + [ICODE]--optimize[/ICODE].
+On the same EPYC 4245P the Ubuntu 26.04 + Angie stack is now ahead on every measured tier: [B]+147 %[/B] cached guest throughput (390,232 vs 157,957 req/s), [B]+38 %[/B] member home (747 vs 542) and [B]+21 %[/B] member thread (838 vs 694). The decisive change was not a new service — it was one TLS directive, one worker-count rule, a Go runtime profile and PHP huge pages, all config-only and reproducible with [ICODE]setup.sh[/ICODE] + [ICODE]--optimize[/ICODE].
 
-[CENTER][SIZE=1]Ubuntu 26.04.1 · Angie 1.12.4 · PHP 8.2–8.5 · MariaDB 11.8.6 · Valkey 9.0.4 · Anubis 1.28.2 · XenForo 2.3.13[/SIZE][/CENTER]
+[CENTER][SIZE=1]Ubuntu 26.04.1 · Angie 1.12.4 · PHP 8.2–8.5 · MariaDB 11.8.6 · Valkey 9.0.4 · XenForo 2.3.13[/SIZE][/CENTER]

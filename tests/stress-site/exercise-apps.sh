@@ -19,9 +19,9 @@ expect() {
   fi
 }
 PW=$(cat /root/audit/test-admin-pass); V=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
-# Address used to reach the vhosts.  Anubis forwards it as X-Real-IP; some
-# applications (Chevereto) reject a loopback X-Real-IP, so an Anubis run must
-# pass TARGET_IP=<host LAN address> to exercise the same path as a client.
+# Address used to reach the vhosts.  Some applications (Chevereto) reject a
+# loopback X-Real-IP, so a run through a front proxy must pass
+# TARGET_IP=<host LAN address> to exercise the same path as a client.
 TIP=${TARGET_IP:-127.0.0.1}
 J=/root/audit/cookies; mkdir -p $J; rm -f $J/*.jar
 LOG=/var/www/logs/php/php-error.log

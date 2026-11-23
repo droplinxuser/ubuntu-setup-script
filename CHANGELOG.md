@@ -4,6 +4,49 @@ Release notes for ubuntu-setup-script. Current behaviour is documented in
 README.md; measurements in tests/stress-site/RESULTS.md.  Per-cycle
 reports and raw test logs cited by entries up to 1.21.32 were removed from
 the tree on 2026-11-19; retrieve them with `git show 84b0db5:<path>`.
+Reports of the 1.21.33-1.21.61 cycles that measured the removed Anubis
+filter were deleted from the tree on 2026-11-23 for the same reason;
+`git show <commit>:<path>` recovers them.
+
+## 1.21.62 (2026-11-23)
+
+- **Anubis is gone** (primary focus).  The optional bot filter was a Go
+  proxy in front of every vhost, with a TLS-terminator generator, a
+  static-asset shadow, an njs pass-cookie verifier, a systemd unit and a
+  policy file: `lib/anubis.sh` alone was 1,690 lines and the integration
+  touched nine modules.  Production sites sit behind Cloudflare, so the
+  whole feature is deleted (2,4xx lines with its tests and documentation)
+  and `--angie anubis=…`, `--optimize anubis=…` and `SETUP_ANUBIS*` now
+  fail with an explanation instead of silently deploying without the filter
+  they ask for.  `tools/remove-anubis.sh` migrates a host that still runs
+  it: restore every vhost from its pre-integration copy, remove the
+  generated Angie files, `angie -t` and a graceful reload while the filter
+  is still up, then stop/disable it (`--purge` also deletes the binary,
+  `/etc/anubis`, the unit and the user).  A vhost whose backup is missing
+  stops the tool before anything is stopped.  `setup.sh` refuses to run on
+  an Anubis-managed host (`--diagnostics` and `--purge` still work) so no
+  host can be left half-migrated.
+- **Cloudflare TLS is no longer suppressed.**  `cloudflare_tls_migrate`
+  returned early whenever the filter was managed, which is why the
+  Cloudflare path never ran on a protected host; it now applies to every
+  vhost with a certbot certificate.
+- **The Anubis traces in the Angie tree are gone** (`server-configs-nginx`
+  1.6.55): the `techaro.lol-anubis-*` alternatives left the
+  `$guest_cookie_unlisted` allowlist and the `unix:` peers left the
+  `$app_https`/`$trusted_forwarder` maps.
+- **Chevereto's front-controller redirect is a string compare, not a PCRE**
+  (primary focus: leaner maps).  Both Chevereto PHP files tested
+  `$request_uri ~ "^/index\.php(?:[?]|$)"` on every request; a request Angie
+  did not rewrite has `$request_uri == "$uri$is_args$args"` while a
+  `try_files` redirect keeps the original `$request_uri`, so the identical
+  rule is now one string comparison.  Verified live: `/index.php` → 301 `/`,
+  `/index.php?a=1` → 301 `/?a=1`, `/explore` untouched.
+- **`http.d/referer_map.conf` removed**: it defined `$302_referer` and
+  `$302_method`, which nothing referenced; `--optimize` retires an existing
+  copy.
+- Suites: 1,469 unit checks, 226 dry runs, functional 0 unexpected, install
+  3:09 / 0 warnings.  Measurements and the before/after table:
+  `tests/stress-site/AUDIT-20261123-1.21.62.md`.
 
 ## 1.21.61 (2026-11-23)
 

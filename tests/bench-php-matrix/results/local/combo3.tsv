@@ -1,21 +1,21 @@
-combo	php	tier	rps	p50	p99	non2xx	errors	angie_cores	php_cores	mariadb_cores	valkey_cores	anubis_cores
-3	8.2	guest_cached	58896	1.35ms	4.85ms	0	0.00	8.62	0.00	0.00	0.00
-3	8.2	guest_uncached	652	147.56ms	170.49ms	0	0.00	0.23	12.99	1.73	0.12
-3	8.2	member_home	528	181.31ms	213.25ms	0	0.00	0.19	12.78	2.08	0.11
-3	8.2	member_thread	432	217.96ms	297.99ms	0	0.00	0.17	13.71	1.45	0.08
-3	8.3	guest_cached	58631	1.38ms	4.90ms	0	0.00	8.71	0.00	0.00	0.00
-3	8.3	guest_uncached	650	147.76ms	169.03ms	0	0.00	0.23	13.01	1.75	0.12
-3	8.3	member_home	533	178.07ms	224.68ms	0	0.00	0.19	12.76	2.11	0.11
-3	8.3	member_thread	434	217.45ms	291.89ms	0	0.00	0.17	13.71	1.47	0.08
-3	8.4	guest_cached	59549	1.36ms	4.93ms	0	0.00	8.75	0.00	0.00	0.00
-3	8.4	guest_uncached	650	149.01ms	169.58ms	0	0.00	0.23	13.00	1.76	0.13
-3	8.4	member_home	538	177.33ms	205.10ms	0	0.00	0.18	12.79	2.12	0.11
-3	8.4	member_thread	431	221.10ms	255.15ms	0	0.00	0.17	13.71	1.46	0.09
-3	8.5	guest_cached	56574	1.49ms	4.93ms	0	0.00	8.26	0.00	0.00	0.00
-3	8.5	guest_uncached	656	146.97ms	167.58ms	0	0.00	0.23	12.95	1.76	0.12
-3	8.5	member_home	537	176.93ms	225.47ms	0	0.00	0.18	12.72	2.13	0.11
-3	8.5	member_thread	432	217.87ms	297.20ms	0	0.00	0.17	13.68	1.46	0.08
-3	8.6	guest_cached	57760	1.43ms	4.91ms	0	0.00	8.53	0.00	0.00	0.00
-3	8.6	guest_uncached	660	146.80ms	166.70ms	0	0.00	0.23	12.97	1.77	0.12
-3	8.6	member_home	536	181.43ms	227.56ms	0	0.00	0.19	12.71	2.13	0.11
-3	8.6	member_thread	434	218.90ms	296.14ms	0	0.00	0.17	13.68	1.48	0.09
+combo	php	tier	rps	p50	p99	non2xx	errors	angie_cores	php_cores	mariadb_cores	valkey_cores
+3	8.2	guest_cached	58896	1.35ms	4.85ms	0	0.00	8.62	0.00	0.00
+3	8.2	guest_uncached	652	147.56ms	170.49ms	0	0.00	0.23	12.99	1.73
+3	8.2	member_home	528	181.31ms	213.25ms	0	0.00	0.19	12.78	2.08
+3	8.2	member_thread	432	217.96ms	297.99ms	0	0.00	0.17	13.71	1.45
+3	8.3	guest_cached	58631	1.38ms	4.90ms	0	0.00	8.71	0.00	0.00
+3	8.3	guest_uncached	650	147.76ms	169.03ms	0	0.00	0.23	13.01	1.75
+3	8.3	member_home	533	178.07ms	224.68ms	0	0.00	0.19	12.76	2.11
+3	8.3	member_thread	434	217.45ms	291.89ms	0	0.00	0.17	13.71	1.47
+3	8.4	guest_cached	59549	1.36ms	4.93ms	0	0.00	8.75	0.00	0.00
+3	8.4	guest_uncached	650	149.01ms	169.58ms	0	0.00	0.23	13.00	1.76
+3	8.4	member_home	538	177.33ms	205.10ms	0	0.00	0.18	12.79	2.12
+3	8.4	member_thread	431	221.10ms	255.15ms	0	0.00	0.17	13.71	1.46
+3	8.5	guest_cached	56574	1.49ms	4.93ms	0	0.00	8.26	0.00	0.00
+3	8.5	guest_uncached	656	146.97ms	167.58ms	0	0.00	0.23	12.95	1.76
+3	8.5	member_home	537	176.93ms	225.47ms	0	0.00	0.18	12.72	2.13
+3	8.5	member_thread	432	217.87ms	297.20ms	0	0.00	0.17	13.68	1.46
+3	8.6	guest_cached	57760	1.43ms	4.91ms	0	0.00	8.53	0.00	0.00
+3	8.6	guest_uncached	660	146.80ms	166.70ms	0	0.00	0.23	12.97	1.77
+3	8.6	member_home	536	181.43ms	227.56ms	0	0.00	0.19	12.71	2.13
+3	8.6	member_thread	434	218.90ms	296.14ms	0	0.00	0.17	13.68	1.48

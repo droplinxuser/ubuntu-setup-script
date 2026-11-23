@@ -27,6 +27,7 @@ Elasticsearch, Node.js and helper tools, plus per-domain vhosts.
 | `tests/stress-site/` | Synthetic full-stack test site, local and remote load harness, results |
 | `tools/diff_configs.sh` | Compare the canonical configs of both repos with the live `/etc` |
 | `tools/fleet-update.sh` | Safe, logged host update: non-interactive APT, snapd guard, fresh setup.sh checkout, `--optimize` dry run then apply, reboot notice |
+| `tools/remove-anubis.sh` | One-shot migration for a host that still runs the removed Anubis filter: restores the vhosts, removes the generated Angie files, stops/disables the service (`--purge` deletes it) |
 | `SECURITY-PERFORMANCE.md` | What the script hardens, what it leaves to the operator, and the large-site checklist |
 
 ## Requirements
@@ -74,14 +75,14 @@ bash setup.sh --upgrade-php=8.6 --dry-run
 | Command | Purpose | Details |
 |---|---|---|
 | `--basic [server=] [host=] [swap=] [time=]` | OS baseline; required for every install | [`--basic`](#--basic) |
-| `--angie [anubis=yes\|no]` | Angie web server and its configuration tree; optional Anubis bot filter | [Angie](#angie---angie), [Anubis](#anubis-bot-filter---angie-anubisyes) |
+| `--angie` | Angie web server and its configuration tree | [Angie](#angie---angie) |
 | `--php [ver=] [children=] [max_requests=]` | PHP-FPM | [PHP](#php---php) |
 | `--mariadb user= pass= [size=] [bind=]` | MariaDB | [MariaDB](#mariadb---mariadb) |
 | `--valkey [ram=] [policy=] [io_threads=]` | Valkey cache | [Valkey](#valkey---valkey) |
 | `--elastic [host=] [ram=]` | Elasticsearch | [Elasticsearch](#elasticsearch---elastic) |
 | `--others ITEM... \| all` | helper packages | [Other packages](#other-packages---others) |
 | `--domain DOMAIN [app=] [db=] [user=] [pass=] [sql=]` | vhost, certificate and optional database | [Domains](#domains---domain) |
-| `--optimize [anubis=yes\|no]` | tune the OS and every installed service in place; optionally enable/disable Anubis. Recorded tuning overrides are always ignored | [`--optimize`](#--optimize) |
+| `--optimize` | tune the OS and every installed service in place. Recorded tuning overrides are always ignored | [`--optimize`](#--optimize) |
 | `--upgrade-php=X.Y` | replace the installed PHP version in place | [`--upgrade-php`](#--upgrade-phpxy) |
 | `--diagnostics` | write a redacted `diagnostics.log`; read-only | [Maintenance](#--diagnostics---restart-all---purge) |
 | `--restart-all` | ordered restart of every active service | [Maintenance](#--diagnostics---restart-all---purge) |
@@ -134,7 +135,7 @@ templates onto it where their PHP include is at server level, and leaves
 
 ### Angie (`--angie`)
 
-`--angie [anubis=yes|no]`. What it does:
+`--angie`. What it does:
 
 | Step | Detail |
 |---|---|
@@ -173,109 +174,10 @@ Notes:
   making `angie -t` fail with *host not found in upstream*. The include is
   regenerated on each install/`--optimize` and retired once the repository
   defines the name again.
-
-### Anubis bot filter (`--angie anubis=yes`)
-
-An optional, lean bot filter in front of every site on the host.  It is
-installed only when asked for and works on both a fresh install and an
-existing server:
-
-```sh
-# fresh install
-sudo bash setup.sh --basic --angie anubis=yes --php --mariadb user=... pass=...
-sudo bash setup.sh --domain example.com app=wordpress
-
-# an existing server (installs Anubis when missing; every vhost is migrated)
-sudo bash setup.sh --optimize anubis=yes
-
-# turn it off again: vhosts return to direct TLS, the service is stopped
-sudo bash setup.sh --optimize anubis=no
-```
-
-Measured cost of the filter on a cached guest page: 80.5k req/s without it
-and 27.7k through it (XenForo home page, browser user agent with a valid
-challenge cookie, 12-thread Xeon E-2236 at 94 % CPU; `c=400` does not
-raise it).  Since 1.21.55 only requests that need a decision take that hop:
-a non-browser client or a search-engine crawler goes straight to the
-backend (XenForo cached page 29.5k -> 73.2k req/s for a non-browser
-User-Agent), while browsers with a pass cookie still pay it (17.7k).
-Anubis is CPU-bound at roughly 180 µs per proxied request, so a
-host that needs more than ~30k guest cache hits per second should leave it
-off or front only its dynamic locations.  Subrequest (`auth_request`) mode
-was measured at 28.5k and is not faster.  The challenge location, when a
-custom integration is built, needs `^~ /.within.website/`: the
-application's dotfile deny regex otherwise answers 403.
-
-| Piece | Detail |
-|---|---|
-| Release | Anubis 1.28.2, static `linux-amd64` or `linux-arm64` binary from the official GitHub release, SHA-256 verified |
-| Service | `anubis.service`, system user `anubis`, Unix socket `/run/anubis/nginx.sock`, metrics on `127.0.0.1:8240`, sandboxed unit |
-| Angie path | `:443` TLS terminator -> Anubis (Unix socket) -> application vhost (Unix socket `/run/angie/anubis-backend.sock`) |
-| Static assets | CSS/JS/images/fonts/media are proxied to a static-only *shadow* of each application block on `/run/angie-static/static.sock`: same root, same includes and deny rules, and a 404 for every non-file URI or miss, which the terminator retries through Anubis with `X-Anubis-Static-Miss: 1` (the `static-miss` rule challenges browsers there, so `/x.css?rest_route=` cannot reach PHP unchallenged).  Assets never enter the Go proxy; a dynamic route cannot be reached through this socket even by a local account. Measured 41 603 -> 137 090 req/s for one CSS file, Anubis 0.42 -> 0.00 cores. `SETUP_ANUBIS_STATIC_BYPASS=0` disables it |
-| Vhost migration | every `conf.d` site with a `server_name` has its 443 listeners moved to the backend socket and gets a generated terminator; the original file is kept in `/var/lib/setup.sh/anubis/vhosts/*.orig` |
-| Backend socket | `00-anubis-common.conf` holds a `default_server` catch-all on the backend socket that carries `backlog=` = somaxconn (a Unix socket refuses with EAGAIN instead of queueing once the 511 default is full) and answers 444 for a Host no protected vhost serves; the static shadow socket carries the same backlog; neither path spools a response to `proxy_temp` (`proxy_max_temp_file_size 0`) |
-| Backend trust | `set_real_ip_from unix:` + `real_ip_header X-Real-IP`, so PHP and the per-IP limiter see the client address |
-| HTTPS flag | the application leg is HTTP; the Angie tree rebuilds PHP's `HTTPS` from `X-Forwarded-Proto` (`http.d/https_map.conf`) |
-| Challenge page | stock Anubis page; no Nginx `sub_filter` and no response rewriting |
-| Cache safety | the client `Accept-Encoding` is passed through end to end; cached gzip bodies stay compressed and no `sub_filter` runs |
-| Dot segments | answered `400` at the edge (Anubis itself answers `500` before its policy check) |
-| Policy | `allow-good-crawlers`, `deny-ai-crawlers`, infrastructure routes allowed, `static-miss` and `Mozilla` challenged; unmatched clients are allowed so API/CLI clients keep working |
-| Edge route | requests the policy allows without a cookie skip the Go hop: the terminator's `proxy_pass http://$anubis_route` picks the backend socket for a search-engine User-Agent (`allow-good-crawlers`) and for any non-browser, non-empty, non-AI User-Agent (the policy's default-allow), with the same headers Anubis forwards.  Browsers (`Mozilla`) without a valid pass cookie, an empty User-Agent, AI crawlers and `/.within.website/` always reach Anubis.  The two maps in `00-anubis-common.conf` and `botPolicies.yaml` are generated from the same patterns |
-| Pass-cookie check | a browser whose Anubis cookie is valid skips the Go hop as well.  With `angie-module-njs` (installed with the filter), `/etc/angie/njs/anubis_pass.js` checks the cookie in Angie the way Anubis does for a CHALLENGE rule: HS512 signature with the Anubis secret, `exp`/`nbf`, `action`, and the `restriction` claim (the visitor address) when present.  A token issued before `botPolicies.yaml` last changed, the first request after a challenge (Referer restore) and anything malformed still go to Anubis.  A verified token is remembered per visitor address in a 4 MB njs shared dict until its `exp` (keyed also by the policy epoch and a secret fingerprint), so repeat requests skip the HMAC.  The secret reaches Angie through the root-only `/etc/angie/ssl/anubis/pass-key.conf` (under `ssl/`, which the tree normaliser leaves at 0600).  Without the module the browser route stays on Anubis |
-| Redirects | `REDIRECT_DOMAINS` lists the protected server names, so the post-challenge `?redir=` cannot leave the site (left out when a vhost uses a regex `server_name`) |
-| WebSocket | a terminator gets `location ^~ /socket/` only when its vhost has a `/socket/` location (XenForo push); only a WebSocket upgrade skips the filter, any other request under `/socket/` is challenged like a page |
-| Persistence | `ANUBIS=1` in `/etc/default/setup-tuning`; a later plain `--optimize` (or `--domain`) keeps it and protects new vhosts |
-| Disable | `--optimize anubis=no` restores every vhost, removes the generated Angie files and stops/disables the service; the binary and `/etc/anubis` stay for a fast re-enable. `--purge angie` stops it too |
-
-Environment options:
-
-| Variable | Default | Effect |
-|---|---|---|
-| `SETUP_ANUBIS=1\|0` | unset | one-off equivalent of `anubis=yes\|no` |
-| `SETUP_ANUBIS_VERSION` | `1.28.2` | another release tag; set `SETUP_ANUBIS_SHA256` with it |
-| `SETUP_ANUBIS_SHA256` | pinned per architecture | expected tarball checksum for a custom version |
-| `SETUP_ANUBIS_STATIC_BYPASS=0` | on | keep static assets on the Anubis proxy hop (persisted as `ANUBIS_STATIC_BYPASS`) |
-| `SETUP_ANUBIS_PASS_EDGE=0` | on | keep browsers with a pass cookie on the Anubis hop (no njs check) |
-
-Notes:
-
-- One Anubis instance served ~49 000 req/s on the 16-CPU audit host (about
-  0.16 ms of CPU per proxied request; ~1.1 GB/s of body copy).  The static
-  fast path keeps the bulk of a real site's request volume (assets) out of it;
-  measure it (see the 1.21.15+ Anubis sections of `tests/stress-site/RESULTS.md`)
-  before changing it.
-- The static shadow is generated from each integrated application block, so
-  `/internal_data` (XenForo) stays `internal`, dotfiles and backup archives
-  stay denied, `Range`/`HEAD`/conditional requests keep working and a missing
-  file falls back through Anubis.  The filter listens on a `0660`
-  `anubis:anubis` socket in a `0750` runtime directory; `www-data` is added to
-  the `anubis` group (nginx re-runs `initgroups()` for each worker) so Angie
-  can connect, while every other local account is refused.  The static shadow
-  socket is reachable only through its `root:www-data 0750` directory.
-- Anubis is a userspace proxy: cached guest pages still pass through it, so
-  compare capacity with the Anubis on/off tables in `tests/stress-site/RESULTS.md`
-  before enabling it on a bandwidth-heavy origin.  It does not rewrite
-  responses: the client `Accept-Encoding` is passed through, cached gzip bodies
-  stay compressed (~16 KB instead of the ~115 KB identity page), and no
-  `sub_filter` runs.  On the Ubuntu test host this moved the no-pass cached
-  guest tier from 5.8k to 30.5k req/s (the 12-thread EPYC's 7.9k baseline is
-  recorded separately); the stock Anubis challenge page is served as-is.  The whole Go profile is
-  hardware-derived and rewritten by every install/`--optimize`:
-  `GOMAXPROCS=min(8, CPUs)` (the measured plateau: 6 871 cached pages/s with
-  3.92 cores vs 7 203 with all 16 and 4.17 cores, same p99),
-  `GOGC` 100 at ≤2 GB / 200 at ≤4 GB / 300 at ≤8 GB / 400 at ≤16 GB, and
-  `off` at 16 GB or more: with `GOMEMLIMIT` as the backstop the collector only
-  runs as the heap approaches the limit, measured 51 949 → 57 082 cached
-  req/s (+9.9 %) on a 30 GB host with RSS still below 2 GiB,
-  `GOMEMLIMIT` 1/8 of RAM clamped to 256 MiB–2 GiB (the proxy holds ~120 MB),
-  and `LimitNOFILE` cores × 4096 clamped to 16k–128k.  On a 32-core/64 GB
-  host the unit therefore gets `GOMAXPROCS=8 GOGC=off GOMEMLIMIT=2048MiB
-  LimitNOFILE=131072`; on a 2-core/2 GB VPS `2/100/256MiB/16384`.
-- An empty `User-Agent` is challenged by the shipped policy, so a load test
-  must send one (`wrk` sends none by default); all loop harnesses now send
-  `User-Agent: setup-bench/1.0`.
-- `--optimize anubis=no` is safe to repeat; a host without the managed marker
-  (for example an Anubis installed by hand) is left untouched.
+- There is no bot filter in the Angie tier.  Anubis support was removed in
+  1.21.62 (Cloudflare or another CDN/WAF belongs in front of the origin).  A
+  host that still runs the filter is refused by `setup.sh` until
+  `sudo bash tools/remove-anubis.sh` has restored its vhosts to direct TLS.
 
 ### PHP (`--php`)
 
@@ -554,15 +456,13 @@ the application files afterwards and tunes separately.
 | Option | Effect |
 |---|---|
 | `--optimize` | tune the OS and every installed service in place (Ubuntu 22.04, 24.04, 26.04) |
-| `--optimize anubis=yes` | also install/update the Anubis bot filter and put every existing site behind it |
-| `--optimize anubis=no` | restore the vhosts to direct TLS, remove the generated Anubis Angie files and stop/disable the service |
 | `--optimize --dry-run` | print the planned OS and service values only; runs as a normal user |
 
 Tunes the OS and every installed service in place. It never installs, starts
 or purges a managed service and never
 touches swap, the resolver (DNS) or the firewall (UFW), which stay as
 `--basic` or the operator left them; the only package it may add is
-`angie-module-brotli` (and the Anubis static binary when `anubis=yes`), and
+`angie-module-brotli`, and
 the only one it may remove is certbot, once nothing uses it (see
 Cloudflare-proxied sites below). The
 drivers run with `set -e`
@@ -681,13 +581,13 @@ What the reset does on every `--optimize`:
 
 | Moved/ignored | Detail |
 |---|---|
-| `/etc/default/setup-tuning` | rewritten with only host facts/feature choices: `ANUBIS`, `ANUBIS_STATIC_BYPASS`, `XF_JOB_CRON`, `NODE_MAJOR`, `NODE_ALLOW_MAJOR_UPGRADE`. Old `TCP_CC`, `QDISC`, `STORAGE_CLASS`, compression/JIT/page-cache and rate-limit pins no longer survive |
+| `/etc/default/setup-tuning` | rewritten with only host facts/feature choices: `XF_JOB_CRON`, `NODE_MAJOR`, `NODE_ALLOW_MAJOR_UPGRADE`. Old `TCP_CC`, `QDISC`, `STORAGE_CLASS`, compression/JIT/page-cache and rate-limit pins no longer survive |
 | `/var/lib/setup.sh/explicit-options.conf` | moved to `/tmp`; recorded `php_children`/`max_requests`, MariaDB/Valkey/ES sizes and the dedi/vps pin are dropped and the shared memory plan recomputes them |
 | tuning environment | `SETUP_TCP_CC`, `SETUP_QDISC`, `SETUP_STORAGE_CLASS`, `SETUP_PHP_WORKERS_PER_CPU`, `SETUP_PHP_JIT_HOT_*`, `SETUP_GZIP_LEVEL`, `SETUP_BROTLI_LEVEL`, `SETUP_ANGIE_COMPRESSION`, `SETUP_MARIADB_IO_CAPACITY`, `SETUP_LIMIT_REQ_EXEMPT`, `SETUP_PRECOMPRESS_ASSETS`, `SETUP_PHP_PAGE_GZIP`, `SETUP_PHP_JIT_WORDPRESS` are unset for the run and listed in the report/warning |
 
-Feature choices are not performance overrides and still apply: `anubis=yes|no`
-(and `SETUP_ANUBIS*`), `NODE_MAJOR`, the WordPress/Chevereto cache and security
-toggles, and the `CONFIG_*` source knobs.
+Feature choices are not performance overrides and still apply: `NODE_MAJOR`,
+the WordPress/Chevereto cache and security toggles, and the `CONFIG_*` source
+knobs.
 
 What is still **preserved** (never moved or edited by the reset):
 
@@ -722,7 +622,7 @@ Fleet example:
 
 ```bash
 for h in web1 web2 web3; do
-  ssh root@"$h" 'bash /root/ubuntu-setup-script/setup.sh --optimize anubis=yes'
+  ssh root@"$h" 'bash /root/ubuntu-setup-script/setup.sh --optimize'
 done
 ```
 
@@ -843,7 +743,6 @@ unless the same variable is passed again.
 | `SETUP_SSL_REJECT_UNKNOWN_SNI` | `auto\|0\|1` | catch-all HTTPS server refuses handshakes with an unknown or missing SNI (`ssl_reject_handshake on`, hides the origin host name from IP scanners). `auto` (default) leaves it off while a loaded vhost trusts a reverse proxy outside the Cloudflare ranges (`set_real_ip_from`), since such a proxy may connect without the site name as SNI and every request would answer 502; `1` once every proxy in front sends it (`proxy_ssl_server_name on; proxy_ssl_name $host;`); read from `SSL_REJECT_UNKNOWN_SNI` in `/etc/default/setup-tuning` |
 | `SETUP_NODE_MAJOR` | major number | Node.js major installed by `--others nodejs` |
 | `SETUP_NODE_ALLOW_MAJOR_UPGRADE` | `1` | allows a one-off Node.js major switch |
-| `SETUP_ANUBIS_LANGUAGE` | language | Anubis UI language (default `en`, the only catalogue complete in every shipped release; `th` currently panics upstream). The application still gets the visitor's `Accept-Language` |
 | `SETUP_UFW_SSH_LIMIT` | `0\|1` | 1 (default) rate-limits the SSH port with `ufw limit` (6 new connections per 30 s per address); 0 writes a plain `ufw allow` rule for automation hosts (see troubleshooting) |
 | `SETUP_PHP_SESSION_HARDENING` | `1` | opt-in session/cgi hardening |
 | `SETUP_WP_DB_SPLIT` | `0` | keeps a WordPress `DB_USER` with global privileges as it is |
@@ -981,8 +880,6 @@ tests. Angie configuration and Cloudflare IP ranges are downloaded.
 | PHP-FPM slow log full of queued requests | `request_slowlog_timeout` counts from accept; check `listen queue` in `/fpm-status.php`, add workers or cache the endpoint |
 | "upstream prematurely closed connection" during a load test | worker recycling at `pm.max_requests` or an FPM reload; set `pm.max_requests = 0` for a benchmark |
 | `--domain` says Angie or MariaDB is missing | it only creates the vhost/database; install the stack first or combine the flags |
-| Every page (and every image) answers 502 right after `anubis=yes` on a host that only accepts traffic from its CDN | the vhost had `if ($realip_remote_addr != "<edge IP>") { return 444; }`; behind Anubis the direct peer is the local Unix socket, so the guard always fired.  1.21.31 comments the guard out on integration (and for already-integrated vhosts); re-run `--optimize anubis=yes`.  The app still only listens on the filter's socket |
-| Anubis 502s only for one language (`th` on 1.28.2) | upstream incomplete catalogue: `MustLocalize` panics on `simplified_explanation`.  The managed env pins `FORCED_LANGUAGE=en`; set `SETUP_ANUBIS_LANGUAGE=th` once the catalogue is fixed |
 | SSH suddenly answers "Connection refused" or drops for a minute after several rapid connections | `ufw limit` on the SSH port (6 new connections per 30 s from one address); retrying refreshes the window. Wait ~1-2 minutes, reuse one connection (`ssh -M -S … -o ControlPersist=1h`), or install with `SETUP_UFW_SSH_LIMIT=0` for an automation host. `ufw status numbered` shows the rule |
 
 ## Files and state
@@ -991,7 +888,7 @@ tests. Angie configuration and Cloudflare IP ranges are downloaded.
 |---|---|
 | `/run/setup.sh.lock`, `/tmp/setup-optimize.*` | run lock; `--optimize` rollback backups |
 | `/var/lib/setup.sh/` | originals for `--purge basic`, UFW/swap state, package-origin markers, and `explicit-options.conf` (moved to `/tmp` by every `--optimize`) |
-| `/etc/default/setup-tuning` | host facts/feature choices kept by `--optimize` (`ANUBIS`, `NODE_MAJOR`, ...); tuning pins are cleared on each run |
+| `/etc/default/setup-tuning` | host facts/feature choices kept by `--optimize` (`NODE_MAJOR`, ...); tuning pins are cleared on each run |
 | `/etc/angie/` | Angie tree (`conf.d/<domain>.conf`, `ssl/<domain>/`, `http.d/zz-setup-*.conf` managed maps/zones) |
 | `/home/nginx_cache*`, `/home/xf_proxy_cache`, `/home/proxy_cache*` | Angie cache directories |
 | `/etc/php/<ver>/fpm/conf.d/zz-setup-optimize.ini`, `custom_dan.ini`, `pool.d/www.conf` | PHP tuning |

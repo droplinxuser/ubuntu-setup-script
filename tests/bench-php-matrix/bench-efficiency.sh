@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Low-concurrency PHP efficiency pass on the plain stack (no page cache, no
-# Valkey, no Anubis): 8 clients, so requests are not queued behind every FPM
+# Valkey): 8 clients, so requests are not queued behind every FPM
 # worker.  Measures guest (cache-bypass) and member home.
 set -Eeuo pipefail
 export LC_ALL=C.UTF-8
@@ -16,8 +16,8 @@ SECS=15
 
 . "$ENVF"
 
-echo "== disable Anubis and page cache, disable Valkey data cache"
-CONFIG_SOURCE_DIR=$CONFIGS bash "$SETUP/setup.sh" --optimize anubis=no > /root/audit/eff-disable-anubis.log 2>&1 || true
+echo "== disable page cache, disable Valkey data cache"
+CONFIG_SOURCE_DIR=$CONFIGS bash "$SETUP/setup.sh" --optimize > /root/audit/eff-disable.log 2>&1 || true
 sed -i -E 's|^([[:space:]]*fastcgi_cache[[:space:]]+)[A-Za-z0-9_]+;|\1off;|' /etc/angie/h5bp/php_xf.conf /etc/angie/h5bp/php_xf_proxy.conf 2>/dev/null || true
 sed -i "s/^\$config\['cache'\]\['enabled'\] = .*/\$config['cache']['enabled'] = false;/" "$ROOT/src/config.php"
 grep -rlE 'limit_req[[:space:]]+zone=' /etc/angie --include='*.conf' 2>/dev/null \

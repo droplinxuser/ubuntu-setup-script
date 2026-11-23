@@ -198,26 +198,6 @@ install_angie() {
 
   systemctl status angie --no-pager -l || true
   systemctl is-active angie >/dev/null
-  # Optional bot filter.  Runs after Angie is validated and running; a
-  # failure fails the Angie step instead of reporting a protected host that
-  # is not protected.
-  if anubis_wanted || anubis_managed; then
-    if anubis_apply; then
-      if (( ANUBIS_ANGIE_DIRTY )); then
-        if ! /usr/sbin/angie -t >/dev/null 2>&1 || ! systemctl reload angie; then
-          warn "Anubis: Angie reload failed after enabling the bot filter"
-          return 1
-        fi
-      fi
-      # anubis=no in an install run restores the vhosts; stop the filter only
-      # after the reload above has put the direct-TLS config live.
-      anubis_finish_disable
-      info "$ANUBIS_SUMMARY"
-    else
-      warn "Anubis setup failed (${ANUBIS_FAILED:-unknown}); sites stay directly exposed"
-      return 1
-    fi
-  fi
   ok "Angie installed and running"
 }
 

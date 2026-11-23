@@ -24,22 +24,6 @@ DRY_RUN=0
 # keeping the extension set and custom configuration.  Empty means off.
 UPGRADE_PHP=""
 UPGRADE_PHP_SEEN=0
-# Optional Anubis bot filter.  Enabled with `--angie anubis=yes` (fresh
-# install) or `--optimize anubis=yes` (existing host), disabled again with
-# `--optimize anubis=no`.  The choice is persisted as ANUBIS=1/0 in
-# /etc/default/setup-tuning, so a later plain --optimize keeps it.
-ANUBIS_ENABLED="${ANUBIS:-0}"
-[[ $ANUBIS_ENABLED == 1 ]] || ANUBIS_ENABLED=0
-# Non-empty when the operator selected a state on this command line; the
-# install/optimize paths persist it only after a successful apply.
-ANUBIS_SETTING=""
-if [[ -n ${SETUP_ANUBIS+x} ]]; then
-  case ${SETUP_ANUBIS,,} in
-    1|yes|on|true)  ANUBIS_ENABLED=1; ANUBIS_SETTING=1 ;;
-    0|no|off|false) ANUBIS_ENABLED=0; ANUBIS_SETTING=0 ;;
-    *) die "SETUP_ANUBIS='${SETUP_ANUBIS}' is invalid (use 1 or 0)" ;;
-  esac
-fi
 PURGE_TARGETS=()
 PURGE_ORDER=()
 SERVICE_ORDER=(basic angie php mariadb valkey elastic others domain)
@@ -74,21 +58,10 @@ Basic (always required for an install; all values are optional):
              every --optimize keeps it.  Omitted = never touched.
 
 Services (optional; only the ones listed are installed):
-  --angie     [anubis=yes|no]
-      anubis=yes  install the Anubis bot filter (v1.28.2, static binary) and
-                  put every vhost behind it: Angie TLS terminator -> Anubis ->
-                  application vhost, both legs on Unix sockets.  Browsers get
-                  a branding-free proof-of-work challenge; search engines and
-                  infrastructure routes are allowed, AI crawlers are denied.
-                  Only valid with --angie.  The choice is persisted as
-                  ANUBIS=1 so later --optimize runs keep it.  anubis=no is
-                  accepted for symmetry and leaves the host unchanged.
-                  Static assets (CSS/JS/images/fonts/media) are served by a
-                  static-only shadow of each vhost instead of the Go proxy:
-                  same root and same deny rules, every other URI and every
-                  miss still goes through Anubis.  SETUP_ANUBIS_STATIC_BYPASS=0
-                  keeps them on the proxy hop (persisted as
-                  ANUBIS_STATIC_BYPASS).
+  --angie
+      Angie web server and its configuration tree (server-configs-nginx
+      layout under /etc/angie).  There is no bot filter: put Cloudflare or
+      another CDN/WAF in front of the origin.
   --php       [ver=8.5] [children=auto|N] [max_requests=N]
       ver          PHP version (default: latest stable in Sury)
       children     PHP-FPM worker count (default: auto from RAM/CPU)
@@ -147,7 +120,7 @@ Domain setup (standalone; Angie + MariaDB must already be installed/running):
       no --purge for domains; remove the files/database manually.
 
 Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
-  --optimize [anubis=yes|no] [mitigations=on|off] [--dry-run]
+  --optimize [mitigations=on|off] [--dry-run]
       One command for the whole host.  It synchronizes Angie's /etc/angie
       tree from server-configs-nginx (or CONFIG_SOURCE_DIR), applies the
       hardware-aware OS profile (CPU governor, PAM security limits, and
@@ -158,13 +131,9 @@ Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
       zone, style/language cache keys and session-cookie bypass.
       It never installs, purges or starts a managed service; the only packages
       it may add are angie-module-brotli and the brotli CLI (asset
-      precompression) when Angie is installed (and the Anubis static binary
-      when anubis=yes), and the only one it removes is angie-module-zstd left
-      by 1.21.58 (unless a configuration still uses it), so install and optimize share
-      the same compression/bot-filter profile.  `anubis=yes` enables the bot
-      filter for every site on the host and installs it when missing;
-      `anubis=no` restores the vhosts to direct TLS and stops it.  A host
-      that already has ANUBIS=1 persisted keeps it on a plain --optimize run.
+      precompression) when Angie is installed, and the only one it removes is
+      angie-module-zstd left by 1.21.58 (unless a configuration still uses
+      it), so install and optimize share the same compression profile.
       It also never
       touches the resolver (DNS), the firewall (UFW) or swap: those are
       --basic decisions and stay as the operator left them.  Allocations
@@ -194,8 +163,8 @@ Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
       hardware.  Every recorded tuning override is ignored and moved to /tmp
       (never deleted) before the tuners run:
         - /etc/default/setup-tuning keeps only host facts/feature choices
-          (ANUBIS, ANUBIS_STATIC_BYPASS, XF_JOB_CRON, NODE_MAJOR,
-          NODE_ALLOW_MAJOR_UPGRADE).  TCP_CC, QDISC, STORAGE_CLASS and the
+          (XF_JOB_CRON, NODE_MAJOR, NODE_ALLOW_MAJOR_UPGRADE).  TCP_CC,
+          QDISC, STORAGE_CLASS and the
           PHP/compression/rate-limit pins are cleared and go back to the
           current defaults (bbr/fq, etc.);
         - /var/lib/setup.sh/explicit-options.conf is moved to /tmp, dropping
@@ -208,7 +177,7 @@ Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
           SETUP_LIMIT_REQ_EXEMPT, SETUP_PRECOMPRESS_ASSETS,
           SETUP_PHP_PAGE_GZIP, SETUP_PHP_JIT_WORDPRESS) are ignored with a
           warning, so two servers with the same hardware get the same
-          profile.  Feature choices (ANUBIS, Node major, application cache
+          profile.  Feature choices (Node major, application cache
           and security toggles) and the CONFIG_* source knobs still apply.
       Third-party sysctl files and units are never deleted; the managed
       profile is re-applied after systemd-sysctl at boot by
@@ -384,13 +353,12 @@ NORMALIZED_ARGS=()
 # People paste commands from documentation into shells that keep typographic
 # dashes (em dash U+2014, en dash U+2013). Accept them instead of failing with
 # "Unknown argument" and rewrite them to ASCII "--".
-# anubis=yes|no (also 1/0, on/off) belongs to --angie and --optimize.
-anubis_set() {
-  case "${1,,}" in
-    yes|1|on|true)  ANUBIS_ENABLED=1; ANUBIS_SETTING=1 ;;
-    no|0|off|false) ANUBIS_ENABLED=0; ANUBIS_SETTING=0 ;;
-    *) die "anubis= expects yes or no (got '$1')" ;;
-  esac
+# Anubis was removed in 1.21.62.  The word is still recognised so a script,
+# a runbook or a persisted command that carries `anubis=...` stops with an
+# explanation instead of "Unknown argument", and so nobody believes a bot
+# filter is protecting the host when it is not.
+anubis_gone() {
+  die "Anubis support was removed in 1.21.62; put Cloudflare (or another CDN/WAF) in front of the origin instead. On a host that still runs Anubis, run tools/remove-anubis.sh first."
 }
 
 # mitigations=on|off belongs to --basic and --optimize (CPU_MITIGATIONS).
@@ -439,10 +407,6 @@ parse_args() {
         ;;
       --angie)
         ENABLED[angie]=1; shift
-        while (( $# )) && [[ $1 == anubis=* ]]; do
-          anubis_set "${1#*=}"
-          shift
-        done
         ;;
       --valkey)
         ENABLED[valkey]=1; shift
@@ -495,7 +459,7 @@ parse_args() {
               continue
               ;;
             anubis=*)
-              die "anubis= belongs to --angie (install) or --optimize (existing host), not --domain"
+              anubis_gone
               ;;
           esac
           d=${1,,}; d=${d%.}
@@ -521,7 +485,7 @@ parse_args() {
         OPTIMIZE=1; shift
         while (( $# )) && [[ $1 == anubis=* || $1 == mitigations=* ]]; do
           case $1 in
-            anubis=*) anubis_set "${1#*=}" ;;
+            anubis=*) anubis_gone ;;
             *)        mitigations_set "${1#*=}" ;;
           esac
           shift
@@ -556,10 +520,8 @@ parse_args() {
         ;;
       --dry-run|--check) DRY_RUN=1; shift ;;
       anubis=*)
-        # Accepted here so validate_all can explain that it belongs to
-        # --angie/--optimize instead of reporting an unknown argument.
-        anubis_set "${1#*=}"
-        shift ;;
+        # Recognised only to explain that the feature is gone.
+        anubis_gone ;;
       mitigations=*)
         # Same for mitigations= after another flag: `--optimize --dry-run
         # mitigations=off` used to die as an unknown argument although the

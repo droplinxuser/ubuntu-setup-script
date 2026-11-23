@@ -57,7 +57,7 @@ done
 # MariaDB postinst then logs "mysql.user table already exists").  List their
 # top level only: names, not contents, so the manifest stays stable.
 for d in /root /home/* /var/lib/mariadb /var/lib/mysql /var/lib/mysql-files /var/lib/valkey /var/lib/redis \
-         /var/lib/elasticsearch /var/lib/anubis /var/cache/angie /var/log/angie; do
+         /var/lib/elasticsearch /var/cache/angie /var/log/angie; do
   if [ -e "$d" ]; then
     echo "-- $d (top level)"
     find "$d" -xdev -mindepth 1 -maxdepth 1 ! -name .ssh ! -name .cache ! -name .bash_history \

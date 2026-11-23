@@ -649,11 +649,13 @@ ssh_ports_ok() {
 }
 check "sshd port discovery always returns at least one numeric port" ssh_ports_ok
 # --- audit 1.21.58: os-purge
-# The widened ephemeral range (1024-65535) must not hand the Anubis metrics
-# listener's port to an outbound connection before anubis.service rebinds it.
-check "ANUBIS_METRICS listens on 8240" test "${ANUBIS_METRICS##*:}" = 8240
-check "ip_local_reserved_ports includes the Anubis metrics port" \
-  bash -c 'sed -n "/^configure_sysctl()/,/^}/p" "$1" | grep -E "^[[:space:]]*reserved_ports=" | grep -qF "\${ANUBIS_METRICS##*:}"' _ "$ROOT/lib/os.sh"
+# The widened ephemeral range (1024-65535) must not hand a service port to an
+# outbound connection before the service rebinds it.  The Anubis metrics port
+# (8240) is no longer reserved: Anubis support was removed in 1.21.62.
+check "ip_local_reserved_ports covers the service ports" \
+  bash -c 'sed -n "/^configure_sysctl()/,/^}/p" "$1" | grep -E "^[[:space:]]*reserved_ports=" | grep -qF "3306 6379 9000 9200 9300"' _ "$ROOT/lib/os.sh"
+check "ip_local_reserved_ports no longer reserves the Anubis metrics port" \
+  bash -c 'sed -n "/^configure_sysctl()/,/^}/p" "$1" | grep -E "^[[:space:]]*reserved_ports=" | grep -q "8240" && exit 1; exit 0' _ "$ROOT/lib/os.sh"
 
 # SSH must be rate-limited by UFW, and an older plain ALLOW rule must be
 # removed so it cannot shadow the LIMIT rule.
@@ -3851,7 +3853,7 @@ printf 'server {\n    root %s;\n    include h5bp/php_xf.conf;\n}\n' "$TMP/capsit
 printf "<?php\n\$config['db']['host'] = 'localhost';\n" > "$TMP/capsite/xf/src/config.php"
 check "angie_vhost_root reads the root directive" \
   test "$(angie_vhost_root "$TMP/capsite/conf.d/xf.conf")" = "$TMP/capsite/xf"
-# A generated vhost (the Anubis TLS terminator, a redirect-only block) has no
+# A generated vhost (a redirect-only block or a generated terminator) has no
 # root directive.  The lookup must print nothing and return 0: under
 # `set -e` + inherit_errexit the old grep pipeline returned 1 and the
 # --upgrade-php preflight (which walks every conf.d file) printed false
@@ -4665,8 +4667,8 @@ check "the managed sysctl.conf is not reported as a foreign source" \
   tuning_is_own_sysctl_file /etc/sysctl.conf
 check "an unrelated sysctl drop-in is reported as foreign" \
   not tuning_is_own_sysctl_file /etc/sysctl.d/50-custom-performance.conf
-check "reset keeps the Anubis and Node pins" \
-  test "$(printf '%s\n' "${RESET_KEEP_PINS[@]}" | grep -cE '^(ANUBIS|NODE_MAJOR)$')" -eq 2
+check "reset keeps the Node pin" \
+  test "$(printf '%s\n' "${RESET_KEEP_PINS[@]}" | grep -cE '^NODE_MAJOR$')" -eq 1
 
 # --optimize always recomputes the profile: recorded pins/sizes are cleared
 # and tuning environment variables are ignored, while feature choices stay.
@@ -4677,16 +4679,15 @@ check "the profile reset sets fq without honouring SETUP_QDISC" \
   bash -c '! grep -q "SETUP_QDISC+x" <<< "$1"' _ "$reset_body"
 ignored_env=$( (
   export SETUP_TCP_CC=cubic SETUP_PHP_WORKERS_PER_CPU=2.0 SETUP_LIMIT_REQ_EXEMPT=10.0.0.1 \
-         SETUP_ANUBIS=1 SETUP_XF_JOB_CRON=0 SETUP_PHP_JIT_WORDPRESS=0
+         SETUP_XF_JOB_CRON=0 SETUP_PHP_JIT_WORDPRESS=0
   optimize_ignore_tuning_env >/dev/null 2>&1
-  printf '%s;%s;%s;%s;%s;%s;%s\n' \
+  printf '%s;%s;%s;%s;%s\n' \
     "${SETUP_TCP_CC-none}" "${SETUP_PHP_WORKERS_PER_CPU-none}" \
-    "${SETUP_LIMIT_REQ_EXEMPT-none}" "${SETUP_ANUBIS-none}" \
-    "${SETUP_XF_JOB_CRON-none}" "${SETUP_PHP_JIT_WORDPRESS-none}" \
-    "${OPTIMIZE_IGNORED_ENV[*]}"
+    "${SETUP_LIMIT_REQ_EXEMPT-none}" \
+    "${SETUP_XF_JOB_CRON-none}" "${SETUP_PHP_JIT_WORDPRESS-none}"
 ) )
 check "optimize ignores tuning environment overrides but keeps feature choices" \
-  test "$ignored_env" = "none;none;none;1;0;none;SETUP_TCP_CC=cubic SETUP_PHP_WORKERS_PER_CPU=2.0 SETUP_PHP_JIT_WORDPRESS=0 SETUP_LIMIT_REQ_EXEMPT=10.0.0.1"
+  test "$ignored_env" = "none;none;none;0;none"
 optimize_body=$(sed -n '/^run_optimize()/,/^}/p' "$ALL_SRC")
 check "run_optimize always resets recorded overrides" \
   grep -q '^  reset_operator_overrides$' <<<"$optimize_body"
@@ -5215,597 +5216,6 @@ check "the OpenSSH application profile counts as an SSH rule for port 22" \
   test "$(ufw_rule_ssh_port 'ufw allow OpenSSH' 22)" = 22
 check "the OpenSSH application profile is not matched for another port" \
   not ufw_rule_ssh_port 'ufw allow OpenSSH' 2222
-
-# ---------------------------------------------------------------------------
-# Anubis vhost migration
-# ---------------------------------------------------------------------------
-mkdir -p "$TMP/anubis/conf.d" "$TMP/anubis/state"
-cat > "$TMP/anubis/conf.d/site.test.conf" <<'EOF'
-server {
-    listen      80;
-    server_name site.test www.site.test;
-    return 301 https://site.test$request_uri;
-}
-
-server {
-    listen      443 ssl;
-    listen [::]:443 ssl;
-    server_name site.test;
-    http2 on;
-
-    include h5bp/tls/ssl_engine.conf;
-    ssl_certificate     /etc/angie/ssl/site.test/fullchain.pem;
-    ssl_certificate_key /etc/angie/ssl/site.test/privkey.pem;
-
-    root /var/www/site.test/public;
-    include h5bp/php_wp.conf;
-}
-EOF
-cat > "$TMP/anubis/conf.d/default.conf" <<'EOF'
-server {
-    listen 443 ssl default_server;
-    server_name _;
-    ssl_certificate     /etc/angie/ssl/default/fullchain.pem;
-    ssl_certificate_key /etc/angie/ssl/default/privkey.pem;
-    return 444;
-}
-EOF
-cp "$TMP/anubis/conf.d/site.test.conf" "$TMP/anubis/site.before"
-ANUBIS_STATE="$TMP/anubis/state"
-ANUBIS_BACKEND_SOCKET="/run/angie/anubis-test.sock"
-tune_reset_changes
-anubis_integrate_vhost "$TMP/anubis/conf.d/site.test.conf"
-check "Anubis moves the 443 listener to the backend socket" \
-  grep -qx '    listen unix:/run/angie/anubis-test.sock;' "$TMP/anubis/conf.d/site.test.conf"
-check "Anubis drops the IPv6 443 listener" \
-  bash -c '! grep -q "listen \[::\]:443" "$1"' _ "$TMP/anubis/conf.d/site.test.conf"
-check "Anubis removes http2 from the backend block" \
-  bash -c '! grep -q "http2 on;" "$1"' _ "$TMP/anubis/conf.d/site.test.conf"
-check "Anubis trusts the Unix peer for the real client address" \
-  grep -qx '    set_real_ip_from unix:;' "$TMP/anubis/conf.d/site.test.conf"
-check "Anubis reads X-Real-IP" \
-  grep -qx '    real_ip_header X-Real-IP;' "$TMP/anubis/conf.d/site.test.conf"
-check "the port 80 server keeps its public listener" \
-  grep -qx '    listen      80;' "$TMP/anubis/conf.d/site.test.conf"
-check "the pre-integration vhost is backed up" \
-  test -f "$TMP/anubis/state/vhosts/site.test.conf.orig"
-check "the backup is byte-identical to the original" \
-  cmp -s "$TMP/anubis/site.before" "$TMP/anubis/state/vhosts/site.test.conf.orig"
-after_first=$(md5sum < "$TMP/anubis/conf.d/site.test.conf")
-tune_reset_changes
-anubis_integrate_vhost "$TMP/anubis/conf.d/site.test.conf"
-check "the vhost migration is idempotent" \
-  test "${#TUNE_CHANGES[@]}" -eq 0
-check "the migrated vhost is unchanged on the second pass" \
-  test "$after_first" = "$(md5sum < "$TMP/anubis/conf.d/site.test.conf")"
-
-# A non-443 TLS port must not be treated as the public HTTPS listener.
-cat > "$TMP/anubis/conf.d/alt.test.conf" <<'EOF'
-server {
-    listen 8443 ssl;
-    server_name alt.test;
-}
-EOF
-check "Anubis leaves an 8443 SSL listener alone" \
-  bash -c '! anubis_vhost_needs_migration "$1"' _ "$TMP/anubis/conf.d/alt.test.conf"
-# IPv6-only TLS blocks used to lose their only listener and fall back to :80.
-cat > "$TMP/anubis/conf.d/v6.test.conf" <<'EOF'
-server {
-    listen [::]:443 ssl;
-    server_name v6.test;
-}
-EOF
-anubis_integrate_vhost "$TMP/anubis/conf.d/v6.test.conf"
-check "Anubis migrates an IPv6-only TLS listener" \
-  grep -qx '    listen unix:/run/angie/anubis-test.sock;' "$TMP/anubis/conf.d/v6.test.conf"
-
-# Losing the state directory (it also holds the marker) used to make
-# `anubis=no` a silent no-op: the vhosts stayed on the backend socket and,
-# once the filter was stopped, every site answered 502.  The integrated form
-# is reversible, so the disable rebuilds the public listener instead.
-mkdir -p "$TMP/anubis2/conf.d"
-cp "$TMP/anubis/conf.d/site.test.conf" "$TMP/anubis2/conf.d/site.test.conf"
-check "the copied vhost is still integrated" \
-  anubis_vhost_integrated "$TMP/anubis2/conf.d/site.test.conf"
-check "no pre-integration copy exists for it" \
-  not test -e "$TMP/anubis2/state/vhosts/site.test.conf.orig"
-# The marker lives in the state directory, so the artifacts must speak for it.
-ANUBIS_TERMINATORS="$TMP/anubis2/none.conf"
-ANUBIS_COMMON="$TMP/anubis2/none-common.conf"
-ANUBIS_LOCATION="$TMP/anubis2/none-location.conf"
-ANUBIS_STATIC_BLOCKS="$TMP/anubis2/none-static.conf"
-check "a missing marker is detected from an integrated vhost" \
-  anubis_artifacts_present "$TMP/anubis2/conf.d"
-check "restore without a backup succeeds" \
-  anubis_restore_vhosts "$TMP/anubis2/conf.d" "$TMP/anubis2/state"
-check "the rebuilt vhost listens on 443 again" \
-  grep -qx '    listen 443 ssl;' "$TMP/anubis2/conf.d/site.test.conf"
-check "the rebuilt vhost listens on IPv6 443 again" \
-  grep -qx '    listen \[::\]:443 ssl;' "$TMP/anubis2/conf.d/site.test.conf"
-check "the rebuilt vhost carries http2 again" \
-  grep -qx '    http2 on;' "$TMP/anubis2/conf.d/site.test.conf"
-check "the rebuilt vhost no longer trusts the Unix peer" \
-  bash -c '! grep -q "set_real_ip_from unix:;" "$1"' _ "$TMP/anubis2/conf.d/site.test.conf"
-check "the rebuilt vhost no longer reads the proxy's X-Real-IP" \
-  bash -c '! grep -q "real_ip_header X-Real-IP;" "$1"' _ "$TMP/anubis2/conf.d/site.test.conf"
-check "the rebuilt vhost keeps its port 80 redirect" \
-  grep -qx '    listen      80;' "$TMP/anubis2/conf.d/site.test.conf"
-check "the rebuilt vhost keeps its TLS certificate" \
-  grep -qE 'ssl_certificate_key[[:space:]]+/etc/angie/ssl/site.test/privkey.pem;' \
-  "$TMP/anubis2/conf.d/site.test.conf"
-check "de-integration is idempotent" \
-  bash -c '! grep -q "listen unix:/run/angie/anubis-test.sock;" "$1"' _ \
-  "$TMP/anubis2/conf.d/site.test.conf"
-tune_reset_changes
-anubis_deintegrate_vhost "$TMP/anubis2/conf.d/site.test.conf"
-check "de-integrating an already public vhost changes nothing" \
-  test "${#TUNE_CHANGES[@]}" -eq 0
-
-# Terminators are generated from the integrated blocks only; the catch-all
-# (server_name _) must never become a public terminator.
-anubis_render_terminators "$TMP/anubis/conf.d" "$TMP/anubis/terminators.conf"
-check "the terminator carries the site's server_name" \
-  grep -qx '    server_name site.test;' "$TMP/anubis/terminators.conf"
-check "the terminator reuses the vhost certificate" \
-  grep -q 'ssl_certificate     /etc/angie/ssl/site.test/fullchain.pem;' "$TMP/anubis/terminators.conf"
-check "the terminator includes the Anubis location" \
-  grep -q 'include snippets/anubis-location.conf;' "$TMP/anubis/terminators.conf"
-check "a vhost without a /socket/ location gets no socket route" \
-  bash -c '! grep -q "/socket/" "$1"' _ "$TMP/anubis/terminators.conf"
-# A XenForo vhost with push: only the WebSocket upgrade skips the filter, and
-# the route sets each proxy header once (h5bp/proxy_ws.conf repeated Host,
-# which made the backend answer 400 to every handshake).
-mkdir -p "$TMP/anubis/ws"
-sed 's|^    root /var/www/site.test/public;|&\n    location /socket/ { proxy_pass http://xf_websocket; }|' \
-  "$TMP/anubis/conf.d/site.test.conf" > "$TMP/anubis/ws/xf.test.conf"
-anubis_render_terminators "$TMP/anubis/ws" "$TMP/anubis/ws-terminators.conf"
-check "the XenForo socket route passes only WebSocket upgrades to the backend" \
-  bash -c 'grep -qF "location ^~ /socket/ {" "$1" && grep -qF "if (\$http_upgrade !~* ^websocket\$) { return 418; }" "$1" && grep -qF "proxy_pass http://anubis_backend;" "$1"' \
-  _ "$TMP/anubis/ws-terminators.conf"
-check "the socket route sets Host once (no h5bp/proxy_ws.conf include)" \
-  bash -c '! grep -q "proxy_ws.conf" "$1" && test "$(sed -n "/location ^~ \/socket\//,/^    }/p" "$1" | grep -c "proxy_set_header Host ")" = 1' \
-  _ "$TMP/anubis/ws-terminators.conf"
-check "the catch-all vhost gets no terminator" \
-  bash -c '! grep -q "server_name _;" "$1"' _ "$TMP/anubis/terminators.conf"
-terminator_md5=$(md5sum < "$TMP/anubis/terminators.conf")
-anubis_render_terminators "$TMP/anubis/conf.d" "$TMP/anubis/terminators.conf"
-check "the terminator render is idempotent" \
-  test "$terminator_md5" = "$(md5sum < "$TMP/anubis/terminators.conf")"
-
-# The static-asset fast path: a static-only shadow of the application block on
-# its own socket.  It must keep the application's root and rules, drop the
-# public TLS listener, and refuse anything that is not an existing static file.
-ANUBIS_STATIC_SOCKET="$TMP/anubis/static.sock"
-ANUBIS_STATIC_BLOCKS="$TMP/anubis/static.conf"
-ANUBIS_STATIC_BYPASS=1
-ANUBIS_STATIC_ACTIVE=0
-anubis_render_static_blocks "$TMP/anubis/conf.d" "$TMP/anubis/static.conf"
-check "the static shadow listens on its own socket" \
-  grep -qx "    listen unix:${ANUBIS_STATIC_SOCKET};" "$TMP/anubis/static.conf"
-check "the static shadow keeps the application root" \
-  grep -qx '    root /var/www/site.test/public;' "$TMP/anubis/static.conf"
-check "the static shadow keeps the application rules" \
-  grep -qx '    include h5bp/php_wp.conf;' "$TMP/anubis/static.conf"
-check "the static shadow refuses a non-static URI" \
-  grep -q 'if (\$uri !~\* ".*css|js' "$TMP/anubis/static.conf"
-check "the static shadow refuses a missing file" \
-  grep -qx '    if (!-f $request_filename) { return 404; }' "$TMP/anubis/static.conf"
-check "the static shadow drops the public TLS listener" \
-  bash -c '! grep -qE "listen +443|ssl_certificate|http2 on;" "$1"' _ "$TMP/anubis/static.conf"
-check "the static shadow has a 404 default server for an unknown Host" \
-  grep -qx "    listen unix:${ANUBIS_STATIC_SOCKET} default_server backlog=$(effective_backlog);" "$TMP/anubis/static.conf"
-check "the catch-all block itself is not copied" \
-  bash -c '! grep -q "^# shadow of .*default.conf" "$1"' _ "$TMP/anubis/static.conf"
-check "the static shadow sets the active flag" test "$ANUBIS_STATIC_ACTIVE" = 1
-anubis_render_terminators "$TMP/anubis/conf.d" "$TMP/anubis/terminators.conf"
-check "the terminator proxies assets to the static shadow" \
-  grep -q 'proxy_pass http://anubis_static;' "$TMP/anubis/terminators.conf"
-check "an asset miss falls back to Anubis" \
-  grep -qx '        error_page 404 = @anubis_static_miss;' "$TMP/anubis/terminators.conf"
-static_md5=$(md5sum < "$TMP/anubis/static.conf")
-anubis_render_static_blocks "$TMP/anubis/conf.d" "$TMP/anubis/static.conf"
-check "the static shadow render is idempotent" \
-  test "$static_md5" = "$(md5sum < "$TMP/anubis/static.conf")"
-# A server-level redirect cannot be pushed through the proxy again.
-cat > "$TMP/anubis/conf.d/redirect.test.conf" <<'EOF'
-server {
-    listen 443 ssl;
-    server_name redirect.test;
-    root /var/www/redirect.test/public;
-    return 301 https://redirect.test$request_uri;
-}
-EOF
-sed -i "s|listen 443 ssl;|listen unix:${ANUBIS_BACKEND_SOCKET};|" "$TMP/anubis/conf.d/redirect.test.conf"
-anubis_render_static_blocks "$TMP/anubis/conf.d" "$TMP/anubis/static.conf"
-check "a redirecting block gets no static shadow" \
-  bash -c '! grep -q "server_name redirect.test;" "$1"' _ "$TMP/anubis/static.conf"
-rm -f "$TMP/anubis/conf.d/redirect.test.conf"
-# The operator switch turns the fast path off completely.
-ANUBIS_STATIC_BYPASS=0
-ANUBIS_STATIC_ACTIVE=0
-anubis_render_static_blocks "$TMP/anubis/conf.d" "$TMP/anubis/static.conf" >/dev/null 2>&1 || true
-check "disabling the fast path removes the static shadow" test ! -e "$TMP/anubis/static.conf"
-check "disabling the fast path clears the active flag" test "$ANUBIS_STATIC_ACTIVE" = 0
-ANUBIS_STATIC_BYPASS=1
-anubis_render_terminators "$TMP/anubis/conf.d" "$TMP/anubis/terminators.conf"
-check "no static location without the shadow" \
-  bash -c '! grep -q "proxy_pass http://anubis_static;" "$1"' _ "$TMP/anubis/terminators.conf"
-
-
-anubis_restore_vhosts "$TMP/anubis/conf.d" "$TMP/anubis/state/vhosts"
-check "disabling Anubis restores the vhost byte-for-byte" \
-  cmp -s "$TMP/anubis/site.before" "$TMP/anubis/conf.d/site.test.conf"
-check "the restored vhost terminates TLS again" \
-  grep -q 'listen      443 ssl;' "$TMP/anubis/conf.d/site.test.conf"
-
-# A vhost that already carried a real-IP configuration must not keep reading
-# a client-supplied X-Forwarded-For: the backend peer is the Anubis socket.
-cat > "$TMP/anubis/conf.d/realip.test.conf" <<'EOF'
-server {
-    listen 443 ssl;
-    server_name realip.test;
-    real_ip_header X-Forwarded-For;
-    set_real_ip_from 10.0.0.0/8;
-}
-EOF
-anubis_integrate_vhost "$TMP/anubis/conf.d/realip.test.conf"
-check "the migration drops a pre-existing real_ip_header" \
-  bash -c '! grep -q "real_ip_header X-Forwarded-For" "$1"' _ "$TMP/anubis/conf.d/realip.test.conf"
-check "the migrated block reads X-Real-IP only" \
-  test "$(grep -c '^    real_ip_header X-Real-IP;' "$TMP/anubis/conf.d/realip.test.conf")" -eq 1
-check "the migration keeps an operator's other trusted ranges" \
-  grep -q 'set_real_ip_from 10.0.0.0/8;' "$TMP/anubis/conf.d/realip.test.conf"
-anubis_restore_vhosts "$TMP/anubis/conf.d" "$TMP/anubis/state/vhosts"
-
-# The generated terminator snippet: uploads are bounded by the backend vhost,
-# not by the http-level 11m, and the client's X-Forwarded-For is replaced.
-ANUBIS_LOCATION="$TMP/anubis/anubis-location.conf"
-anubis_write_location
-check "the terminator does not cap uploads at the http-level body size" \
-  grep -qx 'client_max_body_size 0;' "$TMP/anubis/anubis-location.conf"
-check "the terminator replaces X-Forwarded-For" \
-  grep -qx 'proxy_set_header X-Forwarded-For \$remote_addr;' "$TMP/anubis/anubis-location.conf"
-check "the terminator passes the client Accept-Encoding through" \
-  grep -qx 'proxy_set_header Accept-Encoding \$http_accept_encoding;' "$TMP/anubis/anubis-location.conf"
-check "the terminator no longer rewrites responses with sub_filter" \
-  bash -c '! grep -q "^sub_filter" "$1"' _ "$TMP/anubis/anubis-location.conf"
-ANUBIS_LOCATION=/etc/angie/snippets/anubis-location.conf
-
-# No response-rewrite maps remain in the shared file.
-ANUBIS_COMMON="$TMP/anubis/anubis-common.conf"
-anubis_write_common
-check "the Anubis common file has no encoding-strip map" \
-  bash -c '! grep -q "anubis_strip_encoding\|anubis_upstream_accept_encoding" "$1"' _ "$TMP/anubis/anubis-common.conf"
-check "the backend socket catch-all carries the somaxconn backlog" \
-  grep -qx "    listen unix:${ANUBIS_BACKEND_SOCKET} default_server backlog=$(effective_backlog);" "$TMP/anubis/anubis-common.conf"
-check "the backend socket catch-all drops an unknown Host" \
-  bash -c 'grep -A3 "default_server backlog=" "$1" | grep -qx "    return 444;"' _ "$TMP/anubis/anubis-common.conf"
-check "the terminator never spools a response to proxy_temp" \
-  grep -qx 'proxy_max_temp_file_size 0;' "$TMP/anubis/anubis-location.conf"
-check "the static shadow default server carries the backlog" \
-  grep -q 'listen unix:${ANUBIS_STATIC_SOCKET} default_server backlog=$(effective_backlog);' "$ROOT/lib/anubis.sh"
-# Edge route: what the policy allows without a cookie skips the Go hop, and
-# the route is built from the same User-Agent patterns as the policy.
-check "the terminator proxies to the edge route, not always to Anubis" \
-  grep -qx 'proxy_pass http://\$anubis_route;' "$TMP/anubis/anubis-location.conf"
-check "the edge route sends allowed crawlers straight to the backend" \
-  grep -qxF "    \"~*(?:${ANUBIS_GOOD_UA_RE})\" anubis_backend;" "$TMP/anubis/anubis-common.conf"
-check "the edge route leaves AI crawlers to Anubis (DENY)" \
-  grep -qxF "    \"~*(?:${ANUBIS_AI_UA_RE})\"   anubis;" "$TMP/anubis/anubis-common.conf"
-check "the edge route leaves browsers and an empty User-Agent to Anubis" \
-  bash -c 'grep -qxF "    \"~Mozilla\"                   anubis;" "$1" && grep -qxF "    \"\"                           anubis;" "$1"' _ "$TMP/anubis/anubis-common.conf"
-check "the edge route keeps the default-allow of the policy" \
-  grep -qxF '    default                      anubis_backend;' "$TMP/anubis/anubis-common.conf"
-check "Anubis endpoints always reach Anubis" \
-  grep -qxF '    "~^/\.within\.website/"    anubis;' "$TMP/anubis/anubis-common.conf"
-check "the good-crawler rule precedes the AI rule in the edge route (policy order)" \
-  test "$(grep -n 'anubis_backend;$' "$TMP/anubis/anubis-common.conf" | sed -n 2p | cut -d: -f1)" -lt \
-       "$(grep -n '~\*(?:GPTBot' "$TMP/anubis/anubis-common.conf" | cut -d: -f1)"
-# Pass-cookie edge check: only when njs is active, browsers go through the
-# njs route; the key file is root-only; opting out removes every piece.
-ANUBIS_PASS_ACTIVE=1
-anubis_write_common
-check "with the njs check active, browsers take the pass-cookie route" \
-  bash -c 'grep -qxF "    \"~Mozilla\"                   \$anubis_pass_route;" "$1" && grep -qxF "js_set \$anubis_pass_route anubis_pass.route;" "$1"' _ "$TMP/anubis/anubis-common.conf"
-check "an empty User-Agent never takes the pass-cookie route" \
-  grep -qxF '    ""                           anubis;' "$TMP/anubis/anubis-common.conf"
-ANUBIS_PASS_ACTIVE=0
-(
-  ANUBIS_ENV="$TMP/anubis/pe.env" ANUBIS_POLICY="$TMP/anubis/pe.yaml"
-  ANUBIS_NJS_DIR="$TMP/anubis/njs" ANUBIS_PASS_JS="$TMP/anubis/njs/anubis_pass.js"
-  ANUBIS_PASS_KEY="$TMP/anubis/key/pass-key.conf" ANUBIS_NJS_LOAD="$TMP/anubis/me/60-anubis-njs.conf"
-  echo "HS512_SECRET=$(printf 'a%.0s' {1..128})" > "$ANUBIS_ENV"; : > "$ANUBIS_POLICY"
-  pkg_ok() { return 0; }; chown() { :; }
-  anubis_write_pass_edge
-  printf '%s %s %s\n' "$ANUBIS_PASS_ACTIVE" "$(stat -c %a "$ANUBIS_PASS_KEY")" \
-    "$(grep -c 'js_var \$anubis_pass_key a\{128\};' "$ANUBIS_PASS_KEY")" > "$TMP/anubis/pe.on"
-  ANUBIS_PASS_EDGE=0 anubis_write_pass_edge
-  printf '%s %s\n' "$ANUBIS_PASS_ACTIVE" "$(ls "$TMP/anubis/njs" "$ANUBIS_PASS_KEY" "$ANUBIS_NJS_LOAD" 2>/dev/null | wc -l)" > "$TMP/anubis/pe.off"
-)
-check "the pass-cookie key file is root-only and holds the Anubis secret" \
-  test "$(cat "$TMP/anubis/pe.on")" = "1 600 1"
-check "SETUP_ANUBIS_PASS_EDGE=0 removes the njs check" \
-  test "$(cat "$TMP/anubis/pe.off")" = "0 0"
-check "the njs check falls back to Anubis on anything unexpected" \
-  test "$(anubis_pass_js | grep -o "return 'anubis';" | wc -l)" -eq 11
-ANUBIS_POLICY="$TMP/anubis/botPolicies.yaml"
-anubis_write_policy >/dev/null 2>&1 || true
-check "the policy uses the same crawler patterns as the edge route" \
-  bash -c 'grep -qxF "    user_agent_regex: (?i)($2)" "$1" && grep -qxF "    user_agent_regex: (?i)($3)" "$1"' \
-  _ "$TMP/anubis/botPolicies.yaml" "$ANUBIS_GOOD_UA_RE" "$ANUBIS_AI_UA_RE"
-check "the policy still ends with the browser challenge" \
-  bash -c 'tail -n 3 "$1" | grep -qx "    user_agent_regex: Mozilla"' _ "$TMP/anubis/botPolicies.yaml"
-ANUBIS_POLICY=/etc/anubis/botPolicies.yaml
-ANUBIS_COMMON=/etc/angie/conf.d/00-anubis-common.conf
-
-# The backend socket is created 0777, so the directory is the access control.
-ANUBIS_TMPFILES="$TMP/anubis/tmpfiles.conf"
-anubis_write_tmpfiles
-check "the backend socket directory is private to root and anubis" \
-  grep -qx 'd /run/angie 0750 root anubis -' "$TMP/anubis/tmpfiles.conf"
-ANUBIS_TMPFILES=/etc/tmpfiles.d/angie-anubis.conf
-
-# A vhost whose certificate comes from an http-level include has no
-# ssl_certificate line; the terminator must fall back to the default
-# certificate instead of leaving the site without a public listener.
-cat > "$TMP/anubis/conf.d/nocert.test.conf" <<'EOF'
-server {
-    listen 443 ssl;
-    server_name nocert.test;
-}
-EOF
-anubis_integrate_vhost "$TMP/anubis/conf.d/nocert.test.conf"
-anubis_render_terminators "$TMP/anubis/conf.d" "$TMP/anubis/terminators2.conf"
-check "a vhost without a local certificate uses the default one" \
-  grep -q 'ssl_certificate     /etc/angie/ssl/default/fullchain.pem;' "$TMP/anubis/terminators2.conf"
-check "the default-certificate fallback is reported" \
-  grep -q 'no ssl_certificate in the vhost, using the default certificate' "$TMP/anubis/terminators2.conf"
-
-# ---------------------------------------------------------------------------
-# Anubis runtime profile is hardware-derived
-# ---------------------------------------------------------------------------
-# The proxy must not carry values sized for one machine: GOMAXPROCS follows
-# the core count (capped at the measured plateau), GOGC/GOMEMLIMIT follow RAM,
-# and the fd ceiling follows cores.
-check "Anubis GOMAXPROCS on 1 CPU" test "$(anubis_gomaxprocs 1)" = 1
-check "Anubis GOMAXPROCS on 2 CPUs" test "$(anubis_gomaxprocs 2)" = 2
-check "Anubis GOMAXPROCS on 4 CPUs" test "$(anubis_gomaxprocs 4)" = 4
-check "Anubis GOMAXPROCS on 8 CPUs" test "$(anubis_gomaxprocs 8)" = 8
-check "Anubis GOMAXPROCS caps at 8 on 16 CPUs" test "$(anubis_gomaxprocs 16)" = 8
-check "Anubis GOMAXPROCS caps at 8 on 32 CPUs" test "$(anubis_gomaxprocs 32)" = 8
-check "Anubis GOMAXPROCS caps at 8 on 64 CPUs" test "$(anubis_gomaxprocs 64)" = 8
-check "Anubis GOGC keeps the default on 2 GB" test "$(anubis_gogc 2048)" = 100
-check "Anubis GOGC on 4 GB" test "$(anubis_gogc 4096)" = 200
-check "Anubis GOGC on 8 GB" test "$(anubis_gogc 8192)" = 300
-check "Anubis GOGC on 16 GB" test "$(anubis_gogc 16384)" = off
-check "Anubis GOGC on 64 GB" test "$(anubis_gogc 65536)" = off
-check "Anubis GOMEMLIMIT floors at 256 MiB on 1 GB" test "$(anubis_memlimit_mb 1024)" = 256
-check "Anubis GOMEMLIMIT on 4 GB" test "$(anubis_memlimit_mb 4096)" = 512
-check "Anubis GOMEMLIMIT on 8 GB" test "$(anubis_memlimit_mb 8192)" = 1024
-check "Anubis GOMEMLIMIT on 16 GB" test "$(anubis_memlimit_mb 16384)" = 2048
-check "Anubis GOMEMLIMIT caps at 2 GiB on 64 GB" test "$(anubis_memlimit_mb 65536)" = 2048
-check "Anubis LimitNOFILE floors on 1 CPU" test "$(anubis_nofile 1)" = 16384
-check "Anubis LimitNOFILE on 8 CPUs" test "$(anubis_nofile 8)" = 32768
-check "Anubis LimitNOFILE on 16 CPUs" test "$(anubis_nofile 16)" = 65536
-check "Anubis LimitNOFILE caps on 64 CPUs" test "$(anubis_nofile 64)" = 131072
-check "Anubis rejects a non-numeric CPU count" test "$(anubis_gomaxprocs bogus)" = 1
-check "Anubis rejects a non-numeric RAM value" test "$(anubis_gogc bogus)" = 100
-
-# The generated unit must carry the same values for a simulated host.  Run in
-# a subshell so the stubs do not leak into other checks.
-unit_profile=$( (
-  ANUBIS_UNIT="$TMP/anubis-generated.service"
-  effective_cpus() { printf '32'; }
-  mem_total_mb() { printf '65536'; }
-  # Earlier checks leave a systemctl stub that expects arguments; the writer
-  # only needs a no-op here.
-  systemctl() { :; }
-  anubis_write_unit >/dev/null 2>&1 || true
-  grep -hE '^(Environment=(GOGC|GOMEMLIMIT|GOMAXPROCS)|LimitNOFILE)=' "$ANUBIS_UNIT" 2>/dev/null | paste -sd' ' -
-) )
-check "the generated Anubis unit carries the 32 CPU / 64 GB profile" \
-  test "$unit_profile" = "LimitNOFILE=131072 Environment=GOGC=off Environment=GOMEMLIMIT=2048MiB Environment=GOMAXPROCS=8"
-
-unit_profile_small=$( (
-  ANUBIS_UNIT="$TMP/anubis-generated-small.service"
-  effective_cpus() { printf '2'; }
-  mem_total_mb() { printf '2048'; }
-  systemctl() { :; }
-  anubis_write_unit >/dev/null 2>&1 || true
-  grep -hE '^(Environment=(GOGC|GOMEMLIMIT|GOMAXPROCS)|LimitNOFILE)=' "$ANUBIS_UNIT" 2>/dev/null | paste -sd' ' -
-) )
-check "the generated Anubis unit carries the 2 CPU / 2 GB profile" \
-  test "$unit_profile_small" = "LimitNOFILE=16384 Environment=GOGC=100 Environment=GOMEMLIMIT=256MiB Environment=GOMAXPROCS=2"
-
-check "the Anubis unit keeps the filter in its own group with a 0750 runtime dir" \
-  grep -qx 'Group=anubis' "$TMP/anubis-generated.service" \
-  && grep -qx 'RuntimeDirectoryMode=0750' "$TMP/anubis-generated.service"
-
-# ---------------------------------------------------------------------------
-# Anubis own-page language (Thai catalogue panics -> 502)
-# ---------------------------------------------------------------------------
-unset SETUP_ANUBIS_LANGUAGE
-check "Anubis forces English when no language is requested" \
-  test "$(anubis_forced_language)" = en
-check "Anubis accepts a complete locale override" \
-  test "$(SETUP_ANUBIS_LANGUAGE=pt-BR anubis_forced_language)" = pt-BR
-check "Anubis rejects an invalid language override" \
-  test "$(SETUP_ANUBIS_LANGUAGE='th;rm -rf /' anubis_forced_language)" = en
-en_body=$(sed -n '/^anubis_write_env()/,/^}/p' "$ALL_SRC")
-check "the managed Anubis env pins FORCED_LANGUAGE" \
-  grep -q '^FORCED_LANGUAGE=$(anubis_forced_language)$' <<<"$en_body"
-
-# An outer-perimeter guard cannot pass over the Anubis socket: disable it.
-guard_vhost="$TMP/vhost-guard.conf"
-cat > "$guard_vhost" <<'EOF'
-server {
-    listen unix:/run/angie/anubis-backend.sock;
-    set_real_ip_from unix:;
-    real_ip_header X-Real-IP;
-    server_name site-e.example;
-    root /var/www/site-e.example/public;
-    set_real_ip_from 203.0.113.23;
-    real_ip_recursive on;
-    if ($realip_remote_addr != "203.0.113.23") { return 444; }
-    location / { index index.php; }
-}
-EOF
-anubis_disable_realip_guards "$guard_vhost" >/dev/null 2>&1
-check "an outer realip 444 guard is commented out" \
-  grep -q '^#    if ($realip_remote_addr' "$guard_vhost"
-check "the rest of the vhost is preserved" \
-  grep -q '^    root /var/www/site-e.example/public;' "$guard_vhost"
-check "a commented guard is not re-commented" \
-  test "$(grep -c 'realip_remote_addr' "$guard_vhost")" -eq 1
-
-multiline_vhost="$TMP/vhost-guard-multi.conf"
-cat > "$multiline_vhost" <<'EOF'
-server {
-    server_name site-f.example;
-    if ($realip_remote_addr != "203.0.113.23") {
-        return 444;
-    }
-    location / { return 200; }
-}
-EOF
-anubis_disable_realip_guards "$multiline_vhost" >/dev/null 2>&1
-check "a multi-line realip guard is disabled as a block" \
-  bash -c '! grep -qE "^(if|[[:space:]]*return 444)" "$1"' _ "$multiline_vhost"
-check "the directive after a multi-line guard survives" \
-  grep -q 'location / { return 200; }' "$multiline_vhost"
-# --- audit 1.21.58: anubis
-
-# The origin lockdown commented out of the socket-side vhost must come back on
-# the public terminator, or an origin that only accepts its edge proxy answers
-# anyone on 443 once Anubis is on.  Only guards this module commented (marked,
-# or live in the pre-integration copy) are carried; a guard the operator
-# commented by hand, a location-level guard, and a commented block whose
-# braces never close are not.
-mkdir -p "$TMP/anubis/lock" "$ANUBIS_STATE/vhosts"
-cat > "$TMP/anubis/lock/lock.test.conf" <<EOF2
-server {
-    listen unix:${ANUBIS_BACKEND_SOCKET};
-    server_name site-g.example;
-    ssl_certificate     /etc/angie/ssl/site-g.example/fullchain.pem;
-    ssl_certificate_key /etc/angie/ssl/site-g.example/privkey.pem;
-    if (\$realip_remote_addr != "203.0.113.23") {
-        return 444;
-    }
-    location /admin {
-        if (\$realip_remote_addr != "203.0.113.7") { return 403; }
-    }
-    root /var/www/site-g.example/public;
-}
-EOF2
-cat > "$TMP/anubis/lock/open.test.conf" <<EOF2
-server {
-    listen unix:${ANUBIS_BACKEND_SOCKET};
-    server_name site-h.example;
-    ssl_certificate     /etc/angie/ssl/site-h.example/fullchain.pem;
-    ssl_certificate_key /etc/angie/ssl/site-h.example/privkey.pem;
-    root /var/www/site-h.example/public;
-}
-EOF2
-anubis_disable_realip_guards "$TMP/anubis/lock/lock.test.conf" >/dev/null 2>&1
-anubis_render_terminators "$TMP/anubis/lock" "$TMP/anubis/lock-terminators.conf"
-lock_term=$(sed -n '/server_name site-g.example;/,/^}/p' "$TMP/anubis/lock-terminators.conf")
-open_term=$(sed -n '/server_name site-h.example;/,/^}/p' "$TMP/anubis/lock-terminators.conf")
-check "the socket-side vhost keeps its realip guard commented" \
-  grep -q '^#    if ($realip_remote_addr != "203.0.113.23") {' "$TMP/anubis/lock/lock.test.conf"
-check "the commented guard carries the setup.sh mark" \
-  grep -qF "#    if (\$realip_remote_addr != \"203.0.113.23\") {${ANUBIS_GUARD_MARK}" "$TMP/anubis/lock/lock.test.conf"
-check "the terminator re-applies the vhost's edge-proxy guard" \
-  bash -c 'printf "%s\n" "$1" | grep -qxF "    if (\$realip_remote_addr != \"203.0.113.23\") {" && printf "%s\n" "$1" | grep -qxF "        return 444;"' _ "$lock_term"
-check "the carried guard precedes every terminator location" \
-  bash -c 'g=$(printf "%s\n" "$1" | grep -n "realip_remote_addr" | head -1 | cut -d: -f1); l=$(printf "%s\n" "$1" | grep -n "location " | head -1 | cut -d: -f1); [[ -n $g && -n $l ]] && (( g < l ))' _ "$lock_term"
-check "a location-level realip guard is not lifted to the terminator" \
-  bash -c '! printf "%s\n" "$1" | grep -q "203.0.113.7"' _ "$lock_term"
-check "a vhost without a guard gets none on its terminator" \
-  bash -c '! printf "%s\n" "$1" | grep -q "realip_remote_addr"' _ "$open_term"
-check "every terminator server block balances its braces" \
-  awk '{ t = $0; sub(/#.*/, "", t); o = gsub(/{/, "{", t); c = gsub(/}/, "}", t); d += o - c; if (d < 0) exit 1 } END { exit d != 0 }' "$TMP/anubis/lock-terminators.conf"
-lock_md5=$(md5sum < "$TMP/anubis/lock-terminators.conf")
-anubis_render_terminators "$TMP/anubis/lock" "$TMP/anubis/lock-terminators.conf"
-check "re-rendering keeps exactly one carried guard" \
-  test "$lock_md5" = "$(md5sum < "$TMP/anubis/lock-terminators.conf")"
-
-# Turning the filter off without the pre-integration copy puts the moved
-# guard back in force on the public listener.
-cp "$TMP/anubis/lock/lock.test.conf" "$TMP/anubis/lock-deint.conf"
-anubis_deintegrate_vhost "$TMP/anubis/lock-deint.conf" >/dev/null 2>&1
-check "deintegration re-applies the moved edge-proxy guard" \
-  bash -c 'grep -qxF "    if (\$realip_remote_addr != \"203.0.113.23\") {" "$1" && grep -qx "        return 444;" "$1" && grep -qx "    }" "$1"' _ "$TMP/anubis/lock-deint.conf"
-check "deintegration re-applies the location-level guard in place" \
-  grep -qxF "        if (\$realip_remote_addr != \"203.0.113.7\") { return 403; }" "$TMP/anubis/lock-deint.conf"
-check "deintegration leaves no setup.sh guard mark behind" \
-  bash -c '! grep -qF "$2" "$1"' _ "$TMP/anubis/lock-deint.conf" "$ANUBIS_GUARD_MARK"
-
-# A guard the operator retired by hand (no mark, commented in the
-# pre-integration copy too) must stay retired: re-applying it at the public
-# listener would 444 every visitor, the current edge included.
-cat > "$TMP/anubis/lock/lock.test.conf" <<EOF2
-server {
-    listen unix:${ANUBIS_BACKEND_SOCKET};
-    server_name site-g.example;
-    ssl_certificate     /etc/angie/ssl/site-g.example/fullchain.pem;
-    ssl_certificate_key /etc/angie/ssl/site-g.example/privkey.pem;
-#if (\$realip_remote_addr != "203.0.113.9") { return 444; }
-    root /var/www/site-g.example/public;
-}
-EOF2
-sed -e "s#listen unix:${ANUBIS_BACKEND_SOCKET};#listen 443 ssl;#" \
-  "$TMP/anubis/lock/lock.test.conf" > "$ANUBIS_STATE/vhosts/lock.test.conf.orig"
-anubis_render_terminators "$TMP/anubis/lock" "$TMP/anubis/lock-terminators.conf"
-check "a guard commented by hand is not re-applied on the terminator" \
-  bash -c '! grep -q "realip_remote_addr" "$1"' _ "$TMP/anubis/lock-terminators.conf"
-cp "$TMP/anubis/lock/lock.test.conf" "$TMP/anubis/lock-deint.conf"
-anubis_deintegrate_vhost "$TMP/anubis/lock-deint.conf" >/dev/null 2>&1
-check "a guard commented by hand stays commented after deintegration" \
-  grep -qxF "#if (\$realip_remote_addr != \"203.0.113.9\") { return 444; }" "$TMP/anubis/lock-deint.conf"
-
-# A host enabled by a release that did not mark the guard: the guard that
-# was live in the pre-integration copy is still recognised and carried.
-cat > "$ANUBIS_STATE/vhosts/lock.test.conf.orig" <<EOF2
-server {
-    listen 443 ssl;
-    server_name site-g.example;
-    if (\$realip_remote_addr != "203.0.113.23") { return 444; }
-    root /var/www/site-g.example/public;
-}
-EOF2
-cat > "$TMP/anubis/lock/lock.test.conf" <<EOF2
-server {
-    listen unix:${ANUBIS_BACKEND_SOCKET};
-    server_name site-g.example;
-    ssl_certificate     /etc/angie/ssl/site-g.example/fullchain.pem;
-    ssl_certificate_key /etc/angie/ssl/site-g.example/privkey.pem;
-#    if (\$realip_remote_addr != "203.0.113.23") { return 444; }
-    root /var/www/site-g.example/public;
-}
-EOF2
-anubis_render_terminators "$TMP/anubis/lock" "$TMP/anubis/lock-terminators.conf"
-check "an unmarked guard that was live before Anubis is carried (older release)" \
-  grep -qxF "    if (\$realip_remote_addr != \"203.0.113.23\") { return 444; }" "$TMP/anubis/lock-terminators.conf"
-rm -f "$ANUBIS_STATE/vhosts/lock.test.conf.orig"
-
-cat > "$TMP/anubis/lock/lock.test.conf" <<EOF2
-server {
-    listen unix:${ANUBIS_BACKEND_SOCKET};
-    server_name site-g.example;
-    ssl_certificate     /etc/angie/ssl/site-g.example/fullchain.pem;
-    ssl_certificate_key /etc/angie/ssl/site-g.example/privkey.pem;
-#    if (\$realip_remote_addr != "203.0.113.23") {${ANUBIS_GUARD_MARK}
-#        return 444;
-    root /var/www/site-g.example/public;
-}
-EOF2
-anubis_render_terminators "$TMP/anubis/lock" "$TMP/anubis/lock-terminators.conf"
-check "a commented guard with unbalanced braces is not half-emitted" \
-  bash -c '! grep -q "realip_remote_addr" "$1"' _ "$TMP/anubis/lock-terminators.conf"
-cp "$TMP/anubis/lock/lock.test.conf" "$TMP/anubis/lock-deint.conf"
-anubis_deintegrate_vhost "$TMP/anubis/lock-deint.conf" >/dev/null 2>&1
-check "deintegration keeps an unbalanced commented guard commented" \
-  bash -c '! grep -q "^[[:space:]]*if (\$realip_remote_addr" "$1" && grep -q "^#        return 444;" "$1"' _ "$TMP/anubis/lock-deint.conf"
 
 # ---------------------------------------------------------------------------
 # --basic upgrade: needrestart runs after the upgrade, not from its APT hook
@@ -6429,12 +5839,12 @@ check "--purge basic removes the mitigations drop-in" \
 check "--purge basic clears the CPU_MITIGATIONS pin" \
   bash -c 'sed -n "/^purge_basic()/,/^}/p" "$1" | grep -q "^[[:space:]]*purge_cpu_mitigations_pin"' _ "$ROOT/lib/purge.sh"
 mkdir -p "$TMP/mitpin"
-printf 'ANUBIS="1"\nCPU_MITIGATIONS="off"\nexport CPU_MITIGATIONS=off\nNODE_MAJOR="22"\n' > "$TMP/mitpin/setup-tuning"
+printf 'NODE_ALLOW_MAJOR_UPGRADE="1"\nCPU_MITIGATIONS="off"\nexport CPU_MITIGATIONS=off\nNODE_MAJOR="22"\n' > "$TMP/mitpin/setup-tuning"
 mitpin_out=$( (info() { :; }; warn() { :; }; CPU_MITIGATIONS=off; purge_cpu_mitigations_pin "$TMP/mitpin/setup-tuning"; printf '%s' "$CPU_MITIGATIONS") )
 check "the CPU_MITIGATIONS pin (plain and export form) is removed" \
   not grep -q CPU_MITIGATIONS "$TMP/mitpin/setup-tuning"
 check "other pins survive the CPU_MITIGATIONS removal" \
-  bash -c 'grep -qx "ANUBIS=\"1\"" "$1" && grep -qx "NODE_MAJOR=\"22\"" "$1"' _ "$TMP/mitpin/setup-tuning"
+  bash -c 'grep -qx "NODE_ALLOW_MAJOR_UPGRADE=\"1\"" "$1" && grep -qx "NODE_MAJOR=\"22\"" "$1"' _ "$TMP/mitpin/setup-tuning"
 check "the running process forgets CPU_MITIGATIONS after the purge" test -z "$mitpin_out"
 # Called in this shell, not via bash -c: the lib functions are sourced, not exported.
 check "clearing the pin without a pin file is a no-op" \
@@ -6958,20 +6368,6 @@ CF_TEST_CODE=200
 cp "$cft/site.conf.in" "$cft/angie/conf.d/site.conf"
 cp "$cft/cfonly.orig" "$cft/angie/conf.d/cfonly.conf"
 
-# With Anubis in place the whole step is skipped; its generated
-# terminators are never migrated on their own either.
-anubis_managed() { return 0; }
-out=$(cloudflare_tls_migrate "$cft/angie" 1)
-check "Anubis managed: the migration is skipped" \
-  bash -c 'grep -q "skipped (the Anubis integration" <<<"$1" && ! grep -q "would point" <<<"$1"' _ "$out"
-unset -f anubis_managed
-anubis_managed() { return 1; }
-cp "$cft/cfonly.orig" "$cft/angie/conf.d/00-anubis-terminators.conf"
-out=$(cloudflare_tls_migrate "$cft/angie" 1)
-check "00-anubis-* files are never migrated" not grep -q '00-anubis' <<<"$out"
-rm -f "$cft/angie/conf.d/00-anubis-terminators.conf"
-unset -f anubis_managed
-
 # CF_SELF_SIGNED=0 leaves every file alone.
 CF_SELF_SIGNED=0 cloudflare_tls_migrate "$cft/angie" 0
 check "CF_SELF_SIGNED=0: no vhost is rewritten" cmp -s "$cft/angie/conf.d/cfonly.conf" "$cft/cfonly.orig"
@@ -7054,11 +6450,11 @@ check "certbot users: a bare LE_DIR=/etc/letsencrypt counts" certbot_users_conta
 printf 'old=/etc/letsencrypt-old/x\n' > "$cft/etc/postfix/compose.yml"
 check "certbot users: /etc/letsencrypt-old is a different path" not certbot_users_contains postfix/compose.yml
 rm -f "$cft/etc/postfix/compose.yml"
-mkdir -p "$cft/state/anubis/vhosts"
-printf 'ssl_certificate /etc/letsencrypt/live/a/fullchain.pem;\n' > "$cft/state/anubis/vhosts/a.conf.orig"
+mkdir -p "$cft/state/kept/vhosts"
+printf 'ssl_certificate /etc/letsencrypt/live/a/fullchain.pem;\n' > "$cft/state/kept/vhosts/a.conf.orig"
 CERTBOT_EXTRA_ROOTS="$cft/state"
-check "certbot users: an Anubis vhost backup in the state tree counts" \
-  certbot_users_contains anubis/vhosts/a.conf.orig
+check "certbot users: a vhost backup in the state tree counts" \
+  certbot_users_contains kept/vhosts/a.conf.orig
 CERTBOT_EXTRA_ROOTS=""
 check "certbot users: the setup.sh state tree is a default root" \
   grep -qF '"${STATE_DIR:-/var/lib/setup.sh}")' "$ROOT/lib/web.sh"
@@ -7315,10 +6711,73 @@ check_tree "guest cache: an unknown cookie beside analytics is a bypass" \
   guest_cookie_unknown '_ga=GA1.1.1.1; sso_token=abc'
 check_tree "guest cache: PHPSESSID is not a page-neutral cookie" \
   guest_cookie_unknown 'PHPSESSID=abc'
-check_tree "guest cache: the Anubis pass cookie is page-neutral" \
-  guest_cookie_allowed 'techaro.lol-anubis-auth-5ab17f3c=eyJhbGci'
-check_tree "guest cache: an unknown cookie beside the Anubis pass still bypasses" \
-  guest_cookie_unknown 'techaro.lol-anubis-auth-5ab17f3c=x; plugin_session=1'
+check_tree "guest cache: a folded PHPSESSID is not page-neutral either" \
+  guest_cookie_unknown 'PHP.SESSID=abc'
+
+# ---------------------------------------------------------------------------
+# Anubis removal (1.21.62)
+# ---------------------------------------------------------------------------
+# The feature is gone; the only traces left must be the guard that explains it
+# and the one-shot teardown tool.  An argument or environment variable that
+# asks for it stops the run instead of silently deploying without a bot filter.
+# Each call runs from $TMP (every invocation writes setup_<stamp>.log to the
+# current directory) and without SETUP_TEST_SOURCE_ONLY, which this suite
+# exports so that sourcing setup.sh here does not run main().
+anubis_msg() {
+  local out
+  out=$(cd "$TMP" && env -u SETUP_TEST_SOURCE_ONLY "$@" 2>&1 || true)
+  grep -q "Anubis support was removed" <<<"$out"
+}
+check "anubis= is rejected with an explanation" \
+  anubis_msg bash "$ROOT/setup.sh" --dry-run --optimize anubis=yes
+check "anubis= is rejected for a fresh install too" \
+  anubis_msg bash "$ROOT/setup.sh" --dry-run --basic --angie anubis=yes
+check "anubis= is rejected after another flag" \
+  anubis_msg bash "$ROOT/setup.sh" --optimize --dry-run anubis=no
+check "SETUP_ANUBIS in the environment is rejected" \
+  anubis_msg env SETUP_ANUBIS=1 bash "$ROOT/setup.sh" --dry-run --optimize
+check "the lib module is gone" test ! -e "$ROOT/lib/anubis.sh"
+check "the teardown tool parses" bash -n "$ROOT/tools/remove-anubis.sh"
+check "the teardown tool refuses to run unprivileged" \
+  grep -q 'EUID == 0' "$ROOT/tools/remove-anubis.sh"
+
+# ---------------------------------------------------------------------------
+# Angie tree: no per-request PCRE hidden in an `if`
+# ---------------------------------------------------------------------------
+# An `if` is only cheap when its condition is a 0/1 variable test: `return`
+# runs in the rewrite phase and a map cannot express "return only when true".
+# A regex or a string comparison in the condition is evaluated for the whole
+# request, so every one of those must be justified.  After 1.21.62 the only
+# remaining tests are the 0/1 flags and one exact-string compare (the
+# Chevereto front-controller redirect), and the sample template.
+check_tree "no regex condition in a shipped if" \
+  bash -c '! grep -rnE "^[[:space:]]*if[[:space:]]*\([^)]*[[:space:]]~" "$1" --include="*.conf" | grep -v "/templates/"' _ "$ANGIE_TREE"
+check_tree "no if evaluates a request header or URI with a pattern" \
+  bash -c '! grep -rnE "^[[:space:]]*if[[:space:]]*\(\\\$[a-z_]+[[:space:]]*[!=~]{1,2}[[:space:]]*[^0-9\"]" "$1" --include="*.conf" | grep -v "/templates/"' _ "$ANGIE_TREE"
+check_tree "the Chevereto redirect is a string compare" \
+  grep -qxF 'if ($request_uri = "$uri$is_args$args") { return 301 /$is_args$args; }' "$ANGIE_TREE/h5bp/php_chev_cache.conf"
+check_tree "the Chevereto redirect carries no regex in the non-cached include" \
+  bash -c '! grep -q "request_uri ~" "$1/h5bp/php_chev.conf"' _ "$ANGIE_TREE"
+check_tree "the dead referer map is gone" \
+  test ! -e "$ANGIE_TREE/http.d/referer_map.conf"
+check_tree "the cookie allowlist no longer names the removed filter" \
+  bash -c '! grep -qi "anubis" "$1/http.d/fastcgi_cache.conf"' _ "$ANGIE_TREE"
+check_tree "no unix: peer is trusted for forwarded headers" \
+  bash -c '! grep -qE "^[[:space:]]*\"unix:" "$1/http.d/https_map.conf"' _ "$ANGIE_TREE"
+
+# A host still behind the filter is detected from the files only the old
+# release generated, and only from those: a hand-installed Anubis never
+# touched the Angie tree and needs no migration.
+rm -rf "$SETUP_STATE_DIR/anubis"
+check "anubis_host_present: a clean host is not detected" not anubis_host_present
+mkdir -p "$SETUP_STATE_DIR/anubis"
+: > "$SETUP_STATE_DIR/anubis/enabled"
+check "anubis_host_present: a managed marker is detected" anubis_host_present
+rm -rf "$SETUP_STATE_DIR/anubis"
+check "--optimize refuses on an Anubis-managed host" \
+  bash -c 'mkdir -p "$2/anubis" && : > "$2/anubis/enabled"; out=$(cd "$3" && env -u SETUP_TEST_SOURCE_ONLY SETUP_STATE_DIR="$2" bash "$1" --dry-run --optimize 2>&1 || true); rm -rf "$2/anubis"; grep -q "tools/remove-anubis.sh" <<<"$out"' _ "$ROOT/setup.sh" "$SETUP_STATE_DIR" "$TMP"
+check "--diagnostics still runs on an Anubis-managed host" \
+  grep -q "! PURGE && ! DIAGNOSTICS" "$ROOT/lib/validate.sh"
 
 printf '\nTOTAL pass=%d fail=%d skip=%d\n' "$PASS" "$FAIL" "$SKIP"
 [[ $FAIL -eq 0 ]]

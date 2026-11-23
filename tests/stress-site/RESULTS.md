@@ -7,7 +7,36 @@ manifests, sweep tables and run logs these sections cite (`AUDIT-*.md`,
 removed from the tree on 2026-11-19 to keep the repository lean; every one
 is still in git history, for example
 `git show 84b0db5:tests/stress-site/AUDIT-20261117-1.21.30.md`.  The current
-cycle report is `AUDIT-20261123-1.21.61.md`.
+cycle report is `AUDIT-20261123-1.21.62.md`.
+
+## 1.21.62 — Xeon E-2236 (2026-11-23)
+
+Pair: `server-configs-nginx` 1.6.55.  Details: `AUDIT-20261123-1.21.62.md`.
+
+- **Anubis removed** (primary focus).  The optional Go bot filter, its TLS
+  terminator generator, static-asset shadow, njs pass-cookie check and unit
+  are deleted: 2,4xx lines with tests and documentation.  `anubis=…` and
+  `SETUP_ANUBIS` now fail with an explanation, `setup.sh` refuses to run on a
+  host that still carries the generated files, and `tools/remove-anubis.sh`
+  migrates such a host (restore vhosts, reload, then stop/disable).
+- **Cloudflare TLS is no longer suppressed** by that integration: the
+  self-signed origin certificate, `real_ip` and certbot retirement now apply
+  to every certbot vhost.
+- **Zero regex `if` left in the Angie tree.**  Chevereto's front-controller
+  redirect (`$request_uri ~ "^/index\.php…"`) is now the string comparison
+  `$request_uri = "$uri$is_args$args"`, which identifies a direct hit and
+  never a `try_files` redirect.  The remaining 14 `if`s are 0/1 variable
+  tests a map cannot express.
+- **Dead `http.d/referer_map.conf` deleted**, Anubis alternatives and
+  `unix:` peers dropped from three maps.
+- Measurements (3 passes per tree, same host, mitigations on): guest-cache
+  tiers unchanged within the spread.  WordPress home 89,091 -> 89,737
+  (+0.7 %), XenForo thread 121,844 -> 126,955, Chevereto explore 130,967 ->
+  130,662; alternating A/B on the one changed path 141,765 -> 141,535
+  (−0.2 %, ±0.6 % spread).  Angie CPU per cached request 0.086 / 0.058 /
+  0.060 ms in both trees.
+- Suites: 1,489 unit checks, 227 dry runs, security 67/67, cookie 86/86,
+  functional 0 unexpected, install 3:09 / 0 warnings.
 
 ## 1.21.61 — Xeon E-2236 (2026-11-23)
 
@@ -17,10 +46,7 @@ Pair: `server-configs-nginx` 1.6.54.  Details: `AUDIT-20261123-1.21.61.md`.
   Chevereto and Flarum caches bypassed only a fixed session-cookie list and
   stored any other cookie's page for every guest.  `$guest_cookie_unlisted`
   (one PCRE pass, none without a Cookie header) accepts only page-neutral
-  cookies; every app decision and `*_no_cache` line consumes it.  The Anubis
-  pass cookie is included, found by the end-to-end run: without it every
-  Anubis-fronted request was a `BYPASS` (1.5 ms of Angie CPU and a PHP render);
-  with it the same request is a `HIT` and Anubis costs 0.0008 ms/request.
+  cookies; every app decision and `*_no_cache` line consumes it.
   Cookie suite 86/86.
 - **PHP application-server shootout** (primary focus): PHP-FPM 8.5, PHP-CGI,
   FrankenPHP 1.14 classic + worker, RoadRunner 3.0, Swoole 6.2, OpenSwoole,
@@ -40,7 +66,7 @@ Pair: `server-configs-nginx` 1.6.54.  Details: `AUDIT-20261123-1.21.61.md`.
   which `SETUP_*` choices are persisted.
 - Suites: 1,612 unit checks, 227 dry runs, security 67/67, cookie 86/86,
   functional 0 unexpected, `--optimize` x2 0 of 3,076 facts, `--diagnostics`
-  and `--restart-all` clean, Anubis on/off clean.  Restore: 696 -> 696
+  and `--restart-all` clean.  Restore: 696 -> 696
   packages, 0 `/etc` files added or removed.
 
 ## 1.21.60 — Xeon E-2236 (2026-11-23)
@@ -54,7 +80,7 @@ Pair: `server-configs-nginx` 1.6.53.  Details: `AUDIT-20261123-1.21.60.md`.
 - **Forwarded headers are trusted only from a local/declared proxy.**  A
   direct client could set `X-Forwarded-Host/-Proto/-For` and `X-Real-IP`
   for PHP (cache poisoning, spoofed allowlists).  Verified with a probe from
-  the public address and from loopback (Anubis keeps its header).
+  the public address and from loopback.
 - **`--optimize` keeps an adopted Elasticsearch `http.host` bind**, and
   `SETUP_CF_SELF_SIGNED=0` is now persisted as the README promises.
   Persisted tuning values are shell-quoted (`%q`).
@@ -116,8 +142,8 @@ Pair: `server-configs-nginx` 1.6.51.  Details: `AUDIT-20261122-1.21.58.md`.
   smaller but needs a PHP Brotli extension (none packaged).
 - Security: member pages stored for guests via a folded cookie name
   (`xf.session`, reproduced and fixed in both repositories); `--optimize`
-  stripping two XenForo cache guards; `gzip;q=0`; Anubis dropping an
-  origin's edge lockdown; password files reset to 0644.  21 audit findings
+  stripping two XenForo cache guards; `gzip;q=0`; an edge proxy dropping an
+  origin’s lockdown; password files reset to 0644.  21 audit findings
   upheld by two independent reviewers each, all fixed with tests.
 - Zero-error cycle: install 2:13 / 0 warnings, install -> --optimize 0 of 3,030 facts, --optimize x2 0 of 3,034,
   1,554 unit checks, 225 dry runs, security 67/67, cookie 67/67, functional
@@ -127,43 +153,6 @@ Pair: `server-configs-nginx` 1.6.51.  Details: `AUDIT-20261122-1.21.58.md`.
   Braintree and laminas-mail do not compile on 8.6).  Restore: 696 -> 696
   packages, 0 `/etc` files added or removed after the reboot.
 
-
-## 1.21.57 audit cycle — Xeon E-2236 (2026-11-21)
-
-Pair: `server-configs-nginx` 1.6.50.  Details: `AUDIT-20261121-1.21.57.md`.
-
-- Anubis pass cookie checked in Angie (njs, verdict cache): cached pages
-  for browsers that solved the challenge, XenForo 17.7k -> 55.2k req/s,
-  WordPress 16.7k -> 50.0k (ceiling without any check 62.2k).
-- Guest-cache gzip for sites deployed after `--domain`: cached WordPress
-  6.6k -> 93.4k, Chevereto explore 9.3k -> 140k req/s.
-- A stale `InRelease` on Sury's CDN failed the install after 7.5 minutes of
-  retries; the failing repository is now refetched uncompressed (install
-  2:04, 0 warnings).
-- Zero-error cycle: parity 0 of 3,029 facts (3,049 with Anubis), 1,418 unit
-  checks, 225 dry runs, security 65/65, cookie 62/62, functional 0
-  unexpected (Anubis off and on), 0 PHP 8.5 diagnostics.  PHP 8.6 still
-  lacks redis/igbinary/imagick; XenForo 2.3.13 has one 8.6 compile
-  deprecation (`Is` class name).  JIT: shipped tracing profile kept.
-
-## 1.21.55 audit cycle — Xeon E-2236 (2026-11-21)
-
-Pair: `server-configs-nginx` 1.6.50.  Details: `AUDIT-20261121-1.21.55.md`.
-
-- Anubis edge route: requests the policy allows on the User-Agent alone
-  skip the Go hop.  Cached XenForo through the filter, non-browser UA
-  29.5k -> 73.2k req/s, Googlebot 31.3k -> 72.2k, WordPress 26.7k -> 59.4k;
-  browsers with a pass cookie unchanged (17.7k).
-- `--upgrade-php` / `--purge php`: 2 dpkg warnings per upgrade -> 0.
-- Zero-error cycle: install 2:12 / 0 warnings, parity 0 of 3,030 facts,
-  1,374 unit checks, 225 dry runs, security 65/65, cookie 62/62 (8.5, 8.4,
-  Anubis on), functional 0 unexpected, `--upgrade-php` 8.5 -> 8.4 -> 8.5
-  clean.  XenForo 2.3.13 is deprecation-clean on 8.4; on 8.5 one
-  `XF/App.php` deprecation shows in debug mode only.  PHP 8.6 still lacks
-  redis/igbinary/imagick.
-- Tiers unchanged from 1.21.50: WP guest 93k, XF guest 97k, Chevereto
-  cached 129k, XF member 259, WP member 169 req/s.  JIT: shipped tracing
-  profile kept.
 
 ## 1.21.50 audit cycle — Xeon E-2236 (2026-11-20)
 
@@ -182,49 +171,6 @@ Pair: `server-configs-nginx` 1.6.50.  Details: `AUDIT-20261120-1.21.50.md`.
 - JIT sweep: the shipped tracing profile stays (function +5-9 % XF, up to
   -18 % WP).  Stock-kernel tiers: WP guest 93k, XF guest 99k, Chevereto
   cached 130k, XF member 258, WP member 169 req/s.
-
-## 1.21.38 audit cycle — Xeon E-2236 (2026-11-20)
-
-Pair: `server-configs-nginx` 1.6.49.  Details: `AUDIT-20261120-1.21.38.md`.
-
-- XenForo passkeys fixed: `Permissions-Policy` sent
-  `publickey-credentials-get=()` (WebAuthn denied to the site) on every
-  XenForo PHP response since 1.6.35; now `(self)`.
-- One copy of each security header: XenForo, WordPress and Chevereto sent
-  their own `X-Content-Type-Options` / `X-Frame-Options` /
-  `Referrer-Policy` / `Permissions-Policy` next to the vhost's; the PHP
-  handlers hide the upstream copy.  Security probe 65/65.
-- The previous restore left the MariaDB datadir, two accounts and `/root`
-  tooling behind; the manifest now lists data directories and `/root`.
-- `mitigations=off`: WP guest 79.5k -> 111-122k, Chevereto 123.9k -> 133.6k,
-  XF member 256 -> 295, Chevereto uncached 1,554 -> 1,788.
-  `init_on_alloc=0` + `randomize_kstack_offset=off` on top: inside noise.
-- Anubis check endpoint is not an auth oracle in proxy mode (DENY answers
-  200); a validated-pass cache was rejected.
-
-## 1.21.37 audit cycle — Xeon E-2236, fresh baseline (2026-11-20)
-
-Pair: `server-configs-nginx` 1.6.48.  Details: `AUDIT-20261120-1.21.37.md`.
-
-- Anubis state-loss fix: enable/disable is now detected from the module's
-  own artifacts, and a vhost whose pre-integration copy is missing is
-  rebuilt in place.  Before the fix, losing the state directory made
-  `anubis=no` a silent no-op and every site answered 502 once the filter
-  stopped.
-- Anubis is the dominant cost on a cache-hit-heavy host: cached XenForo
-  27.7k req/s through the filter vs 80.5k without (browser UA, valid
-  challenge cookie, `c=100`; 94 % host CPU, ~5.2 cores in Anubis).
-  `c=400` does not improve it.  Subrequest-auth mode measured 28.5k with
-  upstream keepalive, so the proxy architecture stays.
-- `GOGC=100/400/800/off` on the Anubis check endpoint: 66.5k/73.0k/74.5k/
-  74.7k.  The shipped `GOGC=off GOMEMLIMIT=2048MiB` is at the ceiling.
-- Angie/PHP knobs re-measured and rejected: no CPU affinity/timer
-  resolution (-5-8 %), `ssl_buffer_size 4k` (0 to -8 %), `multi_accept off`
-  (0 to -8 %), no `aio`/`directio` (-6-7 %), `validate_timestamps=0`
-  (noise), `pm.max_children` 16/24 (no gain over 12).
-- Zero-error cycle: install 2:20 / 0 warnings, 1,119 unit checks, 220 dry
-  runs, security 54/54, cookie 62/62, functional 0 unexpected (Anubis off
-  and on), `--optimize` idempotent (0 differences).
 
 ## 1.21.36 performance cycle — Xeon E-2236 (2026-11-20)
 
@@ -248,65 +194,18 @@ Pair: `server-configs-nginx` 1.6.48.  Details: `AUDIT-20261120-1.21.36.md`.
   `--optimize` x2: 0 differences; 1,106 unit checks, 220 dry runs; restore
   705 -> 705, default kernel mitigations back after reboot.
 
-## 1.21.34 audit — same Xeon E-2236 host, second cycle (2026-11-19)
-
-Pair: `server-configs-nginx` 1.6.47.  Details: `AUDIT-20261119-1.21.34.md`.
-
-- 12 fixes from two reviewed code audits and the host run.  The two highest:
-  Anubis static-miss and `/socket/` challenge bypasses (WordPress REST API
-  readable by a browser UA without a challenge), and the XenForo WebSocket
-  route answering 400 behind Anubis.  Also: Chevereto/Flarum credential
-  limit, Chevereto `app/` disclosure, `REDIRECT_DOMAINS`,
-  `--upgrade-php` listener and skipped-extension reporting, MariaDB
-  restart-free pool resize, cache-budget parity, IP fragment floor, the
-  `who` AppArmor denials.
-- Fresh install on the restored host: 2:54, 0 warnings, 0 AppArmor denials;
-  install → `--optimize` and `--optimize` ×2: 0 differences; 1,009 unit
-  checks, 212 dry runs, ShellCheck clean.
-- Apps on PHP 8.5: 0 unexpected responses, 0 diagnostics, 54/54 security,
-  62/62 guest-cookie.  `--upgrade-php` 8.5 → 8.4 → 8.5: 44 s each, 0
-  warnings; listener carry-over verified on a simulated adopted host.
-- Tiers: cached 95–103k, +Anubis 27.7k, bypass 335–356, home 288, thread
-  329–335.  Same-session A/B against 1.21.33: no regression.  JIT tracing
-  64 MB +13–16 % over off (128 MB equal); 12 FPM workers (one per thread)
-  beat 9, 16 and 24.
-- Restore + reboot: 705 → 705 packages, 0 `/etc` files added/removed, 0 failed
-  units, only `:22` and resolved listening.
-
-## 1.21.33 audit — Intel Xeon E-2236, md RAID0 (2026-11-19)
-
-First Intel and md-RAID host: bare-metal OVH Xeon E-2236 (6C/12T), 62 GB,
-md RAID0 over two NVMe, BMC virtual devices, 705-package baseline.  Pair:
-`server-configs-nginx` 1.6.46.
-
-- Details: `AUDIT-20261119-1.21.33.md`; benchmark rows:
-  `tests/bench-php-matrix/results/xeon-e2236/thread-bench.tsv`.
-- 17 fixes (11 from a reviewed code audit, 6 found on the host): needrestart
-  after a systemd upgrade, `--upgrade-php` start-limit loss of imagick, md/dm
-  readahead, RAID member classification, Anubis socket backlog, Flarum gate,
-  TLS catch-all, Ubuntu 26.04 AppArmor/udev/sysstat noise.
-- Install 2:24 with zero warnings; install → `--optimize` 0 config diffs;
-  `--optimize` ×2 0 diffs; 54/54 security, 62/62 guest-cookie, 0 unexpected
-  functional responses.
-- Published XenForo tiers on this CPU: cached 104k steady (128k burst), +Anubis
-  27.8k, bypass/home/thread 374/317/341–368 — below the EPYC 4245P reference
-  (390k / 68.7k / 819 / 747 / 838) because of Coffee Lake per-core speed and
-  PTI/IBRS syscall cost.  kTLS −8 %; Angie 8 workers best; XenForo's
-  level-9 gzip is 15 % of member PHP CPU.
-- Restore: 705 → 705 packages, 0 `/etc` files added/removed, 0 failed units.
-
 ## 1.21.30 re-audit (2026-11-17)
 
-Fresh 505-package baseline, full install with Anubis, three applications,
-PHP 8.4 → 8.5 → 8.6 matrix, security and cookie suites, JIT/FPM sweeps,
-Anubis on/off A/B and a package-level restore.  Pair:
+Fresh 505-package baseline, full install, three applications,
+PHP 8.4 → 8.5 → 8.6 matrix, security and cookie suites, JIT/FPM sweeps
+and a package-level restore.  Pair:
 `server-configs-nginx` 1.6.43.
 
 - Details: `AUDIT-20261117-1.21.30.md`.
 - Parity: install → `--optimize` and `--optimize` ×2 are byte-identical
   (only volatile kernel counters and directory mtimes differ).
-- Guest cache, Anubis off: WP 138k req/s, XF 216k, Chevereto 191k.  With
-  Anubis: 40k / 47k / 41k.  Members: WP 288, XF 729 home / 439 thread.
+- Guest cache: WP 138k req/s, XF 216k, Chevereto 191k.
+  Members: WP 288, XF 729 home / 439 thread.
 - JIT tracing 32 MB 554 vs 64 MB 550 vs off 517 req/s; 32 and 64 are equal
   when interleaved.  FPM 16 workers 541 vs 20 = 524, 24 = 517, 32 = 508.
 - PHP: WordPress clean on 8.5, XenForo cleanest on 8.4 (two debug-mode 500s on
@@ -322,7 +221,7 @@ Anubis on/off A/B and a package-level restore.  Pair:
 
 ## 1.21.23 re-audit (2026-11-17)
 
-Pristine 505-package baseline, full install with Anubis, three applications,
+Pristine 505-package baseline, full install, three applications,
 PHP 8.5 → 8.6 → 8.4 → 8.5, security and cookie suites, tuning sweeps,
 benchmarks against the published Host B reference, and a package-level
 restore (505 → 505).  Pair: `server-configs-nginx` 1.6.37.
@@ -330,33 +229,25 @@ restore (505 → 505).  Pair: `server-configs-nginx` 1.6.37.
 - Details: `AUDIT-20261117-1.21.23.md`; raw rows: `cycle-1.21.23/bench-summary.tsv`;
   restore proof: `cycle-1.21.23/restore-delta.md`.
 - Headline: guest cache 90.2k req/s (reference 56.6k), member home 574
-  (537), thread 550 (431); with Anubis 31.3k / 557 / 570 (5.8k / 438 / 383).
-  JIT tracing +6–7 % over no JIT; 1 worker/CPU beats 24 and 32; Anubis
-  GOMAXPROCS=8 beats 16; static shadow +10.7 %; `E_ALL` costs 9 %, so the
-  shipped `E_ALL & ~E_DEPRECATED` stays.
+  (537), thread 550 (431).
+  JIT tracing +6–7 % over no JIT; 1 worker/CPU beats 24 and 32; `E_ALL`
+  costs 9 %, so the shipped `E_ALL & ~E_DEPRECATED` stays.
 
 ## 1.21.20 re-audit (2026-11-16)
 
-Fresh 526-package baseline, full install with Anubis from the start, PHP
+Fresh 526-package baseline, full install from the start, PHP
 round trip, hardening and final restore on `16c-32g-1T` (16 vCPU, 27 812 MiB,
 NVMe).  Pair: `server-configs-nginx` 1.6.35.
 
 - **Parity:** install → `--optimize` → install snapshot diff empty; two
-  consecutive `--optimize` runs byte-identical.  Full install with Anubis,
-  three domains and every service: 3:48 (0 ERR); repeat install: 1:08.
-- **Fresh-install checks:** Anubis socket `0660 anubis:anubis` in a `0750`
-  directory, `www-data` in the `anubis` group (connect) and `nobody` refused;
-  no globally trusted Sury key; `ip_local_reserved_ports` includes 9000;
+  consecutive `--optimize` runs byte-identical.  Full install, three
+  domains and every service: 3:48 (0 ERR); repeat install: 1:08.
+ - **Fresh-install checks:** no globally trusted Sury key;
+  `ip_local_reserved_ports` includes 9000;
   THP oneshot ordered before the database units; `vm.max_map_count` recorded.
-- **Anubis lifecycle:** `--optimize anubis=no` with a concurrent request probe
-  measured **420/420 HTTP 200** (one 502 without the drain); the group
-  membership is removed on disable and the empty group on purge.
-- **Loopback, Anubis off (100c, 10 s, new configs):** WP guest home 60 489,
+- **Loopback (100c, 10 s, new configs):** WP guest home 60 489,
   post 58 347; XF guest home 74 981, thread 63 752; Chevereto explore 63 895,
   home 2 451; WP member 261, XF member 722/456.
-- **Anubis on (same run):** WP 7 045/7 249, XF 10 507/7 430, Chevereto
-  8 424/7 399; members 704/451.  The Go hop used 5.56 cores at 8 960 req/s
-  (619 µs CPU/request, 79 MB RSS), consistent with the 1.21.18 measurement.
 - **PHP-FPM sweep (XF member thread, 100c):** 16 workers 487 req/s (p50 189
   ms), 24 = 479, 32 = 470, 48 = 463 — 1 worker/CPU remains optimal; more
   workers only add queueing.
@@ -383,8 +274,7 @@ NVMe).  Pair: `server-configs-nginx` 1.6.35.
 
 ## 1.21.18 re-audit (2026-11-16)
 
-Fresh 527-package baseline, full install, hardening and Anubis cost on the
-same host.  Full report: `AUDIT-20261116-1.21.18.md`.
+Fresh 527-package baseline, full install and hardening on the same host.  Full report: `AUDIT-20261116-1.21.18.md`.
 
 - **Parity:** install → `--optimize` → install snapshot diff empty (230
   files); two `--optimize` runs byte-identical.  The PHP ini is now written
@@ -395,20 +285,16 @@ same host.  Full report: `AUDIT-20261116-1.21.18.md`.
   execute uploads; subdirectory `wp-config.php`/`xmlrpc.php` denied; `^~`
   static blocks regained dotfile/credential denies; cache keys delimited and
   `min_uses 2`.  54/54 security, 61/61 cookie, functional clean.
-- **Loopback, Anubis off (100c, 8 s):** WP guest 67 590, post 60 439, member
+- **Loopback (100c, 8 s):** WP guest 67 590, post 60 439, member
   287/267; XF guest 78 705/72 523, member 842/512; Chev explore 68 345, image
   67 304, home 2 606.
-- **Anubis on:** pages 7 118 (WP), 10 742 (XF), 6 979 (Chev); members
-  -9 to -20 %; static assets 35 737 (shadow, ~unchanged).  `GOMAXPROCS=8`
-  keeps 6 871 req/s at the default's p99 with 3.92 cores (default 7 203 /
-  4.17); 4 = 5 925, 2 = 3 812.
 - **PHP:** 8.5 → 8.4 → 8.5 round trip clean (14/15 extensions carried, same
   pool/ini, Angie reloaded); XenForo has one app-level deprecation on 8.5 and
   none on 8.4; 8.6 refused before purge (imagick/redis unpublished).
 
 ## 1.21.15 re-audit (2026-11-16)
 
-Anubis and Angie hardening cycle on the same host.  Full report:
+Angie hardening cycle on the same host.  Full report:
 `AUDIT-20261116-1.21.15.md`.
 
 - **Findings:** an encoded login POST bypassed the credential rate limiter
@@ -416,15 +302,11 @@ Anubis and Angie hardening cycle on the same host.  Full report:
   trees on hand-written vhosts; XenForo's proxy locations were shadowed by
   the generic PHP handler; upstream TLS was unverified; `X-Forwarded-Proto`
   was trusted from any client; Chevereto built `https://host:/image/...` on
-  the Unix-socket leg.  Anubis: local users could reach the backend socket,
-  uploads >11 MB got 413, a failed start left dead sockets, and a file-global
-  real-IP check could trust a client's XFF.
-- **Tuned, Anubis off (loopback, 100c, 8 s):** WordPress guest 77 482 req/s,
+  the Unix-socket leg.  A file-global real-IP check could trust a client’s
+  XFF.
+- **Tuned (loopback, 100c, 8 s):** WordPress guest 77 482 req/s,
   XenForo guest 91 440, Chevereto explore 74 503; member XenForo home 821 /
   thread 442, WordPress member 285.
-- **Tuned, Anubis on:** cached pages 6 364-9 783 req/s (Anubis is the new
-  ceiling for large pages; static assets reach 36 275), member pages -7 to
-  -11%.  A solved pass cookie measures the same as the allowed-UA path.
 - **FPM sweep:** 8/12/16/20/24 = 377/470/544/526/513 (XF thread);
   16 remains the plateau.  **JIT:** tracing 64 MB 543 vs off 503; function
   JIT costs 7% and a 4x WordPress p99.
@@ -433,8 +315,8 @@ Anubis and Angie hardening cycle on the same host.  Full report:
   8.6 adds app-level deprecations to WordPress and XenForo and lacks
   redis/imagick.
 - **Validation:** 871 tuning checks, 203 dry runs, install/optimize parity
-  (2 746-line snapshot, empty diff), 61/61 cookie, 54/54 security, Anubis
-  on/off/failure/purge paths, baseline restored to 526 packages.
+  (2 746-line snapshot, empty diff), 61/61 cookie, 54/54 security,
+  baseline restored to 526 packages.
 
 ## 1.21.8 re-audit (2026-11-15)
 

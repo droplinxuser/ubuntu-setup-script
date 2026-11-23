@@ -272,10 +272,8 @@ purge_basic() {
 
 purge_angie() {
   step "Purge Angie"
-  # The bot filter is part of the web tier; stop it first so nothing keeps
-  # proxying to a stopped backend.  Its configuration is kept for re-enable.
-  if declare -F anubis_purge_stop >/dev/null 2>&1; then
-    anubis_purge_stop || true
+  if anubis_host_present; then
+    warn "This host still runs the Anubis bot filter; run tools/remove-anubis.sh to restore the vhosts and remove it"
   fi
   purge_service_stop angie
   apt_purge_pkgs angie

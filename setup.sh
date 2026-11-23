@@ -36,7 +36,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.21.61"
+readonly SCRIPT_VERSION="1.21.62"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -272,9 +272,6 @@ source "${SCRIPT_DIR}/lib/overrides.sh"
 
 # shellcheck source=lib/web.sh
 source "${SCRIPT_DIR}/lib/web.sh"
-
-# shellcheck source=lib/anubis.sh
-source "${SCRIPT_DIR}/lib/anubis.sh"
 
 # shellcheck source=lib/services.sh
 source "${SCRIPT_DIR}/lib/services.sh"

@@ -6,8 +6,6 @@
 #   loopback HTTPS against xf.test.local, wrk -t4 -c100 -d10s, 2 s warm-up,
 #   Accept-Encoding: gzip, member = fresh XenForo session cookie,
 #   member thread = the median 9-post thread.
-#   Behind Anubis (ANUBIS=1) wrk 4.1.0 under-reads Go-proxy bodies, so the
-#   tiers are measured with oha (same connections/duration) instead.
 #
 # Usage: LABEL=baseline [TIERS="cached bypass home thread"] [RUNS=1] \
 #          bench-thread-tiers.sh >> results.tsv
@@ -22,7 +20,6 @@ RUNS=${RUNS:-1}
 CONNS=${CONNS:-100}
 SECS=${SECS:-10}
 THREADS=${THREADS:-4}
-ANUBIS=${ANUBIS:-0}
 OHA=${OHA:-/root/work/oha}
 HOST=xf.test.local
 ENVF=/root/audit/bench-env.sh
@@ -75,7 +72,7 @@ oha_tier() { # url cookie -> "rps p50 p99 non2xx"
 }
 
 one() {
-  if (( ANUBIS )); then oha_tier "$@"; else wrk_tier "$@"; fi
+  wrk_tier "$@"
 }
 
 for _ in $(seq 1 "$RUNS"); do

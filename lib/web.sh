@@ -565,7 +565,7 @@ TLS_REJECT_OFF_MARK='# setup.sh: off, a reverse proxy in front may connect witho
 #   ADDR 1; # setup.sh exempt         rate-limit exemption (LIMIT_REQ_EXEMPT)
 #   ADDR:https on;                    custom.d/https_trusted_peers.map
 # Directives sharing a line are split on ';' first.  Skipped: unix: sources
-# (Anubis, local sockets never make a TLS handshake), loopback, `all`, and
+# (a local socket never makes a TLS handshake), loopback, `all`, and
 # addresses inside a Cloudflare range of http.d/cloudflare.conf (a CIDR only
 # when it fits inside the range).  A source that is not an IP literal, or any
 # source when the ranges file is missing, counts as a proxy: a missed proxy
@@ -991,20 +991,12 @@ cloudflare_tls_migrate() {
     persist_tuning_var CF_SELF_SIGNED "$CF_SELF_SIGNED"
   fi
   [[ ${CF_SELF_SIGNED:-1} != 0 ]] || return 0
-  # Anubis owns the TLS terminators (regenerated from the vhosts each run,
-  # which would drop the keep marker) and keeps one-time copies of the
-  # vhosts it integrated; leave certificates alone while it is in place.
-  if declare -F anubis_managed >/dev/null && anubis_managed; then
-    cf_tls_say "$dry" "- Cloudflare TLS: skipped (the Anubis integration owns the TLS terminators and vhost backups)"
-    return 0
-  fi
   ranges="$target/http.d/cloudflare.conf"
   shopt -s nullglob
   vhosts=("$target"/conf.d/*.conf)
   shopt -u nullglob
   for f in "${vhosts[@]}"; do
     [[ -f $f && ! -L $f ]] || continue
-    case ${f##*/} in 00-anubis-*) continue ;; esac
     cf_tls_file_uses_letsencrypt "$f" || continue
     if head -n 1 -- "$f" | grep -qF -- "$CF_TLS_KEEP_MARKER"; then
       cf_tls_say "$dry" "- Cloudflare TLS: \`${f}\` kept on its certificate (${CF_TLS_KEEP_MARKER} marker; delete that line to retry)"
@@ -1126,8 +1118,8 @@ cf_tls_docker() { timeout 20 docker "$@"; }
 certbot_letsencrypt_users() {
   local etc=${CERTBOT_ETC:-/etc} le=${CERTBOT_DIR:-/etc/letsencrypt}
   local angie_bin=${ANGIE_BIN:-/usr/sbin/angie} dump root lnk hit hook
-  # The setup.sh state tree holds vhost copies (Anubis .orig backups) that
-  # are put back live later; they count as consumers too.
+  # The setup.sh state tree holds vhost copies that are put back live later;
+  # they count as consumers too.
   local -a roots=("$etc") extra=(/opt /srv /usr/local /root /home /var/spool/cron "${STATE_DIR:-/var/lib/setup.sh}")
   [[ -n ${CERTBOT_EXTRA_ROOTS+x} ]] && read -ra extra <<<"$CERTBOT_EXTRA_ROOTS"
   roots+=("${extra[@]}")
@@ -1505,7 +1497,6 @@ tune_vhost_lean_locations() {
   for file in "$target"/conf.d/*.conf; do
     [[ -f $file ]] || continue
     name=${file##*/}
-    case $name in 00-anubis-*) continue ;; esac
     grep -qE '^[[:space:]]*include[[:space:]]+h5bp/(basic(_xf|_flarum)?\.conf|php_(xf|wp|chev_cache|chev|flarum)\.conf);' "$file" || continue
     tmp=$(tmp_file) || return 1
     awk '
@@ -1801,8 +1792,8 @@ persist_xf_job_cron() {
 
 # Document root of an Angie vhost file ("" when none).  Shared by the
 # WordPress/XenForo vhost scanners, the worker cap and asset precompression.
-# A generated vhost can legitimately have no root directive (the Anubis TLS
-# terminators, a redirect-only block).  Under `set -e` with inherit_errexit a
+# A generated vhost can legitimately have no root directive (a redirect-only
+# block or a generated terminator).  Under `set -e` with inherit_errexit a
 # failing `grep -m1` inside the command substitution aborted the callers and
 # printed false "[ERR] command failed ... sed" lines during --upgrade-php (the
 # preflight walks every conf.d file, including those terminators), so the
@@ -3000,9 +2991,9 @@ php_accelerated_files_target() {
     printf '130987'
     return 0
   fi
-  # The Anubis static shadow repeats each vhost root and www/apex pairs often
-  # share one; find does not de-duplicate its operands, so count each tree
-  # once or the script table is sized 2x (and clamped at the ceiling).
+  # A www/apex pair often shares one document root; find does not
+  # de-duplicate its operands, so count each tree once or the script table is
+  # sized 2x (and clamped at the ceiling).
   mapfile -t roots < <(printf '%s\n' "${roots[@]}" | sort -u)
   n=$(find "${roots[@]}" -xdev -type f -name '*.php' 2>/dev/null | wc -l | tr -d ' ')
   [[ $n =~ ^[0-9]+$ ]] && count=$n
@@ -3744,7 +3735,7 @@ deploy_angie_tree() {
         "$target/http.d/xf_websocket_conf" \
         "$target/http.d/limit_req_conf" \
         "$target/http.d/proxy_cache_conf" \
-        "$target/http.d/referer_map_conf" \
+        "$target/http.d/referer_map.conf" \
         "$target/h5bp/limit_req/_high_conf" \
         "$target/h5bp/limit_req/_medium_conf" \
         "$target/h5bp/tls/private.key" \

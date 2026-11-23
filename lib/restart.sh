@@ -50,7 +50,6 @@ restart_all_plan() {
   printf '  restart active MariaDB\n'
   printf '  wait for SELECT 1 (up to 300s)\n'
   printf '  start the PHP-FPM versions that were stopped\n'
-  printf '  restart anubis (if active)\n'
   printf '  start angie if it was stopped\n'
   if (( ${#active[@]} == 0 )); then
     printf 'No active supported services detected.\n'
@@ -59,7 +58,7 @@ restart_all_plan() {
 
 run_restart_all() {
   local unit rc=0
-  local angie_active=0 mariadb_active=0 anubis_active=0
+  local angie_active=0 mariadb_active=0
   local elastic_active=0 es_url="" es_ok=0
   local -a php_units=() cache_units=() failures=()
 
@@ -80,7 +79,6 @@ run_restart_all() {
 
   systemctl daemon-reload || warn "systemctl daemon-reload failed"
   systemctl is-active --quiet angie 2>/dev/null && angie_active=1
-  systemctl is-active --quiet anubis 2>/dev/null && anubis_active=1
   mapfile -t php_units < <(list_active_php_units)
   unit=$(active_cache_unit)
   [[ -n $unit ]] && cache_units+=("$unit")
@@ -170,16 +168,6 @@ run_restart_all() {
 
   # 4. Start PHP-FPM first, then Angie, regardless of a MariaDB probe failure:
   #    restore the services that were active before the restart and report it.
-  #    Anubis restarts first so the proxy is listening when Angie comes back.
-  if (( anubis_active )); then
-    if systemctl restart anubis 2>/dev/null; then
-      info "Restarted anubis"
-    else
-      warn "Could not restart anubis"
-      failures+=("restart anubis")
-      rc=1
-    fi
-  fi
   if ! opt_resume_web_frontends "the restart"; then
     failures+=("start php-fpm/angie")
     rc=1
