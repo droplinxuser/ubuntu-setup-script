@@ -7,7 +7,32 @@ manifests, sweep tables and run logs these sections cite (`AUDIT-*.md`,
 removed from the tree on 2026-11-19 to keep the repository lean; every one
 is still in git history, for example
 `git show 84b0db5:tests/stress-site/AUDIT-20261117-1.21.30.md`.  The current
-cycle report is `AUDIT-20261123-1.21.63.md`.
+cycle report is `AUDIT-20261123-1.21.64.md`.
+
+## 1.21.64 — Xeon E-2236 (2026-11-23)
+
+Pair: `server-configs-nginx` 1.6.56.  Details: `AUDIT-20261123-1.21.64.md`.
+Mitigations off (operator request, test host only).
+
+- **PHP install source and build flags: measured, no gain** (primary focus).
+  Four arms on one host, 3 rotated rounds, clock pinned at 3.6 GHz: Sury
+  8.5.13 (`-O2` generic), Ubuntu 26.04's 8.5.4, PHP 8.5.13 built from
+  source with `-O2 -march=x86-64` and with CentminMod's
+  `-O3 -m64 -march=native` plus the minimal XenForo module set.  WordPress
+  member flat; XenForo member home/thread −3.8 % to +1.6 % with
+  overlapping spreads; every change inside the noise.  A CLI probe of C
+  builtins is 1.9 % *slower* for `-march=native` than Sury, and the
+  JIT-emitted loop code is identical (0.218 ms) for all four: with the
+  tracing JIT on, the hot code is generated at run time and never sees the
+  C compiler.  **Verdict: keep Sury**; no `repo=` switch, no source build.
+  The harness is `tests/bench-php-matrix/`.
+- **Per-app PHP maximum re-verified**: WordPress 8.6, XenForo 8.5
+  (production pages run on 8.6, but XenForo debug mode 500s on every page
+  and two bundled vendor files still do not parse), Chevereto 8.6.  The
+  `--upgrade-php` round trip carried 14 extensions with 0 skipped.
+- Suites: install 3:24 / 0 warnings, 1,496 unit checks, 227 dry runs,
+  security 67/67, cookie 86/86, functional 0 unexpected, `--optimize` x2
+  0 of 3,285 facts.  Restore: 696 → 696 packages, 0 `/etc` changes.
 
 ## 1.21.63 — Xeon E-2236 (2026-11-23)
 

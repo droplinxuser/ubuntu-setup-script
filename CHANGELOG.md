@@ -8,6 +8,42 @@ Reports of the 1.21.33-1.21.61 cycles that measured the removed Anubis
 filter were deleted from the tree on 2026-11-23 for the same reason;
 `git show <commit>:<path>` recovers them.
 
+## 1.21.64 (2026-11-23)
+
+- **PHP install source and build flags: measured, no gain; Sury stays**
+  (primary focus).  Four arms on the Xeon test host, 3 rotated rounds,
+  clock pinned at 3.6 GHz: Sury 8.5.13 (Debian rules: `-O2` generic,
+  hardening, `optimize=-lto`), Ubuntu 26.04's 8.5.4 from `universe`, and
+  PHP 8.5.13 built from source with the minimal XenForo module set at
+  `-O2 -march=x86-64` and at CentminMod's `-O3 -m64 -march=native`.  The
+  builds are genuinely different (26,148 AVX2 instructions in the
+  `-march=native` binary against 171 in the distribution ones), and the
+  result is still flat: WordPress member unchanged, XenForo member home
+  and thread −3.8 % to +1.6 % with overlapping spreads, nothing outside
+  the noise.  A 15-run CLI probe of C builtins (json, preg, string, hash,
+  sort) is 1.9 % slower for `-march=native` than Sury's `-O2` and 5.5 %
+  slower for the generic source build; the JIT-emitted loop section is
+  0.218 ms for all four arms.  With `opcache.jit=tracing` the hot PHP code
+  is generated at run time and never passes through the C compiler, so
+  the flags only reach the interpreter's own helpers, which are a small
+  share of a page since 1.21.63 moved zlib to Angie.  Decisions: no
+  `--php repo=` switch (Ubuntu is not slower, but it is 9 patch releases
+  behind and adds a packaging path for no gain) and no compiled PHP (a
+  toolchain and manual security updates on every host for nothing).  The
+  harness is new under `tests/bench-php-matrix/` so the question can be
+  re-opened when the JIT, the compiler or the workload changes.
+- **Per-application PHP maximum re-verified** with the full round trip
+  (`--upgrade-php=8.6` 1:23, back to 8.5 1:12, 14 extensions carried, 0
+  skipped) and `compat-php.sh` on each version: WordPress 8.6, XenForo
+  8.5, Chevereto 8.6.  XenForo serves its production pages on 8.6, but its
+  debug mode answers 500 on every page and the bundled Braintree and
+  laminas-mail files still fail `php -l` (the same two files also fail on
+  8.5; they only break the payment and mail code paths there).
+- Suites: fresh install 3:24 / 0 warnings, 1,496 unit checks, 227 dry
+  runs, security 67/67, guest-cache cookies 86/86, functional exercise 0
+  unexpected on 8.5 and 8.6, `--optimize` twice with 0 of 3,285 facts
+  different.  Restore: 696 → 696 packages, 0 `/etc` files changed.
+
 ## 1.21.63 (2026-11-23)
 
 - **XenForo member pages: +5 % home, +9 % thread, lower p99** (primary

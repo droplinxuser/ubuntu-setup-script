@@ -208,6 +208,23 @@ Install behaviour:
 | Changing version | use `--upgrade-php=8.6`, which preflights the purge (a held package or an application that would be removed stops it while PHP is still serving), then carries the extension set and custom configuration |
 | Extensions | the XenForo profile: `fpm cli opcache mysql gd curl xml zip gmp mbstring`.  No `redis`/`igbinary` by default: XenForo runs without them (SV RedisCache falls back to its pure-PHP Credis client) and so does WordPress without an object-cache drop-in.  `--domain` installs what a site cannot run without (Chevereto: `redis`, which pulls `igbinary`, and `imagick`); `--upgrade-php` carries whatever the old version had.  Add `redis` yourself to keep the XenForo data cache on php-redis (see XenForo below), or `intl`/`bcmath` if an add-on needs them |
 
+**Measured: install source and build flags (1.21.64).**  Four arms on one
+host (3 rotated rounds, clock pinned at 3.6 GHz): Sury 8.5.13, Ubuntu
+26.04's 8.5.4, and PHP 8.5.13 built from source with only the XenForo
+module set at `-O2 -march=x86-64` and at CentminMod's `-O3 -m64
+-march=native`.  No arm moved a PHP-bound tier outside its spread
+(WordPress member flat; XenForo member home/thread −3.8 % to +1.6 %), and
+a CLI probe of C builtins was 1.9 % slower for `-march=native` than Sury
+while the JIT-emitted loop code was identical at 0.218 ms for every arm.
+With the tracing JIT on, hot PHP code is generated at run time and never
+sees the C compiler; the flags only reach interpreter helpers, a small
+share of a page.  Sury therefore stays: it is also 9 patch releases ahead
+of the Ubuntu archive.  A compiled PHP would put a toolchain and manual
+security updates on every host for no measured gain.  Re-run the
+measurement with `tests/bench-php-matrix/` (`build-php-source.sh`,
+`extract-php-debs.sh`, `switch-php-arm.sh`, `bench-php-sources.sh`) when
+the JIT, the compiler or the workload changes.
+
 Pool (`pool.d/www.conf`):
 
 | Setting | Value |
