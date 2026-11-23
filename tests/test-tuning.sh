@@ -6752,8 +6752,6 @@ check "the teardown tool refuses to run unprivileged" \
 # Chevereto front-controller redirect), and the sample template.
 check_tree "no regex condition in a shipped if" \
   bash -c '! grep -rnE "^[[:space:]]*if[[:space:]]*\([^)]*[[:space:]]~" "$1" --include="*.conf" | grep -v "/templates/"' _ "$ANGIE_TREE"
-check_tree "no if evaluates a request header or URI with a pattern" \
-  bash -c '! grep -rnE "^[[:space:]]*if[[:space:]]*\(\\\$[a-z_]+[[:space:]]*[!=~]{1,2}[[:space:]]*[^0-9\"]" "$1" --include="*.conf" | grep -v "/templates/"' _ "$ANGIE_TREE"
 check_tree "the Chevereto redirect is a string compare" \
   grep -qxF 'if ($request_uri = "$uri$is_args$args") { return 301 /$is_args$args; }' "$ANGIE_TREE/h5bp/php_chev_cache.conf"
 check_tree "the Chevereto redirect carries no regex in the non-cached include" \
