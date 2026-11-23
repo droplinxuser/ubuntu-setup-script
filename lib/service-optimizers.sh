@@ -548,16 +548,20 @@ mariadb_server_version() {
 # restarting a busy database with the web tiers paused.
 MARIADB_ONLINE_ORDER=(innodb_buffer_pool_size innodb_log_file_size tmp_table_size
                       max_heap_table_size innodb_io_capacity innodb_io_capacity_max
-                      table_open_cache max_connections thread_pool_size
-                      innodb_flush_neighbors)
+                      table_open_cache table_definition_cache max_connections
+                      thread_pool_size innodb_flush_neighbors)
 # One list, two views: the array drives the SET order and the ERE used to
 # ignore those keys when deciding whether a restart is needed.  Keeping a
 # separate regex string here let the two drift apart.
 MARIADB_ONLINE_KEYS=$(IFS='|'; printf '%s' "${MARIADB_ONLINE_ORDER[*]}")
 # Keys that only matter at the next start and must not force one now:
 # loose-innodb_buffer_pool_size_max is read-only, and the running server
-# already has the ceiling it started with.
-MARIADB_DEFERRED_KEYS='loose-innodb_buffer_pool_size_max'
+# already has the ceiling it started with.  innodb_open_files follows
+# table_open_cache (the profile writes all three from one value) but is
+# read-only on the supported releases; without it here every max_connections
+# change above 250 forced a full restart with the web tier paused, although
+# the two keys it moves with are dynamic.
+MARIADB_DEFERRED_KEYS='loose-innodb_buffer_pool_size_max|innodb_open_files'
 cnf_only_pool_changed() {
   local old=$1 new=$2
   [[ -f $old && -f $new ]] || return 1
@@ -879,8 +883,16 @@ optimize_mariadb() {
 # Run a command against the local Valkey/Redis, preferring the Unix socket.
 # Returns non-zero when no client is installed or the server is unreachable.
 valkey_live_cli() {
-  local cli="" sock=""
-  if [[ -S /run/valkey/valkey.sock ]] && command -v valkey-cli >/dev/null 2>&1; then
+  local cli="" sock="" conf_sock
+  # An operator's custom unixsocket (kept by valkey_apply_config) first, then
+  # the default paths, then TCP.
+  conf_sock=$(valkey_conf_get /etc/valkey/valkey.conf unixsocket 2>/dev/null || true)
+  if [[ -n $conf_sock && -S $conf_sock ]] && command -v valkey-cli >/dev/null 2>&1; then
+    cli=valkey-cli; sock=$conf_sock
+  elif conf_sock=$(valkey_conf_get /etc/redis/redis.conf unixsocket 2>/dev/null || true) \
+       && [[ -n $conf_sock && -S $conf_sock ]] && command -v redis-cli >/dev/null 2>&1; then
+    cli=redis-cli; sock=$conf_sock
+  elif [[ -S /run/valkey/valkey.sock ]] && command -v valkey-cli >/dev/null 2>&1; then
     cli=valkey-cli; sock=/run/valkey/valkey.sock
   elif [[ -S /run/redis/redis.sock ]] && command -v redis-cli >/dev/null 2>&1; then
     cli=redis-cli; sock=/run/redis/redis.sock
@@ -1246,11 +1258,17 @@ optimize_valkey() {
   # away the whole cache when persistence is disabled (the installer writes
   # `save ""` and `appendonly no`), so a tuning run must not restart a busy
   # cache just to add timeout/hz/lazyfree defaults.
+  # The running server listens where its current config says.  An adopted
+  # config may keep an operator bind/port, so the CLI default (127.0.0.1:6379)
+  # is not always this server; the installer pings the socket for the same
+  # reason.
+  local -a live_ep=()
+  [[ -n $socket_before && -S $socket_before ]] && live_ep=(-s "$socket_before")
   if (( active )); then
     online_ok=1
     while read -r k v; do
       [[ -n $k ]] || continue
-      if ! "$cli" CONFIG SET "$k" "$v" >/dev/null 2>&1; then
+      if ! "$cli" "${live_ep[@]}" CONFIG SET "$k" "$v" >/dev/null 2>&1; then
         online_ok=0
         opt_report "- Online \`CONFIG SET ${k} ${v}\` failed; a restart is required"
         break
@@ -1258,7 +1276,7 @@ optimize_valkey() {
     done < <(valkey_runtime_settings "$max_mb" "$policy" "$io_threads")
     # io-threads is fixed at startup.  A systemd fd drop-in also needs a new
     # process before maxclients can exceed the old limit.
-    live_io=$("$cli" CONFIG GET io-threads 2>/dev/null | tail -n1 || true)
+    live_io=$("$cli" "${live_ep[@]}" CONFIG GET io-threads 2>/dev/null | tail -n1 || true)
     if [[ $live_io =~ ^[0-9]+$ ]] && [[ $live_io != "$io_threads" ]]; then
       online_ok=0
       opt_report "- io-threads=${io_threads} differs from live ${live_io}; a restart is required"
@@ -1272,7 +1290,7 @@ optimize_valkey() {
     fi
   fi
   if (( active )) && (( online_ok )); then
-    live_backlog=$("$cli" CONFIG GET tcp-backlog 2>/dev/null | tail -n1 || true)
+    live_backlog=$("$cli" "${live_ep[@]}" CONFIG GET tcp-backlog 2>/dev/null | tail -n1 || true)
     if [[ $live_backlog =~ ^[0-9]+$ ]] && [[ $live_backlog != "$backlog" ]]; then
       opt_report "- tcp-backlog=${backlog} applies at startup (live ${live_backlog}); restart deferred"
     fi
@@ -1285,7 +1303,7 @@ optimize_valkey() {
   fi
 
   if (( active )); then
-    opt_restart_service "$unit" "$conf_dir" "$kind" "${kind}-systemd" valkey_restart_probe "$cli" \
+    opt_restart_service "$unit" "$conf_dir" "$kind" "${kind}-systemd" valkey_restart_probe "$cli" "$socket_path" \
       || return 1
     # A socket path change does not alter the supplementary groups the PHP
     # workers already have.  Restarting PHP just because the cache moved to
@@ -1722,7 +1740,7 @@ verify_optimized_services() {
     opt_log_errors mariadb MariaDB
   fi
   if [[ " ${OPT_DETECTED[*]} " == *" valkey "* ]] && systemctl is-active --quiet valkey-server; then
-    if valkey-cli ping 2>/dev/null | grep -qx 'PONG'; then
+    if valkey_endpoint_pong valkey-cli "$(valkey_conf_get /etc/valkey/valkey.conf unixsocket)"; then
       opt_report "- Valkey: active and responding to PING"
     else
       opt_report "- Valkey: **FAILED** active but PING failed"
@@ -1731,7 +1749,7 @@ verify_optimized_services() {
     opt_log_errors valkey-server Valkey
   fi
   if [[ " ${OPT_DETECTED[*]} " == *" redis "* ]] && systemctl is-active --quiet redis-server; then
-    if redis-cli ping 2>/dev/null | grep -qx 'PONG'; then
+    if valkey_endpoint_pong redis-cli "$(valkey_conf_get /etc/redis/redis.conf unixsocket)"; then
       opt_report "- Redis: active and responding to PING"
     else
       opt_report "- Redis: **FAILED** active but PING failed"
@@ -1898,9 +1916,19 @@ optimize_plan() {
     plan_allowance=$(php_worker_allowance_mb "$(php_primary_version 2>/dev/null || true)" 2>/dev/null || true)
     [[ $plan_allowance =~ ^[0-9]+$ ]] && (( plan_allowance > 0 )) || plan_allowance=64
     max_children=$(php_plan_max_children "$nproc" "$ram_mb" "$live_children" "$explicit_children" "${OPT_PHP_BUDGET_MB:-0}" "$plan_allowance")
+    # tune_php_fpm_version splits the planned pool across running FPM versions
+    # (each runs its own static pool) unless --php children= pins it; preview
+    # the per-version share it will write, not the whole pool.
+    local plan_active_versions=0 plan_split_note=""
+    plan_active_versions=$(php_fpm_active_versions | grep -c . || true)
+    if [[ -z $explicit_children ]] && (( plan_active_versions > 1 )) \
+       && systemctl is-active --quiet "php$(php_primary_version 2>/dev/null || true)-fpm" 2>/dev/null; then
+      max_children=$(php_split_children "$max_children" "$plan_active_versions")
+      plan_split_note=" (each of ${plan_active_versions} running PHP-FPM versions)"
+    fi
     [[ $explicit_requests =~ ^[0-9]+$ ]] || explicit_requests=$(( nproc * 1024 ))
-    printf '  PHP-FPM:  max_children=%s max_requests=%s backlog=%s\n' \
-      "$max_children" "$explicit_requests" "$backlog"
+    printf '  PHP-FPM:  max_children=%s%s max_requests=%s backlog=%s\n' \
+      "$max_children" "$plan_split_note" "$explicit_requests" "$backlog"
     # Same helper as the ini writer, so the preview shows the JIT the run
     # would write (opcache.memory_consumption follows RAM/16, 128..512 MB).
     local plan_opcache_mb jit_mode jit_buffer_mb wp_roots

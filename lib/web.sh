@@ -2782,9 +2782,11 @@ php_hugepages_ok() {
 
 # Tracing-JIT hotness thresholds.  Higher values compile later (less CPU
 # spent in the JIT, more in the interpreter); lower values compile sooner.
-# PHP's defaults are used on every host with four or more effective CPUs: an
-# aggressive set (16/64/8/32) measured within noise of the defaults on the dev host,
-# while a conservative set (128/255/32/128) lost 3-4% on the member tiers.
+# Hosts with three or more effective CPUs get a tuned set (64/127/16/64):
+# loop and func are PHP's defaults, while return and side_exit are raised from
+# PHP's 8/8 so rarely taken return paths and side exits are not traced.  An
+# aggressive set (16/64/8/32) measured within noise of it on the dev host,
+# while the conservative set (128/255/32/128) lost 3-4% on the member tiers.
 # A 1-2 CPU host pays proportionally more for compilation, so it gets the
 # conservative set, which keeps the single PHP worker serving requests.
 # SETUP_PHP_JIT_HOT_{LOOP,FUNC,RETURN,SIDE_EXIT} override each value.
@@ -3236,9 +3238,20 @@ session.cookie_httponly = 1
 session.cookie_secure = 1
 session.cookie_samesite = Lax
 session.gc_maxlifetime = 14400
+EOF
+    # session.sid_length and session.sid_bits_per_character are deprecated as
+    # of PHP 8.4 (each FPM start logs the deprecation, and a later release
+    # drops them); 8.4 uses its defaults instead (32 chars x 4 bits = 128 bits
+    # of session-ID entropy, still far beyond guessing).
+    local php_major=${ver%%.*} php_minor=${ver#*.}
+    php_minor=${php_minor%%.*}
+    if [[ $php_major =~ ^[0-9]+$ && $php_minor =~ ^[0-9]+$ ]] \
+       && (( php_major < 8 || (php_major == 8 && php_minor < 4) )); then
+      cat >> "$ini" <<EOF
 session.sid_length = 48
 session.sid_bits_per_character = 6
 EOF
+    fi
   fi
   # Per-directory sections must come last: everything after a section header
   # belongs to that section.

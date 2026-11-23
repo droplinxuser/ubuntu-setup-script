@@ -29,12 +29,15 @@ TIERS=$(cd -- "$HERE/../stress-site" && pwd)/loopback-tiers.sh
 COOKIES=/root/audit/cookies/cookies.tsv
 OUT=$(mktemp /tmp/bench-php-sources.XXXXXX)
 trap 'rm -f "$OUT"' EXIT
+# RAW=path keeps every row (arm, round, tier, req/s, p50, p99, non-2xx, CPU)
+# for the report.  The summary reads req/s (column 4) and p99 (column 6);
+# until 1.21.67 it read column 5, so its "p99" was the median (p50).
 [[ -s $COOKIES ]] || { echo "missing $COOKIES: run tests/stress-site/exercise-apps.sh keep first" >&2; exit 1; }
 [[ -x $TIERS ]] || { echo "missing $TIERS" >&2; exit 1; }
 
 clear_cache() {
   local d
-  for d in /home/nginx_cache /home/nginx_cache_chev; do
+  for d in /home/nginx_cache /home/nginx_cache_chev /var/cache/ols/xf; do
     [[ -d $d ]] && find "$d" -mindepth 1 -delete 2>/dev/null || true
   done
 }
@@ -67,17 +70,18 @@ for (( r = 1; r <= ROUNDS; r++ )); do
       | awk -F'|' -v arm="$arm" -v rnd="$r" '
           NF >= 5 && $2 !~ /Tier|---/ {
             for (i = 2; i <= NF; i++) { gsub(/^[ \t]+|[ \t]+$/, "", $i) }
-            printf "%s\t%s\t%s\t%s\t%s\t%s\n", arm, rnd, $2, $3, $4, $5
+            printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", arm, rnd, $2, $3, $4, $5, $6, $7
           }' >> "$OUT"
   done
 done
 
+[[ -n ${RAW:-} ]] && cp "$OUT" "$RAW"
 echo
 echo "| tier | arm | median req/s | spread | p99 median | rounds | delta vs first arm |"
 echo "|---|---|---:|---|---:|---:|---:|"
 awk -F'\t' -v ARMORDER="$(IFS=,; echo "${ARMS[*]}")" '
   BEGIN { na = split(ARMORDER, armorder, ",") }
-  { key = $3 "\t" $1; n[key]++; rps[key, n[key]] = $4 + 0; p99[key, n[key]] = $5; }  END {
+  { key = $3 "\t" $1; n[key]++; rps[key, n[key]] = $4 + 0; p99[key, n[key]] = $6; }  END {
     # Keep the tier order of first appearance.
     for (k in n) {
       split(k, a, "\t"); tier = a[1]

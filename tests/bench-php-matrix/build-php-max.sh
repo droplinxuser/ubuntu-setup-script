@@ -25,6 +25,11 @@
 #   IGBINARY_VER    PECL igbinary release (default 3.2.17RC1, the first
 #                   that compiles against 8.5)
 #
+# The LiteSpeed SAPI (--enable-litespeed, $PREFIX/bin/lsphp) is built too, so
+# the OpenLiteSpeed arms (install-ols.sh, switch-php-arm.sh ols-src-TAG) can run
+# the same compiled PHP over LSAPI.  It is a separate binary: php-fpm is the
+# same with or without it.
+#
 # `switch-php-arm.sh src-TAG` treats an extension directory that contains
 # .source-built-ext as authoritative and does not fall back to the
 # distribution's .so files.
@@ -140,6 +145,7 @@ cd "$SRC"
   --enable-xmlreader --enable-xmlwriter --enable-simplexml \
   --with-gmp --enable-sockets \
   --with-zlib --with-sodium \
+  --enable-litespeed \
   --disable-cgi --disable-phpdbg \
   --disable-gcc-global-regs \
   > "/root/work/build-$TAG-$STAGE-configure.log" 2>&1 \

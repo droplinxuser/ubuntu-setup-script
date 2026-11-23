@@ -44,7 +44,16 @@ if [[ -n $ADDED ]]; then
   # shellcheck disable=SC2086
   apt-get purge -y $ADDED > "$WORK/apt-purge.log" 2>&1 || echo "apt purge reported an error (see $WORK/apt-purge.log)"
 fi
-apt-get autoremove --purge -y >> "$WORK/apt-purge.log" 2>&1 || true
+# Dependencies the purge orphaned, but only names the baseline never had: a
+# blanket autoremove also purged baseline packages that were auto-installed
+# and merely unused on the pristine host.  Repeat while purging orphans more.
+for _ in 1 2 3 4 5; do
+  orphans=$(apt-get -s autoremove 2>/dev/null | awk '$1 == "Remv" { print $2 }' \
+            | grep -vxFf <(printf '%s\n' "$BASE_NAMES") || true)
+  [[ -n $orphans ]] || break
+  # shellcheck disable=SC2086
+  apt-get purge -y $orphans >> "$WORK/apt-purge.log" 2>&1 || break
+done
 
 echo "== repositories and keys"
 rm -f /etc/apt/sources.list.d/angie.list /etc/apt/sources.list.d/angie.sources \
@@ -52,12 +61,14 @@ rm -f /etc/apt/sources.list.d/angie.list /etc/apt/sources.list.d/angie.sources \
       /etc/apt/sources.list.d/nodesource.sources /etc/apt/sources.list.d/nodesource.list \
       /etc/apt/sources.list.d/php.list /etc/apt/sources.list.d/php.sources \
       /etc/apt/sources.list.d/mariadb.list /etc/apt/sources.list.d/mariadb.sources \
-      /etc/apt/sources.list.d/valkey.list
+      /etc/apt/sources.list.d/valkey.list \
+      /etc/apt/sources.list.d/lst_debian_repo.list
 rm -f /usr/share/keyrings/angie-signing.gpg /usr/share/keyrings/elasticsearch-keyring.gpg \
       /usr/share/keyrings/nodesource.gpg /usr/share/keyrings/debsuryorg-archive-keyring.gpg \
       /usr/share/keyrings/deb.sury.org-*.gpg /etc/apt/keyrings/angie* /etc/apt/keyrings/elastic* \
       /etc/apt/keyrings/nodesource* /etc/apt/preferences.d/angie* /etc/apt/preferences.d/php* \
-      /etc/apt/preferences.d/nodejs* /etc/apt/preferences.d/nodesource*
+      /etc/apt/preferences.d/nodejs* /etc/apt/preferences.d/nodesource* \
+      /usr/share/keyrings/lst-debian.gpg
 apt-get update > "$WORK/apt-update.log" 2>&1 || true
 apt-get clean
 
@@ -69,6 +80,18 @@ rm -f /etc/systemd/system/anubis.service /usr/local/bin/anubis \
       /etc/tmpfiles.d/angie-anubis.conf
 rm -rf /etc/anubis /run/anubis /var/lib/anubis /var/cache/anubis
 id anubis >/dev/null 2>&1 && userdel anubis >/dev/null 2>&1 || true
+# Benchmark-only trees: OpenLiteSpeed (bench-php-matrix/install-ols.sh) and the
+# source PHP arms (build-php-max.sh).  The openlitespeed package leaves its
+# lsadm account and parts of /usr/local/lsws behind (its repository and
+# keyring go with the others above, before the apt-get update).
+systemctl stop lshttpd >/dev/null 2>&1 || true
+for u in /etc/systemd/system/php-src-*.service; do
+  [[ -f $u ]] || continue
+  systemctl disable --now "$(basename "$u")" >/dev/null 2>&1 || true
+  rm -f "$u"
+done
+rm -rf /usr/local/lsws /etc/php-ols /etc/php-src /var/cache/ols /tmp/lshttpd /opt/php-*
+id lsadm >/dev/null 2>&1 && userdel lsadm >/dev/null 2>&1 || true
 rm -rf /var/www /etc/angie /etc/php /etc/mysql /etc/valkey /etc/redis /etc/elasticsearch \
        /var/lib/setup.sh /var/lib/mysql /var/lib/mariadb /var/lib/valkey /var/lib/redis /var/lib/elasticsearch \
        /var/lib/php /var/cache/php /var/cache/angie /var/log/angie /var/log/mysql /var/log/valkey \

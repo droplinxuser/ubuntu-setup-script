@@ -254,4 +254,21 @@ for u in "$X/whats-new/?enc=$RANDOM" "$W/?enc=$RANDOM" "${C:-https://chev.test.l
   chk "$n: a plain client gets the plain entry" "$(hdr ei content-encoding):$(head -c 1 "$T/ei.body")" ":<"
 done
 
+echo "################ Control characters in Cookie (1.21.67)"
+# PHP strips \v and \f in front of a cookie name; the allowlist and Angie's
+# $cookie_* lookup did not.  "_ga=1;\vxf_language_id=2" rendered language 2
+# under the default key, and "\vsso=..." an unseen login cookie.  Two
+# requests each (min_uses 2): neither may be stored or served from the cache.
+for u in "$X/whats-new/?cc=$RANDOM" "$W/?cc=$RANDOM" "${C:-https://chev.test.local}/explore/?cc=$RANDOM"; do
+  n=${u#https://}; n=${n%%/*}
+  for ck in $'_ga=1;\vxf_language_id=2' $'_ga=1;\fxf_style_id=2' $'\vsso_token=abc123'; do
+    for _ in 1 2 3; do req cc -H "Cookie: $ck" "$u"; done
+    chk "$n: a Cookie with a control character bypasses the guest cache ($(printf '%q' "$ck"))" \
+      "$(hdr cc x-cache-status)" BYPASS
+  done
+  req ccg "$u"
+  chk "$n: no control-character request reached the guest entry" \
+    "$(hdr ccg x-cache-status)" MISS
+done
+
 echo; echo "TOTAL pass=$P fail=$F"; rm -rf "$T"

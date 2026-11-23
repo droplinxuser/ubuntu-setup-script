@@ -192,7 +192,7 @@ Environment options:
 | Variable | Default | Effect |
 |---|---|---|
 | `SETUP_PHP_WORKERS_PER_CPU` | by host class (see the pool table) | pins the workers-per-CPU factor for an install/one run; `--optimize` ignores it |
-| `SETUP_PHP_JIT_HOT_LOOP`, `_FUNC`, `_RETURN`, `_SIDE_EXIT` | PHP defaults on 4+ CPU hosts; a conservative set on 1-2 CPUs | JIT hotness thresholds |
+| `SETUP_PHP_JIT_HOT_LOOP`, `_FUNC`, `_RETURN`, `_SIDE_EXIT` | tuned set 64/127/16/64 on 3+ CPU hosts (loop/func are PHP's defaults, return/side_exit raised from PHP's 8/8); a conservative set on 1-2 CPUs | JIT hotness thresholds |
 | `SETUP_PHP_JIT_WORDPRESS=0` | 1 (WordPress uses the JIT) | keeps `opcache.jit = off` for every WordPress document root through a `[PATH=<root>]` section of the managed ini, for a site that misbehaves with the JIT.  Tuning override: ignored by `--optimize` |
 | `SETUP_PHP_PAGE_GZIP=0` | 1 | by default the managed ini turns `zlib.output_compression` (level 4) on in a `[PATH=<root>]` section for every WordPress and Chevereto document root whose guest cache key carries the encoding token, so the FastCGI cache stores the gzip page (0.12 ms of Angie CPU per hit instead of about 1 ms to compress each hit); Chevereto roots also get PHP session GC (`session.gc_probability = 1`, divisor 1000) because no timer cleans its session directory; tuning override: ignored by `--optimize` (profile default 1) |
 | `SETUP_PHP_SESSION_HARDENING=1` | off | opt-in `session.*` strict settings, `cgi.fix_pathinfo=0`, `display_errors=Off` and a central `error_log`; it broke Joomla/Polr logins on a mixed host.  Persisted as `PHP_SESSION_HARDENING` (kept by `--optimize`; `=0` turns it off) |
@@ -488,7 +488,10 @@ vhost changes the plan (PHP-FPM worker cap, OPcache file budget, guest cache
 for the new root, managed wp-cron / XenForo job entries): a domain install
 therefore leaves the host in the state "install, then `--optimize`" produced.
 `SETUP_DOMAIN_OPTIMIZE=0` skips that pass for a deployment script that copies
-the application files afterwards and tunes separately.
+the application files afterwards and tunes separately.  The pass runs after
+the installation summary, in the main process: an interrupted run resumes a
+web tier it paused for a MariaDB restart, and a failed tuner ends the run with
+a non-zero exit and the optimize report, exactly like `--optimize`.
 
 ## `--optimize`
 
@@ -598,7 +601,10 @@ Explicit values (`--basic server=`, `--php children=`/`max_requests=`,
 `/var/lib/setup.sh/explicit-options.conf` for the installation run. They are
 not a permanent override: `--optimize` always moves that file to `/tmp` and
 recomputes workers, pool sizes and the dedi/vps class from the current
-hardware, so a fleet with the same hardware converges on one profile. An
+hardware, so a fleet with the same hardware converges on one profile.  The
+one exception is the closing tuning pass of a run that installs services and
+adds a `--domain` in the same command: that pass keeps the run's own explicit
+values and `SETUP_*` tuning (a domain-only run resets like `--optimize`). An
 under-floor `--mariadb size=`/`--valkey ram=` is still raised to 128m with a
 warning so install and the first `--optimize` agree.
 

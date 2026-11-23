@@ -9,8 +9,25 @@ run_service() {
   local start end rc
   step "Installing ${name}"
   start=$(date +%s)
+  # An ignored HUP is inherited, never replaced: --upgrade-php ignores it
+  # between purging the old PHP and the new FPM serving, and apt/dpkg run
+  # from install_php here must keep ignoring it (a handler would be reset to
+  # the default "terminate" in every child it execs).
+  local hup_action='exit 129'
+  [[ $(trap -p HUP) == "trap -- '' SIGHUP" ]] && hup_action=''
   set +e
-  ( set -Eeuo pipefail; "$@" )
+  # The installer runs in a subshell, which starts with the parent's traps
+  # reset, and whatever it pauses (the web tier around a MariaDB restart after
+  # a dump import) is invisible to the parent's on_exit.  Give it its own
+  # signal-to-exit traps and an EXIT guard that undoes that pause, so a
+  # Ctrl-C or a dropped SSH session cannot leave Angie and PHP-FPM stopped.
+  ( set -Eeuo pipefail
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    # shellcheck disable=SC2064  # expanded now on purpose: the action is fixed
+    trap "$hup_action" HUP
+    trap run_service_exit_guard EXIT
+    "$@" )
   rc=$?
   set -e
   end=$(date +%s)
@@ -127,3 +144,13 @@ print_plan() {
   done
 }
 
+
+# EXIT trap of run_service's subshell: resume a web tier the installer paused
+# (opt_pause_web_frontends) and did not get to resume.
+run_service_exit_guard() {
+  local rc=$?
+  if (( ${OPT_WEB_PAUSED_ANGIE:-0} )) || (( ${#OPT_WEB_PAUSED_PHP[@]} > 0 )); then
+    opt_resume_web_frontends "an interrupted install step" || true
+  fi
+  return "$rc"
+}

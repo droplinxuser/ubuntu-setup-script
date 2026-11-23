@@ -24,8 +24,32 @@ declare -A unit=(
 )
 # A host with another PHP version installed: sample every php*-fpm unit and
 # label them php-fpm.
-extra_php=$(cd "$BASE" 2>/dev/null && ls -d php*-fpm.service 2>/dev/null | head -1)
+extra_php=$(cd "$BASE" 2>/dev/null && ls -d php*-fpm.service php-src-*.service 2>/dev/null | head -1)
 [[ -n ${extra_php:-} ]] && unit[php-fpm]=$extra_php
+# OpenLiteSpeed (benchmark arms only).  Its lsphp children live in the same
+# cgroup, so "ols" is server + PHP; the "lsphp" line below is the PHP share
+# (live children plus what the LSAPI parent has reaped).
+[[ -d $BASE/lshttpd.service ]] && unit[ols]=lshttpd.service
+
+lsphp_jiffies() {
+  # /proc/PID/stat fields 14-17: utime stime cutime cstime (clock ticks).
+  # Count cutime/cstime only for the LSAPI parent (its parent is not lsphp),
+  # so a reaped child is counted once.
+  local pid stat ppid sum=0 rest
+  for pid in $(pgrep -x lsphp 2>/dev/null); do
+    stat=$(cat "/proc/$pid/stat" 2>/dev/null) || continue
+    rest=${stat##*) }
+    # shellcheck disable=SC2086
+    set -- $rest
+    ppid=$2
+    if [[ $(cat "/proc/$ppid/comm" 2>/dev/null) == lsphp ]]; then
+      sum=$(( sum + ${12} + ${13} ))
+    else
+      sum=$(( sum + ${12} + ${13} + ${14} + ${15} ))
+    fi
+  done
+  echo "$sum"
+}
 
 : > "$OUT"
 start=$SECONDS
@@ -38,6 +62,7 @@ while (( SECONDS - start < DUR )); do
     [[ $usec =~ ^[0-9]+$ ]] || continue
     printf '%s %s %s\n' "$ts" "$name" "$(( usec / 10000 ))" >> "$OUT"
   done
+  [[ -n ${unit[ols]:-} ]] && printf '%s lsphp %s\n' "$ts" "$(lsphp_jiffies)" >> "$OUT"
   # /proc/stat fields: user nice system idle iowait irq softirq steal ...
   # Count only busy time.  Including idle made the "host CPU used" line
   # report ~one core-second per core per second on an idle host, which hid

@@ -591,6 +591,14 @@ check "cnf_only_pool_changed accepts max_connections (dynamic)" \
 cnf_other_changed() { ! cnf_only_pool_changed "$1" "$2"; }
 check "cnf_only_pool_changed rejects a startup-only setting" \
   cnf_other_changed "$TMP/cnf-a" "$TMP/cnf-d"
+# The open-file trio moves together with max_connections above 250: the two
+# dynamic keys apply online, innodb_open_files waits for the next start.
+printf '[mysqld]\nmax_connections = 370\ntable_open_cache = 5920\ntable_definition_cache = 5920\ninnodb_open_files = 5920\ninnodb_flush_method = fsync\n' > "$TMP/cnf-open-a"
+printf '[mysqld]\nmax_connections = 690\ntable_open_cache = 11040\ntable_definition_cache = 11040\ninnodb_open_files = 11040\ninnodb_flush_method = fsync\n' > "$TMP/cnf-open-b"
+check "a max_connections change with the open-file trio stays online" \
+  cnf_only_pool_changed "$TMP/cnf-open-a" "$TMP/cnf-open-b"
+check "table_definition_cache is applied online and read back" \
+  grep -qw table_definition_cache <<<"${MARIADB_ONLINE_ORDER[*]}"
 check "Angie-only cache budget uses 50% RAM" \
   test "$(tune_cache_total_mb 7747 59000 50 10)" = 3840
 check "Angie+PHP cache budget uses 30% RAM" \
@@ -4689,10 +4697,14 @@ ignored_env=$( (
 check "optimize ignores tuning environment overrides but keeps feature choices" \
   test "$ignored_env" = "none;none;none;0;none"
 optimize_body=$(sed -n '/^run_optimize()/,/^}/p' "$ALL_SRC")
-check "run_optimize always resets recorded overrides" \
-  grep -q '^  reset_operator_overrides$' <<<"$optimize_body"
-check "run_optimize always ignores tuning environment overrides" \
-  grep -q '^  optimize_ignore_tuning_env$' <<<"$optimize_body"
+# 1.21.67: the reset is skipped only for the closing pass of an install that
+# also added a domain (OPT_KEEP_EXPLICIT, set by run_post_domain_optimize).
+check "run_optimize resets recorded overrides unless it is a same-run closing pass" \
+  bash -c 'grep -q "^    reset_operator_overrides$" <<<"$1" && grep -q "OPT_KEEP_EXPLICIT:-0" <<<"$1"' _ "$optimize_body"
+check "run_optimize ignores tuning environment overrides unless it is a same-run closing pass" \
+  grep -q '^    optimize_ignore_tuning_env$' <<<"$optimize_body"
+check "only the post-domain pass sets OPT_KEEP_EXPLICIT" \
+  bash -c 'test "$(grep -c "OPT_KEEP_EXPLICIT=\$keep" "$1")" = 1' _ "$ALL_SRC"
 check "the dry run previews the profile reset" \
   grep -q 'reset_operator_overrides 2' "$ALL_SRC"
 
@@ -4953,6 +4965,32 @@ check "valkey_pong passes the endpoint arguments to the client" \
 check "valkey_pong fails on another endpoint" not valkey_pong fake_cli
 check "the Valkey install pings the socket it wrote" \
   bash -c 'sed -n "/^install_valkey()/,/^}/p" "$1" | grep -q "wait_for_cmd 20 valkey_pong valkey-cli -s \"\$socket\""' _ "$ALL_SRC"
+# 1.21.67: --optimize still sent CONFIG SET/GET, the restart probe and the
+# verify PING to 127.0.0.1:6379 (adopted bind/port: restart, rollback restart
+# and FAILED on every run, each restart emptying the cache).
+fake_sock=$TMP/valkey-test.sock
+rm -f "$fake_sock"
+python3 -c 'import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1])' "$fake_sock" 2>/dev/null \
+  || perl -MIO::Socket::UNIX -e 'IO::Socket::UNIX->new(Type=>SOCK_STREAM(),Local=>$ARGV[0],Listen=>1) or exit 1' "$fake_sock" 2>/dev/null || true
+if [[ -S $fake_sock ]]; then
+  fake_cli() { [[ "$*" == "-s $fake_sock ping" ]] && echo PONG; }
+  check "valkey_endpoint_pong uses the configured socket when it exists" \
+    valkey_endpoint_pong fake_cli "$fake_sock"
+else
+  t_skip "valkey_endpoint_pong socket case (no AF_UNIX helper)" 2>/dev/null || true
+fi
+fake_cli() { [[ "$*" == "ping" ]] && echo PONG; }
+check "valkey_endpoint_pong falls back to TCP when the socket is missing" \
+  valkey_endpoint_pong fake_cli "$TMP/no-such.sock"
+optimize_valkey_body=$(sed -n '/^optimize_valkey()/,/^}/p' "$ALL_SRC")
+check "every optimizer CONFIG call targets the live endpoint" \
+  bash -c '! grep -E "\"\\\$cli\" CONFIG " <<<"$1" && grep -qF "\"\$cli\" \"\${live_ep[@]}\" CONFIG SET" <<<"$1"' _ "$optimize_valkey_body"
+check "the optimizer restart probe pings the written socket" \
+  grep -qF 'valkey_restart_probe "$cli" "$socket_path"' <<<"$optimize_valkey_body"
+verify_body=$(sed -n '/^verify_optimized_services()/,/^}/p' "$ALL_SRC")
+check "verification never pings the bare TCP default" \
+  bash -c '! grep -qE "(valkey|redis)-cli ping" <<<"$1"' _ "$verify_body"
+rm -f "$fake_sock"
 unset -f fake_cli
 swap_auto_body=$(sed -n '/^configure_swap_auto()/,/^}/p' "$ALL_SRC")
 check "automatic swap never switches the live file off itself" \
@@ -6812,7 +6850,7 @@ check_tree "cache paths reserve filesystem headroom (min_free)" \
 # the map and prove both directions -- known page-neutral cookies keep the
 # cache, anything else bypasses.
 guest_cookie_re=$(awk '/map \$http_cookie \$guest_cookie_unlisted/ { f = 1; next }
-  f && /^[[:space:]]*"~/ { sub(/^[[:space:]]*"~/, ""); sub(/"[[:space:]]*1;$/, ""); print; exit }' \
+  f && /^[[:space:]]*"~/ && !/\\x00-/ { sub(/^[[:space:]]*"~/, ""); sub(/"[[:space:]]*1;$/, ""); print; exit }' \
   "$ANGIE_TREE/http.d/fastcgi_cache.conf")
 check_tree "guest cache: the unknown-cookie map exists" test -n "$guest_cookie_re"
 guest_cookie_allowed() { ! perl -e 'exit(($ARGV[1] =~ /$ARGV[0]/i) ? 0 : 1)' "$guest_cookie_re" "$1"; }
@@ -6823,6 +6861,15 @@ check_tree "guest cache: WordPress guest cookies stay page-neutral" \
   guest_cookie_allowed 'wordpress_test_cookie=WP%20Cookie%20check; comment_author_abc=me'
 check_tree "guest cache: XenForo CSRF and key cookies stay page-neutral" \
   guest_cookie_allowed 'xf_csrf=abc; xf_style_id=2; xf_language_id=1'
+# 1.6.58: the control-character rule, evaluated with Perl like the allowlist.
+guest_cc_re=$(awk '/map \$http_cookie \$guest_cookie_unlisted/ { f = 1; next }
+  f && /^[[:space:]]*"~/ && /\\x00-/ { sub(/^[[:space:]]*"~/, ""); sub(/"[[:space:]]*1;$/, ""); print; exit }' \
+  "$ANGIE_TREE/http.d/fastcgi_cache.conf")
+guest_cc_hit() { perl -e 'exit(($ARGV[1] =~ /$ARGV[0]/) ? 0 : 1)' "$guest_cc_re" "$1"; }
+check_tree "guest cache: a vertical tab before a cookie name is caught" guest_cc_hit $'_ga=1;\vxf_language_id=2'
+check_tree "guest cache: a form feed before a cookie name is caught" guest_cc_hit $'\fsso_token=abc'
+check_tree "guest cache: plain and TAB-separated cookies are not caught" \
+  not guest_cc_hit $'_ga=GA1.1.1.1; _fbp=fb.1;\txf_csrf=abc'
 check_tree "guest cache: an unknown cookie is a bypass" \
   guest_cookie_unknown 'plugin_session=abc'
 check_tree "guest cache: an unknown cookie beside analytics is a bypass" \
@@ -6890,6 +6937,15 @@ check_tree "the cookie allowlist no longer names the removed filter" \
   bash -c '! grep -qi "anubis" "$1/http.d/fastcgi_cache.conf"' _ "$ANGIE_TREE"
 check_tree "no unix: peer is trusted for forwarded headers" \
   bash -c '! grep -qE "^[[:space:]]*\"unix:" "$1/http.d/https_map.conf"' _ "$ANGIE_TREE"
+# 1.6.58: PHP strips \v/\f before a cookie name, the allowlist regex and
+# Angie's $cookie_* did not; a Cookie header with a control character is
+# unlisted, and that rule is the first regex of the map.
+check_tree "a Cookie header with a control character is never guest-cacheable" \
+  bash -c 'awk "/^map \\\$http_cookie \\\$guest_cookie_unlisted/{f=1} f && /\"~/{print; exit}" "$1/http.d/fastcgi_cache.conf" | grep -qF "\"~[\\x00-\\x08\\x0a-\\x1f\\x7f]\" 1;"' _ "$ANGIE_TREE"
+check_tree "the XenForo proxy cache never stores an origin 403 or 429" \
+  bash -c 'a=$(grep -n "proxy_cache_valid *403 429 0s;" "$1/h5bp/xf_proxy_pass.conf" | cut -d: -f1); b=$(grep -n "proxy_cache_valid *any" "$1/h5bp/xf_proxy_pass.conf" | cut -d: -f1); [[ -n $a && -n $b && $a -lt $b ]]' _ "$ANGIE_TREE"
+check_tree "the credential limiter keys IPv6 clients per /64" \
+  bash -c 'grep -qF "\"~(?s)^(?<login_v6_net>.{8}).{8}\\z\" \$login_v6_net;" "$1/http.d/limit_req.conf" && grep -qE "^ *default +\\\$limit_req_login_addr;" "$1/http.d/limit_req.conf"' _ "$ANGIE_TREE"
 
 # A host still behind the filter is detected from the files only the old
 # release generated, and only from those: a hand-installed Anubis never
@@ -6904,6 +6960,243 @@ check "--optimize refuses on an Anubis-managed host" \
   bash -c 'mkdir -p "$2/anubis" && : > "$2/anubis/enabled"; out=$(cd "$3" && env -u SETUP_TEST_SOURCE_ONLY SETUP_STATE_DIR="$2" bash "$1" --dry-run --optimize 2>&1 || true); rm -rf "$2/anubis"; grep -q "tools/remove-anubis.sh" <<<"$out"' _ "$ROOT/setup.sh" "$SETUP_STATE_DIR" "$TMP"
 check "--diagnostics still runs on an Anubis-managed host" \
   grep -q "! PURGE && ! DIAGNOSTICS" "$ROOT/lib/validate.sh"
+
+
+# 1.21.67: the closing --optimize pass of --domain ran inside run_service's
+# subshell (paused web tier invisible to on_exit, set -e suspended by
+# `|| warn`) and reset the explicit sizes of the same install run.
+check "create_domains no longer runs the optimizer itself" \
+  bash -c '! sed -n "/^create_domains()/,/^}/p" "$1" | grep -q "run_optimize"' _ "$ALL_SRC"
+main_body=$(sed -n '/^main()/,/^}/p' "$ALL_SRC")
+check "main runs the post-domain pass as a plain call after the summary" \
+  bash -c 's=$(grep -n "print_summary || summary_ok=0" <<<"$1" | cut -d: -f1); p=$(grep -nx "  run_post_domain_optimize" <<<"$1" | cut -d: -f1); [[ -n $s && -n $p && $p -gt $s ]]' _ "$main_body"
+run_service_body=$(sed -n '/^run_service()/,/^}/p' "$ALL_SRC")
+check "run_service's subshell traps signals and resumes a paused web tier" \
+  bash -c 'grep -q "trap run_service_exit_guard EXIT" <<<"$1" && grep -qF "trap \"\$hup_action\" HUP" <<<"$1"' _ "$run_service_body"
+# An ignored HUP (--upgrade-php while PHP is replaced) must stay ignored in
+# the installer subshell and in what it execs; otherwise HUP ends the step.
+hup_probe() { kill -HUP "$BASHPID"; : > "$TMP/hup-alive"; }
+rm -f "$TMP/hup-alive"
+( trap '' HUP; run_service hupprobe hup_probe ) >/dev/null 2>&1 || true
+check "run_service keeps an inherited HUP ignore" test -e "$TMP/hup-alive"
+if [[ $(trap -p HUP) == "trap -- '' SIGHUP" ]]; then
+  # Started under nohup: HUP was ignored on entry and cannot be trapped.
+  t_skip "run_service ends a step on HUP (suite runs with HUP ignored)"
+else
+  rm -f "$TMP/hup-alive"
+  ( run_service hupprobe hup_probe ) >/dev/null 2>&1 || true
+  check "run_service still ends a step on HUP when it is not ignored" test ! -e "$TMP/hup-alive"
+fi
+unset -f hup_probe
+saved_pdo_fns=$(declare -f run_optimize info 2>/dev/null || true)
+pdo_seen=""
+run_optimize() { pdo_seen="optimize=$OPTIMIZE keep=$OPT_KEEP_EXPLICIT"; }
+info() { :; }
+# shellcheck disable=SC2154  # associative key, not a variable
+SVC_STATUS=([domain]=OK)
+ENABLED=([domain]=1 [php]=1)
+OPTIMIZE=0; OPT_KEEP_EXPLICIT=0
+run_post_domain_optimize
+check "an install + domain run keeps its explicit sizes in the closing pass" \
+  test "$pdo_seen" = "optimize=1 keep=1"
+check "the closing pass leaves OPTIMIZE and the keep flag cleared" \
+  test "$OPTIMIZE$OPT_KEEP_EXPLICIT" = 00
+ENABLED=([domain]=1); pdo_seen=""
+run_post_domain_optimize
+check "a domain-only run resets the profile like --optimize" \
+  test "$pdo_seen" = "optimize=1 keep=0"
+# shellcheck disable=SC2154  # associative key, not a variable
+SVC_STATUS=([domain]=FAILED); pdo_seen=""
+run_post_domain_optimize
+check "a failed domain step skips the closing pass" test -z "$pdo_seen"
+# shellcheck disable=SC2154  # associative key, not a variable
+SVC_STATUS=([domain]=OK); pdo_seen=""
+SETUP_DOMAIN_OPTIMIZE=0 run_post_domain_optimize
+check "SETUP_DOMAIN_OPTIMIZE=0 skips the closing pass" test -z "$pdo_seen"
+unset -f run_optimize info
+eval "$saved_pdo_fns"
+ENABLED=(); SVC_STATUS=(); OPTIMIZE=0
+
+
+# ---- 1.21.67 round-2 fixes: /etc/hosts newline + 127.0.1.1 lines, ES sysctl purge
+# /etc/hosts across --basic + --purge basic: a provider file without a final
+# newline must stay without one (awk terminates every record it prints), and
+# every original 127.0.1.1 line must come back, not only the first (--basic
+# collapses duplicates into one).
+hf=$TMP/hosts-nonl
+printf '127.0.0.1\tlocalhost\n127.0.1.1\torig orig\n::1\tip6-localhost' > "$hf"
+cp "$hf" "$TMP/hosts-nonl.orig"
+hosts_set_loopback_line "$hf" "$(printf '127.0.1.1\tnew-host')"
+check "hosts: a file without a final newline does not gain one" \
+  test -n "$(tail -c 1 "$hf")"
+hosts_set_loopback_line "$hf" "$(printf '127.0.1.1\torig orig')"
+check "hosts: no-final-newline file round-trips byte for byte" \
+  cmp -s "$hf" "$TMP/hosts-nonl.orig"
+printf '127.0.0.1\tlocalhost' > "$hf"
+hosts_set_loopback_line "$hf" "$(printf '127.0.1.1\tnew-host')"
+hosts_set_loopback_line "$hf" ""
+check "hosts: append then remove on a no-final-newline file restores it" \
+  test "$(od -An -c "$hf" | tr -d ' \n')" = "127.0.0.1\\tlocalhost"
+printf '127.0.0.1\tlocalhost\n' > "$hf"
+hosts_set_loopback_line "$hf" "$(printf '127.0.1.1\tnew-host')"
+check "hosts: a file with a final newline still ends with one" \
+  test "$(tail -c 1 "$hf" | od -An -c | tr -d ' ')" = '\n'
+printf '127.0.0.1\tlocalhost\n127.0.1.1\tx\n' > "$hf"
+hosts_set_loopback_line "$hf" "$(printf '127.0.1.1\ta\\\\b\n127.0.1.1\tc')" || true
+check "hosts: a multi-line LINE goes in at one position, backslashes kept" \
+  test "$(cat "$hf")" = "$(printf '127.0.0.1\tlocalhost\n127.0.1.1\ta\\\\b\n127.0.1.1\tc')"
+: > "$hf"
+hosts_set_loopback_line "$hf" ""
+check "hosts: an empty file stays empty" test ! -s "$hf"
+
+# The purge_basic hosts block, run against scratch copies of /etc/hosts and
+# the backup.
+hosts_purge_block=$(sed -n '/^purge_basic()/,/^}/p' "$ALL_SRC" \
+  | sed -n '/hosts\.recorded" && -f/,/^  fi$/p')
+check "purge: the hosts restore block was found" test -n "$hosts_purge_block"
+hosts_purge_sim() {
+  # BACKUP_DIR is readonly in setup.sh: point the block at the scratch
+  # backup by substitution, like /etc/hosts.
+  # shellcheck disable=SC2034  # both are read by the eval-ed block
+  local hb_dir=$1 live=$2 blk=$hosts_purge_block
+  blk=${blk//\$\{BACKUP_DIR\}/\$hb_dir}
+  eval "${blk//\/etc\/hosts/\"\$live\"}"
+}
+hb=$TMP/hosts-backup
+mkdir -p "$hb"
+printf 'present\n' > "$hb/hosts.recorded"
+printf '127.0.0.1\tlocalhost\n127.0.1.1\tone one\n# provider\n127.0.1.1\ttwo\n::1\tip6' > "$hb/hosts"
+hf=$TMP/hosts-live
+cp "$hb/hosts" "$hf"
+hosts_set_loopback_line "$hf" "$(printf '127.0.1.1\tnew-host')"
+check "purge sim: --basic left a single 127.0.1.1 line" \
+  test "$(grep -c '^127\.0\.1\.1' "$hf")" = 1
+hosts_purge_sim "$hb" "$hf" >/dev/null 2>&1
+check "purge: an otherwise untouched hosts file comes back byte for byte (all 127.0.1.1 lines)" \
+  cmp -s "$hf" "$hb/hosts"
+cp "$hb/hosts" "$hf"
+hosts_set_loopback_line "$hf" "$(printf '127.0.1.1\tnew-host')"
+printf '\n192.0.2.9\tadded-later' >> "$hf"
+hosts_purge_sim "$hb" "$hf" >/dev/null 2>&1
+check "purge: a later entry survives the restore" grep -q 'added-later' "$hf"
+check "purge: every original 127.0.1.1 line is back when other entries changed" \
+  test "$(grep '^127\.0\.1\.1' "$hf")" = "$(printf '127.0.1.1\tone one\n127.0.1.1\ttwo')"
+check "purge: the edited file keeps its no-final-newline state" \
+  test -n "$(tail -c 1 "$hf")"
+
+# --purge elastic retires the vm.max_map_count drop-in that
+# ensure_es_max_map_count records for exactly that purpose.
+elastic_purge_body=$(sed -n '/^purge_elastic()/,/^}/p' "$ALL_SRC")
+check "purge elastic restores /etc/sysctl.d/99-elasticsearch.conf" \
+  grep -qF 'restore_original /etc/sysctl.d/99-elasticsearch.conf sysctl.d-99-elasticsearch.conf' <<<"$elastic_purge_body"
+check "the elasticsearch drop-in is recorded under the same name" \
+  grep -qF 'record_original "$f" sysctl.d-99-elasticsearch.conf' "$ALL_SRC"
+
+# ---- 1.21.67: --upgrade-php post-Angie refresh, dry-run pool split, JIT comment, sid_* gate
+# ---------------------------------------------------------------------------
+# --upgrade-php post-Angie refresh, dry-run PHP pool split, JIT threshold
+# comment, PHP 8.4 session-ID deprecations
+# ---------------------------------------------------------------------------
+# php_refresh_after_angie() is gated on OPT_PHP_OK; php_upgrade_optimize must
+# set it before the PHP pass (as run_optimize does) and clear it on failure.
+php_upgrade_ok_probe=$(
+  detect_installed_services() { :; }
+  plan_memory_budget() { :; }
+  verify_optimized_services() { :; }
+  info() { :; }
+  warn() { :; }
+  probe_during='unset'
+  optimize_php_services() { probe_during=${OPT_PHP_OK:-unset}; return 0; }
+  OPT_PHP_OK=0
+  php_upgrade_optimize >/dev/null 2>&1 || true
+  printf 'during=%s\n' "$probe_during"
+  printf 'after_ok=%s\n' "$OPT_PHP_OK"
+  optimize_php_services() { return 1; }
+  php_upgrade_optimize >/dev/null 2>&1 || true
+  printf 'after_fail=%s\n' "$OPT_PHP_OK"
+)
+check "--upgrade-php sets OPT_PHP_OK before the PHP pass" \
+  grep -qx 'during=1' <<<"$php_upgrade_ok_probe"
+check "--upgrade-php keeps OPT_PHP_OK=1 after a clean PHP pass" \
+  grep -qx 'after_ok=1' <<<"$php_upgrade_ok_probe"
+check "--upgrade-php clears OPT_PHP_OK when the PHP pass fails" \
+  grep -qx 'after_fail=0' <<<"$php_upgrade_ok_probe"
+php_upgrade_opt_body=$(sed -n '/^php_upgrade_optimize()/,/^}/p' "$ALL_SRC")
+check "php_upgrade_optimize sets OPT_PHP_OK=1 ahead of optimize_php_services" \
+  test "$(awk '/OPT_PHP_OK=1/{s=NR} /if optimize_php_services/{o=NR} END{print (s && o && s < o) ? "ok" : "bad"}' <<<"$php_upgrade_opt_body")" = ok
+
+# The dry-run preview must split the pool exactly like tune_php_fpm_version.
+optimize_plan_body=$(sed -n '/^optimize_plan()/,/^}/p' "$ALL_SRC")
+check "optimize_plan counts running PHP-FPM versions" \
+  grep -q 'php_fpm_active_versions' <<<"$optimize_plan_body"
+check "optimize_plan splits the preview pool with php_split_children" \
+  grep -q 'max_children=$(php_split_children "$max_children" "$plan_active_versions")' <<<"$optimize_plan_body"
+check "optimize_plan leaves an explicit --php children= unsplit" \
+  grep -q '\[\[ -z \$explicit_children \]\] && (( plan_active_versions > 1 ))' <<<"$optimize_plan_body"
+check "php_split_children halves a pool across two versions" \
+  test "$(php_split_children 64 2)" = 32
+check "php_split_children keeps the pool for one version" \
+  test "$(php_split_children 64 1)" = 64
+
+# jit_hot_return/side_exit are tuned (PHP's defaults are 8/8); values stay.
+php_jit_comment=$(awk '/^# Tracing-JIT hotness thresholds/{f=1} f; /^php_jit_threshold_lines\(\)/{exit}' "$ALL_SRC")
+check "JIT threshold comment no longer calls the tuned set PHP's defaults" not \
+  grep -q "PHP's defaults are used" <<<"$php_jit_comment"
+check "JIT threshold comment names PHP's 8/8 defaults" \
+  grep -q "8/8" <<<"$php_jit_comment"
+php_jit_lines_4cpu=$(SETUP_PHP_JIT_HOT_RETURN='' SETUP_PHP_JIT_HOT_SIDE_EXIT='' php_jit_threshold_lines 4)
+check "JIT keeps jit_hot_return=16 on a 4-CPU host" \
+  grep -qx 'opcache.jit_hot_return = 16' <<<"$php_jit_lines_4cpu"
+check "JIT keeps jit_hot_side_exit=64 on a 4-CPU host" \
+  grep -qx 'opcache.jit_hot_side_exit = 64' <<<"$php_jit_lines_4cpu"
+
+# session.sid_length / sid_bits_per_character are deprecated in PHP 8.4:
+# written only inside the pre-8.4 version gate.
+php_sid_gate=$(awk '/php_major < 8 \|\| \(php_major == 8 && php_minor < 4\)/{f=1} f' <<<"$php_tune_hardening")
+check "opt-in hardening gates sid_length on PHP < 8.4" \
+  grep -q '^session.sid_length = 48$' <<<"$php_sid_gate"
+check "opt-in hardening gates sid_bits_per_character on PHP < 8.4" \
+  grep -q '^session.sid_bits_per_character = 6$' <<<"$php_sid_gate"
+check "opt-in hardening derives the gate from the pool version" \
+  grep -qF 'php_major=${ver%%.*}' <<<"$php_tune_hardening"
+php_sid_gate_eval() {
+  local ver=$1 php_major php_minor
+  php_major=${ver%%.*} php_minor=${ver#*.}
+  php_minor=${php_minor%%.*}
+  [[ $php_major =~ ^[0-9]+$ && $php_minor =~ ^[0-9]+$ ]] \
+    && (( php_major < 8 || (php_major == 8 && php_minor < 4) ))
+}
+check "PHP 8.3 still gets the session-ID length lines" php_sid_gate_eval 8.3
+check "PHP 8.4 skips the deprecated session-ID lines" not php_sid_gate_eval 8.4
+check "PHP 8.5 skips the deprecated session-ID lines" not php_sid_gate_eval 8.5
+
+# ---- 1.21.67: interrupted --diagnostics leaves no unredacted temp report
+# An interrupted --diagnostics (Ctrl-C, set -e, die) left its unredacted
+# temp report (diagnostics.log.XXXXXX, raw root dumps) in the checkout under
+# a name .gitignore did not match.  DIAG_TMP is now a global that on_exit
+# removes while set, and run_diagnostics clears it after the move.
+diag_exit_probe() {
+  ( OPTIMIZE=0 PHP_UPGRADE_IN_FLIGHT=0 DIAG_TMP=$1
+    cleanup_configs() { :; }; release_run_lock() { :; }; finish_run_log() { :; }
+    set +eE; trap - ERR
+    (exit "$2"); on_exit ) 2>/dev/null || true
+}
+diag_left="$TMP/diagnostics.log.AbC123"
+: > "$diag_left"
+diag_exit_probe "$diag_left" 130
+check "on_exit removes an interrupted --diagnostics temp report" test ! -e "$diag_left"
+diag_dir="$TMP/diagnostics.log.dir"; mkdir -p "$diag_dir"
+diag_exit_probe "$diag_dir" 130
+check "on_exit removes only a regular diagnostics temp file" test -d "$diag_dir"
+rmdir "$diag_dir"
+diag_body=$(sed -n '/^run_diagnostics()/,/^}/p' "$ALL_SRC")
+check "DIAG_TMP is a global, not a local hidden from on_exit" \
+  not grep -qE 'local [^#]*\bDIAG_TMP\b' <<<"$diag_body"
+check "run_diagnostics clears DIAG_TMP after publishing the report" \
+  bash -c 'awk "/mv -f \"\\\$DIAG_FILE\" \"\\\$out\"/{m=1} m && /DIAG_TMP=\"\"/{f=1} END{exit !f}" <<<"$1"' _ "$diag_body"
+diag_gitignore=$(cat "$ROOT/.gitignore")
+check ".gitignore covers the in-progress diagnostics report" \
+  grep -qxF 'diagnostics.log.*' <<<"$diag_gitignore"
 
 printf '\nTOTAL pass=%d fail=%d skip=%d\n' "$PASS" "$FAIL" "$SKIP"
 [[ $FAIL -eq 0 ]]

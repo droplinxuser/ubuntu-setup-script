@@ -4,6 +4,12 @@
 # Diagnostics: one read-only report for an OpenCode/analysis session
 # ---------------------------------------------------------------------------
 DIAG_FILE=""
+# The unredacted in-progress report (diagnostics.log.XXXXXX in the checkout).
+# A global, not a local of run_diagnostics, so on_exit can remove it when a
+# Ctrl-C, set -e or die interrupts the run before the redaction and move:
+# it holds raw root dumps and its random suffix is not what .gitignore
+# would otherwise match.  Empty whenever no such file exists.
+DIAG_TMP=""
 
 diag_section() {
   printf '\n\n===== %s =====\n' "$*" >> "$DIAG_FILE"
@@ -301,7 +307,7 @@ redact_diagnostics() {
 
 run_diagnostics() {
   local out="${SCRIPT_DIR}/diagnostics.log"
-  local u ver fpm_bin f es_url redis_unit redis_bin redis_cli redis_label DIAG_TMP
+  local u ver fpm_bin f es_url redis_unit redis_bin redis_cli redis_label
   local -a units=(angie mariadb valkey-server redis-server elasticsearch)
 
   umask 077
@@ -591,6 +597,8 @@ run_diagnostics() {
   # replaced (mv does not follow it), never written through.
   mv -f "$DIAG_FILE" "$out" || die "Could not publish ${out}"
   DIAG_FILE=""
+  # Moved into place and redacted: nothing left for on_exit to remove.
+  DIAG_TMP=""
   give_to_invoking_user "$out"
   printf '%s\n' "$out"
 }

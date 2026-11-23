@@ -8,6 +8,102 @@ Reports of the 1.21.33-1.21.61 cycles that measured the removed Anubis
 filter were deleted from the tree on 2026-11-23 for the same reason;
 `git show <commit>:<path>` recovers them.
 
+## 1.21.67 (2026-11-24)
+
+- **XenForo server shootout: Angie stays.**  Angie + Sury PHP-FPM with
+  `fastcgi_cache`, Angie + a clang `-O3 -march=native` PHP-FPM, OpenLiteSpeed
+  1.9.4 + LiteSpeed's lsphp85 with LSCache through the official XenForo
+  add-on, and OpenLiteSpeed + the clang lsphp.  Same PHP 8.5.13, php.ini, 12
+  PHP processes, certificate and forum (20k users, 10.2k threads, 103k
+  posts), clock pinned at 3.6 GHz, arms rotated.  **Cached guest pages:
+  Angie 125.0k vs 96.7k req/s on the forum index (−22.6 % for
+  OpenLiteSpeed) and 99.4k vs 83.3k on a thread (−16 %)**; an LSCache hit
+  costs 14-22 % more CPU.  **Member pages: a tie** once the harness defects
+  below were fixed (thread +0.9 %, index +3.6 % for OpenLiteSpeed, equal CPU
+  per page).  Under saturation Angie + FPM served every visitor in about
+  0.45 s (p99 0.46-0.48 s); OpenLiteSpeed kept ~12 connections moving and
+  parked the rest (p99 2-5 s, 4 of 300 probe requests past 30 s).  clang
+  PHP: +3 % on member pages, 0 on cached ones, as in 1.21.66.  Report:
+  `tests/stress-site/AUDIT-20261124-1.21.67.md`.
+- **OpenLiteSpeed + the LSCache XenForo add-on, as documented, shows members
+  the cached guest page.**  `CacheLookup on` serves the public entry to
+  every request, and the add-on's `xf_lscxf_logged_in` marker only exists
+  for logins made after it was installed, so remember-me sessions saw a
+  logged-out forum.  The harness (`tests/bench-php-matrix/install-ols.sh`)
+  adds `E="cache-vary:xf_session,xf_user,xf_lscxf_logged_in,xf_session_admin"`;
+  it also documents two silent OpenLiteSpeed limits: `maxKeepAliveReq` above
+  32767 becomes 100, and lsphp as `www-data` needs `minUID 11`.
+- **Harness defects found while measuring:** `bench-php-sources.sh` printed
+  p50 in its "p99" column since 1.21.64 (fixed; `RAW=` keeps every row with
+  non-2xx and CPU); lsphp children outlived OpenLiteSpeed and cost the next
+  Angie arm ~10 % (`switch-php-arm.sh` now drains them); wrk records latency
+  only for finished requests, so a per-visitor probe measures starvation.
+- **`--optimize` talks to Valkey where it really listens.**  The optimizer
+  sent `CONFIG SET`/`GET`, the post-restart probe and the verification PING
+  to the client default, 127.0.0.1:6379 (1.21.66 fixed only the installer's
+  PING).  On an adopted cache that keeps an operator `bind` without loopback,
+  or another `port`, every run failed the online change, restarted the cache
+  (emptying it), failed the probe, restarted it again in the rollback and
+  reported FAILED.  All of these now use the configured Unix socket
+  (`valkey_endpoint_pong`), and `valkey_live_cli` prefers an operator's
+  custom `unixsocket`.
+- **The closing tuning pass of `--domain` runs in the main process.**  It ran
+  inside `run_service`'s subshell as `run_optimize || warn`.  A web tier
+  paused for a MariaDB restart there was invisible to `on_exit`, so a Ctrl-C
+  or a dropped SSH session left Angie and PHP-FPM stopped, and the `|| warn`
+  suspended `set -e` for every tuner.  The pass now runs from `main()` after
+  the installation summary, as a plain call, like `--optimize`.  A failed
+  tuner ends the run non-zero with the optimize report (it used to warn and
+  exit 0).  `run_service`'s subshell also gets its own INT/TERM/HUP traps
+  and an EXIT guard that resumes a paused web tier (the dump-import restart).
+  An ignored HUP is inherited, never replaced, so `--upgrade-php` keeps
+  apt/dpkg immune to a dropped session while PHP is being replaced.
+- **An install that adds a domain keeps its own explicit sizes.**  `--php
+  children=8 --mariadb size=2g ... --domain ...` logged the override and
+  then reset it in the closing pass of the same run.  That pass now keeps
+  the run's explicit values and `SETUP_*` tuning; a domain-only run on an
+  existing host still resets the profile like `--optimize`.
+- **MariaDB: a `max_connections` change no longer forces a restart.**
+  `table_definition_cache` and `innodb_open_files` move with
+  `table_open_cache` above 250 connections, but neither was an online or
+  deferred key, so the online path was refused and the database restarted
+  with the web tier paused.  `table_definition_cache` is now applied online
+  (and read back); `innodb_open_files` waits for the next start.
+- **`--upgrade-php` runs its post-Angie PHP refresh.**  `OPT_PHP_OK` was
+  never set to 1 there, so `php_refresh_after_angie` never ran after an
+  upgrade.  It now mirrors `--optimize`.
+- **`--optimize --dry-run` previews the per-version PHP pool** that the real
+  run writes when more than one FPM version is running.
+- **`/etc/hosts` keeps its final-newline state.**  `hosts_set_loopback_line`
+  rewrote the file through awk, which always ends the last line, so every
+  install and restore cycle added one trailing newline (the open item of the
+  last three cycles).  `--purge` now also restores every original
+  `127.0.1.1` line, not only the first, and the file byte for byte when
+  nothing else changed.
+- **`--purge elastic` removes `/etc/sysctl.d/99-elasticsearch.conf`**, which
+  the install recorded "so --purge can remove it".
+- **An interrupted `--diagnostics` leaves no unredacted report behind**:
+  `on_exit` removes the temporary file, and `.gitignore` covers its name.
+- The JIT threshold comment and README called the tuned 64/127/16/64 set
+  "PHP's defaults" (PHP's return/side-exit defaults are 8/8); the opt-in
+  session hardening no longer writes `session.sid_length` and
+  `sid_bits_per_character` on PHP 8.4+, where they are deprecated.
+- **Security (server-configs-nginx 1.6.58):** a Cookie header carrying a
+  control character (`\v`, `\f`, ...) is never guest-cacheable.  PHP strips
+  those bytes in front of a cookie name while the allowlist and Angie's
+  `$cookie_*` did not, so `_ga=1;\vsso_token=...` stored its page for every
+  guest (measured: `MISS MISS HIT`, then a plain guest got that copy).  The
+  XenForo front-proxy cache no longer stores an origin 403/429, and the
+  credential limiter counts an IPv6 client per /64 (40 addresses of one /64:
+  all 200 before, 429 at attempt 12 after).  New checks: three tree checks,
+  12 cookie probes (cookie suite 86 → 98) and an IPv6 /64 probe (security
+  suite 73 → 74).
+- **Harness:** `restore-baseline.sh` purges only orphaned packages the
+  baseline never had (a blanket autoremove could remove baseline packages),
+  removes the OpenLiteSpeed and source-PHP trees, and drops the vendor
+  repository before `apt-get update`.  `sample-cpu.sh` attributes
+  OpenLiteSpeed and lsphp CPU; the source arms now build the LiteSpeed SAPI.
+
 ## 1.21.66 (2026-11-23)
 
 - **PHP build sources, last round: clang is +3 % on XenForo, nothing else

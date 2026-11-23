@@ -319,21 +319,34 @@ EOF
 
 # Set the 127.0.1.1 line of a hosts file in place: the first such line is
 # replaced where it stands and any further ones are dropped; with no such line
-# the new one is appended.  An empty LINE removes them.  Deleting and
-# appending (the old way) moved the line to the end, so --purge basic could
-# never give back the provider's file byte for byte.
+# the new one is appended.  An empty LINE removes them; a LINE holding several
+# newline-separated lines puts all of them at that one position (--purge
+# basic uses this to give back every 127.0.1.1 line of the original).
+# Deleting and appending (the old way) moved the line to the end, so --purge
+# basic could never give back the provider's file byte for byte.
 #   hosts_set_loopback_line FILE LINE
 hosts_set_loopback_line() {
-  local file=$1 line=$2 tmp
+  local file=$1 line=$2 tmp nonl=0
   tmp=$(tmp_file) || return 1
-  awk -v l="$line" '
-    /^[[:space:]]*127\.0\.1\.1[[:space:]]/ { if (!done && l != "") print l; done = 1; next }
-    { print }
-    END { if (!done && l != "") print l }
+  # awk terminates every record it prints, so a provider file without a final
+  # newline gained one across --basic + --purge and was no longer byte for
+  # byte the original.  Note the state here and let awk write the separators
+  # itself.  $(...) drops a trailing newline, so a non-empty result means the
+  # last byte is something else.
+  [[ -s $file && -n $(tail -c 1 "$file") ]] && nonl=1
+  # ENVIRON instead of -v: -v expands backslash escapes, which would alter a
+  # restored original line that happens to contain one.
+  HOSTS_LOOPBACK_LINE=$line awk -v nonl="$nonl" '
+    function out(s) { if (n++) printf "\n"; printf "%s", s }
+    BEGIN { l = ENVIRON["HOSTS_LOOPBACK_LINE"] }
+    /^[[:space:]]*127\.0\.1\.1[[:space:]]/ { if (!done && l != "") out(l); done = 1; next }
+    { out($0) }
+    END { if (!done && l != "") out(l); if (n && !nonl) printf "\n" }
   ' "$file" > "$tmp" || return 1
   # Rewrite through the existing inode: mode, owner and any symlink stay.
   cat "$tmp" > "$file"
 }
+
 
 configure_hostname() {
   local host=$1

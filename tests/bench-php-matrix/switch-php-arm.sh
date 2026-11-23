@@ -2,7 +2,7 @@
 # Put exactly one PHP arm in front of Angie's shared FastCGI socket
 # (/run/php/php-fpm.sock) and prove it is serving.
 #
-# Usage: switch-php-arm.sh sury|ubuntu|src-TAG
+# Usage: switch-php-arm.sh sury|ubuntu|src-TAG|ols-lsphp|ols-src-TAG
 #
 # "sury" and "ubuntu" both start the distribution unit (php8.5-fpm); which
 # package provides it is decided by the caller (the audit purges one before
@@ -10,10 +10,15 @@
 # build-php-source.sh and gives it a private extension directory that mirrors
 # the distribution's conf.d minus redis/imagick, with the arm's own builds
 # added from its ext/ directory (the unit sets PHP_INI_SCAN_DIR).
+#
+# "ols-lsphp" and "ols-src-TAG" stop Angie and every FPM pool and serve the
+# XenForo vhost from OpenLiteSpeed (install-ols.sh) with LiteSpeed's lsphp85
+# or the source arm's lsphp (LSAPI) and LSCache.  Every other arm stops
+# OpenLiteSpeed and makes sure Angie is running.
 set -Eeuo pipefail
 export LC_ALL=C
 
-ARM=${1:?usage: switch-php-arm.sh sury|ubuntu|src-TAG}
+ARM=${1:?usage: switch-php-arm.sh sury|ubuntu|src-TAG|ols-lsphp|ols-src-TAG}
 PHP_INI_DIR=/etc/php/8.5/fpm
 SOCK=/run/php/php-fpm.sock
 
@@ -44,6 +49,58 @@ stop_all() {
   return 1
 }
 
+# LSAPI children outlive lshttpd for a few seconds after a stop and keep
+# burning CPU: an Angie arm measured right after an OpenLiteSpeed arm lost
+# ~10 % (199 vs 222 req/s) with lsphp still in its CPU samples.  Wait until
+# every lsphp has exited (SIGKILL after 10 s).
+stop_lsphp() {
+  local i
+  pkill -x lsphp 2>/dev/null || true
+  for (( i = 0; i < 50; i++ )); do
+    pgrep -x lsphp >/dev/null 2>&1 || return 0
+    sleep 0.2
+  done
+  pkill -9 -x lsphp 2>/dev/null || true
+  sleep 0.5
+}
+
+# The scan directory of a source arm (FPM unit and OpenLiteSpeed lsphp alike),
+# rebuilt on every switch so a later --optimize reaches it.
+prepare_src_scan_dir() {
+  local tag=$1 f ext mods prio
+  local -a ext_ini=()
+  CONF_DIR="/etc/php-src/$tag/conf.d"
+  EXT_DIR="/etc/php-src/$tag/ext"
+  [[ -x /opt/php-$tag/bin/php ]] || { echo "no /opt/php-$tag/bin/php; build the arm first" >&2; exit 1; }
+  mkdir -p "$CONF_DIR" "$EXT_DIR"
+  # Mirror the managed configuration (zz-setup-optimize.ini is rewritten by
+  # setup.sh --optimize) but never the distribution's redis/imagick .so:
+  # the arm loads its own builds from $EXT_DIR.
+  rsync -aL --delete --exclude '*redis*.ini' --exclude '*imagick*.ini' \
+    "$PHP_INI_DIR/conf.d/" "$CONF_DIR/"
+  # The source build compiles its module set into the binary and has an empty
+  # extension_dir, so every conf.d file that loads a shared module would log
+  # "Unable to load dynamic library".  Keep only the settings files
+  # (custom_dan.ini, zz-setup-optimize.ini, zzz-audit.ini) and load the three
+  # extensions the applications need from the distribution's builds, which
+  # share the Zend module API, by absolute path.
+  # conf.d entries are symlinks into mods-available: follow them.
+  mapfile -t ext_ini < <(find -L "$CONF_DIR" -name '*.ini' \
+    -exec grep -lE '^[[:space:]]*extension[[:space:]]*=' {} + 2>/dev/null || true)
+  for f in "${ext_ini[@]}"; do rm -f "$f"; done
+  if [[ ! -f $EXT_DIR/.source-built-ext ]]; then
+    # No source-built extensions in this arm: reuse the distribution ones.
+    for ext in igbinary redis imagick; do
+      mods=(/usr/lib/php/*/"$ext".so)
+      [[ -f ${mods[0]:-} ]] || continue
+      prio=99; [[ $ext == igbinary ]] && prio=20
+      printf 'extension=%s\n' "${mods[0]}" > "$EXT_DIR/$prio-$ext.ini"
+    done
+  fi
+  # The same scan path the unit uses, so the CLI checks below describe FPM.
+  export PHP_INI_SCAN_DIR="$CONF_DIR:$EXT_DIR"
+}
+
 case $ARM in
   sury)
     UNIT=php8.5-fpm
@@ -71,57 +128,73 @@ case $ARM in
     TAG=${ARM#src-}
     UNIT="php-src-$TAG.service"
     BIN="/opt/php-$TAG/bin/php"
-    CONF_DIR="/etc/php-src/$TAG/conf.d"
-    EXT_DIR="/etc/php-src/$TAG/ext"
-    [[ -x $BIN ]] || { echo "no $BIN; build the arm first" >&2; exit 1; }
-    mkdir -p "$CONF_DIR" "$EXT_DIR"
-    # Mirror the managed configuration (zz-setup-optimize.ini is rewritten by
-    # setup.sh --optimize) but never the distribution's redis/imagick .so:
-    # the arm loads its own builds from $EXT_DIR.
-    rsync -aL --delete --exclude '*redis*.ini' --exclude '*imagick*.ini' \
-      "$PHP_INI_DIR/conf.d/" "$CONF_DIR/"
-    # The source build compiles its module set into the binary and has an empty
-    # extension_dir, so every conf.d file that loads a shared module would log
-    # "Unable to load dynamic library".  Keep only the settings files
-    # (custom_dan.ini, zz-setup-optimize.ini, zzz-audit.ini) and load the three
-    # extensions the applications need from the distribution's builds, which
-    # share the Zend module API, by absolute path.
-    # conf.d entries are symlinks into mods-available: follow them.
-    mapfile -t ext_ini < <(find -L "$CONF_DIR" -name '*.ini' \
-      -exec grep -lE '^[[:space:]]*extension[[:space:]]*=' {} + 2>/dev/null || true)
-    for f in "${ext_ini[@]}"; do rm -f "$f"; done
-    if [[ ! -f $EXT_DIR/.source-built-ext ]]; then
-      # No source-built extensions in this arm: reuse the distribution ones.
-      for ext in igbinary redis imagick; do
-        mods=(/usr/lib/php/*/"$ext".so)
-        [[ -f ${mods[0]:-} ]] || continue
-        prio=99; [[ $ext == igbinary ]] && prio=20
-        printf 'extension=%s\n' "${mods[0]}" > "$EXT_DIR/$prio-$ext.ini"
-      done
-    fi
-    # The same scan path the unit uses, so the CLI checks below describe FPM.
-    export PHP_INI_SCAN_DIR="$CONF_DIR:$EXT_DIR"
+    prepare_src_scan_dir "$TAG"
     PHP_ARGS=()
+    ;;
+  ols-*)
+    # OpenLiteSpeed + LSAPI.  The handler name matches an extprocessor that
+    # install-ols.sh wrote (lsphp85, or lsphp-src-TAG for a source arm, which
+    # needs build-php-max.sh's --enable-litespeed lsphp binary).
+    case $ARM in
+      ols-lsphp)
+        HANDLER=lsphp85; BIN=/usr/local/lsws/lsphp85/bin/php
+        # LiteSpeed's own extension .ini files stay; the managed settings
+        # files are refreshed on every switch, as for the source arms.
+        mkdir -p /etc/php-ols/conf.d
+        for ini in custom_dan.ini zz-setup-optimize.ini zzz-audit.ini; do
+          [[ -f $PHP_INI_DIR/conf.d/$ini ]] && cp -fL "$PHP_INI_DIR/conf.d/$ini" /etc/php-ols/conf.d/
+        done
+        export PHP_INI_SCAN_DIR=/etc/php-ols/conf.d ;;
+      ols-src-*)
+        TAG=${ARM#ols-src-}; HANDLER=lsphp-src-$TAG; BIN=/opt/php-$TAG/bin/php
+        prepare_src_scan_dir "$TAG" ;;
+      *) echo "unknown arm: $ARM" >&2; exit 1 ;;
+    esac
+    OLS_CONF=/usr/local/lsws/conf/httpd_config.conf
+    grep -q "^extprocessor $HANDLER " "$OLS_CONF" \
+      || { echo "no extprocessor $HANDLER in $OLS_CONF; run install-ols.sh config" >&2; exit 1; }
+    PHP_ARGS=(-c "$PHP_INI_DIR/php.ini")
+    UNIT=lshttpd.service
     ;;
   *)
     echo "unknown arm: $ARM" >&2; exit 1 ;;
 esac
 
 stop_all
-systemctl reset-failed "$UNIT" >/dev/null 2>&1 || true
-systemctl start "$UNIT"
+if [[ $ARM == ols-* ]]; then
+  systemctl stop angie >/dev/null 2>&1 || true
+  systemctl stop lshttpd >/dev/null 2>&1 || true
+  stop_lsphp
+  sed -i -E "s#^([[:space:]]*add[[:space:]]+lsapi:)[^[:space:]]+([[:space:]]+php)#\1$HANDLER\2#" "$OLS_CONF"
+  # The LSCache store belongs to the arm that filled it.
+  find /var/cache/ols -mindepth 2 -delete 2>/dev/null || true
+  systemctl reset-failed lshttpd >/dev/null 2>&1 || true
+  systemctl start lshttpd
+  PROBE_URL=https://xf.test.local/
+else
+  if systemctl is-active --quiet lshttpd 2>/dev/null; then
+    systemctl stop lshttpd
+  fi
+  stop_lsphp
+  systemctl is-active --quiet angie || systemctl start angie
+  systemctl reset-failed "$UNIT" >/dev/null 2>&1 || true
+  systemctl start "$UNIT"
+  PROBE_URL=https://wp.test.local/
+fi
 
-for _ in $(seq 1 100); do
-  [[ -S $SOCK ]] && break
-  sleep 0.2
-done
-[[ -S $SOCK ]] || { systemctl status "$UNIT" --no-pager >&2 || true; echo "$SOCK never appeared" >&2; exit 1; }
+if [[ $ARM != ols-* ]]; then
+  for _ in $(seq 1 100); do
+    [[ -S $SOCK ]] && break
+    sleep 0.2
+  done
+  [[ -S $SOCK ]] || { systemctl status "$UNIT" --no-pager >&2 || true; echo "$SOCK never appeared" >&2; exit 1; }
+fi
 
 # The first request after a switch loads OPcache; wait for a 2xx/3xx.
 code=""
 for _ in $(seq 1 50); do
   code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 \
-           -H 'Cookie: arm-probe=1' https://wp.test.local/ 2>/dev/null || true)
+           -H 'Cookie: arm-probe=1' "$PROBE_URL" 2>/dev/null || true)
   [[ $code =~ ^[23] ]] && break
   sleep 0.3
 done

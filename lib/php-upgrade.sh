@@ -1039,14 +1039,19 @@ php_upgrade_optimize() {
   local rc=0 change
   detect_installed_services
   plan_memory_budget
-  OPT_PHP_OK=0
   OPT_PHP_SOCKET=""
   tune_reset_changes
+  # Same contract as run_optimize(): OPT_PHP_OK is set before the PHP
+  # pass and cleared only when it fails.  php_refresh_after_angie() is gated
+  # on it, so leaving it at 0 silently skipped the post-Angie [PATH=] ini
+  # refresh on every --upgrade-php.
+  OPT_PHP_OK=1
   if optimize_php_services; then
     for change in "${TUNE_CHANGES[@]}"; do info "${change}"; done
     for change in "${TUNE_MISSES[@]}"; do warn "Not applied: ${change}"; done
   else
     warn "PHP optimization reported a failure"
+    OPT_PHP_OK=0
     rc=1
   fi
   # A host installed from distribution packages serves PHP over TCP and

@@ -119,8 +119,21 @@ mariadb_restart_probe() {
   return 1
 }
 
+# PING the cache where it really listens: the Unix socket the config names
+# when it exists, else the client default (127.0.0.1:6379).  An adopted
+# configuration may keep an operator bind or port, so the TCP default is not
+# always this server.  Usage: valkey_endpoint_pong CLI [SOCKET]
+valkey_endpoint_pong() {
+  local cli=$1 sock=${2:-}
+  if [[ -n $sock && -S $sock ]]; then
+    valkey_pong "$cli" -s "$sock"
+  else
+    valkey_pong "$cli"
+  fi
+}
+
 valkey_restart_probe() {
-  wait_for_cmd 20 valkey_pong "$1" && return 0
+  wait_for_cmd 20 valkey_endpoint_pong "$1" "${2:-}" && return 0
   OPT_RESTART_FAIL_NOTE="PING"
   return 1
 }

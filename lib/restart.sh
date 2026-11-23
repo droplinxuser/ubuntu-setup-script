@@ -354,8 +354,17 @@ run_optimize() {
   # across servers with the same hardware instead of inheriting old host
   # settings.
   step "Recomputing the hardware profile"
-  optimize_ignore_tuning_env
-  reset_operator_overrides
+  RESET_ACTIONS=()
+  OPTIMIZE_IGNORED_ENV=()
+  if (( ${OPT_KEEP_EXPLICIT:-0} )); then
+    # The closing pass of an install that also added a domain: the operator's
+    # --php children=, --mariadb size=, --valkey ram=, --elastic ram= and
+    # SETUP_* tuning of this same run stay in force (run_post_domain_optimize).
+    RESET_ACTIONS+=("kept this run's explicit sizes and tuning environment (same-run install)")
+  else
+    optimize_ignore_tuning_env
+    reset_operator_overrides
+  fi
   opt_report "## Profile reset"
   local reset_action
   for reset_action in "${RESET_ACTIONS[@]}"; do
@@ -510,10 +519,45 @@ on_exit() {
     warn "PHP upgrade interrupted (exit ${rc}); restoring PHP ${PHP_UPGRADE_OLD_VERSION:-?}"
     php_upgrade_rollback || warn "Rollback did not complete; inspect /var/lib/setup.sh"
   fi
+  # An interrupted --diagnostics leaves its unredacted temp report (raw root
+  # dumps) in the checkout.  This run created it with mktemp, so removing it
+  # is in scope; run_diagnostics clears DIAG_TMP once the report is moved.
+  if [[ -n ${DIAG_TMP:-} && -f $DIAG_TMP ]]; then
+    rm -f -- "$DIAG_TMP" || true
+    DIAG_TMP=""
+  fi
   cleanup_configs
   release_run_lock
   finish_run_log "$rc"
   return "$rc"
+}
+
+# The closing --optimize pass after --domain.  A new vhost changes what the
+# tuner plans (PHP-FPM worker cap, OPcache file budget, the FastCGI guest cache
+# for the new root, the managed wp-cron / XenForo job entries); running the
+# same pass --optimize runs keeps a domain install identical to "install,
+# then --optimize".  SETUP_DOMAIN_OPTIMIZE=0 skips it for a caller that
+# deploys the application files later and tunes afterwards.
+#
+# It runs here in the main shell with a plain call, like --optimize itself:
+# inside create_domains (run_service's subshell) a web tier paused for a
+# MariaDB restart was invisible to on_exit, and `run_optimize || warn`
+# suspended set -e for every tuner.  When this same run also installed
+# services, their explicit sizes are kept (OPT_KEEP_EXPLICIT); a domain-only
+# run on an existing host resets the profile as --optimize does.
+run_post_domain_optimize() {
+  [[ ${SETUP_DOMAIN_OPTIMIZE:-1} != 0 ]] || return 0
+  [[ ${SVC_STATUS[domain]:-} == OK ]] || return 0
+  local svc keep=0
+  for svc in basic angie php mariadb valkey elastic; do
+    [[ ${ENABLED[$svc]:-0} -eq 1 ]] && keep=1
+  done
+  info "Re-tuning installed services for the new vhost(s) (the --optimize pass)"
+  OPTIMIZE=1
+  OPT_KEEP_EXPLICIT=$keep
+  run_optimize
+  OPT_KEEP_EXPLICIT=0
+  OPTIMIZE=0
 }
 
 main() {
@@ -708,8 +752,13 @@ main() {
     write_cron || warn "Could not refresh the managed crontab"
   fi
 
+  local summary_ok=1
+  print_summary || summary_ok=0
+  # After the summary: a failed tuner exits through on_exit (report written,
+  # paused web tier resumed) exactly as a standalone --optimize would.
+  run_post_domain_optimize
   cleanup_configs
-  if print_summary; then
+  if (( summary_ok )); then
     printf '\n%sAll installations completed successfully.%s\n' "$C_GREEN" "$C_RESET"
     exit 0
   else

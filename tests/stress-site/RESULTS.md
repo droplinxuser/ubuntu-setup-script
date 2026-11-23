@@ -7,7 +7,40 @@ manifests, sweep tables and run logs these sections cite (`AUDIT-*.md`,
 removed from the tree on 2026-11-19 to keep the repository lean; every one
 is still in git history, for example
 `git show 84b0db5:tests/stress-site/AUDIT-20261117-1.21.30.md`.  The current
-cycle report is `AUDIT-20261123-1.21.66.md`.
+cycle report is `AUDIT-20261124-1.21.67.md`.
+
+## 1.21.67 — Xeon E-2236 (2026-11-24)
+
+Pair: `server-configs-nginx` 1.6.58.  Details: `AUDIT-20261124-1.21.67.md`.
+Mitigations off (operator request, test host only).
+
+- **XenForo server shootout: keep Angie + Sury PHP-FPM + `fastcgi_cache`**
+  (primary focus).  Seeded forum (20k users, 10.2k threads, 103k posts),
+  four arms on PHP 8.5.13 with one php.ini and 12 PHP processes, 5 rotated
+  rounds at 3.6 GHz.  Cached guests: Angie 125.0k / 99.4k req/s (index /
+  thread) against OpenLiteSpeed + LSCache 96.7k / 83.3k (−22.6 % / −16 %).
+  Members, controlled A/B: 221 vs 223 (thread), 248 vs 257 (index), equal
+  CPU per page.  Under saturation Angie + FPM p99 0.46 s for every visitor;
+  OpenLiteSpeed p99 2-5 s with requests parked past 30 s.  clang PHP +3 % on
+  members only.  The LSCache add-on's documented rules show members the
+  cached guest page; the harness adds a `cache-vary` on the session cookies.
+- **Security (1.6.58):** a Cookie with a control character bypasses every
+  guest cache (it stored a page under the guest key on the old tree); the
+  XenForo proxy cache never stores 403/429; the login limiter counts IPv6
+  per /64.
+- **Robustness:** `--optimize` reaches Valkey on its socket; the closing
+  pass of `--domain` runs in the main process (signal-safe, `set -e`
+  active) and keeps the same run's explicit sizes; MariaDB applies a
+  `max_connections` change online; `--upgrade-php` runs its post-Angie
+  refresh; `/etc/hosts` keeps its final-newline state (closes the restore
+  drift open since 1.21.64); `--purge elastic` removes its sysctl drop-in.
+- Baseline (Sury, standard data, 3 runs): WP cached 98.1k / 93.3k, XF cached
+  136.7k / 126.3k, Chevereto cached 131.2k / 130.3k req/s; WP member 141 /
+  133, XF member 448 / 251, Chevereto uncached 1,488, member 506.
+- Suites: install 2:09 / 0 warnings, 1,595 unit checks, 227 dry runs,
+  security 74/74, cookie 98/98, functional 0 unexpected, `--optimize` x2
+  3,016 facts (4 lines: the pool following live data), `--upgrade-php` 8.6
+  with a HUP mid-install and back.
 
 ## 1.21.66 — Xeon E-2236 (2026-11-23)
 

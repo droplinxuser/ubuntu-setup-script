@@ -219,14 +219,27 @@ purge_basic() {
     orig_host=$(<"${STATE_DIR}/original-hostname")
     if [[ -n $orig_host ]]; then hostnamectl set-hostname "$orig_host" || true; fi
   fi
-  # configure_hostname only rewrote the 127.0.1.1 line; put that one line
-  # back instead of the whole snapshot, which would discard every /etc/hosts
-  # entry added since the install (cloud-init, the operator, other tools).
+  # configure_hostname only rewrote the 127.0.1.1 lines; put those back
+  # instead of the whole snapshot, which would discard every /etc/hosts entry
+  # added since the install (cloud-init, the operator, other tools).  When
+  # nothing else changed, the recorded original is written back byte for byte:
+  # --basic collapses duplicate 127.0.1.1 lines into one, and restoring only
+  # the first left the others lost.  Otherwise all of the original's
+  # 127.0.1.1 lines go back where the current one stands.
   if [[ -f "${BACKUP_DIR}/hosts.recorded" && -f "${BACKUP_DIR}/hosts" ]]; then
-    local orig_line
-    orig_line=$(grep -E '^[[:space:]]*127\.0\.1\.1[[:space:]]' "${BACKUP_DIR}/hosts" | head -n1 || true)
-    hosts_set_loopback_line /etc/hosts "$orig_line"
-    info "Restored the 127.0.1.1 line of /etc/hosts (other entries untouched)"
+    local hosts_re='^[[:space:]]*127\.0\.1\.1[[:space:]]' orig_lines
+    # A symlinked /etc/hosts was recorded as a link to the live file; cat-ing
+    # that over itself would empty it, so only a real copy takes this path.
+    if [[ ! -L "${BACKUP_DIR}/hosts" ]] \
+       && cmp -s <(grep -vE "$hosts_re" /etc/hosts || true) \
+              <(grep -vE "$hosts_re" "${BACKUP_DIR}/hosts" || true); then
+      # Through the existing inode, like hosts_set_loopback_line.
+      cat "${BACKUP_DIR}/hosts" > /etc/hosts
+    else
+      orig_lines=$(grep -E "$hosts_re" "${BACKUP_DIR}/hosts" || true)
+      hosts_set_loopback_line /etc/hosts "$orig_lines"
+    fi
+    info "Restored the 127.0.1.1 lines of /etc/hosts (other entries untouched)"
   fi
   if [[ -f "${STATE_DIR}/original-timezone" ]]; then
     local orig_tz
@@ -374,6 +387,10 @@ purge_elastic() {
   step "Purge Elasticsearch"
   purge_service_stop elasticsearch
   apt_purge_pkgs elasticsearch
+  # ensure_es_max_map_count recorded this drop-in so it can go here; left in
+  # place it keeps raising vm.max_map_count at every boot with no
+  # Elasticsearch to need it.  A host that already had the file gets it back.
+  restore_original /etc/sysctl.d/99-elasticsearch.conf sysctl.d-99-elasticsearch.conf
   info "Leaving Elasticsearch data, configuration and logs in place"
   systemctl daemon-reload || true
   ok "Elasticsearch purged (files preserved)"

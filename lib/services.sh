@@ -2271,20 +2271,11 @@ create_domains() {
     fi
     info "XenForo ${d}: dynamic Brotli compression is enabled; with php-redis + local Valkey keep the XF data cache on (measured +7-9% authenticated throughput; without php-redis the Credis fallback measured slower), and disable the Members online / Trending / Featured widgets if you do not need them (measured +39% authenticated throughput)."
   done
-  # A new vhost changes what the tuner plans: the PHP-FPM worker cap, the
-  # OPcache file budget, the FastCGI guest cache for the new root, and the
-  # managed wp-cron / XenForo job entries.  Running the same pass --optimize
-  # runs keeps a domain install byte-identical to "install, then --optimize"
-  # instead of leaving the host in a half-tuned state until someone runs the
-  # optimizer by hand.  SETUP_DOMAIN_OPTIMIZE=0 skips it for a caller that
-  # deploys the application files later and tunes afterwards.
-  if [[ ${SETUP_DOMAIN_OPTIMIZE:-1} != 0 ]]; then
-    info "Re-tuning installed services for the new vhost(s) (the --optimize pass)"
-    local saved_optimize=${OPTIMIZE:-0}
-    OPTIMIZE=1
-    run_optimize || warn "Post-domain tuning reported an issue (see the report)"
-    OPTIMIZE=$saved_optimize
-  fi
+  # The closing --optimize pass for the new vhost(s) runs from main()
+  # (run_post_domain_optimize), not here: this function runs in
+  # run_service's subshell, where a web tier paused for a MariaDB restart
+  # was invisible to the parent's on_exit and set -e was suspended by the
+  # `|| warn` around the call.
   ok "Domain setup complete"
 }
 

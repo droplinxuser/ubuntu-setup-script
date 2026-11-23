@@ -36,7 +36,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.21.66"
+readonly SCRIPT_VERSION="1.21.67"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -81,7 +81,7 @@ if [[ -n ${SETUP_PRECOMPRESS_ASSETS+x} ]]; then
   PRECOMPRESS_ASSETS_PERSIST=1
 fi
 # OPcache JIT: the tracing JIT is always on for the pool (buffer OPcache/8,
-# 32..128 MB, with PHP's default hotness thresholds on 4+ CPU hosts and a
+# 32..128 MB, with tuned hotness thresholds (64/127/16/64) on 3+ CPU hosts and a
 # conservative set on 1-2 CPU hosts; measured +5% on the CPU-bound XenForo
 # member tiers and neutral-to-positive on WordPress, see
 # tests/stress-site/RESULTS.md).  There is no mode switch any more; an old

@@ -3,3 +3,6 @@
 *.swp
 setup_*.log
 diagnostics.log
+# The in-progress report run_diagnostics builds (mktemp diagnostics.log.XXXXXX);
+# unredacted, so it must never be committed if a run is interrupted.
+diagnostics.log.*

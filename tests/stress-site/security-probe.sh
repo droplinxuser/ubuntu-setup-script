@@ -6,7 +6,8 @@
 # reachable) fails the run instead of quietly shipping.
 #
 # Usage: IP=<host address> bash security-probe.sh
-# Read-only: it only sends requests.
+# Read-only apart from the IPv6 /64 limiter probe, which (as root, when the
+# vhosts run on this machine) adds and removes 2001:db8 addresses on lo.
 set -u
 IP=${IP:?set IP to the test host address}
 WP=${WP_DOMAIN:-wp.test.local}
@@ -182,6 +183,36 @@ enc="/%77hats-new/?probe=$RANDOM"
 s1=$(cache_status "$XF" "$enc"); s2=$(cache_status "$XF" "$enc")
 if [[ $s1 == BYPASS && $s2 == BYPASS ]]; then ok "xf percent-encoded route bypasses the guest cache"
 else bad "xf percent-encoded route bypasses the guest cache" "$s1/$s2"; fi
+
+echo "################ Credential limiter per IPv6 /64 (1.21.67)"
+# Keyed on the full 16-byte address, one /64 rotated through 2^64 buckets of
+# 20 attempts a minute.  Documentation-prefix addresses on lo (destination
+# and sources), so the probe needs no public IPv6 and nothing leaves the host;
+# root only, removed afterwards.  40 login POSTs, each from another address
+# of the same /64: the limiter (burst 10) must answer 429 well before the end.
+# The probe adds addresses on this machine's lo, so it only means something
+# when the vhosts under test run here (IP is a local address).
+if [[ $EUID -eq 0 ]] && command -v ip >/dev/null 2>&1 \
+   && ip -o addr show 2>/dev/null | grep -qwF -- "$IP"; then
+  V6NET=2001:db8:6464:$(printf %x $((RANDOM % 65536)))
+  V6DST=2001:db8:6465::1
+  ip -6 addr add "$V6DST/128" dev lo nodad 2>/dev/null || true
+  for i in $(seq 1 40); do ip -6 addr add "$V6NET::$i/128" dev lo nodad 2>/dev/null || true; done
+  first429=0
+  for i in $(seq 1 40); do
+    code=$(curl -sk -6 --max-time 10 --interface "$V6NET::$i" --resolve "$WP:443:[$V6DST]" \
+             -o /dev/null -w '%{http_code}' -X POST --data 'log=probe&pwd=probe' "https://$WP/wp-login.php" || true)
+    if [[ $code == 429 ]]; then first429=$i; break; fi
+    [[ $code == 000 ]] && { bad "one IPv6 /64 shares a login bucket" "address $V6NET::$i could not connect"; first429=-1; break; }
+  done
+  for i in $(seq 1 40); do ip -6 addr del "$V6NET::$i/128" dev lo 2>/dev/null || true; done
+  ip -6 addr del "$V6DST/128" dev lo 2>/dev/null || true
+  if (( first429 < 0 )); then :
+  elif (( first429 > 0 && first429 <= 25 )); then ok "one IPv6 /64 shares a login bucket (429 at attempt $first429)"
+  else bad "one IPv6 /64 shares a login bucket" "no 429 in 40 attempts from one /64"; fi
+else
+  printf 'SKIP  IPv6 /64 login bucket (needs root and iproute2)\n'
+fi
 
 echo
 echo "TOTAL pass=$P fail=$F"
