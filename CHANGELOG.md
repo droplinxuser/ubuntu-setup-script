@@ -74,12 +74,17 @@ filter were deleted from the tree on 2026-11-23 for the same reason;
   upgrade.  It now mirrors `--optimize`.
 - **`--optimize --dry-run` previews the per-version PHP pool** that the real
   run writes when more than one FPM version is running.
-- **`/etc/hosts` keeps its final-newline state.**  `hosts_set_loopback_line`
-  rewrote the file through awk, which always ends the last line, so every
-  install and restore cycle added one trailing newline (the open item of the
-  last three cycles).  `--purge` now also restores every original
-  `127.0.1.1` line, not only the first, and the file byte for byte when
-  nothing else changed.
+- **`--purge` restores `/etc/hosts` byte for byte (the restore drift open
+  since 1.21.64).**  The extra trailing newline came from cloud-init: with
+  `manage_etc_hosts: localhost` it rewrites `/etc/hosts` at the first boot
+  after `--basic` renames the host, and `--purge`, seeing a file that no
+  longer matched the original outside the `127.0.1.1` lines, merged instead
+  of restoring and kept cloud-init's blank line.  Blank lines no longer
+  count in that comparison, and the audit restore removes its own hosts line
+  before purging (reproduced on the test host: 265 vs 264 bytes before,
+  byte-exact after).  `hosts_set_loopback_line` also keeps the file's
+  final-newline state (awk used to add one), and `--purge` restores every
+  original `127.0.1.1` line, not only the first.
 - **`--purge elastic` removes `/etc/sysctl.d/99-elasticsearch.conf`**, which
   the install recorded "so --purge can remove it".
 - **An interrupted `--diagnostics` leaves no unredacted report behind**:

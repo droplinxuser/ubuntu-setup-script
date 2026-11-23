@@ -20,6 +20,12 @@ HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 WORK=$(mktemp -d /tmp/restore-baseline.XXXXXX)
 [[ -r $BASE ]] || { echo "baseline manifest not readable: $BASE" >&2; exit 1; }
 
+# The audit tooling's own /etc/hosts line goes first: --purge restores the
+# recorded original byte for byte only when nothing but the 127.0.1.1 (and
+# blank) lines changed, and a line still present here sent it down the merge
+# path, which kept cloud-init's extra blank line (one byte of drift per cycle).
+sed -i '/# audit$/d' /etc/hosts
+
 if [[ -n $SETUP && -r $SETUP ]]; then
   echo "== setup.sh --purge all"
   # From $WORK: setup.sh writes its setup_<stamp>.log run log to the current

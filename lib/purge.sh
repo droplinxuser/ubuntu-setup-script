@@ -228,11 +228,17 @@ purge_basic() {
   # 127.0.1.1 lines go back where the current one stands.
   if [[ -f "${BACKUP_DIR}/hosts.recorded" && -f "${BACKUP_DIR}/hosts" ]]; then
     local hosts_re='^[[:space:]]*127\.0\.1\.1[[:space:]]' orig_lines
+    # Blank lines do not count either: cloud-init's update_etc_hosts
+    # (manage_etc_hosts: localhost) rewrites the file at the first boot after
+    # the rename, and the merge path below then kept the blank line its
+    # rewrite left (one extra byte after every
+    # install + purge on such hosts).
+    local hosts_cmp_re="${hosts_re}|^[[:space:]]*\$"
     # A symlinked /etc/hosts was recorded as a link to the live file; cat-ing
     # that over itself would empty it, so only a real copy takes this path.
     if [[ ! -L "${BACKUP_DIR}/hosts" ]] \
-       && cmp -s <(grep -vE "$hosts_re" /etc/hosts || true) \
-              <(grep -vE "$hosts_re" "${BACKUP_DIR}/hosts" || true); then
+       && cmp -s <(grep -vE "$hosts_cmp_re" /etc/hosts || true) \
+              <(grep -vE "$hosts_cmp_re" "${BACKUP_DIR}/hosts" || true); then
       # Through the existing inode, like hosts_set_loopback_line.
       cat "${BACKUP_DIR}/hosts" > /etc/hosts
     else

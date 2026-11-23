@@ -32,15 +32,18 @@ Mitigations off (operator request, test host only).
   pass of `--domain` runs in the main process (signal-safe, `set -e`
   active) and keeps the same run's explicit sizes; MariaDB applies a
   `max_connections` change online; `--upgrade-php` runs its post-Angie
-  refresh; `/etc/hosts` keeps its final-newline state (closes the restore
-  drift open since 1.21.64); `--purge elastic` removes its sysctl drop-in.
+  refresh; `--purge` restores `/etc/hosts` byte for byte (the drift open since
+  1.21.64 came from cloud-init rewriting the file after the rename);
+  `--purge elastic` removes its sysctl drop-in.
 - Baseline (Sury, standard data, 3 runs): WP cached 98.1k / 93.3k, XF cached
   136.7k / 126.3k, Chevereto cached 131.2k / 130.3k req/s; WP member 141 /
   133, XF member 448 / 251, Chevereto uncached 1,488, member 506.
 - Suites: install 2:09 / 0 warnings, 1,595 unit checks, 227 dry runs,
   security 74/74, cookie 98/98, functional 0 unexpected, `--optimize` x2
   3,016 facts (4 lines: the pool following live data), `--upgrade-php` 8.6
-  with a HUP mid-install and back.
+  with a HUP mid-install and back.  Restore: 696 -> 696 packages, 0 `/etc`
+  changes (after removing the one byte the pre-fix purge left; root cause
+  fixed and reproduced).
 
 ## 1.21.66 — Xeon E-2236 (2026-11-23)
 

@@ -7074,6 +7074,15 @@ check "purge sim: --basic left a single 127.0.1.1 line" \
 hosts_purge_sim "$hb" "$hf" >/dev/null 2>&1
 check "purge: an otherwise untouched hosts file comes back byte for byte (all 127.0.1.1 lines)" \
   cmp -s "$hf" "$hb/hosts"
+# cloud-init (manage_etc_hosts: localhost) rewrites the file at the first boot
+# after the rename and leaves a blank line; that alone must not cost the
+# byte-for-byte restore (it was one byte of drift per install + purge).
+cp "$hb/hosts" "$hf"
+hosts_set_loopback_line "$hf" "$(printf '127.0.1.1\tnew-host')"
+printf '\n\n' >> "$hf"
+hosts_purge_sim "$hb" "$hf" >/dev/null 2>&1
+check "purge: a blank line added after the install still restores byte for byte" \
+  cmp -s "$hf" "$hb/hosts"
 cp "$hb/hosts" "$hf"
 hosts_set_loopback_line "$hf" "$(printf '127.0.1.1\tnew-host')"
 printf '\n192.0.2.9\tadded-later' >> "$hf"
