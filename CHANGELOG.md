@@ -8,6 +8,46 @@ Reports of the 1.21.33-1.21.61 cycles that measured the removed Anubis
 filter were deleted from the tree on 2026-11-23 for the same reason;
 `git show <commit>:<path>` recovers them.
 
+## 1.21.69 (2026-11-24)
+
+- **One compiled php-fpm, built from source, faster than both 1.21.68
+  builds.**  `SETUP_PHP_BUILD=clang` now compiles PHP, redis/igbinary and
+  every linked library from upstream (versions in `php-build.conf`), lean and
+  static, with ThinLTO and BOLT; `lean` and `source` are aliases, and a
+  persisted `PHP_BUILD=lean` keeps working.  The 1.21.68 `clang` mode (Sury's
+  core and extensions) is gone.  Fresh install with WordPress, XenForo and
+  Chevereto, 5 rotated rounds, vs the package: XenForo member thread / home
+  **+11.0 % / +10.1 %** (1.21.68 clang: +8.9 % / +8.0 %), WordPress member
+  home **+7.9 %** (+6.5 %), Chevereto uncached **+5.9 %** (+4.4 %); every
+  round of the new build beat the old one's median.
+- **Why the from-source build trailed:** ICU.  Before BOLT it ran 9 % fewer
+  instructions per XenForo page than clang + Sury's extensions, yet it was
+  1-2 % slower.  intl compiled ICU in, made the binary 102 MB and cost 4.5x
+  the data-TLB misses (233 M against 52 M in 20 s).  intl is gone (XenForo
+  ships Symfony's intl polyfills, WordPress checks `function_exists`,
+  Chevereto does not use it); the binary is 60 MB, its misses match the
+  package's, and it links only glibc and libsystemd.  Ruled out by
+  measurement: `-fPIC` against `-fPIE` for the PHP core (no difference; the
+  build now uses `-fPIE`), and BOLT sampling with `opcache.huge_code_pages`
+  off (2,549 against 2,541 functions profiled, same speed; not shipped).
+- **Every download has a second source**, tried when the first times out or
+  fails: the project's own site first, GitHub (or a second official mirror)
+  next, including LLVM's GitHub release tarball when apt.llvm.org is down.
+  Published SHA-256s are checked from either source; Git snapshots get their
+  `configure` generated.  A version lookup that no source answers keeps the
+  version the running build was made from.  GMP's ftp.gnu.org timing out for
+  minutes stopped a test build; the old code then only failed at `tar`.
+- **Build recipe:** `build.info` records it, and `--optimize` and the daily
+  timer rebuild an older one, so a 1.21.68 build is replaced once.
+- **BOLT swaps the binary with a graceful reload** instead of a restart.
+- **Test harness:** Chevereto starts a session file in `/tmp` for every
+  cookie-less request.  At benchmark rates (1,500 req/s) its 24-minute GC
+  window holds about 2 million files, past the tmpfs inode limit: MariaDB
+  then failed its temporary tables and every application broke mid-run.
+  `bench-php-sources.sh` now clears them between arms (production rates stay
+  far below the limit; setup already turns GC on for Chevereto).
+- Report: `tests/stress-site/AUDIT-20261124-1.21.69.md`.
+
 ## 1.21.68 (2026-11-24)
 
 - **Three php-fpm builds, chosen with `SETUP_PHP_BUILD`** (primary focus).

@@ -109,7 +109,7 @@ systemctl disable --now setup-php-fpm-build-refresh.timer >/dev/null 2>&1 || tru
 rm -f /etc/systemd/system/setup-php-fpm-build@.service /etc/systemd/system/setup-php-fpm-build-refresh.* \
       /etc/systemd/system/php*-fpm.service.d/zz-setup-build.conf /etc/apt/apt.conf.d/99setup-php-fpm-build \
       /etc/apt/sources.list.d/setup-llvm.sources /etc/apt/preferences.d/setup-llvm.pref /etc/apt/keyrings/setup-llvm.asc
-rm -rf /usr/local/lib/setup-php /var/cache/setup-php-build /run/setup-php-build
+rm -rf /usr/local/lib/setup-php /var/cache/setup-php-build /run/setup-php-build /opt/setup-llvm
 id lsadm >/dev/null 2>&1 && userdel lsadm >/dev/null 2>&1 || true
 rm -rf /var/www /etc/angie /etc/php /etc/mysql /etc/valkey /etc/redis /etc/elasticsearch \
        /var/lib/setup.sh /var/lib/mysql /var/lib/mariadb /var/lib/valkey /var/lib/redis /var/lib/elasticsearch \

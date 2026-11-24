@@ -9,6 +9,25 @@ is still in git history, for example
 `git show 84b0db5:tests/stress-site/AUDIT-20261117-1.21.30.md`.  The current
 cycle report is `AUDIT-20261124-1.21.67.md`.
 
+## 1.21.69 — Xeon E-2236 (2026-11-24)
+
+Pair: `server-configs-nginx` 1.6.59.  Details: `AUDIT-20261124-1.21.69.md`.
+Mitigations off (operator request, test host only).
+
+- **One compiled php-fpm, from source** (`SETUP_PHP_BUILD=clang`): vs the
+  package, XenForo member thread / home +11.0 % / +10.1 %, WordPress member
+  home +7.9 %, Chevereto uncached +5.9 %, ahead of 1.21.68's clang build
+  (+8.9 / +8.0 / +6.5 / +4.4 %) on every tier and every round.  Root cause of
+  the earlier gap: ICU (intl) made the from-source binary 102 MB with 4.5x the
+  data-TLB misses; without it the binary is 60 MB and links only glibc and
+  libsystemd.
+- Every download has a second source (project site, then GitHub or a second
+  official mirror; LLVM falls back to its GitHub release).
+- Suites: 1,651 unit checks, 227 dry runs; on the BOLTed build through
+  `setup.sh --optimize`: security 78/78, cookie 105/105, functional 0
+  failures; plain `--optimize` reports the build current; `=package` removes
+  it cleanly.
+
 ## 1.21.68 — Xeon E-2236 (2026-11-24)
 
 Pair: `server-configs-nginx` 1.6.59.  Details: `AUDIT-20261124-1.21.68.md`.

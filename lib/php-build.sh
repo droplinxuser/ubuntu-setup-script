@@ -1,21 +1,23 @@
 # shellcheck shell=bash
 # ---------------------------------------------------------------------------
-# Opt-in compiled php-fpm (PHP_BUILD=clang or PHP_BUILD=lean)
+# Opt-in compiled php-fpm (PHP_BUILD=clang; lean and source are aliases)
 # ---------------------------------------------------------------------------
-# Three choices for the php-fpm binary the unit starts:
+# Two choices for the php-fpm binary the unit starts:
 #   (unset)/package  the Sury package's php-fpm (the default)
-#   clang            the package's PHP version and compiled-in core rebuilt
-#                    with clang (apt.llvm.org), -O3 -march=native, ThinLTO
-#                    and BOLT; Sury's shared extensions load unchanged
-#   lean             WordPress, XenForo, Chevereto: the newest PHP, redis/igbinary and every
-#                    linked library from upstream sources (versions in
-#                    php-build.conf), statically linked, ThinLTO and BOLT,
-#                    with only the modules the three applications use
-# php.ini, pools, the unit and the package CLI stay the package's in every
-# mode.  tools/php-fpm-build.sh does the work and goes back to the package
-# binary when an APT update changes the package; a daily timer rebuilds when
-# a newer upstream release appears.  Measured (1.21.68, Xeon E-2236): see
-# tests/stress-site/RESULTS.md.
+#   clang            a lean php-fpm for WordPress, XenForo and Chevereto
+#                    compiled from upstream sources: the newest PHP,
+#                    redis/igbinary and every linked library (versions in
+#                    php-build.conf), clang from apt.llvm.org, -O3
+#                    -march=native -fPIE, static, ThinLTO and BOLT, with only
+#                    the modules the three applications use
+# 1.21.68 shipped two compiled modes (clang: Sury's core and extensions;
+# lean: everything from source).  1.21.69 merged them: the from-source
+# build without ICU (intl), which made it 102 MB and cost 4.5x the data-TLB
+# misses, is faster than both.  A persisted PHP_BUILD=lean keeps working.
+# php.ini, pools, the unit and the package CLI stay the package's.
+# tools/php-fpm-build.sh does the work and goes back to the package binary
+# when an APT update makes the package newer; a daily timer rebuilds when a
+# newer upstream release appears.  Measured: tests/stress-site/RESULTS.md.
 #
 # The choice is persisted in /etc/default/setup-tuning like PHP_JIT_WORDPRESS,
 # so the install, a later --optimize and --upgrade-php reach the same state.
@@ -32,13 +34,12 @@ PHP_BUILD_CONF_FILE="${PHP_BUILD_ROOT}/php-build.conf"
 # apt.llvm.org source the tool adds (removed with the last build).
 PHP_BUILD_LLVM_FILES=(/etc/apt/sources.list.d/setup-llvm.sources /etc/apt/preferences.d/setup-llvm.pref /etc/apt/keyrings/setup-llvm.asc)
 
-# "clang", "lean", "package", or "" (never chosen on this host: nothing to do).
+# "clang", "package", or "" (never chosen on this host: nothing to do).
 php_build_mode() {
   local v=${PHP_BUILD:-}
   case ${v,,} in
     "")                      printf '' ;;
-    clang)                   printf 'clang' ;;
-    lean|upstream)           printf 'lean' ;;
+    clang|lean|source|upstream) printf 'clang' ;;
     package|sury|off|none|0) printf 'package' ;;
     *)                       printf 'invalid' ;;
   esac
@@ -48,7 +49,7 @@ php_build_mode() {
 # and PHP_BUILD_PERSIST from SETUP_PHP_BUILD or the host file).
 php_build_validate() {
   if [[ $(php_build_mode) == invalid ]]; then
-    die "PHP_BUILD='${PHP_BUILD}' is not supported; use package, clang or lean"
+    die "PHP_BUILD='${PHP_BUILD}' is not supported; use package or clang"
   fi
   return 0
 }
@@ -98,7 +99,7 @@ php_build_install_support() {
 
 php_build_refresh_unit_text() {
   cat <<EOF
-# Managed by setup.sh (PHP_BUILD=clang/lean): rebuild php-fpm when php.net, PECL,
+# Managed by setup.sh (PHP_BUILD=clang): rebuild php-fpm when php.net, PECL,
 # LLVM or a linked library published a release php-build.conf asks for.
 [Unit]
 Description=Check for newer upstream releases of the compiled php-fpm (setup.sh PHP_BUILD)
@@ -115,7 +116,7 @@ EOF
 
 php_build_refresh_timer_text() {
   cat <<EOF
-# Managed by setup.sh (PHP_BUILD=clang/lean)
+# Managed by setup.sh (PHP_BUILD=clang)
 [Unit]
 Description=Daily upstream release check for the compiled php-fpm
 
@@ -131,7 +132,7 @@ EOF
 
 php_build_unit_text() {
   cat <<EOF
-# Managed by setup.sh (PHP_BUILD=clang/lean): rebuild php-fpm for PHP %i (started by
+# Managed by setup.sh (PHP_BUILD=clang): rebuild php-fpm for PHP %i (started by
 # the APT hook after a package update, or by the daily upstream check).
 [Unit]
 Description=Rebuild the compiled php-fpm for PHP %i (setup.sh PHP_BUILD)
@@ -149,7 +150,7 @@ EOF
 
 php_build_apt_hook_text() {
   cat <<EOF
-// Managed by setup.sh (PHP_BUILD=clang/lean): after any dpkg run, a PHP version
+// Managed by setup.sh (PHP_BUILD=clang): after any dpkg run, a PHP version
 // whose package changed goes back to the package's php-fpm at once and is
 // rebuilt in the background (setup-php-fpm-build@X.Y.service).
 DPkg::Post-Invoke { "if [ -x ${PHP_BUILD_TOOL} ]; then ${PHP_BUILD_TOOL} apt-hook || true; fi"; };
@@ -164,7 +165,7 @@ php_build_remove_support() {
   systemctl disable --now "${PHP_BUILD_REFRESH_TIMER##*/}" >/dev/null 2>&1 || true
   rm -f "$PHP_BUILD_APT_HOOK" "$PHP_BUILD_UNIT" "$PHP_BUILD_TOOL" "$PHP_BUILD_CONF_FILE" \
     "$PHP_BUILD_REFRESH_UNIT" "$PHP_BUILD_REFRESH_TIMER" "${PHP_BUILD_LLVM_FILES[@]}"
-  rm -rf /var/cache/setup-php-build /run/setup-php-build
+  rm -rf /var/cache/setup-php-build /run/setup-php-build /opt/setup-llvm
   rmdir "$PHP_BUILD_ROOT" 2>/dev/null || true
   systemctl daemon-reload 2>/dev/null || true
 }
@@ -211,8 +212,7 @@ php_build_apply() {
   esac
   php_build_install_support || return 1
   local tag="PHP_BUILD=${mode}" what
-  what="the package's PHP version with clang and Sury's extensions (3-6 minutes)"
-  [[ $mode == lean ]] && what="a lean php-fpm for WordPress, XenForo and Chevereto from upstream sources (15-25 minutes with the libraries, 3-6 when only PHP changed)"
+  what="a lean php-fpm for WordPress, XenForo and Chevereto from upstream sources (about 5 minutes with the libraries, 3 when only PHP changed)"
   if ! php_build_current "$ver" "$mode"; then
     [[ -n $PHP_BUILD_CHECK_OUT ]] && "$out" "- ${tag}: PHP ${ver} build ${PHP_BUILD_CHECK_OUT}"
     "$out" "- ${tag}: building ${what}"
@@ -258,8 +258,7 @@ php_build_purge() {
 
 php_build_plan() { # dry-run line
   case $(php_build_mode) in
-    clang)   printf 'PHP_BUILD=clang: the package PHP version rebuilt with clang ThinLTO (Sury extensions) for each installed version; BOLT under traffic on --optimize' ;;
-    lean)    printf 'PHP_BUILD=lean: lean XenForo php-fpm compiled from upstream sources (versions in php-build.conf) for each installed version; BOLT under traffic on --optimize' ;;
+    clang)   printf 'PHP_BUILD=clang: lean php-fpm compiled from upstream sources (versions in php-build.conf) for each installed version; BOLT under traffic on --optimize' ;;
     package) printf 'PHP_BUILD=package: the package php-fpm (any compiled build is removed)' ;;
     *)       printf '' ;;
   esac

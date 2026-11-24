@@ -7310,8 +7310,8 @@ check ".gitignore covers the in-progress diagnostics report" \
 
 # ---- 1.21.68: PHP_BUILD=clang (lib/php-build.sh, tools/php-fpm-build.sh)
 pb_mode() { ( PHP_BUILD=$1; php_build_mode ); }
-check "PHP_BUILD: clang, lean/upstream, package/sury/off and unset map to their modes" \
-  test "$(pb_mode clang),$(pb_mode CLANG),$(pb_mode lean),$(pb_mode upstream),$(pb_mode package),$(pb_mode sury),$(pb_mode off),$(pb_mode '')" = "clang,clang,lean,lean,package,package,package,"
+check "PHP_BUILD: clang (lean/source aliases), package/sury/off and unset map to their modes" \
+  test "$(pb_mode clang),$(pb_mode CLANG),$(pb_mode lean),$(pb_mode source),$(pb_mode package),$(pb_mode sury),$(pb_mode off),$(pb_mode '')" = "clang,clang,clang,clang,package,package,package,"
 pb_invalid() { ( PHP_BUILD=gcc; die() { exit 7; }; php_build_validate ); [[ $? == 7 ]]; }
 check "PHP_BUILD: an unknown value is refused before anything changes" pb_invalid
 check "validate_all checks PHP_BUILD" \
@@ -7394,27 +7394,45 @@ pb_tool_case() { # case -> result line
         cmd_apt_hook ;;
       newer)
         stub_fpm 8.5.13; printf 'version=8.5.14\nbolt=1\n' > "$T/root/8.5/build.info"; cmd_apt_hook ;;
-      clangdiff)
-        # A clang build must equal the package (its shared extensions).
-        stub_fpm 8.5.13; printf 'mode=clang\nversion=8.5.14\nbolt=1\n' > "$T/root/8.5/build.info"; cmd_apt_hook ;;
-      clangsame)
-        stub_fpm 8.5.13; printf 'mode=clang\nversion=8.5.13\nbolt=1\n' > "$T/root/8.5/build.info"; cmd_apt_hook ;;
-      clangact)
-        stub_fpm 8.5.13; printf 'mode=clang\nversion=8.5.13\n' > "$T/root/8.5/build.info"
-        printf '[Service]\nType=notify\nExecStart=%s/php-fpm8.5 --nodaemonize --fpm-config /etc/php/8.5/fpm/php-fpm.conf\nExecReload=/bin/kill -USR2 $MAINPID\n' "$T/sbin" > "$T/pkgunits/php8.5-fpm.service"
-        rm -f "$T/units/php8.5-fpm.service.d/zz-setup-build.conf"
-        restart_checked() { return 0; }
-        activate 8.5
-        d="$T/units/php8.5-fpm.service.d/zz-setup-build.conf"
-        printf '%s %s %s' "$(grep -c "^ExecStart=$T/root/8.5/php-fpm " "$d")" \
-          "$(grep -c '^ExecStartPre=' "$d")" "$(grep -c '^ExecReload' "$d")"
+      recipe_old|recipe_cur)
+        # Every component pinned: check resolves without the network.
+        export PHP_BUILD_CONF="$T/php-build.conf"; CONF=$PHP_BUILD_CONF
+        : > "$CONF"; : > "$T/root/8.5/build.info"
+        for c in "${COMPONENTS[@]}"; do
+          case $c in php) v=8.5.13 ;; llvm) v=23 ;; *) v=1.0 ;; esac
+          printf '%s=%s\n' "$(conf_key "$c")" "$v" >> "$CONF"; printf '%s=%s\n' "$c" "$v" >> "$T/root/8.5/build.info"
+        done
+        [[ $1 == recipe_old ]] && printf 'recipe=1\n' >> "$T/root/8.5/build.info"
+        [[ $1 == recipe_cur ]] && printf 'recipe=%s\n' "$BUILD_RECIPE" >> "$T/root/8.5/build.info"
+        rc=0; out=$(cmd_check 8.5) || rc=$?; printf '%s rc=%s' "$out" "$rc"
         return 0 ;;
-      modeswitch)
-        stub_fpm 8.5.13; printf 'mode=clang\nversion=8.5.13\nllvm=23\n' > "$T/root/8.5/build.info"
-        out=$(cmd_check 8.5 lean); rc=$?; printf '%s rc=%s' "$out" "$rc"
+      primarydown)
+        # Every primary host down (and GitHub release assets for the
+        # GitHub-only projects): each component must come from its fallback.
+        gh_digest() { :; }
+        http_get() {
+          case $1 in
+            https://www.php.net/*|https://pecl.php.net/*|https://www.openssl.org/*|https://zlib.net/*|\
+            https://download.libsodium.org/*|https://curl.se/*|https://libzip.org/*|https://download.gnome.org/*|\
+            https://ftp.gnu.org/*|https://download.sourceforge.net/*|https://storage.googleapis.com/*|\
+            https://github.com/PCRE2Project/*/releases/download/*|\
+            https://github.com/libjpeg-turbo/*/releases/download/*) return 1 ;;
+          esac
+          [[ -n ${2:-} ]] && printf '%s' "$1" > "$2"; return 0
+        }
+        SRC_CACHE="$T/cache"; mkdir -p "$T/cache/src"
+        ok=0; bad=""
+        for c in php redis igbinary "${LIBS[@]}"; do
+          if p=$( ( fetch_component "$c" 1.2.3 ) 2>/dev/null ) && [[ -s $p ]]; then ok=$((ok + 1)); else bad+="$c "; fi
+        done
+        printf '%s|%s|%s' "$ok" "$(( 3 + ${#LIBS[@]} ))" "$bad"
         return 0 ;;
-      nomode)
-        printf 'version=8.5.13\n' > "$T/root/8.5/build.info"; build_mode 8.5
+      mirrors)
+        http_get() { [[ $1 == https://b/* ]] || return 1; printf 'data' > "$2"; }
+        PHP_BUILD_CACHE="$T/cache" SRC_CACHE="$T/cache"; mkdir -p "$T/cache"
+        ( fetch_to "https://a/f.tar https://b/f.tar" "$T/cache/f.tar" ) >/dev/null 2>&1; r1=$?
+        ( fetch_to "https://a/g.tar https://c/g.tar" "$T/cache/g.tar" ) >/dev/null 2>&1; r2=$?
+        printf '%s %s %s' "$r1" "$(cat "$T/cache/f.tar" 2>/dev/null)" "$r2"
         return 0 ;;
     esac
     printf '%s %s %s' \
@@ -7435,16 +7453,14 @@ check "php-fpm-build activate: resets ExecStart, rewrites the package's line, mi
   test "$(pb_tool_case activate)" = "1 1 1 1 1"
 check "php-fpm-build apt-hook: a build newer than the package (php.net ahead of Sury) is left alone" \
   test "$(pb_tool_case newer)" = "dropin build 0"
-check "php-fpm-build apt-hook: a clang build that is not the package's version reverts (Sury's extensions must match)" \
-  test "$(pb_tool_case clangdiff)" = "nodropin build 1"
-check "php-fpm-build apt-hook: a clang build of the package's version is left alone" \
-  test "$(pb_tool_case clangsame)" = "dropin build 0"
-check "php-fpm-build activate (clang): no conf.d mirror, the package's reload is kept" \
-  test "$(pb_tool_case clangact)" = "1 0 0"
-check "php-fpm-build check: a build of the other mode is stale" \
-  test "$(pb_tool_case modeswitch)" = "stale: mode clang -> lean rc=10"
-check "php-fpm-build: a build.info without mode= is a lean build (built before modes)" \
-  test "$(pb_tool_case nomode)" = "lean"
+check "php-fpm-build check: a build from an older recipe (1.21.68: -fPIC, intl) is stale" \
+  test "$(pb_tool_case recipe_old)" = "stale: recipe 1 -> 2 rc=10"
+check "php-fpm-build check: the current recipe with every pinned version is current" \
+  test "$(pb_tool_case recipe_cur)" = "current rc=0"
+check "php-fpm-build fetch: the next mirror serves when the first fails; all failing stops" \
+  test "$(pb_tool_case mirrors)" = "0 data 1"
+pb_primarydown_ok() { local r; r=$(pb_tool_case primarydown); [[ ${r%%|*} == "$(cut -d'|' -f2 <<<"$r")" && $r == *"|" ]]; }
+check "php-fpm-build fetch: every component downloads from its second source when its own site is down" pb_primarydown_ok
 check "php-fpm-build apt-hook: a build that lost a system library reverts and rebuilds" \
   test "$(pb_tool_case lostlib)" = "nodropin build 1"
 check "php-fpm-build conf: extension lines are commented out, settings kept, stale files removed" \
@@ -7454,13 +7470,14 @@ check "php-build.conf: pins, quotes and comments parse; unset keys mean latest; 
 check "php-build.conf: a value that is neither latest nor a version is refused" \
   test "$(pb_tool_case confbad)" = "refused"
 check "php-build.conf ships beside setup.sh with every component the tool builds" \
-  bash -c 'for k in PHP LLVM REDIS IGBINARY OPENSSL PCRE2 ZLIB LIBXML2 LIBSODIUM GMP CURL ICU LIBJPEG_TURBO LIBPNG LIBWEBP LIBZIP; do grep -qx "${k}_VERSION=latest" "$1/php-build.conf" || exit 1; done' _ "$ROOT"
+  bash -c 'for k in PHP LLVM REDIS IGBINARY OPENSSL PCRE2 ZLIB LIBXML2 LIBSODIUM GMP CURL LIBJPEG_TURBO LIBPNG LIBWEBP LIBZIP; do grep -qx "${k}_VERSION=latest" "$1/php-build.conf" || exit 1; done' _ "$ROOT"
 lean_set_ok() {
   local f
-  f=$(sed -n '/^cmd_build_lean()/,/^}/p' "$ROOT/tools/php-fpm-build.sh")
+  f=$(sed -n '/^cmd_build()/,/^}/p' "$ROOT/tools/php-fpm-build.sh")
   grep -q -- "--disable-cli" <<<"$f" && grep -q -- "--enable-session" <<<"$f" \
     && grep -q -- "--with-pdo-mysql" <<<"$f" && grep -q -- "--enable-xmlreader" <<<"$f" \
-    && ! grep -qiE -- "imagick|--enable-(posix|pcntl|sockets|bcmath|soap|calendar|ftp|tokenizer|phar)\b" <<<"$f"
+    && ! grep -qiE -- "imagick|--enable-(intl|posix|pcntl|sockets|bcmath|soap|calendar|ftp|tokenizer|phar)\b" <<<"$f" \
+    && grep -q -- 'BASE_FLAGS="[^"]*-fPIE' <<<"$f" && ! grep -q -- 'BASE_FLAGS="[^"]*-fPIC' <<<"$f"
 }
 check "the lean build compiles only the three applications' module set (no CLI, imagick or extras)" lean_set_ok
 check "php-fpm-build EXIT traps name a global (a local is gone when the trap fires under set -u)" \
@@ -7468,7 +7485,7 @@ check "php-fpm-build EXIT traps name a global (a local is gone when the trap fir
 gpg_home_ok() {
   local f="$ROOT/tools/php-fpm-build.sh"
   [[ $(grep -cF 'gpg --show-keys' "$f") == "$(grep -cF 'GNUPGHOME=$gnupg_home gpg --show-keys' "$f")" ]] \
-    && grep -qF 'rm -rf "$gnupg_home"' "$f"
+    && grep -qF 'rm -rf "${gnupg_home:?}"' "$f"
 }
 check "the apt.llvm.org key check runs gpg in a throwaway home (no /root/.gnupg on the server)" gpg_home_ok
 check "the test-host restore never purges kernel packages (main-modules included)" \
@@ -7532,12 +7549,12 @@ check "--optimize keeps the persisted PHP_FPM_MODULES choice" \
   bash -c 'printf "%s\n" "$@" | grep -qx PHP_FPM_MODULES' _ "${RESET_KEEP_PINS[@]}"
 check "install_php and optimize_php_services both apply the module policy (parity)" \
   bash -c 'sed -n "/^install_php()/,/^}/p" "$1" | grep -q "php_fpm_modules_apply" && sed -n "/^optimize_php_services()/,/^}/p" "$1" | grep -q "php_fpm_modules_apply"' _ "$ALL_SRC"
-check "the lean build's module list matches the shared-extension policy plus the built-in core" \
+check "the compiled build's module list matches the shared-extension policy (intl: package only)" \
   bash -c 'for m in $(sed -n "/^PHP_FPM_APP_MODS=(/,/)/p" "$1/lib/php-build.sh" | tr -d "()" | sed "s/PHP_FPM_APP_MODS=//"); do
-             case $m in opcache) m="Zend OPcache" ;; simplexml) m=SimpleXML ;; pdo) m=PDO ;; esac
+             case $m in opcache) m="Zend OPcache" ;; simplexml) m=SimpleXML ;; pdo) m=PDO ;; intl) continue ;; esac
              sed -n "/^APP_MODULES=(/,/)/p" "$1/tools/php-fpm-build.sh" | grep -qF -- "$m" || { echo "missing $m"; exit 1; }
            done' _ "$ROOT"
-unset -f fm_case fm_twice lean_set_ok gpg_home_ok
+unset -f fm_case fm_twice lean_set_ok gpg_home_ok pb_primarydown_ok
 
 printf '\nTOTAL pass=%d fail=%d skip=%d\n' "$PASS" "$FAIL" "$SKIP"
 [[ $FAIL -eq 0 ]]

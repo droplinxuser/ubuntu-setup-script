@@ -61,6 +61,11 @@ for (( r = 1; r <= ROUNDS; r++ )); do
     echo "== round $r arm $arm" >&2
     "$HERE/switch-php-arm.sh" "$arm" >/dev/null
     clear_cache
+    # Chevereto starts a session file in /tmp for every cookie-less request.
+    # At benchmark rates (1,500 req/s) its 24-minute GC window holds ~2 million
+    # files, past a tmpfs inode limit: MariaDB then failed its temp tables and
+    # every application broke mid-run (1.21.69).  Clear them between arms.
+    find /tmp -maxdepth 1 -name 'sess_*' -type f -delete 2>/dev/null || true
     # A first-request burst per vhost, so OPcache and the app's own caches are
     # warm before the first timed tier and every arm starts equally.
     for u in https://wp.test.local/ https://xf.test.local/ https://chev.test.local/explore/; do
