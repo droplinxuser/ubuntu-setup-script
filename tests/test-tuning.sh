@@ -7465,6 +7465,14 @@ lean_set_ok() {
 check "the lean build compiles only the three applications' module set (no CLI, imagick or extras)" lean_set_ok
 check "php-fpm-build EXIT traps name a global (a local is gone when the trap fires under set -u)" \
   bash -c 'f="$1/tools/php-fpm-build.sh"; ! grep -E "trap .*EXIT" "$f" | grep -vqF "\${WORK_DIR:-}"' _ "$ROOT"
+gpg_home_ok() {
+  local f="$ROOT/tools/php-fpm-build.sh"
+  [[ $(grep -cF 'gpg --show-keys' "$f") == "$(grep -cF 'GNUPGHOME=$gnupg_home gpg --show-keys' "$f")" ]] \
+    && grep -qF 'rm -rf "$gnupg_home"' "$f"
+}
+check "the apt.llvm.org key check runs gpg in a throwaway home (no /root/.gnupg on the server)" gpg_home_ok
+check "the test-host restore never purges kernel packages (main-modules included)" \
+  grep -qF "KERNEL_RE='^linux-(image|modules|modules-extra|main-modules|headers|generic|image-generic|headers-generic)" "$ROOT/tests/deploy-audit/restore-baseline.sh"
 check "GMP is built without assembly (its jump tables in data stop BOLT)" \
   grep -q -- "--disable-assembly" "$ROOT/tools/php-fpm-build.sh"
 check "the refresh timer runs the tool daily at idle priority" \
@@ -7529,7 +7537,7 @@ check "the lean build's module list matches the shared-extension policy plus the
              case $m in opcache) m="Zend OPcache" ;; simplexml) m=SimpleXML ;; pdo) m=PDO ;; esac
              sed -n "/^APP_MODULES=(/,/)/p" "$1/tools/php-fpm-build.sh" | grep -qF -- "$m" || { echo "missing $m"; exit 1; }
            done' _ "$ROOT"
-unset -f fm_case fm_twice lean_set_ok
+unset -f fm_case fm_twice lean_set_ok gpg_home_ok
 
 printf '\nTOTAL pass=%d fail=%d skip=%d\n' "$PASS" "$FAIL" "$SKIP"
 [[ $FAIL -eq 0 ]]

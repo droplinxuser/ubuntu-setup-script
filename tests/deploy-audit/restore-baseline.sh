@@ -45,7 +45,7 @@ ADDED=$(printf '%s\n' "$ADDED" | grep -vxFf <(printf '%s\n' "$BASE_NAMES") || tr
 # Kernel packages are never purged: a kernel that unattended-upgrades added
 # during the run carries the linux-generic metapackages with it, and purging
 # it left the host without them (1.21.68).  A newer kernel is upstream drift.
-KERNEL_RE='^linux-(image|modules|modules-extra|headers|generic|image-generic|headers-generic)(-|$)'
+KERNEL_RE='^linux-(image|modules|modules-extra|main-modules|headers|generic|image-generic|headers-generic)(-|$)'
 ADDED=$(printf '%s\n' "$ADDED" | grep -vE "$KERNEL_RE" || true)
 echo "added packages: $(printf '%s\n' "$ADDED" | sed '/^$/d' | wc -l)"
 for unit in angie anubis mariadb valkey-server elasticsearch 'php*-fpm' sysstat smartmontools; do

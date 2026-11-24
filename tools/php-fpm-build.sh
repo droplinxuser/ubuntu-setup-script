@@ -390,14 +390,19 @@ llvm_install() { # major packages...
   [[ -n $c ]] || die "cannot read VERSION_CODENAME from /etc/os-release"
   llvm_suite_ok "$n" || die "apt.llvm.org has no LLVM $n for Ubuntu $c (set LLVM_VERSION in $CONF)"
   ensure_packages ca-certificates curl gnupg
-  if ! gpg --show-keys --with-colons "$LLVM_KEYRING" 2>/dev/null | grep -q "^fpr:::::::::$LLVM_KEY_FPR:"; then
+  # gpg reads the key in a throwaway home: --show-keys would otherwise create
+  # /root/.gnupg on the server.
+  local gnupg_home
+  gnupg_home=$(mktemp -d)
+  if ! GNUPGHOME=$gnupg_home gpg --show-keys --with-colons "$LLVM_KEYRING" 2>/dev/null | grep -q "^fpr:::::::::$LLVM_KEY_FPR:"; then
     key=$(mktemp)
     http_get https://apt.llvm.org/llvm-snapshot.gpg.key "$key" || { rm -f "$key"; die "cannot fetch the apt.llvm.org key"; }
-    fpr=$(gpg --show-keys --with-colons "$key" 2>/dev/null | awk -F: '$1 == "fpr" { print $10 }' | sed -n 1p)
+    fpr=$(GNUPGHOME=$gnupg_home gpg --show-keys --with-colons "$key" 2>/dev/null | awk -F: '$1 == "fpr" { print $10 }' | sed -n 1p)
     [[ $fpr == "$LLVM_KEY_FPR" ]] || { rm -f "$key"; die "apt.llvm.org key fingerprint is $fpr, expected $LLVM_KEY_FPR"; }
     install -d -m 755 "$(dirname "$LLVM_KEYRING")"
     install -m 644 "$key" "$LLVM_KEYRING"; rm -f "$key"
   fi
+  rm -rf "$gnupg_home"
   src=$(printf '# Managed by setup.sh (PHP_BUILD=clang): LLVM %s for the compiled php-fpm.\nTypes: deb\nURIs: https://apt.llvm.org/%s/\nSuites: llvm-toolchain-%s-%s\nComponents: main\nSigned-By: %s\n' \
     "$n" "$c" "$c" "$n" "$LLVM_KEYRING")
   pin=$(printf '# Managed by setup.sh (PHP_BUILD=clang): apt.llvm.org never replaces Ubuntu packages.\nPackage: *\nPin: origin apt.llvm.org\nPin-Priority: 100\n')
