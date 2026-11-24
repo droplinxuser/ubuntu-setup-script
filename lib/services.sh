@@ -196,6 +196,10 @@ install_angie() {
     /usr/sbin/angie -t && systemctl reload angie || true
   fi
 
+  # ANGIE_BUILD=clang: the compiled Angie (BOLT waits for --optimize under traffic).
+  angie_build_apply install info \
+    || warn "Angie: ANGIE_BUILD=${ANGIE_BUILD} build failed; the package's Angie keeps serving"
+
   systemctl status angie --no-pager -l || true
   systemctl is-active angie >/dev/null
   ok "Angie installed and running"

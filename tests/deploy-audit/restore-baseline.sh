@@ -110,6 +110,12 @@ rm -f /etc/systemd/system/setup-php-fpm-build@.service /etc/systemd/system/setup
       /etc/systemd/system/php*-fpm.service.d/zz-setup-build.conf /etc/apt/apt.conf.d/99setup-php-fpm-build \
       /etc/apt/sources.list.d/setup-llvm.sources /etc/apt/preferences.d/setup-llvm.pref /etc/apt/keyrings/setup-llvm.asc
 rm -rf /usr/local/lib/setup-php /var/cache/setup-php-build /run/setup-php-build /opt/setup-llvm
+# ANGIE_BUILD=clang (1.21.70) and the Angie A/B arms.
+systemctl disable --now setup-angie-build-refresh.timer >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/setup-angie-build.service /etc/systemd/system/setup-angie-build-refresh.* \
+      /etc/systemd/system/angie.service.d/zz-setup-build.conf /etc/apt/apt.conf.d/99setup-angie-build \
+      /run/systemd/system/angie.service.d/zz-bench-angie.conf /etc/angie/angie-bench-src.conf
+rm -rf /usr/local/lib/setup-angie /var/cache/setup-angie-build /opt/angie-*
 id lsadm >/dev/null 2>&1 && userdel lsadm >/dev/null 2>&1 || true
 rm -rf /var/www /etc/angie /etc/php /etc/mysql /etc/valkey /etc/redis /etc/elasticsearch \
        /var/lib/setup.sh /var/lib/mysql /var/lib/mariadb /var/lib/valkey /var/lib/redis /var/lib/elasticsearch \

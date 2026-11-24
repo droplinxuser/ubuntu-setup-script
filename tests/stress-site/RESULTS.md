@@ -7,7 +7,32 @@ manifests, sweep tables and run logs these sections cite (`AUDIT-*.md`,
 removed from the tree on 2026-11-19 to keep the repository lean; every one
 is still in git history, for example
 `git show 84b0db5:tests/stress-site/AUDIT-20261117-1.21.30.md`.  The current
-cycle report is `AUDIT-20261124-1.21.67.md`.
+cycle report is `AUDIT-20261125-1.21.70.md`.
+
+## 1.21.70 — Xeon E-2236 (2026-11-25)
+
+Pair: `server-configs-nginx` 1.6.60.  Details: `AUDIT-20261125-1.21.70.md`.
+Mitigations off (operator request, test host only).
+
+- **Compiled Angie** (`SETUP_ANGIE_BUILD=clang`, new): installed through
+  `setup.sh --optimize` with BOLT, vs the package, 5 rotated rounds: cached
+  WordPress home / post +12.4 / +11.5 %, XenForo thread / home +6.6 / +4.4 %,
+  Chevereto image / explore +6.1 / +2.2 %; member and uncached pages
+  unchanged.  Before BOLT: +3.6 to +6.1 %.
+- **Compression:** Angie CPU per XenForo member page, gzip 1.19 ms
+  (package) → 0.94 ms (zlib-ng, -21 %); Brotli 1.91 → 1.82 ms.  PHP with
+  zlib-ng: uncached Chevereto +7.3 % (PHP gzips those pages).
+- **Compiled php-fpm hardened** (stack protector, stack-clash, FORTIFY=3,
+  CET, full RELRO were missing since 1.21.68): cost 0.5-2 % before BOLT.
+  Hardened LTO + BOLT vs the package: XenForo thread / home +10.6 / +6.8 %,
+  WordPress +6.5 %, Chevereto uncached +3.8 %.  Instrumented PGO + BOLT and
+  AutoFDO + BOLT measured and not adopted (mixed, and slower).
+- php-fpm links only libc and libm (libsystemd replaced by an `sd_notify`
+  implementation); BOLTed binary 48.4 MB stripped (1.21.69: 60.4 MB
+  unstripped).  A static glibc built from source was measured and dropped: it
+  cannot load Ubuntu's NSS modules (workers abort switching to www-data).
+- Suites: unit 1,681, dry runs 227; on both builds through `setup.sh`:
+  security 78/78, cookie 105/105, functional 0 failures.
 
 ## 1.21.69 — Xeon E-2236 (2026-11-24)
 

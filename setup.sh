@@ -36,7 +36,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.21.69"
+readonly SCRIPT_VERSION="1.21.70"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -113,10 +113,9 @@ if [[ -n ${SETUP_PHP_PAGE_GZIP+x} ]]; then
   PHP_PAGE_GZIP_PERSIST=1
 fi
 [[ $PHP_PAGE_GZIP == 0 ]] || PHP_PAGE_GZIP=1
-# Compiled php-fpm (opt-in).  SETUP_PHP_BUILD=clang rebuilds the package's PHP
-# version with clang (Sury's extensions kept); =lean builds a XenForo-only
-# php-fpm from upstream sources (php-build.conf).  Both get BOLT from live
-# traffic on --optimize; =package goes back.  Persisted as PHP_BUILD.  See lib/php-build.sh and
+# Compiled php-fpm (opt-in).  SETUP_PHP_BUILD=clang builds a lean php-fpm for
+# WordPress, XenForo and Chevereto from upstream sources (php-build.conf),
+# with BOLT from live traffic on --optimize; =package goes back.  Persisted as PHP_BUILD.  See lib/php-build.sh and
 # tools/php-fpm-build.sh.
 PHP_BUILD="${PHP_BUILD:-}"
 PHP_BUILD_PERSIST=0
@@ -132,6 +131,16 @@ PHP_FPM_MODULES_PERSIST=0
 if [[ -n ${SETUP_PHP_FPM_MODULES+x} ]]; then
   PHP_FPM_MODULES=$SETUP_PHP_FPM_MODULES
   PHP_FPM_MODULES_PERSIST=1
+fi
+# Compiled Angie (opt-in, 1.21.70).  SETUP_ANGIE_BUILD=clang builds a lean Angie
+# from upstream sources (angie-build.conf) with BOLT on --optimize; =package
+# goes back.  Persisted as ANGIE_BUILD.  See lib/angie-build.sh and
+# tools/angie-build.sh.
+ANGIE_BUILD="${ANGIE_BUILD:-}"
+ANGIE_BUILD_PERSIST=0
+if [[ -n ${SETUP_ANGIE_BUILD+x} ]]; then
+  ANGIE_BUILD=$SETUP_ANGIE_BUILD
+  ANGIE_BUILD_PERSIST=1
 fi
 [[ $PRECOMPRESS_ASSETS == 0 ]] || PRECOMPRESS_ASSETS=1
 # XenForo job runner.  XenForo runs its job queue (cron tasks, search
@@ -328,6 +337,9 @@ source "${SCRIPT_DIR}/lib/php-upgrade.sh"
 
 # shellcheck source=lib/php-build.sh
 source "${SCRIPT_DIR}/lib/php-build.sh"
+
+# shellcheck source=lib/angie-build.sh
+source "${SCRIPT_DIR}/lib/angie-build.sh"
 
 
 # Tests source this file with SETUP_TEST_SOURCE_ONLY=1 to exercise the pure

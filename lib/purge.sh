@@ -295,6 +295,7 @@ purge_angie() {
     warn "This host still runs the Anubis bot filter; run tools/remove-anubis.sh to restore the vhosts and remove it"
   fi
   purge_service_stop angie
+  angie_build_purge
   apt_purge_pkgs angie
   # Configuration, data, caches and logs are left on disk.  Reinstalling Angie
   # then restores the exact site instead of starting from an empty tree.

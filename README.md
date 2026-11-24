@@ -154,6 +154,7 @@ Environment options:
 | `SETUP_ANGIE_COMPRESSION=0` | on | turns the managed compression profile off |
 | `SETUP_PRECOMPRESS_ASSETS=0` | on (since 1.21.58) | writes `.br`/`.gz` siblings for the static assets of every XenForo/WordPress root and keeps them fresh from cron (a 177 KB script: 22,000 req/s from the sibling vs 2,100 compressed per request).  0 removes the siblings it made.  Install-time only: `--optimize` ignores the tuning override and uses the default (on) |
 | `SETUP_XF_JOB_CRON=0` | on | removes the managed crontab entry that runs `cmd.php xf:run-jobs` once a minute as www-data for every XenForo root; persisted as `XF_JOB_CRON` |
+| `SETUP_ANGIE_BUILD=clang` | off (the package's Angie) | opt-in Angie compiled from upstream sources with only the modules this configuration uses; see [Compiled Angie](#compiled-angie-setup_angie_buildclang).  Persisted as `ANGIE_BUILD` (kept by `--optimize`; `=package` goes back) |
 | `CONFIG_REPO_URL`, `CONFIG_REPO_REF` | `droplinxuser/server-configs-nginx`, `main` | select a fork or branch of the configuration tree |
 | `CONFIG_SOURCE_DIR=/path` | unset | use a local checkout instead of downloading |
 
@@ -179,6 +180,52 @@ Notes:
   host that still runs the filter is refused by `setup.sh` until
   `sudo bash tools/remove-anubis.sh` has restored its vhosts to direct TLS.
 
+#### Compiled Angie (`SETUP_ANGIE_BUILD=clang`)
+
+An opt-in Angie built from upstream sources, the same way as the compiled
+php-fpm.  `SETUP_ANGIE_BUILD=clang ./setup.sh --optimize` builds and
+activates it; `SETUP_ANGIE_BUILD=package` goes back and removes it.
+
+| Measured (1.21.70, Xeon E-2236 test host, 5 rotated rounds) | Package | Compiled |
+|---|---:|---:|
+| Cached guest pages, req/s (WordPress home / post, XenForo thread / home, Chevereto image / explore) | 73,275-116,133 | **+12.4 / +11.5, +6.6 / +4.4, +6.1 / +2.2 %** with BOLT |
+| Angie CPU per gzip-compressed XenForo member page | 1.19 ms | **0.94 ms** (zlib-ng) |
+| Angie CPU per Brotli-compressed member page | 1.91 ms | 1.82 ms |
+| Member and uncached pages | — | unchanged (PHP sets the pace) |
+
+**What it is.**  Angie from download.angie.software, OpenSSL, PCRE2 (JIT),
+zlib-ng (zlib's API; a fifth less gzip CPU than zlib) and Brotli (google/brotli
+with google/ngx_brotli), each at the version in
+[`angie-build.conf`](angie-build.conf), compiled with clang from apt.llvm.org
+at `-O3 -march=native` with Ubuntu's hardening flags, OpenSSL, PCRE2 and
+zlib-ng static, ThinLTO, then rewritten by LLVM BOLT from a 60 s perf sample
+of live traffic.  It links only glibc from Ubuntu.  Only the
+modules `server-configs-nginx` uses are built: the http core with SSL,
+HTTP/2, HTTP/3, realip, gzip_static, threads and Brotli.  Mail, stream, ACME,
+DAV, mp4/flv, sub, SSI, uwsgi, scgi, grpc, memcached, userid, autoindex,
+split_clients, empty_gif, browser, mirror, auth_basic, limit_conn and
+referer are left out.
+
+**Safety.**  The package binary stays at `/usr/sbin/angie` and the
+configuration, unit and logs stay the package's: a drop-in
+(`/etc/systemd/system/angie.service.d/zz-setup-build.conf`) only changes the
+binary the unit starts.  The build has its own prefix
+(`/usr/local/lib/setup-angie`), so `modules-enabled/50-brotli.conf` loads the
+build's own Brotli modules while `/etc/angie/angie.conf` is read unchanged.
+Every start first runs `angie -t` with the build; a configuration that needs a
+left-out module (naxsi, a `sub_filter`, another `load_module`) fails that test
+and `--optimize` puts the package binary back with a report line.  The APT
+hook goes back to the package when it becomes newer than the build and
+rebuilds; the daily `setup-angie-build-refresh.timer` rebuilds when a component
+publishes a newer release; a build made on another CPU model (the build uses
+`-march=native`) refuses to start and the package takes over until the
+rebuild.  Switching binaries restarts Angie (well under a second).
+
+**Manual control:** `/usr/local/lib/setup-angie/angie-build.sh status`,
+`check`, `versions`, `build`, `rebuild`, `bolt [seconds]`, `deactivate`,
+`activate`, `remove`.  `--purge angie` removes the build.  The LLVM toolchain
+is shared with `SETUP_PHP_BUILD=clang` and goes with the last of the two.
+
 ### PHP (`--php`)
 
 | Option | Default | Effect |
@@ -196,7 +243,7 @@ Environment options:
 | `SETUP_PHP_JIT_WORDPRESS=0` | 1 (WordPress uses the JIT) | keeps `opcache.jit = off` for every WordPress document root through a `[PATH=<root>]` section of the managed ini, for a site that misbehaves with the JIT.  Tuning override: ignored by `--optimize` |
 | `SETUP_PHP_PAGE_GZIP=0` | 1 | by default the managed ini turns `zlib.output_compression` (level 4) on in a `[PATH=<root>]` section for every WordPress and Chevereto document root whose guest cache key carries the encoding token, so the FastCGI cache stores the gzip page (0.12 ms of Angie CPU per hit instead of about 1 ms to compress each hit); Chevereto roots also get PHP session GC (`session.gc_probability = 1`, divisor 1000) because no timer cleans its session directory; tuning override: ignored by `--optimize` (profile default 1) |
 | `SETUP_PHP_SESSION_HARDENING=1` | off | opt-in `session.*` strict settings, `cgi.fix_pathinfo=0`, `display_errors=Off` and a central `error_log`; it broke Joomla/Polr logins on a mixed host.  Persisted as `PHP_SESSION_HARDENING` (kept by `--optimize`; `=0` turns it off) |
-| `SETUP_PHP_BUILD=clang` | off (the package's php-fpm) | opt-in php-fpm compiled from upstream sources with only what WordPress, XenForo and Chevereto use (`lean`/`source` are aliases); see [Compiled php-fpm](#compiled-php-fpm-setup_php_buildclang).  Persisted as `PHP_BUILD` (kept by `--optimize`; `=package` goes back) |
+| `SETUP_PHP_BUILD=clang` | off (the package's php-fpm) | opt-in php-fpm compiled from upstream sources with only what WordPress, XenForo and Chevereto use; see [Compiled php-fpm](#compiled-php-fpm-setup_php_buildclang).  Persisted as `PHP_BUILD` (kept by `--optimize`; `=package` goes back) |
 | `SETUP_PHP_FPM_MODULES=all` | off: php-fpm loads only what WordPress, XenForo and Chevereto need | keep every installed extension loaded in php-fpm, see [PHP-FPM modules](#php-fpm-modules-only-what-the-applications-need).  Persisted as `PHP_FPM_MODULES` (kept by `--optimize`) |
 
 #### Compiled php-fpm (`SETUP_PHP_BUILD=clang`)
@@ -204,10 +251,10 @@ Environment options:
 Two choices for the binary the PHP-FPM unit starts.  Switching is one
 `SETUP_PHP_BUILD=... ./setup.sh --optimize`:
 
-| `SETUP_PHP_BUILD` | php-fpm | Measured vs the package (1.21.69: XF member thread / home, WP member home, Chevereto uncached home) |
+| `SETUP_PHP_BUILD` | php-fpm | Measured vs the package (1.21.70: XF member thread / home, WP member home, Chevereto uncached home) |
 |---|---|---|
-| unset or `package` (default) | the Sury package, Sury's shared extensions | baseline: 237 / 415, 139, 1,474 req/s |
-| `clang` (`lean`, `source` are aliases) | compiled from upstream sources, lean, static, ThinLTO and BOLT | **+11.0 % / +10.1 %, +7.9 %, +5.9 %** |
+| unset or `package` (default) | the Sury package, Sury's shared extensions | baseline: 218 / 409, 139, 1,474 req/s |
+| `clang` | compiled from upstream sources, lean, hardened, static, ThinLTO and BOLT | **+10.6 % / +6.8 %, +6.5 %, +3.8 %**, and zlib-ng adds +7.3 % on uncached Chevereto pages |
 
 Cached pages are the same either way, because Angie serves them.  The build
 keeps the package's `php.ini`, pools, unit and `php` CLI (XenForo's `cmd.php`
@@ -216,18 +263,21 @@ and cron still run on it).  BOLT needs `perf` for the running kernel
 keeps the ThinLTO build.
 
 **What it is.**  PHP from php.net, redis and igbinary from PECL, and every
-library php-fpm links (OpenSSL, PCRE2, zlib, libxml2, libsodium, GMP, curl,
-libjpeg-turbo, libpng, libwebp, libzip), each from its own project at the
-version in [`php-build.conf`](php-build.conf), compiled with clang from
-apt.llvm.org at `-O3 -march=native -fPIE`, linked statically with ThinLTO
-across PHP, its extensions, PCRE2, zlib and libxml2, then rewritten by LLVM
-BOLT from a 60 s perf sample of live traffic.  It links only glibc and
-libsystemd from Ubuntu.  It contains only the FPM SAPI and the modules
-WordPress, XenForo 2.3 and Chevereto 4.5 use between them: ctype curl dom
-exif fileinfo filter gd (jpeg, png, webp; GIF and BMP built in) gmp iconv
-libxml mbstring mysqli/mysqlnd openssl pdo/pdo_mysql session simplexml sodium
-xml xmlreader xmlwriter zip zlib, plus redis/igbinary for the Redis caches,
-plus PHP's always-built core.  There is no intl: XenForo ships Symfony's intl
+library php-fpm links (OpenSSL, PCRE2, zlib-ng, libxml2, libsodium, GMP,
+GNU libiconv, curl, libjpeg-turbo, libpng, libwebp, libzip), each from its own
+project at the version in [`php-build.conf`](php-build.conf), compiled with
+clang from apt.llvm.org at `-O3 -march=native -fPIE` with Ubuntu's hardening
+flags (stack protector, stack-clash probes, `_FORTIFY_SOURCE=3`, CET, full
+RELRO), linked statically with ThinLTO across PHP, its extensions, PCRE2,
+zlib-ng and libxml2, then rewritten by LLVM BOLT from a 60 s perf sample of
+live traffic.  It links only glibc (libc, libm) from Ubuntu: PHP-FPM's one
+libsystemd call, `sd_notify()` for the unit, is a small static
+implementation of the protocol.  It contains only the FPM SAPI and the
+modules WordPress, XenForo 2.3 and Chevereto 4.5 use between them: ctype
+curl dom exif fileinfo filter gd (jpeg, png, webp; GIF and BMP built in) gmp
+iconv libxml mbstring mysqli/mysqlnd openssl pdo/pdo_mysql session simplexml
+sodium xml xmlwriter zip zlib, plus redis/igbinary for the Redis caches,
+plus PHP's always-built core (8.5 adds `lexbor` and `uri`).  There is no intl: XenForo ships Symfony's intl
 polyfills, WordPress checks `function_exists`, and Chevereto does not use it.
 There is no ImageMagick: all three use GD.  No shared extensions are loaded:
 before every start and reload the tool mirrors `/etc/php/X.Y/fpm/conf.d` into
@@ -246,10 +296,35 @@ it is the fastest of the three both before and after BOLT.  `-fPIC` against
 `-fPIE` and BOLT sampling with `opcache.huge_code_pages` on or off made no
 measurable difference.
 
+**1.21.70: what was measured.**  Fresh install, 5 rotated rounds, CPU clock
+pinned, LTO builds before BOLT unless noted:
+
+| vs the package | XF thread | XF home | WP home | Chevereto uncached |
+|---|---:|---:|---:|---:|
+| 1.21.69 flags (no hardening) | +6.4 % | +4.4 % | +2.9 % | +2.8 % |
+| hardened | +4.1 % | +2.2 % | +2.2 % | +2.3 % |
+| hardened + zlib-ng | +3.7 % | +2.4 % | +2.9 % | **+9.8 %** |
+| hardened + BOLT (shipped, with zlib) | **+10.6 %** | **+6.8 %** | **+6.5 %** | **+3.8 %** |
+| instrumented PGO + BOLT | +8.3 % | +6.6 % | +7.2 % | +4.9 % |
+| AutoFDO + BOLT | +6.4 % | +3.7 % | +3.6 % | +0.6 % |
+
+The hardening costs 0.5-2 % and stays.  zlib-ng speeds up the gzip PHP
+does itself for WordPress and Chevereto pages (`SETUP_PHP_PAGE_GZIP`).  PGO
+on top of BOLT was mixed (XenForo thread -2 %, the rest within ±1 %) for a
+second build and a training run, and AutoFDO was slower everywhere; neither
+is used.  `-march=native` already covers what CachyOS's x86-64-v3/v4/znver4
+packages do: every server compiles for its own CPU.  glibc stays Ubuntu's: a
+static glibc built from source cannot load the system's NSS modules (the
+workers abort when they switch to www-data), see the CHANGELOG.
+
 **Checks before it serves.**  The build must start without warnings, show
-every module above, give every INI directive it shares with the package the
-package's value (`php-fpm -i`), link none of the libraries above from Ubuntu,
-and pass `php-fpm -t` against the live pool configuration.
+every module above and no other (PHP's fixed core aside), give every INI
+directive it shares with the package the package's value (`php-fpm -i`),
+link none of the libraries above (or libsystemd) from Ubuntu, and pass
+`php-fpm -t` against the live pool configuration.  `build.info` records the
+CPU model: a build started on another CPU (disk moved, VM migrated) refuses
+to start, the package binary takes over and the build is redone.  The binary
+php-fpm runs is stripped (`php-fpm.lto` keeps the symbols for BOLT).
 
 * **Versions:** [`php-build.conf`](php-build.conf), beside `setup.sh`, lists
   every component as `latest` (the newest stable release, never an RC or
@@ -260,12 +335,13 @@ and pass `php-fpm -t` against the live pool configuration.
   source answers a version lookup, the build keeps the version it was made
   from.
 * **Downloads:** every download has a second source, tried when the first
-  times out or fails.  The project's own site comes first and GitHub second:
-  PHP (php.net, then the php-src tag snapshot); redis and igbinary (PECL,
-  then GitHub); OpenSSL, zlib, libsodium, curl and libzip (their sites, then
-  their GitHub releases, the same file under one SHA-256); libxml2
-  (download.gnome.org, then GNOME GitLab or GitHub); GMP (ftp.gnu.org, then
-  ftpmirror.gnu.org); libpng (SourceForge, then GitHub); libwebp
+  times out, stalls (under 1 KB/s for 30 s) or fails.  The project's own site
+  comes first and GitHub second: PHP (php.net, then the php-src tag
+  snapshot); redis and igbinary (PECL, then GitHub); OpenSSL, libsodium, curl
+  and libzip (their sites, then their GitHub releases, the same file under
+  one SHA-256); zlib-ng (its GitHub release archive, then codeload);
+  libxml2 (download.gnome.org, then GNOME GitLab or GitHub); GMP and GNU
+  libiconv (ftp.gnu.org, then ftpmirror.gnu.org); libpng (SourceForge, then GitHub); libwebp
   (downloads.webmproject.org, then GitHub); PCRE2 and libjpeg-turbo (their
   GitHub releases, then GitHub's tag snapshots, as GitHub is their only
   home); LLVM (apt.llvm.org, then LLVM's GitHub release tarball in
@@ -306,12 +382,13 @@ and pass `php-fpm -t` against the live pool configuration.
 php-fpm loads only the shared extensions that WordPress, XenForo and
 Chevereto need between them: ctype curl dom exif fileinfo gd gmp iconv
 igbinary intl json mbstring mysqli mysqlnd opcache pdo pdo_mysql redis
-simplexml sodium xml xmlreader xmlwriter zip.  The sources for that list are
+simplexml sodium xml xmlwriter zip.  The sources for that list are
 setup.sh's per-app requirements, Chevereto's integrity check and WordPress
 Site Health.  Sury enables every installed module for every SAPI, so the
 install and `--optimize` disable the rest (calendar, ffi, ftp, gettext, phar,
-posix, readline, shmop, sockets, sysv*, tokenizer, xsl, imagick) for php-fpm
-only, with `phpdismod -s fpm`.  That marks them "disabled by admin", so
+posix, readline, shmop, sockets, sysv*, tokenizer, xmlreader, xsl, imagick)
+for php-fpm only, with `phpdismod -s fpm` (xmlreader since 1.21.70: WordPress
+uses it only when libxml2 is broken).  That marks them "disabled by admin", so
 package updates keep them off.  The CLI keeps every extension.
 
 * A host that serves another PHP application (any `.php` at a vhost root

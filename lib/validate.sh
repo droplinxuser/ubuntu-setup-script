@@ -509,6 +509,7 @@ validate_all() {
 
   # SETUP_PHP_BUILD / PHP_BUILD (lib/php-build.sh): clang or package.
   php_build_validate
+  angie_build_validate
 
   # mitigations=on|off (--basic, --optimize or SETUP_CPU_MITIGATIONS).
   if (( ${CPU_MITIGATIONS_LOOSE:-0} )) && (( ! OPTIMIZE )) && (( ${ENABLED[basic]:-0} != 1 )); then

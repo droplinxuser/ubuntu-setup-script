@@ -230,6 +230,11 @@ optimize_angie() {
   if (( rc == 0 && active )); then
     cloudflare_tls_finish 0 || true
   fi
+  # ANGIE_BUILD=clang/package (1.21.70): build, BOLT from live traffic, or revert.
+  # A failed build leaves the package binary serving and marks the run.
+  if (( rc == 0 )) && ! angie_build_apply "$( (( active )) && echo optimize || echo install)" opt_report; then
+    rc=1
+  fi
   return "$rc"
 }
 
@@ -1904,6 +1909,9 @@ optimize_plan() {
       "$ANGIE_PHP_KEEPALIVE" "$cache_mb"
     printf '  Angie compression: Brotli level %s dynamic, gzip fallback (module installed on apply)\n' \
       "$(angie_brotli_level)"
+    local angie_plan
+    angie_plan=$(angie_build_plan)
+    [[ -n $angie_plan ]] && printf '  Angie: %s\n' "$angie_plan"
     if pkg_ok angie-module-zstd 2>/dev/null; then
       printf '  Angie zstd: retired in 1.21.59; managed stanzas moved away and angie-module-zstd purged unless a configuration still uses it\n'
     fi

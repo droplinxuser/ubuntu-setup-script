@@ -8,6 +8,102 @@ Reports of the 1.21.33-1.21.61 cycles that measured the removed Anubis
 filter were deleted from the tree on 2026-11-23 for the same reason;
 `git show <commit>:<path>` recovers them.
 
+## 1.21.70 (2026-11-25)
+
+- **Compiled Angie (`SETUP_ANGIE_BUILD=clang`, opt-in).**  Angie, OpenSSL,
+  PCRE2, zlib-ng and Brotli from their own releases (versions in the new
+  `angie-build.conf`), clang `-O3 -march=native` with Ubuntu's hardening
+  flags, static, ThinLTO and BOLT from live traffic, with only the modules
+  `server-configs-nginx` uses (no mail, stream, ACME, DAV, SSI, grpc, ...).
+  It links only glibc from Ubuntu.  Before BOLT it served the cached guest
+  pages **+3.6 to +6.1 %** faster than the package (5 rotated rounds, every
+  tier's spread clear of the package's); member and uncached pages are
+  PHP-bound and unchanged.  Installed through
+  `setup.sh --optimize` with BOLT from live traffic: WordPress guest home /
+  post **+12.4 % / +11.5 %**, XenForo guest thread / home +6.6 % / +4.4 %,
+  Chevereto image / explore +6.1 % / +2.2 %.  The configuration, unit and logs
+  stay the package's (a drop-in changes the binary only); the build has its
+  own prefix, so its own Brotli modules load from the unchanged
+  `modules-enabled/`.  Every start runs `angie -t` with the build; a
+  configuration that needs a left-out module sends Angie back to the package
+  on the next `--optimize`.  APT hook, daily rebuild timer and CPU guard as
+  for php-fpm.  `tools/angie-build.sh`, `lib/angie-build.sh`.
+- **Compression (item 4).**  In this stack Angie compresses the dynamic
+  pages (1.6.56); PHP gzips WordPress and Chevereto pages for the guest cache
+  (`SETUP_PHP_PAGE_GZIP`).  Angie's CPU per XenForo member page: gzip 1.19 ms
+  (package) → 1.15 ms (zlib 1.4 from source) → **0.94 ms (zlib-ng 2.3.3,
+  -21 %)**; Brotli 1.91 → 1.82 ms (Brotli 1.2.1 from source).  The compiled
+  Angie uses zlib-ng.  PHP gzips WordPress and Chevereto pages itself, so
+  the compiled php-fpm links zlib-ng too: **+7.3 % on uncached Chevereto pages**
+  against the same build with zlib (WordPress +0.7 %, XenForo unchanged).  A PHP Brotli extension would serve no
+  purpose: none of the three applications compresses with it, and Angie
+  already does.
+- **Security: the compiled php-fpm gets Ubuntu's hardening back.**  Upstream
+  clang, unlike Ubuntu's gcc, enables none of it by default, and the 1.21.68
+  and 1.21.69 builds ran without a stack protector, stack-clash probes,
+  `_FORTIFY_SOURCE`, CET landing pads or full RELRO, all of which the package
+  has.  Every library and PHP itself now build with
+  `-fstack-protector-strong -fstack-clash-protection -D_FORTIFY_SOURCE=3
+  -fcf-protection=full` (BTI on aarch64) and link `-z relro -z now`.
+  Measured cost before BOLT: 0.5-2 % (XenForo thread -2.2 %, WordPress
+  -0.7 %); it stays.
+- **libsystemd is gone from the compiled php-fpm.**  PHP-FPM uses one call
+  of it, `sd_notify()` for the unit's `Type=notify`; a 50-line static
+  implementation of the protocol (a datagram to `$NOTIFY_SOCKET`) replaces
+  it, and a unit test checks the datagram systemd receives.  The build now
+  links only glibc (libc, libm) from Ubuntu.
+- **glibc from source: built, measured, not shipped.**  glibc 2.44 builds
+  from ftp.gnu.org and links statically, but a static php-fpm cannot use the
+  system's NSS modules: when a worker switches to www-data, glibc reads
+  `/etc/nsswitch.conf` (`files systemd`) and `dlopen`s Ubuntu's
+  `libnss_systemd`, which pulls Ubuntu's own glibc 2.43 into the 2.44 binary;
+  glibc aborts ("rtld_static_init.c:90: assertion failed: guard_sym !=
+  NULL"), the master respawns workers forever and requests hang.  It also
+  crashed at startup with `opcache.huge_code_pages` (the remap stub calls
+  `mmap`/`memcpy`, which in a static binary sit inside the code being
+  remapped; a patch fixed that).  Making it work would mean shipping glibc's
+  whole runtime beside the binary, so glibc stays Ubuntu's, as for every
+  package; the experiment code is not kept.  Two general fixes came out of it:
+  `--disable-rpath` (PHP adds a RUNPATH per `--with-x=DIR`) and GNU libiconv
+  for PHP's iconv.
+- **PGO and AutoFDO measured (CachyOS-style).**  `-march=native` already does what CachyOS's
+  x86-64-v3/v4/znver4 repositories do (each server compiles for its own CPU;
+  a v4 binary cannot even start on the AVX2-only test Xeon), and ThinLTO and
+  BOLT were in.  Compiler feedback before BOLT, 5 rotated rounds against the
+  package (XenForo thread / home, WordPress, Chevereto uncached): LTO + BOLT
+  **+10.6 / +6.8 / +6.5 / +3.8 %**; instrumented PGO + BOLT +8.3 / +6.6 /
+  +7.2 / +4.9 %; AutoFDO (LBR samples, `llvm-profgen`) + BOLT +6.4 / +3.7 /
+  +3.6 / +0.6 %.  Neither beats LTO + BOLT enough to justify a second build
+  and a training run; neither is used.
+- **Smaller, leaner php-fpm.**  `xmlreader` is no longer built (WordPress
+  uses it only when libxml2 is broken; the package policy drops it too); PHP's
+  iconv uses GNU libiconv from ftp.gnu.org; OpenSSL drops ciphers and
+  protocols none of the applications use (legacy, national ciphers, binary
+  curves, SRP, DTLS); `--gc-sections` and safe ICF; the binary php-fpm runs is
+  stripped (php-fpm.lto keeps the symbols for BOLT): the BOLTed binary php-fpm runs is 48.4 MB
+  (1.21.69: 60.4 MB unstripped), and it links only libc and libm.  The
+  candidate must now show no module outside the app set and PHP's fixed core
+  (`cgi-fcgi`, `lexbor`, `uri`).  10.4 MB of what remains is fileinfo's magic
+  database.
+- **CPU guard.**  `-march=native` ties a build to its CPU.  `build.info`
+  records the CPU model; a build started on another one (disk moved, VM
+  migrated to other hardware) refuses to start, goes back to the package
+  binary and rebuilds, and `check` reports it as stale.
+- **Downloads:** a transfer under 1 KB/s for 30 s now fails over to the next
+  source (zlib.net stalled after 200 KB during a test build; `--max-time`
+  alone would have waited 30 minutes).
+- **`SETUP_PHP_BUILD=lean`/`source` removed** (operator request); `clang` and
+  `package` remain.  A host file written by 1.21.68 that still says `lean` or
+  `source` is rewritten to `clang` once, with a note.
+- **Tools:** `tools/build-common.sh` holds what both build tools share
+  (downloads with mirrors, checksums, version lookups, the LLVM toolchain);
+  the toolchain is removed only with the last build that uses it.
+  `PHP_BUILD_KEEP_WORK=1` keeps a failed build's work directory, and a failed
+  `configure` keeps its `config.log`.
+- **server-configs-nginx 1.6.60:** CI is back (`angie -t` on the tree and all
+  vhost templates, ShellCheck, the public-address check); it had none since
+  4 November.
+
 ## 1.21.69 (2026-11-24)
 
 - **One compiled php-fpm, built from source, faster than both 1.21.68

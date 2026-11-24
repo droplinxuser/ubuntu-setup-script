@@ -25,6 +25,8 @@ ARMS=("$@")
 (( ${#ARMS[@]} >= 2 )) || { echo "need at least two arms" >&2; exit 1; }
 
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+# SWITCH=switch-angie-arm.sh A/Bs Angie builds with the same rotation (1.21.70).
+SWITCH=${SWITCH:-$HERE/switch-php-arm.sh}
 TIERS=$(cd -- "$HERE/../stress-site" && pwd)/loopback-tiers.sh
 COOKIES=/root/audit/cookies/cookies.tsv
 OUT=$(mktemp /tmp/bench-php-sources.XXXXXX)
@@ -42,7 +44,7 @@ clear_cache() {
   done
 }
 
-"$HERE/switch-php-arm.sh" "${ARMS[0]}" >/dev/null
+"$SWITCH" "${ARMS[0]}" >/dev/null
 
 printf 'arms: %s | conns=%s secs=%s rounds=%s filter=%s\n' \
   "${ARMS[*]}" "$CONNS" "$SECS" "$ROUNDS" "$FILTER"
@@ -59,7 +61,7 @@ for (( r = 1; r <= ROUNDS; r++ )); do
   fi
   for arm in "${order[@]}"; do
     echo "== round $r arm $arm" >&2
-    "$HERE/switch-php-arm.sh" "$arm" >/dev/null
+    "$SWITCH" "$arm" >/dev/null
     clear_cache
     # Chevereto starts a session file in /tmp for every cookie-less request.
     # At benchmark rates (1,500 req/s) its 24-minute GC window holds ~2 million

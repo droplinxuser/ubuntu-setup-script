@@ -45,7 +45,7 @@ jobs:
                    tests/bench-php-matrix/train-php-pgo.sh; do bash -n "$f"; done
           bash -n tools/diff_configs.sh
           bash -n tools/remove-anubis.sh
-          bash -n tools/php-fpm-build.sh
+          bash -n tools/php-fpm-build.sh tools/build-common.sh tools/angie-build.sh tests/bench-php-matrix/switch-angie-arm.sh
           for f in tests/bench-php-matrix/build-php-dropin.sh tests/bench-php-matrix/bolt-php.sh; do bash -n "$f"; done
 
       - name: ShellCheck
@@ -59,8 +59,8 @@ jobs:
             tests/bench-php-matrix/build-php-source.sh tests/bench-php-matrix/extract-php-debs.sh \
             tests/bench-php-matrix/switch-php-arm.sh tests/bench-php-matrix/bench-php-sources.sh \
             tests/bench-php-matrix/bench-php-probe.sh \
-            tools/remove-anubis.sh tools/php-fpm-build.sh \
-            tests/bench-php-matrix/build-php-dropin.sh tests/bench-php-matrix/bolt-php.sh
+            tools/remove-anubis.sh tools/php-fpm-build.sh tools/build-common.sh tools/angie-build.sh \
+            tests/bench-php-matrix/build-php-dropin.sh tests/bench-php-matrix/bolt-php.sh tests/bench-php-matrix/switch-angie-arm.sh
 
       - name: Dry-run matrix
         run: bash tests/test-dry-run-matrix.sh

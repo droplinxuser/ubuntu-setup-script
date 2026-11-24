@@ -7310,8 +7310,15 @@ check ".gitignore covers the in-progress diagnostics report" \
 
 # ---- 1.21.68: PHP_BUILD=clang (lib/php-build.sh, tools/php-fpm-build.sh)
 pb_mode() { ( PHP_BUILD=$1; php_build_mode ); }
-check "PHP_BUILD: clang (lean/source aliases), package/sury/off and unset map to their modes" \
-  test "$(pb_mode clang),$(pb_mode CLANG),$(pb_mode lean),$(pb_mode source),$(pb_mode package),$(pb_mode sury),$(pb_mode off),$(pb_mode '')" = "clang,clang,clang,clang,package,package,package,"
+check "PHP_BUILD: clang, package/sury/off and unset map to their modes" \
+  test "$(pb_mode clang),$(pb_mode CLANG),$(pb_mode package),$(pb_mode sury),$(pb_mode off),$(pb_mode '')" = "clang,clang,package,package,package,"
+pb_alias_cli() { ( PHP_BUILD=$1; PHP_BUILD_PERSIST=1; die() { exit 7; }; php_build_validate ); [[ $? == 7 ]]; }
+pb_alias_cli_both() { pb_alias_cli lean && pb_alias_cli source; }
+check "PHP_BUILD: SETUP_PHP_BUILD=lean or =source is refused (aliases dropped in 1.21.70)" \
+  pb_alias_cli_both
+pb_alias_legacy() { ( PHP_BUILD=lean; PHP_BUILD_PERSIST=0; tune_note() { :; }; php_build_validate; printf '%s,%s' "$PHP_BUILD" "$PHP_BUILD_PERSIST" ); }
+check "PHP_BUILD: a 1.21.68 host file with lean is rewritten to clang once" \
+  test "$(pb_alias_legacy)" = "clang,1"
 pb_invalid() { ( PHP_BUILD=gcc; die() { exit 7; }; php_build_validate ); [[ $? == 7 ]]; }
 check "PHP_BUILD: an unknown value is refused before anything changes" pb_invalid
 check "validate_all checks PHP_BUILD" \
@@ -7416,16 +7423,17 @@ pb_tool_case() { # case -> result line
             https://download.libsodium.org/*|https://curl.se/*|https://libzip.org/*|https://download.gnome.org/*|\
             https://ftp.gnu.org/*|https://download.sourceforge.net/*|https://storage.googleapis.com/*|\
             https://github.com/PCRE2Project/*/releases/download/*|\
-            https://github.com/libjpeg-turbo/*/releases/download/*) return 1 ;;
+            https://github.com/libjpeg-turbo/*/releases/download/*|https://download.angie.software/*|\
+            https://github.com/google/*/archive/*|https://github.com/zlib-ng/*/archive/*) return 1 ;;
           esac
           [[ -n ${2:-} ]] && printf '%s' "$1" > "$2"; return 0
         }
         SRC_CACHE="$T/cache"; mkdir -p "$T/cache/src"
         ok=0; bad=""
-        for c in php redis igbinary "${LIBS[@]}"; do
+        for c in php redis igbinary "${LIBS[@]}" zlib angie brotli ngx-brotli; do
           if p=$( ( fetch_component "$c" 1.2.3 ) 2>/dev/null ) && [[ -s $p ]]; then ok=$((ok + 1)); else bad+="$c "; fi
         done
-        printf '%s|%s|%s' "$ok" "$(( 3 + ${#LIBS[@]} ))" "$bad"
+        printf '%s|%s|%s' "$ok" "$(( 7 + ${#LIBS[@]} ))" "$bad"
         return 0 ;;
       mirrors)
         http_get() { [[ $1 == https://b/* ]] || return 1; printf 'data' > "$2"; }
@@ -7454,7 +7462,7 @@ check "php-fpm-build activate: resets ExecStart, rewrites the package's line, mi
 check "php-fpm-build apt-hook: a build newer than the package (php.net ahead of Sury) is left alone" \
   test "$(pb_tool_case newer)" = "dropin build 0"
 check "php-fpm-build check: a build from an older recipe (1.21.68: -fPIC, intl) is stale" \
-  test "$(pb_tool_case recipe_old)" = "stale: recipe 1 -> 2 rc=10"
+  test "$(pb_tool_case recipe_old)" = "stale: recipe 1 -> 3 rc=10"
 check "php-fpm-build check: the current recipe with every pinned version is current" \
   test "$(pb_tool_case recipe_cur)" = "current rc=0"
 check "php-fpm-build fetch: the next mirror serves when the first fails; all failing stops" \
@@ -7470,20 +7478,20 @@ check "php-build.conf: pins, quotes and comments parse; unset keys mean latest; 
 check "php-build.conf: a value that is neither latest nor a version is refused" \
   test "$(pb_tool_case confbad)" = "refused"
 check "php-build.conf ships beside setup.sh with every component the tool builds" \
-  bash -c 'for k in PHP LLVM REDIS IGBINARY OPENSSL PCRE2 ZLIB LIBXML2 LIBSODIUM GMP CURL LIBJPEG_TURBO LIBPNG LIBWEBP LIBZIP; do grep -qx "${k}_VERSION=latest" "$1/php-build.conf" || exit 1; done' _ "$ROOT"
+  bash -c 'for k in PHP LLVM REDIS IGBINARY OPENSSL PCRE2 ZLIB_NG LIBXML2 LIBSODIUM GMP CURL LIBJPEG_TURBO LIBPNG LIBWEBP LIBZIP LIBICONV; do grep -qx "${k}_VERSION=latest" "$1/php-build.conf" || exit 1; done' _ "$ROOT"
 lean_set_ok() {
   local f
   f=$(sed -n '/^cmd_build()/,/^}/p' "$ROOT/tools/php-fpm-build.sh")
   grep -q -- "--disable-cli" <<<"$f" && grep -q -- "--enable-session" <<<"$f" \
-    && grep -q -- "--with-pdo-mysql" <<<"$f" && grep -q -- "--enable-xmlreader" <<<"$f" \
-    && ! grep -qiE -- "imagick|--enable-(intl|posix|pcntl|sockets|bcmath|soap|calendar|ftp|tokenizer|phar)\b" <<<"$f" \
+    && grep -q -- "--with-pdo-mysql" <<<"$f" && ! grep -q -- "--enable-xmlreader" <<<"$f" \
+    && ! grep -qiE -- "imagick|--enable-(intl|posix|pcntl|sockets|bcmath|soap|calendar|ftp|tokenizer|phar|xmlreader)\b" <<<"$f" \
     && grep -q -- 'BASE_FLAGS="[^"]*-fPIE' <<<"$f" && ! grep -q -- 'BASE_FLAGS="[^"]*-fPIC' <<<"$f"
 }
 check "the lean build compiles only the three applications' module set (no CLI, imagick or extras)" lean_set_ok
 check "php-fpm-build EXIT traps name a global (a local is gone when the trap fires under set -u)" \
   bash -c 'f="$1/tools/php-fpm-build.sh"; ! grep -E "trap .*EXIT" "$f" | grep -vqF "\${WORK_DIR:-}"' _ "$ROOT"
 gpg_home_ok() {
-  local f="$ROOT/tools/php-fpm-build.sh"
+  local f="$ROOT/tools/build-common.sh"
   [[ $(grep -cF 'gpg --show-keys' "$f") == "$(grep -cF 'GNUPGHOME=$gnupg_home gpg --show-keys' "$f")" ]] \
     && grep -qF 'rm -rf "${gnupg_home:?}"' "$f"
 }
@@ -7554,6 +7562,185 @@ check "the compiled build's module list matches the shared-extension policy (int
              case $m in opcache) m="Zend OPcache" ;; simplexml) m=SimpleXML ;; pdo) m=PDO ;; intl) continue ;; esac
              sed -n "/^APP_MODULES=(/,/)/p" "$1/tools/php-fpm-build.sh" | grep -qF -- "$m" || { echo "missing $m"; exit 1; }
            done' _ "$ROOT"
+
+# ---- 1.21.70: hardening, CPU guard, sd_notify shim, ANGIE_BUILD
+PFB_SRC=$(cat "$ROOT/tools/php-fpm-build.sh" "$ROOT/tools/build-common.sh")
+check "php-fpm-build: Ubuntu's hardening flags (stack protector, clash probes, FORTIFY=3, CET/BTI, full RELRO)" \
+  bash -c 'for f in -fstack-protector-strong -fstack-clash-protection -D_FORTIFY_SOURCE=3 -fcf-protection=full -mbranch-protection=standard "-Wl,-z,relro,-z,now"; do grep -qF -- "$f" <<<"$1" || { echo "no $f"; exit 1; }; done' _ "$PFB_SRC"
+check "angie-build: the same hardening flags" \
+  bash -c 'for f in -fstack-protector-strong -fstack-clash-protection -D_FORTIFY_SOURCE=3 -fcf-protection=full "-Wl,-z,relro,-z,now"; do grep -qF -- "$f" "$1" || exit 1; done' _ "$ROOT/tools/angie-build.sh"
+check "build downloads: a stalled transfer (under 1 KB/s for 30 s) fails over to the next source" \
+  bash -c '[[ $(grep -c -- "--speed-limit 1024 --speed-time 30" "$1") -ge 2 ]]' _ "$ROOT/tools/build-common.sh"
+check "php-fpm-build: no RUNPATH in php-fpm (--disable-rpath)" \
+  grep -qF -- '--disable-rpath' "$ROOT/tools/php-fpm-build.sh"
+check "php-fpm-build: the candidate may show no module outside the app set and PHP's fixed core" \
+  bash -c 'grep -qF "candidate has modules outside the app set" "$1" && grep -q "^CORE_MODULES=(cgi-fcgi lexbor uri)" "$1"' _ "$ROOT/tools/php-fpm-build.sh"
+check "php-fpm-build: xmlreader is no longer built (WordPress uses it only when libxml2 is broken)" \
+  bash -c '! sed -n "/^APP_MODULES=(/,/)/p" "$1" | grep -qw xmlreader' _ "$ROOT/tools/php-fpm-build.sh"
+check "php-fpm-build: the binary php-fpm runs is stripped; php-fpm.lto keeps the symbols for BOLT" \
+  bash -c '[[ $(grep -c "install_stripped" "$1") -ge 4 ]] && grep -qF "\$dir/php-fpm.lto" "$1"' _ "$ROOT/tools/php-fpm-build.sh"
+check "php-fpm-build and angie-build share build-common.sh (downloads, mirrors, LLVM)" \
+  bash -c 'grep -qF ". \"\$BUILD_COMMON\"" "$1/tools/php-fpm-build.sh" && grep -qF ". \"\$BUILD_COMMON\"" "$1/tools/angie-build.sh" && ! grep -q "^fetch_first()" "$1/tools/php-fpm-build.sh"' _ "$ROOT"
+check "setup installs build-common.sh beside both tools" \
+  bash -c 'grep -qF "PHP_BUILD_COMMON_FILE" "$1/lib/php-build.sh" && grep -qF "ANGIE_BUILD_COMMON_FILE" "$1/lib/angie-build.sh"' _ "$ROOT"
+check "build-common: a commit hash is a valid pin (ngx_brotli publishes no releases)" \
+  grep -qF '$v =~ ^[0-9a-f]{7,40}$' "$ROOT/tools/build-common.sh"
+
+# CPU guard: a -march=native build on another CPU model goes back to the package.
+pb_cpu_case() { # cpu-in-build.info -> "rc dropin rebuild-started"
+  (
+    T="$TMP/pbcpu"; rm -rf "$T"; mkdir -p "$T/units/php8.5-fpm.service.d" "$T/root/8.5" "$T/etc/8.5/fpm/conf.d" "$T/run"
+    export PHP_BUILD_ROOT="$T/root" PHP_BUILD_UNIT_DIR="$T/units" PHP_BUILD_ETC="$T/etc" PHP_BUILD_RUN_DIR="$T/run" PHP_BUILD_SOURCE_ONLY=1
+    # shellcheck disable=SC1090,SC1091
+    source "$ROOT/tools/php-fpm-build.sh"
+    set +eE; trap - ERR
+    systemctl() { printf '%s\n' "$*" >> "$T/systemctl.log"; return 0; }
+    systemd-run() { printf 'run %s\n' "$*" >> "$T/systemctl.log"; return 0; }
+    logger() { :; }; say() { :; }
+    cpu_model() { printf 'GenuineIntel This CPU'; }
+    printf '[Service]\n' > "$T/units/php8.5-fpm.service.d/zz-setup-build.conf"
+    printf 'version=8.5.13\ncpu=%s\n' "$1" > "$T/root/8.5/build.info"
+    ( cmd_conf 8.5 ) >/dev/null 2>&1; rc=$?
+    printf '%s %s %s' "$rc" \
+      "$([[ -f $T/units/php8.5-fpm.service.d/zz-setup-build.conf ]] && echo dropin || echo nodropin)" \
+      "$(cat "$T/systemctl.log" 2>/dev/null | grep -c 'start --no-block setup-php-fpm-build@8.5.service')"
+  )
+}
+check "php-fpm-build conf: a build made on this CPU starts as usual" \
+  test "$(pb_cpu_case 'GenuineIntel This CPU')" = "0 dropin 0"
+check "php-fpm-build conf: a build made on another CPU model refuses to start, goes back to the package and rebuilds" \
+  test "$(pb_cpu_case 'AuthenticAMD Other CPU')" = "1 nodropin 1"
+check "php-fpm-build: build.info records the CPU and check reports a CPU change as stale" \
+  bash -c 'grep -qF "printf '"'"'cpu=%s\\n'"'"' \"\$(cpu_model)\"" "$1" && grep -qF "stale+=\"cpu " "$1"' _ "$ROOT/tools/php-fpm-build.sh"
+
+# sd_notify shim: a real datagram to $NOTIFY_SOCKET, the way systemd reads it.
+pb_sdnotify_ok() {
+  local cl; cl=$(command -v clang || ls /usr/lib/llvm-*/bin/clang 2>/dev/null | sort -V | tail -n 1)
+  [[ -n $cl ]] && command -v python3 >/dev/null 2>&1 || return 2
+  (
+    T="$TMP/sdn"; rm -rf "$T"; mkdir -p "$T"
+    export PHP_BUILD_SOURCE_ONLY=1
+    # shellcheck disable=SC1090,SC1091
+    source "$ROOT/tools/php-fpm-build.sh"
+    set +eE; trap - ERR
+    CC=$cl AR=$(command -v llvm-ar || ls "$(dirname "$cl")"/llvm-ar 2>/dev/null || command -v ar) BASE_FLAGS="-O2"
+    sdnotify_shim "$T/deps" >/dev/null 2>&1 || exit 1
+    grep -q '^Libs: -L${libdir} -lsystemd$' "$T/deps/lib/pkgconfig/libsystemd.pc" || exit 1
+    printf '#include <systemd/sd-daemon.h>\nint main(void){ return sd_notifyf(0, "READY=1\\nSTATUS=%%s", "ok") == 1 ? 0 : 3; }\n' > "$T/t.c"
+    "$cl" -O2 -flto=thin -fuse-ld=lld -I"$T/deps/include" "$T/t.c" -L"$T/deps/lib" -lsystemd -o "$T/t" 2>/dev/null \
+      || "$cl" -O2 -I"$T/deps/include" "$T/t.c" "$T/deps/src/sd-notify.c" -o "$T/t" || exit 1
+    python3 - "$T/sock" "$T/t" <<'PY'
+import os, socket, subprocess, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM); s.bind(sys.argv[1]); s.settimeout(5)
+env = dict(os.environ, NOTIFY_SOCKET=sys.argv[1])
+rc = subprocess.call([sys.argv[2]], env=env)
+data = s.recv(4096).decode()
+sys.exit(0 if rc == 0 and data == "READY=1\nSTATUS=ok" else 1)
+PY
+  )
+}
+pb_sdnotify_case() { local rc=0; pb_sdnotify_ok || rc=$?; [[ $rc == 2 ]] && { t_skip "sd_notify shim round trip (no clang/python3)"; return 0; }; return "$rc"; }
+check "php-fpm-build: the sd_notify shim sends READY/STATUS to \$NOTIFY_SOCKET like libsystemd" pb_sdnotify_case
+
+
+# ANGIE_BUILD (lib/angie-build.sh, tools/angie-build.sh)
+ab_mode() { ( ANGIE_BUILD=$1; angie_build_mode ); }
+check "ANGIE_BUILD: clang, package/off and unset map to their modes; anything else is invalid" \
+  test "$(ab_mode clang),$(ab_mode package),$(ab_mode off),$(ab_mode ''),$(ab_mode lean)" = "clang,package,package,,invalid"
+ab_invalid() { ( ANGIE_BUILD=gcc; die() { exit 7; }; angie_build_validate ); [[ $? == 7 ]]; }
+check "ANGIE_BUILD: an unknown value is refused before anything changes" ab_invalid
+check "validate_all checks ANGIE_BUILD" \
+  bash -c 'sed -n "/^validate_all()/,/^}/p" "$1" | grep -q angie_build_validate' _ "$ALL_SRC"
+check "--optimize keeps the persisted ANGIE_BUILD choice" \
+  bash -c 'printf "%s\n" "$@" | grep -qx ANGIE_BUILD' _ "${RESET_KEEP_PINS[@]}"
+check "install_angie and optimize_angie both apply ANGIE_BUILD; --purge angie removes it" \
+  bash -c 'sed -n "/^install_angie()/,/^}/p" "$1" | grep -q angie_build_apply && sed -n "/^optimize_angie()/,/^}/p" "$1" | grep -q angie_build_apply && sed -n "/^purge_angie()/,/^}/p" "$1" | grep -q angie_build_purge' _ "$ALL_SRC"
+check "the LLVM toolchain is removed only by the last of PHP_BUILD and ANGIE_BUILD" \
+  bash -c 'sed -n "/^php_build_remove_support()/,/^}/p" "$1" | grep -q "setup-angie}/build" && sed -n "/^angie_build_remove_support()/,/^}/p" "$1" | grep -q "PHP_BUILD_ROOT.*build.info"' _ "$ALL_SRC"
+check "angie-build.conf ships beside setup.sh with every component the tool builds" \
+  bash -c 'for k in ANGIE LLVM OPENSSL PCRE2 ZLIB_NG BROTLI NGX_BROTLI; do grep -qx "${k}_VERSION=latest" "$1/angie-build.conf" || exit 1; done' _ "$ROOT"
+check "angie-build: only the modules server-configs-nginx uses (no mail/stream/ssi/grpc ...)" \
+  bash -c 'f=$(sed -n "/^cmd_build()/,/^}/p" "$1"); for w in http_v3_module http_realip_module http_gzip_static_module with-threads without-http_ssi_module without-http_grpc_module; do grep -q -- "$w" <<<"$f" || exit 1; done; ! grep -qE -- "--with-(mail|stream|http_dav|http_mp4|http_sub|http_acme)" <<<"$f"' _ "$ROOT/tools/angie-build.sh"
+
+ab_tool_case() { # case -> result
+  (
+    T="$TMP/abt"; rm -rf "$T"; mkdir -p "$T/units/angie.service.d" "$T/root/build" "$T/pkg" "$T/sbin"
+    export ANGIE_BUILD_ROOT="$T/root" ANGIE_BUILD_UNIT_DIR="$T/units" ANGIE_BUILD_SOURCE_ONLY=1 \
+           ANGIE_BUILD_PKG_BIN="$T/sbin/angie" ANGIE_BUILD_PKG_UNIT="$T/pkg/angie.service"
+    # shellcheck disable=SC1090,SC1091
+    source "$ROOT/tools/angie-build.sh"
+    set +eE; trap - ERR
+    systemctl() { printf '%s\n' "$*" >> "$T/systemctl.log"; return 0; }
+    systemd-run() { printf 'run %s\n' "$*" >> "$T/systemctl.log"; return 0; }
+    logger() { :; }; say() { :; }
+    stub_angie() { printf '#!/bin/sh\necho "Angie version: Angie/%s" >&2\n' "$1" > "$T/sbin/angie"; chmod +x "$T/sbin/angie"; }
+    d="$T/units/angie.service.d/zz-setup-build.conf"
+    case $1 in
+      activate)
+        stub_angie 1.12.5; printf 'angie=1.12.5\n' > "$T/root/build/build.info"
+        printf '[Service]\nType=forking\nExecStart=%s -c /etc/angie/angie.conf\n' "$T/sbin/angie" > "$T/pkg/angie.service"
+        restart_checked() { return 0; }
+        activate
+        printf '%s %s %s' "$(grep -c '^ExecStart=$' "$d")" \
+          "$(grep -c "^ExecStart=$T/root/build/angie -c /etc/angie/angie.conf$" "$d")" \
+          "$(grep -c "^ExecStartPre=$T/root/angie-build.sh pre$" "$d")"
+        return 0 ;;
+      stale)   stub_angie 1.12.6; printf 'angie=1.12.5\n' > "$T/root/build/build.info"; printf '[Service]\n' > "$d"; cmd_apt_hook ;;
+      current) stub_angie 1.12.5; printf 'angie=1.12.5\n' > "$T/root/build/build.info"; printf '[Service]\n' > "$d"; cmd_apt_hook ;;
+      cpumoved)
+        printf 'angie=1.12.5\ncpu=AuthenticAMD Other CPU\n' > "$T/root/build/build.info"; printf '[Service]\n' > "$d"
+        cpu_model() { printf 'GenuineIntel This CPU'; }
+        ( cmd_pre ) >/dev/null 2>&1; printf 'rc=%s ' "$?" ;;
+    esac
+    printf '%s %s' "$([[ -f $d ]] && echo dropin || echo nodropin)" \
+      "$(cat "$T/systemctl.log" 2>/dev/null | grep -c 'start --no-block setup-angie-build.service')"
+  )
+}
+check "angie-build activate: resets ExecStart to the build and tests the configuration before start" \
+  test "$(ab_tool_case activate)" = "1 1 1"
+check "angie-build apt-hook: a newer Angie package reverts to it and starts a rebuild" \
+  test "$(ab_tool_case stale)" = "nodropin 1"
+check "angie-build apt-hook: a current build is left alone" \
+  test "$(ab_tool_case current)" = "dropin 0"
+check "angie-build pre: a build made on another CPU model refuses to start, goes back and rebuilds" \
+  test "$(ab_tool_case cpumoved)" = "rc=1 nodropin 1"
+# install_stripped under set -euo pipefail with no GitHub toolchain directory
+# (an unmatched glob once ended both builds silently before the install).
+bc_strip_ok() {
+  ( set -euo pipefail
+    T="$TMP/strip"; rm -rf "$T"; mkdir -p "$T"
+    # shellcheck disable=SC1090,SC1091
+    . "$ROOT/tools/build-common.sh"
+    LLVM_OPT="$T/no-such-dir"
+    printf 'not an ELF file\n' > "$T/a"
+    install_stripped "$T/a" "$T/b"
+    [[ -x $T/b ]] && cmp -s "$T/a" "$T/b" )
+}
+check "build-common install_stripped: no llvm-strip and no /opt/setup-llvm still installs the binary (set -e, pipefail)" bc_strip_ok
+# Shared LLVM toolchain: removing PHP_BUILD and ANGIE_BUILD in either order
+# removes it once the second goes (1.21.70: each had deferred to the other).
+llvm_order_case() { # php-first|angie-first -> "after-first after-second"
+  (
+    T="$TMP/llvmord"; rm -rf "$T"; mkdir -p "$T/php/8.5" "$T/angie/build" "$T/llvm"
+    PHP_BUILD_ROOT="$T/php" ANGIE_BUILD_ROOT="$T/angie"
+    PHP_BUILD_TOOL="$T/php/php-fpm-build.sh" PHP_BUILD_CONF_FILE="$T/php/php-build.conf" PHP_BUILD_COMMON_FILE="$T/php/build-common.sh"
+    PHP_BUILD_APT_HOOK="$T/hook1" PHP_BUILD_UNIT="$T/u1" PHP_BUILD_REFRESH_UNIT="$T/u2" PHP_BUILD_REFRESH_TIMER="$T/u3"
+    ANGIE_BUILD_APT_HOOK="$T/hook2" ANGIE_BUILD_UNIT="$T/u4" ANGIE_BUILD_REFRESH_UNIT="$T/u5" ANGIE_BUILD_REFRESH_TIMER="$T/u6"
+    PHP_BUILD_LLVM_FILES=("$T/llvm/setup-llvm.sources")
+    systemctl() { :; }
+    : > "$T/llvm/setup-llvm.sources"; : > "$T/php/8.5/build.info"; : > "$T/php/build-8.5.log"
+    php_gone() { rm -rf "${T:?}/php/8.5"; php_build_remove_support; }
+    left() { [[ -e $T/llvm/setup-llvm.sources ]] && echo kept || echo removed; }
+    if [[ $1 == php-first ]]; then php_gone; a=$(left); angie_build_remove_support; b=$(left)
+    else angie_build_remove_support; a=$(left); php_gone; b=$(left); fi
+    printf '%s %s %s' "$a" "$b" "$([[ -d $T/php ]] && echo phpdir || echo nophpdir)"
+  )
+}
+check "LLVM toolchain: PHP_BUILD removed first, then ANGIE_BUILD: kept, then removed (no PHP dir left)" \
+  test "$(llvm_order_case php-first)" = "kept removed nophpdir"
+check "LLVM toolchain: ANGIE_BUILD removed first, then PHP_BUILD: kept, then removed" \
+  test "$(llvm_order_case angie-first)" = "kept removed nophpdir"
+unset -f pb_cpu_case pb_sdnotify_ok pb_sdnotify_case ab_mode ab_invalid ab_tool_case bc_strip_ok llvm_order_case
 unset -f fm_case fm_twice lean_set_ok gpg_home_ok pb_primarydown_ok
 
 printf '\nTOTAL pass=%d fail=%d skip=%d\n' "$PASS" "$FAIL" "$SKIP"

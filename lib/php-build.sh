@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 # ---------------------------------------------------------------------------
-# Opt-in compiled php-fpm (PHP_BUILD=clang; lean and source are aliases)
+# Opt-in compiled php-fpm (PHP_BUILD=clang)
 # ---------------------------------------------------------------------------
 # Two choices for the php-fpm binary the unit starts:
 #   (unset)/package  the Sury package's php-fpm (the default)
@@ -13,7 +13,9 @@
 # 1.21.68 shipped two compiled modes (clang: Sury's core and extensions;
 # lean: everything from source).  1.21.69 merged them: the from-source
 # build without ICU (intl), which made it 102 MB and cost 4.5x the data-TLB
-# misses, is faster than both.  A persisted PHP_BUILD=lean keeps working.
+# misses, is faster than both.  1.21.70 dropped the lean/source aliases; a
+# host file that still says lean or source (written by 1.21.68) is rewritten
+# to clang once.
 # php.ini, pools, the unit and the package CLI stay the package's.
 # tools/php-fpm-build.sh does the work and goes back to the package binary
 # when an APT update makes the package newer; a daily timer rebuilds when a
@@ -31,6 +33,7 @@ PHP_BUILD_UNIT=${PHP_BUILD_UNIT:-/etc/systemd/system/setup-php-fpm-build@.servic
 PHP_BUILD_REFRESH_UNIT=${PHP_BUILD_REFRESH_UNIT:-/etc/systemd/system/setup-php-fpm-build-refresh.service}
 PHP_BUILD_REFRESH_TIMER=${PHP_BUILD_REFRESH_TIMER:-/etc/systemd/system/setup-php-fpm-build-refresh.timer}
 PHP_BUILD_CONF_FILE="${PHP_BUILD_ROOT}/php-build.conf"
+PHP_BUILD_COMMON_FILE="${PHP_BUILD_ROOT}/build-common.sh"
 # apt.llvm.org source the tool adds (removed with the last build).
 PHP_BUILD_LLVM_FILES=(/etc/apt/sources.list.d/setup-llvm.sources /etc/apt/preferences.d/setup-llvm.pref /etc/apt/keyrings/setup-llvm.asc)
 
@@ -39,7 +42,8 @@ php_build_mode() {
   local v=${PHP_BUILD:-}
   case ${v,,} in
     "")                      printf '' ;;
-    clang|lean|source|upstream) printf 'clang' ;;
+    clang)                   printf 'clang' ;;
+    lean|source|upstream)    if (( ${PHP_BUILD_PERSIST:-0} )); then printf 'invalid'; else printf 'legacy'; fi ;;
     package|sury|off|none|0) printf 'package' ;;
     *)                       printf 'invalid' ;;
   esac
@@ -48,6 +52,11 @@ php_build_mode() {
 # Refuse an unknown value before anything changes (setup.sh sets PHP_BUILD
 # and PHP_BUILD_PERSIST from SETUP_PHP_BUILD or the host file).
 php_build_validate() {
+  if [[ $(php_build_mode) == legacy ]]; then
+    tune_note "PHP: PHP_BUILD=${PHP_BUILD} (1.21.68) is now PHP_BUILD=clang; persisted"
+    PHP_BUILD=clang
+    PHP_BUILD_PERSIST=1
+  fi
   if [[ $(php_build_mode) == invalid ]]; then
     die "PHP_BUILD='${PHP_BUILD}' is not supported; use package or clang"
   fi
@@ -67,6 +76,10 @@ php_build_install_support() {
   install -d -m 755 "$PHP_BUILD_ROOT"
   if ! cmp -s "$src" "$PHP_BUILD_TOOL"; then
     install -m 755 "$src" "$PHP_BUILD_TOOL"
+  fi
+  # Shared download/toolchain code the tool sources (1.21.70).
+  if ! cmp -s "${SCRIPT_DIR}/tools/build-common.sh" "$PHP_BUILD_COMMON_FILE"; then
+    install -m 644 "${SCRIPT_DIR}/tools/build-common.sh" "$PHP_BUILD_COMMON_FILE"
   fi
   unit=$(php_build_unit_text)
   if [[ ! -f $PHP_BUILD_UNIT ]] || [[ $(cat "$PHP_BUILD_UNIT") != "$unit" ]]; then
@@ -163,9 +176,14 @@ php_build_remove_support() {
     [[ -d $d ]] && return 0   # another version still uses it
   done
   systemctl disable --now "${PHP_BUILD_REFRESH_TIMER##*/}" >/dev/null 2>&1 || true
-  rm -f "$PHP_BUILD_APT_HOOK" "$PHP_BUILD_UNIT" "$PHP_BUILD_TOOL" "$PHP_BUILD_CONF_FILE" \
-    "$PHP_BUILD_REFRESH_UNIT" "$PHP_BUILD_REFRESH_TIMER" "${PHP_BUILD_LLVM_FILES[@]}"
-  rm -rf /var/cache/setup-php-build /run/setup-php-build /opt/setup-llvm
+  rm -f "$PHP_BUILD_APT_HOOK" "$PHP_BUILD_UNIT" "$PHP_BUILD_TOOL" "$PHP_BUILD_CONF_FILE" "$PHP_BUILD_COMMON_FILE" \
+    "$PHP_BUILD_REFRESH_UNIT" "$PHP_BUILD_REFRESH_TIMER"
+  rm -f "$PHP_BUILD_ROOT"/build-*.log "$PHP_BUILD_ROOT"/bolt-*.log
+  rm -rf /var/cache/setup-php-build /run/setup-php-build
+  # The LLVM toolchain is shared with ANGIE_BUILD: the last user removes it.
+  if [[ ! -d ${ANGIE_BUILD_ROOT:-/usr/local/lib/setup-angie}/build ]]; then
+    rm -f "${PHP_BUILD_LLVM_FILES[@]}"; rm -rf /opt/setup-llvm
+  fi
   rmdir "$PHP_BUILD_ROOT" 2>/dev/null || true
   systemctl daemon-reload 2>/dev/null || true
 }
@@ -279,7 +297,7 @@ php_build_plan() { # dry-run line
 # PHP_FPM_MODULES) turns the trim off; both re-enable what setup.sh
 # disabled, recorded in /etc/php/X.Y/fpm/setup-disabled-modules.
 PHP_FPM_APP_MODS=(ctype curl dom exif fileinfo gd gmp iconv igbinary intl json mbstring mysqli
-  mysqlnd opcache pdo pdo_mysql redis simplexml sodium xml xmlreader xmlwriter zip)
+  mysqlnd opcache pdo pdo_mysql redis simplexml sodium xml xmlwriter zip)
 PHP_FPM_ETC=${PHP_FPM_ETC:-/etc/php}
 
 # "apps" (the default) or "all".
