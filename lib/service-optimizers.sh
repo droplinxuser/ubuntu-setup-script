@@ -469,6 +469,11 @@ optimize_php_services() {
         opt_report "- Socket migration skipped: Angie inactive or vhosts use a direct fastcgi_pass/next_upstream off"
       fi
     fi
+    # Only the extensions the applications need (lib/php-build.sh); a change
+    # needs the reload below.
+    if php_fpm_modules_apply "$ver" opt_report; then
+      TUNE_DIRTY=1
+    fi
     if (( active )); then
       if (( migrated || migration_failed )); then
         : # migration already reloaded PHP (success or rollback)
@@ -513,6 +518,11 @@ optimize_php_services() {
       fi
     else
       opt_report "- Restart: skipped (service was not active)"
+    fi
+    # PHP_BUILD=clang/lean/package: build, BOLT from live traffic, or revert.  A
+    # failed build leaves the package binary serving and marks the run.
+    if (( active )) && ! php_build_apply "$ver" optimize opt_report; then
+      rc=1
     fi
   done < <(php_fpm_versions)
 
@@ -560,8 +570,12 @@ MARIADB_ONLINE_KEYS=$(IFS='|'; printf '%s' "${MARIADB_ONLINE_ORDER[*]}")
 # table_open_cache (the profile writes all three from one value) but is
 # read-only on the supported releases; without it here every max_connections
 # change above 250 forced a full restart with the web tier paused, although
-# the two keys it moves with are dynamic.
-MARIADB_DEFERRED_KEYS='loose-innodb_buffer_pool_size_max|innodb_open_files'
+# the two keys it moves with are dynamic.  innodb_log_buffer_size (RAM/256)
+# and aria_pagecache_buffer_size (RAM/128) are read-only and follow MemTotal
+# without rounding between their clamps, so a kernel update that moved
+# MemTotal by a few MB restarted the database (web tier paused) for a 1 MB
+# change; the next natural restart applies them.
+MARIADB_DEFERRED_KEYS='loose-innodb_buffer_pool_size_max|innodb_open_files|innodb_log_buffer_size|aria_pagecache_buffer_size'
 cnf_only_pool_changed() {
   local old=$1 new=$2
   [[ -f $old && -f $new ]] || return 1
@@ -956,9 +970,13 @@ valkey_size_to_mb() {
   num=${val%%[a-z]*}
   [[ $num =~ ^[0-9]+$ ]] || { printf '0'; return 0; }
   case ${val#"$num"} in
-    g|gb) printf '%s' $(( num * 1024 )) ;;
-    m|mb) printf '%s' "$num" ;;
-    k|kb) printf '%s' $(( num / 1024 )) ;;
+    # Valkey/Redis units: gb/mb/kb are binary, g/m/k decimal (1g = 10^9).
+    gb) printf "%s" $(( num * 1024 )) ;;
+    g)  printf "%s" $(( num * 1000000000 / 1048576 )) ;;
+    mb) printf "%s" "$num" ;;
+    m)  printf "%s" $(( num * 1000000 / 1048576 )) ;;
+    kb) printf "%s" $(( num / 1024 )) ;;
+    k)  printf "%s" $(( num * 1000 / 1048576 )) ;;
     "")   printf '%s' $(( num / 1048576 )) ;;
     *)    printf '0' ;;
   esac
@@ -1939,6 +1957,9 @@ optimize_plan() {
     wp_roots=$(php_jit_path_sections /etc/angie | grep -c '^opcache\.jit = off$' || true)
     printf '  PHP-FPM:  pm=static opcache=%sM jit=%s buffer=%sM (WordPress roots kept off: %s)\n' \
       "$plan_opcache_mb" "$jit_mode" "$jit_buffer_mb" "${wp_roots:-0}"
+    local build_plan
+    build_plan=$(php_build_plan)
+    [[ -n $build_plan ]] && printf '  PHP-FPM:  %s\n' "$build_plan"
   fi
   if [[ " ${OPT_DETECTED[*]} " == *" mariadb "* ]]; then
     size_mb=$OPT_MARIADB_BUDGET_MB

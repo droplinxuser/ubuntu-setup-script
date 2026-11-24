@@ -53,6 +53,23 @@ probe "wp nested .sql.zst dump is denied"  "$WP" /wp-content/audit.sql.zst 403
 probe "wp uploads are not executable"     "$WP" /wp-content/uploads/audit.php 403 404
 probe "wp uploads PHP suffix is denied"   "$WP" /wp-content/uploads/audit.php.jpg 403 404
 probe "wp cache directory is not PHP"     "$WP" /wp-content/cache/audit.php 403 404
+# 1.6.59: bundled libraries are never entry points (CVE-2017-9841, PHPUnit's
+# eval-stdin.php shipped inside plugins).  A deny answers 403 even for a
+# missing file; the old tree reached try_files (404) and ran existing files.
+probe "wp plugin vendor/ PHP is denied"  "$WP" /wp-content/plugins/audit/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php 403
+probe "wp theme node_modules/ PHP is denied" "$WP" /wp-content/themes/audit/node_modules/x/index.php 403
+# WooCommerce/EDD paid files rely on an Apache .htaccess Angie never reads;
+# they must be internal-only.  Needs a fixture (a missing file is 404 anyway).
+WPROOT=/var/www/$WP/public
+if [[ -w $WPROOT/wp-content/uploads ]]; then
+  for d in woocommerce_uploads edd; do
+    mkdir -p "$WPROOT/wp-content/uploads/$d"; echo paid > "$WPROOT/wp-content/uploads/$d/audit-paid.txt"
+    probe "wp $d/ is internal-only" "$WP" "/wp-content/uploads/$d/audit-paid.txt" 404
+    rm -f "$WPROOT/wp-content/uploads/$d/audit-paid.txt"; rmdir "$WPROOT/wp-content/uploads/$d" 2>/dev/null || true
+  done
+else
+  printf 'SKIP  wp protected download folders (needs a writable local %s)\n' "$WPROOT"
+fi
 probe "wp debug.log is hidden"            "$WP" /wp-content/debug.log 403 404
 probe "wp xmlrpc.php is denied"           "$WP" /xmlrpc.php 403
 # WordPress's own scheduler posts to wp-cron.php from the loopback address,

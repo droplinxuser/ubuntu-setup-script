@@ -1492,6 +1492,20 @@ plan_install_budget() {
       warn "Angie cache budget stays at ${cache_was} MB (sized for the previous service set) until the next --optimize or --angie run, which sets ${cache_now} MB for these services"
     fi
   fi
+  # The PHP worker factor depends on a local database (1.5 per CPU without
+  # one, 1.0 with one on a dedicated SSD host).  A --mariadb run on a host
+  # whose PHP was installed earlier does not touch the pool (only the named
+  # services are), so it keeps the larger count until --optimize; say so,
+  # as for the Angie cache above.
+  if [[ ${ENABLED[mariadb]:-0} -eq 1 && ${ENABLED[php]:-0} -ne 1 \
+        && " ${host_services[*]} " == *" php:"* && " ${host_services[*]} " != *" mariadb "* ]]; then
+    local pool_now pool_plan
+    pool_now=$(php_pool_max_children)
+    pool_plan=$(php_children_floor "$(mem_total_mb)" "$(effective_cpus)")
+    if [[ $pool_now =~ ^[0-9]+$ && $pool_plan =~ ^[0-9]+$ ]] && (( pool_now != pool_plan )); then
+      warn "PHP-FPM keeps ${pool_now} workers (sized without a local database) until the next --optimize or --php run, which sets ${pool_plan} for this host"
+    fi
+  fi
 }
 
 # The one-line memory-plan summary used by the installer, --optimize and the

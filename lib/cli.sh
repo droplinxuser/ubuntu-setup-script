@@ -163,7 +163,8 @@ Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
       hardware.  Every recorded tuning override is ignored and moved to /tmp
       (never deleted) before the tuners run:
         - /etc/default/setup-tuning keeps only host facts/feature choices
-          (XF_JOB_CRON, NODE_MAJOR, NODE_ALLOW_MAJOR_UPGRADE).  TCP_CC,
+          (XF_JOB_CRON, NODE_MAJOR, NODE_ALLOW_MAJOR_UPGRADE,
+          PHP_BUILD ...).  TCP_CC,
           QDISC, STORAGE_CLASS and the
           PHP/compression/rate-limit pins are cleared and go back to the
           current defaults (bbr/fq, etc.);

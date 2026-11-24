@@ -42,6 +42,11 @@ ADDED=$(sed -n 's/^- Added: //p' "$WORK/delta.md" | head -n1 | tr ' ' '\n' | sed
 # refuse the whole transaction, so only names absent from the baseline go.
 BASE_NAMES=$(awk -F'\t' '/^== packages ==/{p=1; next} /^== /{p=0} p && NF {print $1}' "$BASE")
 ADDED=$(printf '%s\n' "$ADDED" | grep -vxFf <(printf '%s\n' "$BASE_NAMES") || true)
+# Kernel packages are never purged: a kernel that unattended-upgrades added
+# during the run carries the linux-generic metapackages with it, and purging
+# it left the host without them (1.21.68).  A newer kernel is upstream drift.
+KERNEL_RE='^linux-(image|modules|modules-extra|headers|generic|image-generic|headers-generic)(-|$)'
+ADDED=$(printf '%s\n' "$ADDED" | grep -vE "$KERNEL_RE" || true)
 echo "added packages: $(printf '%s\n' "$ADDED" | sed '/^$/d' | wc -l)"
 for unit in angie anubis mariadb valkey-server elasticsearch 'php*-fpm' sysstat smartmontools; do
   systemctl stop "$unit" >/dev/null 2>&1 || true
@@ -55,7 +60,7 @@ fi
 # and merely unused on the pristine host.  Repeat while purging orphans more.
 for _ in 1 2 3 4 5; do
   orphans=$(apt-get -s autoremove 2>/dev/null | awk '$1 == "Remv" { print $2 }' \
-            | grep -vxFf <(printf '%s\n' "$BASE_NAMES") || true)
+            | grep -vxFf <(printf '%s\n' "$BASE_NAMES") | grep -vE "$KERNEL_RE" || true)
   [[ -n $orphans ]] || break
   # shellcheck disable=SC2086
   apt-get purge -y $orphans >> "$WORK/apt-purge.log" 2>&1 || break
@@ -97,6 +102,14 @@ for u in /etc/systemd/system/php-src-*.service; do
   rm -f "$u"
 done
 rm -rf /usr/local/lsws /etc/php-ols /etc/php-src /var/cache/ols /tmp/lshttpd /opt/php-*
+# PHP_BUILD=clang/lean (1.21.68), in case --purge did not run or failed: the
+# builds, their source/library cache, the conf.d mirror, the rebuild/refresh
+# units, the APT hook and the apt.llvm.org source.
+systemctl disable --now setup-php-fpm-build-refresh.timer >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/setup-php-fpm-build@.service /etc/systemd/system/setup-php-fpm-build-refresh.* \
+      /etc/systemd/system/php*-fpm.service.d/zz-setup-build.conf /etc/apt/apt.conf.d/99setup-php-fpm-build \
+      /etc/apt/sources.list.d/setup-llvm.sources /etc/apt/preferences.d/setup-llvm.pref /etc/apt/keyrings/setup-llvm.asc
+rm -rf /usr/local/lib/setup-php /var/cache/setup-php-build /run/setup-php-build
 id lsadm >/dev/null 2>&1 && userdel lsadm >/dev/null 2>&1 || true
 rm -rf /var/www /etc/angie /etc/php /etc/mysql /etc/valkey /etc/redis /etc/elasticsearch \
        /var/lib/setup.sh /var/lib/mysql /var/lib/mariadb /var/lib/valkey /var/lib/redis /var/lib/elasticsearch \

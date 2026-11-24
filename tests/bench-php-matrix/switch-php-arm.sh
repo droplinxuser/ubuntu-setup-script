@@ -18,7 +18,7 @@
 set -Eeuo pipefail
 export LC_ALL=C
 
-ARM=${1:?usage: switch-php-arm.sh sury|ubuntu|src-TAG|ols-lsphp|ols-src-TAG}
+ARM=${1:?usage: switch-php-arm.sh sury|ubuntu|src-TAG|dropin-TAG|ols-lsphp|ols-src-TAG}
 PHP_INI_DIR=/etc/php/8.5/fpm
 SOCK=/run/php/php-fpm.sock
 
@@ -101,11 +101,27 @@ prepare_src_scan_dir() {
   export PHP_INI_SCAN_DIR="$CONF_DIR:$EXT_DIR"
 }
 
+# "dropin-TAG" serves the packaged php8.5-fpm unit, configuration and Sury
+# extensions with only the binary replaced by /opt/php-TAG/sbin/php-fpm
+# (build-php-dropin.sh), through a runtime drop-in that a reboot or any
+# other arm removes.
+DROPIN_DIR=/run/systemd/system/php8.5-fpm.service.d
+rm -f "$DROPIN_DIR/zz-bench-dropin.conf"
 case $ARM in
   sury)
     UNIT=php8.5-fpm
     BIN=/usr/bin/php8.5
     PHP_ARGS=()
+    ;;
+  dropin-*)
+    TAG=${ARM#dropin-}
+    [[ -x /opt/php-$TAG/sbin/php-fpm ]] || { echo "no /opt/php-$TAG/sbin/php-fpm; run build-php-dropin.sh $TAG" >&2; exit 1; }
+    mkdir -p "$DROPIN_DIR"
+    printf '[Service]\nExecStart=\nExecStart=/opt/php-%s/sbin/php-fpm --nodaemonize --fpm-config /etc/php/8.5/fpm/php-fpm.conf\n' \
+      "$TAG" > "$DROPIN_DIR/zz-bench-dropin.conf"
+    UNIT=php8.5-fpm
+    BIN=/opt/php-$TAG/bin/php
+    PHP_ARGS=(-c "$PHP_INI_DIR/php.ini")
     ;;
   ubuntu)
     # The Ubuntu archive's packages, extracted (not installed) so they
@@ -161,6 +177,8 @@ case $ARM in
 esac
 
 stop_all
+# The drop-in above was written or removed: let systemd see it before start.
+systemctl daemon-reload
 if [[ $ARM == ols-* ]]; then
   systemctl stop angie >/dev/null 2>&1 || true
   systemctl stop lshttpd >/dev/null 2>&1 || true
@@ -200,6 +218,10 @@ for _ in $(seq 1 50); do
 done
 [[ $code =~ ^[23] ]] || { echo "app answered HTTP ${code:-none} after switching to $ARM" >&2; exit 1; }
 
+# A lean arm (php-fpm-build.sh) has no CLI: its php-fpm reports -v/-m too.
+if [[ ! -x $BIN && -n ${TAG:-} && -x /opt/php-$TAG/sbin/php-fpm ]]; then
+  BIN=/opt/php-$TAG/sbin/php-fpm
+fi
 printf '== arm %s (%s)\n' "$ARM" "$UNIT"
 "$BIN" "${PHP_ARGS[@]}" -v | head -1
 printf 'modules: '

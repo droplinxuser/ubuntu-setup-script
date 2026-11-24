@@ -34,8 +34,12 @@ run "wp member post"   15 "$WPP" "$(ck wp-bench1)"
 run "build probe"      10 "https://wp.test.local/php-build-probe.php?n=120" "probe=1"
 rm -f /var/www/wp.test.local/public/php-build-probe.php
 
-systemctl stop "php-src-${PHP_ARM_TAG:-max}.service"
+TAG=${PHP_ARM_TAG:-max}
+# NO_STOP=1: traffic only (bolt-php.sh samples the running arm with perf).
+[[ ${NO_STOP:-0} == 1 ]] && exit 0
+systemctl stop "php-src-$TAG.service"
 sleep 2
-n=$(find /root/work/pgo-max -name '*.gcda' | wc -l)
-echo "gcda files: $n"
-[[ $n -gt 50 ]] || { echo "too few profile files" >&2; exit 1; }
+# GCC writes one .gcda per object; clang one default_%m.profraw per binary.
+n=$(find "/root/work/pgo-$TAG" \( -name "*.gcda" -o -name "*.profraw" \) | wc -l)
+echo "profile files: $n"
+[[ $n -gt 0 ]] || { echo "no profile files in /root/work/pgo-$TAG" >&2; exit 1; }

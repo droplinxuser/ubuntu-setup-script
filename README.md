@@ -196,6 +196,118 @@ Environment options:
 | `SETUP_PHP_JIT_WORDPRESS=0` | 1 (WordPress uses the JIT) | keeps `opcache.jit = off` for every WordPress document root through a `[PATH=<root>]` section of the managed ini, for a site that misbehaves with the JIT.  Tuning override: ignored by `--optimize` |
 | `SETUP_PHP_PAGE_GZIP=0` | 1 | by default the managed ini turns `zlib.output_compression` (level 4) on in a `[PATH=<root>]` section for every WordPress and Chevereto document root whose guest cache key carries the encoding token, so the FastCGI cache stores the gzip page (0.12 ms of Angie CPU per hit instead of about 1 ms to compress each hit); Chevereto roots also get PHP session GC (`session.gc_probability = 1`, divisor 1000) because no timer cleans its session directory; tuning override: ignored by `--optimize` (profile default 1) |
 | `SETUP_PHP_SESSION_HARDENING=1` | off | opt-in `session.*` strict settings, `cgi.fix_pathinfo=0`, `display_errors=Off` and a central `error_log`; it broke Joomla/Polr logins on a mixed host.  Persisted as `PHP_SESSION_HARDENING` (kept by `--optimize`; `=0` turns it off) |
+| `SETUP_PHP_BUILD=clang` or `=lean` | off (the package's php-fpm) | opt-in compiled php-fpm: `clang` keeps Sury's extensions, `lean` is a build from upstream sources with only what WordPress, XenForo and Chevereto use; see [Compiled php-fpm](#compiled-php-fpm-setup_php_buildclang-or-lean).  Persisted as `PHP_BUILD` (kept by `--optimize`; `=package` goes back) |
+| `SETUP_PHP_FPM_MODULES=all` | off: php-fpm loads only what WordPress, XenForo and Chevereto need | keep every installed extension loaded in php-fpm, see [PHP-FPM modules](#php-fpm-modules-only-what-the-applications-need).  Persisted as `PHP_FPM_MODULES` (kept by `--optimize`) |
+
+#### Compiled php-fpm (`SETUP_PHP_BUILD=clang` or `=lean`)
+
+Three choices for the binary the PHP-FPM unit starts.  All three are kept so
+they can be measured against each other again; switching is one
+`SETUP_PHP_BUILD=... ./setup.sh --optimize`.
+
+| `SETUP_PHP_BUILD` | php-fpm | Extensions | For | Measured vs the package (1.21.68: XF member thread / home, WP member home, Chevereto uncached home) |
+|---|---|---|---|---|
+| unset or `package` (default) | the Sury package | Sury's shared extensions | WordPress, XenForo, Chevereto (others: `SETUP_PHP_FPM_MODULES=all`) | baseline: 224 / 418, 139, 1,228 req/s |
+| `clang` | the package's PHP version and compiled-in core, rebuilt with clang from apt.llvm.org, `-O3 -march=native`, ThinLTO, BOLT | Sury's shared extensions, unchanged | WordPress, XenForo, Chevereto (others: `SETUP_PHP_FPM_MODULES=all`) | +5.8 % / +6.0 %, −5.0 % (spread 131-144), +8.1 % |
+| `lean` | the newest PHP, redis/igbinary and every linked library compiled from upstream sources, statically linked, ThinLTO, BOLT, only the modules the three applications use | compiled in; nothing else loads | WordPress, XenForo, Chevereto | +4.5 % / +5.0 %, +2.2 %, +9.0 % |
+
+Cached pages are the same in all three (±1 %), because Angie serves them.
+Both compiled modes keep the package's `php.ini`, pools, unit and `php` CLI
+(XenForo's `cmd.php` and cron still run on it).  BOLT needs `perf` for the
+running kernel (`linux-tools-$(uname -r)`) and CPU branch records (LBR); a VM
+without them keeps the ThinLTO build.
+
+**`clang`** compiles the package's own version from php.net (SHA-256 checked)
+with exactly Sury's compiled-in core, linked against Ubuntu's libraries like
+the package.  Before it starts, its module list and INI defaults
+(`php-fpm -i`) must match the package's, and `php-fpm -t` must accept the
+live pool configuration.  The APT hook puts the version back on the package
+binary at once when the package changes, then rebuilds in the background.
+3-6 minutes of CPU per build.
+
+**`lean`** compiles everything from each project's own release:
+
+* **PHP** from php.net (SHA-256 published by php.net), the newest release of
+  the installed X.Y, which may be newer than the package.
+* **redis and igbinary** from PECL.
+* **Libraries** from their own projects: OpenSSL, PCRE2, zlib, libxml2,
+  libsodium, GMP, curl, ICU, libjpeg-turbo, libpng, libwebp and libzip.
+  Where the project publishes a SHA-256 (GitHub release assets, GNOME's
+  `.sha256sum`), it is checked; the others are pinned on first download.
+  They are built with the same flags and linked statically, with ThinLTO
+  across PCRE2, zlib and libxml2.  GMP is built without its assembly, whose
+  jump tables in data stop BOLT.  Only glibc, libstdc++ and libsystemd come
+  from Ubuntu.
+
+It contains only the FPM SAPI and the modules WordPress, XenForo 2.3 and
+Chevereto 4.5 use between them: ctype curl dom exif fileinfo filter gd (jpeg,
+png, webp; GIF and BMP built in) gmp iconv intl libxml mbstring
+mysqli/mysqlnd openssl pdo/pdo_mysql session simplexml sodium xml xmlreader
+xmlwriter zip zlib, plus redis/igbinary for the Redis caches, plus PHP's
+always-built core.  Images go through GD in all three (Chevereto picks
+imagick only when it is loaded), so there is no ImageMagick.  It has no CLI,
+CGI or phpdbg, and loads no shared extensions: before every start and reload it mirrors
+`/etc/php/X.Y/fpm/conf.d` into `/run/setup-php-build/X.Y` with the
+`extension=` lines commented out, so OPcache/JIT and other settings written by
+`--optimize` apply as usual.  Another PHP application, or an add-on that needs
+another extension, must use `clang` or the package.  Before
+it starts, the build must start without warnings, show every module above,
+give every INI directive it shares with the package the package's value, link
+none of the libraries above from Ubuntu, and pass `php-fpm -t`.  15-25 minutes
+when a library changed, 3-6 when only PHP did.
+
+* **Versions:** [`php-build.conf`](php-build.conf), beside `setup.sh`, lists
+  every component as `latest` (the newest stable release, never an RC or
+  beta) or a pinned version, such as `OPENSSL_VERSION=3.6.1` or
+  `LLVM_VERSION=23`.  `LLVM_VERSION` applies to both modes, the rest to
+  `lean`.  After an edit, `sudo ./setup.sh --optimize` rebuilds whatever
+  changed.  `php-fpm-build.sh versions 8.5` shows what `latest` resolves to,
+  and `check 8.5` shows what a rebuild would change.
+* **Compiler:** clang, lld and BOLT come from apt.llvm.org, never Ubuntu's
+  archive.  The signing key is checked by fingerprint, and the source is
+  pinned at priority 100 so it never replaces an Ubuntu package.
+* **How it runs:** `/usr/local/lib/setup-php/X.Y/php-fpm`, started through
+  `/etc/systemd/system/phpX.Y-fpm.service.d/zz-setup-build.conf`.  The
+  package binary stays at `/usr/sbin/php-fpmX.Y`.
+* **When:** the install (`--php`) builds it.  `--optimize` rebuilds when the
+  mode or a version changed, and adds BOLT when at least 300 php-fpm
+  functions show up in a 60 s sample (an idle site is skipped and retried by
+  the next `--optimize`).  `--upgrade-php` builds the new version.
+* **Updates:** `setup-php-fpm-build-refresh.timer` checks upstream daily and
+  rebuilds in the background (`setup-php-fpm-build@X.Y`) when LLVM or, for
+  `lean`, php.net, PECL or a library publish a newer release.  The running
+  build keeps serving until the new one has passed every check.  The APT hook
+  (`/etc/apt/apt.conf.d/99setup-php-fpm-build`) goes back to the package
+  binary at once when the package changes (`clang`) or becomes newer than the
+  build (`lean`), and then rebuilds.
+* **Manual control:** `/usr/local/lib/setup-php/php-fpm-build.sh status`,
+  `check X.Y`, `build X.Y clang|lean`, `rebuild X.Y`, `deactivate X.Y` (back
+  to the package binary), `activate X.Y`, `bolt X.Y`.  `--purge php` removes
+  the drop-in, the build, the timer and the apt.llvm.org source.
+
+#### PHP-FPM modules: only what the applications need
+
+php-fpm loads only the shared extensions that WordPress, XenForo and
+Chevereto need between them: ctype curl dom exif fileinfo gd gmp iconv
+igbinary intl json mbstring mysqli mysqlnd opcache pdo pdo_mysql redis
+simplexml sodium xml xmlreader xmlwriter zip.  The sources for that list are
+setup.sh's per-app requirements, Chevereto's integrity check and WordPress
+Site Health.  Sury enables every installed module for every SAPI, so the
+install and `--optimize` disable the rest (calendar, ffi, ftp, gettext, phar,
+posix, readline, shmop, sockets, sysv*, tokenizer, xsl, imagick) for php-fpm
+only, with `phpdismod -s fpm`.  That marks them "disabled by admin", so
+package updates keep them off.  The CLI keeps every extension.
+
+* A host that serves another PHP application (any `.php` at a vhost root
+  that is none of the three) keeps every extension loaded, and the report
+  names the site.
+* `SETUP_PHP_FPM_MODULES=all` (persisted as `PHP_FPM_MODULES`) turns the
+  policy off.  Both cases re-enable exactly what setup.sh disabled, which is
+  recorded in `/etc/php/X.Y/fpm/setup-disabled-modules`.
+* Images go through GD: Chevereto picks imagick only when it is loaded, and
+  its integrity check accepts GD.  New Chevereto sites no longer get
+  `php-imagick`; an installed one is kept for the CLI and carried by
+  `--upgrade-php`.
 
 Install behaviour:
 
@@ -206,7 +318,7 @@ Install behaviour:
 | First installation | `--php` installs the requested version (or the newest Sury build) on a host without PHP-FPM |
 | Existing host | `--php` keeps the installed packages, extensions and extra pools and re-applies only the managed configuration. A different `ver=` is refused, because changing the version needs the extension carry-over and a clean purge |
 | Changing version | use `--upgrade-php=8.6`, which preflights the purge (a held package or an application that would be removed stops it while PHP is still serving), then carries the extension set and custom configuration |
-| Extensions | the XenForo profile: `fpm cli opcache mysql gd curl xml zip gmp mbstring`.  No `redis`/`igbinary` by default: XenForo runs without them (SV RedisCache falls back to its pure-PHP Credis client) and so does WordPress without an object-cache drop-in.  `--domain` installs what a site cannot run without (Chevereto: `redis`, which pulls `igbinary`, and `imagick`); `--upgrade-php` carries whatever the old version had.  Add `redis` yourself to keep the XenForo data cache on php-redis (see XenForo below), or `intl`/`bcmath` if an add-on needs them |
+| Extensions | the XenForo profile: `fpm cli opcache mysql gd curl xml zip gmp mbstring`.  No `redis`/`igbinary` by default: XenForo runs without them (SV RedisCache falls back to its pure-PHP Credis client) and so does WordPress without an object-cache drop-in.  `--domain` installs what a site cannot run without (Chevereto: `redis`, which pulls `igbinary`; images go through GD, so no `imagick`); `--upgrade-php` carries whatever the old version had.  Add `redis` yourself to keep the XenForo data cache on php-redis (see XenForo below), or `intl`/`bcmath` if an add-on needs them |
 
 **Measured: install source and build flags (1.21.64).**  Four arms on one
 host (3 rotated rounds, clock pinned at 3.6 GHz): Sury 8.5.13, Ubuntu
@@ -699,7 +811,7 @@ It is standalone and cannot be combined with install flags, `--optimize`,
 |---|---|
 | 1. Snapshot | every installed PHP package with its exact version, each extension and whether `apt-mark` calls it manual, operator-owned `.ini` drop-ins in `conf.d`, extra FPM pools, the PECL list and a copy of `/etc/php` under `/var/lib/setup.sh/php-upgrade-<timestamp>/` |
 | 2. Target check | adds/refreshes the Sury repository and requires `phpX.Y-fpm` to be published. A pre-release (for example PHP 8.6.0~rc5) is accepted when named explicitly, with a warning |
-| 2b. Application preflight | detects WordPress, XenForo and Chevereto document roots below `/var/www` and in Angie vhosts (including a WordPress object-cache drop-in that mentions Redis and a XenForo `config.php` that selects XenForo's own `Redis` provider; SV RedisCache needs no extension), then checks the target repository for every hard requirement (WordPress/XenForo: mysql, gd, curl, mbstring, xml, zip; Chevereto: those plus redis and imagick). An extension no installed PHP-FPM loads is not a loss (the site already runs without it) and is reported as a note; the dry run and the real run read the same module list. If a site would lose one, the run stops **before the purge** with PHP still serving; `SETUP_PHP_ALLOW_MISSING_EXT=1` accepts the loss explicitly. This is what stops `--upgrade-php=8.6` on a Chevereto host while `php8.6-redis` and `php8.6-imagick` are unpublished |
+| 2b. Application preflight | detects WordPress, XenForo and Chevereto document roots below `/var/www` and in Angie vhosts (including a WordPress object-cache drop-in that mentions Redis and a XenForo `config.php` that selects XenForo's own `Redis` provider; SV RedisCache needs no extension), then checks the target repository for every hard requirement (WordPress/XenForo: mysql, gd, curl, mbstring, xml, zip; Chevereto: those plus redis). An extension no installed PHP-FPM loads is not a loss (the site already runs without it) and is reported as a note; the dry run and the real run read the same module list. If a site would lose one, the run stops **before the purge** with PHP still serving; `SETUP_PHP_ALLOW_MISSING_EXT=1` accepts the loss explicitly. This is what stops `--upgrade-php=8.6` on a Chevereto host while `php8.6-redis` is unpublished |
 | 3. Purge | every `php*` package plus `libapache2-mod-php*`, then the dependencies that only PHP kept installed. The dependency set is the before/after `apt-get -s autoremove` delta, so pre-existing unrelated autoremove candidates are never touched |
 | 4. Install | `phpX.Y-fpm`/`cli` and the default set, then every old extension mapped to `phpX.Y-<ext>`. An extension the new release does not publish yet is reported and skipped; core PHP still installs. A missing optional extension makes the run exit non-zero (`ATTENTION`) without undoing the upgrade, so automation notices. The skipped names are kept in `/var/lib/setup.sh/php-pending-extensions` and installed by the next `--upgrade-php` whose target publishes them (an 8.5 -> 8.6 RC -> 8.5 round trip keeps imagick) |
 | 5. Migrate | operator `.ini` files and extra pools are copied with the version path rewritten, validated with `php-fpm -t` (rejected files are moved out of the live tree and the run reports ATTENTION), and FPM is reloaded so the workers actually load them. The PHP `date.timezone` from the old tree is preserved |
@@ -775,8 +887,8 @@ Feature choices (honoured by `--optimize`):
 
 The `SETUP_*` names in this table are environment inputs for the run that
 applies them.  `SETUP_XF_JOB_CRON`, `SETUP_CF_SELF_SIGNED`,
-`SETUP_PHP_SESSION_HARDENING`, `SETUP_PHP_JIT_WORDPRESS`, `SETUP_PHP_PAGE_GZIP`,
-`SETUP_PRECOMPRESS_ASSETS`, `SETUP_LIMIT_REQ_EXEMPT` and the XenForo gzip
+`SETUP_PHP_SESSION_HARDENING`, `SETUP_PHP_BUILD`, `SETUP_PHP_JIT_WORDPRESS`,
+`SETUP_PHP_PAGE_GZIP`, `SETUP_PRECOMPRESS_ASSETS`, `SETUP_LIMIT_REQ_EXEMPT` and the XenForo gzip
 choice are written to `/etc/default/setup-tuning` and therefore survive a
 later `--optimize`.  The remaining ones are one-run inputs: they are not
 persisted, and a later install/optimize re-applies the host's recorded state

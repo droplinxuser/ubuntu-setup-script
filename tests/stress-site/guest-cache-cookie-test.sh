@@ -271,4 +271,21 @@ for u in "$X/whats-new/?cc=$RANDOM" "$W/?cc=$RANDOM" "${C:-https://chev.test.loc
     "$(hdr ccg x-cache-status)" MISS
 done
 
+echo "################ Encoded XenForo style/language values (1.21.68)"
+# PHP URL-decodes cookie values ("%32" -> "2"; "+2" casts to 2) while the key
+# maps read Angie's raw $cookie_*: such a value used the default key and
+# stored, e.g., a language-2 page for every guest (MISS MISS HIT on 1.6.58).
+u="$X/whats-new/?ev=$RANDOM"
+for ck in 'xf_language_id=%32' 'xf_language_id=+2' 'xf_style_id=%32' 'xf_style_id=2%20' 'xf_style_variation=%61lternate'; do
+  for _ in 1 2 3; do req ev -H "Cookie: $ck" "$u"; done
+  chk "xf: a style/language cookie the key cannot read bypasses the guest cache ($ck)" \
+    "$(hdr ev x-cache-status)" BYPASS
+done
+req evg "$u"
+chk "xf: no encoded-value request reached the guest entry" "$(hdr evg x-cache-status)" MISS
+# A well-formed value still caches under its own key.
+u="$X/whats-new/?ew=$RANDOM"
+for _ in 1 2 3; do req ew -H 'Cookie: xf_language_id=2' "$u"; done
+chk "xf: a well-formed language cookie is still cached under its key" "$(hdr ew x-cache-status)" HIT
+
 echo; echo "TOTAL pass=$P fail=$F"; rm -rf "$T"

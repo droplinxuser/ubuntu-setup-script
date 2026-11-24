@@ -568,10 +568,11 @@ php_upgrade_vhost_roots() {
 # their cache extension in php_upgrade_app_required_extensions().
 php_upgrade_app_requirements() {
   case $1 in
-    # Chevereto 4.5.9 aborts at bootstrap when redis is missing, and its
-    # installer requires imagick for image checks and thumbnails (the --php
-    # installer adds phpX.Y-imagick for exactly this reason).
-    chevereto) printf '%s\n' redis imagick mysqli gd curl mbstring ;;
+    # Chevereto 4.5.9 aborts at bootstrap when redis is missing.  Images go
+    # through GD: Chevereto picks imagick only when it is loaded and its
+    # integrity check accepts GD (PNG GIF JPEG BMP WEBP), so imagick is not
+    # installed (1.21.68; an existing php-imagick is kept and carried).
+    chevereto) printf '%s\n' redis mysqli gd curl mbstring ;;
     # Core WordPress runs on the default set; redis matters only when an
     # object-cache drop-in is installed.
     wordpress) printf '%s\n' mysqli gd curl mbstring ;;
@@ -691,8 +692,8 @@ php_upgrade_loaded_modules_all() {
 
 # Install the extensions APP (at ROOT) cannot run without on PHP VER, when the
 # FPM of VER does not load them yet.  The default --php set leaves out
-# php-redis/php-igbinary and imagick; --domain calls this so only a site that
-# needs one gets it (Chevereto: redis, which pulls igbinary, and imagick).
+# php-redis/php-igbinary; --domain calls this so only a site that needs one
+# gets it (Chevereto: redis, which pulls igbinary).
 # Built-in extensions and the default set are always loaded, so XenForo and
 # WordPress add nothing.  Returns 0; a package that cannot be installed is a
 # warning naming the site.
@@ -959,6 +960,31 @@ php_upgrade_migrate_custom() {
     done < "$dir/custom-inis.txt"
   fi
 
+  # The main pool.  install_php wrote the template www.conf because the old
+  # FPM was purged, which dropped every operator key the template lacks
+  # (user, php_admin_value[...], env[...], pm.status_path ...) while the
+  # README promises the upgrade carries custom configuration.  Carry the old
+  # file over instead, exactly as a re-run of install_php or --optimize keeps
+  # it: php_upgrade_optimize then normalises the managed keys (workers,
+  # backlog, limits) in place.  The listener line is kept verbatim, as for
+  # the extra pools; the template copy comes back if php-fpm -t rejects it.
+  local www_old="$backup/fpm/pool.d/www.conf" www_new="$etc/$new/fpm/pool.d/www.conf"
+  local www_template="" www_migrated=0
+  if [[ -f $www_old && -f $www_new ]] && ! cmp -s "$www_old" "$www_new"; then
+    www_template=$(tmp_file)
+    cp -p "$www_new" "$www_template"
+    if sed -E "/^[[:space:]]*listen[[:space:]]*=/! s/php${old//./\\.}/php${new}/g" "$www_old" > "$www_new.setup-new" 2>/dev/null \
+       && mv -f "$www_new.setup-new" "$www_new"; then
+      chmod 644 "$www_new"
+      www_migrated=1
+      migrated=$(( migrated + 1 ))
+    else
+      rm -f "$www_new.setup-new"
+      cp -p "$www_template" "$www_new"
+      warn "PHP ${new}: could not migrate pool www.conf; kept the template"
+    fi
+  fi
+
   if [[ -s "$dir/custom-pools.txt" ]]; then
     while IFS= read -r rel; do
       [[ -n $rel ]] || continue
@@ -989,6 +1015,7 @@ php_upgrade_migrate_custom() {
       for rel in "${migrated_pools[@]}"; do
         [[ -n $rel ]] && rm -f "$etc/$new/fpm/pool.d/$rel"
       done
+      (( www_migrated )) && cp -p "$www_template" "$www_new"
       for entry in "${migrated_inis[@]}"; do
         IFS=$'\t' read -r rel links <<< "$entry"
         [[ -n $rel ]] || continue
@@ -1078,8 +1105,14 @@ php_upgrade_optimize() {
     fi
   fi
   verify_optimized_services || rc=1
+  # The verdict travels in PHP_UPGRADE_OPTIMIZE_OK, not the exit status, so
+  # run_php_upgrade can call this plainly: a `php_upgrade_optimize || rc=1`
+  # suspended set -e and the ERR trap for every tuner inside (a failed write
+  # of zz-setup-optimize.ini was carried on past), the defect 1.21.67 fixed
+  # for --domain's closing pass.  A hard error now ends the run while
+  # PHP_UPGRADE_IN_FLIGHT is still set, and on_exit rolls back to the old PHP.
   PHP_UPGRADE_OPTIMIZE_OK=$(( rc == 0 ? 1 : 0 ))
-  return "$rc"
+  return 0
 }
 
 # Reload Angie so its upstream pool reconnects to the new FPM master.  A Unix
@@ -1577,7 +1610,8 @@ run_php_upgrade() {
   fi
 
   step "Applying the shared PHP profile"
-  php_upgrade_optimize || rc=1
+  php_upgrade_optimize
+  (( PHP_UPGRADE_OPTIMIZE_OK == 1 )) || rc=1
   # Installing is not the same as serving: if the target cannot keep FPM up
   # (a tuned tree the master rejects, a socket that never appears), put the
   # old, working PHP back instead of leaving the host on a dead version.

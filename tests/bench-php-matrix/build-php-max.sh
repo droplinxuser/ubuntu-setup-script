@@ -75,25 +75,57 @@ elif [[ $CC == clang* ]]; then
   BASE_FLAGS+=" -flto=thin"
   export LDFLAGS="-flto=thin -fuse-ld=lld"
 fi
-if [[ $CC == clang* && $STAGE != plain ]]; then
-  echo "PGO stages are written for GCC's -fprofile-generate/-use; use CC=gcc" >&2
-  exit 1
-fi
 case $STAGE in
   plain)    CFLAGS="$BASE_FLAGS" ;;
   generate)
     rm -rf "$PGO_DIR"
     CFLAGS="$BASE_FLAGS -fprofile-generate=$PGO_DIR"
     mkdir -p "$PGO_DIR"; chmod 777 "$PGO_DIR"
+    [[ $CC == clang* ]] && LDFLAGS="${LDFLAGS:-} -fprofile-generate=$PGO_DIR"
     ;;
   use)
-    # configure probes reuse conftest.c, whose stale profile trips
-    # -Werror=coverage-mismatch; the PHP objects have their own data.
-    find "$PGO_DIR" -name "*conftest*" -delete 2>/dev/null || true
-    CFLAGS="$BASE_FLAGS -fprofile-use=$PGO_DIR -fprofile-correction -Wno-error=coverage-mismatch -Wno-missing-profile"
+    if [[ $CC == clang* ]]; then
+      # clang writes raw profiles (default_%m.profraw); merge them once.
+      shopt -s nullglob
+      raw=("$PGO_DIR"/*.profraw)
+      shopt -u nullglob
+      (( ${#raw[@]} )) || { echo "no .profraw in $PGO_DIR: train first" >&2; exit 1; }
+      PROFDATA=$(command -v llvm-profdata || ls /usr/bin/llvm-profdata-* 2>/dev/null | sort -V | tail -n 1)
+      "$PROFDATA" merge -o "$PGO_DIR/php.profdata" "${raw[@]}"
+      CFLAGS="$BASE_FLAGS -fprofile-use=$PGO_DIR/php.profdata -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date -Wno-backend-plugin"
+    else
+      # configure probes reuse conftest.c, whose stale profile trips
+      # -Werror=coverage-mismatch; the PHP objects have their own data.
+      find "$PGO_DIR" -name "*conftest*" -delete 2>/dev/null || true
+      # -fprofile-partial-training: code the training never ran keeps its
+      # normal optimisation.  Without it GCC optimises every unexecuted
+      # function for size, which is how 1.21.65's PGO arms lost 5-10 %.
+      CFLAGS="$BASE_FLAGS -fprofile-use=$PGO_DIR -fprofile-partial-training -fprofile-correction -Wno-error=coverage-mismatch -Wno-missing-profile"
+    fi
     ;;
   *) echo "unknown stage: $STAGE" >&2; exit 1 ;;
 esac
+# BOLT=1 keeps relocations in php-fpm so llvm-bolt (bolt-php.sh) can reorder it.
+if [[ ${BOLT:-0} == 1 ]]; then
+  LDFLAGS="${LDFLAGS:-} -Wl,--emit-relocs"
+fi
+[[ -n ${LDFLAGS:-} ]] && export LDFLAGS
+# PHP's HYBRID VM keeps the VM state in GCC global register variables.  The
+# 1.21.65/66 harness passed --disable-gcc-global-regs to every GCC arm (it was
+# added with LTO), which costs GCC builds their fastest dispatch and biased
+# those comparisons against GCC.  Sury builds with global registers; so does
+# this harness now, unless NO_GLOBAL_REGS=1.  clang never uses them: PHP 8.5
+# picks the TAILCALL VM for clang >= 19 instead.
+# GCC cannot have both: with -flto the JIT helpers fail to link ("global
+# register variable follows a function definition", zend_jit_vm_helpers.c),
+# which is why the old harness disabled the registers.  LTO was neutral in
+# 1.21.65, so a GCC arm picks one explicitly.
+GLOBAL_REGS_OPT=()
+[[ ${NO_GLOBAL_REGS:-0} == 1 ]] && GLOBAL_REGS_OPT=(--disable-gcc-global-regs)
+if [[ $CC != clang* && ${NO_LTO:-0} != 1 && ${NO_GLOBAL_REGS:-0} != 1 ]]; then
+  echo "GCC: LTO and the HYBRID VM's global registers do not link together; set NO_LTO=1 (keeps the HYBRID VM) or NO_GLOBAL_REGS=1" >&2
+  exit 1
+fi
 export CFLAGS CXXFLAGS="$CFLAGS"
 
 # ---- build dependencies ----------------------------------------------------
@@ -104,7 +136,8 @@ packages=(
   libzip-dev libonig-dev libgmp-dev libsodium-dev libsystemd-dev zlib1g-dev
   libmagickwand-dev
 )
-[[ $CC == clang* ]] && packages+=(clang lld)
+# libclang-rt-dev: the profile runtime clang links into a PGO training build.
+[[ $CC == clang* ]] && packages+=(clang lld llvm libclang-rt-dev)
 missing=()
 for p in "${packages[@]}"; do
   dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q ' installed$' || missing+=("$p")
@@ -147,7 +180,7 @@ cd "$SRC"
   --with-zlib --with-sodium \
   --enable-litespeed \
   --disable-cgi --disable-phpdbg \
-  --disable-gcc-global-regs \
+  ${GLOBAL_REGS_OPT[@]+"${GLOBAL_REGS_OPT[@]}"} \
   > "/root/work/build-$TAG-$STAGE-configure.log" 2>&1 \
   || { tail -30 "/root/work/build-$TAG-$STAGE-configure.log" >&2; exit 1; }
 
@@ -252,6 +285,8 @@ UNIT
 systemctl daemon-reload
 
 "$PREFIX/bin/php" -v | head -1
+# HYBRID (GCC + global registers), TAILCALL (clang >= 19) or CALL (neither).
+echo "vm: $("$PREFIX/bin/php" -n -r 'echo defined("ZEND_VM_KIND") ? ZEND_VM_KIND : "unknown";')"
 printf 'modules: %s\n' "$("$PREFIX/bin/php" -m | tr '\n' ' ')"
 printf 'extensions built: %s\n' "${built[*]:-none}"
 echo "installed: $PREFIX ($STAGE)"

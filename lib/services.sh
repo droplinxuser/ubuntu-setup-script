@@ -440,7 +440,7 @@ install_php() {
   # runs without it (SV RedisCache uses its pure-PHP Credis client) and so
   # does WordPress without an object-cache drop-in.  An application that
   # cannot run without an extension gets it from php_ensure_app_extensions
-  # when its --domain is created (Chevereto: redis and imagick).  Add
+  # when its --domain is created (Chevereto: redis).  Add
   # intl/bcmath/apcu only if a specific add-on needs them.
   #
   # PHP 8.5 made OPcache a mandatory, always-built-in extension: Sury (and
@@ -637,6 +637,14 @@ install_php() {
   fi
   systemctl status "php${ver}-fpm" --no-pager || true
   "$(php_fpm_binary "$ver")" -v || true
+  # Only the extensions the applications need, as --optimize keeps it.
+  if php_fpm_modules_apply "$ver" info; then
+    systemctl restart "php${ver}-fpm" 2>/dev/null || warn "PHP ${ver}: restart after the module change failed"
+  fi
+  # PHP_BUILD=clang/lean: the same compiled php-fpm the next --optimize keeps
+  # (built now; BOLT needs live traffic and is added by --optimize).
+  php_build_apply "$ver" install info \
+    || warn "PHP ${ver}: PHP_BUILD=${PHP_BUILD} build failed; the package's php-fpm keeps serving"
   if (( reapply )); then
     ok "PHP ${ver} configuration re-applied (packages kept)"
   else
@@ -2179,9 +2187,9 @@ create_domains() {
     certdir="/etc/angie/ssl/${d}"
 
     # Extensions the application cannot run without are not in the default
-    # PHP set (no php-redis/php-igbinary, no imagick): install them only for
-    # a site that needs them, including an existing one (Chevereto: redis,
-    # which pulls igbinary, and imagick; XenForo and WordPress: nothing
+    # PHP set (no php-redis/php-igbinary): install them only for a site that
+    # needs them, including an existing one (Chevereto: redis, which pulls
+    # igbinary; images go through GD; XenForo and WordPress: nothing
     # extra).  Use the FPM version Angie talks to, not the alternatives CLI:
     # on a host with 8.4 and 8.5 installed, `php -m` could name the other
     # version and install an extension the pool never loads.
@@ -2192,7 +2200,7 @@ create_domains() {
     if [[ -n $app_php ]]; then
       php_ensure_app_extensions "$req_app" "$dir" "$app_php"
     elif [[ $app == chevereto ]]; then
-      warn "Chevereto requires the PHP redis and Imagick extensions, but the PHP version could not be detected"
+      warn "Chevereto requires the PHP redis extension, but the PHP version could not be detected"
     fi
 
     # Only a tree this run creates is chowned recursively.  An existing site

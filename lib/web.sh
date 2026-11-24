@@ -2921,6 +2921,8 @@ php_session_hardening_load() {
 php_session_hardening_load
 
 persist_php_jit() {
+  php_build_persist
+  php_fpm_modules_persist
   if (( PHP_SESSION_HARDENING_PERSIST )); then
     persist_tuning_var PHP_SESSION_HARDENING "$SETUP_PHP_SESSION_HARDENING"
     tune_note "PHP: PHP_SESSION_HARDENING=${SETUP_PHP_SESSION_HARDENING} persisted in /etc/default/setup-tuning"

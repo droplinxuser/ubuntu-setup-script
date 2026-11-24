@@ -9,6 +9,26 @@ is still in git history, for example
 `git show 84b0db5:tests/stress-site/AUDIT-20261117-1.21.30.md`.  The current
 cycle report is `AUDIT-20261124-1.21.67.md`.
 
+## 1.21.68 — Xeon E-2236 (2026-11-24)
+
+Pair: `server-configs-nginx` 1.6.59.  Details: `AUDIT-20261124-1.21.68.md`.
+Mitigations off (operator request, test host only).
+
+- **Three php-fpm builds** (primary focus), fresh install with WordPress,
+  XenForo and Chevereto, 5 rotated rounds at 3.6 GHz, vs the package
+  (Sury): XenForo member thread/home `clang` (Sury's core and extensions,
+  LLVM 23 ThinLTO + BOLT) +5.8 % / +6.0 %, `lean` (everything from upstream,
+  static, only the applications' modules) +4.5 % / +5.0 %; Chevereto
+  uncached home +8.1 % / +9.0 %; WordPress member home −5.0 % (bimodal) /
+  +2.2 %; cached pages unchanged.  With a XenForo-only BOLT profile on the
+  20k-user forum the drop-in reached +10 %.  Default stays the package.
+- **php-fpm modules:** only what the three applications need (14 shared
+  extensions disabled for php-fpm; the CLI keeps them).  Chevereto runs on
+  GD; imagick is no longer installed.
+- Suites: install 2:11 / 0 warnings, 1,651 unit checks, 227 dry runs,
+  security 76/76 and 78/78, cookie 105/105, functional 0 failures on every
+  build.  Restore: 696 packages plus upstream drift (kernel 7.0.0-44).
+
 ## 1.21.67 — Xeon E-2236 (2026-11-24)
 
 Pair: `server-configs-nginx` 1.6.58.  Details: `AUDIT-20261124-1.21.67.md`.

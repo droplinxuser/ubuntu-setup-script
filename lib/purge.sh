@@ -331,6 +331,9 @@ purge_php() {
       apt_purge_pattern "php${v}-*"
     done
   fi
+  # A PHP_BUILD drop-in would keep pointing a later reinstall at an
+  # old build; the package binary is the only safe state after a purge.
+  php_build_purge "$ver"
   # The session GC timer is shared by every installed version; stop it only
   # when no php-fpm unit remains enabled.
   if ! systemctl list-unit-files 'php*-fpm.service' --state=enabled --no-legend 2>/dev/null | grep -q .; then

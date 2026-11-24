@@ -597,6 +597,12 @@ printf '[mysqld]\nmax_connections = 370\ntable_open_cache = 5920\ntable_definiti
 printf '[mysqld]\nmax_connections = 690\ntable_open_cache = 11040\ntable_definition_cache = 11040\ninnodb_open_files = 11040\ninnodb_flush_method = fsync\n' > "$TMP/cnf-open-b"
 check "a max_connections change with the open-file trio stays online" \
   cnf_only_pool_changed "$TMP/cnf-open-a" "$TMP/cnf-open-b"
+# MemTotal moved by a few MB (kernel update, crashkernel): the RAM-derived
+# read-only buffers change by 1 MB and must not restart the database.
+printf '[mysqld]\ninnodb_log_buffer_size = 31M\naria_pagecache_buffer_size = 62M\ninnodb_flush_method = fsync\n' > "$TMP/cnf-ram-a"
+printf '[mysqld]\ninnodb_log_buffer_size = 30M\naria_pagecache_buffer_size = 61M\ninnodb_flush_method = fsync\n' > "$TMP/cnf-ram-b"
+check "a MemTotal jitter in the log/aria buffers waits for the next start (no restart)" \
+  cnf_only_pool_changed "$TMP/cnf-ram-a" "$TMP/cnf-ram-b"
 check "table_definition_cache is applied online and read back" \
   grep -qw table_definition_cache <<<"${MARIADB_ONLINE_ORDER[*]}"
 check "Angie-only cache budget uses 50% RAM" \
@@ -2181,6 +2187,39 @@ check "install: no cache warning when --angie is part of the run" \
   bash -c '! grep -q "Angie cache budget stays at" <<<"$1"' _ "$(angie_gap_case 1)"
 unset -f angie_gap_case
 
+# A --mariadb run on a host whose PHP was installed without a local database
+# leaves the 1.5-per-CPU pool until --optimize: the run says so (1.21.68).
+php_db_gap_case() { # live-pool php-enabled -> warnings
+  (
+    unset SETUP_PHP_WORKERS_PER_CPU
+    detect_installed_services() { OPT_DETECTED=(angie php:8.5); }
+    plan_memory_budget() { :; }
+    memory_plan_summary() { :; }
+    info() { :; }
+    warn() { printf 'WARN %s\n' "$*"; }
+    mem_total_mb() { printf '32768'; }
+    angie_disk_free_mb() { printf '400000'; }
+    effective_cpus() { printf '12'; }
+    storage_class() { printf 'ssd'; }
+    host_server_type() { printf 'dedi'; }
+    host_has_local_db() { return 0; }
+    php_pool_max_children() { printf '%s' "$stub_pool"; }
+    stub_pool=$1
+    ENABLED=()
+    ENABLED[mariadb]=1
+    [[ ${2:-0} == 1 ]] && ENABLED[php]=1
+    plan_install_budget 2>&1
+    printf '\n'
+  )
+}
+check "install: --mariadb on a PHP host with an 18-worker pool says the pool stays until --optimize (plan 12)" \
+  bash -c 'grep -q "PHP-FPM keeps 18 workers .* sets 12 " <<<"$1"' _ "$(php_db_gap_case 18 0)"
+check "install: no PHP pool warning when the pool already matches the plan" \
+  bash -c '! grep -q "PHP-FPM keeps" <<<"$1"' _ "$(php_db_gap_case 12 0)"
+check "install: no PHP pool warning when --php is part of the run" \
+  bash -c '! grep -q "PHP-FPM keeps" <<<"$1"' _ "$(php_db_gap_case 18 1)"
+unset -f php_db_gap_case
+
 # The same host, now sized by --optimize after the install ran (live pool of
 # 32 workers measured at the 64 MB floor).
 OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
@@ -3019,7 +3058,7 @@ cnf_a=$(mktemp); cnf_b=$(mktemp)
 printf 'innodb_buffer_pool_size = 4011M\nthread_pool_size = 8\n' > "$cnf_a"
 printf 'innodb_buffer_pool_size = 128M\nloose-innodb_buffer_pool_size_max = 51349M\nthread_pool_size = 8\n' > "$cnf_b"
 check "adding the pool ceiling alone does not force a restart" cnf_only_pool_changed "$cnf_a" "$cnf_b"
-printf 'innodb_buffer_pool_size = 128M\nloose-innodb_buffer_pool_size_max = 51349M\nthread_pool_size = 9\ninnodb_log_buffer_size = 32M\n' > "$cnf_b"
+printf 'innodb_buffer_pool_size = 128M\nloose-innodb_buffer_pool_size_max = 51349M\nthread_pool_size = 9\ninnodb_flush_method = fsync\n' > "$cnf_b"
 check "a non-dynamic key still forces the restart path" not cnf_only_pool_changed "$cnf_a" "$cnf_b"
 rm -f "$cnf_a" "$cnf_b"
 check "redo log is never smaller than the log buffer" \
@@ -4380,6 +4419,10 @@ check "cache guard: a full volatile cache that evicts keeps its size on a second
 
 check "valkey_size_to_mb reads the writer's own unit" test "$(valkey_size_to_mb 512mb)" -eq 512
 check "valkey_size_to_mb reads gigabytes" test "$(valkey_size_to_mb 2GB)" -eq 2048
+check "valkey_size_to_mb reads Valkey's decimal g/m units (2g = 1907 MiB, 500m = 476 MiB)" \
+  test "$(valkey_size_to_mb 2g)" -eq 1907 -a "$(valkey_size_to_mb 500m)" -eq 476
+check "effective_cpus ignores OMP_NUM_THREADS / OMP_THREAD_LIMIT" \
+  bash -c 'sed -n "/^effective_cpus()/,/^}/p" "$1" | grep -q "unset OMP_NUM_THREADS OMP_THREAD_LIMIT; nproc"' _ "$ALL_SRC"
 check "valkey_size_to_mb reads plain bytes" test "$(valkey_size_to_mb 536870912)" -eq 512
 check "valkey_size_to_mb treats no limit and garbage as 0" \
   test "$(valkey_size_to_mb 0)" -eq 0 -a "$(valkey_size_to_mb '')" -eq 0 -a "$(valkey_size_to_mb 5tb)" -eq 0
@@ -5037,8 +5080,8 @@ app_roots=$(php_upgrade_app_roots "$TMP/apps")
 check "Chevereto needs only app/env.php, like the --optimize detector" \
   grep -qx $'chevereto\t'"$TMP/apps/chev/public" <<<"$app_roots"
 : > "$TMP/apps/chev/public/app/bin/legacy"
-check "Chevereto requirements include imagick" \
-  php_upgrade_app_required_extensions chevereto "$TMP/apps/chev/public" | grep -qx imagick
+chev_no_imagick() { ! php_upgrade_app_required_extensions chevereto "$TMP/apps/chev/public" | grep -qx imagick; }
+check "Chevereto requirements leave out imagick (GD serves its images)" chev_no_imagick
 check "Chevereto requirements include redis" \
   has_ext php_upgrade_app_required_extensions chevereto "$TMP/apps/chev/public"
 check "WordPress requirements skip redis without an object-cache drop-in" \
@@ -5168,8 +5211,8 @@ pe_run() { # app root loaded-modules published? -> installed packages
     paste -sd' ' - < "$TMP/pe.installed"
   )
 }
-check "a new Chevereto site gets redis and imagick" \
-  test "$(pe_run chevereto "$TMP/apps/chev/public" "mysqli gd curl mbstring" 1)" = "php8.5-redis php8.5-imagick"
+check "a new Chevereto site gets redis only (no imagick: GD serves its images)" \
+  test "$(pe_run chevereto "$TMP/apps/chev/public" "mysqli gd curl mbstring" 1)" = "php8.5-redis"
 check "a Chevereto site whose FPM already loads them gets nothing" \
   test "$(pe_run chevereto "$TMP/apps/chev/public" "mysqli gd curl mbstring redis imagick" 1)" = ""
 printf "\$config['cache']['provider'] = 'SV\\\\RedisCache\\\\Redis';\n" > "$TMP/apps/xf/public/src/config.php"
@@ -5288,6 +5331,33 @@ check "a rejected migration removes what it migrated and keeps the package's 20-
   test "$(mc_run false)" = "1 kept no no no no"
 check "an accepted migration keeps the migrated ini, its link, the pool and the package's ini" \
   test "$(mc_run true)" = "0 kept yes yes yes yes"
+
+mw_run() { # fpm-test-binary -> "rc env-line version-rewritten listen-kept"
+  (
+    M="$TMP/mw"; rm -rf "$M"
+    mkdir -p "$M/man/php-config/8.4/fpm/pool.d" "$M/etc/8.6/fpm/pool.d"
+    PHP_UPGRADE_MANIFEST_DIR="$M/man"; MW_BIN=$1
+    printf '[www]\nuser = shopuser\nlisten = /run/php/php8.4-shop.sock\nenv[APP_ENV] = prod\nslowlog = /var/log/php8.4-fpm.slow.log\n' \
+      > "$M/man/php-config/8.4/fpm/pool.d/www.conf"
+    printf '[www]\nuser = www-data\nlisten = /run/php/php-fpm.sock\n' > "$M/etc/8.6/fpm/pool.d/www.conf"
+    php_fpm_binary() { printf '%s\n' "$MW_BIN"; }
+    systemctl() { return 1; }; ok() { :; }; warn() { :; }
+    rc=0; php_upgrade_migrate_custom 8.4 8.6 "$M/etc" >/dev/null 2>&1 || rc=$?
+    f="$M/etc/8.6/fpm/pool.d/www.conf"
+    printf '%s %s %s %s\n' "$rc" \
+      "$(grep -c '^env\[APP_ENV\] = prod$' "$f")" \
+      "$(grep -c 'php8\.6-fpm\.slow\.log' "$f")" \
+      "$(grep -c '^listen = /run/php/php8\.4-shop\.sock$' "$f")"
+  )
+}
+check "--upgrade-php carries the operator's www.conf keys (env, user) and keeps its listener" \
+  test "$(mw_run true)" = "0 1 1 1"
+check "a www.conf the new FPM rejects is replaced by the template again" \
+  test "$(mw_run false)" = "1 0 0 0"
+check "run_php_upgrade calls php_upgrade_optimize plainly (set -e stays active for every tuner)" \
+  bash -c 'grep -qE "^[[:space:]]*php_upgrade_optimize[[:space:]]*$" <<<"$1" && ! grep -qE "php_upgrade_optimize[[:space:]]*\|\|" <<<"$1"' _ "$upg_body"
+check "php_upgrade_optimize reports through PHP_UPGRADE_OPTIMIZE_OK and returns 0" \
+  bash -c 'sed -n "/^php_upgrade_optimize()/,/^}/p" "$1" | tail -n 3 | grep -q "return 0"' _ "$ALL_SRC"
 
 # apt_update: a repository mid-sync gets the long waits, anything else the
 # three quick tries; the last failure names the reason.
@@ -6947,6 +7017,37 @@ check_tree "the XenForo proxy cache never stores an origin 403 or 429" \
 check_tree "the credential limiter keys IPv6 clients per /64" \
   bash -c 'grep -qF "\"~(?s)^(?<login_v6_net>.{8}).{8}\\z\" \$login_v6_net;" "$1/http.d/limit_req.conf" && grep -qE "^ *default +\\\$limit_req_login_addr;" "$1/http.d/limit_req.conf"' _ "$ANGIE_TREE"
 
+# 1.6.59: PHP URL-decodes cookie values, Angie's $cookie_* does not, so an
+# encoded style/language value rendered that style/language under the default
+# guest key.  Run the shipped $xf_guest_cookie patterns (Perl, as PCRE) on the
+# attack cookies and on the ones that must stay cacheable.
+xf_guest_cookie_hits() { # cookie -> 1 when any shipped pattern matches
+  /usr/bin/env perl -e '
+    my ($f, $ck) = @ARGV; open my $h, "<", $f or exit 2; my $in = 0;
+    while (<$h>) {
+      $in = 1 if /^map \$http_cookie \$xf_guest_cookie\b/; next unless $in;
+      last if /^\}/;
+      if (/^\s*"(~\*?)(.*)"\s+1;/) { my ($m, $re) = ($1, $2); $re =~ s/\\\\/\\/g;
+        if ($m eq "~*" ? $ck =~ /$re/i : $ck =~ /$re/) { print 1; exit } }
+    }
+    print 0;' "$ANGIE_TREE/http.d/fastcgi_cache.conf" "$1"
+}
+xf_ck_all() { # expected cookie... -> 0 when every cookie gives EXPECTED
+  local expected=$1 c; shift
+  for c in "$@"; do [[ $(xf_guest_cookie_hits "$c") == "$expected" ]] || { echo "unexpected for: $c"; return 1; }; done
+}
+check_tree "an encoded XenForo language/style cookie value is never guest-cacheable" \
+  xf_ck_all 1 "xf_language_id=%32" "_ga=1; xf_language_id=+2" "xf_style_id=2%20" "xf_style_id=2 " "xf_style_variation=%61lternate" "a=1;xf_style_variation=x.y"
+check_tree "well-formed XenForo language/style cookies stay guest-cacheable" \
+  xf_ck_all 0 "xf_language_id=2" "_ga=1; xf_style_id=12; xf_style_variation=alternate" "xf_style_variation=dark_mode-2" "xf_csrf=abc%3D"
+check_tree "WordPress refuses PHP inside plugin/theme vendor/ and node_modules/" \
+  grep -qF '|/wp-content/(?:plugins|themes|mu-plugins)/(?:.*/)?(?:vendor|node_modules)/.*\.ph(?:p|tml|ar)(?:/|$)|' "$ANGIE_TREE/h5bp/location/security_wp.conf"
+check_tree "WooCommerce and EDD protected downloads are internal-only" \
+  bash -c 'grep -qE "^location \^~ /wp-content/uploads/woocommerce_uploads/ \{ internal; \}" "$1" && grep -qE "^location \^~ /wp-content/uploads/edd/ \{ internal; \}" "$1"' _ "$ANGIE_TREE/h5bp/wordpress.conf"
+check_tree "no proxy path forwards the client's own X-Forwarded-For" \
+  bash -c '! grep -rnE "X-Forwarded-For[[:space:]]+\\\$proxy_add_x_forwarded_for" "$1/h5bp" "$1/conf.d" && grep -qE "^map \\\$trusted_forwarder \\\$proxy_x_forwarded_for" "$1/http.d/https_map.conf"' _ "$ANGIE_TREE"
+unset -f xf_guest_cookie_hits xf_ck_all
+
 # A host still behind the filter is detected from the files only the old
 # release generated, and only from those: a hand-installed Anubis never
 # touched the Angie tree and needs no migration.
@@ -7206,6 +7307,229 @@ check "run_diagnostics clears DIAG_TMP after publishing the report" \
 diag_gitignore=$(cat "$ROOT/.gitignore")
 check ".gitignore covers the in-progress diagnostics report" \
   grep -qxF 'diagnostics.log.*' <<<"$diag_gitignore"
+
+# ---- 1.21.68: PHP_BUILD=clang (lib/php-build.sh, tools/php-fpm-build.sh)
+pb_mode() { ( PHP_BUILD=$1; php_build_mode ); }
+check "PHP_BUILD: clang, lean/upstream, package/sury/off and unset map to their modes" \
+  test "$(pb_mode clang),$(pb_mode CLANG),$(pb_mode lean),$(pb_mode upstream),$(pb_mode package),$(pb_mode sury),$(pb_mode off),$(pb_mode '')" = "clang,clang,lean,lean,package,package,package,"
+pb_invalid() { ( PHP_BUILD=gcc; die() { exit 7; }; php_build_validate ); [[ $? == 7 ]]; }
+check "PHP_BUILD: an unknown value is refused before anything changes" pb_invalid
+check "validate_all checks PHP_BUILD" \
+  bash -c 'sed -n "/^validate_all()/,/^}/p" "$1" | grep -q php_build_validate' _ "$ALL_SRC"
+check "an explicit SETUP_PHP_BUILD is persisted (persist_php_jit runs php_build_persist)" \
+  bash -c 'sed -n "/^persist_php_jit()/,/^}/p" "$1" | grep -q php_build_persist' _ "$ALL_SRC"
+pb_unit=$(php_build_unit_text)
+check "the rebuild unit runs the installed tool for the instance version, at idle priority" \
+  bash -c 'grep -qF "ExecStart=$2 rebuild %i" <<<"$1" && grep -qx "Nice=19" <<<"$1" && grep -qx "IOSchedulingClass=idle" <<<"$1"' _ "$pb_unit" "$PHP_BUILD_TOOL"
+check "the APT hook runs the tool's apt-hook after every dpkg run and never fails apt" \
+  bash -c 'grep -qF "DPkg::Post-Invoke" <<<"$1" && grep -qF "apt-hook || true" <<<"$1"' _ "$(php_build_apt_hook_text)"
+check "install_php and optimize_php_services both apply PHP_BUILD (install/optimize parity)" \
+  bash -c 'sed -n "/^install_php()/,/^}/p" "$1" | grep -q "php_build_apply \"\$ver\" install" && sed -n "/^optimize_php_services()/,/^}/p" "$1" | grep -q "php_build_apply \"\$ver\" optimize"' _ "$ALL_SRC"
+check "--purge php removes the PHP_BUILD drop-in" \
+  bash -c 'sed -n "/^purge_php()/,/^}/p" "$1" | grep -q php_build_purge' _ "$ALL_SRC"
+check "--optimize keeps the persisted PHP_BUILD choice (a feature choice, not a tuning pin)" \
+  bash -c 'printf "%s\n" "$@" | grep -qx PHP_BUILD' _ "${RESET_KEEP_PINS[@]}"
+
+# The tool itself, sourced in a subshell (it sets its own shell options).
+pb_tool_case() { # case -> result line
+  (
+    T="$TMP/pbt"; rm -rf "$T"; mkdir -p "$T/sbin" "$T/units/php8.5-fpm.service.d" "$T/root/8.5" "$T/pkgunits"
+    export PHP_BUILD_ROOT="$T/root" PHP_BUILD_UNIT_DIR="$T/units" PHP_BUILD_SBIN="$T/sbin" \
+           PHP_BUILD_PKG_UNIT_DIR="$T/pkgunits" PHP_BUILD_SOURCE_ONLY=1
+    stub_fpm() { printf '#!/bin/sh\n[ "$1" = -n ] && [ "$2" = -v ] && echo "PHP %s (fpm-fcgi) (built: x)"\nexit 0\n' "$1" > "$T/sbin/php-fpm8.5"; chmod +x "$T/sbin/php-fpm8.5"; }
+    # shellcheck disable=SC1090,SC1091
+    source "$ROOT/tools/php-fpm-build.sh"
+    set +eE; trap - ERR
+    systemctl() { printf '%s\n' "$*" >> "$T/systemctl.log"; return 0; }
+    logger() { :; }; say() { :; }
+    printf '[Service]\nExecStart=\nExecStart=%s/8.5/php-fpm --nodaemonize --fpm-config /etc/php/8.5/fpm/php-fpm.conf\n' "$T/root" \
+      > "$T/units/php8.5-fpm.service.d/zz-setup-build.conf"
+    case $1 in
+      stale)   stub_fpm 8.5.14; printf 'version=8.5.13\nbolt=1\n' > "$T/root/8.5/build.info"; cmd_apt_hook ;;
+      current) stub_fpm 8.5.13; printf 'version=8.5.13\nbolt=1\n' > "$T/root/8.5/build.info"; cmd_apt_hook ;;
+      gone)    printf 'version=8.5.13\n' > "$T/root/8.5/build.info"; cmd_apt_hook ;;
+      version) stub_fpm 8.5.13; printf '%s' "$(bin_version "$T/sbin/php-fpm8.5")"; return 0 ;;
+      activate)
+        stub_fpm 8.5.13; printf 'version=8.5.13\n' > "$T/root/8.5/build.info"
+        printf '[Service]\nType=notify\nExecStart=%s/php-fpm8.5 --nodaemonize --fpm-config /etc/php/8.5/fpm/php-fpm.conf\nExecReload=/bin/kill -USR2 $MAINPID\n' "$T/sbin" > "$T/pkgunits/php8.5-fpm.service"
+        rm -f "$T/units/php8.5-fpm.service.d/zz-setup-build.conf"
+        restart_checked() { return 0; }
+        activate 8.5
+        d="$T/units/php8.5-fpm.service.d/zz-setup-build.conf"
+        printf '%s %s %s %s %s' "$(grep -c '^ExecStart=$' "$d")" \
+          "$(grep -c "^ExecStart=$T/root/8.5/php-fpm --nodaemonize --fpm-config /etc/php/8.5/fpm/php-fpm.conf$" "$d")" \
+          "$(grep -c "^ExecStartPre=$T/root/php-fpm-build.sh conf 8.5$" "$d")" \
+          "$(grep -c "^ExecReload=$T/root/php-fpm-build.sh conf 8.5$" "$d")" \
+          "$(grep -c '^ExecReload=/bin/kill -USR2 \$MAINPID$' "$d")"
+        return 0 ;;
+      conf)
+        export PHP_BUILD_ETC="$T/etc" PHP_BUILD_RUN_DIR="$T/run"
+        PHP_ETC=$PHP_BUILD_ETC RUN_DIR=$PHP_BUILD_RUN_DIR
+        mkdir -p "$T/etc/8.5/fpm/conf.d" "$T/run"
+        printf 'extension=redis.so\nredis.pconnect.pooling_enabled=1\n' > "$T/etc/8.5/fpm/conf.d/20-redis.ini"
+        printf '  zend_extension = opcache.so\nopcache.jit=tracing\n' > "$T/etc/8.5/fpm/conf.d/10-opcache.ini"
+        printf 'memory_limit = 256M\n' > "$T/etc/8.5/fpm/conf.d/99-custom.ini"
+        printf 'stale\n' > "$T/run/8.5-old.ini"; mkdir -p "$T/run/8.5"; printf 'x\n' > "$T/run/8.5/00-gone.ini"
+        cmd_conf 8.5
+        printf '%s %s %s %s' "$(cat "$T/run/8.5"/*.ini | grep -cE '^[[:space:]]*(zend_)?extension')" \
+          "$(grep -c '^opcache.jit=tracing$' "$T/run/8.5/10-opcache.ini")" \
+          "$(grep -c '^memory_limit = 256M$' "$T/run/8.5/99-custom.ini")" \
+          "$([[ -f $T/run/8.5/00-gone.ini ]] && echo kept || echo removed)"
+        return 0 ;;
+      confget)
+        export PHP_BUILD_CONF="$T/php-build.conf"; CONF=$PHP_BUILD_CONF
+        printf '# c\nPHP_VERSION=8.5.13  # pinned\nLLVM_VERSION="23"\nLIBJPEG_TURBO_VERSION=latest\n' > "$CONF"
+        printf '%s %s %s %s %s' "$(conf_get php)" "$(conf_get llvm)" "$(conf_get libjpeg-turbo)" "$(conf_get openssl)" \
+          "$(ver_ge 8.5.14 8.5.13 && echo ge)$(ver_ge 8.5.9 8.5.13 || echo lt)"
+        return 0 ;;
+      confbad)
+        export PHP_BUILD_CONF="$T/php-build.conf"; CONF=$PHP_BUILD_CONF
+        printf 'OPENSSL_VERSION=$(id)\n' > "$CONF"
+        ( conf_get openssl ) >/dev/null 2>&1 && echo accepted || echo refused
+        return 0 ;;
+      lostlib)
+        stub_fpm 8.5.13; printf 'version=8.5.13\nbolt=1\n' > "$T/root/8.5/build.info"
+        printf '#!/bin/sh\n' > "$T/root/8.5/php-fpm"; chmod +x "$T/root/8.5/php-fpm"
+        ldd() { echo "	libicuuc.so.78 => not found"; }
+        cmd_apt_hook ;;
+      newer)
+        stub_fpm 8.5.13; printf 'version=8.5.14\nbolt=1\n' > "$T/root/8.5/build.info"; cmd_apt_hook ;;
+      clangdiff)
+        # A clang build must equal the package (its shared extensions).
+        stub_fpm 8.5.13; printf 'mode=clang\nversion=8.5.14\nbolt=1\n' > "$T/root/8.5/build.info"; cmd_apt_hook ;;
+      clangsame)
+        stub_fpm 8.5.13; printf 'mode=clang\nversion=8.5.13\nbolt=1\n' > "$T/root/8.5/build.info"; cmd_apt_hook ;;
+      clangact)
+        stub_fpm 8.5.13; printf 'mode=clang\nversion=8.5.13\n' > "$T/root/8.5/build.info"
+        printf '[Service]\nType=notify\nExecStart=%s/php-fpm8.5 --nodaemonize --fpm-config /etc/php/8.5/fpm/php-fpm.conf\nExecReload=/bin/kill -USR2 $MAINPID\n' "$T/sbin" > "$T/pkgunits/php8.5-fpm.service"
+        rm -f "$T/units/php8.5-fpm.service.d/zz-setup-build.conf"
+        restart_checked() { return 0; }
+        activate 8.5
+        d="$T/units/php8.5-fpm.service.d/zz-setup-build.conf"
+        printf '%s %s %s' "$(grep -c "^ExecStart=$T/root/8.5/php-fpm " "$d")" \
+          "$(grep -c '^ExecStartPre=' "$d")" "$(grep -c '^ExecReload' "$d")"
+        return 0 ;;
+      modeswitch)
+        stub_fpm 8.5.13; printf 'mode=clang\nversion=8.5.13\nllvm=23\n' > "$T/root/8.5/build.info"
+        out=$(cmd_check 8.5 lean); rc=$?; printf '%s rc=%s' "$out" "$rc"
+        return 0 ;;
+      nomode)
+        printf 'version=8.5.13\n' > "$T/root/8.5/build.info"; build_mode 8.5
+        return 0 ;;
+    esac
+    printf '%s %s %s' \
+      "$([[ -f $T/units/php8.5-fpm.service.d/zz-setup-build.conf ]] && echo dropin || echo nodropin)" \
+      "$([[ -d $T/root/8.5 ]] && echo build || echo nobuild)" \
+      "$(cat "$T/systemctl.log" 2>/dev/null | grep -c 'start --no-block setup-php-fpm-build@8.5.service')"
+  )
+}
+check "php-fpm-build: reads the package's PHP version from php-fpm -v" \
+  test "$(pb_tool_case version)" = "8.5.13"
+check "php-fpm-build apt-hook: a security update reverts to the package binary and starts a rebuild" \
+  test "$(pb_tool_case stale)" = "nodropin build 1"
+check "php-fpm-build apt-hook: a current build is left alone" \
+  test "$(pb_tool_case current)" = "dropin build 0"
+check "php-fpm-build apt-hook: a removed package drops the drop-in and the build" \
+  test "$(pb_tool_case gone)" = "nodropin nobuild 0"
+check "php-fpm-build activate: resets ExecStart, rewrites the package's line, mirrors conf.d before start and reload" \
+  test "$(pb_tool_case activate)" = "1 1 1 1 1"
+check "php-fpm-build apt-hook: a build newer than the package (php.net ahead of Sury) is left alone" \
+  test "$(pb_tool_case newer)" = "dropin build 0"
+check "php-fpm-build apt-hook: a clang build that is not the package's version reverts (Sury's extensions must match)" \
+  test "$(pb_tool_case clangdiff)" = "nodropin build 1"
+check "php-fpm-build apt-hook: a clang build of the package's version is left alone" \
+  test "$(pb_tool_case clangsame)" = "dropin build 0"
+check "php-fpm-build activate (clang): no conf.d mirror, the package's reload is kept" \
+  test "$(pb_tool_case clangact)" = "1 0 0"
+check "php-fpm-build check: a build of the other mode is stale" \
+  test "$(pb_tool_case modeswitch)" = "stale: mode clang -> lean rc=10"
+check "php-fpm-build: a build.info without mode= is a lean build (built before modes)" \
+  test "$(pb_tool_case nomode)" = "lean"
+check "php-fpm-build apt-hook: a build that lost a system library reverts and rebuilds" \
+  test "$(pb_tool_case lostlib)" = "nodropin build 1"
+check "php-fpm-build conf: extension lines are commented out, settings kept, stale files removed" \
+  test "$(pb_tool_case conf)" = "0 1 1 removed"
+check "php-build.conf: pins, quotes and comments parse; unset keys mean latest; versions compare" \
+  test "$(pb_tool_case confget)" = "8.5.13 23 latest latest gelt"
+check "php-build.conf: a value that is neither latest nor a version is refused" \
+  test "$(pb_tool_case confbad)" = "refused"
+check "php-build.conf ships beside setup.sh with every component the tool builds" \
+  bash -c 'for k in PHP LLVM REDIS IGBINARY OPENSSL PCRE2 ZLIB LIBXML2 LIBSODIUM GMP CURL ICU LIBJPEG_TURBO LIBPNG LIBWEBP LIBZIP; do grep -qx "${k}_VERSION=latest" "$1/php-build.conf" || exit 1; done' _ "$ROOT"
+lean_set_ok() {
+  local f
+  f=$(sed -n '/^cmd_build_lean()/,/^}/p' "$ROOT/tools/php-fpm-build.sh")
+  grep -q -- "--disable-cli" <<<"$f" && grep -q -- "--enable-session" <<<"$f" \
+    && grep -q -- "--with-pdo-mysql" <<<"$f" && grep -q -- "--enable-xmlreader" <<<"$f" \
+    && ! grep -qiE -- "imagick|--enable-(posix|pcntl|sockets|bcmath|soap|calendar|ftp|tokenizer|phar)\b" <<<"$f"
+}
+check "the lean build compiles only the three applications' module set (no CLI, imagick or extras)" lean_set_ok
+check "php-fpm-build EXIT traps name a global (a local is gone when the trap fires under set -u)" \
+  bash -c 'f="$1/tools/php-fpm-build.sh"; ! grep -E "trap .*EXIT" "$f" | grep -vqF "\${WORK_DIR:-}"' _ "$ROOT"
+check "GMP is built without assembly (its jump tables in data stop BOLT)" \
+  grep -q -- "--disable-assembly" "$ROOT/tools/php-fpm-build.sh"
+check "the refresh timer runs the tool daily at idle priority" \
+  bash -c 'grep -qF "ExecStart=$2 refresh" <<<"$1" && grep -qx "OnCalendar=daily" <<<"$3"' _ "$(php_build_refresh_unit_text)" "$PHP_BUILD_TOOL" "$(php_build_refresh_timer_text)"
+check "removing the last build also removes the apt.llvm.org source and the refresh timer" \
+  bash -c 'sed -n "/^php_build_remove_support()/,/^}/p" "$1" | grep -q "PHP_BUILD_LLVM_FILES" && sed -n "/^php_build_remove_support()/,/^}/p" "$1" | grep -q "PHP_BUILD_REFRESH_TIMER"' _ "$ALL_SRC"
+check "phpinfo is not in the shipped disable_functions (XenForo/WordPress admin pages use it)" \
+  bash -c '! grep -E "^disable_functions" "$1/configs/php/custom_dan.ini" | grep -q phpinfo && grep -qx "disable_functions = show_source" "$1/configs/php/custom_dan.ini"' _ "$ROOT"
+unset -f pb_mode pb_tool_case pb_invalid
+
+# ---- 1.21.68: php-fpm loads only what WordPress, XenForo and Chevereto need
+fm_case() { # case -> result line
+  (
+    T="$TMP/fm"; rm -rf "$T"; mkdir -p "$T/etc/8.5/fpm/conf.d" "$T/angie/conf.d" "$T/www/xf/src" "$T/www/other"
+    export PHP_FPM_ETC="$T/etc" PHP_FPM_ANGIE="$T/angie"
+    PHP_FPM_ETC=$T/etc PHP_FPM_MODULES=${FM_MODE:-}
+    printf 'zend_extension=opcache.so\n' > "$T/etc/8.5/fpm/conf.d/10-opcache.ini"
+    for m in curl ffi calendar redis xsl tokenizer mysqli imagick; do printf 'extension=%s.so\n' "$m" > "$T/etc/8.5/fpm/conf.d/20-$m.ini"; done
+    printf '; no extension line\nmemory_limit=1G\n' > "$T/etc/8.5/fpm/conf.d/99-custom.ini"
+    phpdismod() { rm -f "$PHP_FPM_ETC/$2/fpm/conf.d/"[0-9][0-9]"-$5.ini"; }
+    phpenmod() { printf 'extension=%s.so\n' "$5" > "$PHP_FPM_ETC/$2/fpm/conf.d/20-$5.ini"; }
+    angie_vhost_root() { sed -n 's/^[[:space:]]*root[[:space:]]*\(.*\);/\1/p' "$1"; }
+    : > "$T/www/xf/src/XF.php"; : > "$T/www/xf/src/config.php"
+    printf 'server {\n  root %s;\n}\n' "$T/www/xf" > "$T/angie/conf.d/xf.conf"
+    case $1 in
+      foreign) : > "$T/www/other/index.php"; printf 'server {\n  root %s;\n}\n' "$T/www/other" > "$T/angie/conf.d/other.conf" ;;
+      static)  printf '<html>\n' > "$T/www/other/index.html"; printf 'server {\n  root %s;\n}\n' "$T/www/other" > "$T/angie/conf.d/other.conf" ;;
+    esac
+    rc=0; php_fpm_modules_apply 8.5 : || rc=$?
+    if [[ $1 == restore ]]; then
+      PHP_FPM_MODULES=all; rc=0; php_fpm_modules_apply 8.5 : || rc=$?
+    fi
+    printf 'rc=%s %s| %s' "$rc" "$(php_fpm_enabled_modules 8.5 | sort | tr '\n' ' ')" \
+      "$(sort "$T/etc/8.5/fpm/setup-disabled-modules" 2>/dev/null | tr '\n' ' ')"
+  )
+}
+check "php-fpm modules: only the applications' extensions stay loaded; the rest is recorded" \
+  test "$(fm_case trim)" = "rc=0 curl mysqli opcache redis | calendar ffi imagick tokenizer xsl "
+fm_twice() {
+  fm_case trim >/dev/null
+  (
+    T="$TMP/fm"; PHP_FPM_ETC=$T/etc PHP_FPM_ANGIE=$T/angie PHP_FPM_MODULES=
+    phpdismod() { :; }
+    angie_vhost_root() { sed -n 's/^[[:space:]]*root[[:space:]]*\(.*\);/\1/p' "$1"; }
+    rc=0; php_fpm_modules_apply 8.5 : || rc=$?
+    printf 'rc=%s' "$rc"
+  )
+}
+check "php-fpm modules: a second run changes nothing (no reload)" test "$(fm_twice)" = "rc=1"
+check "php-fpm modules: another PHP application on the host keeps every extension" \
+  test "$(fm_case foreign)" = "rc=1 calendar curl ffi imagick mysqli opcache redis tokenizer xsl | "
+check "php-fpm modules: a static site does not count as another PHP application" \
+  test "$(fm_case static)" = "rc=0 curl mysqli opcache redis | calendar ffi imagick tokenizer xsl "
+check "php-fpm modules: PHP_FPM_MODULES=all re-enables exactly what setup.sh disabled" \
+  test "$(fm_case restore)" = "rc=0 calendar curl ffi imagick mysqli opcache redis tokenizer xsl | "
+check "--optimize keeps the persisted PHP_FPM_MODULES choice" \
+  bash -c 'printf "%s\n" "$@" | grep -qx PHP_FPM_MODULES' _ "${RESET_KEEP_PINS[@]}"
+check "install_php and optimize_php_services both apply the module policy (parity)" \
+  bash -c 'sed -n "/^install_php()/,/^}/p" "$1" | grep -q "php_fpm_modules_apply" && sed -n "/^optimize_php_services()/,/^}/p" "$1" | grep -q "php_fpm_modules_apply"' _ "$ALL_SRC"
+check "the lean build's module list matches the shared-extension policy plus the built-in core" \
+  bash -c 'for m in $(sed -n "/^PHP_FPM_APP_MODS=(/,/)/p" "$1/lib/php-build.sh" | tr -d "()" | sed "s/PHP_FPM_APP_MODS=//"); do
+             case $m in opcache) m="Zend OPcache" ;; simplexml) m=SimpleXML ;; pdo) m=PDO ;; esac
+             sed -n "/^APP_MODULES=(/,/)/p" "$1/tools/php-fpm-build.sh" | grep -qF -- "$m" || { echo "missing $m"; exit 1; }
+           done' _ "$ROOT"
+unset -f fm_case fm_twice lean_set_ok
 
 printf '\nTOTAL pass=%d fail=%d skip=%d\n' "$PASS" "$FAIL" "$SKIP"
 [[ $FAIL -eq 0 ]]

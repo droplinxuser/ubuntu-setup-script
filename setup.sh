@@ -36,7 +36,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.21.67"
+readonly SCRIPT_VERSION="1.21.68"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -113,6 +113,26 @@ if [[ -n ${SETUP_PHP_PAGE_GZIP+x} ]]; then
   PHP_PAGE_GZIP_PERSIST=1
 fi
 [[ $PHP_PAGE_GZIP == 0 ]] || PHP_PAGE_GZIP=1
+# Compiled php-fpm (opt-in).  SETUP_PHP_BUILD=clang rebuilds the package's PHP
+# version with clang (Sury's extensions kept); =lean builds a XenForo-only
+# php-fpm from upstream sources (php-build.conf).  Both get BOLT from live
+# traffic on --optimize; =package goes back.  Persisted as PHP_BUILD.  See lib/php-build.sh and
+# tools/php-fpm-build.sh.
+PHP_BUILD="${PHP_BUILD:-}"
+PHP_BUILD_PERSIST=0
+if [[ -n ${SETUP_PHP_BUILD+x} ]]; then
+  PHP_BUILD=$SETUP_PHP_BUILD
+  PHP_BUILD_PERSIST=1
+fi
+# php-fpm loads only the extensions WordPress, XenForo and Chevereto need
+# (lib/php-build.sh); SETUP_PHP_FPM_MODULES=all keeps every installed one.
+# Persisted as PHP_FPM_MODULES.
+PHP_FPM_MODULES="${PHP_FPM_MODULES:-}"
+PHP_FPM_MODULES_PERSIST=0
+if [[ -n ${SETUP_PHP_FPM_MODULES+x} ]]; then
+  PHP_FPM_MODULES=$SETUP_PHP_FPM_MODULES
+  PHP_FPM_MODULES_PERSIST=1
+fi
 [[ $PRECOMPRESS_ASSETS == 0 ]] || PRECOMPRESS_ASSETS=1
 # XenForo job runner.  XenForo runs its job queue (cron tasks, search
 # indexing, XFMG video transcoding) inside member page requests by default
@@ -305,6 +325,9 @@ source "${SCRIPT_DIR}/lib/payloads.sh"
 
 # shellcheck source=lib/php-upgrade.sh
 source "${SCRIPT_DIR}/lib/php-upgrade.sh"
+
+# shellcheck source=lib/php-build.sh
+source "${SCRIPT_DIR}/lib/php-build.sh"
 
 
 # Tests source this file with SETUP_TEST_SOURCE_ONLY=1 to exercise the pure

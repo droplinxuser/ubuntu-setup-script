@@ -314,7 +314,10 @@ effective_cpus() {
     period=$(< /sys/fs/cgroup/cpu/cpu.cfs_period_us)
     cpus=$(cgroup_quota_cpus "$quota" "$period")
   fi
-  n=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+  # nproc honours OMP_NUM_THREADS/OMP_THREAD_LIMIT: a root shell exporting
+  # them would size the whole host for that many CPUs.  Unsetting them keeps
+  # the affinity mask, which getconf would ignore.
+  n=$(unset OMP_NUM_THREADS OMP_THREAD_LIMIT; nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
   [[ $n =~ ^[0-9]+$ ]] && (( n > 0 )) || n=1
   if (( cpus >= 1 && cpus < n )); then
     n=$cpus
@@ -503,6 +506,9 @@ php_installed_version() {
 
 validate_all() {
   local svc
+
+  # SETUP_PHP_BUILD / PHP_BUILD (lib/php-build.sh): clang or package.
+  php_build_validate
 
   # mitigations=on|off (--basic, --optimize or SETUP_CPU_MITIGATIONS).
   if (( ${CPU_MITIGATIONS_LOOSE:-0} )) && (( ! OPTIMIZE )) && (( ${ENABLED[basic]:-0} != 1 )); then

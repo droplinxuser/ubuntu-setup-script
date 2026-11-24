@@ -8,6 +8,61 @@ Reports of the 1.21.33-1.21.61 cycles that measured the removed Anubis
 filter were deleted from the tree on 2026-11-23 for the same reason;
 `git show <commit>:<path>` recovers them.
 
+## 1.21.68 (2026-11-24)
+
+- **Three php-fpm builds, chosen with `SETUP_PHP_BUILD`** (primary focus).
+  `package` (the default) is Sury's binary.  `clang` rebuilds the package's
+  own PHP version and compiled-in core with clang from apt.llvm.org,
+  `-O3 -march=native`, ThinLTO and BOLT, and Sury's shared extensions load
+  unchanged.  `lean` compiles everything from upstream (the newest PHP,
+  redis/igbinary and OpenSSL, PCRE2, zlib, libxml2, libsodium, GMP, curl,
+  ICU, libjpeg-turbo, libpng, libwebp, libzip), links it statically and
+  contains only the modules the three applications use.  Versions live in
+  `php-build.conf` beside `setup.sh` (`latest` or a pin).  A daily timer
+  rebuilds when upstream publishes a newer release, and the APT hook falls
+  back to the package binary the moment the package changes.  Fresh install
+  with WordPress, XenForo and Chevereto, 5 rotated rounds at 3.6 GHz, vs the
+  package: XenForo member thread/home `clang` +5.8 % / +6.0 %, `lean`
+  +4.5 % / +5.0 %; Chevereto uncached home +8.1 % / +9.0 %; WordPress member
+  home `clang` −5.0 % (spread 131-144), `lean` +2.2 %; cached pages
+  unchanged.  All three pass the functional, security and cookie suites
+  with all three applications.  Previous compiler verdicts (1.21.64-66)
+  built GCC without its global registers and never tried BOLT; with BOLT the
+  earlier 20k-user forum measured +10 % on member pages.
+- **php-fpm loads only what WordPress, XenForo and Chevereto need.**  The
+  install and `--optimize` disable calendar, ffi, ftp, gettext, phar, posix,
+  readline, shmop, sockets, sysv*, tokenizer, xsl and imagick for php-fpm
+  only (`phpdismod -s fpm`; the CLI keeps them).  A host with another PHP
+  application keeps everything and the report names the site;
+  `SETUP_PHP_FPM_MODULES=all` turns it off.  Both re-enable exactly what was
+  disabled.
+- **Chevereto images go through GD; imagick is no longer installed.**
+  Chevereto picks imagick only when it is loaded, and its integrity check
+  accepts GD (PNG, GIF, JPEG, BMP, WEBP); uploads pass on all three builds.
+- **phpinfo is no longer in `disable_functions`**: XenForo's "PHP info" and
+  WordPress Site Health need it behind their admin logins.
+- **`--upgrade-php` keeps operator settings in `www.conf`** (`env[...]`,
+  `php_admin_value`, ...): the old pool is migrated with the version
+  rewritten, and the template comes back if `php-fpm -t` rejects the result.
+  Its optimize step no longer runs with `set -e` suspended.
+- **`--mariadb` on a host that already has PHP** warns that the PHP-FPM pool
+  stays sized for no local database until the next `--optimize` or `--php`.
+- **MariaDB:** `innodb_buffer_pool_size_max`, `innodb_open_files`,
+  `innodb_log_buffer_size` and `aria_pagecache_buffer_size` no longer force a
+  restart; they apply at the next one.
+- **Valkey:** `maxmemory 2g`/`512m` are decimal and `2gb`/`512mb` binary, as
+  Valkey reads them (both were read as binary).
+- **CPU count:** `OMP_NUM_THREADS`/`OMP_THREAD_LIMIT` in the environment no
+  longer shrink the worker sizing (`nproc` honours them).
+- **Test host restore** never purges kernel packages: purging the kernel
+  that unattended-upgrades added mid-run took the `linux-generic`
+  metapackages with it.
+- Pair: `server-configs-nginx` 1.6.59 (encoded XenForo style/language
+  cookies bypass the guest cache, plugin/theme `vendor`/`node_modules` PHP is
+  refused, WooCommerce/EDD private uploads are internal, upstream
+  `X-Forwarded-For` only from trusted forwarders).  Report:
+  `tests/stress-site/AUDIT-20261124-1.21.68.md`.
+
 ## 1.21.67 (2026-11-24)
 
 - **XenForo server shootout: Angie stays.**  Angie + Sury PHP-FPM with
