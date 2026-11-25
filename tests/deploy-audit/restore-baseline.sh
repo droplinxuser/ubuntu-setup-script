@@ -48,7 +48,7 @@ ADDED=$(printf '%s\n' "$ADDED" | grep -vxFf <(printf '%s\n' "$BASE_NAMES") || tr
 KERNEL_RE='^linux-(image|modules|modules-extra|main-modules|headers|generic|image-generic|headers-generic)(-|$)'
 ADDED=$(printf '%s\n' "$ADDED" | grep -vE "$KERNEL_RE" || true)
 echo "added packages: $(printf '%s\n' "$ADDED" | sed '/^$/d' | wc -l)"
-for unit in angie anubis mariadb valkey-server elasticsearch 'php*-fpm' sysstat smartmontools; do
+for unit in nginx anubis mariadb valkey-server elasticsearch 'php*-fpm' sysstat smartmontools; do
   systemctl stop "$unit" >/dev/null 2>&1 || true
 done
 if [[ -n $ADDED ]]; then
@@ -67,17 +67,17 @@ for _ in 1 2 3 4 5; do
 done
 
 echo "== repositories and keys"
-rm -f /etc/apt/sources.list.d/angie.list /etc/apt/sources.list.d/angie.sources \
+rm -f /etc/apt/sources.list.d/nginx.list /etc/apt/sources.list.d/nginx.sources \
       /etc/apt/sources.list.d/elastic-*.list /etc/apt/sources.list.d/elastic-*.sources \
       /etc/apt/sources.list.d/nodesource.sources /etc/apt/sources.list.d/nodesource.list \
       /etc/apt/sources.list.d/php.list /etc/apt/sources.list.d/php.sources \
       /etc/apt/sources.list.d/mariadb.list /etc/apt/sources.list.d/mariadb.sources \
       /etc/apt/sources.list.d/valkey.list \
       /etc/apt/sources.list.d/lst_debian_repo.list
-rm -f /usr/share/keyrings/angie-signing.gpg /usr/share/keyrings/elasticsearch-keyring.gpg \
+rm -f /usr/share/keyrings/nginx-signing.gpg /usr/share/keyrings/elasticsearch-keyring.gpg \
       /usr/share/keyrings/nodesource.gpg /usr/share/keyrings/debsuryorg-archive-keyring.gpg \
-      /usr/share/keyrings/deb.sury.org-*.gpg /etc/apt/keyrings/angie* /etc/apt/keyrings/elastic* \
-      /etc/apt/keyrings/nodesource* /etc/apt/preferences.d/angie* /etc/apt/preferences.d/php* \
+      /usr/share/keyrings/deb.sury.org-*.gpg /etc/apt/keyrings/nginx* /etc/apt/keyrings/elastic* \
+      /etc/apt/keyrings/nodesource* /etc/apt/preferences.d/nginx* /etc/apt/preferences.d/php* \
       /etc/apt/preferences.d/nodejs* /etc/apt/preferences.d/nodesource* \
       /usr/share/keyrings/lst-debian.gpg
 apt-get update > "$WORK/apt-update.log" 2>&1 || true
@@ -88,7 +88,7 @@ echo "== service trees, data and state"
 # and configuration are outside the package delta.
 systemctl disable anubis >/dev/null 2>&1 || true
 rm -f /etc/systemd/system/anubis.service /usr/local/bin/anubis \
-      /etc/tmpfiles.d/angie-anubis.conf
+      /etc/tmpfiles.d/nginx-anubis.conf
 rm -rf /etc/anubis /run/anubis /var/lib/anubis /var/cache/anubis
 id anubis >/dev/null 2>&1 && userdel anubis >/dev/null 2>&1 || true
 # Benchmark-only trees: OpenLiteSpeed (bench-php-matrix/install-ols.sh) and the
@@ -110,12 +110,12 @@ rm -f /etc/systemd/system/setup-php-fpm-build@.service /etc/systemd/system/setup
       /etc/systemd/system/php*-fpm.service.d/zz-setup-build.conf /etc/apt/apt.conf.d/99setup-php-fpm-build \
       /etc/apt/sources.list.d/setup-llvm.sources /etc/apt/preferences.d/setup-llvm.pref /etc/apt/keyrings/setup-llvm.asc
 rm -rf /usr/local/lib/setup-php /var/cache/setup-php-build /run/setup-php-build /opt/setup-llvm
-# ANGIE_BUILD=clang (1.21.70) and the Angie A/B arms.
-systemctl disable --now setup-angie-build-refresh.timer >/dev/null 2>&1 || true
-rm -f /etc/systemd/system/setup-angie-build.service /etc/systemd/system/setup-angie-build-refresh.* \
-      /etc/systemd/system/angie.service.d/zz-setup-build.conf /etc/apt/apt.conf.d/99setup-angie-build \
-      /run/systemd/system/angie.service.d/zz-bench-angie.conf /etc/angie/angie-bench-src.conf
-rm -rf /usr/local/lib/setup-angie /var/cache/setup-angie-build /opt/angie-*
+# NGINX_BUILD=clang (1.21.70) and the nginx A/B arms.
+systemctl disable --now setup-nginx-build-refresh.timer >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/setup-nginx-build.service /etc/systemd/system/setup-nginx-build-refresh.* \
+      /etc/systemd/system/nginx.service.d/zz-setup-build.conf /etc/apt/apt.conf.d/99setup-nginx-build \
+      /run/systemd/system/nginx.service.d/zz-bench-nginx.conf /etc/nginx/nginx-bench-src.conf
+rm -rf /usr/local/lib/setup-nginx /var/cache/setup-nginx-build /opt/nginx-*
 # VALKEY_BUILD=clang (1.21.71), the Valkey/nginx/Elasticsearch A/B arms and
 # their sources.
 systemctl disable --now setup-valkey-build-refresh.timer >/dev/null 2>&1 || true
@@ -125,17 +125,17 @@ rm -f /etc/systemd/system/setup-valkey-build.service /etc/systemd/system/setup-v
       /run/systemd/system/elasticsearch.service.d/zz-lean.conf
 rm -rf /usr/local/lib/setup-valkey /var/cache/setup-valkey-build /opt/valkey-* /opt/nginx-* /opt/es-lean \
        /etc/elasticsearch-lean /var/lib/es-lean /var/tmp/es-exp \
-       /etc/angie-ng \
-       /root/vk-proto /root/ng-proto /root/angie-proto /root/es-dl /root/ng-test.conf
+       /etc/nginx-ng \
+       /root/vk-proto /root/ng-proto /root/nginx-proto /root/es-dl /root/ng-test.conf
 id lsadm >/dev/null 2>&1 && userdel lsadm >/dev/null 2>&1 || true
-rm -rf /var/www /etc/angie /etc/php /etc/mysql /etc/valkey /etc/redis /etc/elasticsearch \
+rm -rf /var/www /etc/nginx /etc/php /etc/mysql /etc/valkey /etc/redis /etc/elasticsearch \
        /var/lib/setup.sh /var/lib/mysql /var/lib/mariadb /var/lib/valkey /var/lib/redis /var/lib/elasticsearch \
-       /var/lib/php /var/cache/php /var/cache/angie /var/log/angie /var/log/mysql /var/log/valkey \
+       /var/lib/php /var/cache/php /var/cache/nginx /var/log/nginx /var/log/mysql /var/log/valkey \
        /var/log/elasticsearch /var/log/php* /var/log/setup-*.md /var/log/sysstat \
        /home/nginx_cache /home/nginx_cache_chev /home/proxy_cache /home/proxy_cdn /home/xf_proxy_cache \
        /run/php /usr/share/elasticsearch /opt/stress-node /var/lib/stress-site \
        /etc/stress-site-config.json /etc/systemd/system/stress-node.service
-rm -rf /etc/systemd/system/angie.service.d /etc/systemd/system/mariadb.service.d \
+rm -rf /etc/systemd/system/nginx.service.d /etc/systemd/system/mariadb.service.d \
        /etc/systemd/system/valkey-server.service.d /etc/systemd/system/elasticsearch.service.d \
        /etc/systemd/system/php*-fpm.service.d /etc/systemd/system/setup-cpu-governor.service \
        /etc/systemd/system/multi-user.target.wants/setup-cpu-governor.service \
@@ -148,9 +148,9 @@ rm -f /usr/local/bin/wp /usr/local/bin/mysqlbkup.sh /usr/local/bin/setup-*.sh \
       /etc/apparmor.d/local/usr.sbin.mariadbd /etc/udev/rules.d/*setup*.rules \
       /etc/tmpfiles.d/setup-*.conf /etc/cron.d/setup-*
 rm -f /etc/mysqlbkup.cnf /etc/mysqlbkup.config
-# Written by the angie package's maintainer script (needrestart override),
+# Written by the nginx package's maintainer script (needrestart override),
 # not owned by the package, so a purge leaves it.
-rm -f /etc/needrestart/conf.d/angie.conf
+rm -f /etc/needrestart/conf.d/nginx.conf
 rm -rf /root/mysqltuner.pl /root/tools/mysqlbackup-master
 rmdir /root/tools 2>/dev/null || true
 # Audit-only leftovers: perf(1) symbol cache and the load generator the
@@ -161,7 +161,7 @@ rm -rf /root/.debug /usr/local/bin/oha /usr/local/bin/wrk
 for h in /root /home/*; do rmdir "$h/.config/procps" "$h/.config" 2>/dev/null || true; done
 rm -rf /var/lib/mysql-files
 rm -rf /tmp/php-config.* /tmp/php-install.* /tmp/hsperfdata_root /tmp/node-compile-cache
-find /tmp -maxdepth 1 \( -name 'sess_*' -o -name 'setup-optimize*' -o -name 'angie-*' -o -name 'php-upgrade*' \) \
+find /tmp -maxdepth 1 \( -name 'sess_*' -o -name 'setup-optimize*' -o -name 'nginx-*' -o -name 'php-upgrade*' \) \
   -exec rm -rf {} + 2>/dev/null || true
 sed -i '/# audit$/d' /etc/hosts
 # `--basic swap=` creates /swapfile and `--purge` keeps it on purpose (turning
@@ -196,10 +196,10 @@ if command -v ufw >/dev/null 2>&1; then
 fi
 
 echo "== accounts created by the removed packages"
-for u in angie elasticsearch valkey redis mysql; do
+for u in nginx elasticsearch valkey redis mysql; do
   id "$u" >/dev/null 2>&1 && userdel "$u" >/dev/null 2>&1 || true
 done
-for g in angie elasticsearch valkey redis mysql; do
+for g in nginx elasticsearch valkey redis mysql; do
   getent group "$g" >/dev/null 2>&1 && groupdel "$g" >/dev/null 2>&1 || true
 done
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Security probes for the three audit vhosts.  Every check names the rule it
-# exercises and the code it must answer, so a regression in the Angie
+# exercises and the code it must answer, so a regression in the nginx
 # configuration (a deny rule that no longer wins against the PHP location, a
 # cache key that accepts a forged header, an internal directory that becomes
 # reachable) fails the run instead of quietly shipping.
@@ -18,7 +18,7 @@ ok()  { P=$((P+1)); printf 'PASS  %s\n' "$1"; }
 bad() { F=$((F+1)); printf 'FAIL  %s   [%s]\n' "$1" "$2"; }
 # probe NAME HOST PATH EXPECTED_CODES...
 # PROBE_IP can override the address that is connected to, which changes the
-# source address Angie sees (used for the loopback-only wp-cron rule).
+# source address nginx sees (used for the loopback-only wp-cron rule).
 probe() {
   local name=$1 host=$2 path=$3; shift 3
   local code ip=${PROBE_IP:-$IP}
@@ -58,7 +58,7 @@ probe "wp cache directory is not PHP"     "$WP" /wp-content/cache/audit.php 403 
 # missing file; the old tree reached try_files (404) and ran existing files.
 probe "wp plugin vendor/ PHP is denied"  "$WP" /wp-content/plugins/audit/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php 403
 probe "wp theme node_modules/ PHP is denied" "$WP" /wp-content/themes/audit/node_modules/x/index.php 403
-# WooCommerce/EDD paid files rely on an Apache .htaccess Angie never reads;
+# WooCommerce/EDD paid files rely on an Apache .htaccess nginx never reads;
 # they must be internal-only.  Needs a fixture (a missing file is 404 anyway).
 WPROOT=/var/www/$WP/public
 if [[ -w $WPROOT/wp-content/uploads ]]; then

@@ -5,7 +5,7 @@
 # ---------------------------------------------------------------------------
 # --optimize touches only service configuration, so it is safe on every LTS
 # that still supports the installed packages.  Ubuntu 22.04 shares the same
-# Angie/PHP/MariaDB/Valkey service layout and is supported until 2027.
+# nginx/PHP/MariaDB/Valkey service layout and is supported until 2027.
 optimize_os_supported() {
   case "${1%%.*}" in
     22|24|26) return 0 ;;
@@ -23,13 +23,13 @@ validate_timezone() {
 # Such a host has every vhost listening on a Unix socket and a generated TLS
 # terminator in front of it; this release neither generates nor manages those
 # files, so a run must stop before it changes anything.  A hand-installed
-# Anubis that never touched the Angie tree is not detected (and needs no
+# Anubis that never touched the nginx tree is not detected (and needs no
 # migration).
 anubis_host_present() {
   local f
-  for f in /etc/angie/conf.d/00-anubis-terminators.conf \
-           /etc/angie/conf.d/00-anubis-common.conf \
-           /etc/angie/snippets/anubis-location.conf \
+  for f in /etc/nginx/conf.d/00-anubis-terminators.conf \
+           /etc/nginx/conf.d/00-anubis-common.conf \
+           /etc/nginx/snippets/anubis-location.conf \
            /etc/systemd/system/anubis.service \
            "${STATE_DIR:-/var/lib/setup.sh}/anubis/enabled"; do
     [[ -e $f ]] && return 0
@@ -288,7 +288,7 @@ detect_ram_gb() {
 
 # CPUs available to this host, honouring a cgroup quota.  nproc reports the
 # host's logical CPUs inside a container or a vCPU-capped cloud guest, which
-# would otherwise size 144 PHP workers and 16 Angie/MariaDB threads for a
+# would otherwise size 144 PHP workers and 16 nginx/MariaDB threads for a
 # 2-vCPU quota.
 # CPUs granted by a cgroup CPU quota: ceil(quota / period), 0 when there is no
 # numeric quota ("max").  A fractional quota (cpu.max "50000 100000") rounds
@@ -359,7 +359,7 @@ is_nvme_storage() {
   return 1
 }
 
-# Storage class shared by the MariaDB I/O-capacity and Angie cache tuners so
+# Storage class shared by the MariaDB I/O-capacity and nginx cache tuners so
 # install and --optimize classify the same disk the same way.
 #
 # Classify the device that actually backs the data path, not merely any block
@@ -486,7 +486,7 @@ mariadb_reserved_db() {
 }
 
 # The PHP-FPM version an existing host serves from: the pool that owns the
-# socket Angie uses when that version is a real installed package, otherwise
+# socket nginx uses when that version is a real installed package, otherwise
 # the newest installed one.  Prints nothing on a host without PHP-FPM (and on
 # a machine without dpkg, where a dry run is only a syntax check).
 php_installed_version() {
@@ -509,7 +509,7 @@ validate_all() {
 
   # SETUP_PHP_BUILD / PHP_BUILD (lib/php-build.sh): clang or package.
   php_build_validate
-  angie_build_validate
+  nginx_build_validate
   valkey_build_validate
 
   # The generic GET/POST limits SETUP_LIMIT_REQ_EXEMPT exempted from are gone
@@ -545,10 +545,10 @@ validate_all() {
   # its vhosts listen on a Unix socket behind a terminator only the old
   # release generates.  Stop before changing anything and point at the
   # one-shot teardown tool.  Purging is not one of those runs: --purge must
-  # still be able to remove Angie from such a host (the tool is the supported
+  # still be able to remove nginx from such a host (the tool is the supported
   # path, but a purge that refuses is a trap).
   if (( ! PURGE && ! DIAGNOSTICS )) && anubis_host_present; then
-    die "this host still runs the Anubis bot filter, which was removed in 1.21.62. Run 'sudo bash tools/remove-anubis.sh' first (it restores every vhost to direct TLS and removes the generated Angie files), then re-run setup.sh."
+    die "this host still runs the Anubis bot filter, which was removed in 1.21.62. Run 'sudo bash tools/remove-anubis.sh' first (it restores every vhost to direct TLS and removes the generated nginx files), then re-run setup.sh."
   fi
 
   # --upgrade-php is a standalone mode like --optimize: it works on an
@@ -612,7 +612,7 @@ validate_all() {
 
   for svc in "${!ENABLED[@]}"; do
     case "$svc" in
-      basic|angie|php|mariadb|valkey|elastic|others|domain) ;;
+      basic|nginx|php|mariadb|valkey|elastic|others|domain) ;;
       *) die "Internal error: bad service '${svc}'" ;;
     esac
   done
@@ -624,7 +624,7 @@ validate_all() {
     local t
     for t in "${PURGE_TARGETS[@]}"; do
       case "$t" in
-        all|basic|angie|php|mariadb|valkey|elastic|others) ;;
+        all|basic|nginx|php|mariadb|valkey|elastic|others) ;;
         *) die "--purge: unknown target '${t}'" ;;
       esac
     done
@@ -643,7 +643,7 @@ validate_all() {
       die "--basic is required (see --help)"
     fi
     local s other=0
-    for s in angie php mariadb valkey elastic others; do
+    for s in nginx php mariadb valkey elastic others; do
       [[ ${ENABLED[$s]:-0} -eq 1 ]] && other=1
     done
     (( other == 0 )) || die "--basic is required when installing services other than --domain"

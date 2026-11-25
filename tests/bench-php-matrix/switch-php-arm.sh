@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Put exactly one PHP arm in front of Angie's shared FastCGI socket
+# Put exactly one PHP arm in front of nginx's shared FastCGI socket
 # (/run/php/php-fpm.sock) and prove it is serving.
 #
 # Usage: switch-php-arm.sh sury|ubuntu|src-TAG|ols-lsphp|ols-src-TAG
@@ -11,10 +11,10 @@
 # the distribution's conf.d minus redis/imagick, with the arm's own builds
 # added from its ext/ directory (the unit sets PHP_INI_SCAN_DIR).
 #
-# "ols-lsphp" and "ols-src-TAG" stop Angie and every FPM pool and serve the
+# "ols-lsphp" and "ols-src-TAG" stop nginx and every FPM pool and serve the
 # XenForo vhost from OpenLiteSpeed (install-ols.sh) with LiteSpeed's lsphp85
 # or the source arm's lsphp (LSAPI) and LSCache.  Every other arm stops
-# OpenLiteSpeed and makes sure Angie is running.
+# OpenLiteSpeed and makes sure nginx is running.
 set -Eeuo pipefail
 export LC_ALL=C
 
@@ -50,7 +50,7 @@ stop_all() {
 }
 
 # LSAPI children outlive lshttpd for a few seconds after a stop and keep
-# burning CPU: an Angie arm measured right after an OpenLiteSpeed arm lost
+# burning CPU: an nginx arm measured right after an OpenLiteSpeed arm lost
 # ~10 % (199 vs 222 req/s) with lsphp still in its CPU samples.  Wait until
 # every lsphp has exited (SIGKILL after 10 s).
 stop_lsphp() {
@@ -180,7 +180,7 @@ stop_all
 # The drop-in above was written or removed: let systemd see it before start.
 systemctl daemon-reload
 if [[ $ARM == ols-* ]]; then
-  systemctl stop angie >/dev/null 2>&1 || true
+  systemctl stop nginx >/dev/null 2>&1 || true
   systemctl stop lshttpd >/dev/null 2>&1 || true
   stop_lsphp
   sed -i -E "s#^([[:space:]]*add[[:space:]]+lsapi:)[^[:space:]]+([[:space:]]+php)#\1$HANDLER\2#" "$OLS_CONF"
@@ -194,7 +194,7 @@ else
     systemctl stop lshttpd
   fi
   stop_lsphp
-  systemctl is-active --quiet angie || systemctl start angie
+  systemctl is-active --quiet nginx || systemctl start nginx
   systemctl reset-failed "$UNIT" >/dev/null 2>&1 || true
   systemctl start "$UNIT"
   PROBE_URL=https://wp.test.local/

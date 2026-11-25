@@ -25,7 +25,7 @@ ARMS=("$@")
 (( ${#ARMS[@]} >= 2 )) || { echo "need at least two arms" >&2; exit 1; }
 
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-# SWITCH=switch-angie-arm.sh A/Bs Angie builds with the same rotation (1.21.70).
+# SWITCH=switch-nginx-arm.sh A/Bs nginx builds with the same rotation (1.21.70).
 SWITCH=${SWITCH:-$HERE/switch-php-arm.sh}
 TIERS=$(cd -- "$HERE/../stress-site" && pwd)/loopback-tiers.sh
 COOKIES=/root/audit/cookies/cookies.tsv

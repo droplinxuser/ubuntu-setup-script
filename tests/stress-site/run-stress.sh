@@ -74,7 +74,7 @@ ES_BEFORE=$(curl -fsS 'http://127.0.0.1:9200/_nodes/stats/jvm,indices?filter_pat
   echo
   echo "- Generated: $(date -Is)"
   echo "- Host: $(hostname), $(nproc) vCPU, $(awk '/^MemTotal:/{printf "%.1f GiB", $2/1024/1024}' /proc/meminfo) RAM"
-  echo "- Angie: $(/usr/sbin/angie -v 2>&1 | head -1)"
+  echo "- nginx: $(/usr/sbin/nginx -v 2>&1 | head -1)"
   if command -v php >/dev/null 2>&1; then
     echo "- PHP: $(php -v | head -1)"
   else
@@ -133,7 +133,7 @@ ES_AFTER=$(curl -fsS 'http://127.0.0.1:9200/_nodes/stats/jvm,indices?filter_path
   echo "  on every request). It is limited by PHP worker occupancy and CPU."
   echo "- Client socket timeouts under the slow-1s scenario mean the PHP-FPM"
   echo "  listen queue is full; add workers or cache the endpoint."
-  echo "- Check /var/www/logs/angie/${DOMAIN}.error.log and"
+  echo "- Check /var/www/logs/nginx/${DOMAIN}.error.log and"
   echo "  /var/www/logs/php/php-fpm-slow.log for server-side warnings."
 } >>"$REPORT"
 

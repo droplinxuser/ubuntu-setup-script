@@ -80,7 +80,7 @@ run fail
 run ok   --dry-run --basic
 run ok   --dry-run --basic server=dedi
 run ok   --dry-run --basic server=vps host=test.example.com swap=4G time=UTC
-run ok   --dry-run --basic --angie
+run ok   --dry-run --basic --nginx
 run ok   --dry-run --basic --php
 # --php is a first installation: on a host that already runs PHP-FPM only the
 # installed version is accepted (--upgrade-php changes it), so the explicit
@@ -112,7 +112,7 @@ run fail --dry-run --basic --others fail2ban
 run fail --dry-run --basic --others unattended
 run fail --dry-run --basic --others composer
 run fail --dry-run --basic --others security
-run ok   --dry-run --basic --angie --php --mariadb user=u pass=p size=auto \
+run ok   --dry-run --basic --nginx --php --mariadb user=u pass=p size=auto \
   --valkey --elastic ram=2g --others all
 
 # Domain app parsing, including trailing group defaults and mixed apps.
@@ -165,17 +165,17 @@ run fail --dry-run --restart-all --purge
 run fail --dry-run --restart-all --optimize
 run fail --dry-run --restart-all --diagnostics
 run fail --dry-run --restart-all --domain example.com
-run fail --dry-run --restart-all --angie
+run fail --dry-run --restart-all --nginx
 run fail --dry-run --optimize --basic
-run fail --dry-run --optimize --angie
+run fail --dry-run --optimize --nginx
 run fail --dry-run --optimize --purge
 run fail --dry-run --optimize --domain example.com
 
 # Purge modes and bare names.
 run ok   --dry-run --purge
 run ok   --dry-run --purge all
-run ok   --dry-run --purge basic angie php mariadb valkey elastic others
-run ok   --dry-run --purge --angie --php
+run ok   --dry-run --purge basic nginx php mariadb valkey elastic others
+run ok   --dry-run --purge --nginx --php
 run ok   --dry-run --purge --php ver=8.4
 run ok   --dry-run --purge php mariadb
 
@@ -228,9 +228,9 @@ run fail --dry-run --domain db=early example.com
 run fail --dry-run --basic --harden-ssh
 run fail --dry-run --optimize --cloudflare-only
 run fail --dry-run --domain example.com --purge
-run fail --dry-run --angie
+run fail --dry-run --nginx
 run fail --dry-run --bogus
-run fail --dry-run --sync-angie
+run fail --dry-run --sync-nginx
 
 # --check is an alias for --dry-run; -h is an alias for --help.
 run ok   --check --basic
@@ -288,8 +288,8 @@ run ok   --dry-run --domain example.com example.com
 
 # --domain may be combined with a full install, but any service other than
 # --domain needs --basic, and --diagnostics is read-only.
-run ok   --dry-run --basic --angie --domain x.example.com
-run fail --dry-run --domain x.example.com --angie
+run ok   --dry-run --basic --nginx --domain x.example.com
+run fail --dry-run --domain x.example.com --nginx
 run fail --dry-run --diagnostics --domain x.example.com
 
 # --purge targets: unknown names and malformed --php ver= fail; flag and
@@ -384,9 +384,9 @@ run_env ok SETUP_QDISC=fq_codel --dry-run --optimize
 run_env ok SETUP_LIMIT_REQ_EXEMPT=10.0.0.5 --dry-run --optimize
 # --source (1.21.71): the complete set of compiled components.
 run ok   --dry-run --optimize --source=all
-run ok   --dry-run --optimize --source angie php
+run ok   --dry-run --optimize --source nginx php
 run ok   --dry-run --optimize --source=none
-run ok   --dry-run --basic --angie --php --valkey --source=valkey
+run ok   --dry-run --basic --nginx --php --valkey --source=valkey
 run fail --dry-run --optimize --source=nginx
 run fail --dry-run --optimize --source
 run_env ok SETUP_VALKEY_BUILD=clang --dry-run --optimize
@@ -394,18 +394,18 @@ run_env fail SETUP_VALKEY_BUILD=gcc --dry-run --optimize
 run_env ok SETUP_PRECOMPRESS_ASSETS=1 --dry-run --optimize
 # An invalid SETUP_NODE_MAJOR falls back to the default major, never fails.
 run_env ok SETUP_NODE_MAJOR=bogus --dry-run --basic --others nodejs
-# SETUP_ANGIE_COMPRESSION only tests for 0; any other value keeps Brotli on.
-run_env ok SETUP_ANGIE_COMPRESSION=gzip --dry-run --basic --angie
+# SETUP_NGINX_COMPRESSION only tests for 0; any other value keeps Brotli on.
+run_env ok SETUP_NGINX_COMPRESSION=gzip --dry-run --basic --nginx
 run_env ok SETUP_WP_DB_SPLIT=0 --dry-run --domain a.example.com app=wordpress
 run_env ok SETUP_PURGE_MALWARE=0 --dry-run --optimize
 # A dry run exits before fetch_server_configs, so CONFIG_SOURCE_DIR is not
 # checked and a missing directory does not fail.
-run_env ok CONFIG_SOURCE_DIR=/nonexistent --dry-run --basic --angie
+run_env ok CONFIG_SOURCE_DIR=/nonexistent --dry-run --basic --nginx
 
 # Anubis support was removed in 1.21.62: every spelling must fail the parse
 # with an explanation, and so must a leftover SETUP_ANUBIS in the environment.
-run fail --dry-run --basic --angie anubis=yes
-run fail --dry-run --basic --angie anubis=no
+run fail --dry-run --basic --nginx anubis=yes
+run fail --dry-run --basic --nginx anubis=no
 run fail --dry-run --optimize anubis=yes
 run fail --dry-run --optimize anubis=no
 # CPU mitigations switch (--basic and --optimize, or SETUP_CPU_MITIGATIONS).
@@ -425,10 +425,10 @@ run_env ok   SETUP_CPU_MITIGATIONS=off --dry-run --optimize
 run_env fail SETUP_CPU_MITIGATIONS=sometimes --dry-run --optimize
 run fail --dry-run --optimize anubis=1
 run fail --dry-run --basic anubis=yes
-run fail --dry-run --basic --angie anubis=maybe
+run fail --dry-run --basic --nginx anubis=maybe
 run fail --dry-run --basic --php anubis=yes
-run_env fail SETUP_ANUBIS=1 --dry-run --basic --angie
-run_env fail SETUP_ANUBIS=bogus --dry-run --basic --angie
+run_env fail SETUP_ANUBIS=1 --dry-run --basic --nginx
+run_env fail SETUP_ANUBIS=bogus --dry-run --basic --nginx
 
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

@@ -286,7 +286,7 @@ retire_paths() {
 }
 
 # Restore a backed-up directory tree over a live path without deleting files
-# that are not in the backup.  Used for install-time rollback of Angie/PHP.
+# that are not in the backup.  Used for install-time rollback of nginx/PHP.
 # Restore the directory snapshot SRC over the live DST: overwrite in place
 # (never unlink the live path first) and move files created after the
 # snapshot to /tmp, so a generated file (a drop-in or ini the failed tune
@@ -321,16 +321,16 @@ restore_tree() {
   return "$rc"
 }
 
-rollback_angie_tree() {
+rollback_nginx_tree() {
   local backup=$1
-  [[ -n $backup && -d "${backup}/angie" ]] || return 0
-  restore_tree "${backup}/angie" /etc/angie \
-    || warn "Could not restore the previous /etc/angie tree"
-  if /usr/sbin/angie -t >/dev/null 2>&1; then
-    systemctl reload angie 2>/dev/null || systemctl restart angie 2>/dev/null || true
-    warn "Rolled back Angie configuration from ${backup}"
+  [[ -n $backup && -d "${backup}/nginx" ]] || return 0
+  restore_tree "${backup}/nginx" /etc/nginx \
+    || warn "Could not restore the previous /etc/nginx tree"
+  if /usr/sbin/nginx -t >/dev/null 2>&1; then
+    systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
+    warn "Rolled back nginx configuration from ${backup}"
   else
-    warn "Angie rollback restored files but angie -t still fails"
+    warn "nginx rollback restored files but nginx -t still fails"
   fi
 }
 

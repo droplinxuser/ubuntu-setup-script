@@ -255,7 +255,7 @@ for u in "$X/whats-new/?enc=$RANDOM" "$W/?enc=$RANDOM" "${C:-https://chev.test.l
 done
 
 echo "################ Control characters in Cookie (1.21.67)"
-# PHP strips \v and \f in front of a cookie name; the allowlist and Angie's
+# PHP strips \v and \f in front of a cookie name; the allowlist and nginx's
 # $cookie_* lookup did not.  "_ga=1;\vxf_language_id=2" rendered language 2
 # under the default key, and "\vsso=..." an unseen login cookie.  Two
 # requests each (min_uses 2): neither may be stored or served from the cache.
@@ -273,7 +273,7 @@ done
 
 echo "################ Encoded XenForo style/language values (1.21.68)"
 # PHP URL-decodes cookie values ("%32" -> "2"; "+2" casts to 2) while the key
-# maps read Angie's raw $cookie_*: such a value used the default key and
+# maps read nginx's raw $cookie_*: such a value used the default key and
 # stored, e.g., a language-2 page for every guest (MISS MISS HIT on 1.6.58).
 u="$X/whats-new/?ev=$RANDOM"
 for ck in 'xf_language_id=%32' 'xf_language_id=+2' 'xf_style_id=%32' 'xf_style_id=2%20' 'xf_style_variation=%61lternate'; do

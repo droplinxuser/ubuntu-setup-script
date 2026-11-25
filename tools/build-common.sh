@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# Shared by tools/php-fpm-build.sh, tools/angie-build.sh (1.21.70) and
+# Shared by tools/php-fpm-build.sh, tools/nginx-build.sh (1.21.70) and
 # tools/valkey-build.sh (1.21.71): messages, the apt.llvm.org/GitHub LLVM
 # toolchain, upstream version lookups, downloads with a second source for
 # every file plus the project's own mirror (setup-build-sources), checksums,
@@ -167,10 +167,10 @@ latest_of() {
       v=$(printf '%s' "$listing" | grep -oE "libiconv-[0-9]+\.[0-9]+(\.[0-9]+)?\.tar\.gz" \
         | sed -E "s/^libiconv-|\.tar\.gz\$//g" | sort -V | tail -n 1) ;;
     zlib-ng)  v=$(git_latest zlib-ng/zlib-ng '^([0-9]+\.[0-9]+\.[0-9]+)$') ;;
-    angie)
-      v=$(http_get https://download.angie.software/files/ | grep -oE "angie-[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz" \
-        | sed -E "s/^angie-|\.tar\.gz\$//g" | sort -V | tail -n 1)
-      [[ -n $v ]] || v=$(git_latest webserver-llc/angie "^Angie-([0-9]+\.[0-9]+\.[0-9]+)\$") ;;
+    nginx)
+      v=$(http_get https://download.angie.software/files/ | grep -oE "nginx-[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz" \
+        | sed -E "s/^nginx-|\.tar\.gz\$//g" | sort -V | tail -n 1)
+      [[ -n $v ]] || v=$(git_latest webserver-llc/angie "^nginx-([0-9]+\.[0-9]+\.[0-9]+)\$") ;;
     brotli)   v=$(git_latest google/brotli "^v([0-9]+\.[0-9]+\.[0-9]+)\$") ;;
     # ngx_brotli publishes no releases: its newest commit on the default branch.
     ngx-brotli) v=$(git ls-remote https://github.com/google/ngx_brotli.git HEAD 2>/dev/null | cut -c1-12) ;;
@@ -394,10 +394,10 @@ fetch_component() { # name version -> path of the source archive
     zlib-ng)
       fetch_first "https://github.com/zlib-ng/zlib-ng/archive/refs/tags/$v.tar.gz|$c/zlib-ng-$v.tar.gz|" \
         "https://codeload.github.com/zlib-ng/zlib-ng/tar.gz/refs/tags/$v|$c/zlib-ng-src-$v.tar.gz|" ;;
-    angie)
+    nginx)
       # download.angie.software, then the GitHub tag snapshot.
-      fetch_first "https://download.angie.software/files/angie-$v.tar.gz|$c/angie-$v.tar.gz|" \
-        "https://codeload.github.com/webserver-llc/angie/tar.gz/refs/tags/Angie-$v|$c/angie-src-$v.tar.gz|" ;;
+      fetch_first "https://download.angie.software/files/nginx-$v.tar.gz|$c/nginx-$v.tar.gz|" \
+        "https://codeload.github.com/webserver-llc/angie/tar.gz/refs/tags/Angie-$v|$c/nginx-src-$v.tar.gz|" ;;
     brotli)
       # GitHub is Brotli's only home: release archive, then codeload.
       fetch_first "https://github.com/google/brotli/archive/refs/tags/v$v.tar.gz|$c/brotli-$v.tar.gz|" \

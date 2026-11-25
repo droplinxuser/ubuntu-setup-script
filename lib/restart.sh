@@ -31,7 +31,7 @@ restart_all_plan() {
   local -a active=() php_units=()
   detect_installed_services
   mapfile -t php_units < <(list_active_php_units)
-  systemctl is-active --quiet angie 2>/dev/null && active+=(angie)
+  systemctl is-active --quiet nginx 2>/dev/null && active+=(nginx)
   systemctl is-active --quiet mariadb 2>/dev/null && active+=(mariadb)
   cache_unit=$(active_cache_unit)
   [[ -n $cache_unit ]] && active+=("$cache_unit")
@@ -42,7 +42,7 @@ restart_all_plan() {
   printf 'Active services:     %s\n' "${active[*]:-none}"
   printf 'Order:\n'
   printf '  daemon-reload\n'
-  printf '  stop angie (if active)\n'
+  printf '  stop nginx (if active)\n'
   printf '  stop active php*-fpm.service\n'
   printf '  restart active Valkey/Redis service\n'
   printf '  restart active Elasticsearch\n'
@@ -50,7 +50,7 @@ restart_all_plan() {
   printf '  restart active MariaDB\n'
   printf '  wait for SELECT 1 (up to 300s)\n'
   printf '  start the PHP-FPM versions that were stopped\n'
-  printf '  start angie if it was stopped\n'
+  printf '  start nginx if it was stopped\n'
   if (( ${#active[@]} == 0 )); then
     printf 'No active supported services detected.\n'
   fi
@@ -58,7 +58,7 @@ restart_all_plan() {
 
 run_restart_all() {
   local unit rc=0
-  local angie_active=0 mariadb_active=0
+  local nginx_active=0 mariadb_active=0
   local elastic_active=0 es_url="" es_ok=0
   local -a php_units=() cache_units=() failures=()
 
@@ -78,7 +78,7 @@ run_restart_all() {
   fi
 
   systemctl daemon-reload || warn "systemctl daemon-reload failed"
-  systemctl is-active --quiet angie 2>/dev/null && angie_active=1
+  systemctl is-active --quiet nginx 2>/dev/null && nginx_active=1
   mapfile -t php_units < <(list_active_php_units)
   unit=$(active_cache_unit)
   [[ -n $unit ]] && cache_units+=("$unit")
@@ -86,18 +86,18 @@ run_restart_all() {
   systemctl is-active --quiet mariadb 2>/dev/null && mariadb_active=1
 
   # Report installed-but-inactive units without starting them.
-  for unit in angie mariadb valkey-server redis-server elasticsearch; do
+  for unit in nginx mariadb valkey-server redis-server elasticsearch; do
     if ! systemctl is-active --quiet "$unit" 2>/dev/null \
        && systemctl cat "$unit" >/dev/null 2>&1; then
       info "Skipping ${unit}: installed but inactive"
     fi
   done
 
-  # 1. Stop the request tiers, Angie first, then all active PHP versions
+  # 1. Stop the request tiers, nginx first, then all active PHP versions
   #    (the same pause the MariaDB tuner uses before its restart).
   opt_pause_web_frontends "the restart"
-  if (( angie_active && OPT_WEB_PAUSED_ANGIE == 0 )); then
-    failures+=("stop angie")
+  if (( nginx_active && OPT_WEB_PAUSED_NGINX == 0 )); then
+    failures+=("stop nginx")
     rc=1
   fi
   if (( ${#OPT_WEB_PAUSED_PHP[@]} < ${#php_units[@]} )); then
@@ -119,7 +119,7 @@ run_restart_all() {
     if systemctl restart elasticsearch 2>/dev/null; then
       info "Restarted elasticsearch"
       # Type=simple returns before the node is ready.  Wait for the HTTP
-      # endpoint before the PHP/Angie tiers are started so the first search
+      # endpoint before the PHP/nginx tiers are started so the first search
       # requests do not hit a recovering cluster.  A remote-bound node can be
       # healthy while the host cannot reach its own public address through
       # firewall/NAT; the listener is enough (rc 2).
@@ -166,10 +166,10 @@ run_restart_all() {
     fi
   fi
 
-  # 4. Start PHP-FPM first, then Angie, regardless of a MariaDB probe failure:
+  # 4. Start PHP-FPM first, then nginx, regardless of a MariaDB probe failure:
   #    restore the services that were active before the restart and report it.
   if ! opt_resume_web_frontends "the restart"; then
-    failures+=("start php-fpm/angie")
+    failures+=("start php-fpm/nginx")
     rc=1
   fi
 
@@ -298,7 +298,7 @@ repair_log_ownership() {
       rc=1
     fi
   done <<'EOF'
-angie www-data www-data
+nginx www-data www-data
 php www-data www-data
 nodejs www-data www-data
 gifsicle www-data www-data
@@ -408,7 +408,7 @@ run_optimize() {
   opt_report "- CPU governor, PAM limits and kernel/network/memory sysctls tuned for ${OPT_MEM_TOTAL_MB}MB RAM / $(effective_cpus) CPUs"
   step "Optimizing installed services"
   if (( ${#OPT_DETECTED[@]} == 0 )); then
-    info "No supported installed services detected (Angie, PHP-FPM, MariaDB, Valkey/Redis, Elasticsearch)"
+    info "No supported installed services detected (nginx, PHP-FPM, MariaDB, Valkey/Redis, Elasticsearch)"
     opt_report "No supported installed services detected."
     # No service configuration was touched, so there is nothing to roll back.
     OPT_BACKUP_DIR=""
@@ -433,7 +433,7 @@ run_optimize() {
   info "$(memory_plan_summary 'Memory budget')"
   opt_report "- $(memory_plan_summary 'Memory budget')"
 
-  # PHP first: it owns the FastCGI socket Angie may point at.
+  # PHP first: it owns the FastCGI socket nginx may point at.
   OPT_PHP_OK=0
   OPT_PHP_SOCKET=""
   if [[ ${OPT_DETECTED[*]} == *php:* ]]; then
@@ -445,7 +445,7 @@ run_optimize() {
     [[ $service == php ]] && continue
     [[ " ${OPT_DETECTED[*]} " == *" ${service} "* ]] || continue
     case "$service" in
-      angie)   optimize_angie   || rc=1 ;;
+      nginx)   optimize_nginx   || rc=1 ;;
       mariadb) optimize_mariadb || rc=1 ;;
       valkey)  optimize_valkey valkey || rc=1 ;;
       redis)   optimize_valkey redis  || rc=1 ;;
@@ -453,14 +453,14 @@ run_optimize() {
     esac
   done
 
-  # The managed PHP ini carries [PATH=] sections derived from the Angie tree
+  # The managed PHP ini carries [PATH=] sections derived from the nginx tree
   # the PHP pass saw (guest-cache encoding token, WordPress/Chevereto roots).
-  # optimize_angie has just synced that tree from the repository, so sections
+  # optimize_nginx has just synced that tree from the repository, so sections
   # computed from a tree one version behind would be rewritten by the next run
   # (and a freshly deployed app root would never get its section).  Re-run the
-  # writer after Angie and reload only when it changed something.
-  if [[ " ${OPT_DETECTED[*]} " == *" angie "* ]]; then
-    php_refresh_after_angie opt_report "- " || rc=1
+  # writer after nginx and reload only when it changed something.
+  if [[ " ${OPT_DETECTED[*]} " == *" nginx "* ]]; then
+    php_refresh_after_nginx opt_report "- " || rc=1
   fi
 
   verify_optimized_services || rc=1
@@ -509,7 +509,7 @@ on_exit() {
   # A run that died (set -e, signal, dropped SSH session) between pausing
   # the web tier for a MariaDB restart and resuming it must not leave the
   # site down.
-  if (( ${OPT_WEB_PAUSED_ANGIE:-0} )) || (( ${#OPT_WEB_PAUSED_PHP[@]} > 0 )); then
+  if (( ${OPT_WEB_PAUSED_NGINX:-0} )) || (( ${#OPT_WEB_PAUSED_PHP[@]} > 0 )); then
     opt_resume_web_frontends "an interrupted run" || true
   fi
   # An --upgrade-php run that died between purging the old version and the
@@ -549,7 +549,7 @@ run_post_domain_optimize() {
   [[ ${SETUP_DOMAIN_OPTIMIZE:-1} != 0 ]] || return 0
   [[ ${SVC_STATUS[domain]:-} == OK ]] || return 0
   local svc keep=0
-  for svc in basic angie php mariadb valkey elastic; do
+  for svc in basic nginx php mariadb valkey elastic; do
     [[ ${ENABLED[$svc]:-0} -eq 1 ]] && keep=1
   done
   info "Re-tuning installed services for the new vhost(s) (the --optimize pass)"
@@ -667,7 +667,7 @@ main() {
   fi
 
   if (( OPTIMIZE )); then
-    printf '%s%sUbuntu %s optimization (Angie sync + hardware profile)%s\n' "$C_BOLD" "$C_BLUE" "${VERSION_ID}" "$C_RESET"
+    printf '%s%sUbuntu %s optimization (nginx sync + hardware profile)%s\n' "$C_BOLD" "$C_BLUE" "${VERSION_ID}" "$C_RESET"
     run_optimize
     exit 0
   fi
@@ -696,7 +696,7 @@ main() {
   # Service installers only install packages; this avoids one apt-get update
   # (and its lock/retry overhead) per service.
   local need_repos=0 item
-  (( ${ENABLED[angie]:-0} || ${ENABLED[php]:-0} || ${ENABLED[elastic]:-0} )) && need_repos=1
+  (( ${ENABLED[nginx]:-0} || ${ENABLED[php]:-0} || ${ENABLED[elastic]:-0} )) && need_repos=1
   for item in "${OTHERS[@]}"; do
     [[ $item == nodejs ]] && need_repos=1
   done
@@ -704,18 +704,18 @@ main() {
     prepare_repositories
   fi
 
-  # The external repository now owns Angie config only. PHP-FPM templates are
+  # The external repository now owns nginx config only. PHP-FPM templates are
   # local to this repository (configs/php), so a PHP-only install needs no
   # network fetch.
-  if [[ ${ENABLED[angie]:-0} -eq 1 ]]; then
-    fetch_server_configs || die "Could not prepare the Angie configuration repository"
+  if [[ ${ENABLED[nginx]:-0} -eq 1 ]]; then
+    fetch_server_configs || die "Could not prepare the nginx configuration repository"
   fi
 
   local s
   for s in "${INSTALL_ORDER[@]}"; do
     [[ ${ENABLED[$s]:-0} -eq 1 ]] || continue
     case $s in
-      angie)   run_service angie   install_angie ;;
+      nginx)   run_service nginx   install_nginx ;;
       php)     run_service php     install_php ;;
       mariadb) run_service mariadb install_mariadb ;;
       valkey)  run_service valkey  install_valkey ;;
@@ -741,11 +741,11 @@ main() {
   # The managed crontab depends on what the security pass found (the wp-cron
   # entry is added only once DISABLE_WP_CRON exists), so regenerate it after
   # hardening, in the same order --optimize uses.  write_cron is idempotent
-  # and runs after every install, so a later --angie or --mariadb-only run
+  # and runs after every install, so a later --nginx or --mariadb-only run
   # gets its entries (cloudflare sync, backups, checks) at once instead of at
   # the next --optimize.
   local svc_any=0 svc
-  for svc in basic angie php mariadb valkey elastic others domain; do
+  for svc in basic nginx php mariadb valkey elastic others domain; do
     [[ ${ENABLED[$svc]:-0} -eq 1 ]] && svc_any=1
   done
   if (( svc_any )); then

@@ -65,7 +65,7 @@ log_file() {
 ensure_log_dirs() {
   mkdir -p "$LOG_ROOT"
   chmod 755 "$LOG_ROOT"
-  ensure_log_dir angie         www-data     www-data
+  ensure_log_dir nginx         www-data     www-data
   ensure_log_dir php           www-data     www-data
   ensure_log_dir nodejs        www-data     www-data
   ensure_log_dir gifsicle      www-data     www-data
@@ -75,7 +75,7 @@ ensure_log_dirs() {
   getent passwd redis         >/dev/null 2>&1 && ensure_log_dir redis         redis        redis
   getent passwd elasticsearch >/dev/null 2>&1 && ensure_log_dir elasticsearch elasticsearch elasticsearch
 
-  log_file angie/error.log        www-data www-data
+  log_file nginx/error.log        www-data www-data
   log_file php/php-fpm.log        www-data www-data
   log_file php/php-fpm-slow.log   www-data www-data
   log_file php/php-error.log      www-data www-data
@@ -372,7 +372,7 @@ cleanup_configs() {
 }
 
 # Download/extract server-configs-nginx once for the whole run.  Only the
-# Angie installer consumes this tree; PHP-FPM templates are local configs/php.
+# nginx installer consumes this tree; PHP-FPM templates are local configs/php.
 fetch_server_configs() {
   if [[ -n ${CONFIG_SOURCE_DIR:-} && -d ${CONFIG_SOURCE_DIR} ]]; then
     info "Using server configs from ${CONFIG_SOURCE_DIR}"
@@ -395,7 +395,7 @@ fetch_server_configs() {
   elif command -v wget >/dev/null 2>&1 \
        && retry 3 5 wget -q --https-only --timeout=30 -O "$archive" "$url" 2>/dev/null; then
     # A stock Ubuntu image ships wget but not curl (26.04); --optimize must
-    # not need a package to fetch its Angie tree.
+    # not need a package to fetch its nginx tree.
     fetched=1
   fi
   if (( fetched )); then
@@ -419,8 +419,8 @@ fetch_server_configs() {
     src=$(find "$CONFIG_TEMP_DIR" -mindepth 1 -maxdepth 1 -type d \
       -name 'server-configs-nginx-*' 2>/dev/null | head -n1 || true)
   fi
-  if [[ -z $src || ! -f "${src}/angie.conf" ]]; then
-    warn "Downloaded server configs are missing angie.conf"
+  if [[ -z $src || ! -f "${src}/nginx.conf" ]]; then
+    warn "Downloaded server configs are missing nginx.conf"
     CONFIG_TEMP_DIR=""
     return 1
   fi
@@ -619,7 +619,7 @@ cron_strip_legacy_jobs() {
     /chown[[:space:]]+(-R|--recursive)[[:space:]]+www-data:www-data[[:space:]]+\/var\/www([[:space:]]|\/|$)/ { next }
     /\/usr\/bin\/find[[:space:]]+\/var\/www([[:space:]]|\/|$)/ && /chown/ { next }
     /\/etc\/nginx\/scripts\/cloudflare\.sh/ { next }
-    /\/etc\/angie\/scripts\/cloudflare\.sh/ { next }
+    /\/etc\/nginx\/scripts\/cloudflare\.sh/ { next }
     /\/usr\/bin\/mysqlcheck/ { next }
     /\/usr\/bin\/mariadb-check/ { next }
     /\/usr\/local\/bin\/mysqlbkup\.sh/ { next }
@@ -627,8 +627,8 @@ cron_strip_legacy_jobs() {
   '
 }
 
-cron_angie_configured() {
-  pkg_ok angie && [[ -f /etc/angie/angie.conf ]]
+cron_nginx_configured() {
+  pkg_ok nginx && [[ -f /etc/nginx/nginx.conf ]]
 }
 
 cron_mariadb_configured() {
@@ -638,7 +638,7 @@ cron_mariadb_configured() {
 
 write_cron() {
   local cur tmp line group seen=" "
-  local angie_cron=0 mariadb_cron=0 wp_cron=0 xf_cron=0
+  local nginx_cron=0 mariadb_cron=0 wp_cron=0 xf_cron=0
   local -a lines=() existing=() preserved=()
 
   # Regenerate entries for installed services even when this run only selected
@@ -648,12 +648,12 @@ write_cron() {
   # from the command-line selection: install_basic calls write_cron before the
   # service installers run, so a selected-but-failed service must not leave a
   # cron job pointing at a missing binary or log directory.
-  if cron_angie_configured; then
-    angie_cron=1
+  if cron_nginx_configured; then
+    nginx_cron=1
     lines+=("0 0 * * * ${CRON_WWW_CHOWN} >/dev/null 2>&1")
-    if [[ -x /etc/angie/scripts/cloudflare.sh ]]; then
-      lines+=('1 1 * * * /usr/bin/chmod +x /etc/angie/scripts/cloudflare.sh >/dev/null 2>&1')
-      lines+=('2 1 * * * /etc/angie/scripts/cloudflare.sh >/dev/null 2>&1')
+    if [[ -x /etc/nginx/scripts/cloudflare.sh ]]; then
+      lines+=('1 1 * * * /usr/bin/chmod +x /etc/nginx/scripts/cloudflare.sh >/dev/null 2>&1')
+      lines+=('2 1 * * * /etc/nginx/scripts/cloudflare.sh >/dev/null 2>&1')
     fi
   fi
   if cron_mariadb_configured; then
@@ -723,15 +723,15 @@ write_cron() {
       group=xenforo
     elif [[ $line == *"${CRON_PRECOMPRESS}"* ]]; then
       group=precompress
-    elif [[ $line == *'/etc/angie/'* || $line == *'/usr/bin/find /var/www'* || $line == *"${CRON_WWW_CHOWN_LEGACY}"* ]]; then
-      group=angie
+    elif [[ $line == *'/etc/nginx/'* || $line == *'/usr/bin/find /var/www'* || $line == *"${CRON_WWW_CHOWN_LEGACY}"* ]]; then
+      group=nginx
     else
       group=unknown
     fi
     case "$group" in
-      angie)
-        (( angie_cron )) && continue
-        cron_angie_configured || continue
+      nginx)
+        (( nginx_cron )) && continue
+        cron_nginx_configured || continue
         ;;
       mariadb)
         (( mariadb_cron )) && continue
@@ -744,7 +744,7 @@ write_cron() {
     esac
     # A preserved entry from an older release is rewritten in place so the
     # destructive blanket chown cannot survive a --basic run that does not
-    # select --angie again.  The earlier log-safe find (which did not exclude
+    # select --nginx again.  The earlier log-safe find (which did not exclude
     # the backup directory or *.log files) is upgraded to the current form.
     if [[ $line == *"${CRON_WWW_CHOWN_LEGACY}"* ]]; then
       line="0 0 * * * ${CRON_WWW_CHOWN} >/dev/null 2>&1"

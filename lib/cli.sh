@@ -15,8 +15,8 @@ declare -A DOMAIN_DB_PASS=()
 declare -A DOMAIN_SQL=()
 OTHERS=()
 # --source: the components to compile from source (source_select maps them
-# onto PHP_BUILD, ANGIE_BUILD, ... before validation).
-SOURCE_COMPONENTS=(angie php valkey)
+# onto PHP_BUILD, NGINX_BUILD, ... before validation).
+SOURCE_COMPONENTS=(nginx php valkey)
 SOURCE_ARGS=()
 SOURCE_SEEN=0
 DOMAINS=()
@@ -31,13 +31,13 @@ UPGRADE_PHP=""
 UPGRADE_PHP_SEEN=0
 PURGE_TARGETS=()
 PURGE_ORDER=()
-SERVICE_ORDER=(basic angie php mariadb valkey elastic others domain)
+SERVICE_ORDER=(basic nginx php mariadb valkey elastic others domain)
 # Apply order per mode.  main() and run_optimize() used to repeat these lists
 # inline; one definition keeps them from drifting.  PHP goes first in
-# --optimize because it owns the FastCGI socket Angie points at; --purge has
+# --optimize because it owns the FastCGI socket nginx points at; --purge has
 # its own dependency order in build_purge_order().
-INSTALL_ORDER=(angie php mariadb valkey elastic)
-OPTIMIZE_ORDER=(php angie mariadb valkey redis elastic)
+INSTALL_ORDER=(nginx php mariadb valkey elastic)
+OPTIMIZE_ORDER=(php nginx mariadb valkey redis elastic)
 declare -A SVC_STATUS=()
 declare -A SVC_SECONDS=()
 
@@ -63,9 +63,9 @@ Basic (always required for an install; all values are optional):
              every --optimize keeps it.  Omitted = never touched.
 
 Services (optional; only the ones listed are installed):
-  --angie
-      Angie web server and its configuration tree (server-configs-nginx
-      layout under /etc/angie).  There is no bot filter: put Cloudflare or
+  --nginx
+      nginx web server and its configuration tree (server-configs-nginx
+      layout under /etc/nginx).  There is no bot filter: put Cloudflare or
       another CDN/WAF in front of the origin.
   --php       [ver=8.5] [children=auto|N] [max_requests=N]
       ver          PHP version (default: latest stable in Sury)
@@ -100,22 +100,22 @@ Services (optional; only the ones listed are installed):
       sysstat    sar/iostat performance history
 
 Source-compiled builds (with an install or --optimize):
-  --source=all | --source=angie,php,valkey | --source=none
+  --source=all | --source=nginx,php,valkey | --source=none
       Compile the listed components from their upstream releases with
       clang -O3 -march=native, hardening, ThinLTO and BOLT, linked
       statically and with only the modules the three applications need;
       every component not listed goes back to its package.  Without
       --source a fresh install uses the packages (the same as none) and a
       plain --optimize keeps the builds the server already runs.
-      SETUP_PHP_BUILD / SETUP_ANGIE_BUILD / SETUP_VALKEY_BUILD (clang or
+      SETUP_PHP_BUILD / SETUP_NGINX_BUILD / SETUP_VALKEY_BUILD (clang or
       package) still change one component; --source overrides them.
 
-Domain setup (standalone; Angie + MariaDB must already be installed/running):
+Domain setup (standalone; nginx + MariaDB must already be installed/running):
   --domain DOMAIN [app=TYPE] [db=NAME [user=U pass=P] [sql=FILE]] [DOMAIN ...]
       Creates, per domain:
         /var/www/<domain>/public/
-        /etc/angie/ssl/<domain>/          (self-signed; replace with ACME)
-        /etc/angie/conf.d/<domain>.conf   (full vhost from the Angie repo's
+        /etc/nginx/ssl/<domain>/          (self-signed; replace with ACME)
+        /etc/nginx/conf.d/<domain>.conf   (full vhost from the nginx repo's
                                            conf.d/templates; the basic
                                            template when app= is omitted)
       app=TYPE may be given inside a --domain group and applies to every
@@ -137,32 +137,32 @@ Domain setup (standalone; Angie + MariaDB must already be installed/running):
 
 Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
   --optimize [mitigations=on|off] [--dry-run]
-      One command for the whole host.  It synchronizes Angie's /etc/angie
+      One command for the whole host.  It synchronizes nginx's /etc/nginx
       tree from server-configs-nginx (or CONFIG_SOURCE_DIR), applies the
       hardware-aware OS profile (CPU governor, PAM security limits, and
       kernel/network/memory sysctls) and then tunes every installed service
-      (Angie, PHP-FPM, MariaDB, Valkey or Redis, Elasticsearch) for the
+      (nginx, PHP-FPM, MariaDB, Valkey or Redis, Elasticsearch) for the
       current CPU/RAM/disk.  It also enables FastCGI guest caching for
       detected WordPress and XenForo vhosts, including the shared cache
       zone, style/language cache keys and session-cookie bypass.
       It never installs, purges or starts a managed service; the only packages
-      it may add are angie-module-brotli and the brotli CLI (asset
-      precompression) when Angie is installed, and the only one it removes is
-      angie-module-zstd left by 1.21.58 (unless a configuration still uses
+      it may add are nginx-module-brotli and the brotli CLI (asset
+      precompression) when nginx is installed, and the only one it removes is
+      nginx-module-zstd left by 1.21.58 (unless a configuration still uses
       it), so install and optimize share the same compression profile.
       It also never
       touches the resolver (DNS), the firewall (UFW) or swap: those are
       --basic decisions and stay as the operator left them.  Allocations
       are planned together from one
-      80%-of-RAM budget, and a service is reloaded (Angie, PHP-FPM) or tuned
+      80%-of-RAM budget, and a service is reloaded (nginx, PHP-FPM) or tuned
       online (Valkey/Redis) only when its generated configuration actually
       changed.  Startup-only settings are reported and apply on the next full
       restart.  A live TCP PHP-FPM pool used through the shared local_php
-      upstream is migrated to the Unix socket, and Angie is repointed to it.
+      upstream is migrated to the Unix socket, and nginx is repointed to it.
       The graceful reload is tried first; if the build does not open the new
       listener on SIGUSR2, PHP-FPM is restarted to complete the migration
       (a short, explicit cutover).
-      A failed Angie sync restores the previous tree and is reported.
+      A failed nginx sync restores the previous tree and is reported.
       WordPress/XenForo configs under /var/www are audited, and the report
       lists persistent MariaDB and local Valkey socket settings the admin
       still needs to apply.
@@ -180,7 +180,7 @@ Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
       (never deleted) before the tuners run:
         - /etc/default/setup-tuning keeps only host facts/feature choices
           (XF_JOB_CRON, NODE_MAJOR, NODE_ALLOW_MAJOR_UPGRADE,
-          PHP_BUILD, ANGIE_BUILD ...).  TCP_CC,
+          PHP_BUILD, NGINX_BUILD ...).  TCP_CC,
           QDISC, STORAGE_CLASS and the
           PHP/compression/rate-limit pins are cleared and go back to the
           current defaults (bbr/fq, etc.);
@@ -190,7 +190,7 @@ Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
         - tuning environment variables (SETUP_TCP_CC, SETUP_QDISC,
           SETUP_STORAGE_CLASS, SETUP_PHP_WORKERS_PER_CPU,
           SETUP_PHP_JIT_HOT_*, SETUP_GZIP_LEVEL, SETUP_BROTLI_LEVEL,
-          SETUP_ANGIE_COMPRESSION, SETUP_MARIADB_IO_CAPACITY,
+          SETUP_NGINX_COMPRESSION, SETUP_MARIADB_IO_CAPACITY,
           SETUP_LIMIT_REQ_EXEMPT, SETUP_PRECOMPRESS_ASSETS,
           SETUP_PHP_PAGE_GZIP, SETUP_PHP_JIT_WORDPRESS) are ignored with a
           warning, so two servers with the same hardware get the same
@@ -225,7 +225,7 @@ PHP upgrade (standalone):
           validates them with php-fpm -t;
         - runs the same hardware-aware tuner as install/--optimize (socket,
           static pool, OPcache, tracing JIT, realpath/memory limits) and
-          reloads Angie when it is active;
+          reloads nginx when it is active;
         - verifies the CLI version, FPM service, socket, extension packages
           and JIT, then writes /var/log/setup-php-upgrade-<timestamp>.md.
       The old /etc/php tree and package versions are kept under
@@ -252,8 +252,8 @@ Security hardening (runs automatically):
       - report SSH, firewall and Elasticsearch exposure
 
 Purge (stop/restore) mode:
-  --purge [all|basic|angie|php|mariadb|valkey|elastic|others]
-  --purge --angie --php                 stop only the selected services
+  --purge [all|basic|nginx|php|mariadb|valkey|elastic|others]
+  --purge --nginx --php                 stop only the selected services
   --purge                               stop everything this script manages
   --purge --php ver=8.5                 stop one PHP version (note --php)
   --purge php mariadb                   bare names are also accepted
@@ -262,10 +262,10 @@ Purge (stop/restore) mode:
   under /tmp are allowed to expire on their own.
 
 Configuration source:
-  Angie configuration is downloaded from
+  nginx configuration is downloaded from
   https://github.com/droplinxuser/server-configs-nginx at install time.
   PHP-FPM pool and php.ini templates are local to this repository
-  (configs/php) because they are not Angie configuration.
+  (configs/php) because they are not nginx configuration.
   Environment overrides:
     CONFIG_SOURCE_DIR=/path/to/checkout   use a local checkout (testing/offline)
     CONFIG_REPO_URL=https://github.com/... alternate repository
@@ -279,17 +279,17 @@ Testing:
 Diagnostics:
   --diagnostics
       Collects host/hardware details, running services and their status,
-      Angie/PHP/MariaDB/Valkey/Redis/Elasticsearch runtime statistics,
+      nginx/PHP/MariaDB/Valkey/Redis/Elasticsearch runtime statistics,
       slow-query and slow-request logs, service error logs and kernel/OOM
       reports into diagnostics.log beside setup.sh.  Run as root; this mode
       only reads state and writes that one file.
 
 Restart all:
   --restart-all
-      Detects installed/running services, reloads systemd, stops Angie and
+      Detects installed/running services, reloads systemd, stops nginx and
       every active PHP-FPM version, restarts active Valkey/Redis,
       Elasticsearch and MariaDB, waits for MariaDB SELECT 1, then starts
-      PHP-FPM followed by Angie.  Only services that were active are stopped
+      PHP-FPM followed by nginx.  Only services that were active are stopped
       and started again.  Use --dry-run to print the detected plan.
 
 Notes:
@@ -304,10 +304,10 @@ Notes:
 
 Examples:
   bash setup.sh --basic server=dedi host=custom.host time=Asia/Manila swap=8G \
-      --angie --php ver=8.5 --mariadb user=demo pass=temp size=4gb bind=127.0.0.1 \
+      --nginx --php ver=8.5 --mariadb user=demo pass=temp size=4gb bind=127.0.0.1 \
       --valkey --elastic host=localhost ram=4g --others smartmon nvme gif nodejs
 
-  bash setup.sh --basic --angie --php
+  bash setup.sh --basic --nginx --php
 
   bash setup.sh --basic --mariadb user=demo pass=temp size=4gb \
       bind=127.0.0.1,IPV4
@@ -422,8 +422,8 @@ parse_args() {
         kv_consume elastic 0 "$@"
         shift "$KV_CONSUMED"
         ;;
-      --angie)
-        ENABLED[angie]=1; shift
+      --nginx)
+        ENABLED[nginx]=1; shift
         ;;
       --valkey)
         ENABLED[valkey]=1; shift
@@ -431,7 +431,7 @@ parse_args() {
         shift "$KV_CONSUMED"
         ;;
       --source=*|--source)
-        # --source all | none | angie,php,... (commas or spaces, like --others):
+        # --source all | none | nginx,php,... (commas or spaces, like --others):
         # the complete set of components to compile from source; every other
         # one goes back to its package.  Without it nothing changes: a fresh
         # install runs the packages, --optimize keeps the recorded builds.
@@ -573,20 +573,20 @@ parse_args() {
   source_select
 }
 
-# --source all|none|LIST -> PHP_BUILD / ANGIE_BUILD / VALKEY_BUILD = clang for
+# --source all|none|LIST -> PHP_BUILD / NGINX_BUILD / VALKEY_BUILD = clang for
 # the listed components and package for the rest, each persisted to the host
 # file (--source wins over a SETUP_*_BUILD given for the same run).
 #
 # Without --source nothing changes (operator rule, 1.21.71): a fresh install
 # has no recorded build, so it runs the packages (the same as none), and a
 # plain --optimize keeps the builds the host already runs (the recorded
-# PHP_BUILD / ANGIE_BUILD / VALKEY_BUILD).
+# PHP_BUILD / NGINX_BUILD / VALKEY_BUILD).
 source_select() {
   (( SOURCE_SEEN )) || return 0
   local word c var
   local -A want=()
   (( ${#SOURCE_ARGS[@]} > 0 )) \
-    || die "--source needs a value: all, none, or components from: ${SOURCE_COMPONENTS[*]} (e.g. --source=angie,php)"
+    || die "--source needs a value: all, none, or components from: ${SOURCE_COMPONENTS[*]} (e.g. --source=nginx,php)"
   for word in "${SOURCE_ARGS[@]}"; do
     word=${word,,}
     case $word in

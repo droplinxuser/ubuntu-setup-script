@@ -289,28 +289,28 @@ purge_basic() {
   return "$rc"
 }
 
-purge_angie() {
-  step "Purge Angie"
+purge_nginx() {
+  step "Purge nginx"
   if anubis_host_present; then
     warn "This host still runs the Anubis bot filter; run tools/remove-anubis.sh to restore the vhosts and remove it"
   fi
-  purge_service_stop angie
-  angie_build_purge
-  apt_purge_pkgs angie
-  # Configuration, data, caches and logs are left on disk.  Reinstalling Angie
+  purge_service_stop nginx
+  nginx_build_purge
+  apt_purge_pkgs nginx
+  # Configuration, data, caches and logs are left on disk.  Reinstalling nginx
   # then restores the exact site instead of starting from an empty tree.
-  info "Leaving Angie files under /etc/angie, /var/lib/angie, /var/log/angie, /var/cache/angie and ${LOG_ROOT}/angie"
+  info "Leaving nginx files under /etc/nginx, /var/lib/nginx, /var/log/nginx, /var/cache/nginx and ${LOG_ROOT}/nginx"
   info "Leaving cache directories and /root installer files in place"
-  cron_remove_line '/etc/angie/scripts/cloudflare.sh' || true
+  cron_remove_line '/etc/nginx/scripts/cloudflare.sh' || true
   # Match the ownership job only: the managed wp-cron entry also starts with
-  # "/usr/bin/find /var/www" and must survive an Angie-only purge (PHP keeps
+  # "/usr/bin/find /var/www" and must survive an nginx-only purge (PHP keeps
   # running and DISABLE_WP_CRON stays in wp-config.php).
   cron_remove_line '/usr/bin/find /var/www -mindepth 1' || true
   cron_remove_line "$CRON_WWW_CHOWN_LEGACY" || true
   cron_remove_line "$CRON_WWW_CHOWN" || true
   cron_remove_line "$CRON_PRECOMPRESS" || true
   systemctl daemon-reload || true
-  ok "Angie purged (files preserved)"
+  ok "nginx purged (files preserved)"
 }
 
 purge_php() {
@@ -440,7 +440,7 @@ build_purge_order() {
       wanted[$t]=1
     fi
   done
-  for t in angie php mariadb valkey elastic others basic; do
+  for t in nginx php mariadb valkey elastic others basic; do
     if [[ ${ENABLED[$t]:-0} -eq 1 ]]; then
       wanted[$t]=1
     fi
@@ -452,9 +452,9 @@ build_purge_order() {
   PURGE_ORDER=()
   if [[ -n ${wanted[all]:-} ]]; then
     # Stop dependents before the services they use.  No package is removed.
-    PURGE_ORDER=(angie others php mariadb valkey elastic basic)
+    PURGE_ORDER=(nginx others php mariadb valkey elastic basic)
   else
-    for t in angie others php mariadb valkey elastic basic; do
+    for t in nginx others php mariadb valkey elastic basic; do
       if [[ -n ${wanted[$t]:-} ]]; then
         PURGE_ORDER+=("$t")
       fi
@@ -469,7 +469,7 @@ run_purge() {
   for t in "${PURGE_ORDER[@]}"; do
     case "$t" in
       basic)   purge_basic ;;
-      angie)   purge_angie ;;
+      nginx)   purge_nginx ;;
       php)     purge_php ;;
       mariadb) purge_mariadb ;;
       valkey)  purge_valkey ;;

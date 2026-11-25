@@ -20,7 +20,7 @@ run_service() {
   # reset, and whatever it pauses (the web tier around a MariaDB restart after
   # a dump import) is invisible to the parent's on_exit.  Give it its own
   # signal-to-exit traps and an EXIT guard that undoes that pause, so a
-  # Ctrl-C or a dropped SSH session cannot leave Angie and PHP-FPM stopped.
+  # Ctrl-C or a dropped SSH session cannot leave nginx and PHP-FPM stopped.
   ( set -Eeuo pipefail
     trap 'exit 130' INT
     trap 'exit 143' TERM
@@ -149,7 +149,7 @@ print_plan() {
 # (opt_pause_web_frontends) and did not get to resume.
 run_service_exit_guard() {
   local rc=$?
-  if (( ${OPT_WEB_PAUSED_ANGIE:-0} )) || (( ${#OPT_WEB_PAUSED_PHP[@]} > 0 )); then
+  if (( ${OPT_WEB_PAUSED_NGINX:-0} )) || (( ${#OPT_WEB_PAUSED_PHP[@]} > 0 )); then
     opt_resume_web_frontends "an interrupted install step" || true
   fi
   return "$rc"

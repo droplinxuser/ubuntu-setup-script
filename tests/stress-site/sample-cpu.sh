@@ -17,7 +17,7 @@ BASE=/sys/fs/cgroup/system.slice
 # Map the unit name to the label the report uses.
 declare -A unit=(
   [php-fpm]=php8.5-fpm.service
-  [angie]=angie.service
+  [nginx]=nginx.service
   [mariadbd]=mariadb.service
   [valkey-server]=valkey-server.service
   [elastic]=elasticsearch.service

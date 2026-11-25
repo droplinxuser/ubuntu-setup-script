@@ -38,11 +38,11 @@ PHP_BUILD_COMMON_FILE="${PHP_BUILD_ROOT}/build-common.sh"
 PHP_BUILD_LLVM_FILES=(/etc/apt/sources.list.d/setup-llvm.sources /etc/apt/preferences.d/setup-llvm.pref /etc/apt/keyrings/setup-llvm.asc)
 
 # The LLVM toolchain (apt.llvm.org source, /opt/setup-llvm) is shared by every
-# compiled build (PHP, Angie, Valkey): only the last one removed takes it along.
-setup_build_llvm_release() { # php|angie|valkey: the build being removed
+# compiled build (PHP, nginx, Valkey): only the last one removed takes it along.
+setup_build_llvm_release() { # php|nginx|valkey: the build being removed
   local me=$1
   if [[ $me != php ]] && compgen -G "${PHP_BUILD_ROOT:-/usr/local/lib/setup-php}/[0-9]*/build.info" >/dev/null; then return 0; fi
-  if [[ $me != angie && -d ${ANGIE_BUILD_ROOT:-/usr/local/lib/setup-angie}/build ]]; then return 0; fi
+  if [[ $me != nginx && -d ${NGINX_BUILD_ROOT:-/usr/local/lib/setup-nginx}/build ]]; then return 0; fi
   if [[ $me != valkey && -d ${VALKEY_BUILD_ROOT:-/usr/local/lib/setup-valkey}/build ]]; then return 0; fi
   rm -f "${PHP_BUILD_LLVM_FILES[@]}"; rm -rf /opt/setup-llvm
 }
@@ -319,12 +319,12 @@ php_fpm_modules_mode() {
 
 # Vhost document roots that serve PHP but are none of the three applications.
 php_fpm_foreign_php_sites() {
-  local target=${1:-${PHP_FPM_ANGIE:-/etc/angie}} file root
+  local target=${1:-${PHP_FPM_NGINX:-/etc/nginx}} file root
   local -A seen=()
   [[ -d $target/conf.d ]] || return 0
   for file in "$target"/conf.d/*.conf; do
     [[ -f $file ]] || continue
-    root=$(angie_vhost_root "$file")
+    root=$(nginx_vhost_root "$file")
     [[ -n $root && -d $root && -z ${seen[$root]:-} ]] || continue
     seen[$root]=1
     [[ -n $(app_type_at_root "$root") ]] && continue

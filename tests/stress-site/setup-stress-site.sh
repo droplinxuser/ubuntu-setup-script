@@ -8,8 +8,8 @@ set -Eeuo pipefail
 
 DOMAIN=${DOMAIN:-stress.invalid}
 ROOT="/var/www/${DOMAIN}/public"
-CERTDIR="/etc/angie/ssl/${DOMAIN}"
-LOG_DIR=/var/www/logs/angie
+CERTDIR="/etc/nginx/ssl/${DOMAIN}"
+LOG_DIR=/var/www/logs/nginx
 NODE_LOG_DIR=/var/www/logs/nodejs
 GIF_LOG_DIR=/var/www/logs/gifsicle
 NODE_DIR=/opt/stress-node
@@ -65,7 +65,7 @@ chmod 640 /etc/stress-site-config.json
 
 install -d -m 750 -o www-data -g www-data "$LOG_DIR" "$NODE_LOG_DIR" "$GIF_LOG_DIR"
 
-for svc in angie "$FPM_SVC" mariadb valkey-server elasticsearch; do
+for svc in nginx "$FPM_SVC" mariadb valkey-server elasticsearch; do
   systemctl is-active --quiet "$svc" || {
     echo "service ${svc} is not active; run setup.sh first" >&2
     exit 1
@@ -168,7 +168,7 @@ if [[ -f $POOL ]]; then
     FPM_CHANGED=1
   fi
   # Worker recycling closes FastCGI keepalive connections and shows up as
-  # "upstream prematurely closed connection" in the Angie log during the
+  # "upstream prematurely closed connection" in the nginx log during the
   # high-request-rate PHP tests.  The stress pages are allocation-light, so
   # disable recycling for this test host.  This is test-only; keep a finite
   # pm.max_requests in production.
@@ -186,9 +186,9 @@ if [[ -f $POOL ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# Angie vhost
+# nginx vhost
 # ---------------------------------------------------------------------------
-cat > "/etc/angie/conf.d/${DOMAIN}.conf" <<EOF
+cat > "/etc/nginx/conf.d/${DOMAIN}.conf" <<EOF
 # Managed by tests/stress-site/setup-stress-site.sh
 server {
     listen      80;
@@ -268,15 +268,15 @@ server {
     include h5bp/basic.conf;
 }
 EOF
-chmod 644 "/etc/angie/conf.d/${DOMAIN}.conf"
+chmod 644 "/etc/nginx/conf.d/${DOMAIN}.conf"
 
 # Local name resolution for browser and curl tests.
 if ! grep -qE "(^|[[:space:]])${DOMAIN}([[:space:]]|$)" /etc/hosts; then
   printf '127.0.0.1 %s www.%s\n' "$DOMAIN" "$DOMAIN" >> /etc/hosts
 fi
 
-angie -t
-systemctl reload angie
+nginx -t
+systemctl reload nginx
 find "$LOG_DIR" -type f -name '*.log' -exec chmod 640 {} + 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
@@ -293,7 +293,7 @@ echo
 echo "Stress site deployed:"
 echo "  https://${DOMAIN}/            (full stack page)"
 echo "  https://${DOMAIN}/cached.php  (same page, FastCGI-cached 5s)"
-echo "  https://${DOMAIN}/static.html (Angie only)"
+echo "  https://${DOMAIN}/static.html (nginx only)"
 echo "  https://${DOMAIN}/hello.php   (PHP + OPcache)"
 echo "  https://${DOMAIN}/db.php      (MariaDB)"
 echo "  https://${DOMAIN}/cache.php   (Valkey)"

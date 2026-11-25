@@ -14,37 +14,37 @@
 # ---------------------------------------------------------------------------
 
 # Match the installer's systemd fd limit on an existing server too.  Only the
-# fd limit is checked: Angie daemonises with umask(0), so a UMask= drop-in
+# fd limit is checked: nginx daemonises with umask(0), so a UMask= drop-in
 # does not change the modes of the files its workers create.  Rewriting an
 # unchanged file would force a needless restart, so compare first.
-ANGIE_UNIT_CHANGED=0
-ensure_angie_limits() {
-  local angie_limit angie_dropin=/etc/systemd/system/angie.service.d/limits.conf
-  ANGIE_UNIT_CHANGED=0
-  angie_limit=$(systemctl show -p LimitNOFILE --value angie 2>/dev/null || true)
-  if [[ $angie_limit != infinity ]] \
-     && { ! [[ $angie_limit =~ ^[0-9]+$ ]] || (( angie_limit < 524288 )); }; then
+NGINX_UNIT_CHANGED=0
+ensure_nginx_limits() {
+  local nginx_limit nginx_dropin=/etc/systemd/system/nginx.service.d/limits.conf
+  NGINX_UNIT_CHANGED=0
+  nginx_limit=$(systemctl show -p LimitNOFILE --value nginx 2>/dev/null || true)
+  if [[ $nginx_limit != infinity ]] \
+     && { ! [[ $nginx_limit =~ ^[0-9]+$ ]] || (( nginx_limit < 524288 )); }; then
     # Same writer as the PHP/MariaDB drop-ins; the content mirrors the
     # repository's scripts/limit_nofile.conf, which the sync installs when
     # it succeeds.
-    if write_service_limits_dropin "$angie_dropin" $'[Service]\nLimitNOFILE=524288\nUMask=0027'; then
+    if write_service_limits_dropin "$nginx_dropin" $'[Service]\nLimitNOFILE=524288\nUMask=0027'; then
       systemctl daemon-reload || true
-      ANGIE_UNIT_CHANGED=1
-      tune_summary "Angie: systemd LimitNOFILE=524288 (applies on next restart)"
+      NGINX_UNIT_CHANGED=1
+      tune_summary "nginx: systemd LimitNOFILE=524288 (applies on next restart)"
     fi
   fi
-  # ANGIE_UNIT_CHANGED is the "a change was written" signal.  Returning it as
+  # NGINX_UNIT_CHANGED is the "a change was written" signal.  Returning it as
   # the status made success look like failure to a caller (1 = changed), so the
   # helper always succeeds; callers read the flag.
   return 0
 }
 
 # ---------------------------------------------------------------------------
-# Shared post-Angie PHP refresh
+# Shared post-nginx PHP refresh
 # ---------------------------------------------------------------------------
-# The managed PHP ini carries [PATH=] sections derived from the Angie tree the
+# The managed PHP ini carries [PATH=] sections derived from the nginx tree the
 # PHP pass saw (the guest-cache encoding token and the WordPress/Chevereto
-# document roots).  optimize_angie / angie_apply_profile have just synced that
+# document roots).  optimize_nginx / nginx_apply_profile have just synced that
 # tree from the repository, so the ini must be rewritten afterwards or the next
 # run rewrites sections computed from a tree one version behind (and a newly
 # deployed root never gets its section).  Shared by --optimize and
@@ -54,7 +54,7 @@ ensure_angie_limits() {
 #   $2 line prefix ("- " for the Markdown report, "" for the console)
 # Returns non-zero when a write or a reload failed; sets OPT_CUTOVER=1 when a
 # pool was reloaded.
-php_refresh_after_angie() {
+php_refresh_after_nginx() {
   local reporter=${1:-opt_report} prefix=${2:-- }
   [[ ${OPT_PHP_OK:-0} -eq 1 ]] || return 0
   local v dirty=0 rc=0 snap
@@ -78,17 +78,17 @@ php_refresh_after_angie() {
       # a PHP line under whichever section ran last (Elasticsearch).
       (( TUNE_DIRTY )) || continue
       dirty=1
-      [[ $reporter == opt_report ]] && opt_report "## PHP ${v} (post-Angie refresh)"
+      [[ $reporter == opt_report ]] && opt_report "## PHP ${v} (post-nginx refresh)"
       for change in "${TUNE_CHANGES[@]}"; do
-        "$reporter" "${prefix}${change} (post-Angie refresh)"
+        "$reporter" "${prefix}${change} (post-nginx refresh)"
       done
     else
       if [[ -n $snap ]] && restore_tree "$snap" "/etc/php/${v}"; then
-        warn "PHP ${v}: post-Angie ini refresh failed; restored the configuration the PHP pass wrote"
-        opt_report "- **FAILED** PHP ${v}: post-Angie ini refresh; rolled back to the PHP pass result"
+        warn "PHP ${v}: post-nginx ini refresh failed; restored the configuration the PHP pass wrote"
+        opt_report "- **FAILED** PHP ${v}: post-nginx ini refresh; rolled back to the PHP pass result"
       else
-        warn "PHP ${v}: post-Angie ini refresh failed and could not be rolled back; check php-fpm${v} -t before the next restart"
-        opt_report "- **FAILED** PHP ${v}: post-Angie ini refresh (no rollback; check \`php-fpm${v} -t\`)"
+        warn "PHP ${v}: post-nginx ini refresh failed and could not be rolled back; check php-fpm${v} -t before the next restart"
+        opt_report "- **FAILED** PHP ${v}: post-nginx ini refresh (no rollback; check \`php-fpm${v} -t\`)"
       fi
       rc=1
     fi
@@ -97,44 +97,44 @@ php_refresh_after_angie() {
   while IFS= read -r v; do
     systemctl is-active --quiet "php${v}-fpm" 2>/dev/null || continue
     if systemctl reload "php${v}-fpm" 2>/dev/null; then
-      "$reporter" "${prefix}PHP ${v}: reloaded after the post-Angie ini refresh"
+      "$reporter" "${prefix}PHP ${v}: reloaded after the post-nginx ini refresh"
       OPT_CUTOVER=1
     else
-      warn "PHP ${v}: reload after the post-Angie ini refresh failed"
-      opt_report "- **FAILED** PHP ${v}: reload after the post-Angie ini refresh"
+      warn "PHP ${v}: reload after the post-nginx ini refresh failed"
+      opt_report "- **FAILED** PHP ${v}: reload after the post-nginx ini refresh"
       rc=1
     fi
   done < <(php_fpm_versions)
   return "$rc"
 }
 
-optimize_angie() {
+optimize_nginx() {
   local active=0 change version rc=0 unit_changed=0
-  local limit_file=/etc/systemd/system/angie.service.d/limits.conf
-  local default_file=/etc/default/angie
+  local limit_file=/etc/systemd/system/nginx.service.d/limits.conf
+  local default_file=/etc/default/nginx
   local limit_before="" limit_after="" default_before="" default_after=""
-  systemctl is-active --quiet angie 2>/dev/null && active=1
-  version=$(/usr/sbin/angie -v 2>&1 | head -n1 || true)
-  opt_report "## Angie"
+  systemctl is-active --quiet nginx 2>/dev/null && active=1
+  version=$(/usr/sbin/nginx -v 2>&1 | head -n1 || true)
+  opt_report "## nginx"
   opt_report "- Version: \`${version:-unknown}\`; active: ${active}"
-  opt_backup /etc/angie angie
-  # The repository sync rewrites the unit drop-in and /etc/default/angie too;
+  opt_backup /etc/nginx nginx
+  # The repository sync rewrites the unit drop-in and /etc/default/nginx too;
   # a rollback must cover them like the MariaDB/Valkey/Elasticsearch ones.
-  opt_backup /etc/systemd/system/angie.service.d angie-systemd
-  opt_backup "$default_file" angie-default
+  opt_backup /etc/systemd/system/nginx.service.d nginx-systemd
+  opt_backup "$default_file" nginx-default
   tune_reset_changes
   [[ -f $limit_file ]] && limit_before=$(file_md5 "$limit_file")
   [[ -f $default_file ]] && default_before=$(file_md5 "$default_file")
 
-  # Keep /etc/angie byte-for-byte aligned with the canonical repository before
+  # Keep /etc/nginx byte-for-byte aligned with the canonical repository before
   # applying the hardware-aware profile.  The repository deployer owns the
   # tree layout and validates it; the reload happens once below, after the
   # tuning, and only when the tree actually changed.
   local digest_before digest_after
-  digest_before=$(config_tree_digest /etc/angie)
-  ANGIE_SYNC_RELOAD=0
-  if sync_angie_repo_configs; then
-    ANGIE_SYNC_RELOAD=1
+  digest_before=$(config_tree_digest /etc/nginx)
+  NGINX_SYNC_RELOAD=0
+  if sync_nginx_repo_configs; then
+    NGINX_SYNC_RELOAD=1
     opt_report "- Repository: synchronized from ${CONFIG_REPO_URL} (${CONFIG_REPO_REF})"
     [[ -f $limit_file ]] && limit_after=$(file_md5 "$limit_file")
     [[ -f $default_file ]] && default_after=$(file_md5 "$default_file")
@@ -143,76 +143,76 @@ optimize_angie() {
       opt_report "- Repository: systemd limit/default files refreshed"
     fi
   else
-    ANGIE_SYNC_RELOAD=1
+    NGINX_SYNC_RELOAD=1
     rc=1
-    opt_report "- **FAILED** Angie repository synchronization; restored the existing /etc/angie tree"
-    angie_restore_live
+    opt_report "- **FAILED** nginx repository synchronization; restored the existing /etc/nginx tree"
+    nginx_restore_live
     # No repository deployer ran, so keep the standalone limit tuning.
-    ensure_angie_limits || true
-    unit_changed=$ANGIE_UNIT_CHANGED
+    ensure_nginx_limits || true
+    unit_changed=$NGINX_UNIT_CHANGED
   fi
-  # Same profile as the installer (angie_apply_profile): guest caches,
+  # Same profile as the installer (nginx_apply_profile): guest caches,
   # precompression, the tuner and dynamic Brotli (the module is installed
   # when missing; a failure moves the optional files to /tmp, gzip stays).
-  if ! angie_apply_profile /etc/angie; then
-    angie_restore_live
+  if ! nginx_apply_profile /etc/nginx; then
+    nginx_restore_live
     opt_report "- **FAILED** tuning returned an error; configuration rolled back"
     return 1
   fi
-  opt_report "- ${ANGIE_COMPRESSION_SUMMARY}"
+  opt_report "- ${NGINX_COMPRESSION_SUMMARY}"
   # Cloudflare-proxied vhosts move off certbot certificates before the tree
-  # digest and the angie -t below, so a broken rewrite is rolled back with
+  # digest and the nginx -t below, so a broken rewrite is rolled back with
   # the rest of the tune (cloudflare_tls_finish checks them after the reload).
   # Same condition as the finish step: a rewrite never goes live unchecked.
   if (( rc == 0 && active )); then
-    cloudflare_tls_migrate /etc/angie 0 || true
+    cloudflare_tls_migrate /etc/nginx 0 || true
   fi
   # The sync restores every repository file before the tuner re-applies the
   # same values, so TUNE_DIRTY is set on every run; compare the tree instead
   # so an already-optimized host is not reloaded.
-  digest_after=$(config_tree_digest /etc/angie)
+  digest_after=$(config_tree_digest /etc/nginx)
   if [[ $digest_before == "$digest_after" ]]; then
     TUNE_DIRTY=0
   else
     TUNE_DIRTY=1
   fi
-  local angie_test_log
-  angie_test_log=$(tmp_file)
-  if ! /usr/sbin/angie -t >"$angie_test_log" 2>&1; then
-    opt_report "- **FAILED** \`angie -t\`:"
-    while IFS= read -r change; do opt_report "  \`${change}\`"; done < "$angie_test_log"
-    angie_restore_live
+  local nginx_test_log
+  nginx_test_log=$(tmp_file)
+  if ! /usr/sbin/nginx -t >"$nginx_test_log" 2>&1; then
+    opt_report "- **FAILED** \`nginx -t\`:"
+    while IFS= read -r change; do opt_report "  \`${change}\`"; done < "$nginx_test_log"
+    nginx_restore_live
     return 1
   fi
   for change in "${TUNE_CHANGES[@]}"; do opt_report "- ${change}"; done
   for change in "${TUNE_MISSES[@]}"; do opt_report "- Not applied: ${change}"; done
   local -a inert=()
-  mapfile -t inert < <(angie_inert_cache_files /etc/angie)
+  mapfile -t inert < <(nginx_inert_cache_files /etc/nginx)
   if (( ${#inert[@]} > 0 )); then
     local inert_file
-    opt_report "- Warning: ${#inert[@]} cache/limit file(s) under http.d are not included by angie.conf:"
+    opt_report "- Warning: ${#inert[@]} cache/limit file(s) under http.d are not included by nginx.conf:"
     for inert_file in "${inert[@]}"; do opt_report "  \`${inert_file}\`"; done
-    opt_report "  They are not loaded (angie.conf includes only *.conf).  Rename one to .conf only if no loaded file defines its zones or maps already (otherwise angie -t fails on a duplicate); remove it if it is obsolete."
+    opt_report "  They are not loaded (nginx.conf includes only *.conf).  Rename one to .conf only if no loaded file defines its zones or maps already (otherwise nginx -t fails on a duplicate); remove it if it is obsolete."
   fi
   if (( active )); then
     if (( TUNE_DIRTY == 0 )); then
       if (( unit_changed )); then
-        opt_report "- Restart: deferred (systemd/default Angie files apply on the next restart)"
+        opt_report "- Restart: deferred (systemd/default nginx files apply on the next restart)"
       else
         opt_report "- Restart: skipped (configuration already optimized)"
       fi
-    elif systemctl reload angie 2>/dev/null && systemctl is-active --quiet angie; then
+    elif systemctl reload nginx 2>/dev/null && systemctl is-active --quiet nginx; then
       OPT_CUTOVER=1
       opt_report "- Reload: **OK** (graceful; in-flight requests keep running)"
       if (( unit_changed )); then
-        opt_report "- Note: systemd/default Angie files apply on the next full restart"
+        opt_report "- Note: systemd/default nginx files apply on the next full restart"
       fi
-    elif systemctl restart angie 2>/dev/null && systemctl is-active --quiet angie; then
+    elif systemctl restart nginx 2>/dev/null && systemctl is-active --quiet nginx; then
       OPT_CUTOVER=1
       opt_report "- Reload failed; Restart: **OK**"
     else
       opt_report "- Reload/Restart: **FAILED**; rolling back"
-      angie_restore_live
+      nginx_restore_live
       return 1
     fi
   else
@@ -220,33 +220,33 @@ optimize_angie() {
   fi
   # zstd (1.21.58) module: only after the pass committed, so a rollback above
   # never restores a tree that loads a purged module.
-  if (( rc == 0 && ANGIE_ZSTD_PURGE_PENDING )) && /usr/sbin/angie -t >/dev/null 2>&1; then
-    angie_purge_zstd_module /etc/angie
-    [[ -n $ANGIE_ZSTD_PURGE_RESULT ]] && opt_report "- ${ANGIE_ZSTD_PURGE_RESULT}"
+  if (( rc == 0 && NGINX_ZSTD_PURGE_PENDING )) && /usr/sbin/nginx -t >/dev/null 2>&1; then
+    nginx_purge_zstd_module /etc/nginx
+    [[ -n $NGINX_ZSTD_PURGE_RESULT ]] && opt_report "- ${NGINX_ZSTD_PURGE_RESULT}"
   fi
-  ANGIE_ZSTD_PURGE_PENDING=0
+  NGINX_ZSTD_PURGE_PENDING=0
   # Through-Cloudflare check of the migrated vhosts, then certbot retirement.
-  # Both need the reloaded, running Angie; a stopped one keeps certbot.
+  # Both need the reloaded, running nginx; a stopped one keeps certbot.
   if (( rc == 0 && active )); then
     cloudflare_tls_finish 0 || true
   fi
-  # ANGIE_BUILD=clang/package (1.21.70): build, BOLT from live traffic, or revert.
+  # NGINX_BUILD=clang/package (1.21.70): build, BOLT from live traffic, or revert.
   # A failed build leaves the package binary serving and marks the run.
-  if (( rc == 0 )) && ! angie_build_apply "$( (( active )) && echo optimize || echo install)" opt_report; then
+  if (( rc == 0 )) && ! nginx_build_apply "$( (( active )) && echo optimize || echo install)" opt_report; then
     rc=1
   fi
   return "$rc"
 }
 
-# Roll /etc/angie, the unit drop-in and /etc/default/angie back to the
+# Roll /etc/nginx, the unit drop-in and /etc/default/nginx back to the
 # --optimize snapshot and put the restored configuration live again.
-angie_restore_live() {
-  opt_restore /etc/angie angie
-  opt_restore /etc/systemd/system/angie.service.d angie-systemd
-  opt_restore /etc/default/angie angie-default
+nginx_restore_live() {
+  opt_restore /etc/nginx nginx
+  opt_restore /etc/systemd/system/nginx.service.d nginx-systemd
+  opt_restore /etc/default/nginx nginx-default
   systemctl daemon-reload || true
-  if /usr/sbin/angie -t >/dev/null 2>&1; then
-    systemctl reload angie 2>/dev/null || systemctl restart angie 2>/dev/null || true
+  if /usr/sbin/nginx -t >/dev/null 2>&1; then
+    systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
   fi
   return 0
 }
@@ -254,12 +254,12 @@ angie_restore_live() {
 # True when active PHP vhosts use the shared local_php upstream, so the
 # temporary socket-primary/TCP-backup cutover is safe.  A direct fastcgi_pass
 # or fastcgi_next_upstream off cannot fall back to the TCP listener.
-angie_uses_local_php_upstream() {
-  local target=${1:-/etc/angie}
+nginx_uses_local_php_upstream() {
+  local target=${1:-/etc/nginx}
   grep -rqE '^[[:space:]]*fastcgi_pass[[:space:]]+local_php;' \
-    "$target/angie.conf" "$target"/conf.d "$target"/h5bp 2>/dev/null || return 1
+    "$target/nginx.conf" "$target"/conf.d "$target"/h5bp 2>/dev/null || return 1
   if grep -rqE '^[[:space:]]*fastcgi_pass[[:space:]]+(127\.0\.0\.1|localhost):[0-9]+;' \
-       "$target/angie.conf" "$target"/conf.d "$target"/h5bp 2>/dev/null; then
+       "$target/nginx.conf" "$target"/conf.d "$target"/h5bp 2>/dev/null; then
     return 1
   fi
   if grep -rqE '^[[:space:]]*fastcgi_next_upstream[[:space:]]+off;' \
@@ -273,11 +273,11 @@ angie_uses_local_php_upstream() {
 # Unix socket without dropping requests.  A temporary bridge pool cannot be
 # used: PHP-FPM's SIGUSR2 reload applies changes to existing pools but does
 # not start a newly added pool (verified on PHP 8.3), so the bridge never
-# listened.  Instead Angie gets the socket as primary and the TCP listener as
+# listened.  Instead nginx gets the socket as primary and the TCP listener as
 # backup, the existing pool is switched and reloaded, and the backup is
 # retired once the socket is live.  A request that lands exactly while the
 # old TCP listener closes and the socket opens can fail over to the backup;
-# if both are unavailable for a moment Angie returns 502.  Cache objects
+# if both are unavailable for a moment nginx returns 502.  Cache objects
 # written in that window are reported, never deleted.  On failure both files
 # are restored and the services reload the original configuration.
 MIGRATE_REASON=""
@@ -285,7 +285,7 @@ MIGRATE_REASON=""
 migrate_php_pool_to_socket() {
   local ver=$1 tcp=$2
   local pool="/etc/php/${ver}/fpm/pool.d/www.conf"
-  local angie_conf=/etc/angie/angie.conf
+  local nginx_conf=/etc/nginx/nginx.conf
   local socket=/run/php/php-fpm.sock
   local bakdir bak="${OPT_BACKUP_DIR:-}/php-socket"
   local fpm_bin="" tcp_re port i ok=0
@@ -295,17 +295,17 @@ migrate_php_pool_to_socket() {
     bak="${bakdir}/php-socket"
   fi
 
-  [[ -f $pool && -f $angie_conf ]] || { MIGRATE_REASON="pool or angie.conf is missing"; return 1; }
-  systemctl is-active --quiet angie || { MIGRATE_REASON="Angie is not active"; return 1; }
+  [[ -f $pool && -f $nginx_conf ]] || { MIGRATE_REASON="pool or nginx.conf is missing"; return 1; }
+  systemctl is-active --quiet nginx || { MIGRATE_REASON="nginx is not active"; return 1; }
   if ! fpm_bin=$(php_fpm_binary "$ver"); then
     MIGRATE_REASON="php-fpm${ver} binary not found"
     return 1
   fi
-  angie_uses_local_php_upstream /etc/angie \
+  nginx_uses_local_php_upstream /etc/nginx \
     || { MIGRATE_REASON="vhosts use a direct fastcgi_pass or fastcgi_next_upstream off"; return 1; }
   tcp_re=${tcp//./\\.}
   port=${tcp##*:}
-  grep -qE "^[[:space:]]*server[[:space:]]+${tcp_re};" "$angie_conf" \
+  grep -qE "^[[:space:]]*server[[:space:]]+${tcp_re};" "$nginx_conf" \
     || { MIGRATE_REASON="upstream does not contain ${tcp}"; return 1; }
 
   if ss -lx 2>/dev/null | grep -qF "$socket"; then
@@ -315,33 +315,33 @@ migrate_php_pool_to_socket() {
 
   mkdir -p "$bak"
   cp -a "$pool" "$bak/www.conf"
-  cp -a "$angie_conf" "$bak/angie.conf"
+  cp -a "$nginx_conf" "$bak/nginx.conf"
 
-  # 1. Angie: socket primary, current TCP listener as backup.  angie -t
+  # 1. nginx: socket primary, current TCP listener as backup.  nginx -t
   #    accepts a unix: server whose socket does not exist yet; the connect
   #    fails fast and the backup serves traffic until PHP creates the socket.
   #    max_fails=0 would disable failure accounting and keep the backup
   #    unused, so use a short fail_timeout that retries the socket quickly.
   sed_in_place -E \
     "s|^([[:space:]]*)server[[:space:]]+${tcp_re};|\1server unix:${socket} max_fails=1 fail_timeout=2s;\n\1server ${tcp} backup;|" \
-    "$angie_conf"
-  if ! grep -qF "server unix:${socket} max_fails=1 fail_timeout=2s;" "$angie_conf" \
-     || ! /usr/sbin/angie -t >/dev/null 2>&1 \
-     || ! systemctl reload angie 2>/dev/null; then
-    cp -a "$bak/angie.conf" "$angie_conf"
-    /usr/sbin/angie -t >/dev/null 2>&1 && systemctl reload angie 2>/dev/null || true
-    MIGRATE_REASON="Angie rejected the socket+backup upstream"
+    "$nginx_conf"
+  if ! grep -qF "server unix:${socket} max_fails=1 fail_timeout=2s;" "$nginx_conf" \
+     || ! /usr/sbin/nginx -t >/dev/null 2>&1 \
+     || ! systemctl reload nginx 2>/dev/null; then
+    cp -a "$bak/nginx.conf" "$nginx_conf"
+    /usr/sbin/nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
+    MIGRATE_REASON="nginx rejected the socket+backup upstream"
     return 1
   fi
-  cp -a "$angie_conf" "$bak/angie-backup.conf"
+  cp -a "$nginx_conf" "$bak/nginx-backup.conf"
 
   # 2. Move the existing pool to the socket.  The reload is graceful: old
   #    workers finish in-flight TCP requests while the master opens the socket.
   php_pool_set_listener "$pool" "$ver" "$socket"
   if ! "$fpm_bin" -t >/dev/null 2>&1; then
     cp -a "$bak/www.conf" "$pool"
-    cp -a "$bak/angie.conf" "$angie_conf"
-    /usr/sbin/angie -t >/dev/null 2>&1 && systemctl reload angie 2>/dev/null || true
+    cp -a "$bak/nginx.conf" "$nginx_conf"
+    /usr/sbin/nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
     MIGRATE_REASON="PHP rejected the socket pool"
     return 1
   fi
@@ -351,9 +351,9 @@ migrate_php_pool_to_socket() {
     opt_report "- PHP-FPM reload failed; restarting to apply the socket listener"
     if ! systemctl restart "php${ver}-fpm" 2>/dev/null; then
       cp -a "$bak/www.conf" "$pool"
-      cp -a "$bak/angie.conf" "$angie_conf"
+      cp -a "$bak/nginx.conf" "$nginx_conf"
       "$fpm_bin" -t >/dev/null 2>&1 && systemctl restart "php${ver}-fpm" 2>/dev/null || true
-      /usr/sbin/angie -t >/dev/null 2>&1 && systemctl reload angie 2>/dev/null || true
+      /usr/sbin/nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
       MIGRATE_REASON="PHP-FPM reload and restart failed"
       return 1
     fi
@@ -383,9 +383,9 @@ migrate_php_pool_to_socket() {
     fi
     if (( ok == 0 )); then
       cp -a "$bak/www.conf" "$pool"
-      cp -a "$bak/angie.conf" "$angie_conf"
+      cp -a "$bak/nginx.conf" "$nginx_conf"
       "$fpm_bin" -t >/dev/null 2>&1 && systemctl restart "php${ver}-fpm" 2>/dev/null || true
-      /usr/sbin/angie -t >/dev/null 2>&1 && systemctl reload angie 2>/dev/null || true
+      /usr/sbin/nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
       MIGRATE_REASON="PHP-FPM did not open ${socket} after reload or restart; restored the TCP listener"
       return 1
     fi
@@ -393,14 +393,14 @@ migrate_php_pool_to_socket() {
   fi
 
   # 3. Drop the TCP backup; the socket is proven live.
-  sed_in_place -E "/^[[:space:]]*server[[:space:]]+${tcp_re}[[:space:]]+backup;/d" "$angie_conf"
-  sed_in_place -E "s|server unix:${socket} max_fails=1 fail_timeout=2s;|server unix:${socket};|" "$angie_conf"
-  if ! /usr/sbin/angie -t >/dev/null 2>&1 \
-     || ! systemctl reload angie 2>/dev/null; then
+  sed_in_place -E "/^[[:space:]]*server[[:space:]]+${tcp_re}[[:space:]]+backup;/d" "$nginx_conf"
+  sed_in_place -E "s|server unix:${socket} max_fails=1 fail_timeout=2s;|server unix:${socket};|" "$nginx_conf"
+  if ! /usr/sbin/nginx -t >/dev/null 2>&1 \
+     || ! systemctl reload nginx 2>/dev/null; then
     # Keep the working socket+backup config rather than risking the site.
-    cp -a "$bak/angie-backup.conf" "$angie_conf"
-    /usr/sbin/angie -t >/dev/null 2>&1 && systemctl reload angie 2>/dev/null || true
-    MIGRATE_REASON="Angie could not drop the TCP backup (socket is live; backup kept)"
+    cp -a "$bak/nginx-backup.conf" "$nginx_conf"
+    /usr/sbin/nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
+    MIGRATE_REASON="nginx could not drop the TCP backup (socket is live; backup kept)"
     return 1
   fi
   return 0
@@ -411,17 +411,17 @@ optimize_php_services() {
   local primary ver active listen_path rc=0
   primary=$(php_primary_version)
   if [[ -z $primary ]]; then
-    # No pool we can safely identify: leave Angie's FastCGI upstream alone
+    # No pool we can safely identify: leave nginx's FastCGI upstream alone
     # rather than pointing it at a socket that was never created.
     OPT_PHP_OK=0
-    opt_report "- No PHP-FPM pool with a usable www.conf; Angie upstream left unchanged"
+    opt_report "- No PHP-FPM pool with a usable www.conf; nginx upstream left unchanged"
     return 0
   fi
   while IFS= read -r ver; do
     active=0
     systemctl is-active --quiet "php${ver}-fpm" 2>/dev/null && active=1
     # Preserve the pool's existing listener.  Migrating a live TCP pool to a
-    # Unix socket creates a window where Angie still points at port 9000 and
+    # Unix socket creates a window where nginx still points at port 9000 and
     # every request returns 502.  Installations still use the socket template.
     listen_path=$(php_pool_listen "$ver")
     opt_report "## PHP ${ver}"
@@ -457,8 +457,8 @@ optimize_php_services() {
     local migrated=0 migration_failed=0
     if (( active )) && [[ $ver == "$primary" ]] \
        && [[ $listen_path =~ ^(127\.0\.0\.1|localhost):[0-9]+$ ]]; then
-      if systemctl is-active --quiet angie \
-         && angie_uses_local_php_upstream /etc/angie; then
+      if systemctl is-active --quiet nginx \
+         && nginx_uses_local_php_upstream /etc/nginx; then
         if migrate_php_pool_to_socket "$ver" "$listen_path"; then
           OPT_PHP_SOCKET=/run/php/php-fpm.sock
           OPT_CUTOVER=1
@@ -471,7 +471,7 @@ optimize_php_services() {
           migration_failed=1
         fi
       else
-        opt_report "- Socket migration skipped: Angie inactive or vhosts use a direct fastcgi_pass/next_upstream off"
+        opt_report "- Socket migration skipped: nginx inactive or vhosts use a direct fastcgi_pass/next_upstream off"
       fi
     fi
     # Only the extensions the applications need (lib/php-build.sh); a change
@@ -531,7 +531,7 @@ optimize_php_services() {
     fi
   done < <(php_fpm_versions)
 
-  # Only hand a socket path to Angie when that pool is active and the socket
+  # Only hand a socket path to nginx when that pool is active and the socket
   # actually exists.  TCP pools deliberately leave OPT_PHP_SOCKET empty.
   if (( rc == 0 )); then
     listen_path=$(php_pool_listen "$primary")
@@ -643,21 +643,21 @@ mariadb_pool_resize_short() {
 }
 
 # Stop the request-serving tiers before a MariaDB restart, then bring them
-# back in dependency order (PHP first, Angie last).  Only services that were
+# back in dependency order (PHP first, nginx last).  Only services that were
 # active are touched; an OS-only or DB-only host is unaffected.
-# Stop Angie, then every active PHP-FPM unit; WHY names the reason in the log
+# Stop nginx, then every active PHP-FPM unit; WHY names the reason in the log
 # (default: the MariaDB restart; --restart-all passes its own).
 # shellcheck disable=SC2120
 opt_pause_web_frontends() {
   local why=${1:-the MariaDB restart} unit
-  OPT_WEB_PAUSED_ANGIE=0
+  OPT_WEB_PAUSED_NGINX=0
   OPT_WEB_PAUSED_PHP=()
-  if systemctl is-active --quiet angie 2>/dev/null; then
-    if systemctl stop angie 2>/dev/null; then
-      OPT_WEB_PAUSED_ANGIE=1
-      info "Paused Angie before ${why}"
+  if systemctl is-active --quiet nginx 2>/dev/null; then
+    if systemctl stop nginx 2>/dev/null; then
+      OPT_WEB_PAUSED_NGINX=1
+      info "Paused nginx before ${why}"
     else
-      warn "Could not stop Angie before ${why}"
+      warn "Could not stop nginx before ${why}"
     fi
   fi
   while IFS= read -r unit; do
@@ -672,7 +672,7 @@ opt_pause_web_frontends() {
   done < <(list_active_php_units)
 }
 
-# Start the paused PHP-FPM units first, then Angie.
+# Start the paused PHP-FPM units first, then nginx.
 # shellcheck disable=SC2120
 opt_resume_web_frontends() {
   local why=${1:-the MariaDB restart} unit rc=0
@@ -682,16 +682,16 @@ opt_resume_web_frontends() {
       rc=1
     fi
   done
-  if (( OPT_WEB_PAUSED_ANGIE )); then
-    if ! systemctl start angie 2>/dev/null; then
-      warn "Could not start Angie after ${why}"
+  if (( OPT_WEB_PAUSED_NGINX )); then
+    if ! systemctl start nginx 2>/dev/null; then
+      warn "Could not start nginx after ${why}"
       rc=1
     fi
   fi
-  if (( ${#OPT_WEB_PAUSED_PHP[@]} > 0 || OPT_WEB_PAUSED_ANGIE )); then
+  if (( ${#OPT_WEB_PAUSED_PHP[@]} > 0 || OPT_WEB_PAUSED_NGINX )); then
     info "Resumed web frontends after ${why}"
   fi
-  OPT_WEB_PAUSED_ANGIE=0
+  OPT_WEB_PAUSED_NGINX=0
   OPT_WEB_PAUSED_PHP=()
   return "$rc"
 }
@@ -867,8 +867,8 @@ optimize_mariadb() {
     # overwhelm a freshly started database.
     systemctl daemon-reload || true
     opt_pause_web_frontends
-    if (( OPT_WEB_PAUSED_ANGIE || ${#OPT_WEB_PAUSED_PHP[@]} > 0 )); then
-      opt_report "- Paused web frontends before the MariaDB restart (PHP, then Angie)"
+    if (( OPT_WEB_PAUSED_NGINX || ${#OPT_WEB_PAUSED_PHP[@]} > 0 )); then
+      opt_report "- Paused web frontends before the MariaDB restart (PHP, then nginx)"
     fi
 
     # A large buffer pool may need to preload at startup; the probe allows up
@@ -881,7 +881,7 @@ optimize_mariadb() {
         opt_report "- **WARNING**: slow_query_log is ${live_slow:-unknown} after restart; check AppArmor/log permissions"
       fi
       if ! opt_resume_web_frontends; then
-        opt_report "- Web frontends: **FAILED** to resume; check Angie/PHP-FPM"
+        opt_report "- Web frontends: **FAILED** to resume; check nginx/PHP-FPM"
         return 1
       fi
       opt_report "- Web frontends resumed after the MariaDB restart"
@@ -1341,7 +1341,7 @@ optimize_valkey_tune() {
       || return 1
     # A socket path change does not alter the supplementary groups the PHP
     # workers already have.  Restarting PHP just because the cache moved to
-    # a Unix socket briefly removes /run/php/php-fpm.sock and makes Angie
+    # a Unix socket briefly removes /run/php/php-fpm.sock and makes nginx
     # return 502s; only a real group change needs it.
     if (( group_changed )); then
       restart_php_workers_for_group "$group"
@@ -1729,24 +1729,24 @@ verify_optimized_services() {
   local rc=0 ver sock es_url code
   opt_report "## Verification"
 
-  if [[ -x /usr/sbin/angie ]] && systemctl is-active --quiet angie; then
-    if /usr/sbin/angie -t >/dev/null 2>&1; then
+  if [[ -x /usr/sbin/nginx ]] && systemctl is-active --quiet nginx; then
+    if /usr/sbin/nginx -t >/dev/null 2>&1; then
       local ports
-      ports=$(opt_listen_ports angie)
+      ports=$(opt_listen_ports nginx)
       if [[ -n $ports ]]; then
-        opt_report "- Angie: configuration valid; listening on \`${ports}\`"
+        opt_report "- nginx: configuration valid; listening on \`${ports}\`"
       else
-        opt_report "- Angie: **FAILED** active but no listening socket found"
+        opt_report "- nginx: **FAILED** active but no listening socket found"
         rc=1
       fi
     else
-      opt_report "- Angie: **FAILED** configuration test while active"
+      opt_report "- nginx: **FAILED** configuration test while active"
       rc=1
     fi
-    opt_log_errors angie Angie
+    opt_log_errors nginx nginx
   fi
   if [[ " ${OPT_DETECTED[*]} " == *" php:"* ]]; then
-    (( ${OPT_PHP_OK:-0} )) || opt_report "- PHP: no primary pool was optimized; Angie upstream left unchanged"
+    (( ${OPT_PHP_OK:-0} )) || opt_report "- PHP: no primary pool was optimized; nginx upstream left unchanged"
     local fpm_bin
     while IFS= read -r ver; do
       systemctl is-active --quiet "php${ver}-fpm" || continue
@@ -1891,9 +1891,9 @@ optimize_plan() {
   elif ! cpu_performance_governor_available; then
     governor_desc="skipped (no performance governor)"
   fi
-  disk_free_mb=$(angie_disk_free_mb)
-  cache_mb=$(angie_cache_budget_mb "$ram_mb" "$disk_free_mb")
-  angie_worker_limits "$nproc"
+  disk_free_mb=$(nginx_disk_free_mb)
+  cache_mb=$(nginx_cache_budget_mb "$ram_mb" "$disk_free_mb")
+  nginx_worker_limits "$nproc"
   printf '\n%sDRY RUN%s - optimize scan only, no changes will be made.\n' "$C_BOLD" "$C_RESET"
   printf 'Host: %s  %s CPU  %s MB RAM  %s\n' "$(hostname 2>/dev/null || echo unknown)" \
     "$nproc" "$ram_mb" "$(df -h / | awk 'NR==2{print $4 " free"}')"
@@ -1914,30 +1914,30 @@ optimize_plan() {
     printf '  WARNING: service floors and reserved memory exceed the budget by %sMB; this host is too small for the selected services\n' \
       "$OPT_MEM_OVERCOMMIT_MB"
   fi
-  if [[ " ${OPT_DETECTED[*]} " == *" angie "* ]]; then
-    printf '  Angie: workers=%s connections=%s rlimit=%s keepalive=%s cache_budget=%sMB\n' \
-      "$ANGIE_WORKER_PROCESSES" "$ANGIE_WORKER_CONNECTIONS" "$ANGIE_WORKER_RLIMIT" \
-      "$ANGIE_PHP_KEEPALIVE" "$cache_mb"
-    printf '  Angie compression: Brotli level %s dynamic, gzip fallback (module installed on apply)\n' \
-      "$(angie_brotli_level)"
-    local angie_plan
-    angie_plan=$(angie_build_plan)
-    [[ -n $angie_plan ]] && printf '  Angie: %s\n' "$angie_plan"
-    if pkg_ok angie-module-zstd 2>/dev/null; then
-      printf '  Angie zstd: retired in 1.21.59; managed stanzas moved away and angie-module-zstd purged unless a configuration still uses it\n'
+  if [[ " ${OPT_DETECTED[*]} " == *" nginx "* ]]; then
+    printf '  nginx: workers=%s connections=%s rlimit=%s keepalive=%s cache_budget=%sMB\n' \
+      "$NGINX_WORKER_PROCESSES" "$NGINX_WORKER_CONNECTIONS" "$NGINX_WORKER_RLIMIT" \
+      "$NGINX_PHP_KEEPALIVE" "$cache_mb"
+    printf '  nginx compression: Brotli level %s dynamic, gzip fallback (module installed on apply)\n' \
+      "$(nginx_brotli_level)"
+    local nginx_plan
+    nginx_plan=$(nginx_build_plan)
+    [[ -n $nginx_plan ]] && printf '  nginx: %s\n' "$nginx_plan"
+    if pkg_ok nginx-module-zstd 2>/dev/null; then
+      printf '  nginx zstd: retired in 1.21.59; managed stanzas moved away and nginx-module-zstd purged unless a configuration still uses it\n'
     fi
-    printf '  Angie static assets: precompressed .br/.gz siblings %s (SETUP_PRECOMPRESS_ASSETS)\n' \
+    printf '  nginx static assets: precompressed .br/.gz siblings %s (SETUP_PRECOMPRESS_ASSETS)\n' \
       "$( (( PRECOMPRESS_ASSETS )) && printf on || printf off )"
     printf '  XenForo jobs: managed xf:run-jobs crontab %s for every XenForo root (SETUP_XF_JOB_CRON)\n' \
       "$( (( XF_JOB_CRON )) && printf on || printf off )"
-    printf '  Angie repository: sync %s (%s), then apply the hardware profile\n' \
+    printf '  nginx repository: sync %s (%s), then apply the hardware profile\n' \
       "${CONFIG_REPO_URL}" "${CONFIG_REPO_REF}"
-    # Same gate as the real run: both steps need a running Angie.
-    if systemctl is-active --quiet angie 2>/dev/null; then
-      cloudflare_tls_migrate /etc/angie 1 || true
+    # Same gate as the real run: both steps need a running nginx.
+    if systemctl is-active --quiet nginx 2>/dev/null; then
+      cloudflare_tls_migrate /etc/nginx 1 || true
       certbot_retire_if_unused 1 || true
     elif [[ ${CF_SELF_SIGNED:-1} != 0 ]]; then
-      printf '  Cloudflare TLS / certbot: skipped (Angie is not active)\n'
+      printf '  Cloudflare TLS / certbot: skipped (nginx is not active)\n'
     fi
   fi
   printf '  Applications: audit WordPress/XenForo persistent MariaDB and Valkey socket settings\n'
@@ -1973,7 +1973,7 @@ optimize_plan() {
     plan_opcache_mb=$PHP_PROFILE_OPCACHE_MB
     printf '  PHP-FPM:  memory_limit=%sM realpath_cache=%sk\n' "$PHP_PROFILE_MEMORY_MB" "$PHP_PROFILE_REALPATH_KB"
     read -r jit_mode jit_buffer_mb < <(php_jit_settings "$plan_opcache_mb")
-    wp_roots=$(php_jit_path_sections /etc/angie | grep -c '^opcache\.jit = off$' || true)
+    wp_roots=$(php_jit_path_sections /etc/nginx | grep -c '^opcache\.jit = off$' || true)
     printf '  PHP-FPM:  pm=static opcache=%sM jit=%s buffer=%sM (WordPress roots kept off: %s)\n' \
       "$plan_opcache_mb" "$jit_mode" "$jit_buffer_mb" "${wp_roots:-0}"
     local build_plan

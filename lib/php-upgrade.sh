@@ -21,7 +21,7 @@
 #      extension packages (PHP_EXTRA_PACKAGES);
 #   5. carry over unowned .ini fragments and extra FPM pools;
 #   6. run the shared PHP tuner (the same one install and --optimize use) and
-#      reload Angie if it is active;
+#      reload nginx if it is active;
 #   7. verify and write a Markdown report with the rollback paths.
 #
 # Only PHP (and the services that depend on its socket) is touched: the OS
@@ -38,7 +38,7 @@ PHP_UPGRADE_TARGET_PKGS=()
 PHP_UPGRADE_SKIPPED=()
 # Listener of the old version's www pool.  The new www.conf comes from the
 # template, so without this an operator socket path (an adopted host on
-# /run/php/php8.4-fpm.sock) would change and Angie would answer 502.
+# /run/php/php8.4-fpm.sock) would change and nginx would answer 502.
 PHP_UPGRADE_WWW_LISTEN=""
 PHP_UPGRADE_CUSTOM_INIS=()
 PHP_UPGRADE_CUSTOM_POOLS=()
@@ -55,7 +55,7 @@ PHP_UPGRADE_CARRIED_COUNT=0
 PHP_UPGRADE_BLOCKERS=()
 # "app|root|ext" requirements the old PHP did not load either (not a loss).
 PHP_UPGRADE_NOT_LOADED=()
-PHP_UPGRADE_ANGIE_ACTIVE=0
+PHP_UPGRADE_NGINX_ACTIVE=0
 PHP_UPGRADE_OPTIMIZE_OK=0
 PHP_UPGRADE_VERIFY_OK=0
 
@@ -155,20 +155,20 @@ php_upgrade_custom_pools() {
 # aside: on a host with 8.3 next to 8.5, the 8.3 extra pools (and the sockets
 # their vhosts point at) vanished without a word.  Prints one
 # "version<TAB>kind<TAB>detail" line per loss (kind: ini, pool, listener).  A
-# stock second version's www pool is only a loss when an Angie file actually
+# stock second version's www pool is only a loss when an nginx file actually
 # references its listener, so a merely installed, unused FPM does not block.
 # The listener the target's www pool takes over is not a loss either: the
 # snapshot hands OLD's www listen to the new pool (PHP_UPGRADE_WWW_LISTEN), and
 # with no OLD pool the template default /run/php/php-fpm.sock applies.  Every
-# setup template and Angie's upstream use that shared path, so a stale second
+# setup template and nginx's upstream use that shared path, so a stale second
 # version on the same socket (the state the purge exists to clean up) would
 # otherwise always look like a loss and push the operator to the blanket
 # override.  Pools and listeners only count while that version's FPM package
 # is installed: a removed-not-purged FPM leaves pool.d behind but serves
 # nothing.  Custom inis count regardless (the CLI reads them too).
-# ETC and ANGIE default to the live trees (arguments for unit tests).
+# ETC and NGINX default to the live trees (arguments for unit tests).
 php_upgrade_other_version_losses() {
-  local old=$1 etc=${2:-/etc/php} angie=${3:-/etc/angie} ver rel links pool listen ref kept
+  local old=$1 etc=${2:-/etc/php} nginx=${3:-/etc/nginx} ver rel links pool listen ref kept
   kept=$(ini_get "$etc/$old/fpm/pool.d/www.conf" listen 2>/dev/null || true)
   kept=${kept:-/run/php/php-fpm.sock}
   while IFS= read -r ver; do
@@ -183,8 +183,8 @@ php_upgrade_other_version_losses() {
       printf '%s\tpool\t%s%s\n' "$ver" "$pool" "${listen:+ (listen = ${listen})}"
     done < <(php_upgrade_custom_pools "$etc/$ver")
     listen=$(ini_get "$etc/$ver/fpm/pool.d/www.conf" listen 2>/dev/null || true)
-    if [[ -n $listen && $listen != "$kept" && -d $angie ]]; then
-      ref=$(grep -rlsF -- "$listen" "$angie" 2>/dev/null | head -n 1 || true)
+    if [[ -n $listen && $listen != "$kept" && -d $nginx ]]; then
+      ref=$(grep -rlsF -- "$listen" "$nginx" 2>/dev/null | head -n 1 || true)
       [[ -n $ref ]] && printf '%s\tlistener\t%s (used by %s)\n' "$ver" "$listen" "$ref"
     fi
   done < <(php_upgrade_any_versions)
@@ -298,7 +298,7 @@ php_upgrade_snapshot() {
     printf 'mode: %s\n' "$PHP_UPGRADE_MODE"
     printf 'old_version: %s\n' "$old"
     printf 'target_version: %s\n' "${UPGRADE_PHP:-}"
-    printf 'angie_active: %s\n' "$PHP_UPGRADE_ANGIE_ACTIVE"
+    printf 'nginx_active: %s\n' "$PHP_UPGRADE_NGINX_ACTIVE"
     printf 'package_count: %s\n' "${#pkgs[@]}"
   } > "$dir/manifest.txt"
   printf '%s\n' "${pkgs[@]}" > "$dir/packages.txt"
@@ -542,18 +542,18 @@ php_upgrade_app_roots() {
   done
 }
 
-# The same detection for document roots declared in Angie vhosts, which may
+# The same detection for document roots declared in nginx vhosts, which may
 # live outside /var/www (a mounted or symlinked tree).  --optimize derives its
 # PHP paths from these vhosts, so the upgrade preflight must see them too.
 # Both walks call app_type_at_root so a site can never be recognized by one
 # path and missed by the other (a Chevereto tree needs only app/env.php).
 php_upgrade_vhost_roots() {
-  local target=${1:-/etc/angie} file root app
+  local target=${1:-/etc/nginx} file root app
   local -A seen_root=()
   [[ -d $target/conf.d ]] || return 0
   for file in "$target"/conf.d/*.conf; do
     [[ -f $file ]] || continue
-    root=$(angie_vhost_root "$file")
+    root=$(nginx_vhost_root "$file")
     [[ -n $root && -d $root ]] || continue
     [[ -n ${seen_root[$root]:-} ]] && continue
     seen_root[$root]=1
@@ -1069,8 +1069,8 @@ php_upgrade_optimize() {
   OPT_PHP_SOCKET=""
   tune_reset_changes
   # Same contract as run_optimize(): OPT_PHP_OK is set before the PHP
-  # pass and cleared only when it fails.  php_refresh_after_angie() is gated
-  # on it, so leaving it at 0 silently skipped the post-Angie [PATH=] ini
+  # pass and cleared only when it fails.  php_refresh_after_nginx() is gated
+  # on it, so leaving it at 0 silently skipped the post-nginx [PATH=] ini
   # refresh on every --upgrade-php.
   OPT_PHP_OK=1
   if optimize_php_services; then
@@ -1082,25 +1082,25 @@ php_upgrade_optimize() {
     rc=1
   fi
   # A host installed from distribution packages serves PHP over TCP and
-  # Angie's local_php upstream points at 127.0.0.1:9000.  install_php has
+  # nginx's local_php upstream points at 127.0.0.1:9000.  install_php has
   # already written the Unix-socket pool, so the TCP->socket migration in
   # optimize_php_services cannot fire (it only runs while the pool is still
-  # on TCP) and Angie would be reloaded against a dead port: every site 502.
-  # Apply the shared Angie profile so --upgrade-php reaches the same state as
+  # on TCP) and nginx would be reloaded against a dead port: every site 502.
+  # Apply the shared nginx profile so --upgrade-php reaches the same state as
   # --optimize: guest caches, precompression, compression and the tuner, not
   # only the tuner (an adopted host kept old cache includes otherwise).
-  if [[ -n ${OPT_PHP_SOCKET:-} && -f /etc/angie/angie.conf ]]; then
+  if [[ -n ${OPT_PHP_SOCKET:-} && -f /etc/nginx/nginx.conf ]]; then
     tune_reset_changes
-    if angie_apply_profile /etc/angie; then
-      for change in "${TUNE_CHANGES[@]}"; do info "Angie: ${change}"; done
-      # The managed PHP ini carries [PATH=] sections derived from the Angie
+    if nginx_apply_profile /etc/nginx; then
+      for change in "${TUNE_CHANGES[@]}"; do info "nginx: ${change}"; done
+      # The managed PHP ini carries [PATH=] sections derived from the nginx
       # tree; the sync above may have changed that tree after the PHP pass.
-      # The shared helper mirrors --optimize's post-Angie refresh (including
+      # The shared helper mirrors --optimize's post-nginx refresh (including
       # the cache-cutover accounting) so an upgrade reaches the same file
       # state in one run.
-      php_refresh_after_angie info "" || rc=1
+      php_refresh_after_nginx info "" || rc=1
     else
-      warn "Angie configuration could not be aligned with the PHP socket"
+      warn "nginx configuration could not be aligned with the PHP socket"
       rc=1
     fi
   fi
@@ -1115,27 +1115,27 @@ php_upgrade_optimize() {
   return 0
 }
 
-# Reload Angie so its upstream pool reconnects to the new FPM master.  A Unix
+# Reload nginx so its upstream pool reconnects to the new FPM master.  A Unix
 # socket survives the PHP restart, but a keepalive upstream can hold a dead
 # worker until it notices; a graceful reload is cheap and makes the cutover
 # deterministic.
-php_upgrade_reload_angie() {
-  PHP_UPGRADE_ANGIE_ACTIVE=0
-  systemctl is-active --quiet angie 2>/dev/null || return 0
-  PHP_UPGRADE_ANGIE_ACTIVE=1
-  if ! /usr/sbin/angie -t >/dev/null 2>&1; then
-    warn "Angie configuration test failed; not reloading"
+php_upgrade_reload_nginx() {
+  PHP_UPGRADE_NGINX_ACTIVE=0
+  systemctl is-active --quiet nginx 2>/dev/null || return 0
+  PHP_UPGRADE_NGINX_ACTIVE=1
+  if ! /usr/sbin/nginx -t >/dev/null 2>&1; then
+    warn "nginx configuration test failed; not reloading"
     return 1
   fi
-  if systemctl reload angie 2>/dev/null && systemctl is-active --quiet angie; then
-    ok "Angie reloaded against PHP-FPM"
+  if systemctl reload nginx 2>/dev/null && systemctl is-active --quiet nginx; then
+    ok "nginx reloaded against PHP-FPM"
     return 0
   fi
-  if systemctl restart angie 2>/dev/null && systemctl is-active --quiet angie; then
-    warn "Angie reload failed; restarted instead"
+  if systemctl restart nginx 2>/dev/null && systemctl is-active --quiet nginx; then
+    warn "nginx reload failed; restarted instead"
     return 0
   fi
-  warn "Angie did not come back after the PHP upgrade"
+  warn "nginx did not come back after the PHP upgrade"
   return 1
 }
 
@@ -1190,11 +1190,11 @@ php_upgrade_verify() {
     warn "The CLI does not load OPcache; the JIT is not active"
     rc=1
   fi
-  # Angie must not keep pointing at a TCP PHP port when the pool is on a
+  # nginx must not keep pointing at a TCP PHP port when the pool is on a
   # socket (the state a distro install is in before --upgrade-php).
-  if [[ $socket == /* && -f /etc/angie/angie.conf ]] && systemctl is-active --quiet angie; then
-    if grep -rqE '^[[:space:]]*(fastcgi_pass|server)[[:space:]]+(127\.0\.0\.1|localhost):9000;' /etc/angie 2>/dev/null; then
-      warn "Angie still points at TCP port 9000 while PHP-FPM listens on ${socket}"
+  if [[ $socket == /* && -f /etc/nginx/nginx.conf ]] && systemctl is-active --quiet nginx; then
+    if grep -rqE '^[[:space:]]*(fastcgi_pass|server)[[:space:]]+(127\.0\.0\.1|localhost):9000;' /etc/nginx 2>/dev/null; then
+      warn "nginx still points at TCP port 9000 while PHP-FPM listens on ${socket}"
       rc=1
     fi
   fi
@@ -1273,7 +1273,7 @@ php_upgrade_rollback() {
   else
     warn "PHP ${old} did not start; inspect journalctl -u php${old}-fpm"
   fi
-  /usr/sbin/angie -t >/dev/null 2>&1 && systemctl reload angie 2>/dev/null || true
+  /usr/sbin/nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
 }
 
 # Markdown report kept next to the state, plus a copy under /var/log so the
@@ -1304,7 +1304,7 @@ php_upgrade_write_report() {
     printf -- '- To: %s\n' "$new"
     printf -- '- Result: %s\n' "$([[ $rc -eq 0 ]] && printf PASS || printf ATTENTION)"
     printf -- '- Backup: `%s/php-config`\n' "$PHP_UPGRADE_MANIFEST_DIR"
-    printf -- '- Angie active/reloaded: %s\n\n' "$PHP_UPGRADE_ANGIE_ACTIVE"
+    printf -- '- nginx active/reloaded: %s\n\n' "$PHP_UPGRADE_NGINX_ACTIVE"
     printf '## Extensions carried over\n\n'
     printf '| Extension | Manual | Old package | New package |\n|---|---|---|---|\n'
     if [[ -f "$PHP_UPGRADE_MANIFEST_DIR/extensions.txt" ]]; then
@@ -1379,7 +1379,7 @@ php_upgrade_plan() {
   local -a versions=()
   mapfile -t versions < <(php_upgrade_installed_versions)
   (( ${#versions[@]} > 0 )) || mapfile -t versions < <(php_upgrade_any_versions)
-  # The same source version the real run picks (the pool that owns Angie's
+  # The same source version the real run picks (the pool that owns nginx's
   # socket), not simply the newest FPM: on a host with 8.3 serving and 8.5
   # installed beside it, the plan used to name 8.5 while the run upgraded 8.3.
   if (( ${#versions[@]} > 0 )); then
@@ -1470,7 +1470,7 @@ php_upgrade_plan() {
   printf '  2. purge every PHP package and PHP-only dependencies (autoremove delta)\n'
   printf '  3. install php%s-fpm/cli plus the extension list above\n' "$target"
   printf '  4. migrate operator-owned .ini fragments and extra FPM pools\n'
-  printf '  5. run the shared PHP tuner (pool, OPcache, tracing JIT) and reload Angie if active\n'
+  printf '  5. run the shared PHP tuner (pool, OPcache, tracing JIT) and reload nginx if active\n'
   printf '  6. verify version/socket/extensions and write /var/log/setup-php-upgrade-*.md\n'
   rm -rf "$dir"
 }
@@ -1628,7 +1628,7 @@ run_php_upgrade() {
     PHP_UPGRADE_IN_FLIGHT=0
     trap "exit 129" HUP
   fi
-  php_upgrade_reload_angie || rc=1
+  php_upgrade_reload_nginx || rc=1
   php_upgrade_verify "$target" || rc=1
   php_upgrade_remove_stale_dropins
   php_upgrade_record_pending
@@ -1647,7 +1647,7 @@ run_php_upgrade() {
   printf '%-24s %s\n' 'Extensions carried' "$PHP_UPGRADE_CARRIED_COUNT"
   printf '%-24s %s\n' 'Extensions skipped' "${#PHP_UPGRADE_SKIPPED[@]}"
   printf '%-24s %s\n' 'FPM' "$(systemctl is-active "php${target}-fpm" 2>/dev/null || printf unknown)"
-  printf '%-24s %s\n' 'Angie' "$([[ $PHP_UPGRADE_ANGIE_ACTIVE == 1 ]] && printf reloaded || printf not-running)"
+  printf '%-24s %s\n' 'nginx' "$([[ $PHP_UPGRADE_NGINX_ACTIVE == 1 ]] && printf reloaded || printf not-running)"
   printf '%-24s %s\n' 'Backup' "${PHP_UPGRADE_MANIFEST_DIR}"
   printf '%-24s %s\n' 'Report' "$report"
   printf '%-24s %s\n' 'Duration' "$(format_duration $(( $(date +%s) - start )))"

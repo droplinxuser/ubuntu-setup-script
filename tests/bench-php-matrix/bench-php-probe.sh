@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Measure php-build-probe.php through Angie + PHP-FPM for each arm, so the
+# Measure php-build-probe.php through nginx + PHP-FPM for each arm, so the
 # report can separate a faster C library (json, preg, str, hash, sort) from a
 # faster engine/JIT (objects, arithmetic).
 #

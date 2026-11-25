@@ -98,10 +98,10 @@ valkey_build_install_support() {
   if [[ -f ${SCRIPT_DIR}/valkey-build.conf ]] && ! cmp -s "${SCRIPT_DIR}/valkey-build.conf" "$VALKEY_BUILD_CONF_FILE"; then
     install -m 644 "${SCRIPT_DIR}/valkey-build.conf" "$VALKEY_BUILD_CONF_FILE"
   fi
-  angie_build_write "$VALKEY_BUILD_UNIT" "$(valkey_build_unit_text)" && changed=1
-  angie_build_write "$VALKEY_BUILD_REFRESH_UNIT" "$(valkey_build_refresh_text)" && changed=1
-  angie_build_write "$VALKEY_BUILD_REFRESH_TIMER" "$(valkey_build_timer_text)" && changed=1
-  angie_build_write "$VALKEY_BUILD_APT_HOOK" "$(valkey_build_apt_hook_text)" || true
+  nginx_build_write "$VALKEY_BUILD_UNIT" "$(valkey_build_unit_text)" && changed=1
+  nginx_build_write "$VALKEY_BUILD_REFRESH_UNIT" "$(valkey_build_refresh_text)" && changed=1
+  nginx_build_write "$VALKEY_BUILD_REFRESH_TIMER" "$(valkey_build_timer_text)" && changed=1
+  nginx_build_write "$VALKEY_BUILD_APT_HOOK" "$(valkey_build_apt_hook_text)" || true
   (( changed )) && systemctl daemon-reload 2>/dev/null
   systemctl enable --now "${VALKEY_BUILD_REFRESH_TIMER##*/}" >/dev/null 2>&1 || true
   return 0

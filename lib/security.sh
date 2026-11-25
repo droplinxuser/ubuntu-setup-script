@@ -215,11 +215,11 @@ harden_wordpress_audit_db() {
   return 0
 }
 
-# Directories Angie serves files from: every root and alias in the conf.d
+# Directories nginx serves files from: every root and alias in the conf.d
 # vhosts (a variable suffix such as `root /srv/$host` is cut at the `$`).
-# Empty when Angie is not configured.
+# Empty when nginx is not configured.
 harden_served_roots() {
-  local target=${HARDEN_ANGIE_DIR:-/etc/angie} f p
+  local target=${HARDEN_NGINX_DIR:-/etc/nginx} f p
   [[ -d $target/conf.d ]] || return 0
   for f in "$target"/conf.d/*.conf; do
     [[ -f $f ]] || continue
@@ -263,11 +263,11 @@ harden_wordpress_files() {
   local r unserved=0
   mapfile -t -d '' big < "$big_list"
   rm -f "$ww" "$big_list"
-  # Only an archive below a directory Angie serves can be downloaded.  An
+  # Only an archive below a directory nginx serves can be downloaded.  An
   # application's private store next to its public root (Pingvin Share's
   # pingvin_data/uploads/shares/*/archive.zip, a backup directory) is not,
   # and listing it as web-accessible was a false WARNING on a live host.
-  # Without an Angie configuration every archive is reported, as before.
+  # Without an nginx configuration every archive is reported, as before.
   mapfile -t roots < <(harden_served_roots)
   if (( ${#roots[@]} > 0 )); then
     for f in "${big[@]}"; do
@@ -281,7 +281,7 @@ harden_wordpress_files() {
   fi
   exposed=("${served[@]:0:20}")
   if (( ${#exposed[@]} > 0 )); then
-    harden_warn "  - large archives inside web-accessible paths (below an Angie root/alias):"
+    harden_warn "  - large archives inside web-accessible paths (below an nginx root/alias):"
     for f in "${exposed[@]}"; do harden_warn "      ${f}"; done
     (( ${#served[@]} > 20 )) && harden_warn "      ... and $(( ${#served[@]} - 20 )) more"
   fi
@@ -367,9 +367,9 @@ XF_GZIP_SUPERSEDED='// setup.sh superseded (enableGzip block below): '
 XF_GZIP_LINE_RE='^[[:space:]]*[$]config[[:space:]]*[[][[:space:]]*["'"'"']enableGzip["'"'"'][[:space:]]*[]][[:space:]]*=[^;]*;[[:space:]]*((//|#).*)?$'
 xf_gzip_block() {
   cat <<'EOF'
-// BEGIN setup.sh enableGzip (XF_MEMBER_GZIP=angie in /etc/default/setup-tuning)
+// BEGIN setup.sh enableGzip (XF_MEMBER_GZIP=nginx in /etc/default/setup-tuning)
 // Guests: XenForo compresses (level 9) and the guest cache stores that body.
-// Logged-in visitors: XenForo sends plain HTML and Angie compresses it
+// Logged-in visitors: XenForo sends plain HTML and nginx compresses it
 // (Brotli/gzip level 4), which costs far less PHP CPU per page.
 $config['enableGzip'] = !isset($_COOKIE[($config['cookie']['prefix'] ?? 'xf_') . 'session']);
 // END setup.sh enableGzip
@@ -398,13 +398,13 @@ tune_xenforo_gzip() {
     # The block is appended after one blank line; removing it (or writing
     # it again) first drops the trailing blank lines, so a round trip
     # restores the original file byte for byte.
-    if [[ $XF_MEMBER_GZIP == angie ]] || grep -qF "$XF_GZIP_BEGIN" "$conf"; then
+    if [[ $XF_MEMBER_GZIP == nginx ]] || grep -qF "$XF_GZIP_BEGIN" "$conf"; then
       sed -i -e ':a' -e '/^[[:space:]]*$/{$d;N;ba' -e '}' "$tmp"
     fi
     # Earlier enableGzip lines: commented out while the block manages the
     # setting, given back (prefix stripped) when it does not.
     tmp2=$(tmp_file) || return 1
-    if [[ $XF_MEMBER_GZIP == angie ]]; then
+    if [[ $XF_MEMBER_GZIP == nginx ]]; then
       awk -v re="$XF_GZIP_LINE_RE" -v p="$XF_GZIP_SUPERSEDED" \
         '$0 ~ re { print p $0; next } { print }' "$tmp" > "$tmp2"
     else
@@ -415,7 +415,7 @@ tune_xenforo_gzip() {
     delta=$(( $(grep -cF "$XF_GZIP_SUPERSEDED" "$tmp" || true) - $(grep -cF "$XF_GZIP_SUPERSEDED" "$conf" || true) ))
     # A closing "?>" would print the block as text, so a final "?>" goes
     # and the appended PHP stays inside the file's opening tag.
-    if [[ $XF_MEMBER_GZIP == angie ]]; then
+    if [[ $XF_MEMBER_GZIP == nginx ]]; then
       if [[ $(tail -n1 "$tmp") =~ ^[[:space:]]*\?\>[[:space:]]*$ ]]; then
         sed -i '$d' "$tmp"
       elif [[ $(tail -n1 "$tmp") =~ \?\>[[:space:]]*$ ]]; then
@@ -438,8 +438,8 @@ tune_xenforo_gzip() {
     if (( delta < 0 )); then restored=$(( restored - delta )); fi
   done < <(app_find_xenforo_configs)
   if (( changed > 0 )); then
-    if [[ $XF_MEMBER_GZIP == angie ]]; then
-      harden_note "- XenForo gzip: ${changed} config.php updated (guests: XenForo level 9 for the cache; members: Angie)"
+    if [[ $XF_MEMBER_GZIP == nginx ]]; then
+      harden_note "- XenForo gzip: ${changed} config.php updated (guests: XenForo level 9 for the cache; members: nginx)"
     else
       harden_note "- XenForo gzip: managed block removed from ${changed} config.php (XenForo compresses every page)"
     fi

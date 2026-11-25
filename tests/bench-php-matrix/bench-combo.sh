@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run one benchmark stack (1=plain, 2=Valkey, 3=+Angie cache)
+# Run one benchmark stack (1=plain, 2=Valkey, 3=+nginx cache)
 # across PHP 8.2-8.6 and four request tiers.  Run as root on the forum host.
 #
 # Usage: bench-combo.sh {1|2|3}
@@ -10,7 +10,7 @@ COMBO=${1:?combo 1-3}
 ROOT=/var/www/xf.test.local/public
 ENVF=/root/audit/bench-env.sh
 OUT=/root/audit/combo${COMBO}.tsv
-BACKUP=/root/audit/angie-bench-backup
+BACKUP=/root/audit/nginx-bench-backup
 CONNS=${CONNS:-100}
 SECS=${SECS:-10}
 THREADS=${THREADS:-4}
@@ -29,11 +29,11 @@ export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 if [[ ! -d $BACKUP ]]; then
   mkdir -p "$BACKUP/files"
-  cp -a /etc/angie/angie.conf "$BACKUP/angie.conf"
+  cp -a /etc/nginx/nginx.conf "$BACKUP/nginx.conf"
   cp -a "$ROOT/src/config.php" "$BACKUP/config.php"
   # Only the files that actually carry a page-cache directive are toggled;
   # restoring the whole h5bp tree would undo unrelated tuner changes.
-  grep -rlE '^[[:space:]]*fastcgi_cache[[:space:]]+[A-Za-z0-9_]+;' /etc/angie \
+  grep -rlE '^[[:space:]]*fastcgi_cache[[:space:]]+[A-Za-z0-9_]+;' /etc/nginx \
     > "$BACKUP/cache-files.txt"
   while IFS= read -r f; do
     mkdir -p "$BACKUP/files$(dirname "$f")"
@@ -41,16 +41,16 @@ if [[ ! -d $BACKUP ]]; then
   done < "$BACKUP/cache-files.txt"
 fi
 
-reload_angie() {
-  angie -t >/tmp/angie-bench-test.log 2>&1 || { cat /tmp/angie-bench-test.log >&2; return 1; }
-  systemctl reload angie
+reload_nginx() {
+  nginx -t >/tmp/nginx-bench-test.log 2>&1 || { cat /tmp/nginx-bench-test.log >&2; return 1; }
+  systemctl reload nginx
   sleep 0.3
 }
 
 set_php() {
   local v=$1
-  sed -i -E "s|^([[:space:]]*server[[:space:]]+)unix:/run/php/[^;]+;|\\1unix:/run/php/php${v}-fpm.sock;|" /etc/angie/angie.conf
-  reload_angie
+  sed -i -E "s|^([[:space:]]*server[[:space:]]+)unix:/run/php/[^;]+;|\\1unix:/run/php/php${v}-fpm.sock;|" /etc/nginx/nginx.conf
+  reload_nginx
   local got
   got=$(curl -sk --max-time 10 -H 'Cookie: xf_session=bench-bypass' \
     --resolve xf.test.local:443:127.0.0.1 "https://xf.test.local/phpver.php?probe=${v}-${RANDOM}")
@@ -62,7 +62,7 @@ cache_off() {
     [[ -f $f ]] || continue
     sed -i -E 's|^([[:space:]]*fastcgi_cache[[:space:]]+)[A-Za-z0-9_]+;|\1off;|' "$f"
   done < "$BACKUP/cache-files.txt"
-  reload_angie
+  reload_nginx
 }
 
 cache_on() {
@@ -70,7 +70,7 @@ cache_on() {
     [[ -f $f ]] || continue
     cp -a "$BACKUP/files$f" "$f"
   done < "$BACKUP/cache-files.txt"
-  reload_angie
+  reload_nginx
 }
 
 valkey_off() {
@@ -87,11 +87,11 @@ valkey_on() {
 }
 
 rate_off() {
-  grep -rlE 'limit_req[[:space:]]+zone=' /etc/angie --include='*.conf' 2>/dev/null \
+  grep -rlE 'limit_req[[:space:]]+zone=' /etc/nginx --include='*.conf' 2>/dev/null \
     | while IFS= read -r f; do
         sed -i -E 's|^([[:space:]]*)limit_req([[:space:]]+zone=)|\1# bench: limit_req\2|' "$f"
       done
-  reload_angie
+  reload_nginx
 }
 
 clear_page_cache() {
@@ -116,9 +116,9 @@ run_tier() {
   wrk -t"$THREADS" -c"$CONNS" -d2s "${h[@]}" "$url" >/dev/null 2>&1 || true
 
   local a0 p0 m0 v0 n0 a1 p1 m1 v1 n1
-  a0=$(cg_usage angie); p0=$(cg_usage "php$VER-fpm"); m0=$(cg_usage mariadb); v0=$(cg_usage valkey-server)
+  a0=$(cg_usage nginx); p0=$(cg_usage "php$VER-fpm"); m0=$(cg_usage mariadb); v0=$(cg_usage valkey-server)
   out=$(wrk -t"$THREADS" -c"$CONNS" -d"${SECS}s" --latency "${h[@]}" "$url" 2>&1) || true
-  a1=$(cg_usage angie); p1=$(cg_usage "php$VER-fpm"); m1=$(cg_usage mariadb); v1=$(cg_usage valkey-server)
+  a1=$(cg_usage nginx); p1=$(cg_usage "php$VER-fpm"); m1=$(cg_usage mariadb); v1=$(cg_usage valkey-server)
 
   rps=$(awk '/^Requests\/sec/{printf "%d", $2}' <<<"$out")
   p50=$(awk '$1=="50%"{print $2}' <<<"$out")
@@ -141,7 +141,7 @@ case $COMBO in
 esac
 
 echo "== writing $OUT"
-printf 'combo\tphp\ttier\trps\tp50\tp99\tnon2xx\terrors\tangie_cores\tphp_cores\tmariadb_cores\tvalkey_cores\n' > "$OUT"
+printf 'combo\tphp\ttier\trps\tp50\tp99\tnon2xx\terrors\tnginx_cores\tphp_cores\tmariadb_cores\tvalkey_cores\n' > "$OUT"
 
 echo '<?php echo PHP_VERSION;' > "$ROOT/phpver.php"
 chown www-data:www-data "$ROOT/phpver.php"

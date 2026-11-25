@@ -2,7 +2,7 @@
 # Compare the canonical configuration files from both repositories with the
 # live /etc tree and print only the added (+) and removed (-) lines.
 #
-# Angie/Nginx files live in server-configs-nginx; PHP-FPM and all other
+# nginx/Nginx files live in server-configs-nginx; PHP-FPM and all other
 # service files live in ubuntu-setup-script.
 set -u
 
@@ -41,13 +41,13 @@ config_files=(
     "${SETUP_REPO}/configs/system/limits.conf /etc/security/limits.d/99-setup.conf"
     "${SETUP_REPO}/configs/mariadb/limit_nofile.conf /etc/systemd/system/mariadb.service.d/limits.conf"
     "${SETUP_REPO}/configs/mariadb/mariadb_server.cnf /etc/mysql/mariadb.conf.d/50-server.cnf"
-    "${CONFIG_REPO}/angie.conf /etc/angie/angie.conf"
-    "${CONFIG_REPO}/scripts/limit_nofile.conf /etc/systemd/system/angie.service.d/limits.conf"
-    "${CONFIG_REPO}/scripts/etc_default_nginx /etc/default/angie"
-    "${CONFIG_REPO}/http.d/ppa_eilander_conf /etc/angie/http.d/ppa_eilander.conf"
-    "${CONFIG_REPO}/http.d/brotli_conf /etc/angie/http.d/brotli.conf"
-    "${CONFIG_REPO}/http.d/http_trim_filter_conf /etc/angie/http.d/http_trim_filter.conf"
-    "${CONFIG_REPO}/h5bp/wordpress_cache.conf /etc/angie/h5bp/wordpress_cache.conf"
+    "${CONFIG_REPO}/nginx.conf /etc/nginx/nginx.conf"
+    "${CONFIG_REPO}/scripts/limit_nofile.conf /etc/systemd/system/nginx.service.d/limits.conf"
+    "${CONFIG_REPO}/scripts/etc_default_nginx /etc/default/nginx"
+    "${CONFIG_REPO}/http.d/ppa_eilander_conf /etc/nginx/http.d/ppa_eilander.conf"
+    "${CONFIG_REPO}/http.d/brotli_conf /etc/nginx/http.d/brotli.conf"
+    "${CONFIG_REPO}/http.d/http_trim_filter_conf /etc/nginx/http.d/http_trim_filter.conf"
+    "${CONFIG_REPO}/h5bp/wordpress_cache.conf /etc/nginx/h5bp/wordpress_cache.conf"
 )
 
 for entry in "${config_files[@]}"; do

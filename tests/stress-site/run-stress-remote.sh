@@ -40,7 +40,7 @@ HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd -- "$HERE/../.." && pwd)
 OHA=${OHA:-$ROOT/.tools/oha}
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/stress-remote.XXXXXX")
-# Scenarios whose answer was dominated by HTTP 429.  Since 1.21.71 Angie
+# Scenarios whose answer was dominated by HTTP 429.  Since 1.21.71 nginx
 # limits only login/registration POSTs (http.d/limit_req.conf), so a 429 here
 # means a scenario hit a credential endpoint or an older host still has the
 # generic per-IP zones.  A throttled
@@ -178,7 +178,7 @@ if [[ -n $RATE_LIMITED_SCENARIOS ]]; then
     echo "Update the host (setup.sh 1.21.71+ --optimize drops the generic per-IP"
     echo "limits) or keep scenarios off the login/registration endpoints."
   } >> "$REPORT"
-  echo "ERROR: rate-limited by Angie; results are not valid (see the WARNING section)" >&2
+  echo "ERROR: rate-limited by nginx; results are not valid (see the WARNING section)" >&2
 fi
 echo "Report written to ${REPORT}" >&2
 grep -E '^\|' "$REPORT" >&2 || true

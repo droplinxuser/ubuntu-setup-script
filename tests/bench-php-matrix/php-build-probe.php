@@ -2,7 +2,7 @@
 /**
  * Deterministic PHP build probe for tests/bench-php-matrix/bench-php-sources.sh.
  *
- * Served through Angie + PHP-FPM it gives every arm the same work per request,
+ * Served through nginx + PHP-FPM it gives every arm the same work per request,
  * split so the report can tell a faster interpreter from faster C library
  * code:
  *

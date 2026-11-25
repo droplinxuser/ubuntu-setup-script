@@ -28,7 +28,7 @@ RESET_ACTIONS=()
 RESET_KEEP_PINS=(
   XF_JOB_CRON NODE_MAJOR NODE_ALLOW_MAJOR_UPGRADE
   CPU_MITIGATIONS XF_MEMBER_GZIP CF_SELF_SIGNED SSL_REJECT_UNKNOWN_SNI
-  PHP_SESSION_HARDENING PHP_BUILD PHP_FPM_MODULES ANGIE_BUILD VALKEY_BUILD
+  PHP_SESSION_HARDENING PHP_BUILD PHP_FPM_MODULES NGINX_BUILD VALKEY_BUILD
 )
 
 # Every sysctl key this host's managed profile actually defines.  A key this
@@ -228,10 +228,10 @@ tuning_overrides_report() {
   drift=$(tuning_drift_lines | head -n 60)
   if [[ -n $drift ]]; then printf '%s\n' "$drift"; else printf '(none)\n'; fi
 
-  # Operator PHP/Angie fragments are preserved by --optimize, so list
+  # Operator PHP/nginx fragments are preserved by --optimize, so list
   # the ones that can win over the managed profile instead of silently
   # leaving them out of the report.
-  printf '\n== PHP/Angie fragments that can override the managed profile ==\n'
+  printf '\n== PHP/nginx fragments that can override the managed profile ==\n'
   local pv dir f
   for pv in $(php_fpm_versions 2>/dev/null); do
     dir=/etc/php/$pv/fpm/conf.d
@@ -246,9 +246,9 @@ tuning_overrides_report() {
       if [[ ${f##*/} != www.conf ]]; then printf '  %s (extra PHP-FPM pool)\n' "$f"; fi
     done
   done
-  for f in /etc/angie/custom.d/*.conf; do
+  for f in /etc/nginx/custom.d/*.conf; do
     [[ -f $f ]] || continue
-    printf '  %s (Angie custom.d)\n' "$f"
+    printf '  %s (nginx custom.d)\n' "$f"
   done
 }
 
@@ -292,7 +292,7 @@ optimize_ignore_tuning_env() {
     SETUP_PHP_JIT SETUP_PHP_JIT_WORDPRESS \
     SETUP_PHP_JIT_HOT_LOOP SETUP_PHP_JIT_HOT_FUNC \
     SETUP_PHP_JIT_HOT_RETURN SETUP_PHP_JIT_HOT_SIDE_EXIT \
-    SETUP_GZIP_LEVEL SETUP_BROTLI_LEVEL SETUP_ANGIE_COMPRESSION \
+    SETUP_GZIP_LEVEL SETUP_BROTLI_LEVEL SETUP_NGINX_COMPRESSION \
     SETUP_MARIADB_IO_CAPACITY SETUP_LIMIT_REQ_EXEMPT \
     SETUP_PRECOMPRESS_ASSETS SETUP_PHP_PAGE_GZIP; do
     if [[ -n ${!v+x} ]]; then

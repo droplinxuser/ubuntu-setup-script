@@ -77,10 +77,10 @@ diag_tail_files() {
   done
 }
 
-diag_angie_log_files() {
+diag_nginx_log_files() {
   {
-    if [[ -x /usr/sbin/angie ]]; then
-      /usr/sbin/angie -T 2>/dev/null | awk '
+    if [[ -x /usr/sbin/nginx ]]; then
+      /usr/sbin/nginx -T 2>/dev/null | awk '
         $1 == "error_log" || $1 == "access_log" {
           path = $2
           sub(/;$/, "", path)
@@ -88,15 +88,15 @@ diag_angie_log_files() {
         }
       ' || true
     fi
-    printf '%s\n' /var/log/angie/error.log /var/log/angie/access.log
-  } | awk '{ if ($0 !~ /^\//) $0 = "/etc/angie/" $0; print }' | sort -u
+    printf '%s\n' /var/log/nginx/error.log /var/log/nginx/access.log
+  } | awk '{ if ($0 !~ /^\//) $0 = "/etc/nginx/" $0; print }' | sort -u
 }
 
-diag_angie_certificates() {
+diag_nginx_certificates() {
   local f
   {
-    if [[ -x /usr/sbin/angie ]]; then
-      /usr/sbin/angie -T 2>/dev/null | awk '
+    if [[ -x /usr/sbin/nginx ]]; then
+      /usr/sbin/nginx -T 2>/dev/null | awk '
         $1 == "ssl_certificate" {
           path = $2
           sub(/;$/, "", path)
@@ -104,8 +104,8 @@ diag_angie_certificates() {
         }
       ' || true
     fi
-    find /etc/angie/ssl -type f -name 'fullchain.pem' 2>/dev/null || true
-  } | awk '{ if ($0 !~ /^\//) $0 = "/etc/angie/" $0; print }' | sort -u | while IFS= read -r f; do
+    find /etc/nginx/ssl -type f -name 'fullchain.pem' 2>/dev/null || true
+  } | awk '{ if ($0 !~ /^\//) $0 = "/etc/nginx/" $0; print }' | sort -u | while IFS= read -r f; do
     [[ -f $f ]] || continue
     printf -- '--- %s\n' "$f"
     if command -v openssl >/dev/null 2>&1; then
@@ -273,15 +273,15 @@ diag_elasticsearch_allocation() {  local es_url=$1 health status unassigned
     "${es_url}/_cluster/allocation/explain?pretty" | head -n 200
 }
 
-diag_angie_include_status() {
+diag_nginx_include_status() {
   local included f
-  if [[ ! -x /usr/sbin/angie ]]; then
-    printf 'Angie is not installed\n'
+  if [[ ! -x /usr/sbin/nginx ]]; then
+    printf 'nginx is not installed\n'
     return 0
   fi
-  included=$(/usr/sbin/angie -T 2>/dev/null \
-    | sed -n 's|^# configuration file /etc/angie/http\.d/\(.*\):$|\1|p' | sort -u)
-  find /etc/angie/http.d -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | sort | while IFS= read -r f; do
+  included=$(/usr/sbin/nginx -T 2>/dev/null \
+    | sed -n 's|^# configuration file /etc/nginx/http\.d/\(.*\):$|\1|p' | sort -u)
+  find /etc/nginx/http.d -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | sort | while IFS= read -r f; do
     if printf '%s\n' "$included" | grep -qxF -- "$f"; then
       printf 'ACTIVE   %s\n' "$f"
     else
@@ -308,7 +308,7 @@ redact_diagnostics() {
 run_diagnostics() {
   local out="${SCRIPT_DIR}/diagnostics.log"
   local u ver fpm_bin f es_url redis_unit redis_bin redis_cli redis_label
-  local -a units=(angie mariadb valkey-server redis-server elasticsearch)
+  local -a units=(nginx mariadb valkey-server redis-server elasticsearch)
 
   umask 077
   # Build the report in a private temp file and move it into place at the end.
@@ -408,13 +408,13 @@ run_diagnostics() {
     diag "systemctl cat ${u}" systemctl cat "$u"
   done
 
-  diag_sh "Angie version" 'if [ -x /usr/sbin/angie ]; then /usr/sbin/angie -V; else echo "Angie is not installed"; fi'
-  diag_sh "Angie config test" 'if [ -x /usr/sbin/angie ]; then /usr/sbin/angie -t; else echo "Angie is not installed"; fi'
-  diag_sh "Angie loaded configuration" 'if [ -x /usr/sbin/angie ]; then /usr/sbin/angie -T 2>&1 | head -n 3000; else echo "Angie is not installed"; fi'
-  diag_sh "Angie vhosts" 'find /etc/angie/conf.d -maxdepth 1 -type f -name "*.conf" -printf "%f\n" 2>/dev/null | sort'
-  diag "Angie certificates" diag_angie_certificates
-  diag "Angie http.d include status" diag_angie_include_status
-  diag_sh "Angie error/access log sizes" 'du -sh /var/www/logs/angie /var/log/angie 2>/dev/null || true'
+  diag_sh "nginx version" 'if [ -x /usr/sbin/nginx ]; then /usr/sbin/nginx -V; else echo "nginx is not installed"; fi'
+  diag_sh "nginx config test" 'if [ -x /usr/sbin/nginx ]; then /usr/sbin/nginx -t; else echo "nginx is not installed"; fi'
+  diag_sh "nginx loaded configuration" 'if [ -x /usr/sbin/nginx ]; then /usr/sbin/nginx -T 2>&1 | head -n 3000; else echo "nginx is not installed"; fi'
+  diag_sh "nginx vhosts" 'find /etc/nginx/conf.d -maxdepth 1 -type f -name "*.conf" -printf "%f\n" 2>/dev/null | sort'
+  diag "nginx certificates" diag_nginx_certificates
+  diag "nginx http.d include status" diag_nginx_include_status
+  diag_sh "nginx error/access log sizes" 'du -sh /var/www/logs/nginx /var/log/nginx 2>/dev/null || true'
 
   diag_sh "PHP CLI version" 'if command -v php >/dev/null 2>&1; then php -v; else echo "php CLI is not installed"; fi'
   diag_sh "PHP CLI modules" 'if command -v php >/dev/null 2>&1; then php -m; else echo "php CLI is not installed"; fi'
@@ -547,7 +547,7 @@ run_diagnostics() {
 
   # Slow logs first: these matter most for application tuning.  Resolve the
   # live paths instead of assuming the /var/www/logs layout: old hosts still
-  # write PHP-FPM to /var/log/php-fpm, Angie vhosts to their document root,
+  # write PHP-FPM to /var/log/php-fpm, nginx vhosts to their document root,
   # MariaDB to its datadir, and Elasticsearch to /var/log/elasticsearch.
   local -a log_files=()
   while IFS= read -r ver; do
@@ -557,7 +557,7 @@ run_diagnostics() {
   done < <(php_fpm_versions)
   mapfile -t log_files < <(diag_mariadb_log_files)
   diag_tail_files 800 "${log_files[@]}"
-  mapfile -t log_files < <(diag_angie_log_files)
+  mapfile -t log_files < <(diag_nginx_log_files)
   diag_tail_files 500 "${log_files[@]}"
   mapfile -t log_files < <(diag_redis_log_files)
   diag_tail_files 500 "${log_files[@]}"
@@ -569,7 +569,7 @@ run_diagnostics() {
   mapfile -t log_files < <(find /var/www/logs -type f \( -name '*.log' -o -name '*.json' \) 2>/dev/null | sort)
   diag_tail_files 200 "${log_files[@]:0:120}"
 
-  diag_sh "log sizes" 'du -sh /var/www/logs/* /var/log/angie /var/log/php* /var/log/mysql /var/log/redis* /var/www/*/error.log /var/www/*/access.log 2>/dev/null | sort -h || true'
+  diag_sh "log sizes" 'du -sh /var/www/logs/* /var/log/nginx /var/log/php* /var/log/mysql /var/log/redis* /var/www/*/error.log /var/www/*/access.log 2>/dev/null | sort -h || true'
   diag_sh "web root ownership" 'ls -ld /var/www /var/www/logs /var/www/logs/* /var/www/mysql_database 2>/dev/null || true'
   diag_sh "log tree ownership" 'find /var/www/logs -maxdepth 2 -printf "%M %u:%g %p\n" 2>/dev/null | sort || true'
   diag_sh "logrotate debug" 'if command -v logrotate >/dev/null 2>&1 && [ -f /etc/logrotate.d/setup-logs ]; then logrotate -d /etc/logrotate.d/setup-logs; else echo "logrotate or /etc/logrotate.d/setup-logs is not installed"; fi'
@@ -580,9 +580,9 @@ run_diagnostics() {
   diag_sh "last logins" 'if command -v last >/dev/null 2>&1; then last -n 30; else echo "last is not installed"; fi'
   diag "who" who
   diag "apt upgradable" bash -c 'apt list --upgradable 2>/dev/null | head -100'
-  diag_sh "installed service packages" 'dpkg -l | awk "\$1==\"ii\" && (\$2 ~ /^(angie|php|mariadb|valkey|redis|elasticsearch|nodejs|nginx)/){print \$2, \$3}"'
+  diag_sh "installed service packages" 'dpkg -l | awk "\$1==\"ii\" && (\$2 ~ /^(nginx|php|mariadb|valkey|redis|elasticsearch|nodejs|nginx)/){print \$2, \$3}"'
   diag_sh "setup state" 'find /var/lib/setup.sh -maxdepth 2 -type f -printf "%p %s bytes\n" 2>/dev/null | sort'
-  diag_sh "cache and data sizes" 'du -sh /var/lib/mysql /var/lib/mariadb /var/lib/elasticsearch /var/cache/angie /home/nginx_cache* /var/cache/php/opcache 2>/dev/null | sort -h || true'
+  diag_sh "cache and data sizes" 'du -sh /var/lib/mysql /var/lib/mariadb /var/lib/elasticsearch /var/cache/nginx /home/nginx_cache* /var/cache/php/opcache 2>/dev/null | sort -h || true'
 
   redact_diagnostics "$DIAG_FILE"
 

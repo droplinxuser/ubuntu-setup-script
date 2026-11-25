@@ -7,13 +7,13 @@
 # ---------------------------------------------------------------------------
 # Add every selected third-party repository first, then run one apt-get update
 # in prepare_repositories().  The service installers only install packages.
-configure_angie_repo() {
-  local keyring=/usr/share/keyrings/angie-signing.gpg
-  local legacy=/etc/apt/trusted.gpg.d/angie-signing.gpg
-  refresh_blob_key "$keyring" blob_angie_key || return 1
+configure_nginx_repo() {
+  local keyring=/usr/share/keyrings/nginx-signing.gpg
+  local legacy=/etc/apt/trusted.gpg.d/nginx-signing.gpg
+  refresh_blob_key "$keyring" blob_nginx_key || return 1
   chmod 644 "$keyring"
   # Older releases installed the key into trusted.gpg.d, where it can sign
-  # *every* configured repository.  Scope it to the Angie source with
+  # *every* configured repository.  Scope it to the nginx source with
   # signed-by (the other third-party repositories already work this way) and
   # retire the globally trusted copy when it is byte-identical to the embedded
   # key; an operator-supplied key is left alone.
@@ -22,9 +22,9 @@ configure_angie_repo() {
   fi
   # shellcheck disable=SC1091
   . /etc/os-release
-  printf 'deb [signed-by=%s] https://download.angie.software/angie/%s/%s %s main\n' \
-    "$keyring" "$ID" "$VERSION_ID" "$VERSION_CODENAME" > /etc/apt/sources.list.d/angie.list
-  chmod 644 /etc/apt/sources.list.d/angie.list
+  printf 'deb [signed-by=%s] https://download.angie.software/nginx/%s/%s %s main\n' \
+    "$keyring" "$ID" "$VERSION_ID" "$VERSION_CODENAME" > /etc/apt/sources.list.d/nginx.list
+  chmod 644 /etc/apt/sources.list.d/nginx.list
 }
 
 configure_php_repo() {
@@ -119,8 +119,8 @@ EOF
 prepare_repositories() {
   local configured=0 item
   apt_install ca-certificates curl gnupg lsb-release apt-transport-https
-  if [[ ${ENABLED[angie]:-0} -eq 1 ]]; then
-    configure_angie_repo || die "Could not configure the Angie APT repository"
+  if [[ ${ENABLED[nginx]:-0} -eq 1 ]]; then
+    configure_nginx_repo || die "Could not configure the nginx APT repository"
     configured=1
   fi
   if [[ ${ENABLED[php]:-0} -eq 1 ]]; then
@@ -150,59 +150,59 @@ prepare_repositories() {
   fi
 }
 
-install_angie() {
-  step "Angie web server"
-  local angie_backup=""
+install_nginx() {
+  step "nginx web server"
+  local nginx_backup=""
   apt_install ca-certificates curl wget unzip rsync openssl
 
-  apt_install angie
+  apt_install nginx
 
   systemctl daemon-reload || true
-  systemctl enable --now angie || warn "Angie did not start with the packaged config"
+  systemctl enable --now nginx || warn "nginx did not start with the packaged config"
 
   # Keep a copy of the deployed tree so a failed repo deploy/tune can be
   # rolled back instead of leaving a live host with a broken configuration.
-  if [[ -d /etc/angie ]]; then
-    angie_backup=$(tmp_dir angie-install.XXXXXX) \
-      || die "Could not create an Angie backup directory"
-    cp -a /etc/angie "$angie_backup/" \
-      || die "Could not back up /etc/angie to ${angie_backup}"
+  if [[ -d /etc/nginx ]]; then
+    nginx_backup=$(tmp_dir nginx-install.XXXXXX) \
+      || die "Could not create an nginx backup directory"
+    cp -a /etc/nginx "$nginx_backup/" \
+      || die "Could not back up /etc/nginx to ${nginx_backup}"
   fi
 
-  if ! deploy_angie_configs; then
-    rollback_angie_tree "$angie_backup"
+  if ! deploy_nginx_configs; then
+    rollback_nginx_tree "$nginx_backup"
     return 1
   fi
-  chmod 755 /etc/angie/scripts/cloudflare.sh 2>/dev/null || true
+  chmod 755 /etc/nginx/scripts/cloudflare.sh 2>/dev/null || true
 
   systemctl daemon-reload
-  if ! /usr/sbin/angie -t; then
-    rollback_angie_tree "$angie_backup"
+  if ! /usr/sbin/nginx -t; then
+    rollback_nginx_tree "$nginx_backup"
     return 1
   fi
-  if ! systemctl restart angie; then
-    rollback_angie_tree "$angie_backup"
+  if ! systemctl restart nginx; then
+    rollback_nginx_tree "$nginx_backup"
     return 1
   fi
   # A reinstall over a 1.21.58 host: the zstd module goes now that the tree
   # without it is validated and running.
-  if (( ANGIE_ZSTD_PURGE_PENDING )); then
-    angie_purge_zstd_module /etc/angie
-    ANGIE_ZSTD_PURGE_PENDING=0
+  if (( NGINX_ZSTD_PURGE_PENDING )); then
+    nginx_purge_zstd_module /etc/nginx
+    NGINX_ZSTD_PURGE_PENDING=0
   fi
 
-  if ! /etc/angie/scripts/cloudflare.sh; then
+  if ! /etc/nginx/scripts/cloudflare.sh; then
     warn "Cloudflare IP update failed; keeping the existing cloudflare.conf"
-    /usr/sbin/angie -t && systemctl reload angie || true
+    /usr/sbin/nginx -t && systemctl reload nginx || true
   fi
 
-  # ANGIE_BUILD=clang: the compiled Angie (BOLT waits for --optimize under traffic).
-  angie_build_apply install info \
-    || warn "Angie: ANGIE_BUILD=${ANGIE_BUILD} build failed; the package's Angie keeps serving"
+  # NGINX_BUILD=clang: the compiled nginx (BOLT waits for --optimize under traffic).
+  nginx_build_apply install info \
+    || warn "nginx: NGINX_BUILD=${NGINX_BUILD} build failed; the package's nginx keeps serving"
 
-  systemctl status angie --no-pager -l || true
-  systemctl is-active angie >/dev/null
-  ok "Angie installed and running"
+  systemctl status nginx --no-pager -l || true
+  systemctl is-active nginx >/dev/null
+  ok "nginx installed and running"
 }
 
 # ---------------------------------------------------------------------------
@@ -406,9 +406,9 @@ install_php() {
   fi
 
   # Everything that can refuse the request is checked before a unit is
-  # stopped or a package is removed.  PHP-FPM is not an Angie concern: its
+  # stopped or a package is removed.  PHP-FPM is not an nginx concern: its
   # pool/ini templates live in this repository under configs/php and do not
-  # depend on the Angie config repository being fetched.
+  # depend on the nginx config repository being fetched.
   local pool_template="${SCRIPT_DIR}/configs/php/www_${ver//./}.conf"
   local ini_template="${SCRIPT_DIR}/configs/php/custom_dan.ini"
   [[ -f $pool_template ]] \
@@ -1989,7 +1989,7 @@ install_others() {
 # ---------------------------------------------------------------------------
 # Render a vhost from a server-configs-nginx template.  Every template uses
 # the same placeholders (domain.com / sample.com / example.com, Let's Encrypt
-# or /etc/angie/ssl/default certificate paths, the hostname_ssl include), so
+# or /etc/nginx/ssl/default certificate paths, the hostname_ssl include), so
 # one token-based substitution pass serves all of them.  Tokens are replaced
 # before the real domain is inserted, so a domain that itself contains
 # "example.com" (blog.example.com) is never substituted twice.
@@ -2009,8 +2009,8 @@ domain_render_vhost() {
     node)       tpl=sample_node.conf ;;
     *) die "Internal error: unhandled app '${app}' for ${d}" ;;
   esac
-  src="/etc/angie/conf.d/templates/${tpl}"
-  [[ -f $src ]] || die "Missing Angie template ${src} (app=${app})"
+  src="/etc/nginx/conf.d/templates/${tpl}"
+  [[ -f $src ]] || die "Missing nginx template ${src} (app=${app})"
   cp "$src" "$vhost"
   tls="include h5bp/tls/ssl_engine.conf;\n    include h5bp/tls/policy_balanced.conf;\n    ssl_certificate     ${certdir}/fullchain.pem;\n    ssl_certificate_key ${certdir}/privkey.pem;"
   sed_in_place \
@@ -2019,7 +2019,7 @@ domain_render_vhost() {
     -e "s|@@WWW@@|www.${d}|g" -e "s|@@DOMAIN@@|${d}|g" \
     -e "s#/etc/letsencrypt/live/${d}/fullchain.pem#${certdir}/fullchain.pem#g" \
     -e "s#/etc/letsencrypt/live/${d}/privkey.pem#${certdir}/privkey.pem#g" \
-    -e "s#/etc/angie/ssl/default/#${certdir}/#g" \
+    -e "s#/etc/nginx/ssl/default/#${certdir}/#g" \
     -e "s|include h5bp/hostname_ssl.conf;|${tls}|g" \
     "$vhost"
   case "$app" in
@@ -2035,7 +2035,7 @@ domain_render_vhost() {
       cat "$tmp" > "$vhost"
       ;;
     xf)
-      sed_in_place -e "s#/var/www/html/${d}/websocket.log#${LOG_ROOT}/angie/${d}-websocket.log#g" "$vhost"
+      sed_in_place -e "s#/var/www/html/${d}/websocket.log#${LOG_ROOT}/nginx/${d}-websocket.log#g" "$vhost"
       ;;
     pingvin)
       mkdir -p "/var/www/${d}/data" "/var/www/${d}/frontend"
@@ -2171,8 +2171,8 @@ create_domains() {
   step "Domains"
   (( ${#DOMAINS[@]} > 0 )) || return 0
 
-  [[ -d /etc/angie/conf.d ]] \
-    || die "Angie is not installed (/etc/angie/conf.d missing). Install with --angie first."
+  [[ -d /etc/nginx/conf.d ]] \
+    || die "nginx is not installed (/etc/nginx/conf.d missing). Install with --nginx first."
   local d need_db=0
   for d in "${DOMAINS[@]}"; do
     [[ -n ${DOMAIN_DB[$d]:-} ]] && need_db=1
@@ -2190,14 +2190,14 @@ create_domains() {
   for d in "${DOMAINS[@]}"; do
     app=${DOMAIN_APP[$d]:-basic}
     dir="/var/www/${d}/public"
-    conf="/etc/angie/conf.d/${d}.conf"
-    certdir="/etc/angie/ssl/${d}"
+    conf="/etc/nginx/conf.d/${d}.conf"
+    certdir="/etc/nginx/ssl/${d}"
 
     # Extensions the application cannot run without are not in the default
     # PHP set (no php-redis/php-igbinary): install them only for a site that
     # needs them, including an existing one (Chevereto: redis, which pulls
     # igbinary; images go through GD; XenForo and WordPress: nothing
-    # extra).  Use the FPM version Angie talks to, not the alternatives CLI:
+    # extra).  Use the FPM version nginx talks to, not the alternatives CLI:
     # on a host with 8.4 and 8.5 installed, `php -m` could name the other
     # version and install an extension the pool never loads.
     local app_php req_app
@@ -2214,10 +2214,10 @@ create_domains() {
     # keeps its ownership (root:www-data wp-config.php, deploy-owned files);
     # the nightly managed cron applies the log-safe ownership pass.
     if [[ -d "/var/www/${d}" ]]; then
-      mkdir -p "$dir" "${LOG_ROOT}/angie"
+      mkdir -p "$dir" "${LOG_ROOT}/nginx"
       chown www-data:www-data "$dir" 2>/dev/null || true
     else
-      mkdir -p "$dir" "${LOG_ROOT}/angie"
+      mkdir -p "$dir" "${LOG_ROOT}/nginx"
       chown -R www-data:www-data "/var/www/${d}"
     fi
     chmod 755 "/var/www/${d}" "$dir"
@@ -2242,26 +2242,26 @@ create_domains() {
     # Never overwrite an existing non-empty vhost; the operator may have
     # customised it.  Empty placeholder files are upgraded.
     if [[ -e $conf && -s $conf ]]; then
-      info "Angie config already exists and is non-empty; keeping ${conf}"
+      info "nginx config already exists and is non-empty; keeping ${conf}"
     else
       tmp=$(tmp_file)
       domain_render_vhost "$app" "$d" "$certdir" "$tmp"
       install -m 644 "$tmp" "$conf"
       local domain_test_log
       domain_test_log=$(tmp_file)
-      if ! /usr/sbin/angie -t >"$domain_test_log" 2>&1; then
+      if ! /usr/sbin/nginx -t >"$domain_test_log" 2>&1; then
         cat "$domain_test_log" >&2 || true
         # Keep the rejected file out of the live config without deleting it.
         local rejected
         rejected=$(preserve_to_tmp "$conf" || true)
         [[ -n $rejected ]] && warn "Moved rejected vhost to ${rejected}"
-        die "Angie rejected the generated vhost for ${d} (app=${app})"
+        die "nginx rejected the generated vhost for ${d} (app=${app})"
       fi
-      # "angie -t" runs from this shell (umask 022) and creates the per-vhost
+      # "nginx -t" runs from this shell (umask 022) and creates the per-vhost
       # log files before systemd's UMask=0027 applies. Normalise them now.
-      find "${LOG_ROOT}/angie" -type f -name '*.log' -exec chmod 640 {} + 2>/dev/null || true
+      find "${LOG_ROOT}/nginx" -type f -name '*.log' -exec chmod 640 {} + 2>/dev/null || true
       changed=1
-      info "Created Angie vhost: ${conf} (app=${app})"
+      info "Created nginx vhost: ${conf} (app=${app})"
     fi
 
     if domain_provision_database "$d"; then
@@ -2270,8 +2270,8 @@ create_domains() {
   done
 
   if (( changed )); then
-    systemctl reload angie 2>/dev/null || systemctl restart angie 2>/dev/null \
-      || warn "Could not reload Angie after creating vhosts"
+    systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null \
+      || warn "Could not reload nginx after creating vhosts"
   fi
   if (( imported )); then
     reoptimize_mariadb_after_import

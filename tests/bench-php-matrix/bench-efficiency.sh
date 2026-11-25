@@ -18,16 +18,16 @@ SECS=15
 
 echo "== disable page cache, disable Valkey data cache"
 CONFIG_SOURCE_DIR=$CONFIGS bash "$SETUP/setup.sh" --optimize > /root/audit/eff-disable.log 2>&1 || true
-sed -i -E 's|^([[:space:]]*fastcgi_cache[[:space:]]+)[A-Za-z0-9_]+;|\1off;|' /etc/angie/h5bp/php_xf.conf /etc/angie/h5bp/php_xf_proxy.conf 2>/dev/null || true
+sed -i -E 's|^([[:space:]]*fastcgi_cache[[:space:]]+)[A-Za-z0-9_]+;|\1off;|' /etc/nginx/h5bp/php_xf.conf /etc/nginx/h5bp/php_xf_proxy.conf 2>/dev/null || true
 sed -i "s/^\$config\['cache'\]\['enabled'\] = .*/\$config['cache']['enabled'] = false;/" "$ROOT/src/config.php"
-grep -rlE 'limit_req[[:space:]]+zone=' /etc/angie --include='*.conf' 2>/dev/null \
+grep -rlE 'limit_req[[:space:]]+zone=' /etc/nginx --include='*.conf' 2>/dev/null \
   | while IFS= read -r f; do sed -i -E 's|^([[:space:]]*)limit_req([[:space:]]+zone=)|\1# bench: limit_req\2|' "$f"; done
 
 set_php() {
   local v=$1
-  sed -i -E "s|^([[:space:]]*server[[:space:]]+)unix:/run/php/[^;]+;|\\1unix:/run/php/php${v}-fpm.sock;|" /etc/angie/angie.conf
-  angie -t >/dev/null
-  systemctl reload angie
+  sed -i -E "s|^([[:space:]]*server[[:space:]]+)unix:/run/php/[^;]+;|\\1unix:/run/php/php${v}-fpm.sock;|" /etc/nginx/nginx.conf
+  nginx -t >/dev/null
+  systemctl reload nginx
   sleep 0.5
   for s in $VERS; do systemctl is-active --quiet "php$s-fpm" && systemctl reload "php$s-fpm" || true; done
   sleep 0.3

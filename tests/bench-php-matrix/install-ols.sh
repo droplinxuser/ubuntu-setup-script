@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Install OpenLiteSpeed + LiteSpeed's lsphp next to the Angie stack, for the
+# Install OpenLiteSpeed + LiteSpeed's lsphp next to the nginx stack, for the
 # XenForo server shootout (switch-php-arm.sh ols-lsphp | ols-src-TAG).
 #
 # Nothing here is part of a production install.  OpenLiteSpeed is installed
 # from the vendor repository, configured for one vhost (xf.test.local) on the
-# same document root, certificate, database, Valkey and php.ini as the Angie
+# same document root, certificate, database, Valkey and php.ini as the nginx
 # arms, and left stopped and disabled: switch-php-arm.sh starts it only while
-# Angie is stopped.
+# nginx is stopped.
 #
-# Parity with the Angie arms (h5bp tree + setup.sh tuning):
-#   * workers         = nproc (Angie worker_processes auto)
+# Parity with the nginx arms (h5bp tree + setup.sh tuning):
+#   * workers         = nproc (nginx worker_processes auto)
 #   * PHP children    = the FPM pool's pm.max_children (static), one LSAPI
 #                       parent per arm so OPcache is shared
 #   * php.ini         = /etc/php/8.5/fpm/php.ini (PHPRC) + the managed
@@ -18,17 +18,17 @@
 #   * TLS             = the same certificate, TLS 1.2 + 1.3, HTTP/1.1 via wrk
 #   * keep-alive      = 32767 requests per connection (OpenLiteSpeed's maximum;
 #                       65536 is rejected and silently becomes 100), 60 s;
-#                       Angie allows 65536, neither limit is reached in a run
-#   * compression     = gzip level 4 for dynamic responses (Angie gzip and
+#                       nginx allows 65536, neither limit is reached in a run
+#   * compression     = gzip level 4 for dynamic responses (nginx gzip and
 #                       brotli 4); OpenLiteSpeed has no dynamic brotli
-#   * access log      = off (Angie access_log off)
-#   * guest cache     = LSCache, 300 s (Angie fastcgi_cache_valid 200 5m),
+#   * access log      = off (nginx access_log off)
+#   * guest cache     = LSCache, 300 s (nginx fastcgi_cache_valid 200 5m),
 #                       stored only for requests without a XenForo member or
 #                       LSCache login cookie (the addon's documented rule set)
 #
 # The LiteSpeed Cache addon for XenForo (xenforo_addon_LiteSpeedCache-*.zip in
 # /root/work/pkg) is installed into the forum so every arm runs the same PHP
-# code: under Angie it only adds a no-cache response header for members and a
+# code: under nginx it only adds a no-cache response header for members and a
 # cookie on login.
 #
 # Usage: install-ols.sh [install|config|addon]
@@ -49,10 +49,10 @@ WORKERS=$(nproc)
 (( WORKERS > 16 )) && WORKERS=16          # OpenLiteSpeed's maximum
 
 cert_pair() {
-  # The Angie vhost's own certificate, so both servers do the same handshake.
+  # The nginx vhost's own certificate, so both servers do the same handshake.
   local vhost crt key
-  vhost=$(grep -rlE "server_name[^;]*\b$XF_HOST\b" /etc/angie/conf.d /etc/angie/sites-enabled 2>/dev/null | head -n1 || true)
-  [[ -n $vhost ]] || { echo "no Angie vhost for $XF_HOST" >&2; return 1; }
+  vhost=$(grep -rlE "server_name[^;]*\b$XF_HOST\b" /etc/nginx/conf.d /etc/nginx/sites-enabled 2>/dev/null | head -n1 || true)
+  [[ -n $vhost ]] || { echo "no nginx vhost for $XF_HOST" >&2; return 1; }
   crt=$(awk '$1 == "ssl_certificate" { gsub(/;/, "", $2); print $2; exit }' "$vhost")
   key=$(awk '$1 == "ssl_certificate_key" { gsub(/;/, "", $2); print $2; exit }' "$vhost")
   [[ -r $crt && -r $key ]] || { echo "certificate not found in $vhost" >&2; return 1; }
@@ -293,7 +293,7 @@ CONF
   # guest page (measured: x-litespeed-cache: hit, no data-logged-in).  The
   # add-on still refuses to store any logged-in page (X-LiteSpeed-Cache-
   # Control: no-cache), so a varied member key never fills and members reach
-  # PHP, as they do through Angie's session-cookie bypass.
+  # PHP, as they do through nginx's session-cookie bypass.
   cat > "$LSWS/conf/vhosts/xf/vhconf.conf" <<CONF
 docRoot                   $XF_ROOT/
 enableGzip                1

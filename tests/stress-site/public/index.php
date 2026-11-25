@@ -103,7 +103,7 @@ $timings['total_ms'] = round((microtime(true) - $t0) * 1000, 2);
 
 header('Content-Type: text/html; charset=utf-8');
 header('Cache-Control: no-store');
-header('X-Stress-Site: angie-php-mariadb-valkey-elastic-node-gifsicle');
+header('X-Stress-Site: nginx-php-mariadb-valkey-elastic-node-gifsicle');
 ?>
 <!doctype html>
 <html lang="en">
@@ -115,7 +115,7 @@ header('X-Stress-Site: angie-php-mariadb-valkey-elastic-node-gifsicle');
 </head>
 <body>
   <main>
-    <h1>Angie + PHP + MariaDB + Valkey + Elasticsearch + Node.js + GifSicle</h1>
+    <h1>nginx + PHP + MariaDB + Valkey + Elasticsearch + Node.js + GifSicle</h1>
     <p class="lead">Every request below touches all six runtime services. The GIF is optimized with <code>gifsicle -O3</code>.</p>
 
     <section class="grid">

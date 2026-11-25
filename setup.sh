@@ -8,11 +8,11 @@
 #   * Runs as root only.
 #   * Idempotent: every step can be re-run on an already configured machine.
 #   * Only the services named on the command line are touched.
-#   * Angie configuration is owned by
+#   * nginx configuration is owned by
 #     https://github.com/droplinxuser/server-configs-nginx and downloaded at
-#     install time.  PHP-FPM pool/php.ini templates are non-Angie config and
-#     live locally in configs/php.  Do not add Angie config content to this
-#     script; update the Angie repo.
+#     install time.  PHP-FPM pool/php.ini templates are non-nginx config and
+#     live locally in configs/php.  Do not add nginx config content to this
+#     script; update the nginx repo.
 #     Other vendor payloads that must be reproducible offline are embedded in
 #     the "EMBEDDED PAYLOADS" section at the bottom.
 #   * Each service is timed; a summary is printed at the end.
@@ -70,7 +70,7 @@ LIMIT_REQ_EXEMPT_IGNORED=0
 [[ -n ${SETUP_LIMIT_REQ_EXEMPT+x} ]] && LIMIT_REQ_EXEMPT_IGNORED=1
 # Static-asset precompression (.br/.gz siblings served by brotli_static and
 # gzip_static) is on by default since 1.21.58: compressing
-# an asset per request capped a 177 KB script at 2,100 req/s (3.8 ms of Angie
+# an asset per request capped a 177 KB script at 2,100 req/s (3.8 ms of nginx
 # CPU each) where the sibling is served at the uncompressed rate, and a CDN
 # still sends the origin every miss.  SETUP_PRECOMPRESS_ASSETS=0 turns it off
 # (the siblings it made are removed) and is persisted in the same host file.
@@ -103,7 +103,7 @@ fi
 [[ $PHP_JIT_WORDPRESS == 0 ]] || PHP_JIT_WORDPRESS=1
 # Guest-cache page compression: PHP gzips the output of WordPress and
 # Chevereto document roots that sit behind the FastCGI guest cache, so the
-# cache stores the compressed page instead of Angie compressing every hit
+# cache stores the compressed page instead of nginx compressing every hit
 # (see php_page_gzip_roots).  SETUP_PHP_PAGE_GZIP=0 turns it off and is
 # persisted in the same host file (PHP_PAGE_GZIP).
 PHP_PAGE_GZIP="${PHP_PAGE_GZIP:-1}"
@@ -132,15 +132,15 @@ if [[ -n ${SETUP_PHP_FPM_MODULES+x} ]]; then
   PHP_FPM_MODULES=$SETUP_PHP_FPM_MODULES
   PHP_FPM_MODULES_PERSIST=1
 fi
-# Compiled Angie (opt-in, 1.21.70).  SETUP_ANGIE_BUILD=clang builds a lean Angie
-# from upstream sources (angie-build.conf) with BOLT on --optimize; =package
-# goes back.  Persisted as ANGIE_BUILD.  See lib/angie-build.sh and
-# tools/angie-build.sh.
-ANGIE_BUILD="${ANGIE_BUILD:-}"
-ANGIE_BUILD_PERSIST=0
-if [[ -n ${SETUP_ANGIE_BUILD+x} ]]; then
-  ANGIE_BUILD=$SETUP_ANGIE_BUILD
-  ANGIE_BUILD_PERSIST=1
+# Compiled nginx (opt-in, 1.21.70).  SETUP_NGINX_BUILD=clang builds a lean nginx
+# from upstream sources (nginx-build.conf) with BOLT on --optimize; =package
+# goes back.  Persisted as NGINX_BUILD.  See lib/nginx-build.sh and
+# tools/nginx-build.sh.
+NGINX_BUILD="${NGINX_BUILD:-}"
+NGINX_BUILD_PERSIST=0
+if [[ -n ${SETUP_NGINX_BUILD+x} ]]; then
+  NGINX_BUILD=$SETUP_NGINX_BUILD
+  NGINX_BUILD_PERSIST=1
 fi
 # Compiled Valkey (opt-in, 1.21.71), the same way: SETUP_VALKEY_BUILD=clang or
 # --source=valkey.  Persisted as VALKEY_BUILD.  See lib/valkey-build.sh.
@@ -158,7 +158,7 @@ fi
 # setup.sh installs one managed crontab entry that runs the queue of every
 # XenForo root under /var/www once a minute as the PHP user.  Running it as
 # www-data also stops the root-owned data directories a root CLI run leaves
-# behind (Angie then returns 403 for every file below them; 16% of the
+# behind (nginx then returns 403 for every file below them; 16% of the
 # requests on one audited host).  SETUP_XF_JOB_CRON=0 drops the entry and is
 # persisted in the same host file (XF_JOB_CRON).
 XF_JOB_CRON="${XF_JOB_CRON:-1}"
@@ -185,23 +185,23 @@ CF_SELF_SIGNED="${SETUP_CF_SELF_SIGNED:-${CF_SELF_SIGNED:-1}}"
 SSL_REJECT_UNKNOWN_SNI="${SETUP_SSL_REJECT_UNKNOWN_SNI:-${SSL_REJECT_UNKNOWN_SNI:-auto}}"
 [[ $SSL_REJECT_UNKNOWN_SNI =~ ^(auto|0|1)$ ]] || SSL_REJECT_UNKNOWN_SNI=auto
 # XenForo page compression.  XenForo gzips every page itself at level 9
-# (15% of member-page PHP CPU on the audit host).  With XF_MEMBER_GZIP=angie
+# (15% of member-page PHP CPU on the audit host).  With XF_MEMBER_GZIP=nginx
 # (default) a managed block at the end of each XenForo src/config.php keeps
 # XenForo's gzip for guests -- the FastCGI guest cache stores that compressed
 # body, so a hit costs no compression -- and turns it off for visitors with a
-# session cookie, whose pages Angie compresses (Brotli/gzip level 4).
+# session cookie, whose pages nginx compresses (Brotli/gzip level 4).
 # SETUP_XF_MEMBER_GZIP=xenforo removes the block; the choice is persisted in
 # /etc/default/setup-tuning.  Since server-configs-nginx 1.6.56 the uncached
-# Angie handler withholds Accept-Encoding from PHP, so uncached pages are
-# compressed by Angie whatever the block says (new installs included); the
+# nginx handler withholds Accept-Encoding from PHP, so uncached pages are
+# compressed by nginx whatever the block says (new installs included); the
 # block remains a second guard for hosts on an older tree.
-XF_MEMBER_GZIP="${XF_MEMBER_GZIP:-angie}"
+XF_MEMBER_GZIP="${XF_MEMBER_GZIP:-nginx}"
 XF_MEMBER_GZIP_PERSIST=0
 if [[ -n ${SETUP_XF_MEMBER_GZIP+x} ]]; then
   XF_MEMBER_GZIP=$SETUP_XF_MEMBER_GZIP
   XF_MEMBER_GZIP_PERSIST=1
 fi
-[[ $XF_MEMBER_GZIP == xenforo ]] || XF_MEMBER_GZIP=angie
+[[ $XF_MEMBER_GZIP == xenforo ]] || XF_MEMBER_GZIP=nginx
 # CPU vulnerability mitigations (Spectre/Meltdown/MDS/Retbleed...).  Empty =
 # never touched (the kernel default, on).  `--basic mitigations=off`,
 # `--optimize mitigations=off` or SETUP_CPU_MITIGATIONS=off add
@@ -240,7 +240,7 @@ readonly BACKUP_DIR="${STATE_DIR}/backup"
 # Every service writes its logs below this single directory so an operator can
 # collect one tree (tar -czf /tmp/logs.tgz -C /var/www logs) for inspection.
 readonly LOG_ROOT="/var/www/logs"
-# Angie and PHP configuration is owned by this repository, not by setup.sh.
+# nginx and PHP configuration is owned by this repository, not by setup.sh.
 # Override the ref or point CONFIG_SOURCE_DIR at a local checkout for testing.
 readonly CONFIG_REPO_URL="${CONFIG_REPO_URL:-https://github.com/droplinxuser/server-configs-nginx}"
 readonly CONFIG_REPO_REF="${CONFIG_REPO_REF:-main}"
@@ -346,8 +346,8 @@ source "${SCRIPT_DIR}/lib/php-upgrade.sh"
 # shellcheck source=lib/php-build.sh
 source "${SCRIPT_DIR}/lib/php-build.sh"
 
-# shellcheck source=lib/angie-build.sh
-source "${SCRIPT_DIR}/lib/angie-build.sh"
+# shellcheck source=lib/nginx-build.sh
+source "${SCRIPT_DIR}/lib/nginx-build.sh"
 # shellcheck source=lib/valkey-build.sh
 source "${SCRIPT_DIR}/lib/valkey-build.sh"
 

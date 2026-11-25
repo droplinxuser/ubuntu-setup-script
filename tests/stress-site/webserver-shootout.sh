@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Web-server shootout on the audit host.
 #
-# Compares Angie, nginx, FreeNginx, OpenResty, Tengine, Caddy and
+# Compares nginx, nginx, FreeNginx, OpenResty, Tengine, Caddy and
 # OpenLiteSpeed against the same PHP-FPM pool, application roots, TLS
 # certificates and kernel.  One server owns :443 at a time and runs as a
 # transient systemd unit, so its CPU is read from that unit's cgroup.
@@ -29,13 +29,13 @@ CACHEDIR=${CACHEDIR:-/var/cache/shootout}
 SOCK=${SOCK:-/run/php/php-fpm.sock}
 C=${C:-100}; D=${D:-8}; RUNS=${RUNS:-3}; WARM=${WARM:-1}
 WP=${WP:-wp.test.local}; XF=${XF:-xf.test.local}; CH=${CH:-chev.test.local}
-CERTDIR=${CERTDIR:-/etc/angie/ssl}
+CERTDIR=${CERTDIR:-/etc/nginx/ssl}
 CK=${CK:-/root/audit/cookies/cookies.tsv}
 MODE=${1:-run}; shift 2>/dev/null || true
 
-SERVERS=(angie nginx freenginx openresty tengine caddy openlitespeed)
+SERVERS=(nginx nginx freenginx openresty tengine caddy openlitespeed)
 declare -A BIN=(
-  [angie]=/usr/sbin/angie
+  [nginx]=/usr/sbin/nginx
   [nginx]=/usr/sbin/nginx
   [freenginx]=/opt/freenginx/sbin/nginx
   [openresty]=/usr/local/openresty/nginx/sbin/nginx
@@ -44,7 +44,7 @@ declare -A BIN=(
   [openlitespeed]=/usr/local/lsws/bin/openlitespeed
 )
 declare -A FAMILY=(
-  [angie]=nginx [nginx]=nginx [freenginx]=nginx [openresty]=nginx
+  [nginx]=nginx [nginx]=nginx [freenginx]=nginx [openresty]=nginx
   [tengine]=nginx [caddy]=caddy [openlitespeed]=ols
 )
 
@@ -215,7 +215,7 @@ write_configs() {
 
 start_server() {
   local srv=$1
-  systemctl stop angie nginx caddy lshttpd openresty tengine freenginx 2>/dev/null || true
+  systemctl stop nginx nginx caddy lshttpd openresty tengine freenginx 2>/dev/null || true
   systemd-run --unit="bench-$srv" --collect --quiet --service-type=simple \
     --property=LimitNOFILE=520000 --property=Restart=no \
     -- bash -c "exec ${BIN[$srv]} $STARTARGS" >/dev/null 2>&1 || return 1

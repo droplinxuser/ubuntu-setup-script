@@ -70,7 +70,7 @@ CONF=${PHP_BUILD_CONF:-$ROOT/php-build.conf}
 TOOL=${PHP_BUILD_TOOL_PATH:-$ROOT/php-fpm-build.sh}
 SBIN=${PHP_BUILD_SBIN:-/usr/sbin}
 LOG_TAG=setup-php-fpm-build
-# Shared download, version and toolchain code (also used by angie-build.sh).
+# Shared download, version and toolchain code (also used by nginx-build.sh).
 BUILD_COMMON=${PHP_BUILD_COMMON:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/build-common.sh}
 # shellcheck source=tools/build-common.sh
 . "$BUILD_COMMON"

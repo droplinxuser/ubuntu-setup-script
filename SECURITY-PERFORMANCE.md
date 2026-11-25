@@ -9,7 +9,7 @@ per-option details are in `README.md`.
 
 | Layer | In place |
 |---|---|
-| Angie | `worker_processes`/connections/rlimit from the hardware, HTTP/2, TLS 1.2/1.3 with HSTS, Brotli 5 + gzip, FastCGI/proxy cache zones sized to RAM and disk with `min_free` headroom, a login brute-force limiter (20 credential POSTs a minute per address, IPv6 per /64, loopback exempt, `429` on reject, logged at `info`; the generic per-IP limits were removed in 1.21.71), guest full-page caches for WordPress/XenForo/Chevereto/Flarum whose cookie rule is default-deny (an unknown cookie is never a guest page; analytics, consent and CDN cookies are the allowlist), immutable asset locations, dotfile/`wp-config.php`/`xmlrpc.php` denies, no PHP from upload directories, access log off, error log under `/var/www/logs/angie` |
+| nginx | `worker_processes`/connections/rlimit from the hardware, HTTP/2, TLS 1.2/1.3 with HSTS, Brotli 5 + gzip, FastCGI/proxy cache zones sized to RAM and disk with `min_free` headroom, a login brute-force limiter (20 credential POSTs a minute per address, IPv6 per /64, loopback exempt, `429` on reject, logged at `info`; the generic per-IP limits were removed in 1.21.71), guest full-page caches for WordPress/XenForo/Chevereto/Flarum whose cookie rule is default-deny (an unknown cookie is never a guest page; analytics, consent and CDN cookies are the allowlist), immutable asset locations, dotfile/`wp-config.php`/`xmlrpc.php` denies, no PHP from upload directories, access log off, error log under `/var/www/logs/nginx` |
 | PHP-FPM | static pool sized to CPU/RAM (4 per core on CPU-bound XenForo/WordPress hosts), Unix socket, OPcache 128-512 MB, tracing JIT always on (`SETUP_PHP_JIT_WORDPRESS=0` exempts WordPress roots), slow log 10 s, worker recycling, `LimitNOFILE=524288`, `UMask=0027`, `expose_php=Off`, `PATH_TRANSLATED` and `open_basedir` leak repairs; opt-in session/cgi hardening |
 | MariaDB | buffer pool (data+5%) and redo log from live data, thread pool, NVMe/SSD/HDD I/O capacity, connections from the PHP pool, `skip_name_resolve`, `secure_file_priv`, `local_infile=0`, loopback bind, slow/error logs, AppArmor fix, systemd fd limit, embedded backup job (30 dumps) and `mysqltuner.pl`, config validated before every restart |
 | Valkey / Redis | loopback + `protected-mode`, Unix socket 770 with `www-data` in the group, cache-only persistence, `maxmemory` = working set +20% (128 MB minimum; RAM floor only on a fresh install), `allkeys-lru`, `io-threads 1`, lazy-free, online `CONFIG SET` tuning |
@@ -24,7 +24,7 @@ and a fresh install followed by `--optimize` is byte-identical.
 ## 2. What is left to the operator (priority order)
 
 1. **Certificates.** Replace the self-signed per-domain certificates with
-   ACME (`http_acme` is built into Angie) and automate renewal.
+   ACME (`http_acme` is built into nginx) and automate renewal.
 2. **SSH and brute force.** Keys only, no root/password login, fail2ban or
    provider protection; the script only rate-limits SSH in UFW and reports
    password authentication.
@@ -62,7 +62,7 @@ Scale in this order, measuring RSS, CPU, queue depth and p99 on the real
 workload after every step; do not copy numbers from another host.
 
 1. CDN and edge cache for static assets and anonymous HTML.
-2. Angie FastCGI/proxy microcaching for guest pages and API GETs (bypass on
+2. nginx FastCGI/proxy microcaching for guest pages and API GETs (bypass on
    session/auth cookies, correct `Cache-Control`/`Vary`). Caching is the
    largest lever measured: the same page went from ~7k to ~180k req/s.
 3. Object cache (Valkey over the Unix socket) where it beats the database;
@@ -72,7 +72,7 @@ workload after every step; do not copy numbers from another host.
    connection churn remains; analytics on a replica.
 5. Elasticsearch on its own node/cluster with shard sizing, replicas, ILM and
    snapshots.
-6. Multiple Angie/PHP nodes behind a load balancer, sessions in Valkey,
+6. Multiple nginx/PHP nodes behind a load balancer, sessions in Valkey,
    uploads on shared/object storage, atomic releases.
 7. Load-test each step with a realistic traffic mix; the included harness is
    synthetic.
@@ -85,12 +85,12 @@ WordPress profiles this repository deploys.
 - **FrankenPHP 1.13.5** (PHP 8.5.12, classic mode, same document root and
   database, loopback TLS, 16 threads) served the XenForo member page at
   **688 req/s with 21.7 ms of host CPU per request**, against **852 req/s and
-  17.4 ms** for Angie + PHP-FPM 8.4 with 16 static workers on the same host.
+  17.4 ms** for nginx + PHP-FPM 8.4 with 16 static workers on the same host.
   32 FrankenPHP threads reached 702 req/s at 22.7 ms. It is a single static
   binary with the required extensions (mysqli, pdo_mysql, redis, OPcache, gd,
   intl), so the test is reproducible, but it is 17-19% slower here and it
   replaces the FastCGI cache, Brotli/gzip, rate limiting and HTTP/3 setup
-  Angie already provides. Its worker mode is not usable for these applications:
+  nginx already provides. Its worker mode is not usable for these applications:
   XenForo and WordPress keep per-request state in superglobals and bootstrap
   their container on every request, so a long-lived worker leaks state between
   visitors unless the application is rewritten.
