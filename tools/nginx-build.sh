@@ -586,8 +586,8 @@ cmd_build() { # [normal|cpu]
   # -I/-L like a system zlib (only libz.a exists in that directory).
   fetch_unpack zlib-ng "${VERS[zlib-ng]}" "$work/zlib-ng"
   ( cd "$work/zlib-ng" && CC=$CC CFLAGS="$flags $lto" ./configure --static --zlib-compat \
-      && make -j"$j" libz.a ) >> "$LOG_FILE" 2>&1 || { tail -n 30 "$LOG_FILE" >&2; die "zlib-ng failed to build (log: $LOG_FILE)"; }
-  build_deps "$work" "$j" "$flags $lto" || { tail -n 30 "$LOG_FILE" >&2; die "Brotli failed to build (log: $LOG_FILE)"; }
+      && make -j"$j" libz.a ) >> "$LOG_FILE" 2>&1 || { log_excerpt "$LOG_FILE" 30; die "zlib-ng failed to build (log: $LOG_FILE)"; }
+  build_deps "$work" "$j" "$flags $lto" || { log_excerpt "$LOG_FILE" 30; die "Brotli failed to build (log: $LOG_FILE)"; }
   if [[ ! -x $src/configure ]]; then   # a Git snapshot keeps it in auto/
     [[ -x $src/auto/configure ]] || die "nginx ${VERS[nginx]}: no configure script in the source"
     cp "$src/auto/configure" "$src/configure"
@@ -605,7 +605,7 @@ cmd_build() { # [normal|cpu]
       --with-pcre="$work/pcre2" --with-pcre-jit --with-pcre-opt="$flags" \
       --add-module="$work/ngx_brotli"
     nice -n 10 make -j"$j"
-  ) >> "$LOG_FILE" 2>&1 || { tail -n 40 "$LOG_FILE" >&2; die "nginx ${VERS[nginx]} failed to build (log: $LOG_FILE)"; }
+  ) >> "$LOG_FILE" 2>&1 || { log_excerpt "$LOG_FILE" 40; die "nginx ${VERS[nginx]} failed to build (log: $LOG_FILE)"; }
   verify_binary "$src/objs/nginx"
   rm -rf "$STAGING"
   install -d -m 755 "$STAGING/sbin"
@@ -904,7 +904,7 @@ cmd_bolt() {
   "$bolt" "$base" -o "$work/nginx.bolt" -data="$work/nginx.fdata" \
     -reorder-blocks=ext-tsp -reorder-functions=cdsort -split-functions \
     -split-all-cold -split-eh -icf >> "$LOG_FILE" 2>&1 \
-    || { tail -n 5 "$LOG_FILE" >&2; die "llvm-bolt failed"; }
+    || { log_excerpt "$LOG_FILE" 5; die "llvm-bolt failed"; }
   bolt_stack_check "$work/nginx.bolt"
   [[ -n $(bin_version "$work/nginx.bolt") ]] || die "the BOLT output does not run"
   conf_test "$work/nginx.bolt" >/dev/null || die "the BOLT output rejects $NGINX_CONF"

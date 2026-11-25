@@ -778,6 +778,28 @@ build_deprioritize() {
   echo 900 > "/proc/$BASHPID/oom_score_adj" 2>/dev/null || true
   renice -n 10 -p "$BASHPID" >/dev/null 2>&1 || true
   ionice -c 3 -p "$BASHPID" >/dev/null 2>&1 || true
+  # No single file a build writes may exceed 20 GB (SETUP_BUILD_MAX_FILE_GB):
+  # a runaway write fails the build (SIGXFSZ) instead of filling the disk
+  # under MariaDB (1.22.0 --upgrade-php test: a 1.7 TB log).  The largest
+  # real build file, the LTO php-fpm, is about 60 MB.
+  ulimit -f $(( ${SETUP_BUILD_MAX_FILE_GB:-20} * 1024 * 1024 )) 2>/dev/null || true
+}
+
+# The last N lines of a build log, on stderr, for the operator.  Never when
+# stderr IS that log: setup.sh runs the tools with `>>"$log" 2>&1` and passes
+# the same file, and `tail -n N log >&2` then reads what it appends to the
+# file it reads and never reaches the end (1.22.0 --upgrade-php=8.6 test: a
+# failed make grew the log to 1.7 TB in 15 minutes, filled the disk and took
+# MariaDB down).  Bounded either way: at most N lines, read once.
+log_excerpt() { # FILE [N]
+  local f=$1 n=${2:-30} a b
+  [[ -f $f ]] || return 0
+  a=$(stat -L -c '%d:%i' -- "$f" 2>/dev/null) || return 0
+  # The calling shell's fd 2, read through /proc: a plain /dev/stderr would be
+  # stat's own stderr, which the 2>/dev/null has already replaced.
+  b=$(stat -L -c '%d:%i' "/proc/$BASHPID/fd/2" 2>/dev/null || true)
+  [[ -n $b && $a == "$b" ]] && return 0
+  tail -n "$n" -- "$f" | head -n "$n" >&2 || true
 }
 
 llvm_apt_install() { # major codename packages...

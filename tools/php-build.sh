@@ -493,7 +493,7 @@ build_libs() { # deps work jobs log libs...
             --disable-tests --disable-samples --disable-extras --disable-layoutex
           make -j"$j" && make install ;;
       esac
-    ) >> "$log" 2>&1 || { tail -n 40 "$log" >&2; die "$name $v failed to build (log: $log)"; }
+    ) >> "$log" 2>&1 || { log_excerpt "$log" 40; die "$name $v failed to build (log: $log)"; }
     rm -rf "$src"
   done
 }
@@ -592,7 +592,7 @@ cmd_build() { # X.Y [exact]
   done
   cd "$src"
   say "building PHP ${VERS[php]} (FPM + CLI) with clang $n: ${set// /,}"
-  ./buildconf --force >> "$log" 2>&1 || { tail -n 20 "$log" >&2; die "buildconf failed (log: $log)"; }
+  ./buildconf --force >> "$log" 2>&1 || { log_excerpt "$log" 20; die "buildconf failed (log: $log)"; }
   # Through a file, not a process substitution: an unknown name must stop
   # the build here, not just its subshell.
   ext_flags "$ver" "$set" "$deps" > "$work/configure-exts"
@@ -614,7 +614,7 @@ cmd_build() { # X.Y [exact]
     --enable-fpm --with-fpm-user=www-data --with-fpm-group=www-data --with-fpm-systemd \
     --with-external-pcre --with-mysql-sock="$MYSQL_SOCK" \
     "${cfg[@]}" \
-    >> "$log" 2>&1 || { tail -n 30 "$log" >&2; install -m 640 config.log "$LOG_DIR/php-$ver-config-$(date -u +%Y%m%d-%H%M%S).log" 2>/dev/null || true; die "configure failed (log: $log; config.log copied to $LOG_DIR)"; }
+    >> "$log" 2>&1 || { log_excerpt "$log" 30; install -m 640 config.log "$LOG_DIR/php-$ver-config-$(date -u +%Y%m%d-%H%M%S).log" 2>/dev/null || true; die "configure failed (log: $log; config.log copied to $LOG_DIR)"; }
   # Debian's include_path, compiled in (no php.ini line needed).
   sed -i -E "s|^#define[[:space:]]+PHP_INCLUDE_PATH[[:space:]].*|#define PHP_INCLUDE_PATH \"${INCLUDE_PATH}\"|" main/build-defs.h
   grep -qF "#define PHP_INCLUDE_PATH \"$INCLUDE_PATH\"" main/build-defs.h \
@@ -629,7 +629,7 @@ cmd_build() { # X.Y [exact]
       || say "PHP $ver: could not set the compiled session.save_path default (the managed php.ini sets it)"
   fi
   nice -n 10 make -j"$j" >> "$log" 2>&1 \
-    || { tail -n 40 "$log" >&2; die "make failed (log: $log)"; }
+    || { log_excerpt "$log" 40; die "make failed (log: $log)"; }
   [[ -x sapi/fpm/php-fpm && -x sapi/cli/php ]] || die "make did not produce sapi/fpm/php-fpm and sapi/cli/php (log: $log)"
   if opcache_shared "$ver"; then [[ -f modules/opcache.so ]] || die "make did not produce modules/opcache.so (log: $log)"; fi
 

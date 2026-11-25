@@ -1209,7 +1209,10 @@ migrate_nginx_scan() {
     # http.d/default.conf with its `api` status location, modules-enabled,
     # ...) cannot block the migration: the 1.22.0 migration test stopped on
     # that `api` line although the file is left behind with /etc/angie.
-    [[ $f == "$tree"/* ]] && migrate_angie_skip "${f#"$tree"/}" && continue
+    # angie.conf itself is still scanned although it is never copied: a
+    # load_module there names a module the operator relies on, which nginx
+    # will not have.
+    [[ $f == "$tree"/* && $f != "$tree"/angie.conf ]] && migrate_angie_skip "${f#"$tree"/}" && continue
     awk -v file="$f" -v drop="$drop" -v unbuilt="$unbuilt" -v angie="$MIGRATE_NGINX_ANGIE_ONLY_RE" '
       function emit(kind, d) { printf "%s\t%s:%d\t%s\n", kind, file, NR, d }
       {

@@ -518,5 +518,28 @@ check "run_migrate_unit resets the in-memory profile before it detects" \
 check "run_migrate_unit detects (migrate) before plan_memory_budget" \
   before "$ROOT/lib/restart.sh" run_migrate_unit 'detect_installed_services migrate' '^[[:space:]]+plan_memory_budget'
 
+# log_excerpt never copies a log into itself (1.22.0 --upgrade-php test: the
+# tool's stderr was the log, `tail log >&2` grew it to 1.7 TB).
+lx_case() { # self|other -> bytes the excerpt added to the log, lines on stderr
+  (
+    set +eE; trap - ERR
+    # shellcheck disable=SC1090,SC1091
+    . "$ROOT/tools/build-common.sh"
+    f=$TMP/lx.log; seq 1 100 > "$f"
+    if [[ $1 == self ]]; then
+      log_excerpt "$f" 30 2>>"$f"
+      printf '%s' "$(( $(stat -c %s "$f") - $(seq 1 100 | wc -c) ))"
+    else
+      printf '%s' "$(log_excerpt "$f" 30 2>&1 >/dev/null | wc -l)"
+    fi
+  )
+}
+check "log_excerpt writes nothing when stderr is the log itself (no self-copy loop)" test "$(lx_case self)" = 0
+check "log_excerpt prints exactly N lines to another stderr" test "$(lx_case other)" = 30
+check "the tools never tail their own log to stderr directly" \
+  bash -c '! grep -nE "tail -n [0-9]+ \"\\\$(log|LOG_FILE)\" >&2" "$1"/tools/*.sh' _ "$ROOT"
+check "builds cap the size of any file they write (ulimit -f)" \
+  bash -c 'sed -n "/^build_deprioritize()/,/^}/p" "$1" | grep -q "ulimit -f"' _ "$ROOT/tools/build-common.sh"
+
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

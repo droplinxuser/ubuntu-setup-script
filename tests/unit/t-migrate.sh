@@ -877,6 +877,8 @@ retry_case() { # code-recorded(current|old) -> rc of migrate_part_retry_ok
     [[ $1 == old ]] && migrate_state_set nginx.code "an-older-release"
     migrate_part_retry_ok nginx "digest-a"
     printf '%s' "$?"
+    # Leave no state behind for the pre-flight checks below.
+    migrate_state_del nginx; migrate_state_del nginx.scan; migrate_state_del nginx.code
   )
 }
 check "retry: the same code and the same tree do not retry a rolled-back part" test "$(retry_case current)" = 1
