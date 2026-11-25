@@ -163,6 +163,9 @@ migrate_state_get() {
 
 migrate_state_set() {
   local key=$1 value=${2:-} f=$MIGRATE_STATE_FILE tmp
+  # Recording a part's scan digest also records the code that judged it.
+  [[ $key == *.scan ]] && [[ ${MIGRATE_STATE_CODE_REC:-0} != 1 ]] \
+    && MIGRATE_STATE_CODE_REC=1 migrate_state_set "${key%.scan}.code" "$(migrate_code_digest)"
   mkdir -p "$(dirname "$f")"
   tmp="${f}.new.$$"
   {
@@ -173,6 +176,15 @@ migrate_state_set() {
   mv -f "$tmp" "$f"
   # The history is for the operator and the next run's resume decisions.
   printf '%s %s=%s\n' "$(migrate_stamp)" "$key" "$value" >> "${f}.history" 2>/dev/null || true
+}
+
+# The code that recorded a part's blocked/rolled-back state.  Stored next to
+# every <part>.scan, so a new release (a fixed migration) retries the part even
+# when the host's configuration did not change (1.22.0 migration test: two
+# fixes to the nginx pre-flight were never retried on an unchanged tree).
+MIGRATE_SELF=${BASH_SOURCE[0]}
+migrate_code_digest() {
+  { printf '%s\n' "${SCRIPT_VERSION:-}"; cat -- "$MIGRATE_SELF" 2>/dev/null; } | md5sum | awk '{ print $1 }'
 }
 
 migrate_state_del() {
@@ -455,6 +467,7 @@ migrate_part_retry_ok() {
   case $st in
     blocked:*|rolled-back:*|failed:*|refused:*)
       [[ ${SETUP_MIGRATE_RETRY:-0} == 1 ]] && return 0
+      [[ $(migrate_state_get "${part}.code") != "$(migrate_code_digest)" ]] && return 0
       [[ $(migrate_state_get "${part}.scan") != "$digest" ]] ;;
     *) return 0 ;;
   esac
@@ -668,8 +681,11 @@ migrate_baseline() {
   local tree=$1 out=$2 name scheme file root php auth a
   : > "$out"
   command -v curl >/dev/null 2>&1 || return 1
-  # The catch-all answers too (often 444, which curl shows as 000).
-  printf 'localhost\thttp\t/\t%s\t0\n' "$(migrate_http_code http localhost /)" >> "$out"
+  # The catch-all answers too (often 444, which curl shows as 000).  Kind
+  # "catchall": under Angie the PACKAGE's http.d/default.conf answered
+  # Host: localhost with its welcome page (200); that file is never copied,
+  # so under nginx the SCN catch-all closes it (444).  Compared leniently.
+  printf 'localhost\thttp\t/\t%s\tcatchall\n' "$(migrate_http_code http localhost /)" >> "$out"
   while IFS=$'\t' read -r name scheme file root php auth; do
     [[ -n $name ]] || continue
     printf '%s\t%s\t/\t%s\t%s\n' "$name" "$scheme" "$(migrate_http_code "$scheme" "$name" /)" "$php" >> "$out"
@@ -696,6 +712,11 @@ migrate_compare_baseline() {
       (( try < 3 )) && sleep 1
     done
     if [[ $now != "$code" ]]; then
+      # The catch-all may close (000) or refuse (4xx) where the package
+      # welcome page used to answer; it must still never 5xx.
+      if [[ $kind == catchall ]] && [[ $now == 000 || $now == 4* ]]; then
+        continue
+      fi
       # A baseline that was itself 000/5xx cannot be held against the new
       # server, but the new one must not be worse than that.
       if [[ $code == 000 || $code == 5* ]] && [[ $now != 000 && $now != 5* ]]; then
@@ -1184,6 +1205,11 @@ migrate_nginx_scan() {
     case $f in
       */mime.types|*/fastcgi.conf|*/fastcgi_params|*/scgi_params|*/uwsgi_params) continue ;;
     esac
+    # Files never copied to /etc/nginx (the Angie package's own
+    # http.d/default.conf with its `api` status location, modules-enabled,
+    # ...) cannot block the migration: the 1.22.0 migration test stopped on
+    # that `api` line although the file is left behind with /etc/angie.
+    [[ $f == "$tree"/* ]] && migrate_angie_skip "${f#"$tree"/}" && continue
     awk -v file="$f" -v drop="$drop" -v unbuilt="$unbuilt" -v angie="$MIGRATE_NGINX_ANGIE_ONLY_RE" '
       function emit(kind, d) { printf "%s\t%s:%d\t%s\n", kind, file, NR, d }
       {

@@ -843,6 +843,46 @@ check "scan: an \$angie_* variable is Angie-only" has "$scan" $'angie-only\t'"$S
 check "scan: an unbuilt module directive is found" has "$scan" $'unbuilt\t'"$S:8"$'\tauth_request'
 check "scan: a droppable directive is classified droppable" has "$scan" $'droppable\t'"$S:6"$'\tsub_filter'
 check "scan: limit_conn is a security control" has "$scan" $'security\t'"$S:7"$'\tlimit_conn'
+# The Angie package's http.d/default.conf (an `api` status location) is never
+# copied to /etc/nginx, so it must not block (1.22.0 migration test).
+pkgtree=$TMP/scan-pkg; rm -rf "$pkgtree"; mkdir -p "$pkgtree/http.d"
+printf '%s\n' 'events {}' 'http {' '    include http.d/*.conf;' '}' > "$pkgtree/angie.conf"
+printf '%s\n' 'server {' '    listen 80;' '    location /status/ {' '        api /status/;' '    }' '}' > "$pkgtree/http.d/default.conf"
+pkgscan=$(migrate_nginx_scan "$pkgtree" "$pkgtree/angie.conf")
+check "scan: the package's http.d/default.conf (api status) is skipped, not a blocker" test -z "$pkgscan"
+# Catch-all vs real vhosts in the cutover comparison (1.22.0 migration test:
+# Angie's package page answered Host: localhost with 200; nginx closes it).
+cmp_case() { # localhost-now vhost-now -> rc
+  (
+    set +eE; trap - ERR
+    b=$TMP/cmp-base.tsv
+    printf 'localhost\thttp\t/\t200\tcatchall\nsite.example.test\thttps\t/\t200\t1\n' > "$b"
+    migrate_http_code() { case $2 in localhost) printf '%s' "$CMP_L" ;; *) printf '%s' "$CMP_V" ;; esac; }
+    sleep() { :; }
+    CMP_L=$1 CMP_V=$2 migrate_compare_baseline "$b" >/dev/null
+    printf '%s' "$?"
+  )
+}
+check "baseline: the catch-all may close (000) or refuse (4xx) where the package page answered" \
+  test "$(cmp_case 000 200),$(cmp_case 404 200)" = "0,0"
+check "baseline: a catch-all 5xx or a real vhost that stops answering still fails the cutover" \
+  test "$(cmp_case 502 200),$(cmp_case 000 000)" = "1,1"
+# Retry rule: an unchanged tree is not retried by the same code, but a new
+# release (a fixed migration) retries a blocked/rolled-back part.
+retry_case() { # code-recorded(current|old) -> rc of migrate_part_retry_ok
+  (
+    set +eE; trap - ERR
+    migrate_state_set nginx "rolled-back:test"
+    migrate_state_set nginx.scan "digest-a"
+    [[ $1 == old ]] && migrate_state_set nginx.code "an-older-release"
+    migrate_part_retry_ok nginx "digest-a"
+    printf '%s' "$?"
+  )
+}
+check "retry: the same code and the same tree do not retry a rolled-back part" test "$(retry_case current)" = 1
+check "retry: a new release retries a rolled-back part on an unchanged tree" test "$(retry_case old)" = 0
+check "retry: recording a part's scan digest records the code digest with it" \
+  bash -c 'grep -q "\.code\" \"\$(migrate_code_digest)\"" "$1"' _ "$ROOT/lib/migrate.sh"
 check "scan: a load_module line is reported" has "$scan" $'load_module\t'"$T_ANGIE/angie.conf:3"
 check "scan: the brotli load_module is not a blocker" lacks "$scan" "brotli"
 printf '%s\n' "$scan" > "$TMP/scan.tsv"
