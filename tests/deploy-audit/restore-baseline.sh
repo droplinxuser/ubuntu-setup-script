@@ -162,7 +162,7 @@ rm -rf /var/www /etc/nginx /etc/angie /etc/php /etc/mysql /etc/valkey /etc/redis
        /var/lib/php /var/cache/php /var/cache/nginx /var/log/nginx /var/cache/angie /var/log/angie /var/lib/angie /var/log/mysql /var/log/valkey \
        /var/log/elasticsearch /var/log/php* /var/log/setup-*.md /var/log/sysstat \
        /home/nginx_cache /home/nginx_cache_chev /home/proxy_cache /home/proxy_cdn /home/xf_proxy_cache \
-       /run/php /usr/share/elasticsearch /opt/stress-node /var/lib/stress-site \
+       /run/php /usr/share/elasticsearch /opt/stress-node /var/lib/stress-site /var/lib/tls-arms-bench \
        /etc/stress-site-config.json /etc/systemd/system/stress-node.service
 rm -rf /etc/systemd/system/nginx.service.d /etc/systemd/system/angie.service.d /etc/systemd/system/mariadb.service.d \
        /etc/systemd/system/valkey-server.service.d /etc/systemd/system/elasticsearch.service.d \
