@@ -9,8 +9,8 @@
 #   * Idempotent: every step can be re-run on an already configured machine.
 #   * Only the services named on the command line are touched.
 #   * nginx configuration is owned by
-#     https://github.com/droplinxuser/server-configs-nginx (its "nginx"
-#     branch) and downloaded at install time.  PHP-FPM pool/php.ini templates
+#     https://github.com/droplinxuser/server-configs-nginx (branch main)
+#     and downloaded at install time.  PHP-FPM pool/php.ini templates
 #     are non-nginx config and live locally in configs/php.  Do not add nginx
 #     config content to this script; update the nginx repo.
 #     Other vendor payloads that must be reproducible offline are embedded in
@@ -242,12 +242,11 @@ readonly BACKUP_DIR="${STATE_DIR}/backup"
 readonly LOG_ROOT="/var/www/logs"
 # nginx configuration is owned by this repository, not by setup.sh.
 # Override the ref or point CONFIG_SOURCE_DIR at a local checkout for testing.
-# The nginx tree lives on the repository's "nginx" branch: its main branch
-# stays the Angie tree that every 1.21.x host still downloads, so switching
-# main would break the hosts not yet migrated (hosts that stay on 1.21.x pin
-# CONFIG_REPO_REF=angie-final).
+# The nginx tree is the repository's only branch, main.  Tags: nginx (the
+# frozen 1.7.1 tree that setup.sh 1.22.0/1.22.1 download) and angie-final
+# (the last Angie tree, for hosts kept on 1.21.x).
 readonly CONFIG_REPO_URL="${CONFIG_REPO_URL:-https://github.com/droplinxuser/server-configs-nginx}"
-readonly CONFIG_REPO_REF="${CONFIG_REPO_REF:-nginx}"
+readonly CONFIG_REPO_REF="${CONFIG_REPO_REF:-main}"
 CONFIG_SOURCE_DIR="${CONFIG_SOURCE_DIR:-}"
 CONFIG_TEMP_DIR=""
 readonly CRON_BEGIN="# BEGIN setup.sh managed cron"

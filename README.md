@@ -317,7 +317,7 @@ the unit tests; anywhere else it is ignored with a warning.
 ### nginx (`--nginx`)
 
 `--nginx` builds the nginx.org mainline release from source, deploys the
-`server-configs-nginx` tree (branch `nginx`) to `/etc/nginx`, applies the
+`server-configs-nginx` tree (branch `main`) to `/etc/nginx`, applies the
 hardware profile and starts its own `nginx.service`.  `--angie` still works
 as a deprecated alias: it prints a warning and installs nginx.
 
@@ -397,17 +397,17 @@ Environment options:
 | `SETUP_NGINX_COMPRESSION=0` | on | turns the managed compression profile off (`SETUP_ANGIE_COMPRESSION` is still read as the old name) |
 | `SETUP_XF_JOB_CRON=0` | on | removes the managed crontab entry that runs `cmd.php xf:run-jobs` once a minute as www-data for every XenForo root; persisted as `XF_JOB_CRON` |
 | `SETUP_NGINX_BUILD_BOLT=0` | 1 | skip the BOLT pass of `--optimize` |
-| `CONFIG_REPO_URL`, `CONFIG_REPO_REF` | `droplinxuser/server-configs-nginx`, `nginx` | select a fork or branch of the configuration tree |
+| `CONFIG_REPO_URL`, `CONFIG_REPO_REF` | `droplinxuser/server-configs-nginx`, `main` | select a fork, branch or tag of the configuration tree |
 | `CONFIG_SOURCE_DIR=/path` | unset | use a local checkout instead of downloading |
 
-**server-configs-nginx branches.**  The 1.22 tree lives on the branch
-`nginx` (server-configs-nginx 1.7.1, the first without `gzip_static` and
-`brotli_static`, which setup.sh 1.22.1 needs), and setup.sh 1.22 downloads
-it (`CONFIG_REPO_REF=nginx`).  `main` stays the Angie tree for hosts that still
-run 1.21.x, and the tag `angie-final` marks the last Angie `main` (a host
-kept on 1.21.x can pin `CONFIG_REPO_REF=angie-final`).  Once every host runs
-1.22, merging `nginx` into `main` is a manual operator step; setup.sh never
-does it.
+**server-configs-nginx branch.**  The nginx tree is the repository's only
+branch, `main`, and setup.sh downloads it (`CONFIG_REPO_REF=main`).  Two
+tags keep older releases working: `nginx` (the frozen 1.7.1 tree that
+setup.sh 1.22.0 and 1.22.1 download by default) and `angie-final` (the last
+Angie tree; a host kept on 1.21.x can pin `CONFIG_REPO_REF=angie-final`).
+A 1.21.x setup.sh that downloads `main` refuses the nginx tree (no
+`angie.conf`) and keeps its Angie tree, so update the checkout before
+`--optimize`: 1.22 migrates the host to nginx.
 
 Notes:
 

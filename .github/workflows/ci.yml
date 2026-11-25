@@ -18,8 +18,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           repository: droplinxuser/server-configs-nginx
-          # 1.22 uses the nginx tree; main stays the Angie tree for 1.21.x.
-          ref: nginx
+          ref: main
           path: server-configs-nginx
 
       # Real server addresses must never be committed (see

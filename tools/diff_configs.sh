@@ -9,8 +9,8 @@
 # compare for them any more.
 #
 # CONFIG_REPO_REF picks the server-configs-nginx branch or tag, as setup.sh
-# does (hosts still on 1.21.x use angie-final; their tree is /etc/angie and
-# this comparison does not apply to them).
+# does (default main, the nginx tree; hosts still on 1.21.x use angie-final,
+# their tree is /etc/angie and this comparison does not apply to them).
 set -u
 
 SETUP_REPO="${SETUP_REPO:-https://raw.githubusercontent.com/droplinxuser/ubuntu-setup-script/main}"

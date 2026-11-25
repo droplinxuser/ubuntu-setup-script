@@ -8,6 +8,17 @@ Reports of the 1.21.33-1.21.61 cycles that measured the removed Anubis
 filter were deleted from the tree on 2026-11-23 for the same reason;
 `git show <commit>:<path>` recovers them.
 
+## Unreleased (1.22.2)
+
+- **server-configs-nginx has one branch, `main`.**  setup.sh downloads
+  `CONFIG_REPO_REF=main` (was `nginx`), and CI checks out `main`.  The
+  `nginx` branch became a tag (the frozen 1.7.1 tree), so 1.22.0 and 1.22.1
+  hosts keep downloading a working tree; `angie-final` still holds the last
+  Angie tree.  A 1.21.x setup.sh that downloads `main` refuses the nginx
+  tree (no `angie.conf`) and keeps Angie: update the checkout before
+  `--optimize`.  This repository's `v1.22` branch (the unsquashed 1.22.0
+  commits) is now the tag `v1.22.0-history`.
+
 ## 1.22.1 (2026-11-26)
 
 - **gzip_static and brotli_static removed from the nginx build** (operator

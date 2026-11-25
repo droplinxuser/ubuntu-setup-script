@@ -3542,10 +3542,10 @@ deploy_nginx_tree() {
   local log_dir="${LOG_ROOT}/nginx"
   local src=${CONFIG_SOURCE_DIR:-}
   [[ -n $src && -d $src ]] || { warn "No nginx config source directory available"; return 1; }
-  # The nginx branch of server-configs-nginx (CONFIG_REPO_REF=nginx) ships
+  # The nginx tree of server-configs-nginx (CONFIG_REPO_REF=main) ships
   # its own fastcgi.conf / fastcgi_params (SERVER_SOFTWARE "nginx" with no
   # version, R38) and mime.types; no package provides them any more, so a
-  # tree without them (the 1.21 Angie tree on SCN main) is refused before
+  # tree without them (the 1.21 Angie tree, tag angie-final) is refused before
   # anything in /etc/nginx changes.
   local req
   for req in nginx.conf mime.types fastcgi.conf fastcgi_params; do
@@ -3761,7 +3761,7 @@ retire_nginx_double_underscore() {
   return 0
 }
 
-# The nginx tree (CONFIG_REPO_REF, the SCN "nginx" branch) into /etc/nginx.
+# The nginx tree (CONFIG_REPO_REF, SCN main) into /etc/nginx.
 # The 1.21 tree also shipped scripts/limit_nofile.conf and
 # scripts/etc_default_nginx for a unit drop-in and /etc/default/<server>.
 # The nginx.service written by lib/nginx-build.sh sets LimitNOFILE=524288 and

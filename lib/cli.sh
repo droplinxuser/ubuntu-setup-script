@@ -297,9 +297,9 @@ Configuration source:
   Environment overrides:
     CONFIG_SOURCE_DIR=/path/to/checkout   use a local checkout (testing/offline)
     CONFIG_REPO_URL=https://github.com/... alternate repository
-    CONFIG_REPO_REF=nginx                  branch or tag to download (the
-                                           nginx tree; hosts that stay on
-                                           1.21.x use angie-final)
+    CONFIG_REPO_REF=main                   branch or tag to download (hosts
+                                           that stay on 1.21.x use
+                                           angie-final)
 
 Testing:
   --dry-run                             parse and validate only; show the plan
