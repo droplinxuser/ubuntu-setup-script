@@ -9,7 +9,7 @@ per-option details are in `README.md`.
 
 | Layer | In place |
 |---|---|
-| Angie | `worker_processes`/connections/rlimit from the hardware, HTTP/2, TLS 1.2/1.3 with HSTS, Brotli 5 + gzip, FastCGI/proxy cache zones sized to RAM and disk with `min_free` headroom, per-IP rate limiting (loopback and `SETUP_LIMIT_REQ_EXEMPT` exempt, `429` on reject, logged at `info`), guest full-page caches for WordPress/XenForo/Chevereto/Flarum whose cookie rule is default-deny (an unknown cookie is never a guest page; analytics, consent and CDN cookies are the allowlist), immutable asset locations, dotfile/`wp-config.php`/`xmlrpc.php` denies, no PHP from upload directories, access log off, error log under `/var/www/logs/angie` |
+| Angie | `worker_processes`/connections/rlimit from the hardware, HTTP/2, TLS 1.2/1.3 with HSTS, Brotli 5 + gzip, FastCGI/proxy cache zones sized to RAM and disk with `min_free` headroom, a login brute-force limiter (20 credential POSTs a minute per address, IPv6 per /64, loopback exempt, `429` on reject, logged at `info`; the generic per-IP limits were removed in 1.21.71), guest full-page caches for WordPress/XenForo/Chevereto/Flarum whose cookie rule is default-deny (an unknown cookie is never a guest page; analytics, consent and CDN cookies are the allowlist), immutable asset locations, dotfile/`wp-config.php`/`xmlrpc.php` denies, no PHP from upload directories, access log off, error log under `/var/www/logs/angie` |
 | PHP-FPM | static pool sized to CPU/RAM (4 per core on CPU-bound XenForo/WordPress hosts), Unix socket, OPcache 128-512 MB, tracing JIT always on (`SETUP_PHP_JIT_WORDPRESS=0` exempts WordPress roots), slow log 10 s, worker recycling, `LimitNOFILE=524288`, `UMask=0027`, `expose_php=Off`, `PATH_TRANSLATED` and `open_basedir` leak repairs; opt-in session/cgi hardening |
 | MariaDB | buffer pool (data+5%) and redo log from live data, thread pool, NVMe/SSD/HDD I/O capacity, connections from the PHP pool, `skip_name_resolve`, `secure_file_priv`, `local_infile=0`, loopback bind, slow/error logs, AppArmor fix, systemd fd limit, embedded backup job (30 dumps) and `mysqltuner.pl`, config validated before every restart |
 | Valkey / Redis | loopback + `protected-mode`, Unix socket 770 with `www-data` in the group, cache-only persistence, `maxmemory` = working set +20% (128 MB minimum; RAM floor only on a fresh install), `allkeys-lru`, `io-threads 1`, lazy-free, online `CONFIG SET` tuning |
@@ -117,6 +117,5 @@ sudo bash tests/stress-site/run-stress.sh /tmp/report.md # loopback suite (wrk)
 bash tests/stress-site/run-stress-remote.sh SERVER_IP stress.invalid /tmp/remote.md   # from a workstation (oha)
 ```
 
-Run the server with `SETUP_LIMIT_REQ_EXEMPT=<workstation IP>` before a remote
-run, pair it with `sudo bash tests/stress-site/collect-metrics.sh /tmp/metrics.log 5`
+For a remote run, pair it with `sudo bash tests/stress-site/collect-metrics.sh /tmp/metrics.log 5`
 on the server, and remove the test site afterwards.

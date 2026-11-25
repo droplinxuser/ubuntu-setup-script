@@ -8,6 +8,153 @@ Reports of the 1.21.33-1.21.61 cycles that measured the removed Anubis
 filter were deleted from the tree on 2026-11-23 for the same reason;
 `git show <commit>:<path>` recovers them.
 
+## 1.21.71 (2026-11-25)
+
+- **`--source=all | angie,php,valkey | none`** (operator request): one
+  option for the compiled builds, like `--others`, on an install or
+  `--optimize`.  The list is the complete set: every component not named
+  goes back to its package; `none` puts all back.  Commas or spaces
+  (`--source angie php`).  Without `--source` nothing changes: a fresh
+  install has no build and runs the packages (the same as `none`), and a
+  plain `--optimize` keeps the builds the server already runs.  It sets and
+  records `PHP_BUILD`, `ANGIE_BUILD` and `VALKEY_BUILD` like the
+  `SETUP_*_BUILD` variables (which still work; `--source` wins when both are
+  given).
+- **Compiled Valkey (`--source=valkey`, `SETUP_VALKEY_BUILD=clang`, opt-in).**
+  Valkey from its newest GitHub release (9.2.0; Ubuntu ships 9.0.6) with
+  clang `-O3 -march=native`, Ubuntu's hardening flags, full LTO, no frame
+  pointers, bundled jemalloc and Lua (the XenForo Redis add-ons run Lua
+  scripts), no TLS, then BOLT from a `valkey-benchmark` profile of the build
+  itself.  `sd_notify()` is the static shim, so it links only glibc and
+  libgcc_s.  Against the package, 5 rotated rounds over the Unix socket:
+  pipelined (16) GET/SET **+3.1 / +2.6 %**, single requests 0 to +1.5 %.
+  Valkey is about 0.3 % of a page's server CPU, so pages do not change
+  measurably.  A host whose `valkey.conf` persists data stays on the
+  package's X.Y series (an older server cannot read a newer RDB/AOF); the
+  managed cache-only configuration may run the newest release.  The drop-in
+  adds the build to the packaged unit's `ExecPaths=`.  `tools/valkey-build.sh`,
+  `lib/valkey-build.sh`, `valkey-build.conf`.
+- **Valkey from source: the first build was 32-41 % slower, and why.**  The
+  prototype passed `CFLAGS=` on make's command line.  A command-line variable
+  overrides the assignment in every sub-make, so Valkey's bundled jemalloc
+  and Lua lost their own `-O` flags and built unoptimised: 9,430
+  instructions per pipelined request against 6,152 for the package and
+  5,770 for an upstream-default build.  The tool passes CFLAGS/LDFLAGS
+  through the environment (5,926 with the hardening flags), and a unit test
+  keeps it that way.
+- **Compiled Angie: `auth_basic` built in, `limit_conn` out, and
+  incompatible directives commented out automatically.**  The build now
+  includes `auth_basic` (password-protected areas on a live site) and
+  `limit_req` (the login limiter); `limit_conn` stays out.  When the
+  configuration uses a directive of a module the build leaves out, and that
+  directive only transforms or limits responses (`sub_filter*`, `ssi*`,
+  `add_before_body`/`add_after_body`/`addition_types`, `limit_conn*`,
+  `userid*`, `autoindex*`, `random_index`, `gunzip*`, `mp4*`, `flv`),
+  `--optimize` comments it out in its file with a marker
+  (`# setup-angie-build-off: `), reports each one (file:line), and activates
+  the build.  Going back to the package (`ANGIE_BUILD=package`, the APT hook,
+  the CPU guard, a failed start) restores every marked line byte for byte.
+  Access control (`auth_request`, `secure_link`, ...) and content handlers
+  (`uwsgi_pass`, `grpc_pass`, `memcached_pass`, `empty_gif`, ...) are never
+  commented out: a location without its handler would serve its root as
+  static files, so such a configuration keeps the package, as before.  The
+  build's `ExecStartPre` does the same for a directive added after
+  activation, and goes back to the package instead of leaving Angie stopped
+  when anything else fails its test.
+- **Rate limiting: only the login limiter is left** (operator request, with
+  the login limiter kept on purpose: WordPress has no login throttling of its
+  own).  server-configs-nginx 1.6.61 drops the generic per-IP GET (100 r/s)
+  and POST (30 r/s) zones and their exemption list; the credential zone (20
+  login/registration/reset POSTs a minute per address, burst 10) stays in
+  every PHP location.  The tuner no longer sizes the removed zones, and
+  `SETUP_LIMIT_REQ_EXEMPT` is ignored with a warning (the credential zone
+  never honoured it).  A `LIMIT_REQ_EXEMPT` an older release persisted is
+  still read as a sign of a reverse proxy in front, so the TLS catch-all
+  guard keeps answering such hosts without SNI.
+- **More PHP compiler flags measured, none kept** (operator request: tune
+  beyond the defaults).  Three arms of the shipped build, each BOLTed from
+  the same member traffic, against the package, 5 rotated rounds (XenForo
+  thread / home, WordPress home / post, Chevereto uncached): shipped flags
+  **+9.4 / +8.4 / +6.5 / +6.9 / +11.3 %**; plus `-fno-plt` and LTO `-O3`
+  at link time +9.9 / +5.2 / +7.2 / +6.9 / +11.5 % (inside the noise);
+  plus a higher inline threshold and ThinLTO import limit +6.3 / +3.5 /
+  +4.3 / +4.6 / +9.5 % and 3 MB larger.  For Valkey, dropping frame
+  pointers saves 3.4 % of instructions and is kept; the hardening flags cost
+  6 % of instructions and stay.  Non-PIE builds were not tried: PIE is
+  ASLR for the main binary.
+- **Angie vs nginx, both compiled** (question).  Angie 1.12.5 and nginx
+  1.31.10 from their own releases, the same clang flags, OpenSSL, PCRE2,
+  zlib-ng, Brotli and module set, no BOLT on either, on identical files (a
+  copy of the live tree without the Angie package's three Angie-only pieces:
+  the `api` status location, `$upstream_request_method` and
+  `$angie_version`), 5 rotated rounds.  nginx served the cached guest pages
+  **+0.5 to +1.5 %** faster (XenForo home 123,007 against 121,482 req/s);
+  member and uncached pages tied; both beat the Angie package by 3-6 %.
+  `switch-angie-arm.sh nginx-TAG | ngtree-TAG` reproduce it.
+- **Elasticsearch: no source build** (operator request: compile it with only
+  what XenForo Enhanced Search uses).  XFES 2.3.13 needs the search core,
+  `analysis-common` (stemmer, stop words, asciifolding), `more_like_this`,
+  `function_score` with a date decay, `_bulk` and the index settings API.
+  Elasticsearch is Java: compiling it from source produces the same
+  bytecode, and the JIT already generates code for the exact CPU, so there
+  is nothing for `-march=native`, LTO or BOLT to act on.  A trimmed
+  distribution of the same release (9.5.7) was tried instead: ES 9 refuses
+  to start without `apm`, `x-pack-core` and `x-pack-security` (its launcher
+  loads them even with security off), and the keystore and cluster state tie
+  it to further modules (`x-pack-encryption`, ILM, geoip), so a trimmed node
+  needs its own data directory and a full reindex and can break on any
+  upgrade.  Not shipped; the package stays.
+- **MariaDB: not compiled.**  Its share of the server's CPU on logged-in
+  pages (package stack, loopback tiers): WordPress member home 7.6 %,
+  XenForo member home 13 %, thread 8 % (PHP takes the rest).  Even a 10 %
+  faster mariadbd would gain about 1 % of page throughput, for an hour-long
+  build and a data directory that must never meet an older server.
+- **fileinfo stays** (question): it cannot be removed.  Chevereto's image
+  library calls `finfo_file()`/`finfo_buffer()` on every upload
+  (intervention/image), WordPress checks every upload's real type with
+  `finfo_file()` (`wp_check_filetype_and_ext`), and XenForo's attachment
+  validators (laminas, flysystem) use it too.  Its 10.4 MB magic database is
+  read-only data in the binary: pages nobody touches are never loaded, so it
+  costs disk, not memory or speed.
+- **Download mirror** (operator request):
+  [droplinxuser/setup-build-sources](https://github.com/droplinxuser/setup-build-sources)
+  holds an unmodified copy of every source archive the compiled builds use,
+  one release per component with a `SHA256SUMS`, refreshed daily by its own
+  workflow with the same download code the servers run.  It is the last
+  source, tried only when every upstream source has failed, and never a
+  trust root of its own: a mirrored file must match the upstream's published
+  SHA-256, the hash this host pinned on its first download, or the mirror's
+  `SHA256SUMS`, or it is refused.  An archive is never replaced there; a
+  file that changes upstream under the same name fails the mirror's run.
+  `SETUP_BUILD_MIRROR=off` disables it, another URL points at a fork.
+- **Security fix: BOLT gave the compiled binaries an executable stack.**
+  llvm-bolt's `-use-gnu-stack` (1.21.68-1.21.70) turns the `PT_GNU_STACK`
+  header into the new code segment, and without that header Linux gives the
+  process an executable stack.  The php-fpm and Angie builds ran that way;
+  Valkey's unit (`MemoryDenyWriteExecute=`) refused to start its BOLTed
+  binary, which is how it showed.  The flag is gone, every BOLT output must
+  carry a non-executable `GNU_STACK` (`bolt_stack_check`), and the PHP and
+  Angie recipes are bumped, so the next `--optimize` rebuilds existing
+  builds.  The binaries grow by the new segment's alignment padding on disk
+  (php-fpm 51.4 MB, Angie 15.6 MB, Valkey 10.9 MB); what is loaded does not.
+- **Compiled Angie links Ubuntu's libcrypt** now that `auth_basic` is in:
+  password hashes nginx does not implement itself (bcrypt, SHA-512 crypt)
+  go to crypt(3).  Everything else is still compiled in.
+- **Fix (tests): a root unit run deleted a live build cache.**
+  `php_build_remove_support` removed `/var/cache/setup-php-build` and
+  `/run/setup-php-build` by literal path, and a unit test calls it; run as
+  root on the test host during a benchmark build, it deleted the cache under
+  the running build.  The removal paths of all three builds are now
+  overridable like the tools' own, the tests point them at their scratch
+  directory, and a check refuses any literal `/var/cache/setup-*` or
+  `/run/setup-*` removal.
+- **Tools:** the sd_notify shim moved to `tools/build-common.sh` (php-fpm
+  and Valkey use it); `setup_build_llvm_release` removes the shared LLVM
+  toolchain with the last of the three builds;
+  `tests/bench-php-matrix/switch-valkey-arm.sh` and `bench-valkey.sh` (A/B
+  of Valkey binaries), and `switch-angie-arm.sh nginx-TAG` (an nginx arm for
+  the Angie vs nginx comparison).
+
 ## 1.21.70 (2026-11-25)
 
 - **Compiled Angie (`SETUP_ANGIE_BUILD=clang`, opt-in).**  Angie, OpenSSL,

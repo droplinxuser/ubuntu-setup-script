@@ -1,7 +1,9 @@
 # shellcheck shell=bash
-# Shared by tools/php-fpm-build.sh and tools/angie-build.sh (1.21.70):
-# messages, the apt.llvm.org/GitHub LLVM toolchain, upstream version lookups,
-# downloads with a second source for every file, checksums and unpacking.
+# Shared by tools/php-fpm-build.sh, tools/angie-build.sh (1.21.70) and
+# tools/valkey-build.sh (1.21.71): messages, the apt.llvm.org/GitHub LLVM
+# toolchain, upstream version lookups, downloads with a second source for
+# every file plus the project's own mirror (setup-build-sources), checksums,
+# unpacking and the static sd_notify shim.
 # The sourcing tool defines LOG_TAG, SRC_CACHE, CONF, COMPONENTS and VERS.
 
 # apt.llvm.org signing key (Sylvestre Ledru, LLVM's APT archive).
@@ -172,6 +174,12 @@ latest_of() {
     brotli)   v=$(git_latest google/brotli "^v([0-9]+\.[0-9]+\.[0-9]+)\$") ;;
     # ngx_brotli publishes no releases: its newest commit on the default branch.
     ngx-brotli) v=$(git ls-remote https://github.com/google/ngx_brotli.git HEAD 2>/dev/null | cut -c1-12) ;;
+    # Valkey: the newest release, or the newest of series X.Y when one is
+    # given (a host that persists data stays on the package's series).
+    valkey)
+      if [[ -n $x ]]; then v=$(git_latest valkey-io/valkey "^(${x//./\\.}\\.[0-9]+)\$")
+      else v=$(git_latest valkey-io/valkey '^([0-9]+\.[0-9]+\.[0-9]+)$')
+      fi ;;
     *) return 1 ;;
   esac
   [[ -n $v ]] && printf '%s' "$v"
@@ -262,12 +270,40 @@ fetch_to() { # urls file [sha256]: download unless the cached copy verifies
 
 # Try each "urls|file|sha256" source in order (sha256 may be empty); print
 # the file of the first that downloads and verifies.
+# Last resort: the project's own copy of every source archive (1.21.71),
+# github.com/droplinxuser/setup-build-sources, one release per component
+# (tag = component name, assets = the archives under their usual names, plus
+# a SHA256SUMS the mirror's workflow wrote after checking each download
+# against the upstream's published SHA-256 or its first-seen hash).  A file
+# from the mirror must match, in order: the SHA-256 the caller expects (the
+# upstream's published one), the hash pinned on this host's first download,
+# or the mirror's SHA256SUMS; without any of the three it is refused.
+# SETUP_BUILD_MIRROR=off disables it; another URL points at a fork.
+BUILD_MIRROR=${SETUP_BUILD_MIRROR:-https://github.com/droplinxuser/setup-build-sources/releases/download}
+FETCH_NAME=""
+
+fetch_mirror() { # file [sha256]
+  local file=$1 want=${2:-} base sums
+  [[ -n $BUILD_MIRROR && $BUILD_MIRROR != off && -n $FETCH_NAME ]] || return 1
+  base=${file##*/}
+  if [[ -z $want && ! -s $SRC_CACHE/sums/$base ]]; then
+    sums=$(http_get "$BUILD_MIRROR/$FETCH_NAME/SHA256SUMS" 2>/dev/null) || return 1
+    want=$(awk -v f="$base" '$2 == f || $2 == "*" f { print $1; exit }' <<<"$sums" | grep -E '^[0-9a-f]{64}$') || return 1
+  fi
+  say "trying the project's mirror for $base"
+  ( fetch_to "$BUILD_MIRROR/$FETCH_NAME/$base" "$file" "$want" )
+}
+
 fetch_first() {
   local s urls file sum
   for s in "$@"; do
     IFS='|' read -r urls file sum <<<"$s"
     if ( fetch_to "$urls" "$file" "$sum" ); then printf '%s' "$file"; return 0; fi
     say "source failed: ${urls%% *}"
+  done
+  for s in "$@"; do
+    IFS='|' read -r urls file sum <<<"$s"
+    if fetch_mirror "$file" "$sum"; then printf '%s' "$file"; return 0; fi
   done
   die "every source failed for ${file##*/}"
 }
@@ -295,6 +331,7 @@ site_or_github() { # site-urls repo tag asset [site-sha]
 
 fetch_component() { # name version -> path of the source archive
   local v=$2 c=$SRC_CACHE/src sum m urls=""
+  FETCH_NAME=$1
   case $1 in
     php)
       # php.net (its SHA-256), then the php-src tag snapshot (pinned).
@@ -368,6 +405,10 @@ fetch_component() { # name version -> path of the source archive
     ngx-brotli)
       fetch_first "https://github.com/google/ngx_brotli/archive/$v.tar.gz|$c/ngx_brotli-$v.tar.gz|" \
         "https://codeload.github.com/google/ngx_brotli/tar.gz/$v|$c/ngx_brotli-src-$v.tar.gz|" ;;
+    valkey)
+      # GitHub is Valkey's source home: the tag archive, then codeload.
+      fetch_first "https://github.com/valkey-io/valkey/archive/refs/tags/$v.tar.gz|$c/valkey-$v.tar.gz|" \
+        "https://codeload.github.com/valkey-io/valkey/tar.gz/refs/tags/$v|$c/valkey-src-$v.tar.gz|" ;;
     *) die "unknown component $1" ;;
   esac
 }
@@ -471,4 +512,90 @@ llvm_github_install() { # major
   rm -rf "${dest:?}.new"; mkdir -p "$dest.new"
   tar -xf "$arc" -C "$dest.new" --strip-components=1
   rm -rf "${dest:?}"; mv "$dest.new" "$dest"
+}
+
+# sd_notify()/sd_notifyf() for a Type=notify unit (PHP-FPM, Valkey), as a
+# static library in place of Ubuntu's libsystemd, which cannot be linked
+# statically.  The datagram protocol of sd_notify(3).  Needs CC and AR.
+sdnotify_shim() { # dir cflags
+  local d=$1 cflags=$2
+  mkdir -p "$d/include/systemd" "$d/lib/pkgconfig" "$d/src"
+  rm -f "$d/lib/pkgconfig/libsystemd.pc"
+  cat > "$d/include/systemd/sd-daemon.h" <<'EOF'
+/* setup.sh build-common: the sd_notify subset of libsystemd PHP-FPM and Valkey use. */
+#ifndef SETUP_SD_DAEMON_H
+#define SETUP_SD_DAEMON_H
+int sd_notify(int unset_environment, const char *state);
+int sd_notifyf(int unset_environment, const char *format, ...) __attribute__((format(printf, 2, 3)));
+#endif
+EOF
+  cat > "$d/src/sd-notify.c" <<'EOF'
+/* setup.sh build-common: sd_notify(3) over $NOTIFY_SOCKET (AF_UNIX datagram). */
+#define _GNU_SOURCE
+#include <errno.h>
+#include <stdarg.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+#include "systemd/sd-daemon.h"
+
+int sd_notify(int unset_environment, const char *state) {
+  const char *e = getenv("NOTIFY_SOCKET");
+  struct sockaddr_un sa;
+  size_t n;
+  int fd, r = 0;
+  if (!e || !state) goto out;
+  n = strlen(e);
+  if ((e[0] != '/' && e[0] != '@') || n < 2 || n >= sizeof(sa.sun_path)) { r = -EINVAL; goto out; }
+  memset(&sa, 0, sizeof(sa));
+  sa.sun_family = AF_UNIX;
+  memcpy(sa.sun_path, e, n);
+  if (sa.sun_path[0] == '@') sa.sun_path[0] = 0;
+  fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  if (fd < 0) { r = -errno; goto out; }
+  if (sendto(fd, state, strlen(state), MSG_NOSIGNAL, (struct sockaddr *)&sa,
+             (socklen_t)(offsetof(struct sockaddr_un, sun_path) + n)) < 0) r = -errno;
+  else r = 1;
+  close(fd);
+out:
+  if (unset_environment) unsetenv("NOTIFY_SOCKET");
+  return r;
+}
+
+int sd_notifyf(int unset_environment, const char *format, ...) {
+  va_list ap;
+  char *p = NULL;
+  int r;
+  va_start(ap, format);
+  r = vasprintf(&p, format, ap);
+  va_end(ap);
+  if (r < 0) {
+    if (unset_environment) unsetenv("NOTIFY_SOCKET");
+    return -ENOMEM;
+  }
+  r = sd_notify(unset_environment, p);
+  free(p);
+  return r;
+}
+EOF
+  # shellcheck disable=SC2086
+  "$CC" $cflags -I"$d/include" -c "$d/src/sd-notify.c" -o "$d/src/sd-notify.o"
+  rm -f "$d/lib/libsystemd.a"
+  "$AR" rcs "$d/lib/libsystemd.a" "$d/src/sd-notify.o"
+  printf 'prefix=%s\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\n\nName: libsystemd\nDescription: sd_notify only (setup.sh build-common)\nVersion: 258\nLibs: -L${libdir} -lsystemd\nCflags: -I${includedir}\n' \
+    "$d" > "$d/lib/pkgconfig/libsystemd.pc"
+}
+
+# A BOLT output must keep a non-executable stack.  llvm-bolt's
+# -use-gnu-stack (used until 1.21.71) turns the PT_GNU_STACK header into the
+# new code segment's LOAD; without PT_GNU_STACK Linux gives the process an
+# executable stack, which is a hardening loss, and a unit with
+# MemoryDenyWriteExecute= (Valkey's) refuses to start it at all.
+bolt_stack_check() { # binary
+  readelf -lW "$1" 2>/dev/null | grep -qE '^[[:space:]]*GNU_STACK[[:space:]].*[[:space:]]RW[[:space:]]+(0x)?[0-9a-f]+[[:space:]]*$' \
+    || die "BOLT output ${1##*/} has no non-executable GNU_STACK header; not installed"
 }

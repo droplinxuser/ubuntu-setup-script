@@ -1140,7 +1140,18 @@ restart_php_workers_for_group() {
   done < <(list_active_php_units)
 }
 
+# VALKEY_BUILD=clang/package (1.21.71) runs after the tuning, only for the
+# valkey-server package (never an adopted Redis) and only when it succeeded.
 optimize_valkey() {
+  local rc=0
+  optimize_valkey_tune "$@" || rc=$?
+  if [[ ${1:-valkey} == valkey ]] && (( rc == 0 )) && ! valkey_build_apply opt_report; then
+    warn "Valkey: VALKEY_BUILD=${VALKEY_BUILD} build failed; the package's Valkey keeps serving"
+  fi
+  return "$rc"
+}
+
+optimize_valkey_tune() {
   local kind=${1:-valkey}
   local label=Valkey conf=/etc/valkey/valkey.conf conf_dir=/etc/valkey
   local unit=valkey-server cli=valkey-cli
@@ -2000,6 +2011,9 @@ optimize_plan() {
       unmeasured) cache_note=" (kept: not measurable)" ;;
     esac
     printf '  %s: maxmemory=%sMB backlog=%s%s\n' "$cache_label" "$max_mb" "$backlog" "$cache_note"
+    local valkey_plan
+    valkey_plan=$(valkey_build_plan)
+    [[ -n $valkey_plan && $cache_label == Valkey ]] && printf '  Valkey: %s\n' "$valkey_plan"
   fi
   if [[ " ${OPT_DETECTED[*]} " == *" elastic "* ]]; then
     heap_mb=$(service_mem_mb elastic)

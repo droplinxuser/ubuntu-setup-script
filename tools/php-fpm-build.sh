@@ -89,7 +89,8 @@ LIB_RECIPE=5
 # `check` reports an older recipe as stale, so --optimize and the daily timer
 # rebuild.  1: 1.21.68 (-fPIC, intl).  2: 1.21.69 (-fPIE, no intl/ICU).
 # 3: 1.21.70 (Ubuntu hardening flags, GNU libiconv, no xmlreader, stripped).
-BUILD_RECIPE=3
+# 4: 1.21.71 (BOLT keeps a non-executable stack: -use-gnu-stack dropped).
+BUILD_RECIPE=4
 # Build order matters: curl needs OpenSSL and zlib, libpng and libzip zlib.
 LIBS=("$ZLIB_IMPL" openssl pcre2 libxml2 libsodium gmp libiconv curl libjpeg-turbo libpng libwebp libzip)
 COMPONENTS=(php llvm redis igbinary "${LIBS[@]}")
@@ -257,82 +258,6 @@ build_libs() { # deps work jobs
   done
 }
 
-# sd_notify()/sd_notifyf() for PHP-FPM's systemd support (the unit is
-# Type=notify), as a static library in place of Ubuntu's libsystemd, which
-# cannot be linked statically.  The datagram protocol of sd_notify(3).
-sdnotify_shim() { # deps
-  local d=$1
-  mkdir -p "$d/include/systemd" "$d/lib/pkgconfig" "$d/src"
-  rm -f "$d/lib/pkgconfig/libsystemd.pc"
-  cat > "$d/include/systemd/sd-daemon.h" <<'EOF'
-/* setup.sh php-fpm-build: the sd_notify subset of libsystemd that PHP-FPM uses. */
-#ifndef SETUP_SD_DAEMON_H
-#define SETUP_SD_DAEMON_H
-int sd_notify(int unset_environment, const char *state);
-int sd_notifyf(int unset_environment, const char *format, ...) __attribute__((format(printf, 2, 3)));
-#endif
-EOF
-  cat > "$d/src/sd-notify.c" <<'EOF'
-/* setup.sh php-fpm-build: sd_notify(3) over $NOTIFY_SOCKET (AF_UNIX datagram). */
-#define _GNU_SOURCE
-#include <errno.h>
-#include <stdarg.h>
-#include <stddef.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <unistd.h>
-#include "systemd/sd-daemon.h"
-
-int sd_notify(int unset_environment, const char *state) {
-  const char *e = getenv("NOTIFY_SOCKET");
-  struct sockaddr_un sa;
-  size_t n;
-  int fd, r = 0;
-  if (!e || !state) goto out;
-  n = strlen(e);
-  if ((e[0] != '/' && e[0] != '@') || n < 2 || n >= sizeof(sa.sun_path)) { r = -EINVAL; goto out; }
-  memset(&sa, 0, sizeof(sa));
-  sa.sun_family = AF_UNIX;
-  memcpy(sa.sun_path, e, n);
-  if (sa.sun_path[0] == '@') sa.sun_path[0] = 0;
-  fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-  if (fd < 0) { r = -errno; goto out; }
-  if (sendto(fd, state, strlen(state), MSG_NOSIGNAL, (struct sockaddr *)&sa,
-             (socklen_t)(offsetof(struct sockaddr_un, sun_path) + n)) < 0) r = -errno;
-  else r = 1;
-  close(fd);
-out:
-  if (unset_environment) unsetenv("NOTIFY_SOCKET");
-  return r;
-}
-
-int sd_notifyf(int unset_environment, const char *format, ...) {
-  va_list ap;
-  char *p = NULL;
-  int r;
-  va_start(ap, format);
-  r = vasprintf(&p, format, ap);
-  va_end(ap);
-  if (r < 0) {
-    if (unset_environment) unsetenv("NOTIFY_SOCKET");
-    return -ENOMEM;
-  }
-  r = sd_notify(unset_environment, p);
-  free(p);
-  return r;
-}
-EOF
-  # shellcheck disable=SC2086
-  "$CC" $BASE_FLAGS -flto=thin -I"$d/include" -c "$d/src/sd-notify.c" -o "$d/src/sd-notify.o"
-  rm -f "$d/lib/libsystemd.a"
-  "$AR" rcs "$d/lib/libsystemd.a" "$d/src/sd-notify.o"
-  printf 'prefix=%s\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\n\nName: libsystemd\nDescription: sd_notify only (setup.sh php-fpm-build)\nVersion: 258\nLibs: -L${libdir} -lsystemd\nCflags: -I${includedir}\n' \
-    "$d" > "$d/lib/pkgconfig/libsystemd.pc"
-}
-
 cmd_build() {
   local ver=$1 pkg pkg_version ext_dir inc_path sess_path sock work src dir key deps n j line
   local -A VERS=()
@@ -392,7 +317,7 @@ cmd_build() {
   fi
   # pkg-config searches $deps only.
   # glibc comes from Ubuntu; libsystemd is replaced by the sd_notify shim.
-  sdnotify_shim "$deps"
+  sdnotify_shim "$deps" "$BASE_FLAGS -flto=thin"
 
   src=$work/php
   fetch_unpack php "${VERS[php]}" "$src"
@@ -651,8 +576,9 @@ cmd_bolt() {
   fi
   "$bolt" "$base" -o "$work/php-fpm.bolt" -data="$work/php-fpm.fdata" \
     -reorder-blocks=ext-tsp -reorder-functions=cdsort -split-functions \
-    -split-all-cold -split-eh -icf -use-gnu-stack > "$work/bolt.log" 2>&1 \
+    -split-all-cold -split-eh -icf > "$work/bolt.log" 2>&1 \
     || { tail -n 5 "$work/bolt.log" >&2; die "llvm-bolt failed"; }
+  bolt_stack_check "$work/php-fpm.bolt"
   verify_binary "$ver" "$work/php-fpm.bolt"
   install -m 600 "$work/php-fpm.fdata" "$dir/php-fpm.fdata"
   install_stripped "$work/php-fpm.bolt" "$dir/php-fpm.new"

@@ -58,7 +58,7 @@ wait "$perf_pid"
   || { tail -20 "$W/perf2bolt.log" >&2; exit 1; }
 "$BOLT" "/opt/php-$SRC/sbin/php-fpm" -o "$W/php-fpm.bolt" -data="$W/php-fpm.fdata" \
   -reorder-blocks=ext-tsp -reorder-functions=cdsort -split-functions \
-  -split-all-cold -split-eh -dyno-stats -icf=1 -use-gnu-stack \
+  -split-all-cold -split-eh -dyno-stats -icf=1 \
   >"$W/bolt.log" 2>&1 || { tail -20 "$W/bolt.log" >&2; exit 1; }
 install -m 0755 "$W/php-fpm.bolt" "/opt/php-$DST/sbin/php-fpm"
 grep -E 'BOLT-INFO: (basic block reordering|.*functions? (have|with) profile)' "$W/bolt.log" | head -5 || true

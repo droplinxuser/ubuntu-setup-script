@@ -37,6 +37,16 @@ PHP_BUILD_COMMON_FILE="${PHP_BUILD_ROOT}/build-common.sh"
 # apt.llvm.org source the tool adds (removed with the last build).
 PHP_BUILD_LLVM_FILES=(/etc/apt/sources.list.d/setup-llvm.sources /etc/apt/preferences.d/setup-llvm.pref /etc/apt/keyrings/setup-llvm.asc)
 
+# The LLVM toolchain (apt.llvm.org source, /opt/setup-llvm) is shared by every
+# compiled build (PHP, Angie, Valkey): only the last one removed takes it along.
+setup_build_llvm_release() { # php|angie|valkey: the build being removed
+  local me=$1
+  if [[ $me != php ]] && compgen -G "${PHP_BUILD_ROOT:-/usr/local/lib/setup-php}/[0-9]*/build.info" >/dev/null; then return 0; fi
+  if [[ $me != angie && -d ${ANGIE_BUILD_ROOT:-/usr/local/lib/setup-angie}/build ]]; then return 0; fi
+  if [[ $me != valkey && -d ${VALKEY_BUILD_ROOT:-/usr/local/lib/setup-valkey}/build ]]; then return 0; fi
+  rm -f "${PHP_BUILD_LLVM_FILES[@]}"; rm -rf /opt/setup-llvm
+}
+
 # "clang", "package", or "" (never chosen on this host: nothing to do).
 php_build_mode() {
   local v=${PHP_BUILD:-}
@@ -179,11 +189,10 @@ php_build_remove_support() {
   rm -f "$PHP_BUILD_APT_HOOK" "$PHP_BUILD_UNIT" "$PHP_BUILD_TOOL" "$PHP_BUILD_CONF_FILE" "$PHP_BUILD_COMMON_FILE" \
     "$PHP_BUILD_REFRESH_UNIT" "$PHP_BUILD_REFRESH_TIMER"
   rm -f "$PHP_BUILD_ROOT"/build-*.log "$PHP_BUILD_ROOT"/bolt-*.log
-  rm -rf /var/cache/setup-php-build /run/setup-php-build
-  # The LLVM toolchain is shared with ANGIE_BUILD: the last user removes it.
-  if [[ ! -d ${ANGIE_BUILD_ROOT:-/usr/local/lib/setup-angie}/build ]]; then
-    rm -f "${PHP_BUILD_LLVM_FILES[@]}"; rm -rf /opt/setup-llvm
-  fi
+  # Overridable like the tool's own paths: the unit tests run as root and
+  # once removed a live build cache in the middle of a build.
+  rm -rf "${PHP_BUILD_CACHE:-/var/cache/setup-php-build}" "${PHP_BUILD_RUN_DIR:-/run/setup-php-build}"
+  setup_build_llvm_release php
   rmdir "$PHP_BUILD_ROOT" 2>/dev/null || true
   systemctl daemon-reload 2>/dev/null || true
 }

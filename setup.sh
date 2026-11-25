@@ -36,7 +36,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.21.70"
+readonly SCRIPT_VERSION="1.21.71"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -59,15 +59,15 @@ TCP_CC="${SETUP_TCP_CC:-$TCP_CC}"
 QDISC="${SETUP_QDISC:-$QDISC}"
 [[ $TCP_CC =~ ^[a-z0-9_]+$ ]] || TCP_CC=bbr
 [[ $QDISC =~ ^[a-z0-9_]+$ ]] || QDISC=fq
-# Rate-limit exemptions (load generator, monitor, reverse proxy) live in the
-# same host file so a plain --optimize keeps them; SETUP_LIMIT_REQ_EXEMPT in
-# the environment overrides and is persisted there (an empty value clears).
+# Rate-limit exemptions went away with the generic GET/POST limits
+# (server-configs-nginx 1.6.61): the only limit left is the credential zone,
+# which never honoured them.  A LIMIT_REQ_EXEMPT an older release persisted in
+# the host file is still read, and only as a hint for the TLS catch-all guard
+# (an exempt address was usually a reverse proxy in front);
+# SETUP_LIMIT_REQ_EXEMPT itself is ignored with a warning.
 LIMIT_REQ_EXEMPT="${LIMIT_REQ_EXEMPT:-}"
-LIMIT_REQ_EXEMPT_PERSIST=0
-if [[ -n ${SETUP_LIMIT_REQ_EXEMPT+x} ]]; then
-  LIMIT_REQ_EXEMPT=$SETUP_LIMIT_REQ_EXEMPT
-  LIMIT_REQ_EXEMPT_PERSIST=1
-fi
+LIMIT_REQ_EXEMPT_IGNORED=0
+[[ -n ${SETUP_LIMIT_REQ_EXEMPT+x} ]] && LIMIT_REQ_EXEMPT_IGNORED=1
 # Static-asset precompression (.br/.gz siblings served by brotli_static and
 # gzip_static) is on by default since 1.21.58: compressing
 # an asset per request capped a 177 KB script at 2,100 req/s (3.8 ms of Angie
@@ -141,6 +141,14 @@ ANGIE_BUILD_PERSIST=0
 if [[ -n ${SETUP_ANGIE_BUILD+x} ]]; then
   ANGIE_BUILD=$SETUP_ANGIE_BUILD
   ANGIE_BUILD_PERSIST=1
+fi
+# Compiled Valkey (opt-in, 1.21.71), the same way: SETUP_VALKEY_BUILD=clang or
+# --source=valkey.  Persisted as VALKEY_BUILD.  See lib/valkey-build.sh.
+VALKEY_BUILD="${VALKEY_BUILD:-}"
+VALKEY_BUILD_PERSIST=0
+if [[ -n ${SETUP_VALKEY_BUILD+x} ]]; then
+  VALKEY_BUILD=$SETUP_VALKEY_BUILD
+  VALKEY_BUILD_PERSIST=1
 fi
 [[ $PRECOMPRESS_ASSETS == 0 ]] || PRECOMPRESS_ASSETS=1
 # XenForo job runner.  XenForo runs its job queue (cron tasks, search
@@ -340,6 +348,8 @@ source "${SCRIPT_DIR}/lib/php-build.sh"
 
 # shellcheck source=lib/angie-build.sh
 source "${SCRIPT_DIR}/lib/angie-build.sh"
+# shellcheck source=lib/valkey-build.sh
+source "${SCRIPT_DIR}/lib/valkey-build.sh"
 
 
 # Tests source this file with SETUP_TEST_SOURCE_ONLY=1 to exercise the pure

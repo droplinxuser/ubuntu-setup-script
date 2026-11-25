@@ -81,6 +81,7 @@ bash setup.sh --upgrade-php=8.6 --dry-run
 | `--valkey [ram=] [policy=] [io_threads=]` | Valkey cache | [Valkey](#valkey---valkey) |
 | `--elastic [host=] [ram=]` | Elasticsearch | [Elasticsearch](#elasticsearch---elastic) |
 | `--others ITEM... \| all` | helper packages | [Other packages](#other-packages---others) |
+| `--source=all \| angie,php,valkey \| none` | compile those components from upstream sources (with an install or `--optimize`); the rest use their packages | [Source-compiled builds](#source-compiled-builds---source) |
 | `--domain DOMAIN [app=] [db=] [user=] [pass=] [sql=]` | vhost, certificate and optional database | [Domains](#domains---domain) |
 | `--optimize` | tune the OS and every installed service in place. Recorded tuning overrides are always ignored | [`--optimize`](#--optimize) |
 | `--upgrade-php=X.Y` | replace the installed PHP version in place | [`--upgrade-php`](#--upgrade-phpxy) |
@@ -131,6 +132,67 @@ templates onto it where their PHP include is at server level, and leaves
 (and reports) any other vhost with the full set. Angie access logging is off by default; only
 `error_log` is written.
 
+## Source-compiled builds (`--source`)
+
+```bash
+sudo ./setup.sh --optimize --source=all             # php-fpm, Angie and Valkey from source
+sudo ./setup.sh --optimize --source=angie,php       # these two; Valkey back on its package
+sudo ./setup.sh --optimize --source=none            # everything back on the packages
+```
+
+`--source` takes `all`, `none`, or a list of `angie`, `php` and `valkey`
+(commas or spaces, like `--others`), on an install or `--optimize`.  The list
+is the complete set: a component not named goes back to its package and its
+build is removed.
+
+**Without `--source` nothing changes.**  A fresh install has no compiled
+build, so it runs the packages (the same as `--source=none`); a plain
+`--optimize` keeps the builds the server already runs, rebuilding them when
+a component has a newer release.  The choice is recorded in
+`/etc/default/setup-tuning` (`PHP_BUILD`, `ANGIE_BUILD`, `VALKEY_BUILD`).
+`SETUP_PHP_BUILD`, `SETUP_ANGIE_BUILD` and `SETUP_VALKEY_BUILD` (`clang` or
+`package`) still change one component; `--source` wins when both are given.
+
+Every build:
+
+* compiles from the project's own releases, never Ubuntu's archive, with
+  clang from apt.llvm.org at `-O3 -march=native` and Ubuntu's hardening flags
+  (stack protector, stack-clash probes, `_FORTIFY_SOURCE=3`, CET, full
+  RELRO), link-time optimisation and LLVM BOLT;
+* links only glibc (libc, libm) from Ubuntu: every library it needs is
+  compiled in, and the units' `sd_notify()` is a small static implementation;
+* contains only what WordPress, XenForo and Chevereto use;
+* replaces nothing: the package's binary, configuration, unit and data stay,
+  and a systemd drop-in only changes the binary the unit starts;
+* goes back to the package on its own when the package becomes newer (APT
+  hook) or the host's CPU model changes (`-march=native`), and rebuilds in
+  the background; a daily timer rebuilds when a component publishes a newer
+  release.
+
+Downloads have two upstream sources each, then the project's own mirror,
+[setup-build-sources](https://github.com/droplinxuser/setup-build-sources),
+tried only when both fail.  A mirrored file must match the upstream's
+published SHA-256, the hash the host pinned on its first download, or the
+mirror's `SHA256SUMS`, or it is refused (`SETUP_BUILD_MIRROR=off` turns the
+mirror off).  The details of each build: [Compiled
+Angie](#compiled-angie-setup_angie_buildclang), [Compiled
+php-fpm](#compiled-php-fpm-setup_php_buildclang), [Compiled
+Valkey](#compiled-valkey-setup_valkey_buildclang).
+
+| Measured (1.21.71, Xeon E-2236 test host, 5 rotated rounds against the packages) | Gain |
+|---|---|
+| `php`: XenForo member thread / home, WordPress member home / post, Chevereto uncached | +9.4 / +8.4 / +6.5 / +6.9 / +11.3 % |
+| `angie`: cached guest pages (1.21.70) | +2.2 to +12.4 % |
+| `valkey`: pipelined GET / SET, single requests | +3.1 / +2.6 %, 0 to +1.5 % (Valkey is ~0.3 % of a page's CPU) |
+
+Not offered, and why: **MariaDB** uses 8-13 % of the server's CPU on a
+logged-in page, so even a 10 % faster build would move pages by about 1 %;
+**Elasticsearch** is Java (the JIT already compiles for the exact CPU), and
+Elasticsearch 9 cannot be trimmed to the modules XenForo Enhanced Search
+uses without a separate data directory and a reindex.  **nginx** compiled the
+same way served cached pages 0.5-1.5 % faster than compiled Angie (1.21.71);
+the configuration targets Angie.
+
 ## Services
 
 ### Angie (`--angie`)
@@ -154,7 +216,7 @@ Environment options:
 | `SETUP_ANGIE_COMPRESSION=0` | on | turns the managed compression profile off |
 | `SETUP_PRECOMPRESS_ASSETS=0` | on (since 1.21.58) | writes `.br`/`.gz` siblings for the static assets of every XenForo/WordPress root and keeps them fresh from cron (a 177 KB script: 22,000 req/s from the sibling vs 2,100 compressed per request).  0 removes the siblings it made.  Install-time only: `--optimize` ignores the tuning override and uses the default (on) |
 | `SETUP_XF_JOB_CRON=0` | on | removes the managed crontab entry that runs `cmd.php xf:run-jobs` once a minute as www-data for every XenForo root; persisted as `XF_JOB_CRON` |
-| `SETUP_ANGIE_BUILD=clang` | off (the package's Angie) | opt-in Angie compiled from upstream sources with only the modules this configuration uses; see [Compiled Angie](#compiled-angie-setup_angie_buildclang).  Persisted as `ANGIE_BUILD` (kept by `--optimize`; `=package` goes back) |
+| `SETUP_ANGIE_BUILD=clang` | off (the package's Angie) | opt-in Angie compiled from upstream sources with only the modules this configuration uses; see [Compiled Angie](#compiled-angie-setup_angie_buildclang).  Same as adding/removing `angie` in `--source`; recorded as `ANGIE_BUILD` (a plain `--optimize` keeps it; `=package` goes back) |
 | `CONFIG_REPO_URL`, `CONFIG_REPO_REF` | `droplinxuser/server-configs-nginx`, `main` | select a fork or branch of the configuration tree |
 | `CONFIG_SOURCE_DIR=/path` | unset | use a local checkout instead of downloading |
 
@@ -183,8 +245,9 @@ Notes:
 #### Compiled Angie (`SETUP_ANGIE_BUILD=clang`)
 
 An opt-in Angie built from upstream sources, the same way as the compiled
-php-fpm.  `SETUP_ANGIE_BUILD=clang ./setup.sh --optimize` builds and
-activates it; `SETUP_ANGIE_BUILD=package` goes back and removes it.
+php-fpm.  `./setup.sh --optimize --source=angie` (or `--source=all`) builds and
+activates it; a plain `--optimize` keeps it, and `--source` without `angie`
+(or `--source=none`) goes back to the package and removes it.
 
 | Measured (1.21.70, Xeon E-2236 test host, 5 rotated rounds) | Package | Compiled |
 |---|---:|---:|
@@ -200,11 +263,12 @@ with google/ngx_brotli), each at the version in
 at `-O3 -march=native` with Ubuntu's hardening flags, OpenSSL, PCRE2 and
 zlib-ng static, ThinLTO, then rewritten by LLVM BOLT from a 60 s perf sample
 of live traffic.  It links only glibc from Ubuntu.  Only the
-modules `server-configs-nginx` uses are built: the http core with SSL,
-HTTP/2, HTTP/3, realip, gzip_static, threads and Brotli.  Mail, stream, ACME,
-DAV, mp4/flv, sub, SSI, uwsgi, scgi, grpc, memcached, userid, autoindex,
-split_clients, empty_gif, browser, mirror, auth_basic, limit_conn and
-referer are left out.
+modules `server-configs-nginx` and a typical live site use are built: the
+http core with SSL, HTTP/2, HTTP/3, realip, gzip_static, threads, Brotli,
+`limit_req` (the login limiter) and `auth_basic` (password-protected areas,
+1.21.71).  Mail, stream, ACME, DAV, mp4/flv, sub, SSI, uwsgi, scgi, grpc,
+memcached, userid, autoindex, split_clients, empty_gif, browser, mirror,
+limit_conn and referer are left out.
 
 **Safety.**  The package binary stays at `/usr/sbin/angie` and the
 configuration, unit and logs stay the package's: a drop-in
@@ -212,9 +276,24 @@ configuration, unit and logs stay the package's: a drop-in
 binary the unit starts.  The build has its own prefix
 (`/usr/local/lib/setup-angie`), so `modules-enabled/50-brotli.conf` loads the
 build's own Brotli modules while `/etc/angie/angie.conf` is read unchanged.
-Every start first runs `angie -t` with the build; a configuration that needs a
-left-out module (naxsi, a `sub_filter`, another `load_module`) fails that test
-and `--optimize` puts the package binary back with a report line.  The APT
+Every start first runs `angie -t` with the build.
+
+**Directives the build cannot serve (1.21.71).**  A directive of a left-out
+module that only transforms or limits responses (`sub_filter*`, `ssi*`,
+`add_before_body`, `add_after_body`, `addition_types`, `limit_conn*`,
+`userid*`, `autoindex*`, `random_index`, `gunzip*`, `mp4*`, `flv`) is
+commented out in its file with the marker `# setup-angie-build-off: `, and
+the `--optimize` report lists each one (file:line).  Every way back to the
+package (`--source` without angie, `SETUP_ANGIE_BUILD=package`, the APT hook,
+the CPU guard, a failed start) restores the marked lines byte for byte.
+Access control (`auth_request`, `secure_link`, ...) and content handlers
+(`uwsgi_pass`, `grpc_pass`, `memcached_pass`, `empty_gif`, naxsi, another
+`load_module`) are never commented out: without its handler a location
+would serve its root as static files.  Such a configuration keeps the
+package binary, with a report line.  A droppable directive added after
+activation is handled the same way when Angie next starts; anything else
+that fails the build's test then starts the package instead of leaving
+Angie down.  The APT
 hook goes back to the package when it becomes newer than the build and
 rebuilds; the daily `setup-angie-build-refresh.timer` rebuilds when a component
 publishes a newer release; a build made on another CPU model (the build uses
@@ -224,7 +303,7 @@ rebuild.  Switching binaries restarts Angie (well under a second).
 **Manual control:** `/usr/local/lib/setup-angie/angie-build.sh status`,
 `check`, `versions`, `build`, `rebuild`, `bolt [seconds]`, `deactivate`,
 `activate`, `remove`.  `--purge angie` removes the build.  The LLVM toolchain
-is shared with `SETUP_PHP_BUILD=clang` and goes with the last of the two.
+is shared with the other compiled builds and goes with the last one.
 
 ### PHP (`--php`)
 
@@ -243,13 +322,14 @@ Environment options:
 | `SETUP_PHP_JIT_WORDPRESS=0` | 1 (WordPress uses the JIT) | keeps `opcache.jit = off` for every WordPress document root through a `[PATH=<root>]` section of the managed ini, for a site that misbehaves with the JIT.  Tuning override: ignored by `--optimize` |
 | `SETUP_PHP_PAGE_GZIP=0` | 1 | by default the managed ini turns `zlib.output_compression` (level 4) on in a `[PATH=<root>]` section for every WordPress and Chevereto document root whose guest cache key carries the encoding token, so the FastCGI cache stores the gzip page (0.12 ms of Angie CPU per hit instead of about 1 ms to compress each hit); Chevereto roots also get PHP session GC (`session.gc_probability = 1`, divisor 1000) because no timer cleans its session directory; tuning override: ignored by `--optimize` (profile default 1) |
 | `SETUP_PHP_SESSION_HARDENING=1` | off | opt-in `session.*` strict settings, `cgi.fix_pathinfo=0`, `display_errors=Off` and a central `error_log`; it broke Joomla/Polr logins on a mixed host.  Persisted as `PHP_SESSION_HARDENING` (kept by `--optimize`; `=0` turns it off) |
-| `SETUP_PHP_BUILD=clang` | off (the package's php-fpm) | opt-in php-fpm compiled from upstream sources with only what WordPress, XenForo and Chevereto use; see [Compiled php-fpm](#compiled-php-fpm-setup_php_buildclang).  Persisted as `PHP_BUILD` (kept by `--optimize`; `=package` goes back) |
+| `SETUP_PHP_BUILD=clang` | off (the package's php-fpm) | opt-in php-fpm compiled from upstream sources with only what WordPress, XenForo and Chevereto use; see [Compiled php-fpm](#compiled-php-fpm-setup_php_buildclang).  Same as adding/removing `php` in `--source`; recorded as `PHP_BUILD` (a plain `--optimize` keeps it; `=package` goes back) |
 | `SETUP_PHP_FPM_MODULES=all` | off: php-fpm loads only what WordPress, XenForo and Chevereto need | keep every installed extension loaded in php-fpm, see [PHP-FPM modules](#php-fpm-modules-only-what-the-applications-need).  Persisted as `PHP_FPM_MODULES` (kept by `--optimize`) |
 
 #### Compiled php-fpm (`SETUP_PHP_BUILD=clang`)
 
-Two choices for the binary the PHP-FPM unit starts.  Switching is one
-`SETUP_PHP_BUILD=... ./setup.sh --optimize`:
+Two choices for the binary the PHP-FPM unit starts: `--source=php` (or
+`--source=all`) on an install or `--optimize` for the compiled build (a
+plain `--optimize` keeps it), `--source` without `php` for the package:
 
 | `SETUP_PHP_BUILD` | php-fpm | Measured vs the package (1.21.70: XF member thread / home, WP member home, Chevereto uncached home) |
 |---|---|---|
@@ -619,6 +699,49 @@ Notes:
   authenticated throughput; without php-redis (the add-on's pure-PHP Credis
   client) it measured slower than local MariaDB. See the XenForo section.
 
+#### Compiled Valkey (`SETUP_VALKEY_BUILD=clang`)
+
+Opt-in with `--source=valkey` (or `--source=all`) on an install or
+`--optimize`; a plain `--optimize` keeps it, and `--source` without `valkey`
+(or `--source=none`) goes back to the package and removes the build.
+`SETUP_VALKEY_BUILD=clang`/`package` does the same on its own.
+
+| Measured (1.21.71, Unix socket, 5 rotated rounds) | Package 9.0.6 | Compiled 9.2.0 + BOLT |
+|---|---:|---:|
+| GET / SET, 50 connections, pipelined 16 | 1,067,806 / 978,234 req/s | **+3.1 / +2.6 %** |
+| GET / SET / HSET / LPUSH / MSET, no pipelining | 133,565-136,221 req/s | 0 to +1.5 % |
+| Share of a member page's server CPU | ~0.3 % | unchanged in practice |
+
+**What it is.**  Valkey from its newest GitHub release (pin another in
+[`valkey-build.conf`](valkey-build.conf)), compiled with clang at `-O3
+-march=native` with the hardening flags and full LTO, without frame pointers,
+with Valkey's bundled jemalloc and Lua (the XenForo Redis add-ons run Lua
+scripts) and without TLS (the applications use the Unix socket), then
+rewritten by LLVM BOLT from a perf profile of a `valkey-benchmark` run
+against the build itself (GET/SET/HSET/LPUSH/MSET/INCR in database 9,
+flushed afterwards), so it needs no live traffic.  It links only glibc;
+`sd_notify()` for the unit's `Type=notify` is the static shim.
+
+**Versions.**  The managed `valkey.conf` is a cache (`save ""`, `appendonly
+no`), so the build may run a newer release than Ubuntu's package and going
+back loses nothing.  When the configuration persists data (`save` or
+`appendonly yes`), "latest" means the newest release of the package's X.Y
+series: an older server cannot read a newer RDB/AOF.  The build is never
+older than the package.
+
+**Safety.**  The package's `/usr/bin/valkey-server`, configuration, socket
+and data stay; the drop-in
+`/etc/systemd/system/valkey-server.service.d/zz-setup-build.conf` changes
+the binary and adds it to the unit's `ExecPaths=` (the packaged unit forbids
+executing anything else).  A new build serves only after it answered PING and
+a Lua `EVAL` on a private socket.  Switching binaries restarts Valkey, which
+empties the cache.  The APT hook, the daily refresh timer and the CPU guard
+work as for Angie.  A Redis server is never replaced.
+
+**Manual control:** `/usr/local/lib/setup-valkey/valkey-build.sh status`,
+`check`, `versions`, `build`, `rebuild`, `bolt`, `deactivate`, `activate`,
+`remove`.  `--purge valkey` removes the build.
+
 ### Elasticsearch (`--elastic`)
 
 | Option | Default | Effect |
@@ -981,8 +1104,8 @@ Feature choices (honoured by `--optimize`):
 The `SETUP_*` names in this table are environment inputs for the run that
 applies them.  `SETUP_XF_JOB_CRON`, `SETUP_CF_SELF_SIGNED`,
 `SETUP_PHP_SESSION_HARDENING`, `SETUP_PHP_BUILD`, `SETUP_PHP_JIT_WORDPRESS`,
-`SETUP_PHP_PAGE_GZIP`, `SETUP_PRECOMPRESS_ASSETS`, `SETUP_LIMIT_REQ_EXEMPT` and the XenForo gzip
-choice are written to `/etc/default/setup-tuning` and therefore survive a
+`SETUP_PHP_PAGE_GZIP`, `SETUP_PRECOMPRESS_ASSETS`, `SETUP_ANGIE_BUILD`,
+`SETUP_VALKEY_BUILD` (and `--source`) and the XenForo gzip choice are written to `/etc/default/setup-tuning` and therefore survive a
 later `--optimize`.  The remaining ones are one-run inputs: they are not
 persisted, and a later install/optimize re-applies the host's recorded state
 unless the same variable is passed again.
@@ -1015,7 +1138,7 @@ Tuning overrides (ignored by `--optimize`, which uses the hardware profile):
 | `SETUP_GZIP_LEVEL`, `SETUP_BROTLI_LEVEL` | dynamic compression levels |
 | `SETUP_ANGIE_COMPRESSION` | 0 turns the managed compression profile off |
 | `SETUP_MARIADB_IO_CAPACITY` | `innodb_io_capacity`/`_max` |
-| `SETUP_LIMIT_REQ_EXEMPT` | rate-limit exemptions for a load generator or monitor |
+| `SETUP_LIMIT_REQ_EXEMPT` | ignored since 1.21.71 (the generic per-IP limits it exempted from are gone; the login limiter never used it).  A value an older release persisted only tells the TLS catch-all guard that a proxy sits in front |
 | `SETUP_PRECOMPRESS_ASSETS` | static-asset precompression (profile default 1) |
 | `SETUP_PHP_PAGE_GZIP` | PHP page gzip for the guest cache (profile default 1) |
 | `SETUP_PHP_JIT_WORDPRESS` | 0 exempts WordPress roots from the tracing JIT (profile default 1) |
@@ -1081,9 +1204,9 @@ tests. Angie configuration and Cloudflare IP ranges are downloaded.
   and re-runs the walk with each application in its strict debug mode (the
   applications hide `E_DEPRECATED` themselves), `loopback-tiers.sh` measures
   the load tiers on the host with `wrk`, and `sweep-php.sh jit|fpm|stock`
-  A/Bs JIT profiles, worker counts and the distribution defaults.  Run the install or `--optimize` with
-  `SETUP_LIMIT_REQ_EXEMPT=<generator IP>` first, or every remote PHP request
-  is answered `429`. Results and findings: `tests/stress-site/RESULTS.md` (one
+  A/Bs JIT profiles, worker counts and the distribution defaults.  Since
+  1.21.71 only login, registration and password-reset POSTs are limited, so
+  a remote load generator needs no exemption. Results and findings: `tests/stress-site/RESULTS.md` (one
   section per audit cycle) and the current cycle report
   `tests/stress-site/AUDIT-20261120-1.21.38.md`.
 - `tests/deploy-audit/`: `host-manifest.sh` and `state-snapshot.sh` capture a
@@ -1126,7 +1249,7 @@ tests. Angie configuration and Cloudflare IP ranges are downloaded.
 | "Another PHP-FPM version is active" | only one version can own the socket: use `--upgrade-php=X.Y`, which carries extensions and custom pools over; `--php ver=X` is a first installation and refuses to replace an existing version |
 | "Installation of system tables failed" (MariaDB) | Ubuntu 26.04 AppArmor profile; the script adds the override, re-run after `--purge --mariadb` if a previous install was interrupted |
 | `smartd could not be enabled` | no SMART-capable disk (VMs); a warning only |
-| `429` behind Cloudflare/a proxy | the limiter keys on the direct client address: enable real-IP (`/etc/angie/scripts/cloudflare.sh`, `cloudflare.conf`); tune `http.d/limit_req.conf` and `h5bp/limit_req/*.conf` |
+| `429` on logins behind Cloudflare/a proxy | the login limiter keys on the direct client address: enable real-IP (`/etc/angie/scripts/cloudflare.sh`, `cloudflare.conf`); tune `http.d/limit_req.conf` and `h5bp/limit_req/*.conf` |
 | PHP-FPM slow log full of queued requests | `request_slowlog_timeout` counts from accept; check `listen queue` in `/fpm-status.php`, add workers or cache the endpoint |
 | "upstream prematurely closed connection" during a load test | worker recycling at `pm.max_requests` or an FPM reload; set `pm.max_requests = 0` for a benchmark |
 | `--domain` says Angie or MariaDB is missing | it only creates the vhost/database; install the stack first or combine the flags |

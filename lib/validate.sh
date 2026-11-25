@@ -510,6 +510,12 @@ validate_all() {
   # SETUP_PHP_BUILD / PHP_BUILD (lib/php-build.sh): clang or package.
   php_build_validate
   angie_build_validate
+  valkey_build_validate
+
+  # The generic GET/POST limits SETUP_LIMIT_REQ_EXEMPT exempted from are gone
+  # (server-configs-nginx 1.6.61); the credential zone never honoured it.
+  (( ${LIMIT_REQ_EXEMPT_IGNORED:-0} )) \
+    && warn "SETUP_LIMIT_REQ_EXEMPT is ignored: the only request limit left is the login limiter, which never exempts a remote address"
 
   # mitigations=on|off (--basic, --optimize or SETUP_CPU_MITIGATIONS).
   if (( ${CPU_MITIGATIONS_LOOSE:-0} )) && (( ! OPTIMIZE )) && (( ${ENABLED[basic]:-0} != 1 )); then

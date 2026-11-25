@@ -114,16 +114,13 @@ angie_build_install_support() {
   return 0
 }
 
-# The LLVM toolchain (apt.llvm.org source, /opt/setup-llvm) is shared with
-# PHP_BUILD: only the last user removes it.
+# The LLVM toolchain is shared with the other compiled builds
+# (setup_build_llvm_release).
 angie_build_remove_support() {
   systemctl disable --now "${ANGIE_BUILD_REFRESH_TIMER##*/}" >/dev/null 2>&1 || true
   rm -f "$ANGIE_BUILD_APT_HOOK" "$ANGIE_BUILD_UNIT" "$ANGIE_BUILD_REFRESH_UNIT" "$ANGIE_BUILD_REFRESH_TIMER"
-  rm -rf "${ANGIE_BUILD_ROOT:?}" /var/cache/setup-angie-build
-  if ! compgen -G "${PHP_BUILD_ROOT:-/usr/local/lib/setup-php}/[0-9]*/build.info" >/dev/null; then
-    rm -f "${PHP_BUILD_LLVM_FILES[@]}"
-    rm -rf /opt/setup-llvm
-  fi
+  rm -rf "${ANGIE_BUILD_ROOT:?}" "${ANGIE_BUILD_CACHE:-/var/cache/setup-angie-build}"
+  setup_build_llvm_release angie
   systemctl daemon-reload 2>/dev/null || true
 }
 
@@ -153,12 +150,22 @@ angie_build_apply() {
   esac
   angie_build_install_support || return 1
   tag="ANGIE_BUILD=clang"
-  # A configuration change the lean build cannot serve (a module it leaves
-  # out) sends Angie back to the package before anything else.
-  if [[ -f $ANGIE_BUILD_DROPIN ]] && ! "$ANGIE_BUILD_TOOL" pre >/dev/null 2>&1; then
-    "$ANGIE_BUILD_TOOL" deactivate >/dev/null 2>&1 || true
-    "$out" "- **${tag}: the configuration needs a module the lean build leaves out; Angie is back on the package binary** ($(/usr/local/lib/setup-angie/build/angie -t -c /etc/angie/angie.conf 2>&1 | grep -m1 emerg))"
-    return 1
+  # A directive of a module the lean build leaves out: a droppable one
+  # (sub_filter, ssi, limit_conn, ...) is commented out in its file and
+  # reported; anything else sends Angie back to the package before anything
+  # else (which restores what was commented out).
+  if [[ -f $ANGIE_BUILD_DROPIN ]]; then
+    local fit="" line why
+    if fit=$("$ANGIE_BUILD_TOOL" fit 2>&1); then
+      while IFS= read -r line; do
+        [[ $line == *"commented out"* ]] && "$out" "- ${tag}: ${line#*Angie build: }"
+      done <<< "$fit"
+    else
+      why=$(grep -m1 -E 'emerg|error' <<< "$fit" || true)
+      "$ANGIE_BUILD_TOOL" deactivate >/dev/null 2>&1 || true
+      "$out" "- **${tag}: the configuration needs a module the lean build leaves out; Angie is back on the package binary** (${why:-angie -t failed})"
+      return 1
+    fi
   fi
   chk=$("$ANGIE_BUILD_TOOL" check 2>&1) || rc=$?
   if [[ ! -f $ANGIE_BUILD_DROPIN ]] || (( rc == 10 )); then

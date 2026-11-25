@@ -369,6 +369,7 @@ purge_mariadb() {
 
 purge_valkey() {
   step "Purge Valkey"
+  valkey_build_purge
   purge_service_stop valkey-server
   # --optimize and --restart-all treat an adopted Redis as a managed cache
   # (a host that only had redis-server is tuned, restarted and reported on).

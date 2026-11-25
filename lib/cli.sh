@@ -14,6 +14,11 @@ declare -A DOMAIN_DB_USER=()
 declare -A DOMAIN_DB_PASS=()
 declare -A DOMAIN_SQL=()
 OTHERS=()
+# --source: the components to compile from source (source_select maps them
+# onto PHP_BUILD, ANGIE_BUILD, ... before validation).
+SOURCE_COMPONENTS=(angie php valkey)
+SOURCE_ARGS=()
+SOURCE_SEEN=0
 DOMAINS=()
 PURGE=0
 OPTIMIZE=0
@@ -93,6 +98,17 @@ Services (optional; only the ones listed are installed):
               (or: --others all)
       nvme-cli is installed only on a dedicated server with NVMe storage.
       sysstat    sar/iostat performance history
+
+Source-compiled builds (with an install or --optimize):
+  --source=all | --source=angie,php,valkey | --source=none
+      Compile the listed components from their upstream releases with
+      clang -O3 -march=native, hardening, ThinLTO and BOLT, linked
+      statically and with only the modules the three applications need;
+      every component not listed goes back to its package.  Without
+      --source a fresh install uses the packages (the same as none) and a
+      plain --optimize keeps the builds the server already runs.
+      SETUP_PHP_BUILD / SETUP_ANGIE_BUILD / SETUP_VALKEY_BUILD (clang or
+      package) still change one component; --source overrides them.
 
 Domain setup (standalone; Angie + MariaDB must already be installed/running):
   --domain DOMAIN [app=TYPE] [db=NAME [user=U pass=P] [sql=FILE]] [DOMAIN ...]
@@ -414,6 +430,24 @@ parse_args() {
         kv_consume valkey 0 "$@"
         shift "$KV_CONSUMED"
         ;;
+      --source=*|--source)
+        # --source all | none | angie,php,... (commas or spaces, like --others):
+        # the complete set of components to compile from source; every other
+        # one goes back to its package.  Without it nothing changes: a fresh
+        # install runs the packages, --optimize keeps the recorded builds.
+        local -a srcparts=()
+        SOURCE_SEEN=1
+        if [[ $1 == --source=* ]]; then
+          IFS=', ' read -r -a srcparts <<< "${1#--source=}"
+          SOURCE_ARGS+=("${srcparts[@]}"); shift
+        else
+          shift
+          while (( $# )) && [[ $1 != --* ]]; do
+            IFS=', ' read -r -a srcparts <<< "$1"
+            SOURCE_ARGS+=("${srcparts[@]}"); shift
+          done
+        fi
+        ;;
       --others)
         ENABLED[others]=1; shift
         while (( $# )) && [[ $1 != --* ]]; do
@@ -535,6 +569,39 @@ parse_args() {
       --help|-h) usage; exit 0 ;;
       *) die "Unknown argument: '$1' (use --help)" ;;
     esac
+  done
+  source_select
+}
+
+# --source all|none|LIST -> PHP_BUILD / ANGIE_BUILD / VALKEY_BUILD = clang for
+# the listed components and package for the rest, each persisted to the host
+# file (--source wins over a SETUP_*_BUILD given for the same run).
+#
+# Without --source nothing changes (operator rule, 1.21.71): a fresh install
+# has no recorded build, so it runs the packages (the same as none), and a
+# plain --optimize keeps the builds the host already runs (the recorded
+# PHP_BUILD / ANGIE_BUILD / VALKEY_BUILD).
+source_select() {
+  (( SOURCE_SEEN )) || return 0
+  local word c var
+  local -A want=()
+  (( ${#SOURCE_ARGS[@]} > 0 )) \
+    || die "--source needs a value: all, none, or components from: ${SOURCE_COMPONENTS[*]} (e.g. --source=angie,php)"
+  for word in "${SOURCE_ARGS[@]}"; do
+    word=${word,,}
+    case $word in
+      all)  for c in "${SOURCE_COMPONENTS[@]}"; do want[$c]=1; done ;;
+      none) ;;
+      *)
+        [[ " ${SOURCE_COMPONENTS[*]} " == *" $word "* ]] \
+          || die "--source: unknown component '${word}' (use all, none or: ${SOURCE_COMPONENTS[*]})"
+        want[$word]=1 ;;
+    esac
+  done
+  for c in "${SOURCE_COMPONENTS[@]}"; do
+    var=${c^^}_BUILD
+    if [[ -n ${want[$c]:-} ]]; then printf -v "$var" clang; else printf -v "$var" package; fi
+    printf -v "${var}_PERSIST" 1
   done
 }
 

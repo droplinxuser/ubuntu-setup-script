@@ -1497,8 +1497,8 @@ tune_angie_configs "$TMP/legacy"
 check "legacy fastcgi_cache_conf is resized in place" \
   grep -qE 'keys_zone=fastcgicache:[0-9]+m max_size=[0-9]+[MG]' \
   "$TMP/legacy/http.d/fastcgi_cache_conf"
-check "legacy limit_req_conf zones are resized in place" \
-  grep -qE 'zone=limit_req_post_head:[0-9]+m' "$TMP/legacy/http.d/limit_req_conf"
+check "legacy limit_req_conf: rejections logged at info" \
+  grep -qE '^[[:space:]]*limit_req_log_level[[:space:]]+info;' "$TMP/legacy/http.d/limit_req_conf"
 check "legacy tuning does not create a duplicate .conf file" \
   test ! -e "$TMP/legacy/http.d/fastcgi_cache.conf"
 custom_zone=$(grep -oE 'keys_zone=customcache:[0-9]+m' \
@@ -3631,20 +3631,6 @@ not_changed() { ! write_service_limits_dropin "$@"; }
 check "write_service_limits_dropin is silent when identical" \
   not_changed "$TMP/dropin/limits.conf" $'[Service]\nLimitNOFILE=1'
 
-# Rate-limit exemptions for a load generator or monitor.
-cat > "$TMP/limit_req.conf" <<'EOF'
-geo $limit_req_whitelist {
-    default 0;
-    127.0.0.0/8 1;
-    ::1/128     1;
-}
-limit_req_log_level warn;
-EOF
-LIMIT_REQ_EXEMPT='192.0.2.50,10.0.0.0/8 bogus' tune_limit_req_exemptions "$TMP/limit_req.conf" limit_req.conf
-check "tune_limit_req_exemptions adds managed entries" \
-  bash -c "grep -qx '    192.0.2.50 1; # setup.sh exempt' '$TMP/limit_req.conf' && grep -qx '    10.0.0.0/8 1; # setup.sh exempt' '$TMP/limit_req.conf'"
-check "tune_limit_req_exemptions ignores invalid entries" \
-  bash -c "! grep -q bogus '$TMP/limit_req.conf'"
 hostname_valid() {
   validate_hostname web1 && validate_hostname web1.example.com && validate_hostname 16c-32g-1T
 }
@@ -3654,28 +3640,6 @@ hostname_invalid() {
 }
 check "hostname validation accepts normal host and FQDN names" hostname_valid
 check "hostname validation rejects empty labels, bad labels and >64 chars" hostname_invalid
-exempt_valid() {
-  tune_valid_exempt_entry 192.0.2.50 && tune_valid_exempt_entry 10.0.0.0/8 \
-    && tune_valid_exempt_entry 2001:db8::1 && tune_valid_exempt_entry 2001:db8::/32 \
-    && tune_valid_exempt_entry ::1
-}
-exempt_invalid() {
-  ! tune_valid_exempt_entry 10.0.0.256 && ! tune_valid_exempt_entry 10.0.0.5/99 \
-    && ! tune_valid_exempt_entry 1.2.3 && ! tune_valid_exempt_entry cafe \
-    && ! tune_valid_exempt_entry 1:2:3 && ! tune_valid_exempt_entry ::: \
-    && ! tune_valid_exempt_entry 2001:db8::/129
-}
-check "rate-limit exemption: valid IPv4, IPv6 and CIDR are accepted" exempt_valid
-check "rate-limit exemption: malformed addresses/masks are rejected" exempt_invalid
-LIMIT_REQ_EXEMPT='10.0.0.256,10.0.0.5/99,cafe,2001:db8::/129,192.0.2.50' tune_limit_req_exemptions "$TMP/limit_req.conf" limit_req.conf
-check "tune_limit_req_exemptions writes only the valid subset" \
-  bash -c "grep -qx '    192.0.2.50 1; # setup.sh exempt' '$TMP/limit_req.conf' && [ \$(grep -c 'setup.sh exempt' '$TMP/limit_req.conf') -eq 1 ]"
-LIMIT_REQ_EXEMPT='192.0.2.50' tune_limit_req_exemptions "$TMP/limit_req.conf" limit_req.conf
-check "tune_limit_req_exemptions replaces the managed set" \
-  test "$(grep -c 'setup.sh exempt' "$TMP/limit_req.conf")" -eq 1
-LIMIT_REQ_EXEMPT='' tune_limit_req_exemptions "$TMP/limit_req.conf" limit_req.conf
-check "tune_limit_req_exemptions removes managed entries when unset" \
-  bash -c "! grep -q 'setup.sh exempt' '$TMP/limit_req.conf'"
 # The host file is sourced as root: a value with a quote or a command
 # substitution must stay data.
 tune_file="$TMP/host-tuning"
@@ -4582,7 +4546,7 @@ effective_cpus() { printf '16'; }
 mem_total_mb() { printf '27812'; }
 mariadb_data_size_mb() { printf '0'; }
 
-valkey_opt_body=$(sed -n '/^optimize_valkey()/,/^}/p' "$ALL_SRC")
+valkey_opt_body=$(sed -n '/^optimize_valkey_tune()/,/^}/p' "$ALL_SRC")
 check "optimize_valkey writes the planned size without re-deriving it" \
   bash -c '! grep -qE "needed_mb|hard_cap" <<< "$1"' _ "$valkey_opt_body"
 check "optimize_valkey reports a full cache and how to grow it" \
@@ -5025,7 +4989,7 @@ fi
 fake_cli() { [[ "$*" == "ping" ]] && echo PONG; }
 check "valkey_endpoint_pong falls back to TCP when the socket is missing" \
   valkey_endpoint_pong fake_cli "$TMP/no-such.sock"
-optimize_valkey_body=$(sed -n '/^optimize_valkey()/,/^}/p' "$ALL_SRC")
+optimize_valkey_body=$(sed -n '/^optimize_valkey_tune()/,/^}/p' "$ALL_SRC")
 check "every optimizer CONFIG call targets the live endpoint" \
   bash -c '! grep -E "\"\\\$cli\" CONFIG " <<<"$1" && grep -qF "\"\$cli\" \"\${live_ep[@]}\" CONFIG SET" <<<"$1"' _ "$optimize_valkey_body"
 check "the optimizer restart probe pings the written socket" \
@@ -5690,6 +5654,12 @@ printf 'geo $limit_req_whitelist {\n  default 0;\n  127.0.0.1 1;\n  203.0.113.23
 check "TLS reject guard: a rate-limit exemption (LIMIT_REQ_EXEMPT) counts, loopback does not" \
   test "$(tls_proxies_for 'server { }')" = "limit_req.conf:203.0.113.23"
 rm -f "$tp/http.d/limit_req.conf"
+# 1.21.71: the tree has no exemption list any more; a value an older release
+# persisted still marks a proxy in front (loopback never does).
+check "TLS reject guard: a persisted LIMIT_REQ_EXEMPT counts after the 1.6.61 tree drops the list" \
+  test "$(LIMIT_REQ_EXEMPT='127.0.0.1, 198.51.100.40' tls_proxies_for 'server { }')" = "setup-tuning:198.51.100.40"
+check "TLS reject guard: an empty LIMIT_REQ_EXEMPT adds nothing" \
+  test -z "$(LIMIT_REQ_EXEMPT='' tls_proxies_for 'server { }')"
 check "TLS reject guard: loopback and allow all are not proxies" \
   test -z "$(tls_proxies_for 'server { allow 127.0.0.1; allow ::1; set_real_ip_from 127.0.0.1; allow all; }')"
 check "TLS reject guard: a CIDR wider than the Cloudflare range it starts in counts" \
@@ -7462,7 +7432,7 @@ check "php-fpm-build activate: resets ExecStart, rewrites the package's line, mi
 check "php-fpm-build apt-hook: a build newer than the package (php.net ahead of Sury) is left alone" \
   test "$(pb_tool_case newer)" = "dropin build 0"
 check "php-fpm-build check: a build from an older recipe (1.21.68: -fPIC, intl) is stale" \
-  test "$(pb_tool_case recipe_old)" = "stale: recipe 1 -> 3 rc=10"
+  test "$(pb_tool_case recipe_old)" = "stale: recipe 1 -> 4 rc=10"
 check "php-fpm-build check: the current recipe with every pinned version is current" \
   test "$(pb_tool_case recipe_cur)" = "current rc=0"
 check "php-fpm-build fetch: the next mirror serves when the first fails; all failing stops" \
@@ -7503,7 +7473,7 @@ check "GMP is built without assembly (its jump tables in data stop BOLT)" \
 check "the refresh timer runs the tool daily at idle priority" \
   bash -c 'grep -qF "ExecStart=$2 refresh" <<<"$1" && grep -qx "OnCalendar=daily" <<<"$3"' _ "$(php_build_refresh_unit_text)" "$PHP_BUILD_TOOL" "$(php_build_refresh_timer_text)"
 check "removing the last build also removes the apt.llvm.org source and the refresh timer" \
-  bash -c 'sed -n "/^php_build_remove_support()/,/^}/p" "$1" | grep -q "PHP_BUILD_LLVM_FILES" && sed -n "/^php_build_remove_support()/,/^}/p" "$1" | grep -q "PHP_BUILD_REFRESH_TIMER"' _ "$ALL_SRC"
+  bash -c 'sed -n "/^php_build_remove_support()/,/^}/p" "$1" | grep -q "setup_build_llvm_release php" && sed -n "/^setup_build_llvm_release()/,/^}/p" "$1" | grep -q "PHP_BUILD_LLVM_FILES" && sed -n "/^php_build_remove_support()/,/^}/p" "$1" | grep -q "PHP_BUILD_REFRESH_TIMER"' _ "$ALL_SRC"
 check "phpinfo is not in the shipped disable_functions (XenForo/WordPress admin pages use it)" \
   bash -c '! grep -E "^disable_functions" "$1/configs/php/custom_dan.ini" | grep -q phpinfo && grep -qx "disable_functions = show_source" "$1/configs/php/custom_dan.ini"' _ "$ROOT"
 unset -f pb_mode pb_tool_case pb_invalid
@@ -7623,8 +7593,8 @@ pb_sdnotify_ok() {
     # shellcheck disable=SC1090,SC1091
     source "$ROOT/tools/php-fpm-build.sh"
     set +eE; trap - ERR
-    CC=$cl AR=$(command -v llvm-ar || ls "$(dirname "$cl")"/llvm-ar 2>/dev/null || command -v ar) BASE_FLAGS="-O2"
-    sdnotify_shim "$T/deps" >/dev/null 2>&1 || exit 1
+    CC=$cl AR=$(command -v llvm-ar || ls "$(dirname "$cl")"/llvm-ar 2>/dev/null || command -v ar)
+    sdnotify_shim "$T/deps" "-O2" >/dev/null 2>&1 || exit 1
     grep -q '^Libs: -L${libdir} -lsystemd$' "$T/deps/lib/pkgconfig/libsystemd.pc" || exit 1
     printf '#include <systemd/sd-daemon.h>\nint main(void){ return sd_notifyf(0, "READY=1\\nSTATUS=%%s", "ok") == 1 ? 0 : 3; }\n' > "$T/t.c"
     "$cl" -O2 -flto=thin -fuse-ld=lld -I"$T/deps/include" "$T/t.c" -L"$T/deps/lib" -lsystemd -o "$T/t" 2>/dev/null \
@@ -7655,8 +7625,8 @@ check "--optimize keeps the persisted ANGIE_BUILD choice" \
   bash -c 'printf "%s\n" "$@" | grep -qx ANGIE_BUILD' _ "${RESET_KEEP_PINS[@]}"
 check "install_angie and optimize_angie both apply ANGIE_BUILD; --purge angie removes it" \
   bash -c 'sed -n "/^install_angie()/,/^}/p" "$1" | grep -q angie_build_apply && sed -n "/^optimize_angie()/,/^}/p" "$1" | grep -q angie_build_apply && sed -n "/^purge_angie()/,/^}/p" "$1" | grep -q angie_build_purge' _ "$ALL_SRC"
-check "the LLVM toolchain is removed only by the last of PHP_BUILD and ANGIE_BUILD" \
-  bash -c 'sed -n "/^php_build_remove_support()/,/^}/p" "$1" | grep -q "setup-angie}/build" && sed -n "/^angie_build_remove_support()/,/^}/p" "$1" | grep -q "PHP_BUILD_ROOT.*build.info"' _ "$ALL_SRC"
+check "the LLVM toolchain is removed only by the last of PHP_BUILD, ANGIE_BUILD and VALKEY_BUILD" \
+  bash -c 'for f in php_build_remove_support angie_build_remove_support valkey_build_remove_support; do sed -n "/^$f()/,/^}/p" "$1" | grep -q setup_build_llvm_release || exit 1; done' _ "$ALL_SRC"
 check "angie-build.conf ships beside setup.sh with every component the tool builds" \
   bash -c 'for k in ANGIE LLVM OPENSSL PCRE2 ZLIB_NG BROTLI NGX_BROTLI; do grep -qx "${k}_VERSION=latest" "$1/angie-build.conf" || exit 1; done' _ "$ROOT"
 check "angie-build: only the modules server-configs-nginx uses (no mail/stream/ssi/grpc ...)" \
@@ -7666,7 +7636,8 @@ ab_tool_case() { # case -> result
   (
     T="$TMP/abt"; rm -rf "$T"; mkdir -p "$T/units/angie.service.d" "$T/root/build" "$T/pkg" "$T/sbin"
     export ANGIE_BUILD_ROOT="$T/root" ANGIE_BUILD_UNIT_DIR="$T/units" ANGIE_BUILD_SOURCE_ONLY=1 \
-           ANGIE_BUILD_PKG_BIN="$T/sbin/angie" ANGIE_BUILD_PKG_UNIT="$T/pkg/angie.service"
+           ANGIE_BUILD_PKG_BIN="$T/sbin/angie" ANGIE_BUILD_PKG_UNIT="$T/pkg/angie.service" \
+           ANGIE_BUILD_ANGIE_CONF="$T/conf/angie.conf"
     # shellcheck disable=SC1090,SC1091
     source "$ROOT/tools/angie-build.sh"
     set +eE; trap - ERR
@@ -7722,7 +7693,8 @@ check "build-common install_stripped: no llvm-strip and no /opt/setup-llvm still
 llvm_order_case() { # php-first|angie-first -> "after-first after-second"
   (
     T="$TMP/llvmord"; rm -rf "$T"; mkdir -p "$T/php/8.5" "$T/angie/build" "$T/llvm"
-    PHP_BUILD_ROOT="$T/php" ANGIE_BUILD_ROOT="$T/angie"
+    PHP_BUILD_ROOT="$T/php" ANGIE_BUILD_ROOT="$T/angie" VALKEY_BUILD_ROOT="$T/valkey"
+    PHP_BUILD_CACHE="$T/cache-php" PHP_BUILD_RUN_DIR="$T/run-php" ANGIE_BUILD_CACHE="$T/cache-angie"
     PHP_BUILD_TOOL="$T/php/php-fpm-build.sh" PHP_BUILD_CONF_FILE="$T/php/php-build.conf" PHP_BUILD_COMMON_FILE="$T/php/build-common.sh"
     PHP_BUILD_APT_HOOK="$T/hook1" PHP_BUILD_UNIT="$T/u1" PHP_BUILD_REFRESH_UNIT="$T/u2" PHP_BUILD_REFRESH_TIMER="$T/u3"
     ANGIE_BUILD_APT_HOOK="$T/hook2" ANGIE_BUILD_UNIT="$T/u4" ANGIE_BUILD_REFRESH_UNIT="$T/u5" ANGIE_BUILD_REFRESH_TIMER="$T/u6"
@@ -7742,6 +7714,293 @@ check "LLVM toolchain: ANGIE_BUILD removed first, then PHP_BUILD: kept, then rem
   test "$(llvm_order_case angie-first)" = "kept removed nophpdir"
 unset -f pb_cpu_case pb_sdnotify_ok pb_sdnotify_case ab_mode ab_invalid ab_tool_case bc_strip_ok llvm_order_case
 unset -f fm_case fm_twice lean_set_ok gpg_home_ok pb_primarydown_ok
+
+# ---- 1.21.71: login limiter only, auth_basic, auto-commented directives,
+# ---- --source, VALKEY_BUILD, the download mirror
+check "server-configs fixture: only the credential limit_req zone is left (generic GET/POST zones removed)" \
+  bash -c '[[ $(grep -cE "^[[:space:]]*limit_req_zone" "$1") -eq 1 ]] && grep -qE "zone=limit_req_login:" "$1" && ! grep -qE "limit_req_post_head|limit_req_get_perip|limit_req_whitelist" "$1"' \
+  _ "$FIXTURES/http.d/limit_req.conf"
+lr_tuned() {
+  local T="$TMP/lr71"; rm -rf "$T"; mkdir -p "$T"; cp -a "$FIXTURES/." "$T/"
+  tune_reset_changes
+  tune_angie_configs "$T" >/dev/null 2>&1 || true
+  [[ $(grep -cE "^[[:space:]]*limit_req_zone" "$T/http.d/limit_req.conf") -eq 1 ]] \
+    && grep -qE '^[[:space:]]*limit_req_log_level[[:space:]]+info;' "$T/http.d/limit_req.conf" \
+    && ! grep -q 'setup.sh exempt' "$T/http.d/limit_req.conf"
+}
+check "Angie tuner: the login zone keeps its size, rejections log at info, no exemption list is written" lr_tuned
+check "SETUP_LIMIT_REQ_EXEMPT is ignored with a warning (validate_all)" \
+  bash -c 'sed -n "/^validate_all()/,/^}/p" "$1" | grep -q "SETUP_LIMIT_REQ_EXEMPT is ignored"' _ "$ALL_SRC"
+check "angie-build: auth_basic and limit_req compiled in, limit_conn left out; recipe 3" \
+  bash -c 'f=$(sed -n "/^cmd_build()/,/^}/p" "$1"); ! grep -q -- "--without-http_auth_basic_module" <<<"$f" && ! grep -q -- "--without-http_limit_req_module" <<<"$f" && grep -q -- "--without-http_limit_conn_module" <<<"$f" && grep -q "^BUILD_RECIPE=3" "$1"' \
+  _ "$ROOT/tools/angie-build.sh"
+
+# Auto-commented directives: a stub Angie that rejects the first directive of
+# its "unknown" list it meets in conf.d/*.conf, reporting the line it ends on
+# (like Angie), so fit_config has to find where it starts.
+af_case() { # case -> result
+  (
+    T="$TMP/afit"; rm -rf "$T"; mkdir -p "$T/conf/conf.d" "$T/units/angie.service.d" "$T/root/build" "$T/sbin"
+    export ANGIE_BUILD_ROOT="$T/root" ANGIE_BUILD_UNIT_DIR="$T/units" ANGIE_BUILD_SOURCE_ONLY=1 \
+           ANGIE_BUILD_PKG_BIN="$T/sbin/angie" ANGIE_BUILD_ANGIE_CONF="$T/conf/angie.conf"
+    # shellcheck disable=SC1090,SC1091
+    source "$ROOT/tools/angie-build.sh"
+    set +eE; trap - ERR
+    systemctl() { printf '%s\n' "$*" >> "$T/systemctl.log"; return 0; }
+    systemd-run() { printf 'run %s\n' "$*" >> "$T/systemctl.log"; return 0; }
+    logger() { :; }; say() { :; }
+    mkstub() { # path unknown-directives...
+      local p=$1; shift
+      cat > "$p" <<EOF
+#!/usr/bin/env bash
+for f in "$T"/conf/conf.d/*.conf; do
+  awk -v f="\$f" -v unk=" $* " '
+    { code = \$0; sub(/#.*/, "", code) }
+    code ~ /^[[:space:]]*\$/ { next }
+    !open { split(code, w, /[[:space:];]+/); d = (w[1] == "" ? w[2] : w[1]); open = 1 }
+    code ~ /;[[:space:]]*\$/ || code ~ /[{}][[:space:]]*\$/ {
+      if (index(unk, " " d " ")) { printf "angie: [emerg] unknown directive \"%s\" in %s:%d\n", d, f, NR > "/dev/stderr"; bad = 1; exit 1 }
+      open = 0
+    }
+    END { exit bad }' "\$f" || exit 1
+done
+exit 0
+EOF
+      chmod +x "$p"
+    }
+    printf 'http { include conf.d/*.conf; }\n' > "$T/conf/angie.conf"
+    cat > "$T/conf/conf.d/site.conf" <<'EOF'
+server {
+    listen 80;
+    sub_filter '<head>' '<head><meta name="x">';
+    location / {
+        sub_filter_types text/html
+                         application/xhtml+xml;
+        limit_conn perip 10;
+        root /var/www/a;
+    }
+}
+EOF
+    cp "$T/conf/conf.d/site.conf" "$T/orig.conf"
+    case $1 in
+      fit)
+        mkstub "$T/build" sub_filter sub_filter_types limit_conn
+        fit_config "$T/build" >/dev/null 2>&1; rc=$?
+        printf '%s %s %s %s' "$rc" "$(grep -c '^ *# setup-angie-build-off: ' "$T/conf/conf.d/site.conf")" \
+          "$(wc -l < "$T/root/build/disabled.list" | tr -d ' ')" \
+          "$(grep -c '^        root /var/www/a;$' "$T/conf/conf.d/site.conf")" ;;
+      restore)
+        mkstub "$T/build" sub_filter sub_filter_types limit_conn
+        fit_config "$T/build" >/dev/null 2>&1; restore_config >/dev/null 2>&1
+        cmp -s "$T/orig.conf" "$T/conf/conf.d/site.conf" && printf 'identical' || printf 'differs'
+        [[ -e $T/root/build/disabled.list ]] && printf ' list' ;;
+      handler)
+        printf 'server {\n    location /app {\n        uwsgi_pass 127.0.0.1:9000;\n    }\n}\n' > "$T/conf/conf.d/app.conf"
+        mkstub "$T/build" sub_filter sub_filter_types limit_conn uwsgi_pass
+        fit_config "$T/build" >/dev/null 2>&1; rc=$?
+        printf '%s %s' "$rc" "$(grep -c 'setup-angie-build-off' "$T/conf/conf.d/app.conf")" ;;
+      prefit)
+        mkstub "$T/root/build/angie" sub_filter sub_filter_types limit_conn
+        printf '[Service]\n' > "$T/units/angie.service.d/zz-setup-build.conf"
+        ( cmd_pre ) >/dev/null 2>&1; rc=$?
+        printf '%s %s %s' "$rc" "$([[ -f $T/units/angie.service.d/zz-setup-build.conf ]] && echo dropin || echo nodropin)" \
+          "$(grep -c 'setup-angie-build-off' "$T/conf/conf.d/site.conf")" ;;
+      prefallback)
+        printf 'server {\n    location /app {\n        uwsgi_pass 127.0.0.1:9000;\n    }\n}\n' > "$T/conf/conf.d/app.conf"
+        mkstub "$T/root/build/angie" sub_filter sub_filter_types limit_conn uwsgi_pass
+        mkstub "$T/sbin/angie"
+        printf '[Service]\n' > "$T/units/angie.service.d/zz-setup-build.conf"
+        ( cmd_pre ) >/dev/null 2>&1; rc=$?
+        printf '%s %s %s %s' "$rc" "$([[ -f $T/units/angie.service.d/zz-setup-build.conf ]] && echo dropin || echo nodropin)" \
+          "$(grep -c 'setup-angie-build-off' "$T/conf/conf.d/site.conf")" \
+          "$(grep -c 'run --no-block --on-active=2' "$T/systemctl.log" 2>/dev/null)" ;;
+    esac
+  )
+}
+check "angie-build fit: sub_filter (also multi-line) and limit_conn are commented out, recorded, the rest untouched" \
+  test "$(af_case fit)" = "0 4 3 1"
+check "angie-build restore: every commented directive comes back byte for byte" \
+  test "$(af_case restore)" = "identical"
+check "angie-build fit: a content handler of a left-out module (uwsgi_pass) is never commented out" \
+  test "$(af_case handler)" = "1 0"
+check "angie-build pre: a droppable directive added after activation is commented out and Angie starts on the build" \
+  test "$(af_case prefit)" = "0 dropin 4"
+check "angie-build pre: any other rejection goes back to the package (directives restored, restart scheduled)" \
+  test "$(af_case prefallback)" = "1 nodropin 0 1"
+check "optimize applies ANGIE_BUILD with 'fit' and reports each commented directive" \
+  bash -c 'sed -n "/^angie_build_apply()/,/^}/p" "$1" | grep -q "ANGIE_BUILD_TOOL\" fit"' _ "$ALL_SRC"
+
+# --source
+src_sel() { # args... -> "PHP ANGIE VALKEY persisted" or "die"
+  (
+    die() { printf 'die'; exit 0; }
+    PHP_BUILD=${SS_PHP:-} ANGIE_BUILD=${SS_ANGIE:-} VALKEY_BUILD="" PHP_BUILD_PERSIST=${SS_PHP_ENV:-0} ANGIE_BUILD_PERSIST=0 VALKEY_BUILD_PERSIST=0
+    SOURCE_ARGS=(); SOURCE_SEEN=0; OPTIMIZE=0; PURGE=0; UPGRADE_PHP_SEEN=0; ENABLED=()
+    parse_args "$@" 2>/dev/null
+    printf '%s %s %s %s' "$PHP_BUILD" "$ANGIE_BUILD" "$VALKEY_BUILD" "$PHP_BUILD_PERSIST$ANGIE_BUILD_PERSIST$VALKEY_BUILD_PERSIST"
+  )
+}
+check "--source=all compiles php, angie and valkey from source" \
+  test "$(src_sel --source=all)" = "clang clang clang 111"
+check "--source=angie,php: the listed ones clang, every other one package, all persisted" \
+  test "$(src_sel --source=angie,php)" = "clang clang package 111"
+check "--source angie valkey (spaces, like --others) stops at the next option" \
+  test "$(src_sel --source angie valkey --optimize)" = "package clang clang 111"
+check "--source=none puts every component back on its package" \
+  test "$(src_sel --source=none)" = "package package package 111"
+check "--source: an unknown component or a missing value is refused" \
+  test "$(src_sel --source=nginx),$(src_sel --source)" = "die,die"
+check "no --source on a fresh install: no build recorded, so the packages run (the same as none)" \
+  test "$(src_sel --basic --angie --php --valkey)" = "   000"
+check "a plain --optimize keeps the builds the host already runs" \
+  test "$(SS_PHP=clang SS_ANGIE=clang src_sel --optimize)" = "clang clang  000"
+check "no --source: a SETUP_PHP_BUILD given for this run still applies" \
+  test "$(SS_PHP=package SS_PHP_ENV=1 src_sel --optimize)" = "package   100"
+check "--source on --optimize replaces the recorded set" \
+  test "$(SS_PHP=clang SS_ANGIE=clang src_sel --optimize --source=valkey)" = "package package clang 111"
+
+# VALKEY_BUILD
+vk_mode() { ( VALKEY_BUILD=$1; valkey_build_mode ); }
+check "VALKEY_BUILD: clang, package/off and unset map to their modes; anything else is invalid" \
+  test "$(vk_mode clang),$(vk_mode package),$(vk_mode off),$(vk_mode ''),$(vk_mode jemalloc)" = "clang,package,package,,invalid"
+check "validate_all checks VALKEY_BUILD; --optimize keeps the persisted choice" \
+  bash -c 'sed -n "/^validate_all()/,/^}/p" "$1" | grep -q valkey_build_validate && printf "%s\n" "${@:2}" | grep -qx VALKEY_BUILD' _ "$ALL_SRC" "${RESET_KEEP_PINS[@]}"
+check "install_valkey and optimize_valkey apply VALKEY_BUILD (Valkey only, never Redis); --purge valkey removes it" \
+  bash -c 'sed -n "/^install_valkey()/,/^}/p" "$1" | grep -q valkey_build_apply && sed -n "/^optimize_valkey()/,/^}/p" "$1" | grep -q "== valkey ]] && (( rc == 0 )) && ! valkey_build_apply" && sed -n "/^purge_valkey()/,/^}/p" "$1" | grep -q valkey_build_purge' _ "$ALL_SRC"
+check "valkey-build.conf ships with VALKEY and LLVM" \
+  bash -c 'grep -qx VALKEY_VERSION=latest "$1/valkey-build.conf" && grep -qx LLVM_VERSION=latest "$1/valkey-build.conf"' _ "$ROOT"
+check "valkey-build: hardening flags, no TLS, bundled jemalloc, sd_notify shim instead of libsystemd" \
+  bash -c 'for f in -fstack-protector-strong -fstack-clash-protection -D_FORTIFY_SOURCE=3 -fcf-protection=full "-Wl,-z,relro,-z,now" BUILD_TLS=no MALLOC=jemalloc "sdnotify_shim \"\$work/deps\""; do grep -qF -- "$f" "$1" || { echo "no $f"; exit 1; }; done' _ "$ROOT/tools/valkey-build.sh"
+check "valkey-build: CFLAGS/LDFLAGS reach make through the environment (on its command line they override the bundled jemalloc and Lua -O flags)" \
+  bash -c 'f=$(sed -n "/^cmd_build()/,/^}/p" "$1"); grep -q "CFLAGS=\"\$flags -I\$work/deps/include\" LDFLAGS=" <<<"$f" && ! grep -qE "make -j[^\\\\]*CFLAGS=|^[[:space:]]+(OPT=[^\\\\]*)?CFLAGS=\"\$flags.*BUILD_TLS" <<<"$f"' _ "$ROOT/tools/valkey-build.sh"
+vk_tool_case() { # case -> result
+  (
+    T="$TMP/vkt"; rm -rf "$T"; mkdir -p "$T/units/valkey-server.service.d" "$T/root/build" "$T/pkg" "$T/bin" "$T/etc"
+    export VALKEY_BUILD_ROOT="$T/root" VALKEY_BUILD_UNIT_DIR="$T/units" VALKEY_BUILD_SOURCE_ONLY=1 \
+           VALKEY_BUILD_PKG_BIN="$T/bin/valkey-server" VALKEY_BUILD_PKG_UNIT="$T/pkg/valkey-server.service" \
+           VALKEY_BUILD_VALKEY_CONF="$T/etc/valkey.conf" VALKEY_BUILD_CACHE="$T/cache"
+    # shellcheck disable=SC1090,SC1091
+    source "$ROOT/tools/valkey-build.sh"
+    set +eE; trap - ERR
+    systemctl() { printf '%s\n' "$*" >> "$T/systemctl.log"; return 0; }
+    systemd-run() { printf 'run %s\n' "$*" >> "$T/systemctl.log"; return 0; }
+    logger() { :; }; say() { :; }
+    stub_vk() { printf '#!/bin/sh\necho "Valkey server v=%s sha=0 malloc=jemalloc-5.3.0 bits=64 build=x"\n' "$1" > "$T/bin/valkey-server"; chmod +x "$T/bin/valkey-server"; }
+    d="$T/units/valkey-server.service.d/zz-setup-build.conf"
+    case $1 in
+      activate)
+        stub_vk 9.0.6; printf 'valkey=9.2.0\n' > "$T/root/build/build.info"
+        printf '[Service]\nType=notify\nExecStart=%s /etc/valkey/valkey.conf --supervised systemd --daemonize no\n' "$T/bin/valkey-server" > "$T/pkg/valkey-server.service"
+        restart_checked() { return 0; }
+        activate
+        printf '%s %s %s %s' "$(grep -c '^ExecStart=$' "$d")" \
+          "$(grep -c "^ExecStart=$T/root/build/valkey-server /etc/valkey/valkey.conf --supervised systemd --daemonize no$" "$d")" \
+          "$(grep -c "^ExecPaths=$T/root/build/valkey-server $T/root/valkey-build.sh$" "$d")" \
+          "$(grep -c "^ExecStartPre=+$T/root/valkey-build.sh pre$" "$d")"
+        return 0 ;;
+      cache)   stub_vk 9.0.6; printf 'save ""\nappendonly no\n' > "$T/etc/valkey.conf"; printf '[%s]' "$(series)"; return 0 ;;
+      rdb)     stub_vk 9.0.6; printf 'save 900 1\nappendonly no\n' > "$T/etc/valkey.conf"; printf '[%s]' "$(series)"; return 0 ;;
+      aof)     stub_vk 9.0.6; printf 'save ""\nappendonly yes\n' > "$T/etc/valkey.conf"; printf '[%s]' "$(series)"; return 0 ;;
+      resolve)
+        stub_vk 9.0.6; printf 'save 900 1\n' > "$T/etc/valkey.conf"
+        latest_of() { case $1 in valkey) [[ -n ${2:-} ]] && printf '%s.8' "$2" || printf '9.2.0' ;; llvm) printf 23 ;; esac; }
+        printf '%s' "$(resolve_all | tr '\n' ' ')"; return 0 ;;
+      stale)   stub_vk 9.2.1; printf 'valkey=9.2.0\n' > "$T/root/build/build.info"; printf '[Service]\n' > "$d"; cmd_apt_hook ;;
+      current) stub_vk 9.0.6; printf 'valkey=9.2.0\n' > "$T/root/build/build.info"; printf '[Service]\n' > "$d"; cmd_apt_hook ;;
+      cpumoved)
+        printf 'valkey=9.2.0\ncpu=AuthenticAMD Other CPU\n' > "$T/root/build/build.info"; printf '[Service]\n' > "$d"
+        : > "$T/root/build/valkey-server"; chmod +x "$T/root/build/valkey-server"
+        cpu_model() { printf 'GenuineIntel This CPU'; }
+        ( cmd_pre ) >/dev/null 2>&1; printf 'rc=%s ' "$?" ;;
+    esac
+    printf '%s %s' "$([[ -f $d ]] && echo dropin || echo nodropin)" \
+      "$(cat "$T/systemctl.log" 2>/dev/null | grep -c 'start --no-block setup-valkey-build.service')"
+  )
+}
+check "valkey-build activate: ExecStart points at the build, which is added to the unit's ExecPaths" \
+  test "$(vk_tool_case activate)" = "1 1 1 1"
+check "valkey-build: a cache-only valkey.conf may run the newest release (no series pin)" \
+  test "$(vk_tool_case cache)" = "[]"
+check "valkey-build: RDB snapshots or AOF pin the build to the package's X.Y series" \
+  test "$(vk_tool_case rdb),$(vk_tool_case aof)" = "[9.0],[9.0]"
+check "valkey-build: with persistence, 'latest' resolves within the package's series" \
+  test "$(vk_tool_case resolve)" = "valkey=9.0.8 llvm=23 "
+check "valkey-build apt-hook: a newer Valkey package reverts to it and starts a rebuild" \
+  test "$(vk_tool_case stale)" = "nodropin 1"
+check "valkey-build apt-hook: a current build is left alone" \
+  test "$(vk_tool_case current)" = "dropin 0"
+check "valkey-build pre: a build made on another CPU model goes back to the package and rebuilds" \
+  test "$(vk_tool_case cpumoved)" = "rc=1 nodropin 1"
+check "switch-valkey-arm: the bench drop-in adds the binary to ExecPaths (the unit's NoExecPaths=/)" \
+  grep -qF 'ExecPaths=%s' "$ROOT/tests/bench-php-matrix/switch-valkey-arm.sh"
+llvm3_case() { # -> LLVM after removing PHP and Angie while a Valkey build remains, then after Valkey
+  (
+    T="$TMP/llvm3"; rm -rf "$T"; mkdir -p "$T/php" "$T/angie" "$T/valkey/build" "$T/llvm"
+    PHP_BUILD_ROOT="$T/php" ANGIE_BUILD_ROOT="$T/angie" VALKEY_BUILD_ROOT="$T/valkey"
+    PHP_BUILD_LLVM_FILES=("$T/llvm/setup-llvm.sources"); : > "$T/llvm/setup-llvm.sources"
+    setup_build_llvm_release angie; a=$([[ -e $T/llvm/setup-llvm.sources ]] && echo kept || echo removed)
+    rm -rf "${T:?}/valkey/build"; setup_build_llvm_release valkey; b=$([[ -e $T/llvm/setup-llvm.sources ]] && echo kept || echo removed)
+    printf '%s %s' "$a" "$b"
+  )
+}
+check "LLVM toolchain: kept while a Valkey build remains, removed with the last build" \
+  test "$(llvm3_case)" = "kept removed"
+
+# The download mirror: last resort, never a trust root of its own.
+mirror_case() { # case -> result
+  (
+    T="$TMP/mirror"; rm -rf "$T"; mkdir -p "$T/cache/src" "$T/srv/openssl"
+    # shellcheck disable=SC1090,SC1091
+    . "$ROOT/tools/build-common.sh"
+    LOG_TAG=t SRC_CACHE="$T/cache" CONF="$T/none" ROOT="$T/none"
+    set +eE; trap - ERR
+    say() { :; }
+    BUILD_MIRROR=https://mirror.invalid/rel
+    printf 'release bytes\n' > "$T/srv/openssl/openssl-9.9.9.tar.gz"
+    good=$(sha256sum "$T/srv/openssl/openssl-9.9.9.tar.gz" | awk '{print $1}')
+    http_get() { # upstream always fails; the mirror serves $T/srv
+      case $1 in https://mirror.invalid/rel/*) local p=${1#https://mirror.invalid/rel/}
+        [[ -f $T/srv/$p ]] || return 22
+        if [[ -n ${2:-} ]]; then cp "$T/srv/$p" "$2"; else cat "$T/srv/$p"; fi ;;
+      *) return 22 ;; esac
+    }
+    FETCH_NAME=openssl
+    case $1 in
+      sums)     printf '%s  openssl-9.9.9.tar.gz\n' "$good" > "$T/srv/openssl/SHA256SUMS" ;;
+      badsums)  printf '%064d  openssl-9.9.9.tar.gz\n' 0 > "$T/srv/openssl/SHA256SUMS" ;;
+      nosums)   : ;;
+      published) printf '%064d  openssl-9.9.9.tar.gz\n' 0 > "$T/srv/openssl/SHA256SUMS" ;;
+      off)      printf '%s  openssl-9.9.9.tar.gz\n' "$good" > "$T/srv/openssl/SHA256SUMS"; BUILD_MIRROR=off ;;
+    esac
+    want=""; [[ $1 == published ]] && want=$good
+    out=$( fetch_first "https://www.openssl.org/x https://github.com/x|$T/cache/src/openssl-9.9.9.tar.gz|$want" 2>/dev/null ) && printf 'ok' || printf 'refused'
+  )
+}
+check "mirror: when every upstream source fails, a file matching the mirror's SHA256SUMS is used" \
+  test "$(mirror_case sums)" = "ok"
+check "mirror: a file that does not match the mirror's SHA256SUMS is refused" \
+  test "$(mirror_case badsums)" = "refused"
+check "mirror: with no published hash, no pin and no SHA256SUMS the file is refused" \
+  test "$(mirror_case nosums)" = "refused"
+check "mirror: the upstream's published SHA-256 wins over the mirror's SHA256SUMS" \
+  test "$(mirror_case published)" = "ok"
+check "mirror: SETUP_BUILD_MIRROR=off never asks the mirror" \
+  test "$(mirror_case off)" = "refused"
+check "build-common: every component download names its mirror release (FETCH_NAME)" \
+  bash -c 'sed -n "/^fetch_component()/,/^}/p" "$1" | grep -q "FETCH_NAME=\$1"' _ "$ROOT/tools/build-common.sh"
+check "BOLT never uses -use-gnu-stack (it turned PT_GNU_STACK into a LOAD: executable stack, and Valkey's MemoryDenyWriteExecute unit refused to start)" \
+  bash -c '! grep -h -- "-use-gnu-stack" "$1"/tools/*.sh "$1"/tests/bench-php-matrix/bolt-php.sh | grep -qv "^[[:space:]]*#" && for t in php-fpm angie valkey; do grep -q "bolt_stack_check" "$1/tools/$t-build.sh" || exit 1; done' _ "$ROOT"
+bsc_case() { # readelf GNU_STACK flags -> ok|refused
+  ( # shellcheck disable=SC1090,SC1091
+    . "$ROOT/tools/build-common.sh"; set +eE; trap - ERR; say() { :; }
+    readelf() { printf '  GNU_STACK      0x000000 0x0000000000000000 0x0000000000000000 0x000000 0x000000 %s 0x10\n' "$STUB_FLAGS"; }
+    ( STUB_FLAGS=$1 bolt_stack_check /x ) >/dev/null 2>&1 && printf ok || printf refused )
+}
+check "bolt_stack_check: an RW GNU_STACK passes, RWE or a missing header is refused" \
+  test "$(bsc_case RW),$(bsc_case RWE),$( ( . "$ROOT/tools/build-common.sh"; set +eE; trap - ERR; say() { :; }; readelf() { :; }; ( bolt_stack_check /x ) >/dev/null 2>&1 && printf ok || printf refused ) )" = "ok,refused,refused"
+check "removing a build deletes its cache only through an overridable path (a root test run once deleted a live cache)" \
+  bash -c '! grep -nE "rm -rf[^#]*[[:space:]](\/var\/cache|\/run)\/setup-" "$1"' _ "$ALL_SRC"
+unset -f lr_tuned af_case src_sel vk_mode vk_tool_case llvm3_case mirror_case
 
 printf '\nTOTAL pass=%d fail=%d skip=%d\n' "$PASS" "$FAIL" "$SKIP"
 [[ $FAIL -eq 0 ]]

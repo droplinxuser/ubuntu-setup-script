@@ -12,12 +12,15 @@
 # gzip CPU per page -21 % (zlib-ng).
 #
 # Lean: only what server-configs-nginx uses: the http core with SSL, HTTP/2,
-# HTTP/3 (QUIC), realip, gzip_static, threads (aio threads) and Brotli.  No
+# HTTP/3 (QUIC), realip, gzip_static, threads (aio threads), auth_basic (1.21.71:
+# password-protected areas), limit_req (the login limiter) and Brotli.  No
 # mail, stream, ACME, DAV, mp4/flv, sub, SSI, uwsgi, scgi, grpc, memcached,
-# auth_basic, limit_conn, referer,
-# userid, autoindex, split_clients, empty_gif, browser or mirror.  A
-# configuration that needs one of them (or another load_module) fails the
-# candidate's `angie -t` and the package stays.
+# limit_conn, referer, userid, autoindex, split_clients, empty_gif, browser
+# or mirror.  A directive of a left-out module that only transforms or limits
+# responses (sub_filter, ssi, limit_conn, ...) is commented out in the
+# operator's file when the build is activated and restored when Angie goes
+# back to the package (`tool pre` / lib/angie-build.sh); anything else that
+# fails the candidate's `angie -t` keeps the package.
 #
 # The binary has its own prefix (/usr/local/lib/setup-angie): load_module's
 # relative "modules/..." paths resolve against the prefix and find this
@@ -40,6 +43,7 @@
 #   angie-build.sh check         0 when current, 10 when a rebuild is due
 #   angie-build.sh versions      what angie-build.conf resolves to
 #   angie-build.sh activate | deactivate | remove | pre | apt-hook | refresh | status
+#   angie-build.sh fit | restore comment out / restore directives of left-out modules
 set -Eeuo pipefail
 export LC_ALL=C DEBIAN_FRONTEND=noninteractive
 
@@ -57,11 +61,76 @@ BUILD_COMMON=${ANGIE_BUILD_COMMON:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")
 # shellcheck source=tools/build-common.sh
 . "$BUILD_COMMON"
 
-BUILD_RECIPE=1
+BUILD_RECIPE=3   # 2: auth_basic compiled in; 3 = 1.21.71: BOLT keeps a non-executable stack
 COMPONENTS=(angie llvm openssl pcre2 zlib-ng brotli ngx-brotli)
 declare -A VERS=()
 # Ubuntu libraries the build must not link (they are compiled in).
 STATIC_LIBS_RE='^(libssl|libcrypto|libpcre2-8|libz|libbrotli[a-z]*)\.so'
+
+# Directives of left-out modules that --optimize may comment out so the build
+# can serve the configuration.  Only ones whose removal stops a response
+# transformation or a connection limit; never access control (auth_request,
+# secure_link, ...) or a content handler (uwsgi_pass, grpc_pass,
+# memcached_pass, empty_gif, ...): without those a location would serve its
+# root as static files, so the package keeps serving instead.
+DROPPABLE_RE='^(sub_filter(_once|_types|_last_modified)?|ssi(_[a-z_]+)?|addition_types|add_before_body|add_after_body|limit_conn(_zone|_status|_log_level|_dry_run)?|userid(_[a-z_]+)?|autoindex(_[a-z_]+)?|random_index|gunzip(_buffers)?|mp4(_[a-z_]+)?|flv)$'
+OFF_MARK='# setup-angie-build-off: '
+conf_dir() { dirname "$ANGIE_CONF"; }
+
+conf_test() { # binary [prefix]: angie -t output, status of the test
+  if [[ -n ${2:-} ]]; then "$1" -t -q -p "$2" -c "$ANGIE_CONF" 2>&1; else "$1" -t -q -c "$ANGIE_CONF" 2>&1; fi
+}
+
+# Comment out directive $3 that ends on line $2 of file $1 (Angie reports the
+# line a directive ends on): from the line it starts on through the line that
+# ends it, each prefixed with OFF_MARK after its indentation.  The file is
+# rewritten in place (same inode, owner and mode).
+comment_directive() { # file line directive
+  local f=$1 n=$2 d=$3 start tmp
+  start=$(awk -v n="$n" -v d="$d" 'NR <= n && $1 == d || NR <= n && index($1, d ";") == 1 { s = NR } END { print s + 0 }' "$f")
+  (( start > 0 )) || return 1
+  tmp=$(mktemp) || return 1
+  awk -v s="$start" -v e="$n" -v mark="$OFF_MARK" '
+    NR >= s && NR <= e { match($0, /^[[:space:]]*/); print substr($0, 1, RLENGTH) mark substr($0, RLENGTH + 1); next }
+    { print }' "$f" > "$tmp" && cat "$tmp" > "$f"
+  rm -f "$tmp"
+}
+
+# Make the configuration acceptable to binary $1 by commenting out droppable
+# directives it does not know, one `angie -t` at a time.  Returns 1 (with the
+# error on stderr) as soon as the test fails for any other reason.
+fit_config() { # binary [prefix]
+  local bin=$1 pfx=${2:-} out dir f n d i
+  dir=$(conf_dir)
+  for (( i = 0; i < 100; i++ )); do
+    out=$(conf_test "$bin" "$pfx") && return 0
+    if [[ $out =~ unknown\ directive\ \"([a-z0-9_]+)\"\ in\ ([^[:space:]]+):([0-9]+) ]]; then
+      d=${BASH_REMATCH[1]}; f=${BASH_REMATCH[2]}; n=${BASH_REMATCH[3]}
+      if [[ $d =~ $DROPPABLE_RE && $f == "$dir"/* && -f $f && ! -L $f ]] && comment_directive "$f" "$n" "$d"; then
+        install -d -m 755 "$BUILD"
+        printf '%s:%s %s\n' "${f#"$dir"/}" "$n" "$d" >> "$BUILD/disabled.list"
+        say "Angie build: commented out $d in ${f#"$dir"/}:$n (module not compiled in; restored when Angie goes back to the package)"
+        continue
+      fi
+    fi
+    grep -m1 -E 'emerg|error' <<<"$out" >&2 || sed -n 1p <<<"$out" >&2
+    return 1
+  done
+  return 1
+}
+
+# Undo fit_config everywhere under the configuration directory.
+restore_config() {
+  local dir f n=0
+  dir=$(conf_dir)
+  while IFS= read -r f; do
+    [[ -f $f && ! -L $f ]] || continue
+    sed -i -E 's/^([[:space:]]*)# setup-angie-build-off: /\1/' "$f" && n=$(( n + 1 ))
+  done < <(grep -rlF -- "$OFF_MARK" "$dir" 2>/dev/null || true)
+  rm -f "$BUILD/disabled.list"
+  (( n == 0 )) || say "Angie: restored the directives the compiled build had commented out (${n} file(s))"
+  return 0
+}
 
 dropin_path() { printf '%s/angie.service.d/zz-setup-build.conf' "$UNIT_DIR"; }
 info_get() { [[ -f $BUILD/build.info ]] && awk -F= -v k="$1" '$1 == k { print substr($0, length(k) + 2); exit }' "$BUILD/build.info"; return 0; }
@@ -175,7 +244,7 @@ cmd_build() {
       --without-http_split_clients_module --without-http_memcached_module --without-http_empty_gif_module \
       --without-http_browser_module --without-http_uwsgi_module --without-http_scgi_module \
       --without-http_grpc_module --without-http_mirror_module \
-      --without-http_auth_basic_module --without-http_limit_conn_module --without-http_referer_module
+      --without-http_limit_conn_module --without-http_referer_module
     nice -n 10 make -j"$j"
     nice -n 10 make -j"$j" modules
   ) >> "$work/build.log" 2>&1 || { tail -n 40 "$work/build.log" >&2; die "Angie ${VERS[angie]} failed to build"; }
@@ -211,9 +280,12 @@ verify_binary() { # binary modules-dir
   tmp=$(mktemp -d)
   mkdir -p "$tmp/modules"
   cp "$mods"/ngx_http_brotli_*_module.so "$tmp/modules/" 2>/dev/null || true
-  if ! "$cand" -t -q -p "$tmp" -c "$ANGIE_CONF" > "$tmp/t.log" 2>&1; then
-    sed -n 1,5p "$tmp/t.log" >&2; rm -rf "$tmp"
-    die "candidate rejects $ANGIE_CONF (a module this lean build leaves out?)"
+  # A droppable directive of a left-out module is commented out (restored if
+  # the build goes no further); any other rejection keeps the package.
+  if ! fit_config "$cand" "$tmp"; then
+    rm -rf "$tmp"
+    [[ -f $(dropin_path) ]] || restore_config
+    die "candidate rejects $ANGIE_CONF (a module this lean build leaves out)"
   fi
   rm -rf "$tmp"
 }
@@ -239,25 +311,39 @@ activate() {
 
 deactivate() {
   rm -f "$(dropin_path)"
+  restore_config
   systemctl daemon-reload 2>/dev/null || true
   systemctl restart angie.service >/dev/null 2>&1 || true
   say "Angie: back on the package's binary"
 }
 
+# Back to the package binary from ExecStartPre: restore what the build had
+# commented out, drop the drop-in, and restart on the package once this start
+# has failed.
+pre_fallback() { # reason
+  logger -t "$LOG_TAG" "Angie: $1: back to the package binary" || true
+  restore_config >/dev/null
+  rm -f "$(dropin_path)"
+  systemctl daemon-reload || true
+  systemd-run --no-block --on-active=2 --unit="setup-angie-fallback-$$" systemctl restart angie.service >/dev/null 2>&1 || true
+  exit 1
+}
+
 # ExecStartPre: refuse a build made for another CPU (-march=native) and test
-# the configuration with the build itself.
+# the configuration with the build itself.  A droppable directive added since
+# activation is commented out; any other rejection goes back to the package
+# instead of leaving Angie stopped (unless the package rejects it too).
 cmd_pre() {
   local built now
   built=$(info_get cpu); now=$(cpu_model)
   if [[ -n $built && $built != "$now" ]]; then
-    logger -t "$LOG_TAG" "Angie: built for '$built', this CPU is '$now': back to the package binary, rebuilding" || true
-    rm -f "$(dropin_path)"
-    systemctl daemon-reload || true
-    systemd-run --no-block --on-active=2 --unit="setup-angie-fallback-$$" systemctl restart angie.service >/dev/null 2>&1 || true
     systemctl start --no-block setup-angie-build.service >/dev/null 2>&1 || true
-    exit 1
+    pre_fallback "built for '$built', this CPU is '$now'; rebuilding"
   fi
-  "$BUILD/angie" -t -q -c "$ANGIE_CONF"
+  conf_test "$BUILD/angie" >/dev/null && return 0
+  fit_config "$BUILD/angie" && return 0
+  conf_test "$PKG_BIN" >/dev/null || exit 1
+  pre_fallback "the configuration needs a module the compiled build leaves out"
 }
 
 cmd_bolt() {
@@ -294,8 +380,9 @@ cmd_bolt() {
   fi
   "$bolt" "$base" -o "$work/angie.bolt" -data="$work/angie.fdata" \
     -reorder-blocks=ext-tsp -reorder-functions=cdsort -split-functions \
-    -split-all-cold -split-eh -icf -use-gnu-stack > "$work/bolt.log" 2>&1 \
+    -split-all-cold -split-eh -icf > "$work/bolt.log" 2>&1 \
     || { tail -n 5 "$work/bolt.log" >&2; die "llvm-bolt failed"; }
+  bolt_stack_check "$work/angie.bolt"
   verify_binary "$work/angie.bolt" "$ROOT/modules"
   install -m 600 "$work/angie.fdata" "$BUILD/angie.fdata"
   install_stripped "$work/angie.bolt" "$BUILD/angie.new"; mv -f "$BUILD/angie.new" "$BUILD/angie"
@@ -367,7 +454,7 @@ cmd_status() {
 }
 
 cmd_remove() {
-  [[ -f $(dropin_path) ]] && deactivate
+  if [[ -f $(dropin_path) ]]; then deactivate; else restore_config; fi
   rm -rf "${BUILD:?}" "${ROOT:?}/modules"
 }
 
@@ -383,10 +470,12 @@ main() {
     deactivate) need_root; deactivate ;;
     remove)     need_root; cmd_remove ;;
     pre)        cmd_pre ;;
+    fit)        need_root; [[ -x $BUILD/angie ]] || die "no build"; fit_config "$BUILD/angie" ;;
+    restore)    need_root; restore_config ;;
     apt-hook)   cmd_apt_hook ;;
     refresh)    cmd_refresh ;;
     status)     cmd_status ;;
-    *) die "usage: $0 build|bolt [S]|rebuild|check|versions|activate|deactivate|remove|pre|apt-hook|refresh|status" ;;
+    *) die "usage: $0 build|bolt [S]|rebuild|check|versions|activate|deactivate|remove|pre|fit|restore|apt-hook|refresh|status" ;;
   esac
 }
 

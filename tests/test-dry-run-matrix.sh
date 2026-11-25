@@ -382,6 +382,15 @@ run_env ok SETUP_PHP_JIT_WORDPRESS=1 --dry-run --optimize
 run_env ok SETUP_TCP_CC=cubic --dry-run --optimize
 run_env ok SETUP_QDISC=fq_codel --dry-run --optimize
 run_env ok SETUP_LIMIT_REQ_EXEMPT=10.0.0.5 --dry-run --optimize
+# --source (1.21.71): the complete set of compiled components.
+run ok   --dry-run --optimize --source=all
+run ok   --dry-run --optimize --source angie php
+run ok   --dry-run --optimize --source=none
+run ok   --dry-run --basic --angie --php --valkey --source=valkey
+run fail --dry-run --optimize --source=nginx
+run fail --dry-run --optimize --source
+run_env ok SETUP_VALKEY_BUILD=clang --dry-run --optimize
+run_env fail SETUP_VALKEY_BUILD=gcc --dry-run --optimize
 run_env ok SETUP_PRECOMPRESS_ASSETS=1 --dry-run --optimize
 # An invalid SETUP_NODE_MAJOR falls back to the default major, never fails.
 run_env ok SETUP_NODE_MAJOR=bogus --dry-run --basic --others nodejs

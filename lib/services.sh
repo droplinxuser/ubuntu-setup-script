@@ -1468,6 +1468,9 @@ install_valkey() {
   wait_for_cmd 20 valkey_pong valkey-cli -s "$socket" || true
   valkey-cli -s "$socket" ping \
     || warn "Valkey did not answer PING on ${socket} (a requirepass in the adopted configuration needs AUTH)"
+  # VALKEY_BUILD=clang: the compiled Valkey (BOLT from a benchmark run).
+  valkey_build_apply info \
+    || warn "Valkey: VALKEY_BUILD=${VALKEY_BUILD} build failed; the package's Valkey keeps serving"
   ok "Valkey installed and running"
 }
 

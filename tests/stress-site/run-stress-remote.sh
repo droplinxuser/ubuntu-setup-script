@@ -40,9 +40,10 @@ HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd -- "$HERE/../.." && pwd)
 OHA=${OHA:-$ROOT/.tools/oha}
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/stress-remote.XXXXXX")
-# Scenarios whose answer was dominated by HTTP 429.  Angie caps GET at
-# 100 r/s per address (http.d/limit_req.conf) and a remote load generator is
-# throttled unless it is exempted with SETUP_LIMIT_REQ_EXEMPT.  A throttled
+# Scenarios whose answer was dominated by HTTP 429.  Since 1.21.71 Angie
+# limits only login/registration POSTs (http.d/limit_req.conf), so a 429 here
+# means a scenario hit a credential endpoint or an older host still has the
+# generic per-IP zones.  A throttled
 # run answers almost instantly, so oha reports a huge, meaningless requests/s
 # (a 200-connection run measured 21k r/s with 168k 429s).  Track it and fail
 # the run instead of publishing the number.
@@ -174,8 +175,8 @@ if [[ -n $RATE_LIMITED_SCENARIOS ]]; then
     echo "$RATE_LIMITED_SCENARIOS"
     echo '```'
     echo
-    echo "Exempt the load generator and re-run:"
-    echo "SETUP_LIMIT_REQ_EXEMPT=<client-ip>/32 setup.sh --optimize on the host."
+    echo "Update the host (setup.sh 1.21.71+ --optimize drops the generic per-IP"
+    echo "limits) or keep scenarios off the login/registration endpoints."
   } >> "$REPORT"
   echo "ERROR: rate-limited by Angie; results are not valid (see the WARNING section)" >&2
 fi

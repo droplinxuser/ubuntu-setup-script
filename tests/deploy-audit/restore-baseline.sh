@@ -116,6 +116,17 @@ rm -f /etc/systemd/system/setup-angie-build.service /etc/systemd/system/setup-an
       /etc/systemd/system/angie.service.d/zz-setup-build.conf /etc/apt/apt.conf.d/99setup-angie-build \
       /run/systemd/system/angie.service.d/zz-bench-angie.conf /etc/angie/angie-bench-src.conf
 rm -rf /usr/local/lib/setup-angie /var/cache/setup-angie-build /opt/angie-*
+# VALKEY_BUILD=clang (1.21.71), the Valkey/nginx/Elasticsearch A/B arms and
+# their sources.
+systemctl disable --now setup-valkey-build-refresh.timer >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/setup-valkey-build.service /etc/systemd/system/setup-valkey-build-refresh.* \
+      /etc/systemd/system/valkey-server.service.d/zz-setup-build.conf /etc/apt/apt.conf.d/99setup-valkey-build \
+      /run/systemd/system/valkey-server.service.d/zz-bench-valkey.conf \
+      /run/systemd/system/elasticsearch.service.d/zz-lean.conf
+rm -rf /usr/local/lib/setup-valkey /var/cache/setup-valkey-build /opt/valkey-* /opt/nginx-* /opt/es-lean \
+       /etc/elasticsearch-lean /var/lib/es-lean /var/tmp/es-exp \
+       /etc/angie-ng \
+       /root/vk-proto /root/ng-proto /root/angie-proto /root/es-dl /root/ng-test.conf
 id lsadm >/dev/null 2>&1 && userdel lsadm >/dev/null 2>&1 || true
 rm -rf /var/www /etc/angie /etc/php /etc/mysql /etc/valkey /etc/redis /etc/elasticsearch \
        /var/lib/setup.sh /var/lib/mysql /var/lib/mariadb /var/lib/valkey /var/lib/redis /var/lib/elasticsearch \

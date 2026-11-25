@@ -562,8 +562,12 @@ TLS_REJECT_OFF_MARK='# setup.sh: off, a reverse proxy in front may connect witho
 #   set_real_ip_from ADDR             the proxy's X-Forwarded-For is trusted
 #   allow ADDR                        origin locked down to the proxy
 #   $realip_remote_addr != "ADDR"     the Pingvin-template 444 gate
-#   ADDR 1; # setup.sh exempt         rate-limit exemption (LIMIT_REQ_EXEMPT)
+#   ADDR 1; # setup.sh exempt         rate-limit exemption a pre-1.21.71
+#                                     limit_req.conf still carries
 #   ADDR:https on;                    custom.d/https_trusted_peers.map
+# plus every LIMIT_REQ_EXEMPT entry an older release persisted in
+# /etc/default/setup-tuning ("setup-tuning:ADDR"): the 1.6.61 tree has no
+# exemption list left, and such an address was usually a proxy in front.
 # Directives sharing a line are split on ';' first.  Skipped: unix: sources
 # (a local socket never makes a TLS handshake), loopback, `all`, and
 # addresses inside a Cloudflare range of http.d/cloudflare.conf (a CIDR only
@@ -630,6 +634,13 @@ tls_reject_front_proxies() {
     done
     queue=("${next[@]}")
     depth=$(( depth + 1 ))
+  done
+  local -a exempt=()
+  IFS=', ' read -r -a exempt <<< "${LIMIT_REQ_EXEMPT:-}"
+  for src in "${exempt[@]}"; do
+    [[ -n $src ]] || continue
+    [[ $src =~ ^(127\.|::1(/|$)) ]] && continue
+    tls_reject_addr_is_cf "$src" "${cf[@]}" || printf 'setup-tuning:%s\n' "$src"
   done
   return 0
 }
@@ -1663,86 +1674,11 @@ tune_angie_dedupe_http() {
   return 0
 }
 
-
-# Per-IP rate limiting exempts loopback only.  A load generator, uptime
-# monitor or reverse proxy on another host is throttled to 100 GET/s and
-# answered with 429, which silently invalidates a remote benchmark (every
-# earlier external run that used wrk, which does not report status codes,
-# measured the rate limiter).  SETUP_LIMIT_REQ_EXEMPT="10.0.0.5,192.0.2.0/24"
-# adds managed entries to the geo whitelist; an empty value removes them.
-# True when an exemption is a real IPv4/IPv6 host or CIDR block.  Angie's geo
-# parser treats a malformed entry as NGX_LOG_EMERG ("invalid network"), which
-# makes `angie -t` fail and rolls the whole tune back, so the value must be
-# checked before it is written.
-tune_valid_exempt_entry() {
-  local e=$1 host=$1 mask="" IFS group nonempty=0
-  [[ $e == */* ]] && { host=${e%%/*}; mask=${e##*/}; }
-  if [[ $host =~ ^[0-9.]+$ ]]; then
-    validate_ipv4 "$host" || return 1
-    if [[ -n $mask ]]; then
-      [[ $mask =~ ^[0-9]{1,2}$ ]] && (( 10#$mask <= 32 )) || return 1
-    fi
-    return 0
-  fi
-  [[ $host == *:* ]] || return 1
-  [[ $host =~ ^[0-9A-Fa-f:]+$ ]] || return 1
-  [[ $host == *:::* || $host == *::*::* ]] && return 1
-  local -a parts
-  IFS=: read -r -a parts <<< "$host"
-  for group in "${parts[@]}"; do
-    [[ -z $group ]] && continue
-    [[ $group =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
-    nonempty=$(( nonempty + 1 ))
-  done
-  (( nonempty <= 8 )) || return 1
-  # Without a "::" compression all eight groups must be present.
-  if [[ $host != *::* ]]; then
-    (( nonempty == 8 )) || return 1
-  fi
-  if [[ -n $mask ]]; then
-    [[ $mask =~ ^[0-9]{1,3}$ ]] && (( 10#$mask <= 128 )) || return 1
-  fi
-  return 0
-}
-
-tune_limit_req_exemptions() {
-  local file=$1 label=$2 tmp entry
-  local -a entries=()
-  grep -qE '^[[:space:]]*geo[[:space:]]+\$limit_req_whitelist[[:space:]]*[{]' "$file" || return 0
-  local raw=${LIMIT_REQ_EXEMPT:-}
-  raw=${raw//,/ }
-  for entry in $raw; do
-    tune_valid_exempt_entry "$entry" || {
-      tune_miss "${label}: ignoring invalid SETUP_LIMIT_REQ_EXEMPT entry '${entry}'"
-      continue
-    }
-    entries+=("$entry")
-  done
-  tmp=$(tmp_file) || return 1
-  awk -v n="${#entries[@]}" -v list="${entries[*]}" '
-    BEGIN { split(list, arr, " ") }
-    /# setup.sh exempt$/ { next }
-    { print }
-    /^[[:space:]]*geo[[:space:]]+\$limit_req_whitelist[[:space:]]*[{]/ && !done {
-      for (i = 1; i <= n; i++) printf "    %s 1; # setup.sh exempt\n", arr[i]
-      done = 1
-    }
-  ' "$file" > "$tmp" || return 1
-  if commit_if_changed "$file" "$tmp"; then
-    if (( ${#entries[@]} > 0 )); then
-      tune_note "${label}: rate-limit exemptions: ${entries[*]}"
-    else
-      tune_note "${label}: removed managed rate-limit exemptions"
-    fi
-  fi
-  return 0
-}
-
 # Record one KEY="VALUE" line in /etc/default/setup-tuning (the host file
 # every run sources at startup), replacing an existing line for the key.
 # Shared by every environment-supplied option that must survive a plain
-# --optimize: rate-limit exemptions, asset precompression, the OPcache JIT
-# mode and the Node.js major.
+# --optimize: asset precompression, the OPcache JIT mode, the Node.js major
+# and the build modes.
 persist_tuning_var() {
   local key=$1 value=$2 f=${SETUP_TUNING_FILE:-/etc/default/setup-tuning} line
   # SETUP_TUNING_FILE is a test hook (a temporary file); the production path
@@ -1751,7 +1687,7 @@ persist_tuning_var() {
   # The host file is sourced as root on every run, so the value is written
   # shell-quoted (%q) rather than wrapped in double quotes: a value that
   # contains a quote, $(...) or a backtick (an operator typo in
-  # SETUP_LIMIT_REQ_EXEMPT, say) must stay data, not become a command.
+  # SETUP_PRECOMPRESS_ASSETS, say) must stay data, not become a command.
   printf -v line '%s=%q' "$key" "$value"
   if [[ -f $f ]] && grep -qE "^${key}=" "$f"; then
     sed_in_place -E "s|^${key}=.*|$(sed_replacement_escape "$line")|" "$f"
@@ -1761,17 +1697,8 @@ persist_tuning_var() {
   chmod 644 "$f" 2>/dev/null || true
 }
 
-# Keep an environment-supplied exemption list in /etc/default/setup-tuning so
-# the next plain --optimize does not silently remove it again.
-persist_limit_req_exemptions() {
-  (( LIMIT_REQ_EXEMPT_PERSIST )) || return 0
-  [[ ${EUID} -eq 0 ]] || return 0
-  persist_tuning_var LIMIT_REQ_EXEMPT "$LIMIT_REQ_EXEMPT"
-  tune_note "limit_req: exemptions persisted in /etc/default/setup-tuning"
-}
-
-# Keep SETUP_PRECOMPRESS_ASSETS in /etc/default/setup-tuning like the
-# exemption list, so a plain --optimize keeps the operator's choice.
+# Keep SETUP_PRECOMPRESS_ASSETS in /etc/default/setup-tuning, so a plain
+# --optimize keeps the operator's choice.
 persist_precompress_assets() {
   (( PRECOMPRESS_ASSETS_PERSIST )) || return 0
   [[ ${EUID} -eq 0 ]] || return 0
@@ -2137,7 +2064,6 @@ tune_angie_configs() {
   local cache_total_mb fcgi_mb chev_mb xf_mb proxy_mb cdn_mb
   local fcgi_zone chev_zone xf_zone proxy_zone cdn_zone
   local fcgi_size chev_size xf_size proxy_size cdn_size
-  local limit_post limit_get
 
   nproc=$(effective_cpus)
   (( nproc > 0 )) || nproc=1
@@ -2401,15 +2327,9 @@ tune_angie_configs() {
     tune_miss "http.d: no active proxy_cache_path"
   fi
 
-  limit_post=$(tune_clamp $(( mem_mb / 4096 )) 8 32)
-  limit_get=$(tune_clamp $(( mem_mb / 2048 )) 16 64)
+  # Only the credential zone is left (1.6.61); its fixed 16m holds ~128k
+  # client keys, so it is not sized from memory like the old GET/POST zones.
   if [[ -n $f_limit ]]; then
-    tune_replace "$f_limit" \
-      'zone=limit_req_post_head:[0-9]+m' "zone=limit_req_post_head:${limit_post}m" \
-      "${f_limit#"${target}"/}: POST zone=${limit_post}m"
-    tune_replace "$f_limit" \
-      'zone=limit_req_get_perip:[0-9]+m' "zone=limit_req_get_perip:${limit_get}m" \
-      "${f_limit#"${target}"/}: GET zone=${limit_get}m"
     # A flood of rejected requests must not turn into a flood of log writes:
     # at 20k req/s the per-rejection warning wrote 266 MB of error log in two
     # minutes (measured), which is a self-inflicted disk bottleneck.  Log
@@ -2420,8 +2340,6 @@ tune_angie_configs() {
       "${f_limit#"${target}"/}: limit_req_log_level=info"
     tune_ensure_line "$f_limit" '^[[:space:]]*limit_req_log_level[[:space:]]' \
       'limit_req_log_level info;' "${f_limit#"${target}"/}: added limit_req_log_level=info"
-    tune_limit_req_exemptions "$f_limit" "${f_limit#"${target}"/}"
-    persist_limit_req_exemptions
   else
     tune_miss "http.d: no active limit_req_zone"
   fi

@@ -7,7 +7,40 @@ manifests, sweep tables and run logs these sections cite (`AUDIT-*.md`,
 removed from the tree on 2026-11-19 to keep the repository lean; every one
 is still in git history, for example
 `git show 84b0db5:tests/stress-site/AUDIT-20261117-1.21.30.md`.  The current
-cycle report is `AUDIT-20261125-1.21.70.md`.
+cycle report is `AUDIT-20261125-1.21.71.md`.
+
+## 1.21.71 — Xeon E-2236 (2026-11-25)
+
+Pair: `server-configs-nginx` 1.6.61.  Details: `AUDIT-20261125-1.21.71.md`.
+Mitigations off (operator request, test host only).
+
+- **`--source=all|angie,php,valkey|none`** (new) through `setup.sh --optimize`
+  under load: all three builds made and BOLTed in 25 minutes; each links
+  only glibc (Angie also libcrypt for `auth_basic`, Valkey libgcc_s).  A
+  plain `--optimize` kept all three; `--source=none` removed them.
+- **Compiled Valkey** 9.2.0 + BOLT vs the 9.0.6 package: pipelined GET / SET
+  +3.1 / +2.6 %, single requests 0 to +1.5 %.  The first prototype was
+  32-41 % *slower*: `CFLAGS=` on make's command line built the bundled
+  jemalloc and Lua unoptimised (9,430 instructions per request against
+  6,152 for the package; 5,926 fixed).
+- **Security:** BOLT's `-use-gnu-stack` removed `PT_GNU_STACK`, giving the
+  BOLTed php-fpm and Angie (1.21.69/70) an executable stack; fixed and
+  checked, recipes bumped.
+- **PHP flags:** shipped LTO + BOLT vs the package +9.4 / +8.4 / +6.5 /
+  +6.9 / +11.3 % (XenForo thread / home, WordPress home / post, Chevereto
+  uncached); `-fno-plt` + LTO `-O3` within the noise; aggressive inlining
+  2-4 % slower.
+- **nginx vs Angie**, both compiled the same way, identical files: nginx
+  +0.5 to +1.5 % on cached pages, tie on PHP pages.
+- **Not compiled:** MariaDB (8-13 % of a member page's server CPU);
+  Elasticsearch (Java; ES 9 refuses a trimmed module set).
+- **Auto-commented directives:** a test vhost's `sub_filter` (multi-line),
+  `sub_filter_once`, `limit_conn` and `limit_conn_zone` were commented out
+  on activation and restored byte for byte on `--source=none`;
+  `auth_basic` answered 401/200 on the build; the login limiter answered
+  429 from the 12th fast attempt.
+- Suites: unit 1,721, dry runs 235; on the three builds through `setup.sh`:
+  security 78/78, cookie 105/105, functional 0 failures.
 
 ## 1.21.70 — Xeon E-2236 (2026-11-25)
 
