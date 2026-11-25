@@ -20,8 +20,36 @@ OPT_CUTOVER=0
 # buffer pool.
 OPT_WEB_PAUSED_NGINX=0
 OPT_WEB_PAUSED_PHP=()
+# 1.22: services are detected from our builds, never from dpkg.
+# OPT_WEB_LEGACY=1 while Angie still serves (web_server_state angie-legacy:
+# the migration's nginx part is refused or pending).  The web tier (nginx
+# and PHP-FPM) is then left alone: no code path may apply nginx-tree logic
+# to /etc/angie (R19/R51).  OPT_DETECT_NOTES holds the report lines for what
+# was found but is not tuned (legacy packages, the small-host gate).
+# OPT_DETECT_LEGACY=1 makes detection also count the package services the
+# migration is about to replace, so the memory plan the migration renders
+# with (nginx_apply_profile, the cache budget) already books them.
+OPT_WEB_LEGACY=0
+OPT_DETECT_NOTES=()
+OPT_DETECT_LEGACY=0
+# migrate_run's status in this run: 0 done or nothing to do, 1 a part
+# failed or rolled back, 2 legacy-Angie mode.
+OPT_MIGRATE_RC=0
 
 opt_report() { OPT_REPORT+=("$*"); }
+
+# Absolute paths of our builds (R2.1: every binary from one variable).  The
+# defaults match lib/nginx-build.sh and lib/valkey-build.sh, so a caller that
+# has not sourced them (tests, the dry run) still never reaches a dpkg path.
+opt_nginx_bin() { printf '%s' "${NGINX_BIN:-/usr/local/lib/setup-nginx/sbin/nginx}"; }
+opt_valkey_server_bin() { printf '%s' "${VALKEY_SERVER_BIN:-/usr/local/lib/setup-valkey/bin/valkey-server}"; }
+# Our valkey-cli when the build is installed; otherwise the one on PATH (a
+# package Valkey the migration has not replaced yet, read by the planner).
+opt_valkey_cli() {
+  local cli=${VALKEY_CLI_BIN:-/usr/local/lib/setup-valkey/bin/valkey-cli}
+  if [[ -x $cli ]]; then printf '%s' "$cli"; return 0; fi
+  command -v valkey-cli 2>/dev/null || printf '%s' "$cli"
+}
 
 opt_backup() {
   local path=$1 name=$2
@@ -181,23 +209,146 @@ elasticsearch_restart_probe() {
   return 1
 }
 
+# Small-host gate (section 7): "4 GB class" = MemTotal >= 3500 MB.  Below
+# it a host runs nginx only: --php/--valkey (and the other PHP-dependent
+# installs) are refused, and --optimize neither migrates nor tunes a PHP or
+# Valkey left over from 1.21.  SETUP_MEM_TOTAL_MB is honoured only in the
+# dry run and source-only test mode (R2.14), never to bypass the gate on a
+# real run.  Defined here only when no other module has (the validate glue
+# may own the canonical copy; both follow the same rule).
+if ! declare -F mem_class_mb >/dev/null 2>&1; then
+  mem_class_mb() {
+    local kb
+    if [[ ${SETUP_MEM_TOTAL_MB:-} =~ ^[0-9]+$ ]] \
+       && { (( ${DRY_RUN:-0} )) || [[ ${SETUP_SOURCE_ONLY:-0} == 1 ]]; }; then
+      printf '%s' "$SETUP_MEM_TOTAL_MB"; return 0
+    fi
+    kb=$(awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo 2>/dev/null || true)
+    [[ $kb =~ ^[0-9]+$ ]] || kb=0
+    printf '%s' "$(( kb / 1024 ))"
+  }
+fi
+if ! declare -F mem_gate_allows >/dev/null 2>&1; then
+  # mem_gate_allows SERVICE: 0 when SERVICE may run on this host.
+  mem_gate_allows() {
+    local mb
+    case ${1:-} in
+      nginx|basic|domain-proxy) return 0 ;;
+    esac
+    mb=$(mem_class_mb)
+    # An unreadable /proc/meminfo must not refuse a working host.
+    [[ $mb =~ ^[0-9]+$ ]] && (( mb > 0 )) || return 0
+    (( mb >= 3500 ))
+  }
+fi
+
+# 0 when PHP X.Y is served by our build: the compiled php-fpm and its
+# build.info under the build root, and (with lib/php-build.sh loaded) our
+# phpX.Y-fpm unit.  A Sury unit that still serves beside a build left by a
+# rolled-back migration is not ours.  Never runs the binary (R60).
+php_fpm_is_ours() {
+  local ver=$1 bin
+  if declare -F php_fpm_bin >/dev/null 2>&1; then
+    bin=$(php_fpm_bin "$ver")
+  else
+    bin="${PHP_BUILD_ROOT:-/usr/local/lib/setup-php}/${ver}/sbin/php-fpm"
+  fi
+  [[ -x $bin && -f ${bin%/sbin/php-fpm}/build.info ]] || return 1
+  if declare -F php_build_unit_is_ours >/dev/null 2>&1; then
+    php_build_unit_is_ours "$ver" || return 1
+  fi
+  return 0
+}
+
+# Versions that still run from a php-fpm package (Sury/Ubuntu) and have a
+# pool: the migration's PHP part (or the small-host refusal) owns them.
+php_fpm_legacy_versions() {
+  local d ver
+  for d in /etc/php/*/fpm; do
+    [[ -d $d ]] || continue
+    ver=$(basename "$(dirname "$d")")
+    [[ $ver =~ ^[0-9]+\.[0-9]+$ ]] || continue
+    compgen -G "${d}/pool.d/*.conf" >/dev/null 2>&1 || continue
+    php_fpm_is_ours "$ver" && continue
+    [[ -x /usr/sbin/php-fpm${ver} ]] || continue
+    printf '%s\n' "$ver"
+  done | sort -V
+}
+
+# 0 when Valkey is our build: the binary, its config and (with
+# lib/valkey-build.sh loaded) our valkey-server.service.
+valkey_is_ours() {
+  [[ -x $(opt_valkey_server_bin) && -f /etc/valkey/valkey.conf ]] || return 1
+  if declare -F valkey_unit_is_ours >/dev/null 2>&1; then
+    valkey_unit_is_ours || return 1
+  fi
+  return 0
+}
+
+# detect_installed_services [migrate]
+# Fills OPT_DETECTED with what --optimize tunes: nginx, php:X.Y, mariadb,
+# valkey, redis, elastic (the tags the planner, the cache budget and the
+# restart code match).  nginx, PHP and Valkey count only as our builds; a
+# package left over from 1.21 is reported in OPT_DETECT_NOTES, not tuned.
+# With "migrate", the package services the 1.22 migration will replace are
+# counted as well (planning only; nothing is tuned from that list).
 detect_installed_services() {
+  local mode=${1:-} ver state="" legacy=""
   OPT_DETECTED=()
-  [[ -x /usr/sbin/nginx && -f /etc/nginx/nginx.conf ]] && OPT_DETECTED+=(nginx)
-  local ver
+  OPT_DETECT_NOTES=()
+  OPT_WEB_LEGACY=0
+  OPT_DETECT_LEGACY=0
+  [[ $mode == migrate ]] && OPT_DETECT_LEGACY=1
+  if declare -F web_server_state >/dev/null 2>&1; then
+    state=$(web_server_state 2>/dev/null || true)
+  fi
+  if [[ $state == angie-legacy ]]; then
+    if (( OPT_DETECT_LEGACY )); then
+      OPT_DETECTED+=(nginx)
+    else
+      OPT_WEB_LEGACY=1
+      OPT_DETECT_NOTES+=("Web server: Angie still serves (legacy mode: the 1.22 migration's nginx part is not done); nginx and PHP-FPM tuning skipped, /etc/angie left as it is")
+    fi
+  elif [[ -x $(opt_nginx_bin) && -f /etc/nginx/nginx.conf ]]; then
+    OPT_DETECTED+=(nginx)
+  fi
   # A stale /etc/php/<ver>/fpm directory survives a purge on some hosts.  Only
   # treat a version as installed when it still has a pool config; otherwise
   # --optimize would create systemd drop-ins for a service that does not exist.
-  while IFS= read -r ver; do
-    OPT_DETECTED+=("php:${ver}")
-  done < <(php_fpm_versions)
+  if (( OPT_WEB_LEGACY )); then
+    legacy=$( { php_fpm_versions; php_fpm_legacy_versions; } | sort -uV | paste -sd' ' - || true)
+    [[ -n $legacy ]] && OPT_DETECT_NOTES+=("PHP-FPM ${legacy}: not tuned while Angie serves (web tier left alone in legacy mode)")
+  elif ! mem_gate_allows php; then
+    legacy=$( { php_fpm_versions; php_fpm_legacy_versions; } | sort -uV | paste -sd' ' - || true)
+    [[ -n $legacy ]] && OPT_DETECT_NOTES+=("PHP-FPM ${legacy}: not tuned or migrated (under the 4 GB class this host runs nginx only)")
+  else
+    while IFS= read -r ver; do
+      [[ -n $ver ]] && OPT_DETECTED+=("php:${ver}")
+    done < <(php_fpm_versions)
+    if (( ! OPT_DETECT_LEGACY )); then
+      legacy=$(php_fpm_legacy_versions | paste -sd' ' - || true)
+      [[ -n $legacy ]] && OPT_DETECT_NOTES+=("PHP-FPM ${legacy}: still the php-fpm package, not tuned (the 1.22 migration moves it to the compiled build; see its report lines)")
+    fi
+  fi
   # The server binary, not the client: a web node with mariadb-client and a
   # remote database is not a local MariaDB host (it was planned a buffer pool,
   # 1.0 PHP workers per core and a systemd drop-in for a unit it lacks).
   if command -v mariadbd >/dev/null 2>&1; then
     [[ -d /etc/mysql ]] && OPT_DETECTED+=(mariadb)
   fi
-  [[ -f /etc/valkey/valkey.conf ]] && OPT_DETECTED+=(valkey)
+  if [[ -f /etc/valkey/valkey.conf ]]; then
+    if ! mem_gate_allows valkey; then
+      OPT_DETECT_NOTES+=("Valkey: not tuned or migrated (under the 4 GB class this host runs nginx only)")
+    elif valkey_is_ours; then
+      OPT_DETECTED+=(valkey)
+    elif (( OPT_DETECT_LEGACY )); then
+      # The package server the migration replaces keeps its dataset and
+      # maxmemory: plan its cache budget now.
+      OPT_DETECTED+=(valkey)
+    else
+      OPT_DETECT_NOTES+=("Valkey: still the valkey-server package (or a server that is not the 1.22 build), not tuned; the 1.22 migration moves it to the compiled build")
+    fi
+  fi
   # Valkey takes precedence.  Tuning both would apply the same shared cache
   # budget twice and could overcommit RAM; Redis-only hosts still get the
   # complete Valkey tuning profile.
@@ -205,6 +356,66 @@ detect_installed_services() {
     OPT_DETECTED+=(redis)
   fi
   [[ -f /etc/elasticsearch/elasticsearch.yml ]] && OPT_DETECTED+=(elastic)
+  return 0
+}
+
+# The 1.22 one-time migration (lib/migrate.sh: Angie -> nginx, Sury PHP and
+# the valkey-server package -> our builds), as the first service step of
+# --optimize.  run_optimize calls it once, right after plan_memory_budget and
+# before run_os_tuning or any tuner:
+#     optimize_migration_step || rc=1
+# When a migration is pending (or running in its unit) it re-plans as the
+# migration will leave the host (the render's nginx_apply_profile and cache
+# budget need the PHP and Valkey it moves), runs migrate_run with opt_report
+# as OUT (the unit's report lines land in this run's report), then detects
+# again from the builds and re-plans, so every later step tunes what now
+# serves.  Legacy-Angie mode (migrate_run rc 2, or web_server_state
+# angie-legacy) leaves OPT_WEB_LEGACY=1: run_optimize then skips the web
+# tier (optimize_nginx and optimize_php_services refuse on their own too).
+# What was found but is not tuned is reported under "Not tuned".
+# Returns 1 when a migration part failed or rolled back (the run must report
+# a failure; the remaining services are still tuned).  Never runs under
+# --dry-run (optimize_plan prints migrate_plan instead).  OPT_SKIP_MIGRATION=1
+# (the closing pass after --domain) only detects and reports: the migration
+# belongs to an explicit --optimize, not to a domain install.
+optimize_migration_step() {
+  local need=0 note
+  OPT_MIGRATE_RC=0
+  if declare -F migrate_run >/dev/null 2>&1 && (( ! ${DRY_RUN:-0} )) \
+     && [[ ${OPT_SKIP_MIGRATION:-0} != 1 ]]; then
+    if declare -F migrate_running >/dev/null 2>&1 && migrate_running; then
+      need=1
+    elif declare -F migrate_needed >/dev/null 2>&1 && migrate_needed; then
+      need=1
+    fi
+  fi
+  if (( need )); then
+    step "1.22 migration (nginx, compiled PHP and Valkey replace Angie and the packages)"
+    detect_installed_services migrate
+    plan_memory_budget
+    opt_report "## Migration 1.22"
+    # Plain call with the status captured: migrate_run's own error handling
+    # decides what rolls back; a failed part must not stop the tuners of the
+    # services that already serve.
+    migrate_run opt_report || OPT_MIGRATE_RC=$?
+    case $OPT_MIGRATE_RC in
+      0) opt_report "- Migration: finished for this run" ;;
+      2) opt_report "- Migration: the nginx part is not done; Angie keeps serving (legacy mode)" ;;
+      *) opt_report "- **FAILED** Migration: a part failed or was rolled back (see the lines above and ${MIGRATE_LOG:-/var/log/setup-migrate-1.22.log})" ;;
+    esac
+    detect_installed_services
+    (( OPT_MIGRATE_RC == 2 )) && OPT_WEB_LEGACY=1
+    # The new services own memory the first plan did not see (or the old
+    # ones are gone): plan once more from what serves now.
+    plan_memory_budget
+  fi
+  if (( ${#OPT_DETECT_NOTES[@]} > 0 )); then
+    opt_report "## Not tuned"
+    for note in "${OPT_DETECT_NOTES[@]}"; do
+      opt_report "- ${note}"
+    done
+  fi
+  (( OPT_MIGRATE_RC == 1 )) && return 1
   return 0
 }
 
@@ -1534,16 +1745,25 @@ memory_plan_summary() {
   return 0
 }
 
-php_fpm_versions() {  local d ver
+# PHP versions --optimize tunes: a pool under /etc/php/X.Y/fpm/pool.d and
+# our compiled build for X.Y (php_fpm_is_ours).  A leftover directory with
+# no pool (common after `--purge --php ver=X`) is not an installed service,
+# and a Sury/Ubuntu php-fpm package is never counted (1.22 is source-only;
+# the migration owns those).  Under OPT_DETECT_LEGACY=1 (planning for the
+# migration) the running package versions it will move count as well.
+php_fpm_versions() {
+  local d ver
   for d in /etc/php/*/fpm; do
     [[ -d $d ]] || continue
     ver=$(basename "$(dirname "$d")")
     [[ $ver =~ ^[0-9]+\.[0-9]+$ ]] || continue
-    # Require a real pool and the matching binary.  A leftover directory with
-    # no pool (common after `--purge --php ver=X`) is not an installed service.
     compgen -G "${d}/pool.d/*.conf" >/dev/null 2>&1 || continue
-    [[ -x "/usr/sbin/php-fpm${ver}" ]] || command -v "php-fpm${ver}" >/dev/null 2>&1 || continue
-    printf '%s\n' "$ver"
+    if php_fpm_is_ours "$ver"; then
+      printf '%s\n' "$ver"
+    elif (( ${OPT_DETECT_LEGACY:-0} )) && [[ -x /usr/sbin/php-fpm${ver} ]] \
+         && systemctl is-active --quiet "php${ver}-fpm" 2>/dev/null; then
+      printf '%s\n' "$ver"
+    fi
   done | sort -V
 }
 
@@ -1625,11 +1845,13 @@ php_pool_max_children() {
 # new pool measures.  It used to be 96 MB here, so --optimize on a host with
 # PHP-FPM stopped planned a smaller buffer pool than the install had written.
 php_worker_allowance_mb() {
-  local ver=${1:-} out avg=0 n=0 allowance=64
-  if [[ -n $ver ]]; then
+  local ver=${1:-} out="" avg=0 n=0 allowance=64
+  # Our build's processes are named php-fpm (ROOT/X.Y/sbin/php-fpm); only a
+  # package server the migration is about to replace runs as php-fpmX.Y.
+  out=$(ps -o rss= -C php-fpm 2>/dev/null || true)
+  if [[ -z $out && -n $ver ]]; then
     out=$(ps -o rss= -C "php-fpm${ver}" 2>/dev/null || true)
   fi
-  [[ -n ${out:-} ]] || out=$(ps -o rss= -C php-fpm 2>/dev/null || true)
   if [[ -n ${out:-} ]]; then
     read -r avg n < <(printf '%s\n' "$out" | awk '
       { sum += $1; n++ }
@@ -1650,7 +1872,15 @@ php_worker_allowance_mb() {
 }
 
 php_primary_version() {
-  local ver listen nginx_socket=""
+  local ver listen nginx_socket="" active=""
+  # 1.22 keeps one active version (/etc/php/setup-active, R61): it owns the
+  # shared socket and every other version of ours is disabled.
+  if declare -F php_active_version >/dev/null 2>&1; then
+    active=$(php_active_version 2>/dev/null || true)
+    if [[ -n $active ]] && php_fpm_versions | grep -qxF -- "$active"; then
+      printf '%s' "$active"; return 0
+    fi
+  fi
   # Prefer the pool that already owns the socket nginx talks to.
   if [[ -f /etc/nginx/nginx.conf ]]; then
     nginx_socket=$(awk '/^[[:space:]]*server[[:space:]]+unix:/{

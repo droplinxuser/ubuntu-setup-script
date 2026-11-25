@@ -19,6 +19,34 @@ TUNE_DIRTY=0
 # site is never pointed at a socket that does not exist.
 OPT_PHP_OK=0
 OPT_PHP_SOCKET=""
+
+# The compiled nginx (lib/nginx-build.sh sets NGINX_BIN; it is sourced after
+# this file, so every use resolves it at call time).  Never /usr/sbin/nginx:
+# that is the distro package path, which 1.22 never uses (R2.1), and the
+# migration installs a temporary shim there while a function still names it.
+NGINX_WEB_BIN_DEFAULT=/usr/local/lib/setup-nginx/sbin/nginx
+
+# Binary for `nginx -t` / `nginx -V` of a rendered tree: the migration's
+# candidate (NGINX_TEST_BIN, set while nothing serves from /etc/nginx yet)
+# first, then the installed build.
+nginx_test_bin() {
+  printf '%s' "${NGINX_TEST_BIN:-${NGINX_BIN:-$NGINX_WEB_BIN_DEFAULT}}"
+}
+
+# True when BIN is runnable (tests may stub it with a function of that name).
+nginx_bin_usable() {
+  [[ -n ${1:-} ]] && { [[ -x $1 ]] || declare -F "$1" >/dev/null 2>&1; }
+}
+
+# `nginx -t` of the tree whose main file is CONF (default /etc/nginx), with
+# the test binary.  Relative includes resolve against dirname(CONF).  Output
+# goes to the caller's stdout/stderr.  Status 2 when there is no binary.
+nginx_test_tree() {
+  local conf=${1:-/etc/nginx/nginx.conf} bin
+  bin=$(nginx_test_bin)
+  nginx_bin_usable "$bin" || { printf 'no nginx binary at %s\n' "$bin" >&2; return 2; }
+  "$bin" -t -c "$conf"
+}
 tune_reset_changes() { TUNE_CHANGES=(); TUNE_MISSES=(); TUNE_DIRTY=0; }
 tune_note() { TUNE_CHANGES+=("$*"); TUNE_DIRTY=1; }
 # Informational line that must not count as a configuration change (and must
@@ -681,29 +709,52 @@ tune_default_tls_reject() {
   return 0
 }
 
-# server-configs-nginx shipped http.d/letsencrypt.conf as an active file for a
-# few hours on 2026-07-22 (d2bf9ac..6b0ac3a) before renaming it to the
-# inactive letsencrypt_conf.  The sync never removes a file that left the
-# repository, so hosts synced that day kept an `acme_client letsencrypt` that
-# no vhost uses, and every `nginx -t` warns 'ACME client "letsencrypt" is
-# defined but not used' (two live hosts, 2026-11-20).  The file is retired
-# (moved to /tmp, never deleted) only while it is byte-identical to the
-# shipped letsencrypt_conf and no vhost has an `acme letsencrypt` directive:
-# a host that uses nginx's built-in ACME keeps it.
+# The 1.22 nginx is built without an ACME module, so an active `acme_client`
+# fails nginx -t ("unknown directive").  server-configs-nginx shipped
+# http.d/letsencrypt.conf as an active file for a few hours on 2026-07-22
+# (d2bf9ac..6b0ac3a) before renaming it to the inactive letsencrypt_conf, and
+# the sync never removes a file that left the repository, so hosts synced
+# that day kept an `acme_client letsencrypt` (two live hosts, 2026-11-20).
+# Every http.d/*.conf whose only active content is acme_client definitions
+# is retired (moved to /tmp, never deleted) while no vhost uses `acme` or an
+# $acme_cert_* variable.  Such a vhost is left to the migration's ACME ->
+# self-signed rewrite (lib/migrate.sh, step 6) and reported here: retiring
+# its client alone would not make the tree load, and the operator must see
+# why nginx -t fails.
 tune_retire_unused_acme_client() {
-  local target=$1 f="$1/http.d/letsencrypt.conf" shipped="$1/http.d/letsencrypt_conf" moved
-  [[ -f $f && -f $shipped ]] || return 0
-  cmp -s "$f" "$shipped" || return 0
-  if grep -rqsE '^[[:space:]]*acme[[:space:]]+letsencrypt[[:space:]]*;' \
-       "$target/conf.d" "$target/http.d" "$target/snippets" 2>/dev/null; then
+  local target=$1 f moved
+  [[ -d $target/http.d ]] || return 0
+  if grep -rqsE '^[^#]*(\$acme_cert_|(^|[[:space:];{])acme[[:space:]]+[A-Za-z0-9_]+[[:space:]]*;)' \
+       "$target/conf.d" "$target/http.d" "$target/snippets" "$target/custom.d" 2>/dev/null; then
+    info "A vhost under ${target} still uses acme/\$acme_cert_*; this nginx has no ACME module"
+    tune_miss "ACME: a vhost under ${target} still uses acme or \$acme_cert_*; this nginx has no ACME module (the 1.22 migration moves such vhosts to the self-signed certificate)"
     return 0
   fi
-  moved=$(preserve_to_tmp "$f") || return 0
-  [[ -n $moved ]] || return 0
-  # info as well: the sync calls this before the tuner, which resets its notes.
-  info "Retired unused ACME client http.d/letsencrypt.conf -> ${moved} (not deleted)"
-  tune_note "http.d/letsencrypt.conf: unused ACME client retired to ${moved} (the repository ships it inactive as letsencrypt_conf)"
+  for f in "$target"/http.d/*.conf; do
+    [[ -f $f && ! -L $f ]] || continue
+    nginx_conf_only_acme_client "$f" || continue
+    moved=$(preserve_to_tmp "$f") || continue
+    [[ -n $moved ]] || continue
+    # info as well: the sync calls this before the tuner, which resets its notes.
+    info "Retired unused ACME client ${f#"$target"/} -> ${moved} (not deleted)"
+    tune_note "${f#"$target"/}: ACME client retired to ${moved} (this nginx has no ACME module)"
+  done
   return 0
+}
+
+# True when FILE has at least one acme_client definition (one line, several
+# lines, or a block) and no other active directive.
+nginx_conf_only_acme_client() {
+  awk '
+    { s = $0; sub(/#.*/, "", s); gsub(/^[ \t]+|[ \t]+$/, "", s) }
+    s == "" { next }
+    depth == 0 && !inside && s ~ /^acme_client([ \t]|$)/ { seen = 1; inside = 1 }
+    {
+      if (!inside && depth == 0) other = 1
+      t = s; n = gsub(/\{/, "", t); t = s; m = gsub(/\}/, "", t); depth += n - m
+      if (depth == 0 && s ~ /[;}]$/) inside = 0
+    }
+    END { exit !(seen && !other) }' "$1" 2>/dev/null
 }
 
 # ---------------------------------------------------------------------------
@@ -1100,7 +1151,7 @@ cloudflare_tls_finish() {
       rm -f -- "${CF_TLS_ORIG[i]}"
     done
     if (( restored )); then
-      if "${NGINX_BIN:-/usr/sbin/nginx}" -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null; then
+      if "${NGINX_BIN:-$NGINX_WEB_BIN_DEFAULT}" -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null; then
         opt_report "- Cloudflare TLS: restored vhost(s) reloaded"
       else
         opt_report "- **FAILED** Cloudflare TLS: reload after the restore failed; check \`nginx -t\`"
@@ -1128,7 +1179,7 @@ cf_tls_docker() { timeout 20 docker "$@"; }
 #   - symlinks into the tree under the same roots
 certbot_letsencrypt_users() {
   local etc=${CERTBOT_ETC:-/etc} le=${CERTBOT_DIR:-/etc/letsencrypt}
-  local nginx_bin=${NGINX_BIN:-/usr/sbin/nginx} dump root lnk hit hook
+  local nginx_bin=${NGINX_BIN:-$NGINX_WEB_BIN_DEFAULT} dump root lnk hit hook
   # The setup.sh state tree holds vhost copies that are put back live later;
   # they count as consumers too.
   local -a roots=("$etc") extra=(/opt /srv /usr/local /root /home /var/spool/cron "${STATE_DIR:-/var/lib/setup.sh}")
@@ -1174,6 +1225,7 @@ certbot_letsencrypt_users() {
   # configuration tree outside /etc/nginx (a server-configs-nginx checkout:
   # nginx.conf next to conf.d/templates, whose samples name certbot paths)
   # is not loaded; the loaded configuration is read through `nginx -T` above.
+  # A checkout of the 1.21 tree (SCN main) has angie.conf there instead.
   local -a own=() own_prune=()
   local d
   for root in "${roots[@]}"; do
@@ -1181,7 +1233,7 @@ certbot_letsencrypt_users() {
     while IFS= read -r -d '' d; do
       case $d in
         */lib/web.sh) d=${d%/lib/web.sh}; [[ -f $d/setup.sh ]] && own+=("$d") ;;
-        */conf.d/templates) d=${d%/conf.d/templates}; [[ -f $d/nginx.conf ]] && own+=("$d") ;;
+        */conf.d/templates) d=${d%/conf.d/templates}; [[ -f $d/nginx.conf || -f $d/angie.conf ]] && own+=("$d") ;;
       esac
     done < <(find "$root" -xdev -maxdepth 4 \( -path '*/lib/web.sh' -type f \
                -o -path '*/conf.d/templates' -type d \) -print0 2>/dev/null || true)
@@ -2632,11 +2684,15 @@ sync_php_ini_template() {
   return 0
 }
 
-# Path of the php-fpm binary for a version (PATH first, then the Debian
-# location), or non-zero when the version is not installed.
+# Path of the php-fpm binary for a version, or non-zero when the version is
+# not installed.  The 1.22 build (ROOT/X.Y/sbin/php-fpm, lib/php-build.sh)
+# comes first; PATH and the Debian location remain for a host whose PHP part
+# has not migrated yet (Sury still serves until its cutover).
 php_fpm_binary() {
   local ver=$1 bin
-  if bin=$(command -v "php-fpm${ver}" 2>/dev/null) && [[ -n $bin ]]; then
+  if declare -F php_fpm_bin >/dev/null 2>&1 && bin=$(php_fpm_bin "$ver") && [[ -x $bin ]]; then
+    printf '%s' "$bin"
+  elif bin=$(command -v "php-fpm${ver}" 2>/dev/null) && [[ -n $bin ]]; then
     printf '%s' "$bin"
   elif [[ -x "/usr/sbin/php-fpm${ver}" ]]; then
     printf '%s' "/usr/sbin/php-fpm${ver}"
@@ -2839,8 +2895,8 @@ php_session_hardening_load() {
 php_session_hardening_load
 
 persist_php_jit() {
-  php_build_persist
-  php_fpm_modules_persist
+  # PHP_BUILD / PHP_FPM_MODULES are no longer persisted: 1.22 always builds
+  # PHP from source with a static extension set (lib/php-build.sh).
   if (( PHP_SESSION_HARDENING_PERSIST )); then
     persist_tuning_var PHP_SESSION_HARDENING "$SETUP_PHP_SESSION_HARDENING"
     tune_note "PHP: PHP_SESSION_HARDENING=${SETUP_PHP_SESSION_HARDENING} persisted in /etc/default/setup-tuning"
@@ -3040,9 +3096,11 @@ tune_php_fpm_version() {
   memory_mb=$PHP_PROFILE_MEMORY_MB
   realpath_kb=$PHP_PROFILE_REALPATH_KB
 
-  mkdir -p /run/php
-  chown www-data:www-data /run/php 2>/dev/null || true
-  chmod 755 /run/php
+  # /run/php belongs to tmpfiles.d/setup-php.conf (root:root 0755) and the
+  # unit's RuntimeDirectory=, which re-chowns it on every start; the sockets
+  # inside carry listen.owner/group.  Only create it when it is missing, so
+  # the tuner does not fight the unit over its owner.
+  [[ -d /run/php ]] || install -d -m 755 /run/php
 
   # Always a static pool: the worker count is already sized to the host
   # (php_plan_max_children), resident workers answer the first request after
@@ -3191,11 +3249,22 @@ EOF
     fi
   fi
 
-  local fpm_bin fpm_test
+  # Test exactly what the unit starts.  The compiled php-fpm has no Debian
+  # defaults: a bare `-t` opens ROOT/X.Y/etc/php-fpm.conf and the CLI's ini
+  # scan dir, so php_fpm_test (-y, -c and PHP_INI_SCAN_DIR) is used for our
+  # build, and a package binary still gets the same explicit paths.
+  local fpm_bin fpm_test fpm_ok=1
   fpm_bin=$(php_fpm_binary "$ver" || true)
   if [[ -n $fpm_bin ]]; then
     fpm_test=$(tmp_file)
-    if ! "$fpm_bin" -t >"$fpm_test" 2>&1; then
+    if declare -F php_fpm_test >/dev/null 2>&1 && declare -F php_fpm_bin >/dev/null 2>&1 \
+       && [[ $fpm_bin == "$(php_fpm_bin "$ver")" ]]; then
+      php_fpm_test "$ver" >"$fpm_test" 2>&1 || fpm_ok=0
+    else
+      "$fpm_bin" -t -y "/etc/php/${ver}/fpm/php-fpm.conf" -c "/etc/php/${ver}/fpm/php.ini" \
+        >"$fpm_test" 2>&1 || fpm_ok=0
+    fi
+    if (( ! fpm_ok )); then
       printf 'PHP %s: php-fpm -t failed:\n' "$ver" >&2
       sed 's/^/  /' "$fpm_test" >&2 || true
       return 1
@@ -3211,51 +3280,57 @@ EOF
 # on by default since 1.21.58), so the per-request filters only see dynamic
 # responses and assets without a sibling.
 #
+# Brotli is compiled into the 1.22 nginx as a static module (--add-module,
+# tools/nginx-build.sh): no package, no load_module, no modules-enabled
+# stanza.  SCN's nginx.conf no longer includes modules-enabled, and a
+# load_module of a Brotli .so would fail nginx -t (there is no such file
+# under the build prefix).  ensure_nginx_compression therefore asks
+# `nginx -V` for the static ngx_brotli, writes http.d/brotli.conf as plain
+# directives, and retires the managed module stanzas and every live
+# load_module of Brotli or zstd (R45, R69).
+#
 # zstd was shipped in 1.21.58 and removed in 1.21.59.  It is cheaper than
 # Brotli for the same bytes (XenForo member thread: 19.4 KB at 0.84 ms of
 # nginx CPU vs Brotli 4's 18.3 KB at 2.1 ms), but Cloudflare asks origins for
 # "br, gzip" only, so on Cloudflare-fronted hosts the module never answered a
-# request.  Hosts that ran 1.21.58 have the stanzas moved away and
-# nginx-module-zstd purged (nginx_retire_zstd, nginx_purge_zstd_module).
+# request.  The 1.22 build has no zstd module at all, so the managed zstd
+# stanzas are always retired, and an operator file that still uses zstd
+# directives is reported (nginx -t rejects it).
 NGINX_COMPRESSION_CHANGED=0
 NGINX_COMPRESSION_SKIPPED=0
 NGINX_BROTLI_OK=0
 NGINX_BROTLI_LEVEL=4
 NGINX_ZSTD_RETIRED=0
+NGINX_MODULE_LOADS_RETIRED=0
+# Prefix of a load_module line commented out for the static build; deleting
+# the prefix restores the line.
+NGINX_LOAD_MODULE_OFF='# setup-1.22 static build: '
 
 # Move the managed zstd stanzas of 1.21.58 (60-zstd.conf, http.d/zstd.conf,
 # and an older 40-zstd.conf) out of the tree.  Only files that carry the
-# "Managed by setup.sh" header: an operator's own zstd stanza stays, and then
-# the module stays installed too (nginx_purge_zstd_module).
+# "Managed by setup.sh" header move; an operator's own zstd use is reported,
+# because this nginx cannot load the module whatever the stanza says.
 nginx_retire_zstd() {
-  local target=${1:-/etc/nginx} f moved
-  local -a managed=()
+  local target=${1:-/etc/nginx} f moved users
   NGINX_ZSTD_RETIRED=0
   for f in "${target}/modules-enabled/40-zstd.conf" "${target}/modules-enabled/60-zstd.conf" \
            "${target}/http.d/zstd.conf"; do
-    [[ -e $f ]] && grep -q '^# Managed by setup.sh' "$f" 2>/dev/null && managed+=("$f")
-  done
-  (( ${#managed[@]} )) || return 0
-  # An operator file that uses zstd directives relies on the managed
-  # load_module: moving it would make nginx reject the tree ("unknown
-  # directive"), so nothing is retired until that file stops using zstd.
-  local users
-  users=$(nginx_zstd_users "$target" "${managed[@]}")
-  if [[ -n $users ]]; then
-    tune_summary "zstd: kept the managed stanzas; zstd is still used by ${users//$'\n'/ } (remove it there to retire the module)"
-    return 0
-  fi
-  for f in "${managed[@]}"; do
+    [[ -e $f ]] && grep -q '^# Managed by setup.sh' "$f" 2>/dev/null || continue
     moved=$(preserve_to_tmp "$f" 2>/dev/null || true)
     [[ -n $moved ]] && info "Moved retired Zstandard file to ${moved}"
     NGINX_ZSTD_RETIRED=1
   done
+  users=$(nginx_zstd_users "$target")
+  if [[ -n $users ]]; then
+    tune_miss "zstd: this nginx is built without zstd, but ${users//$'\n'/ } still configure(s) it (nginx -t rejects those directives; remove them there)"
+  fi
   return 0
 }
 
 # Active files under the tree that load or configure zstd, one per line,
 # leaving out the files named after the tree.  Only *.conf files are read:
-# the repository's old http.d/zstd_conf template is never included.
+# the repository's old http.d/zstd_conf template is never included, and
+# modules-enabled is not included by the nginx tree.
 nginx_zstd_users() {
   local target=${1:-/etc/nginx} f x skip
   shift
@@ -3263,7 +3338,7 @@ nginx_zstd_users() {
     skip=0
     for x in "$@"; do [[ $f == "$x" ]] && { skip=1; break; }; done
     (( skip )) || printf '%s\n' "$f"
-  done < <(grep -RlsE --include='*.conf' \
+  done < <(grep -RlsE --include='*.conf' --exclude-dir=modules-enabled \
     '^[[:space:]]*(load_module[[:space:]].*ngx_http_zstd|zstd(_[a-z_]+)?[[:space:]])' "$target" 2>/dev/null | sort)
 }
 
@@ -3272,42 +3347,72 @@ nginx_zstd_in_use() {
   [[ -n $(nginx_zstd_users "${1:-/etc/nginx}") ]]
 }
 
-# Purge nginx-module-zstd once the nginx pass has committed (optimize_nginx
-# after its reload, install_nginx after its restart): a rollback after an
-# earlier purge would restore a tree that loads a module no longer on disk.
-# Kept when a configuration still uses it, or when apt would take anything
-# else with it.  The outcome is in NGINX_ZSTD_PURGE_RESULT for the caller.
+# 1.21.58 hosts had the zstd module as a package from the Angie repository.
+# The migration purges every angie-module-* package together with Angie, and
+# the 1.22 nginx is not a package, so nothing is left to purge here.  Kept
+# (always empty) so the install and --optimize callers need no change.
 NGINX_ZSTD_PURGE_PENDING=0
 NGINX_ZSTD_PURGE_RESULT=""
 nginx_purge_zstd_module() {
-  local target=${1:-/etc/nginx} sim others
   NGINX_ZSTD_PURGE_RESULT=""
-  pkg_ok nginx-module-zstd || return 0
-  if nginx_zstd_in_use "$target"; then
-    NGINX_ZSTD_PURGE_RESULT="zstd: nginx-module-zstd kept, a configuration under ${target} still uses it"
-    return 0
-  fi
-  if ! sim=$(apt-get -s purge nginx-module-zstd 2>&1); then
-    NGINX_ZSTD_PURGE_RESULT="zstd: nginx-module-zstd kept (apt cannot purge it)"
-    return 0
-  fi
-  others=$(printf '%s\n' "$sim" | awk '/^(Purg|Remv) /{ sub(/:.*/, "", $2); print $2 }' \
-    | grep -vx 'nginx-module-zstd' | paste -sd' ' - || true)
-  if [[ -n $others ]]; then
-    NGINX_ZSTD_PURGE_RESULT="zstd: nginx-module-zstd kept, apt would also remove ${others}"
-    return 0
-  fi
-  if DEBIAN_FRONTEND=noninteractive apt-get purge -y nginx-module-zstd >/dev/null 2>&1; then
-    NGINX_ZSTD_PURGE_RESULT="zstd: nginx-module-zstd purged (Cloudflare asks origins for br/gzip only)"
-  else
-    NGINX_ZSTD_PURGE_RESULT="zstd: could not purge nginx-module-zstd; its stanzas are already out of the configuration"
-    warn "$NGINX_ZSTD_PURGE_RESULT"
-  fi
-  info "$NGINX_ZSTD_PURGE_RESULT"
+  NGINX_ZSTD_PURGE_PENDING=0
   return 0
 }
 
-# Dynamic Brotli level: SETUP_BROTLI_LEVEL when valid, otherwise 5, or 4 on a
+# Status 0 when BIN (default: nginx_test_bin) has ngx_brotli compiled in
+# statically (`--add-module=...ngx_brotli` in nginx -V), 1 when it has none
+# or only a dynamic one (no load_module is ever written, so a dynamic module
+# would not be loaded), 2 when there is no binary to ask.  The same match as
+# tools/nginx-build.sh verify_binary and SCN's ci-config-test.sh.
+nginx_static_brotli() {
+  local bin=${1:-} v re='--add-module=[^[:space:]]*ngx_brotli'
+  [[ -n $bin ]] || bin=$(nginx_test_bin)
+  nginx_bin_usable "$bin" || return 2
+  v=$("$bin" -V 2>&1) || return 1
+  [[ $v =~ $re ]]
+}
+
+# Retire what made a packaged server load Brotli/zstd as dynamic modules:
+# the managed modules-enabled/50-brotli.conf moves to /tmp, an unmanaged
+# modules-enabled link is moved the same way, and a load_module of a Brotli
+# or zstd module in nginx.conf, custom.d (main context) or modules-enabled is
+# commented out with NGINX_LOAD_MODULE_OFF.  Sets NGINX_MODULE_LOADS_RETIRED.
+nginx_retire_module_loads() {
+  local target=${1:-/etc/nginx} f moved tmp
+  local re='^[[:space:]]*load_module[[:space:]][^;#]*ngx_http_(brotli|zstd)[a-z_]*_module'
+  NGINX_MODULE_LOADS_RETIRED=0
+  f="${target}/modules-enabled/50-brotli.conf"
+  if [[ -f $f && ! -L $f ]] && grep -q '^# Managed by setup.sh' "$f" 2>/dev/null; then
+    moved=$(preserve_to_tmp "$f" 2>/dev/null || true)
+    if [[ -n $moved ]]; then
+      info "Moved retired Brotli module stanza to ${moved}"
+      tune_note "modules-enabled/50-brotli.conf: retired to ${moved} (Brotli is compiled in)"
+      NGINX_MODULE_LOADS_RETIRED=1
+    fi
+  fi
+  for f in "${target}/nginx.conf" "${target}"/custom.d/*.conf "${target}"/modules-enabled/*.conf; do
+    [[ -e $f || -L $f ]] || continue
+    grep -qE "$re" "$f" 2>/dev/null || continue
+    if [[ -L $f ]]; then
+      # A package's modules-available link: move the link, never its target.
+      [[ $f == "${target}/modules-enabled/"* ]] || continue
+      moved=$(preserve_to_tmp "$f" 2>/dev/null || true)
+      [[ -n $moved ]] || continue
+      tune_note "${f#"$target"/}: Brotli/zstd module link retired to ${moved}"
+      NGINX_MODULE_LOADS_RETIRED=1
+      continue
+    fi
+    tmp=$(tmp_file) || return 1
+    awk -v re="$re" -v off="$NGINX_LOAD_MODULE_OFF" '$0 ~ re { print off $0; next } { print }' "$f" > "$tmp" || continue
+    if commit_if_changed "$f" "$tmp"; then
+      tune_note "${f#"$target"/}: load_module of a Brotli/zstd module commented out (Brotli is compiled in, zstd is not built)"
+      NGINX_MODULE_LOADS_RETIRED=1
+    fi
+  done
+  return 0
+}
+
+# Dynamic Brotli level: SETUP_BROTLI_LEVEL when valid, otherwise 4, or 3 on a
 # 1-2 CPU host where per-response compression competes with PHP for cores.
 # One owner for the install, --optimize and dry-run values.
 nginx_brotli_level() {
@@ -3331,53 +3436,46 @@ ensure_nginx_compression() {
   NGINX_COMPRESSION_CHANGED=0
   NGINX_COMPRESSION_SKIPPED=0
   NGINX_BROTLI_OK=0
+  local changed=0
+
+  # Before the opt-out: a load_module of a .so that does not exist makes the
+  # whole tree fail nginx -t, so this is a fix to the tree, not a choice of
+  # compression profile.
+  nginx_retire_module_loads "$target"
+  (( NGINX_MODULE_LOADS_RETIRED )) && changed=1
 
   if [[ ${SETUP_NGINX_COMPRESSION:-1} == 0 ]]; then
     NGINX_COMPRESSION_SKIPPED=1
+    NGINX_COMPRESSION_CHANGED=$changed
+    (( changed )) && TUNE_DIRTY=1
     info "nginx dynamic Brotli disabled by SETUP_NGINX_COMPRESSION=0"
     return 0
   fi
 
-  local brotli_level static_mode=off
+  local brotli_level static_mode=off bin brc=0
   brotli_level=$(nginx_brotli_level)
   NGINX_BROTLI_LEVEL=$brotli_level
   # brotli_static serves a .br sibling when one exists and falls back to the
   # dynamic filter otherwise; it is only useful with precompressed assets.
   (( PRECOMPRESS_ASSETS )) && static_mode=on
 
-  local enabled="${target}/modules-enabled"
-  local changed=0
-  if ! pkg_ok nginx-module-brotli; then
-    # --optimize is otherwise install-free.  This one
-    # small module is part of the same compression profile as a fresh --nginx
-    # install, so installing it here keeps both paths identical.  If the
-    # repository or package is unavailable, fall back to gzip.
-    if ! apt-cache show nginx-module-brotli >/dev/null 2>&1; then
-      apt_update || true
-    fi
-    apt_install nginx-module-brotli \
-      || warn "Could not install nginx-module-brotli; gzip remains active"
-  fi
-  pkg_ok nginx-module-brotli && NGINX_BROTLI_OK=1
+  # --optimize installs nothing for compression any more: Brotli is part of
+  # the build, so its presence is a fact of the binary, not a package state.
+  bin=$(nginx_test_bin)
+  nginx_static_brotli "$bin" || brc=$?
+  case $brc in
+    0) NGINX_BROTLI_OK=1 ;;
+    2) warn "No nginx binary at ${bin} to check for static Brotli; http.d/brotli.conf left as it is" ;;
+    *) warn "${bin} has no static Brotli module (ngx_brotli); gzip only" ;;
+  esac
 
-  mkdir -p "$enabled" "${target}/http.d"
+  mkdir -p "${target}/http.d"
   local tmp moved f
   # zstd (1.21.58) is retired: see the header of this section.
   nginx_retire_zstd "$target"
   (( NGINX_ZSTD_RETIRED )) && changed=1
 
   if (( NGINX_BROTLI_OK )); then
-    if ! grep -Rqs 'ngx_http_brotli_filter_module' "$enabled" 2>/dev/null; then
-      tmp=$(tmp_file)
-      cat > "$tmp" <<'EOF'
-# Managed by setup.sh: dynamic Brotli compression.
-load_module modules/ngx_http_brotli_filter_module.so;
-load_module modules/ngx_http_brotli_static_module.so;
-EOF
-      cat "$tmp" > "${enabled}/50-brotli.conf"
-      chmod 644 "${enabled}/50-brotli.conf"
-      changed=1
-    fi
     tmp=$(tmp_file)
     if [[ -f "${target}/http.d/brotli_conf" ]]; then
       {
@@ -3388,44 +3486,53 @@ EOF
       sed_in_place -E "s/^brotli_comp_level [0-9]+;/brotli_comp_level ${brotli_level};/" "$tmp"
       sed_in_place -E "s/^brotli_static (on|off);/brotli_static ${static_mode};/" "$tmp"
     else
-      cat > "$tmp" <<EOF
+      cat > "$tmp" <<EOT
 # Managed by setup.sh: dynamic Brotli (template was missing).
 brotli on;
 brotli_static ${static_mode};
 brotli_comp_level ${brotli_level};
 brotli_min_length 50;
 brotli_types text/plain text/css text/xml application/json application/javascript application/xml image/svg+xml font/ttf font/otf;
-EOF
+EOT
     fi
     if commit_if_changed "${target}/http.d/brotli.conf" "$tmp"; then
       chmod 644 "${target}/http.d/brotli.conf"
       changed=1
     fi
-  elif [[ -f "${enabled}/50-brotli.conf" ]]; then
-    warn "nginx Brotli module is not installed; keeping the existing module stanza"
+  elif (( brc == 1 )) && [[ -f "${target}/http.d/brotli.conf" ]] \
+       && grep -q '^# Managed by setup.sh' "${target}/http.d/brotli.conf" 2>/dev/null; then
+    # This binary does not know the brotli directives; the managed stanza
+    # would fail the whole tree.  Moved to /tmp (never deleted).
+    moved=$(preserve_to_tmp "${target}/http.d/brotli.conf" 2>/dev/null || true)
+    [[ -n $moved ]] && info "Moved http.d/brotli.conf to ${moved}: the nginx binary has no Brotli"
+    changed=1
   fi
 
-  # Never leave the service unable to start because an optional module failed
-  # to load.  Move the managed files to /tmp (the script never deletes) and
-  # keep the gzip fallback.
+  # Never leave the service unable to start because of the compression
+  # stanza.  Only a failure that names brotli moves the managed file away
+  # (to /tmp, never deleted); any other failure belongs to the caller's own
+  # nginx -t gate and must not silently cost the host its Brotli.
   local testlog
-  testlog=$(tmp_file)
-  if ! /usr/sbin/nginx -t >"$testlog" 2>&1; then
-    warn "nginx rejected the dynamic compression configuration; disabling Brotli"
-    sed 's/^/  /' "$testlog" >&2 || true
-    for f in "${enabled}/50-brotli.conf" "${target}/http.d/brotli.conf"; do
-      [[ -e $f ]] || continue
-      moved=$(preserve_to_tmp "$f" 2>/dev/null || true)
-      [[ -n $moved ]] && info "Moved rejected compression file to ${moved}"
-    done
-    NGINX_BROTLI_OK=0
-    changed=1
-    if ! /usr/sbin/nginx -t >/dev/null 2>&1; then
-      warn "nginx still rejects the configuration after removing compression files"
+  if (( brc != 2 )); then
+    testlog=$(tmp_file)
+    if ! nginx_test_tree "$conf" >"$testlog" 2>&1; then
+      if grep -qi 'brotli' "$testlog" && [[ -f "${target}/http.d/brotli.conf" ]] \
+         && grep -q '^# Managed by setup.sh' "${target}/http.d/brotli.conf" 2>/dev/null; then
+        warn "nginx rejected the Brotli configuration; disabling Brotli"
+        sed 's/^/  /' "$testlog" >&2 || true
+        moved=$(preserve_to_tmp "${target}/http.d/brotli.conf" 2>/dev/null || true)
+        [[ -n $moved ]] && info "Moved rejected compression file to ${moved}"
+        NGINX_BROTLI_OK=0
+        changed=1
+        if ! nginx_test_tree "$conf" >/dev/null 2>&1; then
+          warn "nginx still rejects the configuration after removing the Brotli file"
+        fi
+      else
+        warn "nginx -t fails for a reason other than compression; Brotli settings kept"
+        sed 's/^/  /' "$testlog" >&2 || true
+      fi
     fi
   fi
-  # The zstd module is purged by the caller once its nginx pass commits.
-  [[ $target == /etc/nginx ]] && NGINX_ZSTD_PURGE_PENDING=1
 
   NGINX_COMPRESSION_CHANGED=$changed
   if (( changed )); then
@@ -3631,6 +3738,15 @@ deploy_nginx_tree() {
   local log_dir="${LOG_ROOT}/nginx"
   local src=${CONFIG_SOURCE_DIR:-}
   [[ -n $src && -d $src ]] || { warn "No nginx config source directory available"; return 1; }
+  # The nginx branch of server-configs-nginx (CONFIG_REPO_REF=nginx) ships
+  # its own fastcgi.conf / fastcgi_params (SERVER_SOFTWARE "nginx" with no
+  # version, R38) and mime.types; no package provides them any more, so a
+  # tree without them (the 1.21 Angie tree on SCN main) is refused before
+  # anything in /etc/nginx changes.
+  local req
+  for req in nginx.conf mime.types fastcgi.conf fastcgi_params; do
+    [[ -f $src/$req ]] || { warn "server configs at ${src} lack ${req} (CONFIG_REPO_REF=${CONFIG_REPO_REF:-?} is not the nginx tree)"; return 1; }
+  done
 
   # Capture the live upstream blocks before rsync overwrites the files that
   # define them (see nginx_restore_upstreams).
@@ -3642,10 +3758,13 @@ deploy_nginx_tree() {
 
   # --no-owner/--no-group + --chmod prevents a checkout owned by uid 1000 from
   # leaving writable files in /etc/nginx. Never copy the sample private key.
+  # scripts/ci-*.sh and scripts/uss-ref drive the repository's own CI (they
+  # build nginx and run test trees); nothing on a host runs them.
   rsync -a --no-owner --no-group --chmod=D755,F644 \
     --exclude='*.md' --exclude='*.txt' --exclude='.git*' \
     --exclude='.github/' --exclude='test/' --exclude='.editorconfig' \
     --exclude='h5bp/tls/private.key' --exclude='h5bp/tls/certificate.pem' \
+    --exclude='/scripts/ci-*.sh' --exclude='/scripts/uss-ref' \
     "$src"/ "$target"/ || return 1
   mkdir -p "$target/snippets" "$target/custom.d"
   # macOS AppleDouble files appear when a local checkout is used via
@@ -3671,6 +3790,10 @@ deploy_nginx_tree() {
         "$target/scripts/custom_dan.ini" \
         "$target/scripts/php-fpm-limits.conf" \
         "$target/scripts/auto_tune.sh" \
+        "$target"/scripts/ci-*.sh \
+        "$target/scripts/uss-ref" \
+        "$target/scripts/limit_nofile.conf" \
+        "$target/scripts/etc_default_nginx" \
         "$target/http.d/98_setup_cache.conf" \
         "$target/http.d/99_setup_overrides.conf" \
         "$target/http.d/limit_req_whitelist.conf" \
@@ -3765,9 +3888,16 @@ deploy_nginx_tree() {
   tune_retire_unused_acme_client "$target"
   tune_retire_superseded_setup_files "$target"
 
+  # nginx -t opens the temp paths under /var/cache/nginx and the log
+  # directory; A's tmpfiles.d entry creates them (R70, R84).
+  if declare -F nginx_build_tmpfiles_apply >/dev/null 2>&1; then
+    nginx_build_tmpfiles_apply || true
+  fi
+
   # Validate before anything reloads.  A stopped service is valid (the tree is
-  # applied at the next start); reload only when the unit is active.
-  if ! /usr/sbin/nginx -t; then
+  # applied at the next start); reload only when the unit is active.  The
+  # migration tests with its candidate binary (NGINX_TEST_BIN).
+  if ! nginx_test_tree "$target/nginx.conf"; then
     warn "nginx configuration test failed; live service left untouched"
     return 1
   fi
@@ -3807,23 +3937,14 @@ retire_nginx_double_underscore() {
   return 0
 }
 
+# The nginx tree (CONFIG_REPO_REF, the SCN "nginx" branch) into /etc/nginx.
+# The 1.21 tree also shipped scripts/limit_nofile.conf and
+# scripts/etc_default_nginx for a unit drop-in and /etc/default/<server>.
+# The nginx.service written by lib/nginx-build.sh sets LimitNOFILE=524288 and
+# UMask=0027 itself and reads no /etc/default file, so neither is required
+# or installed any more (deploy_nginx_tree retires stale copies).
 sync_nginx_repo_configs() {
   fetch_server_configs || return 1
-  local limit_src="${CONFIG_SOURCE_DIR}/scripts/limit_nofile.conf"
-  local default_src="${CONFIG_SOURCE_DIR}/scripts/etc_default_nginx"
-  [[ -f $limit_src && -f $default_src ]] || {
-    warn "Downloaded server configs lack the systemd/default nginx files"
-    return 1
-  }
-  mkdir -p /etc/systemd/system/nginx.service.d
-  install -m 644 "$limit_src" /etc/systemd/system/nginx.service.d/limits.conf \
-    || return 1
-  install -m 644 "$default_src" /etc/default/nginx || return 1
-
-  # Load the new drop-in before the tree deployer reloads the unit; otherwise
-  # systemctl prints "unit file changed on disk" and may use stale limits.
-  systemctl daemon-reload || true
-
   deploy_nginx_tree || return 1
   retire_nginx_double_underscore /etc/nginx
   return 0
@@ -3925,38 +4046,3 @@ refresh_blob_key_dearmor() {
   install -m 644 "$tmp" "$target" || return 1
   info "Refreshed embedded key: ${target}"
 }
-
-ensure_sury_keyring() {
-  local keyring=/usr/share/keyrings/debsuryorg-archive-keyring.gpg
-  local legacy
-  local deb extract embedded
-  # The vendor .deb also drops the same key in trusted.gpg.d, where it signs
-  # every configured repository.  The source line pins signed-by, so move the
-  # global copy out of the tree once it is proven identical.
-  retire_global_sury_key() {
-    for legacy in /etc/apt/trusted.gpg.d/debsuryorg-archive.gpg \
-                  /etc/apt/trusted.gpg.d/deb.sury.org-php.gpg; do
-      [[ -f $legacy ]] && cmp -s "$legacy" "$keyring" && retire_paths "$legacy"
-    done
-  }
-  deb=$(tmp_file --suffix=.deb) || return 1
-  blob_sury_deb > "$deb" 2>/dev/null || { warn "Could not decode Sury keyring payload"; return 1; }
-  extract=$(tmp_dir) || return 1
-  dpkg-deb -x "$deb" "$extract" 2>/dev/null || true
-  embedded=$(find "$extract" -type f -name '*.gpg' 2>/dev/null | head -n1)
-  if [[ -s $keyring && -n $embedded ]] && cmp -s "$keyring" "$embedded"; then
-    retire_global_sury_key
-    return 0
-  fi
-  # Through apt, not bare dpkg -i: apt waits on the dpkg lock
-  # (DPkg::Lock::Timeout in APT_OPTS) while unattended-upgrades or a
-  # package postinst still holds it; dpkg -i fails at once.  The .deb is
-  # the embedded payload in a root-only temp file, so apt reads it as root
-  # (no "unsandboxed download" warning for the _apt user).
-  apt-get install "${APT_OPTS[@]}" -o APT::Sandbox::User=root \
-    --no-install-recommends "$deb" \
-    || { warn "Could not install the Sury keyring package"; return 1; }
-  retire_global_sury_key
-  info "Refreshed embedded key: ${keyring}"
-}
-

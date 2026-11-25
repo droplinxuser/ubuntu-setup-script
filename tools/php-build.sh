@@ -216,15 +216,19 @@ latest_of() {
       v=$(sqlite_download_line | cut -d, -f2)
       [[ -n $v ]] || v=$(git_latest sqlite/sqlite '^version-([0-9]+\.[0-9]+\.[0-9]+)$') ;;
     icu)
-      # Tags release-76-1; the version is written 76.1.
-      v=$(git_latest unicode-org/icu '^release-([0-9]+-[0-9]+)$'); v=${v//-/.} ;;
+      # Tags release-76-1 up to ICU 77; ICU 78 moved to release-78.1 (with
+      # the asset rename below).  Both forms, normalised to 76.1 BEFORE the
+      # sort, so a mixed list orders by version, not by separator.
+      v=$(git ls-remote --tags --refs https://github.com/unicode-org/icu.git 2>/dev/null \
+        | awk '{ sub("refs/tags/", "", $2); print $2 }' \
+        | sed -nE 's/^release-([0-9]+)[-.]([0-9]+)$/\1.\2/p' | sort -V | tail -n 1 || true) ;;
     *) bc_latest_of "$@"; return ;;
   esac
   [[ -n $v ]] && printf '%s' "$v"
 }
 
 fetch_component() { # name version -> path of the source archive
-  local v=$2 c=$SRC_CACHE/src n y line sha3="" urls="" m arc
+  local v=$2 c=$SRC_CACHE/src n y line sha3="" urls="" m arc tag
   FETCH_NAME=$1
   case $1 in
     sqlite)
@@ -248,11 +252,26 @@ fetch_component() { # name version -> path of the source archive
       fi
       printf '%s' "$arc" ;;
     icu)
-      # GitHub is ICU's release home; the asset name changed with ICU 78
-      # (icu4c-78.1-sources.tgz), older releases use icu4c-76_1-src.tgz.
-      local tag="release-${v//./-}" a1="icu4c-${v//./_}-src.tgz" a2="icu4c-$v-sources.tgz"
-      fetch_first "https://github.com/unicode-org/icu/releases/download/$tag/$a2|$c/$a2|$(gh_digest unicode-org/icu "$tag" "$a2")" \
-        "https://github.com/unicode-org/icu/releases/download/$tag/$a1|$c/$a1|$(gh_digest unicode-org/icu "$tag" "$a1")" ;;
+      # GitHub is ICU's release home.  ICU 78 changed both the tag
+      # (release-78.1) and the asset (icu4c-78.1-sources.tgz); older
+      # releases use release-76-1 and icu4c-76_1-src.tgz.  The likely form
+      # for the major is tried first, the other as the fallback, so a release
+      # that keeps one old spelling still downloads.  A pin may be written
+      # 76.1, 76-1 or 76_1.
+      v=${v//[-_]/.}
+      local maj=${v%%.*} t1 t2 a1 a2 base=https://github.com/unicode-org/icu/releases/download
+      local -a srcs=()
+      if [[ $maj =~ ^[0-9]+$ ]] && (( maj >= 78 )); then
+        t1="release-$v"; t2="release-${v//./-}"; a1="icu4c-$v-sources.tgz"; a2="icu4c-${v//./_}-src.tgz"
+      else
+        t1="release-${v//./-}"; t2="release-$v"; a1="icu4c-${v//./_}-src.tgz"; a2="icu4c-$v-sources.tgz"
+      fi
+      for tag in "$t1" "$t2"; do
+        for arc in "$a1" "$a2"; do
+          srcs+=("$base/$tag/$arc|$c/$arc|$(gh_digest unicode-org/icu "$tag" "$arc")")
+        done
+      done
+      fetch_first "${srcs[@]}" ;;
     *) bc_fetch_component "$@" ;;
   esac
 }
@@ -530,12 +549,17 @@ cmd_build() { # X.Y [exact]
   THINLTO=$(build_thinlto_flag "$j")
   work=$(mktemp -d "$SRC_CACHE/build-$ver.XXXXXX")
   WORK_DIR=$work
+  # The trap reads globals only: with SETUP_BUILD_LOCK_HELD=1 (the CPU chain,
+  # the migration) cmd_build runs in the script's own shell, so the EXIT
+  # trap fires after main returned, when cmd_build's locals are gone; under
+  # set -u a local there failed a successful build with status 1.
+  BUILD_LOG_PREFIX="php-$ver-"
   # PHP_BUILD_KEEP_WORK=1 keeps the work directory (sources, candidate) for
   # debugging.  The log lives in LOG_DIR either way (kept on failure).
   if [[ ${PHP_BUILD_KEEP_WORK:-0} == 1 ]]; then
-    trap 'build_log_keep "$LOG_DIR" "php-$ver-"' EXIT
+    trap 'build_log_keep "${LOG_DIR:-}" "${BUILD_LOG_PREFIX:-php-}" || true' EXIT
   else
-    trap 'rm -rf "${WORK_DIR:-}"; build_log_keep "$LOG_DIR" "php-$ver-"' EXIT
+    trap 'rm -rf "${WORK_DIR:-}"; build_log_keep "${LOG_DIR:-}" "${BUILD_LOG_PREFIX:-php-}" || true' EXIT
   fi
 
   # Libraries: cached per (toolchain, flags, CPU, versions); a PHP-only
@@ -859,6 +883,25 @@ cmd_bolt() {
 cmd_build_activate() {
   cmd_build "$1"
   cmd_activate "$1"
+  start_if_due "$1"
+}
+
+# The refresh path only (setup-php-build@X.Y): after a CPU change where the
+# chain gave up (two failed attempts, unit down), the daily refresh sees the
+# build as stale (cpu) and rebuilds it; nothing else would start the unit
+# until an operator or a reboot did (R13: the refresh retry must recover).
+# Same rule as the CPU chain's start: our unit, enabled, the active version.
+# `activate` on its own never starts a stopped unit (--upgrade-php relies on
+# that: its candidate must stay down until the switch).
+start_if_due() { # X.Y
+  local ver=$1
+  unit_is_ours "$ver" || return 0
+  [[ $(active_version) == "$ver" ]] || return 0
+  [[ $(systemctl is-enabled "php$ver-fpm" 2>/dev/null || true) == enabled ]] || return 0
+  systemctl is-active --quiet "php$ver-fpm" 2>/dev/null && return 0
+  say "PHP $ver: php$ver-fpm was down; starting it on the rebuilt build"
+  systemctl reset-failed "php$ver-fpm" >/dev/null 2>&1 || true
+  systemctl start "php$ver-fpm" || die "PHP $ver: php$ver-fpm did not start on the rebuilt build (systemctl status php$ver-fpm)"
 }
 
 # setup-php-build@X.Y.service: build and activate under the lock, release

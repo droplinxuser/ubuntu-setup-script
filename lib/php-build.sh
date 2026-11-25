@@ -87,6 +87,20 @@ PHP_CORE_EXTS=(core date hash json pcre random reflection spl standard lexbor ur
 
 _pb_warn() { if declare -F warn >/dev/null; then warn "$*"; else printf 'WARN: %s\n' "$*" >&2; fi; }
 _pb_note() { if declare -F tune_note >/dev/null; then tune_note "$*"; fi; }
+# OUT of php_build_ensure/php_build_start: a report function (opt_report,
+# info) or, as lib/migrate.sh passes it, a file path the line is appended
+# to.  Executing a path would lose every line, the failure reasons and log
+# paths included.
+_pb_report() { # out line
+  local out=${1:-info}; shift
+  if [[ $out == */* ]] && ! declare -F "$out" >/dev/null; then
+    printf '%s\n' "$*" >> "$out" 2>/dev/null || printf '%s\n' "$*" >&2
+  elif declare -F "$out" >/dev/null || command -v "$out" >/dev/null 2>&1; then
+    "$out" "$*"
+  else
+    printf '%s\n' "$*" >&2
+  fi
+}
 _pb_valid_ver() { [[ ${1:-} =~ ^[0-9]+\.[0-9]+$ ]]; }
 _pb_ver_ge() { [[ $(printf '%s\n%s\n' "$1" "$2" | sort -V | sed -n 1p) == "$2" ]]; } # $1 >= $2
 _pb_norm() { tr ',[:upper:]' ' [:lower:]' <<<"$*" | tr -s ' \t' '\n' | sed '/^$/d' | sort -u; }
@@ -440,9 +454,17 @@ php_build_release() { bash "$(_pb_tool)" release "$1" 2>/dev/null || true; }
 # starts it: -y, -c and PHP_INI_SCAN_DIR (replacing any inherited value: the
 # compiled scan dir is the CLI's).  Fails on "Unable to load"/"already
 # loaded" warnings and when OPcache is missing.  Output on stdout.
+# With an ETC_ROOT other than /etc/php (the staged tree tested before a
+# cutover), the staged candidate ROOT/X.Y/staging/sbin/php-fpm is tested when
+# one exists: that is the binary the cutover activates (after a build-only
+# step it is the only new one), and the staged tree's 00-setup-opcache.ini
+# points at the staged opcache.so (php_build_layout).
 php_fpm_test() { # X.Y [ETC_ROOT]
   local ver=$1 e=${2:-$PHP_BUILD_ETC}/$1/fpm bin out rc=0
   bin=$(php_fpm_bin "$ver")
+  if [[ -n ${2:-} && $2 != "$PHP_BUILD_ETC" && -x $PHP_BUILD_ROOT/$ver/staging/sbin/php-fpm ]]; then
+    bin=$PHP_BUILD_ROOT/$ver/staging/sbin/php-fpm
+  fi
   [[ -x $bin ]] || { printf 'no compiled php-fpm for PHP %s (%s)\n' "$ver" "$bin"; return 1; }
   out=$(PHP_INI_SCAN_DIR=$e/conf.d "$bin" -t -y "$e/php-fpm.conf" -c "$e/php.ini" 2>&1) || rc=$?
   out+=$'\n'$(PHP_INI_SCAN_DIR=$e/conf.d "$bin" -c "$e/php.ini" -m 2>&1 || true)
@@ -492,6 +514,10 @@ php_build_install_support() {
   if _pb_write "$PHP_BUILD_REBUILD_UNIT" 644 "$unit"; then systemctl daemon-reload 2>/dev/null || true; fi
   tmpf=$(php_build_tmpfiles_text)
   _pb_write "$PHP_BUILD_TMPFILES" 644 "$tmpf" || true
+  # The CPU-change chain and the daily refresh timer are shared by every
+  # compiled component (lib/nginx-build.sh): a host with PHP and no compiled
+  # nginx needs them too, or a CPU change leaves PHP down for good.
+  if declare -F setup_build_install_shared_units >/dev/null; then setup_build_install_shared_units || true; fi
   return 0
 }
 
@@ -517,7 +543,10 @@ EOF
 
 # /run/php is the unit's RuntimeDirectory (root 0755, kept across restarts
 # for the shared socket); tmpfiles re-creates it at boot for nginx's first
-# connection attempts.  The sessions directory belongs to the www pool's
+# connection attempts.  root, not www-data as design section 3 first said:
+# RuntimeDirectory= chowns /run/php to the unit user (root) on every start,
+# so a www-data line here would flip the owner at each boot.  The socket
+# itself is www-data 0660 (listen.owner/listen.mode), as with Sury.  The sessions directory belongs to the www pool's
 # user: PHP's own GC (gc_probability=1) must be able to list it, which
 # Debian's root 1733 directory never allowed (Debian used a cron/timer).
 php_build_tmpfiles_text() {
@@ -716,9 +745,65 @@ include = ${etc}/${ver}/fpm/pool.d/*.conf
 EOF
 }
 
-php_build_opcache_ini_text() { # X.Y
-  printf '%s: OPcache before PHP 8.5 is a shared module of\n; this build (compiled in from 8.5).  Settings: conf.d/zz-setup-optimize.ini.\nzend_extension=%s/%s/lib/opcache.so\n' \
-    "$PHP_BUILD_MARK" "$PHP_BUILD_ROOT" "$1"
+php_build_opcache_ini_text() { # X.Y [opcache.so]
+  printf '%s: OPcache before PHP 8.5 is a shared module of\n; this build (compiled in from 8.5).  Settings: conf.d/zz-setup-optimize.ini.\nzend_extension=%s\n' \
+    "$PHP_BUILD_MARK" "${2:-$PHP_BUILD_ROOT/$1/lib/opcache.so}"
+}
+
+# Keys of a managed www.conf that the tuner or the operator owns: kept when
+# the file is rewritten from a newer template (listen also carries the
+# operator's TCP listener, R24).
+PHP_BUILD_POOL_KEEP_RE='^(user|group|listen(\..*)?|pm(\..*)?|slowlog|access\..*)$'
+
+# The [www] pool from TEMPLATE, keeping the KEEP keys of CURRENT and every
+# directive CURRENT has that the template does not (the session and
+# open_basedir lines, an access log, a status path).
+php_build_pool_merge() { # template current
+  awk -v keep="$PHP_BUILD_POOL_KEEP_RE" '
+    function key(l,   k) { k = l; sub(/=.*/, "", k); gsub(/[[:space:]]/, "", k); return k }
+    function val(l,   v) { v = l; sub(/^[^=]*=/, "", v); return v }
+    FNR == NR {
+      if ($0 ~ /^[[:space:]]*\[/) { s = $0; gsub(/^[[:space:]]*\[|\].*$/, "", s); next }
+      if (s != "www" || $0 ~ /^[[:space:]]*[;#]/ || $0 !~ /=/) next
+      k = key($0); if (!(k in cur)) order[++n] = k
+      cur[k] = $0; next
+    }
+    $0 !~ /^[[:space:]]*[;#]/ && $0 ~ /=/ && $0 !~ /^[[:space:]]*\[/ {
+      k = key($0); intpl[k] = 1
+      if ((k in cur) && k ~ keep) { print cur[k]; next }
+    }
+    { print }
+    END {
+      for (i = 1; i <= n; i++) if (!(order[i] in intpl)) { if (!hdr) { print ""; print "; Kept from the previous www.conf"; hdr = 1 } print cur[order[i]] }
+    }' "$2" "$1"
+}
+
+# Pool files adopted from a package or 1.21 (www_8x.conf) can open with a
+# full [global] section.  php-fpm.conf includes pool.d last, so those values
+# would silently override php-fpm.conf's: the section is commented out
+# (marker "; setup-1.22-off: ", the file backed up once first) so php-fpm.conf
+# stays the only source of global settings.
+php_build_pool_strip_global() { # X.Y [ETC_ROOT]
+  local ver=$1 e=${2:-$PHP_BUILD_ETC}/$1 pool tmp b=""
+  for pool in "$e"/fpm/pool.d/*.conf; do
+    [[ -f $pool && ! -L $pool ]] || continue
+    grep -qiE '^[[:space:]]*\[global\][[:space:]]*([;#].*)?$' "$pool" || continue
+    [[ -n $b ]] || b=$(_pb_backup_dir "php-${ver}-pool-global-$(date -u +%Y%m%d-%H%M%S)")
+    cp -a "$pool" "$b/"
+    tmp="${pool%/*}/.${pool##*/}.tmp.$$"
+    if awk -v m="$PHP_BUILD_OFF_MARK" '
+        /^[[:space:]]*\[[^]]+\]/ { g = (tolower($0) ~ /^[[:space:]]*\[global\]/) }
+        g && $0 !~ /^[[:space:]]*([;#].*)?$/ { print m $0; next }
+        { print }' "$pool" > "$tmp"; then
+      chmod --reference="$pool" "$tmp" 2>/dev/null || chmod 644 "$tmp"
+      mv -f "$tmp" "$pool"
+      _pb_warn "PHP ${ver}: ${pool} had a [global] section; commented out (php-fpm.conf holds the global settings; original in ${b})"
+      PHP_BUILD_CHANGED=1
+    else
+      rm -f "$tmp"
+    fi
+  done
+  return 0
 }
 
 # A managed file: written when absent, ours, or (once backed up) a package's
@@ -871,8 +956,10 @@ php_build_golden_refresh() { # X.Y
 #   version + session path; the CLI also memory_limit=-1), conf.d converted
 #   (php_confd_convert) plus 00-setup-opcache.ini before 8.5 (removed from
 #   8.5: never carried from another version, R56), custom_dan.ini (fpm),
-#   pool.d/www.conf only when absent (an existing pool, Sury's or an
-#   operator's, is adopted as it is: the tuner normalises the managed keys),
+#   pool.d/www.conf when absent or ours (marker line: rewritten from the
+#   template keeping the tuner's keys); a pool without the marker, Sury's,
+#   1.21's or an operator's, is adopted as it is (the tuner normalises the
+#   managed keys); a [global] section in any pool file is commented out,
 #   per-user session dirs, tmpfiles, the unit and the links.
 # ETC_ROOT renders the same tree elsewhere (the migration tests the build in
 # ROOT/X.Y/staging-etc with php_fpm_test X.Y ETC_ROOT before cutover); then
@@ -880,7 +967,7 @@ php_build_golden_refresh() { # X.Y
 # Refuses while a package php-fpm of X.Y still runs: its reload would load
 # the stripped conf.d (R15).  The migration stops it first.
 php_build_layout() { # X.Y [fresh|adopt|auto] [ETC_ROOT]
-  local ver=$1 how=${2:-auto} etc=${3:-$PHP_BUILD_ETC} real=0 e text tpl sapi frag
+  local ver=$1 how=${2:-auto} etc=${3:-$PHP_BUILD_ETC} real=0 e text tpl sapi frag pool
   _pb_valid_ver "$ver" || { _pb_warn "php_build_layout: bad version '${ver}'"; return 1; }
   [[ $etc == "$PHP_BUILD_ETC" ]] && real=1
   e=$etc/$ver
@@ -901,16 +988,33 @@ php_build_layout() { # X.Y [fresh|adopt|auto] [ETC_ROOT]
     frag="$e/$sapi/conf.d/00-setup-opcache.ini"
     if _pb_ver_ge "$ver" 8.5; then
       [[ -e $frag || -L $frag ]] && { rm -f "$frag"; PHP_BUILD_CHANGED=1; }
+    elif (( ! real )) && [[ -f $PHP_BUILD_ROOT/$ver/staging/lib/opcache.so ]]; then
+      # A staged tree is tested with the staged candidate (php_fpm_test X.Y
+      # ETC_ROOT), which needs its own opcache.so, not the active build's.
+      _pb_write "$frag" 644 "$(php_build_opcache_ini_text "$ver" "$PHP_BUILD_ROOT/$ver/staging/lib/opcache.so")" || true
     else
       _pb_write "$frag" 644 "$(php_build_opcache_ini_text "$ver")" || true
     fi
   done
   _pb_write_managed "$ver" "$e/fpm/php-fpm.conf" "$(php_build_fpm_conf_text "$ver" "$etc")" || true
-  if [[ ! -f $e/fpm/pool.d/www.conf ]]; then
+  # Adopted pools must not carry their own [global] (see the function).
+  php_build_pool_strip_global "$ver" "$etc"
+  # www.conf: written when absent; rewritten from the template when it is
+  # ours (first line PHP_BUILD_MARK), keeping the tuner's and operator's
+  # keys (php_build_pool_merge), so a template change reaches every host.
+  # A pool without the marker (an operator's, Sury's, 1.21's) is adopted as
+  # it is: the tuner normalises the managed keys.
+  pool="$e/fpm/pool.d/www.conf"
+  if [[ ! -f $pool ]] || { [[ ! -L $pool ]] && head -n 1 "$pool" | grep -qF "$PHP_BUILD_MARK"; }; then
     tpl=${SCRIPT_DIR:-}/configs/php/www.conf
     [[ -f $tpl ]] || tpl=$PHP_BUILD_TEMPLATES/www.conf
     [[ -f $tpl ]] || { _pb_warn "PHP ${ver}: pool template configs/php/www.conf not found"; return 1; }
-    _pb_write "$e/fpm/pool.d/www.conf" 644 "$(cat "$tpl")" || true
+    if [[ -f $pool ]]; then
+      text=$(php_build_pool_merge "$tpl" "$pool") || { _pb_warn "PHP ${ver}: could not merge ${pool} with the template; left as it is"; text=""; }
+      [[ -z $text ]] || _pb_write "$pool" 644 "$text" || true
+    else
+      _pb_write "$pool" 644 "$(cat "$tpl")" || true
+    fi
   fi
   if (( real )) && declare -F sync_php_ini_template >/dev/null; then
     sync_php_ini_template "$ver" || true
@@ -972,7 +1076,7 @@ php_build_start() { # X.Y OUT
     php_build_unit_is_ours "$v" || continue
     if systemctl is-enabled --quiet "php${v}-fpm" 2>/dev/null || systemctl is-active --quiet "php${v}-fpm" 2>/dev/null; then
       systemctl disable --now "php${v}-fpm" >/dev/null 2>&1 || true
-      "$out" "- PHP ${v}: disabled (PHP ${active} is the active version and owns ${PHP_FPM_SOCKET}; ${v} is kept for --upgrade-php=${v})"
+      _pb_report "$out" "- PHP ${v}: disabled (PHP ${active} is the active version and owns ${PHP_FPM_SOCKET}; ${v} is kept for --upgrade-php=${v})"
     fi
   done
   [[ $ver == "$active" ]] || return 0
@@ -980,17 +1084,17 @@ php_build_start() { # X.Y OUT
   systemctl enable "php${ver}-fpm" >/dev/null 2>&1 || true
   if systemctl is-active --quiet "php${ver}-fpm" 2>/dev/null; then
     (( PHP_BUILD_CHANGED )) || return 0
-    systemctl restart "php${ver}-fpm" || { "$out" "- **FAILED** PHP ${ver}: php${ver}-fpm did not restart (systemctl status php${ver}-fpm)"; return 1; }
+    systemctl restart "php${ver}-fpm" || { _pb_report "$out" "- **FAILED** PHP ${ver}: php${ver}-fpm did not restart (systemctl status php${ver}-fpm)"; return 1; }
   else
     systemctl reset-failed "php${ver}-fpm" >/dev/null 2>&1 || true
-    systemctl start "php${ver}-fpm" || { "$out" "- **FAILED** PHP ${ver}: php${ver}-fpm did not start (systemctl status php${ver}-fpm)"; return 1; }
+    systemctl start "php${ver}-fpm" || { _pb_report "$out" "- **FAILED** PHP ${ver}: php${ver}-fpm did not start (systemctl status php${ver}-fpm)"; return 1; }
   fi
   sleep 1
-  systemctl is-active --quiet "php${ver}-fpm" || { "$out" "- **FAILED** PHP ${ver}: php${ver}-fpm is not running"; return 1; }
-  php_fpm_test "$ver" >/dev/null || { "$out" "- **FAILED** PHP ${ver}: php-fpm -t reports problems ($(php_fpm_test "$ver" | grep -iE 'error|warning|unable|not loaded' | head -n 1))"; return 1; }
+  systemctl is-active --quiet "php${ver}-fpm" || { _pb_report "$out" "- **FAILED** PHP ${ver}: php${ver}-fpm is not running"; return 1; }
+  php_fpm_test "$ver" >/dev/null || { _pb_report "$out" "- **FAILED** PHP ${ver}: php-fpm -t reports problems ($(php_fpm_test "$ver" | grep -iE 'error|warning|unable|not loaded' | head -n 1))"; return 1; }
   sock=$(awk -F= '/^[[:space:]]*listen[[:space:]]*=/ { v = $2; gsub(/[[:space:]]/, "", v); print v; exit }' "${PHP_BUILD_ETC}/${ver}/fpm/pool.d/www.conf" 2>/dev/null)
   if [[ $sock == /* ]] && [[ ! -S $sock ]]; then
-    "$out" "- **FAILED** PHP ${ver}: ${sock} does not exist after the start"; return 1
+    _pb_report "$out" "- **FAILED** PHP ${ver}: ${sock} does not exist after the start"; return 1
   fi
   return 0
 }
@@ -1009,57 +1113,65 @@ php_build_start() { # X.Y OUT
 # Returns 1 on any failure, with the reason and log path reported.
 php_build_ensure() { # X.Y MODE CONTEXT OUT
   local ver=$1 mode=${2:-full} context=${3:-optimize} out=${4:-info} exts log rc=0 missing
-  _pb_valid_ver "$ver" || { "$out" "- **FAILED** PHP: bad version '${ver}'"; return 1; }
-  case $mode in build-only|activate|full) ;; *) "$out" "- **FAILED** PHP ${ver}: unknown mode ${mode}"; return 1 ;; esac
+  _pb_valid_ver "$ver" || { _pb_report "$out" "- **FAILED** PHP: bad version '${ver}'"; return 1; }
+  case $mode in build-only|activate|full) ;; *) _pb_report "$out" "- **FAILED** PHP ${ver}: unknown mode ${mode}"; return 1 ;; esac
   if declare -F mem_gate_allows >/dev/null && ! mem_gate_allows php; then
-    "$out" "- PHP ${ver}: refused on this host (under the 4 GB class: nginx only)"
+    _pb_report "$out" "- PHP ${ver}: refused on this host (under the 4 GB class: nginx only)"
     return 1
   fi
-  php_build_install_support || { "$out" "- **FAILED** PHP ${ver}: build support files missing from this checkout"; return 1; }
+  php_build_install_support || { _pb_report "$out" "- **FAILED** PHP ${ver}: build support files missing from this checkout"; return 1; }
   PHP_BUILD_CHANGED=0
   if [[ $mode != activate ]]; then
     exts=$(php_build_effective_exts "$ver" 2>"${PHP_BUILD_LOG_DIR}/exts-${ver}.err") \
-      || { "$out" "- **FAILED** PHP ${ver}: $(cat "${PHP_BUILD_LOG_DIR}/exts-${ver}.err" 2>/dev/null)"; return 1; }
+      || { _pb_report "$out" "- **FAILED** PHP ${ver}: $(cat "${PHP_BUILD_LOG_DIR}/exts-${ver}.err" 2>/dev/null)"; return 1; }
+    # Warnings of a set that was computed (an uncertain SQLite scan, a
+    # dropped unbuildable name) reach the report: R11/R41 say keep AND
+    # report, and the file is deleted next.
+    # (setup.sh's warn adds a timestamp and colours: stripped.)
+    local wline
+    while IFS= read -r wline; do
+      [[ -n $wline ]] && _pb_report "$out" "- PHP ${ver}: ${wline}"
+    done < <(sed -E 's/\x1b\[[0-9;]*m//g; s/^.*\[WARN\][[:space:]]*//; s/^WARN: //' "${PHP_BUILD_LOG_DIR}/exts-${ver}.err" 2>/dev/null || true)
     rm -f "${PHP_BUILD_LOG_DIR}/exts-${ver}.err"
     if missing=$(php_build_requirements_missing "$exts"); then :; else
-      "$out" "- **FAILED** PHP ${ver}: the extension set lacks application requirements: $(tr '\n' ' ' <<<"$missing")"
+      _pb_report "$out" "- **FAILED** PHP ${ver}: the extension set lacks application requirements: $(tr '\n' ' ' <<<"$missing")"
       return 1
     fi
     install -d -m 755 "$PHP_BUILD_ROOT/$ver"
     printf '%s\n' "$exts" > "$(_pb_want_file "$ver").tmp" && mv -f "$(_pb_want_file "$ver").tmp" "$(_pb_want_file "$ver")"
-    "$out" "- PHP ${ver}: extension set ${exts//,/ }"
-    [[ ,$exts, == *,intl,* ]] && "$out" "- PHP ${ver}: intl is in the set: every site on PHP ${ver} shares the ICU-enlarged binary (measured: ~2x size, 4.5x data-TLB misses, slower XenForo pages)"
+    _pb_report "$out" "- PHP ${ver}: extension set ${exts//,/ }"
+    [[ ,$exts, == *,intl,* ]] && _pb_report "$out" "- PHP ${ver}: intl is in the set: every site on PHP ${ver} shares the ICU-enlarged binary (measured: ~2x size, 4.5x data-TLB misses, slower XenForo pages)"
     if ! php_build_current "$ver"; then
-      [[ -n $PHP_BUILD_CHECK_OUT ]] && "$out" "- PHP ${ver}: build ${PHP_BUILD_CHECK_OUT}"
-      "$out" "- PHP ${ver}: building FPM + CLI from upstream sources (about 5-8 minutes with the libraries, 3-4 when only PHP changed)"
+      [[ -n $PHP_BUILD_CHECK_OUT ]] && _pb_report "$out" "- PHP ${ver}: build ${PHP_BUILD_CHECK_OUT}"
+      _pb_report "$out" "- PHP ${ver}: building FPM + CLI from upstream sources (about 5-8 minutes with the libraries, 3-4 when only PHP changed)"
       if log=$(_pb_run_build "$ver"); then
-        "$out" "- PHP ${ver}: built and verified (log: ${log})"
+        _pb_report "$out" "- PHP ${ver}: built and verified (log: ${log})"
       else
-        "$out" "- **FAILED** PHP ${ver} build; nothing was changed (log: ${log})"
+        _pb_report "$out" "- **FAILED** PHP ${ver} build; nothing was changed (log: ${log})"
         tail -n 8 "$log" >&2 2>/dev/null || true
         return 1
       fi
     else
-      "$out" "- PHP ${ver}: build is current ($("$PHP_BUILD_TOOL" status "$ver" 2>/dev/null | sed -n 1p))"
+      _pb_report "$out" "- PHP ${ver}: build is current ($("$PHP_BUILD_TOOL" status "$ver" 2>/dev/null | sed -n 1p))"
     fi
   fi
   [[ $mode == build-only ]] && return 0
   if [[ -d $PHP_BUILD_ROOT/$ver/staging ]]; then
     if ! "$PHP_BUILD_TOOL" activate "$ver" >>"${PHP_BUILD_LOG_DIR}/activate-${ver}.log" 2>&1; then
-      "$out" "- **FAILED** PHP ${ver}: activation ($(tail -n 1 "${PHP_BUILD_LOG_DIR}/activate-${ver}.log" 2>/dev/null))"
+      _pb_report "$out" "- **FAILED** PHP ${ver}: activation ($(tail -n 1 "${PHP_BUILD_LOG_DIR}/activate-${ver}.log" 2>/dev/null))"
       return 1
     fi
     PHP_BUILD_CHANGED=1
-    "$out" "- PHP ${ver}: $("$PHP_BUILD_TOOL" status "$ver" 2>/dev/null | sed -n 1p)"
+    _pb_report "$out" "- PHP ${ver}: $("$PHP_BUILD_TOOL" status "$ver" 2>/dev/null | sed -n 1p)"
   fi
-  [[ -x $(php_fpm_bin "$ver") ]] || { "$out" "- **FAILED** PHP ${ver}: no compiled build to activate"; return 1; }
+  [[ -x $(php_fpm_bin "$ver") ]] || { _pb_report "$out" "- **FAILED** PHP ${ver}: no compiled build to activate"; return 1; }
   php_build_unit_write "$ver"
   case $context in
     install|optimize|refresh)
       # --php makes its version the active one; --optimize only fills a
       # missing marker (switching is --upgrade-php's job).
       if [[ $context == install || -z $(php_active_version) ]]; then php_active_set "$ver"; fi
-      php_build_layout "$ver" || { "$out" "- **FAILED** PHP ${ver}: /etc/php/${ver} layout"; return 1; }
+      php_build_layout "$ver" || { _pb_report "$out" "- **FAILED** PHP ${ver}: /etc/php/${ver} layout"; return 1; }
       php_build_start "$ver" "$out" || return 1
       ;;
     *) return 0 ;;
@@ -1068,9 +1180,9 @@ php_build_ensure() { # X.Y MODE CONTEXT OUT
      && [[ ${SETUP_PHP_BUILD_BOLT:-1} == 1 ]]; then
     "$PHP_BUILD_TOOL" bolt "$ver" "${SETUP_PHP_BUILD_BOLT_SECONDS:-60}" > "${PHP_BUILD_LOG_DIR}/bolt-${ver}.log" 2>&1 || rc=$?
     case $rc in
-      0) "$out" "- PHP ${ver}: BOLT applied to php-fpm from live traffic" ;;
-      3) "$out" "- PHP ${ver}: BOLT skipped (too little traffic in the sample, or another build held the lock); the next --optimize under load retries" ;;
-      *) "$out" "- PHP ${ver}: BOLT not applied ($(tail -n 1 "${PHP_BUILD_LOG_DIR}/bolt-${ver}.log" 2>/dev/null)); the ThinLTO build keeps serving" ;;
+      0) _pb_report "$out" "- PHP ${ver}: BOLT applied to php-fpm from live traffic" ;;
+      3) _pb_report "$out" "- PHP ${ver}: BOLT skipped (too little traffic in the sample, or another build held the lock); the next --optimize under load retries" ;;
+      *) _pb_report "$out" "- PHP ${ver}: BOLT not applied ($(tail -n 1 "${PHP_BUILD_LOG_DIR}/bolt-${ver}.log" 2>/dev/null)); the ThinLTO build keeps serving" ;;
     esac
     rc=0
   fi
@@ -1139,7 +1251,41 @@ setup_build_llvm_release() { # php|nginx|valkey: the build being removed
   if [[ $me != php ]] && compgen -G "${PHP_BUILD_ROOT}/[0-9]*/build.info" >/dev/null; then return 0; fi
   if [[ $me != nginx ]] && [[ -f $n/build.info || -x $n/sbin/nginx || -d $n/build ]]; then return 0; fi
   if [[ $me != valkey ]] && [[ -f $k/build.info || -x $k/bin/valkey-server || -d $k/build ]]; then return 0; fi
+  _pb_llvm_packages_purge
   rm -f "${PHP_BUILD_LLVM_FILES[@]}"; rm -rf /opt/setup-llvm
+}
+
+# The clang-N/lld-N/llvm-N/bolt-N packages the tools installed from
+# apt.llvm.org go with the source: left behind, they would stay installed
+# with no update source (R81).  Only packages whose installed version is an
+# apt.llvm.org build ("~++" in the version: Ubuntu's own clang-N never has
+# it, and an operator's Ubuntu toolchain stays), and only when apt's dry run
+# removes nothing else (the collateral guard: another package depending on
+# LLVM keeps it).  Best effort: a refusal is reported, never fatal.
+_pb_llvm_packages_purge() {
+  local d n p v sim
+  local -a pkgs=() collateral=()
+  command -v dpkg-query >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1 || return 0
+  for d in /usr/lib/llvm-[0-9]*; do
+    [[ -d $d ]] || continue
+    n=${d##*/llvm-}
+    [[ $n =~ ^[0-9]+$ ]] || continue
+    for p in "clang-$n" "lld-$n" "llvm-$n" "bolt-$n"; do
+      v=$(dpkg-query -W -f='${Status} ${Version}' "$p" 2>/dev/null || true)
+      [[ $v == "install ok installed "* && $v == *'~++'* ]] && pkgs+=("$p")
+    done
+  done
+  (( ${#pkgs[@]} )) || return 0
+  sim=$(apt-get -s purge "${pkgs[@]}" 2>&1) || { _pb_warn "LLVM: apt cannot purge ${pkgs[*]}; left installed"; return 0; }
+  mapfile -t collateral < <(printf '%s\n' "$sim" | awk '/^(Remv|Purg) / { sub(/:.*/, "", $2); print $2 }' \
+    | grep -vxF -f <(printf '%s\n' "${pkgs[@]}") | sort -u || true)
+  if (( ${#collateral[@]} )); then
+    _pb_warn "LLVM: purging ${pkgs[*]} would also remove ${collateral[*]}; the LLVM packages stay installed (remove them by hand once nothing needs them)"
+    return 0
+  fi
+  apt-get -o DPkg::Lock::Timeout=900 purge -y "${pkgs[@]}" >/dev/null 2>&1 \
+    || _pb_warn "LLVM: apt-get purge ${pkgs[*]} failed; left installed"
+  return 0
 }
 
 # ---------------------------------------------------------------------------

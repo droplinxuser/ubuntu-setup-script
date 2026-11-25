@@ -24,6 +24,7 @@
 #   valkey_build_status                    read-only state (diagnostics)
 #   valkey_build_purge                     --purge valkey
 #   valkey_build_retire_legacy             1.21 triggers (APT hook, timers)
+#   valkey_build_retire_legacy_layout OUT  1.21 layout to the backups (after a verified start)
 #   VALKEY_CLI_BIN / VALKEY_SERVER_BIN     absolute paths every caller uses
 
 VALKEY_BUILD_ROOT=${VALKEY_BUILD_ROOT:-/usr/local/lib/setup-valkey}
@@ -58,8 +59,23 @@ valkey_build_write() {
   printf '%s\n' "$2" > "$1"
 }
 
+# OUT is a report function (info, opt_report).  A caller that collects the
+# lines in a file passes its path instead; both work, so no report line (a
+# failure reason, a log path) is lost to "Permission denied".
+valkey_build_report() { # out message
+  local out=${1:-info}
+  shift
+  if [[ $out == */* ]] && ! declare -F "$out" >/dev/null; then
+    printf '%s\n' "$*" >> "$out"
+  else
+    "$out" "$*"
+  fi
+}
+
+VALKEY_BUILD_UNIT_MARK='# setup-valkey-build-unit 1.22'
 valkey_build_unit_text() {
   cat <<EOF
+$VALKEY_BUILD_UNIT_MARK
 [Unit]
 Description=Rebuild the compiled Valkey (setup.sh)
 After=network-online.target
@@ -87,6 +103,10 @@ valkey_build_last_log() { ls -1t "$VALKEY_BUILD_LOG_DIR"/valkey-*.log 2>/dev/nul
 # chain (setup-build-cpu.service) "valkey-build.sh rebuild-cpu".
 valkey_build_install_support() {
   local src="${SCRIPT_DIR}/tools/valkey-build.sh"
+  # A 1.21 job of the same unit name may be running (its APT hook started it
+  # with --no-block); it must end before the file and the tool under it are
+  # replaced.
+  valkey_build_stop_legacy_build_unit
   [[ -f $src && -f ${SCRIPT_DIR}/tools/build-common.sh ]] || { warn "Valkey: tools/valkey-build.sh is missing from this checkout"; return 1; }
   install -d -m 755 "$VALKEY_BUILD_ROOT"
   cmp -s "$src" "$VALKEY_BUILD_TOOL" || install -m 755 "$src" "$VALKEY_BUILD_TOOL"
@@ -101,6 +121,27 @@ valkey_build_install_support() {
   return 0
 }
 
+# 1.21 shipped an on-demand setup-valkey-build.service of the same name
+# (ExecStart=ROOT/valkey-build.sh rebuild), which its APT hook could start
+# during fleet-update's apt phase.  Such a job runs the 1.21 code outside
+# /run/setup-build.lock: it rewrites ROOT/build and the zz-setup-build.conf
+# drop-in and restarts valkey-server, possibly in the middle of a 1.22 build
+# or the cutover (R3 (b)).  A unit file without our marker is that one: stop
+# it (systemctl stop waits for a oneshot), killing it after 3 minutes.
+valkey_build_stop_legacy_build_unit() {
+  local u=${VALKEY_BUILD_UNIT##*/}
+  [[ -f $VALKEY_BUILD_UNIT ]] || return 0
+  grep -qxF "$VALKEY_BUILD_UNIT_MARK" "$VALKEY_BUILD_UNIT" 2>/dev/null && return 0
+  case $(systemctl show -p ActiveState --value "$u" 2>/dev/null) in
+    active|activating|deactivating|reloading) ;;
+    *) return 0 ;;
+  esac
+  warn "Valkey: stopping a running 1.21 ${u} job before its file is replaced"
+  timeout 180 systemctl stop "$u" >/dev/null 2>&1 \
+    || systemctl kill -s KILL "$u" >/dev/null 2>&1 || true
+  return 0
+}
+
 # 1.21.71's triggers: the APT hook (it deleted the build when the package
 # binary disappeared, so it must be gone before the package is removed), the
 # daily refresh timer, and transient fallback units.  The old binary layout
@@ -109,6 +150,7 @@ valkey_build_install_support() {
 valkey_build_retire_legacy() {
   local u changed=0
   [[ -f $VALKEY_BUILD_LEGACY_APT_HOOK ]] && rm -f "$VALKEY_BUILD_LEGACY_APT_HOOK"
+  valkey_build_stop_legacy_build_unit
   if [[ -f $VALKEY_BUILD_LEGACY_REFRESH_TIMER || -f $VALKEY_BUILD_LEGACY_REFRESH_UNIT ]]; then
     systemctl disable --now "${VALKEY_BUILD_LEGACY_REFRESH_TIMER##*/}" >/dev/null 2>&1 || true
     systemctl stop "${VALKEY_BUILD_LEGACY_REFRESH_UNIT##*/}" >/dev/null 2>&1 || true
@@ -123,6 +165,10 @@ valkey_build_retire_legacy() {
 }
 
 # After a verified cutover: the 1.21 layout goes to the backups (0700 root).
+# Never inside the migration's activate: lib/migrate.sh verifies the
+# running executable, PING and the dataset first and may still roll back to
+# the 1.21 state, so it moves the old layout itself once that passes (or
+# calls this then).  install/--optimize call it after their verified start.
 valkey_build_retire_legacy_layout() {
   local out=${1:-info} dest
   valkey_unit_is_ours && systemctl is-active --quiet valkey-server 2>/dev/null || return 0
@@ -130,7 +176,8 @@ valkey_build_retire_legacy_layout() {
   [[ -d $VALKEY_BUILD_LEGACY_DIR ]] || return 0
   install -d -m 700 "$VALKEY_BUILD_BACKUPS"
   dest="${VALKEY_BUILD_BACKUPS}/valkey-build-1.21-$(date +%Y%m%d%H%M%S)"
-  mv "$VALKEY_BUILD_LEGACY_DIR" "$dest" && "$out" "- Valkey: the 1.21 build moved to ${dest}"
+  mv "$VALKEY_BUILD_LEGACY_DIR" "$dest" && valkey_build_report "$out" "- Valkey: the 1.21 build moved to ${dest}"
+  return 0
 }
 
 # User/group, /var/lib/valkey, the log directory, /etc/valkey (valkey.conf
@@ -148,10 +195,11 @@ valkey_build_run() { # out command [args]
   shift 2
   install -d -m 750 "$VALKEY_BUILD_LOG_DIR"
   f="${VALKEY_BUILD_LOG_DIR}/ensure-${cmd}.log"
-  env VALKEY_BUILD_CUTOVER="${VALKEY_BUILD_CUTOVER_FLAG:-0}" "$VALKEY_BUILD_TOOL" "$cmd" "$@" > "$f" 2>&1 || rc=$?
+  env VALKEY_BUILD_CUTOVER="${VALKEY_BUILD_CUTOVER_FLAG:-0}" VALKEY_BUILD_NO_START="${VALKEY_BUILD_CUTOVER_FLAG:-0}" \
+    "$VALKEY_BUILD_TOOL" "$cmd" "$@" > "$f" 2>&1 || rc=$?
   if (( rc != 0 )); then
     tail -n 8 "$f" >&2 2>/dev/null || true
-    "$out" "- **FAILED** Valkey ${cmd} (log: $(valkey_build_last_log || true); tool output: ${f})"
+    valkey_build_report "$out" "- **FAILED** Valkey ${cmd} (log: $(valkey_build_last_log || true); tool output: ${f})"
   fi
   return "$rc"
 }
@@ -164,16 +212,18 @@ valkey_build_run() { # out command [args]
 #        bolt        BOLT only (after the migration; never fails)
 # CONTEXT install|optimize|migrate|domain|...  migrate allows the activate to
 #        replace the valkey-server package's unit (the migration stopped the
-#        package server and took its snapshot first).
-# OUT    report function (info, opt_report).
+#        package server and took its snapshot first); the activate then
+#        installs and enables without starting, and leaves the 1.21 layout
+#        in place (lib/migrate.sh starts, verifies and moves it).
+# OUT    report function (info, opt_report), or a file path to append to.
 # Returns 1 when a build or the activation failed.
 valkey_build_ensure() {
   local mode=${1:-full} context=${2:-install} out=${3:-info} chk="" rc=0
-  case $mode in build-only|activate|full|bolt) ;; *) "$out" "- Valkey: unknown build mode ${mode}"; return 1 ;; esac
+  case $mode in build-only|activate|full|bolt) ;; *) valkey_build_report "$out" "- Valkey: unknown build mode ${mode}"; return 1 ;; esac
   # An adopted Redis is never replaced (it is tuned as Redis instead).
   if valkey_pkg_installed redis-server && ! valkey_pkg_installed valkey-server \
      && ! valkey_unit_is_ours && [[ ! -f $VALKEY_BUILD_INFO ]]; then
-    "$out" "- Valkey: skipped (redis-server is installed; a Redis server is never replaced)"
+    valkey_build_report "$out" "- Valkey: skipped (redis-server is installed; a Redis server is never replaced)"
     return 0
   fi
   valkey_build_retire_legacy
@@ -182,34 +232,42 @@ valkey_build_ensure() {
   if [[ $mode == build-only || $mode == full ]]; then
     chk=$("$VALKEY_BUILD_TOOL" check 2>/dev/null) || rc=$?
     case $rc in
-      0)  "$out" "- Valkey: build is current ($("$VALKEY_BUILD_TOOL" status))" ;;
-      2)  "$out" "- Valkey: upstream version lookup failed (offline?); the current build stays" ;;
-      11) "$out" "- Valkey: ${chk}; fetching it"
-          valkey_build_run "$out" fetch || "$out" "- Valkey: cache not completed; a CPU change would need the network" ;;
-      *)  [[ $chk == stale:* ]] && "$out" "- Valkey: build ${chk}"
-          "$out" "- Valkey: building from its upstream release (about 2 minutes)"
+      0)  if [[ $chk == staged* ]]; then valkey_build_report "$out" "- Valkey: ${chk}"
+          else valkey_build_report "$out" "- Valkey: build is current ($("$VALKEY_BUILD_TOOL" status))"
+          fi ;;
+      2)  valkey_build_report "$out" "- Valkey: upstream version lookup failed (offline?); the current build stays" ;;
+      11) valkey_build_report "$out" "- Valkey: ${chk}; fetching it"
+          valkey_build_run "$out" fetch || valkey_build_report "$out" "- Valkey: cache not completed; a CPU change would need the network" ;;
+      *)  [[ $chk == stale:* ]] && valkey_build_report "$out" "- Valkey: build ${chk}"
+          valkey_build_report "$out" "- Valkey: building from its upstream release (about 2 minutes)"
           valkey_build_run "$out" build || return 1
-          "$out" "- Valkey: $(grep -m1 'built with clang' "${VALKEY_BUILD_LOG_DIR}/ensure-build.log" 2>/dev/null || echo 'build verified and staged')" ;;
+          valkey_build_report "$out" "- Valkey: $(grep -m1 'built with clang' "${VALKEY_BUILD_LOG_DIR}/ensure-build.log" 2>/dev/null || echo 'build verified and staged')" ;;
     esac
     [[ $mode == build-only ]] && return 0
   fi
 
   if [[ $mode == activate || $mode == full ]]; then
     if [[ $context != migrate ]] && valkey_pkg_installed valkey-server && ! valkey_unit_is_ours; then
-      "$out" "- Valkey: the valkey-server package still serves; the 1.22 migration switches it to this build"
+      valkey_build_report "$out" "- Valkey: the valkey-server package still serves; the 1.22 migration switches it to this build"
       return 0
     fi
+    # migrate: the cutover may replace the package's unit (the migration
+    # stopped the package server and took its snapshot first), and the
+    # tool installs without starting: lib/migrate.sh starts the unit and
+    # verifies it (executable path, PING, DBSIZE) and owns the rollback.
     local VALKEY_BUILD_CUTOVER_FLAG=0
     [[ $context == migrate ]] && VALKEY_BUILD_CUTOVER_FLAG=1
     valkey_build_run "$out" activate || return 1
-    "$out" "- Valkey: $("$VALKEY_BUILD_TOOL" status)"
+    valkey_build_report "$out" "- Valkey: $("$VALKEY_BUILD_TOOL" status)"
     # Local PHP workers reach the socket through the valkey group; they pick
     # up a new membership only on a restart.
     if declare -F valkey_ensure_www_group >/dev/null && valkey_ensure_www_group valkey \
        && declare -F restart_php_workers_for_group >/dev/null; then
       restart_php_workers_for_group valkey
     fi
-    valkey_build_retire_legacy_layout "$out"
+    # The 1.21 layout leaves only after a verified start; in the migration
+    # that verification is lib/migrate.sh's, after this returns.
+    [[ $context == migrate ]] || valkey_build_retire_legacy_layout "$out"
     # BOLT never runs inside the migration (a separate pass after it).
     [[ $mode == activate || $context == migrate ]] && return 0
   fi
@@ -217,10 +275,11 @@ valkey_build_ensure() {
   if valkey_build_bolted || [[ ${SETUP_VALKEY_BUILD_BOLT:-1} != 1 ]]; then return 0; fi
   if [[ $mode == bolt ]] && ! valkey_unit_is_ours; then return 0; fi
   rc=0
+  install -d -m 750 "$VALKEY_BUILD_LOG_DIR"
   "$VALKEY_BUILD_TOOL" bolt > "${VALKEY_BUILD_LOG_DIR}/ensure-bolt.log" 2>&1 || rc=$?
   case $rc in
-    0) "$out" "- Valkey: BOLT applied (profile of a valkey-benchmark run)" ;;
-    *) "$out" "- Valkey: BOLT not applied ($(tail -n 1 "${VALKEY_BUILD_LOG_DIR}/ensure-bolt.log" 2>/dev/null)); the LTO build keeps serving" ;;
+    0) valkey_build_report "$out" "- Valkey: BOLT applied (profile of a valkey-benchmark run)" ;;
+    *) valkey_build_report "$out" "- Valkey: BOLT not applied ($(tail -n 1 "${VALKEY_BUILD_LOG_DIR}/ensure-bolt.log" 2>/dev/null)); the LTO build keeps serving" ;;
   esac
   return 0
 }
@@ -281,7 +340,30 @@ valkey_build_purge() {
     info "Valkey: build removed (${VALKEY_BUILD_ROOT})"
   fi
   declare -F setup_build_llvm_release >/dev/null && setup_build_llvm_release valkey
+  valkey_build_release_shared_units
   systemctl daemon-reload 2>/dev/null || true
   systemctl reset-failed valkey-server.service >/dev/null 2>&1 || true
   return 0
+}
+
+# Last-consumer rule (R81): the shared setup-build-refresh.{service,timer},
+# setup-build-cpu.service and the lock go with the last compiled build.
+# "--purge nginx" then "--purge valkey" must not leave the timer and the CPU
+# unit enabled with nothing to build.  Each root is tested on its own (a
+# missing root must not hide a build in another one).
+valkey_build_release_shared_units() {
+  local n=${NGINX_ROOT:-${NGINX_BUILD_ROOT:-/usr/local/lib/setup-nginx}} p=${PHP_BUILD_ROOT:-/usr/local/lib/setup-php}
+  local d=${VALKEY_BUILD_SYSTEMD_DIR} cpu refresh timer lock
+  [[ -f $n/build.info || -x $n/sbin/nginx ]] && return 0
+  compgen -G "${p}/[0-9]*/build.info" >/dev/null && return 0
+  [[ -f $VALKEY_BUILD_INFO ]] && return 0
+  cpu=${SETUP_BUILD_CPU_UNIT:-$d/setup-build-cpu.service}
+  refresh=${SETUP_BUILD_REFRESH_UNIT:-$d/setup-build-refresh.service}
+  timer=${SETUP_BUILD_REFRESH_TIMER:-$d/setup-build-refresh.timer}
+  lock=${SETUP_BUILD_LOCK_FILE:-${SETUP_BUILD_LOCK:-/run/setup-build.lock}}
+  [[ -e $cpu || -e $refresh || -e $timer ]] || return 0
+  systemctl disable --now "${timer##*/}" >/dev/null 2>&1 || true
+  systemctl stop "${cpu##*/}" "${refresh##*/}" >/dev/null 2>&1 || true
+  rm -f "$cpu" "$refresh" "$timer" "$lock"
+  info "Valkey: last compiled build removed; the shared refresh timer and CPU rebuild unit went with it"
 }

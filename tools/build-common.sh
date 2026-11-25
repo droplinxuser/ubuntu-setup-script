@@ -243,9 +243,16 @@ ensure_packages() {
     dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q ' installed$' || missing+=("$p")
   done
   (( ${#missing[@]} )) || return 0
+  # A CI runner (NGINX_BUILD_CI=1) builds as an ordinary user with sudo; on
+  # a host every tool runs as root (need_root).
+  local -a asroot=()
+  if (( EUID != 0 )); then
+    command -v sudo >/dev/null 2>&1 || die "installing ${missing[*]} needs root (or sudo)"
+    asroot=(sudo -n)
+  fi
   say "installing: ${missing[*]}"
-  apt-get -o DPkg::Lock::Timeout=900 update -qq
-  apt-get -o DPkg::Lock::Timeout=900 install -y --no-install-recommends "${missing[@]}" >/dev/null
+  ${asroot[@]+"${asroot[@]}"} apt-get -o DPkg::Lock::Timeout=900 update -qq
+  ${asroot[@]+"${asroot[@]}"} apt-get -o DPkg::Lock::Timeout=900 install -y --no-install-recommends "${missing[@]}" >/dev/null
 }
 
 # ---------------------------------------------------------------- versions
@@ -385,11 +392,16 @@ latest_of() {
   [[ -n $v ]] && printf '%s' "$v"
 }
 
-# The version an existing build of any PHP version recorded for NAME.
+# The version the ACTIVE build recorded for NAME: ROOT/build.info (Valkey),
+# ROOT/build/build.info (nginx; also Valkey's 1.21 layout) or
+# ROOT/X.Y/build.info (any PHP version).  Never a staged or previous build
+# (staging/, prev/): neither serves, and keeping its version when a lookup
+# fails would downgrade the next build and flip back on the next failure.
 last_known() {
   local f v=""
-  for f in "$ROOT"/*/build.info; do
+  for f in "$ROOT/build.info" "$ROOT"/*/build.info; do
     [[ -f $f ]] || continue
+    case ${f%/build.info} in */staging|*/prev) continue ;; esac
     v=$(awk -F= -v k="$1" '$1 == k { print substr($0, length(k) + 2); exit }' "$f")
     [[ -n $v ]] && break
   done
@@ -920,8 +932,18 @@ BUILD_TOOL_PHP=${SETUP_BUILD_TOOL_PHP:-/usr/local/lib/setup-php/php-build.sh}
 BUILD_TOOL_VALKEY=${SETUP_BUILD_TOOL_VALKEY:-/usr/local/lib/setup-valkey/valkey-build.sh}
 BUILD_PHP_ACTIVE=${SETUP_PHP_ACTIVE_FILE:-/etc/php/setup-active}
 BUILD_UNIT_DIR=${SETUP_BUILD_UNIT_DIR:-/etc/systemd/system}
-BUILD_MIGRATE_STATE=${SETUP_MIGRATE_STATE:-/var/lib/setup.sh/migrate-1.22}
+# lib/migrate.sh's MIGRATE_STATE_FILE (KEY=VALUE lines; its test hook
+# SETUP_MIGRATE_STATE_FILE is honoured here too).
+BUILD_MIGRATE_STATE=${SETUP_MIGRATE_STATE:-${SETUP_MIGRATE_STATE_FILE:-/var/lib/setup.sh/migrate-1.22}}
 BUILD_CPU_ATTEMPTS=${SETUP_BUILD_CPU_ATTEMPTS:-/run/setup-build-cpu.attempts}
+# setup.sh's run lock (lib/common.sh LOCK_FILE), held for a whole install,
+# --optimize or --upgrade-php run.
+BUILD_RUN_LOCK=${SETUP_RUN_LOCK:-/run/setup.sh.lock}
+# Per-stage budgets of the CPU chain (seconds).  setup-build-cpu.service's
+# TimeoutStartSec (lib/nginx-build.sh) is sized above their sum.
+BUILD_CHAIN_T_NGINX=${SETUP_BUILD_CHAIN_T_NGINX:-3600}
+BUILD_CHAIN_T_PHP=${SETUP_BUILD_CHAIN_T_PHP:-7200}
+BUILD_CHAIN_T_VALKEY=${SETUP_BUILD_CHAIN_T_VALKEY:-3600}
 
 # Start UNIT after its rebuild, but only when it is enabled: never a masked,
 # disabled or retired unit (an Angie-era or mid-migration unit stays as it is).
@@ -974,31 +996,46 @@ build_chain_cpu() {
   n=$(cat "$BUILD_CPU_ATTEMPTS" 2>/dev/null || echo 0)
   [[ $n =~ ^[0-9]+$ ]] || n=0
   if (( n >= 2 )); then
-    say "chain: two CPU rebuild attempts failed since boot; services stay down (operator rule). Fix the cause (journalctl -t setup-nginx-build -t setup-php-build -t setup-valkey-build) and run: systemctl start setup-build-cpu.service"
-    rm -f "$BUILD_CPU_ATTEMPTS"   # an explicit start after the fix gets two more
+    # The counter stays in /run until reboot: every later gate trigger (each
+    # service's ExecStartPre, a manual start) is refused as well, so a build
+    # that keeps failing cannot loop.  Resetting it is a deliberate operator
+    # step, never just a third start.
+    say "chain: two CPU rebuild attempts failed since boot; services stay down (operator rule). Fix the cause (journalctl -t setup-nginx-build -t setup-php-build -t setup-valkey-build), then run: rm -f $BUILD_CPU_ATTEMPTS && systemctl start setup-build-cpu.service"
     return 1
   fi
   printf '%s' "$(( n + 1 ))" > "$BUILD_CPU_ATTEMPTS" 2>/dev/null || true
   if [[ -f $BUILD_TOOL_NGINX ]]; then
-    chain_stage nginx 3600 nginx.service "$BUILD_TOOL_NGINX" rebuild-cpu || rc=1
+    chain_stage nginx "$BUILD_CHAIN_T_NGINX" nginx.service "$BUILD_TOOL_NGINX" rebuild-cpu || rc=1
   fi
   if [[ -f $BUILD_TOOL_PHP ]]; then
     while IFS= read -r v; do
       [[ -n $v ]] || continue
-      chain_stage "PHP $v" 7200 "php$v-fpm.service" "$BUILD_TOOL_PHP" rebuild-cpu "$v" || rc=1
+      chain_stage "PHP $v" "$BUILD_CHAIN_T_PHP" "php$v-fpm.service" "$BUILD_TOOL_PHP" rebuild-cpu "$v" || rc=1
     done < <(chain_php_versions)
   fi
   if [[ -f $BUILD_TOOL_VALKEY ]]; then
-    chain_stage Valkey 3600 valkey-server.service "$BUILD_TOOL_VALKEY" rebuild-cpu || rc=1
+    chain_stage Valkey "$BUILD_CHAIN_T_VALKEY" valkey-server.service "$BUILD_TOOL_VALKEY" rebuild-cpu || rc=1
   fi
   (( rc == 0 )) && rm -f "$BUILD_CPU_ATTEMPTS"
   return "$rc"
 }
 
-# The 1.22 migration is running or unfinished: its state file has no "done"
-# line yet.  Refresh builds wait for it (R65).
+# The 1.22 migration is running or unfinished: its state file exists without
+# the line lib/migrate.sh's migrate_mark_complete writes, `complete=1`
+# (`complete=0` while a run is under way or after a failed one).  No state
+# file: the host never migrated (a fresh 1.22 install).  Refresh builds wait
+# for it (R65).
 migration_pending() {
-  [[ -f $BUILD_MIGRATE_STATE ]] && ! grep -qxE 'done|complete' "$BUILD_MIGRATE_STATE" 2>/dev/null
+  [[ -f $BUILD_MIGRATE_STATE ]] || return 1
+  ! grep -qx 'complete=1' "$BUILD_MIGRATE_STATE" 2>/dev/null
+}
+
+# A setup.sh run (install, --optimize, --upgrade-php) holds its run lock.
+# Probed with a shared, non-blocking lock that is dropped at once: an
+# exclusive probe could make a setup.sh starting in that instant refuse to run.
+setup_run_active() {
+  [[ -f $BUILD_RUN_LOCK && ! -L $BUILD_RUN_LOCK ]] && command -v flock >/dev/null 2>&1 || return 1
+  ! ( exec 8<"$BUILD_RUN_LOCK" && flock -n -s 8 ) 2>/dev/null
 }
 
 # setup-build-refresh.service (daily timer): each tool's `refresh` checks for
@@ -1010,6 +1047,11 @@ build_chain_refresh() {
   local -a tools=() t
   local i=0 load cpus pick
   if migration_pending; then say "refresh skipped: the 1.22 migration is not finished ($BUILD_MIGRATE_STATE)"; return 0; fi
+  # A running setup.sh may be switching PHP versions (--upgrade-php) or
+  # rewriting units; a refresh activate or restart in the middle of that
+  # would race the handover (R65 c/e).  The timer is Persistent: the next
+  # day's run picks the refresh up.
+  if setup_run_active; then say "refresh skipped: a setup.sh run is in progress ($BUILD_RUN_LOCK)"; return 0; fi
   [[ -f $BUILD_TOOL_NGINX ]] && tools+=("$BUILD_TOOL_NGINX")
   [[ -f $BUILD_TOOL_PHP ]] && tools+=("$BUILD_TOOL_PHP")
   [[ -f $BUILD_TOOL_VALKEY ]] && tools+=("$BUILD_TOOL_VALKEY")

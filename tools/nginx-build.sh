@@ -71,8 +71,8 @@
 #   nginx-build.sh rebuild              build, activate, wait for traffic, bolt
 #   nginx-build.sh rebuild-cpu          CPU-change rebuild (offline, recorded versions)
 #   nginx-build.sh refresh              daily timer: rebuild when stale, BOLT when due
-#   nginx-build.sh check                0 when current, 10 when a rebuild is due
-#   nginx-build.sh versions | status | pre | remove | configure-args
+#   nginx-build.sh check [INFO]         0 when current, 10 when a rebuild is due (INFO: another build.info)
+#   nginx-build.sh versions | status | pre | remove | configure-args | directive-res
 #   nginx-build.sh fit [CONF [BIN]] | restore   comment out / restore directives of left-out modules
 set -Eeuo pipefail
 export LC_ALL=C DEBIAN_FRONTEND=noninteractive
@@ -123,6 +123,12 @@ LOG_FILE=""
 # limit_conn stays out of the build (operator rule, 1.21.71); commenting it
 # out is reported as a removed security control, never silently.
 DROPPABLE_RE='^(sub_filter(_once|_types|_last_modified)?|ssi(_[a-z_]+)?|addition_types|add_before_body|add_after_body|limit_conn(_zone|_status|_log_level|_dry_run)?|userid(_[a-z_]+)?|autoindex(_[a-z_]+)?|random_index|gunzip(_buffers)?|mp4(_[a-z_]+)?|flv)$'
+# Directives of modules this build does not have that are NOT droppable
+# (access control, content handlers, left-out modules nginx never builds by
+# default): a configuration using one blocks the activation.  lib/nginx-build.sh
+# exports both lists (NGINX_BUILD_DROPPABLE_RE / NGINX_BUILD_UNBUILT_RE) for
+# the migration's pre-flight scan, so it matches this configure line.
+UNBUILT_RE='^(valid_referers|referer_hash_(max|bucket)_size|auth_request(_set)?|secure_link(_md5|_secret)?|slice|dav_(methods|access)|create_full_put_path|min_delete_depth|uwsgi_[a-z_]+|scgi_[a-z_]+|grpc_[a-z_]+|memcached_[a-z_]+|empty_gif|mirror(_request_body)?|split_clients|image_filter(_[a-z_]+)?|xslt_[a-z_]+|perl(_[a-z_]+)?|geoip_[a-z_]+|ancient_browser(_value)?|modern_browser(_value)?)$'
 OFF_MARK='# setup-nginx-build-off: '
 # 1.21.70-1.21.71 builds marked their comments this way (in /etc/angie, which
 # the migration copies to /etc/nginx); restore_config recognises both.
@@ -210,7 +216,9 @@ fit_config() { # binary [conf]
     if [[ $out =~ unknown\ directive\ \"([a-z0-9_]+)\"\ in\ ([^[:space:]]+):([0-9]+) ]]; then
       d=${BASH_REMATCH[1]}; f=${BASH_REMATCH[2]}; n=${BASH_REMATCH[3]}
       if [[ $d =~ $DROPPABLE_RE && $f == "$dir"/* && -f $f && ! -L $f ]] && comment_directive "$f" "$n" "$d"; then
-        if host_mode && [[ $conf == "$NGINX_CONF" ]]; then
+        # disabled.list feeds lib/nginx-build.sh's report of comment-outs made
+        # outside a setup.sh run; the migration reports its own fit lines.
+        if host_mode && [[ $conf == "$NGINX_CONF" && $CONTEXT != migrate ]]; then
           install -d -m 755 "$STATE"
           printf '%s:%s %s\n' "${f#"$dir"/}" "$n" "$d" >> "$STATE/disabled.list"
         fi
@@ -295,11 +303,14 @@ BRAND_PAGES_FILE=src/http/ngx_http_special_response.c
 # Status 1 with the reason on stderr when a count differs.
 brand_patch() { # dir
   local d=$1 f n
+  # Counts are taken with `|| true` inside the substitution: grep exits 1 on
+  # zero matches, which under set -e/pipefail would abort a plain call (the
+  # fixture tests call it outside `if`) instead of returning the count.
   for f in "${BRAND_HEADER_FILES[@]}"; do
     [[ -f $d/$f ]] || { say "branding: $f is missing"; return 1; }
-    n=$(grep -oF 'r->headers_out.server == NULL' "$d/$f" | wc -l)
+    n=$( { grep -oF 'r->headers_out.server == NULL' "$d/$f" || true; } | wc -l)
     (( n == 2 )) || { say "branding: $f has $n x 'r->headers_out.server == NULL' (expected 2)"; return 1; }
-    n=$(grep -oF '0 && r->headers_out.server == NULL' "$d/$f" | wc -l)
+    n=$( { grep -oF '0 && r->headers_out.server == NULL' "$d/$f" || true; } | wc -l)
     (( n == 0 )) || { say "branding: $f is already patched"; return 1; }
   done
   [[ -f $d/$BRAND_PAGES_FILE ]] || { say "branding: $BRAND_PAGES_FILE is missing"; return 1; }
@@ -307,7 +318,7 @@ brand_patch() { # dir
   (( n == 3 )) || { say "branding: $BRAND_PAGES_FILE has $n '\"<hr><center>' tail lines (expected 3)"; return 1; }
   for f in "${BRAND_HEADER_FILES[@]}"; do
     sed -i 's/r->headers_out\.server == NULL/0 \&\& r->headers_out.server == NULL/g' "$d/$f"
-    n=$(grep -oF '0 && r->headers_out.server == NULL' "$d/$f" | wc -l)
+    n=$( { grep -oF '0 && r->headers_out.server == NULL' "$d/$f" || true; } | wc -l)
     (( n == 2 )) || { say "branding: $f: $n patched lines after sed (expected 2)"; return 1; }
   done
   sed -i '/^"<hr><center>/d' "$d/$BRAND_PAGES_FILE"
@@ -492,7 +503,8 @@ nginx_source() { # version src
 # verify, stage in ROOT/staging.  Nothing that serves changes.
 cmd_build() { # [normal|cpu]
   local how=${1:-normal} work src n j line flags ld lto="" fb fail="" stamp
-  need_root
+  # CI runners build as an ordinary user (ensure_packages uses sudo there).
+  host_mode && need_root
   ensure_packages ca-certificates curl git xz-utils bzip2 make cmake perl gpgv binutils autoconf automake libtool build-essential
   mkdir -p "$SRC_CACHE/src" "$LOGS"; chmod 700 "$SRC_CACHE"
   host_mode && build_space_check "$SRC_CACHE"
@@ -547,9 +559,13 @@ cmd_build() { # [normal|cpu]
     if [[ $how == cpu ]]; then
       die "nginx $fail: the branding patch no longer applies to the recorded version (source changed?)"
     fi
-    if [[ $CONTEXT == refresh ]]; then
-      # The refresh never falls back (that could be a downgrade): the running
-      # binary keeps serving; tomorrow's run tries again (R68).
+    if [[ $CONTEXT == refresh ]] && master_pid >/dev/null; then
+      # The refresh never falls back while our nginx serves (that could be a
+      # downgrade): the running binary keeps serving; tomorrow's run tries
+      # again (R68).  With no master (a host left down by a failed CPU
+      # chain, which the refresh exists to heal, R13) nothing can be
+      # downgraded: the fallback below builds the recorded patched_ok or
+      # NGINX_FALLBACK, whichever is newer.
       printf '%s\n' "$fail" > "$SKIP_FILE"
       say "nginx $fail: the branding patch does not apply (an upstream change moved a patched line); the running nginx keeps serving"
       exit 3
@@ -600,6 +616,10 @@ cmd_build() { # [normal|cpu]
     install -m 755 "$src/objs/nginx" "$STAGING/sbin/nginx"
   fi
   write_html "$STAGING/html"
+  # The migration's path map points `root /usr/share/angie/html` at
+  # ROOT/html before anything is activated; seed it once (unbranded, nothing
+  # serves from it yet) so the rendered tree finds it.  activate replaces it.
+  if host_mode && [[ ! -d $ROOT/html ]]; then write_html "$ROOT/html"; fi
   {
     printf 'recipe=%s\n' "$BUILD_RECIPE"
     for line in "${COMPONENTS[@]}"; do printf '%s=%s\n' "$line" "${VERS[$line]}"; done
@@ -619,10 +639,18 @@ cmd_build() { # [normal|cpu]
 }
 
 # The candidate reports its version, links none of the compiled-in libraries
-# from Ubuntu, has ngx_brotli compiled in, passes the branding check and
-# (on a host) accepts the live configuration.
+# from Ubuntu, has ngx_brotli compiled in statically (`--add-module=`, the
+# form server-configs-nginx's CI matches; never --add-dynamic-module) and
+# passes the branding check.
+#
+# The live configuration is only TESTED here (report mode), never edited:
+# `build` runs while the old binary serves (install, --optimize, the refresh
+# timer, the CPU chain), and R2.5 promises that it changes nothing that
+# serves.  Commenting out droppable directives in the operator's files is
+# `activate`'s job (cmd_activate runs fit_config right before the swap, and
+# lib/nginx-build.sh reports every line it comments out).
 verify_binary() { # binary
-  local cand=$1 needed v
+  local cand=$1 needed v err
   v=$(bin_version "$cand")
   [[ -n $v ]] || die "candidate does not report an nginx version"
   needed=$(readelf -d "$cand" 2>/dev/null | awk -F'[][]' '/\(NEEDED\)/ { print $2 }')
@@ -632,12 +660,14 @@ verify_binary() { # binary
   # Captured, not piped into grep -q: with pipefail an early grep exit can
   # SIGPIPE the writer and fail a good candidate.
   v=$("$cand" -V 2>&1 || true)
-  [[ $v == *ngx_brotli* ]] || die "candidate has no static ngx_brotli (nginx -V)"
+  [[ $v == *--add-module=*ngx_brotli* ]] || die "candidate has no static ngx_brotli (nginx -V lacks --add-module=...ngx_brotli)"
   [[ $v == *--with-http_stub_status_module* ]] || die "candidate has no stub_status"
   branding_check "$cand" || die "candidate failed the branding check (log: $LOG_FILE)"
   if live_test_enabled; then
     apply_tmpfiles
-    fit_config "$cand" || die "candidate rejects $NGINX_CONF (a module this lean build leaves out); the running nginx keeps serving"
+    if ! err=$(conf_test "$cand"); then
+      say "nginx build: the live configuration does not pass with this build yet ($(grep -m1 -E 'emerg|error' <<<"$err" || sed -n 1p <<<"$err")); activation comments out droppable directives (reported) or refuses, and the running nginx keeps serving"
+    fi
   fi
 }
 
@@ -916,18 +946,24 @@ cache_ensure() {
   done
 }
 
-cmd_check() {
-  local name want have stale="" rc=0 bcpu skip n
-  [[ -f $STATE/build.info ]] || { echo "no build"; return 10; }
-  [[ $(info_get recipe) == "$BUILD_RECIPE" ]] || stale+="recipe $(info_get recipe) -> $BUILD_RECIPE, "
-  bcpu=$(info_get cpu)
+# check [INFO]: is the build recorded in INFO (default: the active
+# ROOT/build/build.info) current?  lib/nginx-build.sh also asks it about
+# ROOT/staging/build.info before activating a leftover staged build (an
+# aborted migration's build-only, a failed earlier activate): a staging made
+# for another recipe, CPU or older versions is discarded, never swapped in.
+cmd_check() { # [info]
+  local info=${1:-$STATE/build.info} name want have stale="" rc=0 bcpu skip n
+  [[ -f $info ]] || { echo "no build"; return 10; }
+  [[ $(info_get recipe "$info") == "$BUILD_RECIPE" ]] || stale+="recipe $(info_get recipe "$info") -> $BUILD_RECIPE, "
+  [[ $(info_get ci "$info") != 1 ]] || stale+="CI build, "
+  bcpu=$(info_get cpu "$info")
   [[ -n $bcpu && $bcpu == "$(cpu_fingerprint)" ]] || stale+="cpu ${bcpu:-unknown} -> $(cpu_fingerprint), "
-  n=$(info_get llvm)
+  n=$(info_get llvm "$info")
   if [[ -n $n && ! -x /usr/lib/llvm-$n/bin/clang && ! -x $LLVM_OPT/$n/bin/clang ]]; then stale+="LLVM $n missing, "; fi
   skip=$(cat "$SKIP_FILE" 2>/dev/null || true)
   while IFS='=' read -r name want; do
     if [[ $want == "?" ]]; then rc=2; continue; fi
-    have=$(info_get "$name")
+    have=$(info_get "$name" "$info")
     # A version the branding patch was refused for is not due again.
     [[ $name == nginx && -n $skip && $want == "$skip" ]] && continue
     [[ $have == "$want" ]] || stale+="$name ${have:-none} -> $want, "
@@ -944,6 +980,10 @@ cmd_check() {
 cmd_refresh() {
   local rc=0 out
   [[ -f $STATE/build.info ]] || return 0
+  # Same gates as the chain driver (build-common.sh build_chain_refresh), for
+  # a `refresh` started by hand: never during the migration or a setup.sh run.
+  if migration_pending; then say "nginx refresh skipped: the 1.22 migration is not finished"; return 0; fi
+  if setup_run_active; then say "nginx refresh skipped: a setup.sh run is in progress"; return 0; fi
   CONTEXT=refresh
   cache_ensure
   out=$(cmd_check 2>/dev/null) || rc=$?
@@ -1001,7 +1041,7 @@ main() {
       build_lock_try cmd_refresh || rc=$?
       if (( rc == 75 )); then say "nginx refresh skipped: build lock held"; return 0; fi
       return "$rc" ;;
-    check)          cmd_check ;;
+    check)          cmd_check ${2:+"$2"} ;;
     versions)       resolve_all ;;
     status)         cmd_status ;;
     pre)            cmd_pre ;;
@@ -1020,7 +1060,8 @@ main() {
     restore)        need_root; restore_config ;;
     remove)         need_root; cmd_remove ;;
     configure-args) configure_paths; printf '%s\n' "${CONFIGURE_MODULES[@]}" --add-module=ngx_brotli ;;
-    *) die "usage: $0 build|build-only|activate|bolt [S]|rebuild|rebuild-cpu|refresh|check|versions|status|pre|fit [CONF [BIN]]|restore|remove|configure-args" ;;
+    directive-res)  printf 'droppable=%s\nunbuilt=%s\n' "$DROPPABLE_RE" "$UNBUILT_RE" ;;
+    *) die "usage: $0 build|build-only|activate|bolt [S]|rebuild|rebuild-cpu|refresh|check|versions|status|pre|fit [CONF [BIN]]|restore|remove|configure-args|directive-res" ;;
   esac
 }
 

@@ -10,6 +10,10 @@
 #   SKIP_APT=1                   skip the apt phase (retry only setup.sh)
 #   DRY_RUN_ONLY=1               stop after the optimize dry run for review
 #   REBOOT=1                     reboot at the end when /var/run/reboot-required
+#   MIN_FREE_MB=6144             free space needed on / (the source builds
+#                                need about 6 GB; less than 2048 always refuses)
+#   DETACH=0                     run --optimize in this session instead of as
+#                                the transient unit setup-fleet-optimize
 #
 # Safe by design:
 #   * non-interactive APT (confold, lock timeout, retries) and needrestart in
@@ -21,7 +25,11 @@
 #     before it runs;
 #   * the full output goes to /root/fleet-update-<timestamp>.log, plus a
 #     separate dry-run and optimize log;
-#   * a pending reboot is reported, not performed unless REBOOT=1.
+#   * a pending reboot is reported, not performed unless REBOOT=1;
+#   * --optimize runs as its own transient unit (systemd-run) with its output
+#     appended to the optimize log, so a dropped SSH session cannot stop the
+#     1.22 source builds or a service cutover half way.  This script only
+#     follows the log; re-attach with `tail -f` on that log.
 
 set -Eeuo pipefail
 
@@ -30,6 +38,8 @@ FORCE_SNAPD_PURGE=${FORCE_SNAPD_PURGE:-0}
 SKIP_APT=${SKIP_APT:-0}
 DRY_RUN_ONLY=${DRY_RUN_ONLY:-0}
 REBOOT=${REBOOT:-0}
+MIN_FREE_MB=${MIN_FREE_MB:-6144}
+DETACH=${DETACH:-1}
 STAMP=$(date +%Y%m%d-%H%M%S)
 WORKDIR=/root/ubuntu-setup-script
 ARCHIVE_URL="https://github.com/droplinxuser/ubuntu-setup-script/archive/refs/heads/${REF}.tar.gz"
@@ -60,9 +70,16 @@ say "Host and preflight"
 . /etc/os-release
 [[ ${ID:-} == ubuntu ]] || { echo "not Ubuntu (ID=${ID:-unknown})" >&2; exit 1; }
 printf 'Host: %s\nOS  : %s\nKernel: %s\n' "$(hostname)" "${PRETTY_NAME:-unknown}" "$(uname -r)"
+# 1.22 compiles nginx, every PHP version and Valkey on the host (LLVM, the
+# source trees and the staged builds): the build tools refuse below 6 GB on
+# the cache filesystem and 2 GB on /, and an apt upgrade on a nearly full /
+# can leave dpkg half-configured.  2 GiB stays the hard floor; MIN_FREE_MB
+# raises it (default 6 GiB) so a rollout does not start what cannot finish.
+[[ $MIN_FREE_MB =~ ^[0-9]+$ ]] || MIN_FREE_MB=6144
+(( MIN_FREE_MB >= 2048 )) || MIN_FREE_MB=2048
 avail_kb=$(df -Pk / | awk 'NR==2{print $4}')
-if [[ $avail_kb =~ ^[0-9]+$ ]] && (( avail_kb < 2097152 )); then
-  echo "less than 2 GiB free on / (${avail_kb} KiB); refusing to upgrade" >&2
+if [[ $avail_kb =~ ^[0-9]+$ ]] && (( avail_kb < MIN_FREE_MB * 1024 )); then
+  echo "less than ${MIN_FREE_MB} MiB free on / (${avail_kb} KiB); refusing to upgrade (MIN_FREE_MB overrides, never below 2048)" >&2
   exit 1
 fi
 say "Logs"
@@ -128,14 +145,51 @@ echo "Deployed: $(grep -m1 '^readonly SCRIPT_VERSION=' "${WORKDIR}/setup.sh" || 
 cd "$WORKDIR"
 
 say "Optimize dry run"
+# The dry run prints the 1.22 migration plan (parts, refusals, cutover
+# windows) and the build plan; it changes nothing.
 bash setup.sh --optimize --dry-run 2>&1 | tee "$DRY_LOG"
+if [[ ! -f /usr/local/lib/setup-nginx/build/build.info ]]; then
+  echo "Note: no compiled nginx yet: the first 1.22 --optimize builds LLVM, nginx, PHP and Valkey from source (typically 20-60 min); the sites keep serving until each cutover."
+fi
 if (( DRY_RUN_ONLY == 1 )); then
   say "DRY_RUN_ONLY=1: stopping after the dry run"
   echo "Review ${DRY_LOG}, then run again without DRY_RUN_ONLY (SKIP_APT=1)."
   exit 0
 fi
 say "Optimize"
-bash setup.sh --optimize 2>&1 | tee "$OPT_LOG"
+# Long builds and the service cutovers must survive a dropped session (R20,
+# R50): with systemd, --optimize runs as the transient unit
+# setup-fleet-optimize-<stamp> and appends to OPT_LOG; this shell only follows
+# the log.  If the session drops, the unit keeps running and this script
+# simply ends (no reboot is attempted).  The unit's exit status becomes
+# this step's status.
+if (( DETACH == 1 )) && command -v systemd-run >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+  OPT_UNIT="setup-fleet-optimize-${STAMP}"
+  install -m 600 /dev/null "$OPT_LOG"
+  echo "Running as ${OPT_UNIT}; follow it with: tail -f ${OPT_LOG}"
+  tail -n +1 -F "$OPT_LOG" 2>/dev/null &
+  tail_pid=$!
+  opt_rc=0
+  # A transient unit does not inherit this shell's environment: pass on the
+  # setup.sh knobs an operator exported for this rollout.
+  setenv_args=()
+  while IFS= read -r name; do
+    setenv_args+=("--setenv=${name}=${!name}")
+  done < <(compgen -e | grep -E '^(SETUP_[A-Z0-9_]+|CONFIG_REPO_(REF|URL)|CONFIG_SOURCE_DIR)$' || true)
+  systemd-run --unit="$OPT_UNIT" --collect --wait --quiet \
+    --working-directory="$WORKDIR" "${setenv_args[@]}" \
+    -p "StandardOutput=append:${OPT_LOG}" -p "StandardError=append:${OPT_LOG}" \
+    /bin/bash "${WORKDIR}/setup.sh" --optimize || opt_rc=$?
+  sleep 1
+  kill "$tail_pid" 2>/dev/null || true
+  wait "$tail_pid" 2>/dev/null || true
+  if (( opt_rc != 0 )); then
+    echo "setup.sh --optimize failed (exit ${opt_rc}); see ${OPT_LOG}" >&2
+    exit "$opt_rc"
+  fi
+else
+  bash setup.sh --optimize 2>&1 | tee "$OPT_LOG"
+fi
 
 say "Summary"
 systemctl --failed --no-legend || true

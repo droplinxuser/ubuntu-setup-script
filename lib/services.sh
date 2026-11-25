@@ -7,35 +7,12 @@
 # ---------------------------------------------------------------------------
 # Add every selected third-party repository first, then run one apt-get update
 # in prepare_repositories().  The service installers only install packages.
-configure_nginx_repo() {
-  local keyring=/usr/share/keyrings/nginx-signing.gpg
-  local legacy=/etc/apt/trusted.gpg.d/nginx-signing.gpg
-  refresh_blob_key "$keyring" blob_nginx_key || return 1
-  chmod 644 "$keyring"
-  # Older releases installed the key into trusted.gpg.d, where it can sign
-  # *every* configured repository.  Scope it to the nginx source with
-  # signed-by (the other third-party repositories already work this way) and
-  # retire the globally trusted copy when it is byte-identical to the embedded
-  # key; an operator-supplied key is left alone.
-  if [[ -f $legacy ]] && cmp -s "$legacy" "$keyring"; then
-    retire_paths "$legacy"
-  fi
-  # shellcheck disable=SC1091
-  . /etc/os-release
-  printf 'deb [signed-by=%s] https://download.angie.software/nginx/%s/%s %s main\n' \
-    "$keyring" "$ID" "$VERSION_ID" "$VERSION_CODENAME" > /etc/apt/sources.list.d/nginx.list
-  chmod 644 /etc/apt/sources.list.d/nginx.list
-}
-
-configure_php_repo() {
-  ensure_sury_keyring || return 1
-  # shellcheck disable=SC1091
-  . /etc/os-release
-  printf 'deb [signed-by=/usr/share/keyrings/debsuryorg-archive-keyring.gpg] https://packages.sury.org/php/ %s main\n' \
-    "$VERSION_CODENAME" > /etc/apt/sources.list.d/php.list
-  chmod 644 /etc/apt/sources.list.d/php.list
-}
-
+#
+# 1.22.0: nginx, PHP and Valkey are compiled from source (lib/nginx-build.sh,
+# lib/php-build.sh, lib/valkey-build.sh), so neither the Angie repository nor
+# the Sury repository is configured any more.  Hosts that still have them get
+# them retired by the one-time migration in --optimize (lib/migrate.sh), only
+# after the compiled builds serve.  Elasticsearch and NodeSource stay apt.
 configure_elastic_repo() {
   refresh_blob_key_dearmor /usr/share/keyrings/elasticsearch-keyring.gpg blob_elastic_key \
     || return 1
@@ -119,14 +96,8 @@ EOF
 prepare_repositories() {
   local configured=0 item
   apt_install ca-certificates curl gnupg lsb-release apt-transport-https
-  if [[ ${ENABLED[nginx]:-0} -eq 1 ]]; then
-    configure_nginx_repo || die "Could not configure the nginx APT repository"
-    configured=1
-  fi
-  if [[ ${ENABLED[php]:-0} -eq 1 ]]; then
-    configure_php_repo || die "Could not configure the Sury APT repository"
-    configured=1
-  fi
+  # No repository for nginx or PHP: both are built from upstream sources by
+  # their install steps (the build tools add apt.llvm.org themselves).
   if [[ ${ENABLED[elastic]:-0} -eq 1 ]]; then
     configure_elastic_repo || die "Could not configure the Elastic APT repository"
     configured=1
@@ -150,15 +121,208 @@ prepare_repositories() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# Shared guards of the compiled-service installers (1.22.0)
+# ---------------------------------------------------------------------------
+# --nginx, --php and --valkey install on a fresh host only.  A host that still
+# runs Angie, a Sury/Ubuntu php-fpm package or the valkey-server package is
+# moved to the compiled builds once, by the migration that only --optimize
+# runs (design REVISION 3, legacy-Angie mode; R19/R51): it builds first,
+# switches each service with a verified cutover and rollback, and purges the
+# packages last.  An installer that wrote our units next to a serving package
+# would race it for the ports and the shared PHP socket, so it refuses
+# instead, before anything changes.
+#
+# services_legacy_block PART: prints why PART (nginx|php|valkey) must not be
+# installed here and returns 0; returns 1 (prints nothing) when the install
+# may go ahead.
+services_legacy_block() {
+  local part=$1 u v
+  if declare -F migrate_running >/dev/null && migrate_running; then
+    printf 'the 1.22 migration is running right now (setup-migrate-1.22.service; follow /var/log/setup-migrate-1.22.log)'
+    return 0
+  fi
+  if declare -F migrate_needed >/dev/null && migrate_needed "$part"; then
+    printf 'the one-time 1.22 migration of %s has not finished on this host' "$part"
+    return 0
+  fi
+  case $part in
+    nginx)
+      # A refused or blocked nginx part leaves Angie serving (migrate_needed
+      # then says "nothing to retry"); the ports are still Angie's.
+      if declare -F web_server_state >/dev/null; then
+        if [[ $(web_server_state) == angie-legacy ]]; then
+          printf 'Angie still serves this host (its 1.22 migration is pending or was refused; the --optimize report names the blocker)'
+          return 0
+        fi
+      elif pkg_ok angie; then
+        printf 'the Angie package is installed'
+        return 0
+      fi
+      ;;
+    php)
+      # Any running package php-fpm (Sury, Ubuntu) owns /run/php/php-fpm.sock
+      # or a pool of its own; ours would start next to it.
+      while IFS= read -r u; do
+        [[ $u =~ ^php([0-9]+\.[0-9]+)-fpm\.service$ ]] || continue
+        v=${BASH_REMATCH[1]}
+        if declare -F php_build_unit_is_ours >/dev/null && php_build_unit_is_ours "$v"; then
+          continue
+        fi
+        printf 'the package unit %s still serves PHP %s' "$u" "$v"
+        return 0
+      done < <(systemctl list-units --state=active --no-legend --plain 'php*-fpm.service' 2>/dev/null \
+                 | awk '{ print $1 }' || true)
+      ;;
+    valkey)
+      if declare -F valkey_pkg_installed >/dev/null; then
+        if valkey_pkg_installed valkey-server && ! valkey_unit_is_ours; then
+          printf 'the valkey-server package is installed'
+          return 0
+        fi
+      elif pkg_ok valkey-server; then
+        printf 'the valkey-server package is installed'
+        return 0
+      fi
+      ;;
+  esac
+  return 1
+}
+
+# The 4 GB class rule (design section 7: hosts under it run nginx only).
+# validate_all refuses the request first; this repeats it for a direct
+# caller.  Without the gate function (older glue) nothing is refused here.
+services_mem_allows() { # php|valkey
+  declare -F mem_gate_allows >/dev/null || return 0
+  mem_gate_allows "$1"
+}
+
+# Keep apt from installing the packages whose paths and unit names the source
+# builds own (R71: an unattended upgrade of nginx-core or a php8.x package
+# would put its binary and maintainer scripts back under our units).  Same
+# file and format as the migration's pin (lib/migrate.sh), merged, so either
+# writer keeps the other's families.  Installed packages are not touched by a
+# -1 pin; --purge removes the file.
+SERVICES_APT_PIN=${MIGRATE_APT_PIN:-/etc/apt/preferences.d/setup-source-builds}
+services_apt_pin_add() { # "pattern ..."
+  local add=$1 old="" tmp
+  [[ -n $add ]] || return 0
+  if [[ -f $SERVICES_APT_PIN ]]; then
+    old=$(sed -nE 's/^Package: //p' "$SERVICES_APT_PIN" | head -n 1)
+  fi
+  tmp=$(tmp_file) || return 0
+  {
+    printf '# Managed by setup.sh 1.22: nginx, PHP and Valkey are built from source\n'
+    printf '# (/usr/local/lib/setup-*).  These packages would take back paths and\n'
+    printf '# unit names the source builds own.  --purge removes this file.\n'
+    printf 'Package: %s\nPin: release *\nPin-Priority: -1\n' \
+      "$(printf '%s %s\n' "$old" "$add" | tr ' ' '\n' | sed '/^$/d' | sort -u | paste -sd' ' -)"
+  } > "$tmp"
+  install -d -m 755 "${SERVICES_APT_PIN%/*}"
+  if commit_if_changed "$SERVICES_APT_PIN" "$tmp"; then
+    chmod 644 "$SERVICES_APT_PIN"
+    info "apt pin: ${add} kept out of apt (${SERVICES_APT_PIN})"
+  fi
+  rm -f -- "$tmp"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# nginx (compiled from nginx.org mainline source)
+# ---------------------------------------------------------------------------
+# A distro nginx (Ubuntu's nginx-core/-full/..., an ondrej PPA build) owns
+# /usr/sbin/nginx, /lib/systemd/system/nginx.service and conffiles at the
+# same paths as the server-configs-nginx tree.  Purging it AFTER our tree is
+# deployed would let dpkg delete our nginx.conf, mime.types and fastcgi
+# files, so the order is (R30/R71): move /etc/nginx aside, purge under the
+# collateral guard, daemon-reload, and only then build and deploy.  A distro
+# nginx that is serving, or one next to an existing compiled nginx, is left
+# alone and the install refuses: taking a running web server down is not
+# something --nginx does without being asked.  Uses lib/migrate.sh's exact
+# package list and apt simulation (never a glob handed to apt).
+services_distro_nginx_clear() {
+  local -a pkgs=()
+  local dest="" stamp owner
+  if declare -F migrate_pkg_list >/dev/null; then
+    mapfile -t pkgs < <(migrate_pkg_list distro-nginx)
+  elif pkg_ok nginx || pkg_ok nginx-common || pkg_ok nginx-core; then
+    die "nginx: a distro nginx package is installed and the package guard (lib/migrate.sh) is not loaded; remove the distro nginx packages first. Nothing was changed"
+  fi
+  (( ${#pkgs[@]} > 0 )) || return 0
+  if systemctl is-active --quiet nginx 2>/dev/null || [[ -x $NGINX_BIN ]]; then
+    die "nginx: the distro nginx packages (${pkgs[*]}) are installed on a host that already runs an nginx; --nginx does not replace a serving web server. Stop relying on the distro nginx and purge it (apt-get purge ${pkgs[*]}), then re-run, or run --optimize on a host that the 1.22 migration manages. Nothing was changed"
+  fi
+  if ! migrate_purge_sim purge "${pkgs[@]}"; then
+    die "nginx: apt refuses to purge the distro nginx packages (${pkgs[*]}; see the lines above). Nothing was changed"
+  fi
+  if (( ${#MIGRATE_SIM_COLLATERAL[@]} > 0 )); then
+    die "nginx: purging the distro nginx packages (${pkgs[*]}) would also remove ${MIGRATE_SIM_COLLATERAL[*]}. Re-home or remove those first. Nothing was changed"
+  fi
+  # Backups live in the 1.22 backup root (R37: 0700 root, trees moved whole).
+  if [[ -e /etc/nginx ]]; then
+    install -d -m 700 -o root -g root /var/backups/setup-1.22 \
+      || die "nginx: could not create /var/backups/setup-1.22"
+    chmod 700 /var/backups/setup-1.22
+    stamp=$(date -u +%Y%m%dT%H%M%SZ)
+    dest="/var/backups/setup-1.22/nginx-distro-${stamp}"
+    install -d -m 700 "$dest" || die "nginx: could not create ${dest}"
+    mv -- /etc/nginx "$dest/nginx" || die "nginx: could not move /etc/nginx to ${dest}"
+    info "nginx: the distro /etc/nginx moved to ${dest}/nginx before the package purge"
+  fi
+  info "nginx: purging the distro nginx packages: ${pkgs[*]}"
+  if ! apt-get purge "${APT_OPTS[@]}" "${pkgs[@]}"; then
+    if [[ -n $dest && -d $dest/nginx && ! -e /etc/nginx ]]; then
+      mv -- "$dest/nginx" /etc/nginx || warn "nginx: could not move ${dest}/nginx back to /etc/nginx"
+    fi
+    die "nginx: purging the distro nginx packages failed; /etc/nginx was put back. Nothing else was changed"
+  fi
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl reset-failed nginx.service >/dev/null 2>&1 || true
+  # The unit must never run a dpkg-owned binary again (R71).
+  owner=$(dpkg-query -S /usr/sbin/nginx 2>/dev/null || true)
+  [[ -z $owner ]] || die "nginx: /usr/sbin/nginx still belongs to a package after the purge (${owner%%:*}); remove it and re-run"
+  ok "nginx: distro nginx packages purged (${pkgs[*]})"
+}
+
+# --nginx: build nginx from source, deploy the server-configs-nginx tree to
+# /etc/nginx, apply the hardware profile, then activate (our own
+# nginx.service, binary under /usr/local/lib/setup-nginx).  There is no
+# package fallback: a failed build ends the step with the build log's path
+# and nothing serves until a re-run succeeds (design section 5).
 install_nginx() {
-  step "nginx web server"
-  local nginx_backup=""
+  step "nginx web server (compiled from source)"
+  local nginx_backup="" why cand fresh=1
+  if why=$(services_legacy_block nginx); then
+    die "nginx: ${why}. --nginx installs on a fresh host only; run setup.sh --optimize, which moves this host to the compiled nginx once. Nothing was changed"
+  fi
+  declare -F nginx_build_ensure >/dev/null \
+    || die "nginx: lib/nginx-build.sh is not loaded; 1.22 builds nginx from source and needs the full checkout"
+  # Fetch, deploy and TLS helpers (the build tools install their own
+  # compiler and library prerequisites).
   apt_install ca-certificates curl wget unzip rsync openssl
 
-  apt_install nginx
+  services_distro_nginx_clear
+  services_apt_pin_add "nginx nginx-* libnginx-mod-*"
 
-  systemctl daemon-reload || true
-  systemctl enable --now nginx || warn "nginx did not start with the packaged config"
+  # A compiled nginx is already here (a re-run of --nginx): keep it serving
+  # through the redeploy and let `full` rebuild only when check finds the
+  # build stale (in-place binary upgrade, no dropped connection).
+  if [[ -x $NGINX_BIN && -f ${NGINX_ROOT}/build/build.info ]]; then
+    fresh=0
+  fi
+
+  if (( fresh )); then
+    # Build and verify into ROOT/staging first: nothing else on the host
+    # changes if the build fails.
+    if ! nginx_build_ensure build-only install info; then
+      warn "nginx: the source build failed (log path above); nothing serves on this host until a re-run of --nginx succeeds"
+      return 1
+    fi
+    cand="${NGINX_BUILD_STAGING}/sbin/nginx"
+    [[ -x $cand ]] || { warn "nginx: the build reported success but ${cand} is missing"; return 1; }
+  else
+    cand=$NGINX_BIN
+  fi
 
   # Keep a copy of the deployed tree so a failed repo deploy/tune can be
   # rolled back instead of leaving a live host with a broken configuration.
@@ -169,6 +333,11 @@ install_nginx() {
       || die "Could not back up /etc/nginx to ${nginx_backup}"
   fi
 
+  # The deployer and the tuner test the tree with NGINX_TEST_BIN: the staged
+  # candidate on a fresh host (nothing is installed at NGINX_BIN yet), the
+  # installed build on a re-run.  tmpfiles.d/setup-nginx.conf was applied by
+  # nginx_build_ensure, so /var/cache/nginx/*_temp exist for `nginx -t`.
+  local -x NGINX_TEST_BIN=$cand
   if ! deploy_nginx_configs; then
     rollback_nginx_tree "$nginx_backup"
     return 1
@@ -176,193 +345,79 @@ install_nginx() {
   chmod 755 /etc/nginx/scripts/cloudflare.sh 2>/dev/null || true
 
   systemctl daemon-reload
-  if ! /usr/sbin/nginx -t; then
+  if ! "$cand" -t; then
     rollback_nginx_tree "$nginx_backup"
     return 1
   fi
-  if ! systemctl restart nginx; then
+
+  if (( fresh )); then
+    # Swap the staged build in, write nginx.service and start it on the
+    # deployed tree (the tool comments out directives of modules the lean
+    # build leaves out, reported in the run log).
+    if ! nginx_build_ensure activate install info; then
+      rollback_nginx_tree "$nginx_backup"
+      return 1
+    fi
+  else
+    if ! nginx_build_ensure full install info; then
+      rollback_nginx_tree "$nginx_backup"
+      return 1
+    fi
+    # The redeployed tree reaches a running master through a graceful reload.
+    if systemctl is-active --quiet nginx; then
+      systemctl reload nginx || systemctl restart nginx || {
+        rollback_nginx_tree "$nginx_backup"
+        return 1
+      }
+    fi
+  fi
+  if ! systemctl is-active --quiet nginx; then
+    warn "nginx did not start (systemctl status nginx; journalctl -u nginx); another server may hold ports 80/443"
     rollback_nginx_tree "$nginx_backup"
     return 1
   fi
-  # A reinstall over a 1.21.58 host: the zstd module goes now that the tree
-  # without it is validated and running.
-  if (( NGINX_ZSTD_PURGE_PENDING )); then
-    nginx_purge_zstd_module /etc/nginx
-    NGINX_ZSTD_PURGE_PENDING=0
-  fi
+  # Angie's module packages (zstd, the dynamic Brotli module) belong to the
+  # migration's Angie purge; a fresh compiled nginx has static Brotli and no
+  # module package to retire.
+  NGINX_ZSTD_PURGE_PENDING=0
 
   if ! /etc/nginx/scripts/cloudflare.sh; then
     warn "Cloudflare IP update failed; keeping the existing cloudflare.conf"
-    /usr/sbin/nginx -t && systemctl reload nginx || true
+    "$NGINX_BIN" -t && systemctl reload nginx || true
   fi
-
-  # NGINX_BUILD=clang: the compiled nginx (BOLT waits for --optimize under traffic).
-  nginx_build_apply install info \
-    || warn "nginx: NGINX_BUILD=${NGINX_BUILD} build failed; the package's nginx keeps serving"
 
   systemctl status nginx --no-pager -l || true
+  "$NGINX_BIN" -v || true
   systemctl is-active nginx >/dev/null
-  ok "nginx installed and running"
+  ok "nginx installed and running (compiled; BOLT is added under traffic by --optimize)"
 }
 
 # ---------------------------------------------------------------------------
-# PHP
+# PHP (compiled from php.net source)
 # ---------------------------------------------------------------------------
-# Extra PHP extension packages requested by --upgrade-php, already mapped to
-# the target version.  install_php() appends them to its default package set so
-# an upgraded host keeps every extension it had and a fresh --php install
-# ignores this array.
-PHP_EXTRA_PACKAGES=()
-
-# Changing the PHP version needs a clean slate: a stopped but installed second
-# PHP version still owns a pool that can later bind /run/php/php-fpm.sock and
-# break the selected version.  Remove every PHP package first, keeping the old
-# /etc/php tree recoverable under /tmp.  Only the --upgrade-php driver calls
-# this (through php_upgrade_purge and install_php); a plain --php never
-# purges.
-#
-# Nothing is stopped until apt has shown that the purge can run and what it
-# would take along, and the units that were serving are brought back when the
-# real purge still fails: a held package or a dpkg lock must not leave the
-# sites down.
-#
-# php_purge_preflight is that check on its own: --upgrade-php runs it before
-# its first removal (the Apache PHP module), purge_php_installations repeats
-# it right before the units are stopped.
-php_purge_preflight() {
-  local -a pkgs=() collateral=()
-  local sim="" sim_rc=0
-  mapfile -t pkgs < <(dpkg-query -W -f='${binary:Package}\n' 2>/dev/null \
-    | grep -E '^(php([0-9]+\.[0-9]+)?(-|$)|libapache2-mod-php)' | sort -u || true)
-  (( ${#pkgs[@]} > 0 )) || return 0
-
-  # Dry transaction with the options of the real one, so a held package or a
-  # broken dependency fails here, while PHP is still serving.
-  sim=$(apt-get -s purge "${APT_OPTS[@]}" "${pkgs[@]}" 2>&1) || sim_rc=$?
-  if (( sim_rc != 0 )); then
-    printf '%s\n' "$sim" | tail -n 5 >&2 || true
-    die "apt cannot purge the existing PHP packages (see the lines above); nothing was stopped or removed"
-  fi
-  # Reverse dependencies apt would remove with PHP: phpMyAdmin, Composer,
-  # Roundcube and the like are applications, not part of the PHP set, and the
-  # upgrade would not bring them back.
-  mapfile -t collateral < <(printf '%s\n' "$sim" \
-    | awk '/^(Remv|Purg) /{ sub(/:.*/, "", $2); print $2 }' \
-    | grep -vE '^(php([0-9]+\.[0-9]+)?(-|$)|libapache2-mod-php)' | sort -u || true)
-  if (( ${#collateral[@]} > 0 )); then
-    if [[ ${SETUP_PHP_ALLOW_COLLATERAL:-0} == 1 ]]; then
-      info "Purging PHP also removes (SETUP_PHP_ALLOW_COLLATERAL=1): ${collateral[*]}"
-    else
-      die "Purging PHP would also remove: ${collateral[*]}. Nothing was stopped or removed. Remove or re-home these packages first, or allow it with SETUP_PHP_ALLOW_COLLATERAL=1"
-    fi
-  fi
-  return 0
+# The --php app types this run's --domain entries create, in the names
+# php_build_effective_exts takes for PHP_BUILD_APPS (none for apps without
+# PHP: basic, node, pingvin).  services_php_build_apps prints them space-separated.
+services_php_build_app() { # DOMAIN_APP value
+  case $1 in
+    basic|node|pingvin|'') return 1 ;;
+    xf) printf 'xenforo' ;;
+    *) printf '%s' "$1" ;;
+  esac
 }
-
-# Regular files in /etc/php/*/*/conf.d that no package owns (symlinks are the
-# phpenmod links, which the packages remove themselves).
-php_unowned_confd_files() {
-  local f
-  for f in /etc/php/*/*/conf.d/*; do
-    [[ -f $f && ! -L $f ]] || continue
-    dpkg-query -S "$f" >/dev/null 2>&1 && continue
-    printf '%s\n' "$f"
+services_php_build_apps() {
+  local d app out=""
+  (( ${#DOMAINS[@]} > 0 )) || return 0
+  for d in "${DOMAINS[@]}"; do
+    app=$(services_php_build_app "${DOMAIN_APP[$d]:-basic}") || continue
+    [[ " $out " == *" $app "* ]] || out+=" $app"
   done
+  printf '%s' "${out# }"
 }
 
-purge_php_installations() {
-  local -a pkgs=() units=() was_enabled=() was_active=()
-  local unit
-  mapfile -t pkgs < <(dpkg-query -W -f='${binary:Package}\n' 2>/dev/null \
-    | grep -E '^php([0-9]+\.[0-9]+)?(-|$)' | sort -u || true)
-  (( ${#pkgs[@]} > 0 )) || return 0
-
-  php_purge_preflight
-
-  mapfile -t units < <(systemctl list-units --all --no-legend --no-pager 'php*-fpm.service' 2>/dev/null \
-    | awk '{print $1}' | grep -E '^php.*-fpm\.service$' || true)
-  for unit in "${units[@]}"; do
-    if systemctl is-enabled --quiet "$unit" 2>/dev/null; then
-      was_enabled+=("$unit")
-    fi
-    if systemctl is-active --quiet "$unit" 2>/dev/null; then
-      was_active+=("$unit")
-    fi
-    systemctl disable --now "$unit" 2>/dev/null || true
-  done
-
-  local backup=""
-  if [[ -d /etc/php ]]; then
-    backup=$(tmp_dir php-config.XXXXXX) || die "Could not create a PHP config backup directory"
-    cp -a /etc/php "$backup/" 2>/dev/null \
-      || warn "Could not back up /etc/php to ${backup}"
-    info "Backed up the existing /etc/php tree to ${backup}"
-  fi
-
-  # Fragments no package owns (zz-setup-optimize.ini, custom_dan.ini, an
-  # operator's own .ini) kept each conf.d directory non-empty, so dpkg warned
-  # "directory ... not empty so not removed" for every SAPI.  They are in the
-  # backup above; they go back if the purge fails.
-  local -a loose=()
-  local f
-  if [[ -n $backup && -d $backup/php ]]; then
-    mapfile -t loose < <(php_unowned_confd_files)
-    for f in "${loose[@]}"; do rm -f -- "$f"; done
-  fi
-  # Extensions first, the -common packages last: the shared mods-available
-  # directory then still has an owner while each extension is removed (one
-  # transaction let apt drop phpX.Y-common first, and every later extension
-  # removal warned that the directory was not empty).
-  local -a first=() last=() p
-  for p in "${pkgs[@]}"; do
-    if [[ $p =~ ^php([0-9]+\.[0-9]+)?-common$ ]]; then last+=("$p"); else first+=("$p"); fi
-  done
-  info "Purging existing PHP packages for a clean installation: ${pkgs[*]}"
-  if ! { (( ${#first[@]} == 0 )) || apt-get purge "${APT_OPTS[@]}" "${first[@]}"; } \
-     || ! { (( ${#last[@]} == 0 )) || apt-get purge "${APT_OPTS[@]}" "${last[@]}"; }; then
-    for f in "${loose[@]}"; do
-      [[ -d ${f%/*} && ! -e $f ]] && cp -a -- "$backup/php/${f#/etc/php/}" "$f" 2>/dev/null
-    done
-    # Put back exactly what was serving.  A unit whose package the failed
-    # transaction did remove cannot start; that is reported, not hidden.
-    for unit in "${was_enabled[@]}"; do
-      systemctl enable "$unit" 2>/dev/null \
-        || warn "Could not re-enable ${unit} after the failed purge"
-    done
-    for unit in "${was_active[@]}"; do
-      systemctl start "$unit" 2>/dev/null \
-        || warn "Could not restart ${unit} after the failed purge"
-    done
-    warn "Could not purge the existing PHP packages; the PHP-FPM units that were running were started again"
-    return 1
-  fi
-
-  # apt purge normally removes the tree; if conffiles survived, keep them in
-  # /tmp instead of leaving a stale pool next to the new installation.
-  if [[ -e /etc/php ]]; then
-    local moved
-    moved=$(preserve_to_tmp /etc/php 2>/dev/null || true)
-    if [[ -n $moved ]]; then
-      info "Moved leftover /etc/php to ${moved}"
-    fi
-  fi
-  systemctl daemon-reload || true
-  systemctl reset-failed 'php*-fpm' 2>/dev/null || true
-}
-
-# Candidate version of phpVER-fpm in the configured repositories, empty when
-# the package is not published.  awk reads to the end on purpose: exiting at
-# the first match kills apt-cache with SIGPIPE and fails the pipeline.
-php_fpm_candidate() {
-  local cand
-  cand=$(apt-cache policy "php${1}-fpm" 2>/dev/null \
-    | awk '/^[[:space:]]*Candidate:/{ if (!found) { print $2; found=1 } }' || true)
-  if [[ -n $cand && $cand != "(none)" ]]; then
-    printf '%s' "$cand"
-  fi
-  return 0
-}
-
+# --php: build PHP X.Y (FPM + CLI, this host's extension set) from source,
+# lay out /etc/php/X.Y, write and start our phpX.Y-fpm.service, then size the
+# pool for the hardware exactly as --optimize does.  No apt, no Sury.
 install_php() {
   local ver=${OPT[php.ver]:-}
   # The php.ini timezone follows --basic time=; a --php-only run keeps the
@@ -370,60 +425,58 @@ install_php() {
   # exactly like --optimize does.
   local tz=""
   [[ ${ENABLED[basic]:-0} -eq 1 ]] && tz=${OPT[basic.time]:-Asia/Manila}
-  local php_backup="" change installed="" reapply=0 upgrade_driver=0
-  step "PHP ${ver:-auto}"
+  local php_backup="" change cur="" reapply=0 why rel
+  step "PHP ${ver:-auto} (compiled from source)"
 
-  # run_php_upgrade sets PHP_UPGRADE_MODE (upgrade|install) before it calls
-  # in here; nothing else does.  That driver is the only caller allowed to
-  # replace an installed PHP.
-  if [[ -n ${PHP_UPGRADE_MODE:-} ]]; then
-    upgrade_driver=1
+  if why=$(services_legacy_block php); then
+    die "PHP: ${why}. --php installs on a fresh host only; run setup.sh --optimize, which moves this host to the compiled PHP once. Nothing was changed"
   fi
+  services_mem_allows php \
+    || die "PHP is not installed on hosts under the 4 GB class (nginx only). Nothing was changed"
+  declare -F php_build_ensure >/dev/null \
+    || die "PHP: lib/php-build.sh is not loaded; 1.22 builds PHP from source and needs the full checkout"
 
-  # --php is a first installation.  On a host that already runs PHP-FPM it
-  # keeps the packages (extra extensions such as imagick, custom pools) and
-  # only re-applies the managed configuration of the installed version; a
-  # different version is --upgrade-php's job.  validate_all makes the same
-  # decision before the run starts; this repeats it against the live package
-  # database for a direct caller.
-  if (( ! upgrade_driver )); then
-    installed=$(php_installed_version)
-    if [[ -n $installed ]]; then
-      [[ -n $ver ]] || ver=$installed
-      [[ $ver == "$installed" ]] \
-        || die "PHP ${installed} is already installed and --php only performs a first installation; change the version with --upgrade-php=${ver}"
-      reapply=1
-      OPT[php.ver]=$ver
-      info "PHP ${ver} is already installed: keeping its packages, extensions and extra pools, re-applying the managed configuration"
-    fi
+  # --php is a first installation.  On a host that already runs a compiled
+  # PHP it keeps the build (rebuilt only when stale or when the extension set
+  # grew), its extra pools and the operator's conf.d files, and re-applies
+  # the managed configuration of that version; a different version is
+  # --upgrade-php's job (build, verified switch, rollback).
+  cur=$(php_active_version 2>/dev/null || true)
+  if [[ -n $cur ]]; then
+    [[ -n $ver ]] || ver=$cur
+    [[ $ver == "$cur" ]] \
+      || die "PHP ${cur} is already installed and --php only performs a first installation; change the version with --upgrade-php=${ver}"
+    reapply=1
+    OPT[php.ver]=$ver
+    info "PHP ${ver} is already installed: keeping its build, extra pools and conf.d files, re-applying the managed configuration"
   fi
 
   if [[ -z $ver ]]; then
-    ver=$(latest_sury_php)
-    [[ -n $ver ]] || die "Could not determine the latest stable PHP version from the Sury repository"
+    ver=$(php_build_latest_series)
+    [[ -n $ver ]] || die "Could not determine the newest PHP release from php.net (offline?); pass --php ver=X.Y"
     OPT[php.ver]=$ver
-    info "Auto-selected latest stable PHP: ${ver}"
+    info "Auto-selected the newest PHP release series: ${ver}"
   fi
+  # The source build supports 8.1 and newer (validate_all checks the same).
+  [[ $ver =~ ^[0-9]+\.[0-9]+$ && $(printf '8.1\n%s\n' "$ver" | sort -V | head -n 1) == 8.1 ]] \
+    || die "PHP ${ver}: not a series setup.sh builds (X.Y, 8.1 or newer). Nothing was changed"
 
-  # Everything that can refuse the request is checked before a unit is
-  # stopped or a package is removed.  PHP-FPM is not an nginx concern: its
-  # pool/ini templates live in this repository under configs/php and do not
-  # depend on the nginx config repository being fetched.
-  local pool_template="${SCRIPT_DIR}/configs/php/www_${ver//./}.conf"
+  # Everything that can refuse the request is checked before anything is
+  # built or written.  The pool/ini templates live in this repository under
+  # configs/php and do not depend on the nginx config repository.
+  local pool_template="${SCRIPT_DIR}/configs/php/www.conf"
   local ini_template="${SCRIPT_DIR}/configs/php/custom_dan.ini"
   [[ -f $pool_template ]] \
-    || die "PHP ${ver} FPM pool template not found: configs/php/www_${ver//./}.conf"
+    || die "PHP FPM pool template not found: configs/php/www.conf"
   [[ -f $ini_template ]] \
     || die "PHP php.ini template not found: configs/php/custom_dan.ini"
-  [[ -n $(php_fpm_candidate "$ver") ]] \
-    || die "php${ver}-fpm is not published by the configured repositories; nothing was changed"
-
-  # The requested PHP version must be the only one installed, not merely the
-  # only one active.  The upgrade driver has normally purged already (this is
-  # then a no-op); on its fresh-install path this removes stray PHP packages
-  # of a version without FPM.
-  if (( upgrade_driver )); then
-    purge_php_installations || return 1
+  # A first install needs a release to build; a re-run keeps the installed
+  # build when the lookup fails (offline), as --optimize does.
+  if (( ! reapply )); then
+    rel=$(php_build_release "$ver")
+    [[ -n $rel ]] \
+      || die "PHP ${ver} has no release on php.net or the php-src tags (or the lookup failed); nothing was changed"
+    info "PHP ${ver}: newest release ${rel}"
   fi
 
   # run_service executes installers in a subshell; persist the selected version
@@ -431,121 +484,33 @@ install_php() {
   ensure_state
   printf '%s\n' "$ver" > "${STATE_DIR}/php-selected-version"
 
-  # A stale socket left by a purged/crashed pool is replaced by PHP-FPM
-  # itself when it binds.  setup.sh does not unlink it in case the path is
-  # still in use by another process.
-  if (( ! reapply )) && [[ -S /run/php/php-fpm.sock ]]; then
-    info "Leaving existing FastCGI socket for PHP-FPM to validate"
+  # The extension set (lib/php-build.sh): a base every site needs, plus the
+  # set of each application found under the vhost roots and /var/www, plus
+  # the apps this run's --domain entries create, plus --php ext= (persisted
+  # as PHP_EXT_EXTRA), add-only against the current build.  A host with no
+  # application yet gets the union of the WordPress, XenForo and Chevereto
+  # sets, so a site dropped in later does not answer 500.
+  local apps
+  apps=$(services_php_build_apps)
+  if [[ ${ENABLED[domain]:-0} -eq 1 && -n $apps ]]; then
+    export PHP_BUILD_APPS="${PHP_BUILD_APPS:+$PHP_BUILD_APPS }${apps}"
+  fi
+  # php_build_layout writes custom_dan.ini through sync_php_ini_template,
+  # which reads PHP_INI_TZ.
+  local -x PHP_INI_TZ="${PHP_INI_TZ:-$tz}"
+
+  # Build (when there is none, or check finds it stale), verify, activate,
+  # lay out /etc/php/X.Y (php.ini from this version's php.ini-production,
+  # php-fpm.conf, the www pool from configs/php/www.conf, sessions, tmpfiles,
+  # the links), mark X.Y active and start it.  A failure is reported with the
+  # build log path; the step ends there (no package to fall back to).
+  if ! php_build_ensure "$ver" full install info; then
+    warn "PHP ${ver}: the source build or its activation failed (reason and log above); no PHP serves on this host until a re-run of --php succeeds"
+    return 1
   fi
 
-  # XenForo-focused extension set: runtime, database, media, HTTP, XML,
-  # archives, math, multibyte, OPcache and the CLI for XenForo cmd.php.
-  # No php-redis (and so no php-igbinary, its dependency) by default: XenForo
-  # runs without it (SV RedisCache uses its pure-PHP Credis client) and so
-  # does WordPress without an object-cache drop-in.  An application that
-  # cannot run without an extension gets it from php_ensure_app_extensions
-  # when its --domain is created (Chevereto: redis).  Add
-  # intl/bcmath/apcu only if a specific add-on needs them.
-  #
-  # PHP 8.5 made OPcache a mandatory, always-built-in extension: Sury (and
-  # Ubuntu) no longer publish php8.5-opcache.  Installing the separate package
-  # unconditionally made the whole PHP step fail on 26.04.  Keep the split
-  # package for 8.4 and older, and rely on the bundled extension for 8.5+.
-  local -a php_pkgs=(
-    "php${ver}-fpm" "php${ver}-cli"
-    "php${ver}-mysql" "php${ver}-gd" "php${ver}-curl" "php${ver}-xml"
-    "php${ver}-zip" "php${ver}-gmp" "php${ver}-mbstring"
-  )
-  # Optional packages (the extensions --upgrade-php carries over) are PECL
-  # builds that can lag a new PHP release by weeks (PHP 8.6.0 shipped without
-  # redis, igbinary and imagick).  A missing one must not abort the whole
-  # installation; the caller and the upgrade report name it instead.
-  local -a php_optional=()
-  if apt-cache show "php${ver}-opcache" >/dev/null 2>&1; then
-    php_pkgs+=("php${ver}-opcache")
-  else
-    info "PHP ${ver} bundles OPcache in the core package; skipping php${ver}-opcache"
-  fi
-  # --upgrade-php hands install_php() the extension packages the old version
-  # had, already rewritten to the target version.  Skip a package the default
-  # set already covers and one the target repository does not publish (an
-  # extension can lag a new PHP major by a few weeks).  The caller has already
-  # filtered and reported the unavailable ones; this is a second guard so a
-  # direct caller of install_php() cannot fail the whole install on one name.
-  local extra pkg
-  for extra in "${PHP_EXTRA_PACKAGES[@]}"; do
-    [[ -n $extra ]] || continue
-    for pkg in "${php_pkgs[@]}"; do
-      [[ $pkg == "$extra" ]] && continue 2
-    done
-    [[ " ${php_optional[*]} " == *" ${extra} "* ]] && continue
-    php_optional+=("$extra")
-  done
-  # Install the core set first: a host without php-fpm is worse than a host
-  # with php-fpm and one missing optional extension.
-  apt_install "${php_pkgs[@]}"
-  local -a optional_ok=() optional_skip=() unversioned_ok=()
-  for pkg in "${php_optional[@]}"; do
-    if ! apt-cache show "$pkg" >/dev/null 2>&1; then
-      optional_skip+=("$pkg")
-    elif [[ $pkg == php-* ]]; then
-      unversioned_ok+=("$pkg")
-    else
-      optional_ok+=("$pkg")
-    fi
-  done
-  # Install optional extensions one at a time.  A published package can still
-  # be uninstallable (missing dependency, conflict, Sury lag on a new minor);
-  # a single all-or-nothing apt transaction would then abort the whole PHP
-  # step and, on --upgrade-php, trigger a full rollback because of one optional
-  # extension.  Report the ones that failed instead.
-  #
-  # They are first tried as ONE transaction: every extension package
-  # re-runs php${ver}-fpm's maintainer trigger, which restarts the service,
-  # and one transaction per package (redis, igbinary, imagick, ...) on top of
-  # the start/stop of --upgrade-php exceeded systemd's start limit (5 in 10 s).
-  # The third restart then failed with start-limit-hit, php${ver}-fpm's
-  # postinst exited 1 and apt rolled back php8.4-imagick, so a Chevereto host
-  # silently lost a hard requirement.  Only when the batch fails is each
-  # package retried on its own, with the start limit cleared and any
-  # half-configured package finished first.
-  local -a optional_failed=()
-  systemctl reset-failed "php${ver}-fpm" 2>/dev/null || true
-  if (( ${#optional_ok[@]} > 0 )) && ! apt_install "${optional_ok[@]}"; then
-    for pkg in "${optional_ok[@]}"; do
-      dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q ' installed$' && continue
-      systemctl reset-failed "php${ver}-fpm" 2>/dev/null || true
-      dpkg --configure -a >/dev/null 2>&1 || true
-      apt_install "$pkg" || {
-        optional_failed+=("$pkg")
-        warn "PHP ${ver}: optional package ${pkg} could not be installed; continuing without it"
-      }
-    done
-  fi
-  systemctl reset-failed "php${ver}-fpm" 2>/dev/null || true
-  # This runs in run_service's subshell: hand the failures to the parent
-  # (php_upgrade_install) through the state directory.
-  if (( ${#optional_failed[@]} > 0 )); then
-    ensure_state
-    for pkg in "${optional_failed[@]}"; do
-      printf '%s (%s: install failed)\n' "${pkg#php*-}" "$pkg"
-    done >> "${STATE_DIR}/php-optional-failed"
-  fi
-  # Unversioned packages --upgrade-php carries over under their own name
-  # (php-pear, PHP libraries).  Their dependencies are not tied to this PHP
-  # version, so they get their own transaction: one that cannot be satisfied
-  # must not undo an otherwise complete installation.
-  if (( ${#unversioned_ok[@]} > 0 )); then
-    apt_install "${unversioned_ok[@]}" \
-      || warn "PHP ${ver}: could not install ${unversioned_ok[*]}; install them by hand once their dependencies resolve"
-  fi
-  for pkg in "${optional_skip[@]:-}"; do
-    [[ -n $pkg ]] || continue
-    warn "PHP ${ver}: extension package ${pkg} is not published yet; skipped (install it later when the repository has it)"
-  done
-
-  # Preserve the package-created configuration so a bad template, tuning pass
-  # or failed start can be rolled back.
+  # Preserve the laid-out configuration so a failed tuning pass or start can
+  # be rolled back.
   if [[ -d "/etc/php/${ver}/fpm" ]]; then
     php_backup=$(tmp_dir php-install.XXXXXX) \
       || die "Could not create a PHP backup directory"
@@ -553,42 +518,20 @@ install_php() {
       || die "Could not back up PHP ${ver} configuration to ${php_backup}"
   fi
 
-  # Keep the CLI on the same version as FPM.  Without this, installing a
-  # distro package can add a newer php-cli and make /usr/bin/php point at a
-  # binary whose extension set differs from the web pool.
-  if command -v update-alternatives >/dev/null 2>&1 \
-     && [[ -x "/usr/bin/php${ver}" ]]; then
-    update-alternatives --set php "/usr/bin/php${ver}" >/dev/null 2>&1 \
-      || warn "Could not pin /usr/bin/php to PHP ${ver}"
-  fi
-
-  # The templates were checked before anything was installed.  A re-run on an
-  # installed host keeps its www.conf, as --optimize does: the tuner below
-  # normalises the managed keys in place, and replacing the file would drop
-  # the measured worker count and any operator key the template lacks.
-  if (( ! reapply )) || [[ ! -f "/etc/php/${ver}/fpm/pool.d/www.conf" ]]; then
-    install -m 644 "$pool_template" "/etc/php/${ver}/fpm/pool.d/www.conf"
-  fi
-  # Same template writer as --optimize (timezone handling included).  Under
-  # --upgrade-php, PHP_INI_TZ was captured from the old tree, while tz is
-  # empty because --basic is not enabled; keep the captured zone.
-  PHP_INI_TZ="${PHP_INI_TZ:-$tz}" sync_php_ini_template "$ver" || die "Could not write custom_dan.ini"
-
   # Hardware-aware pool/ini tuning lives in tune_php_fpm_version, shared with
   # the --optimize command.  It writes the socket listener and the final
   # performance values in conf.d/zz-setup-optimize.ini.  Only a first
-  # installation is "fresh" for the tuner (it then ignores the stock pool the
-  # package auto-started); a re-run sizes the live pool exactly like
-  # --optimize.
+  # installation is "fresh" for the tuner (the pool php_build_ensure just
+  # started has served nothing, so there is nothing to measure); a re-run
+  # sizes the live pool exactly like --optimize.
   tune_reset_changes
   if (( reapply )); then
     PHP_FRESH_INSTALL=0
   else
     PHP_FRESH_INSTALL=1
   fi
-  # --upgrade-php passes the old www listener (empty on a first install:
-  # the tuner then keeps what the pool listens on).
-  if ! tune_php_fpm_version "$ver" "${PHP_UPGRADE_WWW_LISTEN:-}"; then
+  # Empty listener: the tuner keeps what the pool listens on.
+  if ! tune_php_fpm_version "$ver" ""; then
     PHP_FRESH_INSTALL=0
     rollback_php_tree "$php_backup" "$ver"
     return 1
@@ -613,46 +556,40 @@ install_php() {
   fi
   ensure_log_dirs
 
-  php_fpm_write_systemd_limits "$ver" || true
+  # Our unit already carries the limits, KillSignal and UMask the 1.21
+  # limits.conf drop-in added (php_build_unit_text), so no drop-in is written.
   systemctl daemon-reload
-
-  # Only one PHP-FPM version can own the shared /run/php/php-fpm.sock socket.
-  # (--php refuses a second version and --upgrade-php purges the old one
-  # first; this just clears any previous failed state for the same version.)
   systemctl reset-failed "php${ver}-fpm" 2>/dev/null || true
   if (( reapply )); then
     # A serving pool is reloaded (graceful: the master re-executes and
     # workers finish their requests), not restarted; a stopped one is started.
-    if ! systemctl enable "php${ver}-fpm" \
-       || ! systemctl reload-or-restart "php${ver}-fpm"; then
+    if ! systemctl reload-or-restart "php${ver}-fpm"; then
       rollback_php_tree "$php_backup" "$ver"
       return 1
     fi
-  elif ! systemctl enable --now "php${ver}-fpm" \
-       || ! systemctl restart "php${ver}-fpm"; then
+  elif ! systemctl restart "php${ver}-fpm"; then
     rollback_php_tree "$php_backup" "$ver"
     return 1
   fi
-  # php-common enables the session GC timer in its postinst only.  --purge
-  # disables it, and a later --php on the kept packages must switch it back
-  # on: session.gc_probability is 0, so nothing else removes old sessions.
-  if systemctl list-unit-files phpsessionclean.timer --no-legend 2>/dev/null | grep -q .; then
-    systemctl enable --now phpsessionclean.timer 2>/dev/null || true
+  if ! systemctl is-active --quiet "php${ver}-fpm"; then
+    warn "PHP ${ver}: php${ver}-fpm is not running after the tuning pass (systemctl status php${ver}-fpm)"
+    rollback_php_tree "$php_backup" "$ver"
+    return 1
   fi
+  php_fpm_test "$ver" >/dev/null \
+    || warn "PHP ${ver}: php-fpm -t reports problems: $(php_fpm_test "$ver" 2>&1 | grep -iE 'error|warning|unable|not loaded' | head -n 1)"
+  # The golden copy ExecStartPre restores missing files from must hold the
+  # tuned pool and zz-setup-optimize.ini, not the template php_build_ensure
+  # captured before the tuner ran.
+  php_build_golden_refresh "$ver" || true
+  # Sessions use PHP's own GC (gc_probability=1, gc_divisor=1000 in the
+  # managed php.ini; design section 3): no phpsessionclean timer.
   systemctl status "php${ver}-fpm" --no-pager || true
-  "$(php_fpm_binary "$ver")" -v || true
-  # Only the extensions the applications need, as --optimize keeps it.
-  if php_fpm_modules_apply "$ver" info; then
-    systemctl restart "php${ver}-fpm" 2>/dev/null || warn "PHP ${ver}: restart after the module change failed"
-  fi
-  # PHP_BUILD=clang/lean: the same compiled php-fpm the next --optimize keeps
-  # (built now; BOLT needs live traffic and is added by --optimize).
-  php_build_apply "$ver" install info \
-    || warn "PHP ${ver}: PHP_BUILD=${PHP_BUILD} build failed; the package's php-fpm keeps serving"
+  "$(php_fpm_bin "$ver")" -v || true
   if (( reapply )); then
-    ok "PHP ${ver} configuration re-applied (packages kept)"
+    ok "PHP ${ver} configuration re-applied (compiled build kept)"
   else
-    ok "PHP ${ver} installed"
+    ok "PHP ${ver} installed (compiled; BOLT is added under traffic by --optimize)"
   fi
 }
 
@@ -1389,8 +1326,13 @@ valkey_maxclients() {
   printf '%s' "$total"
 }
 
+# --valkey: build Valkey from its upstream release (lib/valkey-build.sh:
+# hash-checked source, our own valkey-server.service with the package unit's
+# hardening, the valkey user and directories, a seeded valkey.conf), then
+# write the managed configuration exactly as --optimize does.  No apt.
 install_valkey() {
-  step "Valkey"
+  step "Valkey (compiled from source)"
+  local why
   if pkg_ok redis-server; then
     warn "redis-server is installed; leaving it untouched because setup.sh never removes packages."
     warn "Valkey was not installed. Run --optimize to tune the existing Redis server with the same cache profile."
@@ -1398,12 +1340,29 @@ install_valkey() {
     # already covered by a compatible cache and --optimize handles it.
     return 0
   fi
-  apt_clean
-  apt_install valkey-server
+  if why=$(services_legacy_block valkey); then
+    die "Valkey: ${why}. --valkey installs on a fresh host only; run setup.sh --optimize, which moves this host to the compiled Valkey once (dataset kept). Nothing was changed"
+  fi
+  services_mem_allows valkey \
+    || die "Valkey is not installed on hosts under the 4 GB class (nginx only). Nothing was changed"
+  declare -F valkey_build_ensure >/dev/null \
+    || die "Valkey: lib/valkey-build.sh is not loaded; 1.22 builds Valkey from source and needs the full checkout"
+  services_apt_pin_add "valkey-server valkey-tools"
+
+  # Build (when there is none or check finds it stale), verify, install our
+  # unit, create the valkey user and /var/lib/valkey, seed
+  # /etc/valkey/valkey.conf only when it is missing, enable and start.  It
+  # runs before the config writer below: the user must exist before
+  # ensure_log_dirs creates /var/www/logs/valkey for it.
+  if ! valkey_build_ensure full install info; then
+    warn "Valkey: the source build or its activation failed (reason and log above); Valkey does not run on this host until a re-run of --valkey succeeds"
+    return 1
+  fi
   ensure_log_dirs
 
-  local conf=/etc/valkey/valkey.conf
-  [[ -f $conf ]] || die "Valkey config ${conf} not found"
+  local conf=/etc/valkey/valkey.conf before
+  [[ -f $conf ]] || die "Valkey config ${conf} not found after the build's layout step"
+  before=$(file_md5 "$conf")
 
   local valkey_mb policy io_threads
   if [[ -n ${OPT[valkey.ram]:-} && ${OPT[valkey.ram],,} != auto ]]; then
@@ -1412,8 +1371,8 @@ install_valkey() {
     valkey_mb=$(service_mem_mb valkey)
   fi
   # Preserve a policy/io-threads value a previous setup.sh tune wrote, exactly
-  # like --optimize does; only a fresh (unmanaged) distro config falls back to
-  # the documented defaults.  Without this a re-install silently reset
+  # like --optimize does; only a fresh (unmanaged) config falls back to the
+  # documented defaults.  Without this a re-install silently reset
   # `--valkey policy=volatile-lru io_threads=4` to allkeys-lru/1.
   policy=${OPT[valkey.policy]:-}
   if [[ -z $policy ]] && valkey_conf_managed "$conf"; then
@@ -1431,7 +1390,7 @@ install_valkey() {
 
   # Keep a socket path an operator already uses: application configs and
   # remote clients point at it, and the writer below would otherwise rewrite
-  # `unixsocket` to the default on every re-install.  A stock distro file has
+  # `unixsocket` to the default on every re-install.  The seeded file has
   # the key commented out, so a fresh install still gets the default.
   local socket
   socket=$(valkey_conf_get "$conf" unixsocket)
@@ -1446,14 +1405,16 @@ install_valkey() {
   info "Valkey maxmemory: ${valkey_mb} MB (${policy}; shared memory plan)"
   tail -24 "$conf"
 
-  valkey_write_systemd_limits valkey-server valkey || true
-  systemctl daemon-reload
-
-  valkey-server -v
-  # The package may have auto-started the stock configuration; one restart
-  # loads the written file (enable --now followed by restart started it twice).
-  systemctl enable valkey-server
-  systemctl restart valkey-server
+  # Our unit already carries LimitNOFILE/LimitCORE and the log directory in
+  # ReadWritePaths, so no limits drop-in is written for valkey-server (an
+  # adopted redis-server still gets one from --optimize).
+  "$VALKEY_SERVER_BIN" -v
+  # One restart loads the written file.  A re-run that changed nothing does
+  # not restart: a restart empties a cache-only Valkey.
+  systemctl enable valkey-server >/dev/null 2>&1 || true
+  if [[ $(file_md5 "$conf") != "$before" ]] || ! systemctl is-active --quiet valkey-server; then
+    systemctl restart valkey-server
+  fi
   systemctl status valkey-server -l --no-pager || true
 
   # Local PHP workers should use the Unix socket instead of opening a fresh
@@ -1465,13 +1426,12 @@ install_valkey() {
 
   # Ask the socket this run just wrote: an adopted configuration may keep an
   # operator bind/port, and then the default 127.0.0.1:6379 is not Valkey.
-  wait_for_cmd 20 valkey_pong valkey-cli -s "$socket" || true
-  valkey-cli -s "$socket" ping \
+  # The CLI is the build's own (absolute path; cron and root shells may lack
+  # /usr/local/bin).
+  wait_for_cmd 20 valkey_pong "$VALKEY_CLI_BIN" -s "$socket" || true
+  "$VALKEY_CLI_BIN" -s "$socket" ping \
     || warn "Valkey did not answer PING on ${socket} (a requirepass in the adopted configuration needs AUTH)"
-  # VALKEY_BUILD=clang: the compiled Valkey (BOLT from a benchmark run).
-  valkey_build_apply info \
-    || warn "Valkey: VALKEY_BUILD=${VALKEY_BUILD} build failed; the package's Valkey keeps serving"
-  ok "Valkey installed and running"
+  ok "Valkey installed and running (compiled)"
 }
 
 # Base and tuning directives for Valkey/Redis.  Active copies of every
@@ -1636,19 +1596,14 @@ Environment=_WSREP_NEW_CLUSTER='
   write_service_limits_dropin /etc/systemd/system/mariadb.service.d/limits.conf "$content"
 }
 
+# 1.22: the compiled PHP's own phpX.Y-fpm.service carries LimitNOFILE,
+# LimitCORE, KillSignal, TimeoutStopSec and UMask (php_build_unit_text), and
+# php_build_unit_write moves a 1.21 limits.conf drop-in to the backups.
+# Writing the drop-in again would only be moved aside on the next layout, so
+# this reports "unchanged" (1) and writes nothing.  Kept for callers that
+# still ask (lib/service-optimizers.sh) until they drop the call.
 php_fpm_write_systemd_limits() {
-  local ver=$1 src="${SCRIPT_DIR}/configs/php/php-fpm-limits.conf" content
-  if [[ -f $src ]]; then
-    content=$(<"$src")
-  else
-    content='[Service]
-LimitNOFILE=524288
-LimitCORE=0
-KillSignal=SIGQUIT
-TimeoutStopSec=15
-UMask=0027'
-  fi
-  write_service_limits_dropin "/etc/systemd/system/php${ver}-fpm.service.d/limits.conf" "$content"
+  return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -2167,10 +2122,64 @@ reoptimize_mariadb_after_import() {
   done
 }
 
+# --domain app=X adds that application's extension set to the compiled PHP
+# (design section 5): the set is computed with this run's PHP app types in
+# PHP_BUILD_APPS (a new site's root is still empty, so detection alone would
+# not see it) and compared with the active build's exts=; only a set that
+# grew rebuilds.  The rebuild runs in the foreground, but the current build
+# keeps serving until the new one passes verify and is swapped in (CONTEXT
+# refresh: layout and restart, no BOLT sample, which belongs to --optimize).  The set is add-only, so the next
+# --optimize keeps these extensions without PHP_BUILD_APPS.
+domain_php_extensions() {
+  local apps ver want have rc=0
+  apps=$(services_php_build_apps)
+  [[ -n $apps ]] || return 0
+  if ! declare -F php_build_ensure >/dev/null; then
+    warn "PHP sites requested (${apps}) but lib/php-build.sh is not loaded; run --optimize to build their extensions"
+    return 0
+  fi
+  ver=$(php_active_version 2>/dev/null || true)
+  if [[ -z $ver ]]; then
+    warn "PHP sites requested (${apps}) but this host has no compiled PHP; install it with --php (the vhosts answer 502 until then)"
+    return 0
+  fi
+  if ! want=$(PHP_BUILD_APPS="$apps" php_build_effective_exts "$ver"); then
+    warn "PHP ${ver}: the extension set for ${apps} cannot be built from source (see the line above); the sites may fail until --php ext= or SETUP_PHP_ALLOW_MISSING_EXT=1 resolves it"
+    return 0
+  fi
+  have=$(awk -F= '$1 == "exts" { print substr($0, 6); exit }' "${PHP_BUILD_ROOT}/${ver}/build.info" 2>/dev/null || true)
+  want=$(tr ',' '\n' <<<"$want" | sed '/^$/d' | sort -u | paste -sd, -)
+  have=$(tr ',' '\n' <<<"$have" | sed '/^$/d' | sort -u | paste -sd, -)
+  if [[ $want == "$have" ]]; then
+    info "PHP ${ver}: the compiled extension set already covers ${apps}"
+    return 0
+  fi
+  info "PHP ${ver}: rebuilding with the extension set for ${apps} (${want//,/ }); the current build serves meanwhile"
+  export PHP_BUILD_APPS="$apps"
+  # php_upgrade_checked keeps set -e and the ERR trap live inside the build
+  # path while still capturing its status (an `if !` or `||` would switch
+  # errexit off for everything the build calls).
+  if declare -F php_upgrade_checked >/dev/null; then
+    php_upgrade_checked php_build_ensure "$ver" full refresh info || rc=$?
+  else
+    php_build_ensure "$ver" full refresh info || rc=$?
+  fi
+  if (( rc != 0 )); then
+    warn "PHP ${ver}: the rebuild for ${apps} failed (log above); the previous build keeps serving and those sites may fail until a re-run of --domain or --optimize succeeds"
+  fi
+  return 0
+}
+
 create_domains() {
   step "Domains"
   (( ${#DOMAINS[@]} > 0 )) || return 0
 
+  # A host still served by Angie (its 1.22 migration pending or refused) has
+  # no live /etc/nginx; a vhost written there would never be served, and
+  # /etc/angie is not touched by 1.22 code (legacy-Angie mode).
+  if declare -F web_server_state >/dev/null && [[ $(web_server_state) == angie-legacy ]]; then
+    die "Angie still serves this host (the 1.22 migration is pending or was refused); run --optimize to finish it before adding domains. Nothing was changed"
+  fi
   [[ -d /etc/nginx/conf.d ]] \
     || die "nginx is not installed (/etc/nginx/conf.d missing). Install with --nginx first."
   local d need_db=0
@@ -2193,22 +2202,8 @@ create_domains() {
     conf="/etc/nginx/conf.d/${d}.conf"
     certdir="/etc/nginx/ssl/${d}"
 
-    # Extensions the application cannot run without are not in the default
-    # PHP set (no php-redis/php-igbinary): install them only for a site that
-    # needs them, including an existing one (Chevereto: redis, which pulls
-    # igbinary; images go through GD; XenForo and WordPress: nothing
-    # extra).  Use the FPM version nginx talks to, not the alternatives CLI:
-    # on a host with 8.4 and 8.5 installed, `php -m` could name the other
-    # version and install an extension the pool never loads.
-    local app_php req_app
-    app_php=$(php_primary_version 2>/dev/null || true)
-    [[ -n $app_php ]] || app_php=$(php -r 'echo PHP_MAJOR_VERSION, ".", PHP_MINOR_VERSION;' 2>/dev/null || true)
-    case $app in xf) req_app=xenforo ;; *) req_app=$app ;; esac
-    if [[ -n $app_php ]]; then
-      php_ensure_app_extensions "$req_app" "$dir" "$app_php"
-    elif [[ $app == chevereto ]]; then
-      warn "Chevereto requires the PHP redis extension, but the PHP version could not be detected"
-    fi
+    # The application's PHP extensions are added once for all domains after
+    # this loop (domain_php_extensions): one rebuild, not one per site.
 
     # Only a tree this run creates is chowned recursively.  An existing site
     # keeps its ownership (root:www-data wp-config.php, deploy-owned files);
@@ -2249,7 +2244,7 @@ create_domains() {
       install -m 644 "$tmp" "$conf"
       local domain_test_log
       domain_test_log=$(tmp_file)
-      if ! /usr/sbin/nginx -t >"$domain_test_log" 2>&1; then
+      if ! "$NGINX_BIN" -t >"$domain_test_log" 2>&1; then
         cat "$domain_test_log" >&2 || true
         # Keep the rejected file out of the live config without deleting it.
         local rejected
@@ -2273,11 +2268,12 @@ create_domains() {
     systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null \
       || warn "Could not reload nginx after creating vhosts"
   fi
+  domain_php_extensions
   if (( imported )); then
     reoptimize_mariadb_after_import
   fi
   local xf_php
-  xf_php=$(php_installed_version 2>/dev/null || true)
+  xf_php=$(php_active_version 2>/dev/null || true)
   for d in "${DOMAINS[@]}"; do
     [[ ${DOMAIN_APP[$d]:-basic} == xf ]] || continue
     # 1.21.58 audit, XenForo 2.3.13 on PHP 8.6.0 (see php_upgrade_app_cautions).

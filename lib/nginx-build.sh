@@ -16,13 +16,15 @@
 # Interfaces (design 1.22.0, REVISION 3):
 #   nginx_build_ensure MODE CONTEXT OUT  MODE build-only|activate|full,
 #                                        CONTEXT install|optimize|migrate; 1 on failure
-#   nginx_build_fit OUT                  comment out directives of left-out modules (reported)
+#   nginx_build_fit OUT [BIN [CONF]]     comment out directives of left-out modules (reported;
+#                                        OUT a FILE: "path:line directive" lines)
 #   nginx_build_plan                     one dry-run line
 #   nginx_build_purge                    --purge nginx
 #   nginx_build_status                   read-only lines for diagnostics
 #   nginx_unit_text, nginx_tmpfiles_text, nginx_build_unit_text,
 #   setup_build_cpu_unit_text, setup_build_refresh_unit_text, setup_build_refresh_timer_text
-#   setup_build_install_shared_units, setup_build_remove_shared_units_if_last
+#   setup_build_install_shared_units, setup_build_remove_shared_units_if_last [COMPONENT]
+#   NGINX_BUILD_STAGING, NGINX_BUILD_DROPPABLE_RE, NGINX_BUILD_UNBUILT_RE (for lib/migrate.sh)
 #   NGINX_ROOT, NGINX_BIN (the binary every caller runs), NGINX_LINK (operators' shell link)
 
 NGINX_ROOT=${NGINX_ROOT:-${NGINX_BUILD_ROOT:-/usr/local/lib/setup-nginx}}
@@ -33,6 +35,14 @@ NGINX_BUILD_TOOL="${NGINX_ROOT}/nginx-build.sh"
 NGINX_BUILD_COMMON_FILE="${NGINX_ROOT}/build-common.sh"
 NGINX_BUILD_CONF_FILE="${NGINX_ROOT}/nginx-build.conf"
 NGINX_BUILD_CACHE=${NGINX_BUILD_CACHE:-/var/cache/setup-nginx-build}
+# Where `build` / build-only leaves the verified candidate (lib/migrate.sh
+# reads it for its step-7 test and fit).
+NGINX_BUILD_STAGING=${NGINX_BUILD_STAGING:-${NGINX_ROOT}/staging}
+# The fit's record of what it commented out in /etc/nginx, and the part of
+# it already shown in a setup.sh report (the refresh timer and nginx's
+# ExecStartPre comment out too, but only the journal sees those runs; R88).
+NGINX_DISABLED_LIST="${NGINX_ROOT}/build/disabled.list"
+NGINX_DISABLED_SEEN="${NGINX_ROOT}/build/disabled.reported"
 NGINX_PIDFILE=/run/nginx.pid
 NGINX_SYSTEMD_DIR=${NGINX_SYSTEMD_DIR:-/etc/systemd/system}
 NGINX_UNIT_FILE=${NGINX_UNIT_FILE:-${NGINX_SYSTEMD_DIR}/nginx.service}
@@ -45,6 +55,28 @@ SETUP_BUILD_LOCK_FILE=${SETUP_BUILD_LOCK:-/run/setup-build.lock}
 # Where each component's copy of build-common.sh lives; the shared units run
 # whichever exists (a host can lose nginx's build and keep PHP's).
 SETUP_BUILD_COMMON_COPIES="${NGINX_ROOT}/build-common.sh /usr/local/lib/setup-php/build-common.sh /usr/local/lib/setup-valkey/build-common.sh"
+SETUP_BUILD_PHP_ROOT=${PHP_BUILD_ROOT:-/usr/local/lib/setup-php}
+SETUP_BUILD_VALKEY_ROOT=${VALKEY_BUILD_ROOT:-/usr/local/lib/setup-valkey}
+
+# The directive classes of the lean configure line, for lib/migrate.sh's
+# pre-flight scan (droppable: commented out with a report; unbuilt: a
+# blocker).  Read from the tool itself (DROPPABLE_RE / UNBUILT_RE), so the
+# scan and the fit can never disagree; an exported value wins (tests).
+_nginx_build_directive_res() {
+  local src="${SCRIPT_DIR:-}/tools/nginx-build.sh" v
+  [[ -f $src ]] || src=$NGINX_BUILD_TOOL
+  [[ -f $src ]] || return 0
+  if [[ -z ${NGINX_BUILD_DROPPABLE_RE:-} ]]; then
+    v=$(sed -n "s/^DROPPABLE_RE='\(.*\)'\$/\1/p" "$src" 2>/dev/null | sed -n 1p)
+    [[ -n $v ]] && export NGINX_BUILD_DROPPABLE_RE=$v
+  fi
+  if [[ -z ${NGINX_BUILD_UNBUILT_RE:-} ]]; then
+    v=$(sed -n "s/^UNBUILT_RE='\(.*\)'\$/\1/p" "$src" 2>/dev/null | sed -n 1p)
+    [[ -n $v ]] && export NGINX_BUILD_UNBUILT_RE=$v
+  fi
+  return 0
+}
+_nginx_build_directive_res
 
 # ------------------------------------------------------------------ texts
 # PIDFile, --pid-path and server-configs-nginx's `pid` are all /run/nginx.pid.
@@ -127,6 +159,12 @@ _setup_build_chain_exec() { # cpu|refresh
 # After a CPU change every gate (nginx, PHP, Valkey ExecStartPre) only starts
 # this unit; it rebuilds nginx, the active PHP and Valkey in that order from
 # their recorded versions, offline, and starts each enabled service.
+# TimeoutStartSec is only a backstop above the chain's own bounds, so systemd
+# never kills the last stage (Valkey) and leaves it down (R33): the lock
+# wait (SETUP_BUILD_LOCK_TIMEOUT, 6 h) + nginx 1 h + PHP 2 h per enabled
+# version + Valkey 1 h (build-common.sh BUILD_CHAIN_T_*), each with 60 s
+# kill-after and up to 300 s for its start: about 13.5 h with two PHP
+# versions.
 setup_build_cpu_unit_text() {
   cat <<EOF
 # Managed by setup.sh (lib/nginx-build.sh).
@@ -137,7 +175,7 @@ Wants=network-online.target
 
 [Service]
 $(_setup_build_service_props)
-TimeoutStartSec=4h
+TimeoutStartSec=16h
 ExecStart=$(_setup_build_chain_exec cpu)
 EOF
 }
@@ -195,15 +233,32 @@ setup_build_install_shared_units() {
   return 0
 }
 
-# Any compiled build left besides nginx (PHP X.Y, Valkey)?
-_setup_build_others_left() {
-  find /usr/local/lib/setup-php /usr/local/lib/setup-valkey -maxdepth 3 -name build.info -print -quit 2>/dev/null | grep -q .
+# Is any compiled build left, other than component EXCEPT (nginx|php|valkey,
+# the one being purged)?  Each root is tested on its own: one find over
+# several roots exits 1 when any root is missing, even after it printed a
+# match, and under setup.sh's pipefail that read as "nothing left" (R81).
+_setup_build_left() { # [except]
+  local except=${1:-} d hit
+  if [[ $except != nginx && -f ${NGINX_ROOT}/build/build.info ]]; then return 0; fi
+  for d in php:"$SETUP_BUILD_PHP_ROOT" valkey:"$SETUP_BUILD_VALKEY_ROOT"; do
+    [[ ${d%%:*} == "$except" ]] && continue
+    d=${d#*:}
+    [[ -d $d ]] || continue
+    hit=$(find "$d" -maxdepth 3 -name build.info -not -path '*/staging/*' -print -quit 2>/dev/null || true)
+    [[ -n $hit ]] && return 0
+  done
+  return 1
 }
+# 1.21 name.
+_setup_build_others_left() { _setup_build_left nginx; }
 
 # Last-consumer rule (R81): the CPU chain, the refresh timer and the lock go
-# with the last remaining build.
-setup_build_remove_shared_units_if_last() {
-  _setup_build_others_left && return 0
+# with the last remaining build.  Every component's purge calls it after
+# removing its own root, naming itself (nginx_build_purge: nginx; PHP's and
+# Valkey's purges: php / valkey).  Without an argument it removes the shared
+# units only when no build at all is left.
+setup_build_remove_shared_units_if_last() { # [component being purged]
+  _setup_build_left "${1:-}" && return 0
   systemctl disable --now "${SETUP_BUILD_REFRESH_TIMER##*/}" >/dev/null 2>&1 || true
   systemctl stop "${SETUP_BUILD_CPU_UNIT##*/}" "${SETUP_BUILD_REFRESH_UNIT##*/}" >/dev/null 2>&1 || true
   rm -f "$SETUP_BUILD_CPU_UNIT" "$SETUP_BUILD_REFRESH_UNIT" "$SETUP_BUILD_REFRESH_TIMER" "$SETUP_BUILD_LOCK_FILE"
@@ -242,13 +297,16 @@ nginx_build_tmpfiles_apply() {
   return 0
 }
 
-# nginx.service, the rebuild unit and the shared units.  CONTEXT migrate
-# writes nginx.service but does not enable it (Angie still serves; the
-# migration's cutover enables and starts it).  Sets NGINX_UNIT_RESTART=1 when
-# a running nginx needs a restart to pick up a changed limit or type.
+# nginx.service, the rebuild unit and the shared units.  Writing the unit
+# never enables it: nginx_build_ensure enables nginx.service only once it is
+# actually running (_nginx_build_enable_if_running), so a host where Angie or
+# a distro nginx still holds :80/:443 does not get two servers racing for the
+# ports at the next boot.  The migration's cutover enables it there.  Sets
+# NGINX_UNIT_RESTART=1 when a running nginx needs a restart to pick up a
+# changed limit or type.  CONTEXT is kept for the callers' signature.
 NGINX_UNIT_RESTART=0
 nginx_build_install_units() { # context
-  local context=${1:-optimize} old="" new changed=0
+  local old="" new changed=0
   NGINX_UNIT_RESTART=0
   new=$(nginx_unit_text)
   [[ -f $NGINX_UNIT_FILE ]] && old=$(cat "$NGINX_UNIT_FILE")
@@ -264,10 +322,58 @@ nginx_build_install_units() { # context
   setup_build_write "$NGINX_BUILD_UNIT" "$(nginx_build_unit_text)" && changed=1
   (( changed )) && systemctl daemon-reload 2>/dev/null
   setup_build_install_shared_units
-  if [[ $context != migrate ]]; then
-    systemctl enable nginx.service >/dev/null 2>&1 || true
+  return 0
+}
+
+# Enable nginx.service once our nginx serves (never in the migration, whose
+# cutover owns that step).  A unit that is not running stays as it is.
+_nginx_build_enable_if_running() { # context
+  [[ ${1:-optimize} == migrate ]] && return 0
+  systemctl is-active -q nginx.service 2>/dev/null || return 0
+  [[ $(systemctl is-enabled nginx.service 2>/dev/null || true) == enabled ]] && return 0
+  systemctl enable nginx.service >/dev/null 2>&1 || true
+  return 0
+}
+
+# Report what the fit commented out in /etc/nginx outside a setup.sh run
+# (nginx's ExecStartPre `pre`, the refresh timer's activate, the CPU chain):
+# those runs only reach the journal, and a removed limit_conn must reach the
+# operator's report (R88).  Lines already shown are remembered.
+_nginx_build_report_disabled() { # out
+  local out=$1 l d where
+  [[ -s $NGINX_DISABLED_LIST ]] || { rm -f "$NGINX_DISABLED_SEEN"; return 0; }
+  while IFS= read -r l; do
+    [[ -n $l ]] || continue
+    grep -qxF -- "$l" "$NGINX_DISABLED_SEEN" 2>/dev/null && continue
+    d=${l##* }; where=${l% *}
+    if [[ $d == limit_conn* ]]; then
+      "$out" "- **nginx: commented out $d in $where: security control removed (operator rule 1.21.71: limit_conn is not compiled in); done by nginx's start check or the daily refresh**"
+    else
+      "$out" "- nginx: commented out $d in $where (module not compiled in; done by nginx's start check or the daily refresh; \`${NGINX_BUILD_TOOL} restore\` puts it back)"
+    fi
+  done < "$NGINX_DISABLED_LIST"
+  _nginx_build_disabled_seen
+}
+# Everything in the list has been reported (by this run's notes or above).
+_nginx_build_disabled_seen() {
+  if [[ -s $NGINX_DISABLED_LIST ]]; then cp -f "$NGINX_DISABLED_LIST" "$NGINX_DISABLED_SEEN" 2>/dev/null || true
+  else rm -f "$NGINX_DISABLED_SEEN"
   fi
   return 0
+}
+
+# OUT may be a report function (info, opt_report, ...) or, as lib/migrate.sh
+# passes it, an absolute path to a file that collects the report lines.
+# Sets NGINX_BUILD_OUT to the function to call.
+NGINX_BUILD_OUT=info
+NGINX_BUILD_OUT_FILE=""
+_nginx_build_out_file() { printf '%s\n' "$*" >> "$NGINX_BUILD_OUT_FILE"; }
+_nginx_build_resolve_out() { # out
+  NGINX_BUILD_OUT=${1:-info}
+  if [[ $NGINX_BUILD_OUT == /* ]] && ! declare -F -- "$NGINX_BUILD_OUT" >/dev/null; then
+    NGINX_BUILD_OUT_FILE=$NGINX_BUILD_OUT
+    NGINX_BUILD_OUT=_nginx_build_out_file
+  fi
 }
 
 # ------------------------------------------------------------------ running
@@ -298,6 +404,8 @@ _nginx_build_report_notes() { # out
       *"commented out limit_conn"*|*"security control removed"*)
         "$out" "- **nginx: ${line#*nginx build: }**" ;;
       *"commented out"*)
+        "$out" "- nginx: ${line#*nginx build: }" ;;
+      *"does not pass with this build yet"*)
         "$out" "- nginx: ${line#*nginx build: }" ;;
     esac
   done <<<"$NGINX_BUILD_LAST_OUT"
@@ -369,13 +477,17 @@ _nginx_build_activate() { # context out
 #                       CONTEXT optimize adds BOLT under traffic
 #   CONTEXT install | optimize | migrate (migrate never starts or enables nginx,
 #           never tests /etc/nginx: the migration renders and tests it later)
-#   OUT     report function (info, opt_report, ...)
+#   OUT     report function (info, opt_report, ...), or an absolute file path
+#           that collects the report lines
+#   nginx.service is enabled only once it runs (never in migrate context).
 nginx_build_ensure() {
-  local mode=${1:-full} context=${2:-optimize} out=${3:-info} rc=0 chk="" need=0
+  local mode=${1:-full} context=${2:-optimize} out rc=0 chk="" need=0 st
+  _nginx_build_resolve_out "${3:-info}"; out=$NGINX_BUILD_OUT
   case $mode in build-only|activate|full) ;; *) "$out" "- **nginx: unknown build mode '$mode'**"; return 1 ;; esac
   case $context in install|optimize|migrate) ;; *) context=optimize ;; esac
   nginx_build_install_tools || { "$out" "- **FAILED: nginx: the build tool is missing from this checkout**"; return 1; }
   _nginx_build_lock || { "$out" "- **FAILED: nginx: timed out waiting for the build lock ($SETUP_BUILD_LOCK_FILE)**"; return 1; }
+  [[ $context == migrate ]] || _nginx_build_report_disabled "$out"
   case $mode in
     build-only)
       _nginx_build_stage "$context" "$out" || rc=1 ;;
@@ -400,6 +512,16 @@ nginx_build_ensure() {
         rc=0
       fi
       nginx_build_install_units "$context"
+      # A staging left behind (an aborted migration's build-only, a failed
+      # earlier activate) is swapped in only when `check` finds it current:
+      # same recipe, this CPU, the versions wanted now.  Anything else could
+      # be a downgrade or a binary for another CPU, so it is discarded.
+      if (( ! need )) && [[ -f ${NGINX_ROOT}/staging/build.info ]]; then
+        if ! st=$("$NGINX_BUILD_TOOL" check "${NGINX_ROOT}/staging/build.info" 2>/dev/null); then
+          "$out" "- nginx: discarded a leftover staged build ($(awk -F= '$1 == "nginx" { print $2 }' "${NGINX_ROOT}/staging/build.info" 2>/dev/null): ${st:-not verifiable})"
+          rm -rf "${NGINX_ROOT:?}/staging"
+        fi
+      fi
       if (( need )); then
         if _nginx_build_stage "$context" "$out" && _nginx_build_activate "$context" "$out"; then :; else rc=1; fi
       elif [[ -f ${NGINX_ROOT}/staging/build.info ]]; then
@@ -412,6 +534,8 @@ nginx_build_ensure() {
         _nginx_build_bolt "$out"
       fi ;;
   esac
+  if (( rc == 0 )) && [[ $mode != build-only ]]; then _nginx_build_enable_if_running "$context"; fi
+  _nginx_build_disabled_seen
   _nginx_build_unlock
   return "$rc"
 }
@@ -452,21 +576,54 @@ _nginx_build_bolt() { # out
   return 0
 }
 
-# Directives of modules the lean build leaves out, in the live tree: the
-# droppable ones are commented out and reported (limit_conn prominently, as a
-# removed security control: operator rule 1.21.71); anything else is a
-# blocker reported with nginx's error.  Status 1 on a blocker.
-nginx_build_fit() { # out
-  local out=${1:-info} why
-  [[ -x $NGINX_BUILD_TOOL && -x $NGINX_BIN ]] || return 0
-  if nginx_build_run_tool optimize fit; then
-    _nginx_build_report_notes "$out"
-    return 0
+# Directives of modules the lean build leaves out: the droppable ones are
+# commented out (marker '# setup-nginx-build-off: ') and reported (limit_conn
+# prominently, as a removed security control: operator rule 1.21.71);
+# anything else is a blocker reported with nginx's error.  Status 1 on a
+# blocker.
+#   OUT   report function, or an absolute FILE path: then exactly one line
+#         'path:line directive' per commented directive is appended to FILE
+#         and nothing else is reported (lib/migrate.sh step 7 reads them)
+#   BIN   the binary to test with (default: the active $NGINX_BIN; with none
+#         installed and no BIN there is nothing to fit, status 0).  The
+#         migration passes the staged candidate.
+#   CONF  the main file of the tree to fit (default /etc/nginx/nginx.conf);
+#         only files under its directory are ever edited.
+nginx_build_fit() { # out [bin [conf]]
+  local out=${1:-info} bin=${2:-} conf=${3:-} file="" why dir line rc=0 ctx=optimize
+  local re='nginx build: commented out ([a-z0-9_]+) in ([^[:space:]]+):([0-9]+) '
+  if [[ $out == /* ]] && ! declare -F -- "$out" >/dev/null; then file=$out; fi
+  NGINX_BUILD_LAST_OUT=""
+  if [[ -z $bin ]]; then
+    [[ -x $NGINX_BIN ]] || return 0
+    bin=$NGINX_BIN
   fi
-  _nginx_build_report_notes "$out"
-  why=$(grep -m1 -E 'emerg|error' <<<"$NGINX_BUILD_LAST_OUT" || true)
-  "$out" "- **nginx: the configuration needs a module the lean build leaves out** (${why:-nginx -t failed}); nginx keeps its current configuration"
-  return 1
+  conf=${conf:-${NGINX_BUILD_NGINX_CONF:-/etc/nginx/nginx.conf}}
+  dir=$(dirname "$conf")
+  if [[ ! -x $bin ]]; then
+    why="no nginx binary at $bin"
+  elif [[ ! -x $NGINX_BUILD_TOOL ]] && ! nginx_build_install_tools; then
+    why="the build tool is missing from this checkout"
+  else
+    # A candidate other than the active binary is the migration's (step 7):
+    # its fit lines are reported by the caller, not recorded for --optimize.
+    if [[ $bin != "$NGINX_BIN" ]]; then ctx=migrate; fi
+    nginx_build_run_tool "$ctx" fit "$conf" "$bin" || rc=$?
+    (( rc == 0 )) || why=$(grep -m1 -E 'emerg|error' <<<"$NGINX_BUILD_LAST_OUT" || true)
+  fi
+  [[ -n ${why:-} ]] && rc=1
+  if [[ -n $file ]]; then
+    while IFS= read -r line; do
+      [[ $line =~ $re ]] && printf '%s/%s:%s %s\n' "$dir" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[1]}" >> "$file"
+    done <<<"$NGINX_BUILD_LAST_OUT"
+    (( rc == 0 )) || printf 'nginx: fit of %s failed: %s\n' "$conf" "${why:-nginx -t failed}" >&2
+  else
+    _nginx_build_report_notes "$out"
+    (( rc == 0 )) || "$out" "- **nginx: the configuration needs a module the lean build leaves out** (${why:-nginx -t failed}); nginx keeps its current configuration"
+  fi
+  # The caller reported these; the next ensure must not repeat them.
+  _nginx_build_disabled_seen
+  return "$rc"
 }
 
 nginx_build_plan() {
@@ -505,7 +662,7 @@ nginx_build_purge() {
   rm -rf "${NGINX_ROOT:?}" "${NGINX_BUILD_CACHE:?}"
   rm -f "$NGINX_TMPFILES"
   rm -rf /var/cache/nginx
-  setup_build_remove_shared_units_if_last
+  setup_build_remove_shared_units_if_last nginx
   if declare -F setup_build_llvm_release >/dev/null; then setup_build_llvm_release nginx; fi
   systemctl daemon-reload 2>/dev/null || true
   systemctl reset-failed >/dev/null 2>&1 || true

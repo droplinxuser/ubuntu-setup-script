@@ -26,12 +26,30 @@ active_cache_unit() {
   return 0
 }
 
+# The web server unit --restart-all stops first and starts last: nginx, or
+# angie while the host stays in legacy-Angie mode (the nginx part of the 1.22
+# migration refused or pending).  Angie is then restarted as it is; no nginx
+# logic is applied to it (R51).
+restart_web_unit() {
+  if declare -F web_server_state >/dev/null 2>&1 \
+     && [[ $(web_server_state 2>/dev/null || true) == angie-legacy ]]; then
+    printf 'angie'
+  else
+    printf 'nginx'
+  fi
+}
+
+# 1 while --restart-all has stopped Angie (legacy mode) and not started it
+# again; on_exit starts it so an interrupted run cannot leave it down.
+RESTART_ANGIE_PAUSED=0
+
 restart_all_plan() {
-  local unit cache_unit=""
+  local unit cache_unit="" web_unit
   local -a active=() php_units=()
   detect_installed_services
+  web_unit=$(restart_web_unit)
   mapfile -t php_units < <(list_active_php_units)
-  systemctl is-active --quiet nginx 2>/dev/null && active+=(nginx)
+  systemctl is-active --quiet "$web_unit" 2>/dev/null && active+=("$web_unit")
   systemctl is-active --quiet mariadb 2>/dev/null && active+=(mariadb)
   cache_unit=$(active_cache_unit)
   [[ -n $cache_unit ]] && active+=("$cache_unit")
@@ -42,7 +60,11 @@ restart_all_plan() {
   printf 'Active services:     %s\n' "${active[*]:-none}"
   printf 'Order:\n'
   printf '  daemon-reload\n'
-  printf '  stop nginx (if active)\n'
+  if [[ $web_unit == angie ]]; then
+    printf '  stop angie (if active; legacy mode: the nginx part of the 1.22 migration is not done)\n'
+  else
+    printf '  stop nginx (if active)\n'
+  fi
   printf '  stop active php*-fpm.service\n'
   printf '  restart active Valkey/Redis service\n'
   printf '  restart active Elasticsearch\n'
@@ -50,15 +72,15 @@ restart_all_plan() {
   printf '  restart active MariaDB\n'
   printf '  wait for SELECT 1 (up to 300s)\n'
   printf '  start the PHP-FPM versions that were stopped\n'
-  printf '  start nginx if it was stopped\n'
+  printf '  start %s if it was stopped\n' "$web_unit"
   if (( ${#active[@]} == 0 )); then
     printf 'No active supported services detected.\n'
   fi
 }
 
 run_restart_all() {
-  local unit rc=0
-  local nginx_active=0 mariadb_active=0
+  local unit rc=0 web_unit
+  local nginx_active=0 mariadb_active=0 angie_active=0
   local elastic_active=0 es_url="" es_ok=0
   local -a php_units=() cache_units=() failures=()
 
@@ -78,7 +100,11 @@ run_restart_all() {
   fi
 
   systemctl daemon-reload || warn "systemctl daemon-reload failed"
+  web_unit=$(restart_web_unit)
   systemctl is-active --quiet nginx 2>/dev/null && nginx_active=1
+  if [[ $web_unit == angie ]] && systemctl is-active --quiet angie 2>/dev/null; then
+    angie_active=1
+  fi
   mapfile -t php_units < <(list_active_php_units)
   unit=$(active_cache_unit)
   [[ -n $unit ]] && cache_units+=("$unit")
@@ -86,7 +112,7 @@ run_restart_all() {
   systemctl is-active --quiet mariadb 2>/dev/null && mariadb_active=1
 
   # Report installed-but-inactive units without starting them.
-  for unit in nginx mariadb valkey-server redis-server elasticsearch; do
+  for unit in "$web_unit" mariadb valkey-server redis-server elasticsearch; do
     if ! systemctl is-active --quiet "$unit" 2>/dev/null \
        && systemctl cat "$unit" >/dev/null 2>&1; then
       info "Skipping ${unit}: installed but inactive"
@@ -95,6 +121,16 @@ run_restart_all() {
 
   # 1. Stop the request tiers, nginx first, then all active PHP versions
   #    (the same pause the MariaDB tuner uses before its restart).
+  if (( angie_active )); then
+    if systemctl stop angie 2>/dev/null; then
+      RESTART_ANGIE_PAUSED=1
+      info "Paused angie before the restart (legacy mode)"
+    else
+      warn "Could not stop angie before the restart"
+      failures+=("stop angie")
+      rc=1
+    fi
+  fi
   opt_pause_web_frontends "the restart"
   if (( nginx_active && OPT_WEB_PAUSED_NGINX == 0 )); then
     failures+=("stop nginx")
@@ -172,6 +208,16 @@ run_restart_all() {
     failures+=("start php-fpm/nginx")
     rc=1
   fi
+  if (( RESTART_ANGIE_PAUSED )); then
+    if systemctl start angie 2>/dev/null; then
+      info "Started angie"
+    else
+      warn "Could not start angie after the restart"
+      failures+=("start angie")
+      rc=1
+    fi
+    RESTART_ANGIE_PAUSED=0
+  fi
 
   if (( rc == 0 )); then
     ok "All detected services restarted successfully"
@@ -205,10 +251,10 @@ run_os_tuning() {
 # Repair legacy cron jobs written by older releases.  It is deliberately a
 # text migration, not a purge: the ownership job's intent (keep web content
 # owned by www-data) is preserved, but it no longer touches the per-service
-# log tree or the database backup directory, and the old nginx/mysqlcheck
+# log tree or the database backup directory, and the old Angie/mysqlcheck
 # paths are replaced by the managed block.
 repair_optimize_legacy_cron() {
-  local cur backup="" had_legacy=0 had_cloudflare=0 had_mysqlcheck=0
+  local cur unmanaged="" backup="" had_legacy=0 had_cloudflare=0 had_mysqlcheck=0
   if ! command -v crontab >/dev/null 2>&1; then
     opt_report "- Cron: skipped (crontab is not installed)"
     return 0
@@ -218,7 +264,13 @@ repair_optimize_legacy_cron() {
      && printf '%s\n' "$cur" | grep -qE 'chown[[:space:]]+www-data:www-data[[:space:]]+(-R|--recursive)[[:space:]]+/var/www|chown[[:space:]]+(-R|--recursive)[[:space:]]+www-data:www-data[[:space:]]+/var/www'; then
     had_legacy=1
   fi
-  if printf '%s\n' "$cur" | grep -qF -- '/etc/nginx/scripts/cloudflare.sh'; then
+  # Only lines OUTSIDE the managed block are stripped as legacy
+  # (cron_strip_legacy_jobs).  The managed /etc/nginx/scripts/cloudflare.sh
+  # job is the current one, so scanning the whole crontab reported a false
+  # "removed legacy path" on every run (R22, R43).  What goes is an
+  # unmanaged /etc/angie/scripts/cloudflare.sh line.
+  [[ -n $cur ]] && unmanaged=$(printf '%s\n' "$cur" | cron_strip_managed || true)
+  if printf '%s\n' "$unmanaged" | grep -qF -- '/etc/angie/scripts/cloudflare.sh'; then
     had_cloudflare=1
   fi
   if printf '%s\n' "$cur" | grep -qF -- '/usr/bin/mysqlcheck'; then
@@ -237,7 +289,7 @@ repair_optimize_legacy_cron() {
       opt_report "- Cron: migrated the legacy 'chown -R /var/www' entry"
     fi
     if (( had_cloudflare )); then
-      opt_report "- Cron: removed the legacy /etc/nginx/scripts/cloudflare.sh path"
+      opt_report "- Cron: removed the unmanaged /etc/angie/scripts/cloudflare.sh line (the managed block carries the Cloudflare job)"
     fi
     if (( had_mysqlcheck )); then
       opt_report "- Cron: removed the legacy /usr/bin/mysqlcheck path"
@@ -337,6 +389,21 @@ EOF
   return "$rc"
 }
 
+# 1 when --optimize skips the web tier because Angie still serves (legacy
+# mode: the nginx part of the 1.22 migration is refused or pending).
+OPT_WEB_LEGACY=0
+OPT_MIGRATION_HEADED=0
+
+# The reporter handed to migrate_run: the "## Migration 1.22" heading goes
+# into the report only when the migration has something to say.
+opt_report_migration() {
+  if (( ! OPT_MIGRATION_HEADED )); then
+    OPT_MIGRATION_HEADED=1
+    opt_report "## Migration 1.22"
+  fi
+  opt_report "$@"
+}
+
 run_optimize() {
   local rc=0 service
   OPT_REPORT_STARTED=1
@@ -376,13 +443,39 @@ run_optimize() {
   detect_installed_services
   # One /var/www walk for every WordPress/XenForo finder in this run.
   app_config_scan_prime
-  if (( ${#OPT_DETECTED[@]} > 0 )); then
-    OPT_BACKUP_DIR=$(tmp_dir setup-optimize.XXXXXX) \
-      || die "Could not create an optimize backup directory"
-  fi
   plan_memory_budget
   run_os_tuning
   report_foreign_sysctl_sources
+  # The one-time 1.22 migration (Angie -> compiled nginx, Sury -> compiled
+  # PHP, the valkey-server package -> compiled Valkey) runs before anything
+  # tunes or reloads the web tier: the tuners below work on what it leaves.
+  # It detaches into its own unit, so a dropped session cannot stop a cutover
+  # half way; this run follows the log and folds its lines into the report.
+  # Status 2: no failure, but the nginx part is not done and Angie still
+  # serves (legacy mode), so every web-tier step is skipped (R19, R51).
+  OPT_WEB_LEGACY=0
+  if declare -F migrate_run >/dev/null 2>&1; then
+    local mig_rc=0
+    OPT_MIGRATION_HEADED=0
+    migrate_run opt_report_migration || mig_rc=$?
+    case $mig_rc in
+      0) ;;
+      2) OPT_WEB_LEGACY=1 ;;
+      *) rc=1 ;;
+    esac
+    # The installed services, units and binaries may have changed: plan
+    # from what is there now.
+    detect_installed_services
+    app_config_scan_prime
+    plan_memory_budget
+  fi
+  if (( ! OPT_WEB_LEGACY )) && declare -F web_server_state >/dev/null 2>&1 \
+     && [[ $(web_server_state 2>/dev/null || true) == angie-legacy ]]; then
+    OPT_WEB_LEGACY=1
+  fi
+  if (( OPT_WEB_LEGACY )); then
+    opt_report "- Web tier: Angie still serves (legacy mode); nginx and PHP-FPM tuning skipped until the nginx part of the migration completes"
+  fi
   # Security first: fix wp-config.php, scoped database users, malware and the
   # OS-level controls before the cron/managed blocks are regenerated.  The
   # WordPress step runs before write_cron so the managed wp-cron entry is
@@ -403,6 +496,11 @@ run_optimize() {
     opt_report "- Log rotation: \`/etc/logrotate.d/setup-logs\` ensured"
   else
     opt_report "- Log rotation: logrotate is not installed; central logs may grow"
+  fi
+  # Created after the migration, which can change what is installed.
+  if (( ${#OPT_DETECTED[@]} > 0 )); then
+    OPT_BACKUP_DIR=$(tmp_dir setup-optimize.XXXXXX) \
+      || die "Could not create an optimize backup directory"
   fi
   opt_report "## Operating system"
   opt_report "- CPU governor, PAM limits and kernel/network/memory sysctls tuned for ${OPT_MEM_TOTAL_MB}MB RAM / $(effective_cpus) CPUs"
@@ -436,13 +534,16 @@ run_optimize() {
   # PHP first: it owns the FastCGI socket nginx may point at.
   OPT_PHP_OK=0
   OPT_PHP_SOCKET=""
-  if [[ ${OPT_DETECTED[*]} == *php:* ]]; then
+  # In legacy-Angie mode PHP still answers Angie's tree; the PHP tuner reads
+  # /etc/nginx for its [PATH=] sections, so it waits for the nginx part too.
+  if [[ ${OPT_DETECTED[*]} == *php:* ]] && (( ! OPT_WEB_LEGACY )); then
     OPT_PHP_OK=1
     optimize_php_services || { rc=1; OPT_PHP_OK=0; }
   fi
   for service in "${OPTIMIZE_ORDER[@]}"; do
     # optimize_php_services() ran above (it is versioned, not a single unit).
     [[ $service == php ]] && continue
+    [[ $service == nginx ]] && (( OPT_WEB_LEGACY )) && continue
     [[ " ${OPT_DETECTED[*]} " == *" ${service} "* ]] || continue
     case "$service" in
       nginx)   optimize_nginx   || rc=1 ;;
@@ -459,7 +560,7 @@ run_optimize() {
   # computed from a tree one version behind would be rewritten by the next run
   # (and a freshly deployed app root would never get its section).  Re-run the
   # writer after nginx and reload only when it changed something.
-  if [[ " ${OPT_DETECTED[*]} " == *" nginx "* ]]; then
+  if [[ " ${OPT_DETECTED[*]} " == *" nginx "* ]] && (( ! OPT_WEB_LEGACY )); then
     php_refresh_after_nginx opt_report "- " || rc=1
   fi
 
@@ -512,6 +613,10 @@ on_exit() {
   if (( ${OPT_WEB_PAUSED_NGINX:-0} )) || (( ${#OPT_WEB_PAUSED_PHP[@]} > 0 )); then
     opt_resume_web_frontends "an interrupted run" || true
   fi
+  if (( ${RESTART_ANGIE_PAUSED:-0} )); then
+    RESTART_ANGIE_PAUSED=0
+    systemctl start angie 2>/dev/null || warn "Could not start angie after an interrupted restart"
+  fi
   # An --upgrade-php run that died between purging the old version and the
   # target serving (signal, set -e, die) would leave the host with no PHP.
   if (( ${PHP_UPGRADE_IN_FLIGHT:-0} )) && (( rc != 0 )); then
@@ -560,7 +665,35 @@ run_post_domain_optimize() {
   OPTIMIZE=0
 }
 
+# Hidden mode `setup.sh --migrate-1.22-unit FILE`: lib/migrate.sh starts it
+# as the transient unit setup-migrate-1.22 (migrate_detach); an operator
+# never types it.  Its output goes to the migration log the unit names, so
+# no run log is started here.  It sets up what the migration's tuner calls
+# read (the --optimize globals up to plan_memory_budget; the tuning file was
+# sourced at startup) and hands over to migrate_unit_main, which takes the
+# run lock itself (the starting run released it) and records the result.
+run_migrate_unit() {
+  local out=${1:-} rc=0
+  trap on_exit EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  [[ ${EUID} -eq 0 ]] || die "--migrate-1.22-unit must run as root"
+  [[ $out == /* ]] || die "--migrate-1.22-unit needs the absolute path of the report file"
+  declare -F migrate_unit_main >/dev/null 2>&1 \
+    || die "lib/migrate.sh is not loaded; cannot run the 1.22 migration unit"
+  OPTIMIZE=1
+  OPT_REPORT=()
+  detect_installed_services
+  app_config_scan_prime
+  plan_memory_budget
+  migrate_unit_main "$out" || rc=$?
+  exit "$rc"
+}
+
 main() {
+  if [[ ${1:-} == --migrate-1.22-unit ]]; then
+    run_migrate_unit "${2:-}"
+  fi
   normalize_cli_args "$@"
   set -- "${NORMALIZED_ARGS[@]}"
 
@@ -628,7 +761,22 @@ main() {
     exit 0
   fi
 
-  acquire_run_lock
+  # A rerun of --optimize while the 1.22 migration unit works attaches to it
+  # instead of failing on the run lock the unit holds: follow its log until it
+  # ends, then take the lock and continue with the normal run.
+  if (( OPTIMIZE )) && declare -F migrate_running >/dev/null 2>&1 && migrate_running; then
+    local attach_rc=0
+    migrate_detach_cmd || attach_rc=$?
+    (( attach_rc == 0 )) || warn "The 1.22 migration unit ended with status ${attach_rc}; see ${MIGRATE_LOG:-its log}"
+  fi
+  (( ${LOCK_HELD:-0} )) || acquire_run_lock
+  # First thing on every real run (after the lock): remove a policy-rc.d a
+  # crashed migration left, finish an interrupted dpkg run and bring back the
+  # side of an interrupted switch that can serve (R21, R34, R50, R73).  A
+  # crash, OOM kill or reboot never ran the traps that would have done it.
+  if declare -F migrate_resume_safe >/dev/null 2>&1; then
+    migrate_resume_safe
+  fi
 
   [[ -r /etc/os-release ]] || die "Cannot read /etc/os-release"
   # shellcheck disable=SC1091
@@ -652,7 +800,11 @@ main() {
 
   if [[ -n ${UPGRADE_PHP:-} ]]; then
     printf '%s%sUbuntu %s PHP upgrade%s\n' "$C_BOLD" "$C_BLUE" "${VERSION_ID}" "$C_RESET"
-    run_php_upgrade
+    if declare -F php_upgrade_run >/dev/null 2>&1; then
+      php_upgrade_run "$UPGRADE_PHP"
+    else
+      run_php_upgrade
+    fi
     exit 0
   fi
 
@@ -694,9 +846,11 @@ main() {
 
   # Add all selected third-party repositories first, then update APT once.
   # Service installers only install packages; this avoids one apt-get update
-  # (and its lock/retry overhead) per service.
+  # (and its lock/retry overhead) per service.  nginx and PHP are compiled
+  # from source since 1.22 and need no third-party repository (the LLVM
+  # source is the build tools' own business).
   local need_repos=0 item
-  (( ${ENABLED[nginx]:-0} || ${ENABLED[php]:-0} || ${ENABLED[elastic]:-0} )) && need_repos=1
+  (( ${ENABLED[elastic]:-0} )) && need_repos=1
   for item in "${OTHERS[@]}"; do
     [[ $item == nodejs ]] && need_repos=1
   done

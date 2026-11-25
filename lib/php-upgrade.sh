@@ -82,6 +82,25 @@ PHP_UPGRADE_PRIOR_TREE=""
 # rollback and the abort move that tree away (a kept tree is never touched
 # by a failed build).
 PHP_UPGRADE_TREE_GENERATED=0
+# What PHP_UPGRADE_IN_FLIGHT=1 protects, so php_upgrade_rollback (called by
+# on_exit in lib/restart.sh after a die, set -e or signal) undoes exactly
+# that: "prepare" (a kept /etc/php/<target> may sit in the manifest and a
+# half-generated tree in its place; the current version still serves) or
+# "handover" (the current version was stopped; it must be started again).
+PHP_UPGRADE_PHASE=""
+# fd holding /run/setup-build.lock from the build to the commit (R65(c)(e)):
+# the refresh chain (build_lock_try) and BOLT skip, the CPU chain and the
+# setup-php-build@ rebuild unit wait, so none of them restarts or rebuilds a
+# version in the middle of the handover.
+PHP_UPGRADE_LOCK_FD=""
+# Handover window output (php_upgrade_window_begin): saved stdout/stderr and
+# the previous HUP/PIPE dispositions.
+PHP_UPGRADE_WINDOW_TEE=0
+PHP_UPGRADE_SAVED_OUT=""
+PHP_UPGRADE_SAVED_ERR=""
+PHP_UPGRADE_SAVED_TRAPS=""
+# Result of php_upgrade_single_unit after the commit (report).
+PHP_UPGRADE_UNITS_OK="not checked"
 
 PHP_UPGRADE_ACTIVE_MARKER=/etc/php/setup-active
 # Oldest series the build recipe supports (php-build.conf); 8.1 is past
@@ -380,11 +399,20 @@ php_upgrade_core_modules() {
 # Effective extension set of the next build (B's php_build_effective_exts:
 # per-app detection + PHP_EXT_EXTRA + base), lower-case, one per line.  The
 # output format of the helper (comma list or one per line) does not matter.
+#
+# The helper's status is captured into a variable, never left inside a pipe:
+# under `set -Eeuo pipefail` + inherit_errexit a failing first stage would
+# end the caller's command substitution through the ERR trap before any
+# explained die.  Its stderr is not discarded: on status 1 it names the
+# extension that has no source build path, and the caller shows that.
+# Returns the helper's status (1 = the set cannot be built as asked).
 php_upgrade_effective_exts() {
   declare -F php_build_effective_exts >/dev/null || return 0
-  php_build_effective_exts 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr ',' '\n' \
+  local raw="" rc=0
+  raw=$(php_build_effective_exts) || rc=$?
+  printf '%s\n' "$raw" | tr '[:upper:]' '[:lower:]' | tr ',' '\n' \
     | tr -s '[:space:]' '\n' | sed '/^$/d' | sort -u
-  return 0
+  return "$rc"
 }
 
 # True when EXT will be in the TARGET build: in the effective set or always
@@ -435,6 +463,21 @@ php_upgrade_loaded_modules() {
   return 0
 }
 
+# Run CMD (a function such as php_build_ensure) with set -e and the ERR trap
+# live inside it, and return its status.  `if ! f`, `f || rc=$?` and `f &&`
+# suspend errexit for the whole function body, so a failed write inside the
+# build path would be skipped silently; a subshell in such a list is
+# suspended the same way.  An asynchronous subshell is not: it runs with
+# errexit active, and `wait` hands its status back.  The subshell keeps no
+# globals, so only callers that need nothing but the status use this.
+php_upgrade_checked() {
+  local pid rc=0
+  ( "$@" ) &
+  pid=$!
+  wait "$pid" || rc=$?
+  return "$rc"
+}
+
 # Ensure the build of PHP VER carries the extensions APP (at ROOT) cannot run
 # without.  --domain calls this before it writes the vhost; the effective set
 # includes the app types of --domain app= (B), so a missing module means the
@@ -459,7 +502,13 @@ php_ensure_app_extensions() {
     return 0
   fi
   info "${app} at ${root} needs ${want[*]}; rebuilding PHP ${ver} with the application's extension set (the current build serves meanwhile)"
-  if ! php_build_ensure "$ver" full optimize info; then
+  # CONTEXT refresh: the same build, layout and restart as optimize, but no
+  # 60 s live-traffic BOLT sample, which belongs to --optimize only.  The
+  # call goes through php_upgrade_checked so set -e and the ERR trap stay
+  # live inside the build path while its status is still captured.
+  local rc=0
+  php_upgrade_checked php_build_ensure "$ver" full refresh info || rc=$?
+  if (( rc != 0 )); then
     warn "PHP ${ver} rebuild failed; ${app} at ${root} may not start until it succeeds (re-run --optimize, or add --php ext=$(IFS=,; printf '%s' "${want[*]}"))"
     return 0
   fi
@@ -601,12 +650,53 @@ php_upgrade_validate_target() {
 
 # Reasons the switch may not run at all; one line each on stdout, empty when
 # it may.  Shared by the dry run (prints them) and the real run (dies).
+# 0 while the 1.22 migration still owns PHP: a PHP switch or the package
+# purge is in flight, the migration unit runs, a Sury phpX.Y-fpm unit still
+# serves a version whose php-X.Y part is not done, or the Sury purge after a
+# done part has not run (it would remove dpkg conffiles under /etc/php).
+# Only the PHP parts count (R19): migrate_needed answers for every part, so
+# a blocked nginx part, a deferred Angie purge, a postponed Valkey part or a
+# leftover distro nginx would lock --upgrade-php out although PHP is done.
+# A deferred Sury purge (collateral the operator must clear) does not block:
+# nothing of it is half-done.  Without lib/migrate.sh nothing is pending.
+php_upgrade_migration_pending() {
+  local st v php_done=0
+  declare -F migrate_state_get >/dev/null || return 1
+  # A PHP-scoped query from the migration module wins when it exists.
+  if declare -F migrate_php_pending >/dev/null; then
+    migrate_php_pending
+    return
+  fi
+  st=$(migrate_state_get inflight 2>/dev/null || true)
+  [[ $st == php-* || $st == purge ]] && return 0
+  if declare -F migrate_running >/dev/null && migrate_running; then return 0; fi
+  if declare -F migrate_sury_active_versions >/dev/null && command -v dpkg-query >/dev/null 2>&1; then
+    while IFS= read -r v; do
+      [[ -n $v ]] || continue
+      [[ $(migrate_state_get "php-${v}" 2>/dev/null || true) == "done" ]] || return 0
+    done < <(migrate_sury_active_versions 2>/dev/null || true)
+  fi
+  if [[ -n ${MIGRATE_STATE_FILE:-} && -f $MIGRATE_STATE_FILE ]] \
+     && grep -qE '^php-[0-9]+\.[0-9]+=done$' "$MIGRATE_STATE_FILE" 2>/dev/null; then
+    php_done=1
+  fi
+  if (( php_done )) && declare -F migrate_pkg_list >/dev/null \
+     && command -v dpkg-query >/dev/null 2>&1 \
+     && [[ -n $(migrate_pkg_list sury 2>/dev/null || true) ]]; then
+    case $(migrate_state_get sury-purge 2>/dev/null || true) in
+      done|deferred:*) ;;
+      *) return 0 ;;
+    esac
+  fi
+  return 1
+}
+
 php_upgrade_refusals() {
   local state
   # The PHP part of the 1.22 migration (Sury -> our build) must be finished:
   # until then phpX.Y-fpm is a package unit and /etc/php is Sury's.  Only the
   # PHP part counts (R19): a blocked nginx part must not lock PHP out forever.
-  if declare -F migrate_needed >/dev/null && migrate_needed php >/dev/null 2>&1; then
+  if php_upgrade_migration_pending; then
     printf '%s\n' "the 1.22 migration of PHP is not finished; run --optimize first (it builds PHP from source and retires the Sury packages)"
   fi
   if declare -F web_server_state >/dev/null; then
@@ -847,7 +937,26 @@ php_upgrade_prepare_runtime() {
   return 0
 }
 
-# Start VER and wait for every Unix-socket listener of its pools.
+# True when the pool listener LISTEN is up: a Unix socket path exists as a
+# socket; a TCP listener ("127.0.0.1:9000", "[::1]:9000", "9000"), which the
+# adopt rule carries verbatim like a socket path (R24), has a listening TCP
+# socket on that port.  A form that cannot be parsed, or a host without ss,
+# is not judged (true): only a listener known to be missing fails.
+php_upgrade_listener_up() {
+  local listen=$1 port
+  if [[ $listen == /* ]]; then
+    [[ -S $listen ]]
+    return
+  fi
+  port=${listen##*:}
+  [[ $port =~ ^[0-9]+$ ]] || return 0
+  command -v ss >/dev/null 2>&1 || return 0
+  ss -Hltn 2>/dev/null | awk -v p=":${port}" '
+    { a = $4; if (length(a) > length(p) && substr(a, length(a) - length(p) + 1) == p) f = 1 }
+    END { exit !f }'
+}
+
+# Start VER and wait for every listener of its pools (Unix socket or TCP).
 php_upgrade_start_wait() {
   local ver=$1 pool listen rc=0
   systemctl daemon-reload 2>/dev/null || true
@@ -857,8 +966,9 @@ php_upgrade_start_wait() {
   systemctl restart "php${ver}-fpm" 2>/dev/null || return 1
   systemctl is-active --quiet "php${ver}-fpm" || return 1
   while IFS=$'\t' read -r pool listen; do
-    [[ $listen == /* ]] || continue
-    wait_for_cmd 10 test -S "$listen" || { warn "PHP ${ver} pool ${pool}: socket ${listen} did not appear"; rc=1; }
+    [[ -n $listen ]] || continue
+    wait_for_cmd 10 php_upgrade_listener_up "$listen" \
+      || { warn "PHP ${ver} pool ${pool}: listener ${listen} did not appear"; rc=1; }
   done < <(php_upgrade_pool_listeners "$ver")
   return "$rc"
 }
@@ -939,8 +1049,9 @@ php_upgrade_verify() {
     warn "php${new}-fpm is not active"; hard=1
   fi
   while IFS=$'\t' read -r pool listen; do
-    if [[ $listen == /* && ! -S $listen ]]; then
-      warn "Pool ${pool}: socket ${listen} was not created"; hard=1
+    [[ -n $listen ]] || continue
+    if ! php_upgrade_listener_up "$listen"; then
+      warn "Pool ${pool}: listener ${listen} is not up"; hard=1
     fi
   done < <(php_upgrade_pool_listeners "$new")
   log=$(tmp_file)
@@ -988,26 +1099,26 @@ php_upgrade_verify() {
 # a switch back to a kept version), restart the old unit on the socket, and
 # point the marker and links at it again.  Nothing is rebuilt or deleted, so
 # this is fast and also runs from on_exit after a signal.
+#
+# During the prepare phase (PHP_UPGRADE_PHASE=prepare: a die or set -e in
+# the carry-over, the ini sync or php_build_layout) the current version never
+# stopped, so only the trees are put back and nothing is restarted.
 php_upgrade_rollback() {
-  local old=$PHP_UPGRADE_OLD_VERSION target=${UPGRADE_PHP:-} dir=$PHP_UPGRADE_MANIFEST_DIR
-  local listen moved bin=${NGINX_BIN:-/usr/local/sbin/nginx}
+  local old=$PHP_UPGRADE_OLD_VERSION target=${UPGRADE_PHP:-}
+  local listen bin=${NGINX_BIN:-/usr/local/sbin/nginx}
   [[ -n $old ]] || { warn "No previous PHP version to roll back to"; return 1; }
+  if [[ $PHP_UPGRADE_PHASE == prepare ]]; then
+    PHP_UPGRADE_PHASE=""
+    [[ -n $target && $target != "$old" ]] && php_upgrade_restore_trees "$target"
+    warn "PHP ${old} kept serving; the PHP ${target:-?} configuration was moved aside"
+    return 0
+  fi
+  PHP_UPGRADE_PHASE=""
   warn "Rolling back to PHP ${old}"
   if [[ -n $target && $target != "$old" ]]; then
     systemctl stop "php${target}-fpm" 2>/dev/null || true
     systemctl disable "php${target}-fpm" 2>/dev/null || true
-    if (( PHP_UPGRADE_TREE_GENERATED )) && [[ -d /etc/php/$target && -n $dir ]]; then
-      mkdir -p "$dir/failed"
-      if mv -- "/etc/php/$target" "$dir/failed/php-${target}" 2>/dev/null; then
-        info "Moved the generated PHP ${target} configuration to ${dir}/failed/php-${target}"
-      elif moved=$(preserve_to_tmp "/etc/php/$target" 2>/dev/null) && [[ -n $moved ]]; then
-        info "Moved the generated PHP ${target} configuration to ${moved}"
-      fi
-    fi
-    if [[ -n $PHP_UPGRADE_PRIOR_TREE && -d $PHP_UPGRADE_PRIOR_TREE && ! -e /etc/php/$target ]]; then
-      mv -- "$PHP_UPGRADE_PRIOR_TREE" "/etc/php/$target" 2>/dev/null \
-        && info "Restored the previous /etc/php/${target}"
-    fi
+    php_upgrade_restore_trees "$target"
   fi
   php_upgrade_set_active "$old"
   php_upgrade_prepare_runtime
@@ -1103,7 +1214,8 @@ php_upgrade_write_report() {
     fi
     printf '\n## Verification\n\n'
     printf -- '- CLI: `%s`\n' "${cli_version:-unknown}"
-    printf -- '- php-fpm active: %s\n' "$(systemctl is-active "php${new}-fpm" 2>/dev/null || echo unknown)"
+    printf -- '- php-fpm active: %s\n' "$(php_upgrade_unit_state "php${new}-fpm")"
+    printf -- '- Single PHP-FPM unit enabled and active: %s\n' "$PHP_UPGRADE_UNITS_OK"
     printf -- '- Socket: `%s`\n' "$(php_pool_listen "$new")"
     printf -- '- Pool: `%s`\n' "${pool_summary:-unavailable}"
     printf -- '- JIT: `%s`\n' "${jit_summary:-unavailable}"
@@ -1129,16 +1241,21 @@ php_upgrade_write_report() {
 # --dry-run: show the exact plan without touching the host.  Works as a normal
 # user (detection that needs root degrades to "unknown").
 php_upgrade_plan() {
-  local target=$UPGRADE_PHP cur="" reason entry app root found_app=0
+  local target=$UPGRADE_PHP cur="" reason entry app root found_app=0 exts_rc=0
   local -a refusals=() versions=()
   php_upgrade_validate_target "$target"
   mapfile -t versions < <(php_upgrade_installed_versions)
   cur=$(php_upgrade_current_version)
-  PHP_UPGRADE_EXTS=$(php_upgrade_effective_exts)
+  # The helper prints its reason (the unbuildable name) on stderr.
+  PHP_UPGRADE_EXTS=$(php_upgrade_effective_exts) || exts_rc=$?
+  (( exts_rc == 0 )) || PHP_UPGRADE_EXTS=""
   printf '\n%sDRY RUN%s - PHP upgrade plan, no changes will be made.\n' "$C_BOLD" "$C_RESET"
   printf 'Target PHP : %s (newest released %s.x from php.net, built from source)\n' "$target" "$target"
   printf 'Current    : %s (setup builds: %s)\n' "${cur:-none}" "${versions[*]:-none}"
   mapfile -t refusals < <(php_upgrade_refusals)
+  if (( exts_rc != 0 )); then
+    refusals+=("the extension set cannot be built as configured (php_build_effective_exts named the extension above); fix --php ext= or set SETUP_PHP_ALLOW_MISSING_EXT=1")
+  fi
   if (( ${#refusals[@]} > 0 )); then
     printf '\nREFUSED: the real run stops before changing anything:\n'
     for reason in "${refusals[@]}"; do printf '  - %s\n' "$reason"; done
@@ -1201,21 +1318,178 @@ php_upgrade_plan() {
   return 0
 }
 
+# Move the /etc/php/TARGET tree this run generated into the manifest and put
+# back the kept tree it replaced.  Shared by the explicit aborts, the
+# prepare-phase rollback (on_exit after a hard error) and the handover
+# rollback.  Never touches a tree this run did not generate, and never
+# deletes anything.
+php_upgrade_restore_trees() {
+  local target=$1 dir=$PHP_UPGRADE_MANIFEST_DIR moved
+  [[ -n $target && $target != "${PHP_UPGRADE_OLD_VERSION:-}" ]] || return 0
+  if (( PHP_UPGRADE_TREE_GENERATED )) && [[ -d /etc/php/$target && -n $dir ]]; then
+    mkdir -p "$dir/failed" 2>/dev/null || true
+    if mv -- "/etc/php/$target" "$dir/failed/php-${target}" 2>/dev/null; then
+      info "Moved the generated PHP ${target} configuration to ${dir}/failed/php-${target}"
+    elif moved=$(preserve_to_tmp "/etc/php/$target" 2>/dev/null) && [[ -n $moved ]]; then
+      info "Moved the generated PHP ${target} configuration to ${moved}"
+    fi
+  fi
+  PHP_UPGRADE_TREE_GENERATED=0
+  if [[ -n $PHP_UPGRADE_PRIOR_TREE && -d $PHP_UPGRADE_PRIOR_TREE && ! -e /etc/php/$target ]]; then
+    mv -- "$PHP_UPGRADE_PRIOR_TREE" "/etc/php/$target" 2>/dev/null \
+      && info "Restored the previous /etc/php/${target}"
+  fi
+  return 0
+}
+
 # Abort before the handover: the current version kept serving the whole
 # time, so only the generated tree is moved away (and a kept tree restored).
+# The in-flight flag is cleared first so on_exit does not undo it twice.
 php_upgrade_abort_prepare() {
-  local target=$1 msg=$2 dir=$PHP_UPGRADE_MANIFEST_DIR report
-  if (( PHP_UPGRADE_TREE_GENERATED )) && [[ -d /etc/php/$target && $target != "$PHP_UPGRADE_OLD_VERSION" ]]; then
-    mkdir -p "$dir/failed"
-    mv -- "/etc/php/$target" "$dir/failed/php-${target}" 2>/dev/null || true
-  fi
-  if [[ -n $PHP_UPGRADE_PRIOR_TREE && -d $PHP_UPGRADE_PRIOR_TREE && ! -e /etc/php/$target ]]; then
-    mv -- "$PHP_UPGRADE_PRIOR_TREE" "/etc/php/$target" 2>/dev/null || true
-  fi
+  local target=$1 msg=$2 report
+  PHP_UPGRADE_IN_FLIGHT=0
+  PHP_UPGRADE_PHASE=""
+  php_upgrade_restore_trees "$target"
   warn "${msg}. Nothing changed for the sites: PHP ${PHP_UPGRADE_OLD_VERSION} kept serving."
   report=$(php_upgrade_write_report "$target" 1)
   warn "Report: ${report}"
+  php_upgrade_lock_release
   return 0
+}
+
+# Take /run/setup-build.lock (blocking, like build_lock_run) in this shell and
+# keep it until php_upgrade_lock_release or the end of the run.  build_lock_run
+# runs its command in a subshell, which would lose the globals on_exit needs,
+# so the fd is opened here; SETUP_BUILD_LOCK_HELD=1 tells the build tool that
+# php_build_ensure calls (and that inherits the fd) not to take it again,
+# which would deadlock.
+php_upgrade_lock_acquire() {
+  local lock=${SETUP_BUILD_LOCK:-/run/setup-build.lock}
+  [[ -n $PHP_UPGRADE_LOCK_FD || ${SETUP_BUILD_LOCK_HELD:-0} == 1 ]] && return 0
+  if ! command -v flock >/dev/null 2>&1; then
+    warn "flock not available; the build timers are not held off during the PHP switch"
+    return 0
+  fi
+  # /run is root-owned; refuse a planted symlink as acquire_run_lock does.
+  [[ -L $lock ]] && die "Refusing to open the build lock ${lock}: it is a symlink. Nothing was changed."
+  exec {PHP_UPGRADE_LOCK_FD}>>"$lock" || die "Cannot open the build lock ${lock}. Nothing was changed."
+  if ! flock -n "$PHP_UPGRADE_LOCK_FD"; then
+    info "Waiting for another build to finish (${lock})"
+    flock -w "${SETUP_BUILD_LOCK_TIMEOUT:-21600}" "$PHP_UPGRADE_LOCK_FD" \
+      || die "Timed out waiting for the build lock ${lock}. Nothing was changed."
+  fi
+  export SETUP_BUILD_LOCK_HELD=1
+  return 0
+}
+
+php_upgrade_lock_release() {
+  [[ -n $PHP_UPGRADE_LOCK_FD ]] || return 0
+  exec {PHP_UPGRADE_LOCK_FD}>&-
+  PHP_UPGRADE_LOCK_FD=""
+  unset SETUP_BUILD_LOCK_HELD
+  return 0
+}
+
+# Handover window output.  A dropped SSH session HUPs the run-log tee
+# (lib/common.sh) or an outer `| tee`: that process inherited the default
+# disposition before any trap here, so it dies, and the next write would
+# raise SIGPIPE in this shell.  The `exit 141` PIPE trap would then end the
+# run, and the rollback in on_exit would die on its own first warn.  So for
+# the window this shell ignores HUP and PIPE (the caller sets that), and its
+# output goes through a tee that ignores HUP, PIPE and INT and keeps writing
+# to MANIFEST/handover.log when the terminal side is gone (tee -p).  The
+# previous dispositions and fds come back in php_upgrade_window_end.
+php_upgrade_window_begin() {
+  PHP_UPGRADE_WINDOW_TEE=0
+  [[ -n $PHP_UPGRADE_MANIFEST_DIR && -d $PHP_UPGRADE_MANIFEST_DIR ]] || return 0
+  tee -p </dev/null >/dev/null 2>&1 || return 0
+  exec {PHP_UPGRADE_SAVED_OUT}>&1 {PHP_UPGRADE_SAVED_ERR}>&2
+  exec > >(trap '' HUP PIPE INT; exec tee -p -a "${PHP_UPGRADE_MANIFEST_DIR}/handover.log") 2>&1
+  PHP_UPGRADE_WINDOW_TEE=1
+  return 0
+}
+
+php_upgrade_window_end() {
+  if (( PHP_UPGRADE_WINDOW_TEE )); then
+    exec 1>&"$PHP_UPGRADE_SAVED_OUT" 2>&"$PHP_UPGRADE_SAVED_ERR"
+    exec {PHP_UPGRADE_SAVED_OUT}>&- {PHP_UPGRADE_SAVED_ERR}>&-
+    PHP_UPGRADE_SAVED_OUT=""
+    PHP_UPGRADE_SAVED_ERR=""
+    PHP_UPGRADE_WINDOW_TEE=0
+  fi
+  trap - HUP PIPE
+  if [[ -n $PHP_UPGRADE_SAVED_TRAPS ]]; then eval "$PHP_UPGRADE_SAVED_TRAPS"; fi
+  PHP_UPGRADE_SAVED_TRAPS=""
+  return 0
+}
+
+# Every PHP version this host knows: setup builds, /etc/php trees and
+# phpX.Y-fpm unit files (ours or a leftover package unit).
+php_upgrade_known_versions() {
+  local d v
+  {
+    php_upgrade_installed_versions
+    for d in /etc/php/[0-9]*.[0-9]* /etc/systemd/system/php*-fpm.service \
+             /lib/systemd/system/php*-fpm.service /usr/lib/systemd/system/php*-fpm.service; do
+      [[ -e $d ]] || continue
+      v=${d##*/}; v=${v#php}; v=${v%-fpm.service}
+      [[ $v =~ ^[0-9]+\.[0-9]+$ ]] && printf '%s\n' "$v"
+    done
+  } | sort -Vu
+  return 0
+}
+
+# After the commit exactly one phpX.Y-fpm unit may be enabled and active
+# (R32, R61 item 7): every unit binds the shared socket, so a second enabled
+# one, even stopped now, races the target for it at boot.  Another enabled
+# unit of ours that is not running is disabled (not masked; --upgrade-php
+# can still switch to it).  One that is running, or a package unit, is left
+# alone and reported.  Returns 1 when more than one stays enabled or active.
+php_upgrade_single_unit() {
+  local target=$1 v rc=0 ours
+  while IFS= read -r v; do
+    [[ -n $v && $v != "$target" ]] || continue
+    if systemctl is-active --quiet "php${v}-fpm" 2>/dev/null; then
+      warn "php${v}-fpm is still running beside PHP ${target}; only one PHP version may serve (stop and disable it, or run --optimize)"
+      rc=1
+      continue
+    fi
+    systemctl is-enabled --quiet "php${v}-fpm" 2>/dev/null || continue
+    ours=0
+    if declare -F php_build_unit_is_ours >/dev/null; then
+      php_build_unit_is_ours "$v" 2>/dev/null && ours=1
+    elif grep -qF "$(php_upgrade_root)/${v}/" "/etc/systemd/system/php${v}-fpm.service" 2>/dev/null; then
+      ours=1
+    fi
+    if (( ours )) && systemctl disable "php${v}-fpm" 2>/dev/null; then
+      info "Disabled php${v}-fpm (enabled but stopped; it would race PHP ${target} for the socket at boot)"
+    else
+      warn "php${v}-fpm is enabled beside PHP ${target}; it would race for the socket at boot (systemctl disable php${v}-fpm)"
+      rc=1
+    fi
+  done < <(php_upgrade_known_versions)
+  systemctl is-enabled --quiet "php${target}-fpm" 2>/dev/null \
+    || { warn "php${target}-fpm is not enabled; PHP would not start at boot"; rc=1; }
+  systemctl is-active --quiet "php${target}-fpm" 2>/dev/null \
+    || { warn "php${target}-fpm is not active"; rc=1; }
+  return "$rc"
+}
+
+# Unit state for the report: systemctl prints inactive/failed and exits
+# non-zero, so the fallback applies only to empty output.
+php_upgrade_unit_state() {
+  local st
+  st=$(systemctl is-active "$1" 2>/dev/null || true)
+  printf '%s' "${st:-unknown}"
+}
+
+# The interface named in the design (section 11): php_upgrade_run X.Y.  It
+# sets UPGRADE_PHP and runs the driver below (lib/restart.sh still calls
+# run_php_upgrade, which reads UPGRADE_PHP from the command line).  Call it
+# plainly, like the driver.
+php_upgrade_run() {
+  [[ -n ${1:-} ]] && UPGRADE_PHP=$1
+  run_php_upgrade
 }
 
 # Mode driver.  A plain return keeps set -e and the ERR trap live inside the
@@ -1238,17 +1512,23 @@ run_php_upgrade() {
   # 1.21's apt flow recorded extensions Sury had not published yet; a source
   # build has no such state.
   rm -f "${STATE_DIR}/php-pending-extensions"
-  PHP_UPGRADE_EXTS=$(php_upgrade_effective_exts)
+  local exts_rc=0
+  # php_build_effective_exts prints the unbuildable name on stderr.
+  PHP_UPGRADE_EXTS=$(php_upgrade_effective_exts) || exts_rc=$?
+  (( exts_rc == 0 )) \
+    || die "Could not compute the PHP extension set (php_build_effective_exts: see the reason above; fix --php ext= or set SETUP_PHP_ALLOW_MISSING_EXT=1). Nothing was changed."
   [[ -n $PHP_UPGRADE_EXTS ]] || die "Could not compute the PHP extension set (php_build_effective_exts). Nothing was changed."
   info "Current PHP: ${cur}; extension set: $(printf '%s' "$PHP_UPGRADE_EXTS" | paste -sd' ' -)"
 
   if [[ $target == "$cur" ]]; then
     # Never take the serving version down to end where it started: rebuild
     # only when stale (B's check), the running binary serves until the new
-    # one passes verify.
+    # one passes verify.  The upgrade context takes the build lock itself.
     PHP_UPGRADE_MODE=rebuild
     PHP_UPGRADE_OLD_VERSION=$cur
-    if php_build_ensure "$target" full upgrade info; then
+    local ensure_rc=0
+    php_upgrade_checked php_build_ensure "$target" full upgrade info || ensure_rc=$?
+    if (( ensure_rc == 0 )); then
       ok "PHP ${target} is active and its build is current"
     else
       warn "PHP ${target} rebuild failed; the existing build keeps serving"
@@ -1301,8 +1581,16 @@ run_php_upgrade() {
   # Build while the current version serves.  The target unit is neither
   # enabled nor active, so activation only installs the build and its unit.
   step "Building PHP ${target} (PHP ${cur} keeps serving)"
-  if ! php_build_ensure "$target" build-only upgrade info \
-     || ! php_build_ensure "$target" activate upgrade info; then
+  # From here to the commit the build lock is held (R65(c)(e)): the refresh
+  # chain, BOLT, the CPU chain and setup-php-build@ cannot rebuild, activate
+  # or restart a version while the switch lays out, hands over and verifies.
+  php_upgrade_lock_acquire
+  local ensure_rc=0
+  php_upgrade_checked php_build_ensure "$target" build-only upgrade info || ensure_rc=$?
+  if (( ensure_rc == 0 )); then
+    php_upgrade_checked php_build_ensure "$target" activate upgrade info || ensure_rc=$?
+  fi
+  if (( ensure_rc != 0 )); then
     php_upgrade_abort_prepare "$target" "PHP ${target} build failed"
     handled_return 1
     return 1
@@ -1323,13 +1611,24 @@ run_php_upgrade() {
   step "Laying out /etc/php/${target} from PHP ${cur}"
   # A kept tree from an earlier switch is replaced by the current version's
   # (the newest operator state); it moves into the manifest, never deleted.
+  # From the move on, a die or set -e (carry-over, ini sync, layout) ends in
+  # on_exit: PHP_UPGRADE_IN_FLIGHT with phase "prepare" makes its
+  # php_upgrade_rollback move the half-generated tree aside and put the kept
+  # one back, without restarting the version that still serves.  The prior
+  # tree and the generated flag are recorded only once each step succeeded,
+  # so a failed move can never send the kept tree to failed/.
   PHP_UPGRADE_PRIOR_TREE=""
-  PHP_UPGRADE_TREE_GENERATED=1
+  PHP_UPGRADE_TREE_GENERATED=0
+  PHP_UPGRADE_PHASE=prepare
+  PHP_UPGRADE_IN_FLIGHT=1
   if [[ -d /etc/php/$target ]]; then
+    mv -- "/etc/php/$target" "${PHP_UPGRADE_MANIFEST_DIR}/prior-php-${target}"
     PHP_UPGRADE_PRIOR_TREE="${PHP_UPGRADE_MANIFEST_DIR}/prior-php-${target}"
-    mv -- "/etc/php/$target" "$PHP_UPGRADE_PRIOR_TREE"
   fi
-  if ! php_upgrade_carry_config "$cur" "$target"; then
+  PHP_UPGRADE_TREE_GENERATED=1
+  local carry_rc=0
+  php_upgrade_carry_config "$cur" "$target" || carry_rc=$?
+  if (( carry_rc != 0 )); then
     php_upgrade_abort_prepare "$target" "Could not copy PHP ${cur}'s configuration to /etc/php/${target}"
     handled_return 1
     return 1
@@ -1337,7 +1636,9 @@ run_php_upgrade() {
   if declare -F sync_php_ini_template >/dev/null; then
     PHP_INI_TZ="${PHP_INI_TZ:-}" sync_php_ini_template "$target" || true
   fi
-  if ! php_build_layout "$target"; then
+  local layout_rc=0
+  php_upgrade_checked php_build_layout "$target" || layout_rc=$?
+  if (( layout_rc != 0 )); then
     php_upgrade_abort_prepare "$target" "php_build_layout ${target} failed"
     handled_return 1
     return 1
@@ -1383,20 +1684,27 @@ run_php_upgrade() {
   php_upgrade_http_probe before
 
   # Handover.  From the stop until the target serves, the host has no PHP:
-  # on_exit rolls back while PHP_UPGRADE_IN_FLIGHT is set, and HUP is
-  # ignored so a closed SSH session cannot stop the switch halfway.
+  # on_exit rolls back while PHP_UPGRADE_IN_FLIGHT is set, and HUP and PIPE
+  # are ignored (output through the window tee, php_upgrade_window_begin) so
+  # a closed SSH session cannot stop the switch, or its rollback, halfway.
   step "Switching PHP ${cur} -> ${target}"
+  PHP_UPGRADE_SAVED_TRAPS=$(trap -p HUP PIPE)
+  PHP_UPGRADE_PHASE=handover
   PHP_UPGRADE_IN_FLIGHT=1
-  trap "" HUP
+  trap "" HUP PIPE
+  php_upgrade_window_begin
   systemctl stop "php${cur}-fpm" 2>/dev/null || true
   php_upgrade_prepare_runtime
-  if ! php_upgrade_start_wait "$target"; then
+  local start_rc=0
+  php_upgrade_start_wait "$target" || start_rc=$?
+  if (( start_rc != 0 )); then
     warn "PHP ${target} did not come up on its listeners; rolling back"
     PHP_UPGRADE_IN_FLIGHT=0
     php_upgrade_rollback || warn "Rollback to PHP ${cur} did not complete"
-    trap "exit 129" HUP
     report=$(php_upgrade_write_report "$target" 1)
     warn "Report: ${report}"
+    php_upgrade_lock_release
+    php_upgrade_window_end
     handled_return 1
     return 1
   fi
@@ -1412,9 +1720,10 @@ run_php_upgrade() {
     warn "PHP ${target} failed verification; rolling back"
     PHP_UPGRADE_IN_FLIGHT=0
     php_upgrade_rollback || warn "Rollback to PHP ${cur} did not complete"
-    trap "exit 129" HUP
     report=$(php_upgrade_write_report "$target" 1)
     warn "Report: ${report}"
+    php_upgrade_lock_release
+    php_upgrade_window_end
     handled_return 1
     return 1
   fi
@@ -1424,13 +1733,19 @@ run_php_upgrade() {
   systemctl enable "php${target}-fpm" 2>/dev/null || { warn "Could not enable php${target}-fpm"; rc=1; }
   systemctl disable "php${cur}-fpm" 2>/dev/null || { warn "Could not disable php${cur}-fpm"; rc=1; }
   PHP_UPGRADE_IN_FLIGHT=0
-  trap "exit 129" HUP
+  PHP_UPGRADE_PHASE=""
 
   php_upgrade_retire_older "$target" "$cur"
   # php_build_purge may re-point the links at the newest remaining build.
   php_upgrade_set_active "$target"
   php_upgrade_remove_stale_dropins
+  # Exactly one phpX.Y-fpm enabled and active (R32): a third version left
+  # enabled would race the target for the shared socket at boot.
+  local units_rc=0
+  php_upgrade_single_unit "$target" || units_rc=$?
+  if (( units_rc == 0 )); then PHP_UPGRADE_UNITS_OK=yes; else PHP_UPGRADE_UNITS_OK=no; rc=1; fi
   if (( ${#PHP_UPGRADE_SKIPPED[@]} > 0 )); then rc=1; fi
+  php_upgrade_lock_release
 
   report=$(php_upgrade_write_report "$target" "$rc")
   printf '\n%sPHP upgrade summary%s\n' "$C_BOLD" "$C_RESET"
@@ -1439,7 +1754,7 @@ run_php_upgrade() {
   printf '%-24s %s\n' 'Mode' "$PHP_UPGRADE_MODE"
   printf '%-24s %s\n' 'Extensions' "$(printf '%s' "$PHP_UPGRADE_EXTS" | wc -l | tr -d ' ')"
   printf '%-24s %s\n' 'Not carried' "${#PHP_UPGRADE_SKIPPED[@]}"
-  printf '%-24s %s\n' 'FPM' "$(systemctl is-active "php${target}-fpm" 2>/dev/null || printf unknown)"
+  printf '%-24s %s\n' 'FPM' "$(php_upgrade_unit_state "php${target}-fpm")"
   printf '%-24s %s\n' 'PHP pages probed' "${PHP_UPGRADE_PROBE_OK} OK"
   printf '%-24s %s\n' 'nginx' "$([[ $PHP_UPGRADE_NGINX_ACTIVE == 1 ]] && printf reloaded || printf not-running)"
   printf '%-24s %s\n' 'Rollback' "--upgrade-php=${cur} (kept, disabled)"
@@ -1451,6 +1766,9 @@ run_php_upgrade() {
   else
     warn "PHP ${target} is serving, but one or more checks reported a problem; see the report"
   fi
+  # The window tee stays until the summary is out, so a session dropped
+  # right after the commit still leaves the whole run in handover.log.
+  php_upgrade_window_end
   handled_return "$rc"
   return "$rc"
 }

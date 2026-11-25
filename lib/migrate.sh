@@ -20,7 +20,9 @@
 #   2  retire the 1.21 build TRIGGERS (timers, APT hooks, jobs, unit files)
 #   3  read-only pre-flight: Angie-only and unbuilt directives, purge
 #      collateral, disk, memory class, PHP extension union, pool listeners
-#   4  build everything (build-only: nothing is activated)
+#   4  build everything (build-only: nothing is activated), then a trial
+#      nginx -t of a private copy of /etc/angie with the candidate, so real
+#      blockers stop the nginx part before anything is purged or rendered
 #   5  distro nginx packages away, /etc/nginx rendered from SCN + /etc/angie
 #   6  Angie ACME -> the host self-signed pair (with a warning block)
 #   7  nginx -t with the candidate, then the hardware profile
@@ -116,6 +118,16 @@ migrate_note() { info "migrate: $*"; migrate_report "- $*"; }
 migrate_warn() { warn "migrate: $*"; migrate_report "- **WARNING** $*"; }
 migrate_fail() { warn "migrate: $*"; migrate_report "- **FAILED** $*"; MIGRATE_FAILED=1; }
 migrate_stamp() { date -u +%Y%m%dT%H%M%SZ; }
+# The OUT reporter handed to nginx_build_ensure, php_build_ensure and
+# valkey_build_ensure: they call "$out" "- line" (a function, never a file).
+# The line goes to the migration report and to the unit's log.
+migrate_out() {
+  local l="$*"
+  [[ -n $l ]] || return 0
+  [[ $l == -* || $l == '#'* || $l == '    '* ]] || l="- ${l}"
+  printf '%s\n' "$l"
+  migrate_report "$l"
+}
 
 migrate_nginx_root()  { printf '%s' "${NGINX_BUILD_ROOT:-/usr/local/lib/setup-nginx}"; }
 migrate_php_root()    { printf '%s' "${PHP_BUILD_ROOT:-/usr/local/lib/setup-php}"; }
@@ -169,6 +181,25 @@ migrate_state_del() {
   grep -q "^${key}=" "$f" 2>/dev/null || return 0
   tmp="${f}.new.$$"
   awk -v k="$key" 'index($0, k "=") != 1' "$f" > "$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$f"
+}
+
+# complete=0|1 (R65).  The refresh timer and the CPU chain (build-common's
+# migration_pending) skip while the file exists without the finish marker.
+# Besides complete=1 a bare 'complete' line is written, so a reader that
+# matches the line `complete` (or `done`) and one that matches `complete=1`
+# both see the same answer; the bare line is removed whenever complete=0.
+migrate_complete_set() {
+  local value=$1 f=$MIGRATE_STATE_FILE tmp
+  mkdir -p "$(dirname "$f")"
+  tmp="${f}.new.$$"
+  {
+    [[ -f $f ]] && awk '$0 != "complete" && $0 != "done" && index($0, "complete=") != 1' "$f"
+    printf 'complete=%s\n' "$value"
+    if [[ $value == 1 ]]; then printf 'complete\n'; fi
+  } > "$tmp" || return 1
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$f"
+  printf '%s complete=%s\n' "$(migrate_stamp)" "$value" >> "${f}.history" 2>/dev/null || true
 }
 
 # Parts and their status, for diagnostics (R80).  Read-only.
@@ -356,6 +387,9 @@ migrate_purge_sim() {
   (( $# > 0 )) || return 0
   local -a opts=()
   declare -p APT_OPTS >/dev/null 2>&1 && opts=("${APT_OPTS[@]}")
+  # Only packages this migration held itself (sury-held) may be simulated
+  # through their hold; an operator's hold still makes apt refuse.
+  [[ ${MIGRATE_SIM_ALLOW_HELD:-0} == 1 ]] && opts+=(--allow-change-held-packages)
   sim=$(apt-get -s "$action" "${opts[@]}" "$@" 2>&1) || rc=$?
   if (( rc != 0 )); then
     printf '%s\n' "$sim" | tail -n 5 >&2 || true
@@ -378,11 +412,24 @@ migrate_purge_sim() {
 # re-homes those applications).
 MIGRATE_SURY_PKGS=()
 migrate_sury_purge_preflight() {
+  local allow=0 p held
   MIGRATE_SURY_PKGS=()
   MIGRATE_SIM_COLLATERAL=()
   mapfile -t MIGRATE_SURY_PKGS < <(migrate_pkg_list sury)
   (( ${#MIGRATE_SURY_PKGS[@]} > 0 )) || return 0
-  migrate_purge_sim purge "${MIGRATE_SURY_PKGS[@]}" || { MIGRATE_SIM_COLLATERAL=("(apt refused the simulation)"); return 1; }
+  # A deferred purge held the Sury packages (migrate_sury_defer).  Those
+  # holds are ours and must not make the simulation fail; a hold the
+  # operator set on any of them still does.
+  held=" $(migrate_state_get sury-held) "
+  if [[ $held != "  " ]]; then
+    allow=1
+    while IFS= read -r p; do
+      [[ -n $p ]] || continue
+      [[ " ${MIGRATE_SURY_PKGS[*]} " == *" $p "* && $held != *" $p "* ]] && { allow=0; break; }
+    done < <(apt-mark showhold 2>/dev/null | sed 's/:.*//' || true)
+  fi
+  MIGRATE_SIM_ALLOW_HELD=$allow migrate_purge_sim purge "${MIGRATE_SURY_PKGS[@]}" \
+    || { MIGRATE_SIM_COLLATERAL=("(apt refused the simulation)"); return 1; }
   if (( ${#MIGRATE_SIM_COLLATERAL[@]} > 0 )) && [[ ${SETUP_PHP_ALLOW_COLLATERAL:-0} != 1 ]]; then
     return 1
   fi
@@ -756,58 +803,78 @@ migrate_nginx_scan_digest() {
   migrate_nginx_scan "$MIGRATE_ANGIE_ETC" "$MIGRATE_ANGIE_ETC/angie.conf" 2>/dev/null | md5sum | awk '{ print $1 }'
 }
 
-# migrate_needed: 0 when a part is pending, when a blocked part's cause may
-# have changed, when a deferred purge can now run, or when 1.21 triggers
-# remain.  Terminal states (done, refused-mem with the same RAM class,
-# blocked with the same scan) do not re-enter the migration.
+# migrate_needed [PART]: 0 when a part is pending, when a blocked part's
+# cause may have changed, when a deferred purge can now run, or when 1.21
+# triggers remain.  Terminal states (done, refused-mem with the same RAM
+# class, blocked with the same scan) do not re-enter the migration.
+# PART (nginx|php|valkey) limits the answer to that part's own states: the
+# --upgrade-php gate asks `migrate_needed php` and must not be held up by a
+# blocked nginx part, a deferred Angie purge or a Valkey postponed:disk (R19).
 migrate_needed() {
-  local st v
-  migrate_old_triggers_present && return 0
-  [[ -f $MIGRATE_POLICY_RC ]] && grep -qF -- "$MIGRATE_POLICY_MARK" "$MIGRATE_POLICY_RC" 2>/dev/null && return 0
-  [[ -n $(migrate_state_get inflight) ]] && return 0
-  case $(migrate_state_get removals) in
-    started|pending|post-purge-failed) return 0 ;;
-  esac
-  if migrate_angie_present; then
+  local part=${1:-all} st v
+  case $part in nginx|php|valkey|all) ;; *) part=all ;; esac
+  if [[ $part == all ]]; then
+    migrate_old_triggers_present && return 0
+    [[ -f $MIGRATE_POLICY_RC ]] && grep -qF -- "$MIGRATE_POLICY_MARK" "$MIGRATE_POLICY_RC" 2>/dev/null && return 0
+    [[ -n $(migrate_state_get inflight) ]] && return 0
+    case $(migrate_state_get removals) in
+      started|pending|post-purge-failed) return 0 ;;
+    esac
+  else
+    # A switch of this part in flight, or an interrupted Sury purge for PHP.
+    case $(migrate_state_get inflight) in
+      "$part"|"$part"-*) return 0 ;;
+      purge) [[ $part == php && $(migrate_state_get sury-purge) == started ]] && return 0 ;;
+    esac
+  fi
+  if [[ $part == all || $part == nginx ]] && migrate_angie_present; then
     st=$(migrate_state_get nginx)
     case $st in
-      done|cutover)
-        case $(migrate_state_get angie-purge) in
-          done) ;;
-          deferred:*) migrate_removal_possible angie && return 0 ;;
-          *) return 0 ;;
-        esac ;;
+      done)
+        if [[ $part == all ]]; then
+          case $(migrate_state_get angie-purge) in
+            done) ;;
+            deferred:*) migrate_removal_possible angie && return 0 ;;
+            *) return 0 ;;
+          esac
+        fi ;;
+      cutover) return 0 ;;  # finished forward by the next run (cron handover)
       blocked:*|rolled-back:*) migrate_part_retry_ok nginx "$(migrate_nginx_scan_digest)" && return 0 ;;
       *) return 0 ;;
     esac
   fi
-  local php_done=0
-  while IFS= read -r v; do
-    [[ -n $v ]] || continue
-    st=$(migrate_state_get "php-${v}")
-    case $st in
-      done) php_done=1 ;;
-      refused-mem) migrate_mem_allows php && return 0 ;;
-      refused:*|failed:*) migrate_part_retry_ok "php-${v}" "$(migrate_php_scan_digest "$v")" && return 0 ;;
-      *) return 0 ;;
-    esac
-  done < <(migrate_sury_active_versions)
-  if (( php_done )) && [[ -n $(migrate_pkg_list sury) ]]; then
-    case $(migrate_state_get sury-purge) in
-      done) ;;
-      deferred:*) migrate_sury_purge_preflight >/dev/null 2>&1 && return 0 ;;
-      *) return 0 ;;
-    esac
+  if [[ $part == all || $part == php ]]; then
+    local php_done=0
+    while IFS= read -r v; do
+      [[ -n $v ]] || continue
+      st=$(migrate_state_get "php-${v}")
+      case $st in
+        done) php_done=1 ;;
+        refused-mem) migrate_mem_allows php && return 0 ;;
+        refused:*|failed:*) migrate_part_retry_ok "php-${v}" "$(migrate_php_scan_digest "$v")" && return 0 ;;
+        *) return 0 ;;
+      esac
+    done < <(migrate_sury_active_versions)
+    if (( php_done )) && [[ -n $(migrate_pkg_list sury) ]]; then
+      case $(migrate_state_get sury-purge) in
+        done) ;;
+        deferred:*) migrate_sury_purge_preflight >/dev/null 2>&1 && return 0 ;;
+        post-purge-failed|failed:*|started) return 0 ;;
+        *) [[ $part == all ]] && return 0 ;;
+      esac
+    fi
   fi
-  if migrate_valkey_pkg_present; then
+  if [[ $part == all || $part == valkey ]] && migrate_valkey_pkg_present; then
     st=$(migrate_state_get valkey)
     case $st in
       done)
-        case $(migrate_state_get valkey-remove) in
-          done) ;;
-          deferred:*) migrate_removal_possible valkey && return 0 ;;
-          *) return 0 ;;
-        esac ;;
+        if [[ $part == all ]]; then
+          case $(migrate_state_get valkey-remove) in
+            done) ;;
+            deferred:*) migrate_removal_possible valkey && return 0 ;;
+            *) return 0 ;;
+          esac
+        fi ;;
       refused-mem) migrate_mem_allows valkey && return 0 ;;
       failed:*) migrate_part_retry_ok valkey "$(migrate_valkey_scan_digest)" && return 0 ;;
       *) return 0 ;;
@@ -815,7 +882,7 @@ migrate_needed() {
   fi
   # Distro nginx on a host already migrated (or a leftover after a deferred
   # purge) is finished by the next run.
-  if [[ $(migrate_state_get nginx) == "done" ]] && [[ -n $(migrate_pkg_list distro-nginx) ]]; then
+  if [[ $part == all ]] && [[ $(migrate_state_get nginx) == "done" ]] && [[ -n $(migrate_pkg_list distro-nginx) ]]; then
     return 0
   fi
   return 1
@@ -832,6 +899,9 @@ migrate_resume_safe() {
   migrate_running && return 0
   [[ ${EUID:-0} -eq 0 ]] || return 0
   migrate_policy_remove || true
+  # Leftovers of a run that died between writing and removing them.
+  migrate_php_probe_cleanup
+  migrate_nginx_test_shim_off
   local phase
   phase=$(migrate_state_get inflight)
   [[ -n $phase ]] || return 0
@@ -872,6 +942,8 @@ migrate_exit_hook() {
     migrate_inflight_rollback || true
   fi
   (( MIGRATE_POLICY_OURS )) && { migrate_policy_remove || true; }
+  migrate_php_probe_cleanup
+  migrate_nginx_test_shim_off
   migrate_lock_release
   if [[ -n $MIGRATE_PREV_EXIT_TRAP ]]; then
     eval "$MIGRATE_PREV_EXIT_TRAP"
@@ -1006,6 +1078,11 @@ migrate_retire_triggers() {
   # (d) old tools: relocated while a drop-in calls them, retired otherwise
   migrate_relocate_legacy_tool php "$(migrate_php_root)" php-fpm-build.sh php-build.conf PHP_BUILD_CONF "$dest" && changed=1
   migrate_relocate_legacy_tool valkey "$(migrate_valkey_root)" valkey-build.sh valkey-build.conf VALKEY_BUILD_CONF "$dest" && changed=1
+  # D's own sweep of the 1.21 Valkey triggers (hook, refresh units, fallback
+  # units); after the moves above it usually finds nothing left.
+  if declare -F valkey_build_retire_legacy >/dev/null 2>&1; then
+    valkey_build_retire_legacy >/dev/null 2>&1 || true
+  fi
   if (( changed )); then
     systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl reset-failed >/dev/null 2>&1 || true
@@ -1194,6 +1271,23 @@ migrate_php_scan_digest() {
   { migrate_php_ext_union "$1"; migrate_php_listeners "$1"; } 2>/dev/null | md5sum | awk '{ print $1 }'
 }
 
+# Lower-case module names some detected application requires (C's lists,
+# over the live vhost roots and the /var/www roots), one per line.  Status 1
+# when C's functions are not loaded: the caller cannot rule anything out.
+migrate_php_app_required_exts() {
+  local tree app root
+  declare -F php_upgrade_app_required_extensions >/dev/null 2>&1 || return 1
+  tree=$(migrate_web_tree)
+  {
+    declare -F php_upgrade_vhost_roots >/dev/null 2>&1 && php_upgrade_vhost_roots "$tree"
+    declare -F php_upgrade_app_roots >/dev/null 2>&1 && php_upgrade_app_roots
+  } 2>/dev/null | sort -u | while IFS=$'\t' read -r app root; do
+    [[ -n $app && -n $root ]] || continue
+    php_upgrade_app_required_extensions "$app" "$root" preflight 2>/dev/null || true
+  done | tr ' ,\t' '\n\n\n' | tr '[:upper:]' '[:lower:]' | sed -e '/^$/d' -e 's/^zend_opcache$/opcache/' | sort -u
+  return 0
+}
+
 # Merge NAMES into PHP_EXT_EXTRA (persisted, comma list) so the effective
 # set keeps them; the operator trims later with --php ext= (R2.9).
 migrate_php_persist_exts() {
@@ -1285,6 +1379,13 @@ migrate_preflight() {
       if [[ -n ${listen_owner[$l]:-} && ${listen_owner[$l]} != "$v" ]]; then listen_owner[$l]+=" $v"; else listen_owner[$l]=$v; fi
     done < <(migrate_php_listeners "$v")
   done
+  # One active version (R61, /etc/php/setup-active): B's php_build_start on
+  # the next --optimize disables every version but the active one, so a
+  # second running version moved onto our units would go down with it.  Only
+  # the primary moves; the others stay on Sury (and keep the Sury purge
+  # deferred) until the operator consolidates them.
+  local primary
+  primary=$(migrate_primary_version)
   for v in "${php_active[@]}"; do
     st=$(migrate_state_get "php-${v}")
     [[ $st == "done" ]] && { (( dry )) && printf '  PHP %s: migrated\n' "$v"; continue; }
@@ -1308,7 +1409,13 @@ migrate_preflight() {
            migrate_fail "PHP ${v}: two versions bind ${conflict}; this version stays on Sury"; fi
       continue
     fi
-    local -a keep=() unb_fpm=() unb_cli=() cli_only=()
+    if [[ -n $primary && $v != "$primary" ]]; then
+      if (( dry )); then printf '  PHP %s: refused, only the active version %s moves to the source build (one active version); Sury keeps serving %s and is not purged\n' "$v" "$primary" "$v"
+      else migrate_state_set "php-${v}" "refused:secondary (active ${primary})"; migrate_state_set "php-${v}.scan" "$(migrate_php_scan_digest "$v")"
+           migrate_warn "PHP ${v}: stays on the Sury package; only the active version ${primary} moves to the source build (the next --optimize would stop a second version).  Move its sites to PHP ${primary}, stop php${v}-fpm and re-run --optimize; the Sury purge waits until then"; fi
+      continue
+    fi
+    local -a keep=() unb_fpm=() unb_cli=() cli_only=() unb_req=()
     while read -r e line; do
       case $e in
         keep) keep+=("$line") ;;
@@ -1317,23 +1424,37 @@ migrate_preflight() {
         unbuildable-cli) unb_cli+=("$line") ;;
       esac
     done < <(migrate_php_ext_union "$v")
+    # Rev3 step 3 (R41, R58): a module the build cannot provide refuses the
+    # version only when a detected application requires it; otherwise it is
+    # dropped with a warning (imagick under the GD rule, ffi from php-common).
+    # Without C's requirement lists nothing can be ruled out: all count.
+    if (( ${#unb_fpm[@]} )); then
+      local req=""
+      if req=$(migrate_php_app_required_exts); then
+        for e in "${unb_fpm[@]}"; do grep -qxF -- "$e" <<<"$req" && unb_req+=("$e"); done
+      else
+        unb_req=("${unb_fpm[@]}")
+      fi
+    fi
     if (( dry )); then
       printf '  PHP %s: Sury -> source build; FPM modules kept: %s\n' "$v" "${keep[*]:-none}"
       (( ${#cli_only[@]} )) && printf '    CLI-only modules kept: %s\n' "${cli_only[*]}"
       (( ${#unb_cli[@]} )) && printf '    CLI-only modules that cannot be built (dropped): %s\n' "${unb_cli[*]}"
-      (( ${#unb_fpm[@]} )) && printf '    FPM modules that cannot be built: %s%s\n' "${unb_fpm[*]}" \
+      (( ${#unb_fpm[@]} )) && printf '    FPM modules that cannot be built: %s\n' "${unb_fpm[*]}"
+      (( ${#unb_req[@]} )) && printf '    required by an application and unbuildable: %s%s\n' "${unb_req[*]}" \
         "$([[ ${SETUP_PHP_ALLOW_MISSING_EXT:-0} == 1 ]] && echo ' (dropped: SETUP_PHP_ALLOW_MISSING_EXT=1)' || echo ' -> this version is REFUSED')"
       if declare -F php_build_effective_exts >/dev/null 2>&1; then
         printf '    effective set after the union: %s\n' "$(PHP_EXT_DETECT_TREE=$MIGRATE_ANGIE_ETC php_build_effective_exts 2>/dev/null || true)"
       fi
       continue
     fi
-    if (( ${#unb_fpm[@]} > 0 )) && [[ ${SETUP_PHP_ALLOW_MISSING_EXT:-0} != 1 ]]; then
-      migrate_state_set "php-${v}" "refused:unbuildable ${unb_fpm[*]}"
+    if (( ${#unb_req[@]} > 0 )) && [[ ${SETUP_PHP_ALLOW_MISSING_EXT:-0} != 1 ]]; then
+      migrate_state_set "php-${v}" "refused:unbuildable ${unb_req[*]}"
       migrate_state_set "php-${v}.scan" "$(migrate_php_scan_digest "$v")"
-      migrate_fail "PHP ${v}: the Sury FPM loads modules the source build cannot provide (${unb_fpm[*]}); Sury keeps serving and is not purged (SETUP_PHP_ALLOW_MISSING_EXT=1 drops them)"
+      migrate_fail "PHP ${v}: an application needs modules the source build cannot provide (${unb_req[*]}); Sury keeps serving and is not purged (SETUP_PHP_ALLOW_MISSING_EXT=1 drops them)"
       continue
     fi
+    (( ${#unb_fpm[@]} )) && migrate_warn "PHP ${v}: FPM modules the source build cannot provide are dropped (no detected application requires them): ${unb_fpm[*]}"
     (( ${#unb_cli[@]} )) && migrate_warn "PHP ${v}: CLI-only modules that cannot be built are dropped: ${unb_cli[*]}"
     migrate_php_persist_exts "${keep[@]}" "${cli_only[@]}"
     migrate_note "PHP ${v}: extensions loaded today kept in PHP_EXT_EXTRA: ${keep[*]:-none}${cli_only[*]:+ (CLI: ${cli_only[*]})}"
@@ -1498,55 +1619,38 @@ migrate_acme_plan() {
 # Step 4: builds (build-only; nothing is activated)
 # ---------------------------------------------------------------------------
 migrate_build_all() {
-  local out v st
-  out=$(tmp_file) || return 1
+  local v st
   st=$(migrate_state_get nginx)
   if (( MIGRATE_DO_NGINX )) && { [[ $st != built && $st != rendered ]] || ! migrate_nginx_bin >/dev/null; }; then
-    : > "$out"
-    if nginx_build_ensure build-only migrate "$out"; then
+    if nginx_build_ensure build-only migrate migrate_out; then
       migrate_state_set nginx built
     else
       migrate_state_set nginx "postponed:build failed"
-      migrate_fail "nginx build failed; Angie keeps serving (retried by the next --optimize)$( [[ -s $out ]] && printf ': %s' "$(tail -n 3 "$out" | paste -sd' ' -)")"
+      migrate_fail "nginx build failed; Angie keeps serving (retried by the next --optimize)"
       MIGRATE_DO_NGINX=0
     fi
-    migrate_fold_report "$out"
   fi
   local -a todo=()
   for v in "${MIGRATE_PHP_TODO[@]}"; do
-    : > "$out"
-    if php_build_ensure "$v" build-only migrate "$out"; then
+    if php_build_ensure "$v" build-only migrate migrate_out; then
       migrate_state_set "php-${v}" built
       todo+=("$v")
     else
       migrate_state_set "php-${v}" "postponed:build failed"
       migrate_fail "PHP ${v} build failed; Sury keeps serving (retried by the next --optimize)"
     fi
-    migrate_fold_report "$out"
   done
   MIGRATE_PHP_TODO=("${todo[@]}")
   if (( MIGRATE_DO_VALKEY )); then
-    : > "$out"
-    if valkey_build_ensure build-only migrate "$out"; then
+    if valkey_build_ensure build-only migrate migrate_out; then
       migrate_state_set valkey built
     else
       migrate_state_set valkey "postponed:build failed"
       migrate_fail "Valkey build failed; the package keeps serving (retried by the next --optimize)"
       MIGRATE_DO_VALKEY=0
     fi
-    migrate_fold_report "$out"
   fi
-  rm -f -- "$out"
-}
-
-migrate_fold_report() {
-  local f=$1 line
-  [[ -s $f ]] || return 0
-  while IFS= read -r line; do
-    [[ -n $line ]] || continue
-    [[ $line == -* || $line == '#'* ]] || line="- ${line}"
-    migrate_report "$line"
-  done < "$f"
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -1648,12 +1752,19 @@ migrate_copy_operator_files() {
 }
 
 # Pin `upstream local_php` to the listener that serves now (R23).
-migrate_pin_local_php() {
-  local listen="" v
+# The address Angie's `upstream local_php` sends PHP to (socket path or
+# host:port), empty when there is none.
+migrate_angie_local_php_listener() {
+  local listen
   listen=$(awk '/^[[:space:]]*upstream[[:space:]]+local_php[[:space:]]*\{/ { f = 1 }
                 f && /^[[:space:]]*server[[:space:]]/ { s = $2; sub(/;.*/, "", s); print s; exit }' \
              "$MIGRATE_ANGIE_ETC/angie.conf" 2>/dev/null || true)
-  listen=${listen#unix:}
+  printf '%s' "${listen#unix:}"
+}
+
+migrate_pin_local_php() {
+  local listen="" v
+  listen=$(migrate_angie_local_php_listener)
   if [[ -z $listen ]] && declare -F php_primary_version >/dev/null 2>&1; then
     v=$(php_primary_version 2>/dev/null || true)
     [[ -n $v ]] && listen=$(migrate_php_listeners "$v" | head -n1)
@@ -1779,13 +1890,145 @@ migrate_acme_to_self_signed() {
   return 0
 }
 
+# The marker A's fit writes in /etc/nginx (`nginx-build.sh restore` undoes
+# it).  The 1.21 Angie marker is restored in the copy first (migrate_path_map)
+# so every directive is fitted again against the nginx candidate (R88, R94).
+MIGRATE_NGINX_FIT_MARK='# setup-nginx-build-off: '
+
+# Make CAND accept CONF by commenting out droppable directives it does not
+# know, one nginx -t at a time: A's tool (`nginx-build.sh fit CONF BIN`, which
+# takes an explicit tree and binary) when it is installed, else the same loop
+# here.  Prints "file:line directive" for each commented directive; status 1
+# with the nginx error on stderr when a directive cannot be commented.
+migrate_nginx_fit() {
+  local conf=$1 cand=$2 tool out rc=0
+  tool=${NGINX_BUILD_TOOL:-$(migrate_nginx_root)/nginx-build.sh}
+  if [[ -x $tool ]]; then
+    out=$(NGINX_BUILD_CONTEXT=migrate "$tool" fit "$conf" "$cand" 2>&1) || rc=$?
+    sed -nE 's/.*nginx build: commented out ([^ ]+) in ([^ ]+) .*/\2 \1/p' <<<"$out"
+    if (( rc != 0 )); then
+      grep -m3 -E 'emerg|error|unknown' <<<"$out" >&2 || sed -n 1p <<<"$out" >&2
+    fi
+    return "$rc"
+  fi
+  migrate_nginx_self_fit "$conf" "$cand"
+}
+
+migrate_nginx_self_fit() {
+  local conf=$1 cand=$2 dir out d f n i start drop
+  drop=${NGINX_BUILD_DROPPABLE_RE:-$MIGRATE_NGINX_DROPPABLE_RE}
+  dir=$(dirname "$conf")
+  for (( i = 0; i < 100; i++ )); do
+    out=$("$cand" -t -q -c "$conf" 2>&1) && return 0
+    if [[ $out =~ unknown\ directive\ \"([a-z0-9_]+)\"\ in\ ([^[:space:]]+):([0-9]+) ]]; then
+      d=${BASH_REMATCH[1]}; f=${BASH_REMATCH[2]}; n=${BASH_REMATCH[3]}
+      if [[ $d =~ $drop && $f == "$dir"/* && -f $f && ! -L $f ]]; then
+        # nginx names the line a directive ends on; comment from its start.
+        start=$(awk -v n="$n" -v d="$d" 'NR <= n && ($1 == d || index($1, d ";") == 1) { s = NR } END { print s + 0 }' "$f")
+        if (( start > 0 )); then
+          sed_in_place -E "${start},${n}s/^([[:space:]]*)/\\1${MIGRATE_NGINX_FIT_MARK}/" "$f"
+          printf '%s:%s %s\n' "${f#"$dir"/}" "$n" "$d"
+          continue
+        fi
+      fi
+    fi
+    grep -m1 -E 'emerg|error' <<<"$out" >&2 || sed -n 1p <<<"$out" >&2
+    return 1
+  done
+  return 1
+}
+
+# Report the "file:line directive" lines of a fit (limit_conn prominently).
+migrate_nginx_fit_report() {
+  local l
+  while IFS= read -r l; do
+    [[ -n $l ]] || continue
+    if [[ $l == *limit_conn* ]]; then migrate_warn "commented ${l}: security control removed (operator rule 1.21.71)"
+    else migrate_note "commented ${l} (module not built)"; fi
+  done <<<"$1"
+}
+
+# Rev3 step 3: a trial of the operator's tree under the candidate BEFORE the
+# distro nginx purge or any change to /etc/nginx.  /etc/angie is copied into
+# a private temp dir, path-mapped onto that dir, the 1.21 fit marker undone,
+# the ACME directives switched as in step 6, and the fit run on the copy with
+# the candidate.  An unknown directive the fit cannot comment out is a real
+# blocker (printed, status 1).  Any other failure, such as a certificate that
+# exists only after the render, is left to the real test of step 7.
+migrate_nginx_trial() {
+  local cand=$1 t f rep err rc=0
+  [[ -f $MIGRATE_ANGIE_ETC/angie.conf ]] || return 0
+  t=$(tmp_dir nginx-trial.XXXXXX) || return 0
+  if ! cp -a -- "$MIGRATE_ANGIE_ETC/." "$t/" 2>/dev/null; then
+    rm -rf -- "$t"; return 0
+  fi
+  while IFS= read -r -d '' f; do
+    sed_in_place -E \
+      -e "s/^([[:space:]]*)${MIGRATE_ANGIE_FIT_MARK}/\\1/" \
+      -e "s#${MIGRATE_ANGIE_ETC}/#${t}/#g" \
+      -e 's#/var/www/logs/angie#/var/www/logs/nginx#g' \
+      -e 's#/var/cache/angie#/var/cache/nginx#g' \
+      -e 's#/run/angie\.pid#/run/nginx.pid#g' \
+      -e 's#^([[:space:]]*user[[:space:]]+)angie([[:space:]]*;|[[:space:]]+angie[[:space:]]*;)#\1www-data;#' \
+      "$f" 2>/dev/null || true
+  done < <(find "$t" -path "$t/ssl" -prune -o -type f -print0 2>/dev/null)
+  rep=$(tmp_file) || rep=/dev/null
+  while IFS= read -r -d '' f; do
+    grep -qE '^[^#]*(acme|\$acme_cert)' "$f" 2>/dev/null && migrate_acme_rewrite_file "$f" "$rep" >/dev/null 2>&1
+  done < <(find "$t" -path "$t/ssl" -prune -o -type f -print0 2>/dev/null)
+  [[ $rep == /dev/null ]] || rm -f -- "$rep"
+  err=$(migrate_nginx_fit "$t/angie.conf" "$cand" 2>&1 >/dev/null) || rc=$?
+  rm -rf -- "$t"
+  (( rc == 0 )) && return 0
+  err=${err//"$t"\//}
+  if [[ $err == *'unknown directive'* ]]; then
+    printf '%s' "$(printf '%s' "$err" | head -n 3 | paste -sd' ' -)"
+    return 1
+  fi
+  migrate_note "the trial nginx -t of the Angie tree was inconclusive ($(printf '%s' "$err" | head -n 1)); the rendered tree is tested at step 7"
+  return 0
+}
+
+# F's deploy_nginx_tree and the tuner's compression step test with
+# /usr/sbin/nginx unless they honour NGINX_TEST_BIN.  An Angie host has no
+# /usr/sbin/nginx (and the distro one was just purged), so the render would
+# fail.  While a loaded function still names /usr/sbin/nginx and nothing is
+# at that path, a temporary symlink to the candidate stands in; it is
+# recorded in the state and moved into the backups right after the render,
+# by the EXIT hook and by the next run's resume.
+migrate_nginx_test_shim_on() {
+  local cand=$1 shim=/usr/sbin/nginx
+  declare -f deploy_nginx_tree nginx_apply_profile ensure_nginx_compression tune_nginx_configs 2>/dev/null \
+    | grep -qF '/usr/sbin/nginx' || return 0
+  [[ -e $shim || -L $shim ]] && return 0
+  migrate_dpkg_owned "$shim" && return 0
+  ln -s -- "$cand" "$shim" 2>/dev/null || return 0
+  migrate_state_set nginx-test-shim "$shim"
+}
+migrate_nginx_test_shim_off() {
+  local shim d
+  shim=$(migrate_state_get nginx-test-shim)
+  [[ -n $shim ]] || return 0
+  if [[ -L $shim && $(readlink "$shim") == "$(migrate_nginx_root)/"* ]]; then
+    d=$(migrate_run_dir 2>/dev/null) || d=""
+    if [[ -n $d ]]; then migrate_stash "$shim" "$d/test-shim" || true
+    else mv -f -- "$shim" "$(tmp_dir)/" 2>/dev/null || true; fi
+  fi
+  migrate_state_del nginx-test-shim
+}
+
 # Steps 5-7 for the nginx part.  Returns 1 with the part's state recorded
 # when it cannot go on (Angie keeps serving).
 migrate_nginx_prepare() {
-  local cand err fitout st
+  local cand err fit st blk
   st=$(migrate_state_get nginx)
   [[ $st == rendered ]] && migrate_nginx_bin >/dev/null && return 0
   cand=$(migrate_nginx_bin) || { migrate_nginx_abort "no nginx candidate binary after the build"; return 1; }
+  # 3 (trial) real nginx -t blockers before anything is purged or rendered
+  if ! blk=$(migrate_nginx_trial "$cand"); then
+    migrate_nginx_abort "the Angie tree fails nginx -t with the new build: ${blk}" blocked keep
+    return 1
+  fi
   # 5a distro nginx
   if [[ -n $(migrate_pkg_list distro-nginx) ]]; then
     migrate_distro_nginx_purge || { migrate_nginx_abort "distro nginx purge failed"; return 1; }
@@ -1803,8 +2046,11 @@ migrate_nginx_prepare() {
   local upsnap
   upsnap=$(tmp_dir nginx-upstreams.XXXXXX) || return 1
   nginx_snapshot_upstreams "$MIGRATE_ANGIE_ETC" "$upsnap"
+  # The temp/log directories nginx -t opens (A's tmpfiles.d) before any test.
+  declare -F nginx_build_tmpfiles_apply >/dev/null 2>&1 && nginx_build_tmpfiles_apply
   # deploy_nginx_tree tests with NGINX_TEST_BIN (the candidate) and does not
   # reload anything (NGINX_SYNC_RELOAD=0): nothing serves from /etc/nginx yet.
+  migrate_nginx_test_shim_on "$cand"
   if ! NGINX_TEST_BIN=$cand NGINX_SYNC_RELOAD=0 deploy_nginx_tree; then
     migrate_nginx_abort "rendering the server-configs-nginx tree failed"
     return 1
@@ -1825,18 +2071,14 @@ migrate_nginx_prepare() {
     migrate_nginx_abort "the rendered tree still names Angie: $(printf '%s' "$residual" | paste -sd' ' -)"
     return 1
   fi
-  # 7 nginx -t with the candidate; droppable directives may be commented by
-  # the fit (each reported), anything else aborts (R26, R88).
+  # 7 nginx -t with the candidate.  The directives the 1.21 fit had commented
+  # are live again in the copy, so the fit runs on the rendered tree with the
+  # candidate: droppable directives are commented with the nginx marker (each
+  # reported), anything else aborts (R26, R88).
   if ! err=$("$cand" -t -q -c "$MIGRATE_NGINX_ETC/nginx.conf" 2>&1); then
-    fitout=$(tmp_file) || return 1
-    if declare -F nginx_build_fit >/dev/null 2>&1 && nginx_build_fit "$fitout" "$cand" \
+    if fit=$(migrate_nginx_fit "$MIGRATE_NGINX_ETC/nginx.conf" "$cand" 2>/dev/null) \
        && err=$("$cand" -t -q -c "$MIGRATE_NGINX_ETC/nginx.conf" 2>&1); then
-      local l
-      while IFS= read -r l; do
-        [[ -n $l ]] || continue
-        if [[ $l == *limit_conn* ]]; then migrate_warn "commented ${l}: security control removed (operator rule 1.21.71)"
-        else migrate_note "commented ${l} (module not built)"; fi
-      done < "$fitout"
+      migrate_nginx_fit_report "$fit"
     else
       migrate_nginx_abort "nginx -t of the rendered tree failed: $(printf '%s' "$err" | grep -m3 -E 'emerg|error' | paste -sd' ' -)"
       return 1
@@ -1850,6 +2092,7 @@ migrate_nginx_prepare() {
     migrate_nginx_abort "the nginx tuner failed on the rendered tree"
     return 1
   fi
+  migrate_nginx_test_shim_off
   local change
   for change in "${TUNE_CHANGES[@]}"; do migrate_report "    - tune: ${change}"; done
   if ! err=$("$cand" -t -q -c "$MIGRATE_NGINX_ETC/nginx.conf" 2>&1); then
@@ -1861,10 +2104,12 @@ migrate_nginx_prepare() {
 }
 
 # Abort the nginx part before cutover: the rendered tree leaves /etc/nginx
-# (so no code path takes it for a live tree) and Angie keeps serving.
+# (so no code path takes it for a live tree) and Angie keeps serving.  KEEP
+# (third argument) leaves /etc/nginx alone: the abort came before the render.
 migrate_nginx_abort() {
-  local why=$1 kind=${2:-blocked} snap
-  if [[ -d $MIGRATE_NGINX_ETC ]]; then
+  local why=$1 kind=${2:-blocked} keep_etc=${3:-} snap=""
+  migrate_nginx_test_shim_off
+  if [[ -z $keep_etc && -d $MIGRATE_NGINX_ETC ]]; then
     snap=$(migrate_snapshot_dir nginx-failed 2>/dev/null) && migrate_stash "$MIGRATE_NGINX_ETC" "$snap"
   fi
   migrate_state_set nginx "${kind}:${why}"
@@ -1885,17 +2130,14 @@ migrate_nginx_cutover() {
   migrate_state_set nginx.baseline "$base"
   angie_enabled=$(systemctl is-enabled angie.service 2>/dev/null || true)
   migrate_state_set nginx.angie-enabled "${angie_enabled:-enabled}"
-  out=$(tmp_file) || return 1
 
   migrate_inflight_set nginx
   systemctl stop angie.service || true
   systemctl mask angie.service >/dev/null 2>&1 || true
-  if ! nginx_build_ensure activate migrate "$out"; then
-    migrate_fold_report "$out"
+  if ! nginx_build_ensure activate migrate migrate_out; then
     migrate_nginx_rollback "activating the nginx build failed"
     return 1
   fi
-  migrate_fold_report "$out"
   systemctl daemon-reload || true
   migrate_clear_dsh_state nginx
   systemctl enable nginx.service >/dev/null 2>&1 || true
@@ -1908,12 +2150,30 @@ migrate_nginx_cutover() {
     migrate_nginx_rollback "vhosts answer differently than under Angie: $(printf '%s' "$bad" | head -n 5 | paste -sd'; ' -)"
     return 1
   fi
-  migrate_state_set nginx cutover
+  # Verified: the part is done before the cron handover, so a run that dies
+  # during write_cron or cloudflare.sh does not leave 'cutover' behind (the
+  # removals, the post-assert and the apt pin all wait for 'done').  The
+  # handover reports its own problems.
+  migrate_state_set nginx "done"
   migrate_inflight_clear
   migrate_note "nginx serves every vhost as Angie did ($(wc -l < "$base") requests compared); Angie stopped and masked until the purge"
   migrate_cron_handover
-  migrate_state_set nginx "done"
   return 0
+}
+
+# A 1.22 draft run could die between 'cutover' and 'done'.  The switch was
+# verified, so it is finished forward: the cron handover, then 'done'.
+migrate_nginx_finish_cutover() {
+  [[ $(migrate_state_get nginx) == cutover ]] || return 0
+  systemctl is-active --quiet nginx.service 2>/dev/null || systemctl start nginx.service >/dev/null 2>&1 || true
+  if systemctl is-active --quiet nginx.service 2>/dev/null; then
+    migrate_state_set nginx "done"
+    migrate_note "nginx cutover of an earlier run finished (cron handover)"
+    migrate_cron_handover
+  else
+    # Angie is masked, not purged (the purge waits for 'done'): it serves again.
+    migrate_nginx_rollback "nginx was not running after an earlier cutover"
+  fi
 }
 
 migrate_nginx_rollback() {
@@ -2006,36 +2266,69 @@ migrate_php_convert_confd() {
 
 # Write a temporary probe into the first PHP root that answers it through the
 # web server; prints "ok <name>" or the reason.  The probe prints the PHP
-# version, whether OPcache is active and a session id (R92, R89).
+# version, whether OPcache is active, a session id, the session handler and
+# save path, and the user PHP runs as (R92, R89).  A static probe file is
+# used rather than index.php?setup_probe because only a file of our own can
+# report OPcache and the session result.  Its path is recorded in the state
+# before it is written, so the EXIT hook and the next run's resume remove it
+# if the run dies in between.
+migrate_php_probe_cleanup() {
+  local p
+  p=$(migrate_state_get php-probe)
+  [[ -n $p ]] || return 0
+  [[ $p == */setup-probe-*.php && -f $p ]] && rm -f -- "$p"
+  migrate_state_del php-probe
+}
+
 migrate_php_probe() {
-  local v=$1 name scheme root rnd probe body code sid out=""
+  local v=$1 name scheme root rnd probe body code sid handler spath user out=""
   rnd="setup-probe-${RANDOM}${RANDOM}$$"
   while IFS=$'\t' read -r name scheme root; do
     probe="$root/${rnd}.php"
-    cat > "$probe" <<'EOF' || continue
+    migrate_state_set php-probe "$probe"
+    cat > "$probe" <<'PHP' || { migrate_php_probe_cleanup; continue; }
 <?php
 header('Cache-Control: no-store');
 $o = function_exists('opcache_get_status') && is_array($s = @opcache_get_status(false)) && !empty($s['opcache_enabled']);
 @session_start();
-echo 'setup-probe ', PHP_MAJOR_VERSION, '.', PHP_MINOR_VERSION, ' ', $o ? 'opcache' : 'no-opcache', ' ', session_id() !== '' ? session_id() : 'no-session', "\n";
-EOF
+$id = session_id();
+@session_write_close();
+$u = function_exists('posix_geteuid') && function_exists('posix_getpwuid') ? (posix_getpwuid(posix_geteuid())['name'] ?? '?') : '?';
+$p = (string) ini_get('session.save_path');
+if (strpos($p, ';') !== false) { $p = substr($p, strrpos($p, ';') + 1); }
+echo 'setup-probe ', PHP_MAJOR_VERSION, '.', PHP_MINOR_VERSION, ' ', $o ? 'opcache' : 'no-opcache', ' ',
+  $id !== '' ? $id : 'no-session', ' ', ini_get('session.save_handler') ?: '?', ' ', $u, ' ', $p !== '' ? $p : '-', "\n";
+PHP
     chmod 644 "$probe"
     body=$(curl -s --max-time 15 -k --resolve "${name}:$([[ $scheme == https ]] && echo 443 || echo 80):127.0.0.1" \
              -H 'Cache-Control: no-cache' -b 'setup_probe=1' -w '\n%{http_code}' \
              "${scheme}://${name}/${rnd}.php" 2>/dev/null) || body=""
-    rm -f -- "$probe"
+    migrate_php_probe_cleanup
     code=${body##*$'\n'}
     body=${body%$'\n'*}
     if [[ $code == 200 && $body == "setup-probe ${v} "* ]]; then
-      sid=$(awk '{ print $4 }' <<<"$body")
+      read -r _ _ _ sid handler user spath <<<"$body"
       if [[ $body != *" opcache "* ]]; then printf 'opcache inactive on %s' "$name"; return 1; fi
       if [[ $sid == no-session ]]; then printf 'session_start failed on %s' "$name"; return 1; fi
-      local sf
-      for sf in /var/lib/php/sessions/sess_"$sid" /var/lib/php/sessions-*/sess_"$sid"; do
-        [[ -f $sf ]] && { rm -f -- "$sf"; printf 'ok %s' "$name"; return 0; }
-      done
-      # A pool with its own save handler (redis) keeps no file; the id is enough.
-      printf 'ok %s (session handler without files)' "$name"
+      if [[ $handler == files ]]; then
+        # R89: the files handler must have written sess_<id>, owned by the
+        # user the pool runs as (a broken session directory fails here).
+        local sf="" cand owner
+        for cand in "${spath%/}/sess_${sid}" /var/lib/php/sessions/sess_"$sid" /var/lib/php/sessions-*/sess_"$sid"; do
+          [[ $cand == -/* ]] && continue
+          [[ -f $cand ]] && { sf=$cand; break; }
+        done
+        [[ -n $sf ]] || { printf 'no session file sess_%s in %s on %s' "$sid" "$spath" "$name"; return 1; }
+        owner=$(stat -c %U -- "$sf" 2>/dev/null || true)
+        rm -f -- "$sf"
+        if [[ $user != '?' && $owner != "$user" ]]; then
+          printf 'session file of %s is owned by %s, not the pool user %s' "$name" "${owner:-?}" "$user"; return 1
+        fi
+        printf 'ok %s' "$name"
+        return 0
+      fi
+      # Another save handler (redis) keeps no file; the id is enough.
+      printf 'ok %s (session handler %s)' "$name" "$handler"
       return 0
     fi
     out+="${name}=${code} "
@@ -2062,7 +2355,6 @@ migrate_php_cutover() {
   migrate_baseline "$(migrate_web_tree)" "$base"
   offs="$snap/log-offsets"
   migrate_log_offsets > "$offs"
-  out=$(tmp_file) || return 1
 
   migrate_inflight_set "php-${v}"
   # (1) stop while the package definition is loaded (its ExecStopPost runs)
@@ -2074,10 +2366,9 @@ migrate_php_cutover() {
   # (1b) Sury conf.d entries out, before any managed file is written
   migrate_php_convert_confd "$v" "$snap"
   # (2) our binary, unit and layout (tmpfiles applied inside, R89)
-  if ! php_build_ensure "$v" activate migrate "$out"; then
-    migrate_fold_report "$out"; migrate_php_rollback "$v" "activating the PHP ${v} build failed"; return 1
+  if ! php_build_ensure "$v" activate migrate migrate_out; then
+    migrate_php_rollback "$v" "activating the PHP ${v} build failed"; return 1
   fi
-  migrate_fold_report "$out"
   if ! php_build_layout "$v" adopt; then
     migrate_php_rollback "$v" "writing the /etc/php/${v} layout failed"; return 1
   fi
@@ -2135,20 +2426,58 @@ migrate_php_cutover() {
   conv=$(migrate_snapshot_dir "php-${v}-converted") || conv=""
   [[ -n $conv ]] && migrate_copy_tree "$MIGRATE_PHP_ETC/$v" "$conv/etc" && migrate_state_set "php-${v}.converted" "$conv"
   migrate_php_retire_old_layout "$v" "$snap"
+  # The active-version marker at the cutover (R61), not only after the
+  # removals: B's php_build_start on the next --optimize and the links key
+  # off it, and a deferred Sury purge may hold the post-assert back for days.
+  if [[ $v == "$(migrate_primary_version)" || ! -s $MIGRATE_PHP_ETC/setup-active ]]; then
+    migrate_php_set_active "$v"
+  fi
   migrate_state_set "php-${v}" "done"
   migrate_inflight_clear
   migrate_note "PHP ${v} serves from the source build (${msg#ok }); Sury unit replaced, configuration snapshot ${snap}"
   return 0
 }
 
-# The active version (one owns the shared socket, R61).
+# The active version (one owns the shared socket, R61): the recorded
+# /etc/php/setup-active when that version still has a tree, else the running
+# version whose pool owns Angie's local_php listener (what serves PHP now),
+# else F's php_primary_version, else the newest running Sury version.
 migrate_primary_version() {
-  local v
+  local v l listen
+  v=$(tr -d '[:space:]' < "$MIGRATE_PHP_ETC/setup-active" 2>/dev/null || true)
+  # A marker counts only for a version that runs or has our build.
+  if [[ $v =~ ^[0-9]+\.[0-9]+$ && -d $MIGRATE_PHP_ETC/$v ]] \
+     && { [[ -x $(migrate_php_active_bin "$v") ]] || migrate_sury_active_versions | grep -qxF -- "$v"; }; then
+    printf '%s' "$v"; return 0
+  fi
+  listen=$(migrate_angie_local_php_listener)
+  if [[ -n $listen ]]; then
+    while IFS= read -r v; do
+      [[ -n $v ]] || continue
+      while IFS= read -r l; do
+        [[ ${l#unix:} == "$listen" ]] && { printf '%s' "$v"; return 0; }
+      done < <(migrate_php_listeners "$v")
+    done < <(migrate_sury_active_versions)
+  fi
   if declare -F php_primary_version >/dev/null 2>&1; then
     v=$(php_primary_version 2>/dev/null || true)
     [[ -n $v ]] && { printf '%s' "$v"; return 0; }
   fi
   migrate_sury_active_versions | tail -n1
+}
+
+# /etc/php/setup-active (B's php_active_set when loaded) plus PHP_ACTIVE.
+migrate_php_set_active() {
+  local v=$1
+  if declare -F php_active_set >/dev/null 2>&1; then
+    php_active_set "$v" || return 1
+  else
+    printf '%s\n' "$v" > "$MIGRATE_PHP_ETC/setup-active.new" \
+      && chmod 644 "$MIGRATE_PHP_ETC/setup-active.new" \
+      && mv -f "$MIGRATE_PHP_ETC/setup-active.new" "$MIGRATE_PHP_ETC/setup-active" || return 1
+  fi
+  declare -F persist_tuning_var >/dev/null 2>&1 && persist_tuning_var PHP_ACTIVE "$v"
+  return 0
 }
 
 # 1.21 compiled layout and tool of a version leave after its cutover (R3).
@@ -2211,10 +2540,24 @@ migrate_valkey_scan_digest() {
     | md5sum | awk '{ print $1 }'
 }
 
+# 0 when the dataset is persisted (R28, R49).  The running server is asked
+# first (CONFIG GET save / appendonly).  When it cannot answer (stopped,
+# CONFIG renamed), the file decides: with no `save` line at all Valkey's
+# built-in RDB schedule is ON (Debian's valkey.conf only has the save lines
+# commented out), so only an explicit `save ""` with appendonly no is off.
 migrate_valkey_persists() {
-  local c=$MIGRATE_VALKEY_ETC/valkey.conf save aof
-  [[ -f $c ]] || return 1
-  save=$(awk '$1 == "save" { $1 = ""; v = $0 } END { gsub(/^ +|"/, "", v); print v }' "$c")
+  local c=$MIGRATE_VALKEY_ETC/valkey.conf save aof live cli
+  cli=${1:-$(command -v valkey-cli || command -v redis-cli || true)}
+  if [[ -n $cli ]]; then
+    live=$(migrate_valkey_cmd "$cli" CONFIG GET save | sed -n 2p || true)
+    aof=$(migrate_valkey_cmd "$cli" CONFIG GET appendonly | sed -n 2p || true)
+    if [[ ${aof,,} == yes || ${aof,,} == no ]]; then
+      [[ ${aof,,} == yes || -n ${live//[[:space:]\"]/} ]]
+      return
+    fi
+  fi
+  [[ -f $c ]] || return 0
+  save=$(awk '$1 == "save" { n++; $1 = ""; v = $0 } END { if (n == 0) print "default"; else { gsub(/^ +|"/, "", v); print v } }' "$c")
   aof=$(awk '$1 == "appendonly" { v = $2 } END { print v }' "$c")
   [[ -n $save || ${aof,,} == yes ]]
 }
@@ -2238,13 +2581,13 @@ migrate_valkey_cutover() {
   migrate_assert_no_old_triggers || { migrate_state_set valkey "failed:1.21 triggers present"; return 1; }
   snap=$(migrate_snapshot_dir valkey) || return 1
   migrate_state_set valkey.snap "$snap"
-  migrate_valkey_persists && echo 1 > "$snap/persists"
   pkgcli=$(command -v valkey-cli || command -v redis-cli || true)
+  # Asked while the package server still runs (it knows its real settings).
+  migrate_valkey_persists "$pkgcli" && echo 1 > "$snap/persists"
   [[ -n $pkgcli ]] && before=$(migrate_valkey_cmd "$pkgcli" DBSIZE | tr -dc '0-9')
   printf '%s' "$before" > "$snap/dbsize"
   systemctl is-enabled valkey-server > "$snap/enabled" 2>/dev/null || true
   en=$(cat "$snap/enabled")
-  out=$(tmp_file) || return 1
 
   migrate_inflight_set valkey
   # (1) stop the package server first: with persistence on it writes its
@@ -2268,10 +2611,9 @@ migrate_valkey_cutover() {
   id -g valkey > "$snap/gid" 2>/dev/null || true
   [[ -e $MIGRATE_UNIT_DIR/valkey-server.service.d/zz-setup-build.conf ]] \
     && migrate_stash "$MIGRATE_UNIT_DIR/valkey-server.service.d/zz-setup-build.conf" "$snap/live"
-  if ! valkey_build_ensure activate migrate "$out"; then
-    migrate_fold_report "$out"; migrate_valkey_rollback "activating the Valkey build failed"; return 1
+  if ! valkey_build_ensure activate migrate migrate_out; then
+    migrate_valkey_rollback "activating the Valkey build failed"; return 1
   fi
-  migrate_fold_report "$out"
   # The package's alias points at /lib; reenable re-points it at our unit.
   if [[ -L $MIGRATE_UNIT_DIR/valkey.service ]] && [[ $(readlink -f "$MIGRATE_UNIT_DIR/valkey.service") != "$(migrate_unit_file valkey-server)" ]]; then
     migrate_stash "$MIGRATE_UNIT_DIR/valkey.service" "$snap/ours"
@@ -2406,6 +2748,9 @@ migrate_removals() {
     if migrate_sury_purge_preflight && (( ${#MIGRATE_SURY_PKGS[@]} > 0 )); then
       sury_pkgs=("${MIGRATE_SURY_PKGS[@]}")
       (( ${#MIGRATE_SIM_COLLATERAL[@]} )) && migrate_warn "the Sury purge also removes ${MIGRATE_SIM_COLLATERAL[*]} (SETUP_PHP_ALLOW_COLLATERAL=1)"
+      # The holds of an earlier deferral go now, or apt refuses the purge
+      # ("Held packages were changed and -y was used").
+      migrate_sury_unhold
     else
       (( ${#MIGRATE_SIM_COLLATERAL[@]} > 0 )) && migrate_sury_defer
       sury_ok=0
@@ -2419,6 +2764,17 @@ migrate_removals() {
       && cp -a -- "$f" "$debs/"
   done
   (( angie_ok || sury_ok || valkey_ok )) || { migrate_removals_verify "${done_php[@]}"; return $?; }
+
+  # The post-removal pass compares against the vhost answers of NOW, not the
+  # cutover baseline: a deferred removal may run weeks after the cutover,
+  # and vhosts the operator changed since are not the removal's doing.
+  local rbase
+  rbase="$(migrate_run_dir)/removals-baseline.tsv"
+  if migrate_baseline "$(migrate_web_tree)" "$rbase"; then
+    migrate_state_set removals.baseline "$rbase"
+  else
+    migrate_state_del removals.baseline
+  fi
 
   migrate_policy_install || return 1
   migrate_inflight_set purge
@@ -2443,10 +2799,20 @@ migrate_removals() {
   # (the conffiles go with it; the verify pass re-lays ours).
   if (( sury_ok )); then
     local sess allphp
-    sess=$(migrate_snapshot_dir php-sessions) || sess=""
-    [[ -n $sess && -d /var/lib/php/sessions ]] && cp -a /var/lib/php/sessions "$sess/" 2>/dev/null
-    migrate_state_set php-sessions "$sess"
-    allphp=$(migrate_snapshot_dir php-etc-prepurge) && migrate_copy_tree "$MIGRATE_PHP_ETC" "$allphp/etc-php"
+    # Snapshotted once: a run resuming an interrupted purge finds a session
+    # directory the purge may already have emptied, and must not replace
+    # the good copy with it (same rule as angie-moved, R74).
+    sess=$(migrate_state_get php-sessions)
+    if [[ -z $sess || ! -d $sess ]]; then
+      sess=$(migrate_snapshot_dir php-sessions) || sess=""
+      [[ -n $sess && -d /var/lib/php/sessions ]] && cp -a /var/lib/php/sessions "$sess/" 2>/dev/null
+      migrate_state_set php-sessions "$sess"
+    fi
+    allphp=$(migrate_state_get php-etc-prepurge)
+    if [[ -z $allphp || ! -d $allphp ]]; then
+      allphp=$(migrate_snapshot_dir php-etc-prepurge) && migrate_copy_tree "$MIGRATE_PHP_ETC" "$allphp/etc-php" \
+        && migrate_state_set php-etc-prepurge "$allphp"
+    fi
     migrate_state_set sury-purge started
     if migrate_apt_remove purge "${sury_pkgs[@]}"; then
       migrate_state_set sury-purge purged
@@ -2470,6 +2836,7 @@ migrate_removals() {
       if [[ -n $vsnap && -f $vsnap/etc/valkey.conf ]] && ! [[ -f $MIGRATE_VALKEY_ETC/valkey.conf ]]; then
         cp -a "$vsnap/etc/valkey.conf" "$MIGRATE_VALKEY_ETC/valkey.conf"
       fi
+      migrate_valkey_user_ensure "$vsnap"
     else
       migrate_state_set valkey-remove "deferred:collateral ${MIGRATE_SIM_COLLATERAL[*]}"
       migrate_warn "removing valkey-server would also remove ${MIGRATE_SIM_COLLATERAL[*]:-?}; the package stays installed"
@@ -2502,6 +2869,7 @@ migrate_removals_verify() {
   fi
   migrate_inflight_clear
   migrate_state_set removals "done"
+  migrate_state_del removals.baseline
   return 0
 }
 
@@ -2528,8 +2896,68 @@ migrate_sury_defer() {
   local -a pkgs=()
   mapfile -t pkgs < <(migrate_pkg_list sury | while IFS= read -r p; do migrate_pkg_installed "$p" && printf '%s\n' "$p"; done)
   migrate_state_set sury-purge "deferred:${MIGRATE_SIM_COLLATERAL[*]}"
-  (( ${#pkgs[@]} )) && apt-mark hold "${pkgs[@]}" >/dev/null 2>&1 || true
+  if (( ${#pkgs[@]} )); then
+    # Only packages that were not held already are ours to unhold later; an
+    # operator's own hold stays the operator's.
+    local -a ours=()
+    local held p
+    held=" $(apt-mark showhold 2>/dev/null | sed 's/:.*//' | tr '\n' ' ') $(migrate_state_get sury-held) "
+    for p in "${pkgs[@]}"; do
+      if [[ $held == *" $p "* ]]; then
+        [[ " $(migrate_state_get sury-held) " == *" $p "* ]] && ours+=("$p")
+      else
+        ours+=("$p")
+      fi
+    done
+    if (( ${#ours[@]} )) && apt-mark hold "${ours[@]}" >/dev/null 2>&1; then
+      migrate_state_set sury-held "${ours[*]}"
+    fi
+  fi
   migrate_warn "Sury purge deferred: it would also remove ${MIGRATE_SIM_COLLATERAL[*]}.  PHP serves from the source build; the Sury packages are held (apt-mark hold).  Re-home those applications, or set SETUP_PHP_ALLOW_COLLATERAL=1, and re-run --optimize"
+}
+
+# Undo exactly the holds migrate_sury_defer set (sury-held), right before
+# the real purge.  Packages already gone are skipped.
+migrate_sury_unhold() {
+  local held p
+  local -a pkgs=()
+  held=$(migrate_state_get sury-held)
+  [[ -n $held ]] || return 0
+  for p in $held; do
+    dpkg-query -W -f='${db:Status-Abbrev}' "$p" >/dev/null 2>&1 && pkgs+=("$p")
+  done
+  if (( ${#pkgs[@]} )) && ! apt-mark unhold "${pkgs[@]}" >/dev/null 2>&1; then
+    migrate_warn "apt-mark unhold failed for ${pkgs[*]}; the Sury purge may be refused"
+    return 1
+  fi
+  migrate_state_del sury-held
+  return 0
+}
+
+# valkey-server's postrm can delete the valkey user and group; our unit runs
+# as valkey and /var/lib/valkey belongs to it.  Re-created with the uid/gid
+# recorded in the cutover snapshot (D's valkey_build_layout when loaded).
+migrate_valkey_user_ensure() {
+  local snap=${1:-} uid="" gid=""
+  id -u valkey >/dev/null 2>&1 && return 0
+  if declare -F valkey_build_layout >/dev/null 2>&1; then
+    valkey_build_layout >/dev/null 2>&1 || true
+  fi
+  if ! id -u valkey >/dev/null 2>&1; then
+    [[ -n $snap ]] && uid=$(tr -dc '0-9' < "$snap/uid" 2>/dev/null || true)
+    [[ -n $snap ]] && gid=$(tr -dc '0-9' < "$snap/gid" 2>/dev/null || true)
+    getent group valkey >/dev/null 2>&1 \
+      || groupadd --system ${gid:+--gid "$gid"} valkey 2>/dev/null || groupadd --system valkey 2>/dev/null || true
+    useradd --system --gid valkey --home-dir "$MIGRATE_VALKEY_DATA" --no-create-home --shell /usr/sbin/nologin \
+      ${uid:+--uid "$uid"} valkey 2>/dev/null \
+      || useradd --system --gid valkey --home-dir "$MIGRATE_VALKEY_DATA" --no-create-home --shell /usr/sbin/nologin valkey 2>/dev/null || true
+  fi
+  if id -u valkey >/dev/null 2>&1; then
+    chown -R valkey:valkey "$MIGRATE_VALKEY_DATA" 2>/dev/null || true
+    migrate_note "the valkey user was removed with the package; re-created (uid $(id -u valkey))"
+  else
+    migrate_warn "the valkey user is missing after the package removal and could not be re-created"
+  fi
 }
 
 migrate_angie_move_aside() {
@@ -2672,6 +3100,10 @@ migrate_post_assert() {
   for t in /etc/tmpfiles.d/setup-php.conf /etc/tmpfiles.d/setup-php-pools.conf /etc/tmpfiles.d/setup-nginx.conf; do
     [[ -f $t ]] && systemd-tmpfiles --create "$t" >/dev/null 2>&1
   done
+  # B's own tmpfiles pass also asserts the session directory (www-data 0700).
+  if (( ${#vers[@]} )) && declare -F php_build_tmpfiles_apply >/dev/null 2>&1; then
+    php_build_tmpfiles_apply || bad=1
+  fi
   # Session files back, owned by the pool user, before any restart (R52).
   sess=$(migrate_state_get php-sessions)
   if [[ -n $sess && -d $sess/sessions ]]; then
@@ -2696,8 +3128,14 @@ migrate_post_assert() {
     migrate_link_bin "$(migrate_php_cli_bin "$primary")" /usr/bin/php || true
   fi
   if [[ -n $primary && " ${vers[*]} " == *" $primary "* ]]; then
-    printf '%s\n' "$primary" > "$MIGRATE_PHP_ETC/setup-active.new" && mv -f "$MIGRATE_PHP_ETC/setup-active.new" "$MIGRATE_PHP_ETC/setup-active"
-    persist_tuning_var PHP_ACTIVE "$primary"
+    migrate_php_set_active "$primary" || { warn "migrate: could not write ${MIGRATE_PHP_ETC}/setup-active"; bad=1; }
+  fi
+  # B's links (/usr/local/bin/phpX.Y, the php-fpmX.Y wrapper, /usr/bin/php*
+  # where no package owns them), after the alternative above is gone.
+  if declare -F php_build_links >/dev/null 2>&1; then
+    for v in "${vers[@]}"; do
+      [[ -n $v ]] && { php_build_links "$v" || warn "migrate: php_build_links ${v} reported a problem"; }
+    done
   fi
   # Units: one enable pass after every removal, then the assertions.
   systemctl daemon-reload || true
@@ -2727,6 +3165,15 @@ migrate_post_assert() {
      && [[ $(readlink -f "$MIGRATE_UNIT_DIR/valkey.service") != "$(migrate_unit_file valkey-server)" ]]; then
     migrate_pa_fail "unit assertion: valkey.service does not resolve to our valkey-server.service"; bad=1
   fi
+  # With an operator policy-rc.d kept (R2.7) a package prerm/postrm may have
+  # stopped our same-name nginx or valkey-server unit: start what is down
+  # before verifying it (PHP is restarted below anyway).
+  for u in "${units[@]}"; do
+    [[ $u == php*-fpm ]] && continue
+    systemctl is-active --quiet "${u}.service" 2>/dev/null && continue
+    systemctl reset-failed "${u}.service" >/dev/null 2>&1 || true
+    systemctl start "${u}.service" >/dev/null 2>&1 || warn "migrate: ${u} did not start after the removals"
+  done
   # Restart PHP (full restart: conffiles were rewritten), then verify.
   for v in "${vers[@]}"; do
     [[ -n $v ]] || continue
@@ -2760,9 +3207,15 @@ migrate_post_assert() {
       || { migrate_pa_fail "Valkey PING failed after the removals"; bad=1; }
     id -nG www-data 2>/dev/null | grep -qw valkey || usermod -aG valkey www-data 2>/dev/null || true
   fi
-  # Each baseline recorded at a cutover must still hold.
+  # The vhost answers recorded right before this removal phase must still
+  # hold.  The cutover baseline is used only within the run that recorded
+  # it: a later run's vhosts may differ for reasons of the operator's own.
   local b out
-  b=$(migrate_state_get nginx.baseline)
+  b=$(migrate_state_get removals.baseline)
+  if [[ -z $b || ! -s $b ]]; then
+    b=$(migrate_state_get nginx.baseline)
+    [[ -n $MIGRATE_RUN_DIR && $b == "$MIGRATE_RUN_DIR"/* ]] || b=""
+  fi
   if [[ -n $b && -s $b ]]; then
     out=$(migrate_compare_baseline "$b") || { migrate_pa_fail "vhosts changed after the removals: $(printf '%s' "$out" | head -n 3 | paste -sd'; ' -)"; bad=1; }
   fi
@@ -2835,7 +3288,7 @@ migrate_final_report() {
 migrate_mark_complete() {
   [[ -z $(migrate_state_get inflight) ]] || return 0
   case $(migrate_state_get removals) in started|pending|post-purge-failed) return 0 ;; esac
-  migrate_state_set complete 1
+  migrate_complete_set 1
 }
 
 # BOLT after the migration, outside it (R14): non-blocking, rc-tolerant.
@@ -2862,8 +3315,11 @@ migrate_start_bolt() {
 # The migration body (inside the unit, or inline when it cannot detach)
 # ---------------------------------------------------------------------------
 migrate_main() {
-  local out=${1:-} rc=0
+  local out=${1:-} rc=0 prev_sig_traps
   MIGRATE_REPORT=(); MIGRATE_FAILED=0; MIGRATE_RUN_DIR=""
+  # The caller's own handlers come back at the end (an inherited HUP ignore,
+  # which runner.sh and php-upgrade rely on, must survive the inline path).
+  prev_sig_traps=$(trap -p HUP PIPE INT TERM)
   # Ignored for the whole run: a dropped session or a closed pipe must not
   # stop a cutover half-way (R20, R50).  Children inherit the ignore.
   trap '' HUP PIPE
@@ -2878,9 +3334,11 @@ migrate_main() {
   migrate_lock_release
   (( MIGRATE_POLICY_OURS )) && migrate_policy_remove
   migrate_write_out "$out"
-  trap - TERM INT
+  # Back to the caller's handlers: reset ours, then re-install what `trap -p`
+  # printed (a signal it did not list had the default disposition).
+  trap - HUP PIPE INT TERM
+  [[ -n $prev_sig_traps ]] && eval "$prev_sig_traps"
   if [[ -n $MIGRATE_PREV_EXIT_TRAP ]]; then eval "$MIGRATE_PREV_EXIT_TRAP"; else trap - EXIT; fi
-  trap - HUP PIPE
   return "$rc"
 }
 
@@ -2893,9 +3351,10 @@ migrate_main_body() {
   migrate_report "## Migration 1.22 (Angie/Sury/valkey-server -> source builds)"
   migrate_report "- Log: \`${MIGRATE_LOG}\`; backups: \`${MIGRATE_BACKUP_ROOT}\`; state: \`${MIGRATE_STATE_FILE}\`"
   migrate_resume_safe
-  migrate_state_set complete 0
+  migrate_complete_set 0
   migrate_scrub_knobs || true
   migrate_retire_triggers || return 1
+  migrate_nginx_finish_cutover
   migrate_preflight 0 || true
 
   if (( MIGRATE_DO_NGINX || ${#MIGRATE_PHP_TODO[@]} || MIGRATE_DO_VALKEY )); then
@@ -3019,37 +3478,68 @@ migrate_detach() {
   return "$rc"
 }
 
-# migrate_run OUT: the --optimize entry.  Report lines (markdown) are
-# appended to OUT for the caller's report.  Returns 0 (done or nothing to
-# do), 1 (a part failed or rolled back: the run must report a failure) or 2
-# (no failure, but the nginx part is not done: the host is in legacy-Angie
-# mode and the caller skips every web-tier step).  --dry-run prints the plan
-# and changes nothing.
+# The report file the migration body (inline or in the unit) appends to.
+# Fixed, root-only, next to the state file: a run that only attaches to a
+# running unit reads the same file the unit writes.
+MIGRATE_REPORT_FILE=${MIGRATE_STATE_FILE}.report
+
+# Hand the lines of FILE to the caller's OUT: a reporter function (the
+# interface contract, e.g. opt_report), or, for older callers, a file path
+# the lines are appended to.
+migrate_emit() {
+  local out=$1 file=$2 line
+  [[ -n $out && -s $file ]] || return 0
+  if declare -F "$out" >/dev/null 2>&1; then
+    while IFS= read -r line; do
+      [[ -n $line ]] && "$out" "$line"
+    done < "$file"
+  else
+    cat -- "$file" >> "$out" 2>/dev/null || true
+  fi
+}
+
+# migrate_run OUT: the --optimize entry.  OUT is a reporter function (called
+# as "$out" "- line", like opt_report) that receives the markdown report
+# lines; a file path is still accepted and appended to.  Returns 0 (done or
+# nothing to do), 1 (a part failed or rolled back: the run must report a
+# failure) or 2 (no failure, but the nginx part is not done: the host is in
+# legacy-Angie mode and the caller skips every web-tier step).  --dry-run
+# prints the plan and changes nothing.
 migrate_run() {
-  local out=${1:-} why
+  local out=${1:-} why rc=0 rep=$MIGRATE_REPORT_FILE
   if (( ${DRY_RUN:-0} )); then
     migrate_plan
     [[ $(web_server_state) == angie-legacy ]] && return 2
     return 0
   fi
   if migrate_running; then
-    migrate_detach "$out"
-    return
+    # Attach: the unit writes the report file its starter named (the same).
+    migrate_detach "$rep" || rc=$?
+    migrate_emit "$out" "$rep"
+    return "$rc"
   fi
   migrate_resume_safe
   if ! migrate_needed; then
     if [[ $(web_server_state) == angie-legacy ]]; then
       why=$(migrate_state_get nginx)
-      [[ -n $out ]] && printf '%s\n' "- Web server: Angie (legacy mode; nginx part ${why:-pending}); web tuning skipped" >> "$out"
+      if declare -F "$out" >/dev/null 2>&1; then
+        "$out" "- Web server: Angie (legacy mode; nginx part ${why:-pending}); web tuning skipped"
+      elif [[ -n $out ]]; then
+        printf '%s\n' "- Web server: Angie (legacy mode; nginx part ${why:-pending}); web tuning skipped" >> "$out"
+      fi
       return 2
     fi
     return 0
   fi
+  mkdir -p "$(dirname "$rep")"
+  install -m 600 /dev/null "$rep" 2>/dev/null || : > "$rep"
   if migrate_can_detach; then
-    migrate_detach "$out"
+    migrate_detach "$rep" || rc=$?
   else
-    migrate_main "$out"
+    migrate_main "$rep" || rc=$?
   fi
+  migrate_emit "$out" "$rep"
+  return "$rc"
 }
 
 # Dry-run lines (--optimize --dry-run).  Read-only.

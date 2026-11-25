@@ -118,6 +118,16 @@ PHP
   chmod 600 "$WP_HELPER"
 }
 
+# Run the WordPress helper with the absolute PHP CLI (php_cli_path, lib/util.sh)
+# instead of whatever `php` the PATH finds first: root hardens wp-config.php
+# with it, so the binary must be the one setup.sh manages or Sury's until the
+# migration, never a stray copy earlier in PATH.  Returns 127 without a CLI.
+harden_php() {
+  local cli
+  cli=$(php_cli_path) || return 127
+  "$cli" "$@"
+}
+
 # Give each WordPress site its own database account.  A shared account with
 # GRANT OPTION / global privileges turns one compromised site into access to
 # every database on the host.  The original (admin/backup) account is left in
@@ -126,9 +136,9 @@ harden_wordpress_db() {
   local conf=$1 helper=$2 db user host grants global newuser newpass bak
   local esc_db esc_user esc_pass
   [[ ${SETUP_WP_DB_SPLIT:-1} == 1 ]] || return 0
-  db=$(php "$helper" get "$conf" DB_NAME 2>/dev/null) || return 0
-  user=$(php "$helper" get "$conf" DB_USER 2>/dev/null) || return 0
-  host=$(php "$helper" get "$conf" DB_HOST 2>/dev/null) || return 0
+  db=$(harden_php "$helper" get "$conf" DB_NAME 2>/dev/null) || return 0
+  user=$(harden_php "$helper" get "$conf" DB_USER 2>/dev/null) || return 0
+  host=$(harden_php "$helper" get "$conf" DB_HOST 2>/dev/null) || return 0
   host=${host%%:*}
   [[ -n $db && -n $user ]] || return 0
   [[ $host == localhost || $host == 127.0.0.1 ]] || return 0
@@ -177,9 +187,9 @@ SQL
     return 0
   fi
   bak=$(tmp_file); cp -p "$conf" "$bak" 2>/dev/null || bak=""
-  php "$helper" set "$conf" DB_USER "$newuser" string >/dev/null 2>&1 || true
-  WP_CFG_VALUE="$newpass" php "$helper" set "$conf" DB_PASSWORD '' string >/dev/null 2>&1 || true
-  if [[ $(php "$helper" testdb "$conf" 2>/dev/null) != OK ]]; then
+  harden_php "$helper" set "$conf" DB_USER "$newuser" string >/dev/null 2>&1 || true
+  WP_CFG_VALUE="$newpass" harden_php "$helper" set "$conf" DB_PASSWORD '' string >/dev/null 2>&1 || true
+  if [[ $(harden_php "$helper" testdb "$conf" 2>/dev/null) != OK ]]; then
     if [[ -n $bak && -f $bak && ! -L $conf ]]; then
       cp -p "$bak" "$conf"
       chown -h root:www-data "$conf" 2>/dev/null || true
@@ -197,8 +207,8 @@ SQL
 harden_wordpress_audit_db() {
   local conf=$1 helper=$2 db prefix role reg rogue
   command -v mariadb >/dev/null 2>&1 || return 0
-  db=$(php "$helper" get "$conf" DB_NAME 2>/dev/null) || return 0
-  prefix=$(php "$helper" prefix "$conf" 2>/dev/null) || return 0
+  db=$(harden_php "$helper" get "$conf" DB_NAME 2>/dev/null) || return 0
+  prefix=$(harden_php "$helper" prefix "$conf" 2>/dev/null) || return 0
   [[ -n $db && -n $prefix ]] || return 0
   # Both values come from a file the web user can write and are interpolated
   # into SQL identifiers; only plain identifiers are accepted.
@@ -217,9 +227,18 @@ harden_wordpress_audit_db() {
 
 # Directories nginx serves files from: every root and alias in the conf.d
 # vhosts (a variable suffix such as `root /srv/$host` is cut at the `$`).
-# Empty when nginx is not configured.
+# Empty when nginx is not configured.  A host left in legacy-Angie mode (the
+# nginx part of the 1.22 migration refused or pending) still serves from
+# /etc/angie, so its roots are read there (R51).
 harden_served_roots() {
-  local target=${HARDEN_NGINX_DIR:-/etc/nginx} f p
+  local target=${HARDEN_NGINX_DIR:-} f p
+  if [[ -z $target ]]; then
+    target=/etc/nginx
+    if declare -F web_server_state >/dev/null 2>&1 \
+       && [[ $(web_server_state 2>/dev/null || true) == angie-legacy ]]; then
+      target=/etc/angie
+    fi
+  fi
   [[ -d $target/conf.d ]] || return 0
   for f in "$target"/conf.d/*.conf; do
     [[ -f $f ]] || continue
@@ -378,7 +397,7 @@ EOF
 
 tune_xenforo_gzip() {
   local conf tmp tmp2 changed=0 kept=0 php_bin delta superseded=0 restored=0
-  php_bin=$(command -v php 2>/dev/null || true)
+  php_bin=$(php_cli_path || true)
   persist_xf_member_gzip
   while IFS= read -r conf; do
     [[ -n $conf && -f $conf ]] || continue
@@ -472,7 +491,7 @@ harden_wordpress() {
     scan_wordpress_malware || true
     return 0
   fi
-  if ! command -v php >/dev/null 2>&1; then
+  if ! php_cli_path >/dev/null; then
     harden_warn "- WordPress: PHP is not installed; skipped wp-config hardening"
     harden_wordpress_files || true
     scan_wordpress_malware || true
@@ -490,24 +509,24 @@ harden_wordpress() {
       harden_note "  - is a symbolic link; skipped (root does not write through links in a web root)"
       continue
     fi
-    if [[ -z $(php "$helper" get "$conf" DB_NAME 2>/dev/null) ]]; then
+    if [[ -z $(harden_php "$helper" get "$conf" DB_NAME 2>/dev/null) ]]; then
       harden_note "  - not a WordPress config (no DB_NAME); skipped"
       continue
     fi
     chown -h root:www-data "$conf" 2>/dev/null || true
     chmod 640 "$conf" 2>/dev/null || true
     for kv in "DISALLOW_FILE_EDIT:true" "DISABLE_WP_CRON:true" "WP_DEBUG_DISPLAY:false" "FORCE_SSL_ADMIN:true"; do
-      php "$helper" set "$conf" "${kv%%:*}" "${kv#*:}" literal >/dev/null 2>&1 \
+      harden_php "$helper" set "$conf" "${kv%%:*}" "${kv#*:}" literal >/dev/null 2>&1 \
         || { harden_warn "  - could not set ${kv%%:*}"; rc=1; }
     done
     if [[ ${SETUP_WP_ALLOW_FILE_MODS:-0} == 1 ]]; then
       harden_note "  - DISALLOW_FILE_MODS skipped (SETUP_WP_ALLOW_FILE_MODS=1)"
     else
-      php "$helper" set "$conf" DISALLOW_FILE_MODS true literal >/dev/null 2>&1 \
+      harden_php "$helper" set "$conf" DISALLOW_FILE_MODS true literal >/dev/null 2>&1 \
         || { harden_warn "  - could not set DISALLOW_FILE_MODS"; rc=1; }
       harden_note "  - plugin/theme installs disabled (update via WP-CLI or the server; SETUP_WP_ALLOW_FILE_MODS=1 to skip)"
     fi
-    if [[ $(php "$helper" salts "$conf" 2>/dev/null) == rotated ]]; then
+    if [[ $(harden_php "$helper" salts "$conf" 2>/dev/null) == rotated ]]; then
       harden_note "  - placeholder salts replaced"
     fi
     harden_wordpress_db "$conf" "$helper" || rc=1

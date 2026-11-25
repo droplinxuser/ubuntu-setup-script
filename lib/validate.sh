@@ -3,9 +3,11 @@
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
-# --optimize touches only service configuration, so it is safe on every LTS
-# that still supports the installed packages.  Ubuntu 22.04 shares the same
-# nginx/PHP/MariaDB/Valkey service layout and is supported until 2027.
+# --optimize tunes service configuration and rebuilds the source builds, so
+# it runs on every LTS that still has the build toolchain: apt.llvm.org
+# publishes clang/lld/BOLT for 22.04, 24.04 and 26.04, and the MariaDB and
+# Elasticsearch packages share one service layout there.  22.04 is
+# supported until 2027.
 optimize_os_supported() {
   case "${1%%.*}" in
     22|24|26) return 0 ;;
@@ -24,14 +26,31 @@ validate_timezone() {
 # terminator in front of it; this release neither generates nor manages those
 # files, so a run must stop before it changes anything.  A hand-installed
 # Anubis that never touched the nginx tree is not detected (and needs no
-# migration).
+# migration).  A 1.21.x host that has not run the 1.22 migration keeps the
+# generated files in /etc/angie, so both trees are checked: the migration
+# copies operator files from /etc/angie and must never carry them over.
 anubis_host_present() {
   local f
   for f in /etc/nginx/conf.d/00-anubis-terminators.conf \
            /etc/nginx/conf.d/00-anubis-common.conf \
            /etc/nginx/snippets/anubis-location.conf \
+           /etc/angie/conf.d/00-anubis-terminators.conf \
+           /etc/angie/conf.d/00-anubis-common.conf \
+           /etc/angie/snippets/anubis-location.conf \
            /etc/systemd/system/anubis.service \
            "${STATE_DIR:-/var/lib/setup.sh}/anubis/enabled"; do
+    [[ -e $f ]] && return 0
+  done
+  return 1
+}
+
+# 0 when the Anubis files sit in the Angie tree: the 1.22 tools/remove-anubis.sh
+# only knows /etc/nginx, so such a host needs the 1.21.71 copy of the tool.
+anubis_in_angie_tree() {
+  local f
+  for f in /etc/angie/conf.d/00-anubis-terminators.conf \
+           /etc/angie/conf.d/00-anubis-common.conf \
+           /etc/angie/snippets/anubis-location.conf; do
     [[ -e $f ]] && return 0
   done
   return 1
@@ -443,27 +462,123 @@ storage_class() {
   printf '%s' "$best"
 }
 
-latest_sury_php() {
-  local pkg ver cand upstream best=""
-  while read -r pkg; do
-    ver=${pkg#php}
-    ver=${ver%-fpm}
-    cand=$(apt-cache policy "$pkg" 2>/dev/null | awk '/^[[:space:]]*Candidate:/{print $2}')
-    cand=${cand%%$'\n'*}
-    [[ -n $cand && $cand != "(none)" ]] || continue
-    upstream=${cand#*:}
-    upstream=${upstream%%-*}
-    # Ignore alpha/beta/RC/dev packages: their upstream version has a suffix.
-    [[ $upstream =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
-    # Auto-selection must only pick a version this repository has a pool
-    # template for; otherwise the day Sury publishes 8.7 `--basic --php`
-    # would fail late, after --basic already changed the host.
-    [[ -f ${SCRIPT_DIR}/configs/php/www_${ver//./}.conf ]] || continue
-    if [[ -z $best ]] || [[ $(printf '%s\n%s\n' "$best" "$ver" | sort -V | tail -n1) == "$ver" ]]; then
-      best=$ver
+# ---------------------------------------------------------------------------
+# Memory class (small hosts run nginx only)
+# ---------------------------------------------------------------------------
+# A source build of PHP or Valkey (clang + ThinLTO links, the LLVM toolchain)
+# and the services themselves do not fit beside MariaDB on a 1-2 GB host, and
+# the CPU-change rule keeps a service down until its native rebuild finishes,
+# so an OOM during that rebuild would leave the site down.  The "4 GB class"
+# starts at 3500 MB: a 4 GB VM reports about 3.7-3.9 GiB in MemTotal once the
+# kernel and firmware reservations are taken out.
+MEM_GATE_MIN_MB=3500
+
+# SETUP_MEM_TOTAL_MB stands in for the host's RAM only in a dry run and in
+# the unit tests.  Read anywhere else it would let an exported variable (a
+# runbook, a fleet shell) start LLVM, PHP and Valkey builds on a 1-2 GB host
+# (R39); validate_all warns that it is ignored.
+mem_override_allowed() {
+  (( ${DRY_RUN:-0} )) || [[ ${SETUP_TEST_SOURCE_ONLY:-0} == 1 ]]
+}
+
+# RAM class of this host in MB: mem_total_mb (MemTotal, capped by a cgroup
+# memory limit, like every other sizing decision of this script).  Prints 0
+# when /proc/meminfo cannot be read (mem_total_mb would guess 1024 MB, and a
+# guess must not refuse a working host).  lib/optimize.sh defines a fallback
+# copy only when this one is not loaded.
+mem_class_mb() {
+  if [[ -n ${SETUP_MEM_TOTAL_MB:-} ]] && mem_override_allowed \
+     && [[ $SETUP_MEM_TOTAL_MB =~ ^[1-9][0-9]*$ ]]; then
+    printf '%s' "$SETUP_MEM_TOTAL_MB"
+    return 0
+  fi
+  if ! grep -qE '^MemTotal:[[:space:]]+[1-9]' /proc/meminfo 2>/dev/null; then
+    printf '0'
+    return 0
+  fi
+  mem_total_mb
+}
+
+# 0 when SERVICE may be built, installed or migrated on this host.  Below
+# the 4 GB class only nginx (and the services that need no PHP or memory of
+# their own: --basic, --others, a static or Node --domain) are allowed.  An
+# unknown name is judged by the class, so a new service fails safe; an
+# unknown class (0: no /proc/meminfo) allows, like the fallback copy.
+mem_gate_allows() {
+  local mb
+  case ${1:-} in
+    nginx|basic|others|domain|domain-proxy) return 0 ;;
+  esac
+  mb=$(mem_class_mb)
+  [[ $mb =~ ^[0-9]+$ ]] && (( mb > 0 )) || return 0
+  (( mb >= MEM_GATE_MIN_MB ))
+}
+
+# 0 when a --domain app type runs on PHP (and so needs the PHP build and the
+# 4 GB class).  basic serves static files; node and pingvin are reverse
+# proxies to a Node.js process.
+domain_app_needs_php() {
+  case ${1:-basic} in
+    basic|node|pingvin) return 1 ;;
+  esac
+  return 0
+}
+
+# One line for refusals: the measured class and the rule.
+mem_gate_reason() {
+  printf 'this host has %s MB RAM, below the 4 GB class (%s MB): only nginx is built here' \
+    "$(mem_class_mb)" "$MEM_GATE_MIN_MB"
+}
+
+# ---------------------------------------------------------------------------
+# --php ext=LIST
+# ---------------------------------------------------------------------------
+# Check the list before anything changes: names (letters, digits, _), -NAME
+# to drop one added earlier, or the single word none.  A name the source
+# build cannot compile is refused here with the buildable list
+# (php_build_ext_buildable, lib/php-build.sh), so --basic never runs for a
+# request the PHP step would refuse later.
+php_ext_validate() {
+  local list=${1,,} name
+  [[ -n $list ]] || die "--php ext= requires a list (e.g. ext=intl,gmp) or none"
+  if [[ $list == none ]]; then
+    return 0
+  fi
+  for name in ${list//,/ }; do
+    [[ $name == none ]] && die "--php ext=none clears the list and cannot be combined with other names"
+    [[ ${name#-} =~ ^[a-z0-9_]+$ ]] \
+      || die "--php ext: '${name}' is not an extension name (use e.g. ext=intl,gmp, -NAME to drop one, or none)"
+    [[ $name == -* ]] && continue
+    if declare -F php_build_ext_buildable >/dev/null \
+       && ! php_build_ext_buildable "$name"; then
+      die "--php ext=${name}: the PHP source build cannot compile this extension (buildable: ${PHP_BUILDABLE_EXTS[*]:-see lib/php-build.sh})"
     fi
-  done < <(apt-cache pkgnames 2>/dev/null | grep -E '^php[0-9]+\.[0-9]+-fpm$' | sort -u || true)
-  printf '%s' "$best"
+  done
+  return 0
+}
+
+# Record --php ext= (PHP_EXT_EXTRA in /etc/default/setup-tuning and the
+# PHP_BUILD_EXT_RESET export that lets a removal shrink the next build)
+# through lib/php-build.sh.  Called by the PHP install step right before the
+# build, after the run lock is held; a dry run never records anything, and a
+# second call in the same run is a no-op.
+PHP_EXT_REQUEST_APPLIED=0
+php_ext_request_apply() {
+  [[ -n ${OPT[php.ext]:-} ]] || return 0
+  (( ${DRY_RUN:-0} )) && return 0
+  (( PHP_EXT_REQUEST_APPLIED )) && return 0
+  php_build_ext_option "${OPT[php.ext]}" \
+    || die "--php ext=${OPT[php.ext]} could not be applied (see above); nothing was built"
+  PHP_EXT_REQUEST_APPLIED=1
+  return 0
+}
+
+# 0 when X.Y is a PHP series the source build supports (8.1 and newer; a
+# future 9.x passes).  php.net availability is checked separately.
+php_series_supported() {
+  local v=$1 floor=${PHP_UPGRADE_MIN_SERIES:-8.1}
+  [[ $v =~ ^[0-9]+\.[0-9]+$ ]] || return 1
+  [[ $(printf '%s\n%s\n' "$floor" "$v" | sort -V | head -n 1) == "$floor" ]]
 }
 
 # Accounts and schemas the server itself depends on.  Re-keying root replaces
@@ -486,13 +601,15 @@ mariadb_reserved_db() {
 }
 
 # The PHP-FPM version an existing host serves from: the pool that owns the
-# socket nginx uses when that version is a real installed package, otherwise
-# the newest installed one.  Prints nothing on a host without PHP-FPM (and on
-# a machine without dpkg, where a dry run is only a syntax check).
+# socket nginx uses when that version has a source build, otherwise the
+# newest build.  Versions come from the build layout
+# (php_upgrade_installed_versions reads /usr/local/lib/setup-php and never
+# runs a binary), so no dpkg is involved.  Prints nothing on a host without
+# a PHP build; a host still on Sury packages is refused earlier (it must run
+# the --optimize migration first).
 php_installed_version() {
   local primary=""
   local -a versions=()
-  command -v dpkg-query >/dev/null 2>&1 || return 0
   mapfile -t versions < <(php_upgrade_installed_versions || true)
   (( ${#versions[@]} > 0 )) || return 0
   primary=$(php_primary_version 2>/dev/null || true)
@@ -504,13 +621,55 @@ php_installed_version() {
   return 0
 }
 
+# The 1.22 migration owns a host that still serves through Angie, Sury PHP
+# or the valkey-server package (R19/R51): an install step on such a host
+# would write our nginx/phpX.Y-fpm/valkey-server units over the packaged
+# ones outside the migration's snapshot and rollback.  Prints one refusal
+# line per selected service that has to wait for --optimize; empty when
+# lib/migrate.sh is not loaded.  Read-only (state file, dpkg, systemctl).
+legacy_stack_refusals() {
+  local state=""
+  declare -F web_server_state >/dev/null || return 0
+  state=$(web_server_state 2>/dev/null || true)
+  if [[ $state == angie-legacy ]]; then
+    if (( ${ENABLED[nginx]:-0} )); then
+      printf '%s\n' "--nginx: this host still serves through Angie; run --optimize first (the one-time 1.22 migration moves it to nginx)"
+    fi
+    if (( ${#DOMAINS[@]} > 0 )); then
+      printf '%s\n' "--domain: this host still serves through Angie (vhosts live in /etc/angie); run --optimize first (the one-time 1.22 migration moves it to nginx)"
+    fi
+  fi
+  declare -F migrate_needed >/dev/null || return 0
+  local d php_domain=""
+  for d in "${DOMAINS[@]}"; do
+    if domain_app_needs_php "${DOMAIN_APP[$d]:-basic}"; then php_domain=$d; break; fi
+  done
+  if (( ${ENABLED[php]:-0} )) || [[ -n $php_domain ]]; then
+    if migrate_needed php 2>/dev/null; then
+      if (( ${ENABLED[php]:-0} )); then
+        printf '%s\n' "--php: the Sury PHP packages on this host have not been migrated yet; run --optimize first (it builds PHP from source and retires Sury)"
+      else
+        printf '%s\n' "--domain '${php_domain}' needs PHP, and the Sury PHP packages on this host have not been migrated yet; run --optimize first"
+      fi
+    fi
+  fi
+  if (( ${ENABLED[valkey]:-0} )) && migrate_needed valkey 2>/dev/null; then
+    printf '%s\n' "--valkey: the valkey-server package on this host has not been migrated yet; run --optimize first (it builds Valkey from source)"
+  fi
+  return 0
+}
+
 validate_all() {
   local svc
 
-  # SETUP_PHP_BUILD / PHP_BUILD (lib/php-build.sh): clang or package.
-  php_build_validate
-  nginx_build_validate
-  valkey_build_validate
+  # Build-mode knobs removed in 1.22.0 (setup.sh drops them before parsing).
+  if declare -p RETIRED_BUILD_ENV >/dev/null 2>&1 && (( ${#RETIRED_BUILD_ENV[@]} > 0 )); then
+    warn "Ignored (removed in 1.22.0; nginx, PHP and Valkey are always built from source, and --php ext=LIST adds PHP extensions): ${RETIRED_BUILD_ENV[*]}"
+  fi
+  # SETUP_MEM_TOTAL_MB is a dry-run/test stand-in for the host's RAM only.
+  if [[ -n ${SETUP_MEM_TOTAL_MB+x} ]] && ! mem_override_allowed; then
+    warn "SETUP_MEM_TOTAL_MB is ignored outside --dry-run; the memory class comes from the host (${MEM_GATE_MIN_MB} MB = 4 GB class)"
+  fi
 
   # The generic GET/POST limits SETUP_LIMIT_REQ_EXEMPT exempted from are gone
   # (server-configs-nginx 1.6.61); the credential zone never honoured it.
@@ -547,13 +706,16 @@ validate_all() {
   # one-shot teardown tool.  Purging is not one of those runs: --purge must
   # still be able to remove nginx from such a host (the tool is the supported
   # path, but a purge that refuses is a trap).
+  if (( ! PURGE && ! DIAGNOSTICS )) && anubis_in_angie_tree; then
+    die "this host still runs the Anubis bot filter in /etc/angie, which was removed in 1.21.62. Run 'sudo bash tools/remove-anubis.sh' from the 1.21.71 release first (this release's copy only knows /etc/nginx), then re-run setup.sh."
+  fi
   if (( ! PURGE && ! DIAGNOSTICS )) && anubis_host_present; then
     die "this host still runs the Anubis bot filter, which was removed in 1.21.62. Run 'sudo bash tools/remove-anubis.sh' first (it restores every vhost to direct TLS and removes the generated nginx files), then re-run setup.sh."
   fi
 
   # --upgrade-php is a standalone mode like --optimize: it works on an
-  # installed host, needs the Sury repository and must not be mixed with
-  # install/purge/diagnostics flags that would change the same packages.
+  # installed host, builds the target series from source and must not be
+  # mixed with install/purge/diagnostics flags that change the same files.
   #
   # Branch on the flag having been given, not on its value: an empty value
   # (--upgrade-php="$VER" with VER unset) used to fall through into whatever
@@ -564,9 +726,11 @@ validate_all() {
       || die "--upgrade-php requires a version, e.g. --upgrade-php=8.6 (the value is empty)"
     [[ $UPGRADE_PHP =~ ^[0-9]+\.[0-9]+$ ]] \
       || die "--upgrade-php='${UPGRADE_PHP}' is invalid (use e.g. --upgrade-php=8.6)"
-    local major=${UPGRADE_PHP%%.*} minor=${UPGRADE_PHP#*.}
-    (( major == 8 && minor >= 1 )) \
-      || die "--upgrade-php supports PHP 8.1 and newer (found ${UPGRADE_PHP})"
+    # Any series php.net publishes from 8.1 on (9.x included); whether the
+    # series has a release is the build's question (it fails with the
+    # current version still serving).
+    php_series_supported "$UPGRADE_PHP" \
+      || die "--upgrade-php supports PHP ${PHP_UPGRADE_MIN_SERIES:-8.1} and newer (found ${UPGRADE_PHP})"
     (( OPTIMIZE )) && die "--upgrade-php cannot be combined with --optimize (the upgrade runs the PHP tuner itself)"
     (( PURGE )) && die "--upgrade-php cannot be combined with --purge"
     (( DIAGNOSTICS )) && die "--upgrade-php cannot be combined with --diagnostics"
@@ -575,11 +739,15 @@ validate_all() {
       || die "--upgrade-php cannot be combined with --domain"
     [[ ${#ENABLED[@]} -eq 0 ]] \
       || die "--upgrade-php is standalone and cannot be combined with install flags"
-    # The pool template is version-specific.  A dry run on a machine without
-    # the repository still prints the plan; the real run must fail before it
-    # purges PHP if a template is missing.
-    if (( ! DRY_RUN )) && [[ ! -f "${SCRIPT_DIR}/configs/php/www_${UPGRADE_PHP//./}.conf" ]]; then
-      die "No FPM pool template for PHP ${UPGRADE_PHP} (${SCRIPT_DIR}/configs/php/www_${UPGRADE_PHP//./}.conf); add one before upgrading"
+    # The 4 GB class applies here too (R39): on a small host whose nginx
+    # migration finished, nothing else would stop a PHP source build.  The
+    # dry run is refused the same way, so a preview cannot promise a switch
+    # the real run refuses.
+    mem_gate_allows php || die "--upgrade-php: $(mem_gate_reason)"
+    # One version-independent pool template (configs/php/www.conf) serves
+    # every series; a checkout without it cannot lay out /etc/php/X.Y.
+    if (( ! DRY_RUN )) && [[ ! -f "${SCRIPT_DIR}/configs/php/www.conf" ]]; then
+      die "The FPM pool template ${SCRIPT_DIR}/configs/php/www.conf is missing from this checkout"
     fi
     return 0
   fi
@@ -621,13 +789,20 @@ validate_all() {
     if [[ ${#DOMAINS[@]} -gt 0 ]]; then
       die "--domain cannot be combined with --purge (remove domain files/database manually)"
     fi
-    local t
-    for t in "${PURGE_TARGETS[@]}"; do
+    local t i
+    for i in "${!PURGE_TARGETS[@]}"; do
+      t=${PURGE_TARGETS[$i]}
       case "$t" in
         all|basic|nginx|php|mariadb|valkey|elastic|others) ;;
+        angie)
+          # The 1.21 name of the web-server target (runbooks, old docs).
+          warn "--purge angie is deprecated: the web server is nginx since 1.22.0; purging nginx"
+          PURGE_TARGETS[i]=nginx ;;
         *) die "--purge: unknown target '${t}'" ;;
       esac
     done
+    [[ -z ${OPT[php.ext]:-} ]] \
+      || die "--purge --php ext= is not a purge option (ext= only applies to an install)"
     if [[ ${#PURGE_TARGETS[@]} -eq 0 ]] && [[ ${#ENABLED[@]} -eq 0 ]]; then
       PURGE_TARGETS=(all)
     fi
@@ -721,11 +896,36 @@ validate_all() {
     DOMAINS=("${dedup[@]}")
   fi
 
+  # Small hosts run nginx only (section 7): every service that needs PHP or
+  # memory of its own is refused here, before --basic or anything else has
+  # changed the host, and the dry run shows the same refusal.
+  local gated
+  for gated in php valkey mariadb elastic; do
+    (( ${ENABLED[$gated]:-0} )) || continue
+    mem_gate_allows "$gated" || die "--${gated}: $(mem_gate_reason)"
+  done
+  if [[ ${#DOMAINS[@]} -gt 0 ]] && ! mem_gate_allows php; then
+    local dd
+    for dd in "${DOMAINS[@]}"; do
+      if domain_app_needs_php "${DOMAIN_APP[$dd]:-basic}"; then
+        die "--domain '${dd}' app=${DOMAIN_APP[$dd]} needs PHP: $(mem_gate_reason) (basic, node and pingvin sites are allowed)"
+      fi
+    done
+  fi
+
+  # A host the 1.22 migration still owns waits for --optimize.
+  local refusals
+  refusals=$(legacy_stack_refusals)
+  [[ -z $refusals ]] || die "${refusals//$'\n'/; }"
+
   if [[ ${ENABLED[php]:-0} -eq 1 ]]; then
     if [[ -n ${OPT[php.ver]:-} ]]; then
       [[ ${OPT[php.ver]} =~ ^[0-9]+\.[0-9]+$ ]] \
         || die "--php ver='${OPT[php.ver]}' is invalid (use e.g. 8.5)"
+      php_series_supported "${OPT[php.ver]}" \
+        || die "--php ver=${OPT[php.ver]}: the source build supports PHP ${PHP_UPGRADE_MIN_SERIES:-8.1} and newer"
     fi
+    [[ -z ${OPT[php.ext]:-} ]] || php_ext_validate "${OPT[php.ext]}"
     # --php is a first installation.  On a host that already runs PHP-FPM it
     # only re-applies the managed configuration of that version; changing the
     # version is --upgrade-php's job (it carries the extensions and custom
@@ -741,11 +941,20 @@ validate_all() {
         die "PHP ${php_installed} is already installed and --php only performs a first installation; change the version with --upgrade-php=${OPT[php.ver]}"
       fi
     fi
-    # The pool template is version-specific (see --upgrade-php above).  With
-    # no ver= on a host without PHP the version is only known once the Sury
-    # repository is configured; install_php repeats the check then.
-    if [[ -n ${OPT[php.ver]:-} && ! -f "${SCRIPT_DIR}/configs/php/www_${OPT[php.ver]//./}.conf" ]]; then
-      die "No FPM pool template for PHP ${OPT[php.ver]} (${SCRIPT_DIR}/configs/php/www_${OPT[php.ver]//./}.conf); use a version that has one"
+    # One pool template serves every series (configs/php/www.conf).  A
+    # requested series that is not installed yet must exist on php.net
+    # before --basic changes the host: php_build_release prints the newest
+    # X.Y.Z (empty when php.net and GitHub list none, or cannot be reached).
+    # A dry run may be offline and skips the lookup; with no ver= the
+    # install step builds the newest series.
+    if (( ! DRY_RUN )); then
+      [[ -f "${SCRIPT_DIR}/configs/php/www.conf" ]] \
+        || die "The FPM pool template ${SCRIPT_DIR}/configs/php/www.conf is missing from this checkout"
+      if [[ -n ${OPT[php.ver]:-} && ${OPT[php.ver]} != "$php_installed" ]] \
+         && declare -F php_build_release >/dev/null \
+         && [[ -z $(php_build_release "${OPT[php.ver]}") ]]; then
+        die "--php ver=${OPT[php.ver]}: php.net lists no stable release of that series (or php.net and GitHub could not be reached)"
+      fi
     fi
     if [[ -n ${OPT[php.children]:-} ]]; then
       [[ ${OPT[php.children]} == auto || ${OPT[php.children]} =~ ^[1-9][0-9]*$ ]] \

@@ -3,6 +3,21 @@
 # ---------------------------------------------------------------------------
 # PURGE
 # ---------------------------------------------------------------------------
+# --purge never removes apt packages (the documented contract).  For the
+# components setup.sh compiles (nginx, PHP, Valkey) it removes what it built:
+# the units, the build roots, the PATH links, tmpfiles entries and build
+# units, through each module's own purge (R81).  Configuration, data, logs
+# and /var/backups/setup-1.22 always stay.  The one-time removal of the Angie,
+# Sury and valkey-server packages is the 1.22 migration's (lib/migrate.sh),
+# never this file's.
+
+# True while the host stays in legacy-Angie mode (the nginx part of the 1.22
+# migration refused or pending): Angie is the web server this script manages.
+purge_angie_legacy() {
+  declare -F web_server_state >/dev/null 2>&1 || return 1
+  [[ $(web_server_state 2>/dev/null || true) == angie-legacy ]]
+}
+
 apt_purge_pkgs() {
   # Disabled by design: package purging permanently deletes files and can
   # break a running server.  Keep the packages and say so in the log.
@@ -294,14 +309,25 @@ purge_nginx() {
   if anubis_host_present; then
     warn "This host still runs the Anubis bot filter; run tools/remove-anubis.sh to restore the vhosts and remove it"
   fi
+  # Legacy-Angie mode: Angie is what serves, so it is what stops.  Its
+  # packages, /etc/angie and its data stay like every other package.
+  if purge_angie_legacy; then
+    purge_service_stop angie
+    info "Stopped and disabled angie (legacy mode); its packages, /etc/angie and /var/lib/angie stay"
+  fi
   purge_service_stop nginx
-  nginx_build_purge
-  apt_purge_pkgs nginx
-  # Configuration, data, caches and logs are left on disk.  Reinstalling nginx
-  # then restores the exact site instead of starting from an empty tree.
-  info "Leaving nginx files under /etc/nginx, /var/lib/nginx, /var/log/nginx, /var/cache/nginx and ${LOG_ROOT}/nginx"
-  info "Leaving cache directories and /root installer files in place"
+  # Our unit, the compiled build, its tool root, the /usr/sbin/nginx link,
+  # tmpfiles and build units; the shared refresh/CPU units and LLVM only
+  # when no other build remains (lib/nginx-build.sh).
+  if declare -F nginx_build_purge >/dev/null 2>&1; then
+    nginx_build_purge
+  fi
+  # Configuration and logs are left on disk.  Reinstalling nginx then
+  # restores the exact site instead of starting from an empty tree.
+  info "Leaving nginx files under /etc/nginx and ${LOG_ROOT}/nginx, and the backups in /var/backups/setup-1.22"
+  info "Leaving /root installer files in place"
   cron_remove_line '/etc/nginx/scripts/cloudflare.sh' || true
+  cron_remove_line '/etc/angie/scripts/cloudflare.sh' || true
   # Match the ownership job only: the managed wp-cron entry also starts with
   # "/usr/bin/find /var/www" and must survive an nginx-only purge (PHP keeps
   # running and DISABLE_WP_CRON stays in wp-config.php).
@@ -319,29 +345,34 @@ purge_php() {
 
   if [[ -n $ver ]]; then
     purge_service_stop "php${ver}-fpm"
-    apt_purge_pattern "php${ver}-*"
   else
+    # Every version with a configuration tree or a compiled build: a Sury
+    # version the migration has not taken over yet is stopped like ours.
     local -a vers=()
-    for d in /etc/php/*; do
+    for d in /etc/php/* "${PHP_BUILD_ROOT:-/usr/local/lib/setup-php}"/*; do
       [[ -d $d ]] || continue
       v=$(basename "$d")
-      [[ $v =~ ^[0-9]+\.[0-9]+$ ]] && vers+=("$v")
+      [[ $v =~ ^[0-9]+\.[0-9]+$ ]] || continue
+      [[ " ${vers[*]} " == *" ${v} "* ]] || vers+=("$v")
     done
     for v in "${vers[@]}"; do
       purge_service_stop "php${v}-fpm"
-      apt_purge_pattern "php${v}-*"
     done
   fi
-  # A PHP_BUILD drop-in would keep pointing a later reinstall at an
-  # old build; the package binary is the only safe state after a purge.
-  php_build_purge "$ver"
+  # Our unit, the compiled build and its links for that version (every
+  # version without ver=); the tool, template unit, tmpfiles and caches with
+  # the last version, LLVM with the last build of any kind
+  # (lib/php-build.sh).  /etc/php, logs and session data stay.
+  if declare -F php_build_purge >/dev/null 2>&1; then
+    php_build_purge "$ver"
+  fi
   # The session GC timer is shared by every installed version; stop it only
   # when no php-fpm unit remains enabled.
   if ! systemctl list-unit-files 'php*-fpm.service' --state=enabled --no-legend 2>/dev/null | grep -q .; then
     systemctl disable --now phpsessionclean.timer 2>/dev/null || true
   fi
   systemctl daemon-reload || true
-  info "Leaving PHP configuration, logs, caches and packages in place"
+  info "Leaving PHP configuration (/etc/php), logs, session data and any packages in place"
   ok "PHP purged (files preserved)"
 }
 
@@ -369,7 +400,12 @@ purge_mariadb() {
 
 purge_valkey() {
   step "Purge Valkey"
-  valkey_build_purge
+  # Our unit, the compiled build, its links and build units; the shared
+  # refresh/CPU units and LLVM only with the last build (lib/valkey-build.sh).
+  if declare -F valkey_build_purge >/dev/null 2>&1; then
+    valkey_build_purge
+  fi
+  # A package valkey-server the migration has not replaced yet.
   purge_service_stop valkey-server
   # --optimize and --restart-all treat an adopted Redis as a managed cache
   # (a host that only had redis-server is tuned, restarted and reported on).
@@ -386,7 +422,6 @@ purge_valkey() {
       break
     fi
   done
-  apt_purge_pattern 'valkey-*'
   # Keep the valkey group and www-data's membership.  Removing the account
   # would break a reinstall and is an account change, not an uninstall.
   info "Leaving Valkey data, configuration and logs in place"
@@ -479,7 +514,7 @@ run_purge() {
   done
 
   apt_clean
-  info "Purge only stopped services; all configuration, data and log files were preserved"
-  printf '\n%sPurge complete (no files were deleted).%s\n' "$C_GREEN" "$C_RESET"
+  info "Purge stopped services and removed only the compiled nginx/PHP/Valkey builds; configuration, data, log and backup files were preserved"
+  printf '\n%sPurge complete (configuration, data and logs were kept).%s\n' "$C_GREEN" "$C_RESET"
 }
 

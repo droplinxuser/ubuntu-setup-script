@@ -1366,8 +1366,6 @@ tinyproxy     soft nofile 1048576
 tinyproxy     hard nofile 1048576
 www-data      soft nofile 1048576
 www-data      hard nofile 1048576
-nginx         soft nofile 1048576
-nginx         hard nofile 1048576
 *             soft nofile 1048576
 *             hard nofile 1048576
 EOF

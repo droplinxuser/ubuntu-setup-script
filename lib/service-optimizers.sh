@@ -87,8 +87,10 @@ php_refresh_after_nginx() {
         warn "PHP ${v}: post-nginx ini refresh failed; restored the configuration the PHP pass wrote"
         opt_report "- **FAILED** PHP ${v}: post-nginx ini refresh; rolled back to the PHP pass result"
       else
-        warn "PHP ${v}: post-nginx ini refresh failed and could not be rolled back; check php-fpm${v} -t before the next restart"
-        opt_report "- **FAILED** PHP ${v}: post-nginx ini refresh (no rollback; check \`php-fpm${v} -t\`)"
+        # /usr/local/sbin/php-fpmX.Y is the build's wrapper: it passes the
+        # same -y, -c and PHP_INI_SCAN_DIR as the unit (php_fpm_test).
+        warn "PHP ${v}: post-nginx ini refresh failed and could not be rolled back; check /usr/local/sbin/php-fpm${v} -t before the next restart"
+        opt_report "- **FAILED** PHP ${v}: post-nginx ini refresh (no rollback; check \`/usr/local/sbin/php-fpm${v} -t\`)"
       fi
       rc=1
     fi
@@ -113,8 +115,18 @@ optimize_nginx() {
   local limit_file=/etc/systemd/system/nginx.service.d/limits.conf
   local default_file=/etc/default/nginx
   local limit_before="" limit_after="" default_before="" default_after=""
+  local nginx_bin
+  nginx_bin=$(opt_nginx_bin)
+  # Legacy-Angie mode (R19/R51): /etc/nginx is not the live tree and no
+  # nginx-tree logic may touch /etc/angie.  detect_installed_services already
+  # leaves nginx out; this guards a direct caller.
+  if (( ${OPT_WEB_LEGACY:-0} )); then
+    opt_report "## nginx"
+    opt_report "- Skipped: Angie still serves (legacy mode); the 1.22 migration retries on the next --optimize"
+    return 0
+  fi
   systemctl is-active --quiet nginx 2>/dev/null && active=1
-  version=$(/usr/sbin/nginx -v 2>&1 | head -n1 || true)
+  version=$("$nginx_bin" -v 2>&1 | head -n1 || true)
   opt_report "## nginx"
   opt_report "- Version: \`${version:-unknown}\`; active: ${active}"
   opt_backup /etc/nginx nginx
@@ -152,8 +164,8 @@ optimize_nginx() {
     unit_changed=$NGINX_UNIT_CHANGED
   fi
   # Same profile as the installer (nginx_apply_profile): guest caches,
-  # precompression, the tuner and dynamic Brotli (the module is installed
-  # when missing; a failure moves the optional files to /tmp, gzip stays).
+  # precompression, the tuner and Brotli (a static module of our build, so
+  # only directives are written, never load_module; gzip stays the fallback).
   if ! nginx_apply_profile /etc/nginx; then
     nginx_restore_live
     opt_report "- **FAILED** tuning returned an error; configuration rolled back"
@@ -178,7 +190,7 @@ optimize_nginx() {
   fi
   local nginx_test_log
   nginx_test_log=$(tmp_file)
-  if ! /usr/sbin/nginx -t >"$nginx_test_log" 2>&1; then
+  if ! "$nginx_bin" -t >"$nginx_test_log" 2>&1; then
     opt_report "- **FAILED** \`nginx -t\`:"
     while IFS= read -r change; do opt_report "  \`${change}\`"; done < "$nginx_test_log"
     nginx_restore_live
@@ -220,7 +232,7 @@ optimize_nginx() {
   fi
   # zstd (1.21.58) module: only after the pass committed, so a rollback above
   # never restores a tree that loads a purged module.
-  if (( rc == 0 && NGINX_ZSTD_PURGE_PENDING )) && /usr/sbin/nginx -t >/dev/null 2>&1; then
+  if (( rc == 0 && NGINX_ZSTD_PURGE_PENDING )) && "$nginx_bin" -t >/dev/null 2>&1; then
     nginx_purge_zstd_module /etc/nginx
     [[ -n $NGINX_ZSTD_PURGE_RESULT ]] && opt_report "- ${NGINX_ZSTD_PURGE_RESULT}"
   fi
@@ -230,9 +242,12 @@ optimize_nginx() {
   if (( rc == 0 && active )); then
     cloudflare_tls_finish 0 || true
   fi
-  # NGINX_BUILD=clang/package (1.21.70): build, BOLT from live traffic, or revert.
-  # A failed build leaves the package binary serving and marks the run.
-  if (( rc == 0 )) && ! nginx_build_apply "$( (( active )) && echo optimize || echo install)" opt_report; then
+  # The compiled nginx (lib/nginx-build.sh): rebuild when `check` finds the
+  # build stale (new mainline or library, CPU, recipe), swap it in with an
+  # in-place upgrade, start nginx if it is down, then BOLT from live traffic.
+  # It runs after the tune so the build's live-config test sees the tuned
+  # tree.  A failed build keeps the running binary serving and marks the run.
+  if (( rc == 0 )) && ! nginx_build_ensure full optimize opt_report; then
     rc=1
   fi
   return "$rc"
@@ -245,7 +260,7 @@ nginx_restore_live() {
   opt_restore /etc/systemd/system/nginx.service.d nginx-systemd
   opt_restore /etc/default/nginx nginx-default
   systemctl daemon-reload || true
-  if /usr/sbin/nginx -t >/dev/null 2>&1; then
+  if "$(opt_nginx_bin)" -t >/dev/null 2>&1; then
     systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
   fi
   return 0
@@ -288,7 +303,8 @@ migrate_php_pool_to_socket() {
   local nginx_conf=/etc/nginx/nginx.conf
   local socket=/run/php/php-fpm.sock
   local bakdir bak="${OPT_BACKUP_DIR:-}/php-socket"
-  local fpm_bin="" tcp_re port i ok=0
+  local tcp_re port i ok=0 nginx_bin
+  nginx_bin=$(opt_nginx_bin)
   MIGRATE_REASON=""
   if [[ -z ${OPT_BACKUP_DIR:-} ]]; then
     bakdir=$(tmp_dir setup-php-socket.XXXXXX) || { MIGRATE_REASON="could not create a backup directory"; return 1; }
@@ -297,8 +313,10 @@ migrate_php_pool_to_socket() {
 
   [[ -f $pool && -f $nginx_conf ]] || { MIGRATE_REASON="pool or nginx.conf is missing"; return 1; }
   systemctl is-active --quiet nginx || { MIGRATE_REASON="nginx is not active"; return 1; }
-  if ! fpm_bin=$(php_fpm_binary "$ver"); then
-    MIGRATE_REASON="php-fpm${ver} binary not found"
+  # Every config test below is php_fpm_test (the unit's -y, -c and
+  # PHP_INI_SCAN_DIR, R2.8); a bare `php-fpm -t` read the CLI scan dir.
+  if ! php_fpm_is_ours "$ver"; then
+    MIGRATE_REASON="PHP ${ver} is not the compiled build"
     return 1
   fi
   nginx_uses_local_php_upstream /etc/nginx \
@@ -326,10 +344,10 @@ migrate_php_pool_to_socket() {
     "s|^([[:space:]]*)server[[:space:]]+${tcp_re};|\1server unix:${socket} max_fails=1 fail_timeout=2s;\n\1server ${tcp} backup;|" \
     "$nginx_conf"
   if ! grep -qF "server unix:${socket} max_fails=1 fail_timeout=2s;" "$nginx_conf" \
-     || ! /usr/sbin/nginx -t >/dev/null 2>&1 \
+     || ! "$nginx_bin" -t >/dev/null 2>&1 \
      || ! systemctl reload nginx 2>/dev/null; then
     cp -a "$bak/nginx.conf" "$nginx_conf"
-    /usr/sbin/nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
+    "$nginx_bin" -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
     MIGRATE_REASON="nginx rejected the socket+backup upstream"
     return 1
   fi
@@ -338,10 +356,10 @@ migrate_php_pool_to_socket() {
   # 2. Move the existing pool to the socket.  The reload is graceful: old
   #    workers finish in-flight TCP requests while the master opens the socket.
   php_pool_set_listener "$pool" "$ver" "$socket"
-  if ! "$fpm_bin" -t >/dev/null 2>&1; then
+  if ! php_fpm_test "$ver" >/dev/null 2>&1; then
     cp -a "$bak/www.conf" "$pool"
     cp -a "$bak/nginx.conf" "$nginx_conf"
-    /usr/sbin/nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
+    "$nginx_bin" -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
     MIGRATE_REASON="PHP rejected the socket pool"
     return 1
   fi
@@ -352,8 +370,8 @@ migrate_php_pool_to_socket() {
     if ! systemctl restart "php${ver}-fpm" 2>/dev/null; then
       cp -a "$bak/www.conf" "$pool"
       cp -a "$bak/nginx.conf" "$nginx_conf"
-      "$fpm_bin" -t >/dev/null 2>&1 && systemctl restart "php${ver}-fpm" 2>/dev/null || true
-      /usr/sbin/nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
+      php_fpm_test "$ver" >/dev/null 2>&1 && systemctl restart "php${ver}-fpm" 2>/dev/null || true
+      "$nginx_bin" -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
       MIGRATE_REASON="PHP-FPM reload and restart failed"
       return 1
     fi
@@ -384,8 +402,8 @@ migrate_php_pool_to_socket() {
     if (( ok == 0 )); then
       cp -a "$bak/www.conf" "$pool"
       cp -a "$bak/nginx.conf" "$nginx_conf"
-      "$fpm_bin" -t >/dev/null 2>&1 && systemctl restart "php${ver}-fpm" 2>/dev/null || true
-      /usr/sbin/nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
+      php_fpm_test "$ver" >/dev/null 2>&1 && systemctl restart "php${ver}-fpm" 2>/dev/null || true
+      "$nginx_bin" -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
       MIGRATE_REASON="PHP-FPM did not open ${socket} after reload or restart; restored the TCP listener"
       return 1
     fi
@@ -395,20 +413,26 @@ migrate_php_pool_to_socket() {
   # 3. Drop the TCP backup; the socket is proven live.
   sed_in_place -E "/^[[:space:]]*server[[:space:]]+${tcp_re}[[:space:]]+backup;/d" "$nginx_conf"
   sed_in_place -E "s|server unix:${socket} max_fails=1 fail_timeout=2s;|server unix:${socket};|" "$nginx_conf"
-  if ! /usr/sbin/nginx -t >/dev/null 2>&1 \
+  if ! "$nginx_bin" -t >/dev/null 2>&1 \
      || ! systemctl reload nginx 2>/dev/null; then
     # Keep the working socket+backup config rather than risking the site.
     cp -a "$bak/nginx-backup.conf" "$nginx_conf"
-    /usr/sbin/nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
+    "$nginx_bin" -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
     MIGRATE_REASON="nginx could not drop the TCP backup (socket is live; backup kept)"
     return 1
   fi
   return 0
 }
 optimize_php_services() {
-
-
-  local primary ver active listen_path rc=0
+  local primary ver active listen_path rc=0 build_ver="" build_rc=0
+  # Legacy-Angie mode: the web tier is left alone (R19/R51); the PHP
+  # [PATH=] sections are computed from /etc/nginx, which is not live yet.
+  if (( ${OPT_WEB_LEGACY:-0} )); then
+    OPT_PHP_OK=0
+    opt_report "## PHP"
+    opt_report "- Skipped: Angie still serves (legacy mode); PHP-FPM is tuned once the 1.22 migration moved the web tier to nginx"
+    return 0
+  fi
   primary=$(php_primary_version)
   if [[ -z $primary ]]; then
     # No pool we can safely identify: leave nginx's FastCGI upstream alone
@@ -417,31 +441,44 @@ optimize_php_services() {
     opt_report "- No PHP-FPM pool with a usable www.conf; nginx upstream left unchanged"
     return 0
   fi
+  # Only the active version is built, laid out and started (one version
+  # owns the shared socket, R61): /etc/php/setup-active, else the primary
+  # pool, which php_build_ensure then records as the active version.  The
+  # others stay on disk, disabled, for --upgrade-php=X.Y.
+  if declare -F php_active_version >/dev/null 2>&1; then
+    build_ver=$(php_active_version 2>/dev/null || true)
+  fi
+  [[ -n $build_ver ]] || build_ver=$primary
   while IFS= read -r ver; do
+    opt_report "## PHP ${ver}"
+    # Build first: a stale build (new release, changed extension set, other
+    # CPU, recipe) is rebuilt and swapped in, the managed /etc/php/X.Y files
+    # are re-laid (www.conf keeps the tuner's pm/listen keys), the unit is
+    # started if it is down, and BOLT samples live traffic.  The tune below
+    # then applies on top of exactly what serves, and its backup is taken
+    # after the layout, so a rollback never pairs the new binary with files
+    # an older layout wrote.  A failed build keeps the running one serving:
+    # it fails the run (build_rc) but does not stop the tune or the socket
+    # handover to nginx below.
+    if [[ $ver == "$build_ver" ]] && ! php_build_ensure "$ver" full optimize opt_report; then
+      build_rc=1
+    fi
     active=0
     systemctl is-active --quiet "php${ver}-fpm" 2>/dev/null && active=1
     # Preserve the pool's existing listener.  Migrating a live TCP pool to a
     # Unix socket creates a window where nginx still points at port 9000 and
     # every request returns 502.  Installations still use the socket template.
     listen_path=$(php_pool_listen "$ver")
-    opt_report "## PHP ${ver}"
-    # Same end-of-life check the installer runs (report only).
     opt_report "- Active: ${active}; listen kept: \`${listen_path:-unknown}\`"
     opt_backup "/etc/php/${ver}" "php-${ver}"
     opt_backup "/etc/systemd/system/php${ver}-fpm.service.d" "php-${ver}-systemd"
     tune_reset_changes
     # Replace a stale managed php.ini copy before tuning.  Keep the live
     # timezone; everything else follows configs/php/custom_dan.ini.
+    # (The fd/core limits and the graceful stop are part of our unit text,
+    # php_build_unit_text: the 1.21 limits drop-in is moved aside by
+    # php_build_unit_write and must not be written again here.)
     sync_php_ini_template "$ver"
-    # Keep the systemd fd/core limits in sync with the installer; an old
-    # server may still be capped at the package default (1024 fds) while the
-    # pool asks for 524288.
-    local limits_changed=0
-    if php_fpm_write_systemd_limits "$ver"; then
-      systemctl daemon-reload || true
-      limits_changed=1
-      tune_note "PHP ${ver}: systemd drop-in updated (LimitNOFILE=524288, graceful SIGQUIT stop)"
-    fi
     if ! tune_php_fpm_version "$ver"; then
       opt_restore "/etc/php/${ver}" "php-${ver}"
       opt_restore "/etc/systemd/system/php${ver}-fpm.service.d" "php-${ver}-systemd"
@@ -474,11 +511,6 @@ optimize_php_services() {
         opt_report "- Socket migration skipped: nginx inactive or vhosts use a direct fastcgi_pass/next_upstream off"
       fi
     fi
-    # Only the extensions the applications need (lib/php-build.sh); a change
-    # needs the reload below.
-    if php_fpm_modules_apply "$ver" opt_report; then
-      TUNE_DIRTY=1
-    fi
     if (( active )); then
       if (( migrated || migration_failed )); then
         : # migration already reloaded PHP (success or rollback)
@@ -493,11 +525,6 @@ optimize_php_services() {
         # 1-3 second 502 window on a busy site.
         OPT_CUTOVER=1
         opt_report "- Reload: **OK** (graceful; no request was dropped)"
-        # SIGUSR2 re-reads the pool, not the unit: LimitNOFILE/UMask from the
-        # drop-in reach the workers only after a full restart.
-        if (( limits_changed )); then
-          opt_report "- Note: the systemd limits drop-in applies on the next full restart"
-        fi
         if [[ -f "/etc/php/${ver}/fpm/php-fpm.conf" ]] \
            && grep -q 'process_control_timeout' "/etc/php/${ver}/fpm/php-fpm.conf"; then
           opt_report "- Note: master-level process_control_timeout applies on the next full restart"
@@ -524,11 +551,6 @@ optimize_php_services() {
     else
       opt_report "- Restart: skipped (service was not active)"
     fi
-    # PHP_BUILD=clang/lean/package: build, BOLT from live traffic, or revert.  A
-    # failed build leaves the package binary serving and marks the run.
-    if (( active )) && ! php_build_apply "$ver" optimize opt_report; then
-      rc=1
-    fi
   done < <(php_fpm_versions)
 
   # Only hand a socket path to nginx when that pool is active and the socket
@@ -541,6 +563,7 @@ optimize_php_services() {
       OPT_PHP_SOCKET=$listen_path
     fi
   fi
+  (( build_rc )) && rc=1
   return "$rc"
 }
 
@@ -902,21 +925,25 @@ optimize_mariadb() {
 # Run a command against the local Valkey/Redis, preferring the Unix socket.
 # Returns non-zero when no client is installed or the server is unreachable.
 valkey_live_cli() {
-  local cli="" sock="" conf_sock
+  local cli="" sock="" conf_sock vcli
+  # Our build's valkey-cli by absolute path (a package copy on PATH only
+  # while the migration has not replaced the package server yet).
+  vcli=$(opt_valkey_cli)
+  [[ -x $vcli ]] || vcli=""
   # An operator's custom unixsocket (kept by valkey_apply_config) first, then
   # the default paths, then TCP.
   conf_sock=$(valkey_conf_get /etc/valkey/valkey.conf unixsocket 2>/dev/null || true)
-  if [[ -n $conf_sock && -S $conf_sock ]] && command -v valkey-cli >/dev/null 2>&1; then
-    cli=valkey-cli; sock=$conf_sock
+  if [[ -n $conf_sock && -S $conf_sock && -n $vcli ]]; then
+    cli=$vcli; sock=$conf_sock
   elif conf_sock=$(valkey_conf_get /etc/redis/redis.conf unixsocket 2>/dev/null || true) \
        && [[ -n $conf_sock && -S $conf_sock ]] && command -v redis-cli >/dev/null 2>&1; then
     cli=redis-cli; sock=$conf_sock
-  elif [[ -S /run/valkey/valkey.sock ]] && command -v valkey-cli >/dev/null 2>&1; then
-    cli=valkey-cli; sock=/run/valkey/valkey.sock
+  elif [[ -S /run/valkey/valkey.sock && -n $vcli ]]; then
+    cli=$vcli; sock=/run/valkey/valkey.sock
   elif [[ -S /run/redis/redis.sock ]] && command -v redis-cli >/dev/null 2>&1; then
     cli=redis-cli; sock=/run/redis/redis.sock
-  elif command -v valkey-cli >/dev/null 2>&1; then
-    cli=valkey-cli
+  elif [[ -n $vcli ]]; then
+    cli=$vcli
   elif command -v redis-cli >/dev/null 2>&1; then
     cli=redis-cli
   else
@@ -1140,13 +1167,18 @@ restart_php_workers_for_group() {
   done < <(list_active_php_units)
 }
 
-# VALKEY_BUILD=clang/package (1.21.71) runs after the tuning, only for the
-# valkey-server package (never an adopted Redis) and only when it succeeded.
+# The compiled Valkey (lib/valkey-build.sh) is brought to its build after
+# the tuning, only for our Valkey (never an adopted Redis, which is tuned as
+# Redis) and only when the tune succeeded: rebuild when `check` finds it
+# stale, swap it in (a restart only when a new build was staged), BOLT.
+# A failed build keeps the running build serving and fails the run, like
+# nginx and PHP.
 optimize_valkey() {
   local rc=0
   optimize_valkey_tune "$@" || rc=$?
-  if [[ ${1:-valkey} == valkey ]] && (( rc == 0 )) && ! valkey_build_apply opt_report; then
-    warn "Valkey: VALKEY_BUILD=${VALKEY_BUILD} build failed; the package's Valkey keeps serving"
+  if [[ ${1:-valkey} == valkey ]] && (( rc == 0 )) && ! valkey_build_ensure full optimize opt_report; then
+    warn "Valkey: the build failed; the running Valkey build keeps serving (see the report for the log)"
+    rc=1
   fi
   return "$rc"
 }
@@ -1154,7 +1186,10 @@ optimize_valkey() {
 optimize_valkey_tune() {
   local kind=${1:-valkey}
   local label=Valkey conf=/etc/valkey/valkey.conf conf_dir=/etc/valkey
-  local unit=valkey-server cli=valkey-cli
+  # Our build's client by absolute path (R2.1); valkey-cli on PATH may be a
+  # leftover package copy or missing (/usr/local/bin is not in every PATH).
+  local unit=valkey-server cli
+  cli=$(opt_valkey_cli)
   if [[ $kind == redis ]]; then
     label=Redis conf=/etc/redis/redis.conf conf_dir=/etc/redis
     unit=redis-server cli=redis-cli
@@ -1269,9 +1304,13 @@ optimize_valkey_tune() {
   # A large maxclients is unusable if systemd still caps the unit at 1024
   # fds.  Same drop-in as the installer (name, comment and ReadWritePaths
   # included) so a fresh install and --optimize converge.
+  # Our valkey-server.service (lib/valkey-build.sh) already carries
+  # LimitNOFILE=524288, LimitCORE=0 and the log tree in ReadWritePaths (with
+  # the '-' prefix a missing directory needs), so the drop-in is written
+  # only for an adopted redis-server package unit.
   dropin="/etc/systemd/system/${unit}.service.d/limits.conf"
   opt_backup "$(dirname "$dropin")" "${kind}-systemd"
-  if valkey_write_systemd_limits "$unit" "$kind"; then
+  if { [[ $kind == redis ]] || ! valkey_is_ours; } && valkey_write_systemd_limits "$unit" "$kind"; then
     unit_changed=1
     systemctl daemon-reload || true
     opt_report "- systemd limits: LimitNOFILE=524288, ReadWritePaths=${LOG_ROOT}/${kind}"
@@ -1726,11 +1765,20 @@ opt_log_errors() {
 }
 
 verify_optimized_services() {
-  local rc=0 ver sock es_url code
+  local rc=0 ver sock es_url code nginx_bin out
+  nginx_bin=$(opt_nginx_bin)
   opt_report "## Verification"
 
-  if [[ -x /usr/sbin/nginx ]] && systemctl is-active --quiet nginx; then
-    if /usr/sbin/nginx -t >/dev/null 2>&1; then
+  if (( ${OPT_WEB_LEGACY:-0} )); then
+    # Legacy-Angie mode: nothing in the web tier was changed; only say
+    # whether the server that still owns :80/:443 is up.
+    if systemctl is-active --quiet angie 2>/dev/null; then
+      opt_report "- Angie (legacy mode): active; not tuned or verified by --optimize"
+    else
+      opt_report "- Angie (legacy mode): **not active**; check \`systemctl status angie\`"
+    fi
+  elif [[ -x $nginx_bin ]] && systemctl is-active --quiet nginx; then
+    if "$nginx_bin" -t >/dev/null 2>&1; then
       local ports
       ports=$(opt_listen_ports nginx)
       if [[ -n $ports ]]; then
@@ -1747,13 +1795,13 @@ verify_optimized_services() {
   fi
   if [[ " ${OPT_DETECTED[*]} " == *" php:"* ]]; then
     (( ${OPT_PHP_OK:-0} )) || opt_report "- PHP: no primary pool was optimized; nginx upstream left unchanged"
-    local fpm_bin
     while IFS= read -r ver; do
       systemctl is-active --quiet "php${ver}-fpm" || continue
       sock=$(php_pool_listen "$ver")
-      fpm_bin=$(php_fpm_binary "$ver" || true)
-      if [[ -x $fpm_bin ]] && ! "$fpm_bin" -t >/dev/null 2>&1; then
-        opt_report "- PHP ${ver}: **FAILED** configuration test"
+      # php_fpm_test: the unit's -y, -c and PHP_INI_SCAN_DIR, and it fails
+      # on extension load warnings or a missing OPcache (R2.8).
+      if ! out=$(php_fpm_test "$ver" 2>&1); then
+        opt_report "- PHP ${ver}: **FAILED** configuration test ($(grep -iE 'error|warning|unable|not loaded|no compiled' <<<"$out" | head -n 1 | tr '`' "'"))"
         rc=1
       elif ! opt_listener_ok "$sock"; then
         opt_report "- PHP ${ver}: **FAILED** active but listener \`${sock:-unknown}\` is missing"
@@ -1774,7 +1822,7 @@ verify_optimized_services() {
     opt_log_errors mariadb MariaDB
   fi
   if [[ " ${OPT_DETECTED[*]} " == *" valkey "* ]] && systemctl is-active --quiet valkey-server; then
-    if valkey_endpoint_pong valkey-cli "$(valkey_conf_get /etc/valkey/valkey.conf unixsocket)"; then
+    if valkey_endpoint_pong "$(opt_valkey_cli)" "$(valkey_conf_get /etc/valkey/valkey.conf unixsocket)"; then
       opt_report "- Valkey: active and responding to PING"
     else
       opt_report "- Valkey: **FAILED** active but PING failed"
@@ -1882,7 +1930,16 @@ optimize_plan() {
   nproc=$(effective_cpus)
   ram_mb=$(mem_total_mb)
   backlog=$(effective_backlog)
-  detect_installed_services
+  # A pending 1.22 migration runs first in the real run (optimize_migration_step):
+  # plan the tuning for the host it leaves behind (nginx instead of Angie,
+  # the compiled PHP and Valkey instead of the packages).
+  local migrate_pending=0 note
+  if declare -F migrate_needed >/dev/null 2>&1 && migrate_needed; then
+    migrate_pending=1
+    detect_installed_services migrate
+  else
+    detect_installed_services
+  fi
   plan_memory_budget
   # Same decision as configure_cpu_governor: a guest never touches the
   # governor, even when nested virtualisation exposes a cpufreq interface.
@@ -1901,11 +1958,22 @@ optimize_plan() {
     "$governor_desc" "$nproc" "$ram_mb"
   printf '  Legacy repair: nightly cron chown and /var/www/logs ownership\n'
   printf '  Security: wp-config 640, scoped DB users, malware quarantine, OS/SSH/firewall audit\n'
+  if declare -F migrate_plan >/dev/null 2>&1; then
+    migrate_plan || true
+  fi
+  if (( ${#OPT_DETECT_NOTES[@]} > 0 )); then
+    printf '  Not tuned:\n'
+    for note in "${OPT_DETECT_NOTES[@]}"; do printf '    %s\n' "$note"; done
+  fi
   if (( ${#OPT_DETECTED[@]} == 0 )); then
     printf 'No supported installed services detected.\n'
     return 0
   fi
-  printf 'Detected: %s\n' "${OPT_DETECTED[*]}"
+  if (( migrate_pending )); then
+    printf 'Detected (as the migration leaves the host): %s\n' "${OPT_DETECTED[*]}"
+  else
+    printf 'Detected: %s\n' "${OPT_DETECTED[*]}"
+  fi
   printf '  %s\n' "$(memory_plan_summary Memory)"
   if [[ -n ${CPU_MITIGATIONS:-} ]]; then
     printf '  CPU mitigations: %s\n' "$(cpu_mitigations_plan_text)"
@@ -1918,7 +1986,7 @@ optimize_plan() {
     printf '  nginx: workers=%s connections=%s rlimit=%s keepalive=%s cache_budget=%sMB\n' \
       "$NGINX_WORKER_PROCESSES" "$NGINX_WORKER_CONNECTIONS" "$NGINX_WORKER_RLIMIT" \
       "$NGINX_PHP_KEEPALIVE" "$cache_mb"
-    printf '  nginx compression: Brotli level %s dynamic, gzip fallback (module installed on apply)\n' \
+    printf '  nginx compression: Brotli level %s (static module of the compiled nginx), gzip fallback\n' \
       "$(nginx_brotli_level)"
     local nginx_plan
     nginx_plan=$(nginx_build_plan)

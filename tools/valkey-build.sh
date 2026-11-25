@@ -29,17 +29,19 @@
 # Version policy.  Valkey here is a cache (save "", appendonly no): the
 # newest release is safe to run.  A host whose valkey.conf persists data
 # (save or appendonly) stays on the X.Y series of the server that wrote the
-# data: the active build (build.info valkey=), else the valkey-server
-# package while it is still installed (recorded as pkg_version= in
-# build.info during the 1.22 migration), else the 1.21 build.  An older
+# data: the active build (build.info valkey=), else the newer of the
+# valkey-server package (recorded as pkg_version= in build.info during the
+# 1.22 migration) and the 1.21 build its drop-in ran.  An older
 # server cannot load a newer RDB/AOF, so such a host never goes below that
 # version either.
 #
 # Downloads: the release archive is checked against the SHA-256 in
 # valkey-io/valkey-hashes, a second repository the Valkey project keeps for
 # exactly this.  A mismatch stops the build.  Only when that repository is
-# unreachable is the archive pinned on first use (reported); an automatic
-# refresh never adopts a release valkey-hashes does not list yet.
+# unreachable is the archive pinned on first use (reported).  When it answers
+# but does not list the release yet, "latest" means the newest release it
+# does list (reported), and a pinned version builds only when build.info
+# already records that archive's hash; otherwise the build stops.
 #
 # Usage (root):
 #   valkey-build.sh build [--cpu-only]  build + verify into ROOT/staging
@@ -170,12 +172,19 @@ persists() {
 }
 
 # "source:version" of the server whose data a persisting host keeps: our
-# active build, the package while installed, the 1.21 build; "" when none.
+# active build; else the newer of the valkey-server package and the 1.21
+# build.  On a 1.21 clang host the package is still installed but its unit
+# ran the 1.21 build (through the zz-setup-build.conf drop-in), so either may
+# have written the RDB/AOF, and only the newer one is a safe floor.  "" when
+# there is none.
 data_writer() {
-  local v
-  v=$(info_get "$INFO" valkey);                [[ -n $v ]] && { printf 'build:%s' "$v"; return 0; }
-  v=$(pkg_version);                            [[ -n $v ]] && { printf 'package:%s' "$v"; return 0; }
-  v=$(info_get "$LEGACY_BUILD/build.info" valkey); [[ -n $v ]] && { printf 'build-1.21:%s' "$v"; return 0; }
+  local v p l
+  v=$(info_get "$INFO" valkey); [[ -n $v ]] && { printf 'build:%s' "$v"; return 0; }
+  p=$(pkg_version)
+  l=$(info_get "$LEGACY_BUILD/build.info" valkey)
+  [[ $l =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || l=""
+  if [[ -n $l ]] && { [[ -z $p ]] || ver_ge "$l" "$p"; }; then printf 'build-1.21:%s' "$l"; return 0; fi
+  [[ -n $p ]] && printf 'package:%s' "$p"
   return 0
 }
 
@@ -189,11 +198,63 @@ series() {
   printf '%s' "${w%.*}"
 }
 
+# build-common's resolve() falls back to last_known() when no source answers.
+# Its glob ("$ROOT"/*/build.info) fits PHP's per-version trees; here it
+# would read ROOT/prev or ROOT/staging, and an offline refresh would "update"
+# to the previous build and flip back on the next failed lookup.  Only the
+# active record, then the 1.21 build, count.
+last_known() {
+  local v
+  v=$(info_get "$INFO" "$1")
+  [[ -n $v ]] || v=$(info_get "$LEGACY_BUILD/build.info" "$1")
+  printf '%s' "$v"
+}
+
+# The valkey-hashes file, or status 2 when the repository is unreachable.
+hashes_text() {
+  local u txt
+  for u in $HASHES_URLS; do
+    txt=$(http_get "$u" 2>/dev/null) && [[ -n $txt ]] && { printf '%s\n' "$txt"; return 0; }
+  done
+  return 2
+}
+
+# The newest X.Y.Z valkey-hashes lists that is no newer than MAX and, when
+# SERIES is set, inside that X.Y series.  Empty when there is none.
+hashes_newest_listed() { # series max
+  local txt v
+  txt=$(hashes_text) || return 0
+  awk '$1 == "hash" && $3 == "sha256" && $4 ~ /^[0-9a-f]+$/ && length($4) == 64 && $2 ~ /^valkey-[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz$/ {
+         v = $2; sub(/^valkey-/, "", v); sub(/\.tar\.gz$/, "", v); print v }' <<<"$txt" \
+    | while IFS= read -r v; do
+        [[ -z $1 || ${v%.*} == "$1" ]] || continue
+        ver_ge "$2" "$v" && printf '%s\n' "$v"
+      done | sort -V | tail -n 1
+  return 0
+}
+
 resolve_all() {
-  local c v rc=0 x
+  local c v rc=0 x h alt
   x=$(series)
   for c in "${COMPONENTS[@]}"; do
-    if [[ $c == valkey ]]; then v=$(resolve valkey "$x") || v=""
+    if [[ $c == valkey ]]; then
+      v=$(resolve valkey "$x") || v=""
+      # "latest" never means a release valkey-hashes cannot vouch for yet
+      # while that repository answers (first-use trust only when it is
+      # unreachable).  check and build both resolve here, so they agree and
+      # the daily refresh does not rebuild the same version every day.
+      # The active build's own version needs no lookup (its hash is in
+      # build.info).
+      if [[ -n $v && $(conf_get valkey) == latest && $v != "$(info_get "$INFO" valkey)" ]]; then
+        h=0; hashes_lookup "$v" >/dev/null 2>&1 || h=$?
+        if (( h == 3 )); then
+          alt=$(hashes_newest_listed "$x" "$v")
+          if [[ -n $alt ]]; then
+            say "valkey-hashes does not list Valkey $v yet: using $alt, the newest release it lists"
+            v=$alt
+          fi
+        fi
+      fi
     else v=$(resolve "$c") || v=""
     fi
     if [[ -n $v ]]; then printf '%s=%s\n' "$c" "$v"; else printf '%s=?\n' "$c"; rc=1; fi
@@ -222,12 +283,8 @@ lock_busy() {
 # empty); status 2 when the repository is unreachable, 3 when it answers but
 # does not list V yet.
 hashes_lookup() { # version
-  local u txt="" line
-  for u in $HASHES_URLS; do
-    txt=$(http_get "$u" 2>/dev/null) && [[ -n $txt ]] && break
-    txt=""
-  done
-  [[ -n $txt ]] || return 2
+  local txt line
+  txt=$(hashes_text) || return 2
   line=$(awk -v f="valkey-$1.tar.gz" '$1 == "hash" && $2 == f && $3 == "sha256" && $4 ~ /^[0-9a-f]{64}$/ { print $4, $5; exit }' <<<"$txt")
   [[ -n $line ]] || return 3
   printf '%s' "$line"
@@ -248,11 +305,13 @@ fetch_valkey() { # version [known-sha256]
     0) read -r sum url <<<"$line"; SRC_CHECK=valkey-hashes ;;
     2) say "valkey-hashes is unreachable: valkey-$v.tar.gz is pinned on first download (reported)"
        SRC_CHECK=tofu ;;
-    3) if [[ ${VALKEY_BUILD_AUTO:-0} == 1 && -z $known ]]; then
-         die "valkey-hashes does not list Valkey $v yet: an automatic refresh keeps the running build"
-       fi
-       say "valkey-hashes does not list Valkey $v yet: valkey-$v.tar.gz is pinned on first download (reported)"
-       SRC_CHECK=tofu ;;
+    # The verification source answered and does not vouch for this archive:
+    # fail closed, unless build.info already records this exact archive's
+    # hash (the active build's own version; used just below).  First-use
+    # trust is only for an unreachable repository (R36/R95).
+    3) [[ -n $known ]] \
+         || die "valkey-hashes does not list Valkey $v: refusing an unverified archive (pin a listed VALKEY_VERSION in $CONF, or retry once valkey-hashes lists it)"
+       say "valkey-hashes does not list Valkey $v: using the hash build.info records for it" ;;
   esac
   # A recorded hash of this exact file (the active build) wins over first use.
   [[ -z $sum && -n $known ]] && { sum=$known; SRC_CHECK=build.info; }
@@ -272,18 +331,18 @@ llvm_use() { # major: the recorded toolchain without any network lookup
   return 1
 }
 
-# Free space: the Valkey tree and archives need well under 1 GB; LLVM, when
-# it still has to be installed, about 4 GB more on /.  A build that would
-# fill the disk MariaDB writes to is refused instead.
+# Free space (R2.4): the floor every build shares (build_space_check: 6 GB
+# on the build cache filesystem, 2 GB on /), plus about 4 GB more on / when
+# the LLVM toolchain still has to be installed.  A build that would fill the
+# disk MariaDB writes to is refused instead.
 space_check() { # llvm-major
-  local cache_mb root_mb need_root=${VALKEY_BUILD_MIN_ROOT_MB:-2048}
-  llvm_use "$1" || need_root=$(( need_root + 4096 ))
-  cache_mb=$(free_mb "$SRC_CACHE")
+  local root_mb need_root
+  build_space_check "$SRC_CACHE"
+  llvm_use "$1" && return 0
+  need_root=$(( BUILD_MIN_ROOT_MB + 4096 ))
   root_mb=$(free_mb /)
-  [[ -z $cache_mb ]] || (( cache_mb >= ${VALKEY_BUILD_MIN_CACHE_MB:-1024} )) \
-    || die "only ${cache_mb} MB free under $SRC_CACHE (need ${VALKEY_BUILD_MIN_CACHE_MB:-1024}); not building"
-  [[ -z $root_mb ]] || (( root_mb >= need_root )) \
-    || die "only ${root_mb} MB free on / (need $need_root); not building"
+  [[ ! $root_mb =~ ^[0-9]+$ ]] || (( root_mb >= need_root )) \
+    || die "only ${root_mb} MB free on /; installing LLVM $1 and building needs $need_root MB; free space and retry"
 }
 
 cmd_build() { # [--cpu-only]
@@ -317,7 +376,7 @@ cmd_build() { # [--cpu-only]
   n=${VERS[llvm]}
   [[ $n =~ ^[0-9]+$ ]] || die "LLVM_VERSION must be a major version (e.g. 23), not $n"
   space_check "$n"
-  if (( cpu_only )); then llvm_use_recorded "$n" "$n" "clang-$n" "lld-$n" "llvm-$n"
+  if (( cpu_only )); then llvm_use_recorded "$n" "clang-$n" "lld-$n" "llvm-$n"
   else llvm_install "$n" "clang-$n" "lld-$n" "llvm-$n"
   fi
   export CC=$LLVM_BIN/clang CXX=$LLVM_BIN/clang++ AR=$LLVM_BIN/llvm-ar RANLIB=$LLVM_BIN/llvm-ranlib NM=$LLVM_BIN/llvm-nm
@@ -341,9 +400,11 @@ cmd_build() { # [--cpu-only]
   sdnotify_shim "$work/deps" "-O3 $flags -flto"
   src=$work/valkey
   arc="" SRC_CHECK=""
-  if (( cpu_only )); then read -r arc SRC_CHECK <<<"$(fetch_valkey "${VERS[valkey]}" "$(info_get "$INFO" src_sha256)")"
-  else read -r arc SRC_CHECK <<<"$(fetch_valkey "${VERS[valkey]}")"
-  fi
+  # build.info's hash vouches only for the exact version it records (the CPU
+  # rebuild, or a recipe change that rebuilds the active version).
+  sum=""
+  [[ $(info_get "$INFO" valkey) == "${VERS[valkey]}" ]] && sum=$(info_get "$INFO" src_sha256)
+  read -r arc SRC_CHECK <<<"$(fetch_valkey "${VERS[valkey]}" "$sum")"
   [[ -s $arc ]] || die "Valkey ${VERS[valkey]}: no verified source archive"
   sum=$(sha256sum "$arc" | awk '{print $1}')
   unpack "$arc" "$src"
@@ -624,6 +685,12 @@ cmd_activate() {
   LAYOUT_UNIT_CHANGED=0
   cmd_layout >/dev/null
   state=$(unit_state)
+  # The migration cutover starts the unit itself: it verifies the running
+  # executable, PING and the dataset, and owns the rollback to the package.
+  if [[ ${VALKEY_BUILD_NO_START:-0} == 1 ]]; then
+    say "Valkey $(info_get "$INFO" valkey) installed; valkey-server.service ($state) is left to the caller to start"
+    return 0
+  fi
   # A restart empties a cache-only Valkey: only for a new binary, a changed
   # unit, or a unit that is down.
   if systemctl is-active --quiet "$UNIT.service" && (( ! staged )) && [[ $LAYOUT_UNIT_CHANGED != 1 ]]; then
@@ -754,18 +821,44 @@ cmd_rebuild_cpu() {
 }
 
 # --------------------------------------------------------------- refresh
-cmd_check() {
-  local name want have stale="" rc=0 bcpu f
-  [[ -f $INFO ]] || { echo "no build"; return 10; }
-  [[ $(info_get "$INFO" recipe) == "$BUILD_RECIPE" ]] || stale+="recipe $(info_get "$INFO" recipe) -> $BUILD_RECIPE, "
-  bcpu=$(info_get "$INFO" cpu)
-  [[ -n $bcpu && $bcpu == "$(cpu_fingerprint)" ]] || stale+="cpu $(info_get "$INFO" cpu_desc) -> $(cpu_desc), "
-  for f in "${BINS[@]}"; do [[ -e $BIN/$f ]] || stale+="$f missing, "; done
+# What makes the build recorded in RECORD (with its binaries in BINDIR)
+# stale: CHECK_STALE gets "what old -> new, " pieces (empty when current),
+# CHECK_LOOKUP_FAILED=1 when a version lookup failed (that component is not
+# judged).  Globals, not output: a command substitution would lose them.
+check_record() { # record bindir
+  local rec=$1 bdir=$2 name want have stale="" bcpu f
+  CHECK_LOOKUP_FAILED=0
+  [[ $(info_get "$rec" recipe) == "$BUILD_RECIPE" ]] || stale+="recipe $(info_get "$rec" recipe) -> $BUILD_RECIPE, "
+  bcpu=$(info_get "$rec" cpu)
+  [[ -n $bcpu && $bcpu == "$(cpu_fingerprint)" ]] || stale+="cpu $(info_get "$rec" cpu_desc) -> $(cpu_desc), "
+  for f in "${BINS[@]}"; do [[ -e $bdir/$f ]] || stale+="$f missing, "; done
   while IFS='=' read -r name want; do
-    if [[ $want == "?" ]]; then rc=2; continue; fi
-    have=$(info_get "$INFO" "$name")
+    if [[ $want == "?" ]]; then CHECK_LOOKUP_FAILED=1; continue; fi
+    have=$(info_get "$rec" "$name")
     [[ $have == "$want" ]] || stale+="$name ${have:-none} -> $want, "
   done < <(resolve_all || true)
+  CHECK_STALE=$stale
+}
+
+cmd_check() {
+  local stale rc=0 f
+  if [[ ! -f $INFO ]]; then
+    # No active build yet, but a verified one waits in staging (the package
+    # still serves: migration postponed or rolled back).  Rebuilding it on
+    # every --optimize would cost minutes for nothing.
+    if [[ -f $STAGE/build.info ]]; then
+      check_record "$STAGE/build.info" "$STAGE/bin"; stale=$CHECK_STALE
+      if [[ -z $stale ]]; then
+        echo "staged build $(info_get "$STAGE/build.info" valkey) is current (waiting for activate)"
+        (( CHECK_LOOKUP_FAILED )) && return 2
+        return 0
+      fi
+      echo "stale: staged ${stale%, }"; return 10
+    fi
+    echo "no build"; return 10
+  fi
+  check_record "$INFO" "$BIN"; stale=$CHECK_STALE
+  (( CHECK_LOOKUP_FAILED )) && rc=2
   if [[ -n $stale ]]; then echo "stale: ${stale%, }"; return 10; fi
   # The CPU rebuild needs the active build's archive and toolchain offline.
   f=$SRC_CACHE/src/$(info_get "$INFO" src)
