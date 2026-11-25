@@ -304,7 +304,7 @@ optimize_ignore_tuning_env() {
     SETUP_PHP_JIT_HOT_RETURN SETUP_PHP_JIT_HOT_SIDE_EXIT \
     SETUP_GZIP_LEVEL SETUP_BROTLI_LEVEL SETUP_NGINX_COMPRESSION \
     SETUP_MARIADB_IO_CAPACITY SETUP_LIMIT_REQ_EXEMPT \
-    SETUP_PRECOMPRESS_ASSETS SETUP_PHP_PAGE_GZIP; do
+    SETUP_PHP_PAGE_GZIP; do
     if [[ -n ${!v+x} ]]; then
       OPTIMIZE_IGNORED_ENV+=("$v=${!v}")
       unset "$v"
@@ -394,7 +394,6 @@ reset_operator_overrides() {
     QDISC=fq
     PHP_JIT_WORDPRESS=1
     PHP_PAGE_GZIP=1
-    PRECOMPRESS_ASSETS=1
     LIMIT_REQ_EXEMPT=""
     unset STORAGE_CLASS 2>/dev/null || true
     RESET_ACTIONS+=("recomputed network profile: TCP_CC=${TCP_CC} QDISC=${QDISC}")

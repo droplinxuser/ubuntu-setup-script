@@ -2,11 +2,11 @@
 # Switch the compression settings the compression benchmark compares, then
 # validate and reload.  Audit host only; a plain `setup.sh --optimize`
 # restores the shipped profile.  (zstd, measured in 1.21.58, was removed in
-# 1.21.59: Cloudflare asks origins for "br, gzip" only.)
+# 1.21.59: Cloudflare asks origins for "br, gzip" only; brotli_static and
+# gzip_static, the precompressed siblings, were removed in 1.22.1.)
 #
 #   set-comp.sh br LEVEL|off       nginx dynamic Brotli level (or off)
 #   set-comp.sh gzip LEVEL         nginx gzip_comp_level
-#   set-comp.sh static on|off      brotli_static/gzip_static (precompressed siblings)
 #   set-comp.sh phpgz LEVEL|off    zlib.output_compression for the WP/Chevereto roots
 #   set-comp.sh show
 set -euo pipefail
@@ -23,10 +23,6 @@ case $what in
   gzip)
     sed -i -E "s/^([[:space:]]*gzip_comp_level[[:space:]]+)[0-9]+;/\\1$val;/" $A/h5bp/web_performance/compression.conf
     reload_nginx ;;
-  static)
-    sed -i -E "s/^brotli_static (on|off);/brotli_static $val;/" $A/http.d/brotli.conf
-    sed -i -E "s/^([[:space:]]*gzip_static[[:space:]]+)(on|off);/\\1$val;/" $A/h5bp/web_performance/compression.conf
-    reload_nginx ;;
   phpgz)
     if [[ $val == off ]]; then sed -i -E 's/^zlib.output_compression = On/zlib.output_compression = Off/' "$INI"
     else sed -i -E "s/^zlib.output_compression = (On|Off)/zlib.output_compression = On/; s/^zlib.output_compression_level = [0-9-]+/zlib.output_compression_level = $val/" "$INI"; fi
@@ -36,5 +32,4 @@ case $what in
 esac
 grep -E '^brotli (on|off)|^brotli_comp_level' $A/http.d/brotli.conf | tr '\n' ' '
 grep -E 'gzip_comp_level' $A/h5bp/web_performance/compression.conf | tr -s ' ' | tr '\n' ' '
-grep -hE '^brotli_static|^[[:space:]]*gzip_static' $A/http.d/brotli.conf $A/h5bp/web_performance/compression.conf | tr -s ' ' | tr '\n' ' '
 grep -E '^zlib\.output_compression' "$INI" | sort | uniq -c | tr -s ' ' | tr '\n' ' '; echo

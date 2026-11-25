@@ -44,7 +44,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.22.0"
+readonly SCRIPT_VERSION="1.22.1"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -76,18 +76,18 @@ QDISC="${SETUP_QDISC:-$QDISC}"
 LIMIT_REQ_EXEMPT="${LIMIT_REQ_EXEMPT:-}"
 LIMIT_REQ_EXEMPT_IGNORED=0
 [[ -n ${SETUP_LIMIT_REQ_EXEMPT+x} ]] && LIMIT_REQ_EXEMPT_IGNORED=1
-# Static-asset precompression (.br/.gz siblings served by brotli_static and
-# gzip_static) is on by default since 1.21.58: compressing
-# an asset per request capped a 177 KB script at 2,100 req/s (3.8 ms of nginx
-# CPU each) where the sibling is served at the uncompressed rate, and a CDN
-# still sends the origin every miss.  SETUP_PRECOMPRESS_ASSETS=0 turns it off
-# (the siblings it made are removed) and is persisted in the same host file.
-PRECOMPRESS_ASSETS="${PRECOMPRESS_ASSETS:-1}"
-PRECOMPRESS_ASSETS_PERSIST=0
+# Static-asset precompression (.br/.gz siblings for brotli_static and
+# gzip_static, 1.21.58-1.22.0) was removed in 1.22.1 together with those two
+# modules: nginx compresses with dynamic gzip and Brotli only.  An exported
+# SETUP_PRECOMPRESS_ASSETS is remembered for the warning validate_all prints
+# and dropped from the environment; a PRECOMPRESS_ASSETS line an older
+# release persisted in the host file is dropped from memory here.
+RETIRED_PRECOMPRESS_ENV=""
 if [[ -n ${SETUP_PRECOMPRESS_ASSETS+x} ]]; then
-  PRECOMPRESS_ASSETS=$SETUP_PRECOMPRESS_ASSETS
-  PRECOMPRESS_ASSETS_PERSIST=1
+  RETIRED_PRECOMPRESS_ENV="SETUP_PRECOMPRESS_ASSETS=${SETUP_PRECOMPRESS_ASSETS}"
+  unset SETUP_PRECOMPRESS_ASSETS
 fi
+unset PRECOMPRESS_ASSETS
 # OPcache JIT: the tracing JIT is always on for the pool (buffer OPcache/8,
 # 32..128 MB, with tuned hotness thresholds (64/127/16/64) on 3+ CPU hosts and a
 # conservative set on 1-2 CPU hosts; measured +5% on the CPU-bound XenForo
@@ -146,7 +146,6 @@ if [[ -n ${SETUP_ANGIE_COMPRESSION+x} ]]; then
   [[ -n ${SETUP_NGINX_COMPRESSION+x} ]] || export SETUP_NGINX_COMPRESSION=$SETUP_ANGIE_COMPRESSION
   unset SETUP_ANGIE_COMPRESSION
 fi
-[[ $PRECOMPRESS_ASSETS == 0 ]] || PRECOMPRESS_ASSETS=1
 # XenForo job runner.  XenForo runs its job queue (cron tasks, search
 # indexing, XFMG video transcoding) inside member page requests by default
 # ("Job run trigger: activity-based").  With the admin option switched to
@@ -260,8 +259,6 @@ readonly CRON_END="# END setup.sh managed cron"
 readonly CRON_WWW_CHOWN='/usr/bin/find /var/www -mindepth 1 \( -path /var/www/logs -o -path /var/www/mysql_database -o -name "*.log" -o -name "wp-config.php" \) -prune -o -exec /usr/bin/chown -h www-data:www-data {} +'
 # The form written by releases up to 1.8.33, kept so a re-run upgrades it.
 readonly CRON_WWW_CHOWN_LEGACY='/usr/bin/chown www-data:www-data -R /var/www/'
-# Helper that keeps precompressed static assets fresh (SETUP_PRECOMPRESS_ASSETS=1).
-readonly CRON_PRECOMPRESS='/usr/local/bin/setup-precompress.sh'
 # WordPress ships its own pseudo-cron.  When the hardening step disables it
 # (DISABLE_WP_CRON), this managed entry runs every site's wp-cron.php as the
 # PHP user so scheduled posts, updates and plugin jobs still fire.

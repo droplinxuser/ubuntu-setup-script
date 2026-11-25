@@ -101,6 +101,9 @@ jobs:
         run: |
           rc=0
           for f in tests/unit/t-*.sh; do
+            # Runs only inside tests/test-tuning.sh (needs its check/TMP/ROOT);
+            # the Tuning tests step covers it.
+            [[ $f == tests/unit/t-nginx-build.sh ]] && continue
             echo "::group::$f"
             bash "$f" || rc=1
             echo "::endgroup::"

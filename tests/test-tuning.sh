@@ -3803,6 +3803,24 @@ nb_rc() { local rc=0; nginx_static_brotli "$1" || rc=$?; printf '%s' "$rc"; }
 check "nginx_static_brotli: a static ngx_brotli is found in nginx -V" test "$(nb_rc nb_static)" = 0
 check "nginx_static_brotli: a dynamic ngx_brotli does not count (no load_module is written)" test "$(nb_rc nb_dynamic)" = 1
 check "nginx_static_brotli: a missing binary is status 2" test "$(nb_rc "$TMP/no-such-nginx")" = 2
+nb_filter() { printf 'nginx version: nginx/1.31.10\nconfigure arguments: --prefix=/x --add-module=/build/ngx_brotli/filter --with-threads\n' >&2; }
+check "nginx_static_brotli: the 1.22.1 filter-only form (--add-module=.../ngx_brotli/filter) is found" test "$(nb_rc nb_filter)" = 0
+# brotli.conf never carries brotli_static (not compiled in since 1.22.1): not
+# from the repository template, and an existing generated file that has it
+# (1.22.0, or a line an activation commented out) is rewritten without it.
+bt=$TMP/brotli-static; rm -rf "$bt"; mkdir -p "$bt/http.d"
+printf 'http {\n}\n' > "$bt/nginx.conf"
+printf 'brotli on;\nbrotli_static on;\nbrotli_comp_level 5;\nbrotli_types text/css;\n' > "$bt/http.d/brotli_conf"
+printf '# Managed by setup.sh: dynamic Brotli from http.d/brotli_conf.\n# brotli_static on: precompressed .br siblings (SETUP_PRECOMPRESS_ASSETS=1).\nbrotli on;\n# setup-nginx-build-off: brotli_static on;\nbrotli_comp_level 4;\n' > "$bt/http.d/brotli.conf"
+( NGINX_TEST_BIN=nb_filter ensure_nginx_compression "$bt" ) >/dev/null 2>&1 || true
+check "brotli.conf from the template has no brotli_static" not grep -q 'brotli_static' "$bt/http.d/brotli.conf"
+check "brotli.conf from the template keeps dynamic Brotli at the profile level" \
+  bash -c 'grep -qx "brotli on;" "$1" && grep -qx "brotli_comp_level 4;" "$1"' _ "$bt/http.d/brotli.conf"
+rm -f "$bt/http.d/brotli_conf"
+( NGINX_TEST_BIN=nb_filter ensure_nginx_compression "$bt" ) >/dev/null 2>&1 || true
+check "brotli.conf without a template has no brotli_static" not grep -q 'brotli_static' "$bt/http.d/brotli.conf"
+check "brotli.conf without a template still turns dynamic Brotli on" grep -qx 'brotli on;' "$bt/http.d/brotli.conf"
+unset bt; unset -f nb_filter
 # A load_module of Brotli/zstd (left by a packaged server) is commented out
 # with the static-build marker; the managed 50-brotli.conf stanza moves away.
 ml=$TMP/modload; mkdir -p "$ml/modules-enabled" "$ml/custom.d"
@@ -3836,7 +3854,8 @@ check "that case reports the retirement" test "$(head -1 "$TMP/zstd-own.out")" =
 check "that case still reports the operator file as a miss" grep -qF "zstd: this nginx is built without zstd, but $zo/conf.d/site.conf" "$TMP/zstd-own.out"
 unset zo
 unset -f zt_in_use zt_unused zt_no_install zt_stub_empty nb_static nb_dynamic nb_rc; unset zt
-check "asset precompression is on by default" test "$PRECOMPRESS_ASSETS" = 1
+check "SETUP_PRECOMPRESS_ASSETS / PRECOMPRESS_ASSETS are gone from memory (removed in 1.22.1)" \
+  bash -c '[[ -z ${1} && -z ${2} ]]' _ "${PRECOMPRESS_ASSETS:-}" "${SETUP_PRECOMPRESS_ASSETS:-}"
 
 # --basic server= is persisted and honoured by host_server_type.
 # ENABLED is "declare -A" in lib/cli.sh (sourced at run time): the keys are
@@ -3954,55 +3973,12 @@ check "app_type_at_root: chevereto" test "$(app_type_at_root "$TMP/apptypes/ch")
 check "app_type_at_root: unrelated tree is empty" test -z "$(app_type_at_root "$TMP/apptypes/plain")"
 check "app_type_at_root: missing root is empty" test -z "$(app_type_at_root "$TMP/apptypes/nope")"
 
-mkdir -p "$TMP/assets/js" "$TMP/assets/internal_data"
-head -c 20000 /dev/zero | tr '\0' 'a' > "$TMP/assets/js/app.js"
-head -c 20000 /dev/zero | tr '\0' 'b' > "$TMP/assets/internal_data/skip.js"
-printf 'x' > "$TMP/assets/js/tiny.js"
-precompress_static_assets "$TMP/assets" >/dev/null
-check "precompress_static_assets writes a gzip sibling" test -s "$TMP/assets/js/app.js.gz"
-check "precompress sibling keeps the source mtime" test ! "$TMP/assets/js/app.js" -nt "$TMP/assets/js/app.js.gz"
-no_skip_siblings() { [[ ! -e "$TMP/assets/internal_data/skip.js.gz" && ! -e "$TMP/assets/js/tiny.js.gz" ]]; }
-check "precompress_static_assets skips internal_data and tiny files" no_skip_siblings
-check "precompress_static_assets is incremental" \
-  test "$(precompress_static_assets "$TMP/assets")" = 0
-rm "$TMP/assets/js/app.js"
-precompress_static_assets "$TMP/assets" >/dev/null
-check "precompress_static_assets removes orphaned siblings" test ! -e "$TMP/assets/js/app.js.gz"
-# A source that shrinks to 1 KiB or less loses its sibling: the old pass
-# skipped small files, so the stale .gz of the larger version stayed served.
-head -c 3000 /dev/zero | tr '\0' 'c' > "$TMP/assets/js/shrink.js"
-precompress_static_assets "$TMP/assets" >/dev/null
-head -c 900 /dev/zero | tr '\0' 'd' > "$TMP/assets/js/shrink.js"
-touch -d '+1 minute' "$TMP/assets/js/shrink.js"
-precompress_static_assets "$TMP/assets" >/dev/null
-check "a source that shrank below 1 KiB loses its stale sibling" test ! -e "$TMP/assets/js/shrink.js.gz"
-# A rollback restores an older mtime: the sibling must be rebuilt, not kept.
-head -c 4000 /dev/zero | tr '\0' 'e' > "$TMP/assets/js/roll.js"
-precompress_static_assets "$TMP/assets" >/dev/null
-head -c 4000 /dev/zero | tr '\0' 'f' > "$TMP/assets/js/roll.js"
-touch -d '2001-01-01' "$TMP/assets/js/roll.js"
-precompress_static_assets "$TMP/assets" >/dev/null
-check "a source restored with an older mtime is recompressed" \
-  test "$(gzip -dc "$TMP/assets/js/roll.js.gz" | head -c 1)" = f
-check "the rebuilt sibling carries the restored mtime" \
-  bash -c '[[ ! $1 -nt $2 && ! $1 -ot $2 ]]' _ "$TMP/assets/js/roll.js" "$TMP/assets/js/roll.js.gz"
-# Turning precompression off removes the siblings the helper made (same
-# mtime as the source) and keeps a hand-made one.
-head -c 4000 /dev/zero | tr '\0' 'g' > "$TMP/assets/js/hand.js"
-gzip -9 -n -c "$TMP/assets/js/hand.js" > "$TMP/assets/js/hand.js.gz"
-touch -d '2002-02-02' "$TMP/assets/js/hand.js.gz"
-check "precompress_remove_siblings reports what it removed" \
-  test "$(precompress_remove_siblings "$TMP/assets")" -ge 1
-check "precompress_remove_siblings removes managed siblings" test ! -e "$TMP/assets/js/roll.js.gz"
-check "precompress_remove_siblings keeps a hand-made sibling" test -e "$TMP/assets/js/hand.js.gz"
-check "precompress_remove_siblings keeps the sources" test -s "$TMP/assets/js/roll.js"
-# The cron helper (CRON_PRECOMPRESS is readonly, so read the generator)
-# carries the remove function and its --remove mode.
-pc_helper_has() { local b; b=$(declare -f write_precompress_helper); [[ $b == *"$1"* ]]; }
-check "the precompress helper embeds precompress_remove_siblings" \
-  pc_helper_has "precompress_static_assets precompress_remove_siblings"
-check "the precompress helper has a --remove mode" pc_helper_has "--remove"
-unset -f pc_helper_has
+# Asset precompression was removed in 1.22.1 (no gzip_static/brotli_static);
+# it never ran on a production host, so there is nothing to clean up.
+check "deploy_nginx_tree fits the synced tree to the live build outside the migration (droppable directives added since activation)" \
+  bash -c 'f=$(sed -n "/^deploy_nginx_tree()/,/^}/p" "$1"); grep -qF "elif [[ -z \${NGINX_TEST_BIN:-} && -x \${NGINX_BIN:-} ]]; then" <<<"$f" && grep -qF "nginx_build_fit info \"\" \"\$target/nginx.conf\"" <<<"$f"' _ "$ALL_SRC"
+check "no precompression code is left (helper, pass, persistence, cron line)" \
+  bash -c '! grep -qE "^(write_precompress_helper|configure_asset_precompression|precompress_static_assets|persist_precompress_assets|retire_asset_precompression)\(\)|CRON_PRECOMPRESS" "$1"' _ "$ALL_SRC"
 
 
 # --purge restores paired sysctls in an order the kernel accepts: the
@@ -7409,11 +7385,11 @@ check "nginx-build.conf ships beside setup.sh with every component the tool buil
   bash -c 'for k in NGINX LLVM OPENSSL PCRE2 ZLIB_NG BROTLI NGX_BROTLI; do grep -qx "${k}_VERSION=latest" "$1/nginx-build.conf" || exit 1; done' _ "$ROOT"
 nginx_modules=$(sed -n '/^CONFIGURE_MODULES=(/,/^)/p' "$ROOT/tools/nginx-build.sh")
 check "nginx-build: only the modules server-configs-nginx uses (no mail/stream/ssi/grpc ...)" \
-  bash -c 'for w in http_v3_module http_realip_module http_gzip_static_module http_stub_status_module with-threads without-http_ssi_module without-http_grpc_module; do grep -q -- "$w" <<<"$1" || exit 1; done; ! grep -qE -- "--with-(mail|stream|http_dav|http_mp4|http_sub|http_acme)" <<<"$1"' _ "$nginx_modules"
-check "nginx-build: Brotli is compiled in statically (--add-module, never a dynamic module)" \
-  bash -c 'grep -qF -- "--add-module=\"\$work/ngx_brotli\"" "$1" && ! grep -qE -- "^[^#]*--add-dynamic-module" "$1"' _ "$ROOT/tools/nginx-build.sh"
-check "nginx-build: auth_basic and limit_req compiled in, limit_conn left out; recipe 4" \
-  bash -c '! grep -q -- "--without-http_auth_basic_module" <<<"$1" && ! grep -q -- "--without-http_limit_req_module" <<<"$1" && grep -q -- "--without-http_limit_conn_module" <<<"$1" && grep -q "^BUILD_RECIPE=4" "$2"' \
+  bash -c 'for w in http_v3_module http_realip_module http_stub_status_module with-threads without-http_ssi_module without-http_grpc_module; do grep -q -- "$w" <<<"$1" || exit 1; done; ! grep -qE -- "--with-(mail|stream|http_dav|http_mp4|http_sub|http_acme|http_gzip_static)" <<<"$1"' _ "$nginx_modules"
+check "nginx-build: only the Brotli filter is compiled in statically (--add-module=ngx_brotli/filter, no brotli_static, never a dynamic module)" \
+  bash -c 'grep -qF -- "--add-module=\"\$work/ngx_brotli/filter\"" "$1" && ! grep -qF -- "--add-module=\"\$work/ngx_brotli\"" "$1" && ! grep -qE -- "^[^#]*--add-dynamic-module" "$1"' _ "$ROOT/tools/nginx-build.sh"
+check "nginx-build: auth_basic and limit_req compiled in, limit_conn left out; recipe 5" \
+  bash -c '! grep -q -- "--without-http_auth_basic_module" <<<"$1" && ! grep -q -- "--without-http_limit_req_module" <<<"$1" && grep -q -- "--without-http_limit_conn_module" <<<"$1" && grep -q "^BUILD_RECIPE=5" "$2"' \
   _ "$nginx_modules" "$ROOT/tools/nginx-build.sh"
 unset nginx_modules
 # install_stripped under set -euo pipefail with no GitHub toolchain directory

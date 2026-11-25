@@ -339,6 +339,13 @@ install_nginx() {
   # installed build on a re-run.  tmpfiles.d/setup-nginx.conf was applied by
   # nginx_build_ensure, so /var/cache/nginx/*_temp exist for `nginx -t`.
   local -x NGINX_TEST_BIN=$cand
+  # Fresh host: deploy_nginx_tree fits the rendered tree (operator vhosts
+  # included) to the staged candidate before its test, so a directive the
+  # lean build leaves out (gzip_static, brotli_static since 1.22.1) is
+  # commented out and reported instead of failing --nginx.  activate runs the
+  # same fit again against the installed binary (a no-op by then).
+  local NGINX_DEPLOY_FIT_BIN=""
+  (( fresh )) && NGINX_DEPLOY_FIT_BIN=$cand
   if ! deploy_nginx_configs; then
     rollback_nginx_tree "$nginx_backup"
     return 1

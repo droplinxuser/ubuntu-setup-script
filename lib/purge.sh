@@ -371,7 +371,6 @@ purge_nginx() {
   cron_remove_line '/usr/bin/find /var/www -mindepth 1' || true
   cron_remove_line "$CRON_WWW_CHOWN_LEGACY" || true
   cron_remove_line "$CRON_WWW_CHOWN" || true
-  cron_remove_line "$CRON_PRECOMPRESS" || true
   systemctl daemon-reload || true
   ok "nginx purged (files preserved)"
 }

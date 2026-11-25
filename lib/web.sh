@@ -1729,7 +1729,7 @@ tune_nginx_dedupe_http() {
 # Record one KEY="VALUE" line in /etc/default/setup-tuning (the host file
 # every run sources at startup), replacing an existing line for the key.
 # Shared by every environment-supplied option that must survive a plain
-# --optimize: asset precompression, the OPcache JIT mode, the Node.js major
+# --optimize: the OPcache JIT mode, the Node.js major
 # and the build modes.
 persist_tuning_var() {
   local key=$1 value=$2 f=${SETUP_TUNING_FILE:-/etc/default/setup-tuning} line
@@ -1739,7 +1739,7 @@ persist_tuning_var() {
   # The host file is sourced as root on every run, so the value is written
   # shell-quoted (%q) rather than wrapped in double quotes: a value that
   # contains a quote, $(...) or a backtick (an operator typo in
-  # SETUP_PRECOMPRESS_ASSETS, say) must stay data, not become a command.
+  # SETUP_PHP_PAGE_GZIP, say) must stay data, not become a command.
   printf -v line '%s=%q' "$key" "$value"
   if [[ -f $f ]] && grep -qE "^${key}=" "$f"; then
     sed_in_place -E "s|^${key}=.*|$(sed_replacement_escape "$line")|" "$f"
@@ -1747,15 +1747,6 @@ persist_tuning_var() {
     printf '%s\n' "$line" >> "$f"
   fi
   chmod 644 "$f" 2>/dev/null || true
-}
-
-# Keep SETUP_PRECOMPRESS_ASSETS in /etc/default/setup-tuning, so a plain
-# --optimize keeps the operator's choice.
-persist_precompress_assets() {
-  (( PRECOMPRESS_ASSETS_PERSIST )) || return 0
-  [[ ${EUID} -eq 0 ]] || return 0
-  persist_tuning_var PRECOMPRESS_ASSETS "$PRECOMPRESS_ASSETS"
-  tune_note "precompress: PRECOMPRESS_ASSETS=${PRECOMPRESS_ASSETS} persisted in /etc/default/setup-tuning"
 }
 
 # Keep SETUP_XF_JOB_CRON in /etc/default/setup-tuning the same way.  Called
@@ -1770,7 +1761,7 @@ persist_xf_job_cron() {
 }
 
 # Document root of an nginx vhost file ("" when none).  Shared by the
-# WordPress/XenForo vhost scanners, the worker cap and asset precompression.
+# WordPress/XenForo vhost scanners and the worker cap.
 # A generated vhost can legitimately have no root directive (a redirect-only
 # block or a generated terminator).  Under `set -e` with inherit_errexit a
 # failing `grep -m1` inside the command substitution aborted the callers and
@@ -1806,214 +1797,6 @@ app_db_host_is_local() {
     ""|localhost|127.0.0.1|::1|/*|unix:*) return 0 ;;
     *) return 1 ;;
   esac
-}
-
-# Precompress the static assets under one document root so brotli_static and
-# gzip_static serve .br/.gz siblings instead of
-# compressing on every request (one 177 KB XenForo script compressed per
-# request: 2,100 req/s at 3.8 ms of nginx CPU each on the Xeon E-2236 test
-# host, 22,000 req/s uncompressed).  Incremental: a sibling carries its source's
-# mtime and is (re)built whenever the two differ in either direction (a
-# rollback with tar/rsync -a/cp -p restores an older mtime), orphaned siblings
-# are removed, a sibling that is not smaller is dropped, and ownership follows
-# the source so a rerun is a no-op.  A source of 1 KiB or less is not worth a
-# sibling, and one that shrank below that loses the sibling it had: the old
-# rule skipped small files entirely, so a 3 KB script replaced by a 900-byte
-# one kept serving the old siblings to every compressing client.  The source's
-# size and mtime are read before compressing and checked again afterwards; a
-# file rewritten mid-way (an upgrade during the 5-minute cron) is left for the
-# next run instead of being stamped fresh with stale content.  Images, woff2
-# and the application data directories are skipped.  Prints the number of
-# siblings written.
-precompress_static_assets() {
-  local root=$1 f out tmp ext n=0 have_brotli=0 before
-  [[ -d $root ]] || { printf 0; return 0; }
-  command -v brotli >/dev/null 2>&1 && have_brotli=1
-  while IFS= read -r -d '' f; do
-    before=$(stat -c '%y %s' "$f" 2>/dev/null) || continue
-    if (( ${before##* } <= 1024 )); then
-      rm -f "${f}.gz" "${f}.br"
-      continue
-    fi
-    for ext in gz br; do
-      out="${f}.${ext}"
-      if [[ $ext == br && $have_brotli -eq 0 ]]; then
-        # No CLI to rebuild it: a sibling that no longer matches must go.
-        [[ -e $out && ( $f -nt $out || $f -ot $out ) ]] && rm -f "$out"
-        continue
-      fi
-      [[ ! -e $out || $f -nt $out || $f -ot $out ]] || continue
-      tmp="${out}.tmp.$$"
-      if { [[ $ext == gz ]] && gzip -9 -n -c < "$f" > "$tmp"; } \
-         || { [[ $ext == br ]] && brotli -q 11 -c < "$f" > "$tmp"; }; then
-        if [[ $(stat -c '%y %s' "$f" 2>/dev/null) != "$before" ]]; then
-          rm -f "$tmp" "$out"
-        elif (( $(stat -c %s "$tmp") < ${before##* } )); then
-          touch -r "$f" "$tmp"
-          chown --reference="$f" "$tmp" 2>/dev/null || true
-          chmod 644 "$tmp"
-          mv -f "$tmp" "$out"
-          n=$(( n + 1 ))
-        else
-          rm -f "$tmp" "$out"
-        fi
-      else
-        rm -f "$tmp"
-      fi
-    done
-  done < <(find "$root" -type f -regextype posix-extended \
-             -regex '.*\.(js|mjs|css|svg|json|xml|txt|map|ico|webmanifest|ttf|otf|eot|woff)$' \
-             ! -path '*/internal_data/*' ! -path '*/data/*' ! -path '*/src/*' ! -path '*/install/*' \
-             ! -path '*/wp-content/uploads/*' ! -path '*/wp-content/cache/*' ! -path '*/.git/*' \
-             -print0 2>/dev/null)
-  # Siblings whose source is gone (an upgrade removed or renamed the file).
-  while IFS= read -r -d '' f; do
-    [[ -e ${f%.*} ]] || rm -f "$f"
-  done < <(find "$root" -type f -regextype posix-extended \
-             -regex '.*\.(js|mjs|css|svg|json|xml|txt|map|ico|webmanifest|ttf|otf|eot|woff)\.(gz|br)$' \
-             ! -path '*/internal_data/*' ! -path '*/data/*' ! -path '*/wp-content/uploads/*' \
-             -print0 2>/dev/null)
-  printf '%s' "$n"
-}
-
-# Remove the siblings precompress_static_assets made under one root: a .gz/.br
-# next to its source with exactly the source's mtime (the helper stamps every
-# sibling that way; a hand-made one almost never matches).  Used when the
-# feature is turned off or a root leaves the list: gzip_static stays on at
-# http level, so siblings left behind would be served long after an upgrade
-# changed their sources.  Prints the number removed.
-precompress_remove_siblings() {
-  local root=$1 f src n=0
-  [[ -d $root ]] || { printf 0; return 0; }
-  while IFS= read -r -d '' f; do
-    src=${f%.*}
-    [[ -f $src && ! $src -nt $f && ! $src -ot $f ]] || continue
-    rm -f "$f" && n=$(( n + 1 ))
-  done < <(find "$root" -type f -regextype posix-extended \
-             -regex '.*\.(js|mjs|css|svg|json|xml|txt|map|ico|webmanifest|ttf|otf|eot|woff)\.(gz|br)$' \
-             ! -path '*/internal_data/*' ! -path '*/data/*' ! -path '*/wp-content/uploads/*' \
-             -print0 2>/dev/null)
-  printf '%s' "$n"
-}
-
-# The account the precompress helper works as.  The web roots belong to the
-# PHP user, so a root process creating and renaming files there can be steered
-# through a planted symlink; as www-data the helper can only touch what a
-# compromised PHP process could already touch.
-readonly PRECOMPRESS_USER=www-data
-# Command prefix that runs the helper as that account.  One definition for the
-# cron entry and the first pass, so both run it the same way.
-readonly PRECOMPRESS_RUNNER="/usr/sbin/runuser -u ${PRECOMPRESS_USER} --"
-
-# Install the cron helper that keeps the siblings fresh.  It carries a copy of
-# precompress_static_assets (declare -f), so the cron job has no dependency on
-# this script's location, and is regenerated by every install/--optimize.
-write_precompress_helper() {
-  local helper=$CRON_PRECOMPRESS tmp
-  tmp=$(tmp_file) || return 1
-  {
-    printf '#!/bin/bash\n'
-    printf '# Managed by setup.sh %s: keep .br/.gz siblings of static assets fresh for\n' "$SCRIPT_VERSION"
-    printf '# brotli_static/gzip_static.  Regenerated by every --optimize; do not edit.\n'
-    printf 'set -u\nexport LC_ALL=C PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n'
-    # A root caller (a crontab line written by an older release, an operator
-    # at the prompt) drops to the web user before any file is touched.
-    printf '%s\n' "if [ \"\$(id -u)\" = 0 ]; then exec ${PRECOMPRESS_RUNNER} \"\$0\" \"\$@\"; fi"
-    printf 'ROOTS=(%s)\n' "$(printf '%q ' "$@")"
-    # One pass at a time: the first pass of a large tree runs in the
-    # background and may outlast the next 5-minute cron tick, which then
-    # skips; --remove waits for a running pass instead.
-    printf '%s\n' 'if exec 9>/run/lock/setup-precompress.lock 2>/dev/null; then' \
-      '  if [ "${1:-}" = --remove ]; then flock 9; else flock -n 9 || exit 0; fi' 'fi'
-    declare -f precompress_static_assets precompress_remove_siblings
-    # `--remove [ROOT...]` deletes the siblings it made (all ROOTS by default).
-    printf 'if [ "${1:-}" = --remove ]; then\n  shift; [ $# -gt 0 ] || set -- "${ROOTS[@]}"\n  total=0\n  for root in "$@"; do\n    n=$(precompress_remove_siblings "$root")\n    total=$(( total + ${n:-0} ))\n  done\n  printf "removed %%s precompressed files\\n" "$total"\n  exit 0\nfi\n'
-    printf 'total=0\nfor root in "${ROOTS[@]}"; do\n  n=$(precompress_static_assets "$root")\n  total=$(( total + ${n:-0} ))\ndone\nprintf "precompressed %%s files\\n" "$total"\n'
-  } > "$tmp"
-  if commit_if_changed "$helper" "$tmp"; then
-    tune_note "precompress: helper ${helper} written for ${*}"
-  fi
-  chmod 755 "$helper"
-}
-
-# Asset precompression for every detected XenForo/WordPress vhost: writes the
-# cron helper and runs it once (install and --optimize), or retires the
-# helper when the feature is off.  write_cron adds the 5-minute entry so an
-# application upgrade is re-compressed (and stale siblings dropped) quickly.
-configure_asset_precompression() {
-  local target=${1:-/etc/nginx} helper=$CRON_PRECOMPRESS file root moved out
-  local -a roots=() nicer=(nice -n 19)
-  local -a old_roots=()
-  persist_precompress_assets
-  command -v ionice >/dev/null 2>&1 && nicer+=(ionice -c 3)
-  # Roots the current helper serves (its ROOTS line is written with %q).
-  if [[ -f $helper ]] && grep -q 'Managed by setup.sh' "$helper" 2>/dev/null; then
-    mapfile -t old_roots < <(bash -c 'eval "$(grep -m1 "^ROOTS=(" "$1")"; printf "%s\n" "${ROOTS[@]}"' _ "$helper" 2>/dev/null)
-  fi
-  if (( ! PRECOMPRESS_ASSETS )); then
-    if [[ -f $helper ]] && grep -q 'Managed by setup.sh' "$helper" 2>/dev/null; then
-      # gzip_static stays on at http level: siblings left behind would be
-      # served after the next upgrade changed their sources.
-      # A helper from 1.21.57 or older has no --remove mode: rewrite it for
-      # the same roots first.
-      if (( ${#old_roots[@]} )) && write_precompress_helper "${old_roots[@]}"; then
-        # shellcheck disable=SC2086
-        out=$("${nicer[@]}" $PRECOMPRESS_RUNNER "$helper" --remove 2>/dev/null || true)
-        [[ -n $out ]] && tune_note "precompress: ${out} (PRECOMPRESS_ASSETS=0)"
-      fi
-      moved=$(preserve_to_tmp "$helper" 2>/dev/null || true)
-      [[ -n $moved ]] && tune_note "precompress: helper moved to ${moved} (PRECOMPRESS_ASSETS=0)"
-      write_cron >/dev/null 2>&1 || true
-    fi
-    return 0
-  fi
-  while IFS= read -r file; do
-    [[ -n $file ]] || continue
-    root=$(nginx_vhost_root "$file")
-    [[ -n $root && -d $root ]] && roots+=("$root")
-  done < <({ nginx_xenforo_vhosts "$target"; nginx_wordpress_vhosts "$target"; } 2>/dev/null | sort -u)
-  if (( ${#roots[@]} == 0 )); then
-    # Not a fault: precompression is on by default (1.21.58) and a fresh
-    # install has no site yet; the next --domain or --optimize picks it up.
-    tune_summary "precompress: no XenForo/WordPress vhost with files yet; nothing to precompress"
-    return 0
-  fi
-  # The brotli CLI (a 15 KB package) builds the .br siblings; without it the
-  # pass produces gzip siblings only.  Installed here, before the first pass,
-  # not in the compression step that runs later in the same nginx pass.
-  if ! command -v brotli >/dev/null 2>&1; then
-    apt_install brotli || warn "Could not install the brotli CLI; precompressed assets will be gzip only"
-  fi
-  write_precompress_helper "${roots[@]}" || return 1
-  # The managed crontab was written before the helper existed on a first run.
-  write_cron >/dev/null 2>&1 || warn "Could not refresh the managed crontab for the precompress helper"
-  # A root that left the list (vhost removed, application changed) keeps no
-  # siblings that nothing refreshes any more.
-  local old keep r
-  for old in "${old_roots[@]}"; do
-    keep=0
-    for r in "${roots[@]}"; do [[ $r == "$old" ]] && { keep=1; break; }; done
-    (( keep )) && continue
-    # Unquoted on purpose: PRECOMPRESS_RUNNER is a fixed command prefix.
-    # shellcheck disable=SC2086
-    out=$("${nicer[@]}" $PRECOMPRESS_RUNNER "$helper" --remove "$old" 2>/dev/null || true)
-    [[ -n $out ]] && tune_note "precompress: ${out} under ${old} (no longer listed)"
-  done
-  # The first pass over a tree without siblings is the slow one (gzip -9 and
-  # brotli -q 11 for every asset: several minutes for a XenForo + WordPress
-  # host), so it runs in the background and the run does not wait for it;
-  # nginx serves dynamic compression until each sibling exists.  Later passes
-  # only touch changed files and run in line.
-  if [[ -z $(find "${roots[@]}" -type f \( -name '*.js.gz' -o -name '*.css.gz' \) -print -quit 2>/dev/null) ]]; then
-    # shellcheck disable=SC2086
-    setsid "${nicer[@]}" $PRECOMPRESS_RUNNER "$helper" </dev/null >/dev/null 2>&1 &
-    tune_note "precompress: first pass started in the background under ${roots[*]} (brotli_static/gzip_static; refreshed every 5 min by cron)"
-    return 0
-  fi
-  # shellcheck disable=SC2086
-  out=$("${nicer[@]}" $PRECOMPRESS_RUNNER "$helper" 2>/dev/null || true)
-  tune_note "precompress: ${out:-ran} under ${roots[*]} (brotli_static/gzip_static; refreshed every 5 min by cron)"
-  return 0
 }
 
 # Remove the FastCGI upstream keepalive cache from nginx.conf.  Every idle
@@ -3298,9 +3081,11 @@ EOF
 # ---------------------------------------------------------------------------
 # nginx dynamic compression: Brotli, then gzip
 # ---------------------------------------------------------------------------
-# Static assets are precompressed (.br/.gz siblings, SETUP_PRECOMPRESS_ASSETS,
-# on by default since 1.21.58), so the per-request filters only see dynamic
-# responses and assets without a sibling.
+# Every response is compressed per request (dynamic gzip and Brotli).  The
+# static-asset precompression of 1.21.58-1.22.0 (.br/.gz siblings for
+# gzip_static and brotli_static) was removed in 1.22.1 with those modules:
+# the build has neither, so brotli.conf never carries brotli_static, and a
+# generated brotli.conf that still does is rewritten without it.
 #
 # Brotli is compiled into the 1.22 nginx as a static module (--add-module,
 # tools/nginx-build.sh): no package, no load_module, no modules-enabled
@@ -3440,7 +3225,7 @@ nginx_retire_module_loads() {
 nginx_brotli_level() {
   local level=${SETUP_BROTLI_LEVEL:-}
   if ! [[ $level =~ ^([1-9]|1[01])$ ]]; then
-    # Dynamic responses only (static assets use precompressed .br siblings).
+    # Every compressible response, static assets included (no siblings).
     # Measured on an 8 vCPU XenForo origin (130 KB HTML thread page, nginx
     # CPU per request): level 5 = 5.3 ms, level 4 = 2.7 ms, level 3 = 1.5 ms
     # for 21 / 23 / 24 KB on the wire.  Level 4 halves the compression CPU of
@@ -3474,12 +3259,9 @@ ensure_nginx_compression() {
     return 0
   fi
 
-  local brotli_level static_mode=off bin brc=0
+  local brotli_level bin brc=0
   brotli_level=$(nginx_brotli_level)
   NGINX_BROTLI_LEVEL=$brotli_level
-  # brotli_static serves a .br sibling when one exists and falls back to the
-  # dynamic filter otherwise; it is only useful with precompressed assets.
-  (( PRECOMPRESS_ASSETS )) && static_mode=on
 
   # --optimize installs nothing for compression any more: Brotli is part of
   # the build, so its presence is a fact of the binary, not a package state.
@@ -3502,16 +3284,16 @@ ensure_nginx_compression() {
     if [[ -f "${target}/http.d/brotli_conf" ]]; then
       {
         printf '# Managed by setup.sh: dynamic Brotli from http.d/brotli_conf.\n'
-        printf '# brotli_static %s: precompressed .br siblings (SETUP_PRECOMPRESS_ASSETS=%s).\n' "$static_mode" "$PRECOMPRESS_ASSETS"
         cat "${target}/http.d/brotli_conf"
       } > "$tmp"
       sed_in_place -E "s/^brotli_comp_level [0-9]+;/brotli_comp_level ${brotli_level};/" "$tmp"
-      sed_in_place -E "s/^brotli_static (on|off);/brotli_static ${static_mode};/" "$tmp"
+      # brotli_static is not compiled in (1.22.1): never carried over, also
+      # not as a line an activation commented out.
+      sed_in_place -E '/^[[:space:]]*(# setup-nginx-build-off: )?brotli_static([[:space:]]|;)/d' "$tmp"
     else
       cat > "$tmp" <<EOT
 # Managed by setup.sh: dynamic Brotli (template was missing).
 brotli on;
-brotli_static ${static_mode};
 brotli_comp_level ${brotli_level};
 brotli_min_length 50;
 brotli_types text/plain text/css text/xml application/json application/javascript application/xml image/svg+xml font/ttf font/otf;
@@ -3916,6 +3698,26 @@ deploy_nginx_tree() {
     nginx_build_tmpfiles_apply || true
   fi
 
+  # A fresh install (install_nginx sets NGINX_DEPLOY_FIT_BIN to the staged
+  # candidate) fits the tree to that build before the first test: operator
+  # vhosts left in /etc/nginx (e.g. after a distro nginx was cleared) may
+  # still carry directives of modules the lean build leaves out (gzip_static,
+  # brotli_static since 1.22.1).  They are commented out with the
+  # '# setup-nginx-build-off: ' marker and reported, the same as activation
+  # does, instead of failing the test and rolling the install back.  A line
+  # the fit cannot handle is left to the test below, which reports it.
+  # Every other sync (--optimize) fits to the live build the same way, so a
+  # droppable directive an operator added since activation does not fail the
+  # sync (1.22.1 test: a new vhost with gzip_static on; stopped --optimize).
+  # The migration tests its own candidate (NGINX_TEST_BIN) and fits it there.
+  if declare -F nginx_build_fit >/dev/null 2>&1; then
+    if [[ -n ${NGINX_DEPLOY_FIT_BIN:-} ]]; then
+      nginx_build_fit info "$NGINX_DEPLOY_FIT_BIN" "$target/nginx.conf" || true
+    elif [[ -z ${NGINX_TEST_BIN:-} && -x ${NGINX_BIN:-} ]]; then
+      nginx_build_fit info "" "$target/nginx.conf" || true
+    fi
+  fi
+
   # Validate before anything reloads.  A stopped service is valid (the tree is
   # applied at the next start); reload only when the unit is active.  The
   # migration tests with its candidate binary (NGINX_TEST_BIN).
@@ -3973,7 +3775,7 @@ sync_nginx_repo_configs() {
 }
 
 # The hardware-aware nginx profile applied to a freshly synced /etc/nginx:
-# guest caches, asset precompression, the tuner and dynamic compression, in
+# guest caches, the tuner and dynamic compression, in
 # the one order both the installer and --optimize use (the repository
 # templates are restored first so the tuner's cache values win).  Returns 1
 # when the tuner fails; the compression outcome is left in
@@ -3984,7 +3786,6 @@ nginx_apply_profile() {
   optimize_wordpress_cache "$target" || warn "WordPress cache setup was skipped"
   ensure_xf_guest_cache "$target" || warn "XenForo cache setup was skipped"
   nginx_migrate_guest_cache_includes "$target" || warn "Guest cache include migration was skipped"
-  configure_asset_precompression "$target" || warn "Asset precompression was skipped"
   tune_nginx_configs "$target" || return 1
   # Dynamic Brotli compression.  The module is optional, so a failure here
   # must not stop the run; gzip remains active.

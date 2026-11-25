@@ -128,6 +128,13 @@ by 1.21 (`PHP_BUILD`, `ANGIE_BUILD`, `VALKEY_BUILD`, `PHP_FPM_MODULES`) are
 dropped from `/etc/default/setup-tuning`.  There are no package modes left to
 choose.  Use `--php ext=` to add PHP extensions.
 
+Removed in 1.22.1: static-asset precompression (`SETUP_PRECOMPRESS_ASSETS`)
+and the two nginx modules it fed, `gzip_static` and `brotli_static`.  nginx
+compresses every response with dynamic gzip and Brotli.  The variable is
+accepted, ignored and named in a warning.  A `gzip_static` or `brotli_static` line in an operator
+vhost is commented out with the `# setup-nginx-build-off: ` marker and
+reported, instead of failing `nginx -t`.
+
 ## `--basic`
 
 | Option | Default | Effect |
@@ -145,7 +152,7 @@ What `--basic` does:
 | DNS | drop-in with `8.8.8.8`, `1.1.1.1` and `Domains=~.`, so they are the default route rather than only a fallback |
 | Packages | upgrades packages; installs the basic tools, `cron`, `logrotate` and `unattended-upgrades` |
 | OS profile | sysctl, PAM limits, governor, THP `madvise`, udev I/O rules (see [Hardware profile](#hardware-profile)) |
-| Root crontab | ownership repair of `/var/www` that skips logs and `wp-config.php`; Cloudflare IP refresh; MariaDB backup at 03:03 and monthly `mariadb-check`; `wp-cron.php` every 5 minutes; asset precompression (on by default) |
+| Root crontab | ownership repair of `/var/www` that skips logs and `wp-config.php`; Cloudflare IP refresh; MariaDB backup at 03:03 and monthly `mariadb-check`; `wp-cron.php` every 5 minutes |
 | Firewall (UFW) | deny in, allow out, `ufw limit` on every effective SSH port, 80/443 open |
 | State | originals are recorded under `/var/lib/setup.sh` for `--purge basic` |
 
@@ -327,17 +334,19 @@ as a deprecated alias: it prints a warning and installs nginx.
 **What it is.**  nginx from nginx.org (the highest published version, which
 is the mainline branch), OpenSSL, PCRE2 (JIT), zlib-ng (zlib's API; 21 %
 less gzip CPU than Ubuntu's zlib) and Brotli (google/brotli with
-google/ngx_brotli, compiled in statically, so there is no `load_module`),
+the filter module of google/ngx_brotli, compiled in statically, so there is
+no `load_module`),
 each at the version in [`nginx-build.conf`](nginx-build.conf), compiled with
 clang at `-O3 -march=native` with the hardening flags, ThinLTO, then
 rewritten by LLVM BOLT from a 60 s perf sample of live traffic (at least
 150 profiled functions; an idle server is skipped).  Only the modules
 `server-configs-nginx` uses are built: the http core with SSL, HTTP/2,
-HTTP/3 (QUIC), realip, gzip_static, stub_status (the metrics script polls it
-on 127.0.0.1), threads, Brotli, `limit_req` (the login limiter) and
+HTTP/3 (QUIC), realip, stub_status (the metrics script polls it on
+127.0.0.1), threads, dynamic Brotli, `limit_req` (the login limiter) and
 `auth_basic` (password-protected areas).  Mail, stream, ACME, DAV, mp4/flv,
 sub, SSI, uwsgi, scgi, grpc, memcached, userid, autoindex, split_clients,
-empty_gif, browser, mirror, `limit_conn` and referer are left out.
+empty_gif, browser, mirror, `limit_conn`, referer, `gzip_static` and
+`brotli_static` (both removed in 1.22.1) are left out.
 
 **Branding strip.**  Before configure, the source is patched so no response
 names the server: no default `Server` header on HTTP/1.1, HTTP/2 or HTTP/3,
@@ -386,15 +395,15 @@ Environment options:
 |---|---|---|
 | `SETUP_BROTLI_LEVEL=1..11` | 4 (3 on 1-2 CPU hosts) | dynamic Brotli level; gzip is the fallback.  Measured on a XenForo member thread page (1.21.63, pinned clock): level 1 = 0.8 ms nginx CPU / 23.9 KB, 2 = 1.3 ms / 18.4 KB, 3 = 1.4 ms / 17.9 KB, 4 = 2.1 ms / 17.1 KB; level 1 gave +4-6 % member req/s for 40 % more bytes, levels 2-3 were inside the noise.  A CPU-bound origin whose only client is Cloudflare can take 1.  There is no zstd: Cloudflare asks origins for `br, gzip` only, and `--optimize` removes old zstd stanzas |
 | `SETUP_NGINX_COMPRESSION=0` | on | turns the managed compression profile off (`SETUP_ANGIE_COMPRESSION` is still read as the old name) |
-| `SETUP_PRECOMPRESS_ASSETS=0` | on | writes `.br`/`.gz` siblings for the static assets of every XenForo/WordPress root and keeps them fresh from cron (a 177 KB script: 22,000 req/s from the sibling vs 2,100 compressed per request).  0 removes the siblings it made.  Install-time only: `--optimize` ignores the tuning override and uses the default (on).  Installs the `brotli` CLI |
 | `SETUP_XF_JOB_CRON=0` | on | removes the managed crontab entry that runs `cmd.php xf:run-jobs` once a minute as www-data for every XenForo root; persisted as `XF_JOB_CRON` |
 | `SETUP_NGINX_BUILD_BOLT=0` | 1 | skip the BOLT pass of `--optimize` |
 | `CONFIG_REPO_URL`, `CONFIG_REPO_REF` | `droplinxuser/server-configs-nginx`, `nginx` | select a fork or branch of the configuration tree |
 | `CONFIG_SOURCE_DIR=/path` | unset | use a local checkout instead of downloading |
 
 **server-configs-nginx branches.**  The 1.22 tree lives on the branch
-`nginx` (server-configs-nginx 1.7.0), and setup.sh 1.22 downloads it
-(`CONFIG_REPO_REF=nginx`).  `main` stays the Angie tree for hosts that still
+`nginx` (server-configs-nginx 1.7.1, the first without `gzip_static` and
+`brotli_static`, which setup.sh 1.22.1 needs), and setup.sh 1.22 downloads
+it (`CONFIG_REPO_REF=nginx`).  `main` stays the Angie tree for hosts that still
 run 1.21.x, and the tag `angie-final` marks the last Angie `main` (a host
 kept on 1.21.x can pin `CONFIG_REPO_REF=angie-final`).  Once every host runs
 1.22, merging `nginx` into `main` is a manual operator step; setup.sh never
@@ -842,7 +851,7 @@ migration, and never touches swap, the resolver (DNS) or the firewall (UFW),
 which stay as `--basic` or the operator left them.  The only packages it may
 add are the build prerequisites (compilers and autotools, cmake, nasm, git,
 gpgv, perf from `linux-tools` for the running kernel, the apt.llvm.org
-toolchain) and the `brotli` CLI for asset precompression; the only packages
+toolchain); the only packages
 it may remove are certbot, once nothing uses it (see Cloudflare-proxied
 sites below), and, once, the replaced packages of a 1.21.x host (see
 [Upgrading from 1.21.x](#upgrading-from-121x)).  The drivers run with
@@ -1122,7 +1131,7 @@ What the reset does on every `--optimize`:
 |---|---|
 | `/etc/default/setup-tuning` | rewritten with only host facts/feature choices: `XF_JOB_CRON`, `NODE_MAJOR`, `NODE_ALLOW_MAJOR_UPGRADE`, `PHP_EXT_EXTRA`, ... Old `TCP_CC`, `QDISC`, `STORAGE_CLASS`, compression/JIT/page-cache and rate-limit pins no longer survive |
 | `/var/lib/setup.sh/explicit-options.conf` | moved to `/tmp`; recorded `php_children`/`max_requests`, MariaDB/Valkey/ES sizes and the dedi/vps pin are dropped and the shared memory plan recomputes them |
-| tuning environment | `SETUP_TCP_CC`, `SETUP_QDISC`, `SETUP_STORAGE_CLASS`, `SETUP_PHP_WORKERS_PER_CPU`, `SETUP_PHP_JIT_HOT_*`, `SETUP_GZIP_LEVEL`, `SETUP_BROTLI_LEVEL`, `SETUP_NGINX_COMPRESSION`, `SETUP_MARIADB_IO_CAPACITY`, `SETUP_LIMIT_REQ_EXEMPT`, `SETUP_PRECOMPRESS_ASSETS`, `SETUP_PHP_PAGE_GZIP`, `SETUP_PHP_JIT_WORDPRESS` are unset for the run and listed in the report/warning |
+| tuning environment | `SETUP_TCP_CC`, `SETUP_QDISC`, `SETUP_STORAGE_CLASS`, `SETUP_PHP_WORKERS_PER_CPU`, `SETUP_PHP_JIT_HOT_*`, `SETUP_GZIP_LEVEL`, `SETUP_BROTLI_LEVEL`, `SETUP_NGINX_COMPRESSION`, `SETUP_MARIADB_IO_CAPACITY`, `SETUP_LIMIT_REQ_EXEMPT`, `SETUP_PHP_PAGE_GZIP`, `SETUP_PHP_JIT_WORDPRESS` are unset for the run and listed in the report/warning |
 
 Feature choices are not performance overrides and still apply: `NODE_MAJOR`,
 `PHP_EXT_EXTRA`, the WordPress/Chevereto cache and security toggles, and the
@@ -1280,7 +1289,7 @@ hardware (with a warning), see
 The `SETUP_*` names below are environment inputs for the run that applies
 them.  `SETUP_XF_JOB_CRON`, `SETUP_CF_SELF_SIGNED`,
 `SETUP_PHP_SESSION_HARDENING`, `SETUP_PHP_JIT_WORDPRESS`,
-`SETUP_PHP_PAGE_GZIP`, `SETUP_PRECOMPRESS_ASSETS`, `SETUP_CPU_MITIGATIONS`,
+`SETUP_PHP_PAGE_GZIP`, `SETUP_CPU_MITIGATIONS`,
 `--php ext=` (`PHP_EXT_EXTRA`) and the XenForo gzip choice are written to
 `/etc/default/setup-tuning` and therefore survive a later `--optimize`.  The
 remaining ones are one-run inputs: they are not persisted, and a later
@@ -1334,7 +1343,7 @@ Tuning overrides (ignored by `--optimize`, which uses the hardware profile):
 | `SETUP_NGINX_COMPRESSION` | 0 turns the managed compression profile off |
 | `SETUP_MARIADB_IO_CAPACITY` | `innodb_io_capacity`/`_max` |
 | `SETUP_LIMIT_REQ_EXEMPT` | ignored since 1.21.71 (the generic per-IP limits it exempted from are gone; the login limiter never used it).  A value an older release persisted only tells the TLS catch-all guard that a proxy sits in front |
-| `SETUP_PRECOMPRESS_ASSETS` | static-asset precompression (profile default 1) |
+| `SETUP_PRECOMPRESS_ASSETS` | removed in 1.22.1 (no `gzip_static`/`brotli_static`); ignored with a warning on every path |
 | `SETUP_PHP_PAGE_GZIP` | PHP page gzip for the guest cache (profile default 1) |
 | `SETUP_PHP_JIT_WORDPRESS` | 0 exempts WordPress roots from the tracing JIT (profile default 1) |
 
@@ -1512,7 +1521,7 @@ downloaded.
 | `/etc/systemd/system/<unit>.service.d/limits.conf` | fd/memlock drop-ins for MariaDB, Elasticsearch and an adopted Redis (nginx, PHP-FPM and Valkey carry their limits in their own units) |
 | `/etc/sysctl.d/90-setup-network.conf`, `/etc/security/limits.d/99-setup.conf`, `/etc/udev/rules.d/60-setup-io.rules`, `setup-io-tuning.service` | OS profile |
 | `/var/www/logs/<service>/` | one log tree for every service (rotated by `/etc/logrotate.d/setup-logs`) |
-| `/usr/local/bin/setup-precompress.sh`, `/usr/local/bin/mysqlbkup.sh`, `/etc/mysqlbkup.cnf`, `/root/mysqltuner.pl` | cron helpers and embedded tools |
+| `/usr/local/bin/mysqlbkup.sh`, `/etc/mysqlbkup.cnf`, `/root/mysqltuner.pl` | cron helpers and embedded tools |
 | `/var/log/setup-optimize-*.md`, `/var/log/setup-php-upgrade-*.md`, `diagnostics.log`, `setup_*.log` | reports and run logs |
 
 Credentials are never stored in the repository; the MariaDB password is written

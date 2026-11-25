@@ -100,6 +100,23 @@ check "a host-file PHP_BUILD pin is dropped from memory" has "$out" "php_build="
 check "a host-file PHP_BUILD pin is not kept" lacks "$out" "php_build=set"
 check "validate_all prints the retired-knob warning" \
   grep -q 'Ignored (removed in 1.22.0' "$ROOT/lib/validate.sh"
+# Asset precompression, removed in 1.22.1: SETUP_PRECOMPRESS_ASSETS is
+# remembered for the warning and dropped; a persisted PRECOMPRESS_ASSETS
+# is dropped from memory.
+precompress_probe() {
+  env SETUP_PRECOMPRESS_ASSETS=0 PRECOMPRESS_ASSETS=1 \
+    SETUP_TEST_SOURCE_ONLY=1 SETUP_STATE_DIR="$TMP/state" \
+    bash -c 'source "$1" >/dev/null 2>&1
+             printf "mem=%s\n" "${PRECOMPRESS_ASSETS+set}"
+             printf "env=%s\n" "${SETUP_PRECOMPRESS_ASSETS+set}"
+             printf "retired=%s\n" "$RETIRED_PRECOMPRESS_ENV"' _ "$ROOT/setup.sh"
+}
+out=$(precompress_probe 2>&1) || true
+check "SETUP_PRECOMPRESS_ASSETS is recorded as removed" has "$out" "retired=SETUP_PRECOMPRESS_ASSETS=0"
+check "SETUP_PRECOMPRESS_ASSETS is dropped from the environment" has "$out" "env="$'\n'
+check "a persisted PRECOMPRESS_ASSETS is dropped from memory" has "$out" "mem="$'\n'
+check "validate_all warns that SETUP_PRECOMPRESS_ASSETS is ignored (removed in 1.22.1)" \
+  grep -qF 'Ignored (removed in 1.22.1' "$ROOT/lib/validate.sh"
 
 # ---------------------------------------------------------------------------
 # --php ext=LIST

@@ -3,8 +3,8 @@
 #
 # A lean nginx built from upstream sources only: nginx from nginx.org (PGP
 # signature checked against the nginx.org keys pinned in build-common.sh),
-# OpenSSL, PCRE2 (JIT), zlib-ng, Brotli (google/brotli + google/ngx_brotli,
-# compiled in statically) from their own releases at the versions in
+# OpenSSL, PCRE2 (JIT), zlib-ng, Brotli (google/brotli + google/ngx_brotli's filter
+# module, compiled in statically) from their own releases at the versions in
 # nginx-build.conf ("latest" by default; nginx's latest is the mainline),
 # compiled with clang from apt.llvm.org at -O3 -march=native with Ubuntu's
 # hardening flags, OpenSSL, PCRE2 and zlib-ng linked statically, ThinLTO,
@@ -13,8 +13,10 @@
 # with BOLT (+3.6 to +6.1 % before it); gzip CPU per page -21 % (zlib-ng).
 #
 # Lean: only what server-configs-nginx uses: the http core with SSL, HTTP/2,
-# HTTP/3 (QUIC), realip, gzip_static, stub_status (the metrics script polls
-# it on 127.0.0.1), threads (aio threads), auth_basic, limit_req and Brotli.
+# HTTP/3 (QUIC), realip, stub_status (the metrics script polls it on
+# 127.0.0.1), threads (aio threads), auth_basic, limit_req and dynamic Brotli
+# (the ngx_brotli filter; gzip_static and brotli_static are left out since
+# 1.22.1: no precompressed siblings, dynamic gzip and Brotli only).
 # No mail, stream, DAV, mp4/flv, sub, SSI, uwsgi, scgi, grpc, memcached,
 # limit_conn, referer, userid, autoindex, split_clients, empty_gif, browser
 # or mirror.  A directive of a left-out module that only transforms or
@@ -59,7 +61,7 @@
 # CI (NGINX_BUILD_CI=1, server-configs-nginx's scripts/ci-build-nginx.sh):
 # `build` compiles and verifies with no host side effect (no unit, tmpfiles,
 # timers, systemctl, links, lock), honours NGINX_BUILD_ROOT, _CACHE, _CONF
-# and _COMMON, keeps the configure module set (static ngx_brotli) and the
+# and _COMMON, keeps the configure module set (static ngx_brotli filter) and the
 # branding patch, skips LTO, BOLT and -march=native (the system cc), leaves
 # the binary at ROOT/staging/sbin/nginx and prints that path as the last
 # line of stdout.
@@ -102,7 +104,9 @@ BUILD_COMMON=${NGINX_BUILD_COMMON:-$(dirname "$SELF")/build-common.sh}
 
 # 4 = 1.22.0: nginx.org mainline, static Brotli, branding patch, stub_status,
 # own unit and paths (1-3 were the opt-in builds of 1.21.70-1.21.71).
-BUILD_RECIPE=4
+# 5 = 1.22.1: no gzip_static, only the ngx_brotli filter (no brotli_static);
+# a host on recipe 4 rebuilds on its next --optimize or refresh.
+BUILD_RECIPE=5
 NGINX_FALLBACK_DEFAULT=1.31.10
 if [[ $CI == 1 ]]; then
   COMPONENTS=(nginx openssl pcre2 zlib-ng brotli ngx-brotli)
@@ -122,7 +126,9 @@ LOG_FILE=""
 # serve its root as static files, so the activation stops instead.
 # limit_conn stays out of the build (operator rule, 1.21.71); commenting it
 # out is reported as a removed security control, never silently.
-DROPPABLE_RE='^(sub_filter(_once|_types|_last_modified)?|ssi(_[a-z_]+)?|addition_types|add_before_body|add_after_body|limit_conn(_zone|_status|_log_level|_dry_run)?|userid(_[a-z_]+)?|autoindex(_[a-z_]+)?|random_index|gunzip(_buffers)?|mp4(_[a-z_]+)?|flv)$'
+# gzip_static and brotli_static (left out since 1.22.1) only choose a
+# precompressed sibling over dynamic compression; dynamic gzip/Brotli serve on.
+DROPPABLE_RE='^(gzip_static|brotli_static|sub_filter(_once|_types|_last_modified)?|ssi(_[a-z_]+)?|addition_types|add_before_body|add_after_body|limit_conn(_zone|_status|_log_level|_dry_run)?|userid(_[a-z_]+)?|autoindex(_[a-z_]+)?|random_index|gunzip(_buffers)?|mp4(_[a-z_]+)?|flv)$'
 # Directives of modules this build does not have that are NOT droppable
 # (access control, content handlers, left-out modules nginx never builds by
 # default): a configuration using one blocks the activation.  lib/nginx-build.sh
@@ -424,7 +430,7 @@ EOF
 CONFIGURE_MODULES=(
   --with-threads --with-file-aio
   --with-http_ssl_module --with-http_v2_module --with-http_v3_module
-  --with-http_realip_module --with-http_gzip_static_module --with-http_stub_status_module
+  --with-http_realip_module --with-http_stub_status_module
   --without-http_ssi_module --without-http_userid_module --without-http_autoindex_module
   --without-http_split_clients_module --without-http_memcached_module --without-http_empty_gif_module
   --without-http_browser_module --without-http_uwsgi_module --without-http_scgi_module
@@ -453,6 +459,11 @@ build_deps() { # work jobs cflags: Brotli's static libraries for the static ngx_
     -DCMAKE_C_COMPILER="$CC" -DCMAKE_AR="$AR" -DCMAKE_RANLIB="$RANLIB" \
     -DCMAKE_C_FLAGS="$f" >> "$LOG_FILE" 2>&1
   cmake --build "$nb/deps/brotli/out" -j "$j" --target brotlienc brotlicommon >> "$LOG_FILE" 2>&1
+  # Only the filter is built (--add-module=.../ngx_brotli/filter, 1.22.1).
+  # filter/config looks for the library under its own addon directory
+  # (filter/deps/brotli); the root config, which also builds the static
+  # module, is the only one that finds deps/ one level up.
+  ln -sfn ../deps "$nb/filter/deps"
 }
 
 # Unbranded default pages for `root html` (ROOT/html): what the stock
@@ -603,7 +614,7 @@ cmd_build() { # [normal|cpu]
       --with-openssl="$work/openssl" \
       --with-openssl-opt="no-shared no-tests no-docs no-apps no-legacy no-module enable-ec_nistp_64_gcc_128 --openssldir=/usr/lib/ssl $OPENSSL_TRIM $flags" \
       --with-pcre="$work/pcre2" --with-pcre-jit --with-pcre-opt="$flags" \
-      --add-module="$work/ngx_brotli"
+      --add-module="$work/ngx_brotli/filter"
     nice -n 10 make -j"$j"
   ) >> "$LOG_FILE" 2>&1 || { log_excerpt "$LOG_FILE" 40; die "nginx ${VERS[nginx]} failed to build (log: $LOG_FILE)"; }
   verify_binary "$src/objs/nginx"
@@ -1069,7 +1080,7 @@ main() {
       fit_config "$bin" "$conf" ;;
     restore)        need_root; restore_config ;;
     remove)         need_root; cmd_remove ;;
-    configure-args) configure_paths; printf '%s\n' "${CONFIGURE_MODULES[@]}" --add-module=ngx_brotli ;;
+    configure-args) configure_paths; printf '%s\n' "${CONFIGURE_MODULES[@]}" --add-module=ngx_brotli/filter ;;
     directive-res)  printf 'droppable=%s\nunbuilt=%s\n' "$DROPPABLE_RE" "$UNBUILT_RE" ;;
     *) die "usage: $0 build|build-only|activate|bolt [S]|rebuild|rebuild-cpu|refresh|check|versions|status|pre|fit [CONF [BIN]]|restore|remove|configure-args|directive-res" ;;
   esac

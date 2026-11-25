@@ -415,7 +415,7 @@ fi
 run_env ok SETUP_PHP_JIT=tracing --dry-run --optimize
 run_env ok SETUP_PHP_JIT=bogus --dry-run --optimize
 run_env ok SETUP_PHP_JIT_WORDPRESS=1 --dry-run --optimize
-# Network tuning, rate-limit exemptions and asset precompression overrides.
+# Network tuning and rate-limit exemption overrides.
 run_env ok SETUP_TCP_CC=cubic --dry-run --optimize
 run_env ok SETUP_QDISC=fq_codel --dry-run --optimize
 # SETUP_LIMIT_REQ_EXEMPT lost its generic limits: accepted, with a warning.
@@ -437,7 +437,10 @@ run_env_msg ok 'SETUP_ANGIE_BUILD=package' 'Ignored (removed in 1.22.0' --dry-ru
 run_env_msg ok 'SETUP_PHP_FPM_MODULES=all' 'Ignored (removed in 1.22.0' --dry-run --basic --php
 # The old compression name still works under the new one.
 run_env ok SETUP_ANGIE_COMPRESSION=gzip --dry-run --basic --nginx
-run_env ok SETUP_PRECOMPRESS_ASSETS=1 --dry-run --optimize
+# Asset precompression was removed in 1.22.1 (no gzip_static/brotli_static):
+# the knob is accepted and ignored with a warning, on every path.
+run_env_msg ok 'SETUP_PRECOMPRESS_ASSETS=1' 'Ignored (removed in 1.22.1' --dry-run --optimize
+run_env_msg ok 'SETUP_PRECOMPRESS_ASSETS=0' 'Ignored (removed in 1.22.1' --dry-run --basic --nginx
 # An invalid SETUP_NODE_MAJOR falls back to the default major, never fails.
 run_env ok SETUP_NODE_MAJOR=bogus --dry-run --basic --others nodejs
 # SETUP_NGINX_COMPRESSION only tests for 0; any other value keeps Brotli on.

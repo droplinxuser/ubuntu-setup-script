@@ -9,6 +9,23 @@ is still in git history, for example
 `git show 84b0db5:tests/stress-site/AUDIT-20261117-1.21.30.md`.  The current
 cycle report is `AUDIT-20261125-1.22.0.md`.
 
+## 1.22.1 — Xeon E-2236 (2026-11-26)
+
+- **Change:** gzip_static and brotli_static removed from the nginx build,
+  along with the static-asset precompression job.
+- **Upgrade from 1.22.0:** a host with an operator vhost using both
+  directives took one `--optimize` (133 s).
+  - nginx was rebuilt with the Brotli filter only.
+  - The vhost lines were commented out with the marker and reported.
+  - nginx stayed active, `nginx -t` passes, and responses are compressed
+    with `br` and `gzip`.
+  - A second `--optimize` passed with no further changes.
+- **Fresh install:** 89 s.  A vhost added after activation is also
+  commented out by `--optimize` (fixed in this release).
+- **Fix found by the test:** the filter-only ngx_brotli build needs
+  `filter/deps`.
+- **Suites:** see the CHANGELOG entry.
+
 ## 1.22.0 — Xeon E-2236 (2026-11-25)
 
 Pair: `server-configs-nginx` 1.7.0 (branch `nginx`).  Details:

@@ -127,7 +127,7 @@ optimize_nginx() {
     nginx_restore_live
   fi
   # Same profile as the installer (nginx_apply_profile): guest caches,
-  # precompression, the tuner and Brotli (a static module of our build, so
+  # the tuner and Brotli (a static module of our build, so
   # only directives are written, never load_module; gzip stays the fallback).
   if ! nginx_apply_profile /etc/nginx; then
     nginx_restore_live
@@ -1947,8 +1947,6 @@ optimize_plan() {
     if pkg_ok nginx-module-zstd 2>/dev/null; then
       printf '  nginx zstd: retired in 1.21.59; managed stanzas moved away and nginx-module-zstd purged unless a configuration still uses it\n'
     fi
-    printf '  nginx static assets: precompressed .br/.gz siblings %s (SETUP_PRECOMPRESS_ASSETS)\n' \
-      "$( (( PRECOMPRESS_ASSETS )) && printf on || printf off )"
     printf '  XenForo jobs: managed xf:run-jobs crontab %s for every XenForo root (SETUP_XF_JOB_CRON)\n' \
       "$( (( XF_JOB_CRON )) && printf on || printf off )"
     printf '  nginx repository: sync %s (%s), then apply the hardware profile\n' \

@@ -749,16 +749,6 @@ write_cron() {
   if (( xf_cron )); then
     lines+=("* * * * * $(cron_php_command "$CRON_XF_JOBS") >/dev/null 2>&1 || true")
   fi
-  # Precompressed-asset refresh: only while the feature is on and the helper
-  # exists (configure_asset_precompression writes it); dropped otherwise.
-  # The helper runs as the web user, never as root (see PRECOMPRESS_USER).
-  # Earlier releases wrote the entry without runuser; every existing
-  # precompress line is dropped below and regenerated from this one, so a
-  # re-run upgrades it.  No "%" may appear here: crontab treats it as a
-  # newline.
-  if (( PRECOMPRESS_ASSETS )) && [[ -x $CRON_PRECOMPRESS ]]; then
-    lines+=("*/5 * * * * /usr/bin/nice -n 19 ${PRECOMPRESS_RUNNER} ${CRON_PRECOMPRESS} >/dev/null 2>&1")
-  fi
 
   cur=$(crontab -l 2>/dev/null || true)
   if [[ -n $cur ]]; then
@@ -777,8 +767,6 @@ write_cron() {
       group=wordpress
     elif [[ $line == *xf:run-jobs* ]]; then
       group=xenforo
-    elif [[ $line == *"${CRON_PRECOMPRESS}"* ]]; then
-      group=precompress
     elif [[ $line == *'/etc/nginx/'* || $line == *'/etc/angie/'* || $line == *'/usr/bin/find /var/www'* || $line == *"${CRON_WWW_CHOWN_LEGACY}"* ]]; then
       group=nginx
     else
@@ -797,7 +785,7 @@ write_cron() {
         (( mariadb_cron )) && continue
         cron_mariadb_configured || continue
         ;;
-      wordpress|precompress|xenforo)
+      wordpress|xenforo)
         # Regenerated above when needed; drop a stale entry otherwise.
         continue
         ;;

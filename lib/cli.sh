@@ -114,6 +114,9 @@ Source builds (always; there are no package modes):
       --source and SETUP_PHP_BUILD / SETUP_NGINX_BUILD / SETUP_VALKEY_BUILD /
       SETUP_PHP_FPM_MODULES were removed in 1.22.0; they are ignored with a
       warning.  Use --php ext= to add PHP extensions.
+      SETUP_PRECOMPRESS_ASSETS was removed in 1.22.1 (nginx has no
+      gzip_static or brotli_static; dynamic gzip and Brotli compress every
+      response); it is ignored with a warning.
 
 Small hosts (below the 4 GB class, MemTotal under 3500 MB):
       nginx only.  --php, --valkey, --mariadb, --elastic, --upgrade-php and
@@ -162,7 +165,7 @@ Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
       It rebuilds a source build whose release, CPU or extension set is
       stale (then BOLTs it from live traffic), but never installs a new
       service.  Brotli is built into nginx; the only packages it may add are
-      the build prerequisites and the brotli CLI (asset precompression).
+      the build prerequisites.
       One-time migration (hosts provisioned by 1.21.x): the first --optimize
       builds nginx, every active PHP version and Valkey from source while
       Angie, Sury PHP-FPM and the valkey-server package keep serving, moves
@@ -217,8 +220,8 @@ Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
           SETUP_STORAGE_CLASS, SETUP_PHP_WORKERS_PER_CPU,
           SETUP_PHP_JIT_HOT_*, SETUP_GZIP_LEVEL, SETUP_BROTLI_LEVEL,
           SETUP_NGINX_COMPRESSION, SETUP_MARIADB_IO_CAPACITY,
-          SETUP_LIMIT_REQ_EXEMPT, SETUP_PRECOMPRESS_ASSETS,
-          SETUP_PHP_PAGE_GZIP, SETUP_PHP_JIT_WORDPRESS) are ignored with a
+          SETUP_LIMIT_REQ_EXEMPT, SETUP_PHP_PAGE_GZIP,
+          SETUP_PHP_JIT_WORDPRESS) are ignored with a
           warning, so two servers with the same hardware get the same
           profile.  Feature choices (Node major, application cache
           and security toggles) and the CONFIG_* source knobs still apply.

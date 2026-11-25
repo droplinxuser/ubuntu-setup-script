@@ -77,8 +77,8 @@ MIGRATE_OLD_HOOKS=(/etc/apt/apt.conf.d/99setup-php-fpm-build /etc/apt/apt.conf.d
 
 # Directive classes for the pre-flight scan of /etc/angie (R26, R76, R88).
 # A's lib may export NGINX_BUILD_DROPPABLE_RE / NGINX_BUILD_UNBUILT_RE; these
-# defaults mirror the 1.21.71 configure line (tools/nginx-build.sh).
-MIGRATE_NGINX_DROPPABLE_RE='^(sub_filter(_once|_types|_last_modified)?|ssi(_[a-z_]+)?|addition_types|add_before_body|add_after_body|limit_conn(_zone|_status|_log_level|_dry_run)?|userid(_[a-z_]+)?|autoindex(_[a-z_]+)?|random_index|gunzip(_buffers)?|mp4(_[a-z_]+)?|flv)$'
+# defaults mirror the 1.22.1 configure line (tools/nginx-build.sh).
+MIGRATE_NGINX_DROPPABLE_RE='^(gzip_static|brotli_static|sub_filter(_once|_types|_last_modified)?|ssi(_[a-z_]+)?|addition_types|add_before_body|add_after_body|limit_conn(_zone|_status|_log_level|_dry_run)?|userid(_[a-z_]+)?|autoindex(_[a-z_]+)?|random_index|gunzip(_buffers)?|mp4(_[a-z_]+)?|flv)$'
 MIGRATE_NGINX_UNBUILT_RE='^(valid_referers|referer_hash_(max|bucket)_size|auth_request(_set)?|secure_link(_md5|_secret)?|slice|dav_(methods|access)|create_full_put_path|min_delete_depth|uwsgi_[a-z_]+|scgi_[a-z_]+|grpc_[a-z_]+|memcached_[a-z_]+|empty_gif|mirror(_request_body)?|split_clients|image_filter(_[a-z_]+)?|xslt_[a-z_]+|perl(_[a-z_]+)?|geoip_[a-z_]+|ancient_browser(_value)?|modern_browser(_value)?)$'
 # Angie-only features nginx does not have.  `zone` in an upstream is NOT one
 # (stock nginx has it; SCN's own local_php uses it, R76); acme/acme_client

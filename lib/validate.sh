@@ -667,6 +667,9 @@ validate_all() {
   if declare -p RETIRED_BUILD_ENV >/dev/null 2>&1 && (( ${#RETIRED_BUILD_ENV[@]} > 0 )); then
     warn "Ignored (removed in 1.22.0; nginx, PHP and Valkey are always built from source, and --php ext=LIST adds PHP extensions): ${RETIRED_BUILD_ENV[*]}"
   fi
+  # Static-asset precompression removed in 1.22.1 (setup.sh drops the knob).
+  [[ -n ${RETIRED_PRECOMPRESS_ENV:-} ]] \
+    && warn "Ignored (removed in 1.22.1; gzip_static and brotli_static are not compiled in, nginx compresses with dynamic gzip and Brotli): ${RETIRED_PRECOMPRESS_ENV}"
   # SETUP_MEM_TOTAL_MB is a dry-run/test stand-in for the host's RAM only.
   if [[ -n ${SETUP_MEM_TOTAL_MB+x} ]] && ! mem_override_allowed; then
     warn "SETUP_MEM_TOTAL_MB is ignored outside --dry-run; the memory class comes from the host (${MEM_GATE_MIN_MB} MB = 4 GB class)"

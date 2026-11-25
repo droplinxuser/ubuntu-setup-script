@@ -1072,7 +1072,7 @@ php_upgrade_optimize() {
   fi
   # When the tuner moved a pool to the socket, apply the shared nginx
   # profile so --upgrade-php reaches the same state as --optimize (guest
-  # caches, precompression, compression and the tuner), then refresh the
+  # caches, compression and the tuner), then refresh the
   # [PATH=] ini sections that derive from the nginx tree.
   if [[ -n ${OPT_PHP_SOCKET:-} && -f /etc/nginx/nginx.conf ]]; then
     tune_reset_changes

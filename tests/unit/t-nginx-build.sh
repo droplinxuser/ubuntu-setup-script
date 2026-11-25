@@ -1,5 +1,6 @@
 # shellcheck shell=bash
-# Unit tests for the compiled nginx of 1.22.0: tools/nginx-build.sh (branding
+# Unit tests for the compiled nginx of 1.22.0 (1.22.1: no gzip_static, only
+# the ngx_brotli filter): tools/nginx-build.sh (branding
 # patch and fallback version, configure module set, CPU gate, fit/restore,
 # CI mode, PGP verification, in-place upgrade), tools/build-common.sh (CPU
 # fingerprint) and lib/nginx-build.sh (unit and tmpfiles texts, the
@@ -217,11 +218,15 @@ TNB_ARGS_CI=$(env -u NGINX_BUILD_SOURCE_ONLY -u NGINX_BUILD_NGINX_CONF NGINX_BUI
   NGINX_BUILD_ROOT="$TMP/tnb-args/root" bash "$TNB_REPO/tools/nginx-build.sh" configure-args 2>/dev/null || true)
 tnb_args_have() { local a; for a in "$@"; do tnb_line "$TNB_ARGS" "$a" || return 1; done; }
 tnb_args_lack() { local a; for a in "$@"; do tnb_noline "$TNB_ARGS" "$a" || return 1; done; }
-check "configure-args: Brotli is compiled in statically (--add-module=ngx_brotli, no dynamic module)" \
-  bash -c 'grep -qx -- "--add-module=ngx_brotli" <<<"$1" && ! grep -q -- "--add-dynamic-module" <<<"$1"' _ "$TNB_ARGS"
-check "configure-args: SSL, HTTP/2, HTTP/3, realip, gzip_static, threads and stub_status are built" \
+check "configure-args: only the Brotli filter is compiled in statically (--add-module=ngx_brotli/filter, no dynamic module)" \
+  bash -c 'grep -qx -- "--add-module=ngx_brotli/filter" <<<"$1" && ! grep -qx -- "--add-module=ngx_brotli" <<<"$1" && ! grep -q -- "--add-dynamic-module" <<<"$1"' _ "$TNB_ARGS"
+check "configure-args: no gzip_static and no ngx_brotli static module (removed in 1.22.1)" \
+  bash -c '! grep -q -- "gzip_static" <<<"$1" && ! grep -q -- "ngx_brotli/static" <<<"$1"' _ "$TNB_ARGS"
+check "configure-args: the filter form still matches the static-Brotli checks (*--add-module=*ngx_brotli*)" \
+  bash -c 'v=$(tr "\n" " " <<<"$1"); [[ $v == *--add-module=*ngx_brotli* ]]' _ "$TNB_ARGS"
+check "configure-args: SSL, HTTP/2, HTTP/3, realip, threads and stub_status are built" \
   tnb_args_have --with-http_ssl_module --with-http_v2_module --with-http_v3_module --with-http_realip_module \
-    --with-http_gzip_static_module --with-threads --with-http_stub_status_module
+    --with-threads --with-http_stub_status_module
 check "configure-args: auth_basic and limit_req stay in the build (never --without-...)" \
   tnb_args_lack --without-http_auth_basic_module --without-http_limit_req_module
 check "configure-args: limit_conn, SSI, userid, autoindex, referer and the unused handlers are left out" \
@@ -236,8 +241,13 @@ check "configure-args: the paths of the compiled layout (ROOT/sbin/nginx, /etc/n
     --pid-path=/run/nginx.pid --user=www-data --group=www-data
 check "configure-args: CI mode prints exactly the same module set and paths" \
   bash -c '[[ -n $1 && $1 == "$2" ]]' _ "$TNB_ARGS" "$TNB_ARGS_CI"
-check "cmd_build configures with CONFIGURE_MODULES and a static --add-module ngx_brotli" \
-  bash -c 'f=$(sed -n "/^cmd_build()/,/^}/p" "$1"); grep -qF "\"\${CONFIGURE_MODULES[@]}\"" <<<"$f" && grep -qF -- "--add-module=\"\$work/ngx_brotli\"" <<<"$f" && ! grep -q -- "--add-dynamic-module" <<<"$f"' \
+check "cmd_build configures with CONFIGURE_MODULES and a static --add-module of the ngx_brotli filter" \
+  bash -c 'f=$(sed -n "/^cmd_build()/,/^}/p" "$1"); grep -qF "\"\${CONFIGURE_MODULES[@]}\"" <<<"$f" && grep -qF -- "--add-module=\"\$work/ngx_brotli/filter\"" <<<"$f" && ! grep -qF -- "--add-module=\"\$work/ngx_brotli\"" <<<"$f" && ! grep -q -- "--add-dynamic-module" <<<"$f"' \
+  _ "$TNB_REPO/tools/nginx-build.sh"
+# filter/config looks for Brotli under filter/deps (the 1.22.1 test-host
+# install failed with "Brotli library is missing" without this link).
+check "build_deps links filter/deps to the Brotli sources and libraries one level up" \
+  bash -c 'sed -n "/^build_deps()/,/^}/p" "$1" | grep -qF "ln -sfn ../deps \"\$nb/filter/deps\""' \
   _ "$TNB_REPO/tools/nginx-build.sh"
 tnb_res_ok() {
   local res drop unb
@@ -245,15 +255,25 @@ tnb_res_ok() {
   drop=$(sed -n 's/^droppable=//p' <<<"$res"); unb=$(sed -n 's/^unbuilt=//p' <<<"$res")
   [[ -n $drop && -n $unb ]] || return 1
   [[ limit_conn =~ $drop && limit_conn_zone =~ $drop && ssi =~ $drop && sub_filter =~ $drop ]] || return 1
+  # Left out since 1.22.1: commented out with the marker, never a blocker.
+  [[ gzip_static =~ $drop && brotli_static =~ $drop ]] || return 1
+  [[ gzip_static =~ $unb || brotli_static =~ $unb ]] && return 1
   [[ auth_request =~ $unb && grpc_pass =~ $unb && valid_referers =~ $unb ]] || return 1
   # Built-in modules are neither droppable nor blockers.
   local d
-  for d in auth_basic auth_basic_user_file limit_req limit_req_zone brotli stub_status gzip_static; do
+  for d in auth_basic auth_basic_user_file limit_req limit_req_zone brotli brotli_comp_level gzip gzip_comp_level stub_status; do
     [[ $d =~ $drop || $d =~ $unb ]] && return 1
   done
   return 0
 }
-check "directive classes: limit_conn/ssi droppable, auth_request blocks, auth_basic/limit_req/brotli are built in" tnb_res_ok
+check "directive classes: limit_conn/ssi/gzip_static/brotli_static droppable, auth_request blocks, auth_basic/limit_req/brotli/gzip are built in" tnb_res_ok
+check "the migration's fallback droppable list matches the tool's (gzip_static and brotli_static included)" \
+  bash -c 'a=$(sed -n "s/^DROPPABLE_RE=//p" "$1"); b=$(sed -n "s/^MIGRATE_NGINX_DROPPABLE_RE=//p" "$2"); [[ -n $a && $a == "$b" ]]' \
+  _ "$TNB_REPO/tools/nginx-build.sh" "$TNB_REPO/lib/migrate.sh"
+check "lib/nginx-build.sh exports the tool's droppable list to the migration (gzip_static included)" \
+  bash -c 'v=$(sed -n "s/^DROPPABLE_RE='"'"'\(.*\)'"'"'\$/\1/p" "$1" | sed -n 1p); [[ gzip_static =~ $v && brotli_static =~ $v ]]' _ "$TNB_REPO/tools/nginx-build.sh"
+check "build recipe 5 (1.22.1): a host built with recipe 4 is stale and rebuilds without gzip_static/brotli_static" \
+  grep -qx 'BUILD_RECIPE=5' "$TNB_REPO/tools/nginx-build.sh"
 
 # ---------------------------------------------------------------------------
 # nginx.service and tmpfiles.d (lib/nginx-build.sh)
@@ -375,7 +395,7 @@ while [ $# -gt 0 ]; do [ "$1" = -c ] && { conf=$2; shift; }; shift; done
 for f in "$conf" "$(dirname "$conf")"/conf.d/*.conf; do
   [ -f "$f" ] || continue
   hit=$(awk '$1 ~ /^#/ { next }
-    !name && ($1 == "sub_filter" || $1 == "limit_conn_zone" || $1 == "limit_conn" || $1 == "ssi" || $1 == "grpc_pass") { name = $1 }
+    !name && ($1 == "sub_filter" || $1 == "limit_conn_zone" || $1 == "limit_conn" || $1 == "ssi" || $1 == "grpc_pass" || $1 == "gzip_static" || $1 == "brotli_static") { name = $1 }
     name && /;/ { print FILENAME ":" FNR " " name; exit }' "$f")
   if [ -n "$hit" ]; then
     echo "nginx: [emerg] unknown directive \"${hit##* }\" in ${hit% *}" >&2
@@ -426,6 +446,15 @@ tnb_fit_case() ( # variant -> result line
       ln -s "$NB/outside/shared.conf" "$NB/etc/conf.d/shared.conf"
       fit_config "$NB/nginx" 2>/dev/null || rc=$?
       printf 'rc=%s unchanged=%s' "$rc" "$(cmp -s "$NB/outside/shared.conf" "$NB/shared.orig" && echo 1 || echo 0)" ;;
+    static)
+      # 1.22.1: an operator vhost that still asks for precompressed siblings.
+      printf '%s\n' 'server {' '    gzip on;' '    location /assets/ {' '        gzip_static on;' \
+        '        brotli_static on;' '    }' '}' > "$site"
+      fit_config "$NB/nginx" 2>"$NB/err" || rc=$?
+      printf 'rc=%s lines=%s ' "$rc" "$(grep -n '^[[:space:]]*# setup-nginx-build-off: ' "$site" | cut -d: -f1 | tr '\n' ',')"
+      printf 'gzip=%s ' "$(grep -cx '    gzip on;' "$site")"
+      printf 'list=[%s] ' "$(tr '\n' ',' 2>/dev/null < "$STATE/disabled.list")"
+      printf 'said=%s' "$(grep -c 'nginx build: commented out [a-z_]*_static in conf.d/site.conf' "$NB/err")" ;;
   esac
 )
 check "fit: droppable directives are commented out line by line (a two-line directive whole)" \
@@ -444,6 +473,8 @@ check "fit: a content handler of a left-out module (grpc_pass) is a blocker; not
   test "$(tnb_fit_case blocker)" = "rc=1 unchanged=1 emerg=1"
 check "fit: a symlinked file (pointing outside the tree) is never edited; the fit fails" \
   test "$(tnb_fit_case symlink)" = "rc=1 unchanged=1"
+check "fit: gzip_static and brotli_static in an operator vhost are commented out with the marker; gzip stays" \
+  test "$(tnb_fit_case static)" = "rc=0 lines=4,5, gzip=1 list=[conf.d/site.conf:4 gzip_static,conf.d/site.conf:5 brotli_static,] said=2"
 
 # ---------------------------------------------------------------------------
 # CI mode: build output on stderr, the staged binary's path on stdout

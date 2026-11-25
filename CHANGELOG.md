@@ -8,6 +8,56 @@ Reports of the 1.21.33-1.21.61 cycles that measured the removed Anubis
 filter were deleted from the tree on 2026-11-23 for the same reason;
 `git show <commit>:<path>` recovers them.
 
+## 1.22.1 (2026-11-26)
+
+- **gzip_static and brotli_static removed from the nginx build** (operator
+  decision).  `tools/nginx-build.sh` no longer passes
+  `--with-http_gzip_static_module` and builds only the ngx_brotli filter
+  (`--add-module=.../ngx_brotli/filter`; `configure-args` prints the new
+  form).  Build recipe 5: every host rebuilds nginx on its next
+  `--optimize`.  Dynamic gzip and dynamic Brotli stay as they were.
+- **Static-asset precompression removed** (the `.br`/`.gz` siblings of
+  1.21.58-1.22.0, `setup-precompress.sh` and its cron line).  It never ran
+  on a production host, so there is no cleanup step.
+  `SETUP_PRECOMPRESS_ASSETS` is ignored with a warning, like the options
+  removed in 1.22.0.  `brotli.conf` is written without `brotli_static`, and
+  an existing generated file is rewritten without it.
+- **Operator vhosts stay valid.**  `gzip_static` and `brotli_static` are now
+  in the droppable list: if a vhost still uses them, activation comments
+  the line out with the `# setup-nginx-build-off: ` marker and reports it,
+  instead of failing `nginx -t`.  This now also happens on every
+  `--optimize` sync, not only when a new binary is activated.  Before, a
+  vhost added after activation stopped the sync at `nginx -t`, although
+  nginx kept serving.  A fresh `--nginx` onto a host whose `/etc/nginx`
+  already holds operator vhosts fits the rendered tree to the staged build
+  before the first `nginx -t`.
+- **Fix found by the test host: the filter-only Brotli build.**
+  `ngx_brotli/filter/config` looks for the library under `filter/deps`, so
+  the first build failed with "Brotli library is missing".  The build now
+  links `filter/deps` to `../deps`.
+- **Measured on the Xeon E-2236 test host:**
+  - **Upgrade:** a 1.22.0 host (recipe 4, gzip_static compiled in, the old
+    tree's three `gzip_static on;` lines, and an operator vhost with
+    `gzip_static on;` and `brotli_static on;`) took one `--optimize` of
+    1.22.1 (133 s).  It rebuilt nginx with the Brotli filter only, the tree
+    has no active static directive, and the vhost's two lines carry the
+    marker and were reported.
+  - **After the upgrade:** nginx stayed active and `nginx -t` passes;
+    responses are compressed with `br` and `gzip`.  A second `--optimize`
+    passed with no further changes.
+  - **Fresh install:** 89 s.
+- **Release order.**  setup.sh 1.22.1 needs server-configs-nginx 1.7.1
+  (branch `nginx`, the first tree without `gzip_static`), which also loads
+  on a 1.22.0 binary.  It is pushed first; after the v1.22.1 tag,
+  server-configs-nginx `scripts/uss-ref` is pinned to v1.22.1 so its CI
+  builds the filter-only binary.
+- **CI.**  ShellCheck 0.11.0 is pinned by SHA-256 and runs in groups in
+  parallel (one call over every file ran for over 20 minutes on the
+  runner).  The standalone unit-test loop skips
+  `tests/unit/t-nginx-build.sh`, which runs only inside the tuning suite
+  (it failed every CI run by design).  Failing dry-run cases are reported
+  as annotations.
+
 ## 1.22.0 (2026-11-25)
 
 - **nginx, PHP and Valkey are built from source only** (operator decision).
