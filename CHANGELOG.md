@@ -8,6 +8,228 @@ Reports of the 1.21.33-1.21.61 cycles that measured the removed Anubis
 filter were deleted from the tree on 2026-11-23 for the same reason;
 `git show <commit>:<path>` recovers them.
 
+## 1.22.0 (2026-11-25)
+
+- **nginx, PHP and Valkey are built from source only** (operator decision).
+  There are no package modes any more.  `--nginx` builds the newest nginx
+  mainline from nginx.org; `--php` builds PHP (FPM and CLI) from php.net,
+  any released series from 8.1 on (never an RC); `--valkey` builds the
+  newest Valkey release.  All three use the 1.21.71 recipe: clang `-O3
+  -march=native`, Ubuntu's hardening flags, ThinLTO, then BOLT from live
+  traffic on `--optimize`.  No Angie, Sury or Ubuntu php packages and no
+  valkey-server package are installed.  MariaDB and Elasticsearch stay apt
+  packages (compiling them was measured not worth it in 1.21.71).  The
+  builds live in `/usr/local/lib/setup-nginx`, `/usr/local/lib/setup-php/X.Y`
+  and `/usr/local/lib/setup-valkey`; the units (`nginx`, `phpX.Y-fpm`,
+  `valkey-server`) are this script's own files in `/etc/systemd/system`, and
+  the command links are in `/usr/local/bin` and `/usr/local/sbin`.  A build
+  failure stops the install and names the build log.  A daily timer
+  (`setup-build-refresh.timer`) rebuilds in the background when a new
+  release or a changed extension set needs it; the running binary serves
+  until the new one passes its checks.  nginx binaries are swapped by an
+  in-place upgrade (no restart).  Tools: `tools/nginx-build.sh`,
+  `tools/php-build.sh` (was `php-fpm-build.sh`), `tools/valkey-build.sh`;
+  `lib/nginx-build.sh` replaces `lib/angie-build.sh`.
+- **nginx replaces Angie.**  Compiled nginx 1.31.10 against compiled Angie
+  1.12.5 (1.21.71: same flags, libraries and modules, identical files, 5
+  rotated rounds): cached pages **+0.5 to +1.5 %** (XenForo home 123,007
+  against 121,482 req/s), PHP pages tie.  The build carries `auth_basic` and
+  `limit_req` (the login limiter stays), Brotli as a static module, HTTP/2
+  and HTTP/3; `limit_conn` is not built.  Branding is stripped: no `Server`
+  header and no "nginx" on error pages.  Each source patch is counted; when
+  a new mainline no longer matches, the tool builds the last version the
+  patch applied to (`NGINX_FALLBACK=1.31.10` in `nginx-build.conf`) and
+  reports it.  Directives of modules the build leaves out are still
+  commented out with a marker and reported, now `# setup-nginx-build-off: `.
+- **server-configs-nginx branch `nginx` (1.7.0) is the 1.22 tree.**  setup.sh
+  downloads it by default (`CONFIG_REPO_REF=nginx`).  `main` stays the
+  Angie tree for hosts on 1.21.x, and the tag `angie-final` marks its last
+  commit.  Merging `nginx` into `main` once every host runs 1.22 is an
+  operator step, never automatic.
+- **One-time migration of 1.21.x hosts by `--optimize`.**  On a host with
+  Angie, Sury PHP or the valkey-server package, the first `--optimize`:
+  builds nginx, every active PHP version and Valkey while the old services
+  keep serving; moves `/etc/angie` to `/etc/nginx` (operator files only,
+  paths rewritten); points Angie ACME vhosts at the host's self-signed
+  certificate (Cloudflare Full mode; a vhost not behind Cloudflare is listed
+  in a warning block); rewrites the Angie cron lines to
+  `/etc/nginx/scripts/cloudflare.sh`; switches each service over with a
+  verified cutover; and only then removes the old packages, repositories
+  and keys.  `--optimize --dry-run` prints the plan.  Safety rules:
+  - It runs as the transient unit `setup-migrate-1.22`, so a dropped SSH
+    session does not stop it.  The log is `/var/log/setup-migrate-1.22.log`;
+    re-running the command attaches to it.
+  - Progress is kept in `/var/lib/setup.sh/migrate-1.22`; an interrupted run
+    resumes.
+  - Each part (nginx, PHP, Valkey) rolls back on its own: a failed check
+    stops the new service and starts the old one again.  A part blocked by
+    an Angie-only directive (`api`, `status_zone`, `js_*`, `$angie_*`,
+    `sticky`) or an extension the build cannot provide is reported and
+    keeps serving as before.
+  - Packages are removed only after their replacement serves, and only by
+    exact lists.  `apt-get -s` simulates each removal first; if it would
+    take any other package with it, that removal is skipped and reported.
+    `libapache2-mod-php*` is never in the list.  When the Sury removal is
+    blocked that way, PHP serves from the build, the Sury packages are held,
+    and `SETUP_PHP_ALLOW_COLLATERAL=1` accepts the collateral.  The
+    valkey-server package is removed, not purged (its postrm can delete
+    `/var/lib/valkey`), so it stays in dpkg's `rc` state.
+  - During removals, a temporary `policy-rc.d` stops maintainer scripts
+    from touching only this script's units.  At the end every unit is
+    enabled again and `is-enabled` is checked.
+  - The removed packages' `.deb` files, `/etc/angie`, the old `/etc/php`
+    and `/etc/valkey` trees and Angie's ACME state are kept in
+    `/var/backups/setup-1.22` (mode 0700) for a manual rollback.  This
+    directory is never deleted.
+  - PHP keeps every extension the Sury PHP loaded that the build can
+    compile, recorded in `PHP_EXT_EXTRA`; `--php ext=-NAME` trims it later.
+  - Below the 4 GB class only nginx is migrated; PHP and Valkey stay as
+    they are and are reported.
+- **The migration test found three bugs, all fixed.**  A 1.21.71 host
+  (Angie package, Sury PHP 8.5, valkey-server package, the three apps, an
+  Angie ACME vhost and an `auth_basic`/`sub_filter` vhost) was migrated.
+  PHP and Valkey moved in the first run.  The nginx part was blocked or
+  rolled back three times, and each time Angie kept serving on its own:
+  1. The Angie package's own `http.d/default.conf` (the `api` status
+     location) was scanned as an operator file and blocked the part.
+  2. The cutover check compared the catch-all strictly: `Host: localhost`
+     had been answered by Angie's package welcome page, so the new answer
+     differed and the cutover rolled back.
+  3. A part that had rolled back on an unchanged tree was never retried,
+     even by a fixed release.  The migration now records a digest of its
+     own code with each result, so a new release retries;
+     `SETUP_MIGRATE_RETRY=1` forces a retry.
+- **Per-application PHP extensions.**  A build carries a small base set
+  plus what the host's sites need, detected from the vhosts (and `--domain
+  app=`): WordPress `mysqli gd curl mbstring exif zip xml sodium`; XenForo
+  `mysqli gd curl mbstring xml zip exif`; Chevereto `pdo_mysql pdo mysqli
+  redis igbinary gd curl mbstring exif fileinfo xmlwriter zip`; other PHP
+  apps a generic set (`mysqli pdo_mysql pdo tokenizer bcmath sqlite3
+  pdo_sqlite xml xmlwriter zip exif`).  `redis` and `igbinary` are added
+  when XenForo's cache provider is Redis or a WordPress object-cache
+  drop-in needs `\Redis`; `sqlite3`/`pdo_sqlite` when a root uses SQLite.
+  Detection only adds; a set shrinks only by `--php ext=` or by removing a
+  domain.  The daily timer re-runs detection and rebuilds when the set
+  grew.  `SETUP_PHP_FPM_MODULES` and phpenmod/phpdismod are gone.
+- **`--php ext=LIST`** adds optional extensions (comma list, e.g.
+  `ext=intl,gmp`): `gmp`, `intl` (builds ICU from source), `bcmath`,
+  `sqlite3`/`pdo_sqlite`, `soap` and the rest of what the source build can
+  compile.  `-NAME` drops one you added, `none` clears the list.  It is
+  stored as `PHP_EXT_EXTRA` in `/etc/default/setup-tuning`.  A name the
+  build cannot compile is refused before anything changes.
+- **`--upgrade-php=X.Y` builds from source.**  It builds X.Y (FPM and CLI)
+  with the current extension set while the current version serves, writes
+  `/etc/php/X.Y` from the current managed files, switches the shared
+  socket, checks the sites, and rolls back on failure.  The previous build
+  stays for one switch back without a rebuild.  It is refused while the
+  1.22 migration is incomplete.  Measured on the Xeon E-2236 test host:
+  - **Down to 8.4, 8.3, 8.2 and 8.1:** each built and served, in 162-316 s.
+  - **Back to 8.5:** 38 s from the kept build.
+  - **8.0:** refused before anything changes.
+  - **8.6:** the build fails safely while igbinary does not compile on it,
+    and 8.5 keeps serving.
+- **Hosts under 4 GB RAM: nginx only.**  Below the 4 GB class (MemTotal
+  under 3500 MB) `--php`, `--valkey`, `--mariadb`, `--elastic`,
+  `--upgrade-php` and `--domain` apps that need PHP are refused before
+  anything changes.  `--optimize` tunes nginx and leaves an existing PHP or
+  Valkey alone (reported).
+- **CPU change: services stay down until the native rebuild finishes**
+  (operator rule; there is no generic fallback binary).  Every build
+  records a fingerprint of the CPU (model and the ISA flags `-march=native`
+  can use).  When it differs at a unit's start, the unit stays down and
+  `setup-build-cpu.service` rebuilds nginx, then the active PHP version,
+  then Valkey from the cached sources at the recorded versions, starting
+  each service when its build passes.  Until it finishes, a cron job using
+  the PHP CLI can fail on the new CPU (accepted).
+- **Supply chain.**  nginx tarballs are checked against nginx.org's PGP
+  signing keys (fingerprints embedded) and refused on any failure.  Valkey
+  tarballs are checked against the SHA-256 in valkey-io/valkey-hashes.  PHP
+  uses php.net's SHA-256 as before.  The setup-build-sources mirror stays
+  the last source under the same hash rules (nginx needs its `.asc`
+  there too).
+- **Security.**  The hardening flags stay; BOLT output must keep a
+  non-executable stack (`bolt_stack_check`).  The units are hardened; the
+  Valkey unit keeps the package unit's sandbox (`NoExecPaths=/` with
+  `ExecPaths=` for the build, `/usr/lib` and `/lib`,
+  `MemoryDenyWriteExecute=yes`).
+- **Fix: BOLT on an idle server.**  On a fresh install with no traffic yet,
+  `--optimize` reported a BOLT error.  It now reports "too little traffic,
+  BOLT skipped", and the next `--optimize` under load retries.
+- **Fix: a failed build could fill the disk with its own log.**  setup.sh
+  sends a build tool's stderr to the same file as the build log, so the
+  log excerpt a failed build prints was appended to the log it was reading,
+  which grew without bound.  The PHP 8.6 test grew it to 1.7 TB, filled the
+  disk and stopped MariaDB.  The excerpt is now skipped when stderr is the
+  log itself, and no single file a build writes may exceed
+  `SETUP_BUILD_MAX_FILE_GB` (default 20 GB, enforced with `ulimit -f`).
+- **Fix: the migration scan checks `angie.conf` for `load_module` again.**
+  `angie.conf` is never copied to `/etc/nginx`, but a `load_module` in it
+  (other than Brotli) names a module the operator relies on and nginx will
+  not have, so it blocks the nginx part again and Angie keeps serving.
+- **Fix: PHP 8.4 and older did not build (found by the downgrade test).**
+  PHP's bundled libtool drops `-fuse-ld=lld` on some links (the shared
+  `opcache.so` below 8.5, and the `php`/`php-fpm` programs before 8.3), so
+  clang fell back to GNU ld, which rejects the ThinLTO options.  The PHP
+  build now runs clang through a small driver that adds `-fuse-ld=lld` to
+  every call that links.  PHP 8.1 does not compile against OpenSSL 4, so
+  the 8.1 series builds with the newest OpenSSL 3.x release.
+- **Fix: `--upgrade-php` checks each app's minimum PHP version.**  An app
+  whose Composer platform check needs a newer PHP than the target now
+  blocks the switch before anything is built.  Chevereto 4.5 needs PHP 8.2,
+  and the downgrade test to 8.1 answered 500 on every Chevereto page.
+- **Fix: the after-switch site check now reaches PHP.**  It requested
+  `/index.php?…`, which nginx answers with a canonical 301 without running
+  PHP, so it reported "3 OK" while Chevereto was broken.  It now requests
+  the home page with the cache-bypass cookie.
+- **`--upgrade-php` keeps exactly one previous version** for rollback, newer
+  or older.  The message for a retired build no longer calls a newer
+  version "older".
+- **Removed options and behaviour changes** (check scripts and exported
+  `SETUP_*` variables):
+  - `--angie` is now `--nginx`; `--angie` still works and warns.
+  - `--source` is ignored with a warning.
+  - `SETUP_PHP_BUILD`, `SETUP_ANGIE_BUILD`, `SETUP_NGINX_BUILD`,
+    `SETUP_VALKEY_BUILD` and `SETUP_PHP_FPM_MODULES` are ignored with a
+    warning.  The migration removes the persisted `PHP_BUILD`,
+    `ANGIE_BUILD`, `NGINX_BUILD`, `VALKEY_BUILD` and `PHP_FPM_MODULES` from
+    `/etc/default/setup-tuning` and turns `XF_MEMBER_GZIP=angie` into
+    `nginx`.
+  - `SETUP_ANGIE_COMPRESSION` is read as `SETUP_NGINX_COMPRESSION` (the new
+    name wins when both are set).
+  - `SETUP_LIMIT_REQ_EXEMPT` is unchanged: ignored since 1.21.71.
+  - `SETUP_MEM_TOTAL_MB` is honoured only with `--dry-run`.
+  - "`--purge` never removes packages" no longer holds for the one-time
+    migration, which removes the Angie, Sury PHP and valkey-server packages
+    as described above.  `--purge` itself still removes no packages: for
+    nginx, PHP and Valkey it removes the units, builds and links, and keeps
+    `/var/backups/setup-1.22`.
+  - A host still on Angie, Sury PHP or the valkey-server package must run
+    `--optimize` first; `--nginx`, `--domain`, `--php` and `--valkey` refuse
+    until it has.
+- **Validation** on the Xeon E-2236 test host (Ubuntu 26.04.1):
+  - Final tree, after every fix: unit suite 2,797 checks pass (0 fail,
+    1 skipped), dry-run matrix 290, ShellCheck clean.
+  - Fresh install (`--basic --nginx --php ver=8.5 --mariadb --valkey
+    --elastic --others all`): **10 min 15 s**, including building nginx
+    1.31.10, PHP 8.5.13 and Valkey 9.2.0 with LLVM 23.  WordPress, XenForo
+    and Chevereto deployed; functional walk 0 failures, security 78/78,
+    cookie 105/105.  `--optimize` under load BOLTed nginx (in-place
+    upgrade, no restart), PHP and Valkey; a second `--optimize` found every
+    build current.  No `Server` or `X-Powered-By` header; the 404 page has
+    no "nginx".
+  - Migration of the 1.21.71 host above (1.21 suites 76/76 and 105/105
+    before): Angie, its repository and the `angie` user purged, `/etc/angie`
+    moved to `/var/backups/setup-1.22`, `angie.service` now an alias of
+    `nginx.service`, the ACME vhost served by the self-signed certificate
+    (200), `auth_basic` 401/200 on nginx, `sub_filter` commented out with
+    the marker, no Angie, PHP or Valkey packages left (valkey only in `rc`
+    state).  The PHP build kept every extension Sury had loaded (calendar,
+    ftp, gettext, gmp, sockets, xmlreader and more) on top of the apps'
+    sets.  After: security 78/78, cookie 105/105, functional 0 failures.
+    After a reboot nginx, php8.5-fpm and valkey-server were active and
+    enabled, 0 failed units, every site 200.  A second `--optimize` found
+    nothing to migrate and every build current.
+
 ## 1.21.71 (2026-11-25)
 
 - **`--source=all | angie,php,valkey | none`** (operator request): one

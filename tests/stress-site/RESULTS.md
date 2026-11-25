@@ -7,7 +7,51 @@ manifests, sweep tables and run logs these sections cite (`AUDIT-*.md`,
 removed from the tree on 2026-11-19 to keep the repository lean; every one
 is still in git history, for example
 `git show 84b0db5:tests/stress-site/AUDIT-20261117-1.21.30.md`.  The current
-cycle report is `AUDIT-20261125-1.21.71.md`.
+cycle report is `AUDIT-20261125-1.22.0.md`.
+
+## 1.22.0 — Xeon E-2236 (2026-11-25)
+
+Pair: `server-configs-nginx` 1.7.0 (branch `nginx`).  Details:
+`AUDIT-20261125-1.22.0.md`.
+
+- **Source-only nginx, PHP and Valkey** (new): nginx replaces Angie; no
+  Angie, Sury PHP or valkey-server packages.  Why nginx (1.21.71, both
+  compiled the same way, identical files): cached pages +0.5 to +1.5 %,
+  PHP pages tie.
+- **Fresh install** (`--basic --nginx --php ver=8.5 --mariadb --valkey
+  --elastic --others all`): 10 min 15 s including building nginx 1.31.10,
+  PHP 8.5.13 and Valkey 9.2.0 with LLVM 23.  `--optimize` under load
+  BOLTed all three (nginx by in-place upgrade, no restart); a second
+  `--optimize` found every build current.  No `Server` or `X-Powered-By`
+  header; no "nginx" on the 404 page.
+- **Migration of a 1.21.71 host** (Angie, Sury PHP 8.5, valkey-server
+  package, three apps, an Angie ACME vhost, an `auth_basic`/`sub_filter`
+  vhost; 1.21 suites 76/76 and 105/105 before): PHP and Valkey moved in the
+  first run.  The nginx part found three bugs (a package file scanned as
+  the operator's, a strict catch-all comparison, no retry by a fixed
+  release); Angie kept serving each time.  After the fixes: Angie purged,
+  `/etc/angie` in `/var/backups/setup-1.22`, ACME vhost on the self-signed
+  certificate (200), `auth_basic` 401/200, `sub_filter` commented out, no
+  Angie/PHP/Valkey packages left (valkey `rc` only), every extension Sury
+  had loaded kept.  Reboot: all units active and enabled, every site 200.
+- **`--upgrade-php`:**
+  - **8.6:** the build failed safely (igbinary 3.2.16 does not compile on
+    8.6), 8.5 kept serving, and the log stayed at 427 KB.
+  - **8.0:** refused before anything changed.
+  - **Down to 8.4, 8.3, 8.2 and 8.1:** each built and served, in 162-316 s.
+    8.1 builds with OpenSSL 3.6.5.
+  - **Back to 8.5:** 38 s from the kept build.
+  - **Suites:** 78/78, 105/105 and 0 functional failures on 8.2-8.5.
+  - **8.1 and Chevereto:** Chevereto 4.5 needs PHP 8.2, so that switch is
+    now refused up front.
+  - **Bugs found and fixed:** two link bugs (GNU ld instead of lld) in 8.4
+    and older, the OpenSSL 4 incompatibility of 8.1, and an after-switch
+    check that never reached PHP.
+- **Fix:** BOLT on an idle server reported an error; now "too little
+  traffic, BOLT skipped".
+- Suites (final tree): unit 2,797 pass (0 fail, 1 skipped), dry runs 290,
+  ShellCheck clean; fresh install and migrated
+  host each: security 78/78, cookie 105/105, functional 0 failures.
 
 ## 1.21.71 — Xeon E-2236 (2026-11-25)
 
