@@ -1213,6 +1213,29 @@ check "huge pages: no reservation on a host without PHP" \
 check "huge pages: none below 4 GB" test "$(sysctl_hugepages_target 3910 1)" = 0
 check "huge pages: capped for a 128 GB host" \
   test "$(sysctl_hugepages_target 131072 1)" = 296
+# A --php run after a PHP-less --basic brings the managed line to the target.
+hp_sync_out=$(
+  host_is_container() { return 1; }
+  mem_total_mb() { echo 11955; }
+  sysctl() { :; }
+  info() { :; }
+  warn() { :; }
+  f="$TMP/hp-sysctl.conf"
+  printf '# BEGIN setup.sh tuning\nvm.swappiness = 10\nvm.nr_hugepages = 0\n# END setup.sh tuning\n' > "$f"
+  sysctl_hugepages_sync "$f"; printf 'a=%s\n' "$(grep -c '^vm.nr_hugepages = 296$' "$f")"
+  printf '# BEGIN setup.sh tuning\nvm.swappiness = 10\n# END setup.sh tuning\n' > "$f"
+  sysctl_hugepages_sync "$f"; printf 'b=%s\n' "$(grep -c '^vm.nr_hugepages = 296$' "$f")"
+  printf 'vm.nr_hugepages = 0\n' > "$f"
+  sysctl_hugepages_sync "$f"; printf 'c=%s\n' "$(grep -c '^vm.nr_hugepages = 0$' "$f")"
+  host_is_container() { return 0; }
+  printf '# BEGIN setup.sh tuning\nvm.nr_hugepages = 0\n# END setup.sh tuning\n' > "$f"
+  sysctl_hugepages_sync "$f"; printf 'd=%s\n' "$(grep -c '^vm.nr_hugepages = 0$' "$f")"
+)
+check "huge-page sync raises a managed 0 to the PHP target (--php after --basic)" grep -qx 'a=1' <<<"$hp_sync_out"
+check "huge-page sync adds the line when the managed block lacks it" grep -qx 'b=1' <<<"$hp_sync_out"
+check "huge-page sync leaves an unmanaged sysctl.conf alone" grep -qx 'c=1' <<<"$hp_sync_out"
+check "huge-page sync is a no-op in a container" grep -qx 'd=1' <<<"$hp_sync_out"
+unset hp_sync_out
 check "4+ CPU hosts use PHP's default tracing thresholds" \
   test "$(php_jit_threshold_lines 16)" = "opcache.jit_hot_loop = 64
 opcache.jit_hot_func = 127
@@ -2661,10 +2684,39 @@ for ck in 'xf_session=abc' 'xf.session=abc' 'xf session=abc' 'xf[session=abc' 'x
           'a=1; xf.user=1,tok' 'xf_session_admin=x' 'xf.tfa.trust=t' 'xf.session.admin=s' 'x%66_session=abc'; do
   check "XenForo bypass map treats '${ck}' as a member" xf_ck_match "$ck"
 done
-for ck in 'xf_csrf=abc' 'consent=a%2Cb; xf_csrf=x' '_hjSessionUser_12=x' 'ajs_user_id=7' '_pk_id.1.1fff=abc' 'xf_style_id=2; xf_language_id=1' '_ga=GA1.2.3'; do
+for ck in 'xf_csrf=abc' 'consent=a%2Cb; xf_csrf=x' '_hjSessionUser_12=x' 'ajs_user_id=7' '_pk_id.1.1fff=abc' 'xf_style_id=2; xf_language_id=1' '_ga=GA1.2.3' \
+          'xf_language_id=0000002' 'xf_style_id=000123456' 'xf_language_id=123456'; do
   check "XenForo bypass map keeps '${ck}' a cacheable guest" xf_ck_guest "$ck"
 done
-unset -f xf_ck_match xf_ck_guest; unset xf_ck_res ck
+# A style/language value the key maps cannot read must not reach the default
+# key: PHP decodes "%32" and XenForo casts "0000002"/"+2" to 2 (1.22.2: a
+# 7-character zero-padded value stored a language-2 page for every guest).
+for ck in 'xf_language_id=%32' 'xf_style_id=+2' 'xf_language_id=1234567' 'a=1; xf_style_id=00012345678' 'xf_style_variation=%61lt'; do
+  check "XenForo bypass map keeps '${ck}' out of the guest cache" xf_ck_match "$ck"
+done
+# The key maps strip leading zeros, so "0000002" and "2" share one entry.
+xf_key_of() { # map file, map variable, cookie value -> key token
+  local re
+  re=$(sed -n "/map \\\$cookie_$2 /,/^}/s/^[[:space:]]*\"~\\(.*\\)\"[[:space:]].*/\\1/p" "$1")
+  perl -e 'print(($ARGV[1] =~ /$ARGV[0]/) ? (values %+)[0] : "")' "$re" "$3"
+}
+check "legacy XenForo key map strips leading zeros (0000002 -> 2)" \
+  test "$(xf_key_of "$TMP/xfguest/http.d/zz-setup-fastcgi-cache-map.conf" xf_language_id 0000002)" = 2
+check "legacy XenForo key map keeps 0 for an all-zero value" \
+  test "$(xf_key_of "$TMP/xfguest/http.d/zz-setup-fastcgi-cache-map.conf" xf_style_id 000)" = 0
+check_tree "repository XenForo key map strips leading zeros (0000002 -> 2)" \
+  test "$(xf_key_of "$NGINX_TREE/http.d/fastcgi_cache.conf" xf_language_id 0000002)" = 2
+check_tree "repository XenForo key map keeps a six-digit id" \
+  test "$(xf_key_of "$NGINX_TREE/http.d/fastcgi_cache.conf" xf_style_id 123456)" = 123456
+xf_ck_res=$(sed -n 's/^[[:space:]]*"~\*\{0,1\}\(.*\)"[[:space:]]*1;$/\1/p' "$NGINX_TREE/http.d/fastcgi_cache.conf" 2>/dev/null || true)
+check_tree "repository XenForo bypass map keeps 'xf_language_id=1234567' out of the guest cache" xf_ck_match 'xf_language_id=1234567'
+check_tree "repository XenForo bypass map keeps 'xf_language_id=0000002' a cacheable guest" xf_ck_guest 'xf_language_id=0000002'
+# The CDN proxy forwards the raw request line (proxy_pass with a variable),
+# so its cache key must be $request_uri: the decoded $uri let
+# "/proxy.php%3F..." store an error under the key of "/proxy.php?...".
+check_tree "CDN proxy cache key uses the raw \$request_uri" \
+  grep -qx 'proxy_cache_key "\$scheme|\$host|\$request_method|\$request_uri";' "$NGINX_TREE/h5bp/proxy_cdn.conf"
+unset -f xf_ck_match xf_ck_guest xf_key_of; unset xf_ck_res ck
 
 # A real include is one `location ~ \.php` block: the injected block must land
 # inside the braces (server-context directives would also cache the admin and
@@ -7093,11 +7145,17 @@ php_upgrade_ok_probe=$(
   verify_optimized_services() { :; }
   info() { :; }
   warn() { :; }
+  stub_reset_called=0
+  reset_operator_overrides() { stub_reset_called=1; }
   probe_during='unset'
-  optimize_php_services() { probe_during=${OPT_PHP_OK:-unset}; return 0; }
+  stub_workers_seen='unset'
+  optimize_php_services() { probe_during=${OPT_PHP_OK:-unset}; stub_workers_seen=${SETUP_PHP_WORKERS_PER_CPU:-unset}; return 0; }
   OPT_PHP_OK=0
+  export SETUP_PHP_WORKERS_PER_CPU=2
   php_upgrade_optimize >/dev/null 2>&1 || true
   printf 'during=%s\n' "$probe_during"
+  printf 'workers_env=%s\n' "$stub_workers_seen"
+  printf 'reset=%s\n' "$stub_reset_called"
   printf 'after_ok=%s\n' "$OPT_PHP_OK"
   optimize_php_services() { return 1; }
   php_upgrade_optimize >/dev/null 2>&1 || true
@@ -7105,6 +7163,10 @@ php_upgrade_ok_probe=$(
 )
 check "--upgrade-php sets OPT_PHP_OK before the PHP pass" \
   grep -qx 'during=1' <<<"$php_upgrade_ok_probe"
+check "--upgrade-php ignores tuning environment like --optimize (SETUP_PHP_WORKERS_PER_CPU)" \
+  grep -qx 'workers_env=unset' <<<"$php_upgrade_ok_probe"
+check "--upgrade-php resets recorded pins like --optimize" \
+  grep -qx 'reset=1' <<<"$php_upgrade_ok_probe"
 check "--upgrade-php keeps OPT_PHP_OK=1 after a clean PHP pass" \
   grep -qx 'after_ok=1' <<<"$php_upgrade_ok_probe"
 check "--upgrade-php clears OPT_PHP_OK when the PHP pass fails" \

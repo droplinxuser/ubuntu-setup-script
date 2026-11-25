@@ -8,8 +8,62 @@ Reports of the 1.21.33-1.21.61 cycles that measured the removed Anubis
 filter were deleted from the tree on 2026-11-23 for the same reason;
 `git show <commit>:<path>` recovers them.
 
-## Unreleased (1.22.2)
+## 1.22.2 (2026-11-26)
 
+- **Security: XenForo guest-cache poisoning with zero-padded cookies**
+  (server-configs-nginx 1.7.3).  `xf_language_id=0000002` (7 characters)
+  missed the 1-6 digit key class, so it was keyed as the default guest
+  page, while XenForo int-cast it and rendered language 2: three such
+  requests served every cookieless guest the wrong language (or style) for
+  the cache TTL.  Reproduced on the audit host; the key maps now strip
+  leading zeros and a value with more than six significant digits bypasses
+  the cache.  `--optimize` rewrites the legacy `$setup_xf_guest_bypass`
+  map (hand-written or pre-1.21 `php_xf.conf`) with the same value guards,
+  which also closes `%32`, `+2` and `2x` there.
+- **Security: CDN proxy cache key uses `$request_uri`** (server-configs-nginx
+  1.7.3).  With the decoded `$uri`, `/proxy.php%3Fimage=x` (an origin
+  403/404) shared the key of `/proxy.php?image=x` and blanked that public
+  URL for the error TTL.
+- **`--php` on its own now sets `vm.nr_hugepages`.**  The memory plan books
+  huge pages for OPcache, but only `--basic` wrote the sysctl, so a `--php`
+  run left `opcache.huge_code_pages` with no pool until the next
+  `--optimize`.  `install_php` now syncs the managed sysctl line first (no
+  change on unmanaged files or in containers).
+- **`--upgrade-php` tunes from the same inputs as `--optimize`.**  It now
+  ignores `SETUP_*` tuning env and resets operator pins first, like
+  `--optimize`, so the pool it builds is the one the next
+  `--optimize` keeps.
+- **Opt-in TLS-library and kTLS nginx builds for benchmarks.**
+  `tools/nginx-build.sh build-arm DIR` builds nginx into its own prefix,
+  never activated, with `TLS_LIB=openssl|aws-lc|boringssl`, `KTLS=0|1` and
+  `OPENSSL_VERSION=lts` (newest 3.5.x) in `nginx-build.conf`; AWS-LC and
+  BoringSSL are fetched, built static with cmake/ninja and linked like a
+  system library.  The TLS choice is recorded in `build.info`
+  (`tls_opts=`) and a change makes `check` report the build stale.  The
+  fleet build is unchanged (OpenSSL 4.1, no kTLS, recipe 5).
+  `tests/stress-site/tls-arms-bench.sh` runs the arms standalone on their
+  own ports.  Measured (AUDIT-20261126-1.22.2.md): AWS-LC and BoringSSL
+  need half of OpenSSL's nginx CPU per ECDSA handshake, OpenSSL 4.1 beats
+  3.5, keep-alive and bulk tie; kTLS cuts nginx CPU on large static files
+  by ~44 % but costs 38 % on small keep-alive responses.  Neither becomes
+  the default.
+- **kTLS needs `tcp_notsent_lowat` >= 131072.**  At the 16384 this script
+  sets, `sendfile()` on a kTLS socket sends one 16 KB record per ~200 ms
+  timer and a 1 MB file does not finish (kernel 7.0).  Documented next to
+  `KTLS` in `nginx-build.conf` and `configs/system/sysctl.conf`; the bench
+  refuses a kTLS arm below it.
+- **Help text:** `app=` placement inside a `--domain` group, and
+  `--upgrade-php=<active series>` (rebuild only).
+- **Benchmark harness for PHP series** (`tests/bench-php-matrix/`):
+  `install-php-series.sh` builds any set of series with one extension set
+  (replaces the Sury-based `install-php-versions.sh`); `switch-php-arm.sh
+  series-X.Y` rotates them on the shared socket;
+  `bench-xf-php-series.sh` + `xf-series.tiers` run four XenForo tiers with
+  gating (HTTP 200, page marker, cache status), independent medians,
+  CPU ms/req and MHz; `deploy-xf.sh`/`install-addons.sh` `PLAIN=1` deploy
+  XenForo without Valkey, Elasticsearch or cache add-ons; `seed-xf.sh`
+  writes the member cookie and median thread for the runner; `set-jit.sh`
+  targets the active series (or `X.Y`/`all`).
 - **server-configs-nginx has one branch, `main`.**  setup.sh downloads
   `CONFIG_REPO_REF=main` (was `nginx`), and CI checks out `main`.  The
   `nginx` branch became a tag (the frozen 1.7.1 tree), so 1.22.0 and 1.22.1

@@ -2,7 +2,15 @@
 # Put exactly one PHP arm in front of nginx's shared FastCGI socket
 # (/run/php/php-fpm.sock) and prove it is serving.
 #
-# Usage: switch-php-arm.sh sury|ubuntu|src-TAG|ols-lsphp|ols-src-TAG
+# Usage: switch-php-arm.sh series-X.Y|sury|ubuntu|src-TAG|ols-lsphp|ols-src-TAG
+#
+# "series-X.Y" (the 1.22 layout) starts phpX.Y-fpm.service, a series that
+# tools/php-build.sh compiled and install-php-series.sh laid out under
+# /etc/php/X.Y.  Every series listens on the shared socket, so only one runs;
+# the unit is started, never enabled (/etc/php/setup-active is not changed).
+# The probe requires HTTP 200 and XenForo markup from xf.test.local on
+# 127.0.0.1 (PROBE_URL overrides) and that the FPM master is that build.
+# The other arms below are the 1.21 (Sury package) comparisons.
 #
 # "sury" and "ubuntu" both start the distribution unit (php8.5-fpm); which
 # package provides it is decided by the caller (the audit purges one before
@@ -18,23 +26,36 @@
 set -Eeuo pipefail
 export LC_ALL=C
 
-ARM=${1:?usage: switch-php-arm.sh sury|ubuntu|src-TAG|dropin-TAG|ols-lsphp|ols-src-TAG}
+ARM=${1:?usage: switch-php-arm.sh series-X.Y|sury|ubuntu|src-TAG|dropin-TAG|ols-lsphp|ols-src-TAG}
 PHP_INI_DIR=/etc/php/8.5/fpm
 SOCK=/run/php/php-fpm.sock
+SETUP_PHP=${PHP_BUILD_ROOT:-/usr/local/lib/setup-php}
 
 stop_all() {
   local u
-  # Every pool this host can serve from: the packaged unit, the extracted
-  # Ubuntu unit and every source build.  php-src units are not enabled, so
-  # list every loaded unit rather than unit files.
+  # Every pool this host can serve from: every phpX.Y-fpm (package or
+  # compiled series), the extracted Ubuntu unit and every source build.
+  # Started-only units are not enabled, so list every loaded unit rather
+  # than unit files (--plain: no status bullet in the first column).
   systemctl stop php8.5-fpm php-pkg-ubuntu.service >/dev/null 2>&1 || true
-  for u in $(systemctl list-units --all --no-legend --no-pager \
-               | awk '$1 ~ /^php(-src-.*)?\.service$/ { print $1 }'); do
+  for u in $(systemctl list-units --all --plain --no-legend --no-pager \
+               | awk '$1 ~ /^php([0-9]+\.[0-9]+-fpm|-src-.*)?\.service$/ { print $1 }'); do
     systemctl stop "$u" >/dev/null 2>&1 || true
   done
   # A benchmark visits several arms per minute; without clearing the start
   # rate limit the next unit fails with "start request repeated too quickly".
   systemctl reset-failed >/dev/null 2>&1 || true
+  # Drain: workers finish their request on SIGQUIT; the next arm must start
+  # cold and alone, with no old worker still burning CPU.
+  for _ in $(seq 1 75); do
+    pgrep -f '^php-fpm: ' >/dev/null 2>&1 || break
+    sleep 0.2
+  done
+  if pgrep -f '^php-fpm: ' >/dev/null 2>&1; then
+    echo "php-fpm processes left after stopping every pool; killing them" >&2
+    pkill -9 -f '^php-fpm: ' 2>/dev/null || true
+    sleep 0.5
+  fi
   # Wait for the socket to disappear so the next arm binds a fresh one.
   # A crashed arm can leave the inode behind with no listener; remove it then.
   for _ in $(seq 1 50); do
@@ -108,6 +129,16 @@ prepare_src_scan_dir() {
 DROPIN_DIR=/run/systemd/system/php8.5-fpm.service.d
 rm -f "$DROPIN_DIR/zz-bench-dropin.conf"
 case $ARM in
+  series-*)
+    VER=${ARM#series-}
+    [[ $VER =~ ^[0-9]+\.[0-9]+$ ]] || { echo "bad series in $ARM (want series-X.Y)" >&2; exit 1; }
+    [[ -x $SETUP_PHP/$VER/sbin/php-fpm && -f /etc/systemd/system/php$VER-fpm.service && -f /etc/php/$VER/fpm/php.ini ]] \
+      || { echo "PHP $VER is not installed by tools/php-build.sh; run install-php-series.sh $VER" >&2; exit 1; }
+    UNIT=php$VER-fpm.service
+    BIN=$SETUP_PHP/$VER/bin/php
+    export PHP_INI_SCAN_DIR=/etc/php/$VER/fpm/conf.d
+    PHP_ARGS=(-c "/etc/php/$VER/fpm/php.ini")
+    ;;
   sury)
     UNIT=php8.5-fpm
     BIN=/usr/bin/php8.5
@@ -197,7 +228,7 @@ else
   systemctl is-active --quiet nginx || systemctl start nginx
   systemctl reset-failed "$UNIT" >/dev/null 2>&1 || true
   systemctl start "$UNIT"
-  PROBE_URL=https://wp.test.local/
+  if [[ $ARM == series-* ]]; then PROBE_URL=${PROBE_URL:-https://xf.test.local/}; else PROBE_URL=https://wp.test.local/; fi
 fi
 
 if [[ $ARM != ols-* ]]; then
@@ -210,13 +241,33 @@ fi
 
 # The first request after a switch loads OPcache; wait for a 2xx/3xx.
 code=""
+RESOLVE=()
+if [[ $ARM == series-* ]]; then
+  host=${PROBE_URL#*://}; host=${host%%/*}
+  RESOLVE=(--resolve "$host:443:127.0.0.1" --resolve "$host:80:127.0.0.1")
+fi
 for _ in $(seq 1 50); do
-  code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 \
+  code=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 5 "${RESOLVE[@]}" \
            -H 'Cookie: arm-probe=1' "$PROBE_URL" 2>/dev/null || true)
   [[ $code =~ ^[23] ]] && break
   sleep 0.3
 done
 [[ $code =~ ^[23] ]] || { echo "app answered HTTP ${code:-none} after switching to $ARM" >&2; exit 1; }
+
+if [[ $ARM == series-* ]]; then
+  # The FPM master on the socket must be this series' build, alone.
+  pid=$(systemctl show -p MainPID --value "$UNIT" 2>/dev/null || true)
+  exe=$(readlink -f "/proc/${pid:-0}/exe" 2>/dev/null || true)
+  [[ ${exe%" (deleted)"} == "$SETUP_PHP/$VER/sbin/php-fpm"* ]] \
+    || { echo "$UNIT main PID ${pid:-none} runs '${exe:-?}', not $SETUP_PHP/$VER/sbin/php-fpm" >&2; exit 1; }
+  masters=$(pgrep -fc '^php-fpm: master' 2>/dev/null || true)
+  [[ $masters == 1 ]] || { echo "expected one php-fpm master, found ${masters:-0}" >&2; exit 1; }
+  # 200 and XenForo's page markup (<html id="XF" ...), from loopback.
+  body=$(curl -sk --max-time 10 "${RESOLVE[@]}" -H 'Cookie: arm-probe=1' \
+           -w '\n%{http_code}' "$PROBE_URL" 2>/dev/null || true)
+  [[ ${body##*$'\n'} == 200 && $body == *'id="XF"'* ]] \
+    || { echo "$PROBE_URL did not answer 200 with XenForo markup on $ARM (HTTP ${body##*$'\n'})" >&2; exit 1; }
+fi
 
 # A lean arm (php-fpm-build.sh) has no CLI: its php-fpm reports -v/-m too.
 if [[ ! -x $BIN && -n ${TAG:-} && -x /opt/php-$TAG/sbin/php-fpm ]]; then

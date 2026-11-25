@@ -943,6 +943,29 @@ hugepages_reserved_mb() {
   printf '%s' $(( pages * 2 ))
 }
 
+# A --php run on a host whose --basic ran without PHP left the managed
+# vm.nr_hugepages at 0, while the memory plan booked the pages and
+# huge_code_pages stayed off until the next --optimize (1.22.2 audit).
+# Bring the managed line to the configure_sysctl target and apply it now.
+# Only touches a setup.sh-managed /etc/sysctl.conf; no-op in a container.
+sysctl_hugepages_sync() {
+  local file=${1:-/etc/sysctl.conf} want cur
+  [[ -f $file ]] && grep -q '^# BEGIN setup.sh tuning' "$file" || return 0
+  host_is_container && return 0
+  want=$(sysctl_hugepages_target "$(mem_total_mb)" 1)
+  [[ $want =~ ^[0-9]+$ ]] || return 0
+  cur=$(sed -n 's/^vm\.nr_hugepages[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$file" | tail -n1)
+  [[ $cur == "$want" ]] && return 0
+  if [[ -n $cur ]]; then
+    sed -i "s/^vm\.nr_hugepages[[:space:]]*=.*/vm.nr_hugepages = ${want}/" "$file"
+  else
+    sed -i "s/^# END setup.sh tuning/vm.nr_hugepages = ${want}\n&/" "$file"
+  fi
+  sysctl -q -w "vm.nr_hugepages=${want}" >/dev/null 2>&1 \
+    || warn "vm.nr_hugepages=${want} could not be applied now (it applies at the next boot)"
+  info "OPcache huge pages: vm.nr_hugepages ${cur:-unset} -> ${want}"
+}
+
 configure_sysctl() {
   step "sysctl tweaks"
   record_sysctl_values

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run one benchmark stack (1=plain, 2=Valkey, 3=+nginx cache)
-# across PHP 8.2-8.6 and four request tiers.  Run as root on the forum host.
+# across PHP 8.1-8.6 (switch-php-arm.sh series-X.Y) and four request tiers.  Run as root on the forum host.
 #
 # Usage: bench-combo.sh {1|2|3}
 set -Eeuo pipefail
@@ -14,9 +14,9 @@ BACKUP=/root/audit/nginx-bench-backup
 CONNS=${CONNS:-100}
 SECS=${SECS:-10}
 THREADS=${THREADS:-4}
-VERS=${VERS:-"8.2 8.3 8.4 8.5 8.6"}
-SETUP=/root/work/ubuntu-setup-script
-CONFIGS=/root/work/server-configs-nginx
+VERS=${VERS:-"8.1 8.2 8.3 8.4 8.5 8.6"}
+HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ACTIVE=$(tr -d '[:space:]' < /etc/php/setup-active)
 
 [[ -f $ENVF ]] || { echo "missing $ENVF; run seed-xf.sh first" >&2; exit 1; }
 # shellcheck disable=SC1090
@@ -47,10 +47,11 @@ reload_nginx() {
   sleep 0.3
 }
 
+# 1.22 layout: every compiled series (install-php-series.sh) listens on the
+# shared /run/php/php-fpm.sock; switch-php-arm.sh starts exactly one.
 set_php() {
   local v=$1
-  sed -i -E "s|^([[:space:]]*server[[:space:]]+)unix:/run/php/[^;]+;|\\1unix:/run/php/php${v}-fpm.sock;|" /etc/nginx/nginx.conf
-  reload_nginx
+  "$HERE/switch-php-arm.sh" "series-$v" >/dev/null
   local got
   got=$(curl -sk --max-time 10 -H 'Cookie: xf_session=bench-bypass' \
     --resolve xf.test.local:443:127.0.0.1 "https://xf.test.local/phpver.php?probe=${v}-${RANDOM}")
@@ -102,7 +103,7 @@ clear_page_cache() {
 }
 
 cg_usage() {
-  local unit=$1 f=/sys/fs/cgroup/system.slice/${1}.service/cpu.stat
+  local f=/sys/fs/cgroup/system.slice/${1}.service/cpu.stat
   [[ -r $f ]] || { printf '0'; return; }
   awk '/^usage_usec/{print $2}' "$f" 2>/dev/null || printf '0'
 }
@@ -115,7 +116,7 @@ run_tier() {
 
   wrk -t"$THREADS" -c"$CONNS" -d2s "${h[@]}" "$url" >/dev/null 2>&1 || true
 
-  local a0 p0 m0 v0 n0 a1 p1 m1 v1 n1
+  local a0 p0 m0 v0 a1 p1 m1 v1
   a0=$(cg_usage nginx); p0=$(cg_usage "php$VER-fpm"); m0=$(cg_usage mariadb); v0=$(cg_usage valkey-server)
   out=$(wrk -t"$THREADS" -c"$CONNS" -d"${SECS}s" --latency "${h[@]}" "$url" 2>&1) || true
   a1=$(cg_usage nginx); p1=$(cg_usage "php$VER-fpm"); m1=$(cg_usage mariadb); v1=$(cg_usage valkey-server)
@@ -157,6 +158,6 @@ for VER in $VERS; do
   run_tier member_thread  "https://xf.test.local${XF_THREAD}" "$XF_COOKIE"
 done
 
-set_php 8.5
+set_php "$ACTIVE"
 rm -f "$ROOT/phpver.php"
 echo "== combo $COMBO complete"

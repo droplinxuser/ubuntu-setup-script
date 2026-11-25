@@ -10,10 +10,13 @@ ENVF=/root/audit/bench-env.sh
 OUT=/root/audit/efficiency.tsv
 SETUP=/root/work/ubuntu-setup-script
 CONFIGS=/root/work/server-configs-nginx
-VERS="8.2 8.3 8.4 8.5 8.6"
+VERS=${VERS:-"8.1 8.2 8.3 8.4 8.5 8.6"}
+HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ACTIVE=$(tr -d "[:space:]" < /etc/php/setup-active)
 CONNS=8
 SECS=15
 
+# shellcheck disable=SC1090
 . "$ENVF"
 
 echo "== disable page cache, disable Valkey data cache"
@@ -23,14 +26,11 @@ sed -i "s/^\$config\['cache'\]\['enabled'\] = .*/\$config['cache']['enabled'] = 
 grep -rlE 'limit_req[[:space:]]+zone=' /etc/nginx --include='*.conf' 2>/dev/null \
   | while IFS= read -r f; do sed -i -E 's|^([[:space:]]*)limit_req([[:space:]]+zone=)|\1# bench: limit_req\2|' "$f"; done
 
+# 1.22 layout: every compiled series (install-php-series.sh) listens on the
+# shared /run/php/php-fpm.sock; switch-php-arm.sh starts exactly one, cold.
 set_php() {
   local v=$1
-  sed -i -E "s|^([[:space:]]*server[[:space:]]+)unix:/run/php/[^;]+;|\\1unix:/run/php/php${v}-fpm.sock;|" /etc/nginx/nginx.conf
-  nginx -t >/dev/null
-  systemctl reload nginx
-  sleep 0.5
-  for s in $VERS; do systemctl is-active --quiet "php$s-fpm" && systemctl reload "php$s-fpm" || true; done
-  sleep 0.3
+  "$HERE/switch-php-arm.sh" "series-$v" >/dev/null
   local got
   got=$(curl -sk -H 'Cookie: xf_session=bench-bypass' --resolve xf.test.local:443:127.0.0.1 \
     "https://xf.test.local/phpver.php?probe=${v}-${RANDOM}")
@@ -61,6 +61,6 @@ for VER in $VERS; do
   run guest_uncached "https://xf.test.local/" "xf_session=bench-bypass"
   run member_home    "https://xf.test.local/" "$XF_COOKIE"
 done
-set_php 8.5
+set_php "$ACTIVE"
 rm -f "$ROOT/phpver.php"
 echo "== efficiency done: $OUT"

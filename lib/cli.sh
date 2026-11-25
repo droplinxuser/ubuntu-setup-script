@@ -133,8 +133,10 @@ Domain setup (standalone; nginx + MariaDB must already be installed/running):
         /etc/nginx/conf.d/<domain>.conf   (full vhost from the nginx repo's
                                            conf.d/templates; the basic
                                            template when app= is omitted)
-      app=TYPE may be given inside a --domain group and applies to every
-      domain in that group. TYPE is one of:
+      app=TYPE inside a --domain group: one app= after the whole list
+      applies to every domain in the group; otherwise each app= belongs to
+      the domain just before it (one before any domain is the group
+      default). TYPE is one of:
         basic (default) xf wordpress flarum pingvin chevereto polr lychee
         shlink sfs php node
       A PHP app adds its extension set to the PHP build; PHP is rebuilt
@@ -253,7 +255,9 @@ PHP upgrade (standalone):
           /var/log/setup-php-upgrade-<timestamp>.md.
       The previous version's build and /etc/php tree are kept for one
       rollback: --upgrade-php=OLD switches back without rebuilding when that
-      build is still current.  Refused while the 1.22 migration of PHP is
+      build is still current.  --upgrade-php=<the active series> only
+      rebuilds a stale build (no switch and no re-tune; --optimize tunes).
+      Refused while the 1.22 migration of PHP is
       unfinished, while the web tier is still Angie, and below the 4 GB
       class.  Use --dry-run to print the plan without changes.  It cannot
       be combined with install flags, --optimize, --purge, --diagnostics,

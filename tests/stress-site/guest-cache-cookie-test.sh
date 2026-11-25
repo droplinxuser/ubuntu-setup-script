@@ -276,7 +276,8 @@ echo "################ Encoded XenForo style/language values (1.21.68)"
 # maps read nginx's raw $cookie_*: such a value used the default key and
 # stored, e.g., a language-2 page for every guest (MISS MISS HIT on 1.6.58).
 u="$X/whats-new/?ev=$RANDOM"
-for ck in 'xf_language_id=%32' 'xf_language_id=+2' 'xf_style_id=%32' 'xf_style_id=2%20' 'xf_style_variation=%61lternate'; do
+for ck in 'xf_language_id=%32' 'xf_language_id=+2' 'xf_style_id=%32' 'xf_style_id=2%20' 'xf_style_variation=%61lternate' \
+          'xf_language_id=1234567' 'xf_style_id=00012345678'; do
   for _ in 1 2 3; do req ev -H "Cookie: $ck" "$u"; done
   chk "xf: a style/language cookie the key cannot read bypasses the guest cache ($ck)" \
     "$(hdr ev x-cache-status)" BYPASS
@@ -287,5 +288,13 @@ chk "xf: no encoded-value request reached the guest entry" "$(hdr evg x-cache-st
 u="$X/whats-new/?ew=$RANDOM"
 for _ in 1 2 3; do req ew -H 'Cookie: xf_language_id=2' "$u"; done
 chk "xf: a well-formed language cookie is still cached under its key" "$(hdr ew x-cache-status)" HIT
+# Leading zeros (1.22.2): XenForo casts "0000002" to 2.  The key maps strip
+# the zeros, so it shares the language-2 entry and never the default one.
+req ez -H 'Cookie: xf_language_id=0000002' "$u"
+chk "xf: a zero-padded language cookie uses the language-2 entry" "$(hdr ez x-cache-status)" HIT
+u="$X/whats-new/?ez=$RANDOM"
+for _ in 1 2 3; do req ez -H 'Cookie: xf_language_id=0000002' "$u"; done
+req ezg "$u"
+chk "xf: a zero-padded language cookie never fills the default guest entry" "$(hdr ezg x-cache-status)" MISS
 
 echo; echo "TOTAL pass=$P fail=$F"; rm -rf "$T"

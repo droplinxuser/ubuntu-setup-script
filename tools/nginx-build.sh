@@ -68,6 +68,8 @@
 #
 # Usage (root):
 #   nginx-build.sh build | build-only   build + verify into ROOT/staging (prints its path)
+#   nginx-build.sh build-arm DIR        benchmark build into DIR/sbin/nginx, never activated
+#                                       (TLS_LIB / KTLS arms: see nginx-build.conf)
 #   nginx-build.sh activate             swap staging in (in-place upgrade, or start)
 #   nginx-build.sh bolt [S]             sample S seconds (default 60) of traffic, BOLT
 #   nginx-build.sh rebuild              build, activate, wait for traffic, bolt
@@ -154,6 +156,39 @@ conf_value() { # key default
   local v=""
   [[ -f $CONF ]] && v=$(awk -F= -v k="$1" '{ sub(/\r$/, "") } $1 == k { v = substr($0, length(k) + 2); sub(/[[:space:]]*#.*$/, "", v); gsub(/^[[:space:]"'\'']+|[[:space:]"'\'']+$/, "", v); last = v } END { print last }' "$CONF")
   printf '%s' "${v:-$2}"
+}
+
+# The TLS library (TLS_LIB / NGINX_BUILD_TLS_LIB, KTLS / NGINX_BUILD_KTLS in
+# nginx-build.conf).  openssl without kTLS is the fleet build; aws-lc and
+# boringssl (benchmark arms) take openssl's place in COMPONENTS, so their
+# version is resolved, recorded and checked like any other component.
+# AWS-LC and BoringSSL lack BIO_get_ktls_send: KTLS=1 is ignored for them.
+tls_setup() { # lib ktls
+  local i
+  TLS_LIB=${1:-openssl}; KTLS=${2:-0}; KTLS_IGNORED=0
+  case $TLS_LIB in openssl|aws-lc|boringssl) ;; *) die "TLS_LIB=$TLS_LIB: expected openssl, aws-lc or boringssl" ;; esac
+  case $KTLS in 0|1) ;; *) die "KTLS=$KTLS: expected 0 or 1" ;; esac
+  if [[ $KTLS == 1 && $TLS_LIB != openssl ]]; then KTLS=0; KTLS_IGNORED=1; fi
+  for i in "${!COMPONENTS[@]}"; do
+    case ${COMPONENTS[i]} in openssl|aws-lc|boringssl) COMPONENTS[i]=$TLS_LIB ;; esac
+  done
+}
+tls_setup "${NGINX_BUILD_TLS_LIB:-$(conf_value TLS_LIB openssl)}" "${NGINX_BUILD_KTLS:-$(conf_value KTLS 0)}"
+
+# --with-openssl-opt without the compiler flags.  The default (no kTLS) is
+# exactly the string of recipe 5.
+openssl_opt() {
+  local k=""
+  [[ $KTLS == 1 ]] && k="enable-ktls "
+  printf '%s' "no-shared no-tests no-docs no-apps no-legacy no-module enable-ec_nistp_64_gcc_128 --openssldir=/usr/lib/ssl ${k}$OPENSSL_TRIM"
+}
+
+# build.info tls_opts=: changes with the library, kTLS and the OpenSSL options
+# (OPENSSL_TRIM), so switching any of them makes `check` report the build stale.
+tls_key() { # lib ktls
+  local o=$1
+  [[ $1 == openssl ]] && o+=" ktls=$2 $(KTLS=$2 openssl_opt)"
+  printf '%s' "$o" | sha256sum | cut -c1-16
 }
 
 resolve_all() {
@@ -466,6 +501,32 @@ build_deps() { # work jobs cflags: Brotli's static libraries for the static ngx_
   ln -sfn ../deps "$nb/filter/deps"
 }
 
+# TLS_LIB=aws-lc|boringssl: static libssl.a/libcrypto.a and the headers in
+# WORK/tls-prefix, same compiler and flags as nginx (ThinLTO on hosts).  Only
+# the two libraries are built (no tests, tools, Go or Perl); -Wno-error in the
+# Release flags, which come after the projects' own -Werror.
+tls_lib_build() { # work jobs cflags
+  local work=$1 j=$2 f=$3 src=$1/$TLS_LIB pre=$1/tls-prefix bld l
+  local -a opts=()
+  [[ $TLS_LIB == aws-lc ]] && opts=(-DDISABLE_GO=ON -DDISABLE_PERL=ON -DBUILD_TOOL=OFF)
+  fetch_unpack "$TLS_LIB" "${VERS[$TLS_LIB]}" "$src"
+  bld=$src/out
+  cmake -S "$src" -B "$bld" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+    -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="${CXX:-c++}" -DCMAKE_AR="$AR" -DCMAKE_RANLIB="$RANLIB" \
+    -DCMAKE_C_FLAGS="$f" -DCMAKE_CXX_FLAGS="$f" \
+    -DCMAKE_C_FLAGS_RELEASE="-DNDEBUG -Wno-error" -DCMAKE_CXX_FLAGS_RELEASE="-DNDEBUG -Wno-error" \
+    "${opts[@]}" >> "$LOG_FILE" 2>&1 || return 1
+  cmake --build "$bld" -j "$j" --target ssl crypto >> "$LOG_FILE" 2>&1 || return 1
+  rm -rf "$pre"; mkdir -p "$pre/lib" || return 1
+  cp -a "$src/include" "$pre/" || return 1
+  for l in libssl.a libcrypto.a; do
+    f=$(find "$bld" -name "$l" -print -quit)
+    [[ -n $f ]] || { say "$TLS_LIB: $l was not built"; return 1; }
+    cp "$f" "$pre/lib/" || return 1
+  done
+}
+
 # Unbranded default pages for `root html` (ROOT/html): what the stock
 # html/index.html and 50x.html would say, without naming the server.
 write_html() { # dir
@@ -517,6 +578,11 @@ cmd_build() { # [normal|cpu]
   # CI runners build as an ordinary user (ensure_packages uses sudo there).
   host_mode && need_root
   ensure_packages ca-certificates curl git xz-utils bzip2 make cmake perl gpgv binutils autoconf automake libtool build-essential
+  # CPU-change rebuild: the TLS library and kTLS build.info recorded.
+  [[ $how == cpu ]] && tls_setup "$(info_get tls_lib)" "$(info_get ktls)"
+  # AWS-LC / BoringSSL: cmake + ninja (g++'s libstdc++ comes with build-essential).
+  [[ $TLS_LIB == openssl ]] || ensure_packages ninja-build
+  (( KTLS_IGNORED == 0 )) || say "nginx build: KTLS=1 ignored: $TLS_LIB has no kTLS support (BIO_get_ktls_send)"
   mkdir -p "$SRC_CACHE/src" "$LOGS"; chmod 700 "$SRC_CACHE"
   host_mode && build_space_check "$SRC_CACHE"
   build_deprioritize
@@ -590,7 +656,19 @@ cmd_build() { # [normal|cpu]
   else
     rm -f "$SKIP_FILE"
   fi
-  fetch_unpack openssl "${VERS[openssl]}" "$work/openssl"
+  # The TLS library: OpenSSL compiled in by nginx's configure (--with-openssl),
+  # or AWS-LC / BoringSSL built first and linked like a system library
+  # (-I/-L, static archives only; their libssl is C++, hence -lstdc++).
+  local tls_cc="" tls_ld=""
+  local -a tls_cfg=()
+  if [[ $TLS_LIB == openssl ]]; then
+    fetch_unpack openssl "${VERS[openssl]}" "$work/openssl"
+    tls_cfg=(--with-openssl="$work/openssl" --with-openssl-opt="$(openssl_opt) $flags")
+  else
+    tls_lib_build "$work" "$j" "$flags $lto" || { log_excerpt "$LOG_FILE" 30; die "$TLS_LIB failed to build (log: $LOG_FILE)"; }
+    tls_cc=" -I$work/tls-prefix/include"
+    tls_ld=" -L$work/tls-prefix/lib -lssl -lcrypto -lstdc++"
+  fi
   fetch_unpack pcre2 "${VERS[pcre2]}" "$work/pcre2"
   # zlib-ng with zlib's API (1.21.70: gzip CPU per XenForo page -21 % against
   # Ubuntu's zlib, -19 % against zlib 1.4), built first and linked in through
@@ -609,14 +687,17 @@ cmd_build() { # [normal|cpu]
     cd "$src"
     # shellcheck disable=SC2086
     ./configure "${cfg[@]}" \
-      --with-cc="$CC" --with-cc-opt="$flags $lto -I$work/zlib-ng" --with-ld-opt="$ld -L$work/zlib-ng" \
+      --with-cc="$CC" --with-cc-opt="$flags $lto -I$work/zlib-ng$tls_cc" --with-ld-opt="$ld -L$work/zlib-ng$tls_ld" \
       "${CONFIGURE_MODULES[@]}" \
-      --with-openssl="$work/openssl" \
-      --with-openssl-opt="no-shared no-tests no-docs no-apps no-legacy no-module enable-ec_nistp_64_gcc_128 --openssldir=/usr/lib/ssl $OPENSSL_TRIM $flags" \
+      ${tls_cfg[@]+"${tls_cfg[@]}"} \
       --with-pcre="$work/pcre2" --with-pcre-jit --with-pcre-opt="$flags" \
       --add-module="$work/ngx_brotli/filter"
     nice -n 10 make -j"$j"
   ) >> "$LOG_FILE" 2>&1 || { log_excerpt "$LOG_FILE" 40; die "nginx ${VERS[nginx]} failed to build (log: $LOG_FILE)"; }
+  # OpenSSL's Configure drops kTLS silently when its linux/tls.h probe fails.
+  if [[ $KTLS == 1 ]] && grep -q 'define OPENSSL_NO_KTLS' "$work/openssl/.openssl/include/openssl/configuration.h"; then
+    die "OpenSSL ${VERS[openssl]} was configured without kTLS (KTLS=1; log: $LOG_FILE)"
+  fi
   verify_binary "$src/objs/nginx"
   rm -rf "$STAGING"
   install -d -m 755 "$STAGING/sbin"
@@ -634,6 +715,7 @@ cmd_build() { # [normal|cpu]
   {
     printf 'recipe=%s\n' "$BUILD_RECIPE"
     for line in "${COMPONENTS[@]}"; do printf '%s=%s\n' "$line" "${VERS[$line]}"; done
+    printf 'tls_lib=%s\nktls=%s\ntls_opts=%s\n' "$TLS_LIB" "$KTLS" "$(tls_key "$TLS_LIB" "$KTLS")"
     printf 'patched_ok=%s\n' "${VERS[nginx]}"
     [[ -n $fail ]] && printf 'fallback_from=%s\n' "$fail"
     printf 'compiler=%s\n' "$("$CC" --version | sed -n 1p)"
@@ -673,6 +755,11 @@ verify_binary() { # binary
   v=$("$cand" -V 2>&1 || true)
   [[ $v == *--add-module=*ngx_brotli* ]] || die "candidate has no static ngx_brotli (nginx -V lacks --add-module=...ngx_brotli)"
   [[ $v == *--with-http_stub_status_module* ]] || die "candidate has no stub_status"
+  # "built with OpenSSL 1.1.1 (compatible; AWS-LC x.y.z | BoringSSL)"
+  case $TLS_LIB in
+    aws-lc)    [[ $v == *AWS-LC* ]] || die "candidate is not built with AWS-LC" ;;
+    boringssl) [[ $v == *BoringSSL* ]] || die "candidate is not built with BoringSSL" ;;
+  esac
   branding_check "$cand" || die "candidate failed the branding check (log: $LOG_FILE)"
   if live_test_enabled; then
     apply_tmpfiles
@@ -977,6 +1064,13 @@ cmd_check() { # [info]
   [[ -f $info ]] || { echo "no build"; return 10; }
   [[ $(info_get recipe "$info") == "$BUILD_RECIPE" ]] || stale+="recipe $(info_get recipe "$info") -> $BUILD_RECIPE, "
   [[ $(info_get ci "$info") != 1 ]] || stale+="CI build, "
+  # A build.info without tls_opts= (before the TLS arms) is the default openssl build.
+  have=$(info_get tls_opts "$info"); [[ -n $have ]] || have=$(tls_key openssl 0)
+  want=$(tls_key "$TLS_LIB" "$KTLS")
+  if [[ $have != "$want" ]]; then
+    have=$(info_get tls_lib "$info"); n=$(info_get ktls "$info")
+    stale+="TLS options ${have:-openssl}/ktls=${n:-0} -> $TLS_LIB/ktls=$KTLS, "
+  fi
   bcpu=$(info_get cpu "$info")
   [[ -n $bcpu && $bcpu == "$(cpu_fingerprint)" ]] || stale+="cpu ${bcpu:-unknown} -> $(cpu_fingerprint), "
   n=$(info_get llvm "$info")
@@ -1026,6 +1120,36 @@ cmd_refresh() {
   return 0
 }
 
+# build-arm DIR: a benchmark build into its own prefix, never activated.
+# A child `build` with NGINX_BUILD_ROOT=DIR (so --prefix/--sbin-path are DIR,
+# the staging is DIR/staging), this nginx-build.conf (or NGINX_BUILD_CONF,
+# e.g. one per arm with its own OPENSSL_VERSION / TLS_LIB / KTLS), no live
+# configuration test (`build` never touches the link); then DIR/sbin/nginx.
+# Nothing under ROOT changes and nothing is started.  An arm whose non-TLS
+# components differ from the live build (or that fell back) gets a warning:
+# its benchmark rows would not compare like with like.
+cmd_build_arm() { # dir
+  local dir f c diff=""
+  host_mode || die "build-arm is not available in CI mode"
+  [[ ${1:-} == /* ]] && dir=$(realpath -m -- "$1") || dir=""
+  [[ $dir == /?* && $dir != "$ROOT" && $dir != "$ROOT"/* && $ROOT != "$dir"/* ]] \
+    || die "build-arm DIR: an absolute directory outside and not above $ROOT"
+  NGINX_BUILD_ROOT=$dir NGINX_BUILD_CONF=$CONF NGINX_BUILD_LIVE_TEST=0 \
+    NGINX_BUILD_CONTEXT=install bash "$SELF" build >/dev/null
+  install -d -m 755 "$dir/sbin"
+  for f in nginx nginx.lto; do
+    [[ -f $dir/staging/sbin/$f ]] && mv -f "$dir/staging/sbin/$f" "$dir/sbin/$f"
+  done
+  mv -f "$dir/staging/build.info" "$dir/build.info"
+  rm -rf "${dir:?}/staging"
+  for c in nginx llvm pcre2 zlib-ng brotli ngx-brotli; do
+    [[ $(info_get "$c" "$dir/build.info") == "$(info_get "$c")" ]] || diff+=" $c"
+  done
+  [[ -z $(info_get fallback_from "$dir/build.info") ]] || diff+=" (nginx fell back)"
+  [[ -z $diff ]] || say "WARNING: $dir differs from the live build in:$diff (pin them in the arm's conf)"
+  printf '%s\n' "$dir/sbin/nginx"
+}
+
 cmd_status() {
   local cpu="match" pid
   if [[ -f $STATE/build.info ]]; then
@@ -1054,6 +1178,7 @@ main() {
     build|build-only)
       if host_mode; then build_lock_run cmd_build normal >&2; else cmd_build normal >&2; fi
       printf '%s\n' "$STAGING/sbin/nginx" ;;
+    build-arm)      need_root; cmd_build_arm "${2:-}" ;;
     activate)       build_lock_run cmd_activate ;;
     bolt)           build_lock_run cmd_bolt "${2:-60}" ;;
     rebuild)        build_lock_run cmd_rebuild ;;
@@ -1082,7 +1207,7 @@ main() {
     remove)         need_root; cmd_remove ;;
     configure-args) configure_paths; printf '%s\n' "${CONFIGURE_MODULES[@]}" --add-module=ngx_brotli/filter ;;
     directive-res)  printf 'droppable=%s\nunbuilt=%s\n' "$DROPPABLE_RE" "$UNBUILT_RE" ;;
-    *) die "usage: $0 build|build-only|activate|bolt [S]|rebuild|rebuild-cpu|refresh|check|versions|status|pre|fit [CONF [BIN]]|restore|remove|configure-args|directive-res" ;;
+    *) die "usage: $0 build|build-only|build-arm DIR|activate|bolt [S]|rebuild|rebuild-cpu|refresh|check|versions|status|pre|fit [CONF [BIN]]|restore|remove|configure-args|directive-res" ;;
   esac
 }
 

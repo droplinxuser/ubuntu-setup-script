@@ -1,0 +1,11 @@
+# XenForo tiers of bench-xf-php-series.sh (loopback-tiers.sh TIERS_FILE).
+# label|url|cookie|marker|cache  -  url @NAME = /root/audit/cookies/NAME.url (seed-xf.sh);
+# cookie = cookies.tsv key or =literal; marker must be in the gate response;
+# cache = the X-Cache-Status the gate requires (scn h5bp/php_xf.conf), with
+# wrk's own headers: HIT after one priming request, BYPASS for PHP-rendered tiers.
+# T2: a session cookie bypasses the guest cache ($xf_guest_cookie in scn
+# http.d/fastcgi_cache.conf matches "_session="), so PHP renders the guest page.
+T1 guest cached /|https://xf.test.local/||id="XF"|HIT
+T2 guest uncached /|https://xf.test.local/|=xf_session=bench-bypass|data-logged-in="false"|BYPASS
+T3 member forum index|https://xf.test.local/|xf-member|data-logged-in="true"|BYPASS
+T4 member median thread|@xf-thread|xf-member|data-logged-in="true"|BYPASS

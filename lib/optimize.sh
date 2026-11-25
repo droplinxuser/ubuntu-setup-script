@@ -2268,7 +2268,8 @@ ensure_xf_cookie_bypass_map() {
      || ! grep -qE 'map[[:space:]]+\$setup_cache_enc[[:space:]]+\$setup_cache_ae' "$file" \
      || grep -qE '^[[:space:]]*~\*gzip[[:space:]]+gzip;' "$file" \
      || grep -qE '^[[:space:]]*~\*xf_session=' "$file" \
-     || ! grep -qE 'map[[:space:]]+\$cookie_xf_language_id[[:space:]]+\$setup_xf_key_language' "$file"; then
+     || ! grep -qE 'map[[:space:]]+\$cookie_xf_language_id[[:space:]]+\$setup_xf_key_language' "$file" \
+     || ! grep -qF '=0*[1-9][0-9]{6}" 1;' "$file"; then
     cat > "$file" <<'EOF'
 # BEGIN setup.sh XenForo cookie bypass map
 # Authenticated/session cookies bypass the guest cache.  This is a map (http
@@ -2285,6 +2286,12 @@ map $http_cookie $setup_xf_guest_bypass {
     ""      0;
     "~*[._ \[](?:session(?:[._ \[]admin)?|user|tfa[._ \[]trust)=" 1;
     "~(?:^|;)\s*[^=;]*%[^=;]*=" 1;
+    # A style/language value the key maps below cannot read stays uncached:
+    # PHP decodes cookie values ("%32", "+2") and XenForo casts "0000002" to
+    # 2, which would otherwise store that page under the default key.
+    "~(?:^|;)[ \t]*xf_(?:style_id|language_id)=[^;]*[^0-9;]" 1;
+    "~(?:^|;)[ \t]*xf_style_variation=[^;]*[^A-Za-z0-9_;-]" 1;
+    "~(?:^|;)[ \t]*xf_(?:style_id|language_id)=0*[1-9][0-9]{6}" 1;
 }
 # XenForo gzips its own output when the client accepts gzip.  The cache key
 # must vary on that, otherwise the first visitor's encoding is served to
@@ -2318,11 +2325,11 @@ map $cookie_xf_style_variation $setup_xf_key_variation {
 }
 map $cookie_xf_style_id $setup_xf_key_style {
     default "";
-    "~^[0-9]{1,6}$" $cookie_xf_style_id;
+    "~^0*(?<setup_xf_style_n>[0-9]{1,6})$" $setup_xf_style_n;
 }
 map $cookie_xf_language_id $setup_xf_key_language {
     default "";
-    "~^[0-9]{1,6}$" $cookie_xf_language_id;
+    "~^0*(?<setup_xf_language_n>[0-9]{1,6})$" $setup_xf_language_n;
 }
 # END setup.sh XenForo cookie bypass map
 EOF

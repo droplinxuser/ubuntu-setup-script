@@ -721,8 +721,37 @@ check "shared units: without a component name they stay while any build is left"
 check "shared units: nginx, PHP and Valkey purges all apply the one last-consumer rule with their own name" \
   bash -c 'sed -n "/^nginx_build_purge()/,/^}/p" "$1/lib/nginx-build.sh" | grep -q "setup_build_remove_shared_units_if_last nginx" && grep -q "setup_build_remove_shared_units_if_last php" "$1/lib/php-build.sh" && grep -q "setup_build_remove_shared_units_if_last valkey" "$1/lib/valkey-build.sh"' _ "$TNB_REPO"
 
+# ---------------------------------------------------------------------------
+# TLS library and kTLS arms (1.22.2, benchmark-only; the default is unchanged)
+# ---------------------------------------------------------------------------
+tnb_tls_case() ( # TLS_LIB KTLS -> "lib=.. ktls=.. ignored=.. comps=.. opt=.. key=.."
+  tnb_env "$TMP/tnb-tls"
+  export NGINX_BUILD_TLS_LIB=$1 NGINX_BUILD_KTLS=$2
+  . "$TNB_REPO/tools/nginx-build.sh" 2>/dev/null
+  tnb_quiet
+  printf 'lib=%s ktls=%s ignored=%s comps=%s opt=%s key=%s\n' "$TLS_LIB" "$KTLS" "$KTLS_IGNORED" \
+    "${COMPONENTS[*]}" "$(openssl_opt | tr ' ' ,)" "$(tls_key "$TLS_LIB" "$KTLS")"
+)
+TNB_TLS0=$(tnb_tls_case openssl 0)
+TNB_TLS1=$(tnb_tls_case openssl 1)
+TNB_TLSA=$(tnb_tls_case aws-lc 1)
+check "TLS arms: the default openssl build has no enable-ktls" tnb_lacks "$TNB_TLS0" 'enable-ktls'
+check "TLS arms: KTLS=1 adds enable-ktls to the OpenSSL options" tnb_has "$TNB_TLS1" 'enable-ktls'
+check "TLS arms: KTLS changes the build key (a rebuild is reported)" \
+  test "${TNB_TLS0##*key=}" != "${TNB_TLS1##*key=}"
+check "TLS arms: the build key is stable across runs" test "$(tnb_tls_case openssl 0)" = "$TNB_TLS0"
+check "TLS arms: aws-lc replaces openssl in the component list" \
+  bash -c 'c=${1#*comps=}; c=${c%% opt=*}; [[ " $c " == *" aws-lc "* && " $c " != *" openssl "* ]]' _ "$TNB_TLSA"
+check "TLS arms: KTLS=1 is ignored (with a warning) for aws-lc, which lacks kTLS" \
+  tnb_has "$TNB_TLSA" 'ktls=0 ignored=1'
+check "TLS arms: an invalid KTLS value is refused" not tnb_tls_case openssl yes
+check "TLS arms: an unknown TLS library is refused" not tnb_tls_case wolfssl 0
+check "TLS arms: the default configure-args carry no TLS-arm or kTLS option" \
+  bash -c '[[ -n $1 && $1 != *ktls* && $1 != *aws-lc* && $1 != *boringssl* ]]' _ "$TNB_ARGS"
+
 unset -f tnb_has tnb_lacks tnb_line tnb_noline tnb_env tnb_quiet tnb_break_count tnb_brand_case tnb_fallback \
   tnb_build_case tnb_build_err tnb_args_have tnb_args_lack tnb_res_ok tnb_tmpfiles_ok tnb_fp tnb_fp_text \
   tnb_pre_case tnb_fake_nginx tnb_fit_case tnb_ci_case tnb_gpgv tnb_armor tnb_pgp_case tnb_fetch_case \
-  tnb_master_case tnb_upgrade_case tnb_swap_case tnb_last_case
+  tnb_master_case tnb_upgrade_case tnb_swap_case tnb_last_case tnb_tls_case
+unset TNB_TLS0 TNB_TLS1 TNB_TLSA
 unset TNB_REPO TNB_SRC TNB_CPU TNB_FB TNB_FB1 TNB_FB2 TNB_FB3 TNB_ARGS TNB_ARGS_CI TNB_UNIT TNB_TMPF TNB_FPA TNB_FPT

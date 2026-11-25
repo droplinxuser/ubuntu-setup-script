@@ -55,6 +55,7 @@ GMP_MIRRORS="https://ftp.gnu.org/gnu/gmp https://ftpmirror.gnu.org/gmp https://g
 GNU_MIRRORS="https://ftp.gnu.org/gnu https://ftpmirror.gnu.org"
 # Algorithms and protocols none of the three applications (or curl for
 # them) uses: legacy ciphers, national ciphers, binary curves, SRP, DTLS.
+# Nothing here may disable kTLS (nginx-build.sh KTLS=1 adds enable-ktls).
 # shellcheck disable=SC2034 # used by the sourcing tools
 OPENSSL_TRIM="no-idea no-camellia no-seed no-aria no-sm2 no-sm3 no-sm4 no-whirlpool no-md4 no-rc2 no-rc4 no-mdc2 no-cast no-bf no-gost no-srp no-dtls no-ssl3 no-ec2m no-comp"
 
@@ -267,6 +268,8 @@ conf_get() {
       END { print last }' "$CONF")
   fi
   v=${v:-latest}
+  # OPENSSL_VERSION=lts: the newest release of OpenSSL's LTS series (3.5).
+  [[ $v == lts && $1 == openssl ]] && { printf '%s' "$v"; return 0; }
   [[ $v == latest || $v =~ ^[0-9][0-9A-Za-z._+-]*$ || $v =~ ^[0-9a-f]{7,40}$ ]] || die "$key='$v' in $CONF is neither latest nor a version"
   printf '%s' "$v"
 }
@@ -339,7 +342,14 @@ latest_of() {
           igbinary) v=$(git_latest igbinary/igbinary '^([0-9]+\.[0-9]+\.[0-9]+)$') ;;
         esac
       fi ;;
-    openssl)  v=$(git_latest openssl/openssl '^openssl-([0-9]+\.[0-9]+\.[0-9]+)$') ;;
+    # x=lts (OPENSSL_VERSION=lts): the newest 3.5.x, OpenSSL's LTS series.
+    openssl)
+      if [[ $x == lts ]]; then v=$(git_latest openssl/openssl '^openssl-(3\.5\.[0-9]+)$')
+      else v=$(git_latest openssl/openssl '^openssl-([0-9]+\.[0-9]+\.[0-9]+)$')
+      fi ;;
+    # Opt-in TLS libraries of the nginx build (TLS_LIB in nginx-build.conf).
+    aws-lc)    v=$(git_latest aws/aws-lc '^v([0-9]+\.[0-9]+\.[0-9]+)$') ;;
+    boringssl) v=$(git_latest google/boringssl '^(0\.[0-9]{8}\.[0-9]+)$') ;;
     pcre2)    v=$(git_latest PCRE2Project/pcre2 '^pcre2-([0-9]+\.[0-9]+)$') ;;
     zlib)     v=$(git_latest madler/zlib '^v([0-9]+\.[0-9]+(\.[0-9]+)*)$') ;;
     curl)     v=$(git_latest curl/curl '^curl-([0-9]+_[0-9]+_[0-9]+)$'); v=${v//_/.} ;;
@@ -413,7 +423,8 @@ last_known() {
 resolve() { # name [php X.Y]
   local name=$1 x=${2:-} want cache v
   want=$(conf_get "$name")
-  if [[ $want != latest ]]; then
+  if [[ $want == lts ]]; then x=lts
+  elif [[ $want != latest ]]; then
     printf '%s' "$want"; return 0
   fi
   cache=$SRC_CACHE/resolve/$name${x:+-$x}
@@ -423,6 +434,7 @@ resolve() { # name [php X.Y]
   v=$(latest_of "$name" "$x") || v=""
   if [[ -z $v ]]; then
     v=$(last_known "$name")
+    [[ $x != lts || $v == 3.5.* ]] || v=""   # a recorded 4.x is not "lts"
     [[ -n $v ]] || return 1
     say "$name: no source answered; keeping $v"
     printf '%s' "$v"; return 0
@@ -706,6 +718,14 @@ fetch_component() { # name version -> path of the source archive
     ngx-brotli)
       fetch_first "https://github.com/google/ngx_brotli/archive/$v.tar.gz|$c/ngx_brotli-$v.tar.gz|" \
         "https://codeload.github.com/google/ngx_brotli/tar.gz/$v|$c/ngx_brotli-src-$v.tar.gz|" ;;
+    aws-lc)
+      # GitHub is AWS-LC's only home: tag archive, then codeload (pinned).
+      fetch_first "https://github.com/aws/aws-lc/archive/refs/tags/v$v.tar.gz|$c/aws-lc-$v.tar.gz|" \
+        "https://codeload.github.com/aws/aws-lc/tar.gz/refs/tags/v$v|$c/aws-lc-src-$v.tar.gz|" ;;
+    boringssl)
+      # google/boringssl's GitHub tags (0.YYYYMMDD.N): archive, then codeload.
+      fetch_first "https://github.com/google/boringssl/archive/refs/tags/$v.tar.gz|$c/boringssl-$v.tar.gz|" \
+        "https://codeload.github.com/google/boringssl/tar.gz/refs/tags/$v|$c/boringssl-src-$v.tar.gz|" ;;
     valkey)
       # GitHub is Valkey's source home: the tag archive, then codeload.
       fetch_first "https://github.com/valkey-io/valkey/archive/refs/tags/$v.tar.gz|$c/valkey-$v.tar.gz|" \

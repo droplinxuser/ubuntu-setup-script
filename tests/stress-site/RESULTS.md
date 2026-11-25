@@ -7,7 +7,35 @@ manifests, sweep tables and run logs these sections cite (`AUDIT-*.md`,
 removed from the tree on 2026-11-19 to keep the repository lean; every one
 is still in git history, for example
 `git show 84b0db5:tests/stress-site/AUDIT-20261117-1.21.30.md`.  The current
-cycle report is `AUDIT-20261125-1.22.0.md`.
+cycle report is `AUDIT-20261126-1.22.2.md`.
+
+## 1.22.2 — Xeon E-2236 (2026-11-26)
+
+Full report: `AUDIT-20261126-1.22.2.md`.  Clock pinned at 3.6 GHz, 5
+rotated rounds, medians; mitigations off.
+
+- **XenForo on PHP 8.1-8.6** (plain nginx + PHP-FPM + MariaDB, same clang
+  build and 27 extensions per arm, `wrk -c100`, req/s):
+
+  | PHP | guest cached | guest uncached | member home | member thread |
+  |---|---:|---:|---:|---:|
+  | 8.1.34 | 135,658 | 343 | 308 | 319 |
+  | 8.2.36 | 135,739 | 364 | 326 | 335 |
+  | 8.3.37 | 135,855 | 362 | 325 | 333 |
+  | 8.4.28 | 135,813 | 363 | 326 | 334 |
+  | 8.5.13 | 135,786 | 380 | 336 | 342 |
+  | 8.6.0 | 135,884 | 381 | 336 | 344 |
+
+  8.5/8.6 +7 to +11 % over 8.1 on PHP-rendered pages; 8.2-8.4 tie at
+  +4 to +6 %; spreads under 1.6 %.
+- **TLS libraries** (nginx 1.31.10, nginx CPU ms per full handshake,
+  ECDSA + X25519MLKEM768): OpenSSL 3.5.9 0.517, OpenSSL 4.1.0 0.482,
+  AWS-LC 5.15.0 0.253, BoringSSL 0.274.  Keep-alive and bulk throughput
+  tie (client-bound at ~3.8-4.1 GB/s).
+- **kTLS** (OpenSSL 4.1, `tcp_notsent_lowat=131072`): nginx CPU per 16 MB
+  file 17.8 → 10.6 ms; 1 KB keep-alive 236,655 → 147,937 req/s.  At the
+  script's 16384, kTLS `sendfile()` stalls.  Not enabled.
+- **Suites:** see the CHANGELOG entry.
 
 ## 1.22.1 — Xeon E-2236 (2026-11-26)
 

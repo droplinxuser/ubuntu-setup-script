@@ -1435,9 +1435,9 @@ downloaded.
   host or the managed configuration for diffing (install/`--optimize`
   parity), `restore-baseline.sh` returns a disposable test host to a
   pre-install manifest (`compare-manifest.sh` reports the delta).
-- `tests/bench-php-matrix/`: the XenForo 2.3.13 four-stack / PHP 8.2-8.6
-  benchmark harness (`install-php-versions.sh`, `deploy-xf.sh`,
-  `install-addons.sh`, `seed-xf.sh`, `bench-combo.sh`), the published tier
+- `tests/bench-php-matrix/`: the XenForo 2.3.13 PHP 8.1-8.6 series
+  benchmark harness (`install-php-series.sh`, `deploy-xf.sh` with `PLAIN=1`,
+  `install-addons.sh`, `seed-xf.sh`, `bench-xf-php-series.sh`), the published tier
   reproduction `bench-thread-tiers.sh`, the published reports and their
   result tables.
 

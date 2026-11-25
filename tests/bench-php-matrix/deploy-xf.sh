@@ -2,6 +2,8 @@
 # Deploy a clean XenForo 2.3.13 for the PHP matrix benchmark.
 # Run as root on the target host.  Creates the database, installs XenForo and
 # leaves src/config.php with the cache disabled (combo 1 baseline).
+# PLAIN=1: no cache block at all (no Redis provider, Valkey may be stopped),
+# for the PHP-series benchmark; pair it with `PLAIN=1 install-addons.sh`.
 set -Eeuo pipefail
 export LC_ALL=C.UTF-8 DEBIAN_FRONTEND=noninteractive
 
@@ -10,6 +12,8 @@ PKG=/root/work/pkg
 XF_ZIP=${XF_ZIP:-$(ls "$PKG"/xenforo_*_full.zip 2>/dev/null | head -n1)}
 ADMIN_PW=${ADMIN_PW:-BenchAdmin123!}
 MEMBER_PW=${MEMBER_PW:-BenchPass123!}
+PHP=${PHP:-/usr/local/bin/php}
+PLAIN=${PLAIN:-0}
 WORK=$(mktemp -d /tmp/xf-deploy.XXXXXX)
 
 cleanup() { rm -rf "$WORK"; }
@@ -17,6 +21,7 @@ trap cleanup EXIT
 
 [[ -f $XF_ZIP ]] || { echo "missing $XF_ZIP" >&2; exit 1; }
 [[ -d $ROOT ]] || { echo "missing $ROOT (create the --domain vhost first)" >&2; exit 1; }
+[[ -x $PHP ]] || { echo "missing PHP CLI $PHP (PHP=path overrides)" >&2; exit 1; }
 
 echo "== database"
 mariadb <<'SQL'
@@ -42,6 +47,14 @@ cat > "$ROOT/src/config.php" <<PHP
 \$config['db']['dbname'] = 'xenforo';
 \$config['fullUnicode'] = true;
 
+// Hampel Seeder refuses to write without this literal true.
+\$config['hampelSeeder']['enabled'] = true;
+PHP
+
+# PLAIN=1 stops here: XenForo's database-backed defaults, no cache provider.
+if [[ $PLAIN != 1 ]]; then
+cat >> "$ROOT/src/config.php" <<PHP
+
 // Added by the PHP matrix benchmark.  SV/RedisCache converts the provider to
 // its bundled Credis client, so no php-redis extension is required on any
 // PHP version (8.2 through 8.6).
@@ -57,10 +70,8 @@ cat > "$ROOT/src/config.php" <<PHP
     'database' => 1,
 ];
 \$config['cache']['sessions'] = true;
-
-// Hampel Seeder refuses to write without this literal true.
-\$config['hampelSeeder']['enabled'] = true;
 PHP
+fi
 
 chown -R www-data:www-data "$ROOT"
 find "$ROOT" -type d -exec chmod 755 {} +
@@ -68,7 +79,7 @@ find "$ROOT" -type f -exec chmod 644 {} +
 chmod 640 "$ROOT/src/config.php"
 
 echo "== XenForo install"
-runuser -u www-data -- /usr/bin/php8.5 "$ROOT/cmd.php" xf:install \
+runuser -u www-data -- "$PHP" "$ROOT/cmd.php" xf:install \
   --user=admin --password="$ADMIN_PW" --email=admin@example.com \
   --title="PHP Matrix Benchmark" --url="https://xf.test.local" \
   --skip-statistics -n
@@ -78,4 +89,4 @@ printf '%s\n' "$MEMBER_PW" > /root/audit/member-pass
 chmod 600 /root/audit/admin-pass /root/audit/member-pass
 
 echo "== done"
-runuser -u www-data -- /usr/bin/php8.5 "$ROOT/cmd.php" xf:version 2>/dev/null || true
+runuser -u www-data -- "$PHP" "$ROOT/cmd.php" xf:version 2>/dev/null || true

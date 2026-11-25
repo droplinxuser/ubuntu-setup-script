@@ -1,0 +1,241 @@
+arm	round	tier	rps	p50	p99	non2xx	php_ms_req	nginx_ms_req	mhz	gate
+series-8.1	1	T1 guest cached / [c100]	136046	674.00us	1.14ms	0		0.058	3600	ok
+series-8.1	1	T2 guest uncached / [c100]	343	289.12ms	300.61ms	0	27.107	1.754	3599	ok
+series-8.1	1	T3 member forum index [c100]	308	321.98ms	334.59ms	0	31.585	1.973	3599	ok
+series-8.1	1	T4 member median thread [c100]	319	311.30ms	323.91ms	0	30.846	2.292	3599	ok
+series-8.1	1	T1 guest cached / [c8]	68890	97.00us	226.00us	0		0.046	2900	ok
+series-8.1	1	T2 guest uncached / [c8]	273	29.38ms	33.26ms	0	23.521	1.554	3600	ok
+series-8.1	1	T3 member forum index [c8]	244	32.79ms	37.27ms	0	26.367	1.710	3599	ok
+series-8.1	1	T4 member median thread [c8]	252	31.74ms	36.96ms	0	25.877	1.996	3599	ok
+series-8.2	1	T1 guest cached / [c100]	136142	675.00us	1.18ms	0		0.058	3599	ok
+series-8.2	1	T2 guest uncached / [c100]	364	272.43ms	283.35ms	0	25.056	1.774	3600	ok
+series-8.2	1	T3 member forum index [c100]	326	304.33ms	316.79ms	0	29.197	1.985	3600	ok
+series-8.2	1	T4 member median thread [c100]	335	296.54ms	308.46ms	0	27.663	2.266	3599	ok
+series-8.2	1	T1 guest cached / [c8]	62949	113.00us	209.00us	0		0.044	2666	ok
+series-8.2	1	T2 guest uncached / [c8]	290	27.60ms	31.67ms	0	21.739	1.543	3600	ok
+series-8.2	1	T3 member forum index [c8]	258	30.87ms	35.42ms	0	24.217	1.680	3599	ok
+series-8.2	1	T4 member median thread [c8]	266	30.20ms	35.01ms	0	24.269	2.004	3600	ok
+series-8.3	1	T1 guest cached / [c100]	135673	684.00us	1.02ms	0		0.058	3600	ok
+series-8.3	1	T2 guest uncached / [c100]	364	273.22ms	283.56ms	0	26.158	1.803	3599	ok
+series-8.3	1	T3 member forum index [c100]	326	304.98ms	317.37ms	0	29.256	1.990	3599	ok
+series-8.3	1	T4 member median thread [c100]	331	299.76ms	311.31ms	0	29.262	2.304	3599	ok
+series-8.3	1	T1 guest cached / [c8]	68386	97.00us	205.00us	0		0.048	2900	ok
+series-8.3	1	T2 guest uncached / [c8]	288	27.72ms	31.78ms	0	21.988	1.554	3600	ok
+series-8.3	1	T3 member forum index [c8]	256	31.13ms	35.90ms	0	24.546	1.685	3599	ok
+series-8.3	1	T4 member median thread [c8]	263	30.45ms	35.32ms	0	24.587	1.994	3599	ok
+series-8.4	1	T1 guest cached / [c100]	136043	697.00us	1.00ms	0		0.058	3599	ok
+series-8.4	1	T2 guest uncached / [c100]	365	272.09ms	284.93ms	0	26.064	1.788	3600	ok
+series-8.4	1	T3 member forum index [c100]	326	304.59ms	315.18ms	0	29.175	1.993	3600	ok
+series-8.4	1	T4 member median thread [c100]	334	297.18ms	307.87ms	0	28.935	2.310	3600	ok
+series-8.4	1	T1 guest cached / [c8]	76121	98.00us	204.00us	0		0.053	3133	ok
+series-8.4	1	T2 guest uncached / [c8]	290	27.59ms	31.49ms	0	21.712	1.549	3599	ok
+series-8.4	1	T3 member forum index [c8]	259	30.80ms	35.08ms	0	24.356	1.713	3599	ok
+series-8.4	1	T4 member median thread [c8]	265	30.22ms	35.40ms	0	24.153	1.977	3600	ok
+series-8.5	1	T1 guest cached / [c100]	135786	713.00us	1.10ms	0		0.058	3599	ok
+series-8.5	1	T2 guest uncached / [c100]	380	261.50ms	272.57ms	0	24.708	1.802	3600	ok
+series-8.5	1	T3 member forum index [c100]	336	295.14ms	307.73ms	0	28.059	1.992	3599	ok
+series-8.5	1	T4 member median thread [c100]	341	290.77ms	300.84ms	0	27.034	2.289	3599	ok
+series-8.5	1	T1 guest cached / [c8]	72181	95.00us	195.00us	0		0.050	3366	ok
+series-8.5	1	T2 guest uncached / [c8]	301	26.51ms	30.67ms	0	20.708	1.531	3600	ok
+series-8.5	1	T3 member forum index [c8]	267	29.91ms	34.11ms	0	23.391	1.708	3600	ok
+series-8.5	1	T4 member median thread [c8]	272	29.45ms	34.51ms	0	23.350	1.968	3600	ok
+series-8.6	1	T1 guest cached / [c100]	135884	739.00us	0.94ms	0		0.058	3600	ok
+series-8.6	1	T2 guest uncached / [c100]	379	261.74ms	272.36ms	0	23.788	1.777	3599	ok
+series-8.6	1	T3 member forum index [c100]	336	295.81ms	307.91ms	0	26.935	1.958	3600	ok
+series-8.6	1	T4 member median thread [c100]	342	290.02ms	300.78ms	0	26.808	2.278	3599	ok
+series-8.6	1	T1 guest cached / [c8]	76423	99.00us	134.00us	0		0.050	3133	ok
+series-8.6	1	T2 guest uncached / [c8]	302	26.49ms	30.23ms	0	20.798	1.572	3599	ok
+series-8.6	1	T3 member forum index [c8]	267	29.97ms	34.34ms	0	23.502	1.692	3600	ok
+series-8.6	1	T4 member median thread [c8]	272	29.43ms	34.91ms	0	23.232	1.946	3600	ok
+series-8.6	2	T1 guest cached / [c100]	136123	738.00us	0.96ms	0		0.058	3600	ok
+series-8.6	2	T2 guest uncached / [c100]	381	260.55ms	273.52ms	0	24.659	1.793	3599	ok
+series-8.6	2	T3 member forum index [c100]	336	294.98ms	306.61ms	0	27.989	1.990	3600	ok
+series-8.6	2	T4 member median thread [c100]	343	289.36ms	300.30ms	0	26.793	2.265	3600	ok
+series-8.6	2	T1 guest cached / [c8]	76772	98.00us	133.00us	0		0.053	3133	ok
+series-8.6	2	T2 guest uncached / [c8]	302	26.46ms	30.42ms	0	20.648	1.548	3599	ok
+series-8.6	2	T3 member forum index [c8]	267	29.89ms	33.85ms	0	23.311	1.700	3599	ok
+series-8.6	2	T4 member median thread [c8]	273	29.34ms	34.32ms	0	23.284	1.980	3599	ok
+series-8.5	2	T1 guest cached / [c100]	134936	639.00us	1.67ms	0		0.058	3600	ok
+series-8.5	2	T2 guest uncached / [c100]	378	262.50ms	272.27ms	0	23.864	1.784	3600	ok
+series-8.5	2	T3 member forum index [c100]	335	296.59ms	307.67ms	0	27.052	1.965	3599	ok
+series-8.5	2	T4 member median thread [c100]	341	291.40ms	301.31ms	0	27.072	2.281	3600	ok
+series-8.5	2	T1 guest cached / [c8]	72868	101.00us	183.00us	0		0.051	2900	ok
+series-8.5	2	T2 guest uncached / [c8]	302	26.48ms	30.18ms	0	20.778	1.556	3599	ok
+series-8.5	2	T3 member forum index [c8]	267	29.99ms	34.28ms	0	23.355	1.691	3599	ok
+series-8.5	2	T4 member median thread [c8]	272	29.51ms	34.40ms	0	23.614	1.997	3599	ok
+series-8.4	2	T1 guest cached / [c100]	135781	696.00us	1.15ms	0		0.058	3600	ok
+series-8.4	2	T2 guest uncached / [c100]	363	273.53ms	284.67ms	0	26.193	1.791	3600	ok
+series-8.4	2	T3 member forum index [c100]	327	304.51ms	316.91ms	0	29.246	1.975	3600	ok
+series-8.4	2	T4 member median thread [c100]	334	297.13ms	309.03ms	0	28.938	2.309	3600	ok
+series-8.4	2	T1 guest cached / [c8]	69159	101.00us	233.00us	0		0.047	2666	ok
+series-8.4	2	T2 guest uncached / [c8]	289	27.66ms	31.57ms	0	21.829	1.554	3599	ok
+series-8.4	2	T3 member forum index [c8]	259	30.85ms	35.23ms	0	24.426	1.704	3600	ok
+series-8.4	2	T4 member median thread [c8]	265	30.22ms	35.33ms	0	24.275	1.989	3600	ok
+series-8.3	2	T1 guest cached / [c100]	135855	711.00us	1.24ms	0		0.058	3600	ok
+series-8.3	2	T2 guest uncached / [c100]	362	274.51ms	285.10ms	0	25.307	1.776	3599	ok
+series-8.3	2	T3 member forum index [c100]	325	305.83ms	317.74ms	0	29.355	1.992	3599	ok
+series-8.3	2	T4 member median thread [c100]	333	298.24ms	308.82ms	0	29.004	2.315	3600	ok
+series-8.3	2	T1 guest cached / [c8]	75845	99.00us	180.00us	0		0.049	2900	ok
+series-8.3	2	T2 guest uncached / [c8]	286	27.89ms	31.75ms	0	22.015	1.562	3599	ok
+series-8.3	2	T3 member forum index [c8]	256	31.16ms	35.46ms	0	24.517	1.703	3600	ok
+series-8.3	2	T4 member median thread [c8]	264	30.39ms	35.39ms	0	24.363	1.984	3600	ok
+series-8.2	2	T1 guest cached / [c100]	135739	773.00us	1.05ms	0		0.058	3599	ok
+series-8.2	2	T2 guest uncached / [c100]	365	272.38ms	284.52ms	0	26.127	1.790	3599	ok
+series-8.2	2	T3 member forum index [c100]	325	305.26ms	316.66ms	0	29.282	1.991	3599	ok
+series-8.2	2	T4 member median thread [c100]	334	297.21ms	308.68ms	0	28.943	2.308	3599	ok
+series-8.2	2	T1 guest cached / [c8]	77309	98.00us	131.00us	0		0.051	3133	ok
+series-8.2	2	T2 guest uncached / [c8]	289	27.72ms	31.54ms	0	21.812	1.557	3600	ok
+series-8.2	2	T3 member forum index [c8]	258	30.94ms	35.04ms	0	24.529	1.706	3599	ok
+series-8.2	2	T4 member median thread [c8]	264	30.31ms	35.71ms	0	24.157	1.978	3599	ok
+series-8.1	2	T1 guest cached / [c100]	136049	626.00us	1.27ms	0		0.058	3599	ok
+series-8.1	2	T2 guest uncached / [c100]	343	288.59ms	301.27ms	0	28.173	1.786	3600	ok
+series-8.1	2	T3 member forum index [c100]	309	321.99ms	334.89ms	0	30.187	1.944	3599	ok
+series-8.1	2	T4 member median thread [c100]	319	310.94ms	322.04ms	0	30.690	2.292	3600	ok
+series-8.1	2	T1 guest cached / [c8]	77301	98.00us	222.00us	0		0.046	2900	ok
+series-8.1	2	T2 guest uncached / [c8]	272	29.39ms	33.61ms	0	23.558	1.542	3599	ok
+series-8.1	2	T3 member forum index [c8]	243	32.81ms	37.55ms	0	26.078	1.672	3599	ok
+series-8.1	2	T4 member median thread [c8]	253	31.68ms	37.08ms	0	25.711	1.978	3600	ok
+series-8.1	3	T1 guest cached / [c100]	135658	691.00us	1.10ms	0		0.058	3599	ok
+series-8.1	3	T2 guest uncached / [c100]	343	289.06ms	301.32ms	0	28.248	1.775	3599	ok
+series-8.1	3	T3 member forum index [c100]	306	323.92ms	335.60ms	0	31.704	1.964	3600	ok
+series-8.1	3	T4 member median thread [c100]	318	312.27ms	324.29ms	0	30.902	2.280	3600	ok
+series-8.1	3	T1 guest cached / [c8]	71944	104.00us	218.00us	0		0.053	3133	ok
+series-8.1	3	T2 guest uncached / [c8]	272	29.44ms	33.65ms	0	23.535	1.539	3599	ok
+series-8.1	3	T3 member forum index [c8]	243	32.85ms	37.27ms	0	26.482	1.699	3599	ok
+series-8.1	3	T4 member median thread [c8]	252	31.88ms	36.80ms	0	25.925	1.978	3600	ok
+series-8.2	3	T1 guest cached / [c100]	135509	652.00us	1.34ms	0		0.058	3599	ok
+series-8.2	3	T2 guest uncached / [c100]	364	272.34ms	282.76ms	0	25.098	1.777	3600	ok
+series-8.2	3	T3 member forum index [c100]	326	303.92ms	315.14ms	0	29.094	1.983	3599	ok
+series-8.2	3	T4 member median thread [c100]	332	298.84ms	309.05ms	0	27.913	2.285	3600	ok
+series-8.2	3	T1 guest cached / [c8]	72673	102.00us	177.00us	0		0.054	2900	ok
+series-8.2	3	T2 guest uncached / [c8]	290	27.57ms	31.41ms	0	21.857	1.575	3600	ok
+series-8.2	3	T3 member forum index [c8]	260	30.74ms	34.98ms	0	24.391	1.710	3599	ok
+series-8.2	3	T4 member median thread [c8]	265	30.31ms	35.29ms	0	24.435	1.979	3599	ok
+series-8.3	3	T1 guest cached / [c100]	135503	709.00us	1.09ms	0		0.058	3600	ok
+series-8.3	3	T2 guest uncached / [c100]	364	272.14ms	283.00ms	0	25.030	1.772	3600	ok
+series-8.3	3	T3 member forum index [c100]	327	303.48ms	314.80ms	0	29.051	1.999	3599	ok
+series-8.3	3	T4 member median thread [c100]	335	296.48ms	307.21ms	0	27.716	2.284	3599	ok
+series-8.3	3	T1 guest cached / [c8]	75066	97.00us	176.00us	0		0.048	2899	ok
+series-8.3	3	T2 guest uncached / [c8]	290	27.52ms	31.26ms	0	21.708	1.561	3600	ok
+series-8.3	3	T3 member forum index [c8]	260	30.71ms	34.99ms	0	24.124	1.707	3599	ok
+series-8.3	3	T4 member median thread [c8]	266	30.11ms	35.47ms	0	24.171	1.982	3600	ok
+series-8.4	3	T1 guest cached / [c100]	135813	667.00us	1.09ms	0		0.058	3599	ok
+series-8.4	3	T2 guest uncached / [c100]	361	274.67ms	297.53ms	0	26.277	1.797	3600	ok
+series-8.4	3	T3 member forum index [c100]	326	305.02ms	316.67ms	0	29.238	1.983	3600	ok
+series-8.4	3	T4 member median thread [c100]	335	296.40ms	308.40ms	0	28.937	2.301	3600	ok
+series-8.4	3	T1 guest cached / [c8]	69258	99.00us	260.00us	0		0.048	2900	ok
+series-8.4	3	T2 guest uncached / [c8]	290	27.64ms	31.69ms	0	21.885	1.554	3599	ok
+series-8.4	3	T3 member forum index [c8]	259	30.91ms	35.23ms	0	24.449	1.714	3600	ok
+series-8.4	3	T4 member median thread [c8]	265	30.25ms	35.24ms	0	24.229	1.980	3599	ok
+series-8.5	3	T1 guest cached / [c100]	135773	593.00us	1.23ms	0		0.058	3600	ok
+series-8.5	3	T2 guest uncached / [c100]	380	261.21ms	272.61ms	0	23.806	1.779	3599	ok
+series-8.5	3	T3 member forum index [c100]	336	295.02ms	308.30ms	0	26.984	1.967	3599	ok
+series-8.5	3	T4 member median thread [c100]	342	290.81ms	300.84ms	0	26.963	2.278	3599	ok
+series-8.5	3	T1 guest cached / [c8]	75259	94.00us	222.00us	0		0.046	3133	ok
+series-8.5	3	T2 guest uncached / [c8]	303	26.36ms	30.35ms	0	20.719	1.564	3600	ok
+series-8.5	3	T3 member forum index [c8]	267	29.94ms	34.31ms	0	23.294	1.689	3599	ok
+series-8.5	3	T4 member median thread [c8]	273	29.39ms	34.58ms	0	23.363	1.977	3599	ok
+series-8.6	3	T1 guest cached / [c100]	136105	672.00us	1.08ms	0		0.058	3599	ok
+series-8.6	3	T2 guest uncached / [c100]	382	260.07ms	271.69ms	0	23.603	1.769	3600	ok
+series-8.6	3	T3 member forum index [c100]	337	294.52ms	304.66ms	0	26.795	1.954	3600	ok
+series-8.6	3	T4 member median thread [c100]	344	288.25ms	316.43ms	0	26.634	2.276	3599	ok
+series-8.6	3	T1 guest cached / [c8]	75750	98.00us	173.00us	0		0.050	2899	ok
+series-8.6	3	T2 guest uncached / [c8]	304	26.26ms	29.99ms	0	20.600	1.574	3600	ok
+series-8.6	3	T3 member forum index [c8]	268	29.79ms	34.13ms	0	23.323	1.704	3599	ok
+series-8.6	3	T4 member median thread [c8]	275	29.18ms	34.05ms	0	23.072	1.964	3599	ok
+series-8.6	4	T1 guest cached / [c100]	135633	706.00us	1.07ms	0		0.058	3600	ok
+series-8.6	4	T2 guest uncached / [c100]	382	260.17ms	272.03ms	0	23.685	1.769	3600	ok
+series-8.6	4	T3 member forum index [c100]	338	293.71ms	306.08ms	0	26.821	1.918	3599	ok
+series-8.6	4	T4 member median thread [c100]	345	288.07ms	299.11ms	0	26.799	2.288	3600	ok
+series-8.6	4	T1 guest cached / [c8]	71335	97.00us	226.00us	0		0.049	3133	ok
+series-8.6	4	T2 guest uncached / [c8]	303	26.35ms	30.22ms	0	20.640	1.557	3599	ok
+series-8.6	4	T3 member forum index [c8]	269	29.74ms	33.92ms	0	23.386	1.681	3600	ok
+series-8.6	4	T4 member median thread [c8]	275	29.21ms	33.95ms	0	23.226	1.987	3599	ok
+series-8.5	4	T1 guest cached / [c100]	136166	699.00us	1.14ms	0		0.058	3600	ok
+series-8.5	4	T2 guest uncached / [c100]	379	261.86ms	271.39ms	0	24.697	1.811	3599	ok
+series-8.5	4	T3 member forum index [c100]	336	295.17ms	307.61ms	0	26.926	1.926	3600	ok
+series-8.5	4	T4 member median thread [c100]	342	290.33ms	300.55ms	0	26.885	2.286	3599	ok
+series-8.5	4	T1 guest cached / [c8]	74787	94.00us	201.00us	0		0.051	3133	ok
+series-8.5	4	T2 guest uncached / [c8]	302	26.41ms	30.25ms	0	20.706	1.568	3600	ok
+series-8.5	4	T3 member forum index [c8]	268	29.82ms	33.95ms	0	23.452	1.670	3600	ok
+series-8.5	4	T4 member median thread [c8]	273	29.43ms	34.83ms	0	23.253	1.954	3599	ok
+series-8.4	4	T1 guest cached / [c100]	136066	689.00us	1.14ms	0		0.058	3599	ok
+series-8.4	4	T2 guest uncached / [c100]	364	272.99ms	282.94ms	0	26.098	1.798	3599	ok
+series-8.4	4	T3 member forum index [c100]	327	303.33ms	316.17ms	0	29.171	1.942	3600	ok
+series-8.4	4	T4 member median thread [c100]	331	299.88ms	310.82ms	0	29.272	2.312	3600	ok
+series-8.4	4	T1 guest cached / [c8]	73486	103.00us	187.00us	0		0.053	2899	ok
+series-8.4	4	T2 guest uncached / [c8]	289	27.59ms	31.77ms	0	21.719	1.528	3599	ok
+series-8.4	4	T3 member forum index [c8]	260	30.77ms	35.18ms	0	24.348	1.657	3599	ok
+series-8.4	4	T4 member median thread [c8]	263	30.52ms	35.80ms	0	24.367	1.966	3599	ok
+series-8.3	4	T1 guest cached / [c100]	135984	707.00us	1.08ms	0		0.058	3599	ok
+series-8.3	4	T2 guest uncached / [c100]	362	273.99ms	286.58ms	0	25.260	1.769	3599	ok
+series-8.3	4	T3 member forum index [c100]	324	306.29ms	317.72ms	0	29.420	1.947	3600	ok
+series-8.3	4	T4 member median thread [c100]	333	297.77ms	309.40ms	0	27.827	2.278	3600	ok
+series-8.3	4	T1 guest cached / [c8]	64272	104.00us	265.00us	0		0.045	2666	ok
+series-8.3	4	T2 guest uncached / [c8]	286	27.91ms	31.91ms	0	22.004	1.553	3599	ok
+series-8.3	4	T3 member forum index [c8]	257	31.17ms	35.19ms	0	24.550	1.664	3600	ok
+series-8.3	4	T4 member median thread [c8]	265	30.28ms	35.31ms	0	24.347	1.979	3599	ok
+series-8.2	4	T1 guest cached / [c100]	135715	655.00us	1.02ms	0		0.058	3599	ok
+series-8.2	4	T2 guest uncached / [c100]	364	272.47ms	283.32ms	0	25.156	1.772	3599	ok
+series-8.2	4	T3 member forum index [c100]	327	303.81ms	314.52ms	0	27.962	1.919	3599	ok
+series-8.2	4	T4 member median thread [c100]	337	295.14ms	306.98ms	0	28.677	2.300	3599	ok
+series-8.2	4	T1 guest cached / [c8]	71339	96.00us	191.00us	0		0.051	2900	ok
+series-8.2	4	T2 guest uncached / [c8]	288	27.74ms	32.25ms	0	21.722	1.523	3599	ok
+series-8.2	4	T3 member forum index [c8]	260	30.81ms	35.18ms	0	24.333	1.653	3600	ok
+series-8.2	4	T4 member median thread [c8]	267	30.03ms	35.03ms	0	23.984	1.992	3599	ok
+series-8.1	4	T1 guest cached / [c100]	135477	724.00us	1.11ms	0		0.058	3599	ok
+series-8.1	4	T2 guest uncached / [c100]	345	287.59ms	298.04ms	0	26.896	1.761	3600	ok
+series-8.1	4	T3 member forum index [c100]	309	321.16ms	332.86ms	0	31.365	1.936	3600	ok
+series-8.1	4	T4 member median thread [c100]	320	309.68ms	321.58ms	0	30.522	2.298	3599	ok
+series-8.1	4	T1 guest cached / [c8]	69803	102.00us	183.00us	0		0.053	3366	ok
+series-8.1	4	T2 guest uncached / [c8]	274	29.19ms	33.19ms	0	23.256	1.542	3599	ok
+series-8.1	4	T3 member forum index [c8]	246	32.47ms	37.12ms	0	26.052	1.668	3599	ok
+series-8.1	4	T4 member median thread [c8]	255	31.49ms	36.43ms	0	25.551	2.004	3599	ok
+series-8.1	5	T1 guest cached / [c100]	135350	620.00us	1.40ms	0		0.058	3600	ok
+series-8.1	5	T2 guest uncached / [c100]	344	288.80ms	299.80ms	0	26.879	1.758	3599	ok
+series-8.1	5	T3 member forum index [c100]	308	322.12ms	335.20ms	0	31.319	1.933	3600	ok
+series-8.1	5	T4 member median thread [c100]	320	309.83ms	321.84ms	0	30.532	2.290	3600	ok
+series-8.1	5	T1 guest cached / [c8]	68737	106.00us	243.00us	0		0.052	3133	ok
+series-8.1	5	T2 guest uncached / [c8]	274	29.23ms	33.33ms	0	23.254	1.542	3600	ok
+series-8.1	5	T3 member forum index [c8]	245	32.67ms	37.41ms	0	26.039	1.644	3599	ok
+series-8.1	5	T4 member median thread [c8]	254	31.53ms	36.51ms	0	25.601	1.988	3599	ok
+series-8.2	5	T1 guest cached / [c100]	136116	682.00us	1.07ms	0		0.058	3600	ok
+series-8.2	5	T2 guest uncached / [c100]	365	271.51ms	284.13ms	0	25.995	1.797	3599	ok
+series-8.2	5	T3 member forum index [c100]	327	303.11ms	315.27ms	0	29.072	1.945	3599	ok
+series-8.2	5	T4 member median thread [c100]	335	296.11ms	307.06ms	0	28.776	2.306	3600	ok
+series-8.2	5	T1 guest cached / [c8]	74919	104.00us	147.00us	0		0.047	2899	ok
+series-8.2	5	T2 guest uncached / [c8]	290	27.54ms	31.73ms	0	21.636	1.536	3599	ok
+series-8.2	5	T3 member forum index [c8]	260	30.71ms	34.88ms	0	24.274	1.665	3599	ok
+series-8.2	5	T4 member median thread [c8]	267	30.08ms	34.89ms	0	24.157	1.992	3600	ok
+series-8.3	5	T1 guest cached / [c100]	136145	665.00us	1.20ms	0		0.058	3600	ok
+series-8.3	5	T2 guest uncached / [c100]	361	274.61ms	286.37ms	0	25.327	1.776	3599	ok
+series-8.3	5	T3 member forum index [c100]	323	305.96ms	334.46ms	0	29.424	1.949	3599	ok
+series-8.3	5	T4 member median thread [c100]	331	299.85ms	311.14ms	0	29.269	2.298	3600	ok
+series-8.3	5	T1 guest cached / [c8]	65072	112.00us	190.00us	0		0.054	3133	ok
+series-8.3	5	T2 guest uncached / [c8]	286	27.94ms	32.18ms	0	22.137	1.541	3600	ok
+series-8.3	5	T3 member forum index [c8]	257	31.03ms	35.57ms	0	24.662	1.653	3600	ok
+series-8.3	5	T4 member median thread [c8]	263	30.49ms	35.15ms	0	24.619	1.989	3599	ok
+series-8.4	5	T1 guest cached / [c100]	135775	625.00us	1.31ms	0		0.058	3600	ok
+series-8.4	5	T2 guest uncached / [c100]	362	273.94ms	284.81ms	0	25.308	1.778	3600	ok
+series-8.4	5	T3 member forum index [c100]	325	305.15ms	316.21ms	0	28.114	1.920	3599	ok
+series-8.4	5	T4 member median thread [c100]	333	297.64ms	309.44ms	0	28.990	2.291	3600	ok
+series-8.4	5	T1 guest cached / [c8]	51267	162.00us	344.00us	0		0.047	2899	ok
+series-8.4	5	T2 guest uncached / [c8]	289	27.69ms	31.60ms	0	21.860	1.559	3599	ok
+series-8.4	5	T3 member forum index [c8]	259	30.87ms	34.92ms	0	24.467	1.671	3600	ok
+series-8.4	5	T4 member median thread [c8]	264	30.35ms	35.34ms	0	24.258	1.977	3600	ok
+series-8.5	5	T1 guest cached / [c100]	135871	652.00us	1.09ms	0		0.058	3600	ok
+series-8.5	5	T2 guest uncached / [c100]	380	261.14ms	273.00ms	0	23.800	1.773	3600	ok
+series-8.5	5	T3 member forum index [c100]	337	295.03ms	306.45ms	0	27.057	1.915	3599	ok
+series-8.5	5	T4 member median thread [c100]	342	290.38ms	299.59ms	0	26.966	2.284	3600	ok
+series-8.5	5	T1 guest cached / [c8]	75827	100.00us	167.00us	0		0.050	3366	ok
+series-8.5	5	T2 guest uncached / [c8]	303	26.39ms	30.22ms	0	20.722	1.556	3600	ok
+series-8.5	5	T3 member forum index [c8]	267	29.88ms	33.87ms	0	23.532	1.680	3599	ok
+series-8.5	5	T4 member median thread [c8]	274	29.26ms	34.30ms	0	23.414	1.994	3599	ok
+series-8.6	5	T1 guest cached / [c100]	135866	697.00us	1.00ms	0		0.058	3600	ok
+series-8.6	5	T2 guest uncached / [c100]	381	260.67ms	271.83ms	0	24.622	1.792	3599	ok
+series-8.6	5	T3 member forum index [c100]	335	295.74ms	307.00ms	0	28.081	1.954	3600	ok
+series-8.6	5	T4 member median thread [c100]	344	289.03ms	299.30ms	0	26.772	2.274	3600	ok
+series-8.6	5	T1 guest cached / [c8]	60243	93.00us	306.00us	0		0.045	2899	ok
+series-8.6	5	T2 guest uncached / [c8]	303	26.43ms	30.20ms	0	20.599	1.557	3600	ok
+series-8.6	5	T3 member forum index [c8]	267	29.99ms	34.18ms	0	23.348	1.652	3599	ok
+series-8.6	5	T4 member median thread [c8]	274	29.30ms	34.02ms	0	23.254	1.980	3599	ok

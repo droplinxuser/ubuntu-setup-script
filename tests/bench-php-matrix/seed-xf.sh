@@ -1,15 +1,24 @@
 #!/usr/bin/env bash
 # Seed the benchmark forum with 20k users, 10k threads and ~100k posts using
 # the Hampel Seeder add-on, then prepare a member cookie and thread URL.
+#
+# Writes /root/audit/bench-env.sh (bench-combo.sh) and, for the loopback
+# runners (loopback-tiers.sh, bench-php-sources.sh, bench-xf-php-series.sh),
+# the "xf-member" row of /root/audit/cookies/cookies.tsv (other rows kept)
+# and /root/audit/cookies/xf-thread.url: the thread with the median reply
+# count, so the member thread tier is a typical page.  The login is checked
+# for data-logged-in="true".  COOKIE_ONLY=1 skips the seeding and only logs
+# in again (an expired member cookie).
 set -Eeuo pipefail
 export LC_ALL=C.UTF-8
 
 ROOT=/var/www/xf.test.local/public
-PHP=/usr/bin/php8.5
+PHP=${PHP:-/usr/local/bin/php}
 PW_FILE=/root/audit/member-pass
 MEMBER_PW=$(cat "$PW_FILE" 2>/dev/null || echo 'BenchPass123!')
 ENVF=/root/audit/bench-env.sh
 
+if [[ ${COOKIE_ONLY:-0} != 1 ]]; then
 echo "== stop the managed XenForo job cron during the benchmark"
 crontab -l 2>/dev/null | grep -v 'xf:run-jobs' | crontab - || true
 
@@ -54,6 +63,8 @@ mariadb -N -B xenforo -e "
   UNION ALL SELECT CONCAT('threads=', COUNT(*)) FROM xf_thread
   UNION ALL SELECT CONCAT('posts=', COUNT(*)) FROM xf_post
   UNION ALL SELECT CONCAT('forums=', COUNT(*)) FROM xf_forum;"
+fi
+cd "$ROOT"
 
 echo "== reset benchmark member (lowest non-admin user)"
 cat > "$ROOT/bench-member.php" <<'PHP'
@@ -74,8 +85,11 @@ MEMBER=$(cd "$ROOT" && runuser -u www-data -- "$PHP" bench-member.php "$MEMBER_P
 rm -f "$ROOT/bench-member.php"
 echo "member=$MEMBER"
 
-echo "== find a thread URL"
-TID=$(mariadb -N -B xenforo -e 'SELECT thread_id FROM xf_thread ORDER BY thread_id LIMIT 1')
+echo "== find the median thread (by reply count)"
+NT=$(mariadb -N -B xenforo -e "SELECT COUNT(*) FROM xf_thread WHERE discussion_state = 'visible'")
+TID=$(mariadb -N -B xenforo -e "SELECT thread_id FROM xf_thread WHERE discussion_state = 'visible'
+  ORDER BY reply_count, thread_id LIMIT 1 OFFSET $(( ${NT:-0} / 2 ))")
+[[ $TID =~ ^[0-9]+$ ]] || { echo "no visible thread" >&2; exit 1; }
 THREAD=$(curl -sk -o /dev/null -w '%{url_effective}' -L \
   --resolve xf.test.local:443:127.0.0.1 "https://xf.test.local/threads/${TID}/")
 THREAD=${THREAD#https://xf.test.local}
@@ -106,3 +120,16 @@ XF_MEMBER_PW='${MEMBER_PW}'
 EOF
 chmod 600 "$ENVF"
 echo "== env written to $ENVF (${#COOKIE} cookie bytes)"
+
+LOGGED=$(curl -sk --resolve xf.test.local:443:127.0.0.1 -H "Cookie: $COOKIE" "https://xf.test.local$THREAD" \
+  | grep -c 'data-logged-in="true"' || true)
+(( LOGGED > 0 )) || { echo "the member cookie does not show a logged-in page" >&2; exit 1; }
+
+CK=/root/audit/cookies
+install -d -m 700 "$CK"
+{ awk -F'\t' '$1 != "xf-member"' "$CK/cookies.tsv" 2>/dev/null || true
+  printf 'xf-member\t%s\n' "$COOKIE"; } > "$CK/cookies.tsv.new"
+mv -f "$CK/cookies.tsv.new" "$CK/cookies.tsv"
+printf 'https://xf.test.local%s\n' "$THREAD" > "$CK/xf-thread.url"
+chmod 600 "$CK/cookies.tsv" "$CK/xf-thread.url"
+echo "== xf-member written to $CK/cookies.tsv, thread to $CK/xf-thread.url"

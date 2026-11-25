@@ -544,6 +544,9 @@ install_php() {
   else
     PHP_FRESH_INSTALL=1
   fi
+  # The huge pages the tuner's huge_code_pages decision reads (a no-op when
+  # --basic already reserved them in this or an earlier PHP run).
+  sysctl_hugepages_sync
   # Empty listener: the tuner keeps what the pool listens on.
   if ! tune_php_fpm_version "$ver" ""; then
     PHP_FRESH_INSTALL=0

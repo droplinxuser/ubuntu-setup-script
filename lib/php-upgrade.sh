@@ -1053,6 +1053,16 @@ php_upgrade_optimize() {
   # build lock held.  php_build_ensure also skips it while
   # PHP_UPGRADE_IN_FLIGHT=1; the next --optimize BOLTs the new version.
   local -x SETUP_PHP_BUILD_BOLT=0
+  # The same profile reset as run_optimize (1.22.2): tuning environment
+  # (SETUP_PHP_WORKERS_PER_CPU, SETUP_PHP_JIT...) and recorded pins are
+  # ignored, so the pool this switch writes is the one the next --optimize
+  # computes, not one sized from overrides --optimize discards.
+  RESET_ACTIONS=()
+  OPTIMIZE_IGNORED_ENV=()
+  if (( ! ${OPT_KEEP_EXPLICIT:-0} )); then
+    optimize_ignore_tuning_env
+    reset_operator_overrides
+  fi
   detect_installed_services
   plan_memory_budget
   OPT_PHP_SOCKET=""
