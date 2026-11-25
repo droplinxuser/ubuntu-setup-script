@@ -86,7 +86,13 @@ jobs:
           } | xargs -P "$(nproc)" -I{} sh -c 'shellcheck -S warning {}'
 
       - name: Dry-run matrix
-        run: bash tests/test-dry-run-matrix.sh
+        run: |
+          # Each failing case also becomes an annotation (readable without
+          # the job log).
+          bash tests/test-dry-run-matrix.sh 2>&1 | tee /tmp/matrix.out || {
+            grep '^FAIL' /tmp/matrix.out | head -n 20 | sed 's/^/::error title=Dry-run matrix::/'
+            exit 1
+          }
 
       # Function-level tests: no root, no services; scratch data under /tmp.
       - name: Unit tests
