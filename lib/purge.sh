@@ -3,6 +3,21 @@
 # ---------------------------------------------------------------------------
 # PURGE
 # ---------------------------------------------------------------------------
+# --purge never removes apt packages (the documented contract).  For the
+# components setup.sh compiles (nginx, PHP, Valkey) it removes what it built:
+# the units, the build roots, the PATH links, tmpfiles entries and build
+# units, through each module's own purge (R81).  Configuration, data, logs
+# and /var/backups/setup-1.22 always stay.  The one-time removal of the Angie,
+# Sury and valkey-server packages is the 1.22 migration's (lib/migrate.sh),
+# never this file's.
+
+# True while the host stays in legacy-Angie mode (the nginx part of the 1.22
+# migration refused or pending): Angie is the web server this script manages.
+purge_angie_legacy() {
+  declare -F web_server_state >/dev/null 2>&1 || return 1
+  [[ $(web_server_state 2>/dev/null || true) == angie-legacy ]]
+}
+
 apt_purge_pkgs() {
   # Disabled by design: package purging permanently deletes files and can
   # break a running server.  Keep the packages and say so in the log.
@@ -16,6 +31,41 @@ apt_purge_pattern() {
 purge_service_stop() {
   local unit=$1
   systemctl disable --now "$unit" 2>/dev/null || true
+}
+
+# The apt pin that keeps the packaged nginx, PHP and Valkey out while our
+# source builds own their paths (lib/services.sh services_apt_pin_add and
+# lib/migrate.sh migrate_write_apt_pin write it: a header, one 'Package:'
+# line, Pin and Pin-Priority -1).  A purged component's patterns leave the
+# Package: line, so an operator who removed the source build can install the
+# packaged one again; the file goes when no pattern is left.
+PURGE_APT_PIN=${MIGRATE_APT_PIN:-/etc/apt/preferences.d/setup-source-builds}
+purge_apt_pin_remove() { # "pattern ..."
+  local drop=" $1 " pkgs="" p tmp
+  local -a cur=()
+  [[ -f $PURGE_APT_PIN ]] || return 0
+  # read -a splits without pathname expansion (the patterns hold '*').
+  read -r -a cur <<< "$(sed -nE 's/^Package:[[:space:]]*//p' "$PURGE_APT_PIN" | head -n 1)"
+  for p in "${cur[@]}"; do
+    [[ $drop == *" ${p} "* ]] && continue
+    pkgs+="${pkgs:+ }${p}"
+  done
+  if [[ -z $pkgs ]]; then
+    rm -f -- "$PURGE_APT_PIN"
+    info "apt pin ${PURGE_APT_PIN} removed (no source build left to protect)"
+    return 0
+  fi
+  tmp=$(tmp_file) || return 0
+  # Keep every line but Package: (the header and the Pin lines) as written.
+  awk -v pkgs="$pkgs" '/^Package:/ { print "Package: " pkgs; next } { print }' \
+    "$PURGE_APT_PIN" > "$tmp" || { rm -f -- "$tmp"; return 0; }
+  if ! cmp -s "$tmp" "$PURGE_APT_PIN"; then
+    cat -- "$tmp" > "$PURGE_APT_PIN"
+    chmod 644 "$PURGE_APT_PIN"
+    info "apt pin: ${1} no longer held back (${PURGE_APT_PIN})"
+  fi
+  rm -f -- "$tmp"
+  return 0
 }
 
 # Print the SSH port a recorded `ufw ...` rule line refers to and return 0,
@@ -289,28 +339,41 @@ purge_basic() {
   return "$rc"
 }
 
-purge_angie() {
-  step "Purge Angie"
+purge_nginx() {
+  step "Purge nginx"
   if anubis_host_present; then
     warn "This host still runs the Anubis bot filter; run tools/remove-anubis.sh to restore the vhosts and remove it"
   fi
-  purge_service_stop angie
-  angie_build_purge
-  apt_purge_pkgs angie
-  # Configuration, data, caches and logs are left on disk.  Reinstalling Angie
-  # then restores the exact site instead of starting from an empty tree.
-  info "Leaving Angie files under /etc/angie, /var/lib/angie, /var/log/angie, /var/cache/angie and ${LOG_ROOT}/angie"
-  info "Leaving cache directories and /root installer files in place"
+  # Legacy-Angie mode: Angie is what serves, so it is what stops.  Its
+  # packages, /etc/angie and its data stay like every other package.
+  if purge_angie_legacy; then
+    purge_service_stop angie
+    info "Stopped and disabled angie (legacy mode); its packages, /etc/angie and /var/lib/angie stay"
+  fi
+  purge_service_stop nginx
+  # Our unit, the compiled build, its tool root, the /usr/sbin/nginx link,
+  # tmpfiles and build units; the shared refresh/CPU units and LLVM only
+  # when no other build remains (lib/nginx-build.sh).
+  if declare -F nginx_build_purge >/dev/null 2>&1; then
+    nginx_build_purge
+  fi
+  # The packaged nginx (and Angie) may be installed again.
+  purge_apt_pin_remove "nginx nginx-* libnginx-mod-* angie angie-*"
+  # Configuration and logs are left on disk.  Reinstalling nginx then
+  # restores the exact site instead of starting from an empty tree.
+  info "Leaving nginx files under /etc/nginx and ${LOG_ROOT}/nginx, and the backups in /var/backups/setup-1.22"
+  info "Leaving /root installer files in place"
+  cron_remove_line '/etc/nginx/scripts/cloudflare.sh' || true
   cron_remove_line '/etc/angie/scripts/cloudflare.sh' || true
   # Match the ownership job only: the managed wp-cron entry also starts with
-  # "/usr/bin/find /var/www" and must survive an Angie-only purge (PHP keeps
+  # "/usr/bin/find /var/www" and must survive an nginx-only purge (PHP keeps
   # running and DISABLE_WP_CRON stays in wp-config.php).
   cron_remove_line '/usr/bin/find /var/www -mindepth 1' || true
   cron_remove_line "$CRON_WWW_CHOWN_LEGACY" || true
   cron_remove_line "$CRON_WWW_CHOWN" || true
   cron_remove_line "$CRON_PRECOMPRESS" || true
   systemctl daemon-reload || true
-  ok "Angie purged (files preserved)"
+  ok "nginx purged (files preserved)"
 }
 
 purge_php() {
@@ -319,29 +382,48 @@ purge_php() {
 
   if [[ -n $ver ]]; then
     purge_service_stop "php${ver}-fpm"
-    apt_purge_pattern "php${ver}-*"
   else
+    # Every version with a configuration tree or a compiled build: a Sury
+    # version the migration has not taken over yet is stopped like ours.
     local -a vers=()
-    for d in /etc/php/*; do
+    for d in /etc/php/* "${PHP_BUILD_ROOT:-/usr/local/lib/setup-php}"/*; do
       [[ -d $d ]] || continue
       v=$(basename "$d")
-      [[ $v =~ ^[0-9]+\.[0-9]+$ ]] && vers+=("$v")
+      [[ $v =~ ^[0-9]+\.[0-9]+$ ]] || continue
+      [[ " ${vers[*]} " == *" ${v} "* ]] || vers+=("$v")
     done
     for v in "${vers[@]}"; do
       purge_service_stop "php${v}-fpm"
-      apt_purge_pattern "php${v}-*"
     done
   fi
-  # A PHP_BUILD drop-in would keep pointing a later reinstall at an
-  # old build; the package binary is the only safe state after a purge.
-  php_build_purge "$ver"
+  # Our unit, the compiled build and its links for that version (every
+  # version without ver=); the tool, template unit, tmpfiles and caches with
+  # the last version, LLVM with the last build of any kind
+  # (lib/php-build.sh).  /etc/php, logs and session data stay.
+  if declare -F php_build_purge >/dev/null 2>&1; then
+    php_build_purge "$ver"
+  fi
+  # The packaged PHP may be installed again once no compiled version is left
+  # (ver= of one of several keeps the pin for the others).  Both the
+  # migration's older 'php*' and the narrower families are dropped.
+  if ! compgen -G "${PHP_BUILD_ROOT:-/usr/local/lib/setup-php}/[0-9]*.[0-9]*/sbin/php-fpm" >/dev/null 2>&1; then
+    purge_apt_pin_remove "php* php[0-9]* php-* libapache2-mod-php*"
+    # The shared refresh timer and CPU-change unit go with the last build of
+    # any kind (R81): on a PHP-only host, or after an earlier
+    # '--purge nginx,valkey', PHP is that last build.  The helper keeps them
+    # while an nginx or Valkey build remains, and is idempotent when
+    # php_build_purge already released them.
+    if declare -F setup_build_remove_shared_units_if_last >/dev/null 2>&1; then
+      setup_build_remove_shared_units_if_last php || true
+    fi
+  fi
   # The session GC timer is shared by every installed version; stop it only
   # when no php-fpm unit remains enabled.
   if ! systemctl list-unit-files 'php*-fpm.service' --state=enabled --no-legend 2>/dev/null | grep -q .; then
     systemctl disable --now phpsessionclean.timer 2>/dev/null || true
   fi
   systemctl daemon-reload || true
-  info "Leaving PHP configuration, logs, caches and packages in place"
+  info "Leaving PHP configuration (/etc/php), logs, session data and any packages in place"
   ok "PHP purged (files preserved)"
 }
 
@@ -369,7 +451,14 @@ purge_mariadb() {
 
 purge_valkey() {
   step "Purge Valkey"
-  valkey_build_purge
+  # Our unit, the compiled build, its links and build units; the shared
+  # refresh/CPU units and LLVM only with the last build (lib/valkey-build.sh).
+  if declare -F valkey_build_purge >/dev/null 2>&1; then
+    valkey_build_purge
+  fi
+  # The packaged Valkey may be installed again.
+  purge_apt_pin_remove "valkey-server valkey-tools"
+  # A package valkey-server the migration has not replaced yet.
   purge_service_stop valkey-server
   # --optimize and --restart-all treat an adopted Redis as a managed cache
   # (a host that only had redis-server is tuned, restarted and reported on).
@@ -386,7 +475,6 @@ purge_valkey() {
       break
     fi
   done
-  apt_purge_pattern 'valkey-*'
   # Keep the valkey group and www-data's membership.  Removing the account
   # would break a reinstall and is an account change, not an uninstall.
   info "Leaving Valkey data, configuration and logs in place"
@@ -440,7 +528,7 @@ build_purge_order() {
       wanted[$t]=1
     fi
   done
-  for t in angie php mariadb valkey elastic others basic; do
+  for t in nginx php mariadb valkey elastic others basic; do
     if [[ ${ENABLED[$t]:-0} -eq 1 ]]; then
       wanted[$t]=1
     fi
@@ -452,9 +540,9 @@ build_purge_order() {
   PURGE_ORDER=()
   if [[ -n ${wanted[all]:-} ]]; then
     # Stop dependents before the services they use.  No package is removed.
-    PURGE_ORDER=(angie others php mariadb valkey elastic basic)
+    PURGE_ORDER=(nginx others php mariadb valkey elastic basic)
   else
-    for t in angie others php mariadb valkey elastic basic; do
+    for t in nginx others php mariadb valkey elastic basic; do
       if [[ -n ${wanted[$t]:-} ]]; then
         PURGE_ORDER+=("$t")
       fi
@@ -469,7 +557,7 @@ run_purge() {
   for t in "${PURGE_ORDER[@]}"; do
     case "$t" in
       basic)   purge_basic ;;
-      angie)   purge_angie ;;
+      nginx)   purge_nginx ;;
       php)     purge_php ;;
       mariadb) purge_mariadb ;;
       valkey)  purge_valkey ;;
@@ -479,7 +567,7 @@ run_purge() {
   done
 
   apt_clean
-  info "Purge only stopped services; all configuration, data and log files were preserved"
-  printf '\n%sPurge complete (no files were deleted).%s\n' "$C_GREEN" "$C_RESET"
+  info "Purge stopped services and removed only the compiled nginx/PHP/Valkey builds; configuration, data, log and backup files were preserved"
+  printf '\n%sPurge complete (configuration, data and logs were kept).%s\n' "$C_GREEN" "$C_RESET"
 }
 

@@ -11,13 +11,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      # The paired Angie tree: tests/test-tuning.sh asserts what it ships
-      # (ANGIE_TREE).  Checked out inside the workspace because actions/checkout
+      # The paired nginx tree: tests/test-tuning.sh asserts what it ships
+      # (NGINX_TREE).  Checked out inside the workspace because actions/checkout
       # cannot write next to it.
       - name: Checkout server-configs-nginx
         uses: actions/checkout@v5
         with:
           repository: droplinxuser/server-configs-nginx
+          # 1.22 uses the nginx tree; main stays the Angie tree for 1.21.x.
+          ref: nginx
           path: server-configs-nginx
 
       # Real server addresses must never be committed (see
@@ -27,12 +29,15 @@ jobs:
           bash tools/check-public-ips.sh
           bash tools/check-public-ips.sh server-configs-nginx
 
+      # lib/*.sh includes lib/migrate.sh, lib/nginx-build.sh,
+      # lib/php-build.sh, lib/php-upgrade.sh and lib/valkey-build.sh.
       - name: Bash syntax
         run: |
           bash -n setup.sh
           for f in lib/*.sh; do bash -n "$f"; done
           bash -n tests/test-dry-run-matrix.sh
           bash -n tests/test-tuning.sh
+          for f in tests/unit/*.sh; do bash -n "$f"; done
           bash -n tests/stress-site/setup-stress-site.sh
           bash -n tests/stress-site/run-stress.sh
           bash -n tests/stress-site/run-stress-remote.sh
@@ -45,7 +50,9 @@ jobs:
                    tests/bench-php-matrix/train-php-pgo.sh; do bash -n "$f"; done
           bash -n tools/diff_configs.sh
           bash -n tools/remove-anubis.sh
-          bash -n tools/php-fpm-build.sh tools/build-common.sh tools/angie-build.sh tools/valkey-build.sh tests/bench-php-matrix/switch-angie-arm.sh
+          bash -n tools/fleet-update.sh
+          bash -n tools/php-build.sh tools/build-common.sh tools/nginx-build.sh tools/valkey-build.sh
+          bash -n tests/bench-php-matrix/switch-nginx-arm.sh
           bash -n tests/bench-php-matrix/switch-valkey-arm.sh tests/bench-php-matrix/bench-valkey.sh
           for f in tests/bench-php-matrix/build-php-dropin.sh tests/bench-php-matrix/bolt-php.sh; do bash -n "$f"; done
 
@@ -54,20 +61,34 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y shellcheck
           shellcheck -S warning setup.sh lib/*.sh tests/test-dry-run-matrix.sh tests/test-tuning.sh \
+            tests/unit/*.sh \
             tests/stress-site/setup-stress-site.sh tests/stress-site/run-stress.sh \
             tests/stress-site/run-stress-remote.sh tests/stress-site/collect-metrics.sh tools/diff_configs.sh \
             tests/stress-site/webserver-shootout.sh tests/stress-site/php-server-shootout.sh \
             tests/bench-php-matrix/build-php-source.sh tests/bench-php-matrix/extract-php-debs.sh \
             tests/bench-php-matrix/switch-php-arm.sh tests/bench-php-matrix/bench-php-sources.sh \
             tests/bench-php-matrix/bench-php-probe.sh \
-            tools/remove-anubis.sh tools/php-fpm-build.sh tools/build-common.sh tools/angie-build.sh \
-            tests/bench-php-matrix/build-php-dropin.sh tests/bench-php-matrix/bolt-php.sh tests/bench-php-matrix/switch-angie-arm.sh \
-            tools/valkey-build.sh tests/bench-php-matrix/switch-valkey-arm.sh tests/bench-php-matrix/bench-valkey.sh
+            tools/remove-anubis.sh tools/fleet-update.sh \
+            tools/php-build.sh tools/build-common.sh tools/nginx-build.sh tools/valkey-build.sh \
+            tests/bench-php-matrix/build-php-dropin.sh tests/bench-php-matrix/bolt-php.sh \
+            tests/bench-php-matrix/switch-nginx-arm.sh \
+            tests/bench-php-matrix/switch-valkey-arm.sh tests/bench-php-matrix/bench-valkey.sh
 
       - name: Dry-run matrix
         run: bash tests/test-dry-run-matrix.sh
 
+      # Function-level tests: no root, no services; scratch data under /tmp.
+      - name: Unit tests
+        run: |
+          rc=0
+          for f in tests/unit/t-*.sh; do
+            echo "::group::$f"
+            bash "$f" || rc=1
+            echo "::endgroup::"
+          done
+          exit "$rc"
+
       - name: Tuning tests
         env:
-          ANGIE_TREE: ${{ github.workspace }}/server-configs-nginx
+          NGINX_TREE: ${{ github.workspace }}/server-configs-nginx
         run: bash tests/test-tuning.sh

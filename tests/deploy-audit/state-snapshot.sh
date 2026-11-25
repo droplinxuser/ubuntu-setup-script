@@ -17,7 +17,7 @@ export LC_ALL=C
 sec() { printf '\n## %s\n' "$1"; }
 
 sec files
-for d in /etc/angie /etc/php /etc/mysql /etc/valkey /etc/redis /etc/elasticsearch \
+for d in /etc/nginx /etc/php /etc/mysql /etc/valkey /etc/redis /etc/elasticsearch \
          /etc/sysctl.d /etc/security/limits.d /etc/systemd/system /etc/systemd/journald.conf.d \
          /etc/systemd/resolved.conf.d /etc/default /etc/logrotate.d /etc/apt/sources.list.d \
          /etc/apt/keyrings /etc/apt/preferences.d /etc/apt/apt.conf.d /etc/cron.d /etc/ssh \
@@ -36,7 +36,7 @@ done | sort -z | while IFS= read -r -d '' f; do
 done
 
 sec directories
-for d in /var/www /var/www/logs /var/www/logs/* /home/angie* /var/cache/angie* /run/php /run/valkey \
+for d in /var/www /var/www/logs /var/www/logs/* /home/nginx* /var/cache/nginx* /run/php /run/valkey \
          /var/lib/php/sessions /var/www/mysql_database; do
   [[ -d $d ]] && printf '%s %s\n' "$(stat -c '%a %U:%G' "$d")" "$d"
 done
@@ -71,15 +71,15 @@ swapon --show=NAME,SIZE --noheadings 2>/dev/null
 printf 'hostname=%s timezone=%s\n' "$(hostname)" "$(timedatectl show -p Timezone --value 2>/dev/null)"
 
 sec unit-limits
-for u in angie mariadb valkey-server redis-server elasticsearch $(systemctl list-units --no-legend --plain 'php*-fpm.service' 2>/dev/null | awk '{print $1}'); do
+for u in nginx mariadb valkey-server redis-server elasticsearch $(systemctl list-units --no-legend --plain 'php*-fpm.service' 2>/dev/null | awk '{print $1}'); do
   systemctl cat "$u" >/dev/null 2>&1 || continue
   printf '%s %s\n' "$u" "$(systemctl show "$u" -p LimitNOFILE -p LimitNPROC -p LimitMEMLOCK -p TasksMax -p OOMScoreAdjust -p Nice -p CPUWeight -p IOWeight -p MemoryMax -p MemoryHigh -p Restart -p TimeoutStartUSec -p TimeoutStopUSec 2>/dev/null | tr '\n' ' ')"
 done
 
-sec angie
-if command -v angie >/dev/null 2>&1; then
-  angie -T 2>/dev/null | grep -vE '^\s*(#|$)' | md5sum | cut -c1-32
-  angie -V 2>&1 | head -1
+sec nginx
+if command -v nginx >/dev/null 2>&1; then
+  nginx -T 2>/dev/null | grep -vE '^\s*(#|$)' | md5sum | cut -c1-32
+  nginx -V 2>&1 | head -1
 fi
 
 sec php

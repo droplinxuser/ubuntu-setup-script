@@ -98,6 +98,18 @@ log_selection() {
     "${DRY_RUN:-0}" "${OPTIMIZE:-0}" "${PURGE:-0}" "${DIAGNOSTICS:-0}" "${RESTART_ALL:-0}" "${UPGRADE_PHP:-off}"
   printf 'Services     : %s\n' "$services"
   printf 'Domains      : %s\n' "$domains"
+  # The memory class decides what may be built (nginx only below 4 GB).
+  if declare -F mem_class_mb >/dev/null; then
+    local class_mb
+    class_mb=$(mem_class_mb 2>/dev/null || true)
+    if [[ $class_mb =~ ^[1-9][0-9]*$ ]]; then
+      if (( class_mb >= ${MEM_GATE_MIN_MB:-3500} )); then
+        printf 'Memory class : %s MB (4 GB class: nginx, PHP and Valkey builds allowed)\n' "$class_mb"
+      else
+        printf 'Memory class : %s MB (below the 4 GB class: nginx only)\n' "$class_mb"
+      fi
+    fi
+  fi
   if [[ -n ${UPGRADE_PHP:-} ]]; then
     printf 'PHP upgrade  : target=%s\n' "$UPGRADE_PHP"
   fi
@@ -106,8 +118,8 @@ log_selection() {
       "${OPT[mariadb.user]:-}" "${OPT[mariadb.size]:-}" "${OPT[mariadb.bind]:-}"
   fi
   if [[ ${ENABLED[php]:-0} -eq 1 ]]; then
-    printf 'PHP          : version=%s children=%s max_requests=%s\n' \
-      "${OPT[php.ver]:-auto}" "${OPT[php.children]:-auto}" "${OPT[php.max_requests]:-auto}"
+    printf 'PHP          : version=%s ext=%s children=%s max_requests=%s\n' \
+      "${OPT[php.ver]:-auto}" "${OPT[php.ext]:-unchanged}" "${OPT[php.children]:-auto}" "${OPT[php.max_requests]:-auto}"
   fi
   if [[ ${ENABLED[valkey]:-0} -eq 1 ]]; then
     printf 'Valkey       : ram=%s policy=%s io_threads=%s\n' \
@@ -286,7 +298,8 @@ retire_paths() {
 }
 
 # Restore a backed-up directory tree over a live path without deleting files
-# that are not in the backup.  Used for install-time rollback of Angie/PHP.
+# that are not in the backup.  Used for install-time rollback of /etc/nginx
+# and /etc/php/X.Y (the source builds' configuration trees).
 # Restore the directory snapshot SRC over the live DST: overwrite in place
 # (never unlink the live path first) and move files created after the
 # snapshot to /tmp, so a generated file (a drop-in or ini the failed tune
@@ -321,29 +334,39 @@ restore_tree() {
   return "$rc"
 }
 
-rollback_angie_tree() {
-  local backup=$1
-  [[ -n $backup && -d "${backup}/angie" ]] || return 0
-  restore_tree "${backup}/angie" /etc/angie \
-    || warn "Could not restore the previous /etc/angie tree"
-  if /usr/sbin/angie -t >/dev/null 2>&1; then
-    systemctl reload angie 2>/dev/null || systemctl restart angie 2>/dev/null || true
-    warn "Rolled back Angie configuration from ${backup}"
+# Install-time rollback of /etc/nginx.  The test uses the source build's
+# own binary (NGINX_BIN, lib/nginx-build.sh: ROOT/sbin/nginx, never a
+# dpkg-owned /usr/sbin/nginx).  The one-time migration rolls back to Angie
+# through its own path (lib/migrate.sh), not through this function.
+rollback_nginx_tree() {
+  local backup=$1 bin=${NGINX_BIN:-/usr/local/lib/setup-nginx/sbin/nginx}
+  [[ -n $backup && -d "${backup}/nginx" ]] || return 0
+  restore_tree "${backup}/nginx" /etc/nginx \
+    || warn "Could not restore the previous /etc/nginx tree"
+  if [[ ! -x $bin ]]; then
+    warn "Rolled back nginx configuration from ${backup}; no compiled nginx at ${bin} to test it with"
+  elif "$bin" -t -q -c /etc/nginx/nginx.conf >/dev/null 2>&1; then
+    systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
+    warn "Rolled back nginx configuration from ${backup}"
   else
-    warn "Angie rollback restored files but angie -t still fails"
+    warn "nginx rollback restored files but nginx -t still fails"
   fi
 }
 
+# Install-time rollback of /etc/php/X.Y/fpm.  php_fpm_test (lib/php-build.sh)
+# runs the compiled php-fpm exactly as the unit starts it (-y, -c and
+# PHP_INI_SCAN_DIR): a bare `php-fpmX.Y -t` would read the build's compiled
+# defaults instead of /etc/php/X.Y/fpm and prove nothing.
 rollback_php_tree() {
   local backup=$1 ver=$2
   [[ -n $backup && -d "${backup}/fpm" ]] || return 0
   restore_tree "${backup}/fpm" "/etc/php/${ver}/fpm" \
     || warn "Could not restore the previous PHP ${ver} tree"
-  if "php-fpm${ver}" -t >/dev/null 2>&1; then
+  if declare -F php_fpm_test >/dev/null && php_fpm_test "$ver" >/dev/null 2>&1; then
     systemctl restart "php${ver}-fpm" 2>/dev/null || true
     warn "Rolled back PHP ${ver} configuration from ${backup}"
   else
-    warn "PHP ${ver} rollback restored files but php-fpm${ver} -t still fails; not restarted"
+    warn "PHP ${ver} rollback restored files but php-fpm -t still fails; not restarted"
   fi
 }
 

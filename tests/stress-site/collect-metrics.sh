@@ -2,7 +2,7 @@
 # Server-side sampler for load tests.  Run as root on the host under test while
 # a load generator (run-stress.sh or run-stress-remote.sh) is running:
 #   sudo bash tests/stress-site/collect-metrics.sh /tmp/metrics.log [interval_s] [count]
-# Every sample records CPU/memory/load, socket state, Angie and PHP-FPM status,
+# Every sample records CPU/memory/load, socket state, nginx and PHP-FPM status,
 # MariaDB/Valkey/Elasticsearch counters and new error-log lines, so a
 # bottleneck can be matched to the scenario that produced it.
 set -u
@@ -28,7 +28,7 @@ php_status() {
   busy=$(ps -eo stat=,args= 2>/dev/null | awk '/php-fpm: pool / && $1 ~ /^R/ {n++} END {print n+0}')
   printf 'workers=%s busy~=%s (cgi-fcgi absent);' "${total:-0}" "${busy:-0}"
 }
-angie_status() { curl -s http://127.0.0.1/status/ 2>/dev/null | tr '\n' ' ' | cut -c1-200; }
+nginx_status() { curl -s http://127.0.0.1/status/ 2>/dev/null | tr '\n' ' ' | cut -c1-200; }
 db_status() {
   mariadb -N -B -e "SHOW GLOBAL STATUS WHERE Variable_name IN ('Threads_connected','Threads_running','Questions','Slow_queries','Innodb_buffer_pool_wait_free','Innodb_buffer_pool_reads','Innodb_buffer_pool_read_requests','Created_tmp_disk_tables','Table_open_cache_misses','Aborted_connects','Max_used_connections','Threadpool_threads','Threadpool_idle_threads')" 2>/dev/null | awk '{printf "%s=%s ", $1, $2}'
 }
@@ -39,7 +39,7 @@ vk_status() {
 es_status() { curl -fsS 'http://127.0.0.1:9200/_nodes/stats/jvm,thread_pool,indices?filter_path=nodes.*.jvm.mem.heap_used_percent,nodes.*.thread_pool.search.rejected,nodes.*.thread_pool.search.queue,nodes.*.indices.search.query_total' 2>/dev/null | tr -d ' \n' | cut -c1-240; }
 log_sizes() {
   local f
-  for f in /var/www/logs/angie/*error.log /var/www/logs/php/php-fpm-slow.log /var/www/logs/php/php-fpm.log /var/www/logs/mariadb/error.log /var/www/logs/mariadb/slow.log; do
+  for f in /var/www/logs/nginx/*error.log /var/www/logs/php/php-fpm-slow.log /var/www/logs/php/php-fpm.log /var/www/logs/mariadb/error.log /var/www/logs/mariadb/slow.log; do
     [[ -f $f ]] && printf '%s=%s ' "${f##*/}" "$(wc -l < "$f")"
   done
 }
@@ -57,7 +57,7 @@ sample() {
     echo "[$ts] cpu: $cpu | mem: $mem | load: $load | timewait=$tw conntrack=$conntrack | $drops"
     echo "[$ts] top: $top"
     echo "[$ts] sock: $sock"
-    echo "[$ts] angie: $(angie_status)"
+    echo "[$ts] nginx: $(nginx_status)"
     echo "[$ts] fpm: $(php_status)"
     echo "[$ts] mariadb: $(db_status)"
     echo "[$ts] valkey: $(vk_status)"

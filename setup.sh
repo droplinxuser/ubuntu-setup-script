@@ -8,18 +8,26 @@
 #   * Runs as root only.
 #   * Idempotent: every step can be re-run on an already configured machine.
 #   * Only the services named on the command line are touched.
-#   * Angie configuration is owned by
-#     https://github.com/droplinxuser/server-configs-nginx and downloaded at
-#     install time.  PHP-FPM pool/php.ini templates are non-Angie config and
-#     live locally in configs/php.  Do not add Angie config content to this
-#     script; update the Angie repo.
+#   * nginx configuration is owned by
+#     https://github.com/droplinxuser/server-configs-nginx (its "nginx"
+#     branch) and downloaded at install time.  PHP-FPM pool/php.ini templates
+#     are non-nginx config and live locally in configs/php.  Do not add nginx
+#     config content to this script; update the nginx repo.
 #     Other vendor payloads that must be reproducible offline are embedded in
 #     the "EMBEDDED PAYLOADS" section at the bottom.
+#   * nginx, PHP (FPM + CLI) and Valkey are always built from upstream source
+#     (tools/*-build.sh, lib/*-build.sh); there are no package modes.  Hosts
+#     below the 4 GB class run nginx only (mem_gate_allows).
 #   * Each service is timed; a summary is printed at the end.
 #   * Every run mirrors its complete output to setup_<timestamp>.log in the
 #     invocation directory so the log can be handed to a debugging agent.
 #   * `--purge` stops/disables selected services and restores recorded basic
-#     settings; it never removes packages, data, configuration or log files.
+#     settings; it never removes packages, data, configuration or log files
+#     (a purged source build loses its binaries, unit and links only).
+#   * The one-time 1.22 migration (lib/migrate.sh, run by --optimize) is the
+#     only path that removes packages: Angie, Sury PHP and valkey-server go
+#     only after the source builds serve and verify, with every .deb and
+#     configuration kept in /var/backups/setup-1.22.
 # =============================================================================
 
 set -Eeuo pipefail
@@ -36,7 +44,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.21.71"
+readonly SCRIPT_VERSION="1.22.0"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -70,7 +78,7 @@ LIMIT_REQ_EXEMPT_IGNORED=0
 [[ -n ${SETUP_LIMIT_REQ_EXEMPT+x} ]] && LIMIT_REQ_EXEMPT_IGNORED=1
 # Static-asset precompression (.br/.gz siblings served by brotli_static and
 # gzip_static) is on by default since 1.21.58: compressing
-# an asset per request capped a 177 KB script at 2,100 req/s (3.8 ms of Angie
+# an asset per request capped a 177 KB script at 2,100 req/s (3.8 ms of nginx
 # CPU each) where the sibling is served at the uncompressed rate, and a CDN
 # still sends the origin every miss.  SETUP_PRECOMPRESS_ASSETS=0 turns it off
 # (the siblings it made are removed) and is persisted in the same host file.
@@ -103,7 +111,7 @@ fi
 [[ $PHP_JIT_WORDPRESS == 0 ]] || PHP_JIT_WORDPRESS=1
 # Guest-cache page compression: PHP gzips the output of WordPress and
 # Chevereto document roots that sit behind the FastCGI guest cache, so the
-# cache stores the compressed page instead of Angie compressing every hit
+# cache stores the compressed page instead of nginx compressing every hit
 # (see php_page_gzip_roots).  SETUP_PHP_PAGE_GZIP=0 turns it off and is
 # persisted in the same host file (PHP_PAGE_GZIP).
 PHP_PAGE_GZIP="${PHP_PAGE_GZIP:-1}"
@@ -113,42 +121,30 @@ if [[ -n ${SETUP_PHP_PAGE_GZIP+x} ]]; then
   PHP_PAGE_GZIP_PERSIST=1
 fi
 [[ $PHP_PAGE_GZIP == 0 ]] || PHP_PAGE_GZIP=1
-# Compiled php-fpm (opt-in).  SETUP_PHP_BUILD=clang builds a lean php-fpm for
-# WordPress, XenForo and Chevereto from upstream sources (php-build.conf),
-# with BOLT from live traffic on --optimize; =package goes back.  Persisted as PHP_BUILD.  See lib/php-build.sh and
-# tools/php-fpm-build.sh.
-PHP_BUILD="${PHP_BUILD:-}"
-PHP_BUILD_PERSIST=0
-if [[ -n ${SETUP_PHP_BUILD+x} ]]; then
-  PHP_BUILD=$SETUP_PHP_BUILD
-  PHP_BUILD_PERSIST=1
-fi
-# php-fpm loads only the extensions WordPress, XenForo and Chevereto need
-# (lib/php-build.sh); SETUP_PHP_FPM_MODULES=all keeps every installed one.
-# Persisted as PHP_FPM_MODULES.
-PHP_FPM_MODULES="${PHP_FPM_MODULES:-}"
-PHP_FPM_MODULES_PERSIST=0
-if [[ -n ${SETUP_PHP_FPM_MODULES+x} ]]; then
-  PHP_FPM_MODULES=$SETUP_PHP_FPM_MODULES
-  PHP_FPM_MODULES_PERSIST=1
-fi
-# Compiled Angie (opt-in, 1.21.70).  SETUP_ANGIE_BUILD=clang builds a lean Angie
-# from upstream sources (angie-build.conf) with BOLT on --optimize; =package
-# goes back.  Persisted as ANGIE_BUILD.  See lib/angie-build.sh and
-# tools/angie-build.sh.
-ANGIE_BUILD="${ANGIE_BUILD:-}"
-ANGIE_BUILD_PERSIST=0
-if [[ -n ${SETUP_ANGIE_BUILD+x} ]]; then
-  ANGIE_BUILD=$SETUP_ANGIE_BUILD
-  ANGIE_BUILD_PERSIST=1
-fi
-# Compiled Valkey (opt-in, 1.21.71), the same way: SETUP_VALKEY_BUILD=clang or
-# --source=valkey.  Persisted as VALKEY_BUILD.  See lib/valkey-build.sh.
-VALKEY_BUILD="${VALKEY_BUILD:-}"
-VALKEY_BUILD_PERSIST=0
-if [[ -n ${SETUP_VALKEY_BUILD+x} ]]; then
-  VALKEY_BUILD=$SETUP_VALKEY_BUILD
-  VALKEY_BUILD_PERSIST=1
+# Build-mode knobs retired in 1.22.0.  nginx, PHP and Valkey are always built
+# from upstream source, and the PHP extension set follows the applications
+# the host serves (lib/php-build.sh; --php ext=LIST adds to it, persisted as
+# PHP_EXT_EXTRA).  A 1.21.x host file still carries PHP_BUILD, ANGIE_BUILD,
+# NGINX_BUILD, VALKEY_BUILD or PHP_FPM_MODULES: they are dropped from memory
+# here so no code path can act on them, and the 1.22 migration removes them
+# from the file (keeping a copy; it records PHP_FPM_MODULES first, because
+# =all said 1.21 kept every module in FPM).  An exported SETUP_* knob is
+# remembered for the warning validate_all prints (the run log is not open
+# yet) and then dropped from the environment, so no child tool sees it.
+RETIRED_BUILD_ENV=()
+for _retired in SETUP_PHP_BUILD SETUP_ANGIE_BUILD SETUP_NGINX_BUILD SETUP_VALKEY_BUILD SETUP_PHP_FPM_MODULES; do
+  if [[ -n ${!_retired+x} ]]; then
+    RETIRED_BUILD_ENV+=("${_retired}=${!_retired}")
+    unset "$_retired"
+  fi
+done
+unset _retired PHP_BUILD ANGIE_BUILD NGINX_BUILD VALKEY_BUILD PHP_FPM_MODULES
+# SETUP_ANGIE_COMPRESSION was renamed SETUP_NGINX_COMPRESSION; an operator
+# environment that still exports the old name keeps working (the new name
+# wins when both are set), and --optimize ignores it under the new name.
+if [[ -n ${SETUP_ANGIE_COMPRESSION+x} ]]; then
+  [[ -n ${SETUP_NGINX_COMPRESSION+x} ]] || export SETUP_NGINX_COMPRESSION=$SETUP_ANGIE_COMPRESSION
+  unset SETUP_ANGIE_COMPRESSION
 fi
 [[ $PRECOMPRESS_ASSETS == 0 ]] || PRECOMPRESS_ASSETS=1
 # XenForo job runner.  XenForo runs its job queue (cron tasks, search
@@ -158,7 +154,7 @@ fi
 # setup.sh installs one managed crontab entry that runs the queue of every
 # XenForo root under /var/www once a minute as the PHP user.  Running it as
 # www-data also stops the root-owned data directories a root CLI run leaves
-# behind (Angie then returns 403 for every file below them; 16% of the
+# behind (nginx then returns 403 for every file below them; 16% of the
 # requests on one audited host).  SETUP_XF_JOB_CRON=0 drops the entry and is
 # persisted in the same host file (XF_JOB_CRON).
 XF_JOB_CRON="${XF_JOB_CRON:-1}"
@@ -172,7 +168,10 @@ fi
 # host's self-signed certificate; --optimize moves their vhosts off certbot,
 # checks them through Cloudflare and purges certbot when nothing else uses
 # it (lib/web.sh, cloudflare_tls_migrate).  SETUP_CF_SELF_SIGNED=0 or
-# CF_SELF_SIGNED=0 in /etc/default/setup-tuning leaves certificates alone.
+# CF_SELF_SIGNED=0 in /etc/default/setup-tuning leaves certbot certificates
+# alone.  It does not stop the 1.22 migration from moving Angie ACME vhosts
+# (acme / acme_client / $acme_cert_*) to the self-signed pair: nginx cannot
+# parse those directives, so that rewrite is mandatory (lib/migrate.sh).
 CF_SELF_SIGNED_PERSIST=0
 if [[ -n ${SETUP_CF_SELF_SIGNED+x} ]]; then
   CF_SELF_SIGNED_PERSIST=1
@@ -185,23 +184,25 @@ CF_SELF_SIGNED="${SETUP_CF_SELF_SIGNED:-${CF_SELF_SIGNED:-1}}"
 SSL_REJECT_UNKNOWN_SNI="${SETUP_SSL_REJECT_UNKNOWN_SNI:-${SSL_REJECT_UNKNOWN_SNI:-auto}}"
 [[ $SSL_REJECT_UNKNOWN_SNI =~ ^(auto|0|1)$ ]] || SSL_REJECT_UNKNOWN_SNI=auto
 # XenForo page compression.  XenForo gzips every page itself at level 9
-# (15% of member-page PHP CPU on the audit host).  With XF_MEMBER_GZIP=angie
+# (15% of member-page PHP CPU on the audit host).  With XF_MEMBER_GZIP=nginx
 # (default) a managed block at the end of each XenForo src/config.php keeps
 # XenForo's gzip for guests -- the FastCGI guest cache stores that compressed
 # body, so a hit costs no compression -- and turns it off for visitors with a
-# session cookie, whose pages Angie compresses (Brotli/gzip level 4).
+# session cookie, whose pages nginx compresses (Brotli/gzip level 4).
 # SETUP_XF_MEMBER_GZIP=xenforo removes the block; the choice is persisted in
 # /etc/default/setup-tuning.  Since server-configs-nginx 1.6.56 the uncached
-# Angie handler withholds Accept-Encoding from PHP, so uncached pages are
-# compressed by Angie whatever the block says (new installs included); the
-# block remains a second guard for hosts on an older tree.
-XF_MEMBER_GZIP="${XF_MEMBER_GZIP:-angie}"
+# nginx handler withholds Accept-Encoding from PHP, so uncached pages are
+# compressed by nginx whatever the block says (new installs included); the
+# block remains a second guard for hosts on an older tree.  A 1.21.x host
+# file says XF_MEMBER_GZIP=angie: anything but xenforo means the web server
+# compresses, so it reads as nginx (the migration rewrites the file).
+XF_MEMBER_GZIP="${XF_MEMBER_GZIP:-nginx}"
 XF_MEMBER_GZIP_PERSIST=0
 if [[ -n ${SETUP_XF_MEMBER_GZIP+x} ]]; then
   XF_MEMBER_GZIP=$SETUP_XF_MEMBER_GZIP
   XF_MEMBER_GZIP_PERSIST=1
 fi
-[[ $XF_MEMBER_GZIP == xenforo ]] || XF_MEMBER_GZIP=angie
+[[ $XF_MEMBER_GZIP == xenforo ]] || XF_MEMBER_GZIP=nginx
 # CPU vulnerability mitigations (Spectre/Meltdown/MDS/Retbleed...).  Empty =
 # never touched (the kernel default, on).  `--basic mitigations=off`,
 # `--optimize mitigations=off` or SETUP_CPU_MITIGATIONS=off add
@@ -240,10 +241,14 @@ readonly BACKUP_DIR="${STATE_DIR}/backup"
 # Every service writes its logs below this single directory so an operator can
 # collect one tree (tar -czf /tmp/logs.tgz -C /var/www logs) for inspection.
 readonly LOG_ROOT="/var/www/logs"
-# Angie and PHP configuration is owned by this repository, not by setup.sh.
+# nginx configuration is owned by this repository, not by setup.sh.
 # Override the ref or point CONFIG_SOURCE_DIR at a local checkout for testing.
+# The nginx tree lives on the repository's "nginx" branch: its main branch
+# stays the Angie tree that every 1.21.x host still downloads, so switching
+# main would break the hosts not yet migrated (hosts that stay on 1.21.x pin
+# CONFIG_REPO_REF=angie-final).
 readonly CONFIG_REPO_URL="${CONFIG_REPO_URL:-https://github.com/droplinxuser/server-configs-nginx}"
-readonly CONFIG_REPO_REF="${CONFIG_REPO_REF:-main}"
+readonly CONFIG_REPO_REF="${CONFIG_REPO_REF:-nginx}"
 CONFIG_SOURCE_DIR="${CONFIG_SOURCE_DIR:-}"
 CONFIG_TEMP_DIR=""
 readonly CRON_BEGIN="# BEGIN setup.sh managed cron"
@@ -260,6 +265,10 @@ readonly CRON_PRECOMPRESS='/usr/local/bin/setup-precompress.sh'
 # WordPress ships its own pseudo-cron.  When the hardening step disables it
 # (DISABLE_WP_CRON), this managed entry runs every site's wp-cron.php as the
 # PHP user so scheduled posts, updates and plugin jobs still fire.
+# /usr/bin/php stays the path: cron's PATH has no /usr/local/bin, and the
+# source build links /usr/bin/php to the active CLI wherever dpkg no longer
+# owns it (php_build_links; the migration does it after the Sury purge).
+# Keeping the string also keeps every managed crontab byte-identical.
 readonly CRON_WP_CRON='/usr/bin/find /var/www -maxdepth 6 -type f -name wp-config.php ! -path "*/mysql_database/*" ! -path "*/backup*/*" ! -path "*/.old/*" -exec /usr/bin/dirname {} \; | while IFS= read -r d; do [ -f "$d/wp-cron.php" ] && /usr/sbin/runuser -u www-data -- /usr/bin/php "$d/wp-cron.php"; done'
 # XenForo job runner (XF_JOB_CRON): every XenForo root under /var/www runs its
 # queue once a minute as the PHP user.  --max-execution-time keeps one run
@@ -346,14 +355,21 @@ source "${SCRIPT_DIR}/lib/php-upgrade.sh"
 # shellcheck source=lib/php-build.sh
 source "${SCRIPT_DIR}/lib/php-build.sh"
 
-# shellcheck source=lib/angie-build.sh
-source "${SCRIPT_DIR}/lib/angie-build.sh"
+# shellcheck source=lib/nginx-build.sh
+source "${SCRIPT_DIR}/lib/nginx-build.sh"
 # shellcheck source=lib/valkey-build.sh
 source "${SCRIPT_DIR}/lib/valkey-build.sh"
+
+# Last: its top-level defaults read what the build libs export
+# (NGINX_BUILD_DROPPABLE_RE / NGINX_BUILD_UNBUILT_RE, the build lock path).
+# shellcheck source=lib/migrate.sh
+source "${SCRIPT_DIR}/lib/migrate.sh"
 
 
 # Tests source this file with SETUP_TEST_SOURCE_ONLY=1 to exercise the pure
 # helper functions without running an installation.
 if [[ ${SETUP_TEST_SOURCE_ONLY:-0} != 1 ]]; then
+  # main() also dispatches the hidden `--migrate-1.22-unit REPORT_FILE` mode
+  # that the setup-migrate-1.22 unit runs (run_migrate_unit, lib/restart.sh).
   main "$@"
 fi

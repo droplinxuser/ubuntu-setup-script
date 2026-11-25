@@ -25,11 +25,21 @@
 RESET_ACTIONS=()
 # Pins that describe a host fact or a feature choice, not a performance
 # override: a reset must not silently flip them.
+# PHP_EXT_EXTRA is the operator's --php ext= list (plus the modules the 1.22
+# migration found loaded under Sury): clearing it would let the next build
+# drop an extension a site needs.
 RESET_KEEP_PINS=(
   XF_JOB_CRON NODE_MAJOR NODE_ALLOW_MAJOR_UPGRADE
   CPU_MITIGATIONS XF_MEMBER_GZIP CF_SELF_SIGNED SSL_REJECT_UNKNOWN_SNI
-  PHP_SESSION_HARDENING PHP_BUILD PHP_FPM_MODULES ANGIE_BUILD VALKEY_BUILD
+  PHP_SESSION_HARDENING PHP_EXT_EXTRA
 )
+# Build-mode knobs of 1.21.x (removed in 1.22.0; setup.sh ignores them).
+# They are not tuning pins, so the reset does not report them as cleared:
+# while the 1.22 migration is still pending they stay in the file for it
+# (it records PHP_FPM_MODULES, then removes them with a copy in
+# /var/backups/setup-1.22); once nothing is left to migrate a reset drops
+# them with the original file moved to /tmp like any other change.
+RESET_RETIRED_PINS=(PHP_BUILD ANGIE_BUILD NGINX_BUILD VALKEY_BUILD PHP_FPM_MODULES)
 
 # Every sysctl key this host's managed profile actually defines.  A key this
 # script *may* set only for a service that is not installed (vm.max_map_count
@@ -228,10 +238,10 @@ tuning_overrides_report() {
   drift=$(tuning_drift_lines | head -n 60)
   if [[ -n $drift ]]; then printf '%s\n' "$drift"; else printf '(none)\n'; fi
 
-  # Operator PHP/Angie fragments are preserved by --optimize, so list
+  # Operator PHP/nginx fragments are preserved by --optimize, so list
   # the ones that can win over the managed profile instead of silently
   # leaving them out of the report.
-  printf '\n== PHP/Angie fragments that can override the managed profile ==\n'
+  printf '\n== PHP/nginx fragments that can override the managed profile ==\n'
   local pv dir f
   for pv in $(php_fpm_versions 2>/dev/null); do
     dir=/etc/php/$pv/fpm/conf.d
@@ -246,9 +256,9 @@ tuning_overrides_report() {
       if [[ ${f##*/} != www.conf ]]; then printf '  %s (extra PHP-FPM pool)\n' "$f"; fi
     done
   done
-  for f in /etc/angie/custom.d/*.conf; do
+  for f in /etc/nginx/custom.d/*.conf; do
     [[ -f $f ]] || continue
-    printf '  %s (Angie custom.d)\n' "$f"
+    printf '  %s (nginx custom.d)\n' "$f"
   done
 }
 
@@ -292,7 +302,7 @@ optimize_ignore_tuning_env() {
     SETUP_PHP_JIT SETUP_PHP_JIT_WORDPRESS \
     SETUP_PHP_JIT_HOT_LOOP SETUP_PHP_JIT_HOT_FUNC \
     SETUP_PHP_JIT_HOT_RETURN SETUP_PHP_JIT_HOT_SIDE_EXIT \
-    SETUP_GZIP_LEVEL SETUP_BROTLI_LEVEL SETUP_ANGIE_COMPRESSION \
+    SETUP_GZIP_LEVEL SETUP_BROTLI_LEVEL SETUP_NGINX_COMPRESSION \
     SETUP_MARIADB_IO_CAPACITY SETUP_LIMIT_REQ_EXEMPT \
     SETUP_PRECOMPRESS_ASSETS SETUP_PHP_PAGE_GZIP; do
     if [[ -n ${!v+x} ]]; then
@@ -309,10 +319,15 @@ optimize_ignore_tuning_env() {
 reset_operator_overrides() {
   local dry=${1:-0}
   local f=/etc/default/setup-tuning ex="${STATE_DIR}/explicit-options.conf"
-  local line key moved
-  local -a kept=() removed=()
+  local line key moved keep_retired=0
+  local -a kept=() removed=() retired=()
   RESET_ACTIONS=()
 
+  # The migration reads the retired knobs from this file; keep them for it
+  # while it still has work (lib/migrate.sh; absent in unit tests).
+  if declare -F migrate_needed >/dev/null && migrate_needed 2>/dev/null; then
+    keep_retired=1
+  fi
   if [[ -f $f ]]; then
     while IFS= read -r line || [[ -n $line ]]; do
       case $line in
@@ -321,15 +336,18 @@ reset_operator_overrides() {
           key=${line%%=*}
           if printf '%s\n' "${RESET_KEEP_PINS[@]}" | grep -qxF -- "$key"; then
             kept+=("$line")
+          elif printf '%s\n' "${RESET_RETIRED_PINS[@]}" | grep -qxF -- "$key"; then
+            if (( keep_retired )); then kept+=("$line"); else retired+=("$key"); fi
           else
             removed+=("$key")
           fi
           ;;
       esac
     done < "$f"
-    if (( ${#removed[@]} > 0 )); then
+    if (( ${#removed[@]} + ${#retired[@]} > 0 )); then
       if (( dry )); then
-        RESET_ACTIONS+=("would clear /etc/default/setup-tuning: ${removed[*]}")
+        if (( ${#removed[@]} > 0 )); then RESET_ACTIONS+=("would clear /etc/default/setup-tuning: ${removed[*]}"); fi
+        if (( ${#retired[@]} > 0 )); then RESET_ACTIONS+=("would drop the 1.21 build knobs ${retired[*]} (removed in 1.22.0)"); fi
       else
         moved=$(preserve_to_tmp "$f" 2>/dev/null || true)
         if [[ -n $moved ]]; then
@@ -340,7 +358,8 @@ reset_operator_overrides() {
             } > "$f"
             chmod 644 "$f"
           fi
-          RESET_ACTIONS+=("cleared pins ${removed[*]} (original: ${moved})")
+          if (( ${#removed[@]} > 0 )); then RESET_ACTIONS+=("cleared pins ${removed[*]} (original: ${moved})"); fi
+          if (( ${#retired[@]} > 0 )); then RESET_ACTIONS+=("dropped the 1.21 build knobs ${retired[*]}, removed in 1.22.0 (original: ${moved})"); fi
         else
           warn "Could not move ${f} out of the way; pins may still apply"
         fi

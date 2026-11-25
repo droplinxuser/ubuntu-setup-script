@@ -2,7 +2,7 @@
   "name": "stress-node-all",
   "private": true,
   "version": "1.0.0",
-  "description": "Node.js tier that exercises Angie, MariaDB, Valkey and Elasticsearch",
+  "description": "Node.js tier that exercises nginx, MariaDB, Valkey and Elasticsearch",
   "main": "all.js",
   "scripts": {
     "start": "node all.js"

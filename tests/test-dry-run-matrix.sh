@@ -71,6 +71,43 @@ run_msg() {
   fi
 }
 
+# run_warn TEXT ARGS...: the call must succeed AND print TEXT (a removed
+# option or alias that is accepted with a warning, never silently).
+run_warn() {
+  local text=$1
+  shift
+  local out rc
+  out=$(bash "$SCRIPT_DIR/setup.sh" "$@" 2>&1)
+  rc=$?
+  if (( rc == 0 )) && grep -qF -- "$text" <<<"$out"; then
+    PASS=$((PASS + 1))
+    printf 'PASS  rc=%d  %s  [%s]\n' "$rc" "$*" "$text"
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL  rc=%d expected success with "%s"  %s\n' "$rc" "$text" "$*"
+    printf '%s\n' "$out" | sed 's/^/      /' | head -6
+  fi
+}
+
+# run_env_msg ok|fail VAR=value TEXT ARGS...: run_env that also asserts TEXT
+# in the output, so a row cannot pass on an unrelated message.
+run_env_msg() {
+  local expect=$1 var=$2 text=$3
+  shift 3
+  local out rc
+  out=$(env "$var" bash "$SCRIPT_DIR/setup.sh" "$@" 2>&1)
+  rc=$?
+  if { [[ $expect == ok && $rc -eq 0 ]] || [[ $expect == fail && $rc -ne 0 ]]; } \
+     && grep -qF -- "$text" <<<"$out"; then
+    PASS=$((PASS + 1))
+    printf 'PASS  rc=%d  %s %s  [%s]\n' "$rc" "$var" "$*" "$text"
+  else
+    FAIL=$((FAIL + 1))
+    printf 'FAIL  rc=%d expected=%s with "%s"  %s %s\n' "$rc" "$expect" "$text" "$var" "$*"
+    printf '%s\n' "$out" | sed 's/^/      /' | head -6
+  fi
+}
+
 # Basic CLI.
 run ok   --help
 run ok   --version
@@ -80,7 +117,7 @@ run fail
 run ok   --dry-run --basic
 run ok   --dry-run --basic server=dedi
 run ok   --dry-run --basic server=vps host=test.example.com swap=4G time=UTC
-run ok   --dry-run --basic --angie
+run ok   --dry-run --basic --nginx
 run ok   --dry-run --basic --php
 # --php is a first installation: on a host that already runs PHP-FPM only the
 # installed version is accepted (--upgrade-php changes it), so the explicit
@@ -112,7 +149,7 @@ run fail --dry-run --basic --others fail2ban
 run fail --dry-run --basic --others unattended
 run fail --dry-run --basic --others composer
 run fail --dry-run --basic --others security
-run ok   --dry-run --basic --angie --php --mariadb user=u pass=p size=auto \
+run ok   --dry-run --basic --nginx --php --mariadb user=u pass=p size=auto \
   --valkey --elastic ram=2g --others all
 
 # Domain app parsing, including trailing group defaults and mixed apps.
@@ -165,17 +202,17 @@ run fail --dry-run --restart-all --purge
 run fail --dry-run --restart-all --optimize
 run fail --dry-run --restart-all --diagnostics
 run fail --dry-run --restart-all --domain example.com
-run fail --dry-run --restart-all --angie
+run fail --dry-run --restart-all --nginx
 run fail --dry-run --optimize --basic
-run fail --dry-run --optimize --angie
+run fail --dry-run --optimize --nginx
 run fail --dry-run --optimize --purge
 run fail --dry-run --optimize --domain example.com
 
 # Purge modes and bare names.
 run ok   --dry-run --purge
 run ok   --dry-run --purge all
-run ok   --dry-run --purge basic angie php mariadb valkey elastic others
-run ok   --dry-run --purge --angie --php
+run ok   --dry-run --purge basic nginx php mariadb valkey elastic others
+run ok   --dry-run --purge --nginx --php
 run ok   --dry-run --purge --php ver=8.4
 run ok   --dry-run --purge php mariadb
 
@@ -192,10 +229,10 @@ run fail --dry-run --basic --mariadb user=u size=4gb
 run fail --dry-run --basic --mariadb user=u pass=p size=0
 run fail --dry-run --basic --mariadb user=u pass=p size=4gb bind=bogus
 run fail --dry-run --basic --php ver=8
-# A version without a pool template (configs/php/www_<XY>.conf) is rejected
+# The source build supports PHP 8.1 and newer; an older series is rejected
 # before anything is installed.  The message is asserted: on a host with
 # PHP installed the plain `run fail` row passed on "already installed".
-run_msg 'No FPM pool template for PHP 8.0' --dry-run --basic --php ver=8.0
+run_msg 'the source build supports PHP 8.1 and newer' --dry-run --basic --php ver=8.0
 # Reserved MariaDB accounts and system schemas, in any letter case.
 run fail --dry-run --basic --mariadb user=root pass=x
 run fail --dry-run --basic --mariadb user=ROOT pass=x
@@ -228,9 +265,9 @@ run fail --dry-run --domain db=early example.com
 run fail --dry-run --basic --harden-ssh
 run fail --dry-run --optimize --cloudflare-only
 run fail --dry-run --domain example.com --purge
-run fail --dry-run --angie
+run fail --dry-run --nginx
 run fail --dry-run --bogus
-run fail --dry-run --sync-angie
+run fail --dry-run --sync-nginx
 
 # --check is an alias for --dry-run; -h is an alias for --help.
 run ok   --check --basic
@@ -288,8 +325,8 @@ run ok   --dry-run --domain example.com example.com
 
 # --domain may be combined with a full install, but any service other than
 # --domain needs --basic, and --diagnostics is read-only.
-run ok   --dry-run --basic --angie --domain x.example.com
-run fail --dry-run --domain x.example.com --angie
+run ok   --dry-run --basic --nginx --domain x.example.com
+run fail --dry-run --domain x.example.com --nginx
 run fail --dry-run --diagnostics --domain x.example.com
 
 # --purge targets: unknown names and malformed --php ver= fail; flag and
@@ -381,31 +418,40 @@ run_env ok SETUP_PHP_JIT_WORDPRESS=1 --dry-run --optimize
 # Network tuning, rate-limit exemptions and asset precompression overrides.
 run_env ok SETUP_TCP_CC=cubic --dry-run --optimize
 run_env ok SETUP_QDISC=fq_codel --dry-run --optimize
-run_env ok SETUP_LIMIT_REQ_EXEMPT=10.0.0.5 --dry-run --optimize
-# --source (1.21.71): the complete set of compiled components.
-run ok   --dry-run --optimize --source=all
-run ok   --dry-run --optimize --source angie php
-run ok   --dry-run --optimize --source=none
-run ok   --dry-run --basic --angie --php --valkey --source=valkey
-run fail --dry-run --optimize --source=nginx
-run fail --dry-run --optimize --source
-run_env ok SETUP_VALKEY_BUILD=clang --dry-run --optimize
-run_env fail SETUP_VALKEY_BUILD=gcc --dry-run --optimize
+# SETUP_LIMIT_REQ_EXEMPT lost its generic limits: accepted, with a warning.
+run_env_msg ok 'SETUP_LIMIT_REQ_EXEMPT=10.0.0.5' 'SETUP_LIMIT_REQ_EXEMPT is ignored' --dry-run --optimize
+# --source and the SETUP_*_BUILD knobs were removed in 1.22.0 (nginx, PHP and
+# Valkey are always built from source).  A runbook that still passes them
+# keeps working: each spelling is consumed and ignored with a warning.
+run_warn 'is ignored'                --dry-run --optimize --source=all
+run_warn '--source=nginx php is ignored' --dry-run --optimize --source nginx php
+run_warn '--source=none is ignored'  --dry-run --optimize --source=none
+run_warn 'is ignored'                --dry-run --basic --nginx --php --valkey --source=valkey
+run_warn 'is ignored'                --dry-run --optimize --source=nginx
+run_warn '--source is ignored'       --dry-run --optimize --source
+run_env_msg ok 'SETUP_VALKEY_BUILD=clang' 'Ignored (removed in 1.22.0' --dry-run --optimize
+run_env_msg ok 'SETUP_VALKEY_BUILD=gcc'   'Ignored (removed in 1.22.0' --dry-run --optimize
+run_env_msg ok 'SETUP_PHP_BUILD=package'  'Ignored (removed in 1.22.0' --dry-run --basic --php
+run_env_msg ok 'SETUP_NGINX_BUILD=clang'  'Ignored (removed in 1.22.0' --dry-run --basic --nginx
+run_env_msg ok 'SETUP_ANGIE_BUILD=package' 'Ignored (removed in 1.22.0' --dry-run --basic --nginx
+run_env_msg ok 'SETUP_PHP_FPM_MODULES=all' 'Ignored (removed in 1.22.0' --dry-run --basic --php
+# The old compression name still works under the new one.
+run_env ok SETUP_ANGIE_COMPRESSION=gzip --dry-run --basic --nginx
 run_env ok SETUP_PRECOMPRESS_ASSETS=1 --dry-run --optimize
 # An invalid SETUP_NODE_MAJOR falls back to the default major, never fails.
 run_env ok SETUP_NODE_MAJOR=bogus --dry-run --basic --others nodejs
-# SETUP_ANGIE_COMPRESSION only tests for 0; any other value keeps Brotli on.
-run_env ok SETUP_ANGIE_COMPRESSION=gzip --dry-run --basic --angie
+# SETUP_NGINX_COMPRESSION only tests for 0; any other value keeps Brotli on.
+run_env ok SETUP_NGINX_COMPRESSION=gzip --dry-run --basic --nginx
 run_env ok SETUP_WP_DB_SPLIT=0 --dry-run --domain a.example.com app=wordpress
 run_env ok SETUP_PURGE_MALWARE=0 --dry-run --optimize
 # A dry run exits before fetch_server_configs, so CONFIG_SOURCE_DIR is not
 # checked and a missing directory does not fail.
-run_env ok CONFIG_SOURCE_DIR=/nonexistent --dry-run --basic --angie
+run_env ok CONFIG_SOURCE_DIR=/nonexistent --dry-run --basic --nginx
 
 # Anubis support was removed in 1.21.62: every spelling must fail the parse
 # with an explanation, and so must a leftover SETUP_ANUBIS in the environment.
-run fail --dry-run --basic --angie anubis=yes
-run fail --dry-run --basic --angie anubis=no
+run fail --dry-run --basic --nginx anubis=yes
+run fail --dry-run --basic --nginx anubis=no
 run fail --dry-run --optimize anubis=yes
 run fail --dry-run --optimize anubis=no
 # CPU mitigations switch (--basic and --optimize, or SETUP_CPU_MITIGATIONS).
@@ -425,10 +471,143 @@ run_env ok   SETUP_CPU_MITIGATIONS=off --dry-run --optimize
 run_env fail SETUP_CPU_MITIGATIONS=sometimes --dry-run --optimize
 run fail --dry-run --optimize anubis=1
 run fail --dry-run --basic anubis=yes
-run fail --dry-run --basic --angie anubis=maybe
+run fail --dry-run --basic --nginx anubis=maybe
 run fail --dry-run --basic --php anubis=yes
-run_env fail SETUP_ANUBIS=1 --dry-run --basic --angie
-run_env fail SETUP_ANUBIS=bogus --dry-run --basic --angie
+run_env fail SETUP_ANUBIS=1 --dry-run --basic --nginx
+run_env fail SETUP_ANUBIS=bogus --dry-run --basic --nginx
+
+# ---------------------------------------------------------------------------
+# 1.22.0: nginx built from source, --angie alias, --php ext=, memory gate,
+# the migration plan of --optimize.
+# ---------------------------------------------------------------------------
+# --nginx installs the compiled nginx; --angie is a deprecated alias that
+# still installs nginx, with a warning naming --nginx.
+run ok   --dry-run --basic --nginx
+run_warn '--angie is deprecated' --dry-run --basic --angie
+run_warn 'Use --nginx' --dry-run --basic --angie --php
+run fail --dry-run --angie
+run fail --dry-run --optimize --angie
+run fail --dry-run --restart-all --angie
+run_warn '--purge angie is deprecated' --dry-run --purge angie
+out=$(bash "$SCRIPT_DIR/setup.sh" --dry-run --purge angie 2>&1)
+if grep -qE '^Purge order: nginx$' <<<"$out"; then
+  PASS=$((PASS + 1)); printf 'PASS  --purge angie purges nginx\n'
+else
+  FAIL=$((FAIL + 1)); printf 'FAIL  --purge angie does not map to the nginx target\n'
+  grep -E '^Purge order' <<<"$out" | sed 's/^/      /'
+fi
+run_warn '--angie is deprecated' --dry-run --basic --nginx --angie
+out=$(bash "$SCRIPT_DIR/setup.sh" --dry-run --basic --angie 2>&1)
+if grep -qE '^Services +:.*(^|[[:space:]:])nginx([[:space:]]|$)' <<<"$out" \
+   && ! grep -qE '^Services +:.*angie' <<<"$out"; then
+  PASS=$((PASS + 1)); printf 'PASS  --angie selects the nginx service\n'
+else
+  FAIL=$((FAIL + 1)); printf 'FAIL  --angie does not select the nginx service\n'
+  grep -E '^Services' <<<"$out" | sed 's/^/      /'
+fi
+out=$(bash "$SCRIPT_DIR/setup.sh" --dry-run --basic --nginx 2>&1)
+if [[ $out != *deprecated* ]]; then
+  PASS=$((PASS + 1)); printf 'PASS  --nginx prints no deprecation warning\n'
+else
+  FAIL=$((FAIL + 1)); printf 'FAIL  --nginx printed a deprecation warning\n'
+fi
+
+# --php ext=LIST: names, -NAME, none; refused before --basic changes anything.
+run ok   --dry-run --basic --php ext=intl,gmp
+run ok   --dry-run --basic --php ext=INTL
+run ok   --dry-run --basic --php ext=-intl
+run ok   --dry-run --basic --php ext=none
+run ok   --dry-run --basic --php ext=redis,igbinary children=8
+run_msg 'requires a list'          --dry-run --basic --php ext=
+run_msg 'cannot be combined'       --dry-run --basic --php ext=none,intl
+run_msg 'is not an extension name' --dry-run --basic --php ext=intl.so
+run_msg 'is not an extension name' --dry-run --basic --php 'ext=intl;id'
+run_msg 'cannot compile this extension' --dry-run --basic --php ext=oci8
+run_msg 'not a purge option'       --dry-run --purge --php ext=intl
+run fail --dry-run --php ext=intl
+run fail --dry-run --basic --valkey ext=intl
+run fail --dry-run --basic --nginx ext=intl
+out=$(bash "$SCRIPT_DIR/setup.sh" --dry-run --basic --php ext=intl,gmp 2>&1)
+if grep -qE '^PHP +:.* ext=intl,gmp( |$)' <<<"$out"; then
+  PASS=$((PASS + 1)); printf 'PASS  the plan shows the requested ext= list\n'
+else
+  FAIL=$((FAIL + 1)); printf 'FAIL  the plan does not show the requested ext= list\n'
+  grep -E '^PHP' <<<"$out" | sed 's/^/      /'
+fi
+
+# Memory gate (section 7): SETUP_MEM_TOTAL_MB stands in for the host's RAM in
+# a dry run.  Below the 4 GB class (3500 MB) only nginx (and --basic,
+# --others, static/Node sites) is allowed; refusals come before any change.
+GATE='below the 4 GB class'
+run_env_msg ok   SETUP_MEM_TOTAL_MB=2048 'Memory class : 2048 MB (below the 4 GB class' --dry-run --basic --nginx
+run_env_msg ok   SETUP_MEM_TOTAL_MB=3499 'Memory class : 3499 MB' --dry-run --basic --nginx --others sysstat
+run_env_msg fail SETUP_MEM_TOTAL_MB=2048 "$GATE" --dry-run --basic --php
+run_env_msg fail SETUP_MEM_TOTAL_MB=3499 "$GATE" --dry-run --basic --php
+run_env_msg fail SETUP_MEM_TOTAL_MB=2048 "$GATE" --dry-run --basic --valkey
+run_env_msg fail SETUP_MEM_TOTAL_MB=2048 "$GATE" --dry-run --basic --mariadb user=u pass=p
+run_env_msg fail SETUP_MEM_TOTAL_MB=2048 "$GATE" --dry-run --basic --elastic
+run_env_msg fail SETUP_MEM_TOTAL_MB=2048 "$GATE" --dry-run --basic --nginx --php
+run_env_msg ok   SETUP_MEM_TOTAL_MB=3500 'Memory class : 3500 MB (4 GB class' --dry-run --basic --php
+run_env_msg ok   SETUP_MEM_TOTAL_MB=8192 'Memory class : 8192 MB (4 GB class' --dry-run --basic --nginx --php --valkey
+run_env_msg fail SETUP_MEM_TOTAL_MB=2048 'needs PHP' --dry-run --domain a.example.com app=wordpress
+run_env_msg fail SETUP_MEM_TOTAL_MB=2048 'needs PHP' --dry-run --domain a.example.com app=basic b.example.com app=xf
+run_env ok   SETUP_MEM_TOTAL_MB=2048 --dry-run --domain a.example.com app=basic
+run_env ok   SETUP_MEM_TOTAL_MB=2048 --dry-run --domain a.example.com app=node
+run_env ok   SETUP_MEM_TOTAL_MB=2048 --dry-run --domain a.example.com app=pingvin
+run_env_msg fail SETUP_MEM_TOTAL_MB=2048 "$GATE" --dry-run --upgrade-php=8.6
+run_env ok   SETUP_MEM_TOTAL_MB=8192 --dry-run --upgrade-php=8.6
+run_env ok   SETUP_MEM_TOTAL_MB=2048 --dry-run --optimize
+# A malformed value is ignored (the host's RAM decides), never a failure.
+run_env ok   SETUP_MEM_TOTAL_MB=2g --dry-run --basic --nginx
+# The gate is checked before ext= is recorded: a small host is refused even
+# with a valid list.
+run_env_msg fail SETUP_MEM_TOTAL_MB=2048 "$GATE" --dry-run --basic --php ext=intl
+run_env_msg ok   SETUP_MEM_TOTAL_MB=2048 'Migration 1.22' --dry-run --optimize
+# Outside --dry-run SETUP_MEM_TOTAL_MB is ignored with a warning (R39): an
+# exported value must not let a 1-2 GB host build PHP, nor refuse a large
+# one.  validate_all runs before the root check, so an unprivileged call
+# prints the warning and then stops at "must be run as root" without
+# changing anything.  Never run as root: the call would be a real install.
+MEM_HOST_MB=$(awk '/^MemTotal:/ { print int($2 / 1024) }' /proc/meminfo 2>/dev/null)
+if (( ${EUID:-$(id -u)} != 0 )); then
+  run_env_msg fail SETUP_MEM_TOTAL_MB=2048 'SETUP_MEM_TOTAL_MB is ignored outside --dry-run' --basic --valkey
+  if [[ ${MEM_HOST_MB:-0} =~ ^[0-9]+$ ]] && (( MEM_HOST_MB >= 4096 )); then
+    out=$(env SETUP_MEM_TOTAL_MB=2048 bash "$SCRIPT_DIR/setup.sh" --basic --valkey 2>&1)
+    if [[ $out != *"$GATE"* && $out == *"must be run as root"* ]]; then
+      PASS=$((PASS + 1)); printf 'PASS  a real run ignores SETUP_MEM_TOTAL_MB (no gate refusal on a %s MB host)\n' "$MEM_HOST_MB"
+    else
+      FAIL=$((FAIL + 1)); printf 'FAIL  a real run honoured SETUP_MEM_TOTAL_MB\n'
+      printf '%s\n' "$out" | grep -E 'GB class|root' | sed 's/^/      /'
+    fi
+  fi
+fi
+
+# --optimize --dry-run prints the 1.22 migration plan (or "nothing to
+# migrate") from migrate_plan; a --domain run never plans or starts it.
+out=$(bash "$SCRIPT_DIR/setup.sh" --dry-run --optimize 2>&1)
+if grep -qE '^Migration 1\.22(: nothing to migrate \((nginx|angie-legacy|none)\)| \(runs detached as setup-migrate-1\.22, log )' <<<"$out"; then
+  PASS=$((PASS + 1)); printf 'PASS  --optimize --dry-run prints the migrate_plan lines\n'
+else
+  FAIL=$((FAIL + 1)); printf 'FAIL  --optimize --dry-run prints no migrate_plan line\n'
+  grep -E 'Migration' <<<"$out" | sed 's/^/      /'
+fi
+# A pending migration is planned, never started, by a dry run: the detached
+# unit's plan names the cutover windows and the kept backups.
+if grep -q '^Migration 1\.22 (runs detached' <<<"$out"; then
+  if [[ $out == *"cutover windows:"* && $out == *"removals run only after every cutover verified"* ]]; then
+    PASS=$((PASS + 1)); printf 'PASS  the migration plan names the cutover windows and removals\n'
+  else
+    FAIL=$((FAIL + 1)); printf 'FAIL  the migration plan is incomplete\n'
+  fi
+fi
+out=$(bash "$SCRIPT_DIR/setup.sh" --dry-run --domain a.example.com 2>&1)
+if [[ $out != *"Migration 1.22"* && $out != *setup-migrate-1.22* ]]; then
+  PASS=$((PASS + 1)); printf 'PASS  --domain --dry-run never plans the migration\n'
+else
+  FAIL=$((FAIL + 1)); printf 'FAIL  --domain --dry-run mentions the migration\n'
+fi
+# The migration unit's hidden mode is not a command-line option.
+run fail --dry-run --optimize --migrate-1.22-unit /tmp/report
 
 printf '\nTOTAL pass=%d fail=%d\n' "$PASS" "$FAIL"
 [[ $FAIL -eq 0 ]]

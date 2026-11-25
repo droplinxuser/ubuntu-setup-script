@@ -11,10 +11,10 @@ OUT=/root/audit/redis-control.tsv
 
 apt-get install -y --no-install-recommends php8.5-redis >/dev/null
 sed -i "s/^\$config\['cache'\]\['enabled'\] = .*/\$config['cache']['enabled'] = true;/" "$ROOT/src/config.php"
-sed -i -E 's|^([[:space:]]*fastcgi_cache[[:space:]]+)[A-Za-z0-9_]+;|\1off;|' /etc/angie/h5bp/php_xf.conf /etc/angie/h5bp/php_xf_proxy.conf 2>/dev/null || true
-sed -i -E "s|^([[:space:]]*server[[:space:]]+)unix:/run/php/[^;]+;|\\1unix:/run/php/php8.5-fpm.sock;|" /etc/angie/angie.conf
-angie -t >/dev/null
-systemctl reload angie
+sed -i -E 's|^([[:space:]]*fastcgi_cache[[:space:]]+)[A-Za-z0-9_]+;|\1off;|' /etc/nginx/h5bp/php_xf.conf /etc/nginx/h5bp/php_xf_proxy.conf 2>/dev/null || true
+sed -i -E "s|^([[:space:]]*server[[:space:]]+)unix:/run/php/[^;]+;|\\1unix:/run/php/php8.5-fpm.sock;|" /etc/nginx/nginx.conf
+nginx -t >/dev/null
+systemctl reload nginx
 systemctl reload php8.5-fpm
 sleep 0.5
 /usr/bin/php8.5 -m | grep -qx redis && echo "php-redis: loaded"

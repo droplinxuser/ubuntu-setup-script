@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # PHP runtime shootout on the audit host.
 #
-# One workload, every PHP execution model, the same Angie in front of the
+# One workload, every PHP execution model, the same nginx in front of the
 # HTTP backends.  Two modes:
 #
 #   runtime   an application-shaped page (60-file bootstrap, 2 MariaDB
@@ -29,7 +29,7 @@
 # Environment:
 #   C=64 D=8 WARM=2 RUNS=3   wrk connections, seconds, warm-up, rounds
 #   BASE=/home/ubuntu/bench  scratch tree
-#   PORT=8090                Angie benchmark listener
+#   PORT=8090                nginx benchmark listener
 set -u
 export LC_ALL=C
 HERE=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -43,7 +43,7 @@ SOCK=${SOCK:-/run/php/php-fpm.sock}
 C=${C:-64}; D=${D:-8}; WARM=${WARM:-2}; RUNS=${RUNS:-3}
 PORT=${PORT:-8090}
 WP=${WP:-wp.test.local}; XF=${XF:-xf.test.local}; CH=${CH:-chev.test.local}
-CERTDIR=${CERTDIR:-/etc/angie/ssl}
+CERTDIR=${CERTDIR:-/etc/nginx/ssl}
 CK=${CK:-/root/audit/cookies/cookies.tsv}
 MODE=${1:-run}; shift 2>/dev/null || true
 
@@ -151,10 +151,10 @@ EOF
   say "workload ready under $APPSIM"
 }
 
-# --- Angie in front of every backend ------------------------------------------
+# --- nginx in front of every backend ------------------------------------------
 
-write_angie() {
-  local conf=$BASE/angie-bench.conf prefix port
+write_nginx() {
+  local conf=$BASE/nginx-bench.conf prefix port
   {
     cat <<EOF
 user www-data;
@@ -181,14 +181,14 @@ http {
     server_name _;
     location = /ping { return 200 "pong\n"; }
     location = /fpm/appsim.php {
-      include /etc/angie/fastcgi_params;
+      include /etc/nginx/fastcgi_params;
       fastcgi_param SCRIPT_FILENAME $APPSIM/index.php;
       fastcgi_pass unix:$SOCK;
     }
 EOF
     cat <<EOF
     location = /cgi/appsim.php {
-      include /etc/angie/fastcgi_params;
+      include /etc/nginx/fastcgi_params;
       fastcgi_param SCRIPT_FILENAME $APPSIM/index.php;
       fastcgi_pass 127.0.0.1:${PORT_OF[cgi]};
     }
@@ -223,13 +223,13 @@ start_web() {
   systemctl reset-failed bench-web 2>/dev/null || true
   systemd-run --unit=bench-web --collect --quiet --service-type=simple \
     --property=LimitNOFILE=520000 --property=Restart=no \
-    -- /usr/sbin/angie -c "$BASE/angie-bench.conf" >/dev/null 2>&1 || return 1
+    -- /usr/sbin/nginx -c "$BASE/nginx-bench.conf" >/dev/null 2>&1 || return 1
   local i
   for i in $(seq 1 40); do
     if curl -fsS -o /dev/null --max-time 1 "http://127.0.0.1:$PORT/ping"; then return 0; fi
     sleep 0.25
   done
-  say "bench Angie did not answer on 127.0.0.1:$PORT"
+  say "bench nginx did not answer on 127.0.0.1:$PORT"
   journalctl -u bench-web -n 8 --no-pager >&2 2>/dev/null || true
   return 1
 }
@@ -465,7 +465,7 @@ run_one() { # name round
 summarize() { # tsv file
   local f=$1
   echo
-  echo "| Runtime | req/s (median) | spread | p50 | p99 | PHP CPU ms/req | Angie CPU ms/req | RSS MB |"
+  echo "| Runtime | req/s (median) | spread | p50 | p99 | PHP CPU ms/req | nginx CPU ms/req | RSS MB |"
   echo "|---|---:|---:|---:|---:|---:|---:|---:|"
   awk -F'\t' '
     { key=$1; rps[key]=rps[key] " " $3; p50[key]=$4; p99[key]=$5; a[key]=a[key] " " $7; w[key]=w[key] " " $8; rss[key]=$9; if (!(key in seen)) { seen[key]=1; order[++k]=key } }
@@ -519,9 +519,9 @@ run_runtime() {
 
 # --- real applications --------------------------------------------------------
 
-write_app_angie() { # name fastcgi-target
+write_app_nginx() { # name fastcgi-target
   local name=$1 target=$2
-  local conf=$BASE/angie-apps-$name.conf d root try
+  local conf=$BASE/nginx-apps-$name.conf d root try
   {
     cat <<EOF
 user www-data;
@@ -562,7 +562,7 @@ EOF
     root $root;
     location / { $try }
     location ~ \.php\$ {
-      include /etc/angie/fastcgi_params;
+      include /etc/nginx/fastcgi_params;
       fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
       fastcgi_param HTTPS on;
       fastcgi_param HTTP_PROXY "";
@@ -578,18 +578,18 @@ EOF
 
 start_app_server() { # name
   local name=$1
-  systemctl stop angie bench-app-apps 2>/dev/null || true
+  systemctl stop nginx bench-app-apps 2>/dev/null || true
   wait_port_free 443 || true
   sleep 1
   case $name in
     fpm)
-      write_app_angie fpm "unix:$SOCK"
-      start_web_conf "$BASE/angie-apps-fpm.conf" || return 1 ;;
+      write_app_nginx fpm "unix:$SOCK"
+      start_web_conf "$BASE/nginx-apps-fpm.conf" || return 1 ;;
     cgi)
-      write_app_angie cgi "127.0.0.1:${PORT_OF[cgi]}"
+      write_app_nginx cgi "127.0.0.1:${PORT_OF[cgi]}"
       start_unit cgi-app /usr/bin/spawn-fcgi -n -p "${PORT_OF[cgi]}" -C 12 -u www-data -g www-data -- "$PHP_CGI" -c "$BASE/php.ini"
       tcp_port "${PORT_OF[cgi]}" || return 1
-      start_web_conf "$BASE/angie-apps-cgi.conf" || return 1 ;;
+      start_web_conf "$BASE/nginx-apps-cgi.conf" || return 1 ;;
     frankenphp)
       start_unit frankenphp-app env PHPRC="$BASE/php.ini" "$FRANKENPHP" run --config "$BASE/Caddyfile-apps"
       wait_app_https || return 1 ;;
@@ -608,7 +608,7 @@ start_web_conf() {
     wait_port_free 443 || true
     systemd-run --unit=bench-web --collect --quiet --service-type=simple \
       --property=LimitNOFILE=520000 --property=Restart=no \
-      -- /usr/sbin/angie -c "$conf" >/dev/null 2>&1 || { sleep 1; continue; }
+      -- /usr/sbin/nginx -c "$conf" >/dev/null 2>&1 || { sleep 1; continue; }
     for i in $(seq 1 40); do
       curl -fsk -o /dev/null --max-time 1 --resolve "$WP:443:127.0.0.1" "https://$WP/" 2>/dev/null && return 0
       systemctl is-active --quiet bench-web || break
@@ -616,7 +616,7 @@ start_web_conf() {
     done
     sleep 1
   done
-  say "bench Angie did not answer on :443 with $conf"
+  say "bench nginx did not answer on :443 with $conf"
   journalctl -u bench-web -n 10 --no-pager >&2 2>/dev/null || true
   return 1
 }
@@ -751,13 +751,13 @@ run_apps() {
   echo
   echo "raw: $tsv"
   # Put the production TLS terminator back.
-  systemctl start angie 2>/dev/null || true
+  systemctl start nginx 2>/dev/null || true
 }
 
 case $MODE in
-  setup) setup_workload && write_angie && write_apps_caddy ;;
+  setup) setup_workload && write_nginx && write_apps_caddy ;;
   list) printf '%s\n' "${RUNTIMES[@]}" ;;
-  runtime) setup_workload >/dev/null; write_angie >/dev/null; start_web || exit 1; run_runtime "$@" ;;
+  runtime) setup_workload >/dev/null; write_nginx >/dev/null; start_web || exit 1; run_runtime "$@" ;;
   apps) setup_workload >/dev/null; write_apps_caddy; run_apps "$@" ;;
   stop) stop_all ;;
   *) sed -n '2,30p' "$0"; exit 2 ;;

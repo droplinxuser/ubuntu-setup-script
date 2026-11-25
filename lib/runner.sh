@@ -20,7 +20,7 @@ run_service() {
   # reset, and whatever it pauses (the web tier around a MariaDB restart after
   # a dump import) is invisible to the parent's on_exit.  Give it its own
   # signal-to-exit traps and an EXIT guard that undoes that pause, so a
-  # Ctrl-C or a dropped SSH session cannot leave Angie and PHP-FPM stopped.
+  # Ctrl-C or a dropped SSH session cannot leave nginx and PHP-FPM stopped.
   ( set -Eeuo pipefail
     trap 'exit 130' INT
     trap 'exit 143' TERM
@@ -79,6 +79,9 @@ print_plan() {
     build_purge_order
     printf 'Purge order: %s\n' "${PURGE_ORDER[*]}"
     printf 'Notes: services are stopped/disabled; packages, data, configuration and logs are preserved.\n'
+    printf '       nginx/php/valkey: the compiled build, its unit, PATH links, tmpfiles and build units are removed;\n'
+    printf '       /etc/nginx, /etc/php, /etc/valkey, data, logs and /var/backups/setup-1.22 stay.  The shared\n'
+    printf '       refresh/CPU-rebuild units and LLVM go only with the last remaining build.\n'
     printf '       Packages that existed before setup.sh are preserved for --others.\n'
     return 0
   fi
@@ -93,17 +96,30 @@ print_plan() {
           "${OPT[basic.time]:-Asia/Manila}" "${OPT[basic.swap]:-auto (50% of RAM)}"
         # The host-wide side effects the real run performs, so the preview is
         # not only the tunables.
-        printf '  %-10s apt update/upgrade, cron/logrotate installed, automatic security updates enabled\n' ""
+        # unattended-upgrades covers apt packages only: the compiled nginx,
+        # PHP and Valkey (and their static OpenSSL/PCRE2/zlib-ng) are kept
+        # current by the daily setup-build-refresh.timer instead.
+        printf '  %-10s apt update/upgrade, cron/logrotate installed, automatic security updates enabled (apt packages; compiled builds refresh daily)\n' ""
         if [[ -n ${CPU_MITIGATIONS:-} ]]; then
           printf '  %-10s CPU mitigations: %s\n' "" "$(cpu_mitigations_plan_text)"
         fi
         printf '  %-10s DNS resolvers 8.8.8.8/1.1.1.1, UFW default deny with SSH/80/443 allowed\n' ""
         printf '  %-10s OS profile (sysctl, PAM limits, governor, udev I/O rules) and the managed root crontab\n' ""
         ;;
+      nginx)
+        printf '  %-10s install\n' "$s"
+        if declare -F nginx_build_plan >/dev/null 2>&1; then
+          printf '  %-10s %s\n' "" "$(nginx_build_plan 2>/dev/null || true)"
+        fi
+        printf '  %-10s the first build takes minutes (LLVM toolchain + compile); nothing serves until it passes\n' ""
+        ;;
       php)
         printf '  %-10s version=%s children=%s max_requests=%s\n' "$s" \
-          "${OPT[php.ver]:-auto (latest stable in Sury)}" \
+          "${OPT[php.ver]:-auto (newest php.net release, compiled from source)}" \
           "${OPT[php.children]:-auto}" "${OPT[php.max_requests]:-auto}"
+        if declare -F php_build_plan >/dev/null 2>&1; then
+          printf '  %-10s %s\n' "" "$(php_build_plan "${OPT[php.ver]:-}" 2>/dev/null || true)"
+        fi
         ;;
       mariadb)
         bind_display=${OPT[mariadb.bind]:-127.0.0.1}
@@ -116,6 +132,9 @@ print_plan() {
           "${OPT[valkey.ram]:-auto (memory plan)}" \
           "${OPT[valkey.policy]:-allkeys-lru}" \
           "${OPT[valkey.io_threads]:-1}"
+        if declare -F valkey_build_plan >/dev/null 2>&1; then
+          printf '  %-10s %s\n' "" "$(valkey_build_plan 2>/dev/null || true)"
+        fi
         ;;
       elastic)
         printf '  %-10s host=%s ram=%s\n' "$s" \
@@ -149,7 +168,7 @@ print_plan() {
 # (opt_pause_web_frontends) and did not get to resume.
 run_service_exit_guard() {
   local rc=$?
-  if (( ${OPT_WEB_PAUSED_ANGIE:-0} )) || (( ${#OPT_WEB_PAUSED_PHP[@]} > 0 )); then
+  if (( ${OPT_WEB_PAUSED_NGINX:-0} )) || (( ${#OPT_WEB_PAUSED_PHP[@]} > 0 )); then
     opt_resume_web_frontends "an interrupted install step" || true
   fi
   return "$rc"

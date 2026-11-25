@@ -71,7 +71,7 @@ section "$CUR" "root crontab" | sed 's/^/    /'
 
 echo
 echo "## Managed trees (current)"
-for d in /var/www /etc/angie /etc/php /etc/mysql /etc/valkey /etc/elasticsearch /var/lib/setup.sh /var/cache/php; do
+for d in /var/www /etc/nginx /etc/php /etc/mysql /etc/valkey /etc/elasticsearch /var/lib/setup.sh /var/cache/php; do
   if [ -d "$d" ]; then
     printf '  - %-28s %6s files %8s\n' "$d" "$(find "$d" -xdev -type f 2>/dev/null | wc -l)" "$(du -sh "$d" 2>/dev/null | cut -f1)"
   fi

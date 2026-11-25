@@ -3,7 +3,7 @@
 # consumed by other modules, so SC2034 (unused) is not meaningful in a module.
 # shellcheck disable=SC2034
 # ---------------------------------------------------------------------------
-# ANGIE
+# NGINX
 # ---------------------------------------------------------------------------
 # =============================================================================
 # HARDWARE-AWARE LIVE TUNING
@@ -14,11 +14,39 @@
 TUNE_CHANGES=()
 TUNE_MISSES=()
 TUNE_DIRTY=0
-# Only repoint Angie's FastCGI upstream when the optimized PHP pool already
+# Only repoint nginx's FastCGI upstream when the optimized PHP pool already
 # owns a Unix socket.  --optimize preserves an existing TCP listener so a live
 # site is never pointed at a socket that does not exist.
 OPT_PHP_OK=0
 OPT_PHP_SOCKET=""
+
+# The compiled nginx (lib/nginx-build.sh sets NGINX_BIN; it is sourced after
+# this file, so every use resolves it at call time).  Never /usr/sbin/nginx:
+# that is the distro package path, which 1.22 never uses (R2.1), and the
+# migration installs a temporary shim there while a function still names it.
+NGINX_WEB_BIN_DEFAULT=/usr/local/lib/setup-nginx/sbin/nginx
+
+# Binary for `nginx -t` / `nginx -V` of a rendered tree: the migration's
+# candidate (NGINX_TEST_BIN, set while nothing serves from /etc/nginx yet)
+# first, then the installed build.
+nginx_test_bin() {
+  printf '%s' "${NGINX_TEST_BIN:-${NGINX_BIN:-$NGINX_WEB_BIN_DEFAULT}}"
+}
+
+# True when BIN is runnable (tests may stub it with a function of that name).
+nginx_bin_usable() {
+  [[ -n ${1:-} ]] && { [[ -x $1 ]] || declare -F "$1" >/dev/null 2>&1; }
+}
+
+# `nginx -t` of the tree whose main file is CONF (default /etc/nginx), with
+# the test binary.  Relative includes resolve against dirname(CONF).  Output
+# goes to the caller's stdout/stderr.  Status 2 when there is no binary.
+nginx_test_tree() {
+  local conf=${1:-/etc/nginx/nginx.conf} bin
+  bin=$(nginx_test_bin)
+  nginx_bin_usable "$bin" || { printf 'no nginx binary at %s\n' "$bin" >&2; return 2; }
+  "$bin" -t -c "$conf"
+}
 tune_reset_changes() { TUNE_CHANGES=(); TUNE_MISSES=(); TUNE_DIRTY=0; }
 tune_note() { TUNE_CHANGES+=("$*"); TUNE_DIRTY=1; }
 # Informational line that must not count as a configuration change (and must
@@ -44,9 +72,9 @@ tune_size_value() { mb_to_config "$1"; }
 # down to 256 MB.  The rounding keeps small free-space changes between runs
 # (backups, logs) from resizing every cache zone and forcing a restart.
 # An optional fifth argument is a hard ceiling in MB, applied after the
-# floor: angie_cache_budget_mb passes half of the space actually free, so a
+# floor: nginx_cache_budget_mb passes half of the space actually free, so a
 # nearly full disk never gets a max_size it cannot hold (the 10% share of an
-# Angie-only host on the 10x-free basis, or the 256 MB floor, could reach all
+# nginx-only host on the 10x-free basis, or the 256 MB floor, could reach all
 # of it).  It only binds on a nearly full disk, so normal hosts keep a stable
 # budget between runs.
 tune_cache_total_mb() {
@@ -65,7 +93,7 @@ tune_cache_total_mb() {
 }
 
 # Half of the space free on the cache filesystem, in MB (empty if unknown).
-angie_cache_disk_cap_mb() {
+nginx_cache_disk_cap_mb() {
   local dir=/home avail
   [[ -d $dir ]] || dir=/var/www
   avail=$(df -Pm "$dir" 2>/dev/null | awk 'NR==2{print $4}' || true)
@@ -73,12 +101,12 @@ angie_cache_disk_cap_mb() {
   return 0
 }
 
-# Angie cache budget for the current service set.  A dedicated Angie proxy
-# gets 50% of RAM (10% of the cache disk); Angie+PHP gets 30%; a host with a
-# data or search tier gets 25% (5% of the cache disk, see angie_disk_free_mb).
+# nginx cache budget for the current service set.  A dedicated nginx proxy
+# gets 50% of RAM (10% of the cache disk); nginx+PHP gets 30%; a host with a
+# data or search tier gets 25% (5% of the cache disk, see nginx_disk_free_mb).
 # Callers pass the live RAM and disk basis so --dry-run and the real tuner
 # report the same number.
-angie_cache_budget_mb() {
+nginx_cache_budget_mb() {
   local ram_mb=$1 disk_free_mb=$2 pct=25 disk_pct=5 svc
   local has_php=0 has_maria=0 has_cache=0 has_es=0
   if (( ${#OPT_DETECTED[@]} > 0 )); then
@@ -97,7 +125,7 @@ angie_cache_budget_mb() {
       pct=30
     fi
   fi
-  tune_cache_total_mb "$ram_mb" "$disk_free_mb" "$pct" "$disk_pct" "$(angie_cache_disk_cap_mb)"
+  tune_cache_total_mb "$ram_mb" "$disk_free_mb" "$pct" "$disk_pct" "$(nginx_cache_disk_cap_mb)"
 }
 
 # Pick the first existing file from a list.  Older server-configs-nginx
@@ -113,12 +141,12 @@ tune_first_file() {
   return 1
 }
 
-# Files under http.d that Angie actually includes.  Hosts upgraded from older
+# Files under http.d that nginx actually includes.  Hosts upgraded from older
 # layouts often keep inert *_conf leftovers next to the active *.conf files;
 # tuning those leftovers changes nothing and hides the real cache/limit files.
 TUNE_ACTIVE_HTTP=()
-angie_active_http_files() {
-  local target=$1 conf="${1}/angie.conf" pattern path
+nginx_active_http_files() {
+  local target=$1 conf="${1}/nginx.conf" pattern path
   [[ -f $conf ]] || return 0
   while IFS= read -r pattern; do
     pattern=${pattern#*include}
@@ -136,16 +164,16 @@ angie_active_http_files() {
 }
 
 # The repository ships both .conf and legacy *_conf http.d filenames.  New
-# managed files must use the same suffix as the files angie.conf includes,
+# managed files must use the same suffix as the files nginx.conf includes,
 # otherwise they are inert (and a duplicate cache zone is never loaded).
-angie_http_suffix() {
+nginx_http_suffix() {
   local target=$1 file
   while IFS= read -r file; do
     [[ -n $file ]] || continue
     case "$file" in
       *_conf) printf '_conf'; return 0 ;;
     esac
-  done < <(angie_active_http_files "$target")
+  done < <(nginx_active_http_files "$target")
   printf '.conf'
 }
 
@@ -157,14 +185,14 @@ tune_active_file() {
   return 1
 }
 
-# Cache or limiter files under http.d that angie.conf never includes.  Older
+# Cache or limiter files under http.d that nginx.conf never includes.  Older
 # deployments kept the *_conf names after the repository renamed them to
 # *.conf; those files look active but silently change nothing, which is why
 # --optimize reports "no active fastcgi_cache_path" on such a host.
-angie_inert_cache_files() {
+nginx_inert_cache_files() {
   local target=$1 file active is_active
   local -a active_files=()
-  mapfile -t active_files < <(angie_active_http_files "$target")
+  mapfile -t active_files < <(nginx_active_http_files "$target")
   for file in "$target"/http.d/*; do
     [[ -f $file ]] || continue
     grep -qE '^[[:space:]]*(fastcgi_cache_path|proxy_cache_path|limit_req_zone)[[:space:]]' "$file" || continue
@@ -177,13 +205,13 @@ angie_inert_cache_files() {
   return 0
 }
 
-# Directories backing the cache paths Angie actually includes.  Used after a
+# Directories backing the cache paths nginx actually includes.  Used after a
 # service restart to drop objects written while a backend was unavailable.
-angie_cache_dirs() {
-  local target=${1:-/etc/angie} file
+nginx_cache_dirs() {
+  local target=${1:-/etc/nginx} file
   local -a files=()
-  mapfile -t files < <(angie_active_http_files "$target")
-  files+=("${target}/angie.conf")
+  mapfile -t files < <(nginx_active_http_files "$target")
+  files+=("${target}/nginx.conf")
   for file in "${files[@]}"; do
     [[ -f $file ]] || continue
     awk '
@@ -202,28 +230,28 @@ angie_cache_dirs() {
 
 # Disk-cache max_size is planned from RAM, but a live cache can already hold
 # more than that plan (and may be configured larger by the operator).  Writing
-# a smaller value makes Angie's cache manager evict hot objects immediately,
+# a smaller value makes nginx's cache manager evict hot objects immediately,
 # and chasing usage every run would ratchet the value upward forever.  Rule:
 # never shrink below the existing max_size or the live usage (+5% headroom).
 # A full cache always measures slightly above its max_size: du counts the
 # levels=1:2 directory blocks (up to 4096 directories) and the objects the
-# cache manager has not evicted yet, neither of which Angie charges to
+# cache manager has not evicted yet, neither of which nginx charges to
 # max_size.  Usage within 5% of the configured size is therefore "the cache
 # is full", not "the cache needs more": keeping the size as it is stops a
 # busy cache from gaining 256 MB on every run.
-# Sets ANGIE_CACHE_MB (size to write) and ANGIE_CACHE_NOTE (report line, if
+# Sets NGINX_CACHE_MB (size to write) and NGINX_CACHE_NOTE (report line, if
 # the planned value was raised).  A global result is used instead of command
 # substitution so the note reaches the caller's TUNE_CHANGES array.
-# angie_cache_keep_mb FILE PLANNED_MB [ZONE] [CAP_MB]: with ZONE, only the
+# nginx_cache_keep_mb FILE PLANNED_MB [ZONE] [CAP_MB]: with ZONE, only the
 # *_cache_path directive whose keys_zone is ZONE is considered (a proxy file
 # carries two paths); the directive may wrap onto several lines.  CAP_MB is
 # the RAM/disk-capped cache budget of the host: a kept value is bounded by
 # the same ceiling a freshly planned one gets (0 or absent: no ceiling).
-angie_cache_keep_mb() {
+nginx_cache_keep_mb() {
   local file=$1 planned=$2 zone=${3:-} cap=${4:-0} dir usage existing=0 candidate val directive
   local capped=0
-  ANGIE_CACHE_MB=$planned
-  ANGIE_CACHE_NOTE=""
+  NGINX_CACHE_MB=$planned
+  NGINX_CACHE_NOTE=""
   [[ -f $file ]] || return 0
   # Join each *_cache_path directive onto one line, then pick the first (or
   # the one naming ZONE).
@@ -271,11 +299,11 @@ angie_cache_keep_mb() {
     capped=1
   fi
   (( candidate > planned )) || return 0
-  ANGIE_CACHE_MB=$candidate
+  NGINX_CACHE_MB=$candidate
   if (( capped )); then
-    ANGIE_CACHE_NOTE="kept cache max_size=${candidate}M for ${dir:-cache} (live ${usage}MB; RAM plan was ${planned}M; capped at the ${cap}M cache budget of this host)"
+    NGINX_CACHE_NOTE="kept cache max_size=${candidate}M for ${dir:-cache} (live ${usage}MB; RAM plan was ${planned}M; capped at the ${cap}M cache budget of this host)"
   else
-    ANGIE_CACHE_NOTE="kept cache max_size=${candidate}M for ${dir:-cache} (live ${usage}MB; RAM plan was ${planned}M)"
+    NGINX_CACHE_NOTE="kept cache max_size=${candidate}M for ${dir:-cache} (live ${usage}MB; RAM plan was ${planned}M)"
   fi
   return 0
 }
@@ -286,13 +314,13 @@ angie_cache_keep_mb() {
 # deleted objects written during the run.  setup.sh now only reports them: a
 # cache file is still a file, and deleting the wrong entry is not recoverable.
 count_optimize_cache_entries() {
-  local epoch=${1:-0} target=${2:-/etc/angie} dir count total=0
+  local epoch=${1:-0} target=${2:-/etc/nginx} dir count total=0
   [[ $epoch =~ ^[0-9]+$ ]] && (( epoch > 0 )) || { printf '0'; return 0; }
   while IFS= read -r dir; do
     [[ -n $dir && $dir == /* && $dir != / && -d $dir ]] || continue
     count=$(find "$dir" -type f -newermt "@$epoch" 2>/dev/null | wc -l)
     total=$(( total + count ))
-  done < <(angie_cache_dirs "$target")
+  done < <(nginx_cache_dirs "$target")
   printf '%s' "$total"
 }
 
@@ -519,10 +547,10 @@ tune_ensure_index() {
 }
 
 # ---------------------------------------------------------------------------
-# Angie
+# nginx
 # ---------------------------------------------------------------------------
 # XenForo's own page cache varies on style_id and language_id (see
-# src/XF/PageCache.php).  The deployed Angie vhost only keyed on the style
+# src/XF/PageCache.php).  The deployed nginx vhost only keyed on the style
 # variation, so a guest who picked a non-default style or language could
 # receive another guest's cached HTML.  Add both cookies to the key and enable
 # a background refresh so an expiring entry does not make one visitor wait on
@@ -542,7 +570,7 @@ XF_CACHE_KEY='"$request_method|$scheme|$host|$request_uri|$setup_xf_key_variatio
 #
 # A reverse proxy in front of the origin must send the site name as SNI, or
 # every handshake it makes is refused and the site answers 502 through it.
-# Cloudflare always does; a self-run proxy often does not (nginx/Angie
+# Cloudflare always does; a self-run proxy often does not (nginx/nginx
 # default to proxy_ssl_server_name off, and proxy_ssl_name defaults to the
 # proxy_pass address).  This took site-a.example (2026-11-20) and site-d.example
 # (2026-11-21) down.  SSL_REJECT_UNKNOWN_SNI (/etc/default/setup-tuning,
@@ -681,29 +709,52 @@ tune_default_tls_reject() {
   return 0
 }
 
-# server-configs-nginx shipped http.d/letsencrypt.conf as an active file for a
-# few hours on 2026-07-22 (d2bf9ac..6b0ac3a) before renaming it to the
-# inactive letsencrypt_conf.  The sync never removes a file that left the
-# repository, so hosts synced that day kept an `acme_client letsencrypt` that
-# no vhost uses, and every `angie -t` warns 'ACME client "letsencrypt" is
-# defined but not used' (two live hosts, 2026-11-20).  The file is retired
-# (moved to /tmp, never deleted) only while it is byte-identical to the
-# shipped letsencrypt_conf and no vhost has an `acme letsencrypt` directive:
-# a host that uses Angie's built-in ACME keeps it.
+# The 1.22 nginx is built without an ACME module, so an active `acme_client`
+# fails nginx -t ("unknown directive").  server-configs-nginx shipped
+# http.d/letsencrypt.conf as an active file for a few hours on 2026-07-22
+# (d2bf9ac..6b0ac3a) before renaming it to the inactive letsencrypt_conf, and
+# the sync never removes a file that left the repository, so hosts synced
+# that day kept an `acme_client letsencrypt` (two live hosts, 2026-11-20).
+# Every http.d/*.conf whose only active content is acme_client definitions
+# is retired (moved to /tmp, never deleted) while no vhost uses `acme` or an
+# $acme_cert_* variable.  Such a vhost is left to the migration's ACME ->
+# self-signed rewrite (lib/migrate.sh, step 6) and reported here: retiring
+# its client alone would not make the tree load, and the operator must see
+# why nginx -t fails.
 tune_retire_unused_acme_client() {
-  local target=$1 f="$1/http.d/letsencrypt.conf" shipped="$1/http.d/letsencrypt_conf" moved
-  [[ -f $f && -f $shipped ]] || return 0
-  cmp -s "$f" "$shipped" || return 0
-  if grep -rqsE '^[[:space:]]*acme[[:space:]]+letsencrypt[[:space:]]*;' \
-       "$target/conf.d" "$target/http.d" "$target/snippets" 2>/dev/null; then
+  local target=$1 f moved
+  [[ -d $target/http.d ]] || return 0
+  if grep -rqsE '^[^#]*(\$acme_cert_|(^|[[:space:];{])acme[[:space:]]+[A-Za-z0-9_]+[[:space:]]*;)' \
+       "$target/conf.d" "$target/http.d" "$target/snippets" "$target/custom.d" 2>/dev/null; then
+    info "A vhost under ${target} still uses acme/\$acme_cert_*; this nginx has no ACME module"
+    tune_miss "ACME: a vhost under ${target} still uses acme or \$acme_cert_*; this nginx has no ACME module (the 1.22 migration moves such vhosts to the self-signed certificate)"
     return 0
   fi
-  moved=$(preserve_to_tmp "$f") || return 0
-  [[ -n $moved ]] || return 0
-  # info as well: the sync calls this before the tuner, which resets its notes.
-  info "Retired unused ACME client http.d/letsencrypt.conf -> ${moved} (not deleted)"
-  tune_note "http.d/letsencrypt.conf: unused ACME client retired to ${moved} (the repository ships it inactive as letsencrypt_conf)"
+  for f in "$target"/http.d/*.conf; do
+    [[ -f $f && ! -L $f ]] || continue
+    nginx_conf_only_acme_client "$f" || continue
+    moved=$(preserve_to_tmp "$f") || continue
+    [[ -n $moved ]] || continue
+    # info as well: the sync calls this before the tuner, which resets its notes.
+    info "Retired unused ACME client ${f#"$target"/} -> ${moved} (not deleted)"
+    tune_note "${f#"$target"/}: ACME client retired to ${moved} (this nginx has no ACME module)"
+  done
   return 0
+}
+
+# True when FILE has at least one acme_client definition (one line, several
+# lines, or a block) and no other active directive.
+nginx_conf_only_acme_client() {
+  awk '
+    { s = $0; sub(/#.*/, "", s); gsub(/^[ \t]+|[ \t]+$/, "", s) }
+    s == "" { next }
+    depth == 0 && !inside && s ~ /^acme_client([ \t]|$)/ { seen = 1; inside = 1 }
+    {
+      if (!inside && depth == 0) other = 1
+      t = s; n = gsub(/\{/, "", t); t = s; m = gsub(/\}/, "", t); depth += n - m
+      if (depth == 0 && s ~ /[;}]$/) inside = 0
+    }
+    END { exit !(seen && !other) }' "$1" 2>/dev/null
 }
 
 # ---------------------------------------------------------------------------
@@ -712,10 +763,10 @@ tune_retire_unused_acme_client() {
 # A site whose DNS points only at Cloudflare is reached through Cloudflare's
 # edge, and in SSL mode "Full" Cloudflare accepts any origin certificate,
 # self-signed or expired.  certbot then only adds failure modes: on a live
-# Angie host its renewals had failed since September (`authenticator =
-# nginx`, no nginx plugin on Angie) and the origin served an expired
+# nginx host its renewals had failed since September (`authenticator =
+# nginx`, no nginx plugin on nginx) and the origin served an expired
 # certificate.  --optimize points such server blocks at the host's
-# self-signed /etc/angie/ssl/default pair (only the two certificate paths
+# self-signed /etc/nginx/ssl/default pair (only the two certificate paths
 # change; the TLS policy includes stay), proves through Cloudflare after
 # the reload that the edge still reaches the origin (otherwise the vhost is
 # put back and marked so later runs leave it alone), and purges certbot
@@ -726,11 +777,11 @@ tune_retire_unused_acme_client() {
 # name resolving solely to Cloudflare; a wildcard, regex or `.suffix` name
 # keeps the block where it is (a proxied wildcard record does not prove that
 # explicit grey-cloud records below it are proxied).  certbot stays while
-# the loaded Angie configuration cannot be read, while any file, hook or
+# the loaded nginx configuration cannot be read, while any file, hook or
 # symlink outside its tree refers to it, or while a vhost was put back.
 # CF_SELF_SIGNED=0 (SETUP_CF_SELF_SIGNED=0) skips all of it.
-CF_TLS_DEFAULT_CERT=/etc/angie/ssl/default/fullchain.pem
-CF_TLS_DEFAULT_KEY=/etc/angie/ssl/default/privkey.pem
+CF_TLS_DEFAULT_CERT=/etc/nginx/ssl/default/fullchain.pem
+CF_TLS_DEFAULT_KEY=/etc/nginx/ssl/default/privkey.pem
 # First line written into a vhost that had to be put back; the migration
 # never touches a file carrying it.  Deleting the line allows another try.
 CF_TLS_KEEP_MARKER='# setup-cf-tls: keep'
@@ -992,7 +1043,7 @@ cf_tls_file_uses_letsencrypt() {
 #   $2 = 1 for a dry run (prints the plan, changes nothing).
 # Applied changes are recorded in CF_TLS_* for cloudflare_tls_finish.
 cloudflare_tls_migrate() {
-  local target=${1:-/etc/angie} dry=${2:-0} ranges f b idx el names name list orig ok copy
+  local target=${1:-/etc/nginx} dry=${2:-0} ranges f b idx el names name list orig ok copy
   local -a blocks=() keep_names=() checked=() vhosts=()
   CF_TLS_FILES=(); CF_TLS_ORIG=(); CF_TLS_NAMES=(); CF_TLS_DRY_FULL=()
   # Keep an explicit SETUP_CF_SELF_SIGNED=0/1 on the host so a later plain
@@ -1018,7 +1069,7 @@ cloudflare_tls_migrate() {
       return 0
     fi
     if [[ -z $(cf_tls_ranges "$ranges" 4) ]]; then
-      cf_tls_say "$dry" "- Cloudflare TLS: skipped (no Cloudflare ranges in ${ranges}; run /etc/angie/scripts/cloudflare.sh)"
+      cf_tls_say "$dry" "- Cloudflare TLS: skipped (no Cloudflare ranges in ${ranges}; run /etc/nginx/scripts/cloudflare.sh)"
       return 0
     fi
     list=""; keep_names=()
@@ -1100,10 +1151,10 @@ cloudflare_tls_finish() {
       rm -f -- "${CF_TLS_ORIG[i]}"
     done
     if (( restored )); then
-      if "${ANGIE_BIN:-/usr/sbin/angie}" -t >/dev/null 2>&1 && systemctl reload angie 2>/dev/null; then
+      if "${NGINX_BIN:-$NGINX_WEB_BIN_DEFAULT}" -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null; then
         opt_report "- Cloudflare TLS: restored vhost(s) reloaded"
       else
-        opt_report "- **FAILED** Cloudflare TLS: reload after the restore failed; check \`angie -t\`"
+        opt_report "- **FAILED** Cloudflare TLS: reload after the restore failed; check \`nginx -t\`"
       fi
     fi
   fi
@@ -1115,8 +1166,8 @@ cf_tls_docker() { timeout 20 docker "$@"; }
 
 # Everything outside the certbot tree that may depend on it, one per line;
 # it stops at the first one found (one is enough to keep certbot).  Returns
-# 2 (fail closed) when the loaded Angie configuration cannot be read.
-#   - the loaded Angie configuration (angie -T; comments dropped)
+# 2 (fail closed) when the loaded nginx configuration cannot be read.
+#   - the loaded nginx configuration (nginx -T; comments dropped)
 #   - renewal hooks (scripts, or hook settings in renewal/*.conf): certbot
 #     then feeds another service
 #   - containers with a mount from the tree (docker inspect)
@@ -1128,14 +1179,14 @@ cf_tls_docker() { timeout 20 docker "$@"; }
 #   - symlinks into the tree under the same roots
 certbot_letsencrypt_users() {
   local etc=${CERTBOT_ETC:-/etc} le=${CERTBOT_DIR:-/etc/letsencrypt}
-  local angie_bin=${ANGIE_BIN:-/usr/sbin/angie} dump root lnk hit hook
+  local nginx_bin=${NGINX_BIN:-$NGINX_WEB_BIN_DEFAULT} dump root lnk hit hook
   # The setup.sh state tree holds vhost copies that are put back live later;
   # they count as consumers too.
   local -a roots=("$etc") extra=(/opt /srv /usr/local /root /home /var/spool/cron "${STATE_DIR:-/var/lib/setup.sh}")
   [[ -n ${CERTBOT_EXTRA_ROOTS+x} ]] && read -ra extra <<<"$CERTBOT_EXTRA_ROOTS"
   roots+=("${extra[@]}")
-  if [[ -x $angie_bin ]] || declare -F "$angie_bin" >/dev/null; then
-    dump=$("$angie_bin" -T 2>/dev/null) || return 2
+  if [[ -x $nginx_bin ]] || declare -F "$nginx_bin" >/dev/null; then
+    dump=$("$nginx_bin" -T 2>/dev/null) || return 2
     grep -q '^# configuration file ' <<<"$dump" || return 2
     hit=$(awk '
       /^# configuration file / { f = $4; sub(/:$/, "", f); next }
@@ -1170,10 +1221,11 @@ certbot_letsencrypt_users() {
   # previous checkouts) quote /etc/letsencrypt in lib/web.sh and the
   # changelog, and run logs quote it in report lines: none of them reads the
   # tree, and counting them kept certbot on every fleet host.  A project
-  # copy is a directory holding both setup.sh and lib/web.sh.  An Angie
-  # configuration tree outside /etc/angie (a server-configs-nginx checkout:
-  # angie.conf next to conf.d/templates, whose samples name certbot paths)
-  # is not loaded; the loaded configuration is read through `angie -T` above.
+  # copy is a directory holding both setup.sh and lib/web.sh.  An nginx
+  # configuration tree outside /etc/nginx (a server-configs-nginx checkout:
+  # nginx.conf next to conf.d/templates, whose samples name certbot paths)
+  # is not loaded; the loaded configuration is read through `nginx -T` above.
+  # A checkout of the 1.21 tree (SCN main) has angie.conf there instead.
   local -a own=() own_prune=()
   local d
   for root in "${roots[@]}"; do
@@ -1181,7 +1233,7 @@ certbot_letsencrypt_users() {
     while IFS= read -r -d '' d; do
       case $d in
         */lib/web.sh) d=${d%/lib/web.sh}; [[ -f $d/setup.sh ]] && own+=("$d") ;;
-        */conf.d/templates) d=${d%/conf.d/templates}; [[ -f $d/angie.conf ]] && own+=("$d") ;;
+        */conf.d/templates) d=${d%/conf.d/templates}; [[ -f $d/nginx.conf || -f $d/angie.conf ]] && own+=("$d") ;;
       esac
     done < <(find "$root" -xdev -maxdepth 4 \( -path '*/lib/web.sh' -type f \
                -o -path '*/conf.d/templates' -type d \) -print0 2>/dev/null || true)
@@ -1189,7 +1241,7 @@ certbot_letsencrypt_users() {
   for d in "${own[@]}"; do own_prune+=(-o -path "$d"); done
   for root in "${roots[@]}"; do
     [[ -d $root ]] || continue
-    hit=$(find "$root" -xdev \( -path "$le" -o -path "$etc/angie" -o -path "$etc/apparmor.d" \
+    hit=$(find "$root" -xdev \( -path "$le" -o -path "$etc/nginx" -o -path "$etc/apparmor.d" \
               -o -name node_modules -o -name .git -o -name vendor "${own_prune[@]}" \) -prune \
             -o -type f -size -1024k ! -name '*.dpkg-*' ! -name '*.bak' ! -name '*~' ! -name '*.log' -print0 2>/dev/null \
           | xargs -0 -r grep -lIE "$CF_TLS_LE_ERE" 2>/dev/null | head -n 1 || true)
@@ -1226,7 +1278,7 @@ certbot_retire_if_unused() {
       | awk '$NF == "installed" { print $1 }' || true)
   (( ${#pkgs[@]} > 0 )) || return 0
   if ! out=$(certbot_letsencrypt_users); then
-    cf_tls_say "$dry" "- certbot: kept; the loaded Angie configuration could not be read (angie -T failed)"
+    cf_tls_say "$dry" "- certbot: kept; the loaded nginx configuration could not be read (nginx -T failed)"
     return 0
   fi
   mapfile -t users < <(printf '%s\n' "$out" | sed '/^$/d' | sort -u)
@@ -1272,7 +1324,7 @@ certbot_retire_if_unused() {
   return 0
 }
 
-# A renewal that names the nginx plugin cannot run on an Angie host without
+# A renewal that names the nginx plugin cannot run on an nginx host without
 # python3-certbot-nginx: say so, with the certificate end date.
 certbot_renewal_health() {
   local dry=${1:-0} conf name end le=${CERTBOT_DIR:-/etc/letsencrypt}
@@ -1284,14 +1336,14 @@ certbot_renewal_health() {
     grep -qE '^[[:space:]]*(authenticator|installer)[[:space:]]*=[[:space:]]*nginx' "$conf" || continue
     name=$(basename -- "$conf" .conf)
     end=$(openssl x509 -noout -enddate -in "${le}/live/${name}/cert.pem" 2>/dev/null | cut -d= -f2 || true)
-    cf_tls_say "$dry" "- **WARNING** certbot: \`${name}\` renews with the nginx plugin, which is not installed (Angie host); renewal fails${end:+, the certificate ends ${end}}. Put the site behind Cloudflare (self-signed origin) or use Angie's ACME client"
+    cf_tls_say "$dry" "- **WARNING** certbot: \`${name}\` renews with the nginx plugin, which is not installed (nginx host); renewal fails${end:+, the certificate ends ${end}}. Put the site behind Cloudflare (self-signed origin) or use nginx's ACME client"
   done
   return 0
 }
 
 # Names a file defines that would clash if it were loaded next to another
 # one: cache zones, limit_req zones and map target variables, one per line.
-angie_http_defined_names() {
+nginx_http_defined_names() {
   sed -E 's/#.*//' "$@" 2>/dev/null | awk '
     { for (i = 1; i <= NF; i++) {
         if ($i ~ /^keys_zone=/) { v = $i; sub(/^keys_zone=/, "", v); sub(/:.*/, "", v); print "zone:" v }
@@ -1302,24 +1354,24 @@ angie_http_defined_names() {
 }
 
 # Old setup.sh releases generated http.d/zz-setup-*_conf files (inactive:
-# angie.conf includes only *.conf) whose content later moved into active
+# nginx.conf includes only *.conf) whose content later moved into active
 # files.  --optimize then reported them as "not included" with the advice to
 # re-run the deployment, which never changed anything; activating one would
-# even break `angie -t` with a duplicate zone (zz-setup-wordpress-cache_conf
+# even break `nginx -t` with a duplicate zone (zz-setup-wordpress-cache_conf
 # redefines keys_zone=fastcgicache, live host 2026-11-20).  An inactive
 # zz-setup-* file is retired (moved to /tmp, never deleted) only when every
 # zone and map variable it defines is already defined by a loaded file.
 tune_retire_superseded_setup_files() {
   local target=$1 f name moved
   local -a active=()
-  mapfile -t active < <(angie_active_http_files "$target")
+  mapfile -t active < <(nginx_active_http_files "$target")
   (( ${#active[@]} > 0 )) || return 0
   local defined
-  defined=$(angie_http_defined_names "${active[@]}")
+  defined=$(nginx_http_defined_names "${active[@]}")
   for f in "$target"/http.d/zz-setup-*; do
     [[ -f $f && $f != *.conf ]] || continue
     local -a mine=()
-    mapfile -t mine < <(angie_http_defined_names "$f")
+    mapfile -t mine < <(nginx_http_defined_names "$f")
     (( ${#mine[@]} > 0 )) || continue
     local superseded=1
     for name in "${mine[@]}"; do
@@ -1336,8 +1388,8 @@ tune_retire_superseded_setup_files() {
 
 # server-configs-nginx 1.6.43-1.6.45 shipped
 # `if ($flarum_guest_cacheable$req_encoded_path)` in h5bp/php_flarum.conf.
-# An `if` reads a lone variable, so Angie looks up a variable literally named
-# "flarum_guest_cacheable$req_encoded_path" and `angie -t` fails for every
+# An `if` reads a lone variable, so nginx looks up a variable literally named
+# "flarum_guest_cacheable$req_encoded_path" and `nginx -t` fails for every
 # Flarum vhost.  The encoded-path flag moves into the map (one 0/1 variable,
 # as XenForo/Chevereto do) and a missing background cache update is added.
 tune_flarum_cache_gate() {
@@ -1409,7 +1461,7 @@ tune_xf_cache_vary() {
 # Add one immutable, 30-day regex location (regex beats the existing prefix
 # blocks).  Idempotent and re-applied after the repository sync on every run.
 tune_xf_static_assets() {
-  local file=${1:-/etc/angie/h5bp/xf2.conf}
+  local file=${1:-/etc/nginx/h5bp/xf2.conf}
   [[ -f $file ]] || { tune_miss "XenForo include missing: ${file}"; return 0; }
   grep -q 'setup.sh: static asset cache' "$file" && return 0
   local tmp
@@ -1442,9 +1494,9 @@ tune_xf_static_assets() {
 # Directives that may appear only once in the http context.  A custom
 # http.d file (for example zz-site-e-ratelimit.conf) can predate the canonical
 # limit_req.conf and carry its own limit_req_status/limit_req_log_level; the
-# repository sync then makes `angie -t` fail with "directive is duplicate"
+# repository sync then makes `nginx -t` fail with "directive is duplicate"
 # and the whole tree rolls back.  Keep the canonical definition and comment
-# the operator copy with a marker; --optimize already snapshots /etc/angie.
+# the operator copy with a marker; --optimize already snapshots /etc/nginx.
 # Vhosts rendered from the XenForo and Chevereto templates before
 # server-configs-nginx 1.6.26 carry an unanchored route location:
 # "^/(admin.php|install)" also claims /install.sh or /install.log and
@@ -1452,7 +1504,7 @@ tune_xf_static_assets() {
 # rules, and serves the file.  Existing vhosts are operator-owned and are not
 # re-rendered, so anchor exactly those two generated lines in place.
 tune_vhost_route_anchors() {
-  local target=${1:-/etc/angie} file tmp
+  local target=${1:-/etc/nginx} file tmp
   [[ -f $target/h5bp/location/security_leftover_files.conf ]] || return 0
   for file in "$target"/conf.d/*.conf; do
     [[ -f $file ]] || continue
@@ -1501,9 +1553,9 @@ tune_vhost_route_anchors() {
 #     regex (a media extension on a path without "/."), which refuses
 #     everything the two deny lines refused.
 # Unchanged vhosts keep working and keep every deny rule; they only pay the
-# extra regex calls.  Every change is behind the caller's angie -t gate.
+# extra regex calls.  Every change is behind the caller's nginx -t gate.
 tune_vhost_lean_locations() {
-  local target=${1:-/etc/angie} file tmp name counts switched removed kept
+  local target=${1:-/etc/nginx} file tmp name counts switched removed kept
   [[ -f $target/h5bp/location/security_xf.conf && -f $target/h5bp/basic_headers.conf ]] || return 0
   for file in "$target"/conf.d/*.conf; do
     [[ -f $file ]] || continue
@@ -1638,16 +1690,16 @@ tune_vhost_lean_locations() {
   return 0
 }
 
-ANGIE_SINGLE_HTTP_DIRECTIVES=(limit_req_status limit_conn_status
+NGINX_SINGLE_HTTP_DIRECTIVES=(limit_req_status limit_conn_status
                               limit_req_log_level limit_conn_log_level
                               limit_req_dry_run limit_conn_dry_run)
 
-tune_angie_dedupe_http() {
-  local target=${1:-/etc/angie} directive file keep rel before
+tune_nginx_dedupe_http() {
+  local target=${1:-/etc/nginx} directive file keep rel before
   local -a files=() hits=()
   [[ -d $target/http.d ]] || return 0
   mapfile -t files < <(find "$target/http.d" -maxdepth 1 -type f -name '*.conf' 2>/dev/null | sort)
-  for directive in "${ANGIE_SINGLE_HTTP_DIRECTIVES[@]}"; do
+  for directive in "${NGINX_SINGLE_HTTP_DIRECTIVES[@]}"; do
     hits=()
     for file in "${files[@]}"; do
       grep -qE "^[[:space:]]*${directive}[[:space:]]" "$file" 2>/dev/null || continue
@@ -1668,7 +1720,7 @@ tune_angie_dedupe_http() {
         "s|^([[:space:]]*)(${directive}[[:space:]].*)\$|\\1# setup.sh: duplicate \\2 (kept in ${rel})|" \
         "$file"
       [[ $(file_md5 "$file") != "$before" ]] \
-        && info "Angie: commented duplicate ${directive} in ${file#"$target"/} (kept in ${rel})"
+        && info "nginx: commented duplicate ${directive} in ${file#"$target"/} (kept in ${rel})"
     done
   done
   return 0
@@ -1717,7 +1769,7 @@ persist_xf_job_cron() {
   tune_note "cron: XF_JOB_CRON=${XF_JOB_CRON} persisted in /etc/default/setup-tuning"
 }
 
-# Document root of an Angie vhost file ("" when none).  Shared by the
+# Document root of an nginx vhost file ("" when none).  Shared by the
 # WordPress/XenForo vhost scanners, the worker cap and asset precompression.
 # A generated vhost can legitimately have no root directive (a redirect-only
 # block or a generated terminator).  Under `set -e` with inherit_errexit a
@@ -1725,7 +1777,7 @@ persist_xf_job_cron() {
 # printed false "[ERR] command failed ... sed" lines during --upgrade-php (the
 # preflight walks every conf.d file, including those terminators), so the
 # lookup is an awk that always succeeds.
-angie_vhost_root() {
+nginx_vhost_root() {
   local root=""
   if [[ -r ${1:-} ]]; then
     root=$(awk '
@@ -1759,7 +1811,7 @@ app_db_host_is_local() {
 # Precompress the static assets under one document root so brotli_static and
 # gzip_static serve .br/.gz siblings instead of
 # compressing on every request (one 177 KB XenForo script compressed per
-# request: 2,100 req/s at 3.8 ms of Angie CPU each on the Xeon E-2236 test
+# request: 2,100 req/s at 3.8 ms of nginx CPU each on the Xeon E-2236 test
 # host, 22,000 req/s uncompressed).  Incremental: a sibling carries its source's
 # mtime and is (re)built whenever the two differ in either direction (a
 # rollback with tar/rsync -a/cp -p restores an older mtime), orphaned siblings
@@ -1889,7 +1941,7 @@ write_precompress_helper() {
 # helper when the feature is off.  write_cron adds the 5-minute entry so an
 # application upgrade is re-compressed (and stale siblings dropped) quickly.
 configure_asset_precompression() {
-  local target=${1:-/etc/angie} helper=$CRON_PRECOMPRESS file root moved out
+  local target=${1:-/etc/nginx} helper=$CRON_PRECOMPRESS file root moved out
   local -a roots=() nicer=(nice -n 19)
   local -a old_roots=()
   persist_precompress_assets
@@ -1917,9 +1969,9 @@ configure_asset_precompression() {
   fi
   while IFS= read -r file; do
     [[ -n $file ]] || continue
-    root=$(angie_vhost_root "$file")
+    root=$(nginx_vhost_root "$file")
     [[ -n $root && -d $root ]] && roots+=("$root")
-  done < <({ angie_xenforo_vhosts "$target"; angie_wordpress_vhosts "$target"; } 2>/dev/null | sort -u)
+  done < <({ nginx_xenforo_vhosts "$target"; nginx_wordpress_vhosts "$target"; } 2>/dev/null | sort -u)
   if (( ${#roots[@]} == 0 )); then
     # Not a fault: precompression is on by default (1.21.58) and a fresh
     # install has no site yet; the next --domain or --optimize picks it up.
@@ -1928,7 +1980,7 @@ configure_asset_precompression() {
   fi
   # The brotli CLI (a 15 KB package) builds the .br siblings; without it the
   # pass produces gzip siblings only.  Installed here, before the first pass,
-  # not in the compression step that runs later in the same Angie pass.
+  # not in the compression step that runs later in the same nginx pass.
   if ! command -v brotli >/dev/null 2>&1; then
     apt_install brotli || warn "Could not install the brotli CLI; precompressed assets will be gzip only"
   fi
@@ -1950,7 +2002,7 @@ configure_asset_precompression() {
   # The first pass over a tree without siblings is the slow one (gzip -9 and
   # brotli -q 11 for every asset: several minutes for a XenForo + WordPress
   # host), so it runs in the background and the run does not wait for it;
-  # Angie serves dynamic compression until each sibling exists.  Later passes
+  # nginx serves dynamic compression until each sibling exists.  Later passes
   # only touch changed files and run in line.
   if [[ -z $(find "${roots[@]}" -type f \( -name '*.js.gz' -o -name '*.css.gz' \) -print -quit 2>/dev/null) ]]; then
     # shellcheck disable=SC2086
@@ -1964,16 +2016,16 @@ configure_asset_precompression() {
   return 0
 }
 
-# Remove the FastCGI upstream keepalive cache from angie.conf.  Every idle
+# Remove the FastCGI upstream keepalive cache from nginx.conf.  Every idle
 # connection in that cache occupies one PHP-FPM worker (FPM waits on the open
-# socket for the next request), and the cache is per Angie worker, so the
+# socket for the next request), and the cache is per nginx worker, so the
 # total can reach keepalive x worker_processes and pin the whole FPM pool.
-# A request that then lands on an Angie worker without a cached connection
+# A request that then lands on an nginx worker without a cached connection
 # waits for keepalive_timeout (60 s upstream default) before a worker frees.
 # Measured on the live XenForo origin: 4-7 of 64 non-cacheable /login
 # requests stalled 60-112 s with keepalive 16; with the cache removed, 3 x
 # 128 requests stayed at p99 33-38 ms / max 93 ms and p50 was unchanged.
-angie_disable_php_keepalive() {
+nginx_disable_php_keepalive() {
   local file=${1:-} tmp
   [[ -n $file && -f $file ]] || return 0
   tmp=$(tmp_file) || return 1
@@ -1985,17 +2037,17 @@ angie_disable_php_keepalive() {
     { print }
   ' "$file" > "$tmp" || return 1
   commit_if_changed "$file" "$tmp" \
-    && tune_note "angie.conf: removed the PHP upstream keepalive cache (idle connections pin FPM workers)"
+    && tune_note "nginx.conf: removed the PHP upstream keepalive cache (idle connections pin FPM workers)"
   return 0
 }
 
 # `fastcgi_keep_conn on` only has an effect when an upstream keepalive cache
-# exists (Angie's documentation requires the keepalive directive).  Set it to
+# exists (nginx's documentation requires the keepalive directive).  Set it to
 # off in every PHP include so a future keepalive value cannot silently pin
 # the pool again, and so an old config tree gets the same behaviour as the
 # current repository default.
-angie_disable_php_keep_conn() {
-  local target=${1:-/etc/angie} file
+nginx_disable_php_keep_conn() {
+  local target=${1:-/etc/nginx} file
   for file in "$target"/h5bp/php*.conf; do
     [[ -f $file ]] || continue
     # The current repository already ships `off`; only an old tree has
@@ -2007,13 +2059,13 @@ angie_disable_php_keep_conn() {
   return 0
 }
 
-# Point the server of `upstream local_php` in angie.conf at a PHP-FPM
+# Point the server of `upstream local_php` in nginx.conf at a PHP-FPM
 # listen value (TCP host:port, bare port, or a Unix socket path).  Only that
 # block is touched: another upstream may legitimately use a different socket.
 # PHP-FPM's `listen = 9000` and wildcard listeners accept connections on the
-# loopback address, which is what Angie must dial.  An empty or unrecognised
+# loopback address, which is what nginx must dial.  An empty or unrecognised
 # value leaves the file alone.
-angie_local_php_follow_pool() {
+nginx_local_php_follow_pool() {
   local conf=${1:-} listen=${2:-} addr tmp
   [[ -n $conf && -f $conf ]] || return 0
   if [[ $listen == /* ]]; then
@@ -2039,13 +2091,13 @@ angie_local_php_follow_pool() {
     { print }
   ' "$conf" > "$tmp" || return 1
   commit_if_changed "$conf" "$tmp" \
-    && tune_note "angie.conf: local_php upstream -> ${addr} (the live PHP-FPM listener)"
+    && tune_note "nginx.conf: local_php upstream -> ${addr} (the live PHP-FPM listener)"
   return 0
 }
 
-tune_angie_configs() {
-  local target=${1:-/etc/angie}
-  local nginx_conf="${target}/angie.conf"
+tune_nginx_configs() {
+  local target=${1:-/etc/nginx}
+  local nginx_conf="${target}/nginx.conf"
   [[ -f $nginx_conf ]] || return 1
 
   # Repair the shared PHP include and the two server-level includes that old
@@ -2071,17 +2123,17 @@ tune_angie_configs() {
   (( mem_mb > 0 )) || mem_mb=1024
 
   disk_class=$(storage_class)
-  disk_free_mb=$(angie_disk_free_mb)
+  disk_free_mb=$(nginx_disk_free_mb)
 
-  angie_worker_limits "$nproc"
-  worker_rlimit=$ANGIE_WORKER_RLIMIT
-  worker_connections=$ANGIE_WORKER_CONNECTIONS
+  nginx_worker_limits "$nproc"
+  worker_rlimit=$NGINX_WORKER_RLIMIT
+  worker_connections=$NGINX_WORKER_CONNECTIONS
   # The open-file cache holds static assets, templates and cache objects;
   # size it with RAM (and the file count that implies), not the core count.
   # Cached descriptors are real fds of the worker, so the cache can never
   # exceed what worker_rlimit_nofile leaves after the connections themselves
   # (a 4-core/32 GB host used to get 200000 entries against a 65536 limit).
-  open_files=$(angie_open_file_cache_max "$mem_mb" "$worker_rlimit" "$worker_connections")
+  open_files=$(nginx_open_file_cache_max "$mem_mb" "$worker_rlimit" "$worker_connections")
 
   if (( mem_mb < 2048 )); then
     fastcgi_buffers='32 16k'; fastcgi_busy='256k'; body_buffer='64k'
@@ -2094,17 +2146,17 @@ tune_angie_configs() {
   ssl_cache_mb=$(tune_clamp $(( mem_mb / 512 )) 10 256)
 
   # Scale the disk-cache budget with the services actually present.  A
-  # dedicated Angie proxy has no PHP/DB/search tier to share RAM with, and an
-  # Angie+PHP host has no database/search tier.  The helper is shared with
+  # dedicated nginx proxy has no PHP/DB/search tier to share RAM with, and an
+  # nginx+PHP host has no database/search tier.  The helper is shared with
   # --dry-run so the plan and the applied value match.
-  cache_total_mb=$(angie_cache_budget_mb "$mem_mb" "$disk_free_mb")
+  cache_total_mb=$(nginx_cache_budget_mb "$mem_mb" "$disk_free_mb")
 
-  # Resolve the cache files Angie actually includes before sizing them, so a
+  # Resolve the cache files nginx actually includes before sizing them, so a
   # host that only runs one cache type can use the whole cache budget instead
   # of leaving most of it assigned to caches that do not exist.
   local f_fcgi f_chev f_xf f_proxy f_limit
   TUNE_ACTIVE_HTTP=()
-  mapfile -t TUNE_ACTIVE_HTTP < <(angie_active_http_files "$target")
+  mapfile -t TUNE_ACTIVE_HTTP < <(nginx_active_http_files "$target")
   if (( ${#TUNE_ACTIVE_HTTP[@]} > 0 )); then
     f_fcgi=$(tune_active_file 'keys_zone=fastcgicache:') || f_fcgi=""
     f_chev=$(tune_active_file 'keys_zone=fastcgicache_chev:') || f_chev=""
@@ -2154,31 +2206,31 @@ tune_angie_configs() {
   # Do not force the cache manager to evict a cache that is already larger
   # than the RAM-derived plan (live usage wins on an existing server).
   if [[ -n $f_fcgi ]]; then
-    angie_cache_keep_mb "$f_fcgi" "$fcgi_mb" "" "$cache_total_mb"
-    fcgi_mb=$ANGIE_CACHE_MB
-    [[ -n $ANGIE_CACHE_NOTE ]] && tune_summary "${f_fcgi#"${target}"/}: ${ANGIE_CACHE_NOTE}"
+    nginx_cache_keep_mb "$f_fcgi" "$fcgi_mb" "" "$cache_total_mb"
+    fcgi_mb=$NGINX_CACHE_MB
+    [[ -n $NGINX_CACHE_NOTE ]] && tune_summary "${f_fcgi#"${target}"/}: ${NGINX_CACHE_NOTE}"
   fi
   if [[ -n $f_chev ]]; then
-    angie_cache_keep_mb "$f_chev" "$chev_mb" "" "$cache_total_mb"
-    chev_mb=$ANGIE_CACHE_MB
-    [[ -n $ANGIE_CACHE_NOTE ]] && tune_summary "${f_chev#"${target}"/}: ${ANGIE_CACHE_NOTE}"
+    nginx_cache_keep_mb "$f_chev" "$chev_mb" "" "$cache_total_mb"
+    chev_mb=$NGINX_CACHE_MB
+    [[ -n $NGINX_CACHE_NOTE ]] && tune_summary "${f_chev#"${target}"/}: ${NGINX_CACHE_NOTE}"
   fi
   if [[ -n $f_xf ]]; then
-    angie_cache_keep_mb "$f_xf" "$xf_mb" "" "$cache_total_mb"
-    xf_mb=$ANGIE_CACHE_MB
-    [[ -n $ANGIE_CACHE_NOTE ]] && tune_summary "${f_xf#"${target}"/}: ${ANGIE_CACHE_NOTE}"
+    nginx_cache_keep_mb "$f_xf" "$xf_mb" "" "$cache_total_mb"
+    xf_mb=$NGINX_CACHE_MB
+    [[ -n $NGINX_CACHE_NOTE ]] && tune_summary "${f_xf#"${target}"/}: ${NGINX_CACHE_NOTE}"
   fi
   # The proxy/CDN caches ship at 16g and may hold a populated cache on an
   # adopted host; the same live-usage rule applies to them.
   if (( have_proxy )); then
-    angie_cache_keep_mb "$f_proxy" "$proxy_mb" proxy_cache "$cache_total_mb"
-    proxy_mb=$ANGIE_CACHE_MB
-    [[ -n $ANGIE_CACHE_NOTE ]] && tune_summary "${f_proxy#"${target}"/}: ${ANGIE_CACHE_NOTE}"
+    nginx_cache_keep_mb "$f_proxy" "$proxy_mb" proxy_cache "$cache_total_mb"
+    proxy_mb=$NGINX_CACHE_MB
+    [[ -n $NGINX_CACHE_NOTE ]] && tune_summary "${f_proxy#"${target}"/}: ${NGINX_CACHE_NOTE}"
   fi
   if (( have_cdn )); then
-    angie_cache_keep_mb "$f_proxy" "$cdn_mb" proxy_cdn "$cache_total_mb"
-    cdn_mb=$ANGIE_CACHE_MB
-    [[ -n $ANGIE_CACHE_NOTE ]] && tune_summary "${f_proxy#"${target}"/}: ${ANGIE_CACHE_NOTE}"
+    nginx_cache_keep_mb "$f_proxy" "$cdn_mb" proxy_cdn "$cache_total_mb"
+    cdn_mb=$NGINX_CACHE_MB
+    [[ -n $NGINX_CACHE_NOTE ]] && tune_summary "${f_proxy#"${target}"/}: ${NGINX_CACHE_NOTE}"
   fi
 
   fcgi_zone=$(tune_clamp $(( cache_total_mb / 4 )) 16 512)
@@ -2193,7 +2245,7 @@ tune_angie_configs() {
   proxy_size=$(tune_size_value "$proxy_mb")
   cdn_size=$(tune_size_value "$cdn_mb")
 
-  tune_replace "$nginx_conf" '^([[:space:]]*worker_processes[[:space:]]+)[^;]+;' "\\1${ANGIE_WORKER_PROCESSES};" "angie.conf: worker_processes=${ANGIE_WORKER_PROCESSES}"
+  tune_replace "$nginx_conf" '^([[:space:]]*worker_processes[[:space:]]+)[^;]+;' "\\1${NGINX_WORKER_PROCESSES};" "nginx.conf: worker_processes=${NGINX_WORKER_PROCESSES}"
   # With a cgroup CPU quota below the host's core count, `auto` affinity
   # would pin the N workers to CPUs 0..N-1 while every other service floats;
   # let the scheduler place them instead.
@@ -2202,7 +2254,7 @@ tune_angie_configs() {
   if [[ $host_cpus =~ ^[0-9]+$ ]] && (( nproc < host_cpus )); then
     tune_replace "$nginx_conf" '^([[:space:]]*)worker_cpu_affinity[[:space:]]+auto;' \
       '\1# worker_cpu_affinity auto; # setup.sh: cgroup CPU quota, no pinning' \
-      "angie.conf: worker_cpu_affinity disabled (quota ${nproc} of ${host_cpus} CPUs)"
+      "nginx.conf: worker_cpu_affinity disabled (quota ${nproc} of ${host_cpus} CPUs)"
   fi
   # Storage-class dependent file I/O: on flash the page cache serves hot
   # files cheaply, so only very large files bypass it (directio 16m); a
@@ -2210,34 +2262,34 @@ tune_angie_configs() {
   # cache.  aio threads + sendfile stay on for every class.
   local directio_mb=4
   case $disk_class in nvme|ssd) directio_mb=16 ;; esac
-  tune_replace "$nginx_conf" '^([[:space:]]*directio[[:space:]]+)[0-9]+[mMkK];' "\\1${directio_mb}m;" "angie.conf: directio=${directio_mb}m (${disk_class})"
+  tune_replace "$nginx_conf" '^([[:space:]]*directio[[:space:]]+)[0-9]+[mMkK];' "\\1${directio_mb}m;" "nginx.conf: directio=${directio_mb}m (${disk_class})"
   local gzip_level
-  gzip_level=$(angie_gzip_level)
+  gzip_level=$(nginx_gzip_level)
   tune_replace "$target/h5bp/web_performance/compression.conf" '^([[:space:]]*gzip_comp_level[[:space:]]+)[0-9]+;' "\\1${gzip_level};" "h5bp/web_performance/compression.conf: gzip_comp_level=${gzip_level}"
-  tune_replace "$nginx_conf" '^([[:space:]]*worker_rlimit_nofile[[:space:]]+)[0-9]+;' "\\1${worker_rlimit};" "angie.conf: worker_rlimit_nofile=${worker_rlimit}"
-  tune_replace "$nginx_conf" '^([[:space:]]*worker_connections[[:space:]]+)[0-9]+;' "\\1${worker_connections};" "angie.conf: worker_connections=${worker_connections}"
-  tune_replace "$nginx_conf" '^([[:space:]]*client_body_buffer_size[[:space:]]+).*;' "\\1${body_buffer};" "angie.conf: client_body_buffer_size=${body_buffer}"
-  angie_disable_php_keepalive "$nginx_conf"
-  angie_disable_php_keep_conn "$target"
+  tune_replace "$nginx_conf" '^([[:space:]]*worker_rlimit_nofile[[:space:]]+)[0-9]+;' "\\1${worker_rlimit};" "nginx.conf: worker_rlimit_nofile=${worker_rlimit}"
+  tune_replace "$nginx_conf" '^([[:space:]]*worker_connections[[:space:]]+)[0-9]+;' "\\1${worker_connections};" "nginx.conf: worker_connections=${worker_connections}"
+  tune_replace "$nginx_conf" '^([[:space:]]*client_body_buffer_size[[:space:]]+).*;' "\\1${body_buffer};" "nginx.conf: client_body_buffer_size=${body_buffer}"
+  nginx_disable_php_keepalive "$nginx_conf"
+  nginx_disable_php_keep_conn "$target"
 
   if ! grep -qE '^[[:space:]]*worker_rlimit_nofile[[:space:]]' "$nginx_conf"; then
     tune_insert_after "$nginx_conf" '^[[:space:]]*worker_processes[[:space:]]' \
-      "worker_rlimit_nofile ${worker_rlimit};" "angie.conf: inserted worker_rlimit_nofile=${worker_rlimit}"
+      "worker_rlimit_nofile ${worker_rlimit};" "nginx.conf: inserted worker_rlimit_nofile=${worker_rlimit}"
   fi
   if ! grep -qE '^[[:space:]]*worker_connections[[:space:]]' "$nginx_conf"; then
     tune_insert_after "$nginx_conf" '^[[:space:]]*events[[:space:]]*[{]' \
-      "  worker_connections ${worker_connections};" "angie.conf: inserted worker_connections=${worker_connections}"
+      "  worker_connections ${worker_connections};" "nginx.conf: inserted worker_connections=${worker_connections}"
   fi
   if ! grep -qE '^[[:space:]]*client_body_buffer_size[[:space:]]' "$nginx_conf"; then
     # Anchor on the real block opener: a bare `http[[:space:]]*` also matches
     # directives such as `http2 on;` and would insert inside a server block.
     tune_insert_after "$nginx_conf" '^[[:space:]]*http[[:space:]]*[{]' \
-      "  client_body_buffer_size ${body_buffer};" "angie.conf: inserted client_body_buffer_size=${body_buffer}"
+      "  client_body_buffer_size ${body_buffer};" "nginx.conf: inserted client_body_buffer_size=${body_buffer}"
   fi
 
   # Point any remaining TCP FastCGI handlers at the pool's Unix socket, but
   # only when optimize_php_services found an existing socket listener.  A pool
-  # kept on TCP (the usual live-server case) must keep Angie on TCP as well.
+  # kept on TCP (the usual live-server case) must keep nginx on TCP as well.
   if [[ -n ${OPT_PHP_SOCKET:-} ]]; then
     local file php_socket=${OPT_PHP_SOCKET}
     while IFS= read -r file; do
@@ -2252,12 +2304,12 @@ tune_angie_configs() {
     if grep -qE '^([[:space:]]*server[[:space:]]+)(127\.0\.0\.1|localhost):9000;' "$nginx_conf"; then
       tune_replace "$nginx_conf" \
         '^([[:space:]]*server[[:space:]]+)(127\.0\.0\.1|localhost):9000;' \
-        "\\1unix:${php_socket};" "angie.conf: local_php upstream -> Unix socket"
+        "\\1unix:${php_socket};" "nginx.conf: local_php upstream -> Unix socket"
     fi
-  elif [[ $target == /etc/angie ]]; then
+  elif [[ $target == /etc/nginx ]]; then
     # No socket was handed over: the pool stayed where it was (TCP kept, the
     # migration skipped or rolled back, PHP stopped).  The repository sync has
-    # just rewritten angie.conf to `server unix:/run/php/php-fpm.sock;`, and
+    # just rewritten nginx.conf to `server unix:/run/php/php-fpm.sock;`, and
     # nothing else points it back, so a live TCP pool left every PHP site on
     # 502.  Follow the live pool's listener instead.  Only the live tree is
     # described by the live pool; a staged or test tree is left as synced.
@@ -2267,7 +2319,7 @@ tune_angie_configs() {
     if [[ $live_listen == /* && ! -S $live_listen ]]; then
       live_listen=""
     fi
-    angie_local_php_follow_pool "$nginx_conf" "$live_listen"
+    nginx_local_php_follow_pool "$nginx_conf" "$live_listen"
   fi
 
   if [[ -n $f_fcgi ]]; then
@@ -2334,7 +2386,7 @@ tune_angie_configs() {
     # at 20k req/s the per-rejection warning wrote 266 MB of error log in two
     # minutes (measured), which is a self-inflicted disk bottleneck.  Log
     # rejections at info level (below the configured warn error_log level);
-    # the 429 count stays visible in the Angie status and access metrics.
+    # the 429 count stays visible in the nginx status and access metrics.
     tune_replace "$f_limit" \
       '^([[:space:]]*limit_req_log_level[[:space:]]+)[a-z]+;' '\1info;' \
       "${f_limit#"${target}"/}: limit_req_log_level=info"
@@ -2345,7 +2397,7 @@ tune_angie_configs() {
   fi
 
   # Bound custom cache paths that are not part of the standard set.  Scan
-  # only files Angie includes, so inert legacy leftovers are left untouched.
+  # only files nginx includes, so inert legacy leftovers are left untouched.
   local extra_zone extra_max file tmp
   local -a cache_files=()
   extra_zone=$(tune_clamp $(( cache_total_mb / 16 )) 8 128)
@@ -2446,11 +2498,11 @@ tune_angie_configs() {
   tune_vhost_route_anchors "$target"
   tune_vhost_lean_locations "$target"
 
-  tune_summary "angie summary: ${nproc} CPU / ${mem_mb}MB RAM / ${disk_class} / cache_budget=${cache_total_mb}MB"
+  tune_summary "nginx summary: ${nproc} CPU / ${mem_mb}MB RAM / ${disk_class} / cache_budget=${cache_total_mb}MB"
   # The tuner may have added or rewritten an http-context directive that an
   # operator file also sets; resolve any duplicate before the caller's
-  # angie -t (deploy_angie_tree already does this before tuning too).
-  tune_angie_dedupe_http "$target"
+  # nginx -t (deploy_nginx_tree already does this before tuning too).
+  tune_nginx_dedupe_http "$target"
   return 0
 }
 
@@ -2632,21 +2684,39 @@ sync_php_ini_template() {
   return 0
 }
 
-# Path of the php-fpm binary for a version (PATH first, then the Debian
-# location), or non-zero when the version is not installed.
+# Path of the php-fpm binary for a version, or non-zero when the version is
+# not installed.  The 1.22 build (ROOT/X.Y/sbin/php-fpm, lib/php-build.sh)
+# is the answer whenever X.Y is ours.  The package binary
+# (/usr/sbin/php-fpmX.Y) is returned only while X.Y is still a Sury/Ubuntu
+# version: no build.info of our own for it and no finished migration of it
+# (migrate state php-X.Y=done).  Once X.Y is ours a missing compiled php-fpm
+# is reported (status 1), never hidden behind the package's binary and
+# config layout.
 php_fpm_binary() {
-  local ver=$1 bin
-  if bin=$(command -v "php-fpm${ver}" 2>/dev/null) && [[ -n $bin ]]; then
-    printf '%s' "$bin"
-  elif [[ -x "/usr/sbin/php-fpm${ver}" ]]; then
-    printf '%s' "/usr/sbin/php-fpm${ver}"
+  local ver=$1 bin root=${PHP_BUILD_ROOT:-/usr/local/lib/setup-php}
+  if declare -F php_fpm_bin >/dev/null 2>&1; then
+    bin=$(php_fpm_bin "$ver")
   else
+    bin="${root}/${ver}/sbin/php-fpm"
+  fi
+  if [[ -x $bin ]]; then
+    printf '%s' "$bin"
+    return 0
+  fi
+  [[ -f ${root}/${ver}/build.info ]] && return 1
+  if declare -F migrate_state_get >/dev/null 2>&1 \
+     && [[ $(migrate_state_get "php-${ver}" 2>/dev/null || true) == "done" ]]; then
     return 1
   fi
+  if [[ -x "/usr/sbin/php-fpm${ver}" ]]; then
+    printf '%s' "/usr/sbin/php-fpm${ver}"
+    return 0
+  fi
+  return 1
 }
 
 # Point a pool at its listener (socket path or address) with the socket
-# owner, group and mode Angie expects.  Shared by the pool tuner and the
+# owner, group and mode nginx expects.  Shared by the pool tuner and the
 # TCP-to-socket migration.  listen.allowed_clients is meaningless (and noisy)
 # for a Unix socket, so it is dropped there.
 php_pool_set_listener() {
@@ -2724,7 +2794,7 @@ php_jit_threshold_lines() {
 
 # Document roots whose guest cache may store PHP's own gzip output.  A cached
 # WordPress or Chevereto page used to be stored uncompressed and compressed
-# again by Angie on every hit (about 1 ms of CPU; 14.8k req/s with all 16
+# again by nginx on every hit (about 1 ms of CPU; 14.8k req/s with all 16
 # threads busy on the audit host).  With zlib.output_compression on for the
 # document root the cache stores the gzip body and a hit costs 0.12 ms (72k
 # req/s), the way XenForo's self-compressed pages always did.  Only roots
@@ -2736,7 +2806,7 @@ php_jit_threshold_lines() {
 # no section until the next --optimize found wp-config.php / app/env.php.
 # Compressing PHP output is safe for any root behind an encoding-aware key.
 php_page_gzip_roots() {
-  local target=${1:-/etc/angie} file root
+  local target=${1:-/etc/nginx} file root
   (( PHP_PAGE_GZIP )) || return 0
   [[ -d $target/conf.d ]] || return 0
   local -a incs=()
@@ -2750,7 +2820,7 @@ php_page_gzip_roots() {
   for file in "$target"/conf.d/*.conf; do
     [[ -f $file ]] || continue
     grep -qE "$re" "$file" || continue
-    root=$(angie_vhost_root "$file")
+    root=$(nginx_vhost_root "$file")
     [[ -n $root ]] && printf '%s\n' "$root"
   done
   return 0
@@ -2758,12 +2828,12 @@ php_page_gzip_roots() {
 
 # Document roots of Chevereto vhosts: the vhost includes one of the Chevereto
 # PHP locations and the root holds app/env.php.
-angie_chevereto_roots() {
-  local target=${1:-/etc/angie} file root
+nginx_chevereto_roots() {
+  local target=${1:-/etc/nginx} file root
   for file in "$target"/conf.d/*.conf; do
     [[ -f $file ]] || continue
     grep -qE '^[[:space:]]*include[[:space:]]+h5bp/php_chev(_cache)?\.conf;' "$file" || continue
-    root=$(angie_vhost_root "$file")
+    root=$(nginx_vhost_root "$file")
     [[ -n $root && -f "${root}/app/env.php" ]] && printf '%s\n' "$root"
   done
   return 0
@@ -2779,15 +2849,15 @@ angie_chevereto_roots() {
 # fastcgi_param PHP_VALUE / PHP_ADMIN_VALUE does (measured: a PHP_VALUE set
 # for one vhost was still active for another vhost on the same worker).
 php_jit_path_sections() {
-  local target=${1:-/etc/angie} file root
+  local target=${1:-/etc/nginx} file root
   local -A body=()
   [[ -d $target/conf.d ]] || return 0
   if (( ! PHP_JIT_WORDPRESS )); then
     while IFS= read -r file; do
-      root=$(angie_vhost_root "$file")
+      root=$(nginx_vhost_root "$file")
       [[ -n $root ]] || continue
       body[$root]+=$'; WordPress keeps the bytecode cache only (SETUP_PHP_JIT_WORDPRESS=1 lifts this)\nopcache.jit = off\n'
-    done < <(angie_wordpress_vhosts "$target" | sort -u)
+    done < <(nginx_wordpress_vhosts "$target" | sort -u)
   fi
   # Chevereto keeps its PHP sessions in its own directory (/tmp unless
   # CHEVERETO_SESSION_SAVE_PATH says otherwise) and starts one for every
@@ -2797,7 +2867,7 @@ php_jit_path_sections() {
   while IFS= read -r root; do
     [[ -n $root ]] || continue
     body[$root]+=$'; Chevereto session files are collected by PHP (no timer visits its save path)\nsession.gc_probability = 1\nsession.gc_divisor = 1000\n'
-  done < <(angie_chevereto_roots "$target" | sort -u)
+  done < <(nginx_chevereto_roots "$target" | sort -u)
   # Level 6: the stored page is compressed once per MISS and sent on every
   # hit, so its size is what guests pay.  Measured (1.21.58) on the cached
   # WordPress post / Chevereto explore pages: 14.9 / 12.7 KB at level 4,
@@ -2839,8 +2909,8 @@ php_session_hardening_load() {
 php_session_hardening_load
 
 persist_php_jit() {
-  php_build_persist
-  php_fpm_modules_persist
+  # PHP_BUILD / PHP_FPM_MODULES are no longer persisted: 1.22 always builds
+  # PHP from source with a static extension set (lib/php-build.sh).
   if (( PHP_SESSION_HARDENING_PERSIST )); then
     persist_tuning_var PHP_SESSION_HARDENING "$SETUP_PHP_SESSION_HARDENING"
     tune_note "PHP: PHP_SESSION_HARDENING=${SETUP_PHP_SESSION_HARDENING} persisted in /etc/default/setup-tuning"
@@ -2880,8 +2950,8 @@ PHP_PROFILE_OPCACHE_MB=128
 PHP_PROFILE_MEMORY_MB=256
 PHP_PROFILE_REALPATH_KB=4096
 
-# opcache.max_accelerated_files for the PHP files under the Angie vhost
-# roots (plus /var/www/*/public without Angie): count * 1.5, clamped to
+# opcache.max_accelerated_files for the PHP files under the nginx vhost
+# roots (plus /var/www/*/public without nginx): count * 1.5, clamped to
 # 16384..128256, then written as the prime PHP itself rounds the value up to
 # (OPcache sizes its hash table from a fixed prime list).  The effective
 # table is unchanged, but the ini text only moves when the file count
@@ -2899,9 +2969,9 @@ php_opcache_table_size() {
 php_accelerated_files_target() {
   local file root count=0 n
   local -a roots=()
-  for file in /etc/angie/conf.d/*.conf; do
+  for file in /etc/nginx/conf.d/*.conf; do
     [[ -f $file ]] || continue
-    root=$(angie_vhost_root "$file" 2>/dev/null || true)
+    root=$(nginx_vhost_root "$file" 2>/dev/null || true)
     [[ -n $root && -d $root ]] && roots+=("$root")
   done
   if (( ${#roots[@]} == 0 )); then
@@ -2931,7 +3001,7 @@ tune_php_fpm_version() {
   local ini="${ini_dir}/zz-setup-optimize.ini"
   [[ -d /etc/php/${ver}/fpm ]] || return 0
   [[ -f $pool ]] || { tune_miss "PHP ${ver}: no pool.d/www.conf, skipped"; return 0; }  # With no explicit socket request, keep whatever the pool already listens on
-  # (TCP for a standalone PHP host, Unix socket for an Angie deployment).
+  # (TCP for a standalone PHP host, Unix socket for an nginx deployment).
   if [[ -z $socket ]]; then
     socket=$(php_pool_listen "$ver")
     [[ -n $socket ]] || socket=/run/php/php-fpm.sock
@@ -3040,9 +3110,11 @@ tune_php_fpm_version() {
   memory_mb=$PHP_PROFILE_MEMORY_MB
   realpath_kb=$PHP_PROFILE_REALPATH_KB
 
-  mkdir -p /run/php
-  chown www-data:www-data /run/php 2>/dev/null || true
-  chmod 755 /run/php
+  # /run/php belongs to tmpfiles.d/setup-php.conf (root:root 0755) and the
+  # unit's RuntimeDirectory=, which re-chowns it on every start; the sockets
+  # inside carry listen.owner/group.  Only create it when it is missing, so
+  # the tuner does not fight the unit over its owner.
+  [[ -d /run/php ]] || install -d -m 755 /run/php
 
   # Always a static pool: the worker count is already sized to the host
   # (php_plan_max_children), resident workers answer the first request after
@@ -3109,7 +3181,7 @@ tune_php_fpm_version() {
   chmod 750 /var/cache/php /var/cache/php/opcache 2>/dev/null || true
   # The pool template names its own version (pid path); rewrite any phpN.N,
   # not only php8.x, so a 9.x pool is handled the same way.  The listener is
-  # excluded: php_pool_set_listener already wrote the path Angie points at,
+  # excluded: php_pool_set_listener already wrote the path nginx points at,
   # and renaming a versioned socket here would leave the upstream dangling.
   sed_in_place -E "/^[[:space:]]*listen[[:space:]]*=/! s|php[0-9]+\.[0-9]+|php${ver}|g" "$pool"
   local ini_before=""
@@ -3175,7 +3247,7 @@ EOF
   fi
   # Per-directory sections must come last: everything after a section header
   # belongs to that section.
-  php_jit_path_sections /etc/angie >> "$ini"
+  php_jit_path_sections /etc/nginx >> "$ini"
   chmod 644 "$ini"
   if (( ! PHP_JIT_PERSISTED )); then
     persist_php_jit
@@ -3191,11 +3263,30 @@ EOF
     fi
   fi
 
-  local fpm_bin fpm_test
+  # Test exactly what the unit starts.  The compiled php-fpm has no Debian
+  # defaults: a bare `-t` opens ROOT/X.Y/etc/php-fpm.conf and the CLI's ini
+  # scan dir, so php_fpm_test (-y, -c and PHP_INI_SCAN_DIR) is used for our
+  # build, and a package binary still gets the same explicit paths.
+  local fpm_bin fpm_test fpm_ok=1
   fpm_bin=$(php_fpm_binary "$ver" || true)
+  if [[ -z $fpm_bin ]]; then
+    # Only a version with a php-fpm reaches the tuner (install_php after its
+    # build, --optimize for a detected build): a missing binary is a broken
+    # build, and an untested pool must not be reported as tuned.
+    printf 'PHP %s: no php-fpm binary to test the pool with (%s missing); re-run --php or --optimize to rebuild\n' \
+      "$ver" "${PHP_BUILD_ROOT:-/usr/local/lib/setup-php}/${ver}/sbin/php-fpm" >&2
+    return 1
+  fi
   if [[ -n $fpm_bin ]]; then
     fpm_test=$(tmp_file)
-    if ! "$fpm_bin" -t >"$fpm_test" 2>&1; then
+    if declare -F php_fpm_test >/dev/null 2>&1 && declare -F php_fpm_bin >/dev/null 2>&1 \
+       && [[ $fpm_bin == "$(php_fpm_bin "$ver")" ]]; then
+      php_fpm_test "$ver" >"$fpm_test" 2>&1 || fpm_ok=0
+    else
+      "$fpm_bin" -t -y "/etc/php/${ver}/fpm/php-fpm.conf" -c "/etc/php/${ver}/fpm/php.ini" \
+        >"$fpm_test" 2>&1 || fpm_ok=0
+    fi
+    if (( ! fpm_ok )); then
       printf 'PHP %s: php-fpm -t failed:\n' "$ver" >&2
       sed 's/^/  /' "$fpm_test" >&2 || true
       return 1
@@ -3205,116 +3296,152 @@ EOF
 }
 
 # ---------------------------------------------------------------------------
-# Angie dynamic compression: Brotli, then gzip
+# nginx dynamic compression: Brotli, then gzip
 # ---------------------------------------------------------------------------
 # Static assets are precompressed (.br/.gz siblings, SETUP_PRECOMPRESS_ASSETS,
 # on by default since 1.21.58), so the per-request filters only see dynamic
 # responses and assets without a sibling.
 #
+# Brotli is compiled into the 1.22 nginx as a static module (--add-module,
+# tools/nginx-build.sh): no package, no load_module, no modules-enabled
+# stanza.  SCN's nginx.conf no longer includes modules-enabled, and a
+# load_module of a Brotli .so would fail nginx -t (there is no such file
+# under the build prefix).  ensure_nginx_compression therefore asks
+# `nginx -V` for the static ngx_brotli, writes http.d/brotli.conf as plain
+# directives, and retires the managed module stanzas and every live
+# load_module of Brotli or zstd (R45, R69).
+#
 # zstd was shipped in 1.21.58 and removed in 1.21.59.  It is cheaper than
 # Brotli for the same bytes (XenForo member thread: 19.4 KB at 0.84 ms of
-# Angie CPU vs Brotli 4's 18.3 KB at 2.1 ms), but Cloudflare asks origins for
+# nginx CPU vs Brotli 4's 18.3 KB at 2.1 ms), but Cloudflare asks origins for
 # "br, gzip" only, so on Cloudflare-fronted hosts the module never answered a
-# request.  Hosts that ran 1.21.58 have the stanzas moved away and
-# angie-module-zstd purged (angie_retire_zstd, angie_purge_zstd_module).
-ANGIE_COMPRESSION_CHANGED=0
-ANGIE_COMPRESSION_SKIPPED=0
-ANGIE_BROTLI_OK=0
-ANGIE_BROTLI_LEVEL=4
-ANGIE_ZSTD_RETIRED=0
+# request.  The 1.22 build has no zstd module at all, so the managed zstd
+# stanzas are always retired, and an operator file that still uses zstd
+# directives is reported (nginx -t rejects it).
+NGINX_COMPRESSION_CHANGED=0
+NGINX_COMPRESSION_SKIPPED=0
+NGINX_BROTLI_OK=0
+NGINX_BROTLI_LEVEL=4
+NGINX_ZSTD_RETIRED=0
+NGINX_MODULE_LOADS_RETIRED=0
+# Prefix of a load_module line commented out for the static build; deleting
+# the prefix restores the line.
+NGINX_LOAD_MODULE_OFF='# setup-1.22 static build: '
 
 # Move the managed zstd stanzas of 1.21.58 (60-zstd.conf, http.d/zstd.conf,
 # and an older 40-zstd.conf) out of the tree.  Only files that carry the
-# "Managed by setup.sh" header: an operator's own zstd stanza stays, and then
-# the module stays installed too (angie_purge_zstd_module).
-angie_retire_zstd() {
-  local target=${1:-/etc/angie} f moved
-  local -a managed=()
-  ANGIE_ZSTD_RETIRED=0
+# "Managed by setup.sh" header move; an operator's own zstd use is reported,
+# because this nginx cannot load the module whatever the stanza says.
+nginx_retire_zstd() {
+  local target=${1:-/etc/nginx} f moved users
+  NGINX_ZSTD_RETIRED=0
   for f in "${target}/modules-enabled/40-zstd.conf" "${target}/modules-enabled/60-zstd.conf" \
            "${target}/http.d/zstd.conf"; do
-    [[ -e $f ]] && grep -q '^# Managed by setup.sh' "$f" 2>/dev/null && managed+=("$f")
-  done
-  (( ${#managed[@]} )) || return 0
-  # An operator file that uses zstd directives relies on the managed
-  # load_module: moving it would make Angie reject the tree ("unknown
-  # directive"), so nothing is retired until that file stops using zstd.
-  local users
-  users=$(angie_zstd_users "$target" "${managed[@]}")
-  if [[ -n $users ]]; then
-    tune_summary "zstd: kept the managed stanzas; zstd is still used by ${users//$'\n'/ } (remove it there to retire the module)"
-    return 0
-  fi
-  for f in "${managed[@]}"; do
+    [[ -e $f ]] && grep -q '^# Managed by setup.sh' "$f" 2>/dev/null || continue
     moved=$(preserve_to_tmp "$f" 2>/dev/null || true)
     [[ -n $moved ]] && info "Moved retired Zstandard file to ${moved}"
-    ANGIE_ZSTD_RETIRED=1
+    NGINX_ZSTD_RETIRED=1
   done
+  users=$(nginx_zstd_users "$target")
+  if [[ -n $users ]]; then
+    tune_miss "zstd: this nginx is built without zstd, but ${users//$'\n'/ } still configure(s) it (nginx -t rejects those directives; remove them there)"
+  fi
   return 0
 }
 
 # Active files under the tree that load or configure zstd, one per line,
 # leaving out the files named after the tree.  Only *.conf files are read:
-# the repository's old http.d/zstd_conf template is never included.
-angie_zstd_users() {
-  local target=${1:-/etc/angie} f x skip
+# the repository's old http.d/zstd_conf template is never included, and
+# modules-enabled is not included by the nginx tree.
+nginx_zstd_users() {
+  local target=${1:-/etc/nginx} f x skip
   shift
   while IFS= read -r f; do
     skip=0
     for x in "$@"; do [[ $f == "$x" ]] && { skip=1; break; }; done
     (( skip )) || printf '%s\n' "$f"
-  done < <(grep -RlsE --include='*.conf' \
+  done < <(grep -RlsE --include='*.conf' --exclude-dir=modules-enabled \
     '^[[:space:]]*(load_module[[:space:]].*ngx_http_zstd|zstd(_[a-z_]+)?[[:space:]])' "$target" 2>/dev/null | sort)
 }
 
 # True when an active file under the tree still loads or configures zstd.
-angie_zstd_in_use() {
-  [[ -n $(angie_zstd_users "${1:-/etc/angie}") ]]
+nginx_zstd_in_use() {
+  [[ -n $(nginx_zstd_users "${1:-/etc/nginx}") ]]
 }
 
-# Purge angie-module-zstd once the Angie pass has committed (optimize_angie
-# after its reload, install_angie after its restart): a rollback after an
-# earlier purge would restore a tree that loads a module no longer on disk.
-# Kept when a configuration still uses it, or when apt would take anything
-# else with it.  The outcome is in ANGIE_ZSTD_PURGE_RESULT for the caller.
-ANGIE_ZSTD_PURGE_PENDING=0
-ANGIE_ZSTD_PURGE_RESULT=""
-angie_purge_zstd_module() {
-  local target=${1:-/etc/angie} sim others
-  ANGIE_ZSTD_PURGE_RESULT=""
-  pkg_ok angie-module-zstd || return 0
-  if angie_zstd_in_use "$target"; then
-    ANGIE_ZSTD_PURGE_RESULT="zstd: angie-module-zstd kept, a configuration under ${target} still uses it"
-    return 0
-  fi
-  if ! sim=$(apt-get -s purge angie-module-zstd 2>&1); then
-    ANGIE_ZSTD_PURGE_RESULT="zstd: angie-module-zstd kept (apt cannot purge it)"
-    return 0
-  fi
-  others=$(printf '%s\n' "$sim" | awk '/^(Purg|Remv) /{ sub(/:.*/, "", $2); print $2 }' \
-    | grep -vx 'angie-module-zstd' | paste -sd' ' - || true)
-  if [[ -n $others ]]; then
-    ANGIE_ZSTD_PURGE_RESULT="zstd: angie-module-zstd kept, apt would also remove ${others}"
-    return 0
-  fi
-  if DEBIAN_FRONTEND=noninteractive apt-get purge -y angie-module-zstd >/dev/null 2>&1; then
-    ANGIE_ZSTD_PURGE_RESULT="zstd: angie-module-zstd purged (Cloudflare asks origins for br/gzip only)"
-  else
-    ANGIE_ZSTD_PURGE_RESULT="zstd: could not purge angie-module-zstd; its stanzas are already out of the configuration"
-    warn "$ANGIE_ZSTD_PURGE_RESULT"
-  fi
-  info "$ANGIE_ZSTD_PURGE_RESULT"
+# 1.21.58 hosts had the zstd module as a package from the Angie repository.
+# The migration purges every angie-module-* package together with Angie, and
+# the 1.22 nginx is not a package, so nothing is left to purge here.  Kept
+# (always empty) so the install and --optimize callers need no change.
+NGINX_ZSTD_PURGE_PENDING=0
+NGINX_ZSTD_PURGE_RESULT=""
+nginx_purge_zstd_module() {
+  NGINX_ZSTD_PURGE_RESULT=""
+  NGINX_ZSTD_PURGE_PENDING=0
   return 0
 }
 
-# Dynamic Brotli level: SETUP_BROTLI_LEVEL when valid, otherwise 5, or 4 on a
+# Status 0 when BIN (default: nginx_test_bin) has ngx_brotli compiled in
+# statically (`--add-module=...ngx_brotli` in nginx -V), 1 when it has none
+# or only a dynamic one (no load_module is ever written, so a dynamic module
+# would not be loaded), 2 when there is no binary to ask.  The same match as
+# tools/nginx-build.sh verify_binary and SCN's ci-config-test.sh.
+nginx_static_brotli() {
+  local bin=${1:-} v re='--add-module=[^[:space:]]*ngx_brotli'
+  [[ -n $bin ]] || bin=$(nginx_test_bin)
+  nginx_bin_usable "$bin" || return 2
+  v=$("$bin" -V 2>&1) || return 1
+  [[ $v =~ $re ]]
+}
+
+# Retire what made a packaged server load Brotli/zstd as dynamic modules:
+# the managed modules-enabled/50-brotli.conf moves to /tmp, an unmanaged
+# modules-enabled link is moved the same way, and a load_module of a Brotli
+# or zstd module in nginx.conf, custom.d (main context) or modules-enabled is
+# commented out with NGINX_LOAD_MODULE_OFF.  Sets NGINX_MODULE_LOADS_RETIRED.
+nginx_retire_module_loads() {
+  local target=${1:-/etc/nginx} f moved tmp
+  local re='^[[:space:]]*load_module[[:space:]][^;#]*ngx_http_(brotli|zstd)[a-z_]*_module'
+  NGINX_MODULE_LOADS_RETIRED=0
+  f="${target}/modules-enabled/50-brotli.conf"
+  if [[ -f $f && ! -L $f ]] && grep -q '^# Managed by setup.sh' "$f" 2>/dev/null; then
+    moved=$(preserve_to_tmp "$f" 2>/dev/null || true)
+    if [[ -n $moved ]]; then
+      info "Moved retired Brotli module stanza to ${moved}"
+      tune_note "modules-enabled/50-brotli.conf: retired to ${moved} (Brotli is compiled in)"
+      NGINX_MODULE_LOADS_RETIRED=1
+    fi
+  fi
+  for f in "${target}/nginx.conf" "${target}"/custom.d/*.conf "${target}"/modules-enabled/*.conf; do
+    [[ -e $f || -L $f ]] || continue
+    grep -qE "$re" "$f" 2>/dev/null || continue
+    if [[ -L $f ]]; then
+      # A package's modules-available link: move the link, never its target.
+      [[ $f == "${target}/modules-enabled/"* ]] || continue
+      moved=$(preserve_to_tmp "$f" 2>/dev/null || true)
+      [[ -n $moved ]] || continue
+      tune_note "${f#"$target"/}: Brotli/zstd module link retired to ${moved}"
+      NGINX_MODULE_LOADS_RETIRED=1
+      continue
+    fi
+    tmp=$(tmp_file) || return 1
+    awk -v re="$re" -v off="$NGINX_LOAD_MODULE_OFF" '$0 ~ re { print off $0; next } { print }' "$f" > "$tmp" || continue
+    if commit_if_changed "$f" "$tmp"; then
+      tune_note "${f#"$target"/}: load_module of a Brotli/zstd module commented out (Brotli is compiled in, zstd is not built)"
+      NGINX_MODULE_LOADS_RETIRED=1
+    fi
+  done
+  return 0
+}
+
+# Dynamic Brotli level: SETUP_BROTLI_LEVEL when valid, otherwise 4, or 3 on a
 # 1-2 CPU host where per-response compression competes with PHP for cores.
 # One owner for the install, --optimize and dry-run values.
-angie_brotli_level() {
+nginx_brotli_level() {
   local level=${SETUP_BROTLI_LEVEL:-}
   if ! [[ $level =~ ^([1-9]|1[01])$ ]]; then
     # Dynamic responses only (static assets use precompressed .br siblings).
-    # Measured on an 8 vCPU XenForo origin (130 KB HTML thread page, Angie
+    # Measured on an 8 vCPU XenForo origin (130 KB HTML thread page, nginx
     # CPU per request): level 5 = 5.3 ms, level 4 = 2.7 ms, level 3 = 1.5 ms
     # for 21 / 23 / 24 KB on the wire.  Level 4 halves the compression CPU of
     # every member page for 10% more bytes; 1-2 CPU hosts take level 3.
@@ -3324,60 +3451,53 @@ angie_brotli_level() {
   printf '%s' "$level"
 }
 
-ensure_angie_compression() {
-  local target=${1:-/etc/angie}
-  local conf="${target}/angie.conf"
+ensure_nginx_compression() {
+  local target=${1:-/etc/nginx}
+  local conf="${target}/nginx.conf"
   [[ -f $conf ]] || return 0
-  ANGIE_COMPRESSION_CHANGED=0
-  ANGIE_COMPRESSION_SKIPPED=0
-  ANGIE_BROTLI_OK=0
+  NGINX_COMPRESSION_CHANGED=0
+  NGINX_COMPRESSION_SKIPPED=0
+  NGINX_BROTLI_OK=0
+  local changed=0
 
-  if [[ ${SETUP_ANGIE_COMPRESSION:-1} == 0 ]]; then
-    ANGIE_COMPRESSION_SKIPPED=1
-    info "Angie dynamic Brotli disabled by SETUP_ANGIE_COMPRESSION=0"
+  # Before the opt-out: a load_module of a .so that does not exist makes the
+  # whole tree fail nginx -t, so this is a fix to the tree, not a choice of
+  # compression profile.
+  nginx_retire_module_loads "$target"
+  (( NGINX_MODULE_LOADS_RETIRED )) && changed=1
+
+  if [[ ${SETUP_NGINX_COMPRESSION:-1} == 0 ]]; then
+    NGINX_COMPRESSION_SKIPPED=1
+    NGINX_COMPRESSION_CHANGED=$changed
+    (( changed )) && TUNE_DIRTY=1
+    info "nginx dynamic Brotli disabled by SETUP_NGINX_COMPRESSION=0"
     return 0
   fi
 
-  local brotli_level static_mode=off
-  brotli_level=$(angie_brotli_level)
-  ANGIE_BROTLI_LEVEL=$brotli_level
+  local brotli_level static_mode=off bin brc=0
+  brotli_level=$(nginx_brotli_level)
+  NGINX_BROTLI_LEVEL=$brotli_level
   # brotli_static serves a .br sibling when one exists and falls back to the
   # dynamic filter otherwise; it is only useful with precompressed assets.
   (( PRECOMPRESS_ASSETS )) && static_mode=on
 
-  local enabled="${target}/modules-enabled"
-  local changed=0
-  if ! pkg_ok angie-module-brotli; then
-    # --optimize is otherwise install-free.  This one
-    # small module is part of the same compression profile as a fresh --angie
-    # install, so installing it here keeps both paths identical.  If the
-    # repository or package is unavailable, fall back to gzip.
-    if ! apt-cache show angie-module-brotli >/dev/null 2>&1; then
-      apt_update || true
-    fi
-    apt_install angie-module-brotli \
-      || warn "Could not install angie-module-brotli; gzip remains active"
-  fi
-  pkg_ok angie-module-brotli && ANGIE_BROTLI_OK=1
+  # --optimize installs nothing for compression any more: Brotli is part of
+  # the build, so its presence is a fact of the binary, not a package state.
+  bin=$(nginx_test_bin)
+  nginx_static_brotli "$bin" || brc=$?
+  case $brc in
+    0) NGINX_BROTLI_OK=1 ;;
+    2) warn "No nginx binary at ${bin} to check for static Brotli; http.d/brotli.conf left as it is" ;;
+    *) warn "${bin} has no static Brotli module (ngx_brotli); gzip only" ;;
+  esac
 
-  mkdir -p "$enabled" "${target}/http.d"
+  mkdir -p "${target}/http.d"
   local tmp moved f
   # zstd (1.21.58) is retired: see the header of this section.
-  angie_retire_zstd "$target"
-  (( ANGIE_ZSTD_RETIRED )) && changed=1
+  nginx_retire_zstd "$target"
+  (( NGINX_ZSTD_RETIRED )) && changed=1
 
-  if (( ANGIE_BROTLI_OK )); then
-    if ! grep -Rqs 'ngx_http_brotli_filter_module' "$enabled" 2>/dev/null; then
-      tmp=$(tmp_file)
-      cat > "$tmp" <<'EOF'
-# Managed by setup.sh: dynamic Brotli compression.
-load_module modules/ngx_http_brotli_filter_module.so;
-load_module modules/ngx_http_brotli_static_module.so;
-EOF
-      cat "$tmp" > "${enabled}/50-brotli.conf"
-      chmod 644 "${enabled}/50-brotli.conf"
-      changed=1
-    fi
+  if (( NGINX_BROTLI_OK )); then
     tmp=$(tmp_file)
     if [[ -f "${target}/http.d/brotli_conf" ]]; then
       {
@@ -3388,65 +3508,74 @@ EOF
       sed_in_place -E "s/^brotli_comp_level [0-9]+;/brotli_comp_level ${brotli_level};/" "$tmp"
       sed_in_place -E "s/^brotli_static (on|off);/brotli_static ${static_mode};/" "$tmp"
     else
-      cat > "$tmp" <<EOF
+      cat > "$tmp" <<EOT
 # Managed by setup.sh: dynamic Brotli (template was missing).
 brotli on;
 brotli_static ${static_mode};
 brotli_comp_level ${brotli_level};
 brotli_min_length 50;
 brotli_types text/plain text/css text/xml application/json application/javascript application/xml image/svg+xml font/ttf font/otf;
-EOF
+EOT
     fi
     if commit_if_changed "${target}/http.d/brotli.conf" "$tmp"; then
       chmod 644 "${target}/http.d/brotli.conf"
       changed=1
     fi
-  elif [[ -f "${enabled}/50-brotli.conf" ]]; then
-    warn "Angie Brotli module is not installed; keeping the existing module stanza"
+  elif (( brc == 1 )) && [[ -f "${target}/http.d/brotli.conf" ]] \
+       && grep -q '^# Managed by setup.sh' "${target}/http.d/brotli.conf" 2>/dev/null; then
+    # This binary does not know the brotli directives; the managed stanza
+    # would fail the whole tree.  Moved to /tmp (never deleted).
+    moved=$(preserve_to_tmp "${target}/http.d/brotli.conf" 2>/dev/null || true)
+    [[ -n $moved ]] && info "Moved http.d/brotli.conf to ${moved}: the nginx binary has no Brotli"
+    changed=1
   fi
 
-  # Never leave the service unable to start because an optional module failed
-  # to load.  Move the managed files to /tmp (the script never deletes) and
-  # keep the gzip fallback.
+  # Never leave the service unable to start because of the compression
+  # stanza.  Only a failure that names brotli moves the managed file away
+  # (to /tmp, never deleted); any other failure belongs to the caller's own
+  # nginx -t gate and must not silently cost the host its Brotli.
   local testlog
-  testlog=$(tmp_file)
-  if ! /usr/sbin/angie -t >"$testlog" 2>&1; then
-    warn "Angie rejected the dynamic compression configuration; disabling Brotli"
-    sed 's/^/  /' "$testlog" >&2 || true
-    for f in "${enabled}/50-brotli.conf" "${target}/http.d/brotli.conf"; do
-      [[ -e $f ]] || continue
-      moved=$(preserve_to_tmp "$f" 2>/dev/null || true)
-      [[ -n $moved ]] && info "Moved rejected compression file to ${moved}"
-    done
-    ANGIE_BROTLI_OK=0
-    changed=1
-    if ! /usr/sbin/angie -t >/dev/null 2>&1; then
-      warn "Angie still rejects the configuration after removing compression files"
+  if (( brc != 2 )); then
+    testlog=$(tmp_file)
+    if ! nginx_test_tree "$conf" >"$testlog" 2>&1; then
+      if grep -qi 'brotli' "$testlog" && [[ -f "${target}/http.d/brotli.conf" ]] \
+         && grep -q '^# Managed by setup.sh' "${target}/http.d/brotli.conf" 2>/dev/null; then
+        warn "nginx rejected the Brotli configuration; disabling Brotli"
+        sed 's/^/  /' "$testlog" >&2 || true
+        moved=$(preserve_to_tmp "${target}/http.d/brotli.conf" 2>/dev/null || true)
+        [[ -n $moved ]] && info "Moved rejected compression file to ${moved}"
+        NGINX_BROTLI_OK=0
+        changed=1
+        if ! nginx_test_tree "$conf" >/dev/null 2>&1; then
+          warn "nginx still rejects the configuration after removing the Brotli file"
+        fi
+      else
+        warn "nginx -t fails for a reason other than compression; Brotli settings kept"
+        sed 's/^/  /' "$testlog" >&2 || true
+      fi
     fi
   fi
-  # The zstd module is purged by the caller once its Angie pass commits.
-  [[ $target == /etc/angie ]] && ANGIE_ZSTD_PURGE_PENDING=1
 
-  ANGIE_COMPRESSION_CHANGED=$changed
+  NGINX_COMPRESSION_CHANGED=$changed
   if (( changed )); then
     TUNE_DIRTY=1
   fi
   return 0
 }
 
-# Fetch the canonical Angie tree and run the repository's deployer.  Kept
-# separate from the tuning pass so --optimize can synchronize /etc/angie and
+# Fetch the canonical nginx tree and run the repository's deployer.  Kept
+# separate from the tuning pass so --optimize can synchronize /etc/nginx and
 # then apply the hardware-aware profile to the freshly deployed files.
 # ---------------------------------------------------------------------------
-# Angie config tree
+# nginx config tree
 # ---------------------------------------------------------------------------
 # This deployer used to live in the server-configs-nginx repository as a
 # separate script.  It now lives here so a fresh install and `--optimize`
 # share exactly one implementation: fetch -> sync tree -> hardware profile.
-# deploy_angie_tree reloads a running Angie after the sync unless the caller
+# deploy_nginx_tree reloads a running nginx after the sync unless the caller
 # tunes the tree first and reloads/restarts it itself.
-ANGIE_SYNC_RELOAD=1
-ANGIE_CACHE_DIRS=(/home/nginx_cache /home/nginx_cache_chev /home/xf_proxy_cache
+NGINX_SYNC_RELOAD=1
+NGINX_CACHE_DIRS=(/home/nginx_cache /home/nginx_cache_chev /home/xf_proxy_cache
                   /home/proxy_cache /home/proxy_cdn)
 
 # ---------------------------------------------------------------------------
@@ -3455,13 +3584,13 @@ ANGIE_CACHE_DIRS=(/home/nginx_cache /home/nginx_cache_chev /home/xf_proxy_cache
 # The canonical tree is synced with rsync, so a custom vhost under conf.d can
 # outlive the upstream block it relied on: the repository may rename or drop an
 # upstream between releases (xf_websocket -> xf_websocket_so on one host), and
-# Angie then refuses to load the whole tree with
+# nginx then refuses to load the whole tree with
 #   [emerg] host not found in upstream "soketi_websocket"
 # which made --optimize fail and roll the sync back.  Snapshot every upstream
 # block before the sync, then re-add only the blocks a deployed vhost still
 # references and the new tree no longer defines.  The preserved block lives in
 # one managed include so it is easy to inspect and is regenerated every run.
-angie_tree_files() {
+nginx_tree_files() {
   local dir=$1 exclude=${2:-}
   [[ -d $dir ]] || return 0
   local -a prune=()
@@ -3472,9 +3601,9 @@ angie_tree_files() {
 
 # Names a deployed vhost passes to a *_pass directive.  Only bare names are
 # upstreams; a host:port, unix: path or $variable is not.
-angie_referenced_upstreams() {
+nginx_referenced_upstreams() {
   local dir=$1
-  angie_tree_files "$dir" \
+  nginx_tree_files "$dir" \
     | xargs -0 -r grep -hoE '(proxy_pass|grpc_pass|grpcs_pass|uwsgi_pass|scgi_pass|fastcgi_pass)[[:space:]]+[^;]+' 2>/dev/null \
     | sed -E -e 's|^[a-z_]+[[:space:]]+||' -e 's#^(https?://|grpcs?://)##' \
     | awk '{print $1}' \
@@ -3483,9 +3612,9 @@ angie_referenced_upstreams() {
 
 # Upstream names the tree defines.  EXCLUDE (the managed include) is skipped
 # so its own definitions do not count as canonical on the next run.
-angie_defined_upstreams() {
+nginx_defined_upstreams() {
   local dir=$1 exclude=${2:-}
-  angie_tree_files "$dir" "$exclude" \
+  nginx_tree_files "$dir" "$exclude" \
     | xargs -0 -r grep -hE '^[[:space:]]*upstream[[:space:]]+[A-Za-z0-9_]+' 2>/dev/null \
     | sed -E 's|^[[:space:]]*upstream[[:space:]]+([A-Za-z0-9_]+).*|\1|' | sort -u || true
 }
@@ -3493,10 +3622,10 @@ angie_defined_upstreams() {
 # Write each "upstream NAME { ... }" block of SRC to DEST/NAME.conf.  The awk
 # depth counter keeps multi-line blocks together and stops at the closing
 # brace; comments before a block are not part of it.
-angie_snapshot_upstreams() {
+nginx_snapshot_upstreams() {
   local src=$1 dest=$2 file
   [[ -d $src && -d $dest ]] || return 0
-  angie_tree_files "$src" | while IFS= read -r -d '' file; do
+  nginx_tree_files "$src" | while IFS= read -r -d '' file; do
     awk -v out="$dest" '
       /^[[:space:]]*upstream[[:space:]]+[A-Za-z0-9_]+[[:space:]]*\{/ {
         name = $2
@@ -3519,14 +3648,14 @@ angie_snapshot_upstreams() {
 }
 
 # Re-add the blocks a vhost still references and the synced tree lost.
-angie_restore_upstreams() {
+nginx_restore_upstreams() {
   local target=$1 snapshot=$2
   local include="$target/http.d/zz-setup-preserved-upstreams.conf"
   local name tmp moved
   local -a referenced=() defined=() missing=()
   [[ -d $target ]] || return 0
-  mapfile -t referenced < <(angie_referenced_upstreams "$target")
-  mapfile -t defined < <(angie_defined_upstreams "$target" "$include")
+  mapfile -t referenced < <(nginx_referenced_upstreams "$target")
+  mapfile -t defined < <(nginx_defined_upstreams "$target" "$include")
   for name in "${referenced[@]}"; do
     [[ -n $name ]] || continue
     [[ " ${defined[*]} " == *" $name "* ]] && continue
@@ -3544,10 +3673,10 @@ angie_restore_upstreams() {
   {
     printf '# Managed by setup.sh: upstream definitions preserved from the previous tree.\n'
     printf '# A deployed vhost still references a name the canonical repository no\n'
-    printf '# longer defines; without this block Angie refuses to load with\n'
+    printf '# longer defines; without this block nginx refuses to load with\n'
     printf '# "host not found in upstream".  Regenerated by install/--optimize.\n'
     for name in "${missing[@]}"; do
-      printf '\n# preserved from the previous /etc/angie tree: %s\n' "$name"
+      printf '\n# preserved from the previous /etc/nginx tree: %s\n' "$name"
       # A zone name from the old tree would collide with a zone in the new one;
       # the block works without it.
       sed -E '/^[[:space:]]*zone[[:space:]]/d' "$snapshot/$name.conf"
@@ -3565,10 +3694,10 @@ angie_restore_upstreams() {
 # conf.d/r3f_auth), plus any file an active auth_basic_user_file names.  The
 # deploy normaliser resets every file to root:root 0644, so a password file
 # the operator had tightened to 0640 came back world-readable on every run.
-# Give them 0640 root:<Angie worker group> instead: the workers read the file
+# Give them 0640 root:<nginx worker group> instead: the workers read the file
 # per request, nobody else needs to.  Symlinks and paths that leave the tree
 # are skipped so a crafted reference cannot retarget the chmod.
-angie_auth_user_files() {
+nginx_auth_user_files() {
   local target=$1
   find "$target" -path "$target/ssl" -prune -o \
        -type f \( -name '*.conf' -o -name '*_conf' \) -print0 2>/dev/null \
@@ -3586,21 +3715,21 @@ angie_auth_user_files() {
         }' 2>/dev/null || true
 }
 
-# Group of the Angie workers (angie.conf `user` directive, default www-data).
-angie_auth_group() {
+# Group of the nginx workers (nginx.conf `user` directive, default www-data).
+nginx_auth_group() {
   local group
   group=$(awk '/^[[:space:]]*user[[:space:]]/ {
       g = ($3 != "") ? $3 : $2; sub(/;.*/, "", g); print g; exit
-    }' "$1/angie.conf" 2>/dev/null || true)
+    }' "$1/nginx.conf" 2>/dev/null || true)
   [[ $group =~ ^[A-Za-z0-9_.-]+$ ]] || group=www-data
   printf '%s\n' "$group"
 }
 
-angie_secure_auth_files() {
+nginx_secure_auth_files() {
   local target=$1 group file ref
   local -a files=()
   [[ -d $target ]] || return 0
-  group=$(angie_auth_group "$target")
+  group=$(nginx_auth_group "$target")
   while IFS= read -r -d '' file; do
     files+=("$file")
   done < <(find "$target" -path "$target/ssl" -prune -o \
@@ -3612,7 +3741,7 @@ angie_secure_auth_files() {
     [[ $ref == /* ]] || ref="$target/$ref"
     [[ $ref == "$target"/* && $ref != *..* && -f $ref && ! -L $ref ]] || continue
     files+=("$ref")
-  done < <(angie_auth_user_files "$target")
+  done < <(nginx_auth_user_files "$target")
   # 0640 only after the group change worked: a root:root 0640 file is
   # unreadable for the workers and every protected location would fail.
   for file in "${files[@]}"; do
@@ -3623,29 +3752,41 @@ angie_secure_auth_files() {
   return 0
 }
 
-# Sync CONFIG_SOURCE_DIR into /etc/angie and normalise what a checkout can
+# Sync CONFIG_SOURCE_DIR into /etc/nginx and normalise what a checkout can
 # carry (ownership, modes, macOS AppleDouble files, sample keys).  The caller
 # has already run fetch_server_configs.
-deploy_angie_tree() {
-  local target=/etc/angie
-  local log_dir="${LOG_ROOT}/angie"
+deploy_nginx_tree() {
+  local target=/etc/nginx
+  local log_dir="${LOG_ROOT}/nginx"
   local src=${CONFIG_SOURCE_DIR:-}
-  [[ -n $src && -d $src ]] || { warn "No Angie config source directory available"; return 1; }
+  [[ -n $src && -d $src ]] || { warn "No nginx config source directory available"; return 1; }
+  # The nginx branch of server-configs-nginx (CONFIG_REPO_REF=nginx) ships
+  # its own fastcgi.conf / fastcgi_params (SERVER_SOFTWARE "nginx" with no
+  # version, R38) and mime.types; no package provides them any more, so a
+  # tree without them (the 1.21 Angie tree on SCN main) is refused before
+  # anything in /etc/nginx changes.
+  local req
+  for req in nginx.conf mime.types fastcgi.conf fastcgi_params; do
+    [[ -f $src/$req ]] || { warn "server configs at ${src} lack ${req} (CONFIG_REPO_REF=${CONFIG_REPO_REF:-?} is not the nginx tree)"; return 1; }
+  done
 
   # Capture the live upstream blocks before rsync overwrites the files that
-  # define them (see angie_restore_upstreams).
+  # define them (see nginx_restore_upstreams).
   local upstream_snapshot=""
   if [[ -d $target ]]; then
-    upstream_snapshot=$(tmp_dir angie-upstreams.XXXXXX) || upstream_snapshot=""
-    [[ -n $upstream_snapshot ]] && angie_snapshot_upstreams "$target" "$upstream_snapshot"
+    upstream_snapshot=$(tmp_dir nginx-upstreams.XXXXXX) || upstream_snapshot=""
+    [[ -n $upstream_snapshot ]] && nginx_snapshot_upstreams "$target" "$upstream_snapshot"
   fi
 
   # --no-owner/--no-group + --chmod prevents a checkout owned by uid 1000 from
-  # leaving writable files in /etc/angie. Never copy the sample private key.
+  # leaving writable files in /etc/nginx. Never copy the sample private key.
+  # scripts/ci-*.sh and scripts/uss-ref drive the repository's own CI (they
+  # build nginx and run test trees); nothing on a host runs them.
   rsync -a --no-owner --no-group --chmod=D755,F644 \
     --exclude='*.md' --exclude='*.txt' --exclude='.git*' \
     --exclude='.github/' --exclude='test/' --exclude='.editorconfig' \
     --exclude='h5bp/tls/private.key' --exclude='h5bp/tls/certificate.pem' \
+    --exclude='/scripts/ci-*.sh' --exclude='/scripts/uss-ref' \
     "$src"/ "$target"/ || return 1
   mkdir -p "$target/snippets" "$target/custom.d"
   # macOS AppleDouble files appear when a local checkout is used via
@@ -3671,6 +3812,10 @@ deploy_angie_tree() {
         "$target/scripts/custom_dan.ini" \
         "$target/scripts/php-fpm-limits.conf" \
         "$target/scripts/auto_tune.sh" \
+        "$target"/scripts/ci-*.sh \
+        "$target/scripts/uss-ref" \
+        "$target/scripts/limit_nofile.conf" \
+        "$target/scripts/etc_default_nginx" \
         "$target/http.d/98_setup_cache.conf" \
         "$target/http.d/99_setup_overrides.conf" \
         "$target/http.d/limit_req_whitelist.conf" \
@@ -3688,19 +3833,19 @@ deploy_angie_tree() {
 
   # Re-add any operator-referenced upstream the new tree dropped (rsync
   # overwrites the file that used to define it; a custom vhost survives).
-  angie_restore_upstreams "$target" "$upstream_snapshot"
+  nginx_restore_upstreams "$target" "$upstream_snapshot"
 
   # A custom http.d file may carry a directive the canonical tree also sets;
-  # Angie rejects duplicates in the http context before the tuner can run.
-  tune_angie_dedupe_http "$target" || true
+  # nginx rejects duplicates in the http context before the tuner can run.
+  tune_nginx_dedupe_http "$target" || true
 
   # A hand-written vhost may include h5bp/php_xf.conf inside a location (the
   # old single-location snippet allowed that).  The canonical file defines a
-  # server-level named location, so the tree fails `angie -t` before the
-  # tuner's migration in angie_apply_profile would run.  Point such includes
+  # server-level named location, so the tree fails `nginx -t` before the
+  # tuner's migration in nginx_apply_profile would run.  Point such includes
   # at the generic h5bp/php.conf first; the server-level include stays.
-  if declare -F angie_migrate_guest_cache_includes >/dev/null 2>&1; then
-    angie_migrate_guest_cache_includes "$target" || warn "Nested guest-cache include migration reported a problem"
+  if declare -F nginx_migrate_guest_cache_includes >/dev/null 2>&1; then
+    nginx_migrate_guest_cache_includes "$target" || warn "Nested guest-cache include migration reported a problem"
   fi
 
   # Normalise ownership/modes for everything except operator certificates and
@@ -3712,10 +3857,10 @@ deploy_angie_tree() {
   # that no one but root can write, so it never preserves a checkout's
   # uid-1000 or group-writable leftovers.  It is dropped when the group does
   # not exist: find aborts the whole pass on an unknown -group name.
-  angie_secure_auth_files "$target"
+  nginx_secure_auth_files "$target"
   local auth_group
   local -a keep_secured=()
-  auth_group=$(angie_auth_group "$target")
+  auth_group=$(nginx_auth_group "$target")
   if getent group "$auth_group" >/dev/null 2>&1; then
     keep_secured=(-type f -user root -group "$auth_group" -perm 0640 -prune -o)
   fi
@@ -3754,106 +3899,104 @@ deploy_angie_tree() {
   secure_log_file "$log_dir/error.log" www-data www-data
 
   local cache_dir
-  for cache_dir in "${ANGIE_CACHE_DIRS[@]}"; do
+  for cache_dir in "${NGINX_CACHE_DIRS[@]}"; do
     mkdir -p "$cache_dir"
     chown www-data:www-data "$cache_dir" 2>/dev/null || true
     chmod 750 "$cache_dir"
   done
 
   # Before the first test of the synced tree: otherwise the run that retires
-  # the stale file still prints Angie's "defined but not used" warning.
+  # the stale file still prints nginx's "defined but not used" warning.
   tune_retire_unused_acme_client "$target"
   tune_retire_superseded_setup_files "$target"
 
+  # nginx -t opens the temp paths under /var/cache/nginx and the log
+  # directory; A's tmpfiles.d entry creates them (R70, R84).
+  if declare -F nginx_build_tmpfiles_apply >/dev/null 2>&1; then
+    nginx_build_tmpfiles_apply || true
+  fi
+
   # Validate before anything reloads.  A stopped service is valid (the tree is
-  # applied at the next start); reload only when the unit is active.
-  if ! /usr/sbin/angie -t; then
-    warn "Angie configuration test failed; live service left untouched"
+  # applied at the next start); reload only when the unit is active.  The
+  # migration tests with its candidate binary (NGINX_TEST_BIN).
+  if ! nginx_test_tree "$target/nginx.conf"; then
+    warn "nginx configuration test failed; live service left untouched"
     return 1
   fi
   # The install and --optimize paths tune the synced tree before they reload
-  # or restart it themselves (ANGIE_SYNC_RELOAD=0); reloading here as well
+  # or restart it themselves (NGINX_SYNC_RELOAD=0); reloading here as well
   # briefly ran the repository defaults (65535 connections, 16g cache zones)
   # on every --optimize and doubled the reloads.
-  if (( ANGIE_SYNC_RELOAD )) && systemctl is-active --quiet angie 2>/dev/null; then
+  if (( NGINX_SYNC_RELOAD )) && systemctl is-active --quiet nginx 2>/dev/null; then
     systemctl daemon-reload || true
-    if systemctl reload angie.service 2>/dev/null; then
-      info "Angie configuration reloaded"
+    if systemctl reload nginx.service 2>/dev/null; then
+      info "nginx configuration reloaded"
     else
-      warn "Angie configuration is valid but the reload failed"
+      warn "nginx configuration is valid but the reload failed"
     fi
   fi
-  # Angie's master opens log files as root.  Normalise pre-existing logs for
+  # nginx's master opens log files as root.  Normalise pre-existing logs for
   # the UMask=0027 drop-in; new files are already 0640.
   find "$log_dir" -type f -name '*.log' -exec chmod 640 {} + 2>/dev/null || true
   return 0
 }
 
 # Files named with a double underscore are a botched `.conf` rename from an
-# old layout.  angie.conf includes `http.d/*.conf`, so they are never loaded
+# old layout.  nginx.conf includes `http.d/*.conf`, so they are never loaded
 # and only make the tuner warn about a stale cache zone (e.g.
 # `proxy_cache__conf`).  Move them to /tmp; never delete.
-retire_angie_double_underscore() {
-  local target=${1:-/etc/angie} file moved
+retire_nginx_double_underscore() {
+  local target=${1:-/etc/nginx} file moved
   for file in "$target"/http.d/*__conf; do
     [[ -f $file ]] || continue
     moved=$(preserve_to_tmp "$file" 2>/dev/null || true)
     if [[ -n $moved ]]; then
-      info "Retired legacy Angie file ${file} -> ${moved} (not deleted)"
+      info "Retired legacy nginx file ${file} -> ${moved} (not deleted)"
     else
-      warn "Could not move legacy Angie file ${file}; leaving it in place"
+      warn "Could not move legacy nginx file ${file}; leaving it in place"
     fi
   done
   return 0
 }
 
-sync_angie_repo_configs() {
+# The nginx tree (CONFIG_REPO_REF, the SCN "nginx" branch) into /etc/nginx.
+# The 1.21 tree also shipped scripts/limit_nofile.conf and
+# scripts/etc_default_nginx for a unit drop-in and /etc/default/<server>.
+# The nginx.service written by lib/nginx-build.sh sets LimitNOFILE=524288 and
+# UMask=0027 itself and reads no /etc/default file, so neither is required
+# or installed any more (deploy_nginx_tree retires stale copies).
+sync_nginx_repo_configs() {
   fetch_server_configs || return 1
-  local limit_src="${CONFIG_SOURCE_DIR}/scripts/limit_nofile.conf"
-  local default_src="${CONFIG_SOURCE_DIR}/scripts/etc_default_nginx"
-  [[ -f $limit_src && -f $default_src ]] || {
-    warn "Downloaded server configs lack the systemd/default Angie files"
-    return 1
-  }
-  mkdir -p /etc/systemd/system/angie.service.d
-  install -m 644 "$limit_src" /etc/systemd/system/angie.service.d/limits.conf \
-    || return 1
-  install -m 644 "$default_src" /etc/default/angie || return 1
-
-  # Load the new drop-in before the tree deployer reloads the unit; otherwise
-  # systemctl prints "unit file changed on disk" and may use stale limits.
-  systemctl daemon-reload || true
-
-  deploy_angie_tree || return 1
-  retire_angie_double_underscore /etc/angie
+  deploy_nginx_tree || return 1
+  retire_nginx_double_underscore /etc/nginx
   return 0
 }
 
-# The hardware-aware Angie profile applied to a freshly synced /etc/angie:
+# The hardware-aware nginx profile applied to a freshly synced /etc/nginx:
 # guest caches, asset precompression, the tuner and dynamic compression, in
 # the one order both the installer and --optimize use (the repository
 # templates are restored first so the tuner's cache values win).  Returns 1
 # when the tuner fails; the compression outcome is left in
-# ANGIE_COMPRESSION_SUMMARY for the caller's report.
-ANGIE_COMPRESSION_SUMMARY=""
-angie_apply_profile() {
-  local target=${1:-/etc/angie}
+# NGINX_COMPRESSION_SUMMARY for the caller's report.
+NGINX_COMPRESSION_SUMMARY=""
+nginx_apply_profile() {
+  local target=${1:-/etc/nginx}
   optimize_wordpress_cache "$target" || warn "WordPress cache setup was skipped"
   ensure_xf_guest_cache "$target" || warn "XenForo cache setup was skipped"
-  angie_migrate_guest_cache_includes "$target" || warn "Guest cache include migration was skipped"
+  nginx_migrate_guest_cache_includes "$target" || warn "Guest cache include migration was skipped"
   configure_asset_precompression "$target" || warn "Asset precompression was skipped"
-  tune_angie_configs "$target" || return 1
+  tune_nginx_configs "$target" || return 1
   # Dynamic Brotli compression.  The module is optional, so a failure here
   # must not stop the run; gzip remains active.
-  ensure_angie_compression "$target" || warn "Angie compression setup was skipped"
-  (( ANGIE_COMPRESSION_CHANGED )) && TUNE_DIRTY=1
-  if (( ANGIE_COMPRESSION_SKIPPED )); then
-    ANGIE_COMPRESSION_SUMMARY="Compression: unchanged (SETUP_ANGIE_COMPRESSION=0)"
+  ensure_nginx_compression "$target" || warn "nginx compression setup was skipped"
+  (( NGINX_COMPRESSION_CHANGED )) && TUNE_DIRTY=1
+  if (( NGINX_COMPRESSION_SKIPPED )); then
+    NGINX_COMPRESSION_SUMMARY="Compression: unchanged (SETUP_NGINX_COMPRESSION=0)"
   else
     local -a enc=()
-    (( ANGIE_BROTLI_OK )) && enc+=("Brotli level ${ANGIE_BROTLI_LEVEL}")
+    (( NGINX_BROTLI_OK )) && enc+=("Brotli level ${NGINX_BROTLI_LEVEL}")
     enc+=("gzip")
-    ANGIE_COMPRESSION_SUMMARY="Compression: $(printf '%s, ' "${enc[@]}" | sed 's/, $//') (first the client accepts)"
+    NGINX_COMPRESSION_SUMMARY="Compression: $(printf '%s, ' "${enc[@]}" | sed 's/, $//') (first the client accepts)"
   fi
   return 0
 }
@@ -3873,46 +4016,36 @@ config_tree_digest() {
   (cd "$dir" && find . -type f -print0 2>/dev/null | sort -z | xargs -0 md5sum 2>/dev/null) | md5sum | awk '{print $1}'
 }
 
-deploy_angie_configs() {
-  step "Angie configuration (server-configs-nginx)"
-  # install_angie validates and restarts the service after this function;
+deploy_nginx_configs() {
+  step "nginx configuration (server-configs-nginx)"
+  # install_nginx validates and restarts the service after this function;
   # the sync itself must not reload the untuned tree first.
-  ANGIE_SYNC_RELOAD=0
-  if ! sync_angie_repo_configs; then
-    ANGIE_SYNC_RELOAD=1
-    warn "Angie config deployment failed"
+  NGINX_SYNC_RELOAD=0
+  if ! sync_nginx_repo_configs; then
+    NGINX_SYNC_RELOAD=1
+    warn "nginx config deployment failed"
     return 1
   fi
-  ANGIE_SYNC_RELOAD=1
+  NGINX_SYNC_RELOAD=1
 
-  # Hardware-aware Angie tuning is owned by setup.sh so the same code runs
+  # Hardware-aware nginx tuning is owned by setup.sh so the same code runs
   # during install and during `--optimize`.
   tune_reset_changes
-  if ! angie_apply_profile /etc/angie; then
-    warn "Angie tuning failed"
+  if ! nginx_apply_profile /etc/nginx; then
+    warn "nginx tuning failed"
     return 1
   fi
-  info "$ANGIE_COMPRESSION_SUMMARY"
+  info "$NGINX_COMPRESSION_SUMMARY"
   local change
   for change in "${TUNE_CHANGES[@]}"; do info "tune: ${change}"; done
   for change in "${TUNE_MISSES[@]}"; do warn "tune not applied: ${change}"; done
 }
 
-# Ensure an embedded key file is present and byte-identical to the payload.
-# A truncated file from an interrupted write, or an outdated key, otherwise
-# makes every later apt operation fail until an operator removes it manually.
-refresh_blob_key() {
-  local target=$1 blob=$2 tmp
-  tmp=$(tmp_file) || return 1
-  "$blob" > "$tmp" 2>/dev/null || { warn "Could not decode ${blob}"; return 1; }
-  [[ -s $tmp ]] || { warn "Embedded ${blob} decoded to an empty file"; return 1; }
-  if [[ -s $target ]] && cmp -s "$tmp" "$target"; then
-    return 0
-  fi
-  install -m 644 "$tmp" "$target" || return 1
-  info "Refreshed embedded key: ${target}"
-}
-
+# Ensure an embedded, ASCII-armoured key is present (dearmoured) and
+# byte-identical to the payload.  A truncated file from an interrupted write,
+# or an outdated key, otherwise makes every later apt operation fail until an
+# operator removes it manually.  (The plain refresh_blob_key went with the
+# Sury keyring in 1.22.)
 refresh_blob_key_dearmor() {
   local target=$1 blob=$2 tmp
   tmp=$(tmp_file) || return 1
@@ -3925,38 +4058,3 @@ refresh_blob_key_dearmor() {
   install -m 644 "$tmp" "$target" || return 1
   info "Refreshed embedded key: ${target}"
 }
-
-ensure_sury_keyring() {
-  local keyring=/usr/share/keyrings/debsuryorg-archive-keyring.gpg
-  local legacy
-  local deb extract embedded
-  # The vendor .deb also drops the same key in trusted.gpg.d, where it signs
-  # every configured repository.  The source line pins signed-by, so move the
-  # global copy out of the tree once it is proven identical.
-  retire_global_sury_key() {
-    for legacy in /etc/apt/trusted.gpg.d/debsuryorg-archive.gpg \
-                  /etc/apt/trusted.gpg.d/deb.sury.org-php.gpg; do
-      [[ -f $legacy ]] && cmp -s "$legacy" "$keyring" && retire_paths "$legacy"
-    done
-  }
-  deb=$(tmp_file --suffix=.deb) || return 1
-  blob_sury_deb > "$deb" 2>/dev/null || { warn "Could not decode Sury keyring payload"; return 1; }
-  extract=$(tmp_dir) || return 1
-  dpkg-deb -x "$deb" "$extract" 2>/dev/null || true
-  embedded=$(find "$extract" -type f -name '*.gpg' 2>/dev/null | head -n1)
-  if [[ -s $keyring && -n $embedded ]] && cmp -s "$keyring" "$embedded"; then
-    retire_global_sury_key
-    return 0
-  fi
-  # Through apt, not bare dpkg -i: apt waits on the dpkg lock
-  # (DPkg::Lock::Timeout in APT_OPTS) while unattended-upgrades or a
-  # package postinst still holds it; dpkg -i fails at once.  The .deb is
-  # the embedded payload in a root-only temp file, so apt reads it as root
-  # (no "unsandboxed download" warning for the _apt user).
-  apt-get install "${APT_OPTS[@]}" -o APT::Sandbox::User=root \
-    --no-install-recommends "$deb" \
-    || { warn "Could not install the Sury keyring package"; return 1; }
-  retire_global_sury_key
-  info "Refreshed embedded key: ${keyring}"
-}
-

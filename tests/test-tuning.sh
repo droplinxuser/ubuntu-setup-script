@@ -8,14 +8,14 @@
 set -Eeuo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
-FIXTURES="$ROOT/tests/fixtures/angie"
+FIXTURES="$ROOT/tests/fixtures/nginx"
 # The paired server-configs-nginx checkout.  A few checks assert what the
-# shipped Angie tree contains; they need a real tree, not the fixtures.  CI
-# checks the pair out inside the workspace and sets ANGIE_TREE; a developer
+# shipped nginx tree contains; they need a real tree, not the fixtures.  CI
+# checks the pair out inside the workspace and sets NGINX_TREE; a developer
 # keeps it next to this repository.  Without a tree those checks are skipped
 # and counted, never passed: a negated grep over a missing directory used to
 # pass, and a plain one failed every CI run.
-ANGIE_TREE=${ANGIE_TREE:-$ROOT/../server-configs-nginx}
+NGINX_TREE=${NGINX_TREE:-$ROOT/../server-configs-nginx}
 
 PASS=0
 FAIL=0
@@ -53,13 +53,13 @@ trap - ERR
 
 t_pass() { PASS=$((PASS + 1)); printf 'PASS  %s\n' "$*"; }
 t_skip() { SKIP=$((SKIP + 1)); printf 'SKIP  %s\n' "$*"; }
-# check_tree DESC CMD...: run a check against ANGIE_TREE, or skip it when the
+# check_tree DESC CMD...: run a check against NGINX_TREE, or skip it when the
 # paired tree is not checked out.
 check_tree() {
   local desc=$1
   shift
-  if [[ -d $ANGIE_TREE/h5bp && -d $ANGIE_TREE/conf.d ]]; then check "$desc" "$@"
-  else t_skip "$desc (no server-configs-nginx tree at $ANGIE_TREE; set ANGIE_TREE)"; fi
+  if [[ -d $NGINX_TREE/h5bp && -d $NGINX_TREE/conf.d ]]; then check "$desc" "$@"
+  else t_skip "$desc (no server-configs-nginx tree at $NGINX_TREE; set NGINX_TREE)"; fi
 }
 t_fail() {
   FAIL=$((FAIL + 1))
@@ -168,17 +168,17 @@ check "retire_paths moves the live file away" test ! -e "$TMP/retire/old.conf"
 check "retire_paths preserves the content under /tmp" \
   test -n "$retire_dest" -a "$(cat "$retire_dest" 2>/dev/null)" = stale
 check "retire_paths ignores a missing path" retire_paths "$TMP/retire/missing.conf"
-deploy_body=$(sed -n '/^deploy_angie_tree()/,/^}/p' "$ALL_SRC")
-check "Angie tree deployer never deletes files" \
+deploy_body=$(sed -n '/^deploy_nginx_tree()/,/^}/p' "$ALL_SRC")
+check "nginx tree deployer never deletes files" \
   bash -c '! grep -qE "(^|[[:space:]])rm -|-delete([[:space:]]|$)" <<<"$1"' _ "$deploy_body"
 # --- audit 1.21.58: web-robustness
 
 # Basic-auth password files the templates tell operators to keep in the tree
 # came back root:root 0644 (world-readable) after every sync.  They get
-# 0640 root:<Angie user group>; ordinary config files stay 0644.
+# 0640 root:<nginx user group>; ordinary config files stay 0644.
 au=$TMP/auth-tree
 mkdir -p "$au/htpasswd" "$au/basic_auth" "$au/conf.d" "$au/custom"
-printf 'user www-data;\n' > "$au/angie.conf"
+printf 'user www-data;\n' > "$au/nginx.conf"
 for f in htpasswd/xfadmin basic_auth/wp_auth conf.d/r3f_auth custom/pw custom/plain; do
   printf 'u:x\n' > "$au/$f"; chmod 644 "$au/$f"
 done
@@ -187,7 +187,7 @@ printf 'server {\n  auth_basic_user_file custom/pw;\n  #auth_basic_user_file cus
 chmod 644 "$au/conf.d/site.conf"
 : > "$TMP/auth-chown.log"
 ( chown() { printf '%s %s\n' "$1" "$2" >> "$TMP/auth-chown.log"; }
-  angie_secure_auth_files "$au" )
+  nginx_secure_auth_files "$au" )
 check "htpasswd/ password file is 0640" test "$(stat -c %a "$au/htpasswd/xfadmin")" = 640
 check "basic_auth/ password file is 0640" test "$(stat -c %a "$au/basic_auth/wp_auth")" = 640
 check "*_auth password file is 0640" test "$(stat -c %a "$au/conf.d/r3f_auth")" = 640
@@ -195,15 +195,15 @@ check "auth_basic_user_file target is 0640" test "$(stat -c %a "$au/custom/pw")"
 check "a commented auth_basic_user_file reference is ignored" test "$(stat -c %a "$au/custom/plain")" = 644
 check "ordinary config files stay 0644" test "$(stat -c %a "$au/conf.d/site.conf")" = 644
 check "a reference that leaves the tree is never touched" test "$(stat -c %a "$TMP/outside")" = 644
-check "password files go to the Angie worker group" \
+check "password files go to the nginx worker group" \
   test "$(cut -d' ' -f1 "$TMP/auth-chown.log" | sort -u)" = root:www-data
-check "the worker group comes from the angie.conf user directive" \
-  test "$(angie_auth_group "$au")" = www-data
-printf 'user angie nginxgrp;\n' > "$TMP/auth-grp.conf"; mkdir -p "$TMP/auth-grp"; mv "$TMP/auth-grp.conf" "$TMP/auth-grp/angie.conf"
-check "an explicit user group in angie.conf is used" \
-  test "$(angie_auth_group "$TMP/auth-grp")" = nginxgrp
+check "the worker group comes from the nginx.conf user directive" \
+  test "$(nginx_auth_group "$au")" = www-data
+printf 'user nginx nginxgrp;\n' > "$TMP/auth-grp.conf"; mkdir -p "$TMP/auth-grp"; mv "$TMP/auth-grp.conf" "$TMP/auth-grp/nginx.conf"
+check "an explicit user group in nginx.conf is used" \
+  test "$(nginx_auth_group "$TMP/auth-grp")" = nginxgrp
 printf 'u:x\n' > "$au/htpasswd/new"; chmod 644 "$au/htpasswd/new"
-( chown() { return 1; }; angie_secure_auth_files "$au" )
+( chown() { return 1; }; nginx_secure_auth_files "$au" )
 check "a failed group change keeps the file readable (no root:root 0640)" \
   test "$(stat -c %a "$au/htpasswd/new")" = 644
 # Securing after the 0644 normaliser left each password file world-readable
@@ -211,8 +211,8 @@ check "a failed group change keeps the file readable (no root:root 0640)" \
 # chown/chmod passes skip files already root:<group> 0640.
 auth_before_normaliser() {
   local body s n
-  body=$(sed -n '/^deploy_angie_tree()/,/^}/p' "$ROOT/lib/web.sh")
-  s=$(grep -n 'angie_secure_auth_files "\$target"' <<<"$body" | head -1 | cut -d: -f1)
+  body=$(sed -n '/^deploy_nginx_tree()/,/^}/p' "$ROOT/lib/web.sh")
+  s=$(grep -n 'nginx_secure_auth_files "\$target"' <<<"$body" | head -1 | cut -d: -f1)
   n=$(grep -n 'exec chown root:root' <<<"$body" | head -1 | cut -d: -f1)
   [[ -n $s && -n $n && $s -lt $n ]] || return 1
   test "$(grep -B1 -E 'exec chown root:root|type f -exec chmod 644' <<<"$body" | grep -c keep_secured)" -eq 2
@@ -248,10 +248,17 @@ check "mysqlbackup payload has no AppleDouble entries" \
 check "mysqlbackup installer extracts the payload without -z" \
   grep -qF 'blob_mysqlbackup | tar -xf - -C' "$ALL_SRC"
 
-# The Angie APT key must be scoped to its repository, not globally trusted.
-angie_repo_body=$(sed -n '/^configure_angie_repo()/,/^}/p' "$ALL_SRC")
-check "Angie repository uses a signed-by keyring" \
-  grep -qF 'signed-by=' <<<"$angie_repo_body"
+# Third-party APT keys must be scoped to their repository, not globally
+# trusted.  1.22 has no nginx or PHP repository at all: both are compiled.
+elastic_repo_body=$(sed -n '/^configure_elastic_repo()/,/^}/p' "$ALL_SRC")
+check "Elastic repository uses a signed-by keyring" \
+  grep -qF 'signed-by=' <<<"$elastic_repo_body"
+nodesource_repo_body=$(sed -n '/^configure_nodesource_repo()/,/^}/p' "$ALL_SRC")
+check "NodeSource repository uses a Signed-By keyring" \
+  grep -qF 'Signed-By: ' <<<"$nodesource_repo_body"
+prep_repo_body=$(sed -n '/^prepare_repositories()/,/^}/p' "$ALL_SRC")
+check "no nginx, Angie or Sury repository is configured (all compiled)" \
+  bash -c '! grep -qiE "angie|sury|ondrej|configure_(nginx|php)_repo" <<<"$1"' _ "$prep_repo_body"
 
 # Secrets must not be passed on a command line.
 mariadb_body=$(sed -n '/^install_mariadb()/,/^}/p' "$ALL_SRC")
@@ -278,12 +285,16 @@ check "safe cron chown excludes log files" \
   cron_contains "$CRON_WWW_CHOWN" '*.log'
 stripped_cron=$(printf '%s\n' \
   '0 0 * * * /usr/bin/mysqlcheck -Aos --auto-repair' \
-  '1 1 * * * /etc/nginx/scripts/cloudflare.sh' \
+  '1 1 * * * /etc/angie/scripts/cloudflare.sh' \
+  '1 2 * * * /etc/nginx/scripts/cloudflare.sh' \
   '2 2 * * * /bin/true' | cron_strip_legacy_jobs)
 check "legacy mysqlcheck cron is stripped" \
   cron_not_contains "$stripped_cron" '/usr/bin/mysqlcheck'
-check "legacy nginx cloudflare cron is stripped" \
-  cron_not_contains "$stripped_cron" '/etc/nginx/scripts/cloudflare.sh'
+check "legacy Angie cloudflare cron is stripped" \
+  cron_not_contains "$stripped_cron" '/etc/angie/scripts/cloudflare.sh'
+# Since 1.22 /etc/nginx is the live tree again, not a pre-Angie leftover.
+check "an unmanaged /etc/nginx cloudflare cron line is kept" \
+  cron_contains "$stripped_cron" '/etc/nginx/scripts/cloudflare.sh'
 check "cron strip preserves unrelated entries" \
   cron_contains "$stripped_cron" '/bin/true'
 
@@ -395,7 +406,8 @@ fake_crontab() {
 }
 : > "$CRON_IN"
 (
-  cron_angie_configured() { return 0; }
+  cron_nginx_configured() { return 0; }
+  web_server_state() { printf none; }
   cron_mariadb_configured() { return 0; }
   crontab() { fake_crontab "$@"; }
   write_cron
@@ -414,35 +426,54 @@ check "basic-only cron run restores the log-safe chown" \
 (
   # Simulated command-line selection; write_cron must ignore it.
   # shellcheck disable=SC2034,SC2154
-  ENABLED[angie]=1
+  ENABLED[nginx]=1
   # shellcheck disable=SC2034,SC2154
   ENABLED[mariadb]=1
-  cron_angie_configured() { return 1; }
+  cron_nginx_configured() { return 1; }
+  web_server_state() { printf none; }
   cron_mariadb_configured() { return 1; }
   crontab() { fake_crontab "$@"; }
   write_cron
 ) >/dev/null 2>&1
 check "selected-but-uninstalled MariaDB gets no cron entry" \
   cron_not_contains "$(cat "$CRON_OUT")" 'mysqlbkup'
-check "selected-but-uninstalled Angie gets no cron entry" \
-  cron_not_contains "$(cat "$CRON_OUT")" '/etc/angie/'
+check "selected-but-uninstalled nginx gets no cron entry" \
+  cron_not_contains "$(cat "$CRON_OUT")" '/etc/nginx/'
 
 cat > "$CRON_IN" <<'EOF'
 0 0 * * * /usr/bin/chown www-data:www-data -R /var/www/ >/dev/null 2>&1
-1 1 * * * /etc/nginx/scripts/cloudflare.sh
+1 1 * * * /etc/angie/scripts/cloudflare.sh
 4 4 4 * * /usr/bin/mysqlcheck -Aos --auto-repair
 1 1 * * * /bin/true
 EOF
 (
-  cron_angie_configured() { return 0; }
+  cron_nginx_configured() { return 0; }
+  web_server_state() { printf none; }
   cron_mariadb_configured() { return 1; }
   crontab() { fake_crontab "$@"; }
   write_cron
 ) >/dev/null 2>&1
 check "bare legacy chown is removed" \
   cron_not_contains "$(cat "$CRON_OUT")" 'chown www-data:www-data -R /var/www'
-check "bare legacy cloudflare path is removed" \
-  cron_not_contains "$(cat "$CRON_OUT")" '/etc/nginx/scripts/cloudflare.sh'
+check "bare legacy Angie cloudflare path is removed" \
+  cron_not_contains "$(cat "$CRON_OUT")" '/etc/angie/scripts/cloudflare.sh'
+# The managed web jobs follow the tree that serves: /etc/nginx once the
+# compiled nginx is configured, never /etc/nginx while Angie still serves.
+check "cron_web_etc: a configured compiled nginx serves /etc/nginx" \
+  test "$( web_server_state() { printf nginx; }; cron_nginx_configured() { return 0; }; cron_web_etc )" = /etc/nginx
+check "cron_web_etc: legacy-Angie mode never names /etc/nginx" \
+  test "$( web_server_state() { printf angie-legacy; }; cron_nginx_configured() { return 0; }; cron_web_etc || true )" != /etc/nginx
+cwe_none_fails() {
+  local out rc=0
+  out=$( web_server_state() { printf none; }; cron_nginx_configured() { return 1; }; cron_web_etc ) || rc=$?
+  [[ $rc -ne 0 && -z $out ]]
+}
+check "cron_web_etc: no configured web server prints nothing and fails" cwe_none_fails
+check "cron_php_command: /usr/bin/php leaves the managed string unchanged" \
+  test "$( php_cli_path() { printf /usr/bin/php; }; cron_php_command "$CRON_XF_JOBS" )" = "$CRON_XF_JOBS"
+check "cron_php_command: a host with only /usr/local/bin/php gets that absolute path" \
+  bash -c '[[ $0 == *"-- /usr/local/bin/php "* && $0 != *"/usr/bin/php "* ]]' \
+  "$( php_cli_path() { printf /usr/local/bin/php; }; cron_php_command "$CRON_XF_JOBS" )"
 check "bare legacy mysqlcheck path is removed" \
   cron_not_contains "$(cat "$CRON_OUT")" '/usr/bin/mysqlcheck'
 check "bare legacy chown is replaced by the safe managed line" \
@@ -458,10 +489,11 @@ cat > "$CRON_IN" <<'EOF'
 # END setup.sh managed cron
 EOF
 (
-  cron_angie_configured() { return 1; }
+  cron_nginx_configured() { return 1; }
+  web_server_state() { printf none; }
   cron_mariadb_configured() { return 1; }
   app_find_xenforo_configs() { printf '%s\n' /var/www/xf.example/public/src/config.php; }
-  command() { if [[ ${1:-} == -v && ${2:-} == php ]]; then return 0; fi; builtin command "$@"; }
+  php_cli_path() { printf '/usr/bin/php'; }
   XF_JOB_CRON=1
   crontab() { fake_crontab "$@"; }
   write_cron
@@ -473,10 +505,11 @@ check "managed XF cron redirects the whole loop, not just true" \
 check "stale xf:run-jobs entry is replaced, not duplicated" \
   test "$(grep -c 'xf:run-jobs' "$CRON_OUT")" = 1
 (
-  cron_angie_configured() { return 1; }
+  cron_nginx_configured() { return 1; }
+  web_server_state() { printf none; }
   cron_mariadb_configured() { return 1; }
   app_find_xenforo_configs() { printf '%s\n' /var/www/xf.example/public/src/config.php; }
-  command() { if [[ ${1:-} == -v && ${2:-} == php ]]; then return 0; fi; builtin command "$@"; }
+  php_cli_path() { printf '/usr/bin/php'; }
   XF_JOB_CRON=0
   crontab() { fake_crontab "$@"; }
   write_cron
@@ -484,7 +517,8 @@ check "stale xf:run-jobs entry is replaced, not duplicated" \
 check "XF_JOB_CRON=0 drops the xf:run-jobs entry" \
   cron_not_contains "$(cat "$CRON_OUT")" 'xf:run-jobs'
 (
-  cron_angie_configured() { return 1; }
+  cron_nginx_configured() { return 1; }
+  web_server_state() { printf none; }
   cron_mariadb_configured() { return 1; }
   app_find_xenforo_configs() { :; }
   XF_JOB_CRON=1
@@ -500,26 +534,27 @@ check "CRON_XF_JOBS contains no percent sign (crontab newline)" \
 check "CRON_XF_JOBS skips database dumps, backups and .old copies" \
   bash -c '[[ $0 == *mysql_database* && $0 == *backup* && $0 == *.old* ]]' "$CRON_XF_JOBS"
 check "managed WordPress cron redirects the whole loop" \
-  grep -q 'CRON_WP_CRON} >/dev/null 2>&1 || true' "$ALL_SRC"
+  grep -qF 'cron_php_command "$CRON_WP_CRON") >/dev/null 2>&1 || true' "$ALL_SRC"
 check "managed XF cron redirects the whole loop (source)" \
-  grep -q 'CRON_XF_JOBS} >/dev/null 2>&1 || true' "$ALL_SRC"
+  grep -qF 'cron_php_command "$CRON_XF_JOBS") >/dev/null 2>&1 || true' "$ALL_SRC"
 check "CRON_XF_JOBS no longer ends with its own || true" \
   bash -c '[[ $0 != *"done || true" ]]' "$CRON_XF_JOBS"
 
 cat > "$CRON_IN" <<'EOF'
 # BEGIN setup.sh managed cron
-0 0 * * * /etc/angie/scripts/cloudflare.sh
+0 0 * * * /etc/nginx/scripts/cloudflare.sh
 3 3 * * * /usr/local/bin/mysqlbkup.sh
 # END setup.sh managed cron
 EOF
 (
-  cron_angie_configured() { return 1; }
+  cron_nginx_configured() { return 1; }
+  web_server_state() { printf none; }
   cron_mariadb_configured() { return 0; }
   crontab() { fake_crontab "$@"; }
   write_cron
 ) >/dev/null 2>&1
-check "stale Angie cron entry is dropped" \
-  cron_not_contains "$(cat "$CRON_OUT")" '/etc/angie/'
+check "stale nginx cron entry is dropped" \
+  cron_not_contains "$(cat "$CRON_OUT")" '/etc/nginx/'
 check "MariaDB cron entry is kept" \
   cron_contains "$(cat "$CRON_OUT")" 'mysqlbkup'
 
@@ -529,7 +564,8 @@ check "MariaDB cron entry is kept" \
 cp "$CRON_OUT" "$CRON_IN"
 : > "$CRON_OUT"
 (
-  cron_angie_configured() { return 1; }
+  cron_nginx_configured() { return 1; }
+  web_server_state() { printf none; }
   cron_mariadb_configured() { return 0; }
   crontab() { fake_crontab "$@"; }
   write_cron
@@ -543,7 +579,8 @@ check "unchanged managed crontab is not reinstalled" \
 : > "$CRON_IN"
 empty_cron_repair_ok() {
   (
-    cron_angie_configured() { return 0; }
+    cron_nginx_configured() { return 0; }
+    web_server_state() { printf none; }
     cron_mariadb_configured() { return 1; }
     crontab() { fake_crontab "$@"; }
     repair_optimize_legacy_cron
@@ -605,24 +642,24 @@ check "a MemTotal jitter in the log/aria buffers waits for the next start (no re
   cnf_only_pool_changed "$TMP/cnf-ram-a" "$TMP/cnf-ram-b"
 check "table_definition_cache is applied online and read back" \
   grep -qw table_definition_cache <<<"${MARIADB_ONLINE_ORDER[*]}"
-check "Angie-only cache budget uses 50% RAM" \
+check "nginx-only cache budget uses 50% RAM" \
   test "$(tune_cache_total_mb 7747 59000 50 10)" = 3840
-check "Angie+PHP cache budget uses 30% RAM" \
+check "nginx+PHP cache budget uses 30% RAM" \
   test "$(tune_cache_total_mb 7747 59000 30 5)" = 2304
 
 # The shared helper must produce the same number the real tuner uses.
-OPT_DETECTED=(angie)
-check "Angie-only cache budget uses 50% RAM" \
-  test "$(angie_cache_budget_mb 3815 57000)" = 1792
-OPT_DETECTED=(angie php:8.5)
-check "Angie+PHP cache budget uses 30% RAM" \
-  test "$(angie_cache_budget_mb 3815 57000)" = 1024
-OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
+OPT_DETECTED=(nginx)
+check "nginx-only cache budget uses 50% RAM" \
+  test "$(nginx_cache_budget_mb 3815 57000)" = 1792
+OPT_DETECTED=(nginx php:8.5)
+check "nginx+PHP cache budget uses 30% RAM" \
+  test "$(nginx_cache_budget_mb 3815 57000)" = 1024
+OPT_DETECTED=(nginx php:8.5 mariadb valkey elastic)
 check "full-stack cache budget uses 25% RAM" \
-  test "$(angie_cache_budget_mb 3815 57000)" = 768
+  test "$(nginx_cache_budget_mb 3815 57000)" = 768
 OPT_DETECTED=()
 check "no detected services uses the shared 25% default" \
-  test "$(angie_cache_budget_mb 3815 57000)" = 768
+  test "$(nginx_cache_budget_mb 3815 57000)" = 768
 
 # ---------------------------------------------------------------------------
 # PHP-FPM pool log paths
@@ -641,12 +678,12 @@ check "ensure_fpm_log_path does not create a literal runtime-variable file" \
 # ---------------------------------------------------------------------------
 mkdir -p "$TMP/socket-ok/conf.d" "$TMP/socket-direct/conf.d" "$TMP/socket-off/conf.d"
 printf 'fastcgi_pass local_php;\n' > "$TMP/socket-ok/conf.d/site.conf"
-printf 'server 127.0.0.1:9000;\n' > "$TMP/socket-ok/angie.conf"
+printf 'server 127.0.0.1:9000;\n' > "$TMP/socket-ok/nginx.conf"
 check "socket migration allowed for the local_php upstream" \
-  angie_uses_local_php_upstream "$TMP/socket-ok"
+  nginx_uses_local_php_upstream "$TMP/socket-ok"
 printf 'fastcgi_pass 127.0.0.1:9000;\n' > "$TMP/socket-direct/conf.d/site.conf"
 printf 'fastcgi_pass local_php;\n' > "$TMP/socket-direct/conf.d/other.conf"
-socket_migration_refused() { ! angie_uses_local_php_upstream "$1"; }
+socket_migration_refused() { ! nginx_uses_local_php_upstream "$1"; }
 check "socket migration refused for a direct fastcgi_pass" \
   socket_migration_refused "$TMP/socket-direct"
 printf 'fastcgi_pass local_php;\nfastcgi_next_upstream off;\n' > "$TMP/socket-off/conf.d/site.conf"
@@ -717,27 +754,34 @@ hosts_set_loopback_line "$hf" ""
 check "hosts: an empty line removes the entry (the original had none)" \
   not grep -q '127\.0\.1\.1' "$hf"
 
-# PHP purge (--upgrade-php, --purge php): dpkg warned "directory not empty"
-# for every conf.d holding our own fragments and for mods-available when
-# apt removed phpX.Y-common before the extensions.
-pp_body=$(sed -n '/^purge_php_installations() {/,/^}/p' "$ALL_SRC")
-check "PHP purge removes unowned conf.d fragments only after the /etc/php backup" \
-  bash -c 'b=$(grep -n "cp -a /etc/php" <<<"$1" | cut -d: -f1); r=$(grep -n "php_unowned_confd_files" <<<"$1" | cut -d: -f1); [[ -n $b && -n $r && $b -lt $r ]]' _ "$pp_body"
-check "PHP purge removes the -common packages in a second, last transaction" \
-  bash -c 'grep -qF "^php([0-9]+\.[0-9]+)?-common\$ ]]; then last+=" <<<"$1" && grep -qF "apt-get purge \"\${APT_OPTS[@]}\" \"\${last[@]}\"" <<<"$1"' _ "$pp_body"
-check "a failed PHP purge puts the removed conf.d fragments back" \
-  bash -c 'grep -qF "cp -a -- \"\$backup/php/\${f#/etc/php/}\" \"\$f\"" <<<"$1"' _ "$pp_body"
-pt=$TMP/phpconf; mkdir -p "$pt/8.5/fpm/conf.d" "$pt/8.5/cli/conf.d"
-: > "$pt/8.5/fpm/conf.d/zz-setup-optimize.ini"; : > "$pt/8.5/fpm/conf.d/10-opcache.ini"
-ln -s ../../mods-available/redis.ini "$pt/8.5/cli/conf.d/20-redis.ini"
-check "unowned conf.d fragments: regular files dpkg does not own, never the phpenmod links" \
-  test "$(
-    dpkg-query() { [[ $2 == */10-opcache.ini ]]; }
-    php_unowned_confd_files_t() { local f; for f in "$pt"/*/*/conf.d/*; do [[ -f $f && ! -L $f ]] || continue; dpkg-query -S "$f" >/dev/null 2>&1 && continue; printf '%s\n' "${f##*/}"; done; }
-    php_unowned_confd_files_t
-  )" = zz-setup-optimize.ini
-check "unowned conf.d scan uses the same rules as the test above" \
-  bash -c 'sed -n "/^php_unowned_confd_files() {/,/^}/p" "$1" | grep -qF "[[ -f \$f && ! -L \$f ]] || continue"' _ "$ALL_SRC"
+# --purge php/nginx/valkey: the apt pin that holds the packaged builds back is
+# narrowed, never rewritten from scratch, and goes when nothing is left.  The
+# '*' patterns must not expand against file names in the current directory.
+pin_case() {
+  local d=$TMP/pin-$1
+  mkdir -p "$d"
+  printf '# managed by setup.sh\nPackage: %s\nPin: release *\nPin-Priority: -1\n' "$2" > "$d/pin"
+  ( cd "$d" && : > php-x && : > nginx-y
+    PURGE_APT_PIN=$d/pin
+    info() { :; }
+    purge_apt_pin_remove "$3" )
+  if [[ -f $d/pin ]]; then sed -n 's/^Package: //p' "$d/pin"; else printf 'GONE'; fi
+}
+check "purge pin: nginx patterns go, the PHP families stay as written" \
+  test "$(pin_case a 'nginx nginx-* php[0-9]* php-* valkey-server' 'nginx nginx-* libnginx-mod-* angie angie-*')" = 'php[0-9]* php-* valkey-server'
+check "purge pin: the header and Pin lines are kept" \
+  bash -c 'grep -qx "# managed by setup.sh" "$1" && grep -qx "Pin-Priority: -1" "$1"' _ "$TMP/pin-a/pin"
+check "purge pin: the file is removed when no pattern is left" \
+  test "$(pin_case b 'valkey-server valkey-tools' 'valkey-server valkey-tools')" = GONE
+check "purge pin: the older bare php* pattern is dropped with the PHP families" \
+  test "$(pin_case c 'php* nginx' 'php* php[0-9]* php-* libapache2-mod-php*')" = nginx
+pp_body=$(sed -n '/^purge_php() {/,/^}/p' "$ALL_SRC")
+check "--purge php keeps the pin while another compiled php-fpm is left (ver=)" \
+  bash -c 'c=$(grep -n "compgen -G" <<<"$1" | head -1 | cut -d: -f1); p=$(grep -n "purge_apt_pin_remove" <<<"$1" | head -1 | cut -d: -f1); [[ -n $c && -n $p && $c -lt $p ]]' _ "$pp_body"
+check "--purge php runs php_build_purge and never apt-get purges PHP packages" \
+  bash -c 'grep -qF "php_build_purge \"\$ver\"" <<<"$1" && ! grep -qE "apt-get (purge|remove)|apt_purge" <<<"$1"' _ "$pp_body"
+check "--purge php releases the shared build units with the last build" \
+  grep -qF 'setup_build_remove_shared_units_if_last php' <<<"$pp_body"
 
 # Web-root hygiene: one walk of the tree (a 7.7M-file XenForo host spent
 # ~95 s in five separate walks plus a WordPress-only malware scan).
@@ -749,9 +793,9 @@ truncate -s 101M "$hw/site/mysql_database/db.sql"
 hw_run() {
   (
     SETUP_WWW_ROOT=$hw
-    # Never the host's /etc/angie: on a machine with Angie installed the
+    # Never the host's /etc/nginx: on a machine with nginx installed the
     # served-root filter turned the WARNINGs below into notes.
-    HARDEN_ANGIE_DIR=${HARDEN_ANGIE_DIR:-$hw/no-angie}
+    HARDEN_NGINX_DIR=${HARDEN_NGINX_DIR:-$hw/no-nginx}
     : > "$TMP/hygiene.calls"; : > "$TMP/hygiene.report"
     find() { printf 'x' >> "$TMP/hygiene.calls"; command find "$@"; }
     harden_note() { printf 'NOTE %s\n' "$*" >> "$TMP/hygiene.report"; }
@@ -770,16 +814,16 @@ check "hygiene reports large archives, including a world-writable one" \
   bash -c 'grep -q "WARN .*public/dump.sql" "$1" && grep -q "WARN .*ww-backup.zip" "$1"' _ "$TMP/hygiene.report"
 check "hygiene keeps mysql_database out of the archive report" \
   not grep -q 'mysql_database/db.sql' "$TMP/hygiene.report"
-# With an Angie configuration only archives below a served root/alias are
+# With an nginx configuration only archives below a served root/alias are
 # web-accessible (Pingvin's pingvin_data/uploads/shares/*/archive.zip was a
 # false WARNING on a live host).
-mkdir -p "$hw/angie/conf.d" "$hw/app_data/shares/a1"
+mkdir -p "$hw/nginx/conf.d" "$hw/app_data/shares/a1"
 truncate -s 101M "$hw/app_data/shares/a1/archive.zip"
-printf 'server {\n  root %s/site/public;\n  location /x/ { alias %s/static/; }\n  # root %s/app_data;\n}\n' "$hw" "$hw" "$hw" > "$hw/angie/conf.d/site.conf"
-hw_run_angie() { HARDEN_ANGIE_DIR=$hw/angie hw_run; }
-hw_run_angie
+printf 'server {\n  root %s/site/public;\n  location /x/ { alias %s/static/; }\n  # root %s/app_data;\n}\n' "$hw" "$hw" "$hw" > "$hw/nginx/conf.d/site.conf"
+hw_run_nginx() { HARDEN_NGINX_DIR=$hw/nginx hw_run; }
+hw_run_nginx
 check "hygiene: served roots come from root and alias, comments ignored" \
-  test "$(HARDEN_ANGIE_DIR=$hw/angie harden_served_roots | paste -sd' ' -)" = "$hw/site/public $hw/static"
+  test "$(HARDEN_NGINX_DIR=$hw/nginx harden_served_roots | paste -sd' ' -)" = "$hw/site/public $hw/static"
 check "hygiene: an archive below a served root is still a WARNING" \
   grep -q "WARN .*$hw/site/public/dump.sql" "$TMP/hygiene.report"
 check "hygiene: an archive outside every served root is a note, not a WARNING" \
@@ -841,8 +885,10 @@ check "dry-run preview reads ours from the profile it would write" \
 check "the shipped profile sets rp_filter 2 (Ubuntu's own value)" \
   test "$(sysctl_file_value "$ROOT/configs/system/sysctl.conf" net.ipv4.conf.all.rp_filter)" = 2
 
-# Stale active http.d/letsencrypt.conf (shipped for a few hours on
-# 2026-07-22): retired when it is the shipped file and no vhost uses it.
+# The compiled nginx has no ACME module (1.22): an http.d/*.conf that only
+# defines acme_client (one line, several lines or a block) is retired, while
+# any vhost still using acme/$acme_cert_* keeps everything (the migration
+# moves such vhosts to the self-signed certificate first).
 acme_case() { # setup -> "kept" or "retired"
   local t=$TMP/acme-$1
   rm -rf "$t"; mkdir -p "$t/http.d" "$t/conf.d" "$t/snippets"
@@ -850,30 +896,38 @@ acme_case() { # setup -> "kept" or "retired"
   cp "$t/http.d/letsencrypt_conf" "$t/http.d/letsencrypt.conf"
   printf 'server {\n    server_name a.test;\n}\n' > "$t/conf.d/a.test.conf"
   case $1 in
-    used)   printf 'server {\n    acme letsencrypt;\n}\n' > "$t/conf.d/b.test.conf" ;;
-    edited) printf '# operator\n' >> "$t/http.d/letsencrypt.conf" ;;
+    used)      printf 'server {\n    acme letsencrypt;\n}\n' > "$t/conf.d/b.test.conf" ;;
+    certvar)   printf 'server {\n    ssl_certificate $acme_cert_letsencrypt;\n}\n' > "$t/conf.d/b.test.conf" ;;
+    commented) printf '# operator note\n' >> "$t/http.d/letsencrypt.conf" ;;
+    mixed)     printf 'resolver 127.0.0.53;\n' >> "$t/http.d/letsencrypt.conf" ;;
+    multiline) printf 'acme_client le\n    https://acme-v02.api.letsencrypt.org/directory;\n' > "$t/http.d/letsencrypt.conf" ;;
+    block)     printf 'acme_client le https://acme.test/dir {\n    email a@b.test;\n}\n' > "$t/http.d/letsencrypt.conf" ;;
   esac
   ( tune_reset_changes; tune_retire_unused_acme_client "$t" ) >/dev/null 2>&1
   [[ -f $t/http.d/letsencrypt.conf ]] && echo kept || echo retired
 }
-check "ACME: an unused, as-shipped letsencrypt.conf is retired" test "$(acme_case unused)" = retired
+check "ACME: an unused acme_client-only letsencrypt.conf is retired" test "$(acme_case unused)" = retired
 check "ACME: a vhost with 'acme letsencrypt' keeps it" test "$(acme_case used)" = kept
-check "ACME: an operator-edited file is kept" test "$(acme_case edited)" = kept
+check "ACME: a vhost using \$acme_cert_* keeps it" test "$(acme_case certvar)" = kept
+check "ACME: comments do not count as other directives" test "$(acme_case commented)" = retired
+check "ACME: a file with another active directive is kept" test "$(acme_case mixed)" = kept
+check "ACME: a multi-line acme_client definition is retired" test "$(acme_case multiline)" = retired
+check "ACME: an acme_client block is retired" test "$(acme_case block)" = retired
 check "ACME: the inactive letsencrypt_conf template stays" \
   test -f "$TMP/acme-unused/http.d/letsencrypt_conf"
 # The sync tests the tree before the tuner runs; the retirement must come
-# first or the run that retires it still prints the warning (live host).
+# first or the run that retires it still fails its first nginx -t.
 acme_before_test() {
-  sed -n '/^deploy_angie_tree()/,/^}/p' "$ROOT/lib/web.sh" \
-    | grep -nE 'tune_retire_unused_acme_client|/usr/sbin/angie -t' | head -n 1 \
+  sed -n '/^deploy_nginx_tree()/,/^}/p' "$ROOT/lib/web.sh" \
+    | grep -nE 'tune_retire_unused_acme_client|nginx_test_tree ' | head -n 1 \
     | grep -q tune_retire_unused_acme_client
 }
-check "ACME: the sync retires the stale file before its first angie -t" acme_before_test
+check "ACME: the sync retires the stale file before its first nginx -t" acme_before_test
 
 # Superseded legacy zz-setup-*_conf files (live host: zz-setup-wordpress-
 # cache_conf redefined keys_zone=fastcgicache and map $nocacheuri).
 ls_t=$TMP/legacy-zz; mkdir -p "$ls_t/http.d"
-printf 'http {\n  include http.d/*.conf;\n}\n' > "$ls_t/angie.conf"
+printf 'http {\n  include http.d/*.conf;\n}\n' > "$ls_t/nginx.conf"
 printf 'map $request_uri $nocacheuri {\n  default 0;\n}\nfastcgi_cache_path /home/c levels=1:2 keys_zone=fastcgicache:512m max_size=1G;\n' > "$ls_t/http.d/fastcgi_cache.conf"
 printf 'map $request_uri $nocacheuri {\n  default 0;\n}\n\nfastcgi_cache_path /home/c levels=1:2 keys_zone=fastcgicache:512m max_size=2G;\n' > "$ls_t/http.d/zz-setup-wordpress-cache_conf"
 printf 'fastcgi_cache_path /home/o levels=1:2 keys_zone=onlyhere:16m;\n' > "$ls_t/http.d/zz-setup-unique_conf"
@@ -885,11 +939,11 @@ check "legacy zz-setup file with a zone nothing else defines is kept" test -f "$
 check "an inactive file without the zz-setup- prefix (operator's) is kept" test -f "$ls_t/http.d/operator_conf"
 check "loaded files are never touched by the legacy retirement" test -f "$ls_t/http.d/fastcgi_cache.conf"
 legacy_before_test() {
-  sed -n '/^deploy_angie_tree()/,/^}/p' "$ROOT/lib/web.sh" \
-    | grep -nE 'tune_retire_superseded_setup_files|/usr/sbin/angie -t' | head -n 1 \
+  sed -n '/^deploy_nginx_tree()/,/^}/p' "$ROOT/lib/web.sh" \
+    | grep -nE 'tune_retire_superseded_setup_files|nginx_test_tree ' | head -n 1 \
     | grep -q tune_retire_superseded_setup_files
 }
-check "the sync retires superseded legacy files before its first angie -t" legacy_before_test
+check "the sync retires superseded legacy files before its first nginx -t" legacy_before_test
 
 # Elasticsearch exposure through UFW (live host: network.host = public IP,
 # X-Pack off, UFW admitting only the forum server).  The warning fired twice
@@ -1114,10 +1168,18 @@ check "open_basedir repair is idempotent" test "$TUNE_DIRTY" -eq 0
 # ---------------------------------------------------------------------------
 # SIGTERM killed workers mid-connection: one MariaDB "Aborted connection"
 # warning per persistent connection on every restart.
-check "PHP-FPM unit drop-in stops gracefully (KillSignal=SIGQUIT)" \
-  grep -qx 'KillSignal=SIGQUIT' "$ROOT/configs/php/php-fpm-limits.conf"
-check "PHP-FPM unit drop-in fallback matches the shipped file's directives" \
-  bash -c 'diff <(grep -v "^#" "$1") <(sed -n "/^php_fpm_write_systemd_limits() {/,/^}/p" "$2" | sed -n "/content=.\[Service\]/,/UMask=0027./p" | sed -E "s/^ *content=.//; s/^(UMask=0027).$/\1/")' _ "$ROOT/configs/php/php-fpm-limits.conf" "$ROOT/lib/services.sh"
+# 1.22: the former limits drop-in (configs/php/php-fpm-limits.conf) is part
+# of our own phpX.Y-fpm.service.
+pb_unit=$(php_build_unit_text 8.5)
+check "PHP-FPM unit stops gracefully (KillSignal=SIGQUIT)" \
+  grep -qx 'KillSignal=SIGQUIT' <<<"$pb_unit"
+check "PHP-FPM unit carries the former limits drop-in (LimitNOFILE, UMask 0027)" \
+  bash -c 'grep -qx "LimitNOFILE=524288" <<<"$1" && grep -qx "UMask=0027" <<<"$1"' _ "$pb_unit"
+check "PHP-FPM unit runs only our compiled binary (never /usr/sbin/php-fpmX.Y)" \
+  bash -c 'grep -qE "^ExecStart=/[^ ]*/8\.5/sbin/php-fpm " <<<"$1" && ! grep -q "/usr/sbin/php-fpm" <<<"$1"' _ "$pb_unit"
+check "the 1.21 limits drop-in template is gone" test ! -e "$ROOT/configs/php/php-fpm-limits.conf"
+check "the shipped pool template starts with the managed marker" \
+  bash -c 'head -n 1 "$1" | grep -q "^; Managed by setup.sh"' _ "$ROOT/configs/php/www.conf"
 check "shipped custom_dan.ini leaves opcache.jit to the managed ini" \
   test "$(grep -cE '^[[:space:]]*opcache\.jit[[:space:]]*=' "$ROOT/configs/php/custom_dan.ini")" -eq 0
 check "shipped custom_dan.ini ships no JIT buffer" \
@@ -1173,64 +1235,64 @@ check "the OPcache file cache stays empty (restored scripts are never JIT-compil
   test "$(grep -c 'local opcache_file_cache=""' "$ALL_SRC")" -eq 1
 # [PATH=] sections: only for WordPress roots and only when
 # SETUP_PHP_JIT_WORDPRESS=0 exempts WordPress from the always-on JIT.
-mkdir -p "$TMP/jit-angie/conf.d" "$TMP/jit-wp/public" "$TMP/jit-xf/public/src"
+mkdir -p "$TMP/jit-nginx/conf.d" "$TMP/jit-wp/public" "$TMP/jit-xf/public/src"
 : > "$TMP/jit-wp/public/wp-config.php"
 : > "$TMP/jit-xf/public/src/XF.php"
-printf 'server {\n    root %s/jit-wp/public;\n    include h5bp/php_wp.conf;\n}\n' "$TMP" > "$TMP/jit-angie/conf.d/wp.conf"
-printf 'server {\n    root %s/jit-xf/public;\n    include h5bp/php_xf.conf;\n}\n' "$TMP" > "$TMP/jit-angie/conf.d/xf.conf"
+printf 'server {\n    root %s/jit-wp/public;\n    include h5bp/php_wp.conf;\n}\n' "$TMP" > "$TMP/jit-nginx/conf.d/wp.conf"
+printf 'server {\n    root %s/jit-xf/public;\n    include h5bp/php_xf.conf;\n}\n' "$TMP" > "$TMP/jit-nginx/conf.d/xf.conf"
 PHP_JIT_WORDPRESS=0
 check "WordPress roots get a [PATH=] section with the JIT off" \
-  test "$(php_jit_path_sections "$TMP/jit-angie" | grep -c "^\[PATH=$TMP/jit-wp/public\]")" -eq 1
+  test "$(php_jit_path_sections "$TMP/jit-nginx" | grep -c "^\[PATH=$TMP/jit-wp/public\]")" -eq 1
 check "the [PATH=] section turns the JIT off, not disabled" \
-  test "$(php_jit_path_sections "$TMP/jit-angie" | grep -c '^opcache\.jit = off$')" -eq 1
+  test "$(php_jit_path_sections "$TMP/jit-nginx" | grep -c '^opcache\.jit = off$')" -eq 1
 check "XenForo roots get no [PATH=] section" \
-  test "$(php_jit_path_sections "$TMP/jit-angie" | grep -c 'jit-xf')" -eq 0
+  test "$(php_jit_path_sections "$TMP/jit-nginx" | grep -c 'jit-xf')" -eq 0
 PHP_JIT_WORDPRESS=1
 check "PHP_JIT_WORDPRESS=1 (the default) writes no [PATH=] section" \
-  test -z "$(php_jit_path_sections "$TMP/jit-angie")"
+  test -z "$(php_jit_path_sections "$TMP/jit-nginx")"
 
 # Guest-cache page compression and Chevereto session GC ([PATH=] sections).
-mkdir -p "$TMP/jit-angie/h5bp" "$TMP/jit-chev/public/app"
+mkdir -p "$TMP/jit-nginx/h5bp" "$TMP/jit-chev/public/app"
 : > "$TMP/jit-chev/public/app/env.php"
-printf 'server {\n    root %s/jit-wp/public;\n    include h5bp/wordpress_cache.conf;\n    include h5bp/php_wp.conf;\n}\n' "$TMP" > "$TMP/jit-angie/conf.d/wp.conf"
-printf 'server {\n    root %s/jit-chev/public;\n    include h5bp/php_chev_cache.conf;\n}\n' "$TMP" > "$TMP/jit-angie/conf.d/chev.conf"
-printf 'fastcgi_cache_key "$scheme$request_method$host$request_uri";\n' > "$TMP/jit-angie/h5bp/wordpress_cache.conf"
-printf 'fastcgi_cache_key "$request_method$scheme$host$request_uri";\n' > "$TMP/jit-angie/h5bp/php_chev_cache.conf"
+printf 'server {\n    root %s/jit-wp/public;\n    include h5bp/wordpress_cache.conf;\n    include h5bp/php_wp.conf;\n}\n' "$TMP" > "$TMP/jit-nginx/conf.d/wp.conf"
+printf 'server {\n    root %s/jit-chev/public;\n    include h5bp/php_chev_cache.conf;\n}\n' "$TMP" > "$TMP/jit-nginx/conf.d/chev.conf"
+printf 'fastcgi_cache_key "$scheme$request_method$host$request_uri";\n' > "$TMP/jit-nginx/h5bp/wordpress_cache.conf"
+printf 'fastcgi_cache_key "$request_method$scheme$host$request_uri";\n' > "$TMP/jit-nginx/h5bp/php_chev_cache.conf"
 PHP_PAGE_GZIP=1
 check "a cache key without the encoding token gets no page compression" \
-  test "$(php_jit_path_sections "$TMP/jit-angie" | grep -c '^zlib\.output_compression = On$')" -eq 0
+  test "$(php_jit_path_sections "$TMP/jit-nginx" | grep -c '^zlib\.output_compression = On$')" -eq 0
 check "a Chevereto root always gets PHP session GC" \
-  test "$(php_jit_path_sections "$TMP/jit-angie" | grep -A3 "^\[PATH=$TMP/jit-chev/public\]" | grep -c '^session\.gc_probability = 1$')" -eq 1
-printf 'fastcgi_cache_key "$scheme$request_method$host$request_uri|$guest_cache_enc";\n' > "$TMP/jit-angie/h5bp/wordpress_cache.conf"
-printf 'fastcgi_cache_key "$request_method$scheme$host$request_uri|$guest_cache_enc";\n' > "$TMP/jit-angie/h5bp/php_chev_cache.conf"
+  test "$(php_jit_path_sections "$TMP/jit-nginx" | grep -A3 "^\[PATH=$TMP/jit-chev/public\]" | grep -c '^session\.gc_probability = 1$')" -eq 1
+printf 'fastcgi_cache_key "$scheme$request_method$host$request_uri|$guest_cache_enc";\n' > "$TMP/jit-nginx/h5bp/wordpress_cache.conf"
+printf 'fastcgi_cache_key "$request_method$scheme$host$request_uri|$guest_cache_enc";\n' > "$TMP/jit-nginx/h5bp/php_chev_cache.conf"
 check "WordPress and Chevereto roots behind an encoding-aware cache compress in PHP" \
-  test "$(php_jit_path_sections "$TMP/jit-angie" | grep -c '^zlib\.output_compression = On$')" -eq 2
+  test "$(php_jit_path_sections "$TMP/jit-nginx" | grep -c '^zlib\.output_compression = On$')" -eq 2
 check "each document root gets exactly one [PATH=] section" \
-  test "$(php_jit_path_sections "$TMP/jit-angie" | grep -c '^\[PATH=')" -eq 2
+  test "$(php_jit_path_sections "$TMP/jit-nginx" | grep -c '^\[PATH=')" -eq 2
 # The stored page is compressed once per MISS and sent on every hit: level 6
 # (5 % smaller than 4, 9 adds 0.5 %).
 check "PHP page gzip for the guest cache uses level 6" \
-  test "$(php_jit_path_sections "$TMP/jit-angie" | grep -c '^zlib\.output_compression_level = 6$')" -eq 2
+  test "$(php_jit_path_sections "$TMP/jit-nginx" | grep -c '^zlib\.output_compression_level = 6$')" -eq 2
 # --domain app=wordpress|chevereto creates the vhost before the files exist:
 # the vhost alone decides (the section used to wait for the next --optimize).
 mkdir -p "$TMP/jit-wp2/public" "$TMP/jit-chev2/public"
-printf 'server {\n    root %s/jit-wp2/public;\n    include h5bp/wordpress_cache.conf;\n    include h5bp/php_wp.conf;\n}\n' "$TMP" > "$TMP/jit-angie/conf.d/wp2.conf"
-printf 'server {\n    root %s/jit-chev2/public;\n    include h5bp/php_chev_cache.conf;\n}\n' "$TMP" > "$TMP/jit-angie/conf.d/chev2.conf"
+printf 'server {\n    root %s/jit-wp2/public;\n    include h5bp/wordpress_cache.conf;\n    include h5bp/php_wp.conf;\n}\n' "$TMP" > "$TMP/jit-nginx/conf.d/wp2.conf"
+printf 'server {\n    root %s/jit-chev2/public;\n    include h5bp/php_chev_cache.conf;\n}\n' "$TMP" > "$TMP/jit-nginx/conf.d/chev2.conf"
 check "an empty WordPress/Chevereto root behind an encoding-aware cache compresses in PHP" \
-  test "$(php_jit_path_sections "$TMP/jit-angie" | grep -A2 -E "^\[PATH=$TMP/jit-(wp2|chev2)/public\]" | grep -c '^zlib\.output_compression = On$')" -eq 2
-rm -f "$TMP/jit-angie/conf.d/wp2.conf" "$TMP/jit-angie/conf.d/chev2.conf"
+  test "$(php_jit_path_sections "$TMP/jit-nginx" | grep -A2 -E "^\[PATH=$TMP/jit-(wp2|chev2)/public\]" | grep -c '^zlib\.output_compression = On$')" -eq 2
+rm -f "$TMP/jit-nginx/conf.d/wp2.conf" "$TMP/jit-nginx/conf.d/chev2.conf"
 check "XenForo roots get no page compression (XenForo compresses itself)" \
-  test "$(php_jit_path_sections "$TMP/jit-angie" | grep -c 'jit-xf')" -eq 0
+  test "$(php_jit_path_sections "$TMP/jit-nginx" | grep -c 'jit-xf')" -eq 0
 PHP_JIT_WORDPRESS=0
 check "JIT exemption and page compression share one WordPress section" \
-  test "$(php_jit_path_sections "$TMP/jit-angie" | grep -A6 "^\[PATH=$TMP/jit-wp/public\]" | grep -cE '^(opcache\.jit = off|zlib\.output_compression = On)$')" -eq 2
+  test "$(php_jit_path_sections "$TMP/jit-nginx" | grep -A6 "^\[PATH=$TMP/jit-wp/public\]" | grep -cE '^(opcache\.jit = off|zlib\.output_compression = On)$')" -eq 2
 PHP_JIT_WORDPRESS=1
 PHP_PAGE_GZIP=0
 check "SETUP_PHP_PAGE_GZIP=0 writes no compression section" \
-  test "$(php_jit_path_sections "$TMP/jit-angie" | grep -c '^zlib\.output_compression')" -eq 0
+  test "$(php_jit_path_sections "$TMP/jit-nginx" | grep -c '^zlib\.output_compression')" -eq 0
 PHP_PAGE_GZIP=1
-rm -f "$TMP/jit-angie/conf.d/chev.conf" "$TMP/jit-angie/h5bp/wordpress_cache.conf"
-printf 'server {\n    root %s/jit-wp/public;\n    include h5bp/php_wp.conf;\n}\n' "$TMP" > "$TMP/jit-angie/conf.d/wp.conf"
+rm -f "$TMP/jit-nginx/conf.d/chev.conf" "$TMP/jit-nginx/h5bp/wordpress_cache.conf"
+printf 'server {\n    root %s/jit-wp/public;\n    include h5bp/php_wp.conf;\n}\n' "$TMP" > "$TMP/jit-nginx/conf.d/wp.conf"
 
 # A systemd drop-in with unchanged content is not rewritten (no mtime bump,
 # so systemd does not ask for a daemon-reload).
@@ -1248,17 +1310,6 @@ check "an identical drop-in keeps its mtime" \
   test "$(stat -c %Y "$TMP/dropin/limits.conf")" = "$dropin_mtime"
 check "a changed drop-in is rewritten" \
   write_service_limits_dropin "$TMP/dropin/limits.conf" $'[Service]\nLimitNOFILE=2'
-
-# Extensions a previous --upgrade-php could not install stay wanted.
-PHP_UPGRADE_SKIPPED=("imagick (php8.5-imagick: php8.6-imagick is not published)" "redis (php8.5-redis: php8.6-redis is not published yet)")
-PHP_UPGRADE_PENDING_FILE="$TMP/pending/php-pending-extensions"
-php_upgrade_record_pending
-check "skipped extensions are recorded for the next upgrade" \
-  test "$(tr '\n' ' ' < "$PHP_UPGRADE_PENDING_FILE")" = "imagick redis "
-PHP_UPGRADE_SKIPPED=()
-php_upgrade_record_pending
-check "the pending list is removed once nothing is missing" \
-  test ! -e "$PHP_UPGRADE_PENDING_FILE"
 
 
 mkdir -p "$TMP/index-repair"
@@ -1282,21 +1333,21 @@ tune_ensure_index "$TMP/index-repair/polr.conf"
 check "existing index is left untouched" test "$TUNE_DIRTY" -eq 0
 
 # ---------------------------------------------------------------------------
-# Angie tuning against the repository fixture
+# nginx tuning against the repository fixture
 # ---------------------------------------------------------------------------
-mkdir -p "$TMP/angie"
-cp -a "$FIXTURES/." "$TMP/angie/"
+mkdir -p "$TMP/nginx"
+cp -a "$FIXTURES/." "$TMP/nginx/"
 OPT_PHP_OK=1
 OPT_PHP_SOCKET=/run/php/php-fpm.sock
-OPT_DETECTED=(angie php:8.3 mariadb valkey elastic)
+OPT_DETECTED=(nginx php:8.3 mariadb valkey elastic)
 tune_reset_changes
-tune_angie_configs "$TMP/angie"
+tune_nginx_configs "$TMP/nginx"
 
-check "angie.conf FastCGI upstream moves to the shared socket" \
-  grep -q 'server unix:/run/php/php-fpm.sock;' "$TMP/angie/angie.conf"
-check "angie.conf keeps exactly one client_body_buffer_size" \
-  test "$(grep -c '^[[:space:]]*client_body_buffer_size' "$TMP/angie/angie.conf")" -eq 1
-# Same basis as tune_angie_configs: mem_total_mb is capped by a cgroup
+check "nginx.conf FastCGI upstream moves to the shared socket" \
+  grep -q 'server unix:/run/php/php-fpm.sock;' "$TMP/nginx/nginx.conf"
+check "nginx.conf keeps exactly one client_body_buffer_size" \
+  test "$(grep -c '^[[:space:]]*client_body_buffer_size' "$TMP/nginx/nginx.conf")" -eq 1
+# Same basis as tune_nginx_configs: mem_total_mb is capped by a cgroup
 # memory limit, which raw MemTotal is not (docker --memory=4g on a big host).
 mem_kb=$(( $(mem_total_mb) * 1024 ))
 if (( mem_kb < 2048 * 1024 )); then
@@ -1307,26 +1358,26 @@ else
   exp_body_buffer=256k
 fi
 check "client_body_buffer_size is inside the http block and sized for RAM" \
-  test "$(awk '/^http \{/{getline; print}' "$TMP/angie/angie.conf")" = \
+  test "$(awk '/^http \{/{getline; print}' "$TMP/nginx/nginx.conf")" = \
        "  client_body_buffer_size ${exp_body_buffer};"
 check "worker_rlimit_nofile is inserted after worker_processes" \
-  test "$(awk '/^worker_processes/{getline; print}' "$TMP/angie/angie.conf")" = \
-       "$(grep 'worker_rlimit_nofile' "$TMP/angie/angie.conf")"
+  test "$(awk '/^worker_processes/{getline; print}' "$TMP/nginx/nginx.conf")" = \
+       "$(grep 'worker_rlimit_nofile' "$TMP/nginx/nginx.conf")"
 # Idle FastCGI upstream connections pin PHP-FPM workers (see the live-origin
 # audit): the tuner must remove the cache inside `upstream local_php` and
 # leave the http-level keepalive_timeout alone.
 check "PHP upstream keepalive cache is removed" \
-  test "$(awk '/^upstream[[:space:]]+local_php/{f=1} f&&/^[[:space:]]*}[[:space:]]*$/{f=0} f&&/^[[:space:]]*keepalive([[:space:]]|_timeout)/{n++} END{print n+0}' "$TMP/angie/angie.conf")" -eq 0
-check "the report exposes keepalive as off" test "$ANGIE_PHP_KEEPALIVE" = off
+  test "$(awk '/^upstream[[:space:]]+local_php/{f=1} f&&/^[[:space:]]*}[[:space:]]*$/{f=0} f&&/^[[:space:]]*keepalive([[:space:]]|_timeout)/{n++} END{print n+0}' "$TMP/nginx/nginx.conf")" -eq 0
+check "the report exposes keepalive as off" test "$NGINX_PHP_KEEPALIVE" = off
 check "fastcgi_keep_conn is forced off in every PHP include" \
-  test "$(grep -h '^fastcgi_keep_conn on;' "$TMP/angie"/h5bp/php*.conf | wc -l)" -eq 0
+  test "$(grep -h '^fastcgi_keep_conn on;' "$TMP/nginx"/h5bp/php*.conf | wc -l)" -eq 0
 check "fastcgi_keep_conn off is present where it was on" \
-  grep -q '^fastcgi_keep_conn off;' "$TMP/angie/h5bp/php.conf"
+  grep -q '^fastcgi_keep_conn off;' "$TMP/nginx/h5bp/php.conf"
 # The current server-configs-nginx tree already ships `off`: a second pass
 # has nothing to rewrite and must not report six "tune not applied" warnings
 # on every fresh install.
 tune_reset_changes
-angie_disable_php_keep_conn "$TMP/angie"
+nginx_disable_php_keep_conn "$TMP/nginx"
 check "fastcgi_keep_conn already off is not a missed tune" \
   test "${#TUNE_MISSES[@]}" -eq 0
 check "fastcgi_keep_conn already off is not reported as a change" \
@@ -1356,32 +1407,32 @@ ufw_align_sysctl "$TMP/ufw-sysctl.conf" "$TMP/profile-empty.conf" >/dev/null
 check "ufw sysctl alignment does nothing without a managed value" \
   cmp -s "$TMP/ufw-sysctl.conf" "$TMP/ufw-sysctl.before"
 check "http-level keepalive_timeout is preserved" \
-  grep -q '^[[:space:]]*keepalive_timeout 30s;' "$TMP/angie/angie.conf"
+  grep -q '^[[:space:]]*keepalive_timeout 30s;' "$TMP/nginx/nginx.conf"
 
 # Multi-line proxy_cache_path directives must have their max_size rewritten.
-if grep -q 'max_size=16g' "$TMP/angie/http.d/proxy_cache.conf"; then
+if grep -q 'max_size=16g' "$TMP/nginx/http.d/proxy_cache.conf"; then
   t_fail "proxy_cache.conf max_size is updated on continuation lines"
 else
   t_pass "proxy_cache.conf max_size is updated on continuation lines"
 fi
 check "proxy_cache.conf keeps both cache paths" \
-  test "$(grep -c '^proxy_cache_path' "$TMP/angie/http.d/proxy_cache.conf")" -eq 2
+  test "$(grep -c '^proxy_cache_path' "$TMP/nginx/http.d/proxy_cache.conf")" -eq 2
 check "fastcgi_cache zone is resized" \
   grep -qE 'keys_zone=fastcgicache:[0-9]+m max_size=[0-9]+[MG]' \
-  "$TMP/angie/http.d/fastcgi_cache.conf"
+  "$TMP/nginx/http.d/fastcgi_cache.conf"
 check "fastcgi_cache_chev gains a max_size" \
   grep -qE 'keys_zone=fastcgicache_chev:[0-9]+m max_size=[0-9]+[MG]' \
-  "$TMP/angie/http.d/fastcgi_cache_chev.conf"
+  "$TMP/nginx/http.d/fastcgi_cache_chev.conf"
 check "tuning preserves use_temp_path=off on the FastCGI cache" \
-  grep -q 'use_temp_path=off' "$TMP/angie/http.d/fastcgi_cache.conf"
+  grep -q 'use_temp_path=off' "$TMP/nginx/http.d/fastcgi_cache.conf"
 check "tuning preserves use_temp_path=off on the XenForo proxy cache" \
-  grep -q 'use_temp_path=off' "$TMP/angie/http.d/xf_proxy_cache.conf"
+  grep -q 'use_temp_path=off' "$TMP/nginx/http.d/xf_proxy_cache.conf"
 check "PHP fastcgi buffers are tuned" \
-  grep -qE '^fastcgi_busy_buffers_size [0-9]+[mk];' "$TMP/angie/h5bp/php.conf"
+  grep -qE '^fastcgi_busy_buffers_size [0-9]+[mk];' "$TMP/nginx/h5bp/php.conf"
 
 # A second identical run must not report any changes (idempotency).
 tune_reset_changes
-tune_angie_configs "$TMP/angie"
+tune_nginx_configs "$TMP/nginx"
 check "second tune run is a no-op" test "$TUNE_DIRTY" -eq 0
 # --- audit 1.21.58: web-robustness
 
@@ -1390,73 +1441,73 @@ check "second tune run is a no-op" test "$TUNE_DIRTY" -eq 0
 # pointed it back, so every PHP site returned 502.  The helper follows the
 # live listener in both directions and only inside `upstream local_php`.
 lp=$TMP/local-php; mkdir -p "$lp"
-printf 'upstream other {\n  server unix:/run/other.sock;\n}\nupstream local_php {\n  zone localphp_zone 256k;\n  server unix:/run/php/php-fpm.sock;\n}\n' > "$lp/angie.conf"
+printf 'upstream other {\n  server unix:/run/other.sock;\n}\nupstream local_php {\n  zone localphp_zone 256k;\n  server unix:/run/php/php-fpm.sock;\n}\n' > "$lp/nginx.conf"
 tune_reset_changes
-angie_local_php_follow_pool "$lp/angie.conf" 127.0.0.1:9000
+nginx_local_php_follow_pool "$lp/nginx.conf" 127.0.0.1:9000
 check "local_php follows a live TCP pool after the sync" \
-  grep -qx '  server 127.0.0.1:9000;' "$lp/angie.conf"
+  grep -qx '  server 127.0.0.1:9000;' "$lp/nginx.conf"
 check "local_php repoint leaves another upstream's socket alone" \
-  grep -qx '  server unix:/run/other.sock;' "$lp/angie.conf"
+  grep -qx '  server unix:/run/other.sock;' "$lp/nginx.conf"
 check "local_php TCP repoint is reported as a change" test "$TUNE_DIRTY" -eq 1
-angie_local_php_follow_pool "$lp/angie.conf" 9001
+nginx_local_php_follow_pool "$lp/nginx.conf" 9001
 check "a bare-port pool is dialled on loopback" \
-  grep -qx '  server 127.0.0.1:9001;' "$lp/angie.conf"
-angie_local_php_follow_pool "$lp/angie.conf" '[::]:9002'
+  grep -qx '  server 127.0.0.1:9001;' "$lp/nginx.conf"
+nginx_local_php_follow_pool "$lp/nginx.conf" '[::]:9002'
 check "a wildcard IPv6 pool is dialled on ::1" \
-  grep -qx '  server \[::1\]:9002;' "$lp/angie.conf"
-angie_local_php_follow_pool "$lp/angie.conf" /run/php/php-fpm.sock
+  grep -qx '  server \[::1\]:9002;' "$lp/nginx.conf"
+nginx_local_php_follow_pool "$lp/nginx.conf" /run/php/php-fpm.sock
 check "local_php follows a socket pool back from TCP" \
-  grep -qx '  server unix:/run/php/php-fpm.sock;' "$lp/angie.conf"
+  grep -qx '  server unix:/run/php/php-fpm.sock;' "$lp/nginx.conf"
 tune_reset_changes
-angie_local_php_follow_pool "$lp/angie.conf" /run/php/php-fpm.sock
-angie_local_php_follow_pool "$lp/angie.conf" ""
-angie_local_php_follow_pool "$lp/angie.conf" 'not a listener'
+nginx_local_php_follow_pool "$lp/nginx.conf" /run/php/php-fpm.sock
+nginx_local_php_follow_pool "$lp/nginx.conf" ""
+nginx_local_php_follow_pool "$lp/nginx.conf" 'not a listener'
 check "an unchanged, empty or unknown listener is a no-op" test "$TUNE_DIRTY" -eq 0
 # No pipeline with an early-exiting reader: under `set -o pipefail` a writer
 # killed by SIGPIPE after `awk ... exit` / `grep -q` fails the check even
 # though the text is there (it failed once on CI with identical code).
 local_php_live_gate() {
   local body seg
-  body=$(sed -n '/^tune_angie_configs()/,/^}/p' "$ROOT/lib/web.sh")
-  seg=${body#*'elif [[ $target == /etc/angie ]]; then'}
+  body=$(sed -n '/^tune_nginx_configs()/,/^}/p' "$ROOT/lib/web.sh")
+  seg=${body#*'elif [[ $target == /etc/nginx ]]; then'}
   [[ $seg != "$body" ]] || return 1
   seg=${seg%%$'\n  fi\n'*}
-  [[ $seg == *'angie_local_php_follow_pool "$nginx_conf" "$live_listen"'* ]]
+  [[ $seg == *'nginx_local_php_follow_pool "$nginx_conf" "$live_listen"'* ]]
 }
 check "the tuner follows the live pool only for the live tree without a socket handover" local_php_live_gate
 
-# The deploy path validates the synced tree before angie_apply_profile runs,
+# The deploy path validates the synced tree before nginx_apply_profile runs,
 # so it must apply the nested-include migration first (a hand-written vhost
 # may include php_xf.conf inside a location; the named location is
-# server-level only and angie -t fails otherwise).
-deploy_body=$(declare -f deploy_angie_tree)
-check "the Angie deploy test migrates nested XF includes first" \
-  bash -c 'a=$(grep -n "angie_migrate_guest_cache_includes" <<<"$1" | head -1 | cut -d: -f1); b=$(grep -n "angie -t" <<<"$1" | head -1 | cut -d: -f1); [[ -n $a && -n $b && $a -lt $b ]]' _ "$deploy_body"
+# server-level only and nginx -t fails otherwise).
+deploy_body=$(declare -f deploy_nginx_tree)
+check "the nginx deploy test migrates nested XF includes first" \
+  bash -c 'a=$(grep -n "nginx_migrate_guest_cache_includes" <<<"$1" | head -1 | cut -d: -f1); b=$(grep -n "nginx_test_tree" <<<"$1" | head -1 | cut -d: -f1); [[ -n $a && -n $b && $a -lt $b ]]' _ "$deploy_body"
 
 # A PHP include that only holds locations has no FastCGI buffers of its own:
 # h5bp/php_wp.conf now includes h5bp/php_wp_handler.conf for the handler, so
 # the buffer tuner must skip it instead of reporting three misses per install.
-mkdir -p "$TMP/angie-include"
-cp -a "$FIXTURES/." "$TMP/angie-include/"
+mkdir -p "$TMP/nginx-include"
+cp -a "$FIXTURES/." "$TMP/nginx-include/"
 printf 'location ~ \\.php$ { include h5bp/php_wp_handler.conf; }\n' \
-  > "$TMP/angie-include/h5bp/php_wp.conf"
+  > "$TMP/nginx-include/h5bp/php_wp.conf"
 printf 'fastcgi_pass local_php;\nfastcgi_buffer_size 1k;\nfastcgi_buffers 8 8k;\nfastcgi_busy_buffers_size 16k;\n' \
-  > "$TMP/angie-include/h5bp/php_wp_handler.conf"
+  > "$TMP/nginx-include/h5bp/php_wp_handler.conf"
 tune_reset_changes
-tune_angie_configs "$TMP/angie-include"
+tune_nginx_configs "$TMP/nginx-include"
 check "an include without fastcgi_pass is not a missed buffer tune" \
   test -z "$(printf '%s\n' "${TUNE_MISSES[@]}" | grep 'php_wp.conf' || true)"
 check "the shared PHP handler fragment is still tuned" \
-  not grep -q 'fastcgi_buffer_size 1k;' "$TMP/angie-include/h5bp/php_wp_handler.conf"
+  not grep -q 'fastcgi_buffer_size 1k;' "$TMP/nginx-include/h5bp/php_wp_handler.conf"
 
-# A pool that stays on TCP must leave Angie's TCP upstream alone.
-mkdir -p "$TMP/angie-tcp"
-cp -a "$FIXTURES/." "$TMP/angie-tcp/"
+# A pool that stays on TCP must leave nginx's TCP upstream alone.
+mkdir -p "$TMP/nginx-tcp"
+cp -a "$FIXTURES/." "$TMP/nginx-tcp/"
 OPT_PHP_SOCKET=""
 tune_reset_changes
-tune_angie_configs "$TMP/angie-tcp"
+tune_nginx_configs "$TMP/nginx-tcp"
 check "TCP FastCGI upstream is preserved when PHP stays on TCP" \
-  grep -q '^[[:space:]]*server 127.0.0.1:9000;' "$TMP/angie-tcp/angie.conf"
+  grep -q '^[[:space:]]*server 127.0.0.1:9000;' "$TMP/nginx-tcp/nginx.conf"
 
 # An active .conf file must win over an inert _conf leftover with the same zone.
 mkdir -p "$TMP/active"
@@ -1469,7 +1520,7 @@ fastcgi_cache_path /home/nginx_cache_test levels=1:2 keys_zone=fastcgicache:256m
 EOF
 OPT_PHP_SOCKET=""
 tune_reset_changes
-tune_angie_configs "$TMP/active"
+tune_nginx_configs "$TMP/active"
 # mb_to_config writes a whole GiB as G (a 4096 MB budget gives max_size=2G).
 check "active fastcgi_cache.conf gains a max_size" \
   grep -qE 'keys_zone=fastcgicache:[0-9]+m max_size=[0-9]+[MG]' \
@@ -1485,7 +1536,7 @@ cp -a "$FIXTURES/." "$TMP/legacy/"
 for name in fastcgi_cache fastcgi_cache_chev xf_proxy_cache proxy_cache limit_req; do
   mv "$TMP/legacy/http.d/${name}.conf" "$TMP/legacy/http.d/${name}_conf"
 done
-sed_in_place 's#include http.d/\*\.conf;#include http.d/*_conf;#' "$TMP/legacy/angie.conf"
+sed_in_place 's#include http.d/\*\.conf;#include http.d/*_conf;#' "$TMP/legacy/nginx.conf"
 cat > "$TMP/legacy/http.d/fastcgi_cache_custom_conf" <<'EOF'
 fastcgi_cache_path /home/nginx_cache_custom levels=1:2 keys_zone=customcache:5120m inactive=30d;
 EOF
@@ -1493,7 +1544,7 @@ cat > "$TMP/legacy/http.d/proxy_cache_extra_conf" <<'EOF'
 proxy_cache_path /home/proxy_extra levels=1:2 keys_zone=extracache:128m max_size=512g inactive=30d;
 EOF
 tune_reset_changes
-tune_angie_configs "$TMP/legacy"
+tune_nginx_configs "$TMP/legacy"
 check "legacy fastcgi_cache_conf is resized in place" \
   grep -qE 'keys_zone=fastcgicache:[0-9]+m max_size=[0-9]+[MG]' \
   "$TMP/legacy/http.d/fastcgi_cache_conf"
@@ -1511,7 +1562,7 @@ extra_max=$(grep -oE 'max_size=[0-9]+[mM]' \
   "$TMP/legacy/http.d/proxy_cache_extra_conf" | head -n1 | sed 's/.*=//; s/[mM]$//')
 check "custom proxy cache max_size is capped" test "$extra_max" -le 1024
 tune_reset_changes
-tune_angie_configs "$TMP/legacy"
+tune_nginx_configs "$TMP/legacy"
 check "legacy layout second run is a no-op" test "$TUNE_DIRTY" -eq 0
 
 # A host with only one active cache type gets the whole cache budget.
@@ -1520,8 +1571,8 @@ cache_mem_mb=$(mem_total_mb)
 # capped at 10x its free space).  The test used plain free space on /var/www: equal to the tuner's
 # number only while RAM is the binding cap, so a CI runner with a small,
 # fuller disk failed this check on every push.
-cache_disk_mb=$(angie_disk_free_mb)
-expected_cache_angie=$(tune_cache_total_mb "$cache_mem_mb" "$cache_disk_mb" 50 10)
+cache_disk_mb=$(nginx_disk_free_mb)
+expected_cache_nginx=$(tune_cache_total_mb "$cache_mem_mb" "$cache_disk_mb" 50 10)
 expected_cache_php=$(tune_cache_total_mb "$cache_mem_mb" "$cache_disk_mb" 30 5)
 
 mkdir -p "$TMP/xfonly/disabled"
@@ -1531,11 +1582,11 @@ mv "$TMP/xfonly/http.d/fastcgi_cache.conf" \
    "$TMP/xfonly/http.d/proxy_cache.conf" \
    "$TMP/xfonly/http.d/limit_req.conf" "$TMP/xfonly/disabled/"
 OPT_PHP_SOCKET=""
-OPT_DETECTED=(angie)
+OPT_DETECTED=(nginx)
 tune_reset_changes
-tune_angie_configs "$TMP/xfonly"
-check "proxy-only host gives the whole Angie-only budget to xfproxycache" \
-  grep -q "max_size=$(tune_size_value "$expected_cache_angie")" \
+tune_nginx_configs "$TMP/xfonly"
+check "proxy-only host gives the whole nginx-only budget to xfproxycache" \
+  grep -q "max_size=$(tune_size_value "$expected_cache_nginx")" \
   "$TMP/xfonly/http.d/xf_proxy_cache.conf"
 
 mkdir -p "$TMP/fcgionly/disabled"
@@ -1545,10 +1596,10 @@ mv "$TMP/fcgionly/http.d/fastcgi_cache_chev.conf" \
    "$TMP/fcgionly/http.d/xf_proxy_cache.conf" \
    "$TMP/fcgionly/http.d/limit_req.conf" "$TMP/fcgionly/disabled/"
 OPT_PHP_SOCKET=""
-OPT_DETECTED=(angie php:8.3)
+OPT_DETECTED=(nginx php:8.3)
 tune_reset_changes
-tune_angie_configs "$TMP/fcgionly"
-check "PHP-only host gives the whole Angie+PHP budget to fastcgicache" \
+tune_nginx_configs "$TMP/fcgionly"
+check "PHP-only host gives the whole nginx+PHP budget to fastcgicache" \
   grep -q "max_size=$(tune_size_value "$expected_cache_php")" \
   "$TMP/fcgionly/http.d/fastcgi_cache.conf"
 
@@ -1692,7 +1743,7 @@ check "PATH_TRANSLATED repair is idempotent" test "$TUNE_DIRTY" -eq 0
 
 check "--optimize repairs PATH_TRANSLATED in the PHP includes" \
   grep -q 'tune_fastcgi_path_translated_all "$target"' \
-  <<<"$(sed -n '/^tune_angie_configs()/,/^}/p' "$ALL_SRC")"
+  <<<"$(sed -n '/^tune_nginx_configs()/,/^}/p' "$ALL_SRC")"
 
 # Every php*.conf include is covered, including XenForo and future variants.
 mkdir -p "$TMP/path-translated-all/h5bp"
@@ -1848,7 +1899,7 @@ valkey_data_size_mb() { printf '0'; }
 hugepages_php_present() { return 1; }
 host_is_container() { return 1; }
 elasticsearch_operator_direct_mb() { :; }
-OPT_DETECTED=(angie php:8.4 mariadb valkey elastic)
+OPT_DETECTED=(nginx php:8.4 mariadb valkey elastic)
 plan_memory_budget
 check "PHP budget is at most 50% of RAM" \
   test "$OPT_PHP_BUDGET_MB" -le $(( 131072 * 50 / 100 ))
@@ -1863,7 +1914,7 @@ check "all fixed budgets are positive" \
 # identical on a host whose pool was sized by hand.
 mem_total_mb() { printf '65536'; }
 php_pool_max_children() { printf '128'; }
-OPT_DETECTED=(angie php:8.3 mariadb redis elastic)
+OPT_DETECTED=(nginx php:8.3 mariadb redis elastic)
 plan_memory_budget
 check "PHP budget follows 2 workers per CPU, not the live pool" \
   test "$OPT_PHP_BUDGET_MB" -eq $(( 32 * 96 ))
@@ -1879,7 +1930,7 @@ check "PHP-first plan stays inside the 80% budget" \
 php_pool_max_children() { printf '6'; }
 mariadb_data_size_mb() { printf '20000'; }
 elasticsearch_data_size_mb() { printf '0'; }
-OPT_DETECTED=(angie php:8.3 mariadb)
+OPT_DETECTED=(nginx php:8.3 mariadb)
 plan_memory_budget
 check "PHP budget uses the 2-per-CPU floor" \
   test "$OPT_PHP_BUDGET_MB" -eq $(( 32 * 96 ))
@@ -1888,7 +1939,7 @@ check "MariaDB gets the remaining budget after the PHP floor" \
 
 # Restore the 128-worker context used by the database/index cases below.
 php_pool_max_children() { printf '128'; }
-OPT_DETECTED=(angie php:8.3 mariadb redis elastic)
+OPT_DETECTED=(nginx php:8.3 mariadb redis elastic)
 
 # The buffer pool is sized from the live data+index size plus 5% for growth
 # (a working-set cache, not a mirror of the database).  A mixed host caps it
@@ -1910,7 +1961,7 @@ check "database-fit plan stays inside the 80% budget" \
 mem_total_mb() { printf '25600'; }
 mariadb_current_pool_mb() { printf '0'; }
 mariadb_data_size_mb() { printf '935'; }
-OPT_DETECTED=(angie php:8.5 mariadb)
+OPT_DETECTED=(nginx php:8.5 mariadb)
 plan_memory_budget
 check "a 935 MB database is not under-sized" \
   test "$OPT_MARIADB_BUDGET_MB" -eq 981
@@ -1923,7 +1974,7 @@ mariadb_current_pool_mb() { printf '0'; }
 mariadb_data_size_mb() { printf '81'; }
 elasticsearch_data_size_mb() { printf '0'; }
 php_pool_max_children() { printf '128'; }
-OPT_DETECTED=(angie php:8.4 mariadb valkey elastic)
+OPT_DETECTED=(nginx php:8.4 mariadb valkey elastic)
 plan_memory_budget
 check "tiny live database uses the 128 MB minimum" \
   test "$OPT_MARIADB_BUDGET_MB" -eq 128
@@ -1937,7 +1988,7 @@ check "tiny database floor stays inside the 80% budget" \
 mem_total_mb() { printf '65536'; }
 mariadb_current_pool_mb() { printf '0'; }
 php_pool_max_children() { printf '128'; }
-OPT_DETECTED=(angie php:8.3 mariadb redis elastic)
+OPT_DETECTED=(nginx php:8.3 mariadb redis elastic)
 # The database/heap assertions below are about the data tiers, so pin a small
 # CPU count: the PHP pool now reserves 2 workers per logical CPU, and a large
 # PHP floor would legitimately trim the database share on this 64 GB host.
@@ -1957,7 +2008,7 @@ mem_total_mb() { printf '262144'; }
 mariadb_current_pool_mb() { printf '100000'; }
 mariadb_data_size_mb() { printf '73599'; }
 elasticsearch_data_size_mb() { printf '0'; }
-OPT_DETECTED=(angie php:8.4 mariadb valkey)
+OPT_DETECTED=(nginx php:8.4 mariadb valkey)
 plan_memory_budget
 check "a live pool far above data+5% shrinks to it (73599 MB + 5% = 77278 MB)" \
   test "$OPT_MARIADB_BUDGET_MB" -eq 77278
@@ -2030,9 +2081,9 @@ plan_memory_budget
 check "Valkey-only empty cache uses the RAM floor (RAM/64, 128 MB..1 GB)" \
   test "$OPT_VALKEY_BUDGET_MB" -eq "$(valkey_floor_mb "$(mem_total_mb)")"
 php_pool_max_children() { printf '128'; }
-OPT_DETECTED=(angie php:8.3 valkey)
+OPT_DETECTED=(nginx php:8.3 valkey)
 plan_memory_budget
-check "Angie+PHP+Valkey empty cache uses the RAM floor" \
+check "nginx+PHP+Valkey empty cache uses the RAM floor" \
   test "$OPT_VALKEY_BUDGET_MB" -eq "$(valkey_floor_mb "$(mem_total_mb)")"
 
 # Elasticsearch-only fallback when the index size cannot be measured.
@@ -2056,7 +2107,7 @@ mariadb_current_pool_mb() { printf '0'; }
 mariadb_data_size_mb() { printf '20000'; }
 php_pool_max_children() { printf '128'; }
 mem_total_mb() { printf '65536'; }
-OPT_DETECTED=(angie php:8.3 mariadb redis elastic)
+OPT_DETECTED=(nginx php:8.3 mariadb redis elastic)
 
 # Elasticsearch heap follows a quarter of the live index store (the page
 # cache serves the index), rounded up to 512 MB, within 25% of RAM.
@@ -2081,7 +2132,7 @@ check "Elasticsearch plan stays inside the 80% budget" \
 
 # A huge index is capped at the 31 GB compressed-oops ceiling.
 mem_total_mb() { printf '262144'; }
-OPT_DETECTED=(angie php:8.4 elastic)
+OPT_DETECTED=(nginx php:8.4 elastic)
 elasticsearch_data_size_mb() { printf '200000'; }
 plan_memory_budget
 check "Elasticsearch heap is capped at 31 GB" \
@@ -2099,7 +2150,7 @@ check "Elasticsearch heap is capped at 25% of RAM" \
 # A live heap grossly above the store target is reduced so the freed RAM can
 # serve the other tiers.
 mem_total_mb() { printf '65536'; }
-OPT_DETECTED=(angie php:8.4 mariadb valkey elastic)
+OPT_DETECTED=(nginx php:8.4 mariadb valkey elastic)
 mariadb_data_size_mb() { printf '20000'; }
 elasticsearch_data_size_mb() { printf '13000'; }
 elasticsearch_current_heap_mb() { printf '20000'; }
@@ -2117,7 +2168,7 @@ check "Elasticsearch statistics drift keeps the live heap" \
 
 # A heap that would exceed the shared budget is capped.
 mem_total_mb() { printf '65536'; }
-OPT_DETECTED=(angie php:8.3 mariadb redis elastic)
+OPT_DETECTED=(nginx php:8.3 mariadb redis elastic)
 mariadb_data_size_mb() { printf '40000'; }
 elasticsearch_data_size_mb() { printf '4096'; }
 elasticsearch_current_heap_mb() { printf '30000'; }
@@ -2130,7 +2181,7 @@ effective_cpus() { printf '16'; }
 elasticsearch_current_heap_mb() { printf '0'; }
 elasticsearch_data_size_mb() { printf '0'; }
 mariadb_data_size_mb() { printf '20000'; }
-OPT_DETECTED=(angie php:8.3 mariadb redis elastic)
+OPT_DETECTED=(nginx php:8.3 mariadb redis elastic)
 
 # ---------------------------------------------------------------------------
 # Install / --optimize parity
@@ -2151,7 +2202,7 @@ elasticsearch_current_heap_mb() { printf '0'; }
 # ENABLED is "declare -A" in lib/cli.sh (sourced at run time): the keys are
 # strings, not arithmetic variables (ShellCheck 0.11 reads them as such).
 # shellcheck disable=SC2154
-ENABLED=([angie]=1 [php]=1 [mariadb]=1 [valkey]=1 [elastic]=1)
+ENABLED=([nginx]=1 [php]=1 [mariadb]=1 [valkey]=1 [elastic]=1)
 plan_install_budget
 install_php_budget=$OPT_PHP_BUDGET_MB
 install_children=$OPT_PHP_CHILDREN
@@ -2162,43 +2213,43 @@ check "install plan reserves 64 MB per fresh worker, not 96 MB" \
   test "$install_php_budget" -eq $(( 32 * 64 ))
 # --- audit 1.21.58: planner
 
-# Adding PHP/MariaDB to an installed Angie without --angie leaves the
-# Angie-only cache budget in place until --optimize: the run says so (c10).
-angie_gap_case() {
+# Adding PHP/MariaDB to an installed nginx without --nginx leaves the
+# nginx-only cache budget in place until --optimize: the run says so (c10).
+nginx_gap_case() {
   (
-    detect_installed_services() { OPT_DETECTED=(angie); }
+    detect_installed_services() { OPT_DETECTED=(nginx); }
     plan_memory_budget() { :; }
     memory_plan_summary() { :; }
     info() { :; }
     warn() { printf 'WARN %s\n' "$*"; }
     mem_total_mb() { printf '32768'; }
-    angie_disk_free_mb() { printf '400000'; }
+    nginx_disk_free_mb() { printf '400000'; }
     ENABLED=()
     ENABLED[php]=1
     ENABLED[mariadb]=1
-    [[ ${1:-0} == 1 ]] && ENABLED[angie]=1
+    [[ ${1:-0} == 1 ]] && ENABLED[nginx]=1
     plan_install_budget 2>&1
     printf '\n'
   )
 }
-check "install: adding PHP/MariaDB to an Angie host warns that the cache keeps its Angie-only size" \
-  bash -c 'grep -q "Angie cache budget stays at" <<<"$1"' _ "$(angie_gap_case 0)"
-check "install: no cache warning when --angie is part of the run" \
-  bash -c '! grep -q "Angie cache budget stays at" <<<"$1"' _ "$(angie_gap_case 1)"
-unset -f angie_gap_case
+check "install: adding PHP/MariaDB to an nginx host warns that the cache keeps its nginx-only size" \
+  bash -c 'grep -q "nginx cache budget stays at" <<<"$1"' _ "$(nginx_gap_case 0)"
+check "install: no cache warning when --nginx is part of the run" \
+  bash -c '! grep -q "nginx cache budget stays at" <<<"$1"' _ "$(nginx_gap_case 1)"
+unset -f nginx_gap_case
 
 # A --mariadb run on a host whose PHP was installed without a local database
 # leaves the 1.5-per-CPU pool until --optimize: the run says so (1.21.68).
 php_db_gap_case() { # live-pool php-enabled -> warnings
   (
     unset SETUP_PHP_WORKERS_PER_CPU
-    detect_installed_services() { OPT_DETECTED=(angie php:8.5); }
+    detect_installed_services() { OPT_DETECTED=(nginx php:8.5); }
     plan_memory_budget() { :; }
     memory_plan_summary() { :; }
     info() { :; }
     warn() { printf 'WARN %s\n' "$*"; }
     mem_total_mb() { printf '32768'; }
-    angie_disk_free_mb() { printf '400000'; }
+    nginx_disk_free_mb() { printf '400000'; }
     effective_cpus() { printf '12'; }
     storage_class() { printf 'ssd'; }
     host_server_type() { printf 'dedi'; }
@@ -2222,7 +2273,7 @@ unset -f php_db_gap_case
 
 # The same host, now sized by --optimize after the install ran (live pool of
 # 32 workers measured at the 64 MB floor).
-OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
+OPT_DETECTED=(nginx php:8.5 mariadb valkey elastic)
 plan_memory_budget
 check "install and --optimize reserve the same PHP budget" \
   test "$OPT_PHP_BUDGET_MB" -eq "$install_php_budget"
@@ -2346,16 +2397,16 @@ check "Elasticsearch HTTP URL brackets an IPv6 host" \
 # ---------------------------------------------------------------------------
 # WordPress vhost detection
 # ---------------------------------------------------------------------------
-mkdir -p "$TMP/wpangie/conf.d" "$TMP/wpangie/h5bp" "$TMP/wpangie/www/site/public"
-: > "$TMP/wpangie/www/site/public/wp-config.php"
+mkdir -p "$TMP/wpnginx/conf.d" "$TMP/wpnginx/h5bp" "$TMP/wpnginx/www/site/public"
+: > "$TMP/wpnginx/www/site/public/wp-config.php"
 printf 'server {\n  root %s;\n  include h5bp/php_wp.conf;\n}\n' \
-  "$TMP/wpangie/www/site/public" > "$TMP/wpangie/conf.d/site.conf"
+  "$TMP/wpnginx/www/site/public" > "$TMP/wpnginx/conf.d/site.conf"
 check "WordPress vhost detection finds a real installation" \
-  test "$(angie_wordpress_vhosts "$TMP/wpangie")" = "$TMP/wpangie/conf.d/site.conf"
-mv "$TMP/wpangie/www/site/public/wp-config.php" \
-   "$TMP/wpangie/www/site/public/wp-config.php.hidden"
+  test "$(nginx_wordpress_vhosts "$TMP/wpnginx")" = "$TMP/wpnginx/conf.d/site.conf"
+mv "$TMP/wpnginx/www/site/public/wp-config.php" \
+   "$TMP/wpnginx/www/site/public/wp-config.php.hidden"
 check "WordPress vhost detection ignores a missing wp-config" \
-  test -z "$(angie_wordpress_vhosts "$TMP/wpangie")"
+  test -z "$(nginx_wordpress_vhosts "$TMP/wpnginx")"
 
 # ---------------------------------------------------------------------------
 # WordPress / XenForo persistent-connection audit
@@ -2447,17 +2498,17 @@ check "audit counts the broken WordPress host" \
   test "$APP_CONNECTION_ISSUES" -eq 1
 sed -i "s/DB_HOST., .p:localhost/DB_HOST', 'localhost/" "$TMP/wp-config.php"
 
-opt_body=$(sed -n '/^optimize_angie()/,/^}/p' "$ALL_SRC")
-check "optimize_angie synchronizes the Angie repository" \
-  grep -q 'sync_angie_repo_configs' <<<"$opt_body"
-profile_body=$(sed -n "/^angie_apply_profile()/,/^}/p" "$ALL_SRC")
-check "the shared Angie profile enables the XenForo guest cache" \
+opt_body=$(sed -n '/^optimize_nginx()/,/^}/p' "$ALL_SRC")
+check "optimize_nginx synchronizes the nginx repository" \
+  grep -q 'sync_nginx_repo_configs' <<<"$opt_body"
+profile_body=$(sed -n "/^nginx_apply_profile()/,/^}/p" "$ALL_SRC")
+check "the shared nginx profile enables the XenForo guest cache" \
   grep -q "ensure_xf_guest_cache" <<<"$profile_body"
-check "optimize_angie applies the shared Angie profile" \
-  grep -q "angie_apply_profile" <<<"$opt_body"
-deploy_body=$(sed -n "/^deploy_angie_configs()/,/^}/p" "$ALL_SRC")
-check "the installer applies the same Angie profile" \
-  grep -q "angie_apply_profile" <<<"$deploy_body"
+check "optimize_nginx applies the shared nginx profile" \
+  grep -q "nginx_apply_profile" <<<"$opt_body"
+deploy_body=$(sed -n "/^deploy_nginx_configs()/,/^}/p" "$ALL_SRC")
+check "the installer applies the same nginx profile" \
+  grep -q "nginx_apply_profile" <<<"$deploy_body"
 check "WordPress and XenForo share one FastCGI cache zone helper" \
   bash -c 'grep -q "ensure_fastcgi_cache_zone" "$1" && grep -q "ensure_fastcgi_cache_zone" <<<"$(sed -n "/^optimize_wordpress_cache()/,/^}/p" "$1")"' _ "$ALL_SRC"
 
@@ -2466,7 +2517,7 @@ check "WordPress and XenForo share one FastCGI cache zone helper" \
 # keeps it off and reports the vhost.
 mkdir -p "$TMP/wpguest/conf.d" "$TMP/wpguest/h5bp" "$TMP/wpguest/http.d" \
          "$TMP/wpguest-root"
-printf 'include http.d/*.conf;\n' > "$TMP/wpguest/angie.conf"
+printf 'include http.d/*.conf;\n' > "$TMP/wpguest/nginx.conf"
 printf 'fastcgi_cache_path /home/nginx_cache levels=1:2 keys_zone=fastcgicache:64m max_size=1g inactive=1h use_temp_path=off;\n' \
   > "$TMP/wpguest/http.d/fastcgi_cache.conf"
 printf 'map $request_uri $skip_cache { default 0; }\n' \
@@ -2518,7 +2569,7 @@ unset SETUP_WP_GUEST_CACHE CONFIG_SOURCE_DIR
 # --optimize, and the second run must be a no-op.
 mkdir -p "$TMP/xfguest/conf.d" "$TMP/xfguest/h5bp" "$TMP/xfguest/http.d" \
          "$TMP/xfroot/src"
-printf 'include http.d/*.conf;\n' > "$TMP/xfguest/angie.conf"
+printf 'include http.d/*.conf;\n' > "$TMP/xfguest/nginx.conf"
 printf 'fastcgi_cache_path /home/nginx_cache levels=1:2 keys_zone=fastcgicache:512m max_size=1g inactive=1h use_temp_path=off;\nmap $request_uri $nocacheuri { default 0; }\n' \
   > "$TMP/xfguest/http.d/cache.conf"
 printf 'server {\n    root %s;\n    include h5bp/php_xf.conf;\n}\n' "$TMP/xfroot" \
@@ -2721,7 +2772,7 @@ server {
 EOF
 cp "$TMP/gcm/conf.d/chev.conf" "$TMP/gcm/chev.before"
 tune_reset_changes
-angie_migrate_guest_cache_includes "$TMP/gcm"
+nginx_migrate_guest_cache_includes "$TMP/gcm"
 check "Chevereto server-level include moves to php_chev_cache.conf" \
   grep -qx '    include h5bp/php_chev_cache.conf;' "$TMP/gcm/conf.d/chev.conf"
 check "Chevereto nested include stays on the uncached php_chev.conf" \
@@ -2737,12 +2788,12 @@ check "the server-level php_xf.conf include is kept" \
 check "the include migration reports both vhosts" \
   test "${#TUNE_CHANGES[@]}" -eq 2
 tune_reset_changes
-angie_migrate_guest_cache_includes "$TMP/gcm"
+nginx_migrate_guest_cache_includes "$TMP/gcm"
 check "the include migration is idempotent" \
   test "${#TUNE_CHANGES[@]}" -eq 0
 
 # A one-line `location /x/ { include ...; }` is nested too.  Without this the
-# canonical php_xf.conf (server-level named location) makes `angie -t` fail
+# canonical php_xf.conf (server-level named location) makes `nginx -t` fail
 # and the whole tree is rolled back.
 cat > "$TMP/gcm/conf.d/xf1line.conf" <<'EOF'
 server {
@@ -2751,7 +2802,7 @@ server {
 }
 EOF
 tune_reset_changes
-angie_migrate_guest_cache_includes "$TMP/gcm"
+nginx_migrate_guest_cache_includes "$TMP/gcm"
 check "a one-line nested php_xf.conf include becomes php.conf" \
   grep -q 'location /legacy/ { include h5bp/php.conf; }' "$TMP/gcm/conf.d/xf1line.conf"
 check "the server-level include beside a one-line location is kept" \
@@ -2763,23 +2814,23 @@ cp "$TMP/gcm/chev.before" "$TMP/gcm/conf.d/chev.conf"
 rm -f "$TMP/gcm/conf.d/xf.conf"
 chevereto_guest_uploads() { printf 1; }
 tune_reset_changes; OPT_REPORT=()
-angie_migrate_guest_cache_includes "$TMP/gcm"
+nginx_migrate_guest_cache_includes "$TMP/gcm"
 check "guest uploads enabled: the Chevereto vhost stays uncached" \
   cmp -s "$TMP/gcm/chev.before" "$TMP/gcm/conf.d/chev.conf"
 check "guest uploads enabled: the report explains why" \
   grep -q 'allows guest uploads' <<<"${OPT_REPORT[*]}"
-SETUP_CHEV_GUEST_CACHE=1 angie_migrate_guest_cache_includes "$TMP/gcm"
+SETUP_CHEV_GUEST_CACHE=1 nginx_migrate_guest_cache_includes "$TMP/gcm"
 check "SETUP_CHEV_GUEST_CACHE=1 forces the Chevereto guest cache on" \
   grep -qx '    include h5bp/php_chev_cache.conf;' "$TMP/gcm/conf.d/chev.conf"
-angie_migrate_guest_cache_includes "$TMP/gcm"
+nginx_migrate_guest_cache_includes "$TMP/gcm"
 check "guest uploads enabled later: the cache include is turned back off" \
   cmp -s "$TMP/gcm/chev.before" "$TMP/gcm/conf.d/chev.conf"
 chevereto_guest_uploads() { printf 0; }
-SETUP_CHEV_GUEST_CACHE=0 angie_migrate_guest_cache_includes "$TMP/gcm"
+SETUP_CHEV_GUEST_CACHE=0 nginx_migrate_guest_cache_includes "$TMP/gcm"
 check "SETUP_CHEV_GUEST_CACHE=0 keeps the Chevereto guest cache off" \
   cmp -s "$TMP/gcm/chev.before" "$TMP/gcm/conf.d/chev.conf"
 chevereto_guest_uploads() { :; }
-angie_migrate_guest_cache_includes "$TMP/gcm"
+nginx_migrate_guest_cache_includes "$TMP/gcm"
 check "unknown guest-upload setting: the cookie-safe cache is used" \
   grep -qx '    include h5bp/php_chev_cache.conf;' "$TMP/gcm/conf.d/chev.conf"
 printf "<?php\nreturn [\n    'CHEVERETO_DB_NAME' => 'chevdb', 'CHEVERETO_DB_TABLE_PREFIX' => 'c1_',\n];\n" > "$TMP/chev-env.php"
@@ -2789,7 +2840,7 @@ check "Chevereto env.php parser reads the database name and prefix" \
 # is rewritten: the vhost would otherwise point at a missing file.
 mkdir -p "$TMP/gcm-old/conf.d" "$TMP/gcm-old/h5bp"
 cp "$TMP/gcm/chev.before" "$TMP/gcm-old/conf.d/chev.conf"
-angie_migrate_guest_cache_includes "$TMP/gcm-old"
+nginx_migrate_guest_cache_includes "$TMP/gcm-old"
 check "no migration without h5bp/php_chev_cache.conf" \
   cmp -s "$TMP/gcm/chev.before" "$TMP/gcm-old/conf.d/chev.conf"
 # An include that does not cache has no error policy to repair.
@@ -2869,7 +2920,7 @@ check "sysctl dedupe is idempotent" \
 # Inert cache/limit files under http.d
 # ---------------------------------------------------------------------------
 mkdir -p "$TMP/inert/http.d"
-printf 'include http.d/*.conf;\n' > "$TMP/inert/angie.conf"
+printf 'include http.d/*.conf;\n' > "$TMP/inert/nginx.conf"
 printf 'fastcgi_cache_path /tmp levels=1:2 keys_zone=live:1m;\n' \
   > "$TMP/inert/http.d/fastcgi_cache.conf"
 printf 'fastcgi_cache_path /tmp levels=1:2 keys_zone=legacy:1m;\n' \
@@ -2878,20 +2929,20 @@ printf 'limit_req_zone $binary_remote_addr zone=legacy:1m rate=1r/s;\n' \
   > "$TMP/inert/http.d/limit_req_conf"
 printf 'map $http_user_agent $x { default 0; }\n' > "$TMP/inert/http.d/map.conf"
 check "inert detection reports only non-included cache/limit files" \
-  test "$(angie_inert_cache_files "$TMP/inert" | sort | paste -sd, -)" = \
+  test "$(nginx_inert_cache_files "$TMP/inert" | sort | paste -sd, -)" = \
        "$TMP/inert/http.d/fastcgi_cache_conf,$TMP/inert/http.d/limit_req_conf"
 
 # ---------------------------------------------------------------------------
 # Cache objects written during a restart window
 # ---------------------------------------------------------------------------
 mkdir -p "$TMP/cachetree/http.d" "$TMP/cache/sub"
-printf 'include http.d/*.conf;\n' > "$TMP/cachetree/angie.conf"
+printf 'include http.d/*.conf;\n' > "$TMP/cachetree/nginx.conf"
 printf 'fastcgi_cache_path %s levels=1:2 keys_zone=live:1m;\n' "$TMP/cache" \
   > "$TMP/cachetree/http.d/fastcgi_cache.conf"
 printf 'proxy_cache_path %s/proxy levels=1:2 keys_zone=px:1m;\n' "$TMP/cache" \
   > "$TMP/cachetree/http.d/proxy_cache.conf"
-check "angie_cache_dirs returns the included cache paths" \
-  test "$(angie_cache_dirs "$TMP/cachetree" | sort | paste -sd, -)" = \
+check "nginx_cache_dirs returns the included cache paths" \
+  test "$(nginx_cache_dirs "$TMP/cachetree" | sort | paste -sd, -)" = \
        "$TMP/cache,$TMP/cache/proxy"
 : > "$TMP/cache/old"
 touch -d '1 hour ago' "$TMP/cache/old"
@@ -2911,19 +2962,19 @@ dd if=/dev/zero of="$TMP/cache-keep/objects/obj" bs=1M count=5 status=none
 cat > "$TMP/cache-keep/fastcgi_cache.conf" <<EOF
 fastcgi_cache_path $TMP/cache-keep/objects levels=1:2 keys_zone=fastcgicache:16m inactive=1h;
 EOF
-angie_cache_keep_mb "$TMP/cache-keep/fastcgi_cache.conf" 2
-check "cache max_size is raised above live usage" test "$ANGIE_CACHE_MB" = 256
-check "cache keep records an explanatory note" test -n "$ANGIE_CACHE_NOTE"
-angie_cache_keep_mb "$TMP/cache-keep/fastcgi_cache.conf" 512
-check "cache max_size keeps a larger plan" test "$ANGIE_CACHE_MB" = 512
-check "cache keep is silent when the plan is larger" test -z "$ANGIE_CACHE_NOTE"
+nginx_cache_keep_mb "$TMP/cache-keep/fastcgi_cache.conf" 2
+check "cache max_size is raised above live usage" test "$NGINX_CACHE_MB" = 256
+check "cache keep records an explanatory note" test -n "$NGINX_CACHE_NOTE"
+nginx_cache_keep_mb "$TMP/cache-keep/fastcgi_cache.conf" 512
+check "cache max_size keeps a larger plan" test "$NGINX_CACHE_MB" = 512
+check "cache keep is silent when the plan is larger" test -z "$NGINX_CACHE_NOTE"
 cat > "$TMP/cache-keep/fastcgi_cache.conf" <<EOF
 fastcgi_cache_path $TMP/cache-keep/objects levels=1:2 keys_zone=fastcgicache:16m max_size=1g inactive=1h;
 EOF
-angie_cache_keep_mb "$TMP/cache-keep/fastcgi_cache.conf" 2
-check "cache max_size keeps a configured value above live usage" test "$ANGIE_CACHE_MB" = 1024
-angie_cache_keep_mb "$TMP/cache-keep/missing.conf" 128
-check "cache keep tolerates a missing config" test "$ANGIE_CACHE_MB" = 128
+nginx_cache_keep_mb "$TMP/cache-keep/fastcgi_cache.conf" 2
+check "cache max_size keeps a configured value above live usage" test "$NGINX_CACHE_MB" = 1024
+nginx_cache_keep_mb "$TMP/cache-keep/missing.conf" 128
+check "cache keep tolerates a missing config" test "$NGINX_CACHE_MB" = 128
 
 # ---------------------------------------------------------------------------
 # Small-host budget floors
@@ -2934,11 +2985,11 @@ mariadb_data_size_mb() { printf '0'; }
 mariadb_current_pool_mb() { printf '0'; }
 elasticsearch_data_size_mb() { printf '0'; }
 elasticsearch_current_heap_mb() { printf '0'; }
-OPT_DETECTED=(angie php:8.3 mariadb valkey elastic)
+OPT_DETECTED=(nginx php:8.3 mariadb valkey elastic)
 plan_memory_budget
 check "small host keeps the cache at its 128 MB target, not above" test "$OPT_VALKEY_BUDGET_MB" -eq 128
 check "small host keeps the 512 MB search floor" test "$OPT_ES_BUDGET_MB" -ge 512
-OPT_DETECTED=(angie)
+OPT_DETECTED=(nginx)
 plan_memory_budget
 check "a host without cache/search keeps a zero budget" \
   test "$OPT_VALKEY_BUDGET_MB" -eq 0 -a "$OPT_ES_BUDGET_MB" -eq 0
@@ -2970,8 +3021,8 @@ check "MariaDB restart resumes web frontends afterwards" \
 check "MariaDB restart reloads systemd units before pausing web" \
   test -n "$daemon_line" -a -n "$pause_line" -a "$daemon_line" -lt "$pause_line"
 
-# --restart-all must preserve the dependency order: stop Angie/PHP, restart
-# cache/search, restart MariaDB, wait for SQL, then start PHP and Angie.
+# --restart-all must preserve the dependency order: stop nginx/PHP, restart
+# cache/search, restart MariaDB, wait for SQL, then start PHP and nginx.
 restart_body=$(sed -n '/^run_restart_all()/,/^}/p' "$ALL_SRC")
 ra_daemon=$(printf '%s\n' "$restart_body" | grep -n 'systemctl daemon-reload' | head -n1 | cut -d: -f1)
 ra_pause=$(printf '%s\n' "$restart_body" | grep -n 'opt_pause_web_frontends' | head -n1 | cut -d: -f1)
@@ -2985,16 +3036,16 @@ check "restart-all reloads systemd before pausing the web tiers" \
   test -n "$ra_daemon" -a -n "$ra_pause" -a "$ra_daemon" -lt "$ra_pause"
 check "restart-all pauses the web tiers before restarting cache/search" \
   test -n "$ra_pause" -a -n "$ra_restart_cache" -a "$ra_pause" -lt "$ra_restart_cache"
-# The shared pause helper stops Angie first, then every PHP-FPM unit; the
-# resume helper starts PHP first, then Angie.
+# The shared pause helper stops nginx first, then every PHP-FPM unit; the
+# resume helper starts PHP first, then nginx.
 pause_body=$(sed -n '/^opt_pause_web_frontends()/,/^}/p' "$ALL_SRC")
-check "pause helper stops Angie before PHP-FPM" \
-  test "$(printf '%s\n' "$pause_body" | grep -n 'systemctl stop angie' | head -n1 | cut -d: -f1)" -lt \
+check "pause helper stops nginx before PHP-FPM" \
+  test "$(printf '%s\n' "$pause_body" | grep -n 'systemctl stop nginx' | head -n1 | cut -d: -f1)" -lt \
        "$(printf '%s\n' "$pause_body" | grep -n 'systemctl stop "$unit"' | head -n1 | cut -d: -f1)"
 resume_body=$(sed -n '/^opt_resume_web_frontends()/,/^}/p' "$ALL_SRC")
-check "resume helper starts PHP-FPM before Angie" \
+check "resume helper starts PHP-FPM before nginx" \
   test "$(printf '%s\n' "$resume_body" | grep -n 'systemctl start "$unit"' | head -n1 | cut -d: -f1)" -lt \
-       "$(printf '%s\n' "$resume_body" | grep -n 'systemctl start angie' | head -n1 | cut -d: -f1)"
+       "$(printf '%s\n' "$resume_body" | grep -n 'systemctl start nginx' | head -n1 | cut -d: -f1)"
 check "restart-all restarts cache/search before MariaDB" \
   test -n "$ra_restart_cache" -a -n "$ra_restart_es" -a -n "$ra_restart_db" \
        -a "$ra_restart_cache" -lt "$ra_restart_db" -a "$ra_restart_es" -lt "$ra_restart_db"
@@ -3009,10 +3060,13 @@ check "restart-all waits for MariaDB before resuming the web tiers" \
 # Embedded payload integrity
 # ---------------------------------------------------------------------------
 for blob in blob_sysctl blob_mysqltuner blob_mysqlbackup \
-            blob_angie_key blob_elastic_key blob_sury_deb blob_nodesource_key; do
+            blob_elastic_key blob_nodesource_key; do
   check "embedded ${blob} decodes" \
     bash -c 'source "$1"; "$2" >/dev/null' _ "$ROOT/setup.sh" "$blob"
 done
+# 1.22 compiles nginx and PHP: no Angie key and no Sury keyring package.
+check "the Angie key and the Sury keyring payloads are gone" \
+  bash -c '! grep -qE "^blob_(nginx_key|angie_key|sury_deb)\(\)" "$1"' _ "$ROOT/lib/payloads.sh"
 
 # ---------------------------------------------------------------------------
 # Shared install/--optimize tuning helpers
@@ -3165,7 +3219,7 @@ elasticsearch_data_size_mb() { return 0; }
 elasticsearch_current_heap_mb() { return 0; }
 eval "$(declare -f pkg_ok | sed '1s/^pkg_ok/pkg_ok_saved/')"
 pkg_ok() { return 1; }
-OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
+OPT_DETECTED=(nginx php:8.5 mariadb valkey elastic)
 OPT_INSTALL_PLAN=1
 plan_memory_budget
 OPT_INSTALL_PLAN=0
@@ -3200,7 +3254,7 @@ mariadb_data_size_mb() { return 0; }
 # data+5% is below the operational minimum, so a live database with no
 # real rows gets 128 MB.
 mariadb_data_size_mb() { printf '4'; }
-OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
+OPT_DETECTED=(nginx php:8.5 mariadb valkey elastic)
 OPT_INSTALL_PLAN=0
 plan_memory_budget
 check "measured-empty live database uses the 128 MB minimum" \
@@ -3216,7 +3270,7 @@ mariadb_data_size_mb() { printf '2048'; }
 mariadb_current_pool_mb() { printf '4096'; }
 elasticsearch_data_size_mb() { printf '512'; }
 elasticsearch_current_heap_mb() { printf '4096'; }
-OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
+OPT_DETECTED=(nginx php:8.5 mariadb valkey elastic)
 OPT_INSTALL_PLAN=0
 plan_memory_budget
 check "live MariaDB pool far above the data+5% target is shrunk" \
@@ -3227,7 +3281,7 @@ check "live Elasticsearch heap is reduced to the store/4 minimum" \
 valkey_live_used_mb() { printf '5000'; }
 mariadb_current_pool_mb() { printf '0'; }
 elasticsearch_current_heap_mb() { printf '0'; }
-OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
+OPT_DETECTED=(nginx php:8.5 mariadb valkey elastic)
 plan_memory_budget
 check "live Valkey working set raises the cache budget with headroom" \
   test "$OPT_VALKEY_LIVE_MB" -eq 5000 -a "$OPT_VALKEY_BUDGET_MB" -ge 5500
@@ -3256,7 +3310,7 @@ check "MariaDB+Valkey plan stays inside the 80% budget" \
 mariadb_data_size_mb() { printf '8000'; }
 elasticsearch_data_size_mb() { printf '1000'; }
 valkey_live_used_mb() { printf '1000'; }
-OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
+OPT_DETECTED=(nginx php:8.5 mariadb valkey elastic)
 plan_memory_budget
 check "full stack reserves MariaDB, Valkey and Elasticsearch first" \
   test "$OPT_MARIADB_BUDGET_MB" -eq 8400 \
@@ -3301,16 +3355,16 @@ check_combo() {
   check "${name}: stays inside the 80% budget" test "$total" -le $(( 32768 * 80 / 100 ))
 }
 
-check_combo "Angie+PHP+MariaDB+Valkey+Elasticsearch" \
-  "angie php:8.5 mariadb valkey elastic" 1 1 1 1
-check_combo "Angie+PHP+MariaDB+Elasticsearch" \
-  "angie php:8.5 mariadb elastic" 1 1 0 1
-check_combo "Angie+PHP+MariaDB+Valkey" \
-  "angie php:8.5 mariadb valkey" 1 1 1 0
-check_combo "Angie+PHP+Valkey" \
-  "angie php:8.5 valkey" 1 0 1 0
-check_combo "Angie+PHP" \
-  "angie php:8.5" 1 0 0 0
+check_combo "nginx+PHP+MariaDB+Valkey+Elasticsearch" \
+  "nginx php:8.5 mariadb valkey elastic" 1 1 1 1
+check_combo "nginx+PHP+MariaDB+Elasticsearch" \
+  "nginx php:8.5 mariadb elastic" 1 1 0 1
+check_combo "nginx+PHP+MariaDB+Valkey" \
+  "nginx php:8.5 mariadb valkey" 1 1 1 0
+check_combo "nginx+PHP+Valkey" \
+  "nginx php:8.5 valkey" 1 0 1 0
+check_combo "nginx+PHP" \
+  "nginx php:8.5" 1 0 0 0
 check_combo "MariaDB alone" \
   "mariadb" 0 1 0 0
 check_combo "Elasticsearch alone" \
@@ -3346,7 +3400,7 @@ systemctl() {
     *) return 1 ;;
   esac
 }
-detect_installed_services() { OPT_DETECTED=(angie mariadb valkey); }
+detect_installed_services() { OPT_DETECTED=(nginx mariadb valkey); }
 list_active_php_units() { return 0; }
 plan_out=$(restart_all_plan 2>&1)
 active_line=$(sed -n 's/^Active services: *//p' <<<"$plan_out")
@@ -3364,7 +3418,7 @@ check "on_error ignores SIGPIPE from a closed pipe" \
   grep -q 'rc == 141' <<<"$on_error_body"
 
 # A stock Ubuntu image ships wget but not curl; --optimize must be able to
-# fetch its Angie tree without installing a package.
+# fetch its nginx tree without installing a package.
 fetch_body=$(declare -f fetch_server_configs)
 check "config fetch falls back to wget when curl is absent" \
   grep -q 'wget -q --https-only' <<<"$fetch_body"
@@ -3405,16 +3459,6 @@ check "upgrade parse: --upgrade-php 8.6" \
   test "$( UPGRADE_PHP=''; UPGRADE_PHP_SEEN=0; parse_args --upgrade-php 8.6; printf '%s' "$UPGRADE_PHP" )" = 8.6
 check "upgrade parse: a second --upgrade-php fails" \
   test "$( UPGRADE_PHP=''; UPGRADE_PHP_SEEN=0; rc=0; ( parse_args --upgrade-php=8.6 --upgrade-php=8.5 ) >/dev/null 2>&1 || rc=$?; printf '%s' "$rc" )" -ne 0
-check "upgrade extension name: versioned package" \
-  test "$(php_upgrade_ext_name php8.5-redis)" = redis
-check "upgrade extension name: unversioned package" \
-  test "$(php_upgrade_ext_name php-redis)" = redis
-check "upgrade extension name: fpm" \
-  test "$(php_upgrade_ext_name php8.6-fpm)" = fpm
-check "upgrade extension name: Apache module is not an extension" \
-  test -z "$(php_upgrade_ext_name libapache2-mod-php8.5)"
-check "upgrade extension name: meta package is not an extension" \
-  test -z "$(php_upgrade_ext_name php8.5)"
 
 # --- adaptive pool factor (1.19.0) -----------------------------------------
 check "php_children_from_tenths: one worker per core" \
@@ -3534,7 +3578,7 @@ elasticsearch_data_size_mb() { printf '0'; }
 elasticsearch_current_heap_mb() { printf '0'; }
 mariadb_current_pool_mb() { printf '0'; }
 valkey_live_used_mb() { return 0; }
-OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
+OPT_DETECTED=(nginx php:8.5 mariadb valkey elastic)
 # 20000 + 4096 + the 512 MB heap and its 256 MB direct share no longer fit
 # beside the PHP floor: the plan says so (stderr) instead of hiding it.
 plan_memory_budget 2>/dev/null
@@ -3702,13 +3746,13 @@ check "php_plan_max_children gives a 2-core box 4 workers" \
 
 # Brotli level: explicit, else 4, or 3 on a 1-2 CPU host.
 effective_cpus() { printf 16; }
-check "angie_brotli_level honours SETUP_BROTLI_LEVEL" \
-  test "$(SETUP_BROTLI_LEVEL=7 angie_brotli_level)" = 7
-check "angie_brotli_level ignores an invalid SETUP_BROTLI_LEVEL" \
-  test "$(SETUP_BROTLI_LEVEL=99 angie_brotli_level)" = 4
+check "nginx_brotli_level honours SETUP_BROTLI_LEVEL" \
+  test "$(SETUP_BROTLI_LEVEL=7 nginx_brotli_level)" = 7
+check "nginx_brotli_level ignores an invalid SETUP_BROTLI_LEVEL" \
+  test "$(SETUP_BROTLI_LEVEL=99 nginx_brotli_level)" = 4
 effective_cpus() { printf 2; }
-check "angie_brotli_level drops to 3 on a 2 CPU host" \
-  test "$(angie_brotli_level)" = 3
+check "nginx_brotli_level drops to 3 on a 2 CPU host" \
+  test "$(nginx_brotli_level)" = 3
 effective_cpus() { printf 16; }
 # zstd (1.21.58) is retired in 1.21.59: Cloudflare asks origins for
 # "br, gzip" only.  The managed stanzas go, an operator's own stay, and the
@@ -3719,57 +3763,79 @@ printf '# Managed by setup.sh: dynamic Zstandard for clients that accept it.\nlo
 printf '# Managed by setup.sh: dynamic Zstandard from http.d/zstd_conf.\nzstd on;\nzstd_comp_level 3;\n' > "$zt/http.d/zstd.conf"
 printf '# Managed by setup.sh: dynamic Brotli compression.\nload_module modules/ngx_http_brotli_filter_module.so;\n' > "$zt/modules-enabled/50-brotli.conf"
 printf 'zstd on;\nzstd_comp_level 9;\n' > "$zt/http.d/zstd_conf"    # repository template, never included
-angie_retire_zstd "$zt" >/dev/null 2>&1
+nginx_retire_zstd "$zt" >/dev/null 2>&1
 check "zstd retirement moves the managed module stanza" test ! -e "$zt/modules-enabled/60-zstd.conf"
 check "zstd retirement moves the managed http stanza" test ! -e "$zt/http.d/zstd.conf"
 check "zstd retirement keeps the Brotli stanza" test -e "$zt/modules-enabled/50-brotli.conf"
-check "zstd retirement reports the change" test "$ANGIE_ZSTD_RETIRED" = 1
-zt_in_use() { angie_zstd_in_use "$zt"; }
-zt_unused() { ! angie_zstd_in_use "$zt"; }
+check "zstd retirement reports the change" test "$NGINX_ZSTD_RETIRED" = 1
+zt_in_use() { nginx_zstd_in_use "$zt"; }
+zt_unused() { ! nginx_zstd_in_use "$zt"; }
 check "after retirement nothing in the tree uses zstd (the zstd_conf template is not included)" zt_unused
 printf 'load_module modules/ngx_http_zstd_filter_module.so;\n' > "$zt/modules-enabled/70-own-zstd.conf"
-angie_retire_zstd "$zt" >/dev/null 2>&1
+nginx_retire_zstd "$zt" >/dev/null 2>&1
 check "an operator's own zstd stanza is kept" test -e "$zt/modules-enabled/70-own-zstd.conf"
+# 1.22: SCN's nginx.conf no longer includes modules-enabled (R69), so a
+# stanza there is not live; zstd directives in an included file are.
+check "an operator's own zstd stanza counts as zstd in use only where nginx reads it (not modules-enabled)" zt_unused
+check "a second retirement pass changes nothing" test "$NGINX_ZSTD_RETIRED" = 0
+printf 'zstd on;\n' > "$zt/http.d/own-zstd.conf"
 check "an operator's own zstd stanza counts as zstd in use" zt_in_use
-check "a second retirement pass changes nothing" test "$ANGIE_ZSTD_RETIRED" = 0
-# The purge, with apt and dpkg stubbed: returns what happened.
-zt_purge() { # installed(0|1) apt-sim-output -> summary of the call
-  ( stub_inst=$1 stub_sim=$2 stub_purged=0
-    pkg_ok() { [[ $1 == angie-module-zstd && $stub_inst == 1 ]]; }
-    apt-get() { if [[ $1 == -s ]]; then printf '%s\n' "$stub_sim"; else stub_purged=1; fi; return 0; }
-    angie_purge_zstd_module "$zt" >/dev/null 2>&1
-    printf 'purged=%s %s' "$stub_purged" "$ANGIE_ZSTD_PURGE_RESULT" )
+rm -f "$zt/modules-enabled/70-own-zstd.conf" "$zt/http.d/own-zstd.conf"
+# 1.22: nginx is compiled with Brotli as a static module and without zstd.
+# Compression installs nothing and writes no load_module; there is no zstd
+# package left to purge (nginx_purge_zstd_module is an always-empty stub).
+zt_no_install() {
+  local b; b=$(declare -f ensure_nginx_compression)
+  [[ $b != *apt_install* && $b != *load_module* ]]
 }
-check "the zstd module is kept while a configuration uses it" \
-  bash -c '[[ $1 == "purged=0 "*"still uses it"* ]]' _ "$(zt_purge 1 'Purg angie-module-zstd [1.12.5]')"
-rm -f "$zt/modules-enabled/70-own-zstd.conf"
-check "the zstd module is purged when nothing uses it" \
-  bash -c '[[ $1 == "purged=1 "*"purged"* ]]' _ "$(zt_purge 1 'Purg angie-module-zstd [1.12.5]')"
-check "the zstd module is kept when apt would remove anything else" \
-  bash -c '[[ $1 == "purged=0 "*"would also remove angie"* ]]' _ "$(zt_purge 1 $'Purg angie-module-zstd [1.12.5]\nRemv angie [1.12.5]')"
-check "nothing happens when the zstd module is not installed" \
-  test "$(zt_purge 0 '')" = 'purged=0 '
-zt_no_install() { local b; b=$(declare -f ensure_angie_compression); [[ $b != *'apt_install angie-module-zstd'* ]]; }
-check "ensure_angie_compression installs no zstd module any more" zt_no_install
-# The purge waits until the Angie pass commits (a rollback must not restore a
-# tree that loads a purged module): ensure_angie_compression only marks it.
-zt_deferred() {
-  local e o i
-  e=$(declare -f ensure_angie_compression); o=$(declare -f optimize_angie); i=$(declare -f install_angie)
-  [[ $e != *angie_purge_zstd_module* && $o == *angie_purge_zstd_module* && $i == *angie_purge_zstd_module* ]]
+check "ensure_nginx_compression installs nothing and writes no load_module" zt_no_install
+zt_stub_empty() {
+  NGINX_ZSTD_PURGE_PENDING=1 NGINX_ZSTD_PURGE_RESULT=x
+  nginx_purge_zstd_module "$zt"
+  [[ $NGINX_ZSTD_PURGE_PENDING == 0 && -z $NGINX_ZSTD_PURGE_RESULT ]]
 }
-check "the zstd purge runs only after the Angie pass commits" zt_deferred
-# An operator file that uses zstd relies on the managed load_module: nothing
-# is retired while it does (moving it would make angie -t fail).
+check "the zstd module purge is a no-op stub (no package to purge)" zt_stub_empty
+# nginx_static_brotli: a static ngx_brotli in nginx -V is 0, a dynamic or no
+# Brotli is 1, a missing binary is 2.
+nb_static()  { printf 'nginx version: nginx/1.29.4\nconfigure arguments: --prefix=/x --add-module=/build/ngx_brotli --with-threads\n' >&2; }
+nb_dynamic() { printf 'nginx version: nginx/1.29.4\nconfigure arguments: --prefix=/x --add-dynamic-module=/build/ngx_brotli\n' >&2; }
+nb_rc() { local rc=0; nginx_static_brotli "$1" || rc=$?; printf '%s' "$rc"; }
+check "nginx_static_brotli: a static ngx_brotli is found in nginx -V" test "$(nb_rc nb_static)" = 0
+check "nginx_static_brotli: a dynamic ngx_brotli does not count (no load_module is written)" test "$(nb_rc nb_dynamic)" = 1
+check "nginx_static_brotli: a missing binary is status 2" test "$(nb_rc "$TMP/no-such-nginx")" = 2
+# A load_module of Brotli/zstd (left by a packaged server) is commented out
+# with the static-build marker; the managed 50-brotli.conf stanza moves away.
+ml=$TMP/modload; mkdir -p "$ml/modules-enabled" "$ml/custom.d"
+printf 'load_module modules/ngx_http_brotli_filter_module.so;\nload_module modules/ngx_http_brotli_static_module.so;\nload_module modules/ngx_http_geoip2_module.so;\nuser www-data;\n' > "$ml/nginx.conf"
+printf 'load_module modules/ngx_http_zstd_filter_module.so;\n' > "$ml/custom.d/zstd.conf"
+printf '# Managed by setup.sh: dynamic Brotli compression.\nload_module modules/ngx_http_brotli_filter_module.so;\n' > "$ml/modules-enabled/50-brotli.conf"
+( tune_reset_changes; nginx_retire_module_loads "$ml"; printf '%s' "$NGINX_MODULE_LOADS_RETIRED" > "$TMP/modload.rc" ) >/dev/null 2>&1
+check "module loads: the Brotli load_module lines in nginx.conf are commented out" \
+  test "$(grep -c "^${NGINX_LOAD_MODULE_OFF}load_module modules/ngx_http_brotli" "$ml/nginx.conf")" -eq 2
+check "module loads: a zstd load_module in custom.d is commented out" \
+  grep -qx "${NGINX_LOAD_MODULE_OFF}load_module modules/ngx_http_zstd_filter_module.so;" "$ml/custom.d/zstd.conf"
+check "module loads: another module's load_module and other lines stay" \
+  bash -c 'grep -qx "load_module modules/ngx_http_geoip2_module.so;" "$1" && grep -qx "user www-data;" "$1"' _ "$ml/nginx.conf"
+check "module loads: the managed 50-brotli.conf stanza is moved away" test ! -e "$ml/modules-enabled/50-brotli.conf"
+check "module loads: the retirement is reported" test "$(cat "$TMP/modload.rc")" = 1
+( tune_reset_changes; nginx_retire_module_loads "$ml"; printf '%s' "$NGINX_MODULE_LOADS_RETIRED" > "$TMP/modload.rc" ) >/dev/null 2>&1
+check "module loads: a second pass changes nothing" test "$(cat "$TMP/modload.rc")" = 0
+unset ml
+# 1.22: the compiled nginx has no zstd module, so keeping the managed
+# load_module for an operator file cannot help (nginx -t rejects the zstd
+# directives either way).  The managed stanza is retired and the operator
+# file is named so the operator removes the directives there.
 zo="$TMP/zstd-own"; mkdir -p "$zo/modules-enabled" "$zo/http.d" "$zo/conf.d"
 printf '# Managed by setup.sh: dynamic Zstandard for clients that accept it.\nload_module modules/ngx_http_zstd_filter_module.so;\n' > "$zo/modules-enabled/60-zstd.conf"
 printf 'server {\n    zstd off;\n}\n' > "$zo/conf.d/site.conf"
-angie_retire_zstd "$zo" >/dev/null 2>&1
-check "the managed zstd stanza stays while an operator file uses zstd" test -e "$zo/modules-enabled/60-zstd.conf"
-check "that case retires nothing" test "$ANGIE_ZSTD_RETIRED" = 0
-check "the operator file is named as the zstd user" test "$(angie_zstd_users "$zo" "$zo/modules-enabled/60-zstd.conf")" = "$zo/conf.d/site.conf"
+check "the operator file is named as the zstd user" test "$(nginx_zstd_users "$zo" "$zo/modules-enabled/60-zstd.conf")" = "$zo/conf.d/site.conf"
+( tune_reset_changes; nginx_retire_zstd "$zo"
+  printf '%s\n' "$NGINX_ZSTD_RETIRED" "${TUNE_MISSES[@]}" > "$TMP/zstd-own.out" ) >/dev/null 2>&1 || true
+check "the managed zstd stanza is retired even while an operator file uses zstd (no zstd module in 1.22)" test ! -e "$zo/modules-enabled/60-zstd.conf"
+check "that case reports the retirement" test "$(head -1 "$TMP/zstd-own.out")" = 1
+check "that case still reports the operator file as a miss" grep -qF "zstd: this nginx is built without zstd, but $zo/conf.d/site.conf" "$TMP/zstd-own.out"
 unset zo
-unset -f zt_in_use zt_unused zt_purge zt_no_install zt_deferred; unset zt
+unset -f zt_in_use zt_unused zt_no_install zt_stub_empty nb_static nb_dynamic nb_rc; unset zt
 check "asset precompression is on by default" test "$PRECOMPRESS_ASSETS" = 1
 
 # --basic server= is persisted and honoured by host_server_type.
@@ -3822,7 +3888,7 @@ mariadb_current_pool_mb() { printf 0; }
 elasticsearch_data_size_mb() { printf 0; }
 elasticsearch_current_heap_mb() { printf 0; }
 valkey_live_used_mb() { printf 0; }
-OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
+OPT_DETECTED=(nginx php:8.5 mariadb valkey elastic)
 plan_memory_budget 2>/dev/null
 check "a 1 GB host running every service reports an overcommit" \
   test "${OPT_MEM_OVERCOMMIT_MB:-0}" -gt 0
@@ -3862,8 +3928,8 @@ mkdir -p "$TMP/capsite/conf.d" "$TMP/capsite/xf/src" "$TMP/capsite/wp" "$TMP/cap
 printf 'server {\n    root %s;\n    include h5bp/php_xf.conf;\n}\n' "$TMP/capsite/xf" > "$TMP/capsite/conf.d/xf.conf"
 : > "$TMP/capsite/xf/src/XF.php"
 printf "<?php\n\$config['db']['host'] = 'localhost';\n" > "$TMP/capsite/xf/src/config.php"
-check "angie_vhost_root reads the root directive" \
-  test "$(angie_vhost_root "$TMP/capsite/conf.d/xf.conf")" = "$TMP/capsite/xf"
+check "nginx_vhost_root reads the root directive" \
+  test "$(nginx_vhost_root "$TMP/capsite/conf.d/xf.conf")" = "$TMP/capsite/xf"
 # A generated vhost (a redirect-only block or a generated terminator) has no
 # root directive.  The lookup must print nothing and return 0: under
 # `set -e` + inherit_errexit the old grep pipeline returned 1 and the
@@ -3871,10 +3937,10 @@ check "angie_vhost_root reads the root directive" \
 # "[ERR] command failed" lines.
 printf 'server {\n    listen 443 ssl;\n    server_name term.test;\n}\n' \
   > "$TMP/capsite/conf.d/terminator.conf"
-rootless_vhost_ok() { [[ -z $(angie_vhost_root "$TMP/capsite/conf.d/terminator.conf") ]]; }
-check "angie_vhost_root returns success with no root directive" rootless_vhost_ok
-missing_file_ok() { [[ -z $(angie_vhost_root "$TMP/capsite/conf.d/does-not-exist.conf") ]]; }
-check "angie_vhost_root returns success for a missing file" missing_file_ok
+rootless_vhost_ok() { [[ -z $(nginx_vhost_root "$TMP/capsite/conf.d/terminator.conf") ]]; }
+check "nginx_vhost_root returns success with no root directive" rootless_vhost_ok
+missing_file_ok() { [[ -z $(nginx_vhost_root "$TMP/capsite/conf.d/does-not-exist.conf") ]]; }
+check "nginx_vhost_root returns success for a missing file" missing_file_ok
 
 # One app detector for the --upgrade-php preflight and the tuners.
 mkdir -p "$TMP/apptypes/wp/wp-includes" "$TMP/apptypes/xf/src" \
@@ -3958,7 +4024,7 @@ order_ok() {
 check "restore_sysctl_values writes the non-zero member of each dirty pair, ratios first, ipfrag_low last" order_ok
 
 # ---------------------------------------------------------------------------
-# 1.12.0 helpers: Valkey floor, Angie open_file_cache bound, ini reader,
+# 1.12.0 helpers: Valkey floor, nginx open_file_cache bound, ini reader,
 # in-location insertion, ufw SSH rule matcher, tree digest, rollback of files
 # created during a tune.
 # ---------------------------------------------------------------------------
@@ -3968,11 +4034,11 @@ check "valkey_floor_mb caps at 1 GB" test "$(valkey_floor_mb 131072)" -eq 1024
 check "valkey_floor_mb tolerates garbage" test "$(valkey_floor_mb x)" -eq 128
 
 check "open_file_cache follows RAM when the fd limit allows it" \
-  test "$(angie_open_file_cache_max 4096 131072 32768)" -eq 32768
+  test "$(nginx_open_file_cache_max 4096 131072 32768)" -eq 32768
 check "open_file_cache is bounded by rlimit minus connections (4 CPU / 32 GB)" \
-  test "$(angie_open_file_cache_max 32768 65536 8192)" -eq 56320
+  test "$(nginx_open_file_cache_max 32768 65536 8192)" -eq 56320
 check "open_file_cache keeps the 10000 floor on a small host" \
-  test "$(angie_open_file_cache_max 1024 65536 8192)" -eq 10000
+  test "$(nginx_open_file_cache_max 1024 65536 8192)" -eq 10000
 
 printf 'user = www-data\n; group = x\ngroup=adm \nlisten = /run/php/php-fpm.sock\naccess.log = /x.log\npm.max_children = 64\n' > "$TMP/pool-ini.conf"
 check "ini_get reads a trimmed value" test "$(ini_get "$TMP/pool-ini.conf" group)" = adm
@@ -4089,12 +4155,12 @@ check "php_ini_profile falls back to the 1 GB profile on garbage" \
   test "$PHP_PROFILE_OPCACHE_MB" -eq 128 -a "$PHP_PROFILE_MEMORY_MB" -eq 128 -a "$PHP_PROFILE_REALPATH_KB" -eq 4096
 
 # gzip level: explicit, else 4, or 3 on a 1-2 CPU host.
-check "angie_gzip_level honours SETUP_GZIP_LEVEL" \
-  test "$(SETUP_GZIP_LEVEL=7 angie_gzip_level)" = 7
-check "angie_gzip_level ignores an invalid SETUP_GZIP_LEVEL and drops to 3 on 2 CPUs" \
-  test "$(effective_cpus() { printf 2; }; SETUP_GZIP_LEVEL=bogus angie_gzip_level)" = 3
-check "angie_gzip_level defaults to 4 on 8 CPUs" \
-  test "$(effective_cpus() { printf 8; }; SETUP_GZIP_LEVEL='' angie_gzip_level)" = 4
+check "nginx_gzip_level honours SETUP_GZIP_LEVEL" \
+  test "$(SETUP_GZIP_LEVEL=7 nginx_gzip_level)" = 7
+check "nginx_gzip_level ignores an invalid SETUP_GZIP_LEVEL and drops to 3 on 2 CPUs" \
+  test "$(effective_cpus() { printf 2; }; SETUP_GZIP_LEVEL=bogus nginx_gzip_level)" = 3
+check "nginx_gzip_level defaults to 4 on 8 CPUs" \
+  test "$(effective_cpus() { printf 8; }; SETUP_GZIP_LEVEL='' nginx_gzip_level)" = 4
 
 es_json='{"cluster":{"number_of_nodes": 3,"status" : "green","x":{"size_in_bytes":123456}}}'
 check "es_json_num reads a spaced numeric field" test "$(es_json_num "$es_json" number_of_nodes)" = 3
@@ -4137,7 +4203,7 @@ check "cnf_only_pool_changed accepts an innodb_io_capacity change (dynamic)" \
 check "cnf_only_pool_changed rejects a startup-only key" \
   cnf_other_changed "$TMP/cnf-online-a" "$TMP/cnf-online-d"
 
-# angie_cache_keep_mb must pick the directive for the named zone when a file
+# nginx_cache_keep_mb must pick the directive for the named zone when a file
 # carries several multi-line *_cache_path directives.
 cat > "$TMP/multi-proxy_cache.conf" <<'EOF'
 proxy_cache_path /tmp/pc-a levels=1:2 keys_zone=proxy_cache:64m
@@ -4146,15 +4212,15 @@ proxy_cache_path /tmp/pc-b levels=1:2 keys_zone=proxy_cdn:64m
   max_size=8g inactive=1d;
 EOF
 du() { printf '0\tx\n'; }
-angie_cache_keep_mb "$TMP/multi-proxy_cache.conf" 100 proxy_cache
-check "cache keep leaves the plan alone for an empty first zone" test "$ANGIE_CACHE_MB" = 100
-angie_cache_keep_mb "$TMP/multi-proxy_cache.conf" 100 proxy_cdn
-check "cache keep leaves the plan alone for an empty second zone" test "$ANGIE_CACHE_MB" = 100
+nginx_cache_keep_mb "$TMP/multi-proxy_cache.conf" 100 proxy_cache
+check "cache keep leaves the plan alone for an empty first zone" test "$NGINX_CACHE_MB" = 100
+nginx_cache_keep_mb "$TMP/multi-proxy_cache.conf" 100 proxy_cdn
+check "cache keep leaves the plan alone for an empty second zone" test "$NGINX_CACHE_MB" = 100
 du() { printf '900\tx\n'; }
-angie_cache_keep_mb "$TMP/multi-proxy_cache.conf" 100 proxy_cdn
-check "cache keep preserves the configured 8g that covers live usage" test "$ANGIE_CACHE_MB" = 8192
-check "cache keep note names the zone's own directory" grep -qF '/tmp/pc-b' <<<"$ANGIE_CACHE_NOTE"
-cache_note_not_first_zone() { ! grep -qF '/tmp/pc-a' <<<"$ANGIE_CACHE_NOTE"; }
+nginx_cache_keep_mb "$TMP/multi-proxy_cache.conf" 100 proxy_cdn
+check "cache keep preserves the configured 8g that covers live usage" test "$NGINX_CACHE_MB" = 8192
+check "cache keep note names the zone's own directory" grep -qF '/tmp/pc-b' <<<"$NGINX_CACHE_NOTE"
+cache_note_not_first_zone() { ! grep -qF '/tmp/pc-a' <<<"$NGINX_CACHE_NOTE"; }
 check "cache keep note does not name the other zone's directory" cache_note_not_first_zone
 unset -f du
 
@@ -4173,16 +4239,16 @@ upstream legacy_ws {
     keepalive_timeout 1h;
 }
 EOF
-angie_snapshot_upstreams "$TMP/up-old" "$TMP/up-snap"
+nginx_snapshot_upstreams "$TMP/up-old" "$TMP/up-snap"
 check "upstream snapshot captures the named block" \
   grep -q '^upstream legacy_ws {' "$TMP/up-snap/legacy_ws.conf"
 check "upstream snapshot does not capture host:port directives" \
-  test -z "$(angie_referenced_upstreams "$TMP/up-old" | grep -v '^legacy_ws$')"
+  test -z "$(nginx_referenced_upstreams "$TMP/up-old" | grep -v '^legacy_ws$')"
 
 mkdir -p "$TMP/up-new/conf.d" "$TMP/up-new/http.d"
 cp "$TMP/up-old/conf.d/site.conf" "$TMP/up-new/conf.d/"
 printf 'upstream new_ws {\n    server 127.0.0.1:6001;\n}\n' > "$TMP/up-new/http.d/ws.conf"
-angie_restore_upstreams "$TMP/up-new" "$TMP/up-snap"
+nginx_restore_upstreams "$TMP/up-new" "$TMP/up-snap"
 check "upstream restore keeps a referenced block the new tree dropped" \
   grep -q '^upstream legacy_ws {' "$TMP/up-new/http.d/zz-setup-preserved-upstreams.conf"
 check "upstream restore drops the old zone name" \
@@ -4190,11 +4256,11 @@ check "upstream restore drops the old zone name" \
 check "upstream restore retains the server address" \
   grep -q '127.0.0.1:6001' "$TMP/up-new/http.d/zz-setup-preserved-upstreams.conf"
 cp "$TMP/up-new/http.d/zz-setup-preserved-upstreams.conf" "$TMP/up-first.conf"
-angie_restore_upstreams "$TMP/up-new" "$TMP/up-snap"
+nginx_restore_upstreams "$TMP/up-new" "$TMP/up-snap"
 check "upstream restore is idempotent on the second run" \
   cmp -s "$TMP/up-first.conf" "$TMP/up-new/http.d/zz-setup-preserved-upstreams.conf"
 printf 'upstream legacy_ws {\n    server 127.0.0.1:6001;\n}\n' >> "$TMP/up-new/http.d/ws.conf"
-angie_restore_upstreams "$TMP/up-new" "$TMP/up-snap"
+nginx_restore_upstreams "$TMP/up-new" "$TMP/up-snap"
 check "upstream restore removes the managed include once the tree defines it" \
   test ! -f "$TMP/up-new/http.d/zz-setup-preserved-upstreams.conf"
 
@@ -4217,13 +4283,13 @@ check "world-writable fix reports the count before fixing" ww_count_before_fix
 
 
 # A custom http.d limit file can duplicate an http-context directive that the
-# canonical limit_req.conf owns; angie -t refuses to load until one copy is
+# canonical limit_req.conf owns; nginx -t refuses to load until one copy is
 # commented.  Keep the canonical file and mark the operator copy.
 mkdir -p "$TMP/dedupe/http.d"
 printf 'limit_req_status 429;\nlimit_req_log_level warn;\n' > "$TMP/dedupe/http.d/limit_req.conf"
 printf 'limit_req_status 429;\nlimit_conn_status 429;\nlimit_req_log_level info;\n' > "$TMP/dedupe/http.d/zz-custom.conf"
 tune_reset_changes
-tune_angie_dedupe_http "$TMP/dedupe"
+tune_nginx_dedupe_http "$TMP/dedupe"
 check "duplicate http directive keeps the canonical file" \
   grep -qx 'limit_req_status 429;' "$TMP/dedupe/http.d/limit_req.conf"
 check "duplicate http directive comments the operator copy" \
@@ -4411,7 +4477,7 @@ valkey_current_maxmemory_mb() { printf '512'; }
 valkey_live_uptime_s() { printf '86400'; }
 valkey_live_peak_mb() { printf '0'; }
 valkey_policy_evicts() { printf '1'; }
-OPT_DETECTED=(angie php:8.4 mariadb valkey elastic)
+OPT_DETECTED=(nginx php:8.4 mariadb valkey elastic)
 OPT_INSTALL_PLAN=0
 plan_memory_budget
 check "plan: a full 512 MB cache keeps 512 MB instead of growing to 614" \
@@ -4563,7 +4629,7 @@ check "the dry run prints the same planned cache size" \
 mem_total_mb() { printf '1024'; }
 php_worker_allowance_mb() { printf '96'; }
 php_children_floor() { printf '8'; }
-OPT_DETECTED=(angie php:8.4 mariadb)
+OPT_DETECTED=(nginx php:8.4 mariadb)
 plan_memory_budget 2>/dev/null
 check "overcommit is measured against the real PHP reservation" \
   test "$OPT_PHP_BUDGET_MB" -eq 768 \
@@ -4880,8 +4946,8 @@ php_exit_probe() {
 check "on_exit rolls back an interrupted --upgrade-php" test "$(php_exit_probe 1 143)" = rolled
 check "on_exit leaves a completed --upgrade-php alone" test -z "$(php_exit_probe 0 143)"
 check "on_exit does not roll back a run that succeeded" test -z "$(php_exit_probe 1 0)"
-check "--upgrade-php raises the in-flight flag before the purge" \
-  bash -c 'sed -n "/^run_php_upgrade()/,/^}/p" "$1" | awk "/PHP_UPGRADE_IN_FLIGHT=1/{f=1} /if ! php_upgrade_purge/{exit !f}"' _ "$ALL_SRC"
+check "--upgrade-php raises the in-flight flag before it stops the old FPM" \
+  bash -c 'sed -n "/^run_php_upgrade()/,/^}/p" "$1" | awk "/PHP_UPGRADE_PHASE=handover/{h=1} h && /PHP_UPGRADE_IN_FLIGHT=1/{f=1} /systemctl stop \"php\\\$\\{cur\\}-fpm\"/{exit !f}"' _ "$ALL_SRC"
 rollback_body=$(sed -n '/^php_upgrade_rollback()/,/^}/p' "$ALL_SRC")
 check "a rollback restarts FPM on the restored tree (postinst started the stock one)" \
   grep -qF 'systemctl restart "php${old}-fpm"' <<<"$rollback_body"
@@ -4889,10 +4955,10 @@ check "a rollback does not rely on enable --now for a unit that is already runni
   not grep -qF 'enable --now "php${old}-fpm"' <<<"$rollback_body"
 check "a rollback checks that the restored pool socket listens" \
   grep -qF 'test -S "$listen"' <<<"$rollback_body"
-check "--upgrade-php ignores HUP while no PHP is installed" \
-  bash -c 'sed -n "/^run_php_upgrade()/,/^}/p" "$1" | grep -q "trap \"\" HUP"' _ "$ALL_SRC"
-check "--upgrade-php keeps the listener of a migrated pool" \
-  grep -qF '/^[[:space:]]*listen[[:space:]]*=/! s/php${old//./\\.}/php${new}/g' "$ALL_SRC"
+check "--upgrade-php ignores HUP while no PHP serves" \
+  bash -c 'sed -n "/^run_php_upgrade()/,/^}/p" "$1" | grep -q "trap \"\" HUP PIPE"' _ "$ALL_SRC"
+check "--upgrade-php keeps the listener of a carried pool" \
+  bash -c 'sed -n "/^php_upgrade_rewrite_file()/,/^}/p" "$1" | grep -qF "/^[[:space:]]*listen[[:space:]]*=/! {"' _ "$ALL_SRC"
 check "the optimize report is not world-readable" \
   bash -c 'sed -n "/^write_optimize_report()/,/^}/p" "$1" | grep -q "chmod 640 \"\$file\""' _ "$ALL_SRC"
 mkdir -p "$SETUP_STATE_DIR"
@@ -4931,31 +4997,31 @@ check "pool split: two versions share the planned pool" test "$(php_split_childr
 check "pool split: a share never drops below two workers" test "$(php_split_children 3 4)" = 2
 check "pool split: the FPM writer splits only when several versions run" \
   bash -c 'sed -n "/^tune_php_fpm_version()/,/^}/p" "$1" | grep -q "php_split_children \"\$max_children\" \"\$active_versions\""' _ "$ALL_SRC"
-# 1.21.66: the Angie worker table and the shared listen backlog had no
+# 1.21.66: the nginx worker table and the shared listen backlog had no
 # value checks; a change to the measured 2/3 ratio or the per-core constants
 # passed the suite.
 saved_wl_fns=$(declare -f host_is_vps sysctl_target_somaxconn)
-angie_wl() { stub_vps=$2; angie_worker_limits "$1"; printf '%s/%s/%s' "$ANGIE_WORKER_PROCESSES" "$ANGIE_WORKER_RLIMIT" "$ANGIE_WORKER_CONNECTIONS"; }
+nginx_wl() { stub_vps=$2; nginx_worker_limits "$1"; printf '%s/%s/%s' "$NGINX_WORKER_PROCESSES" "$NGINX_WORKER_RLIMIT" "$NGINX_WORKER_CONNECTIONS"; }
 host_is_vps() { (( ${stub_vps:-0} )); }
-check "angie workers: 1 CPU dedicated"   test "$(angie_wl 1 0)" = 2/65536/8192
-check "angie workers: 12 CPU dedicated"  test "$(angie_wl 12 0)" = 8/98304/24576
-check "angie workers: 256 CPU dedicated" test "$(angie_wl 256 0)" = 170/524288/65535
-check "angie workers: 2 vCPU VPS"        test "$(angie_wl 2 1)" = 2/65536/8192
-check "angie workers: 64 vCPU VPS"       test "$(angie_wl 64 1)" = 42/262144/65535
-angie_wl_invariant() {
+check "nginx workers: 1 CPU dedicated"   test "$(nginx_wl 1 0)" = 2/65536/8192
+check "nginx workers: 12 CPU dedicated"  test "$(nginx_wl 12 0)" = 8/98304/24576
+check "nginx workers: 256 CPU dedicated" test "$(nginx_wl 256 0)" = 170/524288/65535
+check "nginx workers: 2 vCPU VPS"        test "$(nginx_wl 2 1)" = 2/65536/8192
+check "nginx workers: 64 vCPU VPS"       test "$(nginx_wl 64 1)" = 42/262144/65535
+nginx_wl_invariant() {
   local n v r rl wc
   for v in 0 1; do for n in 1 2 3 4 6 8 12 16 24 32 48 64 96 128 256 512; do
-    r=$(angie_wl "$n" "$v")
+    r=$(nginx_wl "$n" "$v")
     IFS=/ read -r _ rl wc <<<"$r"
     (( wc <= rl - 1024 && wc >= 1024 )) || return 1
   done; done
 }
-check "angie workers: connections always leave 1024 fds of headroom" angie_wl_invariant
+check "nginx workers: connections always leave 1024 fds of headroom" nginx_wl_invariant
 sysctl_target_somaxconn() { printf '%s' "$stub_somax"; }
 stub_somax=512;    check "listen backlog: floor 1024"       test "$(effective_backlog)" = 1024
 stub_somax=8192;   check "listen backlog: follows somaxconn" test "$(effective_backlog)" = 8192
 stub_somax=262144; check "listen backlog: capped at 65535"  test "$(effective_backlog)" = 65535
-unset -f host_is_vps sysctl_target_somaxconn angie_wl angie_wl_invariant
+unset -f host_is_vps sysctl_target_somaxconn nginx_wl nginx_wl_invariant
 eval "$saved_wl_fns"
 # 1.21.66: a MariaDB that parsed the generated files but failed to start was
 # left stopped with them live; the install now restores the copy it took.
@@ -4971,7 +5037,7 @@ check "valkey_pong passes the endpoint arguments to the client" \
   valkey_pong fake_cli -s /run/test.sock
 check "valkey_pong fails on another endpoint" not valkey_pong fake_cli
 check "the Valkey install pings the socket it wrote" \
-  bash -c 'sed -n "/^install_valkey()/,/^}/p" "$1" | grep -q "wait_for_cmd 20 valkey_pong valkey-cli -s \"\$socket\""' _ "$ALL_SRC"
+  bash -c 'sed -n "/^install_valkey()/,/^}/p" "$1" | grep -qF "wait_for_cmd 20 valkey_pong \"\$VALKEY_CLI_BIN\" -s \"\$socket\""' _ "$ALL_SRC"
 # 1.21.67: --optimize still sent CONFIG SET/GET, the restart probe and the
 # verify PING to 127.0.0.1:6379 (adopted bind/port: restart, rollback restart
 # and FAILED on every run, each restart emptying the cache).
@@ -5002,8 +5068,15 @@ unset -f fake_cli
 swap_auto_body=$(sed -n '/^configure_swap_auto()/,/^}/p' "$ALL_SRC")
 check "automatic swap never switches the live file off itself" \
   bash -c '! grep -qE "swapoff|release_swap" <<<"$1"' _ "$swap_auto_body"
-check "--php re-enables the session GC timer after a purge" \
-  bash -c 'sed -n "/^install_php()/,/^}/p" "$1" | grep -q "systemctl enable --now phpsessionclean.timer"' _ "$ALL_SRC"
+# 1.22: the compiled PHP uses its own session GC (php.ini-production
+# gc_probability=1, a 0700 www-data session directory); there is no
+# php-common phpsessionclean timer to enable.
+check "--php enables no phpsessionclean timer (PHP's own session GC)" \
+  bash -c '! sed -n "/^install_php()/,/^}/p" "$1" | grep -q "^[^#]*systemctl enable --now phpsessionclean"' _ "$ALL_SRC"
+check "the PHP tmpfiles keep the session directory www-data 0700" \
+  bash -c 'grep -qE "^d [^ ]+ 0700 www-data www-data -$" <<<"$1"' _ "$(php_build_tmpfiles_text)"
+check "--php applies the --php ext= request before the build" \
+  bash -c 'b=$(sed -n "/^install_php()/,/^}/p" "$1"); a=$(grep -n "^[[:space:]]*php_ext_request_apply" <<<"$b" | head -1 | cut -d: -f1); e=$(grep -n "php_build_ensure \"\$ver\" full install" <<<"$b" | head -1 | cut -d: -f1); [[ -n $a && -n $e && $a -lt $e ]]' _ "$ALL_SRC"
 check "--others sysstat re-enables the units a purge disabled" \
   grep -q 'systemctl enable sysstat.service sysstat-rotate.timer' "$ALL_SRC"
 
@@ -5082,16 +5155,22 @@ check "XenForo ignores a commented Redis example" \
 printf "\$config['cache']['provider'] = 'Redis';\n" > "$TMP/apps/xf/public/src/config.php"
 check "XenForo detects a configured Redis cache" \
   has_ext php_upgrade_app_required_extensions xenforo "$TMP/apps/xf/public"
-check "a core extension needs no package lookup" php_upgrade_extension_available 9.9 gd
-check "an unpublished extension is reported unavailable" not php_upgrade_extension_available 9.9 redis
+# 1.22: the target build's extension set (PHP_UPGRADE_EXTS) decides, not
+# which packages a repository publishes.
+PHP_UPGRADE_EXTS=$'mysqli\ngd\ncurl\nmbstring'
+check "a module PHP always compiles in is available with any set" php_upgrade_extension_available 9.9 date
+check "an extension in the target's set is available" php_upgrade_extension_available 9.9 gd
+check "mysqlnd comes with mysqli" php_upgrade_extension_available 9.9 mysqlnd
+check "an extension outside the target's set is unavailable" not php_upgrade_extension_available 9.9 redis
+check "OPcache is always built (core on every series)" php_upgrade_extension_available 8.4 'Zend OPcache'
 php_upgrade_preflight_apps 9.9 "$TMP/apps" ""
 check "the preflight blocks a target without redis" \
   test "$(printf '%s\n' "${PHP_UPGRADE_BLOCKERS[@]}" | grep -c '|redis$')" -eq 3
 php_upgrade_preflight_apps 9.9 "$TMP/apps/plain"
 check "the preflight is empty without an application" test "${#PHP_UPGRADE_BLOCKERS[@]}" -eq 0
-blocker_desc=$(php_upgrade_describe_blocker "chevereto|/var/www/chev|redis")
-check "the blocker names the site and the missing package" \
-  grep -qF 'chevereto at /var/www/chev requires the redis extension' <<<"$blocker_desc"
+blocker_desc=$(UPGRADE_PHP=9.9 php_upgrade_describe_blocker "chevereto|/var/www/chev|redis")
+check "the blocker names the site, the extension and the ext= remedy" \
+  bash -c 'grep -qF "chevereto at /var/www/chev requires the redis extension" <<<"$1" && grep -qF -- "--php ext=redis" <<<"$1"' _ "$blocker_desc"
 
 # 1.21.56: php-redis is a hard requirement only where something needs it.
 # XenForo's own Redis provider uses the \Redis class; SV RedisCache's Credis
@@ -5122,206 +5201,83 @@ check "an extension the old PHP loads still blocks when the target lacks it" \
 pf_out=$(pf_run "")
 check "an unknown module list keeps every requirement (conservative)" \
   bash -c 'test "$(grep "^B:" <<<"$1" | grep -o "|redis" | wc -l | tr -d " ")" -eq 3' _ "$pf_out"
-check "the module list reads php-fpm -m up to the Zend section, lower-cased" \
-  test "$(
-    command() { [[ $2 == php-fpm8.5 ]]; }
-    php-fpm8.5() { printf '[PHP Modules]\nCore\nredis\nZend OPcache\n\n[Zend Modules]\nZend OPcache\n'; }
-    php_upgrade_loaded_modules 8.5 | paste -sd' ' -
-  )" = "core redis zend_opcache"
-check "a php -m that fails reads as unknown (empty), never as a partial list or an error" \
-  test "$(
-    command() { [[ $2 == php-fpm8.5 ]]; }
-    php-fpm8.5() { printf '[PHP Modules]\nCore\n'; return 141; }
+# php_upgrade_loaded_modules reads our compiled php-fpm (never a Sury binary
+# once the version is ours): -m up to the Zend section, lower-cased.
+lm_bin=$TMP/lm-bin; mkdir -p "$lm_bin"
+printf '#!/bin/sh\nprintf "[PHP Modules]\\nCore\\nredis\\nZend OPcache\\n\\n[Zend Modules]\\nZend OPcache\\n"\n' > "$lm_bin/php-fpm-ok"
+printf '#!/bin/sh\nprintf "[PHP Modules]\\nCore\\n"\nexit 141\n' > "$lm_bin/php-fpm-bad"
+chmod +x "$lm_bin/php-fpm-ok" "$lm_bin/php-fpm-bad"
+lm_run() { # fpm-binary -> "rc|modules"
+  ( LM_FPM=$1
+    php_upgrade_fpm_bin() { printf '%s' "$LM_FPM"; }
+    php_upgrade_cli_bin() { printf '%s' "$TMP/no-such-php"; }
+    php_upgrade_sury_window() { return 1; }
     out=$(php_upgrade_loaded_modules 8.5); rc=$?
-    printf '%s|%s' "$rc" "$out"
-  )" = "0|"
-# The purge removes every installed version, so the union decides.
-lm_all() { # "ver:mods,..." per version -> union
-  (
-    LM_SPEC=$1
-    php_upgrade_installed_versions() { local s; for s in $LM_SPEC; do printf '%s\n' "${s%%:*}"; done; }
-    php_upgrade_any_versions() { :; }
-    php_upgrade_loaded_modules() { local s; for s in $LM_SPEC; do [[ ${s%%:*} == "$1" ]] && tr ',' '\n' <<<"${s#*:}" | sed '/^$/d'; done; return 0; }
-    php_upgrade_loaded_modules_all | paste -sd' ' -
-  )
+    printf '%s|%s' "$rc" "$(paste -sd' ' - <<<"$out")" )
 }
-check "an extension loaded by any installed version counts (8.4 redis, 8.5 none)" \
-  test "$(lm_all '8.4:gd,redis 8.5:gd')" = "gd redis"
-check "one unreadable version makes the whole list unknown (conservative)" \
-  test "$(lm_all '8.4:gd,redis 8.5:')" = ""
-check "no installed PHP means an unknown list" test "$(lm_all '')" = ""
-check "the dry run and the real run read the same module union" \
-  bash -c 'test "$(grep -c "php_upgrade_preflight_apps \"\$target\"\$" "$1")" -eq 2' _ "$ROOT/lib/php-upgrade.sh"
-waived_desc=$(PHP_UPGRADE_LOADED_FROM="8.4 8.5" UPGRADE_PHP=8.6 php_upgrade_describe_waived "xenforo|/var/www/f|redis")
-check "the waiver line names the site, the extension and the versions read" \
-  grep -qF 'xenforo at /var/www/f: the redis extension is not loaded by any installed PHP-FPM (8.4 8.5) either' <<<"$waived_desc"
-check "the default --php set installs no php-redis or php-igbinary" \
-  bash -c 'b=$(sed -n "/^install_php() {/,/^}/p" "$1"); grep -qx "  local -a php_optional=()" <<<"$b" && ! grep -E "^[^#]*php\\\$\{ver\}-(redis|igbinary)" <<<"$b" | grep -q .' _ "$ALL_SRC"
-check "--upgrade-php carries redis like any other extension (not part of the core set)" \
-  bash -c '[[ $1 != *" redis "* ]]' _ "$PHP_UPGRADE_CORE_EXT"
-check "--upgrade-php skips redis when the target does not publish it" \
-  test "$( apt-cache() { return 1; }; php_upgrade_classify_package 9.9 php8.5-redis )" = "skip:php9.9-redis is not published"
-check "--upgrade-php keeps redis when the target publishes it" \
-  test "$( apt-cache() { return 0; }; php_upgrade_classify_package 9.9 php8.5-redis )" = "keep:php9.9-redis"
-# php_ensure_app_extensions installs only what the app needs and FPM lacks.
-pe_run() { # app root loaded-modules published? -> installed packages
+check "the module list reads php-fpm -m up to the Zend section, lower-cased" \
+  test "$(lm_run "$lm_bin/php-fpm-ok")" = "0|core redis zend_opcache"
+check "a php -m that fails reads as unknown (empty), never as a partial list or an error" \
+  test "$(lm_run "$lm_bin/php-fpm-bad")" = "0|"
+check "a missing compiled php-fpm outside the Sury window reads as unknown" \
+  test "$(lm_run "$TMP/no-such-fpm")" = "0|"
+check "the dry run and the real run read the same module list (no list passed in)" \
+  bash -c 'for f in php_upgrade_plan run_php_upgrade; do sed -n "/^${f}()/,/^}/p" "$1" | grep -qE "^[[:space:]]*php_upgrade_preflight_apps \"\\\$target\"\$" || exit 1; done' _ "$ROOT/lib/php-upgrade.sh"
+waived_desc=$(PHP_UPGRADE_LOADED_FROM=8.5 UPGRADE_PHP=8.6 php_upgrade_describe_waived "xenforo|/var/www/f|redis")
+check "the waiver line names the site, the extension and the version read" \
+  grep -qF 'xenforo at /var/www/f: the redis extension is not loaded by the current PHP-FPM (8.5) either' <<<"$waived_desc"
+check "--php installs no PHP package (extensions are built in)" \
+  bash -c '! sed -n "/^install_php() {/,/^}/p" "$1" | grep -qE "^[^#]*apt_install[^#]*php"' _ "$ALL_SRC"
+# php_ensure_app_extensions rebuilds the version (refresh context, never
+# BOLT) when the app needs a module the running build lacks; nothing is
+# installed from a package.
+pe_run() { # app root loaded-before loaded-after -> "builds|warnings"
   (
-    php_upgrade_loaded_modules() { printf '%s\n' $PE_MODS; }
-    apt-cache() { [[ $PE_PUB == 1 ]]; }
-    apt_install() { printf '%s\n' "$@" >> "$TMP/pe.installed"; }
-    systemctl() { :; }; info() { :; }; warn() { printf 'WARN %s\n' "$*" >> "$TMP/pe.installed"; }
-    PE_MODS=$3; PE_PUB=$4; : > "$TMP/pe.installed"
+    PE_N=0; PE_BEFORE=$3; PE_AFTER=$4; : > "$TMP/pe.log"
+    php_upgrade_loaded_modules() { if [[ -s $TMP/pe.built ]]; then printf '%s\n' $PE_AFTER; else printf '%s\n' $PE_BEFORE; fi; }
+    php_build_ensure() { printf 'build %s\n' "$*" >> "$TMP/pe.log"; printf x > "$TMP/pe.built"; return 0; }
+    apt_install() { printf 'APT %s\n' "$*" >> "$TMP/pe.log"; }
+    systemctl() { :; }; info() { :; }; warn() { printf 'WARN %s\n' "$*" >> "$TMP/pe.log"; }
+    rm -f "$TMP/pe.built"
     php_ensure_app_extensions "$1" "$2" 8.5
-    paste -sd' ' - < "$TMP/pe.installed"
+    paste -sd'|' - < "$TMP/pe.log"
   )
 }
-check "a new Chevereto site gets redis only (no imagick: GD serves its images)" \
-  test "$(pe_run chevereto "$TMP/apps/chev/public" "mysqli gd curl mbstring" 1)" = "php8.5-redis"
-check "a Chevereto site whose FPM already loads them gets nothing" \
-  test "$(pe_run chevereto "$TMP/apps/chev/public" "mysqli gd curl mbstring redis imagick" 1)" = ""
+# The 1.22 requirement table (R2.9): Chevereto needs all of these; redis is
+# the one the build below lacks.
+pe_chev="pdo_mysql pdo mysqli igbinary gd curl mbstring exif fileinfo xmlwriter zip"
+check "a new Chevereto site whose build lacks redis gets a refresh rebuild of that version" \
+  test "$(pe_run chevereto "$TMP/apps/chev/public" "$pe_chev" "$pe_chev redis")" = "build 8.5 full refresh info"
+check "a rebuild that still lacks the module warns with the ext= remedy" \
+  bash -c '[[ $1 == "build 8.5 full refresh info|WARN "*"still does not load redis"*"--php ext=redis"* ]]' _ \
+  "$(pe_run chevereto "$TMP/apps/chev/public" "$pe_chev" "$pe_chev")"
+check "a Chevereto site whose FPM already loads redis gets nothing" \
+  test "$(pe_run chevereto "$TMP/apps/chev/public" "$pe_chev redis imagick" "")" = ""
 printf "\$config['cache']['provider'] = 'SV\\\\RedisCache\\\\Redis';\n" > "$TMP/apps/xf/public/src/config.php"
-check "a XenForo site (SV RedisCache or no cache) gets no extension" \
-  test "$(pe_run xenforo "$TMP/apps/xf/public" "mysqli gd curl mbstring xml zip" 1)" = ""
-check "a required package that is not published is a warning, not an install" \
-  bash -c 'grep -q "^WARN chevereto at .* needs php8.5-redis, which is not published" <<<"$(tr " " "\n" <<<"$1" | paste -sd" " -)" || [[ $1 == *"needs php8.5-redis, which is not published"* ]]' _ "$(pe_run chevereto "$TMP/apps/chev/public" "mysqli gd curl mbstring" 0)"
-check "an unknown module list installs nothing (no guessing)" \
-  test "$(pe_run chevereto "$TMP/apps/chev/public" "" 1)" = ""
+check "a XenForo site (SV RedisCache or no cache) gets no rebuild" \
+  test "$(pe_run xenforo "$TMP/apps/xf/public" "mysqli gd curl mbstring xml zip exif" "")" = ""
+check "an unknown module list rebuilds nothing (no guessing)" \
+  test "$(pe_run chevereto "$TMP/apps/chev/public" "" "")" = ""
+# 1.22: create_domains hands the new sites' app types to one rebuild
+# (domain_php_extensions -> PHP_BUILD_APPS), named as the requirement table
+# names them.
 check "--domain maps app=xf to the XenForo requirements" \
-  grep -qF 'case $app in xf) req_app=xenforo ;; *) req_app=$app ;; esac' "$ALL_SRC"
-# --- audit 1.21.58: php-upgrade
-
-# --upgrade-php on multi-version hosts, same-version runs, rejected migrations
-mkdir -p "$TMP/ovl/php/8.3/fpm/conf.d" "$TMP/ovl/php/8.3/fpm/pool.d" \
-         "$TMP/ovl/php/8.5/fpm/conf.d" "$TMP/ovl/php/8.5/fpm/pool.d" "$TMP/ovl/angie/sites"
-printf 'memory_limit = 512M\n' > "$TMP/ovl/php/8.3/fpm/conf.d/90-local.ini"
-printf 'date.timezone = UTC\n' > "$TMP/ovl/php/8.3/fpm/conf.d/custom_dan.ini"
-ln -sf ../../mods-available/redis.ini "$TMP/ovl/php/8.3/fpm/conf.d/20-redis.ini"
-printf '[www]\nlisten = /run/php/php8.3-fpm.sock\n' > "$TMP/ovl/php/8.3/fpm/pool.d/www.conf"
-printf '[shop]\nlisten = /run/php/php8.3-fpm-shop.sock\n' > "$TMP/ovl/php/8.3/fpm/pool.d/shop.conf"
-printf '[www]\nlisten = /run/php/php-fpm.sock\n' > "$TMP/ovl/php/8.5/fpm/pool.d/www.conf"
-printf '[api]\nlisten = /run/php/php8.5-fpm-api.sock\n' > "$TMP/ovl/php/8.5/fpm/pool.d/api.conf"
-printf 'location ~ \\.php$ { fastcgi_pass unix:/run/php/php8.3-fpm.sock; }\n' > "$TMP/ovl/angie/sites/legacy.conf"
-ovl_run() { # old [fpm-installed-versions] -> loss lines joined by |
-  ( OVL_FPM=${2:-8.3 8.5}
-    php_upgrade_any_versions() { printf '8.3\n8.5\n'; }
-    php_upgrade_installed_versions() { printf '%s\n' $OVL_FPM; }
-    php_upgrade_other_version_losses "$1" "$TMP/ovl/php" "$TMP/ovl/angie" | paste -sd'|' - )
-}
-ovl_out=$(ovl_run 8.5)
-check "--upgrade-php names another version's custom ini" \
-  grep -qF $'8.3\tini\tfpm/conf.d/90-local.ini' <<<"$ovl_out"
-check "--upgrade-php names another version's extra pool and its socket" \
-  grep -qF $'8.3\tpool\tshop.conf (listen = /run/php/php8.3-fpm-shop.sock)' <<<"$ovl_out"
-check "--upgrade-php names another version's www socket a vhost uses" \
-  grep -qF $'8.3\tlistener\t/run/php/php8.3-fpm.sock (used by '"$TMP/ovl/angie/sites/legacy.conf)" <<<"$ovl_out"
-check "managed and package-owned fragments are not reported as losses" \
-  not grep -qE 'custom_dan|20-redis' <<<"$ovl_out"
-check "the version being upgraded is not reported (it is migrated)" \
-  test "$(tr '|' '\n' <<<"$ovl_out" | grep -c .)" -eq 3
-check "upgrading the other version reports this one's extra pool" \
-  grep -qF $'8.5\tpool\tapi.conf' <<<"$(ovl_run 8.3)"
-check "a removed-not-purged FPM's pools and listener are not losses, its custom ini is" \
-  test "$(ovl_run 8.5 8.5)" = $'8.3\tini\tfpm/conf.d/90-local.ini'
-rm -f "$TMP/ovl/php/8.3/fpm/pool.d/shop.conf" "$TMP/ovl/php/8.3/fpm/conf.d/90-local.ini" "$TMP/ovl/angie/sites/legacy.conf"
-check "an unused stock second PHP-FPM does not block the upgrade" test -z "$(ovl_run 8.5)"
-# Every setup template and Angie's upstream use the shared socket; the target's
-# www pool keeps it, so a stale second version on it is not a loss.
-printf '[www]\nlisten = /run/php/php-fpm.sock\n' > "$TMP/ovl/php/8.3/fpm/pool.d/www.conf"
-printf 'upstream php { server unix:/run/php/php-fpm.sock; }\n' > "$TMP/ovl/angie/angie.conf"
-check "a second version on the shared socket the target keeps does not block" \
-  test -z "$(ovl_run 8.5)"
-mv "$TMP/ovl/php/8.5/fpm/pool.d/www.conf" "$TMP/ovl/php/8.5/fpm/pool.d/www.conf.off"
-check "with no old www pool the target's template socket is still kept" \
-  test -z "$(ovl_run 8.5)"
-printf '[www]\nlisten = /run/php/php8.5-fpm.sock\n' > "$TMP/ovl/php/8.5/fpm/pool.d/www.conf"
-check "the shared socket is a loss when the old version listens elsewhere" \
-  grep -qF $'8.3\tlistener\t/run/php/php-fpm.sock (used by '"$TMP/ovl/angie/angie.conf)" <<<"$(ovl_run 8.5)"
-check "a loss line names the version, the pool and the consequence" \
-  grep -qF 'PHP 8.3 extra FPM pool shop.conf would be deleted' <<<"$(php_upgrade_describe_other_loss $'8.3\tpool\tshop.conf')"
-
-sv_run() { # pending-list published-exts -> "rc installed|pending|repo-calls"
-  (
-    mkdir -p "$TMP/sv"; printf '%s\n' $1 > "$TMP/sv/pending"; : > "$TMP/sv/installed"; : > "$TMP/sv/repo"
-    PHP_UPGRADE_PENDING_FILE="$TMP/sv/pending"; SV_PUB=" $2 "
-    configure_php_repo() { echo repo >> "$TMP/sv/repo"; }; apt_update() { :; }
-    php_upgrade_unversioned_only() { return 1; }
-    dpkg-query() { :; }
-    apt-cache() { [[ $SV_PUB == *" ${2#php8.6-} "* ]]; }
-    apt_install() { printf '%s\n' "$@" >> "$TMP/sv/installed"; }
-    systemctl() { :; }; ok() { :; }; info() { :; }; warn() { :; }
-    rc=0; php_upgrade_same_version 8.6 >/dev/null 2>&1 || rc=$?
-    printf '%s %s|%s|%s\n' "$rc" "$(paste -sd, - < "$TMP/sv/installed")" \
-      "$(cat "$TMP/sv/pending" 2>/dev/null | paste -sd, -)" "$(grep -c . "$TMP/sv/repo")"
-  )
-}
-check "a same-version run installs only the newly published pending extension" \
-  test "$(sv_run 'imagick redis' imagick)" = "1 php8.6-imagick|redis|1"
-check "a same-version run clears the pending list once everything is installed" \
-  test "$(sv_run imagick imagick)" = "0 php8.6-imagick||1"
-check "a same-version run with nothing pending touches nothing" \
-  test "$(sv_run '' imagick)" = "0 ||0"
+  bash -c '[[ $1 == xenforo && $2 == chevereto ]] && sed -n "/^create_domains()/,/^}/p" "$3" | grep -qxE "[[:space:]]*domain_php_extensions"' _ \
+  "$(services_php_build_app xf)" "$(services_php_build_app chevereto)" "$ALL_SRC"
 upg_body=$(sed -n '/^run_php_upgrade()/,/^}/p' "$ALL_SRC")
-check "--upgrade-php to the serving version never reaches the snapshot or purge" \
-  bash -c 'a=$(grep -n "php_upgrade_same_version \"\$target\"" <<<"$1" | cut -d: -f1); b=$(grep -n "php_upgrade_snapshot \"\$old\"" <<<"$1" | cut -d: -f1); [[ -n $a && -n $b && $a -lt $b ]]' _ "$upg_body"
-check "--upgrade-php refuses other versions' losses before the snapshot" \
-  bash -c 'a=$(grep -n "SETUP_PHP_PURGE_OTHER_VERSIONS:-0" <<<"$1" | cut -d: -f1); b=$(grep -n "php_upgrade_snapshot \"\$old\"" <<<"$1" | cut -d: -f1); [[ -n $a && -n $b && $a -lt $b ]]' _ "$upg_body"
+check "--upgrade-php refuses before the snapshot (refusals, conflicts)" \
+  bash -c 'a=$(grep -n "php_upgrade_refusals" <<<"$1" | head -1 | cut -d: -f1); c=$(grep -n "php_upgrade_listen_conflicts" <<<"$1" | head -1 | cut -d: -f1); b=$(grep -n "php_upgrade_snapshot \"\$cur\"" <<<"$1" | head -1 | cut -d: -f1); [[ -n $a && -n $c && -n $b && $a -lt $b && $c -lt $b ]]' _ "$upg_body"
 check "the dry run names the same source version as the real run" \
-  bash -c 'sed -n "/^php_upgrade_plan()/,/^}/p" "$1" | grep -q "old=\$(php_primary_version"' _ "$ALL_SRC"
-
-mc_run() { # fpm-test-binary -> "rc redis bad-ini bad-cli-link bad-pool list"
-  (
-    M="$TMP/mc"; rm -rf "$M"
-    mkdir -p "$M/man/php-config/8.4/fpm/conf.d" "$M/man/php-config/8.4/fpm/pool.d" \
-             "$M/etc/8.6/fpm/conf.d" "$M/etc/8.6/fpm/pool.d" "$M/etc/8.6/cli/conf.d" "$M/etc/8.6/mods-available"
-    PHP_UPGRADE_MANIFEST_DIR="$M/man"; MC_BIN=$1
-    printf 'extension=redis.so\n' > "$M/man/php-config/8.4/fpm/conf.d/20-redis.ini"
-    printf 'zend_extension=/nonexistent/x.so\n' > "$M/man/php-config/8.4/fpm/conf.d/99-bad.ini"
-    printf '[bad]\nlisten = /run/php/bad.sock\n' > "$M/man/php-config/8.4/fpm/pool.d/bad.conf"
-    printf 'fpm/conf.d/20-redis.ini\t\nfpm/conf.d/99-bad.ini\tcli/conf.d\n' > "$M/man/custom-inis.txt"
-    printf 'bad.conf\n' > "$M/man/custom-pools.txt"
-    printf 'extension=redis.so\n' > "$M/etc/8.6/mods-available/redis.ini"
-    ln -s ../../mods-available/redis.ini "$M/etc/8.6/fpm/conf.d/20-redis.ini"
-    php_fpm_binary() { printf '%s\n' "$MC_BIN"; }
-    systemctl() { return 1; }; ok() { :; }; warn() { :; }
-    has() { if [[ -e $1 || -L $1 ]]; then printf yes; else printf no; fi; }
-    rc=0; php_upgrade_migrate_custom 8.4 8.6 "$M/etc" >/dev/null 2>&1 || rc=$?
-    printf '%s %s %s %s %s %s\n' "$rc" \
-      "$([[ -L $M/etc/8.6/fpm/conf.d/20-redis.ini ]] && printf kept || printf lost)" \
-      "$(has "$M/etc/8.6/fpm/conf.d/99-bad.ini")" "$(has "$M/etc/8.6/cli/conf.d/99-bad.ini")" \
-      "$(has "$M/etc/8.6/fpm/pool.d/bad.conf")" "$(has "$M/man/custom-inis.applied.txt")"
-  )
-}
-check "a rejected migration removes what it migrated and keeps the package's 20-redis.ini" \
-  test "$(mc_run false)" = "1 kept no no no no"
-check "an accepted migration keeps the migrated ini, its link, the pool and the package's ini" \
-  test "$(mc_run true)" = "0 kept yes yes yes yes"
-
-mw_run() { # fpm-test-binary -> "rc env-line version-rewritten listen-kept"
-  (
-    M="$TMP/mw"; rm -rf "$M"
-    mkdir -p "$M/man/php-config/8.4/fpm/pool.d" "$M/etc/8.6/fpm/pool.d"
-    PHP_UPGRADE_MANIFEST_DIR="$M/man"; MW_BIN=$1
-    printf '[www]\nuser = shopuser\nlisten = /run/php/php8.4-shop.sock\nenv[APP_ENV] = prod\nslowlog = /var/log/php8.4-fpm.slow.log\n' \
-      > "$M/man/php-config/8.4/fpm/pool.d/www.conf"
-    printf '[www]\nuser = www-data\nlisten = /run/php/php-fpm.sock\n' > "$M/etc/8.6/fpm/pool.d/www.conf"
-    php_fpm_binary() { printf '%s\n' "$MW_BIN"; }
-    systemctl() { return 1; }; ok() { :; }; warn() { :; }
-    rc=0; php_upgrade_migrate_custom 8.4 8.6 "$M/etc" >/dev/null 2>&1 || rc=$?
-    f="$M/etc/8.6/fpm/pool.d/www.conf"
-    printf '%s %s %s %s\n' "$rc" \
-      "$(grep -c '^env\[APP_ENV\] = prod$' "$f")" \
-      "$(grep -c 'php8\.6-fpm\.slow\.log' "$f")" \
-      "$(grep -c '^listen = /run/php/php8\.4-shop\.sock$' "$f")"
-  )
-}
-check "--upgrade-php carries the operator's www.conf keys (env, user) and keeps its listener" \
-  test "$(mw_run true)" = "0 1 1 1"
-check "a www.conf the new FPM rejects is replaced by the template again" \
-  test "$(mw_run false)" = "1 0 0 0"
+  bash -c 'for f in php_upgrade_plan run_php_upgrade; do sed -n "/^${f}()/,/^}/p" "$1" | grep -qF "cur=\$(php_upgrade_current_version)" || exit 1; done' _ "$ALL_SRC"
 check "run_php_upgrade calls php_upgrade_optimize plainly (set -e stays active for every tuner)" \
   bash -c 'grep -qE "^[[:space:]]*php_upgrade_optimize[[:space:]]*$" <<<"$1" && ! grep -qE "php_upgrade_optimize[[:space:]]*\|\|" <<<"$1"' _ "$upg_body"
 check "php_upgrade_optimize reports through PHP_UPGRADE_OPTIMIZE_OK and returns 0" \
   bash -c 'sed -n "/^php_upgrade_optimize()/,/^}/p" "$1" | tail -n 3 | grep -q "return 0"' _ "$ALL_SRC"
+check "php_upgrade_optimize defers BOLT to the next --optimize" \
+  bash -c 'sed -n "/^php_upgrade_optimize()/,/^}/p" "$1" | grep -qE "local -x SETUP_PHP_BUILD_BOLT=0"' _ "$ALL_SRC"
+check "--upgrade-php plans the target's set (php_upgrade_effective_exts \"\$target\")" \
+  bash -c 'for f in php_upgrade_plan run_php_upgrade; do sed -n "/^${f}()/,/^}/p" "$1" | grep -qF "php_upgrade_effective_exts \"\$target\"" || exit 1; done' _ "$ALL_SRC"
+PHP_UPGRADE_EXTS=""
 
 # apt_update: a repository mid-sync gets the long waits, anything else the
 # three quick tries; the last failure names the reason.
@@ -5372,24 +5328,8 @@ check "a stale CDN index is refetched uncompressed for that repository only" \
   test "$(auu_run ok)" = "0 1 1 php.list none"
 check "a failed uncompressed refetch falls back to the mirror-sync waits (once)" \
   test "$(auu_run fail)" = "0 3 1 php.list mirror-sync"
-check "the upgrade explains an apt failure and says nothing changed" \
-  grep -qF 'apt_update || die "Could not refresh the package lists: $(apt_update_failure_hint). Nothing was changed' "$ALL_SRC"
-
-mkdir -p "$TMP/php-manifest"
-printf 'common\t0\tphp-common\ncommon\t0\tphp8.5-common\nredis\t1\tphp8.5-redis\n' \
-  > "$TMP/php-manifest/extensions.txt"
-PHP_UPGRADE_MANIFEST_DIR="$TMP/php-manifest"
-php_upgrade_plan_extensions 9.9
-check "carried extensions are de-duplicated" test "$PHP_UPGRADE_CARRIED_COUNT" -eq 1
-check "an unpublished extension still counts as skipped" \
-  test "${#PHP_UPGRADE_SKIPPED[@]}" -eq 1
-# One extension is often installed twice (php-imagick and php8.5-imagick);
-# the skipped list must name it once, like the carried list and the dry run.
-printf 'imagick\t1\tphp8.5-imagick\nimagick\t0\tphp-imagick\n' \
-  > "$TMP/php-manifest/extensions.txt"
-php_upgrade_plan_extensions 9.9
-check "a duplicated skipped extension is reported once" \
-  test "${#PHP_UPGRADE_SKIPPED[@]}" -eq 1
+check "a failed apt-get update explains why (apt_update_failure_hint)" \
+  grep -qF 'apt_update || die "apt-get update failed: $(apt_update_failure_hint)"' "$ALL_SRC"
 check "the OpenSSH application profile counts as an SSH rule for port 22" \
   test "$(ufw_rule_ssh_port 'ufw allow OpenSSH' 22)" = 22
 check "the OpenSSH application profile is not matched for another port" \
@@ -5469,9 +5409,9 @@ tune_flarum_cache_gate "$fl"
 check "Flarum gate: an operator-edited map leaves the include untouched" \
   grep -qF 'if ($flarum_guest_cacheable$req_encoded_path)' "$fl/h5bp/php_flarum.conf"
 check_tree "Flarum gate: the shipped tree has no joined-variable if" \
-  bash -c '! grep -rqF "\$flarum_guest_cacheable\$req_encoded_path" "$1/h5bp" "$1/http.d"' _ "$ANGIE_TREE"
+  bash -c '! grep -rqF "\$flarum_guest_cacheable\$req_encoded_path" "$1/h5bp" "$1/http.d"' _ "$NGINX_TREE"
 
-# Guest-cache encoding (1.21.59).  With Vary honoured, Angie kept one entry
+# Guest-cache encoding (1.21.59).  With Vary honoured, nginx kept one entry
 # per exact Accept-Encoding string (three for one XenForo thread: Chrome,
 # Safari, Cloudflare).  Every encoding-keyed cache now ignores Vary, which is
 # safe only because the application is given exactly the key's encoding.
@@ -5480,9 +5420,9 @@ ae_map() { # the value $guest_cache_ae gives for a $guest_cache_enc value
     f && $1 == want { sub(/;$/, "", $2); print $2 }' "$1/http.d/fastcgi_cache.conf"
 }
 check_tree "guest cache: the application is given exactly gzip for a gzip key" \
-  test "$(ae_map "$ANGIE_TREE" gzip)" = gzip
+  test "$(ae_map "$NGINX_TREE" gzip)" = gzip
 check_tree "guest cache: the application is given nothing for a plain key" \
-  test "$(ae_map "$ANGIE_TREE" default)" = '""'
+  test "$(ae_map "$NGINX_TREE" default)" = '""'
 # Every FastCGI location that stores pages under an encoding key passes the
 # key's encoding to PHP and ignores Vary (WordPress: the param sits in the PHP
 # handler, the ignore in the server-level cache include).
@@ -5498,14 +5438,14 @@ cache_ae_ok() {
   # same location (a server-level fastcgi_param would be dropped).
   ! grep -qE '^fastcgi_param HTTP_ACCEPT_ENCODING' "$t/h5bp/wordpress_cache.conf"
 }
-check_tree "guest cache: every encoding-keyed FastCGI cache passes the key's encoding and ignores Vary" cache_ae_ok "$ANGIE_TREE"
+check_tree "guest cache: every encoding-keyed FastCGI cache passes the key's encoding and ignores Vary" cache_ae_ok "$NGINX_TREE"
 check_tree "guest cache: no other encoding-keyed cache honours Vary" \
-  bash -c 'for f in $(grep -lE "_cache_key .*\\\$guest_cache_enc" "$1"/h5bp/*.conf); do grep -qE "^(fastcgi|proxy)_ignore_headers .*\bVary;" "$f" || { [[ ${f##*/} == wordpress_cache.conf ]] && grep -q "^fastcgi_ignore_headers Vary;" "$f"; } || { echo "$f"; exit 1; }; done' _ "$ANGIE_TREE"
+  bash -c 'for f in $(grep -lE "_cache_key .*\\\$guest_cache_enc" "$1"/h5bp/*.conf); do grep -qE "^(fastcgi|proxy)_ignore_headers .*\bVary;" "$f" || { [[ ${f##*/} == wordpress_cache.conf ]] && grep -q "^fastcgi_ignore_headers Vary;" "$f"; } || { echo "$f"; exit 1; }; done' _ "$NGINX_TREE"
 check_tree "XenForo proxy cache: guests get the key's encoding, members keep their header" \
-  bash -c 'grep -qE "^proxy_set_header Accept-Encoding +\\\$xf_proxy_ae;" "$1/h5bp/xf_proxy_pass.conf" && awk "/^map .*\\\$xf_proxy_ae/{f=1} f" "$1/http.d/fastcgi_cache.conf" | grep -qE "^ *default +\\\$http_accept_encoding;"' _ "$ANGIE_TREE"
+  bash -c 'grep -qE "^proxy_set_header Accept-Encoding +\\\$xf_proxy_ae;" "$1/h5bp/xf_proxy_pass.conf" && awk "/^map .*\\\$xf_proxy_ae/{f=1} f" "$1/http.d/fastcgi_cache.conf" | grep -qE "^ *default +\\\$http_accept_encoding;"' _ "$NGINX_TREE"
 # 1.21.63: XenForo gzipped every uncached page at level 9 inside the PHP
 # worker (12 % of PHP-FPM CPU on a member thread); the uncached handler now
-# withholds Accept-Encoding so Angie compresses, on a new install too (the
+# withholds Accept-Encoding so nginx compresses, on a new install too (the
 # src/config.php block is only written by --optimize).  The param must sit
 # after the fastcgi snippet, in the handler itself, and the guest cache
 # location must keep passing the key's encoding.
@@ -5514,15 +5454,15 @@ xf_handler_ae_ok() {
   awk '/^include snippets\/fastcgi-php-noinfo\.conf;/ { s = NR } /^fastcgi_param HTTP_ACCEPT_ENCODING "";$/ { p = NR } END { exit !(s && p > s) }' "$f" \
     && grep -qE '^fastcgi_param HTTP_ACCEPT_ENCODING \$guest_cache_ae;' "$1/h5bp/php_xf.conf"
 }
-check_tree "XenForo uncached handler: PHP gets no Accept-Encoding, Angie compresses" xf_handler_ae_ok "$ANGIE_TREE"
+check_tree "XenForo uncached handler: PHP gets no Accept-Encoding, nginx compresses" xf_handler_ae_ok "$NGINX_TREE"
 # Ignoring Vary drops every header it names: a response that varies on
 # anything but Accept-Encoding (a mobile plugin's User-Agent) must not be
 # stored at all, so every guest cache lists $guest_cache_vary_other.
 check_tree "guest cache: every encoding-keyed cache refuses to store a response that varies on more than Accept-Encoding" \
-  bash -c 'for f in $(grep -lE "_cache_key .*\\\$guest_cache_enc" "$1"/h5bp/*.conf); do grep -qE "^(fastcgi|proxy)_no_cache .*\\\$guest_cache_vary_other( |;)" "$f" || { echo "$f"; exit 1; }; done' _ "$ANGIE_TREE"
+  bash -c 'for f in $(grep -lE "_cache_key .*\\\$guest_cache_enc" "$1"/h5bp/*.conf); do grep -qE "^(fastcgi|proxy)_no_cache .*\\\$guest_cache_vary_other( |;)" "$f" || { echo "$f"; exit 1; }; done' _ "$NGINX_TREE"
 vary_map() { # the map value for an upstream Vary value
   local v=$1 re
-  awk '/^map \$upstream_http_vary \$guest_cache_vary_other/ {f=1; next} f && /^}/ {exit} f' "$ANGIE_TREE/http.d/fastcgi_cache.conf" > "$TMP/vary-map.txt"
+  awk '/^map \$upstream_http_vary \$guest_cache_vary_other/ {f=1; next} f && /^}/ {exit} f' "$NGINX_TREE/http.d/fastcgi_cache.conf" > "$TMP/vary-map.txt"
   if grep -qF "\"$v\" " "$TMP/vary-map.txt"; then awk -v v="\"$v\"" '$1 == v { sub(/;$/, "", $2); print $2 }' "$TMP/vary-map.txt"; return; fi
   while read -r re; do
     perl -e 'exit(($ARGV[1] =~ /$ARGV[0]/i) ? 0 : 1)' "$re" "$v" && { echo 0; return; }
@@ -5537,8 +5477,8 @@ check_tree "Vary guard: Accept-Encoding plus Cookie is never stored" test "$(var
 # never stored, whichever PHP location rendered it (a WordPress subdirectory
 # served by h5bp/php.conf passes the raw header).
 check_tree "guest cache: every encoding-keyed cache refuses a body that does not match its key" \
-  bash -c 'for f in $(grep -lE "_cache_key .*\\\$guest_cache_enc" "$1"/h5bp/*.conf); do grep -qE "^(fastcgi|proxy)_no_cache .*\\\$guest_cache_enc_mismatch( |;)" "$f" || { echo "$f"; exit 1; }; done' _ "$ANGIE_TREE"
-mm_map() { awk -v k="\"$1\"" '/^map "\$guest_cache_enc:\$upstream_http_content_encoding"/ {f=1; next} f && /^}/ {exit} f && ($1 == k || ($1 == "default" && d == "")) { if ($1 == "default") d = $2; else { sub(/;$/, "", $2); print $2; found = 1; exit } } END { if (!found) { sub(/;$/, "", d); print d } }' "$ANGIE_TREE/http.d/fastcgi_cache.conf"; }
+  bash -c 'for f in $(grep -lE "_cache_key .*\\\$guest_cache_enc" "$1"/h5bp/*.conf); do grep -qE "^(fastcgi|proxy)_no_cache .*\\\$guest_cache_enc_mismatch( |;)" "$f" || { echo "$f"; exit 1; }; done' _ "$NGINX_TREE"
+mm_map() { awk -v k="\"$1\"" '/^map "\$guest_cache_enc:\$upstream_http_content_encoding"/ {f=1; next} f && /^}/ {exit} f && ($1 == k || ($1 == "default" && d == "")) { if ($1 == "default") d = $2; else { sub(/;$/, "", $2); print $2; found = 1; exit } } END { if (!found) { sub(/;$/, "", d); print d } }' "$NGINX_TREE/http.d/fastcgi_cache.conf"; }
 check_tree "mismatch guard: a plain body under the plain key is stored" test "$(mm_map ':')" = 0
 check_tree "mismatch guard: a gzip body under the gzip key is stored" test "$(mm_map 'gzip:gzip')" = 0
 check_tree "mismatch guard: a deflate body under the plain key is refused" test "$(mm_map ':deflate')" = 1
@@ -5575,7 +5515,7 @@ tl_sum=$(cksum < "$tl/conf.d/1.https.default.conf")
 tune_default_tls_reject "$tl"
 check "default TLS server: a second pass changes nothing" test "$tl_sum" = "$(cksum < "$tl/conf.d/1.https.default.conf")"
 check_tree "default TLS server: the shipped tree already rejects" \
-  grep -qx '  ssl_reject_handshake on;' "$ANGIE_TREE/conf.d/1.https.default.conf"
+  grep -qx '  ssl_reject_handshake on;' "$NGINX_TREE/conf.d/1.https.default.conf"
 
 # A reverse proxy outside Cloudflare that connects without the site's SNI
 # had every handshake refused (site-d.example 502 behind 203.0.113.23).
@@ -5682,17 +5622,9 @@ SSL_REJECT_UNKNOWN_SNI=0 tune_default_tls_reject "$tlr"
 check "TLS reject guard: an operator-edited catch-all is still switched off" \
   grep -qF "# ssl_reject_handshake on;  # setup.sh: off" "$tlr/conf.d/1.https.default.conf"
 check_tree "TLS reject guard: the shipped tree names no front proxy (every plain host keeps the rejection)" \
-  bash -c 'test -z "$1"' _ "$(tls_reject_front_proxies "$ANGIE_TREE")"
+  bash -c 'test -z "$1"' _ "$(tls_reject_front_proxies "$NGINX_TREE")"
 check "SSL_REJECT_UNKNOWN_SNI survives a profile reset" \
   grep -qE '^  CPU_MITIGATIONS .*SSL_REJECT_UNKNOWN_SNI' "$ROOT/lib/overrides.sh"
-
-# PHP optional extensions: one transaction first (one php-fpm restart),
-# per-package fallback with the systemd start limit cleared.
-php_install_body=$(sed -n '/^install_php()/,/^}/p' "$ALL_SRC")
-check "optional PHP extensions are installed in one transaction first" \
-  grep -qF 'apt_install "${optional_ok[@]}"' <<<"$php_install_body"
-check "the per-package fallback clears the php-fpm start limit" \
-  bash -c 'grep -A4 "for pkg in \"\${optional_ok\[@\]}\"" <<<"$1" | grep -q "reset-failed"' _ "$php_install_body"
 
 # --purge others leaves units that were enabled before setup.sh touched them.
 unit_state_dir=$STATE_DIR
@@ -5764,7 +5696,7 @@ plan_snapshot() {
 mem_plan_reset
 mem_total_mb() { printf '131072'; }
 effective_cpus() { printf '16'; }
-OPT_DETECTED=(angie php:8.4 mariadb valkey elastic)
+OPT_DETECTED=(nginx php:8.4 mariadb valkey elastic)
 plan_memory_budget
 hp_off=$(printf '%s ' "$OPT_PHP_CHILDREN" "$OPT_MARIADB_BUDGET_MB" "$OPT_VALKEY_BUDGET_MB" "$OPT_ES_BUDGET_MB")
 hugepages_php_present() { return 0; }
@@ -5776,7 +5708,7 @@ check "the 512 MB heap books its 256 MB direct ceiling" \
   test "$OPT_ES_DIRECT_MB:$OPT_ES_DIRECT_BOOKED_MB" = 256:256
 check "the summary names ES direct memory and huge pages" \
   bash -c '[[ $1 == *" ES-direct=256MB HugePages=592MB)" ]]' _ "$(memory_plan_summary)"
-OPT_DETECTED=(angie php:8.4 mariadb valkey)
+OPT_DETECTED=(nginx php:8.4 mariadb valkey)
 hugepages_php_present() { return 1; }
 plan_memory_budget
 check "without ES or huge pages the summary keeps its old form" \
@@ -5785,7 +5717,7 @@ check "without ES or huge pages the summary keeps its old form" \
 # (b) Direct memory follows the heap that is written, or the operator value.
 mem_plan_reset
 mem_total_mb() { printf '65536'; }
-OPT_DETECTED=(angie php:8.4 mariadb valkey elastic)
+OPT_DETECTED=(nginx php:8.4 mariadb valkey elastic)
 elasticsearch_data_size_mb() { printf '4096'; }
 plan_memory_budget
 check "a 1 GB heap books a 512 MB direct ceiling" \
@@ -5807,7 +5739,7 @@ rm -f "$SETUP_STATE_DIR/explicit-options.conf"
 # either way the plan must fit.
 mem_total_mb() { printf '8192'; }
 effective_cpus() { printf '2'; }
-OPT_DETECTED=(angie php:8.4 mariadb elastic)
+OPT_DETECTED=(nginx php:8.4 mariadb elastic)
 mariadb_data_size_mb() { printf '8000'; }
 elasticsearch_data_size_mb() { printf '0'; }
 printf 'elastic_mb=2048\n' > "$SETUP_STATE_DIR/explicit-options.conf"
@@ -5826,7 +5758,7 @@ rm -f "$SETUP_STATE_DIR/explicit-options.conf"
 mem_plan_reset
 mem_total_mb() { printf '2048'; }
 effective_cpus() { printf '2'; }
-OPT_DETECTED=(angie php:8.4 mariadb valkey elastic)
+OPT_DETECTED=(nginx php:8.4 mariadb valkey elastic)
 mariadb_data_size_mb() { printf '1000'; }
 plan_memory_budget
 small_first=$(plan_snapshot)
@@ -5851,7 +5783,7 @@ for small in 1024 1536; do
   # shellcheck disable=SC2329  # stub called by plan_memory_budget
   mem_total_mb() { printf '%s' "$small"; }
   effective_cpus() { printf '2'; }
-  OPT_DETECTED=(angie php:8.4 mariadb valkey elastic)
+  OPT_DETECTED=(nginx php:8.4 mariadb valkey elastic)
   OPT_INSTALL_PLAN=1
   plan_memory_budget 2>/dev/null
   small_install=$(plan_snapshot)
@@ -5872,7 +5804,7 @@ mem_plan_reset
 mem_total_mb() { printf '8192'; }
 effective_cpus() { printf '2'; }
 hugepages_php_present() { return 0; }
-OPT_DETECTED=(angie php:8.4 mariadb elastic)
+OPT_DETECTED=(nginx php:8.4 mariadb elastic)
 mariadb_data_size_mb() { printf '4000'; }
 elasticsearch_data_size_mb() { printf '8000'; }
 plan_memory_budget
@@ -5920,7 +5852,7 @@ mariadb_data_size_mb() { printf '4000'; }
 mem_plan_reset
 mem_total_mb() { printf '27812'; }
 effective_cpus() { printf '16'; }
-OPT_DETECTED=(angie php:8.5 mariadb valkey elastic)
+OPT_DETECTED=(nginx php:8.5 mariadb valkey elastic)
 ENABLED[php]=1
 hugepages_php_present() { (( ${ENABLED[php]:-0} == 1 )); }
 OPT_INSTALL_PLAN=1
@@ -6067,12 +5999,12 @@ if command -v php >/dev/null 2>&1; then
     ) 2>/dev/null
     md5sum < "$xfg/config.php" | cut -d' ' -f1
   }
-  first=$(xfg_run angie)
+  first=$(xfg_run nginx)
   check "XenForo gzip: the managed block is appended and the operator's line commented out" \
     bash -c 'tail -n1 "$1" | grep -qF "// END setup.sh enableGzip" && grep -qF "$2" "$1" && grep -qxF "$3" "$1"' \
     _ "$xfg/config.php" "\$config['enableGzip'] = !isset(\$_COOKIE[" "${XF_GZIP_SUPERSEDED}\$config['enableGzip'] = true;"
   check "XenForo gzip: the result parses" php -l "$xfg/config.php"
-  check "XenForo gzip: a second run changes nothing" test "$(xfg_run angie)" = "$first"
+  check "XenForo gzip: a second run changes nothing" test "$(xfg_run nginx)" = "$first"
   check "XenForo gzip: a guest renders with XenForo gzip on" \
     test "$(php -r '$config=[]; include $argv[1]; echo $config["enableGzip"] ? 1 : 0;' "$xfg/config.php")" = 1
   check "XenForo gzip: a session cookie turns XenForo gzip off" \
@@ -6087,7 +6019,7 @@ if command -v php >/dev/null 2>&1; then
   printf '%s\n' '<?php' "\$config['enableGzip'] = false; // off for the CDN" \
     "  \$config [ \"enableGzip\" ]=0;" "\$config['debug'] = false; \$config['enableGzip'] = false;" > "$xfg/config.php"
   cp "$xfg/config.php" "$TMP/xfgzip/old.php"
-  xfg_run angie >/dev/null
+  xfg_run nginx >/dev/null
   check "XenForo gzip: an old enableGzip = false line is commented out" \
     grep -qxF "${XF_GZIP_SUPERSEDED}\$config['enableGzip'] = false; // off for the CDN" "$xfg/config.php"
   check "XenForo gzip: an indented, double-quoted line is commented out too" \
@@ -6096,18 +6028,18 @@ if command -v php >/dev/null 2>&1; then
     grep -qxF "\$config['debug'] = false; \$config['enableGzip'] = false;" "$xfg/config.php"
   check "XenForo gzip: with the old lines commented out a guest still gets gzip" \
     test "$(php -r '$config=[]; include $argv[1]; echo $config["enableGzip"] ? 1 : 0;' "$xfg/config.php")" = 1
-  old_sum=$(xfg_run angie)
-  check "XenForo gzip: commenting out is idempotent" test "$(xfg_run angie)" = "$old_sum"
+  old_sum=$(xfg_run nginx)
+  check "XenForo gzip: commenting out is idempotent" test "$(xfg_run nginx)" = "$old_sum"
   xfg_run xenforo >/dev/null
   check "XenForo gzip: XF_MEMBER_GZIP=xenforo un-comments the old lines byte for byte" \
     cmp -s "$xfg/config.php" "$TMP/xfgzip/old.php"
   printf '%s\n' '<?php' "\$config['db']['host'] = 'localhost';" '?>' '' > "$xfg/config.php"
-  xfg_run angie >/dev/null
+  xfg_run nginx >/dev/null
   check "XenForo gzip: a closing ?> is removed so the block stays PHP" \
     bash -c '! grep -q "^?>" "$1" && php -l "$1" >/dev/null' _ "$xfg/config.php"
   printf '%s\n' '<?php' '$config = [' > "$xfg/config.php"
   cp "$xfg/config.php" "$TMP/xfgzip/broken.php"
-  xfg_run angie >/dev/null
+  xfg_run nginx >/dev/null
   check "XenForo gzip: a config.php that would not parse is left untouched" \
     cmp -s "$xfg/config.php" "$TMP/xfgzip/broken.php"
 fi
@@ -6266,15 +6198,15 @@ check "lean chain: a vhost without an application PHP include is not reported" \
   bash -c '! printf "%s\n" "$@" | grep -q "plain.conf"' _ "${TUNE_MISSES[@]}"
 check "lean chain: a plain vhost keeps basic.conf" grep -qx '    include h5bp/basic.conf;' "$lv/conf.d/plain.conf"
 check "a nested php_wp.conf is rewritten before the tree test (exact locations cannot nest)" \
-  bash -c 'sed -n "/^angie_migrate_guest_cache_includes()/,/^}/p" "$1" | grep -qF "angie_rewrite_include_at_level \"\$vhost\" php_wp.conf php.conf nested"' _ "$ROOT/lib/optimize.sh"
+  bash -c 'sed -n "/^nginx_migrate_guest_cache_includes()/,/^}/p" "$1" | grep -qF "nginx_rewrite_include_at_level \"\$vhost\" php_wp.conf php.conf nested"' _ "$ROOT/lib/optimize.sh"
 if command -v php >/dev/null 2>&1; then
   printf '%s\n' '<?php' "\$config['cookie']['prefix'] = 'forum_'; ?>" > "$xfg/config.php"
-  xfg_run angie >/dev/null
+  xfg_run nginx >/dev/null
   check "XenForo gzip: a ?> after code on the last line is removed (no text output)" \
     bash -c '! grep -q "?>" "$1" && [[ -z $(php -r "ob_start(); \$config=[]; include \$argv[1]; echo ob_get_clean();" "$1") ]]' _ "$xfg/config.php"
   printf '%s\n' '<?php' '// BEGIN setup.sh enableGzip (edited)' "\$config['db']['host'] = 'x';" > "$xfg/config.php"
   cp "$xfg/config.php" "$TMP/xfgzip/nobegin.php"
-  xfg_run angie >/dev/null
+  xfg_run nginx >/dev/null
   check "XenForo gzip: a block without its END marker is left untouched" \
     cmp -s "$xfg/config.php" "$TMP/xfgzip/nobegin.php"
 fi
@@ -6369,11 +6301,11 @@ check "ipv6_in_cidr: /29 bit boundary outside" not ipv6_in_cidr 2a06:98c8::1 2a0
 check "ipv6_in_cidr: other provider is outside" not ipv6_in_cidr 2001:db8:2a:27e1::2 2606:4700::/32
 
 cft="$TMP/cftls"
-mkdir -p "$cft/angie/conf.d" "$cft/angie/http.d" "$cft/angie/ssl/default" "$cft/le/renewal" \
+mkdir -p "$cft/nginx/conf.d" "$cft/nginx/http.d" "$cft/nginx/ssl/default" "$cft/le/renewal" \
   "$cft/le/renewal-hooks/deploy" "$cft/etc/postfix" "$cft/www/app"
-printf 'cert\n' > "$cft/angie/ssl/default/fullchain.pem"
-printf 'key\n'  > "$cft/angie/ssl/default/privkey.pem"
-cat > "$cft/angie/http.d/cloudflare.conf" <<'EOF'
+printf 'cert\n' > "$cft/nginx/ssl/default/fullchain.pem"
+printf 'key\n'  > "$cft/nginx/ssl/default/privkey.pem"
+cat > "$cft/nginx/http.d/cloudflare.conf" <<'EOF'
 # Generated by scripts/cloudflare.sh - do not edit by hand.
 set_real_ip_from 173.245.48.0/20;
 set_real_ip_from 104.16.0.0/13;
@@ -6407,7 +6339,7 @@ server {
     return 301 https://$host$request_uri;
 }
 EOF
-cp "$cft/site.conf.in" "$cft/angie/conf.d/site.conf"
+cp "$cft/site.conf.in" "$cft/nginx/conf.d/site.conf"
 cat > "$cft/cfonly.orig" <<'EOF'
 server {
     listen 443 ssl;
@@ -6415,7 +6347,7 @@ server {
     ssl_certificate /etc/letsencrypt/live/only.test/fullchain.pem; ssl_certificate_key /etc/letsencrypt/live/only.test/privkey.pem;
 }
 EOF
-cp "$cft/cfonly.orig" "$cft/angie/conf.d/cfonly.conf"
+cp "$cft/cfonly.orig" "$cft/nginx/conf.d/cfonly.conf"
 # Blocks that must never move although one exact name is behind Cloudflare.
 cat > "$cft/never.conf.in" <<'EOF'
 server {
@@ -6447,15 +6379,15 @@ server {
     server_name only.test;
     ssl_certificate     /etc/letsencrypt/live/only.test/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/only.test/privkey.pem;
-    ssl_certificate     /etc/angie/ssl/rsa/fullchain.pem;
-    ssl_certificate_key /etc/angie/ssl/rsa/privkey.pem;
+    ssl_certificate     /etc/nginx/ssl/rsa/fullchain.pem;
+    ssl_certificate_key /etc/nginx/ssl/rsa/privkey.pem;
 }
 EOF
-cp "$cft/never.conf.in" "$cft/angie/conf.d/never.conf"
-out=$(cf_tls_server_blocks "$cft/angie/conf.d/site.conf")
+cp "$cft/never.conf.in" "$cft/nginx/conf.d/never.conf"
+out=$(cf_tls_server_blocks "$cft/nginx/conf.d/site.conf")
 check "server blocks: three top-level blocks, eligibility and names" \
   test "$out" = "$(printf '1\t1\tcf.test www.cf.test\n2\t1\tdirect.test\n3\t0\tcf.test www.cf.test')"
-out=$(cf_tls_server_blocks "$cft/angie/conf.d/never.conf" | cut -f2 | tr -d '\n')
+out=$(cf_tls_server_blocks "$cft/nginx/conf.d/never.conf" | cut -f2 | tr -d '\n')
 check "server blocks: a cert without its key here, or a second pair, is not eligible" \
   test "$out" = 11100
 printf 'server { listen 443 ssl; ssl_certificate /etc/letsencrypt/live/a/fullchain.pem;\n    ssl_certificate_key /etc/letsencrypt/live/a/privkey.pem;\n    server_name only.test;\n}\nserver {\n    location ~ x { } # setup-cf-tls probe\n    server_name only.test;\n    ssl_certificate /etc/letsencrypt/live/a/fullchain.pem;\n    ssl_certificate_key /etc/letsencrypt/live/a/privkey.pem;\n}\n' > "$TMP/cf-open.conf"
@@ -6500,78 +6432,78 @@ cf_tls_probe() {
   [[ ${CF_TEST_CODE:-200} != 52? && ${CF_TEST_CODE:-200} != 000 ]]
 }
 check "behind Cloudflare: v4 and v6 addresses all in ranges" \
-  cf_tls_name_behind_cloudflare cf.test "$cft/angie/http.d/cloudflare.conf"
+  cf_tls_name_behind_cloudflare cf.test "$cft/nginx/http.d/cloudflare.conf"
 check "behind Cloudflare: a direct address is not" \
-  not cf_tls_name_behind_cloudflare direct.test "$cft/angie/http.d/cloudflare.conf"
+  not cf_tls_name_behind_cloudflare direct.test "$cft/nginx/http.d/cloudflare.conf"
 check "behind Cloudflare: a name that does not resolve is not" \
-  not cf_tls_name_behind_cloudflare nxdomain.test "$cft/angie/http.d/cloudflare.conf"
+  not cf_tls_name_behind_cloudflare nxdomain.test "$cft/nginx/http.d/cloudflare.conf"
 
-out=$(cloudflare_tls_migrate "$cft/angie" 1)
+out=$(cloudflare_tls_migrate "$cft/nginx" 1)
 check "dry run: lists both migratable files" \
   bash -c 'grep -q "would point conf.d/site.conf (cf.test www.cf.test)" <<<"$1" && grep -q "would point conf.d/cfonly.conf (only.test)" <<<"$1"' _ "$out"
-check "dry run: changes nothing" cmp -s "$cft/angie/conf.d/site.conf" "$cft/site.conf.in"
+check "dry run: changes nothing" cmp -s "$cft/nginx/conf.d/site.conf" "$cft/site.conf.in"
 check "dry run: never lists the direct site or a wildcard/regex/.suffix block" \
   not grep -qE 'direct.test|never.conf' <<<"$out"
 
 OPT_REPORT=()
-cloudflare_tls_migrate "$cft/angie" 0
+cloudflare_tls_migrate "$cft/nginx" 0
 check "migrate: records the two eligible files" test "${#CF_TLS_FILES[@]}" = 2
 check "migrate: Cloudflare block uses the self-signed pair" \
-  bash -c 'grep -qx "    ssl_certificate /etc/angie/ssl/default/fullchain.pem;" "$1" && grep -qx "    ssl_certificate_key /etc/angie/ssl/default/privkey.pem;" "$1"' _ "$cft/angie/conf.d/site.conf"
+  bash -c 'grep -qx "    ssl_certificate /etc/nginx/ssl/default/fullchain.pem;" "$1" && grep -qx "    ssl_certificate_key /etc/nginx/ssl/default/privkey.pem;" "$1"' _ "$cft/nginx/conf.d/site.conf"
 check "migrate: certbot options include and dhparam are dropped" \
-  not grep -qE 'options-ssl-nginx|ssl-dhparams|managed by Certbot' "$cft/angie/conf.d/site.conf"
+  not grep -qE 'options-ssl-nginx|ssl-dhparams|managed by Certbot' "$cft/nginx/conf.d/site.conf"
 check "migrate: proxy_ssl_certificate is not an ssl_certificate" \
-  grep -qF 'proxy_ssl_certificate /etc/letsencrypt/live/cf.test/fullchain.pem;' "$cft/angie/conf.d/site.conf"
+  grep -qF 'proxy_ssl_certificate /etc/letsencrypt/live/cf.test/fullchain.pem;' "$cft/nginx/conf.d/site.conf"
 check "migrate: proxy_ssl_trusted_certificate on the same line as a removed directive survives" \
-  grep -qxF '     proxy_ssl_trusted_certificate /etc/letsencrypt/live/up/chain.pem;' "$cft/angie/conf.d/site.conf"
+  grep -qxF '     proxy_ssl_trusted_certificate /etc/letsencrypt/live/up/chain.pem;' "$cft/nginx/conf.d/site.conf"
 check "migrate: the probe location is the first line of each migrated block only" \
-  bash -c 'awk "/^server \\{/{getline n; print n}" "$1" | grep -c "setup-cf-tls probe" | grep -qx 1 && [[ $(grep -c "setup-cf-tls probe" "$1") == 1 ]] && [[ $(sed -n 2p "$1") == "    $2" ]]' _ "$cft/angie/conf.d/site.conf" "$CF_TLS_PROBE_LOCATION"
+  bash -c 'awk "/^server \\{/{getline n; print n}" "$1" | grep -c "setup-cf-tls probe" | grep -qx 1 && [[ $(grep -c "setup-cf-tls probe" "$1") == 1 ]] && [[ $(sed -n 2p "$1") == "    $2" ]]' _ "$cft/nginx/conf.d/site.conf" "$CF_TLS_PROBE_LOCATION"
 check "migrate: the probe echoes digits only, from a named capture" \
   bash -c '[[ $1 == *"(?<setup_cf_probe>[0-9]{1,40})"* && $1 == *"add_header X-Setup-CF-Probe \$setup_cf_probe always; return 204;"* ]]' _ "$CF_TLS_PROBE_LOCATION"
 check "migrate: the direct block keeps its certbot certificate" \
-  bash -c 'grep -q "/etc/letsencrypt/live/direct.test/fullchain.pem" "$1" && grep -q "/etc/letsencrypt/live/direct.test/privkey.pem" "$1"' _ "$cft/angie/conf.d/site.conf"
+  bash -c 'grep -q "/etc/letsencrypt/live/direct.test/fullchain.pem" "$1" && grep -q "/etc/letsencrypt/live/direct.test/privkey.pem" "$1"' _ "$cft/nginx/conf.d/site.conf"
 check "migrate: the TLS policy include and other lines are kept byte for byte" \
-  bash -c 'diff <(grep -vE "ssl_certificate|letsencrypt|setup-cf-tls probe" "$1") <(grep -vE "ssl_certificate|letsencrypt" "$2") >/dev/null' _ "$cft/angie/conf.d/site.conf" "$cft/site.conf.in"
+  bash -c 'diff <(grep -vE "ssl_certificate|letsencrypt|setup-cf-tls probe" "$1") <(grep -vE "ssl_certificate|letsencrypt" "$2") >/dev/null' _ "$cft/nginx/conf.d/site.conf" "$cft/site.conf.in"
 check "migrate: a one-line cert + key pair is rewritten together" \
-  grep -qxF '    ssl_certificate /etc/angie/ssl/default/fullchain.pem; ssl_certificate_key /etc/angie/ssl/default/privkey.pem;' "$cft/angie/conf.d/cfonly.conf"
+  grep -qxF '    ssl_certificate /etc/nginx/ssl/default/fullchain.pem; ssl_certificate_key /etc/nginx/ssl/default/privkey.pem;' "$cft/nginx/conf.d/cfonly.conf"
 check "migrate: wildcard, regex, .suffix and half-pair blocks are never touched" \
-  cmp -s "$cft/angie/conf.d/never.conf" "$cft/never.conf.in"
+  cmp -s "$cft/nginx/conf.d/never.conf" "$cft/never.conf.in"
 
 # Through-Cloudflare proof: anything but a clean answer puts the file back
 # with the keep marker, and later runs skip it.
-ANGIE_BIN=true
+NGINX_BIN=true
 systemctl() { :; }
 dpkg-query() { return 1; }
 CF_TEST_CODE=526
 OPT_REPORT=()
 cloudflare_tls_finish 0
 check "finish: a 526 restores the vhost byte for byte below the keep marker" \
-  bash -c 'head -n1 "$1" | grep -q "^# setup-cf-tls: keep" && cmp -s <(tail -n +2 "$1") "$2"' _ "$cft/angie/conf.d/cfonly.conf" "$cft/cfonly.orig"
+  bash -c 'head -n1 "$1" | grep -q "^# setup-cf-tls: keep" && cmp -s <(tail -n +2 "$1") "$2"' _ "$cft/nginx/conf.d/cfonly.conf" "$cft/cfonly.orig"
 check "finish: the report names Full (strict)" \
   bash -c 'printf "%s\n" "$@" | grep -q "Full (strict)"' _ "${OPT_REPORT[@]}"
 CF_TEST_CODE=200
-cp "$cft/site.conf.in" "$cft/angie/conf.d/site.conf"
+cp "$cft/site.conf.in" "$cft/nginx/conf.d/site.conf"
 OPT_REPORT=()
-cloudflare_tls_migrate "$cft/angie" 0
+cloudflare_tls_migrate "$cft/nginx" 0
 check "migrate: a file with the keep marker is skipped on later runs" \
-  bash -c 'head -n1 "$1" | grep -q "^# setup-cf-tls: keep" && [[ ${#@} -ge 2 ]] && printf "%s\n" "${@:2}" | grep -q "keep marker"' _ "$cft/angie/conf.d/cfonly.conf" "${OPT_REPORT[@]}"
+  bash -c 'head -n1 "$1" | grep -q "^# setup-cf-tls: keep" && [[ ${#@} -ge 2 ]] && printf "%s\n" "${@:2}" | grep -q "keep marker"' _ "$cft/nginx/conf.d/cfonly.conf" "${OPT_REPORT[@]}"
 CF_TEST_CODE=000
 OPT_REPORT=()
 cloudflare_tls_finish 0
 check "finish: no answer through Cloudflare (000) also puts the file back" \
-  bash -c 'head -n1 "$1" | grep -q "^# setup-cf-tls: keep"' _ "$cft/angie/conf.d/site.conf"
+  bash -c 'head -n1 "$1" | grep -q "^# setup-cf-tls: keep"' _ "$cft/nginx/conf.d/site.conf"
 CF_TEST_CODE=200
-cp "$cft/site.conf.in" "$cft/angie/conf.d/site.conf"
-cp "$cft/cfonly.orig" "$cft/angie/conf.d/cfonly.conf"
+cp "$cft/site.conf.in" "$cft/nginx/conf.d/site.conf"
+cp "$cft/cfonly.orig" "$cft/nginx/conf.d/cfonly.conf"
 
 # CF_SELF_SIGNED=0 leaves every file alone.
-CF_SELF_SIGNED=0 cloudflare_tls_migrate "$cft/angie" 0
-check "CF_SELF_SIGNED=0: no vhost is rewritten" cmp -s "$cft/angie/conf.d/cfonly.conf" "$cft/cfonly.orig"
+CF_SELF_SIGNED=0 cloudflare_tls_migrate "$cft/nginx" 0
+check "CF_SELF_SIGNED=0: no vhost is rewritten" cmp -s "$cft/nginx/conf.d/cfonly.conf" "$cft/cfonly.orig"
 # No Cloudflare ranges file: skipped with a note.
-mv "$cft/angie/http.d/cloudflare.conf" "$cft/cf.ranges"
-out=$(cloudflare_tls_migrate "$cft/angie" 1)
+mv "$cft/nginx/http.d/cloudflare.conf" "$cft/cf.ranges"
+out=$(cloudflare_tls_migrate "$cft/nginx" 1)
 check "no ranges file: skipped with the refresh hint" grep -q 'no Cloudflare ranges' <<<"$out"
-mv "$cft/cf.ranges" "$cft/angie/http.d/cloudflare.conf"
+mv "$cft/cf.ranges" "$cft/nginx/http.d/cloudflare.conf"
 
 # certbot retirement.  Only fixture roots are scanned.
 cf_tls_docker() { :; }   # never the host's Docker daemon
@@ -6584,8 +6516,8 @@ dpkg-query() {
 printf 'authenticator = nginx\n' > "$cft/le/renewal/direct.test.conf"
 CERTBOT_DIR="$cft/le"; CERTBOT_ETC="$cft/etc"; CERTBOT_EXTRA_ROOTS=""; CERTBOT_WWW="$cft/www"
 CERTBOT_BACKUP_ROOT="$cft/backups"; mkdir -p "$CERTBOT_BACKUP_ROOT"
-angie_dump() { printf '# configuration file %s:\n' "$cft/angie/conf.d/site.conf"; cat "$cft/angie/conf.d/site.conf"; }
-ANGIE_BIN=angie_dump
+nginx_dump() { printf '# configuration file %s:\n' "$cft/nginx/conf.d/site.conf"; cat "$cft/nginx/conf.d/site.conf"; }
+NGINX_BIN=nginx_dump
 certbot_users_contains() { local o; o=$(certbot_letsencrypt_users) && grep -qF -- "$1" <<<"$o"; }
 OPT_REPORT=(); rm -f "$apt_calls"
 certbot_retire_if_unused 0
@@ -6593,14 +6525,14 @@ check "certbot: kept while a loaded vhost still uses it" \
   bash -c '[[ ! -e $1 ]] && printf "%s\n" "${@:2}" | grep -q "certbot: kept; .* is still used by .*site.conf"' _ "$apt_calls" "${OPT_REPORT[@]}"
 check "certbot: a renewal on the missing nginx plugin is a warning" \
   bash -c 'printf "%s\n" "$@" | grep -q "direct.test. renews with the nginx plugin"' _ "${OPT_REPORT[@]}"
-angie_fail() { return 1; }
-ANGIE_BIN=angie_fail
+nginx_fail() { return 1; }
+NGINX_BIN=nginx_fail
 OPT_REPORT=(); rm -f "$apt_calls"
 certbot_retire_if_unused 0
-check "certbot: kept when angie -T fails (fail closed)" \
-  bash -c '[[ ! -e $1 ]] && printf "%s\n" "${@:2}" | grep -q "angie -T failed"' _ "$apt_calls" "${OPT_REPORT[@]}"
-angie_dump() { printf '# configuration file /etc/angie/angie.conf:\nhttp {}\n'; }
-ANGIE_BIN=angie_dump
+check "certbot: kept when nginx -T fails (fail closed)" \
+  bash -c '[[ ! -e $1 ]] && printf "%s\n" "${@:2}" | grep -q "nginx -T failed"' _ "$apt_calls" "${OPT_REPORT[@]}"
+nginx_dump() { printf '# configuration file /etc/nginx/nginx.conf:\nhttp {}\n'; }
+NGINX_BIN=nginx_dump
 printf 'ssl_dh = </etc/letsencrypt/ssl-dhparams.pem\n' > "$cft/etc/postfix/dovecot.conf"
 check "certbot users: a dhparam-only reference counts" certbot_users_contains postfix/dovecot.conf
 rm -f "$cft/etc/postfix/dovecot.conf"
@@ -6665,11 +6597,11 @@ for d in "$cft/home/ubuntu-setup-script" "$cft/home/ubuntu-setup-script.20261120
 done
 printf 'certbot: kept; /etc/letsencrypt is still used by x\n' > "$cft/home/setup-optimize-20261120.log"
 mkdir -p "$cft/home/server-configs-nginx/conf.d/templates"
-printf 'events {}\n' > "$cft/home/server-configs-nginx/angie.conf"
+printf 'events {}\n' > "$cft/home/server-configs-nginx/nginx.conf"
 printf 'ssl_certificate /etc/letsencrypt/live/example.com/fullchain.pem;\n' \
   > "$cft/home/server-configs-nginx/conf.d/templates/sample_php.conf"
 CERTBOT_EXTRA_ROOTS="$cft/home"
-check "certbot users: project checkouts, Angie template trees and run logs are not consumers" \
+check "certbot users: project checkouts, nginx template trees and run logs are not consumers" \
   test -z "$(certbot_letsencrypt_users)"
 # Only a directory with both setup.sh and lib/web.sh is a project copy.
 mkdir -p "$cft/home/app/lib"
@@ -6707,16 +6639,16 @@ dpkg-query() {
   [[ $* == *python3-certbot-nginx* ]] && return 1
   printf 'certbot install ok installed\n'
 }
-angie_dump() { printf '# configuration file %s:\n' "$cft/angie/conf.d/site.conf"; cat "$cft/angie/conf.d/site.conf"; }
-out=$(cloudflare_tls_migrate "$cft/angie" 1; certbot_retire_if_unused 1)
+nginx_dump() { printf '# configuration file %s:\n' "$cft/nginx/conf.d/site.conf"; cat "$cft/nginx/conf.d/site.conf"; }
+out=$(cloudflare_tls_migrate "$cft/nginx" 1; certbot_retire_if_unused 1)
 check "dry run: a file that keeps a certbot block still keeps certbot" \
   grep -q 'certbot: kept; .*site.conf' <<<"$out"
-unset -f apt-get dpkg-query systemctl angie_dump angie_fail cf_tls_resolve cf_tls_probe certbot_users_contains cf_tls_docker
-unset ANGIE_BIN CERTBOT_DIR CERTBOT_ETC CERTBOT_EXTRA_ROOTS CERTBOT_WWW CERTBOT_BACKUP_ROOT CF_TEST_CODE
+unset -f apt-get dpkg-query systemctl nginx_dump nginx_fail cf_tls_resolve cf_tls_probe certbot_users_contains cf_tls_docker
+unset NGINX_BIN CERTBOT_DIR CERTBOT_ETC CERTBOT_EXTRA_ROOTS CERTBOT_WWW CERTBOT_BACKUP_ROOT CF_TEST_CODE
 check "CF_SELF_SIGNED survives the --optimize pin reset" \
   bash -c 'printf "%s\n" "$@" | grep -qx CF_SELF_SIGNED' _ "${RESET_KEEP_PINS[@]}"
-check "the migration runs only when Angie is active and the run is healthy" \
-  bash -c 'grep -B1 "cloudflare_tls_migrate /etc/angie 0" "$1" | grep -qF "if (( rc == 0 && active )); then"' _ "$ROOT/lib/service-optimizers.sh"
+check "the migration runs only when nginx is active and the run is healthy" \
+  bash -c 'grep -B1 "cloudflare_tls_migrate /etc/nginx 0" "$1" | grep -qF "if (( rc == 0 && active )); then"' _ "$ROOT/lib/service-optimizers.sh"
 
 # --- Elasticsearch: the whole index in RAM (page cache + preload) ---
 esram_plan() {
@@ -6728,7 +6660,7 @@ esram_plan() {
     elasticsearch_operator_direct_mb() { printf '0'; }
     mariadb_data_size_mb() { printf '%s' "$ESRAM_DB"; }
     mariadb_current_pool_mb() { printf '0'; }
-    OPT_DETECTED=(angie php:8.5 mariadb elastic)
+    OPT_DETECTED=(nginx php:8.5 mariadb elastic)
     plan_memory_budget >/dev/null 2>&1
     printf 'preload=%s cache=%s free=%s php=%s maria=%s es=%s\n' \
       "$OPT_ES_PRELOAD" "$OPT_ES_CACHE_MB" "$OPT_ES_CACHE_FREE_MB" "$OPT_PHP_BUDGET_MB" \
@@ -6797,13 +6729,13 @@ check "ES yml: http.host is commented when network.host controls the bind" \
 
 
 # ---------------------------------------------------------------------------
-# Post-Angie PHP refresh: a clean pass reports nothing (the max_children
+# Post-nginx PHP refresh: a clean pass reports nothing (the max_children
 # summary used to repeat under the Elasticsearch section of a live report)
 # ---------------------------------------------------------------------------
 refresh_case() {
   local stub_dirty=$1
   (
-    eval "$(sed -n '/^php_refresh_after_angie() {/,/^}/p' "$ROOT/lib/service-optimizers.sh")"
+    eval "$(sed -n '/^php_refresh_after_nginx() {/,/^}/p' "$ROOT/lib/service-optimizers.sh")"
     REPORT_LINES=()
     opt_report() { REPORT_LINES+=("$*"); }
     warn() { :; }
@@ -6816,15 +6748,15 @@ refresh_case() {
     }
     systemctl() { return 0; }
     OPT_PHP_OK=1
-    php_refresh_after_angie opt_report "- " 2>&1
+    php_refresh_after_nginx opt_report "- " 2>&1
     printf '%s\n' "${REPORT_LINES[@]}"
   )
 }
-check "post-Angie refresh: a clean pass prints nothing and reloads nothing" \
+check "post-nginx refresh: a clean pass prints nothing and reloads nothing" \
   test -z "$(refresh_case 0 | sed '/^$/d')"
 out=$(refresh_case 1)
-check "post-Angie refresh: a changing pass reports under its own PHP heading and reloads" \
-  bash -c 'grep -qx "## PHP 8.5 (post-Angie refresh)" <<<"$1" && grep -q "section rewritten (post-Angie refresh)" <<<"$1" && grep -q "PHP 8.5: reloaded after the post-Angie ini refresh" <<<"$1"' _ "$out"
+check "post-nginx refresh: a changing pass reports under its own PHP heading and reloads" \
+  bash -c 'grep -qx "## PHP 8.5 (post-nginx refresh)" <<<"$1" && grep -q "section rewritten (post-nginx refresh)" <<<"$1" && grep -q "PHP 8.5: reloaded after the post-nginx ini refresh" <<<"$1"' _ "$out"
 # --- audit 1.21.58: planner
 
 # A refresh rejected by php-fpm -t is rolled back to what the PHP pass wrote,
@@ -6837,7 +6769,7 @@ if [[ -d /etc/php ]]; then
   printf 'pm.max_children = 16\n' > "$refresh_dir/fpm/pool.d/www.conf"
   refresh_ver="../..${refresh_dir}"
   out=$(
-    eval "$(sed -n '/^php_refresh_after_angie() {/,/^}/p' "$ROOT/lib/service-optimizers.sh")"
+    eval "$(sed -n '/^php_refresh_after_nginx() {/,/^}/p' "$ROOT/lib/service-optimizers.sh")"
     REPORT_LINES=()
     opt_report() { REPORT_LINES+=("$*"); }
     warn() { :; }
@@ -6850,17 +6782,17 @@ if [[ -d /etc/php ]]; then
     }
     systemctl() { return 0; }
     OPT_PHP_OK=1
-    php_refresh_after_angie opt_report "- " >/dev/null 2>&1 || true
+    php_refresh_after_nginx opt_report "- " >/dev/null 2>&1 || true
     printf '%s\n' "${REPORT_LINES[@]}"
   )
-  check "post-Angie refresh: a rejected pool is restored to the PHP pass result" \
+  check "post-nginx refresh: a rejected pool is restored to the PHP pass result" \
     grep -qxF 'pm.max_children = 16' "$refresh_dir/fpm/pool.d/www.conf"
-  check "post-Angie refresh: a file the failed refresh created is moved out" \
+  check "post-nginx refresh: a file the failed refresh created is moved out" \
     test ! -e "$refresh_dir/fpm/pool.d/new.conf"
-  check "post-Angie refresh: the failure is reported as rolled back" \
+  check "post-nginx refresh: the failure is reported as rolled back" \
     bash -c 'grep -q "rolled back to the PHP pass result" <<<"$1"' _ "$out"
 else
-  t_skip "post-Angie refresh rollback (no /etc/php on this host)"
+  t_skip "post-nginx refresh rollback (no /etc/php on this host)"
 fi
 
 # --- audit 1.21.60: forwarded headers, security headers, cache hygiene
@@ -6868,30 +6800,30 @@ fi
 # A direct client must not choose what PHP believes about its address or
 # scheme: the raw X-Forwarded-*/X-Real-IP headers used to pass through.
 check_tree "PHP forwarded headers: X-Forwarded-Host is the normalised host" \
-  grep -q 'fastcgi_param HTTP_X_FORWARDED_HOST  \$php_http_host;' "$ANGIE_TREE/snippets/fastcgi-php-common.conf"
+  grep -q 'fastcgi_param HTTP_X_FORWARDED_HOST  \$php_http_host;' "$NGINX_TREE/snippets/fastcgi-php-common.conf"
 check_tree "PHP forwarded headers: X-Real-IP is set from the trusted map" \
-  grep -q 'fastcgi_param HTTP_X_REAL_IP         \$php_x_real_ip;' "$ANGIE_TREE/snippets/fastcgi-php-common.conf"
+  grep -q 'fastcgi_param HTTP_X_REAL_IP         \$php_x_real_ip;' "$NGINX_TREE/snippets/fastcgi-php-common.conf"
 check_tree "PHP forwarded headers: Forwarded/X-HTTP-Method-Override are blanked" \
-  bash -c 'grep -q "HTTP_FORWARDED" "$1/snippets/fastcgi-php-common.conf" && grep -q "HTTP_X_HTTP_METHOD_OVERRIDE" "$1/snippets/fastcgi-php-common.conf"' _ "$ANGIE_TREE"
+  bash -c 'grep -q "HTTP_FORWARDED" "$1/snippets/fastcgi-php-common.conf" && grep -q "HTTP_X_HTTP_METHOD_OVERRIDE" "$1/snippets/fastcgi-php-common.conf"' _ "$NGINX_TREE"
 check_tree "PHP forwarded headers: only declared/local peers are trusted" \
-  grep -q 'map "\$realip_remote_addr" \$trusted_forwarder' "$ANGIE_TREE/http.d/https_map.conf"
+  grep -q 'map "\$realip_remote_addr" \$trusted_forwarder' "$NGINX_TREE/http.d/https_map.conf"
 check_tree "Flarum: both PHP locations keep X-Frame-Options" \
-  test "$(grep -c 'security/x-frame-options.conf' "$ANGIE_TREE/h5bp/php_flarum.conf")" -ge 2
+  test "$(grep -c 'security/x-frame-options.conf' "$NGINX_TREE/h5bp/php_flarum.conf")" -ge 2
 check_tree "XenForo static assets: the location keeps CORS and the security set" \
-  bash -c 'grep -q "cross-origin/requests.conf" "$1/h5bp/location/xf_static_assets.conf" && grep -q "security/x-frame-options.conf" "$1/h5bp/location/xf_static_assets.conf"' _ "$ANGIE_TREE"
+  bash -c 'grep -q "cross-origin/requests.conf" "$1/h5bp/location/xf_static_assets.conf" && grep -q "security/x-frame-options.conf" "$1/h5bp/location/xf_static_assets.conf"' _ "$NGINX_TREE"
 check_tree "Chevereto media: sendfile is not disabled and expires adds no second header" \
-  bash -c '! grep -q "sendfile off" "$1/conf.d/templates/sample_chev.conf" && grep -q "expires off;" "$1/conf.d/templates/sample_chev.conf"' _ "$ANGIE_TREE"
+  bash -c '! grep -q "sendfile off" "$1/conf.d/templates/sample_chev.conf" && grep -q "expires off;" "$1/conf.d/templates/sample_chev.conf"' _ "$NGINX_TREE"
 check_tree "XenForo proxy endpoints: a one-shot query is not stored" \
-  grep -q 'fastcgi_cache_min_uses  2;' "$ANGIE_TREE/h5bp/php_xf_proxy.conf"
+  grep -q 'fastcgi_cache_min_uses  2;' "$NGINX_TREE/h5bp/php_xf_proxy.conf"
 check_tree "cache paths reserve filesystem headroom (min_free)" \
-  bash -c 'for f in "$1"/http.d/*cache*.conf; do grep -q "cache_path" "$f" || continue; grep -q "min_free=" "$f" || { echo "$f"; exit 1; }; done' _ "$ANGIE_TREE"
+  bash -c 'for f in "$1"/http.d/*cache*.conf; do grep -q "cache_path" "$f" || continue; grep -q "min_free=" "$f" || { echo "$f"; exit 1; }; done' _ "$NGINX_TREE"
 
 # The unknown-cookie rule (1.21.61): extract the negative-lookahead regex from
 # the map and prove both directions -- known page-neutral cookies keep the
 # cache, anything else bypasses.
 guest_cookie_re=$(awk '/map \$http_cookie \$guest_cookie_unlisted/ { f = 1; next }
   f && /^[[:space:]]*"~/ && !/\\x00-/ { sub(/^[[:space:]]*"~/, ""); sub(/"[[:space:]]*1;$/, ""); print; exit }' \
-  "$ANGIE_TREE/http.d/fastcgi_cache.conf")
+  "$NGINX_TREE/http.d/fastcgi_cache.conf")
 check_tree "guest cache: the unknown-cookie map exists" test -n "$guest_cookie_re"
 guest_cookie_allowed() { ! perl -e 'exit(($ARGV[1] =~ /$ARGV[0]/i) ? 0 : 1)' "$guest_cookie_re" "$1"; }
 guest_cookie_unknown() { ! guest_cookie_allowed "$1"; }
@@ -6904,7 +6836,7 @@ check_tree "guest cache: XenForo CSRF and key cookies stay page-neutral" \
 # 1.6.58: the control-character rule, evaluated with Perl like the allowlist.
 guest_cc_re=$(awk '/map \$http_cookie \$guest_cookie_unlisted/ { f = 1; next }
   f && /^[[:space:]]*"~/ && /\\x00-/ { sub(/^[[:space:]]*"~/, ""); sub(/"[[:space:]]*1;$/, ""); print; exit }' \
-  "$ANGIE_TREE/http.d/fastcgi_cache.conf")
+  "$NGINX_TREE/http.d/fastcgi_cache.conf")
 guest_cc_hit() { perl -e 'exit(($ARGV[1] =~ /$ARGV[0]/) ? 0 : 1)' "$guest_cc_re" "$1"; }
 check_tree "guest cache: a vertical tab before a cookie name is caught" guest_cc_hit $'_ga=1;\vxf_language_id=2'
 check_tree "guest cache: a form feed before a cookie name is caught" guest_cc_hit $'\fsso_token=abc'
@@ -6923,11 +6855,11 @@ check_tree "guest cache: a folded PHPSESSID is not page-neutral either" \
 # with an SSO/add-on cookie was stored for guests.  Every proxy_cache gate
 # in the tree must carry it, on both the store and the lookup side.
 check_tree "proxy guest cache: XenForo proxy never stores an unknown-cookie request" \
-  grep -qE '^proxy_no_cache .*\$guest_cookie_unlisted' "$ANGIE_TREE/h5bp/xf_proxy_pass.conf"
+  grep -qE '^proxy_no_cache .*\$guest_cookie_unlisted' "$NGINX_TREE/h5bp/xf_proxy_pass.conf"
 check_tree "proxy guest cache: XenForo proxy never answers an unknown-cookie request from cache" \
-  grep -qE '^proxy_cache_bypass .*\$guest_cookie_unlisted' "$ANGIE_TREE/h5bp/xf_proxy_pass.conf"
+  grep -qE '^proxy_cache_bypass .*\$guest_cookie_unlisted' "$NGINX_TREE/h5bp/xf_proxy_pass.conf"
 check_tree "proxy guest cache: every proxy_no_cache/proxy_cache_bypass carries the cookie allowlist" \
-  bash -c 'bad=$(grep -rhE "^[[:space:]]*proxy_(no_cache|cache_bypass)[[:space:]]" "$1/h5bp" "$1/conf.d" | grep -v guest_cookie_unlisted || true); [[ -z $bad ]] || { printf "%s\n" "$bad"; exit 1; }' _ "$ANGIE_TREE"
+  bash -c 'bad=$(grep -rhE "^[[:space:]]*proxy_(no_cache|cache_bypass)[[:space:]]" "$1/h5bp" "$1/conf.d" | grep -v guest_cookie_unlisted || true); [[ -z $bad ]] || { printf "%s\n" "$bad"; exit 1; }' _ "$NGINX_TREE"
 
 # ---------------------------------------------------------------------------
 # Anubis removal (1.21.62)
@@ -6946,7 +6878,7 @@ anubis_msg() {
 check "anubis= is rejected with an explanation" \
   anubis_msg bash "$ROOT/setup.sh" --dry-run --optimize anubis=yes
 check "anubis= is rejected for a fresh install too" \
-  anubis_msg bash "$ROOT/setup.sh" --dry-run --basic --angie anubis=yes
+  anubis_msg bash "$ROOT/setup.sh" --dry-run --basic --nginx anubis=yes
 check "anubis= is rejected after another flag" \
   anubis_msg bash "$ROOT/setup.sh" --optimize --dry-run anubis=no
 check "SETUP_ANUBIS in the environment is rejected" \
@@ -6957,7 +6889,7 @@ check "the teardown tool refuses to run unprivileged" \
   grep -q 'EUID == 0' "$ROOT/tools/remove-anubis.sh"
 
 # ---------------------------------------------------------------------------
-# Angie tree: no per-request PCRE hidden in an `if`
+# nginx tree: no per-request PCRE hidden in an `if`
 # ---------------------------------------------------------------------------
 # An `if` is only cheap when its condition is a 0/1 variable test: `return`
 # runs in the rewrite phase and a map cannot express "return only when true".
@@ -6966,28 +6898,28 @@ check "the teardown tool refuses to run unprivileged" \
 # remaining tests are the 0/1 flags and one exact-string compare (the
 # Chevereto front-controller redirect), and the sample template.
 check_tree "no regex condition in a shipped if" \
-  bash -c '! grep -rnE "^[[:space:]]*if[[:space:]]*\([^)]*[[:space:]]~" "$1" --include="*.conf" | grep -v "/templates/"' _ "$ANGIE_TREE"
+  bash -c '! grep -rnE "^[[:space:]]*if[[:space:]]*\([^)]*[[:space:]]~" "$1" --include="*.conf" | grep -v "/templates/"' _ "$NGINX_TREE"
 check_tree "the Chevereto redirect is a string compare" \
-  grep -qxF 'if ($request_uri = "$uri$is_args$args") { return 301 /$is_args$args; }' "$ANGIE_TREE/h5bp/php_chev_cache.conf"
+  grep -qxF 'if ($request_uri = "$uri$is_args$args") { return 301 /$is_args$args; }' "$NGINX_TREE/h5bp/php_chev_cache.conf"
 check_tree "the Chevereto redirect carries no regex in the non-cached include" \
-  bash -c '! grep -q "request_uri ~" "$1/h5bp/php_chev.conf"' _ "$ANGIE_TREE"
+  bash -c '! grep -q "request_uri ~" "$1/h5bp/php_chev.conf"' _ "$NGINX_TREE"
 check_tree "the dead referer map is gone" \
-  test ! -e "$ANGIE_TREE/http.d/referer_map.conf"
+  test ! -e "$NGINX_TREE/http.d/referer_map.conf"
 check_tree "the cookie allowlist no longer names the removed filter" \
-  bash -c '! grep -qi "anubis" "$1/http.d/fastcgi_cache.conf"' _ "$ANGIE_TREE"
+  bash -c '! grep -qi "anubis" "$1/http.d/fastcgi_cache.conf"' _ "$NGINX_TREE"
 check_tree "no unix: peer is trusted for forwarded headers" \
-  bash -c '! grep -qE "^[[:space:]]*\"unix:" "$1/http.d/https_map.conf"' _ "$ANGIE_TREE"
+  bash -c '! grep -qE "^[[:space:]]*\"unix:" "$1/http.d/https_map.conf"' _ "$NGINX_TREE"
 # 1.6.58: PHP strips \v/\f before a cookie name, the allowlist regex and
-# Angie's $cookie_* did not; a Cookie header with a control character is
+# nginx's $cookie_* did not; a Cookie header with a control character is
 # unlisted, and that rule is the first regex of the map.
 check_tree "a Cookie header with a control character is never guest-cacheable" \
-  bash -c 'awk "/^map \\\$http_cookie \\\$guest_cookie_unlisted/{f=1} f && /\"~/{print; exit}" "$1/http.d/fastcgi_cache.conf" | grep -qF "\"~[\\x00-\\x08\\x0a-\\x1f\\x7f]\" 1;"' _ "$ANGIE_TREE"
+  bash -c 'awk "/^map \\\$http_cookie \\\$guest_cookie_unlisted/{f=1} f && /\"~/{print; exit}" "$1/http.d/fastcgi_cache.conf" | grep -qF "\"~[\\x00-\\x08\\x0a-\\x1f\\x7f]\" 1;"' _ "$NGINX_TREE"
 check_tree "the XenForo proxy cache never stores an origin 403 or 429" \
-  bash -c 'a=$(grep -n "proxy_cache_valid *403 429 0s;" "$1/h5bp/xf_proxy_pass.conf" | cut -d: -f1); b=$(grep -n "proxy_cache_valid *any" "$1/h5bp/xf_proxy_pass.conf" | cut -d: -f1); [[ -n $a && -n $b && $a -lt $b ]]' _ "$ANGIE_TREE"
+  bash -c 'a=$(grep -n "proxy_cache_valid *403 429 0s;" "$1/h5bp/xf_proxy_pass.conf" | cut -d: -f1); b=$(grep -n "proxy_cache_valid *any" "$1/h5bp/xf_proxy_pass.conf" | cut -d: -f1); [[ -n $a && -n $b && $a -lt $b ]]' _ "$NGINX_TREE"
 check_tree "the credential limiter keys IPv6 clients per /64" \
-  bash -c 'grep -qF "\"~(?s)^(?<login_v6_net>.{8}).{8}\\z\" \$login_v6_net;" "$1/http.d/limit_req.conf" && grep -qE "^ *default +\\\$limit_req_login_addr;" "$1/http.d/limit_req.conf"' _ "$ANGIE_TREE"
+  bash -c 'grep -qF "\"~(?s)^(?<login_v6_net>.{8}).{8}\\z\" \$login_v6_net;" "$1/http.d/limit_req.conf" && grep -qE "^ *default +\\\$limit_req_login_addr;" "$1/http.d/limit_req.conf"' _ "$NGINX_TREE"
 
-# 1.6.59: PHP URL-decodes cookie values, Angie's $cookie_* does not, so an
+# 1.6.59: PHP URL-decodes cookie values, nginx's $cookie_* does not, so an
 # encoded style/language value rendered that style/language under the default
 # guest key.  Run the shipped $xf_guest_cookie patterns (Perl, as PCRE) on the
 # attack cookies and on the ones that must stay cacheable.
@@ -7000,7 +6932,7 @@ xf_guest_cookie_hits() { # cookie -> 1 when any shipped pattern matches
       if (/^\s*"(~\*?)(.*)"\s+1;/) { my ($m, $re) = ($1, $2); $re =~ s/\\\\/\\/g;
         if ($m eq "~*" ? $ck =~ /$re/i : $ck =~ /$re/) { print 1; exit } }
     }
-    print 0;' "$ANGIE_TREE/http.d/fastcgi_cache.conf" "$1"
+    print 0;' "$NGINX_TREE/http.d/fastcgi_cache.conf" "$1"
 }
 xf_ck_all() { # expected cookie... -> 0 when every cookie gives EXPECTED
   local expected=$1 c; shift
@@ -7011,16 +6943,16 @@ check_tree "an encoded XenForo language/style cookie value is never guest-cachea
 check_tree "well-formed XenForo language/style cookies stay guest-cacheable" \
   xf_ck_all 0 "xf_language_id=2" "_ga=1; xf_style_id=12; xf_style_variation=alternate" "xf_style_variation=dark_mode-2" "xf_csrf=abc%3D"
 check_tree "WordPress refuses PHP inside plugin/theme vendor/ and node_modules/" \
-  grep -qF '|/wp-content/(?:plugins|themes|mu-plugins)/(?:.*/)?(?:vendor|node_modules)/.*\.ph(?:p|tml|ar)(?:/|$)|' "$ANGIE_TREE/h5bp/location/security_wp.conf"
+  grep -qF '|/wp-content/(?:plugins|themes|mu-plugins)/(?:.*/)?(?:vendor|node_modules)/.*\.ph(?:p|tml|ar)(?:/|$)|' "$NGINX_TREE/h5bp/location/security_wp.conf"
 check_tree "WooCommerce and EDD protected downloads are internal-only" \
-  bash -c 'grep -qE "^location \^~ /wp-content/uploads/woocommerce_uploads/ \{ internal; \}" "$1" && grep -qE "^location \^~ /wp-content/uploads/edd/ \{ internal; \}" "$1"' _ "$ANGIE_TREE/h5bp/wordpress.conf"
+  bash -c 'grep -qE "^location \^~ /wp-content/uploads/woocommerce_uploads/ \{ internal; \}" "$1" && grep -qE "^location \^~ /wp-content/uploads/edd/ \{ internal; \}" "$1"' _ "$NGINX_TREE/h5bp/wordpress.conf"
 check_tree "no proxy path forwards the client's own X-Forwarded-For" \
-  bash -c '! grep -rnE "X-Forwarded-For[[:space:]]+\\\$proxy_add_x_forwarded_for" "$1/h5bp" "$1/conf.d" && grep -qE "^map \\\$trusted_forwarder \\\$proxy_x_forwarded_for" "$1/http.d/https_map.conf"' _ "$ANGIE_TREE"
+  bash -c '! grep -rnE "X-Forwarded-For[[:space:]]+\\\$proxy_add_x_forwarded_for" "$1/h5bp" "$1/conf.d" && grep -qE "^map \\\$trusted_forwarder \\\$proxy_x_forwarded_for" "$1/http.d/https_map.conf"' _ "$NGINX_TREE"
 unset -f xf_guest_cookie_hits xf_ck_all
 
 # A host still behind the filter is detected from the files only the old
 # release generated, and only from those: a hand-installed Anubis never
-# touched the Angie tree and needs no migration.
+# touched the nginx tree and needs no migration.
 rm -rf "$SETUP_STATE_DIR/anubis"
 check "anubis_host_present: a clean host is not detected" not anubis_host_present
 mkdir -p "$SETUP_STATE_DIR/anubis"
@@ -7172,12 +7104,12 @@ check "purge elastic restores /etc/sysctl.d/99-elasticsearch.conf" \
 check "the elasticsearch drop-in is recorded under the same name" \
   grep -qF 'record_original "$f" sysctl.d-99-elasticsearch.conf' "$ALL_SRC"
 
-# ---- 1.21.67: --upgrade-php post-Angie refresh, dry-run pool split, JIT comment, sid_* gate
+# ---- 1.21.67: --upgrade-php post-nginx refresh, dry-run pool split, JIT comment, sid_* gate
 # ---------------------------------------------------------------------------
-# --upgrade-php post-Angie refresh, dry-run PHP pool split, JIT threshold
+# --upgrade-php post-nginx refresh, dry-run PHP pool split, JIT threshold
 # comment, PHP 8.4 session-ID deprecations
 # ---------------------------------------------------------------------------
-# php_refresh_after_angie() is gated on OPT_PHP_OK; php_upgrade_optimize must
+# php_refresh_after_nginx() is gated on OPT_PHP_OK; php_upgrade_optimize must
 # set it before the PHP pass (as run_optimize does) and clear it on failure.
 php_upgrade_ok_probe=$(
   detect_installed_services() { :; }
@@ -7278,188 +7210,127 @@ diag_gitignore=$(cat "$ROOT/.gitignore")
 check ".gitignore covers the in-progress diagnostics report" \
   grep -qxF 'diagnostics.log.*' <<<"$diag_gitignore"
 
-# ---- 1.21.68: PHP_BUILD=clang (lib/php-build.sh, tools/php-fpm-build.sh)
-pb_mode() { ( PHP_BUILD=$1; php_build_mode ); }
-check "PHP_BUILD: clang, package/sury/off and unset map to their modes" \
-  test "$(pb_mode clang),$(pb_mode CLANG),$(pb_mode package),$(pb_mode sury),$(pb_mode off),$(pb_mode '')" = "clang,clang,package,package,package,"
-pb_alias_cli() { ( PHP_BUILD=$1; PHP_BUILD_PERSIST=1; die() { exit 7; }; php_build_validate ); [[ $? == 7 ]]; }
-pb_alias_cli_both() { pb_alias_cli lean && pb_alias_cli source; }
-check "PHP_BUILD: SETUP_PHP_BUILD=lean or =source is refused (aliases dropped in 1.21.70)" \
-  pb_alias_cli_both
-pb_alias_legacy() { ( PHP_BUILD=lean; PHP_BUILD_PERSIST=0; tune_note() { :; }; php_build_validate; printf '%s,%s' "$PHP_BUILD" "$PHP_BUILD_PERSIST" ); }
-check "PHP_BUILD: a 1.21.68 host file with lean is rewritten to clang once" \
-  test "$(pb_alias_legacy)" = "clang,1"
-pb_invalid() { ( PHP_BUILD=gcc; die() { exit 7; }; php_build_validate ); [[ $? == 7 ]]; }
-check "PHP_BUILD: an unknown value is refused before anything changes" pb_invalid
-check "validate_all checks PHP_BUILD" \
-  bash -c 'sed -n "/^validate_all()/,/^}/p" "$1" | grep -q php_build_validate' _ "$ALL_SRC"
-check "an explicit SETUP_PHP_BUILD is persisted (persist_php_jit runs php_build_persist)" \
-  bash -c 'sed -n "/^persist_php_jit()/,/^}/p" "$1" | grep -q php_build_persist' _ "$ALL_SRC"
-pb_unit=$(php_build_unit_text)
-check "the rebuild unit runs the installed tool for the instance version, at idle priority" \
-  bash -c 'grep -qF "ExecStart=$2 rebuild %i" <<<"$1" && grep -qx "Nice=19" <<<"$1" && grep -qx "IOSchedulingClass=idle" <<<"$1"' _ "$pb_unit" "$PHP_BUILD_TOOL"
-check "the APT hook runs the tool's apt-hook after every dpkg run and never fails apt" \
-  bash -c 'grep -qF "DPkg::Post-Invoke" <<<"$1" && grep -qF "apt-hook || true" <<<"$1"' _ "$(php_build_apt_hook_text)"
-check "install_php and optimize_php_services both apply PHP_BUILD (install/optimize parity)" \
-  bash -c 'sed -n "/^install_php()/,/^}/p" "$1" | grep -q "php_build_apply \"\$ver\" install" && sed -n "/^optimize_php_services()/,/^}/p" "$1" | grep -q "php_build_apply \"\$ver\" optimize"' _ "$ALL_SRC"
-check "--purge php removes the PHP_BUILD drop-in" \
+# ---- 1.22.0: PHP compiled from source (lib/php-build.sh, tools/php-build.sh)
+# The 1.21 opt-in modes (SETUP_PHP_BUILD, SETUP_NGINX_BUILD,
+# SETUP_VALKEY_BUILD, --source, PHP_FPM_MODULES/phpenmod, the APT hooks and
+# the package drop-ins) are gone: every host runs the compiled builds.  The
+# per-module behaviour is covered in tests/unit/; what follows checks the
+# wiring and the recipes.
+check "the 1.21 build-mode pins are retired, never kept as tuning pins" \
+  bash -c 'for p in PHP_BUILD NGINX_BUILD VALKEY_BUILD PHP_FPM_MODULES; do printf "%s\n" "${@:2}" | grep -qx "$p" || exit 1; printf "%s\n" "$1" | tr " " "\n" | grep -qx "$p" && exit 1; done; exit 0' \
+  _ "${RESET_KEEP_PINS[*]}" "${RESET_RETIRED_PINS[@]}"
+check "no 1.21 build-mode function is left (php/nginx/valkey _build_mode, _validate, _apply, _persist)" \
+  bash -c 'for f in php_build_mode php_build_validate php_build_apply php_build_persist nginx_build_mode nginx_build_validate nginx_build_apply valkey_build_mode valkey_build_validate valkey_build_apply php_fpm_modules_apply php_fpm_modules_persist; do grep -qE "^$f\(\)" "$1" && { echo "$f"; exit 1; }; done; exit 0' _ "$ALL_SRC"
+check "no module writes an APT hook (DPkg::Post-Invoke) or calls phpenmod/phpdismod" \
+  bash -c '! grep -nE "^[^#]*(DPkg::Post-Invoke|phpenmod|phpdismod)" "$1"/setup.sh "$1"/lib/*.sh "$1"/tools/php-build.sh "$1"/tools/nginx-build.sh' _ "$ROOT"
+check "the 1.21 tools are gone (php-fpm-build.sh, angie-build.sh)" \
+  bash -c '[[ ! -e $1/tools/php-fpm-build.sh && ! -e $1/tools/angie-build.sh ]]' _ "$ROOT"
+pb_rebuild_unit=$(php_build_rebuild_unit_text)
+check "the rebuild unit runs the installed tool for the instance version, at idle I/O priority" \
+  bash -c 'grep -qF "ExecStart=$2 rebuild %i" <<<"$1" && grep -qx "IOSchedulingClass=idle" <<<"$1" && grep -qx "Type=oneshot" <<<"$1"' _ "$pb_rebuild_unit" "$PHP_BUILD_TOOL"
+check "install_php and optimize_php_services both run php_build_ensure (install/optimize parity)" \
+  bash -c 'sed -n "/^install_php()/,/^}/p" "$1" | grep -qF "php_build_ensure \"\$ver\" full install" && sed -n "/^optimize_php_services()/,/^}/p" "$1" | grep -qF "php_build_ensure \"\$ver\" full optimize"' _ "$ALL_SRC"
+# --php ext= reaches the build: php_ext_request_apply runs in install_php
+# before php_build_ensure computes the set (integ1).
+check "install_php applies --php ext= (php_ext_request_apply) before php_build_ensure" \
+  test "$(sed -n '/^install_php()/,/^}/p' "$ALL_SRC" | awk '/^[^#]*php_ext_request_apply/ && !a {a=NR} /^[^#]*php_build_ensure "\$ver" full install/ && !b {b=NR} END {print (a && b && a < b) ? "ok" : "bad"}')" = ok
+check "--purge php runs php_build_purge" \
   bash -c 'sed -n "/^purge_php()/,/^}/p" "$1" | grep -q php_build_purge' _ "$ALL_SRC"
-check "--optimize keeps the persisted PHP_BUILD choice (a feature choice, not a tuning pin)" \
-  bash -c 'printf "%s\n" "$@" | grep -qx PHP_BUILD' _ "${RESET_KEEP_PINS[@]}"
+check "php_build_purge of the last version releases LLVM and the shared build units" \
+  bash -c 'f=$(sed -n "/^php_build_purge()/,/^}/p" "$1"); grep -q "setup_build_llvm_release php" <<<"$f" && grep -q "setup_build_remove_shared_units_if_last php" <<<"$f"' _ "$ALL_SRC"
+check "every extension PHP_BUILDABLE_EXTS lists has a configure case in tools/php-build.sh" \
+  bash -c 'f=$(sed -n "/^ext_flags()/,/^}/p" "$1"); shift; for e in "$@"; do grep -qE "^[[:space:]]+$e\)" <<<"$f" || { echo "no case for $e"; exit 1; }; done' \
+  _ "$ROOT/tools/php-build.sh" "${PHP_BUILDABLE_EXTS[@]}"
+check "the base set has neither intl (ICU doubles the binary) nor xmlreader" \
+  bash -c 'printf "%s\n" "$@" | grep -qxE "intl|xmlreader" && exit 1; exit 0' _ "${PHP_BASE_EXTS[@]}" "${PHP_GENERIC_EXTS[@]}"
 
-# The tool itself, sourced in a subshell (it sets its own shell options).
+# The tool itself, sourced in a fresh bash: it sets its own shell options,
+# and its globals (BACKUP_DIR, ...) are readonly in this shell, which sourced
+# setup.sh.
 pb_tool_case() { # case -> result line
+  ROOT=$ROOT TMP=$TMP bash -c "$(declare -f pb_tool_body); pb_tool_body \"\$1\"" _ "$1"
+}
+pb_tool_body() {
   (
-    T="$TMP/pbt"; rm -rf "$T"; mkdir -p "$T/sbin" "$T/units/php8.5-fpm.service.d" "$T/root/8.5" "$T/pkgunits"
-    export PHP_BUILD_ROOT="$T/root" PHP_BUILD_UNIT_DIR="$T/units" PHP_BUILD_SBIN="$T/sbin" \
-           PHP_BUILD_PKG_UNIT_DIR="$T/pkgunits" PHP_BUILD_SOURCE_ONLY=1
-    stub_fpm() { printf '#!/bin/sh\n[ "$1" = -n ] && [ "$2" = -v ] && echo "PHP %s (fpm-fcgi) (built: x)"\nexit 0\n' "$1" > "$T/sbin/php-fpm8.5"; chmod +x "$T/sbin/php-fpm8.5"; }
+    T="$TMP/pbt"; rm -rf "$T"; mkdir -p "$T/root/8.5/sbin" "$T/units" "$T/etc"
+    export PHP_BUILD_ROOT="$T/root" PHP_BUILD_UNIT_DIR="$T/units" PHP_BUILD_ETC="$T/etc" \
+           PHP_BUILD_CACHE="$T/cache" PHP_BUILD_LOG_DIR="$T/logs" PHP_BUILD_BACKUP_DIR="$T/backup" \
+           PHP_BUILD_SOURCE_ONLY=1
+    stub_fpm() { printf '#!/bin/sh\n[ "$1" = -n ] && [ "$2" = -v ] && echo "PHP %s (fpm-fcgi) (built: x)"\nexit 0\n' "$1" > "$T/root/8.5/sbin/php-fpm"; chmod +x "$T/root/8.5/sbin/php-fpm"; }
     # shellcheck disable=SC1090,SC1091
-    source "$ROOT/tools/php-fpm-build.sh"
+    source "$ROOT/tools/php-build.sh"
     set +eE; trap - ERR
     systemctl() { printf '%s\n' "$*" >> "$T/systemctl.log"; return 0; }
+    systemd-tmpfiles() { :; }
     logger() { :; }; say() { :; }
-    printf '[Service]\nExecStart=\nExecStart=%s/8.5/php-fpm --nodaemonize --fpm-config /etc/php/8.5/fpm/php-fpm.conf\n' "$T/root" \
-      > "$T/units/php8.5-fpm.service.d/zz-setup-build.conf"
+    cpu_fingerprint() { printf 'thiscpu'; }
     case $1 in
-      stale)   stub_fpm 8.5.14; printf 'version=8.5.13\nbolt=1\n' > "$T/root/8.5/build.info"; cmd_apt_hook ;;
-      current) stub_fpm 8.5.13; printf 'version=8.5.13\nbolt=1\n' > "$T/root/8.5/build.info"; cmd_apt_hook ;;
-      gone)    printf 'version=8.5.13\n' > "$T/root/8.5/build.info"; cmd_apt_hook ;;
-      version) stub_fpm 8.5.13; printf '%s' "$(bin_version "$T/sbin/php-fpm8.5")"; return 0 ;;
-      activate)
-        stub_fpm 8.5.13; printf 'version=8.5.13\n' > "$T/root/8.5/build.info"
-        printf '[Service]\nType=notify\nExecStart=%s/php-fpm8.5 --nodaemonize --fpm-config /etc/php/8.5/fpm/php-fpm.conf\nExecReload=/bin/kill -USR2 $MAINPID\n' "$T/sbin" > "$T/pkgunits/php8.5-fpm.service"
-        rm -f "$T/units/php8.5-fpm.service.d/zz-setup-build.conf"
-        restart_checked() { return 0; }
-        activate 8.5
-        d="$T/units/php8.5-fpm.service.d/zz-setup-build.conf"
-        printf '%s %s %s %s %s' "$(grep -c '^ExecStart=$' "$d")" \
-          "$(grep -c "^ExecStart=$T/root/8.5/php-fpm --nodaemonize --fpm-config /etc/php/8.5/fpm/php-fpm.conf$" "$d")" \
-          "$(grep -c "^ExecStartPre=$T/root/php-fpm-build.sh conf 8.5$" "$d")" \
-          "$(grep -c "^ExecReload=$T/root/php-fpm-build.sh conf 8.5$" "$d")" \
-          "$(grep -c '^ExecReload=/bin/kill -USR2 \$MAINPID$' "$d")"
-        return 0 ;;
-      conf)
-        export PHP_BUILD_ETC="$T/etc" PHP_BUILD_RUN_DIR="$T/run"
-        PHP_ETC=$PHP_BUILD_ETC RUN_DIR=$PHP_BUILD_RUN_DIR
-        mkdir -p "$T/etc/8.5/fpm/conf.d" "$T/run"
-        printf 'extension=redis.so\nredis.pconnect.pooling_enabled=1\n' > "$T/etc/8.5/fpm/conf.d/20-redis.ini"
-        printf '  zend_extension = opcache.so\nopcache.jit=tracing\n' > "$T/etc/8.5/fpm/conf.d/10-opcache.ini"
-        printf 'memory_limit = 256M\n' > "$T/etc/8.5/fpm/conf.d/99-custom.ini"
-        printf 'stale\n' > "$T/run/8.5-old.ini"; mkdir -p "$T/run/8.5"; printf 'x\n' > "$T/run/8.5/00-gone.ini"
-        cmd_conf 8.5
-        printf '%s %s %s %s' "$(cat "$T/run/8.5"/*.ini | grep -cE '^[[:space:]]*(zend_)?extension')" \
-          "$(grep -c '^opcache.jit=tracing$' "$T/run/8.5/10-opcache.ini")" \
-          "$(grep -c '^memory_limit = 256M$' "$T/run/8.5/99-custom.ini")" \
-          "$([[ -f $T/run/8.5/00-gone.ini ]] && echo kept || echo removed)"
-        return 0 ;;
+      version) stub_fpm 8.5.13; printf '%s' "$(bin_version "$T/root/8.5/sbin/php-fpm")" ;;
+      nobuild) rc=0; out=$(cmd_check 8.5) || rc=$?; printf '%s rc=%s' "$out" "$rc" ;;
+      oldmode)
+        printf 'mode=clang\nversion=8.5.13\n' > "$T/root/8.5/build.info"
+        rc=0; out=$(cmd_check 8.5) || rc=$?; printf '%s rc=%s' "$out" "$rc" ;;
+      cpusame|cpumoved)
+        stub_fpm 8.5.13
+        if [[ $1 == cpusame ]]; then printf 'version=8.5.13\ncpu=thiscpu\n' > "$T/root/8.5/build.info"
+        else printf 'version=8.5.13\ncpu=othercpu\n' > "$T/root/8.5/build.info"; fi
+        ( cmd_pre 8.5 ) >/dev/null 2>&1; rc=$?
+        printf 'rc=%s %s' "$rc" "$(cat "$T/systemctl.log" 2>/dev/null | grep -c 'start --no-block setup-build-cpu.service')" ;;
       confget)
         export PHP_BUILD_CONF="$T/php-build.conf"; CONF=$PHP_BUILD_CONF
         printf '# c\nPHP_VERSION=8.5.13  # pinned\nLLVM_VERSION="23"\nLIBJPEG_TURBO_VERSION=latest\n' > "$CONF"
         printf '%s %s %s %s %s' "$(conf_get php)" "$(conf_get llvm)" "$(conf_get libjpeg-turbo)" "$(conf_get openssl)" \
-          "$(ver_ge 8.5.14 8.5.13 && echo ge)$(ver_ge 8.5.9 8.5.13 || echo lt)"
-        return 0 ;;
+          "$(ver_ge 8.5.14 8.5.13 && echo ge)$(ver_ge 8.5.9 8.5.13 || echo lt)" ;;
       confbad)
         export PHP_BUILD_CONF="$T/php-build.conf"; CONF=$PHP_BUILD_CONF
         printf 'OPENSSL_VERSION=$(id)\n' > "$CONF"
-        ( conf_get openssl ) >/dev/null 2>&1 && echo accepted || echo refused
-        return 0 ;;
-      lostlib)
-        stub_fpm 8.5.13; printf 'version=8.5.13\nbolt=1\n' > "$T/root/8.5/build.info"
-        printf '#!/bin/sh\n' > "$T/root/8.5/php-fpm"; chmod +x "$T/root/8.5/php-fpm"
-        ldd() { echo "	libicuuc.so.78 => not found"; }
-        cmd_apt_hook ;;
-      newer)
-        stub_fpm 8.5.13; printf 'version=8.5.14\nbolt=1\n' > "$T/root/8.5/build.info"; cmd_apt_hook ;;
-      recipe_old|recipe_cur)
-        # Every component pinned: check resolves without the network.
-        export PHP_BUILD_CONF="$T/php-build.conf"; CONF=$PHP_BUILD_CONF
-        : > "$CONF"; : > "$T/root/8.5/build.info"
-        for c in "${COMPONENTS[@]}"; do
-          case $c in php) v=8.5.13 ;; llvm) v=23 ;; *) v=1.0 ;; esac
-          printf '%s=%s\n' "$(conf_key "$c")" "$v" >> "$CONF"; printf '%s=%s\n' "$c" "$v" >> "$T/root/8.5/build.info"
-        done
-        [[ $1 == recipe_old ]] && printf 'recipe=1\n' >> "$T/root/8.5/build.info"
-        [[ $1 == recipe_cur ]] && printf 'recipe=%s\n' "$BUILD_RECIPE" >> "$T/root/8.5/build.info"
-        rc=0; out=$(cmd_check 8.5) || rc=$?; printf '%s rc=%s' "$out" "$rc"
-        return 0 ;;
-      primarydown)
-        # Every primary host down (and GitHub release assets for the
-        # GitHub-only projects): each component must come from its fallback.
-        gh_digest() { :; }
-        http_get() {
-          case $1 in
-            https://www.php.net/*|https://pecl.php.net/*|https://www.openssl.org/*|https://zlib.net/*|\
-            https://download.libsodium.org/*|https://curl.se/*|https://libzip.org/*|https://download.gnome.org/*|\
-            https://ftp.gnu.org/*|https://download.sourceforge.net/*|https://storage.googleapis.com/*|\
-            https://github.com/PCRE2Project/*/releases/download/*|\
-            https://github.com/libjpeg-turbo/*/releases/download/*|https://download.angie.software/*|\
-            https://github.com/google/*/archive/*|https://github.com/zlib-ng/*/archive/*) return 1 ;;
-          esac
-          [[ -n ${2:-} ]] && printf '%s' "$1" > "$2"; return 0
-        }
-        SRC_CACHE="$T/cache"; mkdir -p "$T/cache/src"
-        ok=0; bad=""
-        for c in php redis igbinary "${LIBS[@]}" zlib angie brotli ngx-brotli; do
-          if p=$( ( fetch_component "$c" 1.2.3 ) 2>/dev/null ) && [[ -s $p ]]; then ok=$((ok + 1)); else bad+="$c "; fi
-        done
-        printf '%s|%s|%s' "$ok" "$(( 7 + ${#LIBS[@]} ))" "$bad"
-        return 0 ;;
+        ( conf_get openssl ) >/dev/null 2>&1 && echo accepted || echo refused ;;
       mirrors)
         http_get() { [[ $1 == https://b/* ]] || return 1; printf 'data' > "$2"; }
-        PHP_BUILD_CACHE="$T/cache" SRC_CACHE="$T/cache"; mkdir -p "$T/cache"
+        SRC_CACHE="$T/cache"; mkdir -p "$T/cache"
         ( fetch_to "https://a/f.tar https://b/f.tar" "$T/cache/f.tar" ) >/dev/null 2>&1; r1=$?
         ( fetch_to "https://a/g.tar https://c/g.tar" "$T/cache/g.tar" ) >/dev/null 2>&1; r2=$?
-        printf '%s %s %s' "$r1" "$(cat "$T/cache/f.tar" 2>/dev/null)" "$r2"
-        return 0 ;;
+        printf '%s %s %s' "$r1" "$(cat "$T/cache/f.tar" 2>/dev/null)" "$r2" ;;
     esac
-    printf '%s %s %s' \
-      "$([[ -f $T/units/php8.5-fpm.service.d/zz-setup-build.conf ]] && echo dropin || echo nodropin)" \
-      "$([[ -d $T/root/8.5 ]] && echo build || echo nobuild)" \
-      "$(cat "$T/systemctl.log" 2>/dev/null | grep -c 'start --no-block setup-php-fpm-build@8.5.service')"
   )
 }
-check "php-fpm-build: reads the package's PHP version from php-fpm -v" \
+check "php-build: reads the PHP version from php-fpm -n -v" \
   test "$(pb_tool_case version)" = "8.5.13"
-check "php-fpm-build apt-hook: a security update reverts to the package binary and starts a rebuild" \
-  test "$(pb_tool_case stale)" = "nodropin build 1"
-check "php-fpm-build apt-hook: a current build is left alone" \
-  test "$(pb_tool_case current)" = "dropin build 0"
-check "php-fpm-build apt-hook: a removed package drops the drop-in and the build" \
-  test "$(pb_tool_case gone)" = "nodropin nobuild 0"
-check "php-fpm-build activate: resets ExecStart, rewrites the package's line, mirrors conf.d before start and reload" \
-  test "$(pb_tool_case activate)" = "1 1 1 1 1"
-check "php-fpm-build apt-hook: a build newer than the package (php.net ahead of Sury) is left alone" \
-  test "$(pb_tool_case newer)" = "dropin build 0"
-check "php-fpm-build check: a build from an older recipe (1.21.68: -fPIC, intl) is stale" \
-  test "$(pb_tool_case recipe_old)" = "stale: recipe 1 -> 4 rc=10"
-check "php-fpm-build check: the current recipe with every pinned version is current" \
-  test "$(pb_tool_case recipe_cur)" = "current rc=0"
-check "php-fpm-build fetch: the next mirror serves when the first fails; all failing stops" \
+check "php-build check: no build is stale (rc 10)" \
+  test "$(pb_tool_case nobuild)" = "no build rc=10"
+check "php-build check: a 1.21 build (mode=clang) is replaced by the 1.22 layout" \
+  test "$(pb_tool_case oldmode)" = "1.21 build (replaced by the 1.22 layout) rc=10"
+check "php-build pre: a build made on this CPU passes" \
+  test "$(pb_tool_case cpusame)" = "rc=0 0"
+check "php-build pre: a build made on another CPU stays down and starts setup-build-cpu.service" \
+  test "$(pb_tool_case cpumoved)" = "rc=1 1"
+check "php-build fetch: the next mirror serves when the first fails; all failing stops" \
   test "$(pb_tool_case mirrors)" = "0 data 1"
-pb_primarydown_ok() { local r; r=$(pb_tool_case primarydown); [[ ${r%%|*} == "$(cut -d'|' -f2 <<<"$r")" && $r == *"|" ]]; }
-check "php-fpm-build fetch: every component downloads from its second source when its own site is down" pb_primarydown_ok
-check "php-fpm-build apt-hook: a build that lost a system library reverts and rebuilds" \
-  test "$(pb_tool_case lostlib)" = "nodropin build 1"
-check "php-fpm-build conf: extension lines are commented out, settings kept, stale files removed" \
-  test "$(pb_tool_case conf)" = "0 1 1 removed"
 check "php-build.conf: pins, quotes and comments parse; unset keys mean latest; versions compare" \
   test "$(pb_tool_case confget)" = "8.5.13 23 latest latest gelt"
 check "php-build.conf: a value that is neither latest nor a version is refused" \
   test "$(pb_tool_case confbad)" = "refused"
 check "php-build.conf ships beside setup.sh with every component the tool builds" \
-  bash -c 'for k in PHP LLVM REDIS IGBINARY OPENSSL PCRE2 ZLIB_NG LIBXML2 LIBSODIUM GMP CURL LIBJPEG_TURBO LIBPNG LIBWEBP LIBZIP LIBICONV; do grep -qx "${k}_VERSION=latest" "$1/php-build.conf" || exit 1; done' _ "$ROOT"
+  bash -c 'for k in PHP LLVM REDIS IGBINARY OPENSSL PCRE2 ZLIB_NG LIBXML2 LIBSODIUM GMP CURL LIBJPEG_TURBO LIBPNG LIBWEBP LIBZIP LIBICONV SQLITE ICU; do grep -qx "${k}_VERSION=latest" "$1/php-build.conf" || { echo "no $k"; exit 1; }; done' _ "$ROOT"
 lean_set_ok() {
   local f
-  f=$(sed -n '/^cmd_build()/,/^}/p' "$ROOT/tools/php-fpm-build.sh")
-  grep -q -- "--disable-cli" <<<"$f" && grep -q -- "--enable-session" <<<"$f" \
-    && grep -q -- "--with-pdo-mysql" <<<"$f" && ! grep -q -- "--enable-xmlreader" <<<"$f" \
-    && ! grep -qiE -- "imagick|--enable-(intl|posix|pcntl|sockets|bcmath|soap|calendar|ftp|tokenizer|phar|xmlreader)\b" <<<"$f" \
+  f=$(sed -n '/^cmd_build()/,/^}/p' "$ROOT/tools/php-build.sh")
+  grep -q -- "--disable-all" <<<"$f" && grep -q -- "--disable-cgi" <<<"$f" \
+    && grep -q -- "--disable-phpdbg" <<<"$f" && grep -q -- "--without-pear" <<<"$f" \
+    && ! grep -qi -- "imagick" <<<"$f" \
     && grep -q -- 'BASE_FLAGS="[^"]*-fPIE' <<<"$f" && ! grep -q -- 'BASE_FLAGS="[^"]*-fPIC' <<<"$f"
 }
-check "the lean build compiles only the three applications' module set (no CLI, imagick or extras)" lean_set_ok
-check "php-fpm-build EXIT traps name a global (a local is gone when the trap fires under set -u)" \
-  bash -c 'f="$1/tools/php-fpm-build.sh"; ! grep -E "trap .*EXIT" "$f" | grep -vqF "\${WORK_DIR:-}"' _ "$ROOT"
+check "the build starts from --disable-all (only the host's set; no CGI, phpdbg, PEAR or imagick; -fPIE)" lean_set_ok
+check "php-build: an extension outside the recipe stops the build (never a silent omission)" \
+  bash -c 'sed -n "/^ext_flags()/,/^}/p" "$1" | grep -qF "is not part of the build recipe"' _ "$ROOT/tools/php-build.sh"
+# An EXIT trap fires after the function returned: every variable it names
+# must be a global read as ${VAR:-...} (a local is gone, set -u ends the trap).
+pb_traps_ok() {
+  local t
+  t=$(grep -E "trap .*EXIT" "$ROOT/tools/php-build.sh") || return 1
+  ! grep -qE '\$[A-Za-z_]|\$\{[A-Za-z_][A-Za-z0-9_]*\}' <<<"$t"
+}
+check "php-build EXIT traps name globals only, read with \${VAR:-}" pb_traps_ok
 gpg_home_ok() {
   local f="$ROOT/tools/build-common.sh"
   [[ $(grep -cF 'gpg --show-keys' "$f") == "$(grep -cF 'GNUPGHOME=$gnupg_home gpg --show-keys' "$f")" ]] \
@@ -7469,119 +7340,37 @@ check "the apt.llvm.org key check runs gpg in a throwaway home (no /root/.gnupg 
 check "the test-host restore never purges kernel packages (main-modules included)" \
   grep -qF "KERNEL_RE='^linux-(image|modules|modules-extra|main-modules|headers|generic|image-generic|headers-generic)" "$ROOT/tests/deploy-audit/restore-baseline.sh"
 check "GMP is built without assembly (its jump tables in data stop BOLT)" \
-  grep -q -- "--disable-assembly" "$ROOT/tools/php-fpm-build.sh"
-check "the refresh timer runs the tool daily at idle priority" \
-  bash -c 'grep -qF "ExecStart=$2 refresh" <<<"$1" && grep -qx "OnCalendar=daily" <<<"$3"' _ "$(php_build_refresh_unit_text)" "$PHP_BUILD_TOOL" "$(php_build_refresh_timer_text)"
-check "removing the last build also removes the apt.llvm.org source and the refresh timer" \
-  bash -c 'sed -n "/^php_build_remove_support()/,/^}/p" "$1" | grep -q "setup_build_llvm_release php" && sed -n "/^setup_build_llvm_release()/,/^}/p" "$1" | grep -q "PHP_BUILD_LLVM_FILES" && sed -n "/^php_build_remove_support()/,/^}/p" "$1" | grep -q "PHP_BUILD_REFRESH_TIMER"' _ "$ALL_SRC"
+  grep -q -- "--disable-assembly" "$ROOT/tools/php-build.sh"
+sb_refresh_unit=$(setup_build_refresh_unit_text)
+sb_refresh_timer=$(setup_build_refresh_timer_text)
+check "the shared refresh timer runs the build chain daily" \
+  bash -c 'grep -q "^ExecStart=.*refresh" <<<"$1" && grep -qx "OnCalendar=daily" <<<"$2" && grep -qx "Persistent=true" <<<"$2"' _ "$sb_refresh_unit" "$sb_refresh_timer"
 check "phpinfo is not in the shipped disable_functions (XenForo/WordPress admin pages use it)" \
   bash -c '! grep -E "^disable_functions" "$1/configs/php/custom_dan.ini" | grep -q phpinfo && grep -qx "disable_functions = show_source" "$1/configs/php/custom_dan.ini"' _ "$ROOT"
-unset -f pb_mode pb_tool_case pb_invalid
+unset -f pb_tool_case pb_tool_body lean_set_ok pb_traps_ok gpg_home_ok
 
-# ---- 1.21.68: php-fpm loads only what WordPress, XenForo and Chevereto need
-fm_case() { # case -> result line
-  (
-    T="$TMP/fm"; rm -rf "$T"; mkdir -p "$T/etc/8.5/fpm/conf.d" "$T/angie/conf.d" "$T/www/xf/src" "$T/www/other"
-    export PHP_FPM_ETC="$T/etc" PHP_FPM_ANGIE="$T/angie"
-    PHP_FPM_ETC=$T/etc PHP_FPM_MODULES=${FM_MODE:-}
-    printf 'zend_extension=opcache.so\n' > "$T/etc/8.5/fpm/conf.d/10-opcache.ini"
-    for m in curl ffi calendar redis xsl tokenizer mysqli imagick; do printf 'extension=%s.so\n' "$m" > "$T/etc/8.5/fpm/conf.d/20-$m.ini"; done
-    printf '; no extension line\nmemory_limit=1G\n' > "$T/etc/8.5/fpm/conf.d/99-custom.ini"
-    phpdismod() { rm -f "$PHP_FPM_ETC/$2/fpm/conf.d/"[0-9][0-9]"-$5.ini"; }
-    phpenmod() { printf 'extension=%s.so\n' "$5" > "$PHP_FPM_ETC/$2/fpm/conf.d/20-$5.ini"; }
-    angie_vhost_root() { sed -n 's/^[[:space:]]*root[[:space:]]*\(.*\);/\1/p' "$1"; }
-    : > "$T/www/xf/src/XF.php"; : > "$T/www/xf/src/config.php"
-    printf 'server {\n  root %s;\n}\n' "$T/www/xf" > "$T/angie/conf.d/xf.conf"
-    case $1 in
-      foreign) : > "$T/www/other/index.php"; printf 'server {\n  root %s;\n}\n' "$T/www/other" > "$T/angie/conf.d/other.conf" ;;
-      static)  printf '<html>\n' > "$T/www/other/index.html"; printf 'server {\n  root %s;\n}\n' "$T/www/other" > "$T/angie/conf.d/other.conf" ;;
-    esac
-    rc=0; php_fpm_modules_apply 8.5 : || rc=$?
-    if [[ $1 == restore ]]; then
-      PHP_FPM_MODULES=all; rc=0; php_fpm_modules_apply 8.5 : || rc=$?
-    fi
-    printf 'rc=%s %s| %s' "$rc" "$(php_fpm_enabled_modules 8.5 | sort | tr '\n' ' ')" \
-      "$(sort "$T/etc/8.5/fpm/setup-disabled-modules" 2>/dev/null | tr '\n' ' ')"
-  )
-}
-check "php-fpm modules: only the applications' extensions stay loaded; the rest is recorded" \
-  test "$(fm_case trim)" = "rc=0 curl mysqli opcache redis | calendar ffi imagick tokenizer xsl "
-fm_twice() {
-  fm_case trim >/dev/null
-  (
-    T="$TMP/fm"; PHP_FPM_ETC=$T/etc PHP_FPM_ANGIE=$T/angie PHP_FPM_MODULES=
-    phpdismod() { :; }
-    angie_vhost_root() { sed -n 's/^[[:space:]]*root[[:space:]]*\(.*\);/\1/p' "$1"; }
-    rc=0; php_fpm_modules_apply 8.5 : || rc=$?
-    printf 'rc=%s' "$rc"
-  )
-}
-check "php-fpm modules: a second run changes nothing (no reload)" test "$(fm_twice)" = "rc=1"
-check "php-fpm modules: another PHP application on the host keeps every extension" \
-  test "$(fm_case foreign)" = "rc=1 calendar curl ffi imagick mysqli opcache redis tokenizer xsl | "
-check "php-fpm modules: a static site does not count as another PHP application" \
-  test "$(fm_case static)" = "rc=0 curl mysqli opcache redis | calendar ffi imagick tokenizer xsl "
-check "php-fpm modules: PHP_FPM_MODULES=all re-enables exactly what setup.sh disabled" \
-  test "$(fm_case restore)" = "rc=0 calendar curl ffi imagick mysqli opcache redis tokenizer xsl | "
-check "--optimize keeps the persisted PHP_FPM_MODULES choice" \
-  bash -c 'printf "%s\n" "$@" | grep -qx PHP_FPM_MODULES' _ "${RESET_KEEP_PINS[@]}"
-check "install_php and optimize_php_services both apply the module policy (parity)" \
-  bash -c 'sed -n "/^install_php()/,/^}/p" "$1" | grep -q "php_fpm_modules_apply" && sed -n "/^optimize_php_services()/,/^}/p" "$1" | grep -q "php_fpm_modules_apply"' _ "$ALL_SRC"
-check "the compiled build's module list matches the shared-extension policy (intl: package only)" \
-  bash -c 'for m in $(sed -n "/^PHP_FPM_APP_MODS=(/,/)/p" "$1/lib/php-build.sh" | tr -d "()" | sed "s/PHP_FPM_APP_MODS=//"); do
-             case $m in opcache) m="Zend OPcache" ;; simplexml) m=SimpleXML ;; pdo) m=PDO ;; intl) continue ;; esac
-             sed -n "/^APP_MODULES=(/,/)/p" "$1/tools/php-fpm-build.sh" | grep -qF -- "$m" || { echo "missing $m"; exit 1; }
-           done' _ "$ROOT"
-
-# ---- 1.21.70: hardening, CPU guard, sd_notify shim, ANGIE_BUILD
-PFB_SRC=$(cat "$ROOT/tools/php-fpm-build.sh" "$ROOT/tools/build-common.sh")
-check "php-fpm-build: Ubuntu's hardening flags (stack protector, clash probes, FORTIFY=3, CET/BTI, full RELRO)" \
+# ---- hardening and shared build code (1.21.70, carried into 1.22)
+PFB_SRC=$(cat "$ROOT/tools/php-build.sh" "$ROOT/tools/build-common.sh")
+check "php-build: Ubuntu's hardening flags (stack protector, clash probes, FORTIFY=3, CET/BTI, full RELRO)" \
   bash -c 'for f in -fstack-protector-strong -fstack-clash-protection -D_FORTIFY_SOURCE=3 -fcf-protection=full -mbranch-protection=standard "-Wl,-z,relro,-z,now"; do grep -qF -- "$f" <<<"$1" || { echo "no $f"; exit 1; }; done' _ "$PFB_SRC"
-check "angie-build: the same hardening flags" \
-  bash -c 'for f in -fstack-protector-strong -fstack-clash-protection -D_FORTIFY_SOURCE=3 -fcf-protection=full "-Wl,-z,relro,-z,now"; do grep -qF -- "$f" "$1" || exit 1; done' _ "$ROOT/tools/angie-build.sh"
+check "nginx-build: the same hardening flags" \
+  bash -c 'for f in -fstack-protector-strong -fstack-clash-protection -D_FORTIFY_SOURCE=3 -fcf-protection=full "-Wl,-z,relro,-z,now"; do grep -qF -- "$f" "$1" || exit 1; done' _ "$ROOT/tools/nginx-build.sh"
 check "build downloads: a stalled transfer (under 1 KB/s for 30 s) fails over to the next source" \
   bash -c '[[ $(grep -c -- "--speed-limit 1024 --speed-time 30" "$1") -ge 2 ]]' _ "$ROOT/tools/build-common.sh"
-check "php-fpm-build: no RUNPATH in php-fpm (--disable-rpath)" \
-  grep -qF -- '--disable-rpath' "$ROOT/tools/php-fpm-build.sh"
-check "php-fpm-build: the candidate may show no module outside the app set and PHP's fixed core" \
-  bash -c 'grep -qF "candidate has modules outside the app set" "$1" && grep -q "^CORE_MODULES=(cgi-fcgi lexbor uri)" "$1"' _ "$ROOT/tools/php-fpm-build.sh"
-check "php-fpm-build: xmlreader is no longer built (WordPress uses it only when libxml2 is broken)" \
-  bash -c '! sed -n "/^APP_MODULES=(/,/)/p" "$1" | grep -qw xmlreader' _ "$ROOT/tools/php-fpm-build.sh"
-check "php-fpm-build: the binary php-fpm runs is stripped; php-fpm.lto keeps the symbols for BOLT" \
-  bash -c '[[ $(grep -c "install_stripped" "$1") -ge 4 ]] && grep -qF "\$dir/php-fpm.lto" "$1"' _ "$ROOT/tools/php-fpm-build.sh"
-check "php-fpm-build and angie-build share build-common.sh (downloads, mirrors, LLVM)" \
-  bash -c 'grep -qF ". \"\$BUILD_COMMON\"" "$1/tools/php-fpm-build.sh" && grep -qF ". \"\$BUILD_COMMON\"" "$1/tools/angie-build.sh" && ! grep -q "^fetch_first()" "$1/tools/php-fpm-build.sh"' _ "$ROOT"
-check "setup installs build-common.sh beside both tools" \
-  bash -c 'grep -qF "PHP_BUILD_COMMON_FILE" "$1/lib/php-build.sh" && grep -qF "ANGIE_BUILD_COMMON_FILE" "$1/lib/angie-build.sh"' _ "$ROOT"
+check "php-build: no RUNPATH in php-fpm or php (--disable-rpath)" \
+  grep -qF -- '--disable-rpath' "$ROOT/tools/php-build.sh"
+check "php-build: a candidate showing a module outside the host's set is refused" \
+  grep -qF "candidate has modules outside the set" "$ROOT/tools/php-build.sh"
+check "php-build: the binaries are stripped; php-fpm.lto keeps the symbols for BOLT" \
+  bash -c '[[ $(grep -c "install_stripped" "$1") -ge 4 ]] && grep -qF "sbin/php-fpm.lto" "$1"' _ "$ROOT/tools/php-build.sh"
+check "php-build, nginx-build and valkey-build share build-common.sh (downloads, mirrors, LLVM)" \
+  bash -c 'for t in php nginx valkey; do grep -qF ". \"\$BUILD_COMMON\"" "$1/tools/$t-build.sh" || exit 1; grep -q "^fetch_first()" "$1/tools/$t-build.sh" && exit 1; done; exit 0' _ "$ROOT"
+check "setup installs build-common.sh beside each tool" \
+  bash -c 'grep -qF "PHP_BUILD_COMMON_FILE" "$1/lib/php-build.sh" && grep -qF "NGINX_BUILD_COMMON_FILE" "$1/lib/nginx-build.sh"' _ "$ROOT"
 check "build-common: a commit hash is a valid pin (ngx_brotli publishes no releases)" \
   grep -qF '$v =~ ^[0-9a-f]{7,40}$' "$ROOT/tools/build-common.sh"
-
-# CPU guard: a -march=native build on another CPU model goes back to the package.
-pb_cpu_case() { # cpu-in-build.info -> "rc dropin rebuild-started"
-  (
-    T="$TMP/pbcpu"; rm -rf "$T"; mkdir -p "$T/units/php8.5-fpm.service.d" "$T/root/8.5" "$T/etc/8.5/fpm/conf.d" "$T/run"
-    export PHP_BUILD_ROOT="$T/root" PHP_BUILD_UNIT_DIR="$T/units" PHP_BUILD_ETC="$T/etc" PHP_BUILD_RUN_DIR="$T/run" PHP_BUILD_SOURCE_ONLY=1
-    # shellcheck disable=SC1090,SC1091
-    source "$ROOT/tools/php-fpm-build.sh"
-    set +eE; trap - ERR
-    systemctl() { printf '%s\n' "$*" >> "$T/systemctl.log"; return 0; }
-    systemd-run() { printf 'run %s\n' "$*" >> "$T/systemctl.log"; return 0; }
-    logger() { :; }; say() { :; }
-    cpu_model() { printf 'GenuineIntel This CPU'; }
-    printf '[Service]\n' > "$T/units/php8.5-fpm.service.d/zz-setup-build.conf"
-    printf 'version=8.5.13\ncpu=%s\n' "$1" > "$T/root/8.5/build.info"
-    ( cmd_conf 8.5 ) >/dev/null 2>&1; rc=$?
-    printf '%s %s %s' "$rc" \
-      "$([[ -f $T/units/php8.5-fpm.service.d/zz-setup-build.conf ]] && echo dropin || echo nodropin)" \
-      "$(cat "$T/systemctl.log" 2>/dev/null | grep -c 'start --no-block setup-php-fpm-build@8.5.service')"
-  )
-}
-check "php-fpm-build conf: a build made on this CPU starts as usual" \
-  test "$(pb_cpu_case 'GenuineIntel This CPU')" = "0 dropin 0"
-check "php-fpm-build conf: a build made on another CPU model refuses to start, goes back to the package and rebuilds" \
-  test "$(pb_cpu_case 'AuthenticAMD Other CPU')" = "1 nodropin 1"
-check "php-fpm-build: build.info records the CPU and check reports a CPU change as stale" \
-  bash -c 'grep -qF "printf '"'"'cpu=%s\\n'"'"' \"\$(cpu_model)\"" "$1" && grep -qF "stale+=\"cpu " "$1"' _ "$ROOT/tools/php-fpm-build.sh"
+check "build.info records the CPU fingerprint and check reports a CPU change as stale" \
+  bash -c 'grep -qF "printf '"'"'cpu=%s\\n'"'"' \"\$(cpu_fingerprint)\"" "$1" && grep -qF "stale+=\"cpu " "$1"' _ "$ROOT/tools/php-build.sh"
 
 # sd_notify shim: a real datagram to $NOTIFY_SOCKET, the way systemd reads it.
 pb_sdnotify_ok() {
@@ -7589,9 +7378,8 @@ pb_sdnotify_ok() {
   [[ -n $cl ]] && command -v python3 >/dev/null 2>&1 || return 2
   (
     T="$TMP/sdn"; rm -rf "$T"; mkdir -p "$T"
-    export PHP_BUILD_SOURCE_ONLY=1
     # shellcheck disable=SC1090,SC1091
-    source "$ROOT/tools/php-fpm-build.sh"
+    . "$ROOT/tools/build-common.sh"
     set +eE; trap - ERR
     CC=$cl AR=$(command -v llvm-ar || ls "$(dirname "$cl")"/llvm-ar 2>/dev/null || command -v ar)
     sdnotify_shim "$T/deps" "-O2" >/dev/null 2>&1 || exit 1
@@ -7610,71 +7398,24 @@ PY
   )
 }
 pb_sdnotify_case() { local rc=0; pb_sdnotify_ok || rc=$?; [[ $rc == 2 ]] && { t_skip "sd_notify shim round trip (no clang/python3)"; return 0; }; return "$rc"; }
-check "php-fpm-build: the sd_notify shim sends READY/STATUS to \$NOTIFY_SOCKET like libsystemd" pb_sdnotify_case
+check "build-common: the sd_notify shim sends READY/STATUS to \$NOTIFY_SOCKET like libsystemd" pb_sdnotify_case
 
-
-# ANGIE_BUILD (lib/angie-build.sh, tools/angie-build.sh)
-ab_mode() { ( ANGIE_BUILD=$1; angie_build_mode ); }
-check "ANGIE_BUILD: clang, package/off and unset map to their modes; anything else is invalid" \
-  test "$(ab_mode clang),$(ab_mode package),$(ab_mode off),$(ab_mode ''),$(ab_mode lean)" = "clang,package,package,,invalid"
-ab_invalid() { ( ANGIE_BUILD=gcc; die() { exit 7; }; angie_build_validate ); [[ $? == 7 ]]; }
-check "ANGIE_BUILD: an unknown value is refused before anything changes" ab_invalid
-check "validate_all checks ANGIE_BUILD" \
-  bash -c 'sed -n "/^validate_all()/,/^}/p" "$1" | grep -q angie_build_validate' _ "$ALL_SRC"
-check "--optimize keeps the persisted ANGIE_BUILD choice" \
-  bash -c 'printf "%s\n" "$@" | grep -qx ANGIE_BUILD' _ "${RESET_KEEP_PINS[@]}"
-check "install_angie and optimize_angie both apply ANGIE_BUILD; --purge angie removes it" \
-  bash -c 'sed -n "/^install_angie()/,/^}/p" "$1" | grep -q angie_build_apply && sed -n "/^optimize_angie()/,/^}/p" "$1" | grep -q angie_build_apply && sed -n "/^purge_angie()/,/^}/p" "$1" | grep -q angie_build_purge' _ "$ALL_SRC"
-check "the LLVM toolchain is removed only by the last of PHP_BUILD, ANGIE_BUILD and VALKEY_BUILD" \
-  bash -c 'for f in php_build_remove_support angie_build_remove_support valkey_build_remove_support; do sed -n "/^$f()/,/^}/p" "$1" | grep -q setup_build_llvm_release || exit 1; done' _ "$ALL_SRC"
-check "angie-build.conf ships beside setup.sh with every component the tool builds" \
-  bash -c 'for k in ANGIE LLVM OPENSSL PCRE2 ZLIB_NG BROTLI NGX_BROTLI; do grep -qx "${k}_VERSION=latest" "$1/angie-build.conf" || exit 1; done' _ "$ROOT"
-check "angie-build: only the modules server-configs-nginx uses (no mail/stream/ssi/grpc ...)" \
-  bash -c 'f=$(sed -n "/^cmd_build()/,/^}/p" "$1"); for w in http_v3_module http_realip_module http_gzip_static_module with-threads without-http_ssi_module without-http_grpc_module; do grep -q -- "$w" <<<"$f" || exit 1; done; ! grep -qE -- "--with-(mail|stream|http_dav|http_mp4|http_sub|http_acme)" <<<"$f"' _ "$ROOT/tools/angie-build.sh"
-
-ab_tool_case() { # case -> result
-  (
-    T="$TMP/abt"; rm -rf "$T"; mkdir -p "$T/units/angie.service.d" "$T/root/build" "$T/pkg" "$T/sbin"
-    export ANGIE_BUILD_ROOT="$T/root" ANGIE_BUILD_UNIT_DIR="$T/units" ANGIE_BUILD_SOURCE_ONLY=1 \
-           ANGIE_BUILD_PKG_BIN="$T/sbin/angie" ANGIE_BUILD_PKG_UNIT="$T/pkg/angie.service" \
-           ANGIE_BUILD_ANGIE_CONF="$T/conf/angie.conf"
-    # shellcheck disable=SC1090,SC1091
-    source "$ROOT/tools/angie-build.sh"
-    set +eE; trap - ERR
-    systemctl() { printf '%s\n' "$*" >> "$T/systemctl.log"; return 0; }
-    systemd-run() { printf 'run %s\n' "$*" >> "$T/systemctl.log"; return 0; }
-    logger() { :; }; say() { :; }
-    stub_angie() { printf '#!/bin/sh\necho "Angie version: Angie/%s" >&2\n' "$1" > "$T/sbin/angie"; chmod +x "$T/sbin/angie"; }
-    d="$T/units/angie.service.d/zz-setup-build.conf"
-    case $1 in
-      activate)
-        stub_angie 1.12.5; printf 'angie=1.12.5\n' > "$T/root/build/build.info"
-        printf '[Service]\nType=forking\nExecStart=%s -c /etc/angie/angie.conf\n' "$T/sbin/angie" > "$T/pkg/angie.service"
-        restart_checked() { return 0; }
-        activate
-        printf '%s %s %s' "$(grep -c '^ExecStart=$' "$d")" \
-          "$(grep -c "^ExecStart=$T/root/build/angie -c /etc/angie/angie.conf$" "$d")" \
-          "$(grep -c "^ExecStartPre=$T/root/angie-build.sh pre$" "$d")"
-        return 0 ;;
-      stale)   stub_angie 1.12.6; printf 'angie=1.12.5\n' > "$T/root/build/build.info"; printf '[Service]\n' > "$d"; cmd_apt_hook ;;
-      current) stub_angie 1.12.5; printf 'angie=1.12.5\n' > "$T/root/build/build.info"; printf '[Service]\n' > "$d"; cmd_apt_hook ;;
-      cpumoved)
-        printf 'angie=1.12.5\ncpu=AuthenticAMD Other CPU\n' > "$T/root/build/build.info"; printf '[Service]\n' > "$d"
-        cpu_model() { printf 'GenuineIntel This CPU'; }
-        ( cmd_pre ) >/dev/null 2>&1; printf 'rc=%s ' "$?" ;;
-    esac
-    printf '%s %s' "$([[ -f $d ]] && echo dropin || echo nodropin)" \
-      "$(cat "$T/systemctl.log" 2>/dev/null | grep -c 'start --no-block setup-angie-build.service')"
-  )
-}
-check "angie-build activate: resets ExecStart to the build and tests the configuration before start" \
-  test "$(ab_tool_case activate)" = "1 1 1"
-check "angie-build apt-hook: a newer Angie package reverts to it and starts a rebuild" \
-  test "$(ab_tool_case stale)" = "nodropin 1"
-check "angie-build apt-hook: a current build is left alone" \
-  test "$(ab_tool_case current)" = "dropin 0"
-check "angie-build pre: a build made on another CPU model refuses to start, goes back and rebuilds" \
-  test "$(ab_tool_case cpumoved)" = "rc=1 nodropin 1"
+# ---- nginx compiled from source (lib/nginx-build.sh, tools/nginx-build.sh)
+check "install_nginx and optimize_nginx run nginx_build_ensure; --purge nginx runs nginx_build_purge" \
+  bash -c 'sed -n "/^install_nginx()/,/^}/p" "$1" | grep -q nginx_build_ensure && sed -n "/^optimize_nginx()/,/^}/p" "$1" | grep -q "nginx_build_ensure full optimize" && sed -n "/^purge_nginx()/,/^}/p" "$1" | grep -q nginx_build_purge' _ "$ALL_SRC"
+check "every caller runs NGINX_BIN (the compiled binary), never /usr/sbin/nginx" \
+  bash -c 'grep -qF "NGINX_BIN=\${NGINX_BIN:-\${NGINX_ROOT}/sbin/nginx}" "$1/lib/nginx-build.sh" && ! grep -nE "^[^#]*/usr/sbin/nginx[[:space:]]+-" "$1"/lib/web.sh "$1"/lib/service-optimizers.sh "$1"/lib/optimize.sh' _ "$ROOT"
+check "nginx-build.conf ships beside setup.sh with every component the tool builds" \
+  bash -c 'for k in NGINX LLVM OPENSSL PCRE2 ZLIB_NG BROTLI NGX_BROTLI; do grep -qx "${k}_VERSION=latest" "$1/nginx-build.conf" || exit 1; done' _ "$ROOT"
+nginx_modules=$(sed -n '/^CONFIGURE_MODULES=(/,/^)/p' "$ROOT/tools/nginx-build.sh")
+check "nginx-build: only the modules server-configs-nginx uses (no mail/stream/ssi/grpc ...)" \
+  bash -c 'for w in http_v3_module http_realip_module http_gzip_static_module http_stub_status_module with-threads without-http_ssi_module without-http_grpc_module; do grep -q -- "$w" <<<"$1" || exit 1; done; ! grep -qE -- "--with-(mail|stream|http_dav|http_mp4|http_sub|http_acme)" <<<"$1"' _ "$nginx_modules"
+check "nginx-build: Brotli is compiled in statically (--add-module, never a dynamic module)" \
+  bash -c 'grep -qF -- "--add-module=\"\$work/ngx_brotli\"" "$1" && ! grep -qE -- "^[^#]*--add-dynamic-module" "$1"' _ "$ROOT/tools/nginx-build.sh"
+check "nginx-build: auth_basic and limit_req compiled in, limit_conn left out; recipe 4" \
+  bash -c '! grep -q -- "--without-http_auth_basic_module" <<<"$1" && ! grep -q -- "--without-http_limit_req_module" <<<"$1" && grep -q -- "--without-http_limit_conn_module" <<<"$1" && grep -q "^BUILD_RECIPE=4" "$2"' \
+  _ "$nginx_modules" "$ROOT/tools/nginx-build.sh"
+unset nginx_modules
 # install_stripped under set -euo pipefail with no GitHub toolchain directory
 # (an unmatched glob once ended both builds silently before the install).
 bc_strip_ok() {
@@ -7688,67 +7429,107 @@ bc_strip_ok() {
     [[ -x $T/b ]] && cmp -s "$T/a" "$T/b" )
 }
 check "build-common install_stripped: no llvm-strip and no /opt/setup-llvm still installs the binary (set -e, pipefail)" bc_strip_ok
-# Shared LLVM toolchain: removing PHP_BUILD and ANGIE_BUILD in either order
-# removes it once the second goes (1.21.70: each had deferred to the other).
-llvm_order_case() { # php-first|angie-first -> "after-first after-second"
+
+# Shared LLVM toolchain: kept while any build remains, removed with the last
+# (1.21.70: each had deferred to the other).  Records count, a leftover
+# directory does not (impl2: nginx's ROOT/build alone no longer keeps it).
+# rm and the apt purge are fenced: this must never touch the host's toolchain.
+llvm_case() { # php-first|nginx-first|valkey-last|stale-dir
   (
-    T="$TMP/llvmord"; rm -rf "$T"; mkdir -p "$T/php/8.5" "$T/angie/build" "$T/llvm"
-    PHP_BUILD_ROOT="$T/php" ANGIE_BUILD_ROOT="$T/angie" VALKEY_BUILD_ROOT="$T/valkey"
-    PHP_BUILD_CACHE="$T/cache-php" PHP_BUILD_RUN_DIR="$T/run-php" ANGIE_BUILD_CACHE="$T/cache-angie"
-    PHP_BUILD_TOOL="$T/php/php-fpm-build.sh" PHP_BUILD_CONF_FILE="$T/php/php-build.conf" PHP_BUILD_COMMON_FILE="$T/php/build-common.sh"
-    PHP_BUILD_APT_HOOK="$T/hook1" PHP_BUILD_UNIT="$T/u1" PHP_BUILD_REFRESH_UNIT="$T/u2" PHP_BUILD_REFRESH_TIMER="$T/u3"
-    ANGIE_BUILD_APT_HOOK="$T/hook2" ANGIE_BUILD_UNIT="$T/u4" ANGIE_BUILD_REFRESH_UNIT="$T/u5" ANGIE_BUILD_REFRESH_TIMER="$T/u6"
+    T="$TMP/llvmord"; command rm -rf "$T"; mkdir -p "$T/php/8.5" "$T/nginx/build" "$T/valkey" "$T/llvm"
+    PHP_BUILD_ROOT="$T/php" NGINX_BUILD_ROOT="$T/nginx" VALKEY_BUILD_ROOT="$T/valkey"
     PHP_BUILD_LLVM_FILES=("$T/llvm/setup-llvm.sources")
-    systemctl() { :; }
-    : > "$T/llvm/setup-llvm.sources"; : > "$T/php/8.5/build.info"; : > "$T/php/build-8.5.log"
-    php_gone() { rm -rf "${T:?}/php/8.5"; php_build_remove_support; }
+    _pb_llvm_packages_purge() { :; }
+    rm() { local a; for a in "$@"; do [[ $a == /opt/* ]] && return 0; done; command rm "$@"; }
+    : > "$T/llvm/setup-llvm.sources"; : > "$T/php/8.5/build.info"; : > "$T/nginx/build/build.info"
     left() { [[ -e $T/llvm/setup-llvm.sources ]] && echo kept || echo removed; }
-    if [[ $1 == php-first ]]; then php_gone; a=$(left); angie_build_remove_support; b=$(left)
-    else angie_build_remove_support; a=$(left); php_gone; b=$(left); fi
-    printf '%s %s %s' "$a" "$b" "$([[ -d $T/php ]] && echo phpdir || echo nophpdir)"
+    case $1 in
+      php-first)
+        command rm -rf "$T/php/8.5"; setup_build_llvm_release php; a=$(left)
+        command rm -rf "$T/nginx/build"; setup_build_llvm_release nginx; b=$(left) ;;
+      nginx-first)
+        command rm -rf "$T/nginx/build"; setup_build_llvm_release nginx; a=$(left)
+        command rm -rf "$T/php/8.5"; setup_build_llvm_release php; b=$(left) ;;
+      valkey-last)
+        : > "$T/valkey/build.info"
+        command rm -rf "$T/php/8.5" "$T/nginx/build"; setup_build_llvm_release nginx; a=$(left)
+        command rm -f "$T/valkey/build.info"; setup_build_llvm_release valkey; b=$(left) ;;
+      stale-dir)
+        command rm -rf "$T/php/8.5"; command rm -f "$T/nginx/build/build.info"
+        setup_build_llvm_release valkey; a=$(left); b=- ;;
+    esac
+    printf '%s %s' "$a" "$b"
   )
 }
-check "LLVM toolchain: PHP_BUILD removed first, then ANGIE_BUILD: kept, then removed (no PHP dir left)" \
-  test "$(llvm_order_case php-first)" = "kept removed nophpdir"
-check "LLVM toolchain: ANGIE_BUILD removed first, then PHP_BUILD: kept, then removed" \
-  test "$(llvm_order_case angie-first)" = "kept removed nophpdir"
-unset -f pb_cpu_case pb_sdnotify_ok pb_sdnotify_case ab_mode ab_invalid ab_tool_case bc_strip_ok llvm_order_case
-unset -f fm_case fm_twice lean_set_ok gpg_home_ok pb_primarydown_ok
+check "LLVM toolchain: PHP removed first, then nginx: kept, then removed" \
+  test "$(llvm_case php-first)" = "kept removed"
+check "LLVM toolchain: nginx removed first, then PHP: kept, then removed" \
+  test "$(llvm_case nginx-first)" = "kept removed"
+check "LLVM toolchain: kept while a Valkey build (ROOT/build.info) remains, removed with it" \
+  test "$(llvm_case valkey-last)" = "kept removed"
+check "LLVM toolchain: a leftover nginx ROOT/build directory without build.info does not keep it" \
+  test "$(llvm_case stale-dir)" = "removed -"
+# Last-consumer rule for the shared units (R81): one helper, every root
+# checked on its own (a missing PHP root once read as "no builds left").
+shared_units_case() { # remaining -> kept|removed
+  (
+    T="$TMP/shunits"; rm -rf "$T"; mkdir -p "$T/units" "$T/nginx"
+    NGINX_ROOT="$T/nginx" SETUP_BUILD_PHP_ROOT="$T/no-php" SETUP_BUILD_VALKEY_ROOT="$T/valkey"
+    SETUP_BUILD_CPU_UNIT="$T/units/cpu.service" SETUP_BUILD_REFRESH_UNIT="$T/units/refresh.service"
+    SETUP_BUILD_REFRESH_TIMER="$T/units/refresh.timer" SETUP_BUILD_LOCK_FILE="$T/units/lock"
+    systemctl() { :; }
+    : > "$SETUP_BUILD_CPU_UNIT"; : > "$SETUP_BUILD_REFRESH_UNIT"; : > "$SETUP_BUILD_REFRESH_TIMER"
+    case $1 in
+      valkey) mkdir -p "$T/valkey"; : > "$T/valkey/build.info" ;;
+      staging) mkdir -p "$T/valkey/staging"; : > "$T/valkey/staging/build.info" ;;
+      none) : ;;
+    esac
+    setup_build_remove_shared_units_if_last nginx
+    [[ -e $SETUP_BUILD_REFRESH_TIMER ]] && echo kept || echo removed
+  )
+}
+check "shared build units: kept while a Valkey build remains, even with no PHP root" \
+  test "$(shared_units_case valkey)" = kept
+check "shared build units: a staged candidate alone is not a build (removed)" \
+  test "$(shared_units_case staging)" = removed
+check "shared build units: removed with the last build" \
+  test "$(shared_units_case none)" = removed
+check "valkey_build_purge applies the same last-consumer rule" \
+  bash -c 'sed -n "/^valkey_build_release_shared_units()/,/^}/p" "$1" | grep -q "setup_build_remove_shared_units_if_last valkey"' _ "$ALL_SRC"
+unset -f pb_sdnotify_ok pb_sdnotify_case bc_strip_ok llvm_case shared_units_case
 
-# ---- 1.21.71: login limiter only, auth_basic, auto-commented directives,
-# ---- --source, VALKEY_BUILD, the download mirror
+# ---- 1.21.71: login limiter only, auth_basic, auto-commented directives
 check "server-configs fixture: only the credential limit_req zone is left (generic GET/POST zones removed)" \
   bash -c '[[ $(grep -cE "^[[:space:]]*limit_req_zone" "$1") -eq 1 ]] && grep -qE "zone=limit_req_login:" "$1" && ! grep -qE "limit_req_post_head|limit_req_get_perip|limit_req_whitelist" "$1"' \
   _ "$FIXTURES/http.d/limit_req.conf"
 lr_tuned() {
   local T="$TMP/lr71"; rm -rf "$T"; mkdir -p "$T"; cp -a "$FIXTURES/." "$T/"
   tune_reset_changes
-  tune_angie_configs "$T" >/dev/null 2>&1 || true
+  tune_nginx_configs "$T" >/dev/null 2>&1 || true
   [[ $(grep -cE "^[[:space:]]*limit_req_zone" "$T/http.d/limit_req.conf") -eq 1 ]] \
     && grep -qE '^[[:space:]]*limit_req_log_level[[:space:]]+info;' "$T/http.d/limit_req.conf" \
     && ! grep -q 'setup.sh exempt' "$T/http.d/limit_req.conf"
 }
-check "Angie tuner: the login zone keeps its size, rejections log at info, no exemption list is written" lr_tuned
+check "nginx tuner: the login zone keeps its size, rejections log at info, no exemption list is written" lr_tuned
 check "SETUP_LIMIT_REQ_EXEMPT is ignored with a warning (validate_all)" \
   bash -c 'sed -n "/^validate_all()/,/^}/p" "$1" | grep -q "SETUP_LIMIT_REQ_EXEMPT is ignored"' _ "$ALL_SRC"
-check "angie-build: auth_basic and limit_req compiled in, limit_conn left out; recipe 3" \
-  bash -c 'f=$(sed -n "/^cmd_build()/,/^}/p" "$1"); ! grep -q -- "--without-http_auth_basic_module" <<<"$f" && ! grep -q -- "--without-http_limit_req_module" <<<"$f" && grep -q -- "--without-http_limit_conn_module" <<<"$f" && grep -q "^BUILD_RECIPE=3" "$1"' \
-  _ "$ROOT/tools/angie-build.sh"
 
-# Auto-commented directives: a stub Angie that rejects the first directive of
+# Auto-commented directives: a stub nginx that rejects the first directive of
 # its "unknown" list it meets in conf.d/*.conf, reporting the line it ends on
-# (like Angie), so fit_config has to find where it starts.
+# (like nginx), so fit_config has to find where it starts.
 af_case() { # case -> result
   (
-    T="$TMP/afit"; rm -rf "$T"; mkdir -p "$T/conf/conf.d" "$T/units/angie.service.d" "$T/root/build" "$T/sbin"
-    export ANGIE_BUILD_ROOT="$T/root" ANGIE_BUILD_UNIT_DIR="$T/units" ANGIE_BUILD_SOURCE_ONLY=1 \
-           ANGIE_BUILD_PKG_BIN="$T/sbin/angie" ANGIE_BUILD_ANGIE_CONF="$T/conf/angie.conf"
+    T="$TMP/afit"; rm -rf "$T"; mkdir -p "$T/conf/conf.d" "$T/units" "$T/root/build" "$T/root/sbin"
+    export NGINX_BUILD_ROOT="$T/root" NGINX_BUILD_UNIT_DIR="$T/units" NGINX_BUILD_SOURCE_ONLY=1 \
+           NGINX_BUILD_NGINX_CONF="$T/conf/nginx.conf" NGINX_BUILD_CACHE="$T/cache" NGINX_BUILD_TMPFILES="$T/tmpfiles.conf"
     # shellcheck disable=SC1090,SC1091
-    source "$ROOT/tools/angie-build.sh"
+    source "$ROOT/tools/nginx-build.sh"
     set +eE; trap - ERR
     systemctl() { printf '%s\n' "$*" >> "$T/systemctl.log"; return 0; }
     systemd-run() { printf 'run %s\n' "$*" >> "$T/systemctl.log"; return 0; }
     logger() { :; }; say() { :; }
+    apply_tmpfiles() { :; }
+    cpu_fingerprint() { printf 'thiscpu'; }
     mkstub() { # path unknown-directives...
       local p=$1; shift
       cat > "$p" <<EOF
@@ -7759,7 +7540,7 @@ for f in "$T"/conf/conf.d/*.conf; do
     code ~ /^[[:space:]]*\$/ { next }
     !open { split(code, w, /[[:space:];]+/); d = (w[1] == "" ? w[2] : w[1]); open = 1 }
     code ~ /;[[:space:]]*\$/ || code ~ /[{}][[:space:]]*\$/ {
-      if (index(unk, " " d " ")) { printf "angie: [emerg] unknown directive \"%s\" in %s:%d\n", d, f, NR > "/dev/stderr"; bad = 1; exit 1 }
+      if (index(unk, " " d " ")) { printf "nginx: [emerg] unknown directive \"%s\" in %s:%d\n", d, f, NR > "/dev/stderr"; bad = 1; exit 1 }
       open = 0
     }
     END { exit bad }' "\$f" || exit 1
@@ -7768,7 +7549,7 @@ exit 0
 EOF
       chmod +x "$p"
     }
-    printf 'http { include conf.d/*.conf; }\n' > "$T/conf/angie.conf"
+    printf 'http { include conf.d/*.conf; }\n' > "$T/conf/nginx.conf"
     cat > "$T/conf/conf.d/site.conf" <<'EOF'
 server {
     listen 80;
@@ -7786,9 +7567,15 @@ EOF
       fit)
         mkstub "$T/build" sub_filter sub_filter_types limit_conn
         fit_config "$T/build" >/dev/null 2>&1; rc=$?
-        printf '%s %s %s %s' "$rc" "$(grep -c '^ *# setup-angie-build-off: ' "$T/conf/conf.d/site.conf")" \
+        printf '%s %s %s %s' "$rc" "$(grep -c '^ *# setup-nginx-build-off: ' "$T/conf/conf.d/site.conf")" \
           "$(wc -l < "$T/root/build/disabled.list" | tr -d ' ')" \
           "$(grep -c '^        root /var/www/a;$' "$T/conf/conf.d/site.conf")" ;;
+      fitother)
+        # An explicit CONF that is not the live one (the migration's staged
+        # tree): commented out, but never recorded in disabled.list.
+        mkstub "$T/build" sub_filter sub_filter_types limit_conn
+        fit_config "$T/build" "$T/conf/nginx.conf.staged" >/dev/null 2>&1; rc=$?
+        printf '%s %s' "$rc" "$([[ -e $T/root/build/disabled.list ]] && echo list || echo nolist)" ;;
       restore)
         mkstub "$T/build" sub_filter sub_filter_types limit_conn
         fit_config "$T/build" >/dev/null 2>&1; restore_config >/dev/null 2>&1
@@ -7798,75 +7585,48 @@ EOF
         printf 'server {\n    location /app {\n        uwsgi_pass 127.0.0.1:9000;\n    }\n}\n' > "$T/conf/conf.d/app.conf"
         mkstub "$T/build" sub_filter sub_filter_types limit_conn uwsgi_pass
         fit_config "$T/build" >/dev/null 2>&1; rc=$?
-        printf '%s %s' "$rc" "$(grep -c 'setup-angie-build-off' "$T/conf/conf.d/app.conf")" ;;
+        printf '%s %s' "$rc" "$(grep -c 'setup-nginx-build-off' "$T/conf/conf.d/app.conf")" ;;
       prefit)
-        mkstub "$T/root/build/angie" sub_filter sub_filter_types limit_conn
-        printf '[Service]\n' > "$T/units/angie.service.d/zz-setup-build.conf"
+        mkstub "$T/root/sbin/nginx" sub_filter sub_filter_types limit_conn
+        printf 'nginx=1.31.10\ncpu=thiscpu\n' > "$T/root/build/build.info"
         ( cmd_pre ) >/dev/null 2>&1; rc=$?
-        printf '%s %s %s' "$rc" "$([[ -f $T/units/angie.service.d/zz-setup-build.conf ]] && echo dropin || echo nodropin)" \
-          "$(grep -c 'setup-angie-build-off' "$T/conf/conf.d/site.conf")" ;;
-      prefallback)
+        printf '%s %s' "$rc" "$(grep -c 'setup-nginx-build-off' "$T/conf/conf.d/site.conf")" ;;
+      prestop)
         printf 'server {\n    location /app {\n        uwsgi_pass 127.0.0.1:9000;\n    }\n}\n' > "$T/conf/conf.d/app.conf"
-        mkstub "$T/root/build/angie" sub_filter sub_filter_types limit_conn uwsgi_pass
-        mkstub "$T/sbin/angie"
-        printf '[Service]\n' > "$T/units/angie.service.d/zz-setup-build.conf"
+        mkstub "$T/root/sbin/nginx" sub_filter sub_filter_types limit_conn uwsgi_pass
+        printf 'nginx=1.31.10\ncpu=thiscpu\n' > "$T/root/build/build.info"
         ( cmd_pre ) >/dev/null 2>&1; rc=$?
-        printf '%s %s %s %s' "$rc" "$([[ -f $T/units/angie.service.d/zz-setup-build.conf ]] && echo dropin || echo nodropin)" \
-          "$(grep -c 'setup-angie-build-off' "$T/conf/conf.d/site.conf")" \
-          "$(grep -c 'run --no-block --on-active=2' "$T/systemctl.log" 2>/dev/null)" ;;
+        printf '%s %s' "$rc" "$(grep -c 'setup-nginx-build-off' "$T/conf/conf.d/app.conf")" ;;
+      cpumoved)
+        mkstub "$T/root/sbin/nginx"
+        printf 'nginx=1.31.10\ncpu=othercpu\n' > "$T/root/build/build.info"
+        ( cmd_pre ) >/dev/null 2>&1; rc=$?
+        printf 'rc=%s %s' "$rc" "$(cat "$T/systemctl.log" 2>/dev/null | grep -c 'start --no-block setup-build-cpu.service')" ;;
     esac
   )
 }
-check "angie-build fit: sub_filter (also multi-line) and limit_conn are commented out, recorded, the rest untouched" \
+check "nginx-build fit: sub_filter (also multi-line) and limit_conn are commented out, recorded, the rest untouched" \
   test "$(af_case fit)" = "0 4 3 1"
-check "angie-build restore: every commented directive comes back byte for byte" \
+check "nginx-build fit: a tree other than the live nginx.conf is never recorded in disabled.list" \
+  test "$(af_case fitother)" = "0 nolist"
+check "nginx-build restore: every commented directive comes back byte for byte" \
   test "$(af_case restore)" = "identical"
-check "angie-build fit: a content handler of a left-out module (uwsgi_pass) is never commented out" \
+check "nginx-build fit: a content handler of a left-out module (uwsgi_pass) is never commented out" \
   test "$(af_case handler)" = "1 0"
-check "angie-build pre: a droppable directive added after activation is commented out and Angie starts on the build" \
-  test "$(af_case prefit)" = "0 dropin 4"
-check "angie-build pre: any other rejection goes back to the package (directives restored, restart scheduled)" \
-  test "$(af_case prefallback)" = "1 nodropin 0 1"
-check "optimize applies ANGIE_BUILD with 'fit' and reports each commented directive" \
-  bash -c 'sed -n "/^angie_build_apply()/,/^}/p" "$1" | grep -q "ANGIE_BUILD_TOOL\" fit"' _ "$ALL_SRC"
+check "nginx-build pre: a droppable directive added after activation is commented out and nginx starts" \
+  test "$(af_case prefit)" = "0 4"
+check "nginx-build pre: any other rejection keeps nginx down (no package to fall back to)" \
+  test "$(af_case prestop)" = "1 0"
+check "nginx-build pre: a build made on another CPU stays down and starts setup-build-cpu.service" \
+  test "$(af_case cpumoved)" = "rc=1 1"
+check "nginx_build_fit runs the tool's fit and reports each commented directive" \
+  bash -c 'sed -n "/^nginx_build_fit()/,/^}/p" "$1" | grep -qE "nginx_build_run_tool [^#]*fit"' _ "$ALL_SRC"
 
-# --source
-src_sel() { # args... -> "PHP ANGIE VALKEY persisted" or "die"
-  (
-    die() { printf 'die'; exit 0; }
-    PHP_BUILD=${SS_PHP:-} ANGIE_BUILD=${SS_ANGIE:-} VALKEY_BUILD="" PHP_BUILD_PERSIST=${SS_PHP_ENV:-0} ANGIE_BUILD_PERSIST=0 VALKEY_BUILD_PERSIST=0
-    SOURCE_ARGS=(); SOURCE_SEEN=0; OPTIMIZE=0; PURGE=0; UPGRADE_PHP_SEEN=0; ENABLED=()
-    parse_args "$@" 2>/dev/null
-    printf '%s %s %s %s' "$PHP_BUILD" "$ANGIE_BUILD" "$VALKEY_BUILD" "$PHP_BUILD_PERSIST$ANGIE_BUILD_PERSIST$VALKEY_BUILD_PERSIST"
-  )
-}
-check "--source=all compiles php, angie and valkey from source" \
-  test "$(src_sel --source=all)" = "clang clang clang 111"
-check "--source=angie,php: the listed ones clang, every other one package, all persisted" \
-  test "$(src_sel --source=angie,php)" = "clang clang package 111"
-check "--source angie valkey (spaces, like --others) stops at the next option" \
-  test "$(src_sel --source angie valkey --optimize)" = "package clang clang 111"
-check "--source=none puts every component back on its package" \
-  test "$(src_sel --source=none)" = "package package package 111"
-check "--source: an unknown component or a missing value is refused" \
-  test "$(src_sel --source=nginx),$(src_sel --source)" = "die,die"
-check "no --source on a fresh install: no build recorded, so the packages run (the same as none)" \
-  test "$(src_sel --basic --angie --php --valkey)" = "   000"
-check "a plain --optimize keeps the builds the host already runs" \
-  test "$(SS_PHP=clang SS_ANGIE=clang src_sel --optimize)" = "clang clang  000"
-check "no --source: a SETUP_PHP_BUILD given for this run still applies" \
-  test "$(SS_PHP=package SS_PHP_ENV=1 src_sel --optimize)" = "package   100"
-check "--source on --optimize replaces the recorded set" \
-  test "$(SS_PHP=clang SS_ANGIE=clang src_sel --optimize --source=valkey)" = "package package clang 111"
-
-# VALKEY_BUILD
-vk_mode() { ( VALKEY_BUILD=$1; valkey_build_mode ); }
-check "VALKEY_BUILD: clang, package/off and unset map to their modes; anything else is invalid" \
-  test "$(vk_mode clang),$(vk_mode package),$(vk_mode off),$(vk_mode ''),$(vk_mode jemalloc)" = "clang,package,package,,invalid"
-check "validate_all checks VALKEY_BUILD; --optimize keeps the persisted choice" \
-  bash -c 'sed -n "/^validate_all()/,/^}/p" "$1" | grep -q valkey_build_validate && printf "%s\n" "${@:2}" | grep -qx VALKEY_BUILD' _ "$ALL_SRC" "${RESET_KEEP_PINS[@]}"
-check "install_valkey and optimize_valkey apply VALKEY_BUILD (Valkey only, never Redis); --purge valkey removes it" \
-  bash -c 'sed -n "/^install_valkey()/,/^}/p" "$1" | grep -q valkey_build_apply && sed -n "/^optimize_valkey()/,/^}/p" "$1" | grep -q "== valkey ]] && (( rc == 0 )) && ! valkey_build_apply" && sed -n "/^purge_valkey()/,/^}/p" "$1" | grep -q valkey_build_purge' _ "$ALL_SRC"
+# ---- Valkey compiled from source (lib/valkey-build.sh, tools/valkey-build.sh)
+check "install_valkey and optimize_valkey run valkey_build_ensure (Valkey only, never Redis); --purge valkey runs valkey_build_purge" \
+  bash -c 'sed -n "/^install_valkey()/,/^}/p" "$1" | grep -q "valkey_build_ensure full install" && sed -n "/^optimize_valkey()/,/^}/p" "$1" | grep -q "== valkey ]] && (( rc == 0 )) && ! valkey_build_ensure full optimize" && sed -n "/^purge_valkey()/,/^}/p" "$1" | grep -q valkey_build_purge' _ "$ALL_SRC"
+check "install_valkey installs no valkey-server package" \
+  bash -c '! sed -n "/^install_valkey()/,/^}/p" "$1" | grep -qE "^[^#]*apt_install[^#]*valkey"' _ "$ALL_SRC"
 check "valkey-build.conf ships with VALKEY and LLVM" \
   bash -c 'grep -qx VALKEY_VERSION=latest "$1/valkey-build.conf" && grep -qx LLVM_VERSION=latest "$1/valkey-build.conf"' _ "$ROOT"
 check "valkey-build: hardening flags, no TLS, bundled jemalloc, sd_notify shim instead of libsystemd" \
@@ -7875,76 +7635,67 @@ check "valkey-build: CFLAGS/LDFLAGS reach make through the environment (on its c
   bash -c 'f=$(sed -n "/^cmd_build()/,/^}/p" "$1"); grep -q "CFLAGS=\"\$flags -I\$work/deps/include\" LDFLAGS=" <<<"$f" && ! grep -qE "make -j[^\\\\]*CFLAGS=|^[[:space:]]+(OPT=[^\\\\]*)?CFLAGS=\"\$flags.*BUILD_TLS" <<<"$f"' _ "$ROOT/tools/valkey-build.sh"
 vk_tool_case() { # case -> result
   (
-    T="$TMP/vkt"; rm -rf "$T"; mkdir -p "$T/units/valkey-server.service.d" "$T/root/build" "$T/pkg" "$T/bin" "$T/etc"
+    T="$TMP/vkt"; rm -rf "$T"; mkdir -p "$T/units" "$T/root/bin" "$T/etc" "$T/data" "$T/log"
     export VALKEY_BUILD_ROOT="$T/root" VALKEY_BUILD_UNIT_DIR="$T/units" VALKEY_BUILD_SOURCE_ONLY=1 \
-           VALKEY_BUILD_PKG_BIN="$T/bin/valkey-server" VALKEY_BUILD_PKG_UNIT="$T/pkg/valkey-server.service" \
-           VALKEY_BUILD_VALKEY_CONF="$T/etc/valkey.conf" VALKEY_BUILD_CACHE="$T/cache"
+           VALKEY_BUILD_VALKEY_CONF="$T/etc/valkey.conf" VALKEY_BUILD_CACHE="$T/cache" \
+           VALKEY_BUILD_DATA_DIR="$T/data" VALKEY_BUILD_SERVER_LOG_DIR="$T/log" \
+           VALKEY_BUILD_LINK_DIR="$T/links" VALKEY_BUILD_LEGACY_APT_HOOK="$T/99setup-valkey-build"
     # shellcheck disable=SC1090,SC1091
     source "$ROOT/tools/valkey-build.sh"
     set +eE; trap - ERR
     systemctl() { printf '%s\n' "$*" >> "$T/systemctl.log"; return 0; }
     systemd-run() { printf 'run %s\n' "$*" >> "$T/systemctl.log"; return 0; }
     logger() { :; }; say() { :; }
-    stub_vk() { printf '#!/bin/sh\necho "Valkey server v=%s sha=0 malloc=jemalloc-5.3.0 bits=64 build=x"\n' "$1" > "$T/bin/valkey-server"; chmod +x "$T/bin/valkey-server"; }
-    d="$T/units/valkey-server.service.d/zz-setup-build.conf"
+    # Never ask the host's dpkg: a test host may have a valkey-server package.
+    pkg_version() { printf '%s' "${VK_PKG:-}"; }
+    cpu_fingerprint() { printf 'thiscpu'; }
     case $1 in
-      activate)
-        stub_vk 9.0.6; printf 'valkey=9.2.0\n' > "$T/root/build/build.info"
-        printf '[Service]\nType=notify\nExecStart=%s /etc/valkey/valkey.conf --supervised systemd --daemonize no\n' "$T/bin/valkey-server" > "$T/pkg/valkey-server.service"
-        restart_checked() { return 0; }
-        activate
-        printf '%s %s %s %s' "$(grep -c '^ExecStart=$' "$d")" \
-          "$(grep -c "^ExecStart=$T/root/build/valkey-server /etc/valkey/valkey.conf --supervised systemd --daemonize no$" "$d")" \
-          "$(grep -c "^ExecPaths=$T/root/build/valkey-server $T/root/valkey-build.sh$" "$d")" \
-          "$(grep -c "^ExecStartPre=+$T/root/valkey-build.sh pre$" "$d")"
-        return 0 ;;
-      cache)   stub_vk 9.0.6; printf 'save ""\nappendonly no\n' > "$T/etc/valkey.conf"; printf '[%s]' "$(series)"; return 0 ;;
-      rdb)     stub_vk 9.0.6; printf 'save 900 1\nappendonly no\n' > "$T/etc/valkey.conf"; printf '[%s]' "$(series)"; return 0 ;;
-      aof)     stub_vk 9.0.6; printf 'save ""\nappendonly yes\n' > "$T/etc/valkey.conf"; printf '[%s]' "$(series)"; return 0 ;;
+      cache)   printf 'valkey=9.2.0\n' > "$T/root/build.info"; printf 'save ""\nappendonly no\n' > "$T/etc/valkey.conf"; printf '[%s]' "$(series)" ;;
+      rdb)     printf 'valkey=9.0.6\n' > "$T/root/build.info"; printf 'save 900 1\nappendonly no\n' > "$T/etc/valkey.conf"; printf '[%s]' "$(series)" ;;
+      aof)     printf 'valkey=9.0.6\n' > "$T/root/build.info"; printf 'save ""\nappendonly yes\n' > "$T/etc/valkey.conf"; printf '[%s]' "$(series)" ;;
+      pkg)     printf 'save 900 1\n' > "$T/etc/valkey.conf"; printf '[%s]' "$(VK_PKG=8.1.4; series)" ;;
+      legacy)
+        mkdir -p "$T/root/build"; printf 'valkey=9.0.6\n' > "$T/root/build/build.info"
+        printf 'save 900 1\n' > "$T/etc/valkey.conf"; printf '[%s]' "$(VK_PKG=8.1.4; series)" ;;
       resolve)
-        stub_vk 9.0.6; printf 'save 900 1\n' > "$T/etc/valkey.conf"
+        printf 'valkey=9.0.6\n' > "$T/root/build.info"; printf 'save 900 1\n' > "$T/etc/valkey.conf"
         latest_of() { case $1 in valkey) [[ -n ${2:-} ]] && printf '%s.8' "$2" || printf '9.2.0' ;; llvm) printf 23 ;; esac; }
-        printf '%s' "$(resolve_all | tr '\n' ' ')"; return 0 ;;
-      stale)   stub_vk 9.2.1; printf 'valkey=9.2.0\n' > "$T/root/build/build.info"; printf '[Service]\n' > "$d"; cmd_apt_hook ;;
-      current) stub_vk 9.0.6; printf 'valkey=9.2.0\n' > "$T/root/build/build.info"; printf '[Service]\n' > "$d"; cmd_apt_hook ;;
-      cpumoved)
-        printf 'valkey=9.2.0\ncpu=AuthenticAMD Other CPU\n' > "$T/root/build/build.info"; printf '[Service]\n' > "$d"
-        : > "$T/root/build/valkey-server"; chmod +x "$T/root/build/valkey-server"
-        cpu_model() { printf 'GenuineIntel This CPU'; }
-        ( cmd_pre ) >/dev/null 2>&1; printf 'rc=%s ' "$?" ;;
+        hashes_lookup() { return 0; }
+        printf '%s' "$(resolve_all | tr '\n' ' ')" ;;
+      cpumoved|cpusame|notours)
+        [[ $1 == notours ]] || printf '%s\n[Service]\n' "$UNIT_MARKER" > "$T/units/valkey-server.service"
+        : > "$T/root/bin/valkey-server"; chmod +x "$T/root/bin/valkey-server"
+        if [[ $1 == cpumoved ]]; then printf 'valkey=9.2.0\ncpu=othercpu\n' > "$T/root/build.info"
+        else printf 'valkey=9.2.0\ncpu=thiscpu\n' > "$T/root/build.info"; fi
+        ( cmd_pre ) >/dev/null 2>&1; rc=$?
+        printf 'rc=%s %s' "$rc" "$(cat "$T/systemctl.log" 2>/dev/null | grep -c 'start --no-block setup-build-cpu.service')" ;;
+      apthook)
+        : > "$T/99setup-valkey-build"; cmd_apt_hook; rc=$?
+        printf 'rc=%s %s' "$rc" "$([[ -e $T/99setup-valkey-build ]] && echo kept || echo removed)" ;;
     esac
-    printf '%s %s' "$([[ -f $d ]] && echo dropin || echo nodropin)" \
-      "$(cat "$T/systemctl.log" 2>/dev/null | grep -c 'start --no-block setup-valkey-build.service')"
   )
 }
-check "valkey-build activate: ExecStart points at the build, which is added to the unit's ExecPaths" \
-  test "$(vk_tool_case activate)" = "1 1 1 1"
 check "valkey-build: a cache-only valkey.conf may run the newest release (no series pin)" \
   test "$(vk_tool_case cache)" = "[]"
-check "valkey-build: RDB snapshots or AOF pin the build to the package's X.Y series" \
+check "valkey-build: RDB snapshots or AOF pin the build to the series of the server that wrote the data" \
   test "$(vk_tool_case rdb),$(vk_tool_case aof)" = "[9.0],[9.0]"
-check "valkey-build: with persistence, 'latest' resolves within the package's series" \
+check "valkey-build: before the first build, the valkey-server package's series is the data writer" \
+  test "$(vk_tool_case pkg)" = "[8.1]"
+check "valkey-build: a 1.21 build newer than the package is the data writer" \
+  test "$(vk_tool_case legacy)" = "[9.0]"
+check "valkey-build: with persistence, 'latest' resolves within that series" \
   test "$(vk_tool_case resolve)" = "valkey=9.0.8 llvm=23 "
-check "valkey-build apt-hook: a newer Valkey package reverts to it and starts a rebuild" \
-  test "$(vk_tool_case stale)" = "nodropin 1"
-check "valkey-build apt-hook: a current build is left alone" \
-  test "$(vk_tool_case current)" = "dropin 0"
-check "valkey-build pre: a build made on another CPU model goes back to the package and rebuilds" \
-  test "$(vk_tool_case cpumoved)" = "rc=1 nodropin 1"
+check "valkey-build pre: a build made on this CPU passes" \
+  test "$(vk_tool_case cpusame)" = "rc=0 0"
+check "valkey-build pre: a build made on another CPU stays down and starts setup-build-cpu.service" \
+  test "$(vk_tool_case cpumoved)" = "rc=1 1"
+check "valkey-build pre: a unit that is not ours is left alone" \
+  test "$(vk_tool_case notours)" = "rc=0 0"
+check "valkey-build apt-hook: only removes the 1.21 hook file (no package to follow)" \
+  test "$(vk_tool_case apthook)" = "rc=0 removed"
 check "switch-valkey-arm: the bench drop-in adds the binary to ExecPaths (the unit's NoExecPaths=/)" \
   grep -qF 'ExecPaths=%s' "$ROOT/tests/bench-php-matrix/switch-valkey-arm.sh"
-llvm3_case() { # -> LLVM after removing PHP and Angie while a Valkey build remains, then after Valkey
-  (
-    T="$TMP/llvm3"; rm -rf "$T"; mkdir -p "$T/php" "$T/angie" "$T/valkey/build" "$T/llvm"
-    PHP_BUILD_ROOT="$T/php" ANGIE_BUILD_ROOT="$T/angie" VALKEY_BUILD_ROOT="$T/valkey"
-    PHP_BUILD_LLVM_FILES=("$T/llvm/setup-llvm.sources"); : > "$T/llvm/setup-llvm.sources"
-    setup_build_llvm_release angie; a=$([[ -e $T/llvm/setup-llvm.sources ]] && echo kept || echo removed)
-    rm -rf "${T:?}/valkey/build"; setup_build_llvm_release valkey; b=$([[ -e $T/llvm/setup-llvm.sources ]] && echo kept || echo removed)
-    printf '%s %s' "$a" "$b"
-  )
-}
-check "LLVM toolchain: kept while a Valkey build remains, removed with the last build" \
-  test "$(llvm3_case)" = "kept removed"
+unset -f af_case vk_tool_case lr_tuned
 
 # The download mirror: last resort, never a trust root of its own.
 mirror_case() { # case -> result
@@ -7989,7 +7740,7 @@ check "mirror: SETUP_BUILD_MIRROR=off never asks the mirror" \
 check "build-common: every component download names its mirror release (FETCH_NAME)" \
   bash -c 'sed -n "/^fetch_component()/,/^}/p" "$1" | grep -q "FETCH_NAME=\$1"' _ "$ROOT/tools/build-common.sh"
 check "BOLT never uses -use-gnu-stack (it turned PT_GNU_STACK into a LOAD: executable stack, and Valkey's MemoryDenyWriteExecute unit refused to start)" \
-  bash -c '! grep -h -- "-use-gnu-stack" "$1"/tools/*.sh "$1"/tests/bench-php-matrix/bolt-php.sh | grep -qv "^[[:space:]]*#" && for t in php-fpm angie valkey; do grep -q "bolt_stack_check" "$1/tools/$t-build.sh" || exit 1; done' _ "$ROOT"
+  bash -c '! grep -h -- "-use-gnu-stack" "$1"/tools/*.sh "$1"/tests/bench-php-matrix/bolt-php.sh | grep -qv "^[[:space:]]*#" && for t in php nginx valkey; do grep -q "bolt_stack_check" "$1/tools/$t-build.sh" || exit 1; done' _ "$ROOT"
 bsc_case() { # readelf GNU_STACK flags -> ok|refused
   ( # shellcheck disable=SC1090,SC1091
     . "$ROOT/tools/build-common.sh"; set +eE; trap - ERR; say() { :; }
@@ -8000,7 +7751,32 @@ check "bolt_stack_check: an RW GNU_STACK passes, RWE or a missing header is refu
   test "$(bsc_case RW),$(bsc_case RWE),$( ( . "$ROOT/tools/build-common.sh"; set +eE; trap - ERR; say() { :; }; readelf() { :; }; ( bolt_stack_check /x ) >/dev/null 2>&1 && printf ok || printf refused ) )" = "ok,refused,refused"
 check "removing a build deletes its cache only through an overridable path (a root test run once deleted a live cache)" \
   bash -c '! grep -nE "rm -rf[^#]*[[:space:]](\/var\/cache|\/run)\/setup-" "$1"' _ "$ALL_SRC"
-unset -f lr_tuned af_case src_sel vk_mode vk_tool_case llvm3_case mirror_case
+unset -f lr_tuned mirror_case bsc_case
+
+# ---------------------------------------------------------------------------
+# Per-module unit tests (tests/unit/*.sh, 1.22.0)
+# ---------------------------------------------------------------------------
+# Each file is sourced in its own subshell: a unit file may run on its own
+# (it resets PASS/FAIL, redefines check and ends with its own TOTAL and
+# status), so it must not reset this suite's counters or end it early.  Its
+# PASS/FAIL/SKIP lines are printed and added to the totals here; a file that
+# stops without reporting a failure counts as one.
+for f in "$ROOT"/tests/unit/*.sh; do
+  [[ -f $f ]] || continue
+  printf '\n== %s\n' "${f#"$ROOT"/}"
+  u_rc=0
+  # shellcheck disable=SC1090
+  u_out=$( ( source "$f" ) 2>&1 ) || u_rc=$?
+  printf '%s\n' "$u_out" | grep -v '^TOTAL ' || true
+  u_pass=$(printf '%s\n' "$u_out" | grep -c '^PASS  ' || true)
+  u_fail=$(printf '%s\n' "$u_out" | grep -c '^FAIL  ' || true)
+  u_skip=$(printf '%s\n' "$u_out" | grep -c '^SKIP  ' || true)
+  PASS=$((PASS + u_pass)) FAIL=$((FAIL + u_fail)) SKIP=$((SKIP + u_skip))
+  if (( u_rc != 0 && u_fail == 0 )); then
+    t_fail "${f#"$ROOT"/} stopped with status $u_rc before reporting a failure"
+  fi
+done
+unset f u_rc u_out u_pass u_fail u_skip
 
 printf '\nTOTAL pass=%d fail=%d skip=%d\n' "$PASS" "$FAIL" "$SKIP"
 [[ $FAIL -eq 0 ]]

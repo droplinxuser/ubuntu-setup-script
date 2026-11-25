@@ -44,7 +44,7 @@ echo "== groups =="
 getent group
 echo
 echo "== managed trees =="
-for d in /etc/angie /etc/php /etc/mysql /etc/valkey /etc/redis /etc/elasticsearch \
+for d in /etc/nginx /etc/php /etc/mysql /etc/valkey /etc/redis /etc/elasticsearch \
          /etc/systemd/system /etc/sysctl.d /etc/security/limits.d /etc/logrotate.d \
          /etc/default /var/www /var/lib/setup.sh /opt/stress-node /usr/local/bin; do
   if [ -e "$d" ]; then
@@ -57,7 +57,7 @@ done
 # MariaDB postinst then logs "mysql.user table already exists").  List their
 # top level only: names, not contents, so the manifest stays stable.
 for d in /root /home/* /var/lib/mariadb /var/lib/mysql /var/lib/mysql-files /var/lib/valkey /var/lib/redis \
-         /var/lib/elasticsearch /var/cache/angie /var/log/angie; do
+         /var/lib/elasticsearch /var/cache/nginx /var/log/nginx; do
   if [ -e "$d" ]; then
     echo "-- $d (top level)"
     find "$d" -xdev -mindepth 1 -maxdepth 1 ! -name .ssh ! -name .cache ! -name .bash_history \

@@ -105,7 +105,7 @@ PHP
 # would survive for its full TTL, so drop the cache now that the app is right.
 if [[ -d /home/nginx_cache ]]; then
   find /home/nginx_cache -mindepth 1 -delete 2>/dev/null || true
-  systemctl restart angie
+  systemctl restart nginx
 fi
 
 # ---- Chevereto

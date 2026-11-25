@@ -38,35 +38,100 @@ diag_tail_file() {
   tail -n "$nlines" -- "$logfile" >> "$DIAG_FILE" 2>&1 || true
 }
 
-# Query PHP-FPM's pm.status_path over the FastCGI socket.  curl cannot speak
-# FastCGI; the old probe sent HTTP to the socket and always ended with
-# "Recv failure: Connection reset by peer".  cgi-fcgi is used when available,
-# and a status path without .php is reported instead of being rejected by
-# security.limit_extensions.
+# PHP-FPM state without a FastCGI client (R92, R2.14): setup.sh installs no
+# cgi-fcgi, and the probe used to print "not installed" on every host.  The
+# socket, its owner and mode, the listening process and the pool's status
+# path are reported; a live status page is read through nginx when a vhost
+# exposes it, never by speaking FastCGI from here.
 diag_php_fpm_status() {
-  local pool="/etc/php/${1}/fpm/pool.d/www.conf" status=""
-  if [[ ! -S /run/php/php-fpm.sock ]]; then
-    printf 'FPM socket /run/php/php-fpm.sock is missing\n'
-    return 0
-  fi
-  if ! command -v cgi-fcgi >/dev/null 2>&1; then
-    printf 'cgi-fcgi is not installed; cannot query pm.status_path\n'
-    return 0
+  local pool="/etc/php/${1}/fpm/pool.d/www.conf" status="" sock=/run/php/php-fpm.sock
+  if [[ ! -S $sock ]]; then
+    printf 'FPM socket %s is missing\n' "$sock"
+  else
+    printf 'FPM socket: %s\n' "$(stat -c '%n %U:%G %a' -- "$sock" 2>/dev/null || printf '%s' "$sock")"
+    ss -lxp 2>/dev/null | grep -F -- "$sock" || true
   fi
   if [[ -r $pool ]]; then
     status=$(awk -F= '/^[[:space:]]*pm\.status_path[[:space:]]*=/{gsub(/[[:space:]]/, "", $2); print $2; exit}' "$pool")
   fi
   if [[ -z $status ]]; then
     printf 'pm.status_path is not configured in %s\n' "$pool"
-    return 0
+  else
+    printf 'pm.status_path: %s (read it through an nginx location; no FastCGI client is installed)\n' "$status"
   fi
-  if [[ $status != *.php ]] \
-     && grep -qE '^[[:space:]]*security\.limit_extensions[[:space:]]*=[[:space:]]*\.php([[:space:]]|$)' "$pool" 2>/dev/null; then
-    printf 'pm.status_path %s has no .php extension and security.limit_extensions=.php rejects it\n' "$status"
-    return 0
+  return 0
+}
+
+# The binary of the web server this host runs: the compiled nginx
+# (NGINX_BIN, lib/nginx-build.sh), or Angie while the host stays in
+# legacy-Angie mode.  Prints nothing when neither is there.
+diag_web_bin() {
+  local b
+  if diag_angie_legacy; then
+    [[ -x /usr/sbin/angie ]] && { printf '/usr/sbin/angie'; return 0; }
   fi
-  SCRIPT_FILENAME="$status" SCRIPT_NAME="$status" REQUEST_METHOD=GET \
-    cgi-fcgi -bind -connect /run/php/php-fpm.sock 2>&1 || true
+  for b in "${NGINX_BIN:-/usr/local/lib/setup-nginx/sbin/nginx}" /usr/sbin/nginx; do
+    [[ -x $b ]] && { printf '%s' "$b"; return 0; }
+  done
+  return 1
+}
+
+# The configuration root that binary reads.
+diag_web_etc() {
+  if diag_angie_legacy; then printf '/etc/angie'; else printf '/etc/nginx'; fi
+}
+
+diag_angie_legacy() {
+  declare -F web_server_state >/dev/null 2>&1 || return 1
+  [[ $(web_server_state 2>/dev/null || true) == angie-legacy ]]
+}
+
+# Valkey/Redis clients in order: our build's absolute valkey-cli
+# (VALKEY_CLI_BIN, lib/valkey-build.sh), then a package client a host the
+# migration has not reached yet still has on PATH.
+diag_redis_clis() {
+  local c
+  c=${VALKEY_CLI_BIN:-/usr/local/lib/setup-valkey/bin/valkey-cli}
+  [[ -x $c ]] && printf '%s\n' "$c"
+  for c in valkey-cli redis-cli; do
+    command -v "$c" 2>/dev/null || true
+  done
+}
+
+# Read-only "builds" section (R80): build.info, versions, CPU match, timers
+# and the newest build log of every compiled component, plus the migration
+# state.  Builds nothing and starts nothing.
+diag_builds() {
+  local tool
+  if declare -F nginx_build_status >/dev/null 2>&1; then
+    nginx_build_status 2>&1 || true
+  else
+    printf 'nginx build: lib/nginx-build.sh not loaded\n'
+  fi
+  tool=${PHP_BUILD_TOOL:-/usr/local/lib/setup-php/php-build.sh}
+  if [[ -x $tool ]]; then
+    "$tool" status 2>&1 || printf 'PHP build: status unavailable\n'
+  else
+    printf 'PHP build: none (no %s)\n' "$tool"
+  fi
+  if declare -F valkey_build_status >/dev/null 2>&1; then
+    valkey_build_status 2>&1 || true
+  else
+    printf 'Valkey build: lib/valkey-build.sh not loaded\n'
+  fi
+  printf -- '--- shared build units\n'
+  systemctl list-timers --all --no-pager 'setup-*' 2>/dev/null || true
+  systemctl list-units --all --no-legend --no-pager 'setup-build-*' 'setup-*-build*' 2>/dev/null || true
+  printf -- '--- PATH links\n'
+  ls -l /usr/sbin/nginx /usr/bin/php /usr/local/bin/php /usr/bin/valkey-server /usr/bin/valkey-cli 2>/dev/null || true
+  ls -l /usr/local/bin/php[0-9]* /usr/local/sbin/php-fpm[0-9]* 2>/dev/null || true
+  printf -- '--- migration 1.22\n'
+  if declare -F migrate_status >/dev/null 2>&1; then
+    migrate_status 2>&1 || true
+  else
+    printf 'lib/migrate.sh not loaded\n'
+  fi
+  return 0
 }
 
 diag_tail_files() {
@@ -77,10 +142,13 @@ diag_tail_files() {
   done
 }
 
-diag_angie_log_files() {
+diag_nginx_log_files() {
+  local bin etc
+  bin=$(diag_web_bin || true)
+  etc=$(diag_web_etc)
   {
-    if [[ -x /usr/sbin/angie ]]; then
-      /usr/sbin/angie -T 2>/dev/null | awk '
+    if [[ -n $bin ]]; then
+      "$bin" -T 2>/dev/null | awk '
         $1 == "error_log" || $1 == "access_log" {
           path = $2
           sub(/;$/, "", path)
@@ -88,15 +156,17 @@ diag_angie_log_files() {
         }
       ' || true
     fi
-    printf '%s\n' /var/log/angie/error.log /var/log/angie/access.log
-  } | awk '{ if ($0 !~ /^\//) $0 = "/etc/angie/" $0; print }' | sort -u
+    printf '%s\n' /var/www/logs/nginx/error.log /var/www/logs/nginx/access.log
+  } | awk -v etc="${etc}/" '{ if ($0 !~ /^\//) $0 = etc $0; print }' | sort -u
 }
 
-diag_angie_certificates() {
-  local f
+diag_nginx_certificates() {
+  local f bin etc
+  bin=$(diag_web_bin || true)
+  etc=$(diag_web_etc)
   {
-    if [[ -x /usr/sbin/angie ]]; then
-      /usr/sbin/angie -T 2>/dev/null | awk '
+    if [[ -n $bin ]]; then
+      "$bin" -T 2>/dev/null | awk '
         $1 == "ssl_certificate" {
           path = $2
           sub(/;$/, "", path)
@@ -104,8 +174,8 @@ diag_angie_certificates() {
         }
       ' || true
     fi
-    find /etc/angie/ssl -type f -name 'fullchain.pem' 2>/dev/null || true
-  } | awk '{ if ($0 !~ /^\//) $0 = "/etc/angie/" $0; print }' | sort -u | while IFS= read -r f; do
+    find "${etc}/ssl" -type f -name 'fullchain.pem' 2>/dev/null || true
+  } | awk -v etc="${etc}/" '{ if ($0 !~ /^\//) $0 = etc $0; print }' | sort -u | while IFS= read -r f; do
     [[ -f $f ]] || continue
     printf -- '--- %s\n' "$f"
     if command -v openssl >/dev/null 2>&1; then
@@ -182,13 +252,13 @@ diag_mariadb_log_files() {
 diag_redis_log_files() {
   local cli value
   {
-    for cli in valkey-cli redis-cli; do
-      command -v "$cli" >/dev/null 2>&1 || continue
+    while IFS= read -r cli; do
+      [[ -n $cli ]] || continue
       value=$("$cli" CONFIG GET logfile 2>/dev/null | tail -n1 || true)
       if [[ -n $value ]]; then
         printf '%s\n' "$value"
       fi
-    done
+    done < <(diag_redis_clis)
     printf '%s\n' /var/www/logs/valkey/valkey.log /var/log/redis/redis-server.log
   } | sort -u
 }
@@ -227,7 +297,8 @@ diag_redis_unit() {
 
 # Return the server binary when a package is installed without a unit file.
 diag_redis_server_bin() {
-  local bin
+  local bin=${VALKEY_SERVER_BIN:-/usr/local/lib/setup-valkey/bin/valkey-server}
+  [[ -x $bin ]] && { printf '%s' "$bin"; return 0; }
   for bin in valkey-server redis-server; do
     command -v "$bin" >/dev/null 2>&1 && { printf '%s' "$bin"; return 0; }
   done
@@ -239,10 +310,10 @@ diag_redis_server_bin() {
 # service is installed but stopped or protected by authentication.
 diag_redis_cli() {
   local cli
-  for cli in valkey-cli redis-cli; do
-    command -v "$cli" >/dev/null 2>&1 || continue
+  while IFS= read -r cli; do
+    [[ -n $cli ]] || continue
     "$cli" ping >/dev/null 2>&1 && { printf '%s' "$cli"; return 0; }
-  done
+  done < <(diag_redis_clis)
   return 1
 }
 
@@ -273,15 +344,17 @@ diag_elasticsearch_allocation() {  local es_url=$1 health status unassigned
     "${es_url}/_cluster/allocation/explain?pretty" | head -n 200
 }
 
-diag_angie_include_status() {
-  local included f
-  if [[ ! -x /usr/sbin/angie ]]; then
-    printf 'Angie is not installed\n'
+diag_nginx_include_status() {
+  local included f bin etc
+  bin=$(diag_web_bin || true)
+  etc=$(diag_web_etc)
+  if [[ -z $bin ]]; then
+    printf 'nginx is not installed\n'
     return 0
   fi
-  included=$(/usr/sbin/angie -T 2>/dev/null \
-    | sed -n 's|^# configuration file /etc/angie/http\.d/\(.*\):$|\1|p' | sort -u)
-  find /etc/angie/http.d -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | sort | while IFS= read -r f; do
+  included=$("$bin" -T 2>/dev/null \
+    | sed -n "s|^# configuration file ${etc}/http\\.d/\\(.*\\):\$|\\1|p" | sort -u)
+  find "${etc}/http.d" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | sort | while IFS= read -r f; do
     if printf '%s\n' "$included" | grep -qxF -- "$f"; then
       printf 'ACTIVE   %s\n' "$f"
     else
@@ -307,8 +380,13 @@ redact_diagnostics() {
 
 run_diagnostics() {
   local out="${SCRIPT_DIR}/diagnostics.log"
-  local u ver fpm_bin f es_url redis_unit redis_bin redis_cli redis_label
-  local -a units=(angie mariadb valkey-server redis-server elasticsearch)
+  local u ver fpm_bin f es_url redis_unit redis_bin redis_cli redis_label web_bin web_etc php_cli
+  local -a units=(nginx mariadb valkey-server redis-server elasticsearch setup-build-cpu.service setup-build-refresh.service setup-migrate-1.22.service)
+  # A host in legacy-Angie mode still serves with Angie.
+  diag_angie_legacy && units=(angie "${units[@]}")
+  web_bin=$(diag_web_bin || true)
+  web_etc=$(diag_web_etc)
+  php_cli=$(php_cli_path 2>/dev/null || true)
 
   umask 077
   # Build the report in a private temp file and move it into place at the end.
@@ -408,23 +486,39 @@ run_diagnostics() {
     diag "systemctl cat ${u}" systemctl cat "$u"
   done
 
-  diag_sh "Angie version" 'if [ -x /usr/sbin/angie ]; then /usr/sbin/angie -V; else echo "Angie is not installed"; fi'
-  diag_sh "Angie config test" 'if [ -x /usr/sbin/angie ]; then /usr/sbin/angie -t; else echo "Angie is not installed"; fi'
-  diag_sh "Angie loaded configuration" 'if [ -x /usr/sbin/angie ]; then /usr/sbin/angie -T 2>&1 | head -n 3000; else echo "Angie is not installed"; fi'
-  diag_sh "Angie vhosts" 'find /etc/angie/conf.d -maxdepth 1 -type f -name "*.conf" -printf "%f\n" 2>/dev/null | sort'
-  diag "Angie certificates" diag_angie_certificates
-  diag "Angie http.d include status" diag_angie_include_status
-  diag_sh "Angie error/access log sizes" 'du -sh /var/www/logs/angie /var/log/angie 2>/dev/null || true'
+  # ---------------------------------------------------------------------------
+  # Compiled builds (read-only)
+  # ---------------------------------------------------------------------------
+  diag "builds" diag_builds
 
-  diag_sh "PHP CLI version" 'if command -v php >/dev/null 2>&1; then php -v; else echo "php CLI is not installed"; fi'
-  diag_sh "PHP CLI modules" 'if command -v php >/dev/null 2>&1; then php -m; else echo "php CLI is not installed"; fi'
-  diag_sh "PHP CLI ini" 'if command -v php >/dev/null 2>&1; then php --ini; else echo "php CLI is not installed"; fi'
-  diag_sh "PHP-FPM versions" 'for d in /etc/php/*/fpm; do [ -d "$d" ] || continue; v=${d%/fpm}; v=${v##*/}; echo "--- PHP $v"; if command -v "php-fpm$v" >/dev/null 2>&1; then "php-fpm$v" -v; elif [ -x "/usr/sbin/php-fpm$v" ]; then "/usr/sbin/php-fpm$v" -v 2>&1; else echo "no php-fpm${v} binary (stale configuration directory)"; fi; done'
+  if [[ -n $web_bin ]]; then
+    diag_section "web server: ${web_bin} (${web_etc})"
+    diag "nginx version" "$web_bin" -V
+    diag "nginx config test" "$web_bin" -t
+    diag_sh "nginx loaded configuration" "'${web_bin}' -T 2>&1 | head -n 3000"
+  else
+    diag_sh "nginx" 'echo "nginx is not installed"'
+  fi
+  diag_sh "nginx vhosts" "find '${web_etc}/conf.d' -maxdepth 1 -type f -name '*.conf' -printf '%f\n' 2>/dev/null | sort"
+  diag "nginx certificates" diag_nginx_certificates
+  diag "nginx http.d include status" diag_nginx_include_status
+  diag_sh "nginx error/access log sizes" 'du -sh /var/www/logs/nginx /var/www/logs/angie 2>/dev/null || true'
+
+  if [[ -n $php_cli ]]; then
+    diag "PHP CLI (${php_cli}) version" "$php_cli" -v
+    diag "PHP CLI modules" "$php_cli" -m
+    diag "PHP CLI ini" "$php_cli" --ini
+  else
+    diag_sh "PHP CLI" 'echo "php CLI is not installed"'
+  fi
   while IFS= read -r ver; do
     [[ -n $ver ]] || continue
-    fpm_bin=$(php_fpm_binary "$ver" || printf '/usr/sbin/php-fpm%s' "$ver")
+    fpm_bin=$(php_fpm_binary "$ver" || printf '%s/%s/sbin/php-fpm' "${PHP_BUILD_ROOT:-/usr/local/lib/setup-php}" "$ver")
     diag "PHP ${ver} FPM version" "$fpm_bin" -v
-    diag "PHP ${ver} FPM test" "$fpm_bin" -t
+    # The configuration is named explicitly: the compiled php-fpm's built-in
+    # default is its own prefix, not /etc/php (R2.8).
+    diag "PHP ${ver} FPM test" env "PHP_INI_SCAN_DIR=/etc/php/${ver}/fpm/conf.d" "$fpm_bin" -t \
+      -y "/etc/php/${ver}/fpm/php-fpm.conf" -c "/etc/php/${ver}/fpm/php.ini"
     diag "PHP ${ver} pool" cat "/etc/php/${ver}/fpm/pool.d/www.conf"
     diag "PHP ${ver} global config" cat "/etc/php/${ver}/fpm/php-fpm.conf"
     diag_sh "PHP ${ver} conf.d" "find /etc/php/${ver}/fpm/conf.d -maxdepth 1 -type f -print -exec sh -c 'echo --- \$1; cat \"\$1\"' _ {} \\;"
@@ -492,7 +586,7 @@ run_diagnostics() {
     diag_sh "Valkey/Redis" "printf 'Valkey/Redis is running (%s) but no client can reach it.\\n' '${redis_unit}'"
   else
     redis_label=Valkey
-    [[ $redis_cli == redis-cli ]] && redis_label=Redis
+    [[ ${redis_cli##*/} == redis-cli ]] && redis_label=Redis
     diag "${redis_label} info" "$redis_cli" INFO all
     diag "${redis_label} config" "$redis_cli" CONFIG GET maxmemory
     diag "${redis_label} selected config" diag_redis_config "$redis_cli"
@@ -547,7 +641,7 @@ run_diagnostics() {
 
   # Slow logs first: these matter most for application tuning.  Resolve the
   # live paths instead of assuming the /var/www/logs layout: old hosts still
-  # write PHP-FPM to /var/log/php-fpm, Angie vhosts to their document root,
+  # write PHP-FPM to /var/log/php-fpm, nginx vhosts to their document root,
   # MariaDB to its datadir, and Elasticsearch to /var/log/elasticsearch.
   local -a log_files=()
   while IFS= read -r ver; do
@@ -557,7 +651,7 @@ run_diagnostics() {
   done < <(php_fpm_versions)
   mapfile -t log_files < <(diag_mariadb_log_files)
   diag_tail_files 800 "${log_files[@]}"
-  mapfile -t log_files < <(diag_angie_log_files)
+  mapfile -t log_files < <(diag_nginx_log_files)
   diag_tail_files 500 "${log_files[@]}"
   mapfile -t log_files < <(diag_redis_log_files)
   diag_tail_files 500 "${log_files[@]}"
@@ -569,7 +663,7 @@ run_diagnostics() {
   mapfile -t log_files < <(find /var/www/logs -type f \( -name '*.log' -o -name '*.json' \) 2>/dev/null | sort)
   diag_tail_files 200 "${log_files[@]:0:120}"
 
-  diag_sh "log sizes" 'du -sh /var/www/logs/* /var/log/angie /var/log/php* /var/log/mysql /var/log/redis* /var/www/*/error.log /var/www/*/access.log 2>/dev/null | sort -h || true'
+  diag_sh "log sizes" 'du -sh /var/www/logs/* /var/log/php* /var/log/mysql /var/log/redis* /var/www/*/error.log /var/www/*/access.log 2>/dev/null | sort -h || true'
   diag_sh "web root ownership" 'ls -ld /var/www /var/www/logs /var/www/logs/* /var/www/mysql_database 2>/dev/null || true'
   diag_sh "log tree ownership" 'find /var/www/logs -maxdepth 2 -printf "%M %u:%g %p\n" 2>/dev/null | sort || true'
   diag_sh "logrotate debug" 'if command -v logrotate >/dev/null 2>&1 && [ -f /etc/logrotate.d/setup-logs ]; then logrotate -d /etc/logrotate.d/setup-logs; else echo "logrotate or /etc/logrotate.d/setup-logs is not installed"; fi'
@@ -580,9 +674,12 @@ run_diagnostics() {
   diag_sh "last logins" 'if command -v last >/dev/null 2>&1; then last -n 30; else echo "last is not installed"; fi'
   diag "who" who
   diag "apt upgradable" bash -c 'apt list --upgradable 2>/dev/null | head -100'
-  diag_sh "installed service packages" 'dpkg -l | awk "\$1==\"ii\" && (\$2 ~ /^(angie|php|mariadb|valkey|redis|elasticsearch|nodejs|nginx)/){print \$2, \$3}"'
+  # Package names only: the compiled nginx, PHP and Valkey are not packages.
+  # Anything angie/php/valkey listed here is a leftover the 1.22 migration
+  # has not removed yet (or refused to; see the builds section).
+  diag_sh "installed service packages" 'dpkg -l | awk "\$1==\"ii\" && (\$2 ~ /^(angie|nginx|php|libapache2-mod-php|mariadb|valkey|redis|elasticsearch|nodejs)/){print \$2, \$3}"'
   diag_sh "setup state" 'find /var/lib/setup.sh -maxdepth 2 -type f -printf "%p %s bytes\n" 2>/dev/null | sort'
-  diag_sh "cache and data sizes" 'du -sh /var/lib/mysql /var/lib/mariadb /var/lib/elasticsearch /var/cache/angie /home/nginx_cache* /var/cache/php/opcache 2>/dev/null | sort -h || true'
+  diag_sh "cache and data sizes" 'du -sh /var/lib/mysql /var/lib/mariadb /var/lib/elasticsearch /var/cache/nginx /home/nginx_cache* /var/cache/php/opcache 2>/dev/null | sort -h || true'
 
   redact_diagnostics "$DIAG_FILE"
 

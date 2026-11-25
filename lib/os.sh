@@ -1005,7 +1005,7 @@ configure_sysctl() {
     (( netdev_backlog > 16384 )) && netdev_backlog=16384
   fi
   # Writeback thresholds in bytes.  The stock 30%/5% ratios let a 64 GB host
-  # accumulate ~19 GB of dirty pages and then stall every writer (Angie
+  # accumulate ~19 GB of dirty pages and then stall every writer (nginx
   # cache, Elasticsearch segments, logs) on the flush; rotational disks get
   # tighter caps.
   local disk_class dirty_bg_mb dirty_mb rmem_max
@@ -1366,8 +1366,6 @@ tinyproxy     soft nofile 1048576
 tinyproxy     hard nofile 1048576
 www-data      soft nofile 1048576
 www-data      hard nofile 1048576
-angie         soft nofile 1048576
-angie         hard nofile 1048576
 *             soft nofile 1048576
 *             hard nofile 1048576
 EOF

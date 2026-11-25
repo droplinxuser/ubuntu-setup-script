@@ -18,7 +18,7 @@ set -u
 LABEL=${1:?label}; URL=${2:?url}; KEY=${3:-}; shift 3 2>/dev/null || shift $#
 C=${C:-100}; D=${D:-10}; RUNS=${RUNS:-3}; TTFB_N=${TTFB_N:-25}
 CK=${CK:-/root/audit/cookies/cookies.tsv}
-printf "| Tier | Accept-Encoding | sent | body B | status | TTFB ms med (min-max) | req/s | spread | p50 | p99 | Angie ms/req | PHP ms/req |\n|---|---|---|---:|---:|---|---:|---:|---:|---:|---:|---:|\n" >&2
+printf "| Tier | Accept-Encoding | sent | body B | status | TTFB ms med (min-max) | req/s | spread | p50 | p99 | nginx ms/req | PHP ms/req |\n|---|---|---|---:|---:|---|---:|---:|---:|---:|---:|---:|\n" >&2
 (( $# )) || set -- "gzip" "br" "gzip, deflate, br, zstd" "br, gzip" "identity"
 CG=/sys/fs/cgroup/system.slice
 PHPU=$(cd "$CG" 2>/dev/null && ls -d php*-fpm.service 2>/dev/null | head -1)
@@ -61,9 +61,9 @@ for ae in "$@"; do hdrs "$ae"; wrk -t4 -c"$C" -d2s "${h[@]}" "$URL" >/dev/null 2
 for (( r = 1; r <= RUNS; r++ )); do
   for ae in "$@"; do
     hdrs "$ae"
-    a0=$(usec angie.service); p0=$(usec "$PHPU")
+    a0=$(usec nginx.service); p0=$(usec "$PHPU")
     out=$(wrk -t4 -c"$C" -d"${D}s" --latency "${h[@]}" "$URL" 2>&1)
-    a1=$(usec angie.service); p1=$(usec "$PHPU")
+    a1=$(usec nginx.service); p1=$(usec "$PHPU")
     n=$(awk '/requests in/{print $1}' <<<"$out"); n=${n:-1}
     rps=$(awk '/^Requests\/sec/{printf "%d", $2}' <<<"$out")
     p50=$(awk '$1=="50%"{print $2}' <<<"$out"); p99=$(awk '$1=="99%"{print $2}' <<<"$out")

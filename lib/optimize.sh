@@ -15,19 +15,50 @@ OPT_REPORT_WRITTEN=0
 # objects written during a cutover window are only counted and reported; they
 # are never deleted, and an idempotent run does not touch the live cache.
 OPT_CUTOVER=0
-# Web frontends paused while MariaDB restarts.  Stopping Angie and PHP-FPM
+# Web frontends paused while MariaDB restarts.  Stopping nginx and PHP-FPM
 # first prevents a thundering herd of reconnects while InnoDB preloads a new
 # buffer pool.
-OPT_WEB_PAUSED_ANGIE=0
+OPT_WEB_PAUSED_NGINX=0
 OPT_WEB_PAUSED_PHP=()
+# 1.22: services are detected from our builds, never from dpkg.
+# OPT_WEB_LEGACY=1 while Angie still serves (web_server_state angie-legacy:
+# the migration's nginx part is refused or pending).  The web tier (nginx
+# and PHP-FPM) is then left alone: no code path may apply nginx-tree logic
+# to /etc/angie (R19/R51).  OPT_DETECT_NOTES holds the report lines for what
+# was found but is not tuned (legacy packages, the small-host gate).
+# OPT_DETECT_LEGACY=1 makes detection also count the package services the
+# migration is about to replace, so the memory plan the migration renders
+# with (nginx_apply_profile, the cache budget) already books them.
+OPT_WEB_LEGACY=0
+OPT_DETECT_NOTES=()
+OPT_DETECT_LEGACY=0
+# migrate_run's status in this run: 0 done or nothing to do, 1 a part
+# failed or rolled back, 2 legacy-Angie mode.
+OPT_MIGRATE_RC=0
+# 1 once optimize_migration_step ran migrate_run in this run (the caller
+# re-primes what depends on the vhost trees).
+OPT_MIGRATE_RAN=0
 
 opt_report() { OPT_REPORT+=("$*"); }
+
+# Absolute paths of our builds (R2.1: every binary from one variable).  The
+# defaults match lib/nginx-build.sh and lib/valkey-build.sh, so a caller that
+# has not sourced them (tests, the dry run) still never reaches a dpkg path.
+opt_nginx_bin() { printf '%s' "${NGINX_BIN:-/usr/local/lib/setup-nginx/sbin/nginx}"; }
+opt_valkey_server_bin() { printf '%s' "${VALKEY_SERVER_BIN:-/usr/local/lib/setup-valkey/bin/valkey-server}"; }
+# Our valkey-cli when the build is installed; otherwise the one on PATH (a
+# package Valkey the migration has not replaced yet, read by the planner).
+opt_valkey_cli() {
+  local cli=${VALKEY_CLI_BIN:-/usr/local/lib/setup-valkey/bin/valkey-cli}
+  if [[ -x $cli ]]; then printf '%s' "$cli"; return 0; fi
+  command -v valkey-cli 2>/dev/null || printf '%s' "$cli"
+}
 
 opt_backup() {
   local path=$1 name=$2
   [[ -n $OPT_BACKUP_DIR ]] || OPT_BACKUP_DIR=$(tmp_dir setup-optimize.XXXXXX)
   [[ -n $OPT_BACKUP_DIR ]] || die "Could not create an optimize backup directory"
-  # Copies include /etc/angie/ssl/*/privkey.pem and /etc/mysql/debian.cnf.
+  # Copies include /etc/nginx/ssl/*/privkey.pem and /etc/mysql/debian.cnf.
   # 0700 keeps the rollback tree (and its filenames) private to root.
   install -d -m 700 "$OPT_BACKUP_DIR"
   [[ -e "$OPT_BACKUP_DIR/${name}" || -e "$OPT_BACKUP_DIR/${name}.absent" ]] && return 0
@@ -181,23 +212,118 @@ elasticsearch_restart_probe() {
   return 1
 }
 
+# The small-host gate (section 7: the 4 GB class, MemTotal >= 3500 MB) is
+# defined once, in lib/validate.sh (mem_class_mb, mem_gate_allows), which
+# setup.sh sources before this file.  Tests that source this module alone
+# must source lib/validate.sh too.
+
+# 0 when PHP X.Y is served by our build: the compiled php-fpm and its
+# build.info under the build root, and (with lib/php-build.sh loaded) our
+# phpX.Y-fpm unit.  A Sury unit that still serves beside a build left by a
+# rolled-back migration is not ours.  Never runs the binary (R60).
+php_fpm_is_ours() {
+  local ver=$1 bin
+  if declare -F php_fpm_bin >/dev/null 2>&1; then
+    bin=$(php_fpm_bin "$ver")
+  else
+    bin="${PHP_BUILD_ROOT:-/usr/local/lib/setup-php}/${ver}/sbin/php-fpm"
+  fi
+  [[ -x $bin && -f ${bin%/sbin/php-fpm}/build.info ]] || return 1
+  if declare -F php_build_unit_is_ours >/dev/null 2>&1; then
+    php_build_unit_is_ours "$ver" || return 1
+  fi
+  return 0
+}
+
+# Versions that still run from a php-fpm package (Sury/Ubuntu) and have a
+# pool: the migration's PHP part (or the small-host refusal) owns them.
+php_fpm_legacy_versions() {
+  local d ver
+  for d in /etc/php/*/fpm; do
+    [[ -d $d ]] || continue
+    ver=$(basename "$(dirname "$d")")
+    [[ $ver =~ ^[0-9]+\.[0-9]+$ ]] || continue
+    compgen -G "${d}/pool.d/*.conf" >/dev/null 2>&1 || continue
+    php_fpm_is_ours "$ver" && continue
+    [[ -x /usr/sbin/php-fpm${ver} ]] || continue
+    printf '%s\n' "$ver"
+  done | sort -V
+}
+
+# 0 when Valkey is our build: the binary, its config and (with
+# lib/valkey-build.sh loaded) our valkey-server.service.
+valkey_is_ours() {
+  [[ -x $(opt_valkey_server_bin) && -f /etc/valkey/valkey.conf ]] || return 1
+  if declare -F valkey_unit_is_ours >/dev/null 2>&1; then
+    valkey_unit_is_ours || return 1
+  fi
+  return 0
+}
+
+# detect_installed_services [migrate]
+# Fills OPT_DETECTED with what --optimize tunes: nginx, php:X.Y, mariadb,
+# valkey, redis, elastic (the tags the planner, the cache budget and the
+# restart code match).  nginx, PHP and Valkey count only as our builds; a
+# package left over from 1.21 is reported in OPT_DETECT_NOTES, not tuned.
+# With "migrate", the package services the 1.22 migration will replace are
+# counted as well (planning only; nothing is tuned from that list).
 detect_installed_services() {
+  local mode=${1:-} ver state="" legacy=""
   OPT_DETECTED=()
-  [[ -x /usr/sbin/angie && -f /etc/angie/angie.conf ]] && OPT_DETECTED+=(angie)
-  local ver
+  OPT_DETECT_NOTES=()
+  OPT_WEB_LEGACY=0
+  OPT_DETECT_LEGACY=0
+  [[ $mode == migrate ]] && OPT_DETECT_LEGACY=1
+  if declare -F web_server_state >/dev/null 2>&1; then
+    state=$(web_server_state 2>/dev/null || true)
+  fi
+  if [[ $state == angie-legacy ]]; then
+    if (( OPT_DETECT_LEGACY )); then
+      OPT_DETECTED+=(nginx)
+    else
+      OPT_WEB_LEGACY=1
+      OPT_DETECT_NOTES+=("Web server: Angie still serves (legacy mode: the 1.22 migration's nginx part is not done); nginx and PHP-FPM tuning skipped, /etc/angie left as it is")
+    fi
+  elif [[ -x $(opt_nginx_bin) && -f /etc/nginx/nginx.conf ]]; then
+    OPT_DETECTED+=(nginx)
+  fi
   # A stale /etc/php/<ver>/fpm directory survives a purge on some hosts.  Only
   # treat a version as installed when it still has a pool config; otherwise
   # --optimize would create systemd drop-ins for a service that does not exist.
-  while IFS= read -r ver; do
-    OPT_DETECTED+=("php:${ver}")
-  done < <(php_fpm_versions)
+  if (( OPT_WEB_LEGACY )); then
+    legacy=$( { php_fpm_versions; php_fpm_legacy_versions; } | sort -uV | paste -sd' ' - || true)
+    [[ -n $legacy ]] && OPT_DETECT_NOTES+=("PHP-FPM ${legacy}: not tuned while Angie serves (web tier left alone in legacy mode)")
+  elif ! mem_gate_allows php; then
+    legacy=$( { php_fpm_versions; php_fpm_legacy_versions; } | sort -uV | paste -sd' ' - || true)
+    [[ -n $legacy ]] && OPT_DETECT_NOTES+=("PHP-FPM ${legacy}: not tuned or migrated (under the 4 GB class this host runs nginx only)")
+  else
+    while IFS= read -r ver; do
+      [[ -n $ver ]] && OPT_DETECTED+=("php:${ver}")
+    done < <(php_fpm_versions)
+    if (( ! OPT_DETECT_LEGACY )); then
+      legacy=$(php_fpm_legacy_versions | paste -sd' ' - || true)
+      [[ -n $legacy ]] && OPT_DETECT_NOTES+=("PHP-FPM ${legacy}: still the php-fpm package, not tuned (the 1.22 migration moves it to the compiled build; see its report lines)")
+    fi
+  fi
   # The server binary, not the client: a web node with mariadb-client and a
   # remote database is not a local MariaDB host (it was planned a buffer pool,
   # 1.0 PHP workers per core and a systemd drop-in for a unit it lacks).
   if command -v mariadbd >/dev/null 2>&1; then
     [[ -d /etc/mysql ]] && OPT_DETECTED+=(mariadb)
   fi
-  [[ -f /etc/valkey/valkey.conf ]] && OPT_DETECTED+=(valkey)
+  if [[ -f /etc/valkey/valkey.conf ]]; then
+    if ! mem_gate_allows valkey; then
+      OPT_DETECT_NOTES+=("Valkey: not tuned or migrated (under the 4 GB class this host runs nginx only)")
+    elif valkey_is_ours; then
+      OPT_DETECTED+=(valkey)
+    elif (( OPT_DETECT_LEGACY )); then
+      # The package server the migration replaces keeps its dataset and
+      # maxmemory: plan its cache budget now.
+      OPT_DETECTED+=(valkey)
+    else
+      OPT_DETECT_NOTES+=("Valkey: still the valkey-server package (or a server that is not the 1.22 build), not tuned; the 1.22 migration moves it to the compiled build")
+    fi
+  fi
   # Valkey takes precedence.  Tuning both would apply the same shared cache
   # budget twice and could overcommit RAM; Redis-only hosts still get the
   # complete Valkey tuning profile.
@@ -208,12 +334,75 @@ detect_installed_services() {
   return 0
 }
 
+# The 1.22 one-time migration (lib/migrate.sh: Angie -> nginx, Sury PHP and
+# the valkey-server package -> our builds), as the first service step of
+# --optimize.  run_optimize calls it once, right after plan_memory_budget and
+# before run_os_tuning or any tuner:
+#     optimize_migration_step || rc=1
+# When a migration is pending (or running in its unit) it re-plans as the
+# migration will leave the host (the render's nginx_apply_profile and cache
+# budget need the PHP and Valkey it moves), runs migrate_run with opt_report
+# as OUT (the unit's report lines land in this run's report), then detects
+# again from the builds and re-plans, so every later step tunes what now
+# serves.  Legacy-Angie mode (migrate_run rc 2, or web_server_state
+# angie-legacy) leaves OPT_WEB_LEGACY=1: run_optimize then skips the web
+# tier (optimize_nginx and optimize_php_services refuse on their own too).
+# What was found but is not tuned is reported under "Not tuned".
+# Returns 1 when a migration part failed or rolled back (the run must report
+# a failure; the remaining services are still tuned).  Never runs under
+# --dry-run (optimize_plan prints migrate_plan instead).  OPT_SKIP_MIGRATION=1
+# (the closing pass after --domain) only detects and reports: the migration
+# belongs to an explicit --optimize, not to a domain install.
+optimize_migration_step() {
+  local need=0 note
+  OPT_MIGRATE_RC=0
+  OPT_MIGRATE_RAN=0
+  if declare -F migrate_run >/dev/null 2>&1 && (( ! ${DRY_RUN:-0} )) \
+     && [[ ${OPT_SKIP_MIGRATION:-0} != 1 ]]; then
+    if declare -F migrate_running >/dev/null 2>&1 && migrate_running; then
+      need=1
+    elif declare -F migrate_needed >/dev/null 2>&1 && migrate_needed; then
+      need=1
+    fi
+  fi
+  if (( need )); then
+    step "1.22 migration (nginx, compiled PHP and Valkey replace Angie and the packages)"
+    OPT_MIGRATE_RAN=1
+    detect_installed_services migrate
+    plan_memory_budget
+    opt_report "## Migration 1.22"
+    # Plain call with the status captured: migrate_run's own error handling
+    # decides what rolls back; a failed part must not stop the tuners of the
+    # services that already serve.
+    migrate_run opt_report || OPT_MIGRATE_RC=$?
+    case $OPT_MIGRATE_RC in
+      0) opt_report "- Migration: finished for this run" ;;
+      2) opt_report "- Migration: the nginx part is not done; Angie keeps serving (legacy mode)" ;;
+      *) opt_report "- **FAILED** Migration: a part failed or was rolled back (see the lines above and ${MIGRATE_LOG:-/var/log/setup-migrate-1.22.log})" ;;
+    esac
+    detect_installed_services
+    (( OPT_MIGRATE_RC == 2 )) && OPT_WEB_LEGACY=1
+    # The new services own memory the first plan did not see (or the old
+    # ones are gone): plan once more from what serves now.
+    plan_memory_budget
+  fi
+  if (( ${#OPT_DETECT_NOTES[@]} > 0 )); then
+    opt_report "## Not tuned"
+    for note in "${OPT_DETECT_NOTES[@]}"; do
+      opt_report "- ${note}"
+    done
+  fi
+  # Any status but 0 (done) and 2 (legacy mode) is a failure of this run.
+  case $OPT_MIGRATE_RC in 0|2) return 0 ;; esac
+  return 1
+}
+
 # ---------------------------------------------------------------------------
 # Shared memory budget
 # ---------------------------------------------------------------------------
 # Each service used to choose its own slice of RAM (MariaDB 40%, PHP workers
 # 50%, Valkey 10%, Elasticsearch 25%).  With three or four services installed
-# that adds up to 100-125% before the kernel, Angie and page cache get a byte,
+# that adds up to 100-125% before the kernel, nginx and page cache get a byte,
 # so the first traffic spike ends in the OOM killer.  Allocate once, from a
 # single budget, and leave 20% of RAM for the OS and the web server.
 OPT_MEM_TOTAL_MB=0
@@ -1284,10 +1473,10 @@ php_plan_max_children() {
   printf '%s' "$cap"
 }
 
-# Angie worker limits shared by tune_angie_configs and the dry run.
-# worker_processes is two thirds of the effective CPU count (Angie's "auto"
+# nginx worker limits shared by tune_nginx_configs and the dry run.
+# worker_processes is two thirds of the effective CPU count (nginx's "auto"
 # counts the affinity mask, not a cgroup quota; see the measurements below).
-angie_worker_limits() {
+nginx_worker_limits() {
   local nproc=$1 per_core_conn=2048 per_core_fds=8192
   # Two workers per three CPUs, floor 2.  A worker's only job on a cached
   # guest hit is TLS termination, and every extra worker competes with PHP
@@ -1297,8 +1486,8 @@ angie_worker_limits() {
   # with the member/thread tiers flat (764-767 / 840-843 req/s).  Eight
   # workers on twelve CPUs is the optimum; `auto` (= nproc) cost ~11% of
   # cached throughput.
-  ANGIE_WORKER_PROCESSES=$(( nproc * 2 / 3 ))
-  (( ANGIE_WORKER_PROCESSES < 2 )) && ANGIE_WORKER_PROCESSES=2
+  NGINX_WORKER_PROCESSES=$(( nproc * 2 / 3 ))
+  (( NGINX_WORKER_PROCESSES < 2 )) && NGINX_WORKER_PROCESSES=2
   # A VPS shares its NIC queue and hypervisor with neighbours; the kernel
   # backlogs are already halved there (sysctl_target_somaxconn), so the
   # per-worker connection table follows (1024/core, 4096 fds/core).
@@ -1306,28 +1495,28 @@ angie_worker_limits() {
     per_core_conn=1024
     per_core_fds=4096
   fi
-  ANGIE_WORKER_RLIMIT=$(tune_clamp $(( nproc * per_core_fds )) 65536 524288)
-  ANGIE_WORKER_CONNECTIONS=$(tune_clamp $(( nproc * per_core_conn )) 8192 65535)
-  (( ANGIE_WORKER_CONNECTIONS > ANGIE_WORKER_RLIMIT - 1024 )) && ANGIE_WORKER_CONNECTIONS=$(( ANGIE_WORKER_RLIMIT - 1024 ))
-  (( ANGIE_WORKER_CONNECTIONS < 1024 )) && ANGIE_WORKER_CONNECTIONS=1024
-  # Angie must NOT keep idle FastCGI connections to PHP-FPM.  Every idle
+  NGINX_WORKER_RLIMIT=$(tune_clamp $(( nproc * per_core_fds )) 65536 524288)
+  NGINX_WORKER_CONNECTIONS=$(tune_clamp $(( nproc * per_core_conn )) 8192 65535)
+  (( NGINX_WORKER_CONNECTIONS > NGINX_WORKER_RLIMIT - 1024 )) && NGINX_WORKER_CONNECTIONS=$(( NGINX_WORKER_RLIMIT - 1024 ))
+  (( NGINX_WORKER_CONNECTIONS < 1024 )) && NGINX_WORKER_CONNECTIONS=1024
+  # nginx must NOT keep idle FastCGI connections to PHP-FPM.  Every idle
   # keepalive slot pins one FPM worker (FPM waits on the same socket for the
-  # next request) and the cache is per Angie worker.  On the dev host that produced
-  # 16 idle connections for 16 workers; any request that landed on an Angie
+  # next request) and the cache is per nginx worker.  On the dev host that produced
+  # 16 idle connections for 16 workers; any request that landed on an nginx
   # worker without a cached connection then waited for the upstream
   # keepalive_timeout (60 s default) for a worker to be freed.  Measured on
   # the live 8 CPU host: 4-7 of every 64 non-cacheable /login requests took
   # 60-112 s; after removing the cache, 3 x 128 requests had p99 33-38 ms and
   # no request above 93 ms, with identical p50 (24-25 ms) and sequential
   # latency (14 ms).  A Unix-socket connect is cheaper than any keepalive
-  # benefit here.  ANGIE_PHP_KEEPALIVE is kept as "off" for the report.
-  ANGIE_PHP_KEEPALIVE="off"
+  # benefit here.  NGINX_PHP_KEEPALIVE is kept as "off" for the report.
+  NGINX_PHP_KEEPALIVE="off"
 }
 PHP_WRITTEN_CHILDREN=0
 
 # gzip level from the same CPU rule as Brotli (5, 4 on 1-2 CPUs);
 # SETUP_GZIP_LEVEL=1..9 pins it.
-angie_gzip_level() {
+nginx_gzip_level() {
   local level=${SETUP_GZIP_LEVEL:-}
   if ! [[ $level =~ ^[1-9]$ ]]; then
     # gzip is the fallback for the few clients without Brotli; measured on
@@ -1343,7 +1532,7 @@ angie_gzip_level() {
 # 10000..200000) but never more than the descriptors a worker keeps after its
 # connections, since every cached entry is an open fd.  Shared by the tuner
 # and the dry run.  Arguments: RAM MB, worker_rlimit_nofile, worker_connections.
-angie_open_file_cache_max() {
+nginx_open_file_cache_max() {
   local mem_mb=$1 rlimit=$2 conns=$3 open_files fd_room
   open_files=$(tune_clamp $(( mem_mb * 8 )) 10000 200000)
   fd_room=$(( rlimit - conns - 1024 ))
@@ -1351,20 +1540,20 @@ angie_open_file_cache_max() {
   (( open_files > fd_room )) && open_files=$fd_room
   printf '%s' "$open_files"
 }
-ANGIE_WORKER_PROCESSES=""
-ANGIE_WORKER_RLIMIT=""
-ANGIE_WORKER_CONNECTIONS=""
-ANGIE_PHP_KEEPALIVE=""
+NGINX_WORKER_PROCESSES=""
+NGINX_WORKER_RLIMIT=""
+NGINX_WORKER_CONNECTIONS=""
+NGINX_PHP_KEEPALIVE=""
 
 # Disk basis of the cache budget in MB: the size of the cache filesystem,
 # capped at 10x its free space (so a 5% share never exceeds half of what is
-# free).  Free space alone moved with the install itself: Angie is tuned
+# free).  Free space alone moved with the install itself: nginx is tuned
 # before PHP, MariaDB and Elasticsearch take ~2 GB, so on a small disk the
 # first --optimize rewrote every max_size/keys_zone and broke
 # install/optimize parity.
-angie_disk_free_mb() {
+nginx_disk_free_mb() {
   local mb
-  # The cache zones live under /home (angie_cache_dirs), which can be its
+  # The cache zones live under /home (nginx_cache_dirs), which can be its
   # own filesystem; measure that one, not the web root.
   local dir=/home
   [[ -d $dir ]] || dir=/var/www
@@ -1457,13 +1646,13 @@ service_mem_mb() {
 # the first write instead of each claiming its own percentage of RAM.
 plan_install_budget() {
   # Start from what is already on the host, then add this run's services: a
-  # later `--php --mariadb` on an Angie host must size the data tier exactly
-  # like the next --optimize will.  The Angie cache is only re-sized when
-  # --angie is part of the run (its tuner needs the repository sync, angie -t
+  # later `--php --mariadb` on an nginx host must size the data tier exactly
+  # like the next --optimize will.  The nginx cache is only re-sized when
+  # --nginx is part of the run (its tuner needs the repository sync, nginx -t
   # and a rollback); the check below names the gap instead.
   detect_installed_services
   local -a host_services=("${OPT_DETECTED[@]}")
-  [[ ${ENABLED[angie]:-0} -eq 1   && " ${OPT_DETECTED[*]} " != *" angie "*   ]] && OPT_DETECTED+=(angie)
+  [[ ${ENABLED[nginx]:-0} -eq 1   && " ${OPT_DETECTED[*]} " != *" nginx "*   ]] && OPT_DETECTED+=(nginx)
   [[ ${ENABLED[php]:-0} -eq 1     && " ${OPT_DETECTED[*]} " != *" php:"*     ]] && OPT_DETECTED+=("php:${OPT[php.ver]:-auto}")
   [[ ${ENABLED[mariadb]:-0} -eq 1 && " ${OPT_DETECTED[*]} " != *" mariadb "* ]] && OPT_DETECTED+=(mariadb)
   [[ ${ENABLED[valkey]:-0} -eq 1  && " ${OPT_DETECTED[*]} " != *" valkey "*  ]] && OPT_DETECTED+=(valkey)
@@ -1475,28 +1664,28 @@ plan_install_budget() {
   plan_memory_budget
   OPT_INSTALL_PLAN=0
   info "$(memory_plan_summary)"
-  # angie_cache_budget_mb gives an Angie-only host 50% of RAM (10% of the
+  # nginx_cache_budget_mb gives an nginx-only host 50% of RAM (10% of the
   # cache disk) and a host with PHP or a data tier 30% or 25%: adding PHP or
-  # MariaDB to an installed Angie without --angie leaves the larger cache in
+  # MariaDB to an installed nginx without --nginx leaves the larger cache in
   # place, and that RAM is now booked for the new services too.
-  if [[ ${ENABLED[angie]:-0} -ne 1 && " ${host_services[*]} " == *" angie "* ]]; then
+  if [[ ${ENABLED[nginx]:-0} -ne 1 && " ${host_services[*]} " == *" nginx "* ]]; then
     local -a run_services=("${OPT_DETECTED[@]}")
     local ram_mb disk_mb cache_was cache_now
     ram_mb=$(mem_total_mb)
-    disk_mb=$(angie_disk_free_mb)
-    cache_now=$(angie_cache_budget_mb "$ram_mb" "$disk_mb")
+    disk_mb=$(nginx_disk_free_mb)
+    cache_now=$(nginx_cache_budget_mb "$ram_mb" "$disk_mb")
     OPT_DETECTED=("${host_services[@]}")
-    cache_was=$(angie_cache_budget_mb "$ram_mb" "$disk_mb")
+    cache_was=$(nginx_cache_budget_mb "$ram_mb" "$disk_mb")
     OPT_DETECTED=("${run_services[@]}")
     if (( cache_now < cache_was )); then
-      warn "Angie cache budget stays at ${cache_was} MB (sized for the previous service set) until the next --optimize or --angie run, which sets ${cache_now} MB for these services"
+      warn "nginx cache budget stays at ${cache_was} MB (sized for the previous service set) until the next --optimize or --nginx run, which sets ${cache_now} MB for these services"
     fi
   fi
   # The PHP worker factor depends on a local database (1.5 per CPU without
   # one, 1.0 with one on a dedicated SSD host).  A --mariadb run on a host
   # whose PHP was installed earlier does not touch the pool (only the named
   # services are), so it keeps the larger count until --optimize; say so,
-  # as for the Angie cache above.
+  # as for the nginx cache above.
   if [[ ${ENABLED[mariadb]:-0} -eq 1 && ${ENABLED[php]:-0} -ne 1 \
         && " ${host_services[*]} " == *" php:"* && " ${host_services[*]} " != *" mariadb "* ]]; then
     local pool_now pool_plan
@@ -1534,16 +1723,25 @@ memory_plan_summary() {
   return 0
 }
 
-php_fpm_versions() {  local d ver
+# PHP versions --optimize tunes: a pool under /etc/php/X.Y/fpm/pool.d and
+# our compiled build for X.Y (php_fpm_is_ours).  A leftover directory with
+# no pool (common after `--purge --php ver=X`) is not an installed service,
+# and a Sury/Ubuntu php-fpm package is never counted (1.22 is source-only;
+# the migration owns those).  Under OPT_DETECT_LEGACY=1 (planning for the
+# migration) the running package versions it will move count as well.
+php_fpm_versions() {
+  local d ver
   for d in /etc/php/*/fpm; do
     [[ -d $d ]] || continue
     ver=$(basename "$(dirname "$d")")
     [[ $ver =~ ^[0-9]+\.[0-9]+$ ]] || continue
-    # Require a real pool and the matching binary.  A leftover directory with
-    # no pool (common after `--purge --php ver=X`) is not an installed service.
     compgen -G "${d}/pool.d/*.conf" >/dev/null 2>&1 || continue
-    [[ -x "/usr/sbin/php-fpm${ver}" ]] || command -v "php-fpm${ver}" >/dev/null 2>&1 || continue
-    printf '%s\n' "$ver"
+    if php_fpm_is_ours "$ver"; then
+      printf '%s\n' "$ver"
+    elif (( ${OPT_DETECT_LEGACY:-0} )) && [[ -x /usr/sbin/php-fpm${ver} ]] \
+         && systemctl is-active --quiet "php${ver}-fpm" 2>/dev/null; then
+      printf '%s\n' "$ver"
+    fi
   done | sort -V
 }
 
@@ -1625,11 +1823,13 @@ php_pool_max_children() {
 # new pool measures.  It used to be 96 MB here, so --optimize on a host with
 # PHP-FPM stopped planned a smaller buffer pool than the install had written.
 php_worker_allowance_mb() {
-  local ver=${1:-} out avg=0 n=0 allowance=64
-  if [[ -n $ver ]]; then
+  local ver=${1:-} out="" avg=0 n=0 allowance=64
+  # Our build's processes are named php-fpm (ROOT/X.Y/sbin/php-fpm); only a
+  # package server the migration is about to replace runs as php-fpmX.Y.
+  out=$(ps -o rss= -C php-fpm 2>/dev/null || true)
+  if [[ -z $out && -n $ver ]]; then
     out=$(ps -o rss= -C "php-fpm${ver}" 2>/dev/null || true)
   fi
-  [[ -n ${out:-} ]] || out=$(ps -o rss= -C php-fpm 2>/dev/null || true)
   if [[ -n ${out:-} ]]; then
     read -r avg n < <(printf '%s\n' "$out" | awk '
       { sum += $1; n++ }
@@ -1650,16 +1850,24 @@ php_worker_allowance_mb() {
 }
 
 php_primary_version() {
-  local ver listen angie_socket=""
-  # Prefer the pool that already owns the socket Angie talks to.
-  if [[ -f /etc/angie/angie.conf ]]; then
-    angie_socket=$(awk '/^[[:space:]]*server[[:space:]]+unix:/{
+  local ver listen nginx_socket="" active=""
+  # 1.22 keeps one active version (/etc/php/setup-active, R61): it owns the
+  # shared socket and every other version of ours is disabled.
+  if declare -F php_active_version >/dev/null 2>&1; then
+    active=$(php_active_version 2>/dev/null || true)
+    if [[ -n $active ]] && php_fpm_versions | grep -qxF -- "$active"; then
+      printf '%s' "$active"; return 0
+    fi
+  fi
+  # Prefer the pool that already owns the socket nginx talks to.
+  if [[ -f /etc/nginx/nginx.conf ]]; then
+    nginx_socket=$(awk '/^[[:space:]]*server[[:space:]]+unix:/{
         sub(/^[[:space:]]*server[[:space:]]+unix:/, ""); sub(/;.*/, ""); print; exit
-      }' /etc/angie/angie.conf)
+      }' /etc/nginx/nginx.conf)
   fi
   while IFS= read -r ver; do
     listen=$(php_pool_listen "$ver")
-    if [[ -n $angie_socket && $listen == "$angie_socket" ]]; then
+    if [[ -n $nginx_socket && $listen == "$nginx_socket" ]]; then
       printf '%s' "$ver"; return 0
     fi
     if [[ $listen == /run/php/php-fpm.sock ]]; then
@@ -1677,25 +1885,25 @@ php_primary_version() {
   php_fpm_versions | tail -n1
 }
 
-# WordPress guest-cache support: the Angie repository owns the templates.
-angie_wordpress_vhosts() {
+# WordPress guest-cache support: the nginx repository owns the templates.
+nginx_wordpress_vhosts() {
   local target=$1 file root
   for file in "$target"/conf.d/*.conf; do
     [[ -f $file ]] || continue
     grep -qE '^[[:space:]]*include[[:space:]]+h5bp/(php_wp|wordpress)\.conf;' "$file" || continue
-    root=$(angie_vhost_root "$file")
+    root=$(nginx_vhost_root "$file")
     if [[ -n $root && -f "${root}/wp-config.php" ]]; then printf '%s\n' "$file"; fi
   done
 }
 
 # A XenForo vhost includes h5bp/php_xf.conf (the PHP/cache snippet) or the
 # xf2.conf location set, and its document root contains src/XF.php.
-angie_xenforo_vhosts() {
+nginx_xenforo_vhosts() {
   local target=$1 file root
   for file in "$target"/conf.d/*.conf; do
     [[ -f $file ]] || continue
     grep -qE '^[[:space:]]*include[[:space:]]+h5bp/(php_xf|xf2)\.conf;' "$file" || continue
-    root=$(angie_vhost_root "$file")
+    root=$(nginx_vhost_root "$file")
     if [[ -n $root && -f "${root}/src/XF.php" ]]; then printf '%s\n' "$file"; fi
   done
 }
@@ -1705,7 +1913,7 @@ angie_xenforo_vhosts() {
 # (inside a location).  Brace depth is counted outside comments; a quoted
 # regex quantifier such as "{3}" opens and closes on the same line, so it
 # does not move the depth.  Prints nothing; returns 0 when the file changed.
-angie_rewrite_include_at_level() {
+nginx_rewrite_include_at_level() {
   local file=$1 from=$2 to=$3 level=$4 tmp
   [[ -f $file ]] || return 1
   grep -qE "include[[:space:]]+h5bp/${from//./\\.};" "$file" || return 1
@@ -1762,7 +1970,7 @@ chevereto_guest_uploads() {
 }
 
 # The guest caches for XenForo and Chevereto live in a named location, which
-# Angie only accepts at the server level, once per server:
+# nginx only accepts at the server level, once per server:
 #   * Chevereto: h5bp/php_chev.conf is now the plain (never cached) PHP
 #     location and may stay nested; the server-level include moves to
 #     h5bp/php_chev_cache.conf.  A vhost that is not migrated keeps working,
@@ -1777,8 +1985,8 @@ chevereto_guest_uploads() {
 #     nested inside a location (never in the template, but possible in a
 #     hand-written vhost) is pointed at the generic h5bp/php.conf.
 # Deployed vhosts are otherwise left alone.
-angie_migrate_guest_cache_includes() {
-  local target=${1:-/etc/angie} vhost rel root guest want
+nginx_migrate_guest_cache_includes() {
+  local target=${1:-/etc/nginx} vhost rel root guest want
   [[ -d "${target}/conf.d" ]] || return 0
   for vhost in "$target"/conf.d/*.conf; do
     [[ -f $vhost ]] || continue
@@ -1791,40 +1999,40 @@ angie_migrate_guest_cache_includes() {
         1) want=cache ;;
         *)
           # A vhost without a root directive makes the helper's pipeline fail.
-          root=$(angie_vhost_root "$vhost" || true)
+          root=$(nginx_vhost_root "$vhost" || true)
           guest=""
           if [[ -n $root ]]; then guest=$(chevereto_guest_uploads "$root" || true); fi
           if [[ $guest == 1 ]]; then want=plain; fi
           ;;
       esac
       if [[ $want == cache ]]; then
-        if angie_rewrite_include_at_level "$vhost" php_chev.conf php_chev_cache.conf server; then
+        if nginx_rewrite_include_at_level "$vhost" php_chev.conf php_chev_cache.conf server; then
           tune_note "${rel}: Chevereto guest cache include is h5bp/php_chev_cache.conf (cookie-safe)"
         fi
-      elif angie_rewrite_include_at_level "$vhost" php_chev_cache.conf php_chev.conf server; then
+      elif nginx_rewrite_include_at_level "$vhost" php_chev_cache.conf php_chev.conf server; then
         tune_note "${rel}: Chevereto guest cache turned off (guest uploads are enabled or SETUP_CHEV_GUEST_CACHE=0)"
       elif [[ ${SETUP_CHEV_GUEST_CACHE:-} != 0 ]]; then
         opt_report "- Chevereto: \`${rel}\` allows guest uploads, so guest pages are not cached (a cached page cannot carry the visitor's upload token; SETUP_CHEV_GUEST_CACHE=1 overrides)"
       fi
     fi
     if grep -qE '^[[:space:]]*location[[:space:]]+@xf_guest_cache' "${target}/h5bp/php_xf.conf" 2>/dev/null \
-       && angie_rewrite_include_at_level "$vhost" php_xf.conf php.conf nested; then
+       && nginx_rewrite_include_at_level "$vhost" php_xf.conf php.conf nested; then
       tune_note "${rel}: nested h5bp/php_xf.conf include replaced by h5bp/php.conf (the guest cache is server-level only)"
     fi
     # server-configs-nginx 1.6.48: php_wp.conf has exact `= /index.php` and
-    # `= /wp-cron.php` locations, which Angie refuses inside another
+    # `= /wp-cron.php` locations, which nginx refuses inside another
     # location ("/index.php is outside location /blog/").  A subdirectory
     # install that nested it gets the generic, nestable php.conf, which
     # keeps its own deny rules.
     if grep -qE '^[[:space:]]*location[[:space:]]+=[[:space:]]*/index\.php' "${target}/h5bp/php_wp.conf" 2>/dev/null \
-       && angie_rewrite_include_at_level "$vhost" php_wp.conf php.conf nested; then
+       && nginx_rewrite_include_at_level "$vhost" php_wp.conf php.conf nested; then
       tune_note "${rel}: nested h5bp/php_wp.conf include replaced by h5bp/php.conf (php_wp.conf is server-level only)"
     fi
   done
   return 0
 }
 
-# Download the cache templates from the Angie config repository.  Kept
+# Download the cache templates from the nginx config repository.  Kept
 # separate from the installer fetch path so a failed download is a reported
 # miss instead of aborting --optimize.
 wordpress_cache_templates() {
@@ -1854,12 +2062,12 @@ wordpress_cache_templates() {
 # active http.d file defines fastcgicache.  WordPress and XenForo both use
 # it; a single owner avoids a second, inert cache_path.
 ensure_fastcgi_cache_zone() {
-  local target=${1:-/etc/angie} suffix file active_zone=0 src="" temp=""
-  suffix=$(angie_http_suffix "$target")
+  local target=${1:-/etc/nginx} suffix file active_zone=0 src="" temp=""
+  suffix=$(nginx_http_suffix "$target")
   while IFS= read -r file; do
     [[ -n $file ]] || continue
     grep -qE 'fastcgi_cache_path.*keys_zone=fastcgicache:' "$file" && active_zone=1
-  done < <(angie_active_http_files "$target")
+  done < <(nginx_active_http_files "$target")
   (( active_zone )) && return 0
 
   install -d -m 700 /home/nginx_cache 2>/dev/null || mkdir -p /home/nginx_cache
@@ -1882,13 +2090,13 @@ ensure_fastcgi_cache_zone() {
 }
 
 optimize_wordpress_cache() {
-  local target=${1:-/etc/angie}
+  local target=${1:-/etc/nginx}
   local -a wp_vhosts=()
-  mapfile -t wp_vhosts < <(angie_wordpress_vhosts "$target")
+  mapfile -t wp_vhosts < <(nginx_wordpress_vhosts "$target")
   (( ${#wp_vhosts[@]} > 0 )) || return 0
 
   local -a wp_active=()
-  mapfile -t wp_active < <(angie_active_http_files "$target")
+  mapfile -t wp_active < <(nginx_active_http_files "$target")
   if (( ${#wp_active[@]} == 0 )); then
     tune_miss "WordPress cache: no active http.d include pattern"
     return 0
@@ -2052,8 +2260,8 @@ tune_xf_location_security_headers() {
 # fastcgi_no_cache/fastcgi_cache_bypass.  Keeping it in its own managed file
 # lets --optimize repair old hosts without editing the repository template.
 ensure_xf_cookie_bypass_map() {
-  local target=${1:-/etc/angie} suffix file
-  suffix=$(angie_http_suffix "$target")
+  local target=${1:-/etc/nginx} suffix file
+  suffix=$(nginx_http_suffix "$target")
   file="${target}/http.d/zz-setup-fastcgi-cache-map${suffix}"
   if [[ ! -f $file ]] || ! grep -qE 'map[[:space:]]+\$http_cookie[[:space:]]+\$setup_xf_guest_bypass' "$file" \
      || ! grep -qE 'map[[:space:]]+\$http_accept_encoding[[:space:]]+\$setup_cache_enc' "$file" \
@@ -2064,7 +2272,7 @@ ensure_xf_cookie_bypass_map() {
     cat > "$file" <<'EOF'
 # BEGIN setup.sh XenForo cookie bypass map
 # Authenticated/session cookies bypass the guest cache.  This is a map (http
-# context) so no `if` is needed inside a location block in Angie.
+# context) so no `if` is needed inside a location block in nginx.
 # PHP turns ".", " " and "[" in a cookie name into "_", so "xf.session=<sid>"
 # logs the visitor in as $_COOKIE['xf_session'] while a literal xf_session=
 # test sees a guest, and the member's page was stored for every guest
@@ -2080,7 +2288,7 @@ map $http_cookie $setup_xf_guest_bypass {
 }
 # XenForo gzips its own output when the client accepts gzip.  The cache key
 # must vary on that, otherwise the first visitor's encoding is served to
-# everyone for the TTL: an identity body is then Brotli-compressed by Angie on
+# everyone for the TTL: an identity body is then Brotli-compressed by nginx on
 # every hit (measured 42% of 16 cores at 8k req/s), and a gzip body would
 # reach a client that did not ask for it.  Two variants only: gzip or plain.
 # The gzip token counts only without a q-value: "gzip;q=0" refuses gzip, and
@@ -2121,8 +2329,8 @@ EOF
     chmod 644 "$file"
     tune_note "XenForo: cookie bypass map installed (${file##*/})"
   fi
-  if ! angie_active_http_files "$target" | grep -qx "$file"; then
-    tune_miss "XenForo cache: ${file} is not included by angie.conf"
+  if ! nginx_active_http_files "$target" | grep -qx "$file"; then
+    tune_miss "XenForo cache: ${file} is not included by nginx.conf"
     return 1
   fi
   return 0
@@ -2180,9 +2388,9 @@ tune_xf_cache_default_deny() {
 # error-response policy and the 5-minute TTL.  Idempotent; a file that already
 # has the full block only receives the key/background-update repairs.
 ensure_xf_guest_cache() {
-  local target=${1:-/etc/angie}
+  local target=${1:-/etc/nginx}
   local -a xf_vhosts=()
-  mapfile -t xf_vhosts < <(angie_xenforo_vhosts "$target")
+  mapfile -t xf_vhosts < <(nginx_xenforo_vhosts "$target")
   (( ${#xf_vhosts[@]} > 0 )) || return 0
 
   local file="${target}/h5bp/php_xf.conf"

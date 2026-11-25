@@ -11,8 +11,9 @@
 #   1. restore every vhost from its pre-integration copy
 #      (/var/lib/setup.sh/anubis/vhosts/*.orig),
 #   2. remove the generated terminator/common/static/njs files,
-#   3. `angie -t` and a graceful reload, so the vhosts are back on 443 with
-#      Angie itself terminating TLS while the filter is still running,
+#   3. `angie -t` (or `nginx -t`) and a graceful reload, so the vhosts are
+#      back on 443 with the web server itself terminating TLS while the
+#      filter is still running,
 #   4. stop and disable the service, and (with --purge) delete the binary,
 #      its configuration, user and group,
 #   5. drop ANUBIS=1 from /etc/default/setup-tuning and move the state tree
@@ -20,7 +21,13 @@
 #
 # A vhost whose .orig copy is missing is left untouched and reported: the
 # script does not guess what its direct-TLS listener looked like.  Nothing is
-# stopped until Angie has loaded the restored tree.
+# stopped until the web server has loaded the restored tree.
+#
+# Anubis was only ever integrated into the Angie tree (/etc/angie, socket
+# /run/angie/anubis-backend.sock, angie.service), and setup.sh 1.22 refuses
+# to migrate a host that still runs it, so this script normally works on
+# Angie and must run BEFORE the 1.22 migration.  A tree that was carried to
+# /etc/nginx by hand is handled the same way with the compiled nginx.
 #
 # Usage:
 #   sudo bash tools/remove-anubis.sh [--purge] [--dry-run]
@@ -59,7 +66,31 @@ run() {
 
 (( EUID == 0 )) || die "run as root (sudo bash tools/remove-anubis.sh)"
 
-CONF_DIR=/etc/angie/conf.d
+# Pick the tree the integration lives in: Angie's unless only an /etc/nginx
+# copy carries it.  WEB_BIN is the binary that validates and WEB_UNIT the
+# service that reloads it.
+anubis_in_tree() { # NAME (angie|nginx)
+  local n=$1
+  [[ -e /etc/${n}/conf.d/00-anubis-terminators.conf || -e /etc/${n}/snippets/anubis-location.conf \
+     || -e /etc/tmpfiles.d/${n}-anubis.conf ]] && return 0
+  find "/etc/${n}/conf.d" -maxdepth 1 -type f -name '*.conf' \
+    -exec grep -lF "unix:/run/${n}/anubis-backend.sock" {} + 2>/dev/null | grep -q .
+}
+WEB=angie
+if ! anubis_in_tree angie && anubis_in_tree nginx; then
+  WEB=nginx
+fi
+if [[ $WEB == angie ]]; then
+  WEB_BIN=/usr/sbin/angie
+  WEB_UNIT=angie
+else
+  WEB_BIN=${NGINX_BIN:-/usr/local/lib/setup-nginx/sbin/nginx}
+  [[ -x $WEB_BIN ]] || WEB_BIN=/usr/sbin/nginx
+  WEB_UNIT=nginx
+fi
+WEB_ETC=/etc/${WEB}
+CONF_DIR=${WEB_ETC}/conf.d
+SOCK="unix:/run/${WEB}/anubis-backend.sock"
 STATE="${STATE_DIR}/anubis"
 MARKER="${STATE}/enabled"
 ORIG_DIR="${STATE}/vhosts"
@@ -67,11 +98,11 @@ GENERATED=(
   "${CONF_DIR}/00-anubis-terminators.conf"
   "${CONF_DIR}/00-anubis-common.conf"
   "${CONF_DIR}/00-anubis-static.conf"
-  /etc/angie/snippets/anubis-location.conf
-  /etc/angie/njs/anubis_pass.js
-  /etc/angie/modules-enabled/60-anubis-njs.conf
-  /etc/angie/ssl/anubis/pass-key.conf
-  /etc/tmpfiles.d/angie-anubis.conf
+  "${WEB_ETC}/snippets/anubis-location.conf"
+  "${WEB_ETC}/njs/anubis_pass.js"
+  "${WEB_ETC}/modules-enabled/60-anubis-njs.conf"
+  "${WEB_ETC}/ssl/anubis/pass-key.conf"
+  "/etc/tmpfiles.d/${WEB}-anubis.conf"
 )
 
 managed=0
@@ -87,7 +118,8 @@ fi
 say "Anubis teardown plan$( (( DRY )) && printf ' (dry run)')"
 say "- state:      ${STATE}"
 say "- vhosts:     restored from ${ORIG_DIR}"
-say "- generated:  ${#GENERATED[@]} file(s) under /etc/angie and /etc/tmpfiles.d"
+say "- web server: ${WEB} (${WEB_ETC}, ${WEB_BIN}, ${WEB_UNIT}.service)"
+say "- generated:  ${#GENERATED[@]} file(s) under ${WEB_ETC} and /etc/tmpfiles.d"
 say "- service:    stop and disable anubis.service"
 (( PURGE )) && say "- purge:      binary, /etc/anubis, unit, user and group removed"
 say ""
@@ -96,7 +128,7 @@ say ""
 # 1. Restore every vhost that is still integrated.
 # ---------------------------------------------------------------------------
 mapfile -t live < <(find "$CONF_DIR" -maxdepth 1 -type f -name '*.conf' \
-  -exec grep -lF 'unix:/run/angie/anubis-backend.sock' {} + 2>/dev/null | sort)
+  -exec grep -lF "$SOCK" {} + 2>/dev/null | sort)
 restored=0
 failed=0
 for f in "${live[@]}"; do
@@ -138,7 +170,7 @@ fi
 say "- restored ${restored} vhost(s)"
 
 # ---------------------------------------------------------------------------
-# 2. Remove the generated Angie files (moved aside, never unlinked).
+# 2. Remove the generated web server files (moved aside, never unlinked).
 # ---------------------------------------------------------------------------
 retired=0
 for f in "${GENERATED[@]}"; do
@@ -160,17 +192,21 @@ done
 say "- removed ${retired} generated file(s)"
 
 # ---------------------------------------------------------------------------
-# 3. Validate and reload Angie while the filter is still running.
+# 3. Validate and reload the web server while the filter is still running.
 # ---------------------------------------------------------------------------
 if (( ! DRY )); then
-  if ! /usr/sbin/angie -t >/tmp/anubis-teardown-angie-t.log 2>&1; then
-    warn "angie -t rejected the restored tree:"
-    sed -n '1,40p' /tmp/anubis-teardown-angie-t.log >&2
+  [[ -x $WEB_BIN ]] || die "${WEB_BIN} is missing; cannot validate the restored tree. anubis.service was NOT stopped."
+  # mktemp, not a fixed /tmp name: root must not write through a link
+  # another user planted there.
+  test_log=$(mktemp /tmp/anubis-teardown-test.XXXXXX) || die "could not create a temp file"
+  if ! "$WEB_BIN" -t >"$test_log" 2>&1; then
+    warn "${WEB} -t rejected the restored tree:"
+    sed -n '1,40p' "$test_log" >&2
     die "the generated files are already moved to /tmp; restore the ones named above before stopping the filter. anubis.service was NOT stopped."
   fi
-  if systemctl is-active --quiet angie; then
-    systemctl reload angie || die "angie reload failed; anubis.service was NOT stopped"
-    say "- angie -t OK, reloaded: vhosts answer on 443 directly again"
+  if systemctl is-active --quiet "$WEB_UNIT"; then
+    systemctl reload "$WEB_UNIT" || die "${WEB_UNIT} reload failed; anubis.service was NOT stopped"
+    say "- ${WEB} -t OK, reloaded: vhosts answer on 443 directly again"
   fi
 fi
 
@@ -242,7 +278,8 @@ if (( DRY )); then
 fi
 
 say ""
-say "Done. Every site now terminates TLS in Angie again; nothing sits in front"
+say "Done. Every site now terminates TLS in ${WEB} again; nothing sits in front"
 say "of it.  Put Cloudflare (or another CDN/WAF) in front of the origin for bot"
 say "filtering, then run 'sudo bash setup.sh --optimize' to apply the current"
-say "profile.  ${README_MARK}."
+say "profile (on an Angie host that run also migrates it to the compiled nginx)."
+say "${README_MARK}."

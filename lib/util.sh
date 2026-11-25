@@ -65,7 +65,7 @@ log_file() {
 ensure_log_dirs() {
   mkdir -p "$LOG_ROOT"
   chmod 755 "$LOG_ROOT"
-  ensure_log_dir angie         www-data     www-data
+  ensure_log_dir nginx         www-data     www-data
   ensure_log_dir php           www-data     www-data
   ensure_log_dir nodejs        www-data     www-data
   ensure_log_dir gifsicle      www-data     www-data
@@ -75,7 +75,7 @@ ensure_log_dirs() {
   getent passwd redis         >/dev/null 2>&1 && ensure_log_dir redis         redis        redis
   getent passwd elasticsearch >/dev/null 2>&1 && ensure_log_dir elasticsearch elasticsearch elasticsearch
 
-  log_file angie/error.log        www-data www-data
+  log_file nginx/error.log        www-data www-data
   log_file php/php-fpm.log        www-data www-data
   log_file php/php-fpm-slow.log   www-data www-data
   log_file php/php-error.log      www-data www-data
@@ -372,7 +372,7 @@ cleanup_configs() {
 }
 
 # Download/extract server-configs-nginx once for the whole run.  Only the
-# Angie installer consumes this tree; PHP-FPM templates are local configs/php.
+# nginx installer consumes this tree; PHP-FPM templates are local configs/php.
 fetch_server_configs() {
   if [[ -n ${CONFIG_SOURCE_DIR:-} && -d ${CONFIG_SOURCE_DIR} ]]; then
     info "Using server configs from ${CONFIG_SOURCE_DIR}"
@@ -395,7 +395,7 @@ fetch_server_configs() {
   elif command -v wget >/dev/null 2>&1 \
        && retry 3 5 wget -q --https-only --timeout=30 -O "$archive" "$url" 2>/dev/null; then
     # A stock Ubuntu image ships wget but not curl (26.04); --optimize must
-    # not need a package to fetch its Angie tree.
+    # not need a package to fetch its nginx tree.
     fetched=1
   fi
   if (( fetched )); then
@@ -419,8 +419,8 @@ fetch_server_configs() {
     src=$(find "$CONFIG_TEMP_DIR" -mindepth 1 -maxdepth 1 -type d \
       -name 'server-configs-nginx-*' 2>/dev/null | head -n1 || true)
   fi
-  if [[ -z $src || ! -f "${src}/angie.conf" ]]; then
-    warn "Downloaded server configs are missing angie.conf"
+  if [[ -z $src || ! -f "${src}/nginx.conf" ]]; then
+    warn "Downloaded server configs are missing nginx.conf"
     CONFIG_TEMP_DIR=""
     return 1
   fi
@@ -610,15 +610,21 @@ cron_compact_managed() {
 }
 
 # Drop bare ownership/maintenance jobs that no longer belong outside the
-# managed block: the pre-1.8.34 blanket chown, an earlier log-safe find, and
-# the old nginx/mysqlcheck paths.  write_cron() and purge_basic() both use
-# this so a host cannot keep two competing jobs (one of them broken).
+# managed block: the pre-1.8.34 blanket chown, an earlier log-safe find, the
+# old /etc/angie Cloudflare script and the old mysqlcheck paths.
+# write_cron() and purge_basic() both use this so a host cannot keep two
+# competing jobs (one of them broken).  Callers only ever pass the lines
+# OUTSIDE the managed block (cron_strip_managed first), so the managed
+# /etc/nginx/scripts/cloudflare.sh job is never seen here.  An unmanaged
+# /etc/nginx/scripts/cloudflare.sh line is kept too: since 1.22 that is the
+# live web tree again, not a pre-Angie leftover (R43, R75).  /etc/angie lines
+# point into a tree the migration moves to the backups, so they go; the
+# managed block regenerates the job for whichever tree serves.
 cron_strip_legacy_jobs() {
   awk '
     /chown[[:space:]]+www-data:www-data[[:space:]]+(-R|--recursive)[[:space:]]+\/var\/www([[:space:]]|\/|$)/ { next }
     /chown[[:space:]]+(-R|--recursive)[[:space:]]+www-data:www-data[[:space:]]+\/var\/www([[:space:]]|\/|$)/ { next }
     /\/usr\/bin\/find[[:space:]]+\/var\/www([[:space:]]|\/|$)/ && /chown/ { next }
-    /\/etc\/nginx\/scripts\/cloudflare\.sh/ { next }
     /\/etc\/angie\/scripts\/cloudflare\.sh/ { next }
     /\/usr\/bin\/mysqlcheck/ { next }
     /\/usr\/bin\/mariadb-check/ { next }
@@ -627,8 +633,57 @@ cron_strip_legacy_jobs() {
   '
 }
 
-cron_angie_configured() {
-  pkg_ok angie && [[ -f /etc/angie/angie.conf ]]
+# The compiled nginx serves /etc/nginx.  No dpkg query: nginx is never a
+# package in 1.22, and `pkg_ok nginx` would drop the chown and Cloudflare
+# jobs on every migrated host (R22, R43, R75).
+cron_nginx_configured() {
+  [[ -x ${NGINX_BIN:-/usr/local/lib/setup-nginx/sbin/nginx} && -f /etc/nginx/nginx.conf ]]
+}
+
+# The web tree the managed web jobs serve: /etc/angie while the host stays in
+# legacy-Angie mode (the nginx part of the migration refused or pending: Angie
+# still serves and still needs its Cloudflare real-IP refresh, R51), otherwise
+# /etc/nginx once the compiled nginx is configured.  Prints nothing and
+# returns 1 when no web server this script manages is configured.
+cron_web_etc() {
+  local st=""
+  if declare -F web_server_state >/dev/null 2>&1; then
+    st=$(web_server_state 2>/dev/null || true)
+  fi
+  if [[ $st == angie-legacy ]]; then
+    [[ -f /etc/angie/angie.conf ]] || return 1
+    printf '/etc/angie'
+    return 0
+  fi
+  cron_nginx_configured || return 1
+  printf '/etc/nginx'
+}
+
+# Absolute PHP CLI for the managed cron lines and the hardening helpers.
+# /usr/bin/php is the path the cron strings name; the PHP build lays it once
+# dpkg no longer owns it (php_build_links), and Sury's alternatives link
+# provides it until the migration.  /usr/local/bin/php is the build's own
+# link and is used when /usr/bin/php is absent (dpkg still owned the path
+# when the links were laid).  Prints nothing and returns 1 without a CLI.
+php_cli_path() {
+  local p
+  for p in /usr/bin/php /usr/local/bin/php; do
+    [[ -x $p ]] && { printf '%s' "$p"; return 0; }
+  done
+  p=$(command -v php 2>/dev/null || true)
+  [[ $p == /* && -x $p ]] || return 1
+  printf '%s' "$p"
+}
+
+# A managed cron command with the PHP CLI path this host actually has: the
+# strings in setup.sh name /usr/bin/php, which a host whose /usr/bin/php is
+# still missing would run as "command not found", silently (output goes to
+# /dev/null).  Unchanged when /usr/bin/php exists or no CLI is found.
+cron_php_command() {
+  local cmd=$1 cli
+  cli=$(php_cli_path) || { printf '%s' "$cmd"; return 0; }
+  [[ $cli == /usr/bin/php ]] && { printf '%s' "$cmd"; return 0; }
+  printf '%s' "${cmd//\/usr\/bin\/php /${cli} }"
 }
 
 cron_mariadb_configured() {
@@ -638,7 +693,7 @@ cron_mariadb_configured() {
 
 write_cron() {
   local cur tmp line group seen=" "
-  local angie_cron=0 mariadb_cron=0 wp_cron=0 xf_cron=0
+  local nginx_cron=0 mariadb_cron=0 wp_cron=0 xf_cron=0
   local -a lines=() existing=() preserved=()
 
   # Regenerate entries for installed services even when this run only selected
@@ -648,12 +703,13 @@ write_cron() {
   # from the command-line selection: install_basic calls write_cron before the
   # service installers run, so a selected-but-failed service must not leave a
   # cron job pointing at a missing binary or log directory.
-  if cron_angie_configured; then
-    angie_cron=1
+  local web_etc=""
+  if web_etc=$(cron_web_etc); then
+    nginx_cron=1
     lines+=("0 0 * * * ${CRON_WWW_CHOWN} >/dev/null 2>&1")
-    if [[ -x /etc/angie/scripts/cloudflare.sh ]]; then
-      lines+=('1 1 * * * /usr/bin/chmod +x /etc/angie/scripts/cloudflare.sh >/dev/null 2>&1')
-      lines+=('2 1 * * * /etc/angie/scripts/cloudflare.sh >/dev/null 2>&1')
+    if [[ -x ${web_etc}/scripts/cloudflare.sh ]]; then
+      lines+=("1 1 * * * /usr/bin/chmod +x ${web_etc}/scripts/cloudflare.sh >/dev/null 2>&1")
+      lines+=("2 1 * * * ${web_etc}/scripts/cloudflare.sh >/dev/null 2>&1")
     fi
   fi
   if cron_mariadb_configured; then
@@ -676,13 +732,13 @@ write_cron() {
     fi
   done < <(app_find_wordpress_configs)
   if (( wp_cron )); then
-    lines+=("*/5 * * * * ${CRON_WP_CRON} >/dev/null 2>&1 || true")
+    lines+=("*/5 * * * * $(cron_php_command "$CRON_WP_CRON") >/dev/null 2>&1 || true")
   fi
   # XenForo job runner: one entry for the host while XF_JOB_CRON=1 (default),
   # PHP is installed and at least one XenForo root exists.  The entry itself
   # loops over every root, so a site added later needs no cron change.
   persist_xf_job_cron
-  if (( XF_JOB_CRON )) && command -v php >/dev/null 2>&1; then
+  if (( XF_JOB_CRON )) && php_cli_path >/dev/null; then
     local xf_conf
     while IFS= read -r xf_conf; do
       [[ -n $xf_conf ]] || continue
@@ -691,7 +747,7 @@ write_cron() {
     done < <(app_find_xenforo_configs)
   fi
   if (( xf_cron )); then
-    lines+=("* * * * * ${CRON_XF_JOBS} >/dev/null 2>&1 || true")
+    lines+=("* * * * * $(cron_php_command "$CRON_XF_JOBS") >/dev/null 2>&1 || true")
   fi
   # Precompressed-asset refresh: only while the feature is on and the helper
   # exists (configure_asset_precompression writes it); dropped otherwise.
@@ -723,15 +779,19 @@ write_cron() {
       group=xenforo
     elif [[ $line == *"${CRON_PRECOMPRESS}"* ]]; then
       group=precompress
-    elif [[ $line == *'/etc/angie/'* || $line == *'/usr/bin/find /var/www'* || $line == *"${CRON_WWW_CHOWN_LEGACY}"* ]]; then
-      group=angie
+    elif [[ $line == *'/etc/nginx/'* || $line == *'/etc/angie/'* || $line == *'/usr/bin/find /var/www'* || $line == *"${CRON_WWW_CHOWN_LEGACY}"* ]]; then
+      group=nginx
     else
       group=unknown
     fi
     case "$group" in
-      angie)
-        (( angie_cron )) && continue
-        cron_angie_configured || continue
+      nginx)
+        # Regenerated above for the tree that serves.  An /etc/angie line is
+        # never carried over: after the migration that tree sits in the
+        # backups and the job would fail every night (R43, R75).
+        (( nginx_cron )) && continue
+        [[ $line == *'/etc/angie/'* ]] && continue
+        cron_nginx_configured || continue
         ;;
       mariadb)
         (( mariadb_cron )) && continue
@@ -744,7 +804,7 @@ write_cron() {
     esac
     # A preserved entry from an older release is rewritten in place so the
     # destructive blanket chown cannot survive a --basic run that does not
-    # select --angie again.  The earlier log-safe find (which did not exclude
+    # select --nginx again.  The earlier log-safe find (which did not exclude
     # the backup directory or *.log files) is upgraded to the current form.
     if [[ $line == *"${CRON_WWW_CHOWN_LEGACY}"* ]]; then
       line="0 0 * * * ${CRON_WWW_CHOWN} >/dev/null 2>&1"

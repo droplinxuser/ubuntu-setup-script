@@ -112,7 +112,7 @@ echo "Elasticsearch: indexed 5000 documents into stress_pages\n";
 // ---------------------------------------------------------------------------
 $frameFiles = [];
 foreach ([
-    ['Angie', [15, 23, 42], [56, 189, 248]],
+    ['nginx', [15, 23, 42], [56, 189, 248]],
     ['PHP + DB', [49, 16, 80], [244, 114, 182]],
 ] as $index => [$label, $bg, $fg]) {
     $im = imagecreatetruecolor(240, 120);
