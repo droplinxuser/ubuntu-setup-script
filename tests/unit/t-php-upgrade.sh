@@ -26,6 +26,12 @@
 # follow that across the source boundary.  The stubs are called indirectly
 # by the functions under test.
 # shellcheck disable=SC2034,SC2317,SC2329
+# tests/test-tuning.sh sources each unit file after it sourced setup.sh,
+# whose globals are readonly there: run this file in a fresh bash instead.
+if [[ ${BASH_SOURCE[0]} != "$0" ]]; then
+  bash "${BASH_SOURCE[0]}"
+  return
+fi
 set -Eeuo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -139,7 +145,7 @@ mk_vhost() { # tree name root
 
 sandbox() { # DIR: every path of lib/php-build.sh below DIR (call in a subshell)
   local d=$1
-  mkdir -p "$d/www" "$d/nginx/conf.d" "$d/units"
+  mkdir -p "$d/www" "$d/nginx/conf.d" "$d/units" "$d/etc"
   PHP_BUILD_ROOT=$d/root
   PHP_BUILD_ETC=$d/etc
   PHP_ACTIVE_FILE=$d/etc/setup-active

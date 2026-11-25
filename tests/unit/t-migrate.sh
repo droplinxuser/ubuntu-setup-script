@@ -23,6 +23,17 @@
 # The suites assign globals the sourced helpers read and define stubs that
 # the functions under test call indirectly; ShellCheck cannot follow that.
 # shellcheck disable=SC2034,SC2317,SC2329,SC2016,SC2030,SC2031
+
+# tests/test-tuning.sh sources every tests/unit file in a subshell that has
+# already sourced setup.sh, whose SCRIPT_* variables are readonly: sourcing
+# it again with the module overrides below would abort on the first one.
+# This file needs its own setup.sh load (the overrides must be in place
+# before it), so run it as a fresh process and hand its result back.
+if [[ ${BASH_SOURCE[0]} != "$0" ]] && declare -p SCRIPT_VERSION >/dev/null 2>&1; then
+  bash "${BASH_SOURCE[0]}"
+  return $?
+fi
+
 set -Eeuo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -463,10 +474,18 @@ fresh() {
 # ---------------------------------------------------------------------------
 # Integration: the helpers lib/migrate.sh calls in other modules
 # ---------------------------------------------------------------------------
-# migrate_sury_modules (and so the PHP pre-flight) needs B's one Sury module
-# probe; without it every running version is refused ("no module probe").
-check "lib/php-build.sh defines php_build_sury_loaded_exts (the Sury module probe migrate_sury_modules calls)" \
-  declare -F php_build_sury_loaded_exts
+# The project's one Sury module probe is the module's own (lib/php-build.sh
+# has none): `php-fpmX.Y -m` plus the CLI's own list, as build names.
+T_SURYBIN="$TMP/sury-bin"
+mkdir -p "$T_SURYBIN"
+printf '#!/bin/sh\nprintf "[PHP Modules]\\nCore\\nredis\\nPDO\\n\\n[Zend Modules]\\nZend OPcache\\n"\n' > "$T_SURYBIN/php-fpm8.3"
+printf '#!/bin/sh\nprintf "[PHP Modules]\\nCore\\nigbinary\\npcntl\\n\\n[Zend Modules]\\n"\n' > "$T_SURYBIN/php8.3"
+chmod +x "$T_SURYBIN/php-fpm8.3" "$T_SURYBIN/php8.3"
+check "module probe: FPM and CLI modules as one lower-case set (Zend OPcache -> zend_opcache)" \
+  eqv "$( MIGRATE_SURY_SBIN=$T_SURYBIN MIGRATE_SURY_BIN=$T_SURYBIN; migrate_sury_modules 8.3 | paste -sd' ' - )" \
+      "core igbinary pcntl pdo redis zend_opcache"
+check "module probe: a missing php-fpmX.Y is a failed probe, not an empty set" \
+  eqv "$( MIGRATE_SURY_SBIN=$T_SURYBIN MIGRATE_SURY_BIN=$T_SURYBIN; migrate_sury_modules 8.4 >/dev/null; echo "rc=$?" )" "rc=1"
 for fn in php_build_buildable_exts php_build_ensure php_build_layout php_fpm_test php_active_set \
           php_build_links php_build_tmpfiles_apply nginx_build_ensure nginx_build_tmpfiles_apply \
           valkey_build_ensure valkey_build_retire_legacy deploy_nginx_tree fetch_server_configs \
@@ -490,7 +509,7 @@ migrate_cron_handover() { rec "cron_handover"; }
 valkey_build_retire_legacy() { rec "valkey_build_retire_legacy"; }
 nginx_secure_auth_files() { rec "secure_auth $*"; }
 nginx_build_tmpfiles_apply() { rec "nginx_build_tmpfiles_apply"; }
-php_build_sury_loaded_exts() { printf 'redis\nmysqli\nopcache\n'; }
+migrate_sury_loaded_exts() { printf 'redis\nmysqli\nopcache\n'; }
 php_active_set() { rec "php_active_set $1"; printf '%s\n' "$1" > "$MIGRATE_PHP_ETC/setup-active"; }
 persist_tuning_var() { rec "persist $1=$2"; }
 php_build_layout() { rec "php_build_layout $*"; }
@@ -713,14 +732,14 @@ check "resume: no package is removed again" not_called "APT real"
 
 fresh
 snapa="$MIGRATE_BACKUP_ROOT/angie-earlier"
-mkdir -p "$snapa/etc/angie/http.d" "$T_ANGIE"
-printf 'events {}\n' > "$snapa/etc/angie/angie.conf"
+mkdir -p "$snapa$T_ANGIE/http.d" "$T_ANGIE"
+printf 'events {}\n' > "$snapa$T_ANGIE/angie.conf"
 printf 'live\n' > "$T_ANGIE/live.conf"
 migrate_state_set angie-moved "$snapa"
 out=$( ( migrate_angie_move_aside; echo "rc=$?" ) 2>&1 )
 check "resume: a recorded complete Angie snapshot is reused" has "$out" "rc=0"
 check "resume: /etc/angie is never snapshotted twice" test -f "$T_ANGIE/live.conf"
-rm -rf -- "$snapa/etc/angie/http.d"
+rm -rf -- "$snapa$T_ANGIE/http.d"
 out=$( ( migrate_angie_move_aside; echo "rc=$?"; printf 'R %s\n' "${MIGRATE_REPORT[@]}" ) 2>&1 )
 check "resume: an incomplete recorded Angie snapshot refuses the purge" has "$out" "rc=1"
 check "resume: the refusal names the incomplete snapshot" has "$out" "is incomplete; Angie purge refused"
@@ -913,8 +932,8 @@ check "pre-flight: a refused version is not migrated" has "$out" "todo=[]"
 fresh
 pkgs "ii php8.3-fpm"
 active php8.3-fpm
-out=$( ( unset -f php_build_sury_loaded_exts; migrate_preflight_disk() { :; }; migrate_preflight 0 ) 2>&1 )
-check "pre-flight: without the module probe the version is refused, not moved blind" \
+out=$( ( migrate_sury_loaded_exts() { return 1; }; migrate_preflight_disk() { :; }; migrate_preflight 0 ) 2>&1 )
+check "pre-flight: a failed module probe refuses the version, not moved blind" \
   eqv "$(st php-8.3)" "refused:no module probe"
 fresh
 pkgs "ii php8.3-fpm" "ii php8.4-fpm"

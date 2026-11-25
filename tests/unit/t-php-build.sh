@@ -23,6 +23,12 @@
 # follow that across the source boundary.  The stubs are called indirectly
 # by the functions under test.
 # shellcheck disable=SC2034,SC2317,SC2329
+# tests/test-tuning.sh sources each unit file after it sourced setup.sh,
+# whose globals are readonly there: run this file in a fresh bash instead.
+if [[ ${BASH_SOURCE[0]} != "$0" ]]; then
+  bash "${BASH_SOURCE[0]}"
+  return
+fi
 set -Eeuo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -161,7 +167,7 @@ mk_vhost() { # tree name root
 # Point every path of lib/php-build.sh below DIR.  Call inside a subshell.
 sandbox() { # DIR
   local d=$1
-  mkdir -p "$d/www" "$d/nginx/conf.d"
+  mkdir -p "$d/www" "$d/nginx/conf.d" "$d/etc"
   PHP_BUILD_ROOT=$d/root
   PHP_BUILD_ETC=$d/etc
   PHP_ACTIVE_FILE=$d/etc/setup-active
@@ -418,7 +424,11 @@ out=$(extopt "$tf" "" "intl,GMP") || true
 check "ext=intl,GMP adds both, sorted and lower-case" has "$out" "rc=0 extra=gmp,intl "
 check "adding names does not allow the set to shrink" has "$out" "reset=unset"
 check "PHP_EXT_EXTRA is exported to the build tool" has "$out" "exported=gmp,intl"
-check "PHP_EXT_EXTRA is persisted in the tuning file" file_line "$tf" "PHP_EXT_EXTRA=gmp,intl"
+# The file is written shell-quoted (%q; bash escapes the comma) and sourced
+# by the host: compare the value it yields.
+# shellcheck disable=SC1090
+tuning_value() ( unset "$2"; source "$1"; printf "%s" "${!2-unset}" ) # FILE KEY
+check "PHP_EXT_EXTRA is persisted in the tuning file" test "$(tuning_value "$tf" PHP_EXT_EXTRA)" = "gmp,intl"
 out=$(extopt "$tf" "gmp,intl" "-intl") || true
 check "ext=-intl drops one name" has "$out" "rc=0 extra=gmp "
 check "ext=-NAME allows the next build to shrink" has "$out" "reset=1"

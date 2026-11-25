@@ -1256,14 +1256,29 @@ migrate_php_listeners() {
 }
 
 # Modules the package PHP X.Y loads today, FPM and CLI (each with its own
-# ini tree), as build names (R25, R58).  The project has one Sury module
-# probe, B's php_build_sury_loaded_exts (lib/php-build.sh); this only
-# filters its output to plain module names (a startup warning printed on
-# stdout is dropped).  Status 1 when that probe is not loaded: the set is
-# then unknown, which is not the same as "nothing loaded".
+# ini tree), lower-cased (R2.9, R25, R58).  This is the project's one Sury
+# module probe: lib/php-build.sh has none, the Sury paths are this
+# module's.  `php-fpmX.Y -m` must run; the CLI adds what only it loads
+# when present.  Status 1 when the FPM binary is missing or fails: the set
+# is then unknown, which is not the same as "nothing loaded".
+MIGRATE_SURY_SBIN=${SETUP_MIGRATE_SURY_SBIN:-/usr/sbin}
+MIGRATE_SURY_BIN=${SETUP_MIGRATE_SURY_BIN:-/usr/bin}
+migrate_sury_loaded_exts() { # X.Y
+  local fpm="$MIGRATE_SURY_SBIN/php-fpm$1" cli="$MIGRATE_SURY_BIN/php$1" out
+  [[ -x $fpm ]] || return 1
+  out=$("$fpm" -m 2>/dev/null) || return 1
+  if [[ -x $cli ]]; then out+=$'\n'$("$cli" -m 2>/dev/null || true); fi
+  printf '%s\n' "$out" | grep -v '^\[' | tr '[:upper:]' '[:lower:]' || true
+}
+
+# The probe's output as plain module names ("Zend OPcache" becomes
+# zend_opcache; a startup warning printed on stdout is dropped).  Status 1
+# when the probe failed.
 migrate_sury_modules() {
-  declare -F php_build_sury_loaded_exts >/dev/null 2>&1 || return 1
-  php_build_sury_loaded_exts "$1" 2>/dev/null | tr ' ' '_' | grep -E '^[a-z0-9_]+$' | sort -u || true
+  local out
+  out=$(migrate_sury_loaded_exts "$1" 2>/dev/null) || return 1
+  printf '%s\n' "$out" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | tr ' ' '_' \
+    | grep -E '^[a-z0-9_]+$' | sort -u || true
 }
 
 # The extra web tree B's extension detection must walk during the PHP
@@ -1448,14 +1463,14 @@ migrate_preflight() {
       continue
     fi
     local -a keep=() unb_fpm=() unb_req=()
-    # One module probe for the project (B's php_build_sury_loaded_exts).
-    # Without it the modules Sury loads are unknown, and moving the version
-    # could drop extensions without a word: refuse instead (retried when the
-    # scan digest changes).
-    if ! declare -F php_build_sury_loaded_exts >/dev/null 2>&1; then
-      if (( dry )); then printf '  PHP %s: refused, the loaded-module probe (lib/php-build.sh) is not loaded\n' "$v"
+    # The project's one module probe (migrate_sury_modules).  When it fails
+    # the modules Sury loads are unknown, and moving the version could drop
+    # extensions without a word: refuse instead (retried when the scan
+    # digest changes).
+    if ! migrate_sury_modules "$v" >/dev/null 2>&1; then
+      if (( dry )); then printf '  PHP %s: refused, the loaded-module probe (php-fpm%s -m) failed\n' "$v" "$v"
       else migrate_state_set "php-${v}" "refused:no module probe"; migrate_state_set "php-${v}.scan" "$(migrate_php_scan_digest "$v")"
-           migrate_fail "PHP ${v}: lib/php-build.sh is not loaded, so the modules Sury loads cannot be read; Sury keeps serving and is not purged"; fi
+           migrate_fail "PHP ${v}: php-fpm${v} -m failed, so the modules Sury loads cannot be read; Sury keeps serving and is not purged"; fi
       continue
     fi
     while read -r e line; do
@@ -1908,8 +1923,13 @@ migrate_acme_to_self_signed() {
     [[ -n $f ]] || continue
     n=$(( n + 1 ))
     hsts=0
+    # The vhost or one of the files it includes.  (xargs -r over an empty
+    # include list exits 0 without running grep: a vhost with no includes
+    # was once reported as sending HSTS.)
+    local -a incs=()
+    mapfile -t incs < <(migrate_conf_closure "$MIGRATE_NGINX_ETC" "$f" 2>/dev/null | tail -n +2)
     if grep -qiE '^[^#]*strict-transport-security' "$f" 2>/dev/null \
-       || migrate_conf_closure "$MIGRATE_NGINX_ETC" "$f" | tail -n +2 | xargs -r grep -qiE '^[^#]*strict-transport-security' 2>/dev/null; then
+       || { (( ${#incs[@]} > 0 )) && grep -qiE '^[^#]*strict-transport-security' "${incs[@]}" 2>/dev/null; }; then
       hsts=1
     fi
     cf=""
@@ -3007,7 +3027,7 @@ migrate_angie_move_aside() {
   snap=$(migrate_state_get angie-moved)
   if [[ -n $snap && -d $snap ]]; then
     # Never re-snapshot (R74): a resumed run finds the tree already moved.
-    [[ -f $snap/etc/angie/angie.conf && -d $snap/etc/angie/http.d ]] || {
+    [[ -f ${snap}${MIGRATE_ANGIE_ETC}/angie.conf && -d ${snap}${MIGRATE_ANGIE_ETC}/http.d ]] || {
       migrate_fail "the recorded Angie snapshot ${snap} is incomplete; Angie purge refused"
       return 1
     }
@@ -3023,7 +3043,7 @@ migrate_angie_move_aside() {
     mkdir -p "${snap}$(dirname "$f")" && cp -a -- "$f" "${snap}$(dirname "$f")/" || true
   done
   migrate_stash "$MIGRATE_ANGIE_ETC" "$snap" || { migrate_fail "moving /etc/angie to ${snap} failed; Angie purge refused"; return 1; }
-  [[ -f $snap/etc/angie/angie.conf ]] || { migrate_fail "${snap} holds no angie.conf; Angie purge refused"; return 1; }
+  [[ -f ${snap}${MIGRATE_ANGIE_ETC}/angie.conf ]] || { migrate_fail "${snap} holds no angie.conf; Angie purge refused"; return 1; }
   # Owned by root: the angie UID may be freed by the purge (R37).
   chown -R root:root "$snap" 2>/dev/null || true
   chmod 700 "$snap"

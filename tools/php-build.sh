@@ -731,7 +731,9 @@ verify_candidates() { # X.Y fpm cli opcache.so set work
     [[ $(bin_ini_default "$cli" pdo_mysql.default_socket) == "$MYSQL_SOCK" ]] || die "candidate pdo_mysql.default_socket is not $MYSQL_SOCK"
   fi
   for f in "$fpm" "$cli" ${oc:+"$oc"}; do
-    needed=$(readelf -d "$f" 2>/dev/null | awk -F'[][]' '/\(NEEDED\)/ { print $2 }')
+    # A file readelf cannot read (no ELF header) has no NEEDED entries; under
+    # pipefail its status must not end the verify without a message.
+    needed=$(readelf -d "$f" 2>/dev/null | awk -F'[][]' '/\(NEEDED\)/ { print $2 }') || needed=""
     if grep -qE "$STATIC_LIBS_RE" <<<"$needed"; then
       die "${f##*/} links Ubuntu's $(grep -E "$STATIC_LIBS_RE" <<<"$needed" | tr '\n' ' ')instead of the upstream builds"
     fi

@@ -14,6 +14,15 @@
 # shellcheck disable=SC2034,SC2317,SC2329
 set -Eeuo pipefail
 
+# tests/test-tuning.sh sources every unit file in a subshell after it has
+# sourced setup.sh itself: setup.sh cannot be sourced twice (its readonly
+# SCRIPT_* variables) and the suite's stubs would leak into these checks.
+# Run this file in a fresh shell instead; its output and status are what
+# the caller collects.
+if [[ -n ${SCRIPT_VERSION:-} ]]; then
+  exec bash "${BASH_SOURCE[0]}"
+fi
+
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 PASS=0
 FAIL=0

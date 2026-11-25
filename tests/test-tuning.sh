@@ -534,9 +534,9 @@ check "CRON_XF_JOBS contains no percent sign (crontab newline)" \
 check "CRON_XF_JOBS skips database dumps, backups and .old copies" \
   bash -c '[[ $0 == *mysql_database* && $0 == *backup* && $0 == *.old* ]]' "$CRON_XF_JOBS"
 check "managed WordPress cron redirects the whole loop" \
-  grep -q 'CRON_WP_CRON} >/dev/null 2>&1 || true' "$ALL_SRC"
+  grep -qF 'cron_php_command "$CRON_WP_CRON") >/dev/null 2>&1 || true' "$ALL_SRC"
 check "managed XF cron redirects the whole loop (source)" \
-  grep -q 'CRON_XF_JOBS} >/dev/null 2>&1 || true' "$ALL_SRC"
+  grep -qF 'cron_php_command "$CRON_XF_JOBS") >/dev/null 2>&1 || true' "$ALL_SRC"
 check "CRON_XF_JOBS no longer ends with its own || true" \
   bash -c '[[ $0 != *"done || true" ]]' "$CRON_XF_JOBS"
 
@@ -1482,7 +1482,7 @@ check "the tuner follows the live pool only for the live tree without a socket h
 # server-level only and nginx -t fails otherwise).
 deploy_body=$(declare -f deploy_nginx_tree)
 check "the nginx deploy test migrates nested XF includes first" \
-  bash -c 'a=$(grep -n "nginx_migrate_guest_cache_includes" <<<"$1" | head -1 | cut -d: -f1); b=$(grep -n "nginx -t" <<<"$1" | head -1 | cut -d: -f1); [[ -n $a && -n $b && $a -lt $b ]]' _ "$deploy_body"
+  bash -c 'a=$(grep -n "nginx_migrate_guest_cache_includes" <<<"$1" | head -1 | cut -d: -f1); b=$(grep -n "nginx_test_tree" <<<"$1" | head -1 | cut -d: -f1); [[ -n $a && -n $b && $a -lt $b ]]' _ "$deploy_body"
 
 # A PHP include that only holds locations has no FastCGI buffers of its own:
 # h5bp/php_wp.conf now includes h5bp/php_wp_handler.conf for the handler, so
@@ -3774,9 +3774,13 @@ check "after retirement nothing in the tree uses zstd (the zstd_conf template is
 printf 'load_module modules/ngx_http_zstd_filter_module.so;\n' > "$zt/modules-enabled/70-own-zstd.conf"
 nginx_retire_zstd "$zt" >/dev/null 2>&1
 check "an operator's own zstd stanza is kept" test -e "$zt/modules-enabled/70-own-zstd.conf"
-check "an operator's own zstd stanza counts as zstd in use" zt_in_use
+# 1.22: SCN's nginx.conf no longer includes modules-enabled (R69), so a
+# stanza there is not live; zstd directives in an included file are.
+check "an operator's own zstd stanza counts as zstd in use only where nginx reads it (not modules-enabled)" zt_unused
 check "a second retirement pass changes nothing" test "$NGINX_ZSTD_RETIRED" = 0
-rm -f "$zt/modules-enabled/70-own-zstd.conf"
+printf 'zstd on;\n' > "$zt/http.d/own-zstd.conf"
+check "an operator's own zstd stanza counts as zstd in use" zt_in_use
+rm -f "$zt/modules-enabled/70-own-zstd.conf" "$zt/http.d/own-zstd.conf"
 # 1.22: nginx is compiled with Brotli as a static module and without zstd.
 # Compression installs nothing and writes no load_module; there is no zstd
 # package left to purge (nginx_purge_zstd_module is an always-empty stub).
@@ -3817,15 +3821,19 @@ check "module loads: the retirement is reported" test "$(cat "$TMP/modload.rc")"
 ( tune_reset_changes; nginx_retire_module_loads "$ml"; printf '%s' "$NGINX_MODULE_LOADS_RETIRED" > "$TMP/modload.rc" ) >/dev/null 2>&1
 check "module loads: a second pass changes nothing" test "$(cat "$TMP/modload.rc")" = 0
 unset ml
-# An operator file that uses zstd relies on the managed load_module: nothing
-# is retired while it does (moving it would make nginx -t fail).
+# 1.22: the compiled nginx has no zstd module, so keeping the managed
+# load_module for an operator file cannot help (nginx -t rejects the zstd
+# directives either way).  The managed stanza is retired and the operator
+# file is named so the operator removes the directives there.
 zo="$TMP/zstd-own"; mkdir -p "$zo/modules-enabled" "$zo/http.d" "$zo/conf.d"
 printf '# Managed by setup.sh: dynamic Zstandard for clients that accept it.\nload_module modules/ngx_http_zstd_filter_module.so;\n' > "$zo/modules-enabled/60-zstd.conf"
 printf 'server {\n    zstd off;\n}\n' > "$zo/conf.d/site.conf"
-nginx_retire_zstd "$zo" >/dev/null 2>&1
-check "the managed zstd stanza stays while an operator file uses zstd" test -e "$zo/modules-enabled/60-zstd.conf"
-check "that case retires nothing" test "$NGINX_ZSTD_RETIRED" = 0
 check "the operator file is named as the zstd user" test "$(nginx_zstd_users "$zo" "$zo/modules-enabled/60-zstd.conf")" = "$zo/conf.d/site.conf"
+( tune_reset_changes; nginx_retire_zstd "$zo"
+  printf '%s\n' "$NGINX_ZSTD_RETIRED" "${TUNE_MISSES[@]}" > "$TMP/zstd-own.out" ) >/dev/null 2>&1 || true
+check "the managed zstd stanza is retired even while an operator file uses zstd (no zstd module in 1.22)" test ! -e "$zo/modules-enabled/60-zstd.conf"
+check "that case reports the retirement" test "$(head -1 "$TMP/zstd-own.out")" = 1
+check "that case still reports the operator file as a miss" grep -qF "zstd: this nginx is built without zstd, but $zo/conf.d/site.conf" "$TMP/zstd-own.out"
 unset zo
 unset -f zt_in_use zt_unused zt_no_install zt_stub_empty nb_static nb_dynamic nb_rc; unset zt
 check "asset precompression is on by default" test "$PRECOMPRESS_ASSETS" = 1
@@ -5235,20 +5243,27 @@ pe_run() { # app root loaded-before loaded-after -> "builds|warnings"
     paste -sd'|' - < "$TMP/pe.log"
   )
 }
+# The 1.22 requirement table (R2.9): Chevereto needs all of these; redis is
+# the one the build below lacks.
+pe_chev="pdo_mysql pdo mysqli igbinary gd curl mbstring exif fileinfo xmlwriter zip"
 check "a new Chevereto site whose build lacks redis gets a refresh rebuild of that version" \
-  test "$(pe_run chevereto "$TMP/apps/chev/public" "mysqli gd curl mbstring" "mysqli gd curl mbstring redis")" = "build 8.5 full refresh info"
+  test "$(pe_run chevereto "$TMP/apps/chev/public" "$pe_chev" "$pe_chev redis")" = "build 8.5 full refresh info"
 check "a rebuild that still lacks the module warns with the ext= remedy" \
   bash -c '[[ $1 == "build 8.5 full refresh info|WARN "*"still does not load redis"*"--php ext=redis"* ]]' _ \
-  "$(pe_run chevereto "$TMP/apps/chev/public" "mysqli gd curl mbstring" "mysqli gd curl mbstring")"
+  "$(pe_run chevereto "$TMP/apps/chev/public" "$pe_chev" "$pe_chev")"
 check "a Chevereto site whose FPM already loads redis gets nothing" \
-  test "$(pe_run chevereto "$TMP/apps/chev/public" "mysqli gd curl mbstring redis imagick" "")" = ""
+  test "$(pe_run chevereto "$TMP/apps/chev/public" "$pe_chev redis imagick" "")" = ""
 printf "\$config['cache']['provider'] = 'SV\\\\RedisCache\\\\Redis';\n" > "$TMP/apps/xf/public/src/config.php"
 check "a XenForo site (SV RedisCache or no cache) gets no rebuild" \
-  test "$(pe_run xenforo "$TMP/apps/xf/public" "mysqli gd curl mbstring xml zip" "")" = ""
+  test "$(pe_run xenforo "$TMP/apps/xf/public" "mysqli gd curl mbstring xml zip exif" "")" = ""
 check "an unknown module list rebuilds nothing (no guessing)" \
   test "$(pe_run chevereto "$TMP/apps/chev/public" "" "")" = ""
+# 1.22: create_domains hands the new sites' app types to one rebuild
+# (domain_php_extensions -> PHP_BUILD_APPS), named as the requirement table
+# names them.
 check "--domain maps app=xf to the XenForo requirements" \
-  grep -qF 'case $app in xf) req_app=xenforo ;; *) req_app=$app ;; esac' "$ALL_SRC"
+  bash -c '[[ $1 == xenforo && $2 == chevereto ]] && sed -n "/^create_domains()/,/^}/p" "$3" | grep -qxE "[[:space:]]*domain_php_extensions"' _ \
+  "$(services_php_build_app xf)" "$(services_php_build_app chevereto)" "$ALL_SRC"
 upg_body=$(sed -n '/^run_php_upgrade()/,/^}/p' "$ALL_SRC")
 check "--upgrade-php refuses before the snapshot (refusals, conflicts)" \
   bash -c 'a=$(grep -n "php_upgrade_refusals" <<<"$1" | head -1 | cut -d: -f1); c=$(grep -n "php_upgrade_listen_conflicts" <<<"$1" | head -1 | cut -d: -f1); b=$(grep -n "php_upgrade_snapshot \"\$cur\"" <<<"$1" | head -1 | cut -d: -f1); [[ -n $a && -n $c && -n $b && $a -lt $b && $c -lt $b ]]' _ "$upg_body"
@@ -7229,8 +7244,13 @@ check "every extension PHP_BUILDABLE_EXTS lists has a configure case in tools/ph
 check "the base set has neither intl (ICU doubles the binary) nor xmlreader" \
   bash -c 'printf "%s\n" "$@" | grep -qxE "intl|xmlreader" && exit 1; exit 0' _ "${PHP_BASE_EXTS[@]}" "${PHP_GENERIC_EXTS[@]}"
 
-# The tool itself, sourced in a subshell (it sets its own shell options).
+# The tool itself, sourced in a fresh bash: it sets its own shell options,
+# and its globals (BACKUP_DIR, ...) are readonly in this shell, which sourced
+# setup.sh.
 pb_tool_case() { # case -> result line
+  ROOT=$ROOT TMP=$TMP bash -c "$(declare -f pb_tool_body); pb_tool_body \"\$1\"" _ "$1"
+}
+pb_tool_body() {
   (
     T="$TMP/pbt"; rm -rf "$T"; mkdir -p "$T/root/8.5/sbin" "$T/units" "$T/etc"
     export PHP_BUILD_ROOT="$T/root" PHP_BUILD_UNIT_DIR="$T/units" PHP_BUILD_ETC="$T/etc" \
@@ -7327,7 +7347,7 @@ check "the shared refresh timer runs the build chain daily" \
   bash -c 'grep -q "^ExecStart=.*refresh" <<<"$1" && grep -qx "OnCalendar=daily" <<<"$2" && grep -qx "Persistent=true" <<<"$2"' _ "$sb_refresh_unit" "$sb_refresh_timer"
 check "phpinfo is not in the shipped disable_functions (XenForo/WordPress admin pages use it)" \
   bash -c '! grep -E "^disable_functions" "$1/configs/php/custom_dan.ini" | grep -q phpinfo && grep -qx "disable_functions = show_source" "$1/configs/php/custom_dan.ini"' _ "$ROOT"
-unset -f pb_tool_case lean_set_ok pb_traps_ok gpg_home_ok
+unset -f pb_tool_case pb_tool_body lean_set_ok pb_traps_ok gpg_home_ok
 
 # ---- hardening and shared build code (1.21.70, carried into 1.22)
 PFB_SRC=$(cat "$ROOT/tools/php-build.sh" "$ROOT/tools/build-common.sh")
@@ -7391,7 +7411,7 @@ nginx_modules=$(sed -n '/^CONFIGURE_MODULES=(/,/^)/p' "$ROOT/tools/nginx-build.s
 check "nginx-build: only the modules server-configs-nginx uses (no mail/stream/ssi/grpc ...)" \
   bash -c 'for w in http_v3_module http_realip_module http_gzip_static_module http_stub_status_module with-threads without-http_ssi_module without-http_grpc_module; do grep -q -- "$w" <<<"$1" || exit 1; done; ! grep -qE -- "--with-(mail|stream|http_dav|http_mp4|http_sub|http_acme)" <<<"$1"' _ "$nginx_modules"
 check "nginx-build: Brotli is compiled in statically (--add-module, never a dynamic module)" \
-  bash -c 'grep -qF -- "--add-module=\"\$work/ngx_brotli\"" "$1" && ! grep -q -- "--add-dynamic-module" "$1"' _ "$ROOT/tools/nginx-build.sh"
+  bash -c 'grep -qF -- "--add-module=\"\$work/ngx_brotli\"" "$1" && ! grep -qE -- "^[^#]*--add-dynamic-module" "$1"' _ "$ROOT/tools/nginx-build.sh"
 check "nginx-build: auth_basic and limit_req compiled in, limit_conn left out; recipe 4" \
   bash -c '! grep -q -- "--without-http_auth_basic_module" <<<"$1" && ! grep -q -- "--without-http_limit_req_module" <<<"$1" && grep -q -- "--without-http_limit_conn_module" <<<"$1" && grep -q "^BUILD_RECIPE=4" "$2"' \
   _ "$nginx_modules" "$ROOT/tools/nginx-build.sh"
