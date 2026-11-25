@@ -44,8 +44,9 @@ anubis_host_present() {
   return 1
 }
 
-# 0 when the Anubis files sit in the Angie tree: the 1.22 tools/remove-anubis.sh
-# only knows /etc/nginx, so such a host needs the 1.21.71 copy of the tool.
+# 0 when the Anubis files sit in the Angie tree.  This checkout's
+# tools/remove-anubis.sh detects that tree (/etc/angie, angie.service) and
+# tears it down; the refusal names the tree so the operator knows which.
 anubis_in_angie_tree() {
   local f
   for f in /etc/angie/conf.d/00-anubis-terminators.conf \
@@ -707,7 +708,7 @@ validate_all() {
   # still be able to remove nginx from such a host (the tool is the supported
   # path, but a purge that refuses is a trap).
   if (( ! PURGE && ! DIAGNOSTICS )) && anubis_in_angie_tree; then
-    die "this host still runs the Anubis bot filter in /etc/angie, which was removed in 1.21.62. Run 'sudo bash tools/remove-anubis.sh' from the 1.21.71 release first (this release's copy only knows /etc/nginx), then re-run setup.sh."
+    die "this host still runs the Anubis bot filter in /etc/angie, which was removed in 1.21.62. Run 'sudo bash tools/remove-anubis.sh' from this checkout first (it detects the Angie tree, restores every vhost to direct TLS and removes the generated files), then re-run setup.sh."
   fi
   if (( ! PURGE && ! DIAGNOSTICS )) && anubis_host_present; then
     die "this host still runs the Anubis bot filter, which was removed in 1.21.62. Run 'sudo bash tools/remove-anubis.sh' first (it restores every vhost to direct TLS and removes the generated nginx files), then re-run setup.sh."

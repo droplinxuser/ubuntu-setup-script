@@ -202,7 +202,8 @@ services_mem_allows() { # php|valkey
 # would put its binary and maintainer scripts back under our units).  Same
 # file and format as the migration's pin (lib/migrate.sh), merged, so either
 # writer keeps the other's families.  Installed packages are not touched by a
-# -1 pin; --purge removes the file.
+# -1 pin; --purge drops a purged component's patterns (and the file when
+# none is left: lib/purge.sh purge_apt_pin_remove).
 SERVICES_APT_PIN=${MIGRATE_APT_PIN:-/etc/apt/preferences.d/setup-source-builds}
 services_apt_pin_add() { # "pattern ..."
   local add=$1 old="" tmp
@@ -214,7 +215,7 @@ services_apt_pin_add() { # "pattern ..."
   {
     printf '# Managed by setup.sh 1.22: nginx, PHP and Valkey are built from source\n'
     printf '# (/usr/local/lib/setup-*).  These packages would take back paths and\n'
-    printf '# unit names the source builds own.  --purge removes this file.\n'
+    printf '# unit names the source builds own.  --purge drops a purged component.\n'
     printf 'Package: %s\nPin: release *\nPin-Priority: -1\n' \
       "$(printf '%s %s\n' "$old" "$add" | tr ' ' '\n' | sed '/^$/d' | sort -u | paste -sd' ' -)"
   } > "$tmp"
@@ -490,6 +491,12 @@ install_php() {
   # as PHP_EXT_EXTRA), add-only against the current build.  A host with no
   # application yet gets the union of the WordPress, XenForo and Chevereto
   # sets, so a site dropped in later does not answer 500.
+  # --php ext=LIST is recorded here (the run lock is held and every refusal
+  # above has passed): php_build_ext_option sets and exports PHP_EXT_EXTRA
+  # and PHP_BUILD_EXT_RESET in this shell, the same shell (run_service's
+  # subshell) in which php_build_ensure computes php_build_effective_exts,
+  # and the exports reach the build tool it starts.
+  php_ext_request_apply
   local apps
   apps=$(services_php_build_apps)
   if [[ ${ENABLED[domain]:-0} -eq 1 && -n $apps ]]; then
@@ -1594,16 +1601,6 @@ Environment=MYSQLD_OPTS=
 Environment=_WSREP_NEW_CLUSTER='
   fi
   write_service_limits_dropin /etc/systemd/system/mariadb.service.d/limits.conf "$content"
-}
-
-# 1.22: the compiled PHP's own phpX.Y-fpm.service carries LimitNOFILE,
-# LimitCORE, KillSignal, TimeoutStopSec and UMask (php_build_unit_text), and
-# php_build_unit_write moves a 1.21 limits.conf drop-in to the backups.
-# Writing the drop-in again would only be moved aside on the next layout, so
-# this reports "unchanged" (1) and writes nothing.  Kept for callers that
-# still ask (lib/service-optimizers.sh) until they drop the call.
-php_fpm_write_systemd_limits() {
-  return 1
 }
 
 # ---------------------------------------------------------------------------

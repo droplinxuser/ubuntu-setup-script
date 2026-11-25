@@ -13,31 +13,10 @@
 # shellcheck disable=SC2034
 # ---------------------------------------------------------------------------
 
-# Match the installer's systemd fd limit on an existing server too.  Only the
-# fd limit is checked: nginx daemonises with umask(0), so a UMask= drop-in
-# does not change the modes of the files its workers create.  Rewriting an
-# unchanged file would force a needless restart, so compare first.
-NGINX_UNIT_CHANGED=0
-ensure_nginx_limits() {
-  local nginx_limit nginx_dropin=/etc/systemd/system/nginx.service.d/limits.conf
-  NGINX_UNIT_CHANGED=0
-  nginx_limit=$(systemctl show -p LimitNOFILE --value nginx 2>/dev/null || true)
-  if [[ $nginx_limit != infinity ]] \
-     && { ! [[ $nginx_limit =~ ^[0-9]+$ ]] || (( nginx_limit < 524288 )); }; then
-    # Same writer as the PHP/MariaDB drop-ins; the content mirrors the
-    # repository's scripts/limit_nofile.conf, which the sync installs when
-    # it succeeds.
-    if write_service_limits_dropin "$nginx_dropin" $'[Service]\nLimitNOFILE=524288\nUMask=0027'; then
-      systemctl daemon-reload || true
-      NGINX_UNIT_CHANGED=1
-      tune_summary "nginx: systemd LimitNOFILE=524288 (applies on next restart)"
-    fi
-  fi
-  # NGINX_UNIT_CHANGED is the "a change was written" signal.  Returning it as
-  # the status made success look like failure to a caller (1 = changed), so the
-  # helper always succeeds; callers read the flag.
-  return 0
-}
+# The nginx fd limit and UMask live in our nginx.service (lib/nginx-build.sh
+# writes LimitNOFILE=524288 and UMask=0027), so --optimize writes no
+# nginx.service.d drop-in and no /etc/default/nginx any more (1.21's
+# ensure_nginx_limits and the synced scripts/limit_nofile.conf are gone).
 
 # ---------------------------------------------------------------------------
 # Shared post-nginx PHP refresh
@@ -111,10 +90,7 @@ php_refresh_after_nginx() {
 }
 
 optimize_nginx() {
-  local active=0 change version rc=0 unit_changed=0
-  local limit_file=/etc/systemd/system/nginx.service.d/limits.conf
-  local default_file=/etc/default/nginx
-  local limit_before="" limit_after="" default_before="" default_after=""
+  local active=0 change version rc=0
   local nginx_bin
   nginx_bin=$(opt_nginx_bin)
   # Legacy-Angie mode (R19/R51): /etc/nginx is not the live tree and no
@@ -129,14 +105,10 @@ optimize_nginx() {
   version=$("$nginx_bin" -v 2>&1 | head -n1 || true)
   opt_report "## nginx"
   opt_report "- Version: \`${version:-unknown}\`; active: ${active}"
+  # The tree is all the sync and the tuner write (the unit's limits are in
+  # our nginx.service, not in a drop-in or /etc/default/nginx).
   opt_backup /etc/nginx nginx
-  # The repository sync rewrites the unit drop-in and /etc/default/nginx too;
-  # a rollback must cover them like the MariaDB/Valkey/Elasticsearch ones.
-  opt_backup /etc/systemd/system/nginx.service.d nginx-systemd
-  opt_backup "$default_file" nginx-default
   tune_reset_changes
-  [[ -f $limit_file ]] && limit_before=$(file_md5 "$limit_file")
-  [[ -f $default_file ]] && default_before=$(file_md5 "$default_file")
 
   # Keep /etc/nginx byte-for-byte aligned with the canonical repository before
   # applying the hardware-aware profile.  The repository deployer owns the
@@ -148,20 +120,11 @@ optimize_nginx() {
   if sync_nginx_repo_configs; then
     NGINX_SYNC_RELOAD=1
     opt_report "- Repository: synchronized from ${CONFIG_REPO_URL} (${CONFIG_REPO_REF})"
-    [[ -f $limit_file ]] && limit_after=$(file_md5 "$limit_file")
-    [[ -f $default_file ]] && default_after=$(file_md5 "$default_file")
-    if [[ $limit_before != "$limit_after" || $default_before != "$default_after" ]]; then
-      unit_changed=1
-      opt_report "- Repository: systemd limit/default files refreshed"
-    fi
   else
     NGINX_SYNC_RELOAD=1
     rc=1
     opt_report "- **FAILED** nginx repository synchronization; restored the existing /etc/nginx tree"
     nginx_restore_live
-    # No repository deployer ran, so keep the standalone limit tuning.
-    ensure_nginx_limits || true
-    unit_changed=$NGINX_UNIT_CHANGED
   fi
   # Same profile as the installer (nginx_apply_profile): guest caches,
   # precompression, the tuner and Brotli (a static module of our build, so
@@ -208,17 +171,10 @@ optimize_nginx() {
   fi
   if (( active )); then
     if (( TUNE_DIRTY == 0 )); then
-      if (( unit_changed )); then
-        opt_report "- Restart: deferred (systemd/default nginx files apply on the next restart)"
-      else
-        opt_report "- Restart: skipped (configuration already optimized)"
-      fi
+      opt_report "- Restart: skipped (configuration already optimized)"
     elif systemctl reload nginx 2>/dev/null && systemctl is-active --quiet nginx; then
       OPT_CUTOVER=1
       opt_report "- Reload: **OK** (graceful; in-flight requests keep running)"
-      if (( unit_changed )); then
-        opt_report "- Note: systemd/default nginx files apply on the next full restart"
-      fi
     elif systemctl restart nginx 2>/dev/null && systemctl is-active --quiet nginx; then
       OPT_CUTOVER=1
       opt_report "- Reload failed; Restart: **OK**"
@@ -253,13 +209,10 @@ optimize_nginx() {
   return "$rc"
 }
 
-# Roll /etc/nginx, the unit drop-in and /etc/default/nginx back to the
-# --optimize snapshot and put the restored configuration live again.
+# Roll /etc/nginx back to the --optimize snapshot and put the restored
+# configuration live again.
 nginx_restore_live() {
   opt_restore /etc/nginx nginx
-  opt_restore /etc/systemd/system/nginx.service.d nginx-systemd
-  opt_restore /etc/default/nginx nginx-default
-  systemctl daemon-reload || true
   if "$(opt_nginx_bin)" -t >/dev/null 2>&1; then
     systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
   fi

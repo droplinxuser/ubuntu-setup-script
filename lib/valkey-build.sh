@@ -349,19 +349,33 @@ valkey_build_purge() {
 # Last-consumer rule (R81): the shared setup-build-refresh.{service,timer},
 # setup-build-cpu.service and the lock go with the last compiled build.
 # "--purge nginx" then "--purge valkey" must not leave the timer and the CPU
-# unit enabled with nothing to build.  Each root is tested on its own (a
-# missing root must not hide a build in another one).
+# unit enabled with nothing to build.  The rule itself is
+# lib/nginx-build.sh's setup_build_remove_shared_units_if_last (one copy for
+# every component); the copy below runs only when that file is not sourced
+# (unit tests).  Each root is tested on its own (a missing root must not hide
+# a build in another one).
 valkey_build_release_shared_units() {
   local n=${NGINX_ROOT:-${NGINX_BUILD_ROOT:-/usr/local/lib/setup-nginx}} p=${PHP_BUILD_ROOT:-/usr/local/lib/setup-php}
-  local d=${VALKEY_BUILD_SYSTEMD_DIR} cpu refresh timer lock
-  [[ -f $n/build.info || -x $n/sbin/nginx ]] && return 0
-  compgen -G "${p}/[0-9]*/build.info" >/dev/null && return 0
-  [[ -f $VALKEY_BUILD_INFO ]] && return 0
+  local d=${VALKEY_BUILD_SYSTEMD_DIR} cpu refresh timer lock had=0 hit
   cpu=${SETUP_BUILD_CPU_UNIT:-$d/setup-build-cpu.service}
   refresh=${SETUP_BUILD_REFRESH_UNIT:-$d/setup-build-refresh.service}
   timer=${SETUP_BUILD_REFRESH_TIMER:-$d/setup-build-refresh.timer}
+  [[ -e $cpu || -e $refresh || -e $timer ]] && had=1
+  if declare -F setup_build_remove_shared_units_if_last >/dev/null; then
+    setup_build_remove_shared_units_if_last valkey
+    if (( had )) && [[ ! -e $cpu && ! -e $refresh && ! -e $timer ]]; then
+      info "Valkey: last compiled build removed; the shared refresh timer and CPU rebuild unit went with it"
+    fi
+    return 0
+  fi
+  [[ -f $n/build/build.info ]] && return 0
+  if [[ -d $p ]]; then
+    hit=$(find "$p" -maxdepth 3 -name build.info -not -path '*/staging/*' -print -quit 2>/dev/null || true)
+    [[ -n $hit ]] && return 0
+  fi
+  [[ -f $VALKEY_BUILD_INFO ]] && return 0
+  (( had )) || return 0
   lock=${SETUP_BUILD_LOCK_FILE:-${SETUP_BUILD_LOCK:-/run/setup-build.lock}}
-  [[ -e $cpu || -e $refresh || -e $timer ]] || return 0
   systemctl disable --now "${timer##*/}" >/dev/null 2>&1 || true
   systemctl stop "${cpu##*/}" "${refresh##*/}" >/dev/null 2>&1 || true
   rm -f "$cpu" "$refresh" "$timer" "$lock"

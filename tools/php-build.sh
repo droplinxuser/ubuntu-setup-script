@@ -908,7 +908,17 @@ start_if_due() { # X.Y
 # it while the new workers serve real traffic, then BOLT (which only tries
 # the lock: another build in progress skips it until the next refresh).
 cmd_rebuild() {
-  local ver=$1
+  local ver=$1 active
+  # The refresh queues only the active version.  A rebuild queued before an
+  # --upgrade-php switch runs once the switch released the lock, when its
+  # version is the kept, disabled rollback build: nothing to rebuild there
+  # (the refresh never rebuilds inactive versions either), and its unit is
+  # never started (start_if_due).
+  active=$(active_version)
+  if [[ -n $active && $active != "$ver" ]]; then
+    say "PHP $ver: not the active version (PHP $active); rebuild skipped"
+    return 0
+  fi
   build_lock_run cmd_build_activate "$ver"
   sleep "${PHP_BUILD_BOLT_DELAY:-600}"
   bash "$SELF" bolt "$ver" "${PHP_BUILD_BOLT_SECONDS:-60}" || true
@@ -1027,6 +1037,13 @@ cmd_refresh() {
   local ver out rc new old
   if declare -F migration_pending >/dev/null && migration_pending; then
     say "refresh skipped: the 1.22 migration is not finished"; return 0
+  fi
+  # A setup.sh run holds its run lock: --upgrade-php may be switching the
+  # active version (it also holds the build lock from the build to the
+  # commit), or --optimize is laying /etc/php out.  The chain refresh checks
+  # the same; this covers a direct `php-build.sh refresh` (R65).
+  if declare -F setup_run_active >/dev/null && setup_run_active; then
+    say "refresh skipped: a setup.sh run is in progress"; return 0
   fi
   ver=$(active_version)
   [[ -n $ver ]] || return 0

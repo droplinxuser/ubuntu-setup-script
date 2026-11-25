@@ -361,7 +361,7 @@ migrate_pkg_installed() { dpkg-query -W -f='${db:Status-Abbrev}' "$1" 2>/dev/nul
 
 # Exact package list of one kind (never a glob handed to apt).
 #   angie   angie and angie-module-*
-#   sury    php*, php-* and phpX.Y-* plus debsuryorg-archive-keyring;
+#   sury    php, php-*, phpX.Y and phpX.Y-* plus debsuryorg-archive-keyring;
 #           libapache2-mod-php* is NOT part of it, so the guard reports it
 #           as collateral (Apache may serve through it, R17)
 #   valkey  valkey-server valkey-tools
@@ -888,6 +888,36 @@ migrate_needed() {
   return 1
 }
 
+# 0 only while the PHP side of the migration is pending or in flight: the
+# unit runs, a PHP switch or the Sury purge is in flight, a running Sury
+# phpX.Y-fpm is not on our build yet (any state but done, including the
+# refused ones: it is still a package unit), or a PHP part is done and the
+# Sury purge has neither run nor been deferred.  A deferred purge
+# (collateral the operator must clear) is not pending: nothing of it is
+# half-done.  Unlike migrate_needed php it ignores retry digests, the
+# nginx and Valkey parts and the Angie/distro-nginx leftovers.  Gate for
+# --upgrade-php (C's php_upgrade_migration_pending).
+migrate_php_pending() {
+  local v st php_done=0
+  migrate_running && return 0
+  case $(migrate_state_get inflight) in
+    php-*|purge) return 0 ;;
+  esac
+  while IFS= read -r v; do
+    [[ -n $v ]] || continue
+    [[ $(migrate_state_get "php-${v}") == "done" ]] || return 0
+  done < <(migrate_sury_active_versions)
+  [[ -f $MIGRATE_STATE_FILE ]] && grep -qE '^php-[0-9]+\.[0-9]+=done$' "$MIGRATE_STATE_FILE" 2>/dev/null && php_done=1
+  if (( php_done )) && [[ -n $(migrate_pkg_list sury) ]]; then
+    st=$(migrate_state_get sury-purge)
+    case $st in
+      done|deferred:*) ;;
+      *) return 0 ;;
+    esac
+  fi
+  return 1
+}
+
 # ---------------------------------------------------------------------------
 # migrate_resume_safe: first thing on every run (R21, R34, R50, R73)
 # ---------------------------------------------------------------------------
@@ -1225,20 +1255,25 @@ migrate_php_listeners() {
   done
 }
 
-# Modules the running Sury SAPI loads, as build names (R25, R58).
-#   $1 version, $2 fpm|cli.  Empty when unknown.
+# Modules the package PHP X.Y loads today, FPM and CLI (each with its own
+# ini tree), as build names (R25, R58).  The project has one Sury module
+# probe, B's php_build_sury_loaded_exts (lib/php-build.sh); this only
+# filters its output to plain module names (a startup warning printed on
+# stdout is dropped).  Status 1 when that probe is not loaded: the set is
+# then unknown, which is not the same as "nothing loaded".
 migrate_sury_modules() {
-  local v=$1 sapi=$2 out
-  if [[ $sapi == fpm ]]; then
-    [[ -x /usr/sbin/php-fpm$v ]] || return 0
-    out=$(PHP_INI_SCAN_DIR="$MIGRATE_PHP_ETC/$v/fpm/conf.d" /usr/sbin/php-fpm"$v" \
-            -c "$MIGRATE_PHP_ETC/$v/fpm/php.ini" -m 2>/dev/null) || return 0
-  else
-    [[ -x /usr/bin/php$v ]] || return 0
-    out=$(/usr/bin/php"$v" -m 2>/dev/null) || return 0
-  fi
-  printf '%s\n' "$out" | sed -nE '/^\[Zend Modules\]/,$d; /^[A-Za-z]/{ s/ /_/g; p; }' \
-    | tr '[:upper:]' '[:lower:]' | sed 's/^zend_opcache$/opcache/' | sort -u
+  declare -F php_build_sury_loaded_exts >/dev/null 2>&1 || return 1
+  php_build_sury_loaded_exts "$1" 2>/dev/null | tr ' ' '_' | grep -E '^[a-z0-9_]+$' | sort -u || true
+}
+
+# The extra web tree B's extension detection must walk during the PHP
+# part (PHP_EXT_DETECT_TREE): /etc/angie while Angie is still installed,
+# so its vhosts' application extension sets are in the build.  Empty once
+# Angie is gone: only this module names Angie paths, and php-build.sh
+# does not scan /etc/angie by itself.
+migrate_php_detect_tree() {
+  if [[ -d $MIGRATE_ANGIE_ETC ]] && migrate_angie_present; then printf '%s' "$MIGRATE_ANGIE_ETC"; fi
+  return 0
 }
 
 migrate_php_buildable() {
@@ -1251,20 +1286,17 @@ migrate_php_buildable() {
 }
 
 # Extension union for version V (R2.9, R25, R41, R58).  Prints lines:
-#   keep NAME | cli NAME | unbuildable-fpm NAME | unbuildable-cli NAME
+#   keep NAME | unbuildable NAME
+# The probe returns the FPM and CLI modules as one set, and the source
+# build ships one extension set to both SAPIs, so a module only the CLI
+# loaded today is kept (or counted as unbuildable) like an FPM module.
 migrate_php_ext_union() {
   local v=$1 e
-  local -A fpm=() cli=()
-  while IFS= read -r e; do [[ -n $e ]] && fpm[$e]=1; done < <(migrate_sury_modules "$v" fpm)
-  while IFS= read -r e; do [[ -n $e ]] && cli[$e]=1; done < <(migrate_sury_modules "$v" cli)
-  for e in "${!fpm[@]}"; do
+  while IFS= read -r e; do
+    [[ -n $e ]] || continue
     [[ $MIGRATE_PHP_BASE_EXTS == *" $e "* ]] && continue
-    if migrate_php_buildable "$e"; then printf 'keep %s\n' "$e"; else printf 'unbuildable-fpm %s\n' "$e"; fi
-  done
-  for e in "${!cli[@]}"; do
-    [[ -n ${fpm[$e]:-} || $MIGRATE_PHP_BASE_EXTS == *" $e "* ]] && continue
-    if migrate_php_buildable "$e"; then printf 'cli %s\n' "$e"; else printf 'unbuildable-cli %s\n' "$e"; fi
-  done | sort
+    if migrate_php_buildable "$e"; then printf 'keep %s\n' "$e"; else printf 'unbuildable %s\n' "$e"; fi
+  done < <(migrate_sury_modules "$v") | sort
 }
 
 migrate_php_scan_digest() {
@@ -1415,13 +1447,21 @@ migrate_preflight() {
            migrate_warn "PHP ${v}: stays on the Sury package; only the active version ${primary} moves to the source build (the next --optimize would stop a second version).  Move its sites to PHP ${primary}, stop php${v}-fpm and re-run --optimize; the Sury purge waits until then"; fi
       continue
     fi
-    local -a keep=() unb_fpm=() unb_cli=() cli_only=() unb_req=()
+    local -a keep=() unb_fpm=() unb_req=()
+    # One module probe for the project (B's php_build_sury_loaded_exts).
+    # Without it the modules Sury loads are unknown, and moving the version
+    # could drop extensions without a word: refuse instead (retried when the
+    # scan digest changes).
+    if ! declare -F php_build_sury_loaded_exts >/dev/null 2>&1; then
+      if (( dry )); then printf '  PHP %s: refused, the loaded-module probe (lib/php-build.sh) is not loaded\n' "$v"
+      else migrate_state_set "php-${v}" "refused:no module probe"; migrate_state_set "php-${v}.scan" "$(migrate_php_scan_digest "$v")"
+           migrate_fail "PHP ${v}: lib/php-build.sh is not loaded, so the modules Sury loads cannot be read; Sury keeps serving and is not purged"; fi
+      continue
+    fi
     while read -r e line; do
       case $e in
         keep) keep+=("$line") ;;
-        cli) cli_only+=("$line") ;;
-        unbuildable-fpm) unb_fpm+=("$line") ;;
-        unbuildable-cli) unb_cli+=("$line") ;;
+        unbuildable) unb_fpm+=("$line") ;;
       esac
     done < <(migrate_php_ext_union "$v")
     # Rev3 step 3 (R41, R58): a module the build cannot provide refuses the
@@ -1437,14 +1477,12 @@ migrate_preflight() {
       fi
     fi
     if (( dry )); then
-      printf '  PHP %s: Sury -> source build; FPM modules kept: %s\n' "$v" "${keep[*]:-none}"
-      (( ${#cli_only[@]} )) && printf '    CLI-only modules kept: %s\n' "${cli_only[*]}"
-      (( ${#unb_cli[@]} )) && printf '    CLI-only modules that cannot be built (dropped): %s\n' "${unb_cli[*]}"
-      (( ${#unb_fpm[@]} )) && printf '    FPM modules that cannot be built: %s\n' "${unb_fpm[*]}"
+      printf '  PHP %s: Sury -> source build; modules kept (FPM and CLI): %s\n' "$v" "${keep[*]:-none}"
+      (( ${#unb_fpm[@]} )) && printf '    modules that cannot be built: %s\n' "${unb_fpm[*]}"
       (( ${#unb_req[@]} )) && printf '    required by an application and unbuildable: %s%s\n' "${unb_req[*]}" \
         "$([[ ${SETUP_PHP_ALLOW_MISSING_EXT:-0} == 1 ]] && echo ' (dropped: SETUP_PHP_ALLOW_MISSING_EXT=1)' || echo ' -> this version is REFUSED')"
       if declare -F php_build_effective_exts >/dev/null 2>&1; then
-        printf '    effective set after the union: %s\n' "$(PHP_EXT_DETECT_TREE=$MIGRATE_ANGIE_ETC php_build_effective_exts 2>/dev/null || true)"
+        printf '    effective set after the union: %s\n' "$(PHP_EXT_DETECT_TREE=$(migrate_php_detect_tree) php_build_effective_exts 2>/dev/null || true)"
       fi
       continue
     fi
@@ -1454,10 +1492,9 @@ migrate_preflight() {
       migrate_fail "PHP ${v}: an application needs modules the source build cannot provide (${unb_req[*]}); Sury keeps serving and is not purged (SETUP_PHP_ALLOW_MISSING_EXT=1 drops them)"
       continue
     fi
-    (( ${#unb_fpm[@]} )) && migrate_warn "PHP ${v}: FPM modules the source build cannot provide are dropped (no detected application requires them): ${unb_fpm[*]}"
-    (( ${#unb_cli[@]} )) && migrate_warn "PHP ${v}: CLI-only modules that cannot be built are dropped: ${unb_cli[*]}"
-    migrate_php_persist_exts "${keep[@]}" "${cli_only[@]}"
-    migrate_note "PHP ${v}: extensions loaded today kept in PHP_EXT_EXTRA: ${keep[*]:-none}${cli_only[*]:+ (CLI: ${cli_only[*]})}"
+    (( ${#unb_fpm[@]} )) && migrate_warn "PHP ${v}: modules the source build cannot provide are dropped (no detected application requires them): ${unb_fpm[*]}"
+    migrate_php_persist_exts "${keep[@]}"
+    migrate_note "PHP ${v}: extensions loaded today kept in PHP_EXT_EXTRA: ${keep[*]:-none}"
     MIGRATE_PHP_TODO+=("$v")
   done
   # Installed but stopped versions go with the Sury purge (their /etc/php
@@ -1631,8 +1668,10 @@ migrate_build_all() {
     fi
   fi
   local -a todo=()
+  local detect
+  detect=$(migrate_php_detect_tree)
   for v in "${MIGRATE_PHP_TODO[@]}"; do
-    if php_build_ensure "$v" build-only migrate migrate_out; then
+    if PHP_EXT_DETECT_TREE=$detect php_build_ensure "$v" build-only migrate migrate_out; then
       migrate_state_set "php-${v}" built
       todo+=("$v")
     else
@@ -2366,7 +2405,7 @@ migrate_php_cutover() {
   # (1b) Sury conf.d entries out, before any managed file is written
   migrate_php_convert_confd "$v" "$snap"
   # (2) our binary, unit and layout (tmpfiles applied inside, R89)
-  if ! php_build_ensure "$v" activate migrate migrate_out; then
+  if ! PHP_EXT_DETECT_TREE=$(migrate_php_detect_tree) php_build_ensure "$v" activate migrate migrate_out; then
     migrate_php_rollback "$v" "activating the PHP ${v} build failed"; return 1
   fi
   if ! php_build_layout "$v" adopt; then
@@ -2414,13 +2453,16 @@ migrate_php_cutover() {
   if [[ -n $bad ]]; then
     migrate_php_rollback "$v" "new fatal errors in the logs: $(printf '%s' "$bad" | head -n 3 | paste -sd' ' -)"; return 1
   fi
-  # Verified.  The CLI of cron jobs moves to our build at once (R15c):
-  # update-alternatives with a higher priority while Sury is installed.
-  if [[ -x $(migrate_php_cli_bin "$v") ]] && command -v update-alternatives >/dev/null 2>&1 \
-     && [[ $v == "$(migrate_primary_version)" ]]; then
-    update-alternatives --install /usr/bin/php php "$(migrate_php_cli_bin "$v")" 1000 >/dev/null 2>&1 || true
-    update-alternatives --set php "$(migrate_php_cli_bin "$v")" >/dev/null 2>&1 || true
-  fi
+  # Verified.  No update-alternatives entry for our CLI (R2.1: /usr/bin/php
+  # is a plain symlink, never an alternative): an entry would keep
+  # /etc/alternatives/php alive after the Sury purge, B's php_build_links
+  # would then never re-point /usr/bin/php on an --upgrade-php switch, and
+  # cron would run a retired series.  Until the purge frees /usr/bin/php,
+  # the managed cron lines reach a working CLI through php_cli_path (the
+  # package CLI at /usr/bin/php, else /usr/local/bin/php); the post-purge
+  # assertions link /usr/bin/php to our build.  An entry an earlier 1.22
+  # draft registered is removed here.
+  migrate_php_alt_cleanup
   # Our generated /etc/php, for the post-purge re-lay of pool.d (R24).
   local conv
   conv=$(migrate_snapshot_dir "php-${v}-converted") || conv=""
@@ -3043,11 +3085,16 @@ migrate_write_apt_pin() {
   local -a pats=()
   [[ $(migrate_state_get nginx) == "done" ]] && pats+=("nginx nginx-* libnginx-mod-*")
   (( angie )) && pats+=("angie angie-*")
-  (( sury )) && pats+=("php* libapache2-mod-php*")
+  # The Sury/Ubuntu PHP families only (R2.7): phpX.Y and phpX.Y-*, php-*
+  # (php-common, php-pear, ...) and the Apache module.  Not a bare 'php*',
+  # which would also refuse unrelated packages such as phpmyadmin.
+  (( sury )) && pats+=("php[0-9]* php-* libapache2-mod-php*")
   (( valkey )) && pats+=("valkey-server valkey-tools")
   if [[ -f $MIGRATE_APT_PIN ]]; then
     local old
     old=$(sed -nE 's/^Package: //p' "$MIGRATE_APT_PIN" | head -n1)
+    # An earlier draft wrote the bare 'php*': narrow it on rewrite.
+    old=$(printf '%s\n' "$old" | tr ' ' '\n' | grep -vxF 'php*' | paste -sd' ' - || true)
     [[ -n $old ]] && pats+=("$old")
   fi
   (( ${#pats[@]} )) || return 0
@@ -3056,7 +3103,7 @@ migrate_write_apt_pin() {
     printf '# Managed by setup.sh 1.22: nginx, PHP and Valkey are built from source\n'
     printf '# (/usr/local/lib/setup-*).  These packages would take back paths and\n'
     printf '# unit names the source builds own.  --purge removes this file.\n'
-    printf 'Package: %s\nPin: release *\nPin-Priority: -1\n' "$(printf '%s\n' "${pats[@]}" | tr ' ' '\n' | sort -u | paste -sd' ' -)"
+    printf 'Package: %s\nPin: release *\nPin-Priority: -1\n' "$(printf '%s\n' "${pats[@]}" | tr ' ' '\n' | sed '/^$/d' | sort -u | paste -sd' ' -)"
   } > "$tmp"
   commit_if_changed "$MIGRATE_APT_PIN" "$tmp" && chmod 644 "$MIGRATE_APT_PIN"
   rm -f -- "$tmp"
@@ -3072,6 +3119,27 @@ migrate_link_bin() {
   fi
   tmp="${dst}.setup-new.$$"
   ln -sfn -- "$src" "$tmp" && mv -fT -- "$tmp" "$dst"
+}
+
+# Remove every 'php' alternatives entry that points into our PHP root (an
+# earlier 1.22 draft registered one at the cutover).  The migration never
+# registers one: /usr/bin/php is a plain symlink (R2.1), and an entry of
+# ours would keep /etc/alternatives/php, which stops B's php_build_links
+# from re-pointing /usr/bin/php after an --upgrade-php switch.  Package
+# entries (Sury's CLIs) are left to dpkg.  Always returns 0.
+migrate_php_alt_cleanup() {
+  local root p
+  command -v update-alternatives >/dev/null 2>&1 || return 0
+  root="$(migrate_php_root)/"
+  while IFS= read -r p; do
+    [[ -n $p && $p == "$root"* ]] || continue
+    if update-alternatives --remove php "$p" >/dev/null 2>&1; then
+      migrate_note "removed the update-alternatives entry php -> ${p} (/usr/bin/php is a plain symlink in 1.22)"
+    else
+      migrate_warn "could not remove the update-alternatives entry php -> ${p}; run: update-alternatives --remove php ${p}"
+    fi
+  done < <(update-alternatives --list php 2>/dev/null || true)
+  return 0
 }
 
 # Failures of one post-removal pass: reported only when the repair attempt
@@ -3121,10 +3189,10 @@ migrate_post_assert() {
       migrate_link_bin "$(migrate_php_cli_bin "$v")" "/usr/bin/php${v}" || true
     fi
   done
+  # No alternatives entry of ours may survive (R2.1): it would keep
+  # /etc/alternatives/php and block B's links from re-pointing /usr/bin/php.
+  migrate_php_alt_cleanup
   if [[ -n $primary ]] && [[ " ${vers[*]} " == *" $primary "* ]] && ! migrate_pkg_installed "php${primary}-cli"; then
-    if command -v update-alternatives >/dev/null 2>&1; then
-      update-alternatives --remove php "$(migrate_php_cli_bin "$primary")" >/dev/null 2>&1 || true
-    fi
     migrate_link_bin "$(migrate_php_cli_bin "$primary")" /usr/bin/php || true
   fi
   if [[ -n $primary && " ${vers[*]} " == *" $primary "* ]]; then
@@ -3403,7 +3471,9 @@ migrate_unit_main() {
     { exec 9>>"$LOCK_FILE" && flock -w 120 9; } || warn "migrate: could not take ${LOCK_FILE}; continuing"
   fi
   migrate_main "$out" || rc=$?
-  printf '%s\n' "$rc" > "${MIGRATE_STATE_FILE}.rc"
+  # Atomic, so an attaching run never reads a half-written result.
+  { printf '%s\n' "$rc" > "${MIGRATE_STATE_FILE}.rc.new" && mv -f -- "${MIGRATE_STATE_FILE}.rc.new" "${MIGRATE_STATE_FILE}.rc"; } \
+    || { printf '%s\n' "$rc" > "${MIGRATE_STATE_FILE}.rc"; } 2>/dev/null || true
   return "$rc"
 }
 
@@ -3423,33 +3493,10 @@ migrate_can_detach() {
   [[ -f ${SCRIPT_DIR:-/nonexistent}/setup.sh ]]
 }
 
-# Run CMD... as the transient unit setup-migrate-1.22 (no --pipe: its output
-# goes to the log, never to this session's terminal), follow the log until
-# the unit ends, and return the result the unit recorded.  A rerun while the
-# unit runs only attaches.  F may use this for a whole detached --optimize.
-migrate_detach_cmd() {
-  local rcfile="${MIGRATE_STATE_FILE}.rc" off pid=0 i rc name
-  local -a envs=()
-  mkdir -p "$(dirname "$MIGRATE_LOG")"
-  [[ -e $MIGRATE_LOG ]] || install -m 600 /dev/null "$MIGRATE_LOG"
-  off=$(stat -c %s -- "$MIGRATE_LOG" 2>/dev/null || echo 0)
-  if migrate_running; then
-    info "The 1.22 migration is already running (${MIGRATE_UNIT}); following ${MIGRATE_LOG}"
-  else
-    mkdir -p "$(dirname "$rcfile")"
-    printf '' > "$rcfile"
-    for name in "${MIGRATE_PASS_ENV[@]}"; do
-      [[ -n ${!name:-} ]] && envs+=("--setenv=${name}=${!name}")
-    done
-    declare -F release_run_lock >/dev/null 2>&1 && release_run_lock
-    if ! systemd-run --unit="$MIGRATE_UNIT" --collect --quiet \
-          -p OOMScoreAdjust=-500 -p "StandardOutput=append:${MIGRATE_LOG}" -p "StandardError=append:${MIGRATE_LOG}" \
-          --setenv=SETUP_MIGRATE_IN_UNIT=1 "${envs[@]}" "$@"; then
-      declare -F acquire_run_lock >/dev/null 2>&1 && acquire_run_lock
-      return 125
-    fi
-    info "Running as ${MIGRATE_UNIT}; output follows from ${MIGRATE_LOG}.  A dropped SSH session does not stop it; re-run the same command to follow it again."
-  fi
+# Follow MIGRATE_LOG from byte offset OFF until the unit's main process
+# exits (or at once when the unit is not running any more).
+migrate_follow() {
+  local off=${1:-0} pid=0 i
   for i in $(seq 1 20); do
     pid=$(systemctl show -p MainPID --value "$MIGRATE_UNIT" 2>/dev/null || echo 0)
     [[ $pid =~ ^[0-9]+$ ]] && (( pid > 0 )) && break
@@ -3461,9 +3508,70 @@ migrate_detach_cmd() {
   else
     tail -c "+$(( off + 1 ))" -- "$MIGRATE_LOG" 2>/dev/null || true
   fi
-  declare -F acquire_run_lock >/dev/null 2>&1 && acquire_run_lock
+  return 0
+}
+
+# The result the last migration unit recorded in ${MIGRATE_STATE_FILE}.rc:
+# its status, 1 when a started unit left none (killed before it could write
+# it), 0 when no unit ever ran.
+migrate_recorded_rc() {
+  local rcfile="${MIGRATE_STATE_FILE}.rc" rc
+  [[ -e $rcfile ]] || return 0
   rc=$(tr -dc '0-9' < "$rcfile" 2>/dev/null || true)
-  [[ -n $rc ]] || { warn "The migration unit left no result in ${rcfile}; see ${MIGRATE_LOG}"; rc=1; }
+  [[ -n $rc ]] || { warn "The migration unit left no result in ${rcfile}; see ${MIGRATE_LOG}"; return 1; }
+  return "$rc"
+}
+
+# Attach only: never starts anything and never touches the run lock (the
+# caller takes it afterwards).  While setup-migrate-1.22 runs, follow its
+# log until its main process exits; then return the result it recorded.
+# When the unit already ended (for example between the caller's
+# migrate_running check and this call), return that recorded result at
+# once instead of starting a unit.  restart.sh main() calls this before it
+# takes the run lock on a rerun of --optimize.
+migrate_attach() {
+  local off
+  if migrate_running; then
+    off=$(stat -c %s -- "$MIGRATE_LOG" 2>/dev/null || echo 0)
+    info "The 1.22 migration is already running (${MIGRATE_UNIT}); following ${MIGRATE_LOG}"
+    migrate_follow "$off"
+  fi
+  migrate_recorded_rc
+}
+
+# Run CMD... as the transient unit setup-migrate-1.22 (no --pipe: its output
+# goes to the log, never to this session's terminal), follow the log until
+# the unit ends, and return the result the unit recorded.  While the unit
+# runs, or with no CMD, this only attaches (migrate_attach) and never
+# starts a unit.  Ends holding the run lock.  F may use this for a whole
+# detached --optimize.
+migrate_detach_cmd() {
+  local rcfile="${MIGRATE_STATE_FILE}.rc" off rc=0 name
+  local -a envs=()
+  mkdir -p "$(dirname "$MIGRATE_LOG")"
+  [[ -e $MIGRATE_LOG ]] || install -m 600 /dev/null "$MIGRATE_LOG"
+  if (( $# == 0 )) || migrate_running; then
+    migrate_attach || rc=$?
+    declare -F acquire_run_lock >/dev/null 2>&1 && acquire_run_lock
+    return "$rc"
+  fi
+  off=$(stat -c %s -- "$MIGRATE_LOG" 2>/dev/null || echo 0)
+  mkdir -p "$(dirname "$rcfile")"
+  printf '' > "$rcfile"
+  for name in "${MIGRATE_PASS_ENV[@]}"; do
+    [[ -n ${!name:-} ]] && envs+=("--setenv=${name}=${!name}")
+  done
+  declare -F release_run_lock >/dev/null 2>&1 && release_run_lock
+  if ! systemd-run --unit="$MIGRATE_UNIT" --collect --quiet \
+        -p OOMScoreAdjust=-500 -p "StandardOutput=append:${MIGRATE_LOG}" -p "StandardError=append:${MIGRATE_LOG}" \
+        --setenv=SETUP_MIGRATE_IN_UNIT=1 "${envs[@]}" "$@"; then
+    declare -F acquire_run_lock >/dev/null 2>&1 && acquire_run_lock
+    return 125
+  fi
+  info "Running as ${MIGRATE_UNIT}; output follows from ${MIGRATE_LOG}.  A dropped SSH session does not stop it; re-run the same command to follow it again."
+  migrate_follow "$off"
+  declare -F acquire_run_lock >/dev/null 2>&1 && acquire_run_lock
+  migrate_recorded_rc || rc=$?
   return "$rc"
 }
 

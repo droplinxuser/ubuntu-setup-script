@@ -218,8 +218,6 @@ setup_build_write() {
   install -d -m 755 "$(dirname "$1")"
   printf '%s\n' "$2" > "$1.new" && mv -f "$1.new" "$1"
 }
-# 1.21 name (lib/valkey-build.sh still calls it).
-nginx_build_write() { setup_build_write "$@"; }
 
 # The CPU chain and the refresh timer, shared by every compiled component.
 # Status 0; NGINX_BUILD_UNITS_CHANGED=1 when a file changed.
@@ -249,8 +247,6 @@ _setup_build_left() { # [except]
   done
   return 1
 }
-# 1.21 name.
-_setup_build_others_left() { _setup_build_left nginx; }
 
 # Last-consumer rule (R81): the CPU chain, the refresh timer and the lock go
 # with the last remaining build.  Every component's purge calls it after
@@ -651,9 +647,11 @@ nginx_build_status() {
 }
 
 # --purge nginx: our unit, the build, its tool root, links, tmpfiles and
-# build units go; /etc/nginx, /var/www/logs/nginx and /var/backups/setup-1.22
-# stay.  The shared CPU/refresh units and LLVM go only with the last build.
+# build units go; /etc/nginx, /var/www/logs/nginx, /var/backups/setup-1.22
+# and any cache a vhost keeps under /var/cache/nginx stay.  The shared
+# CPU/refresh units and LLVM go only with the last build.
 nginx_build_purge() {
+  local t
   systemctl disable --now nginx.service >/dev/null 2>&1 || true
   systemctl stop "${NGINX_BUILD_UNIT##*/}" >/dev/null 2>&1 || true
   rm -f "$NGINX_UNIT_FILE" "$NGINX_BUILD_UNIT"
@@ -661,7 +659,11 @@ nginx_build_purge() {
   if [[ -x $NGINX_BUILD_TOOL ]]; then "$NGINX_BUILD_TOOL" restore >/dev/null 2>&1 || true; fi
   rm -rf "${NGINX_ROOT:?}" "${NGINX_BUILD_CACHE:?}"
   rm -f "$NGINX_TMPFILES"
-  rm -rf /var/cache/nginx
+  # Only the build's own *_temp directories: a proxy_cache_path or
+  # fastcgi_cache_path a vhost keeps under /var/cache/nginx is cache data,
+  # which setup.sh never deletes.  The directory goes only when it is empty.
+  for t in client fastcgi proxy scgi uwsgi; do rm -rf "/var/cache/nginx/${t}_temp"; done
+  rmdir /var/cache/nginx 2>/dev/null || true
   setup_build_remove_shared_units_if_last nginx
   if declare -F setup_build_llvm_release >/dev/null; then setup_build_llvm_release nginx; fi
   systemctl daemon-reload 2>/dev/null || true
@@ -669,10 +671,3 @@ nginx_build_purge() {
   info "nginx: compiled nginx, its unit and build files removed (/etc/nginx and the logs are kept)"
   return 0
 }
-
-# ------------------------------------------------------------------ 1.21 names
-# Transitional: callers of 1.21 (validate.sh, services.sh, service-optimizers.sh)
-# until the glue moves to nginx_build_ensure.  The NGINX_BUILD knob no longer
-# exists (nginx is always compiled).
-nginx_build_validate() { return 0; }
-nginx_build_apply() { nginx_build_ensure full "${1:-optimize}" "${2:-info}"; }

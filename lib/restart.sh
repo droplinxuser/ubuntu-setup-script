@@ -392,17 +392,10 @@ EOF
 # 1 when --optimize skips the web tier because Angie still serves (legacy
 # mode: the nginx part of the 1.22 migration is refused or pending).
 OPT_WEB_LEGACY=0
-OPT_MIGRATION_HEADED=0
-
-# The reporter handed to migrate_run: the "## Migration 1.22" heading goes
-# into the report only when the migration has something to say.
-opt_report_migration() {
-  if (( ! OPT_MIGRATION_HEADED )); then
-    OPT_MIGRATION_HEADED=1
-    opt_report "## Migration 1.22"
-  fi
-  opt_report "$@"
-}
+# 1 for the closing pass after --domain (run_post_domain_optimize): the
+# one-time 1.22 migration belongs to an explicit --optimize, never to a
+# domain install.  optimize_migration_step (lib/optimize.sh) honours it.
+OPT_SKIP_MIGRATION=0
 
 run_optimize() {
   local rc=0 service
@@ -444,31 +437,24 @@ run_optimize() {
   # One /var/www walk for every WordPress/XenForo finder in this run.
   app_config_scan_prime
   plan_memory_budget
-  run_os_tuning
-  report_foreign_sysctl_sources
   # The one-time 1.22 migration (Angie -> compiled nginx, Sury -> compiled
   # PHP, the valkey-server package -> compiled Valkey) runs before anything
   # tunes or reloads the web tier: the tuners below work on what it leaves.
-  # It detaches into its own unit, so a dropped session cannot stop a cutover
-  # half way; this run follows the log and folds its lines into the report.
-  # Status 2: no failure, but the nginx part is not done and Angie still
-  # serves (legacy mode), so every web-tier step is skipped (R19, R51).
-  OPT_WEB_LEGACY=0
-  if declare -F migrate_run >/dev/null 2>&1; then
-    local mig_rc=0
-    OPT_MIGRATION_HEADED=0
-    migrate_run opt_report_migration || mig_rc=$?
-    case $mig_rc in
-      0) ;;
-      2) OPT_WEB_LEGACY=1 ;;
-      *) rc=1 ;;
-    esac
-    # The installed services, units and binaries may have changed: plan
-    # from what is there now.
-    detect_installed_services
+  # optimize_migration_step (lib/optimize.sh) is its only entry point: it
+  # plans with the services the migration moves, runs migrate_run (detached
+  # into its own unit, so a dropped session cannot stop a cutover half way;
+  # this run follows the log and folds its lines into the report), then
+  # detects again and re-plans from what serves now.  OPT_SKIP_MIGRATION=1
+  # (the pass after --domain) only detects and reports.  migrate_run status
+  # 2 (no failure, but the nginx part is not done and Angie still serves)
+  # leaves OPT_WEB_LEGACY=1, so every web-tier step is skipped (R19, R51).
+  optimize_migration_step || rc=1
+  if (( OPT_MIGRATE_RAN )); then
+    # The vhost trees may have changed with the cutover.
     app_config_scan_prime
-    plan_memory_budget
   fi
+  run_os_tuning
+  report_foreign_sysctl_sources
   if (( ! OPT_WEB_LEGACY )) && declare -F web_server_state >/dev/null 2>&1 \
      && [[ $(web_server_state 2>/dev/null || true) == angie-legacy ]]; then
     OPT_WEB_LEGACY=1
@@ -660,7 +646,12 @@ run_post_domain_optimize() {
   info "Re-tuning installed services for the new vhost(s) (the --optimize pass)"
   OPTIMIZE=1
   OPT_KEEP_EXPLICIT=$keep
+  # A domain install never starts the one-time 1.22 migration as a side
+  # effect (a pending Sury or valkey-server part would otherwise detach the
+  # whole migration from a --domain run): only an explicit --optimize does.
+  OPT_SKIP_MIGRATION=1
   run_optimize
+  OPT_SKIP_MIGRATION=0
   OPT_KEEP_EXPLICIT=0
   OPTIMIZE=0
 }
@@ -683,11 +674,51 @@ run_migrate_unit() {
     || die "lib/migrate.sh is not loaded; cannot run the 1.22 migration unit"
   OPTIMIZE=1
   OPT_REPORT=()
-  detect_installed_services
+  # The in-memory profile defaults the starting --optimize reset to (TCP_CC,
+  # PHP_JIT_WORDPRESS, ...).  That run already moved the pin files away, so
+  # mode 2 only resets the shell values and moves nothing.
+  RESET_ACTIONS=()
+  OPTIMIZE_IGNORED_ENV=()
+  reset_operator_overrides 2 >/dev/null || true
+  # Plan as the migration will leave the host: nginx in place of Angie and
+  # the package PHP and Valkey it replaces are booked, so the render's
+  # nginx_apply_profile and the cache budget size from the full plan (R23).
+  detect_installed_services migrate
   app_config_scan_prime
   plan_memory_budget
   migrate_unit_main "$out" || rc=$?
   exit "$rc"
+}
+
+# Attach-only follow of a running setup-migrate-1.22 unit: never starts a
+# unit and never touches the run lock (the caller does not hold it yet).
+# Follows the migration log from its current end until the unit's main
+# process exits, then returns the status the unit recorded.  A unit that
+# finished between the caller's migrate_running check and this call is not
+# an error: its recorded result is returned as it is (unlike
+# migrate_detach_cmd with no command, which would try to start a new unit).
+migrate_attach_running() {
+  local unit=${MIGRATE_UNIT:-setup-migrate-1.22} log=${MIGRATE_LOG:-} rcfile pid=0 off=0 rc
+  rcfile="${MIGRATE_STATE_FILE:-/var/lib/setup/migrate-1.22.state}.rc"
+  if [[ -n $log && -f $log ]]; then
+    off=$(stat -c %s -- "$log" 2>/dev/null || echo 0)
+    [[ $off =~ ^[0-9]+$ ]] || off=0
+  fi
+  pid=$(systemctl show -p MainPID --value "$unit" 2>/dev/null || echo 0)
+  if [[ $pid =~ ^[0-9]+$ ]] && (( pid > 0 )); then
+    info "The 1.22 migration is already running (${unit}); following ${log:-its log} until it ends"
+    if [[ -n $log && -f $log ]]; then
+      tail -c "+$(( off + 1 ))" -F --pid="$pid" -- "$log" 2>/dev/null || true
+    else
+      while kill -0 "$pid" 2>/dev/null; do sleep 2; done
+    fi
+  fi
+  rc=$(tr -dc '0-9' < "$rcfile" 2>/dev/null || true)
+  if [[ -z $rc ]]; then
+    warn "The migration unit left no result in ${rcfile}; see ${log:-its log}"
+    return 1
+  fi
+  return "$rc"
 }
 
 main() {
@@ -766,7 +797,7 @@ main() {
   # ends, then take the lock and continue with the normal run.
   if (( OPTIMIZE )) && declare -F migrate_running >/dev/null 2>&1 && migrate_running; then
     local attach_rc=0
-    migrate_detach_cmd || attach_rc=$?
+    migrate_attach_running || attach_rc=$?
     (( attach_rc == 0 )) || warn "The 1.22 migration unit ended with status ${attach_rc}; see ${MIGRATE_LOG:-its log}"
   fi
   (( ${LOCK_HELD:-0} )) || acquire_run_lock

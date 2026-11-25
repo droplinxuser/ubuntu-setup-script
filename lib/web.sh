@@ -2686,19 +2686,33 @@ sync_php_ini_template() {
 
 # Path of the php-fpm binary for a version, or non-zero when the version is
 # not installed.  The 1.22 build (ROOT/X.Y/sbin/php-fpm, lib/php-build.sh)
-# comes first; PATH and the Debian location remain for a host whose PHP part
-# has not migrated yet (Sury still serves until its cutover).
+# is the answer whenever X.Y is ours.  The package binary
+# (/usr/sbin/php-fpmX.Y) is returned only while X.Y is still a Sury/Ubuntu
+# version: no build.info of our own for it and no finished migration of it
+# (migrate state php-X.Y=done).  Once X.Y is ours a missing compiled php-fpm
+# is reported (status 1), never hidden behind the package's binary and
+# config layout.
 php_fpm_binary() {
-  local ver=$1 bin
-  if declare -F php_fpm_bin >/dev/null 2>&1 && bin=$(php_fpm_bin "$ver") && [[ -x $bin ]]; then
-    printf '%s' "$bin"
-  elif bin=$(command -v "php-fpm${ver}" 2>/dev/null) && [[ -n $bin ]]; then
-    printf '%s' "$bin"
-  elif [[ -x "/usr/sbin/php-fpm${ver}" ]]; then
-    printf '%s' "/usr/sbin/php-fpm${ver}"
+  local ver=$1 bin root=${PHP_BUILD_ROOT:-/usr/local/lib/setup-php}
+  if declare -F php_fpm_bin >/dev/null 2>&1; then
+    bin=$(php_fpm_bin "$ver")
   else
+    bin="${root}/${ver}/sbin/php-fpm"
+  fi
+  if [[ -x $bin ]]; then
+    printf '%s' "$bin"
+    return 0
+  fi
+  [[ -f ${root}/${ver}/build.info ]] && return 1
+  if declare -F migrate_state_get >/dev/null 2>&1 \
+     && [[ $(migrate_state_get "php-${ver}" 2>/dev/null || true) == "done" ]]; then
     return 1
   fi
+  if [[ -x "/usr/sbin/php-fpm${ver}" ]]; then
+    printf '%s' "/usr/sbin/php-fpm${ver}"
+    return 0
+  fi
+  return 1
 }
 
 # Point a pool at its listener (socket path or address) with the socket
@@ -3255,6 +3269,14 @@ EOF
   # build, and a package binary still gets the same explicit paths.
   local fpm_bin fpm_test fpm_ok=1
   fpm_bin=$(php_fpm_binary "$ver" || true)
+  if [[ -z $fpm_bin ]]; then
+    # Only a version with a php-fpm reaches the tuner (install_php after its
+    # build, --optimize for a detected build): a missing binary is a broken
+    # build, and an untested pool must not be reported as tuned.
+    printf 'PHP %s: no php-fpm binary to test the pool with (%s missing); re-run --php or --optimize to rebuild\n' \
+      "$ver" "${PHP_BUILD_ROOT:-/usr/local/lib/setup-php}/${ver}/sbin/php-fpm" >&2
+    return 1
+  fi
   if [[ -n $fpm_bin ]]; then
     fpm_test=$(tmp_file)
     if declare -F php_fpm_test >/dev/null 2>&1 && declare -F php_fpm_bin >/dev/null 2>&1 \
@@ -4019,21 +4041,11 @@ deploy_nginx_configs() {
   for change in "${TUNE_MISSES[@]}"; do warn "tune not applied: ${change}"; done
 }
 
-# Ensure an embedded key file is present and byte-identical to the payload.
-# A truncated file from an interrupted write, or an outdated key, otherwise
-# makes every later apt operation fail until an operator removes it manually.
-refresh_blob_key() {
-  local target=$1 blob=$2 tmp
-  tmp=$(tmp_file) || return 1
-  "$blob" > "$tmp" 2>/dev/null || { warn "Could not decode ${blob}"; return 1; }
-  [[ -s $tmp ]] || { warn "Embedded ${blob} decoded to an empty file"; return 1; }
-  if [[ -s $target ]] && cmp -s "$tmp" "$target"; then
-    return 0
-  fi
-  install -m 644 "$tmp" "$target" || return 1
-  info "Refreshed embedded key: ${target}"
-}
-
+# Ensure an embedded, ASCII-armoured key is present (dearmoured) and
+# byte-identical to the payload.  A truncated file from an interrupted write,
+# or an outdated key, otherwise makes every later apt operation fail until an
+# operator removes it manually.  (The plain refresh_blob_key went with the
+# Sury keyring in 1.22.)
 refresh_blob_key_dearmor() {
   local target=$1 blob=$2 tmp
   tmp=$(tmp_file) || return 1

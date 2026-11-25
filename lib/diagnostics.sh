@@ -513,7 +513,7 @@ run_diagnostics() {
   fi
   while IFS= read -r ver; do
     [[ -n $ver ]] || continue
-    fpm_bin=$(php_fpm_binary "$ver" || printf '/usr/sbin/php-fpm%s' "$ver")
+    fpm_bin=$(php_fpm_binary "$ver" || printf '%s/%s/sbin/php-fpm' "${PHP_BUILD_ROOT:-/usr/local/lib/setup-php}" "$ver")
     diag "PHP ${ver} FPM version" "$fpm_bin" -v
     # The configuration is named explicitly: the compiled php-fpm's built-in
     # default is its own prefix, not /etc/php (R2.8).

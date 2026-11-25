@@ -33,6 +33,41 @@ purge_service_stop() {
   systemctl disable --now "$unit" 2>/dev/null || true
 }
 
+# The apt pin that keeps the packaged nginx, PHP and Valkey out while our
+# source builds own their paths (lib/services.sh services_apt_pin_add and
+# lib/migrate.sh migrate_write_apt_pin write it: a header, one 'Package:'
+# line, Pin and Pin-Priority -1).  A purged component's patterns leave the
+# Package: line, so an operator who removed the source build can install the
+# packaged one again; the file goes when no pattern is left.
+PURGE_APT_PIN=${MIGRATE_APT_PIN:-/etc/apt/preferences.d/setup-source-builds}
+purge_apt_pin_remove() { # "pattern ..."
+  local drop=" $1 " pkgs="" p tmp
+  local -a cur=()
+  [[ -f $PURGE_APT_PIN ]] || return 0
+  # read -a splits without pathname expansion (the patterns hold '*').
+  read -r -a cur <<< "$(sed -nE 's/^Package:[[:space:]]*//p' "$PURGE_APT_PIN" | head -n 1)"
+  for p in "${cur[@]}"; do
+    [[ $drop == *" ${p} "* ]] && continue
+    pkgs+="${pkgs:+ }${p}"
+  done
+  if [[ -z $pkgs ]]; then
+    rm -f -- "$PURGE_APT_PIN"
+    info "apt pin ${PURGE_APT_PIN} removed (no source build left to protect)"
+    return 0
+  fi
+  tmp=$(tmp_file) || return 0
+  # Keep every line but Package: (the header and the Pin lines) as written.
+  awk -v pkgs="$pkgs" '/^Package:/ { print "Package: " pkgs; next } { print }' \
+    "$PURGE_APT_PIN" > "$tmp" || { rm -f -- "$tmp"; return 0; }
+  if ! cmp -s "$tmp" "$PURGE_APT_PIN"; then
+    cat -- "$tmp" > "$PURGE_APT_PIN"
+    chmod 644 "$PURGE_APT_PIN"
+    info "apt pin: ${1} no longer held back (${PURGE_APT_PIN})"
+  fi
+  rm -f -- "$tmp"
+  return 0
+}
+
 # Print the SSH port a recorded `ufw ...` rule line refers to and return 0,
 # or return 1 when the rule is not an SSH rule.  Shared by the two purge
 # passes over the recorded firewall rules.
@@ -322,6 +357,8 @@ purge_nginx() {
   if declare -F nginx_build_purge >/dev/null 2>&1; then
     nginx_build_purge
   fi
+  # The packaged nginx (and Angie) may be installed again.
+  purge_apt_pin_remove "nginx nginx-* libnginx-mod-* angie angie-*"
   # Configuration and logs are left on disk.  Reinstalling nginx then
   # restores the exact site instead of starting from an empty tree.
   info "Leaving nginx files under /etc/nginx and ${LOG_ROOT}/nginx, and the backups in /var/backups/setup-1.22"
@@ -366,6 +403,20 @@ purge_php() {
   if declare -F php_build_purge >/dev/null 2>&1; then
     php_build_purge "$ver"
   fi
+  # The packaged PHP may be installed again once no compiled version is left
+  # (ver= of one of several keeps the pin for the others).  Both the
+  # migration's older 'php*' and the narrower families are dropped.
+  if ! compgen -G "${PHP_BUILD_ROOT:-/usr/local/lib/setup-php}/[0-9]*.[0-9]*/sbin/php-fpm" >/dev/null 2>&1; then
+    purge_apt_pin_remove "php* php[0-9]* php-* libapache2-mod-php*"
+    # The shared refresh timer and CPU-change unit go with the last build of
+    # any kind (R81): on a PHP-only host, or after an earlier
+    # '--purge nginx,valkey', PHP is that last build.  The helper keeps them
+    # while an nginx or Valkey build remains, and is idempotent when
+    # php_build_purge already released them.
+    if declare -F setup_build_remove_shared_units_if_last >/dev/null 2>&1; then
+      setup_build_remove_shared_units_if_last php || true
+    fi
+  fi
   # The session GC timer is shared by every installed version; stop it only
   # when no php-fpm unit remains enabled.
   if ! systemctl list-unit-files 'php*-fpm.service' --state=enabled --no-legend 2>/dev/null | grep -q .; then
@@ -405,6 +456,8 @@ purge_valkey() {
   if declare -F valkey_build_purge >/dev/null 2>&1; then
     valkey_build_purge
   fi
+  # The packaged Valkey may be installed again.
+  purge_apt_pin_remove "valkey-server valkey-tools"
   # A package valkey-server the migration has not replaced yet.
   purge_service_stop valkey-server
   # --optimize and --restart-all treat an adopted Redis as a managed cache

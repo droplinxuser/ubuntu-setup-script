@@ -35,6 +35,9 @@ OPT_DETECT_LEGACY=0
 # migrate_run's status in this run: 0 done or nothing to do, 1 a part
 # failed or rolled back, 2 legacy-Angie mode.
 OPT_MIGRATE_RC=0
+# 1 once optimize_migration_step ran migrate_run in this run (the caller
+# re-primes what depends on the vhost trees).
+OPT_MIGRATE_RAN=0
 
 opt_report() { OPT_REPORT+=("$*"); }
 
@@ -209,38 +212,10 @@ elasticsearch_restart_probe() {
   return 1
 }
 
-# Small-host gate (section 7): "4 GB class" = MemTotal >= 3500 MB.  Below
-# it a host runs nginx only: --php/--valkey (and the other PHP-dependent
-# installs) are refused, and --optimize neither migrates nor tunes a PHP or
-# Valkey left over from 1.21.  SETUP_MEM_TOTAL_MB is honoured only in the
-# dry run and source-only test mode (R2.14), never to bypass the gate on a
-# real run.  Defined here only when no other module has (the validate glue
-# may own the canonical copy; both follow the same rule).
-if ! declare -F mem_class_mb >/dev/null 2>&1; then
-  mem_class_mb() {
-    local kb
-    if [[ ${SETUP_MEM_TOTAL_MB:-} =~ ^[0-9]+$ ]] \
-       && { (( ${DRY_RUN:-0} )) || [[ ${SETUP_SOURCE_ONLY:-0} == 1 ]]; }; then
-      printf '%s' "$SETUP_MEM_TOTAL_MB"; return 0
-    fi
-    kb=$(awk '/^MemTotal:/ { print $2; exit }' /proc/meminfo 2>/dev/null || true)
-    [[ $kb =~ ^[0-9]+$ ]] || kb=0
-    printf '%s' "$(( kb / 1024 ))"
-  }
-fi
-if ! declare -F mem_gate_allows >/dev/null 2>&1; then
-  # mem_gate_allows SERVICE: 0 when SERVICE may run on this host.
-  mem_gate_allows() {
-    local mb
-    case ${1:-} in
-      nginx|basic|domain-proxy) return 0 ;;
-    esac
-    mb=$(mem_class_mb)
-    # An unreadable /proc/meminfo must not refuse a working host.
-    [[ $mb =~ ^[0-9]+$ ]] && (( mb > 0 )) || return 0
-    (( mb >= 3500 ))
-  }
-fi
+# The small-host gate (section 7: the 4 GB class, MemTotal >= 3500 MB) is
+# defined once, in lib/validate.sh (mem_class_mb, mem_gate_allows), which
+# setup.sh sources before this file.  Tests that source this module alone
+# must source lib/validate.sh too.
 
 # 0 when PHP X.Y is served by our build: the compiled php-fpm and its
 # build.info under the build root, and (with lib/php-build.sh loaded) our
@@ -381,6 +356,7 @@ detect_installed_services() {
 optimize_migration_step() {
   local need=0 note
   OPT_MIGRATE_RC=0
+  OPT_MIGRATE_RAN=0
   if declare -F migrate_run >/dev/null 2>&1 && (( ! ${DRY_RUN:-0} )) \
      && [[ ${OPT_SKIP_MIGRATION:-0} != 1 ]]; then
     if declare -F migrate_running >/dev/null 2>&1 && migrate_running; then
@@ -391,6 +367,7 @@ optimize_migration_step() {
   fi
   if (( need )); then
     step "1.22 migration (nginx, compiled PHP and Valkey replace Angie and the packages)"
+    OPT_MIGRATE_RAN=1
     detect_installed_services migrate
     plan_memory_budget
     opt_report "## Migration 1.22"
@@ -415,8 +392,9 @@ optimize_migration_step() {
       opt_report "- ${note}"
     done
   fi
-  (( OPT_MIGRATE_RC == 1 )) && return 1
-  return 0
+  # Any status but 0 (done) and 2 (legacy mode) is a failure of this run.
+  case $OPT_MIGRATE_RC in 0|2) return 0 ;; esac
+  return 1
 }
 
 # ---------------------------------------------------------------------------

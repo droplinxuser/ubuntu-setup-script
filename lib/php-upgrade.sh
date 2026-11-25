@@ -396,8 +396,10 @@ php_upgrade_core_modules() {
   return 0
 }
 
-# Effective extension set of the next build (B's php_build_effective_exts:
-# per-app detection + PHP_EXT_EXTRA + base), lower-case, one per line.  The
+# Effective extension set of the next build of X.Y (B's php_build_effective_exts:
+# per-app detection + PHP_EXT_EXTRA + base + the current build's set; for a
+# version other than the active one that includes the active build's set),
+# lower-case, one per line.  X.Y defaults to the active version.  The
 # output format of the helper (comma list or one per line) does not matter.
 #
 # The helper's status is captured into a variable, never left inside a pipe:
@@ -406,10 +408,10 @@ php_upgrade_core_modules() {
 # explained die.  Its stderr is not discarded: on status 1 it names the
 # extension that has no source build path, and the caller shows that.
 # Returns the helper's status (1 = the set cannot be built as asked).
-php_upgrade_effective_exts() {
+php_upgrade_effective_exts() { # [X.Y]
   declare -F php_build_effective_exts >/dev/null || return 0
   local raw="" rc=0
-  raw=$(php_build_effective_exts) || rc=$?
+  raw=$(php_build_effective_exts "${1:-}") || rc=$?
   printf '%s\n' "$raw" | tr '[:upper:]' '[:lower:]' | tr ',' '\n' \
     | tr -s '[:space:]' '\n' | sed '/^$/d' | sort -u
   return "$rc"
@@ -426,10 +428,31 @@ php_upgrade_extension_available() {
   grep -qxF "$ext" <<<"$exts"
 }
 
+# 0 while X.Y is still a Sury (package) version on this host, the 1.21 ->
+# 1.22 legacy window: a package php-fpmX.Y exists and X.Y is not ours yet
+# (php_fpm_legacy_versions when lib/optimize.sh is loaded, else no setup
+# build of X.Y), or the migration state has a php-X.Y part that is not done.
+php_upgrade_sury_window() { # X.Y
+  local ver=$1 st=""
+  [[ -x /usr/sbin/php-fpm${ver} ]] || return 1
+  if declare -F migrate_state_get >/dev/null; then
+    st=$(migrate_state_get "php-${ver}" 2>/dev/null || true)
+    [[ -n $st && $st != "done" ]] && return 0
+  fi
+  if declare -F php_fpm_legacy_versions >/dev/null; then
+    st=$(php_fpm_legacy_versions 2>/dev/null || true)
+    grep -qxF -- "$ver" <<<"$st"
+    return
+  fi
+  ! php_upgrade_fpm_installed "$ver"
+}
+
 # Lower-case names of the modules the PHP-FPM of VERSION loads (the SAPI the
 # sites run on), one per line; the CLI list when no FPM binary exists.  The
 # binary is BIN when given (the migration passes the Sury php-fpmX.Y), else
-# our build, else the Sury package's.  FPM reads its ini only through -c and
+# our build; the Sury package binaries only while X.Y is still a package
+# version (php_upgrade_sury_window): once X.Y is ours, a missing compiled
+# php-fpm shows as "unknown", not as Sury's module list.  FPM reads its ini only through -c and
 # PHP_INI_SCAN_DIR (the unit passes them), so both are given here: without
 # them a < 8.5 build never shows "Zend OPcache" (shared, loaded by conf.d).
 # Empty output means "unknown": the caller then keeps every requirement.
@@ -437,8 +460,11 @@ php_upgrade_loaded_modules() {
   local ver=$1 bin=${2:-} out ini="" scan="" b
   [[ -n $ver ]] || return 0
   if [[ -z $bin ]]; then
-    for b in "$(php_upgrade_fpm_bin "$ver")" "/usr/sbin/php-fpm${ver}" \
-             "$(php_upgrade_cli_bin "$ver")" "/usr/bin/php${ver}"; do
+    local -a cands=("$(php_upgrade_fpm_bin "$ver")" "$(php_upgrade_cli_bin "$ver")")
+    if php_upgrade_sury_window "$ver"; then
+      cands=("$(php_upgrade_fpm_bin "$ver")" "/usr/sbin/php-fpm${ver}" "$(php_upgrade_cli_bin "$ver")" "/usr/bin/php${ver}")
+    fi
+    for b in "${cands[@]}"; do
       [[ -x $b ]] && { bin=$b; break; }
     done
   fi
@@ -654,17 +680,28 @@ php_upgrade_validate_target() {
 # purge is in flight, the migration unit runs, a Sury phpX.Y-fpm unit still
 # serves a version whose php-X.Y part is not done, or the Sury purge after a
 # done part has not run (it would remove dpkg conffiles under /etc/php).
-# Only the PHP parts count (R19): migrate_needed answers for every part, so
-# a blocked nginx part, a deferred Angie purge, a postponed Valkey part or a
-# leftover distro nginx would lock --upgrade-php out although PHP is done.
+# Only the PHP parts count (R19): a plain migrate_needed answers for every
+# part, so a blocked nginx part, a deferred Angie purge, a postponed Valkey
+# part or a leftover distro nginx would lock --upgrade-php out although PHP
+# is done; `migrate_needed php` is the scoped form used here.
 # A deferred Sury purge (collateral the operator must clear) does not block:
 # nothing of it is half-done.  Without lib/migrate.sh nothing is pending.
 php_upgrade_migration_pending() {
   local st v php_done=0
   declare -F migrate_state_get >/dev/null || return 1
-  # A PHP-scoped query from the migration module wins when it exists.
+  # A PHP-scoped query from the migration module wins when it exists:
+  # migrate_php_pending, else migrate_needed php (E's PART-scoped answer: a
+  # PHP switch or interrupted Sury purge in flight, a part not done, a
+  # refused/failed part whose cause changed, a deferred purge that can run
+  # now; a blocked nginx part or a postponed Valkey part never count).  The
+  # migration unit running owns the host either way.
   if declare -F migrate_php_pending >/dev/null; then
     migrate_php_pending
+    return
+  fi
+  if declare -F migrate_needed >/dev/null; then
+    if declare -F migrate_running >/dev/null && migrate_running; then return 0; fi
+    migrate_needed php
     return
   fi
   st=$(migrate_state_get inflight 2>/dev/null || true)
@@ -901,7 +938,9 @@ php_upgrade_http_probe() {
 # Make VER the active version: marker first (php_active_version, the tuner,
 # the CPU chain and the refresh read it), then the unversioned php links.
 # B's php_build_links owns the link rules (/usr/local/bin/php always;
-# /usr/bin/php only where dpkg no longer owns it, R6); the fallback applies
+# /usr/bin/php only where dpkg no longer owns it, R6; a "php" alternative
+# that points into our root, left by a deferred Sury purge, is moved to the
+# new CLI, so cron's /usr/bin/php follows the switch); the fallback applies
 # the same rules so a missing helper cannot leave php on the old version.
 php_upgrade_set_active() {
   local ver=$1 tmp root cli
@@ -978,6 +1017,12 @@ php_upgrade_start_wait() {
 # verification), then align nginx with the socket.
 php_upgrade_optimize() {
   local rc=0 change
+  # No BOLT inside the switch (R2.5/R14): optimize_php_services runs
+  # php_build_ensure TARGET full optimize, whose BOLT step (60 s sample,
+  # binary swap, restart) would land before php_upgrade_verify, with the
+  # build lock held.  php_build_ensure also skips it while
+  # PHP_UPGRADE_IN_FLIGHT=1; the next --optimize BOLTs the new version.
+  local -x SETUP_PHP_BUILD_BOLT=0
   detect_installed_services
   plan_memory_budget
   OPT_PHP_SOCKET=""
@@ -1247,7 +1292,7 @@ php_upgrade_plan() {
   mapfile -t versions < <(php_upgrade_installed_versions)
   cur=$(php_upgrade_current_version)
   # The helper prints its reason (the unbuildable name) on stderr.
-  PHP_UPGRADE_EXTS=$(php_upgrade_effective_exts) || exts_rc=$?
+  PHP_UPGRADE_EXTS=$(php_upgrade_effective_exts "$target") || exts_rc=$?
   (( exts_rc == 0 )) || PHP_UPGRADE_EXTS=""
   printf '\n%sDRY RUN%s - PHP upgrade plan, no changes will be made.\n' "$C_BOLD" "$C_RESET"
   printf 'Target PHP : %s (newest released %s.x from php.net, built from source)\n' "$target" "$target"
@@ -1512,9 +1557,16 @@ run_php_upgrade() {
   # 1.21's apt flow recorded extensions Sury had not published yet; a source
   # build has no such state.
   rm -f "${STATE_DIR}/php-pending-extensions"
+  # A --php ext= of this run is recorded before the set is planned, so the
+  # plan, the build (php_build_ensure applies it again: idempotent) and the
+  # binding gate all see it.
+  if declare -F php_ext_request_apply >/dev/null; then php_ext_request_apply; fi
   local exts_rc=0
+  # The set of the TARGET build (php_build_effective_exts TARGET), which for
+  # a new series includes the current build's set (B's _pb_prev_union): the
+  # plan, the build and the binding gate on the candidate's -m agree.
   # php_build_effective_exts prints the unbuildable name on stderr.
-  PHP_UPGRADE_EXTS=$(php_upgrade_effective_exts) || exts_rc=$?
+  PHP_UPGRADE_EXTS=$(php_upgrade_effective_exts "$target") || exts_rc=$?
   (( exts_rc == 0 )) \
     || die "Could not compute the PHP extension set (php_build_effective_exts: see the reason above; fix --php ext= or set SETUP_PHP_ALLOW_MISSING_EXT=1). Nothing was changed."
   [[ -n $PHP_UPGRADE_EXTS ]] || die "Could not compute the PHP extension set (php_build_effective_exts). Nothing was changed."

@@ -129,26 +129,8 @@ php_build_app_exts() { # app
 php_build_ext_buildable() { [[ " ${PHP_BUILDABLE_EXTS[*]} " == *" ${1,,} "* ]]; }
 php_build_buildable_exts() { printf '%s\n' "${PHP_BUILDABLE_EXTS[@]}"; }
 
-# Build names of the modules a Sury (or any) PHP binary loads: lower case,
-# "Zend OPcache" as opcache, the always-on core dropped.  Used by the 1.22
-# migration's union (lib/migrate.sh) for the FPM and the CLI.
-php_build_module_names() {
-  grep -vE '^(\[.*\])?[[:space:]]*$' | tr '[:upper:]' '[:lower:]' | sed 's/^zend opcache$/opcache/' \
-    | grep -vxF -f <(printf '%s\n' "${PHP_CORE_EXTS[@]}") | sort -u
-}
-
-# Modules the package PHP X.Y loads today, FPM and CLI (each with its own
-# ini tree), as build names.  Empty when neither binary answers ("unknown").
-php_build_sury_loaded_exts() { # X.Y
-  local ver=$1 out=""
-  if [[ -x /usr/sbin/php-fpm$ver ]]; then
-    out+=$(PHP_INI_SCAN_DIR=/etc/php/$ver/fpm/conf.d "/usr/sbin/php-fpm$ver" -c "/etc/php/$ver/fpm/php.ini" -m 2>/dev/null || true)$'\n'
-  fi
-  if [[ -x /usr/bin/php$ver ]]; then
-    out+=$(env -u PHP_INI_SCAN_DIR "/usr/bin/php$ver" -m 2>/dev/null || true)
-  fi
-  printf '%s\n' "$out" | php_build_module_names
-}
+# (The probe of what a Sury PHP loads is lib/migrate.sh's own,
+# migrate_sury_modules: the only one, and the only Sury path here.)
 
 # ---------------------------------------------------------------------------
 # Detection
@@ -171,17 +153,36 @@ _pb_vhost_root() { # file
   printf '%s' "${root%/}"
 }
 
+# Web trees besides /etc/nginx whose vhosts count.  PHP_BUILD_EXTRA_WEB_TREES
+# when set (empty: none).  Otherwise /etc/angie only during the 1.21 -> 1.22
+# legacy window: while Angie still serves (web_server_state angie-legacy:
+# the migration builds PHP before /etc/nginx exists) or while the migration
+# state file has no complete=1.  A leftover /etc/angie after the migration
+# (or one an operator kept) never adds its vhosts' sets to later builds;
+# lib/migrate.sh owns the Angie paths and passes PHP_EXT_DETECT_TREE itself.
+_pb_extra_web_trees() {
+  local a=${PHP_BUILD_ANGIE_ETC:-/etc/angie} st=${MIGRATE_STATE_FILE:-}
+  if [[ -n ${PHP_BUILD_EXTRA_WEB_TREES+x} ]]; then printf '%s' "$PHP_BUILD_EXTRA_WEB_TREES"; return 0; fi
+  [[ -d $a/conf.d ]] || return 0
+  if declare -F web_server_state >/dev/null && [[ $(web_server_state 2>/dev/null || true) == angie-legacy ]]; then
+    printf '%s' "$a"; return 0
+  fi
+  if [[ -n $st && -f $st ]] && ! grep -qx 'complete=1' "$st" 2>/dev/null; then printf '%s' "$a"; fi
+  return 0
+}
+
 # "app<TAB>root" for every PHP document root on the host: the vhosts of the
-# live web tree (/etc/nginx, and /etc/angie while a 1.21 host still serves
-# from it: the migration builds before /etc/nginx exists), the /var/www walk
-# (php_upgrade_app_roots), PHP_EXT_DETECT_TREE (another web tree, e.g. the
-# migration's /etc/angie copy) and PHP_BUILD_DETECT_ROOTS (document roots).
-# A PHP root that is none of the three applications is reported as "php".
+# live web tree (/etc/nginx, plus /etc/angie during the legacy window, see
+# _pb_extra_web_trees), the /var/www walk (php_upgrade_app_roots),
+# PHP_EXT_DETECT_TREE (another web tree, e.g. the migration's /etc/angie
+# copy) and PHP_BUILD_DETECT_ROOTS (document roots).  A PHP root that is
+# none of the three applications is reported as "php".
 php_build_detect_apps() {
-  local t file root app line
+  local t file root app line extra
   local -A seen=()
+  extra=$(_pb_extra_web_trees)
   {
-    for t in "${PHP_BUILD_NGINX:-/etc/nginx}" ${PHP_EXT_DETECT_TREE:-} ${PHP_BUILD_EXTRA_WEB_TREES:-/etc/angie}; do
+    for t in "${PHP_BUILD_NGINX:-/etc/nginx}" ${PHP_EXT_DETECT_TREE:-} ${extra}; do
       [[ -d $t/conf.d ]] || continue
       for file in "$t"/conf.d/*.conf; do
         [[ -f $file ]] || continue
@@ -279,6 +280,22 @@ _pb_prev_exts() { # X.Y
   return 0
 }
 
+# The "current build" input of X.Y's set: its own record, plus, when X.Y is
+# not the active version, the active version's record.  --upgrade-php builds
+# a new series that has no record yet (or a kept older one whose record
+# predates what the active build gained since): the target must get the set
+# the serving build has (design section 8), or every add-only membership of
+# the current build (an earlier --domain app, the bare --php union, a past
+# SQLite or Redis detection) would be dropped and the binding gate on the
+# candidate's -m would abort the switch after the build.
+_pb_prev_union() { # X.Y
+  local v=$1 active
+  _pb_prev_exts "$v"
+  active=$(php_active_version 2>/dev/null || true)
+  if [[ -n $active && $active != "$v" ]]; then printf ','; _pb_prev_exts "$active"; fi
+  return 0
+}
+
 # The effective extension set of X.Y (the active version when omitted), as
 # a sorted comma list on stdout.  Inputs, all unioned:
 #   base; every (app, root) the host serves: the app's table row,
@@ -286,9 +303,10 @@ _pb_prev_exts() { # X.Y
 #   sqlite3/pdo_sqlite when the root uses SQLite; "php" roots: the generic
 #   set; PHP_BUILD_APPS (--domain app= types being created); PHP_EXT_EXTRA
 #   (--php ext=, and the migration's union of what Sury loaded);
-#   and the set the current build has: detection only ADDS (R11), so a
-#   transient miss (unmounted volume, unreadable config, scan timeout) never
-#   shrinks a live build.  PHP_BUILD_EXT_RESET=1 (an explicit --php ext=none
+#   and the set the current build has (X.Y's record, and the active
+#   version's when X.Y is another one: _pb_prev_union): detection only
+#   ADDS (R11), so a transient miss (unmounted volume, unreadable config,
+#   scan timeout) never shrinks a live build.  PHP_BUILD_EXT_RESET=1 (an explicit --php ext=none
 #   / ext=-NAME, or a removed --domain) drops that last input.
 # A host with no application and no previous build (a bare --php) gets the
 # union of the three applications' sets, today's lean APP_MODULES list, so a
@@ -301,7 +319,8 @@ php_build_effective_exts() { # [X.Y]
   local -a bad=()
   [[ -n $ver ]] || ver=$(php_active_version 2>/dev/null || true)
   for name in "${PHP_BASE_EXTS[@]}"; do set[$name]=1; done
-  prev=$(_pb_prev_exts "$ver")
+  prev=$(_pb_prev_union "$ver")
+  prev=${prev#,}; prev=${prev%,}
   for name in $(_pb_norm "$prev"); do prevset[$name]=1; done
   while IFS=$'\t' read -r app root; do
     [[ -n $app ]] || continue
@@ -655,21 +674,76 @@ _pb_symlink() { # src dst
 # A path in /usr/bin may be ours only when no package owns it (dpkg -S) and,
 # for php, no alternatives link manages it (Sury's php-cli postrm would
 # otherwise fight over it).  Until the Sury purge, the /usr/local links serve.
+PHP_BUILD_ALT_LINK=${PHP_BUILD_ALT_LINK:-/etc/alternatives/php}
 _pb_usr_free() { # path
   local p=$1
   if command -v dpkg >/dev/null 2>&1 && dpkg -S "$p" >/dev/null 2>&1; then return 1; fi
-  [[ ${p##*/} == php && -e /etc/alternatives/php ]] && return 1
+  [[ ${p##*/} == php ]] && { [[ -e $PHP_BUILD_ALT_LINK || -L $PHP_BUILD_ALT_LINK ]]; } && return 1
   [[ -e $p && ! -L $p ]] && return 1
   return 0
 }
 
+# The "php" alternatives group, when something registered one: a Sury or
+# Ubuntu php-cli, or a 1.22 migration draft that registered our CLI (R2.1
+# wants /usr/bin/php as a plain symlink, never an alternative).  For the
+# active version CLI:
+#   - every alternative is ours (no package left in the group): our entries
+#     are removed, which deletes the group and its /usr/bin/php link, so the
+#     plain symlink below takes over;
+#   - the selected alternative is ours (a package is still in the group,
+#     e.g. a deferred Sury purge): it is moved to CLI, so cron's
+#     /usr/bin/php follows a switch instead of running the old series (and
+#     never dangles once php_build_purge retired that series);
+#   - a package's alternative is selected (the operator's choice): untouched.
+# Our entries for versions without a CLI any more are always dropped.
+_pb_alt_php_sync() { # active-cli
+  local cli=$1 sel a mine=1 rc=0
+  local -a alts=()
+  [[ -e $PHP_BUILD_ALT_LINK || -L $PHP_BUILD_ALT_LINK ]] || return 0
+  command -v update-alternatives >/dev/null 2>&1 || return 0
+  mapfile -t alts < <(update-alternatives --list php 2>/dev/null || true)
+  sel=$(readlink "$PHP_BUILD_ALT_LINK" 2>/dev/null || true)
+  for a in "${alts[@]}"; do
+    [[ -n $a ]] || continue
+    if [[ $a == "$PHP_BUILD_ROOT"/* ]]; then
+      if [[ ! -x $a ]]; then update-alternatives --remove php "$a" >/dev/null 2>&1 || rc=1; fi
+    else
+      mine=0
+    fi
+  done
+  if (( mine )); then
+    for a in "${alts[@]}"; do
+      [[ $a == "$PHP_BUILD_ROOT"/* && -x $a ]] || continue
+      update-alternatives --remove php "$a" >/dev/null 2>&1 || rc=1
+    done
+    return "$rc"
+  fi
+  if [[ $sel == "$PHP_BUILD_ROOT"/* && $sel != "$cli" ]]; then
+    update-alternatives --install "${PHP_BUILD_USR_BIN}/php" php "$cli" 1000 >/dev/null 2>&1 || rc=1
+    update-alternatives --set php "$cli" >/dev/null 2>&1 || rc=1
+  fi
+  return "$rc"
+}
+
+# Drop our alternative entry for one version's CLI (php_build_purge).
+_pb_alt_php_remove() { # cli
+  local list
+  command -v update-alternatives >/dev/null 2>&1 || return 0
+  list=$(update-alternatives --list php 2>/dev/null || true)
+  grep -qxF -- "$1" <<<"$list" || return 0
+  update-alternatives --remove php "$1" >/dev/null 2>&1 || true
+}
+
 # Links for X.Y: /usr/local/bin/phpX.Y, the /usr/local/sbin/php-fpmX.Y
-# wrapper, and for the active version /usr/local/bin/php.  /usr/bin/phpX.Y
-# and /usr/bin/php (cron's PATH has no /usr/local/bin) only where dpkg no
-# longer owns the path.  Plain symlinks: the CLI has no CPU gate (accepted
-# risk R60: until the CPU chain finishes after a hardware change, a cron run
-# can hit SIGILL; operators never change CPUs).  Idempotent; the migration
-# reruns it after the Sury purge.
+# wrapper, and for the active version /usr/local/bin/php (always, also while
+# dpkg still owns /usr/bin/php: php_cli_path falls back to it).
+# /usr/bin/phpX.Y and /usr/bin/php (cron's PATH has no /usr/local/bin) only
+# where dpkg no longer owns the path and, for /usr/bin/php, after the "php"
+# alternatives group was reconciled (_pb_alt_php_sync).  Plain symlinks: the
+# CLI has no CPU gate (accepted risk R60: until the CPU chain finishes after
+# a hardware change, a cron run can hit SIGILL; operators never change
+# CPUs).  Idempotent; the migration reruns it after the Sury purge, and
+# --upgrade-php (php_upgrade_set_active) after every switch.
 php_build_links() { # X.Y
   local ver=$1 cli wrap rc=0
   cli=$(php_cli_bin "$ver")
@@ -682,6 +756,7 @@ php_build_links() { # X.Y
   _pb_usr_free "${PHP_BUILD_USR_BIN}/php${ver}" && { _pb_symlink "$cli" "${PHP_BUILD_USR_BIN}/php${ver}" || rc=1; }
   if [[ $(php_active_version) == "$ver" ]]; then
     _pb_symlink "$cli" "${PHP_BUILD_LINK_BIN}/php" || rc=1
+    _pb_alt_php_sync "$cli" || _pb_warn "PHP ${ver}: the php alternatives group could not be reconciled (update-alternatives --display php)"
     _pb_usr_free "${PHP_BUILD_USR_BIN}/php" && { _pb_symlink "$cli" "${PHP_BUILD_USR_BIN}/php" || rc=1; }
   fi
   return "$rc"
@@ -1122,6 +1197,16 @@ php_build_ensure() { # X.Y MODE CONTEXT OUT
   php_build_install_support || { _pb_report "$out" "- **FAILED** PHP ${ver}: build support files missing from this checkout"; return 1; }
   PHP_BUILD_CHANGED=0
   if [[ $mode != activate ]]; then
+    # --php ext=LIST of this run (lib/validate.sh php_ext_request_apply:
+    # records PHP_EXT_EXTRA and PHP_BUILD_EXT_RESET; idempotent, a no-op in
+    # a dry run or without ext=).  Applied here, in the shell that computes
+    # the set, so the request takes effect whichever step builds first
+    # (install_php runs this in run_service's subshell, --upgrade-php in an
+    # async subshell): a caller that already applied it changes nothing.
+    # The migration's union goes through PHP_EXT_EXTRA itself.
+    if [[ $context != migrate ]] && declare -F php_ext_request_apply >/dev/null; then
+      php_ext_request_apply
+    fi
     exts=$(php_build_effective_exts "$ver" 2>"${PHP_BUILD_LOG_DIR}/exts-${ver}.err") \
       || { _pb_report "$out" "- **FAILED** PHP ${ver}: $(cat "${PHP_BUILD_LOG_DIR}/exts-${ver}.err" 2>/dev/null)"; return 1; }
     # Warnings of a set that was computed (an uncertain SQLite scan, a
@@ -1176,7 +1261,14 @@ php_build_ensure() { # X.Y MODE CONTEXT OUT
       ;;
     *) return 0 ;;
   esac
-  if [[ $context == optimize && $mode == full && $(php_active_version) == "$ver" ]] && ! php_build_bolted "$ver" \
+  # Never inside an --upgrade-php switch (PHP_UPGRADE_IN_FLIGHT=1: its
+  # closing tuner pass runs this with the build lock held): the 60 s sample,
+  # the binary swap and the restart would land before the switch is
+  # verified, and a BOLT problem would trigger the rollback (R2.5/R14).  The
+  # next --optimize or the refresh rebuild BOLTs the new version.
+  if [[ $context == optimize && $mode == full && ${PHP_UPGRADE_IN_FLIGHT:-0} == 1 ]] && ! php_build_bolted "$ver"; then
+    _pb_report "$out" "- PHP ${ver}: BOLT deferred to the next --optimize (not during the --upgrade-php switch)"
+  elif [[ $context == optimize && $mode == full && $(php_active_version) == "$ver" ]] && ! php_build_bolted "$ver" \
      && [[ ${SETUP_PHP_BUILD_BOLT:-1} == 1 ]]; then
     "$PHP_BUILD_TOOL" bolt "$ver" "${SETUP_PHP_BUILD_BOLT_SECONDS:-60}" > "${PHP_BUILD_LOG_DIR}/bolt-${ver}.log" 2>&1 || rc=$?
     case $rc in
@@ -1216,6 +1308,7 @@ php_build_purge() { # [X.Y]
       rm -f "$PHP_BUILD_UNIT_DIR/php${v}-fpm.service"
     fi
     systemctl stop "setup-php-build@${v}.service" >/dev/null 2>&1 || true
+    _pb_alt_php_remove "$(php_cli_bin "$v")"
     _pb_unlink_ours "${PHP_BUILD_LINK_BIN}/php${v}"
     _pb_unlink_ours "${PHP_BUILD_LINK_SBIN}/php-fpm${v}"
     _pb_unlink_ours "${PHP_BUILD_USR_BIN}/php${v}"
@@ -1236,6 +1329,13 @@ php_build_purge() { # [X.Y]
       "$PHP_BUILD_TMPFILES" "$PHP_BUILD_TMPFILES_POOLS"
     rm -rf "$PHP_BUILD_TEMPLATES" "${PHP_BUILD_CACHE:?}"
     setup_build_llvm_release php
+    # Last-consumer rule (R81): the CPU chain, the refresh timer and the
+    # build lock go with the last remaining build of any kind.  Their
+    # ExecStart names a build-common.sh copy; on a PHP-only host (or after
+    # '--purge nginx,valkey') this purge removes the last one.
+    if declare -F setup_build_remove_shared_units_if_last >/dev/null; then
+      setup_build_remove_shared_units_if_last php
+    fi
     # Logs stay (operator evidence); the root goes when only they are left.
     rmdir "$PHP_BUILD_ROOT" 2>/dev/null || true
   fi
@@ -1249,8 +1349,12 @@ php_build_purge() { # [X.Y]
 setup_build_llvm_release() { # php|nginx|valkey: the build being removed
   local me=$1 n=${NGINX_BUILD_ROOT:-/usr/local/lib/setup-nginx} k=${VALKEY_BUILD_ROOT:-/usr/local/lib/setup-valkey}
   if [[ $me != php ]] && compgen -G "${PHP_BUILD_ROOT}/[0-9]*/build.info" >/dev/null; then return 0; fi
-  if [[ $me != nginx ]] && [[ -f $n/build.info || -x $n/sbin/nginx || -d $n/build ]]; then return 0; fi
-  if [[ $me != valkey ]] && [[ -f $k/build.info || -x $k/bin/valkey-server || -d $k/build ]]; then return 0; fi
+  # Each component's own record: nginx keeps build.info in ROOT/build/,
+  # Valkey in ROOT/build.info (lib/valkey-build.sh VALKEY_BUILD_INFO); the
+  # binary counts too (a build whose record was lost still needs LLVM to
+  # rebuild).  A leftover cache or work directory does not.
+  if [[ $me != nginx ]] && [[ -f $n/build/build.info || -f $n/build.info || -x $n/sbin/nginx ]]; then return 0; fi
+  if [[ $me != valkey ]] && [[ -f $k/build.info || -x $k/bin/valkey-server ]]; then return 0; fi
   _pb_llvm_packages_purge
   rm -f "${PHP_BUILD_LLVM_FILES[@]}"; rm -rf /opt/setup-llvm
 }
@@ -1287,14 +1391,3 @@ _pb_llvm_packages_purge() {
     || _pb_warn "LLVM: apt-get purge ${pkgs[*]} failed; left installed"
   return 0
 }
-
-# ---------------------------------------------------------------------------
-# Compatibility (1.21 callers; removed once lib/services.sh,
-# lib/service-optimizers.sh, lib/validate.sh and lib/web.sh call the 1.22
-# interface directly)
-# ---------------------------------------------------------------------------
-php_build_apply() { php_build_ensure "$1" full "${2:-optimize}" "${3:-info}"; }
-php_build_validate() { return 0; }
-php_build_persist() { return 0; }
-php_fpm_modules_apply() { return 1; }   # nothing to enable/disable: static set
-php_fpm_modules_persist() { return 0; }
