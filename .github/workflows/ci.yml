@@ -58,30 +58,32 @@ jobs:
 
       - name: ShellCheck
         run: |
-          # ShellCheck 0.11.0 pinned by SHA-256, the version used locally:
-          # the runner's packaged 0.9 ran for over 20 minutes on the 1.22
-          # tree without finishing.
+          # ShellCheck 0.11.0 pinned by SHA-256, the version used locally.
           curl -fsSL -o /tmp/sc.tar.xz \
             https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz
           echo "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198  /tmp/sc.tar.xz" | sha256sum -c -
           tar -xJf /tmp/sc.tar.xz -C /tmp
           export PATH="/tmp/shellcheck-v0.11.0:$PATH"
           shellcheck --version
-          # One call for every file: shellcheck needs them together to see
-          # variables set in setup.sh and used in lib/ (about 4 minutes).
-          shellcheck -S warning setup.sh lib/*.sh tests/test-dry-run-matrix.sh tests/test-tuning.sh \
-            tests/unit/*.sh \
-            tests/stress-site/setup-stress-site.sh tests/stress-site/run-stress.sh \
-            tests/stress-site/run-stress-remote.sh tests/stress-site/collect-metrics.sh tools/diff_configs.sh \
-            tests/stress-site/webserver-shootout.sh tests/stress-site/php-server-shootout.sh \
-            tests/bench-php-matrix/build-php-source.sh tests/bench-php-matrix/extract-php-debs.sh \
-            tests/bench-php-matrix/switch-php-arm.sh tests/bench-php-matrix/bench-php-sources.sh \
-            tests/bench-php-matrix/bench-php-probe.sh \
-            tools/remove-anubis.sh tools/fleet-update.sh \
-            tools/php-build.sh tools/build-common.sh tools/nginx-build.sh tools/valkey-build.sh \
-            tests/bench-php-matrix/build-php-dropin.sh tests/bench-php-matrix/bolt-php.sh \
-            tests/bench-php-matrix/switch-nginx-arm.sh \
-            tests/bench-php-matrix/switch-valkey-arm.sh tests/bench-php-matrix/bench-valkey.sh
+          # Files that share variables are checked together (setup.sh with
+          # lib/, the four build tools); every other file alone, in parallel.
+          # One call with every file grows superlinearly: it ran for over
+          # 20 minutes on the runner with the 1.22 tree.  This takes under a
+          # minute and reports the same findings.
+          {
+            echo "setup.sh lib/*.sh"
+            echo "tools/build-common.sh tools/php-build.sh tools/nginx-build.sh tools/valkey-build.sh"
+            for f in tests/test-dry-run-matrix.sh tests/test-tuning.sh tests/unit/*.sh \
+              tests/stress-site/setup-stress-site.sh tests/stress-site/run-stress.sh \
+              tests/stress-site/run-stress-remote.sh tests/stress-site/collect-metrics.sh tools/diff_configs.sh \
+              tests/stress-site/webserver-shootout.sh tests/stress-site/php-server-shootout.sh \
+              tests/bench-php-matrix/build-php-source.sh tests/bench-php-matrix/extract-php-debs.sh \
+              tests/bench-php-matrix/switch-php-arm.sh tests/bench-php-matrix/bench-php-sources.sh \
+              tests/bench-php-matrix/bench-php-probe.sh tools/remove-anubis.sh tools/fleet-update.sh \
+              tests/bench-php-matrix/build-php-dropin.sh tests/bench-php-matrix/bolt-php.sh \
+              tests/bench-php-matrix/switch-nginx-arm.sh tests/bench-php-matrix/switch-valkey-arm.sh \
+              tests/bench-php-matrix/bench-valkey.sh; do echo "$f"; done
+          } | xargs -P "$(nproc)" -I{} sh -c 'shellcheck -S warning {}'
 
       - name: Dry-run matrix
         run: bash tests/test-dry-run-matrix.sh

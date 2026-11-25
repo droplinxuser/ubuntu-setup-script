@@ -121,6 +121,7 @@ ext_apply_probe() ( # DRY_RUN EXT -> number of php_build_ext_option calls
   php_build_ext_option() { n=$((n + 1)); return 0; }
   DRY_RUN=$1
   OPT=()
+  # shellcheck disable=SC2154  # OPT is lib's associative array (keys are strings)
   [[ -n $2 ]] && OPT[php.ext]=$2
   PHP_EXT_REQUEST_APPLIED=0
   php_ext_request_apply
@@ -440,6 +441,7 @@ check "any other migrate_run status fails the run" test "$(mig_step 0 0 1 125)" 
 
 post_domain() ( # -> the OPT_SKIP_MIGRATION run_optimize saw, then the value after
   SVC_STATUS=()
+  # shellcheck disable=SC2154  # SVC_STATUS is lib's associative array
   SVC_STATUS[domain]=OK
   ENABLED=()
   unset SETUP_DOMAIN_OPTIMIZE
