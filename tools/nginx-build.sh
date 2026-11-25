@@ -882,8 +882,18 @@ cmd_bolt() {
   say "nginx: sampling for ${secs}s for BOLT (log: $LOG_FILE)"
   "$perf" record -q -e cycles:u -j any,u -o "$work/perf.data" -a -- sleep "$secs" >/dev/null 2>&1 \
     || die "perf could not record branch samples (no LBR on this CPU or VM?)"
-  "$p2b" -p "$work/perf.data" -o "$work/nginx.fdata" "$base" >> "$LOG_FILE" 2>&1 \
-    || { tail -n 5 "$LOG_FILE" >&2; die "perf2bolt failed"; }
+  # No nginx samples at all (an idle server, e.g. a fresh install with no
+  # site yet): perf2bolt fails with "Please rename the input binary".  That
+  # is too little traffic, not an error (1.22.0 fresh-install test).
+  if ! "$p2b" -p "$work/perf.data" -o "$work/nginx.fdata" "$base" > "$work/p2b.log" 2>&1; then
+    cat "$work/p2b.log" >> "$LOG_FILE"
+    if grep -qE 'Please rename the input binary|no samples|0 out of [0-9]+ functions' "$work/p2b.log"; then
+      say "nginx: no samples in ${secs}s: too little traffic, BOLT skipped"
+      return 3
+    fi
+    tail -n 5 "$work/p2b.log" >&2; die "perf2bolt failed"
+  fi
+  cat "$work/p2b.log" >> "$LOG_FILE"
   samples=$(awk '/BOLT-INFO: [0-9]+ out of [0-9]+ functions in the binary/ { print $2 }' "$LOG_FILE" | sed -n 1p)
   if [[ ${samples:-0} -lt $BOLT_MIN_FUNCS ]]; then
     say "nginx: ${samples:-0} functions profiled in ${secs}s (need $BOLT_MIN_FUNCS): too little traffic, BOLT skipped"

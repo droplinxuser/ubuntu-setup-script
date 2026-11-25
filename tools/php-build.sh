@@ -854,8 +854,18 @@ cmd_bolt() {
   if ! "$perf" record -q -e cycles:u -j any,u -o "$work/perf.data" -a -- sleep "$secs" >/dev/null 2>&1; then
     die "perf could not record branch samples (no LBR on this CPU or VM?)"
   fi
-  "$p2b" -p "$work/perf.data" -o "$work/php-fpm.fdata" "$base" > "$work/p2b.log" 2>&1 \
-    || { tail -n 5 "$work/p2b.log" >&2; die "perf2bolt failed"; }
+  # perf2bolt fails ("Please rename the input binary", after listing the
+  # binaries it did see) when php-fpm took no samples at all: an idle pool,
+  # e.g. the post-domain optimize of a fresh install before any application
+  # exists (1.22.0 fresh-install test).  That is too little traffic, not an
+  # error.
+  if ! "$p2b" -p "$work/perf.data" -o "$work/php-fpm.fdata" "$base" > "$work/p2b.log" 2>&1; then
+    if grep -qE 'Please rename the input binary|no samples|0 out of [0-9]+ functions' "$work/p2b.log"; then
+      say "PHP $ver: php-fpm took no samples in ${secs}s: too little traffic, BOLT skipped"
+      return 3
+    fi
+    tail -n 5 "$work/p2b.log" >&2; die "perf2bolt failed"
+  fi
   samples=$(awk '/BOLT-INFO: [0-9]+ out of [0-9]+ functions in the binary/ { print $2 }' "$work/p2b.log" | sed -n 1p)
   if [[ ${samples:-0} -lt $BOLT_MIN_FUNCS ]]; then
     say "PHP $ver: ${samples:-0} php-fpm functions profiled in ${secs}s (need $BOLT_MIN_FUNCS): too little traffic, BOLT skipped"
