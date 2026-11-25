@@ -1,20 +1,52 @@
 # shellcheck shell=bash
-# Shared by tools/php-fpm-build.sh, tools/nginx-build.sh (1.21.70) and
-# tools/valkey-build.sh (1.21.71): messages, the apt.llvm.org/GitHub LLVM
-# toolchain, upstream version lookups, downloads with a second source for
-# every file plus the project's own mirror (setup-build-sources), checksums,
-# unpacking and the static sd_notify shim.
+# Shared by tools/nginx-build.sh, tools/php-build.sh and tools/valkey-build.sh
+# (1.22.0: every one of the three is built from source): messages, the
+# apt.llvm.org/GitHub LLVM toolchain, upstream version lookups, downloads
+# with a second source for every file plus the project's own mirror
+# (setup-build-sources), checksums and signatures, unpacking, the static
+# sd_notify shim, the CPU fingerprint of -march=native builds, the one build
+# lock (/run/setup-build.lock), memory-aware job counts, build log retention
+# and the serial CPU-change / refresh chain of setup-build-cpu.service and
+# setup-build-refresh.service.
 # The sourcing tool defines LOG_TAG, SRC_CACHE, CONF, COMPONENTS and VERS.
+# Run directly (`bash build-common.sh chain cpu|refresh`) it is the chain
+# driver those two units start.
+#
+# JSON (php.net releases, GitHub's API, GNOME's cache) is parsed with perl's
+# core JSON::PP, never with `php`: a fresh host has no PHP before the first
+# PHP build, and nginx is built before PHP.
 
 # apt.llvm.org signing key (Sylvestre Ledru, LLVM's APT archive).
 LLVM_KEY_FPR=6084F3CF814B57C1CF12EFD515CF4D18AF4F7421
-LLVM_KEYRING=${PHP_BUILD_LLVM_KEYRING:-/etc/apt/keyrings/setup-llvm.asc}
-LLVM_SOURCES=${PHP_BUILD_LLVM_SOURCES:-/etc/apt/sources.list.d/setup-llvm.sources}
-LLVM_PIN=${PHP_BUILD_LLVM_PIN:-/etc/apt/preferences.d/setup-llvm.pref}
+# SETUP_BUILD_LLVM_* (1.22); the PHP_BUILD_LLVM_* names of 1.21 still work.
+LLVM_KEYRING=${SETUP_BUILD_LLVM_KEYRING:-${PHP_BUILD_LLVM_KEYRING:-/etc/apt/keyrings/setup-llvm.asc}}
+LLVM_SOURCES=${SETUP_BUILD_LLVM_SOURCES:-${PHP_BUILD_LLVM_SOURCES:-/etc/apt/sources.list.d/setup-llvm.sources}}
+LLVM_PIN=${SETUP_BUILD_LLVM_PIN:-${PHP_BUILD_LLVM_PIN:-/etc/apt/preferences.d/setup-llvm.pref}}
 # LLVM from its GitHub release tarball when apt.llvm.org is unreachable.
-LLVM_OPT=${PHP_BUILD_LLVM_OPT:-/opt/setup-llvm}
+LLVM_OPT=${SETUP_BUILD_LLVM_OPT:-${PHP_BUILD_LLVM_OPT:-/opt/setup-llvm}}
 # Upstream lookups are cached this long (seconds): GitHub, PECL, php.net.
-RESOLVE_TTL=${PHP_BUILD_RESOLVE_TTL:-3600}
+RESOLVE_TTL=${SETUP_BUILD_RESOLVE_TTL:-${PHP_BUILD_RESOLVE_TTL:-3600}}
+# nginx.org's release-signing keys (https://nginx.org/en/pgp_keys.html), as
+# NAME:FINGERPRINT.  NAME is the key file under https://nginx.org/keys/; the
+# key material is fetched (and cached under SRC_CACHE/keys for offline CPU
+# rebuilds) but only a signature whose PRIMARY key fingerprint is listed here
+# is accepted, so a swapped key file cannot sign anything.  Kept here, not in
+# the writable nginx-build.conf the refresh timer reads.  Checked 2026-11:
+# nginx 1.31.x tarballs are signed by D6786CE3... (Sergey Kandaurov).
+NGINX_PGP_KEYS="pluknet:D6786CE303D9A9022998DC6CC8464D549AF75C0A
+arut:43387825DDB1BB97EC36BA5D007C8D7C15D87369
+thresh:13C82A63B603576156E30A4EA0EA981B66B0D967
+sai:AC50DD4E7CD5D51FD00D1F4C4DB15B66AA75322B
+sb:7338973069ED3F443F4D37DFA64FD5B17ADB39A8"
+# The one lock every build, activation and chain run takes (R2.4).
+BUILD_LOCK=${SETUP_BUILD_LOCK:-/run/setup-build.lock}
+# Builds refuse to start below these free-space floors (MB): the build cache
+# filesystem (LLVM, sources, work trees) and /.
+BUILD_MIN_CACHE_MB=${SETUP_BUILD_MIN_CACHE_MB:-6144}
+BUILD_MIN_ROOT_MB=${SETUP_BUILD_MIN_ROOT_MB:-2048}
+# 1 = CPU-change rebuild: no network unless a pinned file is missing, cached
+# archives whose hash is on record are used as they are.
+BUILD_OFFLINE=${SETUP_BUILD_OFFLINE:-0}
 # GMP comes from GNU: the main site first, then GNU's mirror redirector and
 # gmplib.org (ftp.gnu.org timed out for minutes during the 1.21.68 tests).
 # The first download's SHA-256 is pinned (tofu_check), whichever mirror served it.
@@ -45,9 +77,162 @@ install_stripped() { # src dst
   if [[ -n $s ]] && "$s" --strip-all -o "$2" "$1" 2>/dev/null; then chmod 755 "$2"; else install -m 755 "$1" "$2"; fi
 }
 
-# The CPU a -march=native build is tied to: vendor and model name.
-cpu_model() {
-  awk -F": " '/^vendor_id/ { v = $2 } /^model name/ { m = $2 } v != "" && m != "" { print v " " m; exit }' /proc/cpuinfo
+# --------------------------------------------------------------- CPU
+# The CPU a -march=native build is tied to (1.22, replaces cpu_model, which
+# compared only "vendor model name": on KVM guests that string often stays
+# the same while the host exposes another flag set, and aarch64 has no
+# "model name" line, so the gate was silently skipped).
+#
+# The fingerprint covers vendor, family, model, stepping and model name plus
+# the ISA extensions clang's -march=native can use, from a FIXED allow-list.
+# Kernel, microcode and mitigation flags (md_clear, flush_l1d, ibrs, ssbd,
+# arch_capabilities, hypervisor, constant_tsc, ...) never count: a routine
+# kernel-update reboot must not look like a CPU change, because a change
+# keeps every compiled service down until the native rebuild finished.
+# Linux spells three of the extensions differently (pni = SSE3, abm = LZCNT,
+# rdrand); they are mapped to the allow-list names.  aarch64: implementer,
+# architecture, variant, part, revision and the Features line.
+CPU_ISA_FLAGS="sse3 ssse3 sse4_1 sse4_2 popcnt avx avx2 fma f16c bmi1 bmi2 lzcnt movbe adx aes pclmulqdq vaes vpclmulqdq sha_ni rdrnd rdseed xsave xsavec xsaveopt xsaves avx512f avx512dq avx512cd avx512bw avx512vl avx512_vnni avx512_bf16 avx512vbmi avx512_vbmi2 avx512ifma avx512_bitalg avx512_vpopcntdq gfni avx_vnni amx_tile amx_bf16 amx_int8 clflushopt clwb"
+
+# The plain text the fingerprint hashes (diagnostics and build.info cpu_info=).
+cpu_fingerprint_text() {
+  local info=${SETUP_CPUINFO:-/proc/cpuinfo}
+  [[ -r $info ]] || return 0
+  awk -F'[[:space:]]*:[[:space:]]*' -v allow="$CPU_ISA_FLAGS" '
+    BEGIN { n = split(allow, a, " "); for (i = 1; i <= n; i++) ok[a[i]] = 1
+            alias["pni"] = "sse3"; alias["abm"] = "lzcnt"; alias["rdrand"] = "rdrnd" }
+    # The first processor block only: every core of one host is the same CPU.
+    /^[[:space:]]*$/ { if (seen) exit; next }
+    { seen = 1 }
+    $1 == "vendor_id" || $1 == "cpu family" || $1 == "model" || $1 == "stepping" || $1 == "model name" \
+      || $1 == "CPU implementer" || $1 == "CPU architecture" || $1 == "CPU variant" || $1 == "CPU part" || $1 == "CPU revision" {
+      id = id $1 "=" $2 ";" }
+    $1 == "flags" || $1 == "Features" {
+      m = split($2, f, " ")
+      for (i = 1; i <= m; i++) {
+        x = (f[i] in alias) ? alias[f[i]] : f[i]
+        # x86: only allow-listed ISA flags; aarch64 Features are all ISA.
+        if ($1 == "Features" || (x in ok)) isa[x] = 1
+      } }
+    END {
+      s = ""; c = 0
+      for (x in isa) list[++c] = x
+      # Sorted, so the text does not depend on the order /proc lists them.
+      for (i = 2; i <= c; i++) { v = list[i]; j = i - 1; while (j > 0 && list[j] > v) { list[j + 1] = list[j]; j-- } list[j + 1] = v }
+      for (i = 1; i <= c; i++) s = s (i > 1 ? "," : "") list[i]
+      printf "%sisa=%s\n", id, s }' "$info"
+}
+
+# Prints the hash stored as cpu= in every build.info.  Empty /proc/cpuinfo
+# gives an empty string, which every gate treats as a mismatch (rebuild),
+# never as "skip the check".
+cpu_fingerprint() {
+  local t
+  t=$(cpu_fingerprint_text)
+  [[ -n $t ]] || return 0
+  printf '%s' "$t" | sha256sum | cut -c1-16
+}
+
+# --------------------------------------------------------------- build limits
+# CPUs this host may use: the cgroup v2/v1 quota when set, else nproc (which
+# honours the affinity mask; OMP_* must not shrink it).
+build_cpus() {
+  local n quota period q=0
+  n=$(unset OMP_NUM_THREADS OMP_THREAD_LIMIT; nproc 2>/dev/null || echo 1)
+  [[ $n =~ ^[0-9]+$ ]] && (( n > 0 )) || n=1
+  if [[ -r /sys/fs/cgroup/cpu.max ]]; then
+    read -r quota period < /sys/fs/cgroup/cpu.max 2>/dev/null || true
+  elif [[ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us && -r /sys/fs/cgroup/cpu/cpu.cfs_period_us ]]; then
+    quota=$(< /sys/fs/cgroup/cpu/cpu.cfs_quota_us); period=$(< /sys/fs/cgroup/cpu/cpu.cfs_period_us)
+  fi
+  if [[ ${quota:-} =~ ^[0-9]+$ && ${period:-} =~ ^[0-9]+$ ]] && (( period > 0 && quota > 0 )); then
+    q=$(( (quota + period - 1) / period ))
+  fi
+  (( q > 0 && q < n )) && n=$q
+  printf '%s' "$n"
+}
+
+# Parallel compile/link jobs: min(CPUs, (MemAvailable - 1 GB) / 1.2 GB), at
+# least 1 (R2.4).  A clang -O3 ThinLTO backend job peaks near 1 GB (PHP's
+# largest units); with -j$(nproc) a 4 GB, 4 vCPU host running MariaDB went
+# into the OOM killer, which picks mysqld, not the build.  SETUP_BUILD_JOBS
+# overrides.
+build_jobs() {
+  local n mem j
+  if [[ ${SETUP_BUILD_JOBS:-} =~ ^[1-9][0-9]*$ ]]; then printf '%s' "$SETUP_BUILD_JOBS"; return 0; fi
+  n=$(build_cpus)
+  mem=$(awk '/^MemAvailable:/ { print int($2 / 1024); exit }' "${SETUP_MEMINFO:-/proc/meminfo}" 2>/dev/null)
+  [[ $mem =~ ^[0-9]+$ ]] || mem=0
+  j=$(( (mem - 1024) / 1200 ))
+  (( j < 1 )) && j=1
+  (( j > n )) && j=$n
+  printf '%s' "$j"
+}
+
+# lld's ThinLTO backend starts one thread per CPU whatever make -j says, so
+# the link is capped to the same job count (R66).
+build_thinlto_flag() { # [jobs]
+  printf -- '-Wl,--thinlto-jobs=%s' "${1:-$(build_jobs)}"
+}
+
+# Keep the newest 5 DIR/PREFIX*.log files (R79: logs live outside the work
+# directory, which is deleted on exit, so a failed build's log stays).
+build_log_keep() { # dir prefix
+  local d=$1 p=$2 f n=0
+  [[ -d $d ]] || return 0
+  while IFS= read -r f; do
+    n=$(( n + 1 ))
+    (( n > 5 )) && rm -f -- "$f"
+  done < <(find "$d" -maxdepth 1 -type f -name "${p}*.log" -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-)
+  return 0
+}
+
+# Free MB on the filesystem holding PATH (its nearest existing parent).
+free_mb() {
+  local p=$1
+  while [[ ! -e $p && $p != / ]]; do p=$(dirname "$p"); done
+  df -Pm "$p" 2>/dev/null | awk 'NR == 2 { print $4 }'
+}
+
+# Refuse to start a build that could fill the disk MariaDB writes to.
+build_space_check() { # cache-dir
+  local c r
+  c=$(free_mb "$1"); r=$(free_mb /)
+  [[ $c =~ ^[0-9]+$ && $r =~ ^[0-9]+$ ]] || return 0
+  (( c >= BUILD_MIN_CACHE_MB )) || die "only ${c} MB free on the build cache filesystem ($1); a build needs ${BUILD_MIN_CACHE_MB} MB (LLVM, sources, work tree); free space and retry"
+  (( r >= BUILD_MIN_ROOT_MB )) || die "only ${r} MB free on /; a build needs ${BUILD_MIN_ROOT_MB} MB; free space and retry"
+}
+
+# Run CMD (a command or shell function) holding /run/setup-build.lock,
+# waiting for it (install, --optimize, --upgrade-php, migration, the CPU
+# chain).  Re-entrant: a process that already holds the lock (exported
+# SETUP_BUILD_LOCK_HELD=1, for example the migration controller or the CPU
+# chain calling a tool) runs CMD directly instead of deadlocking on itself.
+# The lock fd is inherited by CMD's children.  SETUP_BUILD_LOCK_TIMEOUT
+# (seconds, default 6 h) bounds the wait.
+build_lock_run() {
+  if [[ ${SETUP_BUILD_LOCK_HELD:-0} == 1 ]]; then "$@"; return; fi
+  (
+    exec 9>>"$BUILD_LOCK" || die "cannot open $BUILD_LOCK"
+    if ! flock -n 9; then
+      say "waiting for another build to finish ($BUILD_LOCK)"
+      flock -w "${SETUP_BUILD_LOCK_TIMEOUT:-21600}" 9 || die "timed out waiting for $BUILD_LOCK"
+    fi
+    export SETUP_BUILD_LOCK_HELD=1
+    "$@"
+  )
+}
+
+# The refresh timer and BOLT: never wait.  Status 75 when the lock is held
+# (the caller reports "skipped: build lock held" and exits 0).
+build_lock_try() {
+  if [[ ${SETUP_BUILD_LOCK_HELD:-0} == 1 ]]; then "$@"; return; fi
+  (
+    exec 9>>"$BUILD_LOCK" || exit 75
+    flock -n 9 || exit 75
+    export SETUP_BUILD_LOCK_HELD=1
+    "$@"
+  )
 }
 
 need_root() { [[ $EUID -eq 0 ]] || die "run as root"; }
@@ -91,6 +276,16 @@ http_get() { # url [out]
   fi
 }
 
+# Evaluate perl CODE with $d = the decoded JSON text and @ARGV = the rest.
+# perl and its core JSON::PP are on every Ubuntu host the builds run on
+# (ensure_packages installs perl for every build); invalid JSON or a missing
+# perl prints nothing, like an unreachable source.
+json_eval() { # code json [args...]
+  local code=$1 json=$2; shift 2
+  perl -MJSON::PP -e 'my $t = shift; my $d = eval { JSON::PP->new->allow_nonref->decode($t) }; exit 0 unless defined $d; '"$code" \
+    "$json" "$@" 2>/dev/null || true
+}
+
 # Highest tag of a GitHub repository matching ERE (group 1 is the version),
 # through git's ref listing (not the rate-limited API).
 git_latest() {
@@ -115,7 +310,7 @@ latest_of() {
   case $name in
     php)
       if json=$(http_get "https://www.php.net/releases/?json&version=$x"); then
-        v=$(php -n -r '$d = json_decode($argv[1], true); echo is_array($d) ? ($d["version"] ?? "") : "";' "$json")
+        v=$(json_eval 'print $d->{version} // "" if ref $d eq "HASH";' "$json")
       fi
       [[ $v == "$x".* ]] || v=$(git_latest php/php-src "^php-(${x//./\\.}\\.[0-9]+)\$") ;;
     llvm)
@@ -152,8 +347,10 @@ latest_of() {
     libsodium) v=$(git_latest jedisct1/libsodium '^([0-9]+\.[0-9]+\.[0-9]+)-RELEASE$') ;;
     libxml2)
       if json=$(http_get https://download.gnome.org/sources/libxml2/cache.json); then
-        v=$(php -n -r '$d = json_decode($argv[1], true); $v = array_keys($d[1]["libxml2"] ?? []);
-          $v = array_filter($v, fn($x) => preg_match("/^\d+\.\d+\.\d+$/", $x)); usort($v, "version_compare"); echo end($v) ?: "";' "$json")
+        v=$(json_eval 'my $h = ref $d eq "ARRAY" && ref $d->[1] eq "HASH" ? $d->[1]{libxml2} : undef;
+          my @v = grep { /^\d+\.\d+\.\d+$/ } (ref $h eq "HASH" ? keys %$h : ());
+          @v = sort { my @x = split /\./, $a; my @y = split /\./, $b; $x[0] <=> $y[0] || $x[1] <=> $y[1] || $x[2] <=> $y[2] } @v;
+          print $v[-1] if @v;' "$json")
       fi
       [[ -n $v ]] || v=$(git_latest GNOME/libxml2 '^v([0-9]+\.[0-9]+\.[0-9]+)$') ;;
     gmp)
@@ -167,10 +364,13 @@ latest_of() {
       v=$(printf '%s' "$listing" | grep -oE "libiconv-[0-9]+\.[0-9]+(\.[0-9]+)?\.tar\.gz" \
         | sed -E "s/^libiconv-|\.tar\.gz\$//g" | sort -V | tail -n 1) ;;
     zlib-ng)  v=$(git_latest zlib-ng/zlib-ng '^([0-9]+\.[0-9]+\.[0-9]+)$') ;;
+    # nginx: the highest version nginx.org publishes, which is the mainline
+    # branch (odd minor; the stable branch is always numbered lower).  Then
+    # the release-X.Y.Z tags of nginx/nginx on GitHub.
     nginx)
-      v=$(http_get https://download.angie.software/files/ | grep -oE "nginx-[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz" \
-        | sed -E "s/^nginx-|\.tar\.gz\$//g" | sort -V | tail -n 1)
-      [[ -n $v ]] || v=$(git_latest webserver-llc/angie "^nginx-([0-9]+\.[0-9]+\.[0-9]+)\$") ;;
+      v=$(http_get https://nginx.org/download/ 2>/dev/null | grep -oE 'nginx-[0-9]+\.[0-9]+\.[0-9]+\.tar\.gz' \
+        | sed -E 's/^nginx-|\.tar\.gz$//g' | sort -V | tail -n 1)
+      [[ -n $v ]] || v=$(git_latest nginx/nginx '^release-([0-9]+\.[0-9]+\.[0-9]+)$') ;;
     brotli)   v=$(git_latest google/brotli "^v([0-9]+\.[0-9]+\.[0-9]+)\$") ;;
     # ngx_brotli publishes no releases: its newest commit on the default branch.
     ngx-brotli) v=$(git ls-remote https://github.com/google/ngx_brotli.git HEAD 2>/dev/null | cut -c1-12) ;;
@@ -263,9 +463,18 @@ fetch_to() { # urls file [sha256]: download unless the cached copy verifies
   fi
   if [[ -n $want ]]; then
     [[ $(sha256sum "$out" | awk '{print $1}') == "$want" ]] || { rm -f "$out"; die "${out##*/}: SHA-256 mismatch"; }
+    # On record too, so a CPU-change rebuild (offline) can reuse the file.
+    mkdir -p "$SRC_CACHE/sums"; printf '%s' "$want" > "$SRC_CACHE/sums/${out##*/}"
   else
     tofu_check "$out"
   fi
+}
+
+# BUILD_OFFLINE=1: a cached archive whose SHA-256 is on record (verified when
+# it was first fetched) is used without any network lookup.
+cached_ok() { # file
+  local f=$1 db=$SRC_CACHE/sums/${1##*/}
+  [[ -s $f && -s $db && $(sha256sum "$f" | awk '{print $1}') == "$(cat "$db")" ]]
 }
 
 # Try each "urls|file|sha256" source in order (sha256 may be empty); print
@@ -296,6 +505,13 @@ fetch_mirror() { # file [sha256]
 
 fetch_first() {
   local s urls file sum
+  if [[ $BUILD_OFFLINE == 1 ]]; then
+    for s in "$@"; do
+      IFS='|' read -r urls file sum <<<"$s"
+      if cached_ok "$file" && [[ -z $sum || $(cat "$SRC_CACHE/sums/${file##*/}") == "$sum" ]]; then printf '%s' "$file"; return 0; fi
+    done
+    say "offline rebuild: ${file##*/} is not cached; fetching the pinned version"
+  fi
   for s in "$@"; do
     IFS='|' read -r urls file sum <<<"$s"
     if ( fetch_to "$urls" "$file" "$sum" ); then printf '%s' "$file"; return 0; fi
@@ -313,11 +529,12 @@ fetch_first() {
 gh_digest() { # repo tag asset
   local json
   local -a auth=()
+  [[ $BUILD_OFFLINE == 1 ]] && return 0
   [[ -n ${GITHUB_TOKEN:-} ]] && auth=(-H "Authorization: Bearer $GITHUB_TOKEN")
   json=$(curl -fsSL --retry 2 --connect-timeout 15 --max-time 60 "${auth[@]}" \
     "https://api.github.com/repos/$1/releases/tags/$2" 2>/dev/null) || return 0
-  php -n -r '$d = json_decode($argv[1], true);
-    foreach (($d["assets"] ?? []) as $a) { if (($a["name"] ?? "") === $argv[2]) { echo preg_replace("/^sha256:/", "", $a["digest"] ?? ""); break; } }' "$json" "$3" \
+  json_eval 'for my $x (ref $d eq "HASH" && ref $d->{assets} eq "ARRAY" ? @{$d->{assets}} : ()) {
+      if (($x->{name} // "") eq $ARGV[0]) { my $s = $x->{digest} // ""; $s =~ s/^sha256://; print $s; last } }' "$json" "$3" \
     | grep -E '^[0-9a-f]{64}$' || true
 }
 
@@ -329,16 +546,89 @@ site_or_github() { # site-urls repo tag asset [site-sha]
   fetch_first "$1 https://github.com/$2/releases/download/$3/$4|$SRC_CACHE/src/$4|$sum"
 }
 
+# 0 when ASC is a good signature of FILE by one of the pinned nginx.org keys
+# (NGINX_PGP_KEYS).  gpgv (Ubuntu's required package; no agent, no keybox
+# daemon, nothing written to /root/.gnupg) checks it against keyrings made in
+# a throwaway directory; the key files are dearmored with perl so gpg itself
+# is not needed.  The PRIMARY key fingerprint gpgv reports must be pinned.
+nginx_pgp_verify() { # file asc
+  local f=$1 asc=$2 home kdir name fpr status prim
+  local -a rings=()
+  command -v gpgv >/dev/null 2>&1 || ensure_packages gpgv
+  home=$(mktemp -d)
+  kdir=$SRC_CACHE/keys; mkdir -p "$kdir"
+  while IFS=: read -r name fpr; do
+    [[ -n $name ]] || continue
+    if [[ ! -s $kdir/$name.key ]]; then
+      if ! http_get "https://nginx.org/keys/$name.key" "$kdir/$name.key.part" 2>/dev/null; then rm -f "$kdir/$name.key.part"; continue; fi
+      mv -f "$kdir/$name.key.part" "$kdir/$name.key"
+    fi
+    perl -MMIME::Base64 -e 'local $/; my $t = <STDIN>; $t =~ s/\r//g;
+      my ($b) = $t =~ /-----BEGIN PGP PUBLIC KEY BLOCK-----\n(.*?)-----END PGP PUBLIC KEY BLOCK-----/s or exit 1;
+      my ($h, @d) = (1);
+      for (split /\n/, $b) { if ($h) { next if /^[A-Za-z][A-Za-z-]*: /; $h = 0; next if /^\s*$/ } last if /^=/; push @d, $_ }
+      binmode STDOUT; print decode_base64(join "", @d);' < "$kdir/$name.key" > "$home/$name.gpg" 2>/dev/null \
+      && [[ -s $home/$name.gpg ]] && rings+=(--keyring "$home/$name.gpg")
+  done <<< "$NGINX_PGP_KEYS"
+  if (( ${#rings[@]} == 0 )); then
+    rm -rf "${home:?}"; say "none of the pinned nginx.org signing keys could be loaded (offline?)"; return 1
+  fi
+  status=$(GNUPGHOME=$home gpgv --status-fd 1 "${rings[@]}" "$asc" "$f" 2>/dev/null) || { rm -rf "${home:?}"; return 1; }
+  rm -rf "${home:?}"
+  prim=$(awk '$1 == "[GNUPG:]" && $2 == "VALIDSIG" { print ($12 != "" ? $12 : $3); exit }' <<<"$status")
+  [[ $prim =~ ^[0-9A-Fa-f]{40}$ ]] && grep -qi ":${prim}\$" <<<"$NGINX_PGP_KEYS"
+}
+
+# The nginx tarball, accepted only with a good nginx.org signature (R36/R95):
+# nginx.org first, then the same tarball and .asc from the nginx/nginx GitHub
+# release, then the project's mirror, every copy checked the same way.  No
+# codeload tag snapshot (it has no signature) and no first-use trust: when
+# nothing verifies, the build stops and the running nginx keeps serving.  A
+# cached tarball is re-verified from its cached .asc (offline CPU rebuilds).
+fetch_nginx_signed() { # version
+  local v=$1 c=$SRC_CACHE/src f src
+  local -a srcs=("https://nginx.org/download" "https://github.com/nginx/nginx/releases/download/release-$v")
+  [[ -n $BUILD_MIRROR && $BUILD_MIRROR != off ]] && srcs+=("$BUILD_MIRROR/nginx")
+  f=$c/nginx-$v.tar.gz
+  mkdir -p "$c"
+  if [[ -s $f && -s $f.asc ]]; then
+    if nginx_pgp_verify "$f" "$f.asc"; then printf '%s' "$f"; return 0; fi
+    say "cached nginx-$v.tar.gz does not verify; fetching it again"
+    rm -f "$f" "$f.asc"
+  fi
+  for src in "${srcs[@]}"; do
+    rm -f "$f.part" "$f.asc.part"
+    if http_get "$src/nginx-$v.tar.gz" "$f.part" && http_get "$src/nginx-$v.tar.gz.asc" "$f.asc.part"; then
+      if nginx_pgp_verify "$f.part" "$f.asc.part"; then
+        mv -f "$f.part" "$f"; mv -f "$f.asc.part" "$f.asc"
+        mkdir -p "$SRC_CACHE/sums"; sha256sum "$f" | awk '{ printf "%s", $1 }' > "$SRC_CACHE/sums/${f##*/}"
+        printf '%s' "$f"; return 0
+      fi
+      say "nginx-$v.tar.gz from ${src%/*}: no valid signature by a pinned nginx.org key; refused"
+    else
+      say "download failed: $src/nginx-$v.tar.gz(.asc)"
+    fi
+  done
+  rm -f "$f.part" "$f.asc.part"
+  die "nginx-$v.tar.gz: no source served it with a valid nginx.org PGP signature (fail closed)"
+}
+
 fetch_component() { # name version -> path of the source archive
   local v=$2 c=$SRC_CACHE/src sum m urls=""
   FETCH_NAME=$1
   case $1 in
     php)
       # php.net (its SHA-256), then the php-src tag snapshot (pinned).
-      local json
+      local json=""
+      if [[ $BUILD_OFFLINE == 1 ]]; then
+        # CPU rebuild: whichever archive was verified and cached before.
+        fetch_first "https://www.php.net/distributions/php-$v.tar.xz|$c/php-$v.tar.xz|" \
+          "https://github.com/php/php-src/archive/refs/tags/php-$v.tar.gz|$c/php-src-php-$v.tar.gz|"
+        return
+      fi
       json=$(http_get "https://www.php.net/releases/?json&version=$v" 2>/dev/null || true)
-      sum=$(php -n -r '$d = json_decode($argv[1], true);
-        foreach (($d["source"] ?? []) as $s) { if (($s["filename"] ?? "") === "php-" . $argv[2] . ".tar.xz") { echo $s["sha256"] ?? ""; } }' "${json:-null}" "$v" 2>/dev/null \
+      sum=$(json_eval 'for my $s (ref $d eq "HASH" && ref $d->{source} eq "ARRAY" ? @{$d->{source}} : ()) {
+          print $s->{sha256} // "" if ($s->{filename} // "") eq "php-$ARGV[0].tar.xz" }' "${json:-null}" "$v" 2>/dev/null \
         | grep -E '^[0-9a-f]{64}$' || true)
       if [[ -n $sum ]]; then
         fetch_first "https://www.php.net/distributions/php-$v.tar.xz|$c/php-$v.tar.xz|$sum" \
@@ -355,7 +645,7 @@ fetch_component() { # name version -> path of the source archive
         "https://github.com/igbinary/igbinary/archive/refs/tags/$v.tar.gz|$c/igbinary-gh-$v.tar.gz|" ;;
     openssl)
       sum=$(gh_digest openssl/openssl "openssl-$v" "openssl-$v.tar.gz")
-      [[ -n $sum ]] || sum=$(http_get "https://www.openssl.org/source/openssl-$v.tar.gz.sha256" 2>/dev/null | grep -oE '^[0-9a-f]{64}' || true)
+      [[ -n $sum || $BUILD_OFFLINE == 1 ]] || sum=$(http_get "https://www.openssl.org/source/openssl-$v.tar.gz.sha256" 2>/dev/null | grep -oE '^[0-9a-f]{64}' || true)
       site_or_github "https://www.openssl.org/source/openssl-$v.tar.gz" openssl/openssl "openssl-$v" "openssl-$v.tar.gz" "$sum" ;;
     zlib)
       site_or_github "https://zlib.net/zlib-$v.tar.xz https://zlib.net/fossils/zlib-$v.tar.xz" madler/zlib "v$v" "zlib-$v.tar.xz" ;;
@@ -395,9 +685,8 @@ fetch_component() { # name version -> path of the source archive
       fetch_first "https://github.com/zlib-ng/zlib-ng/archive/refs/tags/$v.tar.gz|$c/zlib-ng-$v.tar.gz|" \
         "https://codeload.github.com/zlib-ng/zlib-ng/tar.gz/refs/tags/$v|$c/zlib-ng-src-$v.tar.gz|" ;;
     nginx)
-      # download.angie.software, then the GitHub tag snapshot.
-      fetch_first "https://download.angie.software/files/nginx-$v.tar.gz|$c/nginx-$v.tar.gz|" \
-        "https://codeload.github.com/webserver-llc/angie/tar.gz/refs/tags/Angie-$v|$c/nginx-src-$v.tar.gz|" ;;
+      # PGP-verified only (R36/R95): never a tag snapshot, never first use.
+      fetch_nginx_signed "$v" ;;
     brotli)
       # GitHub is Brotli's only home: release archive, then codeload.
       fetch_first "https://github.com/google/brotli/archive/refs/tags/v$v.tar.gz|$c/brotli-$v.tar.gz|" \
@@ -457,6 +746,28 @@ llvm_install() { # major packages...
   [[ -x $LLVM_BIN/clang ]] || die "clang $n missing after install"
 }
 
+# CPU-change rebuild (offline, R13/R33): the LLVM major build.info recorded,
+# straight from /usr/lib/llvm-N or $LLVM_OPT/N, with no apt.llvm.org probe,
+# apt run or GitHub call.  Only when neither exists does it fall back to
+# llvm_install (network).  Sets LLVM_BIN.
+llvm_use_recorded() { # major [packages...]
+  local n=$1
+  if [[ -x /usr/lib/llvm-$n/bin/clang && -x /usr/lib/llvm-$n/bin/ld.lld ]]; then LLVM_BIN=/usr/lib/llvm-$n/bin; return 0; fi
+  if [[ -x $LLVM_OPT/$n/bin/clang ]]; then LLVM_BIN=$LLVM_OPT/$n/bin; return 0; fi
+  say "LLVM $n recorded in build.info is not installed; installing it (network)"
+  llvm_install "$@"
+}
+
+# Lower this process tree's claim on the host before a build: nice 10, idle
+# IO and OOM score 900, so under memory pressure the kernel kills the build,
+# never mysqld, Elasticsearch, PHP-FPM or nginx (R66/R91).  Children inherit
+# all three.  The build units set the same in their unit text.
+build_deprioritize() {
+  echo 900 > "/proc/$BASHPID/oom_score_adj" 2>/dev/null || true
+  renice -n 10 -p "$BASHPID" >/dev/null 2>&1 || true
+  ionice -c 3 -p "$BASHPID" >/dev/null 2>&1 || true
+}
+
 llvm_apt_install() { # major codename packages...
   local n=$1 c=$2 key fpr src pin gnupg_home; shift 2
   ensure_packages ca-certificates curl gnupg
@@ -477,9 +788,9 @@ llvm_apt_install() { # major codename packages...
     install -m 644 "$key" "$LLVM_KEYRING"; rm -f "$key"
   fi
   rm -rf "${gnupg_home:?}"
-  src=$(printf '# Managed by setup.sh (PHP_BUILD=clang): LLVM %s for the compiled php-fpm.\nTypes: deb\nURIs: https://apt.llvm.org/%s/\nSuites: llvm-toolchain-%s-%s\nComponents: main\nSigned-By: %s\n' \
+  src=$(printf '# Managed by setup.sh: LLVM %s for the compiled nginx, PHP and Valkey.\nTypes: deb\nURIs: https://apt.llvm.org/%s/\nSuites: llvm-toolchain-%s-%s\nComponents: main\nSigned-By: %s\n' \
     "$n" "$c" "$c" "$n" "$LLVM_KEYRING")
-  pin=$(printf '# Managed by setup.sh (PHP_BUILD=clang): apt.llvm.org never replaces Ubuntu packages.\nPackage: *\nPin: origin apt.llvm.org\nPin-Priority: 100\n')
+  pin=$(printf '# Managed by setup.sh: apt.llvm.org never replaces Ubuntu packages.\nPackage: *\nPin: origin apt.llvm.org\nPin-Priority: 100\n')
   [[ -f $LLVM_PIN && $(cat "$LLVM_PIN") == "$pin" ]] || { install -d "$(dirname "$LLVM_PIN")"; printf '%s\n' "$pin" > "$LLVM_PIN"; }
   if [[ ! -f $LLVM_SOURCES || $(cat "$LLVM_SOURCES") != "$src" ]]; then
     printf '%s\n' "$src" > "$LLVM_SOURCES"
@@ -599,3 +910,140 @@ bolt_stack_check() { # binary
   readelf -lW "$1" 2>/dev/null | grep -qE '^[[:space:]]*GNU_STACK[[:space:]].*[[:space:]]RW[[:space:]]+(0x)?[0-9a-f]+[[:space:]]*$' \
     || die "BOLT output ${1##*/} has no non-executable GNU_STACK header; not installed"
 }
+
+# ---------------------------------------------------------------- chain
+# setup-build-cpu.service and setup-build-refresh.service run this file as a
+# script (`bash build-common.sh chain cpu|refresh`, whichever component's
+# copy exists).  The tools and units it drives:
+BUILD_TOOL_NGINX=${SETUP_BUILD_TOOL_NGINX:-/usr/local/lib/setup-nginx/nginx-build.sh}
+BUILD_TOOL_PHP=${SETUP_BUILD_TOOL_PHP:-/usr/local/lib/setup-php/php-build.sh}
+BUILD_TOOL_VALKEY=${SETUP_BUILD_TOOL_VALKEY:-/usr/local/lib/setup-valkey/valkey-build.sh}
+BUILD_PHP_ACTIVE=${SETUP_PHP_ACTIVE_FILE:-/etc/php/setup-active}
+BUILD_UNIT_DIR=${SETUP_BUILD_UNIT_DIR:-/etc/systemd/system}
+BUILD_MIGRATE_STATE=${SETUP_MIGRATE_STATE:-/var/lib/setup.sh/migrate-1.22}
+BUILD_CPU_ATTEMPTS=${SETUP_BUILD_CPU_ATTEMPTS:-/run/setup-build-cpu.attempts}
+
+# Start UNIT after its rebuild, but only when it is enabled: never a masked,
+# disabled or retired unit (an Angie-era or mid-migration unit stays as it is).
+chain_start() { # unit
+  local u=$1
+  if [[ $(systemctl is-enabled "$u" 2>/dev/null) != enabled ]]; then
+    say "chain: $u is not enabled; not started"; return 0
+  fi
+  systemctl reset-failed "$u" >/dev/null 2>&1 || true
+  if timeout 300 systemctl start "$u"; then say "chain: $u started"; else say "chain: $u did not start (systemctl status $u)"; return 1; fi
+}
+
+# One stage with its own timeout; a failure is logged and the chain goes on,
+# so a PHP failure never keeps nginx (or Valkey) down.
+chain_stage() { # label timeout-seconds unit tool args...
+  local label=$1 t=$2 unit=$3 rc=0; shift 3
+  say "chain: rebuilding $label for this CPU"
+  timeout --kill-after=60 "$t" bash "$@" || rc=$?
+  if (( rc != 0 )); then
+    say "chain: $label FAILED (status $rc; log under the tool's logs/); $unit stays down; continuing"
+    return 1
+  fi
+  chain_start "$unit"
+}
+
+# The active PHP version(s): /etc/php/setup-active (one version owns the
+# shared socket), else every enabled phpX.Y-fpm unit we wrote.
+chain_php_versions() {
+  local f v
+  if [[ -s $BUILD_PHP_ACTIVE ]]; then
+    v=$(tr -d '[:space:]' < "$BUILD_PHP_ACTIVE")
+    [[ $v =~ ^[0-9]+\.[0-9]+$ ]] && { printf '%s\n' "$v"; return 0; }
+  fi
+  for f in "$BUILD_UNIT_DIR"/php*-fpm.service; do
+    [[ -f $f ]] || continue
+    v=${f##*/php}; v=${v%-fpm.service}
+    [[ $v =~ ^[0-9]+\.[0-9]+$ ]] || continue
+    [[ $(systemctl is-enabled "php$v-fpm.service" 2>/dev/null) == enabled ]] && printf '%s\n' "$v"
+  done | sort -V
+}
+
+# setup-build-cpu.service (R2.4 / REVISION 3): after a CPU change every gate
+# only starts this unit, which rebuilds serially under the build lock: nginx
+# first (proxy-only sites come back first), then the active PHP version, then
+# Valkey, each from the exact versions in its build.info with cached sources
+# and the recorded LLVM (the tools' rebuild-cpu mode), no BOLT (the refresh
+# timer applies it later).  At most two attempts per boot.
+build_chain_cpu() {
+  local n=0 rc=0 v
+  n=$(cat "$BUILD_CPU_ATTEMPTS" 2>/dev/null || echo 0)
+  [[ $n =~ ^[0-9]+$ ]] || n=0
+  if (( n >= 2 )); then
+    say "chain: two CPU rebuild attempts failed since boot; services stay down (operator rule). Fix the cause (journalctl -t setup-nginx-build -t setup-php-build -t setup-valkey-build) and run: systemctl start setup-build-cpu.service"
+    rm -f "$BUILD_CPU_ATTEMPTS"   # an explicit start after the fix gets two more
+    return 1
+  fi
+  printf '%s' "$(( n + 1 ))" > "$BUILD_CPU_ATTEMPTS" 2>/dev/null || true
+  if [[ -f $BUILD_TOOL_NGINX ]]; then
+    chain_stage nginx 3600 nginx.service "$BUILD_TOOL_NGINX" rebuild-cpu || rc=1
+  fi
+  if [[ -f $BUILD_TOOL_PHP ]]; then
+    while IFS= read -r v; do
+      [[ -n $v ]] || continue
+      chain_stage "PHP $v" 7200 "php$v-fpm.service" "$BUILD_TOOL_PHP" rebuild-cpu "$v" || rc=1
+    done < <(chain_php_versions)
+  fi
+  if [[ -f $BUILD_TOOL_VALKEY ]]; then
+    chain_stage Valkey 3600 valkey-server.service "$BUILD_TOOL_VALKEY" rebuild-cpu || rc=1
+  fi
+  (( rc == 0 )) && rm -f "$BUILD_CPU_ATTEMPTS"
+  return "$rc"
+}
+
+# The 1.22 migration is running or unfinished: its state file has no "done"
+# line yet.  Refresh builds wait for it (R65).
+migration_pending() {
+  [[ -f $BUILD_MIGRATE_STATE ]] && ! grep -qxE 'done|complete' "$BUILD_MIGRATE_STATE" 2>/dev/null
+}
+
+# setup-build-refresh.service (daily timer): each tool's `refresh` checks for
+# newer upstream releases, rebuilds in the background and swaps the binary
+# only after the new one passed verify; it never takes a service down.  Runs
+# under build_lock_try (skips while another build or the CPU chain holds the
+# lock).  Under high load only one component (rotating by day) is refreshed.
+build_chain_refresh() {
+  local -a tools=() t
+  local i=0 load cpus pick
+  if migration_pending; then say "refresh skipped: the 1.22 migration is not finished ($BUILD_MIGRATE_STATE)"; return 0; fi
+  [[ -f $BUILD_TOOL_NGINX ]] && tools+=("$BUILD_TOOL_NGINX")
+  [[ -f $BUILD_TOOL_PHP ]] && tools+=("$BUILD_TOOL_PHP")
+  [[ -f $BUILD_TOOL_VALKEY ]] && tools+=("$BUILD_TOOL_VALKEY")
+  (( ${#tools[@]} )) || return 0
+  load=$(awk '{ printf "%d", $1 }' /proc/loadavg 2>/dev/null || echo 0)
+  cpus=$(build_cpus)
+  pick=-1
+  if (( load >= cpus )); then
+    pick=$(( 10#$(date +%j) % ${#tools[@]} ))
+    say "refresh: load $load on $cpus CPUs; refreshing only ${tools[$pick]##*/} today"
+  fi
+  for t in "${tools[@]}"; do
+    if (( pick < 0 || pick == i )); then
+      bash "$t" refresh || say "refresh: ${t##*/} refresh failed (status $?); the running build keeps serving"
+    fi
+    i=$(( i + 1 ))
+  done
+  return 0
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  set -Eeuo pipefail
+  export LC_ALL=C
+  LOG_TAG=setup-build-chain
+  case "${1:-} ${2:-}" in
+    "chain cpu")
+      build_lock_run build_chain_cpu ;;
+    "chain refresh")
+      chain_rc=0
+      build_lock_try build_chain_refresh || chain_rc=$?
+      if (( chain_rc == 75 )); then say "refresh skipped: build lock held ($BUILD_LOCK)"; exit 0; fi
+      exit "$chain_rc" ;;
+    "cpu-fingerprint "*)
+      printf '%s\n' "$(cpu_fingerprint)" ;;
+    *) die "usage: $0 chain cpu|refresh | cpu-fingerprint" ;;
+  esac
+fi
