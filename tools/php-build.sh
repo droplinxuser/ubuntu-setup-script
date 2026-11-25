@@ -112,6 +112,25 @@ valid_ver() { [[ ${1:-} =~ ^[0-9]+\.[0-9]+$ ]]; }
 # 8.1 is the oldest series the build recipe supports (section 8).
 ver_supported() { valid_ver "$1" && ver_ge "$1" 8.1; }
 vdir() { printf '%s/%s' "$ROOT" "$1"; }
+
+# Every PHP link goes through lld.  PHP's bundled libtool drops -fuse-ld=lld
+# from LDFLAGS on some links (shared modules such as opcache.so below 8.5,
+# and the php / php-fpm programs before 8.3), and clang then fell back to
+# GNU ld, which rejects --thinlto-jobs and cannot link the ThinLTO archives
+# (1.22.0 downgrade tests to 8.4 and 8.2).  These drivers add -fuse-ld=lld to
+# every clang call that links; compile-only calls pass through unchanged.
+lld_driver() { # DIR CC CXX
+  local d=$1 n real
+  mkdir -p "$d"
+  for n in clang clang++; do
+    if [[ $n == clang ]]; then real=$2; else real=$3; fi
+    # shellcheck disable=SC2016  # $a and $@ belong to the generated script
+    printf '%s\n' '#!/bin/sh' \
+      'for a in "$@"; do case $a in -c|-E|-S|-M|-MM) exec '"'$real'"' "$@" ;; esac; done' \
+      'exec '"'$real'"' -fuse-ld=lld "$@"' > "$d/$n"
+    chmod 755 "$d/$n"
+  done
+}
 stage_dir() { printf '%s/%s/staging' "$ROOT" "$1"; }
 opcache_shared() { ! ver_ge "$1" 8.5; } # X.Y: OPcache is a shared module
 unit_file() { printf '%s/php%s-fpm.service' "$UNIT_DIR" "$1"; }
@@ -222,6 +241,14 @@ latest_of() {
       v=$(git ls-remote --tags --refs https://github.com/unicode-org/icu.git 2>/dev/null \
         | awk '{ sub("refs/tags/", "", $2); print $2 }' \
         | sed -nE 's/^release-([0-9]+)[-.]([0-9]+)$/\1.\2/p' | sort -V | tail -n 1 || true) ;;
+    openssl)
+      # PHP 8.1 does not compile against OpenSSL 4 (ERR_NUM_ERRORS and other
+      # removed API; 1.22.0 downgrade test): it gets the newest 3.x release.
+      if [[ -n ${2:-} ]] && ! ver_ge "$2" 8.2; then
+        v=$(git_latest openssl/openssl '^openssl-(3\.[0-9]+\.[0-9]+)$')
+      else
+        bc_latest_of "$@"; return
+      fi ;;
     *) bc_latest_of "$@"; return ;;
   esac
   [[ -n $v ]] && printf '%s' "$v"
@@ -600,6 +627,8 @@ cmd_build() { # X.Y [exact]
   # Libraries come from $deps only.  --sysconfdir makes a bare `php-fpm`
   # read /etc/php/X.Y/fpm/php-fpm.conf; the compiled php.ini path and scan
   # dir are the CLI's (the FPM unit passes -c and PHP_INI_SCAN_DIR).
+  lld_driver "$work/lld-cc" "$CC" "$CXX"
+  CC="$work/lld-cc/clang" CXX="$work/lld-cc/clang++" \
   CFLAGS="$BASE_FLAGS -flto=thin ${PHP_BUILD_EXTRA_CFLAGS:-}" CXXFLAGS="$BASE_FLAGS -flto=thin ${PHP_BUILD_EXTRA_CFLAGS:-}" \
   LDFLAGS="-flto=thin -fuse-ld=lld $THINLTO -Wl,--emit-relocs $HARD_LD $GC_LD ${PHP_BUILD_EXTRA_LDFLAGS:-} -L$deps/lib" \
   CPPFLAGS="-I$deps/include" \

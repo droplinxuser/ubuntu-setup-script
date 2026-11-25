@@ -315,6 +315,25 @@ php_upgrade_vhost_roots() {
 # "the default package set" any more).  One entry per name app_type_at_root
 # prints; tests assert each has a row.  Names are PHP's module names as the
 # build and `php -m` spell them (compare case-insensitively).
+# The oldest PHP X.Y an app's Composer dependencies accept: the highest
+# PHP_VERSION_ID floor in its vendor/composer/platform_check.php files, which
+# stop every request on an older PHP (Chevereto 4.5 needs 8.2: the 1.22.0
+# downgrade test to 8.1 answered 500 on every Chevereto page).  Prints
+# nothing when no such file is found.
+php_upgrade_app_php_floor() { # ROOT
+  local root=$1 f n max=0
+  local -a dirs=("$root/vendor" "$root/app/vendor" "$root/src/vendor" "$root"/wp-content/plugins/*/vendor)
+  [[ ${root##*/} == public ]] && dirs+=("${root%/*}/vendor")
+  for f in "${dirs[@]}"; do
+    f=$f/composer/platform_check.php
+    [[ -f $f ]] || continue
+    n=$(grep -oE 'PHP_VERSION_ID >= [0-9]+' "$f" | grep -oE '[0-9]+$' | sort -n | tail -n 1 || true)
+    [[ -n $n ]] && (( n > max )) && max=$n
+  done
+  (( max > 0 )) && printf '%d.%d' $(( max / 10000 )) $(( max / 100 % 100 ))
+  return 0
+}
+
 php_upgrade_app_requirements() {
   case $1 in
     # Chevereto 4.5.9 aborts at bootstrap when redis is missing (redis pulls
@@ -557,7 +576,7 @@ php_ensure_app_extensions() {
 # target's set comes from PHP_UPGRADE_EXTS (filled by the caller; empty means
 # the set could not be computed, and then every requirement blocks).
 php_upgrade_preflight_apps() {
-  local target=$1 base=${2:-/var/www} app root ext loaded="" cur
+  local target=$1 base=${2:-/var/www} app root ext loaded="" cur floor
   PHP_UPGRADE_BLOCKERS=()
   PHP_UPGRADE_NOT_LOADED=()
   if (( $# >= 3 )); then
@@ -578,6 +597,10 @@ php_upgrade_preflight_apps() {
       fi
       PHP_UPGRADE_BLOCKERS+=("${app}|${root}|${ext}")
     done < <(php_upgrade_app_required_extensions "$app" "$root")
+    floor=$(php_upgrade_app_php_floor "$root")
+    if [[ -n $floor && $(printf '%s\n%s\n' "$floor" "$target" | sort -V | head -n 1) != "$floor" ]]; then
+      PHP_UPGRADE_BLOCKERS+=("${app}|${root}|php>=${floor}")
+    fi
   done < <(
     {
       php_upgrade_app_roots "$base"
@@ -643,6 +666,11 @@ php_upgrade_describe_caution() {
 php_upgrade_describe_blocker() {
   local entry=$1 app root ext
   IFS='|' read -r app root ext <<<"$entry"
+  if [[ $ext == 'php>='* ]]; then
+    printf '%s at %s requires PHP %s or newer (its Composer platform check stops every request on an older PHP), so it would fail on PHP %s' \
+      "$app" "$root" "${ext#php>=}" "${UPGRADE_PHP}"
+    return 0
+  fi
   printf '%s at %s requires the %s extension, which is not in the extension set the PHP %s build gets (add it with --php ext=%s)' \
     "$app" "$root" "$ext" "${UPGRADE_PHP}" "$ext"
 }
@@ -881,7 +909,9 @@ php_upgrade_php_vhosts() {
   return 0
 }
 
-# One HTTP probe through the local nginx: GET /index.php?setup_probe=<n> with
+# One HTTP probe through the local nginx: GET /?setup_probe=<n> (the home
+# page; /index.php answers with nginx's canonical 301 without reaching PHP,
+# so the 1.22.0 downgrade test saw "3 OK" while Chevereto answered 500) with
 # the vhost's Host (SNI through --resolve, self-signed origin accepted) and
 # an unlisted cookie, which every guest cache in the SCN tree treats as a
 # bypass ($guest_cookie_unlisted), so the answer comes from PHP-FPM and not
@@ -892,7 +922,7 @@ php_upgrade_probe_one() {
   body=$(tmp_file)
   code=$(curl -s -k -o "$body" -w '%{http_code}' --max-time 20 \
     --resolve "${host}:${port}:127.0.0.1" -H 'Cookie: setup_probe=1' \
-    "${scheme}://${host}/index.php?setup_probe=${RANDOM}${RANDOM}" 2>/dev/null || true)
+    "${scheme}://${host}/?setup_probe=${RANDOM}${RANDOM}" 2>/dev/null || true)
   [[ $code =~ ^[0-9]{3}$ ]] || code=000
   # A 2xx/4xx with an empty body is a dead upstream dressed as success; a
   # redirect (WordPress canonical) legitimately has none.
@@ -1189,7 +1219,7 @@ php_upgrade_rollback() {
 }
 
 # After a verified switch: keep exactly one previous version (OLD) for
-# rollback, disabled; retire every older build (unit, tree, links via B's
+# rollback, disabled; retire every other build, newer or older (unit, tree, links via B's
 # php_build_purge; its /etc/php tree moves into the manifest, never deleted).
 # A version whose unit is enabled or running is never retired.
 php_upgrade_retire_older() {
@@ -1205,7 +1235,7 @@ php_upgrade_retire_older() {
       mkdir -p "$dir/retired"
       mv -- "/etc/php/$v" "$dir/retired/php-${v}" 2>/dev/null || true
     fi
-    info "Retired PHP ${v} (older than the kept rollback version ${old}; config in ${dir}/retired)"
+    info "Retired PHP ${v} (only the previous version ${old} is kept for rollback; config in ${dir}/retired)"
   done < <(php_upgrade_installed_versions)
   return 0
 }
@@ -1610,7 +1640,7 @@ run_php_upgrade() {
     if [[ ${SETUP_PHP_ALLOW_MISSING_EXT:-0} == 1 ]]; then
       warn "SETUP_PHP_ALLOW_MISSING_EXT=1: continuing, the affected sites will fail"
     else
-      die "Refusing to replace PHP ${cur} with PHP ${target}: the site(s) above would break. Nothing was changed. Add the extension with --php ext=, or re-run with SETUP_PHP_ALLOW_MISSING_EXT=1 to accept the loss."
+      die "Refusing to replace PHP ${cur} with PHP ${target}: the site(s) above would break. Nothing was changed. Choose a PHP version every site supports, add a missing extension with --php ext=, or re-run with SETUP_PHP_ALLOW_MISSING_EXT=1 to accept the breakage."
     fi
   fi
   mapfile -t PHP_UPGRADE_CONFLICTS < <(php_upgrade_listen_conflicts "$cur" "$target")

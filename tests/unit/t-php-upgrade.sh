@@ -332,6 +332,28 @@ check "gate: and does not block" line_in "$out" "B:"
 out=$(gate "$base_exts"$'\nredis\nigbinary' $'mysqli\nredis\nigbinary') || true
 check "gate: a target set with redis passes" bash -c 'grep -qx "B:" <<<"$1" && grep -qx "N:" <<<"$1"' _ "$out"
 
+# An app's Composer platform check sets a PHP floor (Chevereto 4.5: 8.2).
+FL=$TMP/floor
+mk_chev "$FL/img/public"
+mkdir -p "$FL/img/public/app/vendor/composer"
+printf '<?php\nif (!(PHP_VERSION_ID >= 80200)) {\n    $issues[] = "x";\n}\nif (!(PHP_VERSION_ID >= 80100)) {}\n' \
+  > "$FL/img/public/app/vendor/composer/platform_check.php"
+check "floor: read from app/vendor/composer/platform_check.php (highest check)" \
+  test "$(php_upgrade_app_php_floor "$FL/img/public")" = 8.2
+check "floor: none without a platform check" test -z "$(php_upgrade_app_php_floor "$PF/forum")"
+floor_gate() ( # TARGET -> blockers
+  PHP_UPGRADE_EXTS=$'pdo_mysql\npdo\nmysqli\nredis\nigbinary\ngd\ncurl\nmbstring\nexif\nfileinfo\nxmlwriter\nzip'
+  php_upgrade_preflight_apps "$1" "$FL" "$PHP_UPGRADE_EXTS"
+  printf 'B:%s\n' "${PHP_UPGRADE_BLOCKERS[@]:-}"
+)
+check "floor: a target below the app's floor blocks" line_in "$(floor_gate 8.1)" "B:chevereto|$FL/img/public|php>=8.2"
+check "floor: the floor itself passes" line_in "$(floor_gate 8.2)" "B:"
+check "floor: a newer target passes" line_in "$(floor_gate 8.5)" "B:"
+out=$(UPGRADE_PHP=8.1 php_upgrade_describe_blocker "chevereto|/x|php>=8.2")
+check "floor: the blocker message names the required PHP" has "$out" "requires PHP 8.2 or newer"
+check "probe: the home page is probed (/index.php only reaches nginx's 301)" \
+  bash -c 'grep -q "://\${host}/?setup_probe=" "$1" && ! grep -q "/index.php?setup_probe=\\\${RANDOM}" "$1"' _ "$ROOT/lib/php-upgrade.sh"
+
 # ---------------------------------------------------------------------------
 # Refusals: migration pending, Angie legacy, memory class
 # ---------------------------------------------------------------------------

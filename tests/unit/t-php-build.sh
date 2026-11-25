@@ -1065,5 +1065,21 @@ check "active version: the only build when there is no marker" test "$(lone)" = 
 stale_marker() ( sandbox "$TMP/stale"; mk_build 8.4; mk_build 8.5; printf '8.3\n' > "$PHP_ACTIVE_FILE"; php_active_version )
 check "active version: a marker without a build does not count" test -z "$(stale_marker)"
 
+# Every PHP link uses lld (libtool drops -fuse-ld=lld on some links): the
+# driver adds it to linking calls only, and passes compile-only calls as is.
+mkdir -p "$TMP/lld-case"
+printf '#!/bin/sh\necho "$*"\n' > "$TMP/lld-case/fake-cc"; chmod 755 "$TMP/lld-case/fake-cc"
+# shellcheck disable=SC2016  # expanded by tool_run's bash
+lld_out=$(D=$TMP/lld-case tool_run 'lld_driver "$D/drv" "$D/fake-cc" "$D/fake-cc"
+  printf "%s|%s|%s|%s" "$("$D/drv/clang" -shared -o x.so a.o)" "$("$D/drv/clang++" -o php a.o)" \
+    "$("$D/drv/clang" -O2 -c a.c -o a.o)" "$("$D/drv/clang" -E conftest.c)"')
+check "lld driver: links get -fuse-ld=lld, compiles do not" \
+  test "$lld_out" = "-fuse-ld=lld -shared -o x.so a.o|-fuse-ld=lld -o php a.o|-O2 -c a.c -o a.o|-E conftest.c"
+ossl_case() { FAKE_TAGS="openssl-3.5.4 openssl-3.6.1 openssl-4.1.0 openssl-4.2.0-alpha1" tool_run "latest_of openssl $1"; }
+check "OpenSSL: PHP 8.1 gets the newest 3.x, 8.2 and newer the newest release" \
+  test "$(ossl_case 8.1)|$(ossl_case 8.2)|$(ossl_case 8.5)" = "3.6.1|4.1.0|4.1.0"
+check "the PHP configure uses the lld drivers" \
+  file_has "$ROOT/tools/php-build.sh" 'CC="$work/lld-cc/clang" CXX="$work/lld-cc/clang++"'
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
