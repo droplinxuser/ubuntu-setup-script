@@ -337,8 +337,51 @@ check "cpu_fingerprint: a new ISA extension (AVX-512) is a CPU change" \
   bash -c '[[ -n $1 && $1 != "$2" ]]' _ "$(tnb_fp "$TNB_CPU/x86-c")" "$TNB_FPA"
 check "cpu_fingerprint: another CPU model is a CPU change" \
   bash -c '[[ -n $1 && $1 != "$2" ]]' _ "$(tnb_fp "$TNB_CPU/x86-d")" "$TNB_FPA"
-check "cpu_fingerprint: the text maps pni/abm/rdrand to sse3/lzcnt/rdrnd and keeps the model" \
-  bash -c '[[ $1 == *"model=106;"* && $1 == *isa=*sse3* && $1 == *lzcnt* && $1 == *rdrnd* && $1 != *pni* ]]' _ "$TNB_FPT"
+check "cpu_fingerprint: the text maps pni/abm to sse3/lzcnt and keeps the model" \
+  bash -c '[[ $1 == *"model=106;"* && $1 == *isa=*sse3* && $1 == *lzcnt* && $1 != *pni* ]]' _ "$TNB_FPT"
+# rdrnd/rdseed are hidden by kernel policy (Linux clears RDSEED on Zen 5
+# parts with the RDSEED erratum; microcode gives it back), so they are not
+# hashed (1.22.4), and a 1.22.0-1.22.3 hash that included them still matches.
+sed -E '/^flags/ s/ (rdrand|rdseed)//g' "$TNB_CPU/x86-a" > "$TMP/tnb-x86-a-nordseed"
+sed -E '/^flags/ s/ rdseed//' "$TNB_CPU/x86-a" > "$TMP/tnb-x86-a-nordseed1"
+tnb_fp_legacy() ( # cpuinfo-file -> the 1.22.3 hash (rdrnd/rdseed hashed when shown)
+  . "$TNB_REPO/tools/build-common.sh"
+  set +eE; trap - ERR
+  extra=$(awk '/^flags/ { for (i = 1; i <= NF; i++) if ($i == "rdrand") r = "rdrnd"; else if ($i == "rdseed") s = "rdseed"; print r, s; exit }' "$1")
+  SETUP_CPUINFO=$1 cpu_fingerprint "$extra"
+)
+tnb_fp_matches() ( # cpuinfo-file built-hash
+  . "$TNB_REPO/tools/build-common.sh"
+  set +eE; trap - ERR
+  SETUP_CPUINFO=$1 cpu_fingerprint_matches "$2"
+)
+check "cpu_fingerprint: rdrnd/rdseed are not in the hashed text" \
+  bash -c '[[ $1 != *rdrnd* && $1 != *rdseed* ]]' _ "$TNB_FPT"
+check "cpu_fingerprint: the kernel hiding RDSEED/RDRAND is not a CPU change" \
+  test "$(tnb_fp "$TMP/tnb-x86-a-nordseed")" = "$TNB_FPA"
+TNB_LEG=$(tnb_fp_legacy "$TNB_CPU/x86-a")
+check "cpu_fingerprint_matches: the 1.22.3 hash (with rdrnd/rdseed) differs from the new one" \
+  test "$TNB_LEG" != "$TNB_FPA"
+check "cpu_fingerprint_matches: the 1.22.3 hash still matches (an update rebuilds nothing)" \
+  tnb_fp_matches "$TNB_CPU/x86-a" "$TNB_LEG"
+check "cpu_fingerprint_matches: a 1.22.3 build stays valid after the kernel hid RDSEED" \
+  tnb_fp_matches "$TMP/tnb-x86-a-nordseed1" "$TNB_LEG"
+check "cpu_fingerprint_matches: the new hash matches" \
+  tnb_fp_matches "$TNB_CPU/x86-a" "$TNB_FPA"
+check "cpu_fingerprint_matches: another CPU's new hash does not match" \
+  not tnb_fp_matches "$TNB_CPU/x86-a" "$(tnb_fp "$TNB_CPU/x86-d")"
+check "cpu_fingerprint_matches: another CPU's 1.22.3 hash does not match" \
+  not tnb_fp_matches "$TNB_CPU/x86-a" "$(tnb_fp_legacy "$TNB_CPU/x86-d")"
+check "cpu_fingerprint_matches: an empty build value is a mismatch" \
+  not tnb_fp_matches "$TNB_CPU/x86-a" ""
+check "cpu_fingerprint_matches: unreadable cpuinfo is a mismatch" \
+  not tnb_fp_matches "$TMP/tnb-no-such-cpuinfo" "$TNB_FPA"
+check "every CPU gate and staleness check uses cpu_fingerprint_matches, not a string compare" \
+  bash -c '! grep -nE "== \"\\\$\(cpu_fingerprint|\\\$built != \"\\\$now\"|built == \"\\\$now\"" "$1"/tools/nginx-build.sh "$1"/tools/php-build.sh "$1"/tools/valkey-build.sh' _ "$TNB_REPO"
+check "perf record failures report perf's own reason (perf_record_die), not a fixed guess" \
+  bash -c '! grep -n "no LBR on this CPU or VM" "$1"/tools/nginx-build.sh "$1"/tools/php-build.sh "$1"/tools/valkey-build.sh && [[ $(grep -c perf_record_die "$1"/tools/nginx-build.sh "$1"/tools/php-build.sh "$1"/tools/valkey-build.sh | grep -c ":1$") == 3 ]]' _ "$TNB_REPO"
+check "perf_record_die quotes the last line of the perf log" \
+  bash -c '. "$1/tools/build-common.sh"; set +eE; trap - ERR; printf "x\nfailed to open event: Operation not supported\n\n" > "$2"; out=$( (perf_record_die "$2") 2>&1 ); [[ $out == *"Operation not supported"*"LbrExtV2"* ]]' _ "$TNB_REPO" "$TMP/tnb-perf.log"
 check "cpu_fingerprint: no security or hypervisor flag and no microcode in the hashed text" \
   bash -c 'for w in ibrs ibpb ssbd stibp md_clear flush_l1d arch_capabilities retbleed hypervisor microcode spectre; do [[ $1 == *"$w"* ]] && exit 1; done; exit 0' _ "$TNB_FPT"
 check "cpu_fingerprint: arm64 hashes implementer/part and the Features line" \

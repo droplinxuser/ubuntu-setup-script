@@ -1140,6 +1140,27 @@ migrate_php_hold_version 8.3 >/dev/null 2>&1
 check "cron: the migrated version's Sury packages are held" eqv "$(sort "$STUBD/held" | paste -sd' ' -)" "php8.3-cli php8.3-fpm php8.3-mysql"
 check "cron: the holds are recorded for the unhold before the purge" eqv "$(st sury-held)" "php8.3-cli php8.3-fpm php8.3-mysql"
 check "cron: another version's packages are not held" not grep -qx php8.4-cli "$STUBD/held"
+# apt-daily / unattended-upgrades holding the dpkg lock: the hold is retried
+# (EPYC 24.04 replica, 1.22.4); any other apt-mark error is not.
+am_case() { # lock-failures other-error -> rc and the number of apt-mark runs
+  local rc cnt=$TMP/am-count
+  : > "$cnt"
+  AM_LOCKS=$1 AM_OTHER=$2 AM_CNT=$cnt
+  # migrate_apt_mark runs apt-mark in $(...): count in a file.
+  apt-mark() {
+    local n
+    echo x >> "$AM_CNT"; n=$(wc -l < "$AM_CNT")
+    if (( n <= AM_LOCKS )); then echo "E: Could not get lock /var/lib/dpkg/lock-frontend. It is held by process 42 (apt-get)" >&2; return 100; fi
+    if [[ $AM_OTHER == 1 ]]; then echo "E: Unable to locate package nope" >&2; return 100; fi
+    return 0
+  }
+  MIGRATE_APT_MARK_TRIES=5 MIGRATE_APT_MARK_SLEEP=0 migrate_apt_mark hold php8.3-cli; rc=$?
+  unset -f apt-mark
+  printf '%s %s' "$rc" "$(wc -l < "$cnt" | tr -d ' ')"
+}
+check "apt-mark: a hold that meets the dpkg lock is retried until it succeeds" eqv "$(am_case 2 0)" "0 3"
+check "apt-mark: a lock that never clears gives up after the retries" eqv "$(am_case 9 0)" "1 5"
+check "apt-mark: any other error is not retried" eqv "$(am_case 0 1)" "1 1"
 migrate_php_undivert_cli 8.3 >/dev/null 2>&1
 check "cron: the rollback removes our link and renames Sury's CLI back" eqv "$(cat "$TROOT/usr/bin/php8.3")" sury-binary
 check "cron: the rollback drops the diversion" eqv "$(cat "$STUBD/diversions")" ""

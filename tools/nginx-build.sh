@@ -921,7 +921,7 @@ cmd_pre() {
   local built now
   [[ -x $SBIN/nginx ]] || die "no nginx build in $SBIN (run setup.sh --optimize)"
   built=$(info_get cpu); now=$(cpu_fingerprint)
-  if [[ -z $built || -z $now || $built != "$now" ]]; then
+  if ! cpu_fingerprint_matches "$built"; then
     say "nginx: built for CPU ${built:-unknown}, this CPU is ${now:-unknown}: staying down until setup-build-cpu.service has rebuilt it"
     systemctl start --no-block setup-build-cpu.service >/dev/null 2>&1 || true
     exit 1
@@ -978,8 +978,8 @@ cmd_bolt() {
     swap_in "$work/nginx.lto-run" "" "$work/build.info"
   fi
   say "nginx: sampling for ${secs}s for BOLT (log: $LOG_FILE)"
-  "$perf" record -q -e cycles:u -j any,u -o "$work/perf.data" -a -- sleep "$secs" >/dev/null 2>&1 \
-    || die "perf could not record branch samples (no LBR on this CPU or VM?)"
+  "$perf" record -q -e cycles:u -j any,u -o "$work/perf.data" -a -- sleep "$secs" > "$work/perf.log" 2>&1 \
+    || { cat "$work/perf.log" >> "$LOG_FILE" 2>/dev/null; perf_record_die "$work/perf.log"; }
   # No nginx samples at all (an idle server, e.g. a fresh install with no
   # site yet): perf2bolt fails with "Please rename the input binary".  That
   # is too little traffic, not an error (1.22.0 fresh-install test).
@@ -1034,7 +1034,7 @@ cmd_rebuild() { # build, activate, let traffic warm up, then BOLT
 cmd_rebuild_cpu() {
   need_root
   [[ -f $STATE/build.info ]] || die "no build.info in $STATE: nothing to rebuild (run setup.sh --optimize)"
-  if [[ -x $SBIN/nginx && -n $(cpu_fingerprint) && $(info_get cpu) == "$(cpu_fingerprint)" ]]; then
+  if [[ -x $SBIN/nginx ]] && cpu_fingerprint_matches "$(info_get cpu)"; then
     say "nginx: the build already matches this CPU"; return 0
   fi
   BUILD_OFFLINE=1
@@ -1072,7 +1072,7 @@ cmd_check() { # [info]
     stale+="TLS options ${have:-openssl}/ktls=${n:-0} -> $TLS_LIB/ktls=$KTLS, "
   fi
   bcpu=$(info_get cpu "$info")
-  [[ -n $bcpu && $bcpu == "$(cpu_fingerprint)" ]] || stale+="cpu ${bcpu:-unknown} -> $(cpu_fingerprint), "
+  cpu_fingerprint_matches "$bcpu" || stale+="cpu ${bcpu:-unknown} -> $(cpu_fingerprint), "
   n=$(info_get llvm "$info")
   if [[ -n $n && ! -x /usr/lib/llvm-$n/bin/clang && ! -x $LLVM_OPT/$n/bin/clang ]]; then stale+="LLVM $n missing, "; fi
   skip=$(cat "$SKIP_FILE" 2>/dev/null || true)
@@ -1153,7 +1153,7 @@ cmd_build_arm() { # dir
 cmd_status() {
   local cpu="match" pid
   if [[ -f $STATE/build.info ]]; then
-    [[ $(info_get cpu) == "$(cpu_fingerprint)" ]] || cpu="MISMATCH (rebuild pending)"
+    cpu_fingerprint_matches "$(info_get cpu)" || cpu="MISMATCH (rebuild pending)"
     pid=$(master_pid || true)
     printf 'nginx: build %s (clang %s, recipe %s), bolt=%s, cpu %s, %s\n' \
       "$(info_get nginx)" "$(info_get llvm)" "$(info_get recipe)" "$(info_get bolt)" "$cpu" \

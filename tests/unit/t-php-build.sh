@@ -1141,5 +1141,10 @@ check "PHP 8.6 compat: the macro follows the igbinary.h include" \
     printf "#include \"igbinary.h\"\nx = PG(unserialize_callback_func);\n" > "$d/ext/igbinary/src/php7/igbinary.c"
     PHP_BUILD_SOURCE_ONLY=1 bash -c "source \"\$1\"; source \"\$2\"; php86_pecl_compat 8.6 \"\$3\"" _ "$2" "$1/tool-stubs.sh" "$d" >/dev/null 2>&1
     sed -n 2p "$d/ext/igbinary/src/php7/igbinary.c" | grep -q "PHP 8.6 keeps the callback name"' _ "$TMP" "$ROOT/tools/php-build.sh"
+# The daily refresh retries a missed BOLT pass on a current build, as nginx's
+# does (1.22.4: the post-migration pass and a concurrent --optimize each
+# found the other holding the build lock, and PHP stayed un-BOLTed).
+check "refresh: a current build with bolt=0 and the unit on our build gets a BOLT pass" \
+  bash -c 'sed -n "/^cmd_refresh()/,/^}/p" "$1" | grep -q "elif (( rc == 0 )) && \[\[ \$(info_get \"\$ver\" bolt) != 1 \]\] && unit_runs_build \"\$ver\"; then" && sed -n "/^cmd_refresh()/,/^}/p" "$1" | grep -qF "bash \"\$SELF\" bolt \"\$ver\" 60"' _ "$ROOT/tools/php-build.sh"
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

@@ -246,6 +246,7 @@ run_os_tuning() {
   configure_limits
   configure_io_tuning
   configure_who_apparmor
+  repair_cloud_init_hostname
 }
 
 # Repair legacy cron jobs written by older releases.  It is deliberately a
@@ -448,6 +449,29 @@ run_optimize() {
   # (the pass after --domain) only detects and reports.  migrate_run status
   # 2 (no failure, but the nginx part is not done and Angie still serves)
   # leaves OPT_WEB_LEGACY=1, so every web-tier step is skipped (R19, R51).
+  # A delayed BOLT unit an earlier migration queued is cancelled: this run
+  # tunes (and reloads) the services and BOLTs them itself.  Left running,
+  # each disturbed the other (1.22.4, EPYC replica on 24.04 and 26.04): this
+  # run's PHP pass found the build lock held, the queued pass sampled PHP
+  # while this run reloaded it (136 functions, skipped), and it re-BOLTed a
+  # Valkey this run had just BOLTed and restarted (perf lost the process).
+  # Only while it still waits (its shell's child is the initial sleep); a
+  # pass already swapping binaries is left to finish.
+  if systemctl is-active -q setup-migrate-bolt-1.22.service 2>/dev/null; then
+    local qpid qchild
+    qpid=$(systemctl show -p MainPID --value setup-migrate-bolt-1.22.service 2>/dev/null || true)
+    qchild=$(pgrep -P "${qpid:-0}" -a 2>/dev/null | awk 'NR == 1 { print $2 }' || true)
+    if [[ ${qchild##*/} == sleep ]]; then
+      systemctl stop setup-migrate-bolt-1.22.service >/dev/null 2>&1 || true
+      info "Cancelled the queued post-migration BOLT pass (this run applies BOLT itself)"
+    else
+      info "Waiting for the post-migration BOLT pass to finish (up to 15 minutes)"
+      local waited=0
+      while systemctl is-active -q setup-migrate-bolt-1.22.service 2>/dev/null && (( waited < 900 )); do
+        sleep 5; waited=$(( waited + 5 ))
+      done
+    fi
+  fi
   optimize_migration_step || rc=1
   if (( OPT_MIGRATE_RAN )); then
     # The vhost trees may have changed with the cutover.
@@ -713,7 +737,7 @@ migrate_attach_running() {
       while kill -0 "$pid" 2>/dev/null; do sleep 2; done
     fi
   fi
-  rc=$(tr -dc '0-9' < "$rcfile" 2>/dev/null || true)
+  rc=$(tr -dc '0-9' 2>/dev/null < "$rcfile" || true)
   if [[ -z $rc ]]; then
     warn "The migration unit left no result in ${rcfile}; see ${log:-its log}"
     return 1
@@ -813,9 +837,12 @@ main() {
   # shellcheck disable=SC1091
   . /etc/os-release
   [[ ${ID:-} == ubuntu ]] || die "This script only supports Ubuntu (found: ${ID:-unknown})"
-  if (( OPTIMIZE || RESTART_ALL )) || [[ -n ${UPGRADE_PHP:-} ]]; then
+  # --purge undoes what an earlier run did, so it runs wherever --optimize
+  # does: before 1.22.4 a 24.04 host that --optimize had migrated could not
+  # be purged at all (found on the EPYC 24.04 replica).
+  if (( OPTIMIZE || RESTART_ALL || PURGE )) || [[ -n ${UPGRADE_PHP:-} ]]; then
     if ! optimize_os_supported "${VERSION_ID:-}"; then
-      die "--optimize/--restart-all/--upgrade-php supports Ubuntu 22.04, 24.04 or 26.04 (found ${VERSION_ID:-unknown})"
+      die "--optimize/--restart-all/--upgrade-php/--purge supports Ubuntu 22.04, 24.04 or 26.04 (found ${VERSION_ID:-unknown})"
     fi
   elif (( ${VERSION_ID%%.*} < 26 )); then
     die "This script requires Ubuntu 26.04 or newer (found ${VERSION_ID})"

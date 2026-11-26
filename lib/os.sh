@@ -267,6 +267,15 @@ configure_cpu_governor() {
   if [[ ! -s "${STATE_DIR}/original-governor" && -r /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]]; then
     cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor > "${STATE_DIR}/original-governor" 2>/dev/null || true
   fi
+  # amd-pstate-epp / intel_pstate (active mode): the performance governor
+  # also forces energy_performance_preference to "performance".  Record the
+  # original so --purge puts the preference back as well (1.22.4).  Only
+  # while the governor is not performance yet: on a host an earlier release
+  # already switched, the live value is the governor's, not the original.
+  if [[ ! -s "${STATE_DIR}/original-epp" && -r /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference ]] \
+     && [[ $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || true) != performance ]]; then
+    cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference > "${STATE_DIR}/original-epp" 2>/dev/null || true
+  fi
   # A native oneshot unit owns the governor.  The cpufrequtils package that
   # releases up to 1.20.6 installed ships SysV init scripts only, and systemd
   # logs "lacks a native systemd unit file ... expect removal soon" for both
@@ -348,6 +357,46 @@ hosts_set_loopback_line() {
 }
 
 
+# cloud-init with manage_etc_hosts (set by many providers in vendor-data)
+# re-renders /etc/hosts from its own idea of the hostname at every boot, and
+# that is the provider metadata name, not the one --basic set: after the
+# first reboot the 127.0.1.1 line named the old host again and `hostname -f`
+# failed (1.22.4, found on a provider bare-metal host).  A cloud.cfg.d
+# drop-in with hostname/fqdn makes cloud-init render (and keep) this name.
+# Only written where cloud-init is installed; --purge removes it.
+SETUP_CLOUD_HOSTNAME_CFG=${SETUP_CLOUD_HOSTNAME_CFG:-/etc/cloud/cloud.cfg.d/99-setup-hostname.cfg}
+cloud_init_pin_hostname() {
+  local host=$1 dir
+  dir=$(dirname "$SETUP_CLOUD_HOSTNAME_CFG")
+  [[ -d $dir ]] || return 0
+  printf '# setup.sh --basic: the hostname it set.  cloud-init renders /etc/hosts\n# from this at every boot (manage_etc_hosts); setup.sh --purge removes it.\nhostname: %s\nfqdn: %s\n' "$host" "$host" > "$SETUP_CLOUD_HOSTNAME_CFG"
+  chmod 644 "$SETUP_CLOUD_HOSTNAME_CFG"
+}
+
+# --optimize on a host that --basic renamed before 1.22.4: write the drop-in
+# and put the 127.0.1.1 line back if cloud-init already reverted it.  Only
+# while the live hostname is still the one --basic applied (an operator who
+# renamed the host since is left alone).
+repair_cloud_init_hostname() {
+  local applied live
+  [[ -s "${STATE_DIR}/applied-hostname" ]] || return 0
+  applied=$(<"${STATE_DIR}/applied-hostname")
+  live=$(hostnamectl hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || true)
+  [[ -n $applied && $applied == "$live" ]] || return 0
+  [[ -d $(dirname "$SETUP_CLOUD_HOSTNAME_CFG") ]] || return 0
+  if [[ ! -f $SETUP_CLOUD_HOSTNAME_CFG ]]; then
+    cloud_init_pin_hostname "$applied"
+    info "cloud-init: pinned the hostname $applied ($SETUP_CLOUD_HOSTNAME_CFG), so its /etc/hosts rewrite at boot keeps it"
+  fi
+  local hosts=${SETUP_HOSTS_FILE:-/etc/hosts}
+  # Correct when any name on a 127.0.1.1 line is the applied one (a line
+  # that lists the FQDN first is left alone).
+  if ! awk -v h="$applied" '$1 == "127.0.1.1" { for (i = 2; i <= NF; i++) if ($i == h) f = 1 } END { exit !f }' "$hosts" 2>/dev/null; then
+    hosts_set_loopback_line "$hosts" "$(printf '127.0.1.1\t%s' "$applied")"
+    info "/etc/hosts: 127.0.1.1 names $applied again (cloud-init had reverted it)"
+  fi
+}
+
 configure_hostname() {
   local host=$1
   step "Hostname"
@@ -360,6 +409,7 @@ configure_hostname() {
   # Keep the local 127.0.1.1 entry in sync; otherwise sudo and hostname -f
   # keep resolving the old name from /etc/hosts after the rename.
   hosts_set_loopback_line /etc/hosts "$(printf '127.0.1.1\t%s' "$host")"
+  cloud_init_pin_hostname "$host"
   # Marks the hostname as applied by --basic (see basic_applied_value).
   printf '%s\n' "$host" > "${STATE_DIR}/applied-hostname"
   hostnamectl status || true

@@ -271,12 +271,16 @@ nginx_build_install_tools() {
     return 1
   fi
   install -d -m 755 "$NGINX_ROOT"
+  # build-common.sh before the tool: a new tool needs the new helpers
+  # (cpu_fingerprint_matches, 1.22.4) and the new build-common.sh still
+  # serves the old tool, so this order has no window where the unit's
+  # ExecStartPre misreads a missing helper as a CPU change.
+  cmp -s "${SCRIPT_DIR}/tools/build-common.sh" "$NGINX_BUILD_COMMON_FILE" \
+    || install -m 644 "${SCRIPT_DIR}/tools/build-common.sh" "$NGINX_BUILD_COMMON_FILE"
   if ! cmp -s "$src" "$NGINX_BUILD_TOOL"; then
     install -m 755 "$src" "$NGINX_BUILD_TOOL.new" && mv -f "$NGINX_BUILD_TOOL.new" "$NGINX_BUILD_TOOL"
     rm -f "${NGINX_ROOT}/patch-skip"
   fi
-  cmp -s "${SCRIPT_DIR}/tools/build-common.sh" "$NGINX_BUILD_COMMON_FILE" \
-    || install -m 644 "${SCRIPT_DIR}/tools/build-common.sh" "$NGINX_BUILD_COMMON_FILE"
   cmp -s "${SCRIPT_DIR}/nginx-build.conf" "$NGINX_BUILD_CONF_FILE" \
     || install -m 644 "${SCRIPT_DIR}/nginx-build.conf" "$NGINX_BUILD_CONF_FILE"
   nginx_build_tmpfiles_apply

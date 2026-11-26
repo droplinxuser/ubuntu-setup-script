@@ -47,8 +47,13 @@ Elasticsearch, Node.js and helper tools, plus per-domain vhosts.
 ## Requirements
 
 - Ubuntu 26.04 LTS or newer for installs; `--optimize`, `--upgrade-php`,
-  `--diagnostics` and `--restart-all` also accept 22.04 and 24.04. Bash 4.4+.
-  Root.
+  `--diagnostics`, `--restart-all` and `--purge` also accept 22.04 and 24.04.
+  Bash 4.4+.  Root.
+- x86-64 (Intel or AMD) or arm64.  Tested on an Intel Xeon E-2236 and an AMD
+  EPYC 4245P (Zen 5), on Ubuntu 24.04 and 26.04.  BOLT needs hardware branch
+  records (Intel LBR, or AMD LbrExtV2 on Zen 4 and later) on bare metal;
+  without them (most VMs, Zen 3 and older) the builds keep their ThinLTO
+  binaries and the report quotes perf's reason.
 - **RAM: the 4 GB class for anything but nginx.**  A host whose `MemTotal`
   is below 3500 MB runs nginx only (see [Small hosts](#small-hosts-the-4-gb-rule)).
 - **Disk for the builds:** a build refuses to start with less than 6 GB free
@@ -140,7 +145,7 @@ reported, instead of failing `nginx -t`.
 | Option | Default | Effect |
 |---|---|---|
 | `server=dedi\|vps` | auto (`systemd-detect-virt`, DMI, cgroups) | `dedi` sets the `performance` CPU governor; this is an install-time hint, `--optimize` re-detects the class from the hardware |
-| `host=FQDN` | `<threads>c-<RAM_GB>g-<storage>` (e.g. `8c-32g-1T`) | hostname via `hostnamectl`; a repeat `--basic` without `host=` keeps the current name |
+| `host=FQDN` | `<threads>c-<RAM_GB>g-<storage>` (e.g. `8c-32g-1T`) | hostname via `hostnamectl`; a repeat `--basic` without `host=` keeps the current name.  Where cloud-init is installed, `/etc/cloud/cloud.cfg.d/99-setup-hostname.cfg` records the name, so a provider's `manage_etc_hosts` rewrite of `/etc/hosts` at boot keeps it (`--optimize` adds it to hosts renamed before 1.22.4; `--purge basic` removes it) |
 | `swap=SIZE` | add swap only when total swap is 0 or below 50% of RAM, up to 50% of RAM (1-8 GiB, 4 GiB on a VPS) | `/swapfile` of exactly that size (`8G`, `8Gi`, `512M`) |
 | `time=REGION/CITY` | `Asia/Manila` | timezone; a repeat `--basic` without `time=` keeps the current zone |
 | `mitigations=off\|on` | not touched | `off` adds `mitigations=off` to the kernel command line (managed `/etc/default/grub.d/zz-setup-mitigations.cfg`, sourced after provider drop-ins such as Hetzner's `hetzner.cfg`, the provider's options kept, `update-grub`), effective at the next reboot; the run checks that the generated boot menu really carries it and names any drop-in that overrides it; `on` removes it.  Persisted as `CPU_MITIGATIONS`, so every `--optimize` keeps it (also `--optimize mitigations=off`, or `SETUP_CPU_MITIGATIONS`).  Measured on a Xeon E-2236: guest-cache hits +14-25 %, PHP tiers +5-7 % (1.21.36); +8-50 % cached and +15 % XenForo member/Chevereto uncached (1.21.38).  Further kernel hardening switches (`init_on_alloc=0`, `randomize_kstack_offset=off`) measured inside run-to-run noise on top of it, so they are not offered; `preempt=none` does not exist on the 7.0 kernel (it runs `lazy`).  It removes the kernel's protection between local processes (Spectre/Meltdown/MDS class), so use it on hosts where only you run code: one key-only administrator, no shared hosting, no untrusted local users |
@@ -248,7 +253,7 @@ file.
 | Event | What happens |
 |---|---|
 | Install (`--nginx`, `--php`, `--valkey`) | builds, verifies, then activates.  Order: nginx, PHP, Valkey.  A build failure stops the install with the build log's path; nothing is half-installed, and nothing serves on that host until a re-run succeeds |
-| `--optimize` | rebuilds a component whose release, recipe, CPU or extension set is stale, then BOLTs it from live traffic.  The running binary serves until the new one passed its checks.  On an idle server BOLT reports "too little traffic, BOLT skipped" and the next `--optimize` retries it |
+| `--optimize` | rebuilds a component whose release, recipe, CPU or extension set is stale, then BOLTs it from live traffic.  The running binary serves until the new one passed its checks.  On an idle server BOLT reports "too little traffic, BOLT skipped" (or "build lock held" when another build ran) and the next `--optimize` or the daily `setup-build-refresh.timer` retries it (PHP since 1.22.4, nginx before) |
 | Daily `setup-build-refresh.timer` | one timer for all builds (daily, randomised by up to 4 h): rebuilds in the background when a component publishes a newer release or PHP's detected extension set grew.  The running binary serves until the new one passed every check, so library security fixes arrive within a day.  It never takes a service down |
 | CPU change | see below |
 | Version file edited | `sudo ./setup.sh --optimize` rebuilds what changed; `<tool> check` shows what a rebuild would change |
@@ -262,7 +267,11 @@ empties the cache.
 
 **CPU change.**  Each build records a CPU fingerprint in its `build.info`
 (vendor, family, model, stepping, model name and the ISA flags
-`-march=native` can use; security and microcode flags never count).  When a
+`-march=native` can use; security and microcode flags never count, and
+neither do RDRAND/RDSEED, which the kernel hides by policy: Linux clears
+RDSEED on AMD Zen 5 parts with the RDSEED erratum, and a microcode update
+gives it back; a build from 1.22.0-1.22.3, whose fingerprint still included
+them, keeps matching).  When a
 unit starts on a CPU that does not match, its `ExecStartPre` starts
 `setup-build-cpu.service` and fails: **the service stays down until the
 native rebuild finishes**, by design (there is no generic fallback binary).
@@ -533,7 +542,7 @@ Install behaviour:
 | Legacy host | a host still serving through Sury PHP packages must run `--optimize` first (the one-time migration); `--php` refuses until it has |
 | Layout | binaries `/usr/local/lib/setup-php/X.Y/sbin/php-fpm` and `bin/php`; links `/usr/local/bin/phpX.Y`, `/usr/local/sbin/php-fpmX.Y`, `/usr/local/bin/php` (active version) and `/usr/bin/php`, `/usr/bin/phpX.Y` once no package owns those paths.  Configuration `/etc/php/X.Y/{fpm,cli}`: `php.ini` from that version's `php.ini-production` plus the managed settings, `php-fpm.conf`, `pool.d/www.conf` (written only when absent or recognisably ours), `conf.d` settings files |
 | Unit | `/etc/systemd/system/phpX.Y-fpm.service`, `Type=notify`, `-c /etc/php/X.Y/fpm/php.ini` and `PHP_INI_SCAN_DIR=/etc/php/X.Y/fpm/conf.d`, `LimitNOFILE=524288`, `UMask=0027`, `KillSignal=SIGQUIT`, a CPU gate and `php-fpm -t` before every start |
-| Sessions | `/var/lib/php/sessions` (www-data, 0700, from `tmpfiles.d/setup-php.conf`), collected by PHP itself (`session.gc_probability = 1`, divisor 1000); there is no `phpsessionclean` timer.  A pool that runs as another user gets `/var/lib/php/sessions-<user>` |
+| Sessions | `/var/lib/php/sessions` (www-data, 0700, from `tmpfiles.d/setup-php.conf`), collected by PHP itself (`session.gc_probability = 1`, divisor 1000); there is no `phpsessionclean` timer.  A pool that runs as another user gets `/var/lib/php/sessions-<user>`.  **Chevereto** keeps file sessions in its own directory (`/tmp` unless `CHEVERETO_SESSION_SAVE_PATH` says otherwise), one per guest visit: PHP's GC is off for its roots (a `[PATH=]` section) because it scanned that whole directory while the request held the session lock, and `setup-php-sessionclean.timer` deletes the expired files every 10 minutes instead.  The `--optimize` report shows the two `env.php` lines that move Chevereto sessions to Valkey (member explore 9,466 vs ~2,200 req/s on the EPYC test host) |
 
 Pool (`pool.d/www.conf`):
 

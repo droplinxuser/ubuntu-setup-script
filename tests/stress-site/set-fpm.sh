@@ -7,7 +7,11 @@
 # Usage: set-fpm.sh N|restore
 set -Eeuo pipefail
 ACTION=${1:?N or restore}
-VER=${PHP_VER:-$(for d in /etc/php/*/; do d=${d%/}; [[ ${d##*/} =~ ^[0-9]+\.[0-9]+$ ]] && echo "${d##*/}"; done | sort -V | tail -1)}
+# The active version (setup.sh writes /etc/php/setup-active), like set-jit.sh;
+# the highest /etc/php/X.Y tree only as a fallback (an --upgrade-php keeps the
+# previous tree for rollback, and that one may sort higher).
+VER=${PHP_VER:-$(tr -d '[:space:]' < /etc/php/setup-active 2>/dev/null || true)}
+[[ -n $VER ]] || VER=$(for d in /etc/php/*/; do d=${d%/}; [[ ${d##*/} =~ ^[0-9]+\.[0-9]+$ ]] && echo "${d##*/}"; done | sort -V | tail -1)
 POOL="/etc/php/${VER}/fpm/pool.d/www.conf"
 STATE=/var/lib/stress-site/fpm-pool-state.conf
 

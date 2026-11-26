@@ -269,6 +269,7 @@ purge_basic() {
     orig_host=$(<"${STATE_DIR}/original-hostname")
     if [[ -n $orig_host ]]; then hostnamectl set-hostname "$orig_host" || true; fi
   fi
+  rm -f "$SETUP_CLOUD_HOSTNAME_CFG"
   # configure_hostname only rewrote the 127.0.1.1 lines; put those back
   # instead of the whole snapshot, which would discard every /etc/hosts entry
   # added since the install (cloud-init, the operator, other tools).  When
@@ -331,6 +332,16 @@ purge_basic() {
       [[ -w $gov_file ]] && printf '%s\n' "$orig_gov" > "$gov_file" 2>/dev/null || true
     done
     info "CPU governor restored to ${orig_gov}"
+  fi
+  if [[ -s "${STATE_DIR}/original-epp" ]]; then
+    local orig_epp epp_file
+    orig_epp=$(<"${STATE_DIR}/original-epp")
+    # Writable only under a non-performance governor; best effort like the
+    # governor (the kernel may also have restored its cached value).
+    for epp_file in /sys/devices/system/cpu/cpu[0-9]*/cpufreq/energy_performance_preference; do
+      [[ -w $epp_file ]] && printf '%s\n' "$orig_epp" > "$epp_file" 2>/dev/null || true
+    done
+    info "CPU energy-performance preference restored to ${orig_epp}"
   fi
 
   systemctl restart systemd-resolved 2>/dev/null || true
@@ -407,6 +418,12 @@ purge_php() {
   # migration's older 'php*' and the narrower families are dropped.
   if ! compgen -G "${PHP_BUILD_ROOT:-/usr/local/lib/setup-php}/[0-9]*.[0-9]*/sbin/php-fpm" >/dev/null 2>&1; then
     purge_apt_pin_remove "php* php[0-9]* php-* libapache2-mod-php*"
+    # The Chevereto session cleanup timer (php_session_clean_timer_sync).
+    systemctl disable --now setup-php-sessionclean.timer >/dev/null 2>&1 || true
+    rm -f "${SETUP_PHP_SESSIONCLEAN_DIR:-/etc/systemd/system}/setup-php-sessionclean.timer" \
+          "${SETUP_PHP_SESSIONCLEAN_DIR:-/etc/systemd/system}/setup-php-sessionclean.service" \
+          "${SETUP_PHP_SESSIONCLEAN_LIST:-/etc/php/setup-sessionclean.dirs}"
+    systemctl daemon-reload >/dev/null 2>&1 || true
     # The shared refresh timer and CPU-change unit go with the last build of
     # any kind (R81): on a PHP-only host, or after an earlier
     # '--purge nginx,valkey', PHP is that last build.  The helper keeps them

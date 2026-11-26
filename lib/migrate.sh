@@ -2439,6 +2439,22 @@ migrate_php_undivert_cli() { # X.Y [after-purge]
 # sury-held, so migrate_sury_unhold releases them right before the purge):
 # until then an apt upgrade would re-run phpenmod (Sury's conf.d links come
 # back next to our built-in modules) and restart a unit that is now ours.
+# apt-mark hold/unhold, retried while dpkg is locked.  apt-daily and
+# unattended-upgrades start on their own timers: on the EPYC 24.04 replica
+# apt-daily took the lock two seconds before the hold, the hold failed, and
+# a host whose purge is deferred would have been left without it (1.22.4).
+# Only a lock error is retried (every 5 s, about 5 minutes); any other
+# failure returns at once.  MIGRATE_APT_MARK_TRIES / _SLEEP for the tests.
+migrate_apt_mark() { # hold|unhold PKG...
+  local i err tries=${MIGRATE_APT_MARK_TRIES:-60}
+  for (( i = 1; i <= tries; i++ )); do
+    err=$(apt-mark "$@" 2>&1 >/dev/null) && return 0
+    grep -qiE 'lock|dpkg frontend|temporarily unavailable' <<<"$err" || return 1
+    (( i < tries )) && sleep "${MIGRATE_APT_MARK_SLEEP:-5}"
+  done
+  return 1
+}
+
 migrate_php_hold_version() { # X.Y
   local v=$1 p held
   local -a ours=()
@@ -2447,7 +2463,7 @@ migrate_php_hold_version() { # X.Y
     [[ -n $p ]] && migrate_pkg_installed "$p" && [[ $held != *" $p "* ]] && ours+=("$p")
   done < <(migrate_dpkg_names | grep -E "^php${v//./\\.}(-|$)" || true)
   (( ${#ours[@]} )) || return 0
-  apt-mark hold "${ours[@]}" >/dev/null 2>&1 || return 1
+  migrate_apt_mark hold "${ours[@]}" || return 1
   # shellcheck disable=SC2046
   migrate_state_set sury-held "$(printf '%s\n' $(migrate_state_get sury-held) "${ours[@]}" | sort -u | paste -sd' ' -)"
 }
@@ -2712,7 +2728,7 @@ migrate_php_cutover() {
 # else F's php_primary_version, else the newest running Sury version.
 migrate_primary_version() {
   local v l listen
-  v=$(tr -d '[:space:]' < "$MIGRATE_PHP_ETC/setup-active" 2>/dev/null || true)
+  v=$(tr -d '[:space:]' 2>/dev/null < "$MIGRATE_PHP_ETC/setup-active" || true)
   # A marker counts only for a version that runs or has our build.
   if [[ $v =~ ^[0-9]+\.[0-9]+$ && -d $MIGRATE_PHP_ETC/$v ]] \
      && { [[ -x $(migrate_php_active_bin "$v") ]] || migrate_sury_active_versions | grep -qxF -- "$v"; }; then
@@ -3215,7 +3231,7 @@ migrate_sury_defer() {
         ours+=("$p")
       fi
     done
-    if (( ${#ours[@]} )) && apt-mark hold "${ours[@]}" >/dev/null 2>&1; then
+    if (( ${#ours[@]} )) && migrate_apt_mark hold "${ours[@]}"; then
       migrate_state_set sury-held "${ours[*]}"
     fi
   fi
@@ -3232,7 +3248,7 @@ migrate_sury_unhold() {
   for p in $held; do
     dpkg-query -W -f='${db:Status-Abbrev}' "$p" >/dev/null 2>&1 && pkgs+=("$p")
   done
-  if (( ${#pkgs[@]} )) && ! apt-mark unhold "${pkgs[@]}" >/dev/null 2>&1; then
+  if (( ${#pkgs[@]} )) && ! migrate_apt_mark unhold "${pkgs[@]}"; then
     migrate_warn "apt-mark unhold failed for ${pkgs[*]}; the Sury purge may be refused"
     return 1
   fi
@@ -3250,8 +3266,8 @@ migrate_valkey_user_ensure() {
     valkey_build_layout >/dev/null 2>&1 || true
   fi
   if ! id -u valkey >/dev/null 2>&1; then
-    [[ -n $snap ]] && uid=$(tr -dc '0-9' < "$snap/uid" 2>/dev/null || true)
-    [[ -n $snap ]] && gid=$(tr -dc '0-9' < "$snap/gid" 2>/dev/null || true)
+    [[ -n $snap ]] && uid=$(tr -dc '0-9' 2>/dev/null < "$snap/uid" || true)
+    [[ -n $snap ]] && gid=$(tr -dc '0-9' 2>/dev/null < "$snap/gid" || true)
     getent group valkey >/dev/null 2>&1 \
       || groupadd --system ${gid:+--gid "$gid"} valkey 2>/dev/null || groupadd --system valkey 2>/dev/null || true
     useradd --system --gid valkey --home-dir "$MIGRATE_VALKEY_DATA" --no-create-home --shell /usr/sbin/nologin \
@@ -3799,7 +3815,7 @@ migrate_follow() {
 migrate_recorded_rc() {
   local rcfile="${MIGRATE_STATE_FILE}.rc" rc
   [[ -e $rcfile ]] || return 0
-  rc=$(tr -dc '0-9' < "$rcfile" 2>/dev/null || true)
+  rc=$(tr -dc '0-9' 2>/dev/null < "$rcfile" || true)
   [[ -n $rc ]] || { warn "The migration unit left no result in ${rcfile}; see ${MIGRATE_LOG}"; return 1; }
   return "$rc"
 }

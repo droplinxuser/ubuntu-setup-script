@@ -754,6 +754,59 @@ hosts_set_loopback_line "$hf" ""
 check "hosts: an empty line removes the entry (the original had none)" \
   not grep -q '127\.0\.1\.1' "$hf"
 
+# cloud-init (manage_etc_hosts from the provider's vendor-data) re-renders
+# /etc/hosts at every boot from its own hostname: --basic pins ours in a
+# cloud.cfg.d drop-in, and --optimize repairs hosts renamed before 1.22.4
+# (found on a provider bare-metal EPYC host, 1.22.4).
+ci_case() { # case -> prints the drop-in, the hosts file and the info lines
+  local d=$TMP/ci-$1
+  rm -rf "$d"; mkdir -p "$d/cloud.cfg.d"
+  printf '127.0.1.1\tprovider-name provider-name\n127.0.0.1\tlocalhost\n' > "$d/hosts"
+  (
+    # STATE_DIR is the suite's (readonly); the marker is removed again below.
+    SETUP_HOSTS_FILE=$d/hosts SETUP_CLOUD_HOSTNAME_CFG=$d/cloud.cfg.d/99-setup-hostname.cfg
+    mkdir -p "$STATE_DIR"; rm -f "$STATE_DIR/applied-hostname"
+    info() { printf 'INFO %s\n' "$*"; }
+    hostnamectl() { printf 'web1\n'; }
+    case $1 in
+      pin) cloud_init_pin_hostname web1 ;;
+      repair) printf 'web1\n' > "$STATE_DIR/applied-hostname"; repair_cloud_init_hostname ;;
+      renamed) printf 'old1\n' > "$STATE_DIR/applied-hostname"; repair_cloud_init_hostname ;;
+      nocloud) rm -rf "$d/cloud.cfg.d"; printf 'web1\n' > "$STATE_DIR/applied-hostname"; repair_cloud_init_hostname ;;
+      again) printf 'web1\n' > "$STATE_DIR/applied-hostname"; repair_cloud_init_hostname >/dev/null; repair_cloud_init_hostname ;;
+      fqdn) printf '127.0.1.1\tweb1.example.com web1\n127.0.0.1\tlocalhost\n' > "$d/hosts"; : > "$SETUP_CLOUD_HOSTNAME_CFG"
+            printf 'web1\n' > "$STATE_DIR/applied-hostname"; repair_cloud_init_hostname ;;
+    esac
+    printf '== cfg\n'; cat "$SETUP_CLOUD_HOSTNAME_CFG" 2>/dev/null || printf 'none\n'
+    printf '== hosts\n'; cat "$d/hosts"
+    rm -f "$STATE_DIR/applied-hostname"
+  )
+}
+out=$(ci_case pin)
+check "cloud-init: --basic writes hostname and fqdn into the drop-in" \
+  bash -c '[[ $1 == *"hostname: web1"* && $1 == *"fqdn: web1"* ]]' _ "$out"
+out=$(ci_case repair)
+check "cloud-init: --optimize pins the name --basic applied and fixes the reverted 127.0.1.1 line" \
+  bash -c '[[ $1 == *"hostname: web1"* && $1 == *"$(printf "127.0.1.1\tweb1")"* && $1 != *provider-name* ]]' _ "$out"
+out=$(ci_case renamed)
+check "cloud-init: a host renamed since --basic is left alone" \
+  bash -c '[[ $(sed -n "/^== cfg\$/{n;p;}" <<<"$1") == none && $1 == *provider-name* ]]' _ "$out"
+out=$(ci_case nocloud)
+check "cloud-init: no cloud.cfg.d (no cloud-init) writes no drop-in" \
+  bash -c '[[ $(sed -n "/^== cfg\$/{n;p;}" <<<"$1") == none ]]' _ "$out"
+out=$(ci_case again)
+check "cloud-init: a second --optimize changes nothing and reports nothing" \
+  bash -c '[[ $1 != *INFO* ]]' _ "$out"
+out=$(ci_case fqdn)
+check "cloud-init: a 127.0.1.1 line that lists the FQDN first is left alone" \
+  bash -c '[[ $1 != *INFO* && $1 == *"$(printf "127.0.1.1\tweb1.example.com web1")"* ]]' _ "$out"
+check "cloud-init: --purge basic removes the drop-in" \
+  grep -qF 'rm -f "$SETUP_CLOUD_HOSTNAME_CFG"' "$ROOT/lib/purge.sh"
+check "--optimize runs the cloud-init hostname repair with the OS tuners" \
+  bash -c 'sed -n "/^run_os_tuning()/,/^}/p" "$1" | grep -q repair_cloud_init_hostname' _ "$ROOT/lib/restart.sh"
+check "CPU governor: the original energy_performance_preference is recorded and restored" \
+  bash -c 'grep -q "original-epp" "$1" && grep -q "original-epp" "$2"' _ "$ROOT/lib/os.sh" "$ROOT/lib/purge.sh"
+
 # --purge php/nginx/valkey: the apt pin that holds the packaged builds back is
 # narrowed, never rewritten from scratch, and goes when nothing is left.  The
 # '*' patterns must not expand against file names in the current directory.
@@ -982,6 +1035,12 @@ check "DNS drop-in routes every query to the global servers" \
 check "optimize supports Ubuntu 22.04" optimize_os_supported 22.04
 check "optimize supports Ubuntu 24.04" optimize_os_supported 24.04
 check "optimize supports Ubuntu 26.04" optimize_os_supported 26.04
+# 1.22.4: --purge was refused below 26.04, so a 24.04 host that --optimize
+# had migrated could not be purged.
+check "--optimize cancels a queued post-migration BOLT pass that is still waiting, and waits for one already running" \
+  bash -c 'b=$(sed -n "/^run_optimize() {/,/optimize_migration_step || rc=1/p" "$1"); grep -q "systemctl stop setup-migrate-bolt-1.22.service" <<<"$b" && grep -q "qchild##\*/} == sleep" <<<"$b" && grep -q "waited < 900" <<<"$b"' _ "$ROOT/lib/restart.sh"
+check "--purge passes the same OS gate as --optimize (22.04-26.04), not the fresh-install gate" \
+  grep -qF 'if (( OPTIMIZE || RESTART_ALL || PURGE )) || [[ -n ${UPGRADE_PHP:-} ]]; then' "$ROOT/lib/restart.sh"
 if optimize_os_supported 20.04; then
   t_fail "optimize rejects Ubuntu 20.04"
 else
@@ -1315,8 +1374,72 @@ printf 'fastcgi_cache_key "$request_method$scheme$host$request_uri";\n' > "$TMP/
 PHP_PAGE_GZIP=1
 check "a cache key without the encoding token gets no page compression" \
   test "$(php_jit_path_sections "$TMP/jit-nginx" | grep -c '^zlib\.output_compression = On$')" -eq 0
-check "a Chevereto root always gets PHP session GC" \
-  test "$(php_jit_path_sections "$TMP/jit-nginx" | grep -A3 "^\[PATH=$TMP/jit-chev/public\]" | grep -c '^session\.gc_probability = 1$')" -eq 1
+# 1.22.4: PHP's GC in requests scanned the whole session directory while the
+# request held its session lock (EPYC replica: member p99 48 -> 457-753 ms);
+# it is off for these roots and setup-php-sessionclean.timer removes the files.
+check "a Chevereto root gets session GC off in requests" \
+  test "$(php_jit_path_sections "$TMP/jit-nginx" | grep -A3 "^\[PATH=$TMP/jit-chev/public\]" | grep -c '^session\.gc_probability = 0$')" -eq 1
+check "chevereto_session_dirs: the default file-session directory is /tmp, depth 0" \
+  test "$(chevereto_session_dirs "$TMP/jit-nginx")" = "0 /tmp"
+printf "<?php return ['CHEVERETO_SESSION_SAVE_PATH' => '2;/srv/chev-sess/'];\n" > "$TMP/jit-chev/public/app/env.php"
+check "chevereto_session_dirs: the N;/path form keeps its depth (sessions live N levels below)" \
+  test "$(chevereto_session_dirs "$TMP/jit-nginx")" = "2 /srv/chev-sess"
+printf "<?php return ['CHEVERETO_SESSION_SAVE_HANDLER' => 'redis', 'CHEVERETO_SESSION_SAVE_PATH' => 'unix:///run/valkey/valkey.sock'];\n" > "$TMP/jit-chev/public/app/env.php"
+check "chevereto_session_dirs: sessions in Valkey/Redis have no directory to clean" \
+  test -z "$(chevereto_session_dirs "$TMP/jit-nginx")"
+printf "<?php return [\n  // 'CHEVERETO_SESSION_SAVE_HANDLER' => 'redis',\n  'CHEVERETO_DB_HOST' => 'localhost',\n];\n" > "$TMP/jit-chev/public/app/env.php"
+check "chevereto_session_dirs: a commented-out handler line does not count" \
+  test "$(chevereto_session_dirs "$TMP/jit-nginx")" = "0 /tmp"
+: > "$TMP/jit-chev/public/app/env.php"
+sc_case() { # -> the timer files and list written by php_session_clean_timer_sync
+  local d=$TMP/sessclean
+  rm -rf "$d"; mkdir -p "$d/units" "$d/etc" "$d/php/8.5/fpm/pool.d"
+  printf '[PHP]\nsession.gc_maxlifetime = 14400\n' > "$d/php.ini"
+  [[ -n ${2:-} ]] && printf '[www]\nphp_admin_value[session.gc_maxlifetime] = %s\n' "$2" > "$d/php/8.5/fpm/pool.d/www.conf"
+  (
+    SETUP_PHP_SESSIONCLEAN_DIR=$d/units SETUP_PHP_SESSIONCLEAN_LIST=$d/etc/sessclean.dirs SETUP_PHP_SESSIONCLEAN_ETC=$d/php
+    systemctl() { printf 'systemctl %s\n' "$*" >> "$d/calls"; }
+    php_session_clean_timer_sync "$d/php.ini" "$1"
+    printf 'rc=%s\n' "$?"
+    cat "$d/etc/sessclean.dirs" 2>/dev/null || true
+    ls "$d/units" || true
+    grep -h '^ExecStart\|^OnUnitActiveSec\|^Nice\|^IOScheduling' "$d/units"/* 2>/dev/null || true
+    cat "$d/calls" 2>/dev/null || true
+  )
+}
+out=$(sc_case "$TMP/jit-nginx")
+check "session clean timer: the list holds gc_maxlifetime in minutes, the depth and the directory" \
+  bash -c 'grep -qx "240 0 /tmp" <<<"$1"' _ "$out"
+check "session clean timer: a oneshot service and a 10-minute timer at idle priority" \
+  bash -c 'grep -qx "setup-php-sessionclean.timer" <<<"$1" && grep -qx "OnUnitActiveSec=10min" <<<"$1" && grep -qx "Nice=19" <<<"$1" && grep -qx "IOSchedulingClass=idle" <<<"$1"' _ "$out"
+check "session clean timer: it deletes only sess_* files older than the lifetime, down to the save-path depth" \
+  bash -c 'grep -q "find \"\$\$d\" -xdev -maxdepth \"\$\$((\$\$n + 1))\" -type f -name \"sess_\*\" -mmin \"+\$\$m\" -delete" <<<"$1"' _ "$out"
+check "session clean timer: enabled and started" \
+  bash -c 'grep -q "systemctl enable --now setup-php-sessionclean.timer" <<<"$1"' _ "$out"
+out=$(sc_case "$TMP/jit-nginx" 86400)
+check "session clean timer: an operator's longer gc_maxlifetime (pool php_admin_value) wins" \
+  bash -c 'grep -qx "1440 0 /tmp" <<<"$1"' _ "$out"
+# The unit's shell line itself: a depth-2 save path is cleaned at depth 3.
+sc_run() {
+  local d=$TMP/sessrun line
+  rm -rf "$d"; mkdir -p "$d/s/a/b"
+  : > "$d/s/a/b/sess_old"; touch -d '2 hours ago' "$d/s/a/b/sess_old"
+  : > "$d/s/a/b/sess_new"; : > "$d/s/a/b/keep_old"; touch -d '2 hours ago' "$d/s/a/b/keep_old"
+  printf '24 2 %s\n' "$d/s" > "$d/list"
+  line=$(sed -n 's/^ExecStart=\/bin\/sh -c //p' "$TMP/sessclean/units/setup-php-sessionclean.service")
+  line=${line#\'}; line=${line%\'}; line=${line//\$\$/\$}; line=${line//$TMP\/sessclean\/etc\/sessclean.dirs/$d/list}
+  sh -c "$line"
+  ls "$d/s/a/b" | paste -sd' ' -
+}
+out=$(sc_case "$TMP/jit-nginx")
+check "session clean timer: the unit's command deletes expired sess_* files at depth 2 and nothing else" \
+  test "$(sc_run)" = "keep_old sess_new"
+mkdir -p "$TMP/jit-empty/conf.d"
+out=$(sc_case "$TMP/jit-empty")
+check "session clean timer: no Chevereto file-session directory, no timer" \
+  bash -c '! grep -q "setup-php-sessionclean" <<<"$(grep -v "^systemctl" <<<"$1")"' _ "$out"
+check "--purge php removes the session clean timer with the last version" \
+  grep -q 'setup-php-sessionclean.timer' "$ROOT/lib/purge.sh"
 printf 'fastcgi_cache_key "$scheme$request_method$host$request_uri|$guest_cache_enc";\n' > "$TMP/jit-nginx/h5bp/wordpress_cache.conf"
 printf 'fastcgi_cache_key "$request_method$scheme$host$request_uri|$guest_cache_enc";\n' > "$TMP/jit-nginx/h5bp/php_chev_cache.conf"
 check "WordPress and Chevereto roots behind an encoding-aware cache compress in PHP" \

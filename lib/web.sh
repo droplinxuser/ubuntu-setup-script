@@ -2628,6 +2628,114 @@ nginx_chevereto_roots() {
   return 0
 }
 
+# File-session directories of the Chevereto roots, one "DEPTH DIR" line each:
+# CHEVERETO_SESSION_SAVE_PATH (default /tmp) for every root whose
+# CHEVERETO_SESSION_SAVE_HANDLER is unset or `files`.  PHP's files handler
+# accepts "N;/path" and "N;MODE;/path" and then stores the sessions N
+# directory levels below /path: DEPTH is that N (0 for a plain path).  A site
+# that keeps sessions in Valkey/Redis has none.  Commented-out env.php lines
+# are ignored.
+chevereto_session_dirs() {
+  local target=${1:-/etc/nginx} root env handler path depth live
+  while IFS= read -r root; do
+    [[ -n $root ]] || continue
+    env="${root}/app/env.php"
+    live=$(sed -E '/^[[:space:]]*(\/\/|#|\/\*|\*)/d' "$env" 2>/dev/null || true)
+    handler=$(sed -nE "s/.*['\"]CHEVERETO_SESSION_SAVE_HANDLER['\"][[:space:]]*=>[[:space:]]*['\"]([^'\"]*)['\"].*/\1/p" <<<"$live" | tail -n1 || true)
+    [[ -z $handler || $handler == files ]] || continue
+    path=$(sed -nE "s/.*['\"]CHEVERETO_SESSION_SAVE_PATH['\"][[:space:]]*=>[[:space:]]*['\"]([^'\"]*)['\"].*/\1/p" <<<"$live" | tail -n1 || true)
+    depth=0
+    [[ $path == *';'* && ${path%%;*} =~ ^[0-9]+$ ]] && depth=${path%%;*}
+    path=${path##*;}
+    [[ -n $path ]] || path=/tmp
+    [[ $path == /* ]] && printf '%s %s\n' "$depth" "${path%/}"
+  done < <(nginx_chevereto_roots "$target")
+  return 0
+}
+
+# The longest session.gc_maxlifetime (seconds) any PHP-FPM configuration on
+# this host sets: the managed INI given, and every php.ini, conf.d/*.ini and
+# pool (php_value / php_admin_value) under /etc/php/*/fpm.  The timer must
+# never delete a session PHP still considers alive, so an operator's own
+# (longer) value wins; 1440 (PHP's default) when nothing sets it.
+php_session_max_lifetime() {
+  local ini=${1:-} etc=${SETUP_PHP_SESSIONCLEAN_ETC:-/etc/php} f
+  local -a files=()
+  [[ -n $ini && -f $ini ]] && files+=("$ini")
+  for f in "$etc"/*/fpm/php.ini "$etc"/*/fpm/conf.d/*.ini "$etc"/*/fpm/pool.d/*.conf; do
+    [[ -f $f ]] && files+=("$f")
+  done
+  (( ${#files[@]} )) || { printf 1440; return 0; }
+  sed -nE 's/^[[:space:]]*(php_(admin_)?value\[)?session\.gc_maxlifetime\]?[[:space:]]*=[[:space:]]*"?([0-9]+).*/\3/p' "${files[@]}" 2>/dev/null \
+    | awk 'BEGIN { m = 0 } $1 + 0 > m { m = $1 + 0 } END { print (m >= 60 ? m : 1440) }'
+}
+
+# setup-php-sessionclean.timer: every 10 minutes, delete the sess_* files of
+# the Chevereto file-session directories that are older than the managed
+# session.gc_maxlifetime (Debian's phpsessionclean design, for the
+# directories its timer never visited).  Installed while such a directory
+# exists, removed when none is left; --purge php removes it with the last
+# PHP version.  Called after every managed php.ini write.
+#   php_session_clean_timer_sync INI [NGINX_DIR]
+SETUP_PHP_SESSIONCLEAN_DIR=${SETUP_PHP_SESSIONCLEAN_DIR:-/etc/systemd/system}
+SETUP_PHP_SESSIONCLEAN_LIST=${SETUP_PHP_SESSIONCLEAN_LIST:-/etc/php/setup-sessionclean.dirs}
+php_session_clean_timer_sync() {
+  local ini=$1 target=${2:-/etc/nginx} life mins dirs unit timer tmp changed=0
+  local svc=setup-php-sessionclean
+  unit="${SETUP_PHP_SESSIONCLEAN_DIR}/${svc}.service"
+  timer="${SETUP_PHP_SESSIONCLEAN_DIR}/${svc}.timer"
+  dirs=$(chevereto_session_dirs "$target" | sort -u)
+  if [[ -z $dirs ]]; then
+    if [[ -f $timer || -f $unit || -f $SETUP_PHP_SESSIONCLEAN_LIST ]]; then
+      systemctl disable --now "${svc}.timer" >/dev/null 2>&1 || true
+      rm -f "$timer" "$unit" "$SETUP_PHP_SESSIONCLEAN_LIST"
+      systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    return 0
+  fi
+  life=$(php_session_max_lifetime "$ini")
+  [[ $life =~ ^[0-9]+$ ]] && (( life >= 60 )) || life=1440
+  mins=$(( (life + 59) / 60 ))
+  mkdir -p "$(dirname "$SETUP_PHP_SESSIONCLEAN_LIST")" "$SETUP_PHP_SESSIONCLEAN_DIR"
+  tmp=$(tmp_file) || return 1
+  printf '%s\n' "$dirs" | awk -v m="$mins" 'NF { print m, $0 }' > "$tmp"
+  commit_if_changed "$SETUP_PHP_SESSIONCLEAN_LIST" "$tmp" && changed=1
+  chmod 644 "$SETUP_PHP_SESSIONCLEAN_LIST" 2>/dev/null || true
+  tmp=$(tmp_file) || return 1
+  cat > "$tmp" <<EOF
+# setup.sh: expired PHP session files of Chevereto sites (no GC in requests).
+[Unit]
+Description=Remove expired Chevereto PHP session files (setup.sh)
+ConditionPathExists=${SETUP_PHP_SESSIONCLEAN_LIST}
+
+[Service]
+Type=oneshot
+Nice=19
+IOSchedulingClass=idle
+ExecStart=/bin/sh -c 'while read -r m n d; do [ -d "\$\$d" ] && find "\$\$d" -xdev -maxdepth "\$\$((\$\$n + 1))" -type f -name "sess_*" -mmin "+\$\$m" -delete; done < ${SETUP_PHP_SESSIONCLEAN_LIST}; exit 0'
+EOF
+  commit_if_changed "$unit" "$tmp" && changed=1
+  tmp=$(tmp_file) || return 1
+  cat > "$tmp" <<'EOF'
+# setup.sh: see setup-php-sessionclean.service.
+[Unit]
+Description=Remove expired Chevereto PHP session files every 10 minutes (setup.sh)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target
+EOF
+  commit_if_changed "$timer" "$tmp" && changed=1
+  chmod 644 "$unit" "$timer" 2>/dev/null || true
+  (( changed )) && systemctl daemon-reload >/dev/null 2>&1
+  systemctl enable --now "${svc}.timer" >/dev/null 2>&1 || return 1
+  return 0
+}
+
 # [PATH=] sections of the managed ini, one per document root:
 #   * `opcache.jit = off` for every WordPress root when
 #     SETUP_PHP_JIT_WORDPRESS=0 asks for it;
@@ -2650,12 +2758,18 @@ php_jit_path_sections() {
   fi
   # Chevereto keeps its PHP sessions in its own directory (/tmp unless
   # CHEVERETO_SESSION_SAVE_PATH says otherwise) and starts one for every
-  # cookie-less request.  The distribution turns PHP's session GC off and its
-  # sessionclean timer only visits session.save_path, so nothing ever removed
-  # them: one load test left 585,000 files (2.4 GB of tmpfs) behind.
+  # cookie-less request.  Nothing visited that directory (one load test left
+  # 585,000 files, 2.4 GB of tmpfs, behind), and turning PHP's own GC on for
+  # these roots (1.22.0-1.22.3) moved the cost into requests: each GC call
+  # lists and stats the whole directory while its request holds the session
+  # lock.  On the EPYC 24.04 replica (1.22.4) that cut the member explore
+  # tier from 2,220 to ~1,100 req/s (p99 48 -> 457-753 ms) and uncached
+  # guests from 4,324 to ~3,400 (p99 37 -> 300-420 ms).  The GC stays off in
+  # requests; setup-php-sessionclean.timer removes the expired files instead
+  # (php_session_clean_timer_sync).
   while IFS= read -r root; do
     [[ -n $root ]] || continue
-    body[$root]+=$'; Chevereto session files are collected by PHP (no timer visits its save path)\nsession.gc_probability = 1\nsession.gc_divisor = 1000\n'
+    body[$root]+=$'; Chevereto session files are removed by setup-php-sessionclean.timer, not in requests\nsession.gc_probability = 0\n'
   done < <(nginx_chevereto_roots "$target" | sort -u)
   # Level 6: the stored page is compressed once per MISS and sent on every
   # hit, so its size is what guests pay.  Measured (1.21.58) on the cached
@@ -3043,6 +3157,7 @@ EOF
   # belongs to that section.
   php_jit_path_sections /etc/nginx >> "$ini"
   chmod 644 "$ini"
+  php_session_clean_timer_sync "$ini" /etc/nginx || warn "PHP ${ver}: the Chevereto session cleanup timer could not be updated"
   if (( ! PHP_JIT_PERSISTED )); then
     persist_php_jit
     PHP_JIT_PERSISTED=1

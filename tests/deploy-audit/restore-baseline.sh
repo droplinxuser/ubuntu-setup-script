@@ -30,7 +30,15 @@ if [[ -n $SETUP && -r $SETUP ]]; then
   echo "== setup.sh --purge all"
   # From $WORK: setup.sh writes its setup_<stamp>.log run log to the current
   # directory, and the caller's home kept one per restore.
-  ( cd "$WORK" && bash "$SETUP" --purge all ) > "$WORK/purge.log" 2>&1 || echo "purge exited $? (see $WORK/purge.log)"
+  # Stop when the purge fails: the steps below delete setup.sh's state, and
+  # with it the originals (hostname, sysctl, ufw) a later purge restores.
+  # 1.22.4: a purge refused on Ubuntu 24.04 was ignored and the host kept
+  # the run's hostname and settings.  RESTORE_IGNORE_PURGE=1 goes on anyway.
+  if ! ( cd "$WORK" && bash "$SETUP" --purge all ) > "$WORK/purge.log" 2>&1; then
+    echo "purge failed (see $WORK/purge.log):"
+    grep -E '\[(FAIL|ERROR)\]' "$WORK/purge.log" | tail -n 3
+    [[ ${RESTORE_IGNORE_PURGE:-0} == 1 ]] || { echo "stopping before anything else is removed (RESTORE_IGNORE_PURGE=1 continues)"; exit 1; }
+  fi
 fi
 
 echo "== packages"
@@ -216,7 +224,19 @@ if crontab -l >/dev/null 2>&1 \
 fi
 
 echo "== firewall"
-if command -v ufw >/dev/null 2>&1; then
+# A baseline with ufw active (a provider image with "22/tcp ALLOW") keeps it:
+# --purge already removed the rules setup.sh added, and resetting/disabling
+# left the EPYC test host without a firewall (1.22.4).  The baseline's rule
+# lines are put back if anything else is missing.
+BASE_UFW_ACTIVE=0
+awk '/^== firewall ==/{f=1; next} /^== /{f=0} f' "$BASE" | grep -q '^Status: active' && BASE_UFW_ACTIVE=1
+if command -v ufw >/dev/null 2>&1 && (( BASE_UFW_ACTIVE )); then
+  awk '/^== firewall ==/{f=1; next} /^== /{f=0} f' "$BASE" \
+    | sed -nE 's/^([0-9]+(:[0-9]+)?\/(tcp|udp))[[:space:]]+ALLOW IN[[:space:]]+Anywhere[[:space:]]*$/\1/p' \
+    | while read -r rule; do ufw allow "$rule" >/dev/null 2>&1 || true; done
+  ufw --force enable >/dev/null 2>&1 || true
+  rm -f /etc/ufw/*.rules.[0-9]* /etc/ufw/*.[0-9]*_[0-9]* 2>/dev/null || true
+elif command -v ufw >/dev/null 2>&1; then
   ufw --force reset >/dev/null 2>&1 || true
   ufw --force disable >/dev/null 2>&1 || true
   rm -f /etc/ufw/*.rules.[0-9]* /etc/ufw/*.[0-9]*_[0-9]* 2>/dev/null || true

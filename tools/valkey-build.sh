@@ -116,7 +116,7 @@ info_set() { # file key value
   mv -f "$f.new" "$f"
 }
 bin_version() { "$1" --version 2>/dev/null | sed -nE 's/.* v=([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | sed -n 1p; }
-# The CPU description for messages; the gate compares cpu_fingerprint.
+# The CPU description for messages; the gate uses cpu_fingerprint_matches.
 cpu_desc() { awk -F': ' '/^vendor_id/ { v = $2 } /^model name/ { m = $2 } END { print v " " m }' /proc/cpuinfo 2>/dev/null; }
 pkg_installed() { dpkg-query -W -f='${Status}' "${1:-valkey-server}" 2>/dev/null | grep -q ' installed$'; }
 # The valkey-server package's upstream version while it is installed.
@@ -688,7 +688,7 @@ cmd_activate() {
     die "the valkey-server package still serves: the 1.22 migration activates this build"
   fi
   if (( staged )); then
-    [[ $(info_get "$STAGE/build.info" cpu) == "$(cpu_fingerprint)" ]] || die "the staged build was made for another CPU"
+    cpu_fingerprint_matches "$(info_get "$STAGE/build.info" cpu)" || die "the staged build was made for another CPU"
     rm -rf "${PREV:?}"
     if [[ -x $BIN/valkey-server ]]; then
       install -d -m 755 "$PREV/bin" "$PREV/lto"
@@ -746,7 +746,7 @@ cmd_pre() {
   [[ -d $DATA_DIR && -d $VK_LOG_DIR ]] || { ensure_user; ensure_dirs; }
   [[ -x $BIN/valkey-server ]] || { say "no Valkey build in $BIN"; exit 1; }
   built=$(info_get "$INFO" cpu); now=$(cpu_fingerprint)
-  [[ -n $built && $built == "$now" ]] && exit 0
+  cpu_fingerprint_matches "$built" && exit 0
   say "Valkey: build made for another CPU ($(info_get "$INFO" cpu_desc), now $(cpu_desc)): staying down until $CPU_UNIT rebuilds it"
   systemctl start --no-block "$CPU_UNIT" >/dev/null 2>&1 \
     || say "Valkey: $CPU_UNIT could not be started; rebuild by hand: $TOOL rebuild-cpu"
@@ -792,7 +792,7 @@ cmd_bolt() {
   "$perf" record -q -e cycles:u -j any,u -o "$work/perf.data" -p "$pid" -- \
     "$bench" "${t[@]}" --dbnum 9 -c 50 -n 400000 -r 100000 -d 256 -q \
       -t get,set,hset,lpush,mset,incr > "$work/bench.log" 2>&1 \
-    || { "$BIN/valkey-cli" "${t[@]}" -n 9 flushdb >/dev/null 2>&1 || true; die "perf could not record branch samples (no LBR on this CPU or VM?)"; }
+    || { "$BIN/valkey-cli" "${t[@]}" -n 9 flushdb >/dev/null 2>&1 || true; perf_record_die "$work/bench.log"; }
   "$BIN/valkey-cli" "${t[@]}" -n 9 flushdb >/dev/null 2>&1 || true
   "$p2b" -p "$work/perf.data" -o "$work/valkey.fdata" "$base" > "$work/p2b.log" 2>&1 \
     || { tail -n 5 "$work/p2b.log" >&2; die "perf2bolt failed"; }
@@ -850,7 +850,7 @@ check_record() { # record bindir
   CHECK_LOOKUP_FAILED=0
   [[ $(info_get "$rec" recipe) == "$BUILD_RECIPE" ]] || stale+="recipe $(info_get "$rec" recipe) -> $BUILD_RECIPE, "
   bcpu=$(info_get "$rec" cpu)
-  [[ -n $bcpu && $bcpu == "$(cpu_fingerprint)" ]] || stale+="cpu $(info_get "$rec" cpu_desc) -> $(cpu_desc), "
+  cpu_fingerprint_matches "$bcpu" || stale+="cpu $(info_get "$rec" cpu_desc) -> $(cpu_desc), "
   for f in "${BINS[@]}"; do [[ -e $bdir/$f ]] || stale+="$f missing, "; done
   while IFS='=' read -r name want; do
     if [[ $want == "?" ]]; then CHECK_LOOKUP_FAILED=1; continue; fi
@@ -920,7 +920,7 @@ cmd_status() {
   local bcpu cpu=no unit=no act
   if [[ -f $INFO ]]; then
     bcpu=$(info_get "$INFO" cpu)
-    [[ -n $bcpu && $bcpu == "$(cpu_fingerprint 2>/dev/null)" ]] && cpu=yes
+    cpu_fingerprint_matches "$bcpu" 2>/dev/null && cpu=yes
     unit_is_ours && unit=yes
     act=$(systemctl is-active "$UNIT.service" 2>/dev/null || true)
     printf 'Valkey: build %s (clang %s, recipe %s, built %s), bolt=%s, cpu match=%s, unit ours=%s (%s, %s), source=%s, log %s%s\n' \

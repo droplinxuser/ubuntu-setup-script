@@ -1185,6 +1185,22 @@ optimize_valkey() {
   return "$rc"
 }
 
+# --optimize report: Chevereto sites still on file sessions are shown the
+# two env.php lines that move them to this Valkey/Redis socket.  Advice only;
+# application files are never edited.
+chevereto_session_hint() {
+  local socket=$1 root n=0
+  while IFS= read -r root; do
+    [[ -n $root ]] || continue
+    n=$(( n + 1 ))
+  done < <(chevereto_session_dirs /etc/nginx 2>/dev/null)
+  if (( n )); then
+    opt_report "  Chevereto (${n} site(s) on file sessions): add \`'CHEVERETO_SESSION_SAVE_HANDLER' => 'redis', 'CHEVERETO_SESSION_SAVE_PATH' => 'unix://${socket}',\` to app/env.php.  File sessions are one file per guest visit and lock a member's parallel requests; in Valkey the member explore tier measured 9,466 vs ~2,200 req/s and uncached guests 4,418 vs 4,324 (1.22.4, EPYC 4245P).  setup-php-sessionclean.timer removes expired files meanwhile."
+  else
+    opt_report "  Chevereto: \`'CHEVERETO_SESSION_SAVE_HANDLER' => 'redis', 'CHEVERETO_SESSION_SAVE_PATH' => 'unix://${socket}',\` in app/env.php keeps sessions here"
+  fi
+}
+
 optimize_valkey_tune() {
   local kind=${1:-valkey}
   local label=Valkey conf=/etc/valkey/valkey.conf conf_dir=/etc/valkey
@@ -1297,6 +1313,14 @@ optimize_valkey_tune() {
   opt_report "  XenForo note: with php-redis and this local socket the XF registry/session cache measured +7-9% authenticated throughput (1.21.23 audit); without php-redis the add-on's pure-PHP Credis client measured slower than local MariaDB (1.20.x audit). Keep it when \`redis\` is in \`php -m\`, disable it for Credis, and use it on multi-node or remote-DB setups."
   opt_report "  XenForo widgets: disabling Members online, Trending content and Featured content on the forum list measured +39% authenticated throughput and 13% smaller HTML; disable them in ACP > Widgets if they are not required."
   opt_report "  WordPress: \`define('WP_REDIS_PATH', '${socket_path}');\`"
+  # Chevereto's default is file sessions in /tmp: PHP's session GC never
+  # removes them (measured: a 2-hour-old file survived gc_divisor=1), so
+  # /tmp grows by one file per guest visit, and the per-session flock
+  # serialises a member's parallel requests.  On the EPYC 24.04 replica
+  # (1.22.4) sessions in Valkey took the member explore tier from ~1,500 to
+  # 9,466 req/s (p99 300-700 -> 11.7 ms) and uncached guests from ~3,600
+  # to 4,418 req/s, and /tmp stopped growing.
+  chevereto_session_hint "$socket_path"
   opt_report "  Laravel/phpredis: \`'host' => '${socket_path}', 'port' => 0\`"
   opt_report "  Test: \`${cli} -s ${socket_path} ping\`"
 

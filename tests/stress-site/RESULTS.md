@@ -7,7 +7,38 @@ manifests, sweep tables and run logs these sections cite (`AUDIT-*.md`,
 removed from the tree on 2026-11-19 to keep the repository lean; every one
 is still in git history, for example
 `git show 84b0db5:tests/stress-site/AUDIT-20261117-1.21.30.md`.  The current
-cycle report is `AUDIT-20261126-1.22.3.md`.
+cycle report is `AUDIT-20261126-1.22.4.md`.
+
+## 1.22.4 — AMD EPYC 4245P, Ubuntu 24.04 and 26.04 (2026-11-26)
+
+Full report: `AUDIT-20261126-1.22.4.md`.  First AMD host (Zen 5, 6C/12T,
+32 GB, bare metal); the 1.21.71 deb-package stack migrated by `--optimize`
+on 24.04, then again after an in-place upgrade to 26.04.
+
+- **AMD:** clang 23 builds for `znver5`; BOLT profiles from AMD LbrExtV2
+  (nginx 991, PHP 2,515, Valkey 398 functions).  Sweeps kept every constant:
+  tracing JIT 64 MB, 12 PHP workers (one per thread), 8 nginx workers (two
+  thirds); BOLT `-hugify` ties.
+- **Chevereto session GC in requests** (1.22.0-1.22.3) cost the member
+  explore tier half its throughput (2,220 -> ~1,100 req/s, p99 48 -> 457-753
+  ms) and uncached guests ~20 %: now a timer.  Sessions in Valkey: 9,466
+  req/s on member explore.
+- **Before/after, Ubuntu 26.04** (req/s medians, 5 rounds):
+
+  | Tier | Angie + Sury | source builds | Δ |
+  |---|---:|---:|---:|
+  | WP guest home (cached) | 362,529 | 378,834 | +4.5 % |
+  | XF guest thread (cached) | 498,524 | 535,104 | +7.3 % |
+  | Chev guest image (cached) | 524,983 | 560,326 | +6.7 % |
+  | WP member home | 320 | 350 | +9.4 % |
+  | XF member home | 1,040 | 1,135 | +9.1 % |
+  | XF member thread | 636 | 632 | tie |
+  | Chev guest home (uncached) | 3,578 | 4,238 | +18.4 % |
+  | Chev member explore | 1,979 | 2,165 | +9.4 % |
+
+- Also fixed: RDSEED in the CPU fingerprint (Zen 5 erratum), `--purge`
+  refused on 24.04, cloud-init reverting the hostname, colliding BOLT
+  passes, `apt-mark hold` against `apt-daily`.
 
 ## 1.22.3 — Xeon E-2236 + KVM replicas (2026-11-26)
 

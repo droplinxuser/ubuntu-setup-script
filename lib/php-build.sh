@@ -546,8 +546,12 @@ php_build_install_support() {
     || { _pb_warn "PHP build: tools/php-build.sh or tools/build-common.sh is missing from this checkout"; return 1; }
   install -d -m 755 "$PHP_BUILD_ROOT" "$PHP_BUILD_TEMPLATES"
   install -d -m 750 "$PHP_BUILD_LOG_DIR"
-  _pb_install_if_changed 755 "${SCRIPT_DIR}/tools/php-build.sh" "$PHP_BUILD_TOOL" || return 1
+  # build-common.sh before the tool: a new tool needs the new helpers
+  # (cpu_fingerprint_matches, 1.22.4) and the new build-common.sh still
+  # serves the old tool, so this order has no window where the unit's
+  # ExecStartPre misreads a missing helper as a CPU change.
   _pb_install_if_changed 644 "${SCRIPT_DIR}/tools/build-common.sh" "$PHP_BUILD_COMMON_FILE" || return 1
+  _pb_install_if_changed 755 "${SCRIPT_DIR}/tools/php-build.sh" "$PHP_BUILD_TOOL" || return 1
   _pb_install_if_changed 644 "${SCRIPT_DIR}/lib/php-build.sh" "$PHP_BUILD_LIB_FILE" || return 1
   # The versions file beside setup.sh is the source of truth; the installed
   # copy is what the refresh and the rebuild units build from.

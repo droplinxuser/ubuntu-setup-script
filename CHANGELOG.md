@@ -8,6 +8,93 @@ Reports of the 1.21.33-1.21.61 cycles that measured the removed Anubis
 filter were deleted from the tree on 2026-11-23 for the same reason;
 `git show <commit>:<path>` recovers them.
 
+## 1.22.4 (2026-11-26)
+
+First test on AMD: an EPYC 4245P (Zen 5, 6C/12T, 32 GB, bare metal) on
+Ubuntu 24.04 and, after an in-place release upgrade, on 26.04, with the
+1.21 deb-package stack (Angie, Sury PHP 8.5, the valkey-server package)
+migrated by `--optimize` on each (AUDIT-20261126-1.22.4.md).  The build
+tools needed no change for AMD: clang 23 targets `znver5`, and BOLT records
+its profile from AMD's own branch records (LbrExtV2) — nginx 991, PHP 2,515
+and Valkey 398 profiled functions, the same order as on the Xeon.
+
+- **Chevereto: no session GC inside requests.**  1.22.0 turned PHP's
+  session GC on for Chevereto roots (a `[PATH=]` section) so `/tmp` would
+  stop filling with one session file per guest visit.  Each GC call then
+  listed and stat'ed the whole directory while its request held the session
+  lock: on the EPYC the member explore tier fell from 2,220 to ~1,100 req/s
+  (p99 48 -> 457-753 ms) and uncached guests from 4,324 to ~3,400 req/s
+  (p99 37 -> 300-420 ms), getting worse as the directory grew.  This was the
+  member-explore p99 regression 1.22.3 measured on the Xeon.  The GC is off
+  for those roots again and `setup-php-sessionclean.timer` (every 10
+  minutes, idle priority) deletes the session files older than
+  `session.gc_maxlifetime` from each Chevereto file-session directory
+  (`CHEVERETO_SESSION_SAVE_PATH`, default `/tmp`).  It keeps the save path's
+  depth (`N;/path`) and the longest `session.gc_maxlifetime` any FPM
+  configuration sets, is installed while such a site exists, and
+  `--purge php` removes it.  The `--optimize` report
+  now shows the two `env.php` lines that keep Chevereto sessions in Valkey:
+  measured 9,466 vs ~2,200 req/s on member explore (p99 11.7 ms), with no
+  files at all.
+- **The CPU fingerprint ignores RDRAND/RDSEED.**  Linux hides RDSEED on
+  Zen 5 parts whose microcode has the RDSEED erratum, and a microcode update
+  gives it back: with the flag in the fingerprint, such a kernel or
+  microcode update looked like a CPU change and kept nginx, PHP and Valkey
+  down until the native rebuild finished.  Compilers never emit either
+  instruction on their own, so a build stays valid.  The gates accept the
+  1.22.0-1.22.3 fingerprints too: updating rebuilds nothing.
+- **`--purge` runs on Ubuntu 22.04 and 24.04.**  It fell into the
+  fresh-install check (26.04 or newer), so a 24.04 host that `--optimize`
+  had migrated could not be purged.
+- **The hostname survives cloud-init.**  Providers that set
+  `manage_etc_hosts` (vendor-data) have cloud-init rewrite `/etc/hosts` from
+  their own hostname at every boot: after the first reboot the name
+  `--basic` set no longer resolved (`hostname -f` failed).  `--basic` now
+  writes `/etc/cloud/cloud.cfg.d/99-setup-hostname.cfg`; `--optimize` adds it
+  (and fixes the 127.0.1.1 line) on hosts renamed by an earlier version;
+  `--purge basic` removes it.  Verified across a reboot.
+- **BOLT passes no longer collide.**  The migration's delayed BOLT pass and
+  an `--optimize` started within its five minutes disturbed each other:
+  the `--optimize` found the build lock held (PHP skipped), the queued pass
+  sampled PHP while `--optimize` reloaded it (136 functions, skipped), and
+  it re-ran a Valkey BOLT that had just restarted Valkey.  `--optimize` now
+  cancels a queued pass that is still waiting (and waits for one already
+  working), and the daily refresh retries a missing PHP BOLT, as it did for
+  nginx (verified live: 2,511 functions).
+- **The Sury hold waits for the dpkg lock.**  `apt-daily` started two seconds
+  before the migration's `apt-mark hold`, which failed.  Holds and unholds
+  are retried while dpkg is locked (about 5 minutes); other errors are not.
+- **BOLT reports perf's own error.**  A failed `perf record` said "no LBR on
+  this CPU or VM?" whatever the cause, and Valkey's pass said the same when
+  the benchmark itself failed.  The message now quotes perf and names what
+  BOLT needs (Intel LBR or AMD LbrExtV2 on bare metal).
+- **The energy-performance preference is restored.**  The performance
+  governor also sets `energy_performance_preference` on amd-pstate-epp and
+  intel_pstate; `--basic` records the original and `--purge basic` puts it
+  back.
+- Each build tool is installed after its `build-common.sh`, so a half-done
+  update can never leave a new tool without the helpers its unit gate calls.
+- Smaller: a stray "No such file" line in the migration log (redirection
+  order); the stress harness refuses to run without `wrk` (it reported 0
+  req/s), `set-fpm.sh` targets the active PHP version, and
+  `restore-baseline.sh` stops when the purge fails and keeps an active UFW.
+
+Measured on the EPYC (5 rounds, no clock pinning; the AMD part boosts to
+4.9-5.4 GHz under these loads), the AMD tuning needed no new constants:
+tracing JIT 64 MB beats JIT off by 10-12 % on WordPress members (function
+JIT +5 % on the XenForo thread, -6 % on WordPress; 128 MB ties); 12 PHP
+workers (one per thread) beat 6, 9, 18 and 24 on every member tier; 8 nginx
+workers (two thirds) beat 6, 10 and 12 on cached pages, at a tenth of the
+p99; BOLT's `-hugify` ties the current layout.
+
+Before/after the migration on the EPYC (Angie + Sury PHP 8.5 + package
+Valkey -> nginx 1.31.10 + PHP 8.5.13 + Valkey 9.2.1 from source with BOLT),
+Ubuntu 26.04, req/s medians: cached pages +4.5 to +8.4 %, WordPress member
+home +9.4 %, XenForo member home +9.1 %, Chevereto uncached +18.4 % and
+member explore +9.4 % (p99 52 -> 48 ms); the XenForo member thread ties.
+Ubuntu 24.04 gave the same picture (cached +7 to +10 %, members +8 to
++9 %).  Functional walk, security 78/78 and cookie 109/109 on both.
+
 ## 1.22.3 (2026-11-26)
 
 Migration of deb-package hosts (Angie, Sury PHP, valkey-server) to the

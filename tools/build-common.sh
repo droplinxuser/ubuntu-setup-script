@@ -93,13 +93,27 @@ install_stripped() { # src dst
 # Linux spells three of the extensions differently (pni = SSE3, abm = LZCNT,
 # rdrand); they are mapped to the allow-list names.  aarch64: implementer,
 # architecture, variant, part, revision and the Features line.
-CPU_ISA_FLAGS="sse3 ssse3 sse4_1 sse4_2 popcnt avx avx2 fma f16c bmi1 bmi2 lzcnt movbe adx aes pclmulqdq vaes vpclmulqdq sha_ni rdrnd rdseed xsave xsavec xsaveopt xsaves avx512f avx512dq avx512cd avx512bw avx512vl avx512_vnni avx512_bf16 avx512vbmi avx512_vbmi2 avx512ifma avx512_bitalg avx512_vpopcntdq gfni avx_vnni amx_tile amx_bf16 amx_int8 clflushopt clwb"
+#
+# rdrnd and rdseed are not part of the fingerprint (1.22.4).  The kernel
+# hides them by policy, not because the CPU changed: Linux clears RDSEED on
+# AMD Zen 5 parts whose microcode has the RDSEED erratum, and a later
+# microcode update gives it back.  Compilers never emit either instruction
+# on their own (only intrinsics do, and the libraries that use them check
+# CPUID at run time), so a build stays valid when the flag comes or goes.
+# Hashing them meant a kernel or microcode update on a Zen 5 host kept every
+# compiled service down until the native rebuild finished.
+CPU_ISA_FLAGS="sse3 ssse3 sse4_1 sse4_2 popcnt avx avx2 fma f16c bmi1 bmi2 lzcnt movbe adx aes pclmulqdq vaes vpclmulqdq sha_ni xsave xsavec xsaveopt xsaves avx512f avx512dq avx512cd avx512bw avx512vl avx512_vnni avx512_bf16 avx512vbmi avx512_vbmi2 avx512ifma avx512_bitalg avx512_vpopcntdq gfni avx_vnni amx_tile amx_bf16 amx_int8 clflushopt clwb"
+# The flags 1.22.0-1.22.3 hashed on top of CPU_ISA_FLAGS (see
+# cpu_fingerprint_matches).
+CPU_ISA_FLAGS_LEGACY="rdrnd rdseed"
 
 # The plain text the fingerprint hashes (diagnostics and build.info cpu_info=).
+# FORCE (x86 only): ISA names added to the list as if /proc/cpuinfo had them,
+# for the 1.22.0-1.22.3 fingerprints.
 cpu_fingerprint_text() {
-  local info=${SETUP_CPUINFO:-/proc/cpuinfo}
+  local info=${SETUP_CPUINFO:-/proc/cpuinfo} force=${1:-}
   [[ -r $info ]] || return 0
-  awk -F'[[:space:]]*:[[:space:]]*' -v allow="$CPU_ISA_FLAGS" '
+  awk -F'[[:space:]]*:[[:space:]]*' -v allow="$CPU_ISA_FLAGS" -v force="$force" '
     BEGIN { n = split(allow, a, " "); for (i = 1; i <= n; i++) ok[a[i]] = 1
             alias["pni"] = "sse3"; alias["abm"] = "lzcnt"; alias["rdrand"] = "rdrnd" }
     # The first processor block only: every core of one host is the same CPU.
@@ -114,7 +128,8 @@ cpu_fingerprint_text() {
         x = (f[i] in alias) ? alias[f[i]] : f[i]
         # x86: only allow-listed ISA flags; aarch64 Features are all ISA.
         if ($1 == "Features" || (x in ok)) isa[x] = 1
-      } }
+      }
+      if ($1 == "flags") { k = split(force, g, " "); for (i = 1; i <= k; i++) isa[g[i]] = 1 } }
     END {
       s = ""; c = 0
       for (x in isa) list[++c] = x
@@ -129,9 +144,44 @@ cpu_fingerprint_text() {
 # never as "skip the check".
 cpu_fingerprint() {
   local t
-  t=$(cpu_fingerprint_text)
+  t=$(cpu_fingerprint_text "${1:-}")
   [[ -n $t ]] || return 0
   printf '%s' "$t" | sha256sum | cut -c1-16
+}
+
+# 0 when BUILT (a build.info cpu= value) was made for this CPU.  Every gate
+# and staleness check uses this, never a plain string compare: a build from
+# 1.22.0-1.22.3 recorded a hash that included rdrnd/rdseed when the kernel
+# showed them, so each of their four combinations is accepted too.  An
+# update to this version therefore rebuilds nothing, and a Zen 5 host whose
+# kernel hid RDSEED after such a build keeps serving.  Empty BUILT or an
+# unreadable /proc/cpuinfo is a mismatch.
+cpu_fingerprint_matches() {
+  local built=${1:-} now extra
+  now=$(cpu_fingerprint)
+  [[ -n $built && -n $now ]] || return 1
+  [[ $built == "$now" ]] && return 0
+  [[ -n $(awk '$1 == "flags" { print; exit }' "${SETUP_CPUINFO:-/proc/cpuinfo}" 2>/dev/null) ]] || return 1
+  # Each legacy flag alone, then all of them (rdrnd, rdseed, "rdrnd rdseed").
+  local -a combos
+  read -r -a combos <<<"$CPU_ISA_FLAGS_LEGACY"
+  combos+=("$CPU_ISA_FLAGS_LEGACY")
+  for extra in "${combos[@]}"; do
+    [[ $built == "$(cpu_fingerprint "$extra")" ]] && return 0
+  done
+  return 1
+}
+
+# The die message for a failed `perf record -j any,u`, with perf's own reason
+# (the last non-empty line of LOG) instead of a guess: the old fixed text
+# ("no LBR on this CPU or VM?") hid a missing perf, a lockdown or a failed
+# workload behind the same words (1.22.4).  Branch records need Intel LBR or
+# AMD LbrExtV2 (Zen 4 and later) on bare metal; most VMs expose neither.
+#   perf_record_die LOG
+perf_record_die() {
+  local why=""
+  [[ -r ${1:-} ]] && why=$(grep -v '^[[:space:]]*$' "$1" | tail -n 1 | cut -c1-200)
+  die "perf could not record branch samples${why:+: $why} (BOLT needs Intel LBR or AMD LbrExtV2 (Zen 4+) on bare metal; most VMs expose neither)"
 }
 
 # --------------------------------------------------------------- build limits

@@ -22,6 +22,8 @@ J=/root/audit/cookies
 CK=$J/cookies.tsv
 ck() { awk -F'\t' -v k="$1" '$1 == k { print $2 }' "$CK"; }
 [[ -s $CK ]] || { echo "missing $CK: run exercise-apps.sh keep (or seed-xf.sh) first" >&2; exit 1; }
+# Without wrk every tier printed 0 req/s and looked like a dead server.
+command -v wrk >/dev/null || { echo "wrk is not installed (apt-get install wrk)" >&2; exit 1; }
 one() { # label url cookie [marker] [cache]
   local label=$1 url=$2 key=${3:-} mark=${4:-} want=${5:-} out cpu cookie="" got
   [[ $label =~ $F ]] || return 0

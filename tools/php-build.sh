@@ -934,8 +934,8 @@ cmd_bolt() {
   # binary's addresses, and sampling with it off profiled the same functions
   # (2,549 vs 2,541) for the same speed (1.21.69).
   say "PHP $ver: sampling php-fpm for ${secs}s for BOLT"
-  if ! "$perf" record -q -e cycles:u -j any,u -o "$work/perf.data" -a -- sleep "$secs" >/dev/null 2>&1; then
-    die "perf could not record branch samples (no LBR on this CPU or VM?)"
+  if ! "$perf" record -q -e cycles:u -j any,u -o "$work/perf.data" -a -- sleep "$secs" > "$work/perf.log" 2>&1; then
+    perf_record_die "$work/perf.log"
   fi
   # perf2bolt fails ("Please rename the input binary", after listing the
   # binaries it did see) when php-fpm took no samples at all: an idle pool,
@@ -1070,7 +1070,7 @@ cmd_pre() {
     done
   done
   built=$(info_get "$ver" cpu); now=$(cpu_fingerprint)
-  if [[ -z $built || -z $now || $built != "$now" ]]; then
+  if ! cpu_fingerprint_matches "$built"; then
     logger -t "$LOG_TAG" "PHP $ver: built for CPU ${built:-unknown}, this CPU is ${now:-unknown}: php$ver-fpm stays down until setup-build-cpu.service rebuilt it" 2>/dev/null || true
     say "PHP $ver: the CPU changed since the build; php$ver-fpm stays down until setup-build-cpu.service has rebuilt it"
     systemctl start --no-block setup-build-cpu.service >/dev/null 2>&1 \
@@ -1103,7 +1103,7 @@ cmd_check() {
   recipe=$(info_get "$ver" recipe)
   [[ ${recipe:-1} == "$BUILD_RECIPE" ]] || stale+="recipe ${recipe:-1} -> $BUILD_RECIPE, "
   bcpu=$(info_get "$ver" cpu)
-  [[ -n $bcpu && $bcpu == "$(cpu_fingerprint)" ]] || stale+="cpu ${bcpu:-none} -> $(cpu_fingerprint), "
+  cpu_fingerprint_matches "$bcpu" || stale+="cpu ${bcpu:-none} -> $(cpu_fingerprint), "
   set=$(want_exts "$ver" 2>/dev/null) || { echo "stale: no extension set recorded"; return 10; }
   hset=$(set_norm "$(info_get "$ver" exts)")
   [[ $set == "$hset" ]] || stale+="extensions ${hset// /,} -> ${set// /,}, "
@@ -1155,6 +1155,14 @@ cmd_refresh() {
   if (( rc == 10 )); then
     say "PHP $ver: $out; rebuilding in the background (setup-php-build@$ver.service); the running build keeps serving"
     systemctl start --no-block "setup-php-build@$ver.service" 2>/dev/null || true
+  elif (( rc == 0 )) && [[ $(info_get "$ver" bolt) != 1 ]] && unit_runs_build "$ver"; then
+    # A current build that never got its BOLT pass (the pass found the build
+    # lock held, or too little traffic) is retried here, as nginx's refresh
+    # does.  Before 1.22.4 only a manual --optimize retried it: on the EPYC
+    # replica the post-migration pass and an --optimize started inside its
+    # five-minute delay each found the other holding the lock, and PHP
+    # stayed on the ThinLTO build.
+    bash "$SELF" bolt "$ver" 60 || true
   fi
   return 0
 }
@@ -1167,7 +1175,7 @@ cmd_status() {
     valid_ver "$ver" || continue
     [[ -n ${1:-} && $1 != "$ver" ]] && continue
     if [[ $(info_get "$ver" mode) == clang ]]; then printf 'PHP %s: 1.21 build (php-fpm only), replaced by the next build\n' "$ver"; continue; fi
-    cpu=match; [[ $(info_get "$ver" cpu) == "$(cpu_fingerprint)" ]] || cpu=CHANGED
+    cpu=match; cpu_fingerprint_matches "$(info_get "$ver" cpu)" || cpu=CHANGED
     printf 'PHP %s: build %s (clang %s, recipe %s), bolt=%s, jit=%s, cpu=%s, running=%s, active=%s, exts=%s\n' "$ver" \
       "$(info_get "$ver" version)" "$(info_get "$ver" llvm)" "$(info_get "$ver" recipe)" "$(info_get "$ver" bolt)" \
       "$(info_get "$ver" jit)" "$cpu" "$(unit_runs_build "$ver" && echo yes || echo no)" \

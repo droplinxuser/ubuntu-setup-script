@@ -109,9 +109,13 @@ valkey_build_install_support() {
   valkey_build_stop_legacy_build_unit
   [[ -f $src && -f ${SCRIPT_DIR}/tools/build-common.sh ]] || { warn "Valkey: tools/valkey-build.sh is missing from this checkout"; return 1; }
   install -d -m 755 "$VALKEY_BUILD_ROOT"
-  cmp -s "$src" "$VALKEY_BUILD_TOOL" || install -m 755 "$src" "$VALKEY_BUILD_TOOL"
+  # build-common.sh before the tool: a new tool needs the new helpers
+  # (cpu_fingerprint_matches, 1.22.4) and the new build-common.sh still
+  # serves the old tool, so this order has no window where the unit's
+  # ExecStartPre misreads a missing helper as a CPU change.
   cmp -s "${SCRIPT_DIR}/tools/build-common.sh" "$VALKEY_BUILD_COMMON_FILE" \
     || install -m 644 "${SCRIPT_DIR}/tools/build-common.sh" "$VALKEY_BUILD_COMMON_FILE"
+  cmp -s "$src" "$VALKEY_BUILD_TOOL" || install -m 755 "$src" "$VALKEY_BUILD_TOOL"
   if [[ -f ${SCRIPT_DIR}/valkey-build.conf ]] && ! cmp -s "${SCRIPT_DIR}/valkey-build.conf" "$VALKEY_BUILD_CONF_FILE"; then
     install -m 644 "${SCRIPT_DIR}/valkey-build.conf" "$VALKEY_BUILD_CONF_FILE"
   fi
