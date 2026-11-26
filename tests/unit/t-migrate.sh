@@ -200,6 +200,35 @@ done
 exit 0
 EOF
 
+cat > "$TBIN/dpkg-divert" <<'EOF2'
+#!/usr/bin/env bash
+printf 'dpkg-divert %s\n' "$*" >> "$STUB_CALLS"
+l=$STUB_DIR/diversions
+touch "$l"
+act="" rename=0 to="" path=""
+while [ $# -gt 0 ]; do
+  case $1 in
+    --list) act=list ;;
+    --add) act=add ;;
+    --remove) act=remove ;;
+    --rename) rename=1 ;;
+    --local|--quiet) ;;
+    --divert) shift; to=$1 ;;
+    *) path=$1 ;;
+  esac
+  shift
+done
+case $act in
+  list) grep -F -- "$path " "$l" | sed 's/^/local diversion of /' ;;
+  add) [ -f "$STUB_DIR/divert-fail" ] && exit 2
+       printf '%s %s\n' "$path" "${to:-$path.distrib}" >> "$l"
+       [ "$rename" = 1 ] && [ -e "$path" ] && mv -f -- "$path" "${to:-$path.distrib}" ;;
+  remove) to=$(grep -F -- "$path " "$l" | awk '{ print $2 }')
+          grep -vF -- "$path " "$l" > "$l.new" || true; mv -f "$l.new" "$l"
+          [ "$rename" = 1 ] && [ -n "$to" ] && [ -e "$to" ] && mv -f -- "$to" "$path" ;;
+esac
+exit 0
+EOF2
 cat > "$TBIN/apt-mark" <<'EOF'
 #!/usr/bin/env bash
 printf 'apt-mark %s\n' "$*" >> "$STUB_CALLS"
@@ -357,6 +386,7 @@ export SETUP_MIGRATE_PHP_ETC="$TROOT/etc/php"
 export SETUP_MIGRATE_VALKEY_ETC="$TROOT/etc/valkey"
 export SETUP_MIGRATE_VALKEY_DATA="$TROOT/var/lib/valkey"
 export SETUP_MIGRATE_LEGACY_TOOLS="$TROOT/usr/local/lib/setup-1.21-legacy"
+export SETUP_MIGRATE_USR_BIN="$TROOT/usr/bin"
 export SETUP_BUILD_LOCK="$TROOT/run/setup-build.lock"
 export SETUP_TUNING_FILE="$TROOT/etc/default/setup-tuning"
 export NGINX_ROOT="$TROOT/usr/local/lib/setup-nginx"
@@ -398,6 +428,7 @@ for p in "$MIGRATE_STATE_FILE" "$MIGRATE_BACKUP_ROOT" "$MIGRATE_LOG" "$MIGRATE_U
          "$MIGRATE_VALKEY_ETC" "$MIGRATE_VALKEY_DATA" "$MIGRATE_LEGACY_TOOLS" "$MIGRATE_BUILD_LOCK" \
          "$MIGRATE_APT_PIN" "$MIGRATE_REPORT_FILE" "${MIGRATE_OLD_HOOKS[@]}" "$NGINX_BUILD_TOOL" \
          "$(migrate_nginx_root)" "$(migrate_php_root)" "$(migrate_valkey_root)" "$SETUP_TUNING_FILE" \
+         "$MIGRATE_USR_BIN" \
          "$STATE_DIR"; do
   if [[ $p != "$TROOT"/* ]]; then
     printf 'ABORT  %s is outside the fixture root %s\n' "$p" "$TROOT"
@@ -461,7 +492,7 @@ ours_policy() {
 fresh() {
   [[ $TROOT == "$TMP"/root && $STUBD == "$TMP"/stub ]] || { echo "ABORT  bad fixture root"; exit 1; }
   rm -rf -- "$TROOT" "$STUBD"
-  mkdir -p "$TROOT/state" "$TROOT/log" "$TROOT/run" "$TROOT/usr/sbin" "$TROOT/etc/default" \
+  mkdir -p "$TROOT/state" "$TROOT/log" "$TROOT/run" "$TROOT/usr/sbin" "$TROOT/usr/bin" "$TROOT/etc/default" \
     "$T_UNITS" "$(dirname "$MIGRATE_APT_PIN")" "$(dirname "${MIGRATE_OLD_HOOKS[0]}")" \
     "$(migrate_nginx_root)" "$(migrate_php_root)" "$(migrate_valkey_root)" "$STUBD"
   : > "$STUBD/dpkg"; : > "$STUBD/active"; : > "$STUBD/enabled"; : > "$STUBD/held"
@@ -469,6 +500,7 @@ fresh() {
   MIGRATE_REPORT=(); MIGRATE_FAILED=0; MIGRATE_RUN_DIR=""; MIGRATE_IN_FLIGHT=""
   MIGRATE_POLICY_OURS=0; MIGRATE_DO_NGINX=0; MIGRATE_DO_VALKEY=0; MIGRATE_PHP_TODO=()
   MIGRATE_SIM_COLLATERAL=(); MIGRATE_SIM_REMOVED=(); MIGRATE_SURY_PKGS=(); MIGRATE_PA_ERRORS=()
+  MIGRATE_SERIES_OK=()
 }
 
 # ---------------------------------------------------------------------------
@@ -516,6 +548,13 @@ php_build_layout() { rec "php_build_layout $*"; }
 php_build_tmpfiles_apply() { rec "php_build_tmpfiles_apply"; }
 php_build_links() { rec "php_build_links $*"; }
 php_primary_version() { cat "$STUBD/php-primary" 2>/dev/null; return 0; }
+# php.net lookups: STUBD/php-newest is the newest released series (default
+# 8.5, an empty file = offline); a series is released when it is not newer.
+php_build_latest_series() { if [[ -f $STUBD/php-newest ]]; then cat "$STUBD/php-newest"; else echo 8.5; fi; }
+php_build_release() {
+  local n; n=$(php_build_latest_series); [[ -n $n ]] || return 0
+  [[ $(printf "%s\n%s\n" "$1" "$n" | sort -V | tail -n1) == "$n" ]] && printf "%s.9\n" "$1"; return 0
+}
 php_fpm_test() {
   rec "php_fpm_test $1"
   if [[ -f $STUBD/php-fpm-test-fail ]]; then echo 'ERROR: stub failure'; return 1; fi
@@ -1004,6 +1043,167 @@ out=$( (
 check "pre-flight: only the active version moves; a second one is refused" eqv "$(st php-8.3)" "refused:secondary (active 8.4)"
 check "pre-flight: the active version is queued" has "$out" "todo=8.4"
 check "pre-flight: the extensions loaded today are kept in PHP_EXT_EXTRA" called "persist PHP_EXT_EXTRA="
+
+# Series the source build cannot make (1.22.3): refused in the pre-flight,
+# never the primary, retried when the series is released.
+fresh
+pkgs "ii php8.5-fpm" "ii php8.6-fpm"
+active php8.5-fpm php8.6-fpm
+for v in 8.5 8.6; do
+  mkdir -p "$T_PHPETC/$v/fpm/pool.d"
+  printf '[www]\nlisten = /run/php/php%s-fpm.sock\n' "$v" > "$T_PHPETC/$v/fpm/pool.d/www.conf"
+done
+out=$( (
+  migrate_preflight_disk() { :; }
+  migrate_php_app_required_exts() { return 0; }
+  migrate_preflight 0
+  echo "todo=${MIGRATE_PHP_TODO[*]}"
+) 2>&1 )
+check "series: an unreleased series (Sury RC) is refused in the pre-flight" eqv "$(st php-8.6)" "refused:series not buildable"
+check "series: an unreleased newer series does not become the primary" has "$out" "todo=8.5"
+check "series: the released version is not refused as secondary" not eqv "$(st php-8.5)" "refused:secondary (active 8.6)"
+d1=$(migrate_state_get php-8.6.scan)
+printf '8.6\n' > "$STUBD/php-newest"; MIGRATE_SERIES_OK=()
+check "series: the X.Y.0 release changes the scan digest (the refusal is retried)" \
+  not eqv "$(migrate_php_scan_digest 8.6)" "$d1"
+fresh
+pkgs "ii php8.0-fpm"
+active php8.0-fpm
+mkdir -p "$T_PHPETC/8.0/fpm/pool.d"
+printf '[www]\nlisten = /run/php/php8.0-fpm.sock\n' > "$T_PHPETC/8.0/fpm/pool.d/www.conf"
+out=$( ( migrate_preflight_disk() { :; }; migrate_preflight 0; echo "todo=[${MIGRATE_PHP_TODO[*]}]" ) 2>&1 )
+check "series: PHP 8.0 is refused before any build" eqv "$(st php-8.0)" "refused:series not buildable"
+check "series: nothing is queued for PHP 8.0" has "$out" "todo=[]"
+fresh
+pkgs "ii php8.0-fpm"
+active php8.0-fpm
+mkdir -p "$T_PHPETC/8.0/fpm/pool.d"
+printf "[www]\nlisten = /run/php/php8.0-fpm.sock\n" > "$T_PHPETC/8.0/fpm/pool.d/www.conf"
+out=$( ( migrate_preflight_disk() { :; }; migrate_preflight 1 ) 2>&1 )
+check "series: the dry run says 8.0 is refused, not 'Sury -> source build'" has "$out" "PHP 8.0: refused, the source build supports"
+fresh
+: > "$STUBD/php-newest"
+check "series: offline (nothing resolves) counts as buildable" migrate_php_series_ok 8.5
+
+# The primary follows the vhosts (1.22.3): an idle newer version does not
+# displace the one the sites call.
+fresh
+pkgs "ii php8.3-fpm" "ii php8.4-fpm" "ii angie"
+active php8.3-fpm php8.4-fpm
+for v in 8.3 8.4; do
+  mkdir -p "$T_PHPETC/$v/fpm/pool.d"
+  printf '[www]\nlisten = /run/php/php%s-fpm.sock\n' "$v" > "$T_PHPETC/$v/fpm/pool.d/www.conf"
+done
+mkdir -p "$T_ANGIE/conf.d"
+printf 'server {\n  location ~ \\.php$ {\n    fastcgi_pass unix:/run/php/php8.3-fpm.sock;\n  }\n}\n' > "$T_ANGIE/conf.d/a.conf"
+printf 'server {\n  location ~ \\.php$ {\n    fastcgi_pass   unix:/run/php/php8.3-fpm.sock ;\n  }\n}\n' > "$T_ANGIE/conf.d/b.conf"
+check "primary: the version the vhosts call wins over a newer idle one" eqv "$(migrate_primary_version)" 8.3
+rm -f "$T_ANGIE"/conf.d/*.conf
+check "primary: without references the newest running version" eqv "$(migrate_primary_version)" 8.4
+
+# Operator php.ini edits survive the layout (1.22.3).
+fresh
+T_SURYINI="$TMP/sury-ini"; rm -rf "$T_SURYINI"; mkdir -p "$T_SURYINI/8.3" "$T_PHPETC/8.3/fpm/conf.d" "$T_PHPETC/8.3/cli/conf.d"
+printf '[PHP]\n; c\nmemory_limit = 128M\nupload_max_filesize = 2M\nexpose_php = Off\n[Date]\n;date.timezone =\n' > "$T_SURYINI/8.3/php.ini-production"
+printf '[PHP]\nmemory_limit = -1\n' > "$T_SURYINI/8.3/php.ini-production.cli"
+printf '[PHP]\nmemory_limit = 512M\nupload_max_filesize = 2M\nexpose_php = Off\nextension = foo.so\n[Date]\ndate.timezone = Asia/Manila\n[HOST=a.example]\nopen_basedir = /var/www/a\n' > "$T_PHPETC/8.3/fpm/php.ini"
+printf '[PHP]\nmemory_limit = -1\n' > "$T_PHPETC/8.3/cli/php.ini"
+( MIGRATE_SURY_INI_DIR=$T_SURYINI; migrate_php_ini_carry 8.3 ) >/dev/null 2>&1
+f="$T_PHPETC/8.3/fpm/conf.d/10-migrated-php-ini.ini"
+c=$(cat "$f" 2>/dev/null || true)
+check "php.ini: a changed directive is carried over" has "$c" "memory_limit = 512M"
+check "php.ini: a directive production leaves commented is carried over" has "$c" "date.timezone = Asia/Manila"
+check "php.ini: [HOST=] blocks are kept" has "$c" "[HOST=a.example]"
+check "php.ini: unchanged directives are not repeated" lacks "$c" "upload_max_filesize"
+check "php.ini: extension lines are not carried (the build has them in)" lacks "$c" "foo.so"
+check "php.ini: an unchanged php.ini writes no file" not test -e "$T_PHPETC/8.3/cli/conf.d/10-migrated-php-ini.ini"
+
+
+# Cron between the cutover and the Sury purge (1.22.3): Sury's
+# /usr/bin/phpX.Y is diverted to our CLI, its packages held; the rollback
+# and the post-purge pass take the diversion back.
+fresh
+pkgs "ii php8.3-cli" "ii php8.3-fpm" "ii php8.3-mysql" "ii php8.4-cli"
+cli=$(migrate_php_cli_bin 8.3); mkexe "$cli" "$TPL/php"
+printf 'sury-binary\n' > "$TROOT/usr/bin/php8.3"
+printf '%s\n' "$TROOT/usr/bin/php8.3" >> "$STUBD/dpkg-owned"
+migrate_php_divert_cli 8.3 >/dev/null 2>&1; rc=$?
+check "cron: the divert succeeds" eqv "$rc" 0
+check "cron: Sury's CLI is diverted locally to phpX.Y.sury" \
+  called "dpkg-divert --local --rename --divert $TROOT/usr/bin/php8.3.sury --add $TROOT/usr/bin/php8.3"
+check "cron: /usr/bin/phpX.Y is our CLI right after the cutover" eqv "$(readlink "$TROOT/usr/bin/php8.3")" "$cli"
+check "cron: Sury's binary is kept beside it" eqv "$(cat "$TROOT/usr/bin/php8.3.sury")" sury-binary
+check "cron: the diversion is recorded" eqv "$(st php-8.3.divert)" "$TROOT/usr/bin/php8.3"
+: > "$TCALLS"; migrate_php_divert_cli 8.3 >/dev/null 2>&1
+check "cron: a second divert does not add another diversion" not_called "--add"
+migrate_php_hold_version 8.3 >/dev/null 2>&1
+check "cron: the migrated version's Sury packages are held" eqv "$(sort "$STUBD/held" | paste -sd' ' -)" "php8.3-cli php8.3-fpm php8.3-mysql"
+check "cron: the holds are recorded for the unhold before the purge" eqv "$(st sury-held)" "php8.3-cli php8.3-fpm php8.3-mysql"
+check "cron: another version's packages are not held" not grep -qx php8.4-cli "$STUBD/held"
+migrate_php_undivert_cli 8.3 >/dev/null 2>&1
+check "cron: the rollback removes our link and renames Sury's CLI back" eqv "$(cat "$TROOT/usr/bin/php8.3")" sury-binary
+check "cron: the rollback drops the diversion" eqv "$(cat "$STUBD/diversions")" ""
+check "cron: the rollback clears the record" eqv "$(st php-8.3.divert)" ""
+# After the purge the package took its copy: only the record goes.
+migrate_php_divert_cli 8.3 >/dev/null 2>&1
+rm -f "$TROOT/usr/bin/php8.3.sury"
+: > "$TCALLS"; migrate_php_undivert_cli 8.3 after-purge >/dev/null 2>&1
+check "cron: after the purge the diversion is removed without a rename" called "dpkg-divert --local --remove $TROOT/usr/bin/php8.3"
+check "cron: after the purge our link stays" eqv "$(readlink "$TROOT/usr/bin/php8.3")" "$cli"
+# A path no package owns (no Sury CLI) is left to the links.
+fresh
+cli=$(migrate_php_cli_bin 8.3); mkexe "$cli" "$TPL/php"
+migrate_php_divert_cli 8.3 >/dev/null 2>&1
+check "cron: no package CLI, no diversion" not_called "dpkg-divert --local"
+
+
+# Leftover Angie references (1.22.3): checkouts of this script and of its
+# configuration repository are not reported.
+fresh
+c="$TROOT/root/work/ubuntu-setup-script"; mkdir -p "$c/lib" "$c/tests/unit" "$TROOT/root/scn/h5bp" "$TROOT/root/scn/http.d" "$TROOT/root/tools"
+: > "$c/setup.sh"; : > "$c/lib/migrate.sh"
+check "leftovers: a file in a setup.sh checkout is skipped" migrate_in_setup_checkout "$c/tests/unit/t.sh"
+check "leftovers: a file in a server-configs-nginx checkout is skipped" migrate_in_setup_checkout "$TROOT/root/scn/http.d/a.conf"
+check "leftovers: an operator script is reported" not migrate_in_setup_checkout "$TROOT/root/tools/reload.sh"
+mkdir -p "$T_ANGIE/h5bp" "$T_ANGIE/http.d"
+check "leftovers: the live Angie tree itself is not a checkout" not migrate_in_setup_checkout "$T_ANGIE/http.d/x.conf"
+
+
+# An nginx-only front proxy keeps local_php with nothing behind it: no
+# warning (1.22.3); with a PHP-FPM running the dead listener is reported.
+fresh
+mkdir -p "$T_ANGIE"
+printf 'http {\n  upstream local_php {\n    server unix:%s/run/none.sock;\n  }\n}\n' "$TROOT" > "$T_ANGIE/angie.conf"
+out=$( ( nginx_local_php_follow_pool() { :; }; migrate_pin_local_php ) 2>&1 )
+check "local_php: a host without PHP gets no dead-listener warning" lacks "$out" "does not accept connections"
+pkgs "ii php8.3-fpm"
+active php8.3-fpm
+out=$( ( nginx_local_php_follow_pool() { :; }; migrate_pin_local_php ) 2>&1 )
+check "local_php: with PHP-FPM running a dead listener is warned about" has "$out" "does not accept connections"
+
+
+# A PECL extension past its series ceiling (1.22.3): redis on PHP 8.6 is
+# unbuildable, so an application that needs it refuses the version in the
+# pre-flight instead of a build that fails on every run.
+fresh
+printf '8.6\n' > "$STUBD/php-newest"; MIGRATE_SERIES_OK=()
+pkgs "ii php8.6-fpm"
+active php8.6-fpm
+mkdir -p "$T_PHPETC/8.6/fpm/pool.d"
+printf '[www]\nlisten = /run/php/php-fpm.sock\n' > "$T_PHPETC/8.6/fpm/pool.d/www.conf"
+out=$( (
+  migrate_preflight_disk() { :; }
+  migrate_php_app_required_exts() { printf 'redis\n'; }
+  migrate_preflight 0; echo "todo=[${MIGRATE_PHP_TODO[*]}]"
+) 2>&1 )
+check "ceiling: redis on PHP 8.6 counts as unbuildable" has "$(migrate_php_ext_union 8.6)" "unbuildable redis"
+check "ceiling: an app that needs redis refuses PHP 8.6 in the pre-flight" eqv "$(st php-8.6)" "refused:unbuildable redis"
+check "ceiling: nothing is queued" has "$out" "todo=[]"
+check "ceiling: the refusal says redis has no PHP 8.6 release yet" has "$out" "redis has no release that builds for PHP 8.6 yet (up to 8.5)"
+check "ceiling: redis on PHP 8.5 is kept" has "$(migrate_php_ext_union 8.5)" "keep redis"
+d1=$(migrate_state_get php-8.6.scan)
+check "ceiling: an application that stops needing redis changes the scan (the refusal retries)" \
+  not eqv "$( migrate_php_app_required_exts() { :; }; migrate_php_scan_digest 8.6 )" "$d1"
 
 # Disk
 disk_probe() (
@@ -1714,6 +1914,7 @@ printf '%s\n' '# */1 * * * * php /var/www/commented/job.php' \
   '*/5 * * * * php /var/www/site/cron.php' \
   '0 * * * * /usr/bin/php /var/www/site/artisan schedule:run' \
   '15 * * * * php8.3 -f /var/www/other/job.php' \
+  '20 * * * * /usr/bin/php8.1 /var/www/old/job.php' \
   '30 * * * * /usr/local/lib/setup-php/8.3/bin/php /var/www/site/ok.php' \
   '45 * * * * /opt/phpmyadmin/cleanup.sh' > "$STUBD/crontab.root"
 printf '*/10 * * * * cd /var/www/wp && php wp-cron.php\n' > "$STUBD/crontab.www-data"
@@ -1721,7 +1922,10 @@ migrate_state_set nginx "done"
 migrate_state_set php-8.3 "done"
 migrate_state_set valkey-remove "done"
 out=$( ( migrate_final_report; printf 'R %s\n' "${MIGRATE_REPORT[@]}" ) 2>&1 )
-check "report: crontab lines that run PHP get their own section" has "$out" "Crontab lines that run PHP (now the source build through /usr/bin/php):"
+check "report: crontab lines that run PHP get their own section" has "$out" "Crontab lines that run PHP:"
+check "report: a bare php line follows the active version" has "$out" 'php /var/www/site/cron.php` → the source build of the active version'
+check "report: a phpX.Y line of a migrated version runs the source build" has "$out" 'job.php` → the source build of PHP 8.3'
+check "report: a line calling a removed series is flagged" has "$out" 'PHP 8.1 is not installed any more: this line fails'
 check "report: a bare php crontab line is listed" has "$out" '`root: */5 * * * * php /var/www/site/cron.php`'
 check "report: a /usr/bin/php crontab line is listed" has "$out" '`root: 0 * * * * /usr/bin/php /var/www/site/artisan schedule:run`'
 check "report: a bare phpX.Y crontab line is listed" has "$out" "php8.3 -f /var/www/other/job.php"

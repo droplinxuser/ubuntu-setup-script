@@ -2534,6 +2534,12 @@ php_jit_settings() {
   local opcache_mb=${1:-128} buf
   [[ $opcache_mb =~ ^[0-9]+$ ]] || opcache_mb=128
   buf=$(tune_clamp $(( opcache_mb / 8 )) 32 128)
+  # A whole number of 2 MB: PHP 8.6's tracing JIT aborts with "mprotect()
+  # failed [22]" on some odd sizes (61 MB, the size a 495 MB OPcache gave,
+  # took php8.6-fpm down after the 1.22.3 migration test of an 8.6 host;
+  # 33 and 63 fail too, every even size tested works).  8.1-8.5 accept
+  # either, so the rounding costs nothing there.
+  buf=$(( buf / 2 * 2 ))
   # Newline-terminated: callers `read` it, and read returns 1 at EOF without one.
   printf 'tracing %s\n' "$buf"
 }
@@ -2716,6 +2722,11 @@ php_ini_profile() {
   PHP_PROFILE_OPCACHE_MB=$(( ram_mb / 16 ))
   (( PHP_PROFILE_OPCACHE_MB < 128 )) && PHP_PROFILE_OPCACHE_MB=128
   (( PHP_PROFILE_OPCACHE_MB > 512 )) && PHP_PROFILE_OPCACHE_MB=512
+  # Whole 2 MB, like the JIT buffer (php_jit_settings): with huge code pages
+  # an odd arena plus an odd JIT buffer (495 + 61 MB, an 8 GB host) leaves
+  # the JIT region unaligned; PHP 8.1 workers then segfaulted running JIT
+  # code and 8.6 refused to start (mprotect() failed [22]), 1.22.3 tests.
+  PHP_PROFILE_OPCACHE_MB=$(( PHP_PROFILE_OPCACHE_MB / 2 * 2 ))
   PHP_PROFILE_MEMORY_MB=$(( ram_mb / 8 ))
   (( PHP_PROFILE_MEMORY_MB < 256 )) && PHP_PROFILE_MEMORY_MB=256
   (( PHP_PROFILE_MEMORY_MB > 512 )) && PHP_PROFILE_MEMORY_MB=512

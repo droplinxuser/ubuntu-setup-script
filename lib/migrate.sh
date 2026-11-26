@@ -1249,13 +1249,35 @@ migrate_leftover_refs() {
   local -a roots=(/etc/cron.d /etc/crontab /var/spool/cron/crontabs /etc/logrotate.d /etc/fail2ban
                   /etc/letsencrypt/renewal /etc/letsencrypt/renewal-hooks /usr/local/bin /opt /root /home
                   "$MIGRATE_UNIT_DIR")
-  local r
+  local r f
+  # Only what can still run or be read by a service counts: logs, notes,
+  # backups (the operator's pre-optimize copies) and checkouts of this
+  # script or its configuration repository mention Angie by nature, and
+  # listing them buried the one line that matters (1.22.3).
   for r in "${roots[@]}"; do
     [[ -e $r ]] || continue
     timeout 30 grep -rIlsE --exclude-dir=.git --exclude-dir=node_modules --exclude-dir=vendor \
+      --exclude-dir='pre-optimize-*' --exclude-dir='*backup*' --exclude-dir='*.bak' \
+      --exclude='*.log' --exclude='*.log.[0-9]*' --exclude='*.md' --exclude='*.txt' --exclude='*.console' \
+      --exclude='*.orig' --exclude='*.bak' --exclude='*.dpkg-*' --exclude='*~' \
       '/etc/angie|angie\.service|/var/www/logs/angie|systemctl[[:space:]]+(reload|restart)[[:space:]]+angie' "$r" 2>/dev/null \
-      | grep -vE "^${MIGRATE_UNIT_DIR}/angie\.service(\.d/.*)?$|/logrotate\.d/angie$" | head -n 40 || true
+      | grep -vE "^${MIGRATE_UNIT_DIR}/angie\.service(\.d/.*)?$|/logrotate\.d/angie$" \
+      | while IFS= read -r f; do migrate_in_setup_checkout "$f" || printf '%s\n' "$f"; done | head -n 40 || true
   done
+}
+
+# 0 when FILE lies inside a checkout of setup.sh (setup.sh next to
+# lib/migrate.sh or lib/web.sh) or of server-configs-nginx (h5bp/ next to
+# http.d/), at most six levels up.
+migrate_in_setup_checkout() {
+  local d=${1%/*} i
+  for (( i = 0; i < 6; i++ )); do
+    [[ -n $d && $d != / ]] || return 1
+    [[ -f $d/setup.sh && ( -f $d/lib/migrate.sh || -f $d/lib/web.sh ) ]] && return 0
+    [[ -d $d/h5bp && -d $d/http.d && $d != "$MIGRATE_ANGIE_ETC" && $d != "$MIGRATE_NGINX_ETC" ]] && return 0
+    d=${d%/*}
+  done
+  return 1
 }
 
 # Crontab lines that call bare php or /usr/bin/php (R6): after the purge they
@@ -1320,8 +1342,34 @@ migrate_php_detect_tree() {
   return 0
 }
 
-migrate_php_buildable() {
-  local e=$1
+# 0 when the source build can build series V: 8.1 or newer and released on
+# php.net (an RC Sury ships before the X.Y.0 release is not).  When neither
+# the series' release nor the newest series resolves (offline) the answer
+# is unknown and counts as buildable: the build itself decides then.
+# Cached per run (one php.net lookup per series).
+declare -gA MIGRATE_SERIES_OK=()
+migrate_php_series_ok() {
+  local v=$1 rc=0
+  [[ $v =~ ^[0-9]+\.[0-9]+$ ]] || return 1
+  [[ $(printf '%s\n%s\n' "$v" 8.1 | sort -V | head -n1) == 8.1 ]] || return 1
+  if [[ -z ${MIGRATE_SERIES_OK[$v]:-} ]]; then
+    if declare -F php_build_release >/dev/null 2>&1 && [[ -z $(php_build_release "$v") ]] \
+       && [[ -n $(php_build_latest_series) ]]; then
+      rc=1
+    fi
+    MIGRATE_SERIES_OK[$v]=$rc
+  fi
+  return "${MIGRATE_SERIES_OK[$v]}"
+}
+
+migrate_php_buildable() { # EXT [X.Y]
+  local e=$1 v=${2:-}
+  # Series-aware (1.22.3): a PECL extension the newest release cannot build
+  # for X.Y counts as unbuildable for that version.
+  if [[ -n $v ]] && declare -F php_build_ext_buildable_for >/dev/null 2>&1; then
+    php_build_ext_buildable_for "$v" "$e"
+    return
+  fi
   if declare -F php_build_buildable_exts >/dev/null 2>&1; then
     php_build_buildable_exts | tr ', ' '\n\n' | grep -qxF -- "$e"
     return
@@ -1339,12 +1387,17 @@ migrate_php_ext_union() {
   while IFS= read -r e; do
     [[ -n $e ]] || continue
     [[ $MIGRATE_PHP_BASE_EXTS == *" $e "* ]] && continue
-    if migrate_php_buildable "$e"; then printf 'keep %s\n' "$e"; else printf 'unbuildable %s\n' "$e"; fi
+    if migrate_php_buildable "$e" "$v"; then printf 'keep %s\n' "$e"; else printf 'unbuildable %s\n' "$e"; fi
   done < <(migrate_sury_modules "$v") | sort
 }
 
 migrate_php_scan_digest() {
-  { migrate_php_ext_union "$1"; migrate_php_listeners "$1"; } 2>/dev/null | md5sum | awk '{ print $1 }'
+  # What the applications require is part of the scan (1.22.3): a version
+  # refused for an unbuildable module an application needs is retried once
+  # that application is gone or no longer needs it.
+  { migrate_php_ext_union "$1"; migrate_php_listeners "$1"
+    migrate_php_series_ok "$1" && echo series=ok || echo series=no
+    printf 'app-req=%s\n' "$(migrate_php_app_required_exts 2>/dev/null | paste -sd, -)"; } 2>/dev/null | md5sum | awk '{ print $1 }'
 }
 
 # Lower-case module names some detected application requires (C's lists,
@@ -1475,6 +1528,16 @@ migrate_preflight() {
       else migrate_state_set "php-${v}" refused-mem; migrate_warn "PHP ${v}: host below the 4 GB class; left on the Sury package (nothing is purged)"; fi
       continue
     fi
+    # A series the build cannot make (older than 8.1, or not yet released on
+    # php.net, e.g. a Sury RC) is refused here, not after a failed build that
+    # would retry on every run.  Its scan digest carries the release state,
+    # so the X.Y.0 release retries it.
+    if ! migrate_php_series_ok "$v"; then
+      if (( dry )); then printf '  PHP %s: refused, the source build supports released series from 8.1 on; Sury keeps serving %s\n' "$v" "$v"
+      else migrate_state_set "php-${v}" "refused:series not buildable"; migrate_state_set "php-${v}.scan" "$(migrate_php_scan_digest "$v")"
+           migrate_warn "PHP ${v}: the source build supports released PHP series from 8.1 on (no RC); Sury keeps serving ${v} and is not purged.  Move its sites to a supported series, or re-run --optimize once ${v}.0 is released"; fi
+      continue
+    fi
     conflict=""
     while IFS= read -r l; do
       [[ -n $l && ${listen_owner[$l]:-} == *" "* ]] && conflict="$l (PHP ${listen_owner[$l]})"
@@ -1533,7 +1596,11 @@ migrate_preflight() {
     if (( ${#unb_req[@]} > 0 )) && [[ ${SETUP_PHP_ALLOW_MISSING_EXT:-0} != 1 ]]; then
       migrate_state_set "php-${v}" "refused:unbuildable ${unb_req[*]}"
       migrate_state_set "php-${v}.scan" "$(migrate_php_scan_digest "$v")"
-      migrate_fail "PHP ${v}: an application needs modules the source build cannot provide (${unb_req[*]}); Sury keeps serving and is not purged (SETUP_PHP_ALLOW_MISSING_EXT=1 drops them)"
+      local why="" x
+      for x in "${unb_req[@]}"; do
+        [[ -n ${PHP_EXT_SERIES_MAX[$x]:-} ]] && why+="; ${x} has no release that builds for PHP ${v} yet (up to ${PHP_EXT_SERIES_MAX[$x]}): re-run --optimize after one ships, or move the sites to PHP ${PHP_EXT_SERIES_MAX[$x]}"
+      done
+      migrate_fail "PHP ${v}: an application needs modules the source build cannot provide (${unb_req[*]})${why}; Sury keeps serving and is not purged (SETUP_PHP_ALLOW_MISSING_EXT=1 drops them)"
       continue
     fi
     (( ${#unb_fpm[@]} )) && migrate_warn "PHP ${v}: modules the source build cannot provide are dropped (no detected application requires them): ${unb_fpm[*]}"
@@ -1853,7 +1920,10 @@ migrate_pin_local_php() {
     [[ -n $v ]] && listen=$(migrate_php_listeners "$v" | head -n1)
   fi
   [[ -n $listen ]] || return 0
-  if ! migrate_listener_up "$listen"; then
+  # A host without PHP (an nginx-only front proxy) keeps the 1.21 tree's
+  # local_php upstream with nothing behind it: nothing to warn about.
+  if ! migrate_listener_up "$listen" \
+     && { [[ -n $(migrate_sury_active_versions) ]] || compgen -G "$(migrate_php_root)/*/sbin/php-fpm" >/dev/null; }; then
     migrate_warn "the live local_php listener ${listen} does not accept connections; PHP vhosts are verified at cutover"
   fi
   nginx_local_php_follow_pool "$MIGRATE_NGINX_ETC/nginx.conf" "$listen"
@@ -2007,7 +2077,7 @@ migrate_nginx_self_fit() {
   drop=${NGINX_BUILD_DROPPABLE_RE:-$MIGRATE_NGINX_DROPPABLE_RE}
   dir=$(dirname "$conf")
   for (( i = 0; i < 100; i++ )); do
-    out=$("$cand" -t -q -c "$conf" 2>&1) && return 0
+    out=$("$cand" -e stderr -t -q -c "$conf" 2>&1) && return 0
     if [[ $out =~ unknown\ directive\ \"([a-z0-9_]+)\"\ in\ ([^[:space:]]+):([0-9]+) ]]; then
       d=${BASH_REMATCH[1]}; f=${BASH_REMATCH[2]}; n=${BASH_REMATCH[3]}
       if [[ $d =~ $drop && $f == "$dir"/* && -f $f && ! -L $f ]]; then
@@ -2163,9 +2233,9 @@ migrate_nginx_prepare() {
   # are live again in the copy, so the fit runs on the rendered tree with the
   # candidate: droppable directives are commented with the nginx marker (each
   # reported), anything else aborts (R26, R88).
-  if ! err=$("$cand" -t -q -c "$MIGRATE_NGINX_ETC/nginx.conf" 2>&1); then
+  if ! err=$("$cand" -e stderr -t -q -c "$MIGRATE_NGINX_ETC/nginx.conf" 2>&1); then
     if fit=$(migrate_nginx_fit "$MIGRATE_NGINX_ETC/nginx.conf" "$cand" 2>/dev/null) \
-       && err=$("$cand" -t -q -c "$MIGRATE_NGINX_ETC/nginx.conf" 2>&1); then
+       && err=$("$cand" -e stderr -t -q -c "$MIGRATE_NGINX_ETC/nginx.conf" 2>&1); then
       migrate_nginx_fit_report "$fit"
     else
       migrate_nginx_abort "nginx -t of the rendered tree failed: $(printf '%s' "$err" | grep -m3 -E 'emerg|error' | paste -sd' ' -)"
@@ -2183,7 +2253,7 @@ migrate_nginx_prepare() {
   migrate_nginx_test_shim_off
   local change
   for change in "${TUNE_CHANGES[@]}"; do migrate_report "    - tune: ${change}"; done
-  if ! err=$("$cand" -t -q -c "$MIGRATE_NGINX_ETC/nginx.conf" 2>&1); then
+  if ! err=$("$cand" -e stderr -t -q -c "$MIGRATE_NGINX_ETC/nginx.conf" 2>&1); then
     migrate_nginx_abort "nginx -t after tuning failed: $(printf '%s' "$err" | grep -m3 -E 'emerg|error' | paste -sd' ' -)"
     return 1
   fi
@@ -2307,7 +2377,7 @@ migrate_cron_handover() {
       || migrate_warn "/etc/nginx/scripts/cloudflare.sh failed once after the cutover"
   fi
   cand=$(migrate_nginx_bin) || cand=${NGINX_BIN:-}
-  if [[ -n $cand ]] && ! "$cand" -t -q -c "$MIGRATE_NGINX_ETC/nginx.conf" >/dev/null 2>&1; then
+  if [[ -n $cand ]] && ! "$cand" -e stderr -t -q -c "$MIGRATE_NGINX_ETC/nginx.conf" >/dev/null 2>&1; then
     migrate_warn "nginx -t fails after the Cloudflare refresh; the running configuration is unchanged"
   fi
 }
@@ -2328,6 +2398,105 @@ migrate_php_vhosts() {
 # Move Sury's conf.d entries out of fpm/ and cli/ (R7, R55): mods-available
 # symlinks and dpkg-owned files go to the snapshot; operator .ini files stay
 # with their extension= / zend_extension= lines commented out.
+# Cron between the cutover and the Sury purge (1.22.3).  The cutover hands
+# /etc/php/X.Y/cli to our build (Sury's conf.d links leave, our php.ini and
+# OPcache fragment arrive), but /usr/bin/phpX.Y, and /usr/bin/php through
+# the alternatives link, stay Sury's binary until the purge frees them.  In
+# between, every crontab line and every php_cli_path caller ran Sury's CLI
+# without its extensions; with a deferred purge (a refused secondary
+# version, collateral) that lasted until the operator acted.  So the cutover
+# diverts the package's /usr/bin/phpX.Y (dpkg-divert --local, to
+# /usr/bin/phpX.Y.sury, which a package upgrade also installs to) and links
+# our CLI in its place.  The rollback takes the diversion back; after the
+# purge only the diversion record is removed (the package took its copy).
+MIGRATE_USR_BIN=${SETUP_MIGRATE_USR_BIN:-/usr/bin}
+migrate_php_divert_cli() { # X.Y
+  local v=$1 p cli
+  p="$MIGRATE_USR_BIN/php${v}"; cli=$(migrate_php_cli_bin "$v")
+  [[ -x $cli ]] || return 1
+  command -v dpkg-divert >/dev/null 2>&1 || return 1
+  if [[ -z $(dpkg-divert --list "$p" 2>/dev/null) ]]; then
+    migrate_dpkg_owned "$p" || return 0
+    dpkg-divert --local --rename --divert "$p.sury" --add "$p" >/dev/null 2>&1 || return 1
+  fi
+  migrate_state_set "php-${v}.divert" "$p"
+  ln -sfn "$cli" "$p.tmp.$$" && mv -Tf "$p.tmp.$$" "$p"
+}
+migrate_php_undivert_cli() { # X.Y [after-purge]
+  local v=$1 p
+  p=$(migrate_state_get "php-${v}.divert")
+  [[ -n $p ]] || return 0
+  if [[ ${2:-} == after-purge ]]; then
+    dpkg-divert --local --remove "$p" >/dev/null 2>&1 || return 1
+  else
+    [[ -L $p && $(readlink "$p") == "$(migrate_php_root)"/* ]] && rm -f -- "$p"
+    dpkg-divert --local --rename --remove "$p" >/dev/null 2>&1 || return 1
+  fi
+  migrate_state_del "php-${v}.divert"
+}
+
+# The migrated version's Sury packages are held at its cutover (recorded in
+# sury-held, so migrate_sury_unhold releases them right before the purge):
+# until then an apt upgrade would re-run phpenmod (Sury's conf.d links come
+# back next to our built-in modules) and restart a unit that is now ours.
+migrate_php_hold_version() { # X.Y
+  local v=$1 p held
+  local -a ours=()
+  held=" $(apt-mark showhold 2>/dev/null | sed 's/:.*//' | tr '\n' ' ') "
+  while IFS= read -r p; do
+    [[ -n $p ]] && migrate_pkg_installed "$p" && [[ $held != *" $p "* ]] && ours+=("$p")
+  done < <(migrate_dpkg_names | grep -E "^php${v//./\\.}(-|$)" || true)
+  (( ${#ours[@]} )) || return 0
+  apt-mark hold "${ours[@]}" >/dev/null 2>&1 || return 1
+  # shellcheck disable=SC2046
+  migrate_state_set sury-held "$(printf '%s\n' $(migrate_state_get sury-held) "${ours[@]}" | sort -u | paste -sd' ' -)"
+}
+
+# Operator edits to Sury's php.ini survive the layout (which writes
+# php.ini-production of our build): every directive whose value differs
+# from the package's own php.ini-production goes to
+# conf.d/10-migrated-php-ini.ini of the same SAPI.  The prefix sorts before
+# the managed zz-setup-*.ini (our tuning wins) and before operator files
+# such as custom_dan.ini.  Section-scoped [PATH=]/[HOST=] blocks are kept
+# verbatim.  No difference, no file.
+MIGRATE_SURY_INI_DIR=${SETUP_MIGRATE_SURY_INI_DIR:-/usr/lib/php}
+migrate_php_ini_carry() { # X.Y
+  local v=$1 sapi live prod out tmp n
+  for sapi in fpm cli; do
+    live="$MIGRATE_PHP_ETC/$v/$sapi/php.ini"
+    prod="$MIGRATE_SURY_INI_DIR/$v/php.ini-production"
+    [[ $sapi == cli && -f $prod.cli ]] && prod+=.cli
+    [[ -f $live && ! -L $live && -f $prod ]] || continue
+    out="$MIGRATE_PHP_ETC/$v/$sapi/conf.d/10-migrated-php-ini.ini"
+    tmp=$(mktemp) || continue
+    awk '
+      function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+      FNR == 1 { file++; sect = "" }
+      /^[ \t]*[;#]/ || /^[ \t]*$/ { next }
+      /^[ \t]*\[/ { sect = trim($0); if (file == 2 && sect ~ /^\[(PATH|HOST)=/) { scoped = scoped $0 "\n" } next }
+      {
+        if (index($0, "=") == 0) next
+        k = trim(substr($0, 1, index($0, "=") - 1)); val = trim(substr($0, index($0, "=") + 1))
+        if (file == 1) { prod[k] = val; next }
+        if (sect ~ /^\[(PATH|HOST)=/) { scoped = scoped $0 "\n"; next }
+        if (k ~ /^(zend_)?extension$/) next
+        if (!(k in prod) || prod[k] != val) { if (!(k in seen)) order[++n] = k; seen[k] = val }
+      }
+      END {
+        for (i = 1; i <= n; i++) printf "%s = %s\n", order[i], seen[order[i]]
+        if (scoped != "") printf "%s", scoped
+      }' "$prod" "$live" > "$tmp" 2>/dev/null || { rm -f "$tmp"; continue; }
+    n=$(grep -c . "$tmp" || true)
+    if (( n > 0 )); then
+      { printf '; setup.sh migration: settings of the Sury %s php.ini that differ from\n; its php.ini-production (the source build writes a fresh php.ini).\n[PHP]\n' "$sapi"; cat "$tmp"; } > "$out"
+      chmod 644 "$out"
+      migrate_note "PHP ${v}: ${n} ${sapi} php.ini setting(s) kept in ${out}: $(sed 's/[[:space:]]*=.*//' "$tmp" | head -n 8 | paste -sd' ' -)"
+    fi
+    rm -f "$tmp"
+  done
+  return 0
+}
+
 migrate_php_convert_confd() {
   local v=$1 snap=$2 sapi d f target
   for sapi in fpm cli; do
@@ -2453,6 +2622,7 @@ migrate_php_cutover() {
     && migrate_stash "$MIGRATE_UNIT_DIR/php${v}-fpm.service.d/zz-setup-build.conf" "$snap/live"
   # (1b) Sury conf.d entries out, before any managed file is written
   migrate_php_convert_confd "$v" "$snap"
+  migrate_php_ini_carry "$v"
   # (2) our binary, unit and layout (tmpfiles applied inside, R89)
   if ! PHP_EXT_DETECT_TREE=$(migrate_php_detect_tree) php_build_ensure "$v" activate migrate migrate_out; then
     migrate_php_rollback "$v" "activating the PHP ${v} build failed"; return 1
@@ -2512,6 +2682,13 @@ migrate_php_cutover() {
   # assertions link /usr/bin/php to our build.  An entry an earlier 1.22
   # draft registered is removed here.
   migrate_php_alt_cleanup
+  # Cron and every /usr/bin/phpX.Y caller reach our CLI from now on, not
+  # Sury's binary without its conf.d (1.22.3); its packages are held until
+  # the purge.
+  if ! migrate_php_divert_cli "$v"; then
+    migrate_php_rollback "$v" "could not divert the Sury CLI ${MIGRATE_USR_BIN}/php${v} to the source build"; return 1
+  fi
+  migrate_php_hold_version "$v" || migrate_warn "PHP ${v}: apt-mark hold of its Sury packages failed; an apt upgrade before the purge may re-add Sury's conf.d links"
   # Our generated /etc/php, for the post-purge re-lay of pool.d (R24).
   local conv
   conv=$(migrate_snapshot_dir "php-${v}-converted") || conv=""
@@ -2541,20 +2718,57 @@ migrate_primary_version() {
      && { [[ -x $(migrate_php_active_bin "$v") ]] || migrate_sury_active_versions | grep -qxF -- "$v"; }; then
     printf '%s' "$v"; return 0
   fi
+  # Only a series the source build can build may become the active one: an
+  # 8.0 or an unreleased (RC) series that serves the sites is refused in the
+  # pre-flight instead, and must not hold the other versions back.
+  local -a cand=()
+  while IFS= read -r v; do
+    [[ -n $v ]] && migrate_php_series_ok "$v" && cand+=("$v")
+  done < <(migrate_sury_active_versions)
+  if (( ${#cand[@]} == 0 )); then
+    # After the purge (no Sury version runs) or with only unbuildable ones.
+    if declare -F php_primary_version >/dev/null 2>&1; then
+      v=$(php_primary_version 2>/dev/null || true)
+      [[ -n $v ]] && { printf '%s' "$v"; return 0; }
+    fi
+    migrate_sury_active_versions | tail -n1
+    return 0
+  fi
   listen=$(migrate_angie_local_php_listener)
   if [[ -n $listen ]]; then
-    while IFS= read -r v; do
-      [[ -n $v ]] || continue
+    for v in "${cand[@]}"; do
       while IFS= read -r l; do
         [[ ${l#unix:} == "$listen" ]] && { printf '%s' "$v"; return 0; }
       done < <(migrate_php_listeners "$v")
-    done < <(migrate_sury_active_versions)
+    done
   fi
+  # The version the vhosts call most (fastcgi_pass to its listener), so an
+  # idle newer version does not displace the one that serves the sites.
+  v=$(migrate_php_vhost_refs "${cand[@]}" | sort -k2,2nr -k1,1Vr | awk '$2 > 0 { print $1; exit }')
+  [[ -n $v ]] && { printf '%s' "$v"; return 0; }
   if declare -F php_primary_version >/dev/null 2>&1; then
     v=$(php_primary_version 2>/dev/null || true)
-    [[ -n $v ]] && { printf '%s' "$v"; return 0; }
+    [[ -n $v ]] && printf '%s\n' "${cand[@]}" | grep -qxF -- "$v" && { printf '%s' "$v"; return 0; }
   fi
-  migrate_sury_active_versions | tail -n1
+  printf '%s' "${cand[-1]}"
+}
+
+# "X.Y COUNT" per version: fastcgi_pass lines in the live web tree that name
+# one of the version's listeners (unix:/path or host:port).
+migrate_php_vhost_refs() {
+  local tree v l n esc
+  tree=$(migrate_web_tree)
+  for v in "$@"; do
+    n=0
+    while IFS= read -r l; do
+      [[ -n $l ]] || continue
+      l=${l#unix:}
+      esc=$(printf '%s' "$l" | sed 's/[][\.*^$/]/\\&/g')
+      n=$(( n + $(grep -rhsE "^[[:space:]]*fastcgi_pass[[:space:]]+(unix:)?${esc}[[:space:]]*;" \
+                   --include='*.conf' "$tree" 2>/dev/null | wc -l) ))
+    done < <(migrate_php_listeners "$v")
+    printf '%s %d\n' "$v" "$n"
+  done
 }
 
 # /etc/php/setup-active (B's php_active_set when loaded) plus PHP_ACTIVE.
@@ -2590,6 +2804,7 @@ migrate_php_rollback() {
   local v=$1 why=$2 snap frag en
   warn "migrate: PHP ${v} cutover failed (${why}); back to the package"
   snap=$(migrate_state_get "php-${v}.snap")
+  migrate_php_undivert_cli "$v" || warn "migrate: could not remove the diversion of ${MIGRATE_USR_BIN}/php${v} (dpkg-divert --list)"
   systemctl stop "php${v}-fpm" >/dev/null 2>&1 || systemctl kill -s KILL "php${v}-fpm" >/dev/null 2>&1 || true
   if [[ -n $snap && -d $snap ]]; then
     [[ -e $(migrate_unit_file "php${v}-fpm") ]] && migrate_stash "$(migrate_unit_file "php${v}-fpm")" "$snap/ours"
@@ -3234,6 +3449,11 @@ migrate_post_assert() {
   # /usr/bin/php and /usr/bin/phpX.Y once no package owns them (R6, R15).
   for v in "${vers[@]}"; do
     [[ -n $v ]] || continue
+    # The cutover's diversion outlives the package only as a record: drop
+    # it once php X.Y-cli is gone, so /usr/bin/phpX.Y counts as free.
+    if ! migrate_pkg_installed "php${v}-cli"; then
+      migrate_php_undivert_cli "$v" after-purge || migrate_pa_fail "the diversion of /usr/bin/php${v} could not be removed (dpkg-divert --list)"
+    fi
     if ! migrate_dpkg_owned "/usr/bin/php${v}"; then
       migrate_link_bin "$(migrate_php_cli_bin "$v")" "/usr/bin/php${v}" || true
     fi
@@ -3307,7 +3527,7 @@ migrate_post_assert() {
   if [[ " ${units[*]} " == *" nginx "* ]]; then
     local cand
     cand=$(migrate_nginx_bin) || cand=""
-    if [[ -n $cand ]] && ! "$cand" -t -q -c "$MIGRATE_NGINX_ETC/nginx.conf" >/dev/null 2>&1; then
+    if [[ -n $cand ]] && ! "$cand" -e stderr -t -q -c "$MIGRATE_NGINX_ETC/nginx.conf" >/dev/null 2>&1; then
       migrate_pa_fail "nginx -t fails after the removals"; bad=1
     fi
     systemctl is-active --quiet nginx || { migrate_pa_fail "nginx is not active after the removals"; bad=1; }
@@ -3378,8 +3598,21 @@ migrate_final_report() {
   local callers refs
   callers=$(migrate_php_cron_callers)
   if [[ -n $callers ]]; then
-    migrate_report "- Crontab lines that run PHP (now the source build through /usr/bin/php):"
-    while IFS= read -r l; do migrate_report "    - \`${l}\`"; done <<<"$(printf '%s\n' "$callers" | head -n 20)"
+    # Each line by the series it names (1.22.3): a bare php follows the
+    # active version; phpX.Y runs our build only when X.Y moved, keeps Sury
+    # while X.Y stays on it, and fails once X.Y was removed with the purge.
+    local l v what
+    migrate_report "- Crontab lines that run PHP:"
+    while IFS= read -r l; do
+      [[ -n $l ]] || continue
+      v=$(grep -oE 'php[0-9]+\.[0-9]+' <<<"${l#*: }" | head -n1); v=${v#php}
+      if [[ -z $v ]]; then what="the source build of the active version"
+      elif [[ $(migrate_state_get "php-${v}") == "done" ]]; then what="the source build of PHP ${v}"
+      elif migrate_sury_active_versions | grep -qxF -- "$v"; then what="still the Sury package of PHP ${v}"
+      else what="**PHP ${v} is not installed any more: this line fails**"; migrate_warn "crontab line calls PHP ${v}, which is not installed any more: ${l}"
+      fi
+      migrate_report "    - \`${l}\` → ${what}"
+    done <<<"$(printf '%s\n' "$callers" | head -n 20)"
   fi
   refs=$(migrate_leftover_refs)
   if [[ -n $refs ]]; then

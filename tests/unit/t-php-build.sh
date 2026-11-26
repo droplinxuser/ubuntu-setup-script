@@ -333,6 +333,41 @@ check "the failure names the extension" has "$out" "no source build path for: oc
 out=$(effp PHP_BUILD_ROOT="$NOROOT" PHP_BUILD_NGINX="$TMP/t-wp" PHP_EXT_EXTRA=oci8 SETUP_PHP_ALLOW_MISSING_EXT=1) || true
 check "SETUP_PHP_ALLOW_MISSING_EXT=1 drops the unbuildable name" csv_lacks "$out" oci8
 check "SETUP_PHP_ALLOW_MISSING_EXT=1 keeps the rest of the set" csv_has "$out" mysqli
+# Series ceilings of PECL extensions (1.22.3): redis 6.3.0 builds up to 8.5.
+check "series ceiling: redis is buildable for PHP 8.5" php_build_ext_buildable_for 8.5 redis
+check "series ceiling: redis is not buildable for PHP 8.6" not php_build_ext_buildable_for 8.6 redis
+check "series ceiling: an extension without a ceiling builds on 8.6" php_build_ext_buildable_for 8.6 igbinary
+check "series ceiling: no version means no ceiling" php_build_ext_buildable_for "" redis
+out=$( ( PHP_BUILD_ROOT=$NOROOT; PHP_BUILD_NGINX=$TMP/t-none; PHP_BUILD_APPS=chevereto; php_build_effective_exts 8.6 >/dev/null ) 2>&1 ) && st=0 || st=$?
+check "series ceiling: Chevereto on PHP 8.6 fails the set (it needs redis)" test "$st" = 1
+check "series ceiling: the failure names the ceiling" has "$out" "redis builds up to PHP 8.5"
+out=$(effp PHP_BUILD_ROOT="$NOROOT" PHP_BUILD_NGINX="$TMP/t-none" PHP_BUILD_APPS=chevereto 8.5) || true
+check "series ceiling: Chevereto on PHP 8.5 keeps redis" csv_has "$out" redis
+out=$(effp PHP_BUILD_ROOT="$NOROOT" PHP_BUILD_NGINX="$TMP/t-wp" PHP_EXT_EXTRA=redis 8.6) && st=0 || st=$?
+check "series ceiling: redis kept only by PHP_EXT_EXTRA is left out on 8.6, the set still resolves" test "$st" = 0
+check "series ceiling: ... and redis is not in it" csv_lacks "$out" redis
+check "series ceiling: ... the rest of the set stays" csv_has "$out" mysqli
+# Purging our build takes the migration's CLI diversion back (1.22.3).
+undivert_case() ( # with-sury-copy(yes|no) -> "link-gone renamed-back calls"
+  d=$(mktemp -d "$TMP/udv.XXXXXX"); PHP_BUILD_USR_BIN=$d; PHP_BUILD_ROOT=$d/root
+  mkdir -p "$PHP_BUILD_ROOT/8.5/bin"; : > "$PHP_BUILD_ROOT/8.5/bin/php"
+  ln -s "$PHP_BUILD_ROOT/8.5/bin/php" "$d/php8.5"
+  [[ $1 == yes ]] && printf 'sury\n' > "$d/php8.5.sury"
+  dpkg-divert() {
+    printf '%s\n' "$*" >> "$d/calls"
+    case " $* " in
+      *" --list "*) printf 'local diversion of %s to %s.sury\n' "$d/php8.5" "$d/php8.5" ;;
+      *" --remove "*) [[ -e $d/php8.5.sury ]] && mv "$d/php8.5.sury" "$d/php8.5"; return 0 ;;
+    esac
+  }
+  _pb_undivert_cli 8.5
+  printf '%s %s %s' "$([[ -L $d/php8.5 ]] && echo link || echo nolink)" \
+    "$(cat "$d/php8.5" 2>/dev/null || echo none)" "$(grep -c -- '--remove' "$d/calls")"
+)
+check "purge: our link goes and Sury's diverted CLI is renamed back" test "$(undivert_case yes)" = "nolink sury 1"
+check "purge: without a Sury copy the diversion record still goes" test "$(undivert_case no)" = "nolink none 1"
+check "purge: php_build_purge takes the diversion back before unlinking /usr/bin/phpX.Y" \
+  bash -c 'sed -n "/^php_build_purge()/,/^}/p" "$1" | grep -B1 "_pb_unlink_ours \"\${PHP_BUILD_USR_BIN}/php\${v}\"" | grep -q "_pb_undivert_cli"' _ "$ROOT/lib/php-build.sh"
 
 # ---------------------------------------------------------------------------
 # Add-only detection (R11)
@@ -1081,5 +1116,30 @@ check "OpenSSL: PHP 8.1 gets the newest 3.x, 8.2 and newer the newest release" \
 check "the PHP configure uses the lld drivers" \
   file_has "$ROOT/tools/php-build.sh" 'CC="$work/lld-cc/clang" CXX="$work/lld-cc/clang++"'
 
+# PHP 8.6 PECL compatibility (1.22.3): the zval_dtor alias and igbinary's
+# zend_string callback name, for 8.6 and later only.
+p86_case() { # VER [hash-has-bin2hex] -> "aliases igb-macro igb-uses" counts after two runs
+  local d; d=$(mktemp -d "$TMP/p86.XXXXXX")
+  mkdir -p "$d/Zend" "$d/ext/igbinary/src/php7" "$d/ext/hash"
+  printf '#ifndef ZEND_PORTABILITY_H\n#define ZEND_PORTABILITY_H\n#endif\n' > "$d/Zend/zend_portability.h"
+  if [[ -n ${2:-} ]]; then printf 'static inline void php_hash_bin2hex(char *o, const unsigned char *i, size_t n) {}\n' > "$d/ext/hash/php_hash.h"; else : > "$d/ext/hash/php_hash.h"; fi
+  printf '#include "php.h"\n#include "igbinary.h"\nuser_func_name = PG(unserialize_callback_func);\nzend_error(E_WARNING, "%%s", PG(unserialize_callback_func));\n' \
+    > "$d/ext/igbinary/src/php7/igbinary.c"
+  tool_run "php86_pecl_compat '$1' '$d'; php86_pecl_compat '$1' '$d'" >/dev/null
+  printf '%s %s %s' "$(grep -cE 'define (zval_dtor|XtOffsetOf|php_hash_bin2hex)\(' "$d/Zend/zend_portability.h")" \
+    "$(grep -c '^#define IGB_UCF()' "$d/ext/igbinary/src/php7/igbinary.c")" \
+    "$(grep -c 'IGB_UCF();\|"%s", IGB_UCF())' "$d/ext/igbinary/src/php7/igbinary.c")"
+}
+check "PHP 8.6 compat: the zval_dtor alias and the igbinary callback macro are added once" test "$(p86_case 8.6)" = "3 1 2"
+check "PHP 8.6 compat: an alias the tree still defines is not added" test "$(p86_case 8.6 hash)" = "2 1 2"
+check "PHP 8.6 compat: INI_STR and WRONG_PARAM_COUNT get their 8.5 definitions"   bash -c 'd=$(mktemp -d "$1/p86i.XXXXXX"); mkdir -p "$d/Zend"; : > "$d/Zend/zend_portability.h"
+    PHP_BUILD_SOURCE_ONLY=1 bash -c "source \"\$1\"; source \"\$2\"; php86_pecl_compat 8.6 \"\$3\"" _ "$2" "$1/tool-stubs.sh" "$d" >/dev/null 2>&1
+    grep -qxF "# define INI_STR(name) zend_ini_string_literal(name)" "$d/Zend/zend_portability.h" && grep -qxF "# define WRONG_PARAM_COUNT ZEND_WRONG_PARAM_COUNT()" "$d/Zend/zend_portability.h"' _ "$TMP" "$ROOT/tools/php-build.sh"
+check "PHP 8.6 compat: nothing changes below 8.6" test "$(p86_case 8.5)" = "0 0 0"
+check "PHP 8.6 compat: the macro follows the igbinary.h include" \
+  bash -c 'd=$(mktemp -d "$1/p86o.XXXXXX"); mkdir -p "$d/Zend" "$d/ext/igbinary/src/php7"; : > "$d/Zend/zend_portability.h"
+    printf "#include \"igbinary.h\"\nx = PG(unserialize_callback_func);\n" > "$d/ext/igbinary/src/php7/igbinary.c"
+    PHP_BUILD_SOURCE_ONLY=1 bash -c "source \"\$1\"; source \"\$2\"; php86_pecl_compat 8.6 \"\$3\"" _ "$2" "$1/tool-stubs.sh" "$d" >/dev/null 2>&1
+    sed -n 2p "$d/ext/igbinary/src/php7/igbinary.c" | grep -q "PHP 8.6 keeps the callback name"' _ "$TMP" "$ROOT/tools/php-build.sh"
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

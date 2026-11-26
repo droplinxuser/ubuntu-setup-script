@@ -525,6 +525,54 @@ build_libs() { # deps work jobs log libs...
   done
 }
 
+# PHP 8.6 removed compatibility aliases PECL sources still use (UPGRADING.
+# INTERNALS "Removed"): igbinary 3.2.16 and redis 6.3.0 call zval_dtor,
+# zval_is_true, XtOffsetOf, INI_STR/INI_INT, EMPTY_SWITCH_DEFAULT_CASE,
+# (ZEND_)WRONG_PARAM_COUNT and php_hash_bin2hex (now zend_bin2hex), and
+# igbinary reads PG(unserialize_callback_func), now a zend_string.  A Sury
+# 8.6 host that loads them could not move to the source build (1.22.3
+# migration test; Sury patches the same way).  For 8.6 and later only:
+# each pure alias the tree no longer defines goes back into
+# Zend/zend_portability.h with its 8.5 definition (every source includes
+# that header early), and igbinary reads the callback name through
+# ZSTR_VAL.  Idempotent.
+PHP86_ALIASES=(
+  'zval_dtor|(zv)|zval_ptr_dtor_nogc(zv)'
+  'zval_is_true|(op)|zend_is_true(op)'
+  'ZVAL_IS_NULL|(z)|Z_ISNULL_P(z)'
+  'XtOffsetOf|(s_type, field)|offsetof(s_type, field)'
+  'INI_STR|(name)|zend_ini_string_literal(name)'
+  'INI_INT|(name)|zend_ini_long_literal(name)'
+  'INI_FLT|(name)|zend_ini_double_literal(name)'
+  'INI_BOOL|(name)|zend_ini_bool_literal(name)'
+  'EMPTY_SWITCH_DEFAULT_CASE|()|default: ZEND_UNREACHABLE(); break;'
+  'ZEND_WRONG_PARAM_COUNT|()|{ zend_wrong_param_count(); return; }'
+  'WRONG_PARAM_COUNT||ZEND_WRONG_PARAM_COUNT()'
+  'php_hash_bin2hex|(out, in, len)|zend_bin2hex((out), (in), (len))'
+)
+php86_pecl_compat() { # X.Y SRC
+  local ver=$1 src=$2 f a name args body block=""
+  ver_ge "$ver" 8.6 || return 0
+  f=$src/Zend/zend_portability.h
+  if [[ -f $f ]] && ! grep -q 'setup.sh php-build: names removed in PHP 8.6' "$f"; then
+    for a in "${PHP86_ALIASES[@]}"; do
+      IFS='|' read -r name args body <<<"$a"
+      # Still defined somewhere in the tree (a macro or, for
+      # php_hash_bin2hex, an inline function): leave it to the tree.
+      grep -rqsE "(define[[:space:]]+${name}\\b|[[:space:]]${name}[[:space:]]*\\()" \
+        --include='*.h' "$src/Zend" "$src/main" "$src/ext/hash" "$src/ext/standard" && continue
+      block+="#ifndef ${name}"$'\n'"# define ${name}${args} ${body}"$'\n'"#endif"$'\n'
+    done
+    [[ -n $block ]] && printf '\n/* setup.sh php-build: names removed in PHP 8.6, still used by PECL sources */\n%s' "$block" >> "$f"
+  fi
+  f=$src/ext/igbinary/src/php7/igbinary.c
+  if [[ -f $f ]] && grep -q 'PG(unserialize_callback_func)' "$f" && ! grep -q 'IGB_UCF()' "$f"; then
+    sed -i 's/PG(unserialize_callback_func)/IGB_UCF()/g' "$f"
+    sed -i '0,/^#include "igbinary.h"$/s//#include "igbinary.h"\n\/* setup.sh php-build: PHP 8.6 keeps the callback name as a zend_string *\/\n#define IGB_UCF() (PG(unserialize_callback_func) ? ZSTR_VAL(PG(unserialize_callback_func)) : NULL)/' "$f"
+  fi
+  return 0
+}
+
 cmd_build() { # X.Y [exact]
   local ver=$1 exact=${2:-0} set work src stage dir key deps n j line log libs_csv
   local -A VERS=()
@@ -617,6 +665,7 @@ cmd_build() { # X.Y [exact]
     printf '/* setup.sh php-build: compatibility wrapper (removed in PHP 8.5) */\n#include "zend_smart_string.h"\n' \
       > "$src/ext/standard/$h.h"
   done
+  php86_pecl_compat "$ver" "$src"
   cd "$src"
   say "building PHP ${VERS[php]} (FPM + CLI) with clang $n: ${set// /,}"
   ./buildconf --force >> "$log" 2>&1 || { log_excerpt "$log" 20; die "buildconf failed (log: $log)"; }
@@ -858,8 +907,13 @@ cmd_bolt() {
   unit_runs_build "$ver" || die "php$ver-fpm is not running the build"
   n=$(info_get "$ver" llvm)
   [[ $n =~ ^[0-9]+$ ]] || die "build.info names no LLVM version: rebuild"
-  ensure_packages linux-tools-common "linux-tools-$(uname -r)" \
-    || die "perf is not installable for kernel $(uname -r)"
+  # A working perf (e.g. a provider kernel's own) is used as it is, like the
+  # nginx and Valkey passes; only a missing one is installed.
+  perf=$(command -v perf || true)
+  if [[ -z $perf ]] || ! "$perf" --version >/dev/null 2>&1; then
+    ensure_packages linux-tools-common "linux-tools-$(uname -r)" \
+      || die "perf is not installable for kernel $(uname -r)"
+  fi
   llvm_install "$n" "bolt-$n"
   perf=$(command -v perf) || die "perf not found"
   p2b=$LLVM_BIN/perf2bolt; bolt=$LLVM_BIN/llvm-bolt

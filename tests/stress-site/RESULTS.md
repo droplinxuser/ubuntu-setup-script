@@ -7,7 +7,37 @@ manifests, sweep tables and run logs these sections cite (`AUDIT-*.md`,
 removed from the tree on 2026-11-19 to keep the repository lean; every one
 is still in git history, for example
 `git show 84b0db5:tests/stress-site/AUDIT-20261117-1.21.30.md`.  The current
-cycle report is `AUDIT-20261126-1.22.2.md`.
+cycle report is `AUDIT-20261126-1.22.3.md`.
+
+## 1.22.3 — Xeon E-2236 + KVM replicas (2026-11-26)
+
+Full report: `AUDIT-20261126-1.22.3.md`.  Replicas of deb-package hosts
+built with the 1.21.71 installer, then migrated by `--optimize`.
+
+- **Migration matrix:** Sury PHP 8.1, 8.2, 8.4, 8.6 (26.04 guests), 8.3 on
+  Ubuntu 24.04 (Valkey 7.2 package), 8.5 plus a running 8.3 on bare metal,
+  and a 2 vCPU/3.8 GB Angie-only proxy.  Every host migrated; 8.6 with
+  Chevereto or a XenForo Redis cache is refused (phpredis has no 8.6
+  release) and keeps Sury.  Functional walk 0 failures, security 78/78,
+  cookie 109/109, zero segfaults after each migration.
+- **Bugs the runs found:** cron ran Sury's CLI without extensions between
+  cutover and purge; Valkey did not build on 24.04 (glibc 2.39 `sprintf`
+  macro); a 495/61 MB OPcache/JIT pair (8 GB hosts) crashed PHP 8.1 workers
+  and stopped 8.6; a reload whose master died was reported as OK.
+- **Before/after the migration** (bare metal, PHP 8.5, `wrk -c100`, 5
+  rounds, req/s medians):
+
+  | Tier | Angie + Sury | source builds | Δ |
+  |---|---:|---:|---:|
+  | WP guest home (cached) | 99,561 | 113,001 | +13.5 % |
+  | XF guest thread (cached) | 128,373 | 153,066 | +19.2 % |
+  | Chev guest explore (cached) | 135,272 | 154,370 | +14.1 % |
+  | WP member home | 141 | 152 | +7.8 % |
+  | XF member home | 448 | 492 | +9.8 % |
+  | Chev guest home (uncached) | 1,668 | 1,894 | +13.5 % |
+
+  XF member thread, WP member post and Chevereto member explore tie within
+  the spread.
 
 ## 1.22.2 — Xeon E-2236 (2026-11-26)
 

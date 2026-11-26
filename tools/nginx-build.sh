@@ -220,7 +220,7 @@ apply_tmpfiles() {
 }
 
 conf_test() { # binary [conf]: nginx -t output, status of the test
-  "$1" -t -q -c "${2:-$NGINX_CONF}" 2>&1
+  "$1" -e stderr -t -q -c "${2:-$NGINX_CONF}" 2>&1
 }
 
 # The live configuration is tested only on a host that has one and outside

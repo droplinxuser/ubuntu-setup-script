@@ -994,9 +994,14 @@ sudo bash setup.sh --optimize          # migrates, then tunes as usual
    the nginx build cannot serve, an apt simulation of every package removal,
    free disk, the memory class, and the PHP extensions every running Sury PHP
    loads.
-3. Builds nginx, every active PHP version (FPM and CLI) and Valkey while
+3. Builds nginx, the active PHP version (FPM and CLI) and Valkey while
    Angie, Sury and the valkey-server package keep serving, then tests a copy
-   of the Angie tree with the new nginx.
+   of the Angie tree with the new nginx.  The active version is the one
+   Angie's `local_php` upstream serves, else the one the vhosts'
+   `fastcgi_pass` lines call most, else the newest; only a series the
+   source build can make (8.1 or newer, released on php.net) qualifies.  A
+   second running Sury version stays on Sury (one active version per host)
+   until its sites move.
 4. Renders `/etc/nginx`: the server-configs-nginx tree plus the operator's
    files from `/etc/angie` (vhosts, `custom.d`, snippets, `ssl/`, htpasswd
    files, `http.d` files the tree does not ship, preserved upstreams), with
@@ -1023,7 +1028,12 @@ sudo bash setup.sh --optimize          # migrates, then tunes as usual
    PHP page of every detected root with a status below 500.  The build keeps
    every extension the Sury PHP loaded that the source build can compile, in
    addition to the applications' sets (recorded in `PHP_EXT_EXTRA`; trim it
-   later with `--php ext=-NAME`).
+   later with `--php ext=-NAME`).  From the cutover on, Sury's
+   `/usr/bin/phpX.Y` is diverted to `/usr/bin/phpX.Y.sury` (`dpkg-divert
+   --local`) and the source CLI linked in its place, so cron and
+   `/usr/bin/php` run the source build even while the Sury purge waits; the
+   version's Sury packages are held until that purge.  Settings an operator
+   changed in Sury's `php.ini` are kept in `conf.d/10-migrated-php-ini.ini`.
 8. Valkey: the package server stops first (so a persisting configuration
    writes its RDB), then `/etc/valkey` and `/var/lib/valkey` are
    snapshotted, our unit starts and must answer PING.
@@ -1105,7 +1115,12 @@ an unchanged configuration is not retried on every run; a new setup.sh
 release or `SETUP_MIGRATE_RETRY=1` retries it.  A PHP version whose sites
 need an extension the build cannot provide (for example imagick for an
 application that requires it) stays on Sury the same way
-(`SETUP_PHP_ALLOW_MISSING_EXT=1` drops it).
+(`SETUP_PHP_ALLOW_MISSING_EXT=1` drops it).  This includes redis on PHP
+8.6: phpredis 6.3.0 does not compile against 8.6.0, so an 8.6 host with
+Chevereto or a XenForo Redis cache keeps Sury 8.6 until a phpredis release
+supports it (or its sites move to 8.5); an 8.6 host without them migrates.
+PHP 8.0 and unreleased series (a Sury RC) are refused the same way, before
+anything is built, and retried once php.net releases the series.
 
 Measured on the Xeon E-2236 test host: a 1.21.71 host (Angie package, Sury
 PHP 8.5, valkey-server package, three applications, an Angie ACME vhost and
@@ -1115,7 +1130,10 @@ afterwards; after a reboot nginx, php8.5-fpm and valkey-server were active
 and enabled, no unit failed and every site answered 200.  A second
 `--optimize` found nothing to migrate and every build current.  The
 valkey-server and valkey-tools packages stay in dpkg's config-files (`rc`)
-state on purpose: their purge would delete `/var/lib/valkey`.
+state on purpose: their purge would delete `/var/lib/valkey`.  1.22.3 repeated
+it on replicas of every Sury series 8.1-8.6, one host with PHP 8.5 plus a
+running 8.3, an Ubuntu 24.04 host (PHP 8.3, Valkey 7.2 package) and a 2
+vCPU/4 GB Angie-only front proxy (AUDIT-20261126-1.22.3.md).
 
 ## Profile pins and tuning overrides
 

@@ -129,6 +129,20 @@ php_build_app_exts() { # app
 php_build_ext_buildable() { [[ " ${PHP_BUILDABLE_EXTS[*]} " == *" ${1,,} "* ]]; }
 php_build_buildable_exts() { printf '%s\n' "${PHP_BUILDABLE_EXTS[@]}"; }
 
+# PECL extensions whose newest release does not compile against a newer PHP
+# series yet: EXT=newest series it builds for.  redis 6.3.0 (the newest
+# phpredis) fails on PHP 8.6.0: its session handler uses the PS() fields
+# 8.6 turned into zend_strings (1.22.3; the removed aliases themselves are
+# restored by tools/php-build.sh php86_pecl_compat).  Remove an entry when
+# a release supports the series.
+declare -gA PHP_EXT_SERIES_MAX=([redis]=8.5)
+php_build_ext_buildable_for() { # X.Y EXT
+  local v=$1 e=${2,,} max
+  php_build_ext_buildable "$e" || return 1
+  max=${PHP_EXT_SERIES_MAX[$e]:-}
+  [[ -z $max || -z $v ]] || _pb_ver_ge "$max" "$v"
+}
+
 # (The probe of what a Sury PHP loads is lib/migrate.sh's own,
 # migrate_sury_modules: the only one, and the only Sury path here.)
 
@@ -315,7 +329,7 @@ _pb_prev_union() { # X.Y
 # SETUP_PHP_ALLOW_MISSING_EXT=1 (dropped with a warning).
 php_build_effective_exts() { # [X.Y]
   local ver=${1:-} app root name prev any=0 rc
-  local -A set=() prevset=()
+  local -A set=() prevset=() req=()
   local -a bad=()
   [[ -n $ver ]] || ver=$(php_active_version 2>/dev/null || true)
   for name in "${PHP_BASE_EXTS[@]}"; do set[$name]=1; done
@@ -325,11 +339,11 @@ php_build_effective_exts() { # [X.Y]
   while IFS=$'\t' read -r app root; do
     [[ -n $app ]] || continue
     any=1
-    for name in $(php_build_app_exts "$app"); do set[${name,,}]=1; done
+    for name in $(php_build_app_exts "$app"); do set[${name,,}]=1; req[${name,,}]=1; done
     if [[ $app != php ]] && declare -F php_upgrade_app_required_extensions >/dev/null; then
-      for name in $(php_upgrade_app_required_extensions "$app" "$root" install 2>/dev/null); do set[${name,,}]=1; done
+      for name in $(php_upgrade_app_required_extensions "$app" "$root" install 2>/dev/null); do set[${name,,}]=1; req[${name,,}]=1; done
     fi
-    if _pb_redis_needed "$app" "$root"; then set[redis]=1; set[igbinary]=1; fi
+    if _pb_redis_needed "$app" "$root"; then set[redis]=1; set[igbinary]=1; req[redis]=1; fi
     if [[ $app != php ]]; then
       rc=0; _pb_sqlite_scan "$root" || rc=$?
       case $rc in
@@ -341,7 +355,7 @@ php_build_effective_exts() { # [X.Y]
   done < <(php_build_detect_apps)
   for app in ${PHP_BUILD_APPS:-}; do
     any=1
-    for name in $(php_build_app_exts "$app"); do set[${name,,}]=1; done
+    for name in $(php_build_app_exts "$app"); do set[${name,,}]=1; req[${name,,}]=1; done
   done
   for name in $(_pb_norm "${PHP_EXT_EXTRA:-}"); do set[$name]=1; done
   if [[ ${PHP_BUILD_EXT_RESET:-0} != 1 ]]; then
@@ -360,14 +374,25 @@ php_build_effective_exts() { # [X.Y]
   [[ -n ${set[xmlreader]:-} ]] && set[dom]=1
   for name in "${PHP_CORE_EXTS[@]}"; do unset "set[$name]"; done
   for name in "${!set[@]}"; do
-    php_build_ext_buildable "$name" || bad+=("$name")
+    if php_build_ext_buildable_for "$ver" "$name"; then continue; fi
+    # Past its series ceiling but wanted only by PHP_EXT_EXTRA or the
+    # previous build (e.g. kept from an 8.5 host), not by an application:
+    # dropped with a warning instead of failing every build (1.22.3).
+    if php_build_ext_buildable "$name" && [[ -z ${req[$name]:-} ]]; then
+      _pb_warn "PHP ${ver}: ${name} has no release that builds for this series yet (up to ${PHP_EXT_SERIES_MAX[$name]:-?}); left out (no detected application requires it)"
+      unset "set[$name]"
+      continue
+    fi
+    bad+=("$name")
   done
   if (( ${#bad[@]} )); then
     if [[ ${SETUP_PHP_ALLOW_MISSING_EXT:-0} == 1 ]]; then
-      _pb_warn "PHP: no source build path for ${bad[*]}; dropped (SETUP_PHP_ALLOW_MISSING_EXT=1)"
+      _pb_warn "PHP: no source build path for ${bad[*]}${ver:+ on PHP ${ver}}; dropped (SETUP_PHP_ALLOW_MISSING_EXT=1)"
       for name in "${bad[@]}"; do unset "set[$name]"; done
     else
-      printf 'PHP: no source build path for: %s (buildable: %s)\n' "${bad[*]}" "${PHP_BUILDABLE_EXTS[*]}" >&2
+      printf 'PHP: no source build path for: %s%s (buildable: %s)\n' "${bad[*]}" \
+        "$(for name in "${bad[@]}"; do [[ -n ${PHP_EXT_SERIES_MAX[$name]:-} ]] && printf ' (%s builds up to PHP %s)' "$name" "${PHP_EXT_SERIES_MAX[$name]}"; done)" \
+        "${PHP_BUILDABLE_EXTS[*]}" >&2
       return 1
     fi
   fi
@@ -760,6 +785,22 @@ php_build_links() { # X.Y
     _pb_usr_free "${PHP_BUILD_USR_BIN}/php" && { _pb_symlink "$cli" "${PHP_BUILD_USR_BIN}/php" || rc=1; }
   fi
   return "$rc"
+}
+
+# The 1.22.3 migration diverts Sury's /usr/bin/phpX.Y to phpX.Y.sury at the
+# PHP cutover (lib/migrate.sh).  Purging our build takes the diversion back:
+# Sury's binary is renamed back when it is still installed, and a package
+# installed later writes /usr/bin/phpX.Y again (a leftover diversion sent
+# php8.5-cli to phpX.Y.sury and its postinst failed).  Read from dpkg, not
+# the migration state, which --purge all removes.
+_pb_undivert_cli() { # X.Y
+  local p="${PHP_BUILD_USR_BIN}/php$1"
+  command -v dpkg-divert >/dev/null 2>&1 || return 0
+  [[ $(dpkg-divert --list "$p" 2>/dev/null) == *"${p}.sury"* ]] || return 0
+  _pb_unlink_ours "$p"
+  dpkg-divert --local --rename --remove "$p" >/dev/null 2>&1 \
+    || _pb_warn "PHP $1: could not remove the diversion of ${p} (dpkg-divert --list ${p})"
+  return 0
 }
 
 # Remove a link only when it points into our root (never an operator's).
@@ -1311,6 +1352,7 @@ php_build_purge() { # [X.Y]
     _pb_alt_php_remove "$(php_cli_bin "$v")"
     _pb_unlink_ours "${PHP_BUILD_LINK_BIN}/php${v}"
     _pb_unlink_ours "${PHP_BUILD_LINK_SBIN}/php-fpm${v}"
+    _pb_undivert_cli "$v"
     _pb_unlink_ours "${PHP_BUILD_USR_BIN}/php${v}"
     rm -rf "${PHP_BUILD_ROOT:?}/${v}"
   done

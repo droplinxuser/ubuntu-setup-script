@@ -33,6 +33,36 @@
 #   $2 line prefix ("- " for the Markdown report, "" for the console)
 # Returns non-zero when a write or a reload failed; sets OPT_CUTOVER=1 when a
 # pool was reloaded.
+#
+# php_fpm_reload_verified X.Y: reload, then confirm the master survived the
+# SIGUSR2 re-exec for ~3 s.  A configuration php-fpm rejects only while it
+# starts (1.22.3: PHP 8.6's tracing JIT on a 61 MB buffer) let `systemctl
+# reload` return success, was reported "Reload: OK", and left the unit
+# failed a moment later: PHP stayed down until someone noticed.
+php_fpm_reload_verified() { # X.Y
+  local v=$1 i
+  systemctl reload "php${v}-fpm" 2>/dev/null || return 1
+  for i in 1 2 3 4 5 6; do
+    sleep 0.5
+    systemctl is-active --quiet "php${v}-fpm" 2>/dev/null || return 1
+  done
+  return 0
+}
+# After a restored configuration: a pool a failed reload took down is started
+# again from what is on disk now (tested first).
+php_fpm_ensure_running() { # X.Y
+  local v=$1
+  systemctl is-active --quiet "php${v}-fpm" 2>/dev/null && return 0
+  if php_fpm_test "$v" >/dev/null 2>&1 && systemctl restart "php${v}-fpm" 2>/dev/null \
+     && systemctl is-active --quiet "php${v}-fpm" 2>/dev/null; then
+    opt_report "- PHP ${v}: started again on the restored configuration"
+    return 0
+  fi
+  warn "PHP ${v}: not running after the rollback; check /usr/local/sbin/php-fpm${v} -t and 'systemctl status php${v}-fpm'"
+  opt_report "- **FAILED** PHP ${v}: not running after the rollback"
+  return 1
+}
+
 php_refresh_after_nginx() {
   local reporter=${1:-opt_report} prefix=${2:-- }
   [[ ${OPT_PHP_OK:-0} -eq 1 ]] || return 0
@@ -65,6 +95,7 @@ php_refresh_after_nginx() {
       if [[ -n $snap ]] && restore_tree "$snap" "/etc/php/${v}"; then
         warn "PHP ${v}: post-nginx ini refresh failed; restored the configuration the PHP pass wrote"
         opt_report "- **FAILED** PHP ${v}: post-nginx ini refresh; rolled back to the PHP pass result"
+        php_fpm_ensure_running "$v"
       else
         # /usr/local/sbin/php-fpmX.Y is the build's wrapper: it passes the
         # same -y, -c and PHP_INI_SCAN_DIR as the unit (php_fpm_test).
@@ -77,12 +108,13 @@ php_refresh_after_nginx() {
   (( dirty )) || return "$rc"
   while IFS= read -r v; do
     systemctl is-active --quiet "php${v}-fpm" 2>/dev/null || continue
-    if systemctl reload "php${v}-fpm" 2>/dev/null; then
+    if php_fpm_reload_verified "$v"; then
       "$reporter" "${prefix}PHP ${v}: reloaded after the post-nginx ini refresh"
       OPT_CUTOVER=1
     else
       warn "PHP ${v}: reload after the post-nginx ini refresh failed"
       opt_report "- **FAILED** PHP ${v}: reload after the post-nginx ini refresh"
+      php_fpm_ensure_running "$v"
       rc=1
     fi
   done < <(php_fpm_versions)
@@ -469,8 +501,7 @@ optimize_php_services() {
         : # migration already reloaded PHP (success or rollback)
       elif (( TUNE_DIRTY == 0 )); then
         opt_report "- Restart: skipped (configuration already optimized)"
-      elif systemctl reload "php${ver}-fpm" 2>/dev/null \
-         && systemctl is-active --quiet "php${ver}-fpm" \
+      elif php_fpm_reload_verified "$ver" \
          && { [[ $listen_path != /* ]] || [[ -S $listen_path ]]; }; then
         # SIGUSR2 reloads the pool without closing the listening socket: old
         # workers finish in-flight requests and new workers pick up the tuned
@@ -498,6 +529,24 @@ optimize_php_services() {
       else
         opt_report "- Reload/Restart: **FAILED**; rolling back"
         opt_rollback_restart "php${ver}-fpm" "/etc/php/${ver}" "php-${ver}" "php-${ver}-systemd"
+        rc=1
+        OPT_PHP_OK=0
+      fi
+    elif systemctl is-failed --quiet "php${ver}-fpm" 2>/dev/null; then
+      # A unit that crashed (not one the operator stopped: that is
+      # "inactive") is started again once the tuned configuration passes
+      # php-fpm -t (1.22.3: a JIT size PHP 8.6 rejects left php8.6-fpm
+      # failed, and the --optimize that wrote a good size skipped it).
+      if php_fpm_test "$ver" >/dev/null 2>&1 && systemctl restart "php${ver}-fpm" 2>/dev/null \
+         && systemctl is-active --quiet "php${ver}-fpm" 2>/dev/null; then
+        opt_report "- Start: **OK** (the unit had failed; the tuned configuration passes php-fpm -t)"
+        # The build step's "did not start" was this configuration, not the
+        # build: with a current build the run is not a failure any more.
+        if [[ $ver == "$build_ver" ]] && declare -F php_build_current >/dev/null 2>&1 && php_build_current "$ver"; then
+          build_rc=0
+        fi
+      else
+        opt_report "- **FAILED** php${ver}-fpm had failed and does not start on the tuned configuration (systemctl status php${ver}-fpm)"
         rc=1
         OPT_PHP_OK=0
       fi

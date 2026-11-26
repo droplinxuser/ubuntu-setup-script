@@ -1198,6 +1198,37 @@ check "the JIT buffer never exceeds 128M" \
   test "$(php_jit_settings 4096)" = "tracing 128"
 check "a garbage OPcache size still yields the tracing JIT" \
   test "$(php_jit_settings garbage)" = "tracing 32"
+check "the JIT buffer is a whole number of 2 MB (PHP 8.6 aborts on 61M: 495M OPcache -> 60M)" \
+  test "$(php_jit_settings 495)|$(php_jit_settings 264)|$(php_jit_settings 1016)" = "tracing 60|tracing 32|tracing 126"
+# A reload whose re-executed master dies right after `systemctl reload`
+# returned (1.22.3: PHP 8.6 + a 61 MB JIT buffer) must not count as OK.
+reload_case() { # active-after-reload(yes|no) -> rc
+  (
+    RL_ST=active RL_AFTER=$1
+    systemctl() {
+      case $1 in
+        reload) [[ $RL_AFTER == yes ]] || RL_ST=failed; return 0 ;;
+        is-active) [[ $RL_ST == active ]] ;;
+        *) return 0 ;;
+      esac
+    }
+    sleep() { :; }
+    rc=0; php_fpm_reload_verified 8.6 || rc=$?; echo "rc=$rc"
+  )
+}
+check "PHP reload: a master that dies after the reload is a failed reload" test "$(reload_case no)" = "rc=1"
+check "PHP reload: a master that survives the re-exec is a good reload" test "$(reload_case yes)" = "rc=0"
+ensure_case() (
+  RL_ST=failed RL_CALLS=""
+  systemctl() { case $1 in is-active) [[ $RL_ST == active ]] ;; restart) RL_ST=active; RL_CALLS+=restart ;; esac; }
+  php_fpm_test() { return 0; }
+  opt_report() { :; }
+  rc=0; php_fpm_ensure_running 8.6 >/dev/null 2>&1 || rc=$?; echo "rc=$rc ${RL_CALLS}"
+)
+check "PHP rollback: a pool the failed reload took down is restarted on the restored files" test "$(ensure_case)" = "rc=0 restart"
+check "PHP reload: the tuner and the post-nginx refresh both verify the re-exec" \
+  bash -c 'test "$(grep -c "php_fpm_reload_verified \"\$v\"\|php_fpm_reload_verified \"\$ver\"" "$1")" -ge 2' _ "$ROOT/lib/service-optimizers.sh"
+unset -f reload_case ensure_case
 check "a huge-page reservation covers OPcache plus the JIT buffer" \
   php_hugepages_ok 479 512 64
 check "an exact huge-page reservation is accepted" php_hugepages_ok 288 512 64
@@ -4169,6 +4200,8 @@ check "restore_snapshot_dir fails on a missing snapshot" snap_missing_fails
 
 # php_ini_profile: OPcache RAM/16 (128..512), memory_limit RAM/8 (256..512,
 # 128 under 2 GB), realpath cache RAM*2 KB (4096..16384).
+php_ini_profile 7935
+check "php_ini_profile 7935 MB (an 8 GB VM): OPcache rounded to whole 2 MB (494, not 495)" test "$PHP_PROFILE_OPCACHE_MB" -eq 494
 php_ini_profile 1024
 check "php_ini_profile 1 GB: 128M OPcache, 128M memory_limit, 4096K realpath" \
   test "$PHP_PROFILE_OPCACHE_MB" -eq 128 -a "$PHP_PROFILE_MEMORY_MB" -eq 128 -a "$PHP_PROFILE_REALPATH_KB" -eq 4096
@@ -7671,6 +7704,31 @@ check "valkey-build: hardening flags, no TLS, bundled jemalloc, sd_notify shim i
   bash -c 'for f in -fstack-protector-strong -fstack-clash-protection -D_FORTIFY_SOURCE=3 -fcf-protection=full "-Wl,-z,relro,-z,now" BUILD_TLS=no MALLOC=jemalloc "sdnotify_shim \"\$work/deps\""; do grep -qF -- "$f" "$1" || { echo "no $f"; exit 1; }; done' _ "$ROOT/tools/valkey-build.sh"
 check "valkey-build: CFLAGS/LDFLAGS reach make through the environment (on its command line they override the bundled jemalloc and Lua -O flags)" \
   bash -c 'f=$(sed -n "/^cmd_build()/,/^}/p" "$1"); grep -q "CFLAGS=\"\$flags -I\$work/deps/include\" LDFLAGS=" <<<"$f" && ! grep -qE "make -j[^\\\\]*CFLAGS=|^[[:space:]]+(OPT=[^\\\\]*)?CFLAGS=\"\$flags.*BUILD_TLS" <<<"$f"' _ "$ROOT/tools/valkey-build.sh"
+# glibc 2.39 (Ubuntu 24.04) defines sprintf as a fortify macro for clang;
+# Valkey's Lua module includes fmacros.h after <stdio.h> (1.22.3).
+vk_fortify_case() {
+  (
+    export VALKEY_BUILD_SOURCE_ONLY=1
+    # shellcheck disable=SC1090,SC1091
+    source "$ROOT/tools/valkey-build.sh"
+    f="$TMP/vk-fmacros.h"
+    printf '#ifndef __cplusplus\nint sprintf(char *str, const char *format, ...)\n    __attribute__((deprecated("x")));\nchar *strcpy(char *restrict dest, const char *src)\n    __attribute__((deprecated("y")));\n#endif\n' > "$f"
+    fortify_sprintf_guard "$f"; fortify_sprintf_guard "$f"
+    tr '\n' '|' < "$f"
+  )
+}
+VK_FG=$(vk_fortify_case)
+check "valkey-build: the sprintf re-declaration is skipped where glibc made sprintf a macro" \
+  test "$VK_FG" = '#ifndef __cplusplus|#ifndef sprintf|int sprintf(char *str, const char *format, ...)|    __attribute__((deprecated("x")));|#endif|char *strcpy(char *restrict dest, const char *src)|    __attribute__((deprecated("y")));|#endif|'
+check "valkey-build: the guard runs right after the source is unpacked" \
+  bash -c 'sed -n "/^cmd_build()/,/^}/p" "$1" | grep -A1 "unpack \"\$arc\" \"\$src\"" | grep -q "fortify_sprintf_guard \"\$src/src/fmacros.h\""' _ "$ROOT/tools/valkey-build.sh"
+unset -f vk_fortify_case; unset VK_FG
+# nginx -t trials of the migration and the build tool log to stderr only:
+# without -e they also wrote their expected [emerg] lines (a module the
+# trial build lacks, a directive about to be commented) into the live
+# /var/www/logs/nginx/error.log (1.22.3 migration test).
+check "nginx: every migration and build-tool config test passes -e stderr" \
+  bash -c '! grep -nE "\"\\\$(cand|1)\" +-t -q" "$1/lib/migrate.sh" "$1/tools/nginx-build.sh" && grep -qE "\"\\\$cand\" -e stderr -t -q" "$1/lib/migrate.sh" && grep -qE "\"\\\$1\" -e stderr -t -q" "$1/tools/nginx-build.sh"' _ "$ROOT"
 vk_tool_case() { # case -> result
   (
     T="$TMP/vkt"; rm -rf "$T"; mkdir -p "$T/units" "$T/root/bin" "$T/etc" "$T/data" "$T/log"

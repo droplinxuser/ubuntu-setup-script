@@ -52,6 +52,13 @@ for unit in nginx angie anubis mariadb valkey-server elasticsearch 'php*-fpm' sy
   systemctl stop "$unit" >/dev/null 2>&1 || true
 done
 if [[ -n $ADDED ]]; then
+  # A package the run added may be held: the 1.22 migration holds Sury
+  # packages while their purge is deferred (a second PHP version still on
+  # Sury), and apt refuses to purge a held package.  Only holds on added
+  # packages are released; the baseline's own holds stay.
+  held=$(comm -12 <(apt-mark showhold 2>/dev/null | sed 's/:.*//' | sort -u) <(printf '%s\n' "$ADDED" | sed '/^$/d' | sort -u) || true)
+  # shellcheck disable=SC2086
+  [[ -n $held ]] && { apt-mark unhold $held >/dev/null 2>&1 || true; echo "released holds: $(printf '%s\n' "$held" | wc -l)"; }
   # shellcheck disable=SC2086
   apt-get purge -y $ADDED > "$WORK/apt-purge.log" 2>&1 || echo "apt purge reported an error (see $WORK/apt-purge.log)"
 fi
@@ -237,7 +244,21 @@ done
 for m in tcp_bbr sch_fq xt_recent xt_conntrack xt_LOG xt_limit xt_hl xt_addrtype nf_conntrack; do
   modprobe -r "$m" >/dev/null 2>&1 || true
 done
+# Diversions the 1.22 migration made (Sury's /usr/bin/phpX.Y -> phpX.Y.sury)
+# that outlived the packages: a reinstall would write to the .sury path.
+dpkg-divert --list 2>/dev/null | awk '$1 == "local" && $4 ~ /^\/usr\/bin\/php[0-9.]+$/ && $6 ~ /\.sury$/ { print $4 }' | while IFS= read -r p; do
+  [[ -L $p ]] && rm -f -- "$p"
+  dpkg-divert --local --rename --remove "$p" >/dev/null 2>&1 && echo "removed diversion $p"
+done
 systemctl daemon-reload
+# Units the baseline had enabled that the run disabled: a package the
+# baseline already carried (sysstat) that --others adopted is disabled by
+# --purge with the services it installed (1.22.3 restore).
+base_enabled=$(awk 'index($0, "== enabled unit files") == 1 { f = 1; next } /^== / { f = 0 } f && NF { print $1 }' "$BASE" | sort -u)
+now_enabled=$(systemctl list-unit-files --state=enabled --no-legend --no-pager 2>/dev/null | awk '{ print $1 }' | sort -u)
+for u in $(comm -23 <(printf '%s\n' "$base_enabled") <(printf '%s\n' "$now_enabled")); do
+  [[ -n $(systemctl list-unit-files --no-legend "$u" 2>/dev/null) ]] && systemctl enable "$u" >/dev/null 2>&1 && echo "re-enabled $u"
+done
 systemctl reset-failed >/dev/null 2>&1 || true
 sysctl --system >/dev/null 2>&1 || true
 ldconfig

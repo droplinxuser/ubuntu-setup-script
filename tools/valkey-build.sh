@@ -345,6 +345,25 @@ space_check() { # llvm-major
     || die "only ${root_mb} MB free on /; installing LLVM $1 and building needs $need_root MB; free space and retry"
 }
 
+# glibc 2.39 (Ubuntu 24.04) defines sprintf as a fortify MACRO for clang at
+# _FORTIFY_SOURCE=3; glibc 2.40 and later (26.04) fortify clang without one.
+# Valkey's fmacros.h re-declares sprintf to deprecate it, and its Lua module
+# includes fmacros.h after <stdio.h>, so on 24.04 the declaration expanded
+# the macro and the build stopped ("expected parameter declarator", 1.22.3
+# migration test of a 24.04 host).  The re-declaration is skipped where
+# sprintf is a macro; nothing changes where it is not.  Idempotent.
+fortify_sprintf_guard() { # fmacros.h
+  local f=$1
+  [[ -f $f ]] || return 0
+  grep -q '^#ifndef sprintf$' "$f" && return 0
+  grep -qE '^int sprintf\(char \*str, const char \*format, \.\.\.\)$' "$f" || return 0
+  sed -i -E '/^int sprintf\(char \*str, const char \*format, \.\.\.\)$/{
+i #ifndef sprintf
+n
+a #endif
+}' "$f"
+}
+
 cmd_build() { # [--cpu-only]
   local cpu_only=0 work src n j flags ld line x w arc sum stamp b
   [[ ${1:-} == --cpu-only ]] && cpu_only=1
@@ -408,6 +427,7 @@ cmd_build() { # [--cpu-only]
   [[ -s $arc ]] || die "Valkey ${VERS[valkey]}: no verified source archive"
   sum=$(sha256sum "$arc" | awk '{print $1}')
   unpack "$arc" "$src"
+  fortify_sprintf_guard "$src/src/fmacros.h"
   # CFLAGS/LDFLAGS go in the ENVIRONMENT, never on make's command line: a
   # command-line variable overrides the assignment in every sub-make, so the
   # bundled jemalloc and Lua lost their own -O flags and built unoptimised

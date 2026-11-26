@@ -8,6 +8,80 @@ Reports of the 1.21.33-1.21.61 cycles that measured the removed Anubis
 filter were deleted from the tree on 2026-11-23 for the same reason;
 `git show <commit>:<path>` recovers them.
 
+## 1.22.3 (2026-11-26)
+
+Migration of deb-package hosts (Angie, Sury PHP, valkey-server) to the
+source builds, tested end to end on replicas of every series 8.1-8.6, on
+Ubuntu 26.04 and 24.04, on bare metal and in KVM guests
+(AUDIT-20261126-1.22.3.md).  Each fix below was found by one of those runs.
+
+- **Cron ran PHP without its extensions after the PHP cutover.**  The
+  cutover hands `/etc/php/X.Y/cli` to the source build, but
+  `/usr/bin/phpX.Y` (and `/usr/bin/php` through the alternatives link)
+  stayed Sury's binary until the Sury purge.  In between, every crontab line
+  and setup.sh's own `wp-cron.php` / `xf:run-jobs` jobs ran a CLI that loaded
+  2 of the 7 application extensions.  When the purge was deferred (a second
+  PHP version still on Sury, or collateral packages) that lasted until the
+  operator acted.  The cutover now diverts Sury's `/usr/bin/phpX.Y`
+  (`dpkg-divert --local`, to `phpX.Y.sury`) and links the source CLI in its
+  place; the rollback takes the diversion back, and the post-purge pass
+  removes the record.  The migrated version's Sury packages are held until
+  the purge, so an `apt upgrade` cannot re-add Sury's conf.d links.
+- **Valkey did not build on Ubuntu 24.04.**  glibc 2.39 defines `sprintf`
+  as a fortify macro for clang; Valkey's Lua module includes `fmacros.h`
+  (which re-declares `sprintf`) after `<stdio.h>`, and the build stopped.
+  The re-declaration is now skipped where `sprintf` is a macro.  24.04
+  hosts kept serving from the valkey-server package; the next `--optimize`
+  migrates them.
+- **PHP JIT sizes are whole 2 MB.**  An 8 GB host got a 495 MB OPcache and
+  a 61 MB JIT buffer.  With huge code pages, PHP 8.1 workers then segfaulted
+  running JIT code (logins and POSTs answered 502) and PHP 8.6 refused to
+  start (`mprotect() failed [22]`).  Both sizes are now rounded down to a
+  multiple of 2 MB (494/60); hosts of 16 GB and more (512/64) do not change.
+- **A failed PHP reload is no longer reported as OK.**  A configuration
+  php-fpm rejects only while starting made the SIGUSR2 re-exec exit after
+  `systemctl reload` had returned success; the tuner reported "Reload: OK"
+  and PHP stayed down.  Reloads now confirm the master survived, a refresh
+  that rolls back restarts the pool from the restored files, and a PHP unit
+  that had *failed* (not one the operator stopped) is started again once
+  the tuned configuration passes `php-fpm -t`.
+- **Series the source build cannot make are refused in the pre-flight.**
+  PHP 8.0 or an unreleased series (a Sury RC) used to be built, fail, and
+  retry on every `--optimize`, and an idle RC could even become the active
+  version.  It is now refused up front (retried once php.net releases X.Y.0);
+  the active version is chosen among buildable series only, and by the
+  vhosts' `fastcgi_pass` references before falling back to the newest.
+- **PHP 8.6 and PECL.**  8.6 removed aliases PECL sources still use
+  (`zval_dtor`, `zval_is_true`, `XtOffsetOf`, `INI_STR`/`INI_INT`,
+  `WRONG_PARAM_COUNT`, `php_hash_bin2hex`, ...).  The build restores each
+  one the tree no longer defines, with its 8.5 definition, and adapts
+  igbinary to the zend_string `unserialize_callback_func`: igbinary 3.2.16
+  builds on 8.6.  redis 6.3.0 still does not (its session handler needs a
+  real port), so redis has a series ceiling of 8.5: an application that
+  needs it (Chevereto, a XenForo Redis cache) refuses the 8.6 migration in
+  the pre-flight with that reason, and a redis kept only by `PHP_EXT_EXTRA`
+  is left out with a warning.
+- **Operator php.ini edits survive the migration** as
+  `conf.d/10-migrated-php-ini.ini` (the differences from Sury's own
+  `php.ini-production`); the managed `zz-setup-*.ini` still wins.
+- **Report and log noise.**  The leftover-Angie-reference scan skips logs,
+  notes, backups and checkouts of this script; a host without PHP (a front
+  proxy) no longer warns about a dead `local_php` listener; the
+  migration's `nginx -t` trials log to stderr only (they wrote expected
+  `[emerg]` lines into the live error.log); crontab lines are listed with
+  the PHP each one will run, and a line calling a removed series is flagged.
+- **PHP BOLT** uses a working `perf` as nginx and Valkey do, instead of
+  always installing `linux-tools-$(uname -r)`.
+- **`restore-baseline.sh`** releases holds on packages the run added (apt
+  refused to purge the held Sury packages of a deferred purge), takes a
+  leftover CLI diversion back, and re-enables the baseline's units that
+  `--purge` disabled (sysstat).
+- **Measured on the Xeon E-2236 test host** (same host before and after the
+  migration, 5 rounds, clock pinned): cached pages +13 to +19 %, PHP pages
+  +8 to +14 % where outside the spread (PHP CPU per request -8 to -14 %).
+  Every replica passed the functional walk, the security probe (78/78) and
+  the cookie suite (109/109) after its migration.
+
 ## 1.22.2 (2026-11-26)
 
 - **Security: XenForo guest-cache poisoning with zero-padded cookies**
