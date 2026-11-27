@@ -391,9 +391,12 @@ php_upgrade_app_required_extensions() {
       # the SV RedisCache add-on talks to Redis or Valkey through its bundled
       # Credis client, which falls back to a pure-PHP connection when the
       # extension is absent (`standalone = !extension_loaded('redis')`).
+      # grep reads all of awk's output (no -q): under pipefail an early
+      # grep -q exit can SIGPIPE awk on a busy host and turn a match into a
+      # miss (seen on a loaded test host).
       if [[ -f $root/src/config.php ]] \
          && awk '!/^[[:space:]]*(#|\/\/|\*)/' "$root/src/config.php" \
-            | grep -qiE "provider[^;]*(['\"]Redis['\"]|Doctrine[\\\\]+Common[\\\\]+Cache[\\\\]+RedisCache)"; then
+            | grep -iE "provider[^;]*(['\"]Redis['\"]|Doctrine[\\\\]+Common[\\\\]+Cache[\\\\]+RedisCache)" >/dev/null; then
         redis=1
       fi
       ;;

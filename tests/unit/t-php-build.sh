@@ -594,6 +594,9 @@ logger() { :; }
 http_get() { [[ -n ${FAKE_JSON:-} ]] || return 1; printf '%s' "$FAKE_JSON"; }
 git() { local t; for t in ${FAKE_TAGS:-}; do printf 'deadbeef\trefs/tags/%s\n' "$t"; done; }
 resolve_all() { :; }
+# The fake php binaries are shell scripts: they run on no allocator.  The
+# real mimalloc check is covered by t-build-alloc.sh and the grep below.
+malloc_linked() { :; }
 EOF
 tool_run() { # CODE: bash with tools/php-build.sh sourced (no main) and the stubs
   PHP_BUILD_SOURCE_ONLY=1 bash -c 'source "$1"; source "$2"; eval "$3"' _ \
@@ -701,7 +704,7 @@ chk() ( # EXTS.WANT -> cmd_check output, then rc=N
   mkdir -p "$CHK_ROOT/8.4/sbin"
   printf '%s\n' "$CHK_WANT" > "$CHK_ROOT/8.4/exts.want"
   tool_run 'ROOT=$CHK_ROOT
-    printf "recipe=%s\ncpu=%s\nexts=ctype,curl\n" "$BUILD_RECIPE" "$(cpu_fingerprint)" > "$ROOT/8.4/build.info"
+    printf "recipe=%s\ncpu=%s\nexts=ctype,curl\nmalloc=mimalloc\n" "$BUILD_RECIPE" "$(cpu_fingerprint)" > "$ROOT/8.4/build.info"
     rc=0; cmd_check 8.4 || rc=$?; echo "rc=$rc"'
 )
 out=$(chk ctype,curl,gmp) || true
@@ -1141,10 +1144,105 @@ check "PHP 8.6 compat: the macro follows the igbinary.h include" \
     printf "#include \"igbinary.h\"\nx = PG(unserialize_callback_func);\n" > "$d/ext/igbinary/src/php7/igbinary.c"
     PHP_BUILD_SOURCE_ONLY=1 bash -c "source \"\$1\"; source \"\$2\"; php86_pecl_compat 8.6 \"\$3\"" _ "$2" "$1/tool-stubs.sh" "$d" >/dev/null 2>&1
     sed -n 2p "$d/ext/igbinary/src/php7/igbinary.c" | grep -q "PHP 8.6 keeps the callback name"' _ "$TMP" "$ROOT/tools/php-build.sh"
-# The daily refresh retries a missed BOLT pass on a current build, as nginx's
-# does (1.22.4: the post-migration pass and a concurrent --optimize each
-# found the other holding the build lock, and PHP stayed un-BOLTed).
-check "refresh: a current build with bolt=0 and the unit on our build gets a BOLT pass" \
-  bash -c 'sed -n "/^cmd_refresh()/,/^}/p" "$1" | grep -q "elif (( rc == 0 )) && \[\[ \$(info_get \"\$ver\" bolt) != 1 \]\] && unit_runs_build \"\$ver\"; then" && sed -n "/^cmd_refresh()/,/^}/p" "$1" | grep -qF "bash \"\$SELF\" bolt \"\$ver\" 60"' _ "$ROOT/tools/php-build.sh"
+# ---------------------------------------------------------------------------
+# 1.22.5: last_known reads the series being resolved (A3)
+# ---------------------------------------------------------------------------
+lk() ( # SETUP-CODE then CODE, in a fresh ROOT; prints CODE's stdout only
+  export LK=$TMP/lk-$RANDOM
+  mkdir -p "$LK/cache"
+  tool_run "ROOT=\$LK/root; SRC_CACHE=\$LK/cache; ACTIVE_FILE=\$LK/active; CONF=\$LK/none.conf
+    $1
+    { $2; } > \$LK/out 2>/dev/null; cat \$LK/out" | tail -n 1
+)
+LK_SETUP='mk() { local v=$1; shift; mkdir -p "$ROOT/$v/sbin"; : > "$ROOT/$v/sbin/php-fpm"; chmod 755 "$ROOT/$v/sbin/php-fpm"; printf "%s\n" "$@" > "$ROOT/$v/build.info"; }'
+S1="$LK_SETUP; mk 8.5 php=8.5.3 openssl=4.0.1 pcre2=10.46; echo 8.5 > \$ACTIVE_FILE"
+check "last_known: --upgrade-php=8.1 offline never gets 8.5's OpenSSL 4 (scenario 1)" \
+  test "$(lk "$S1" 'printf "[%s]" "$(last_known openssl 8.1)"')" = "[]"
+check "last_known: resolve of openssl for 8.1 then fails (no lookup, no 3.x record)" \
+  test "$(lk "$S1" 'rc=0; resolve openssl 8.1 >/dev/null 2>&1 || rc=$?; echo "rc=$rc"')" = "rc=1"
+check "last_known: a new series takes non-series libraries from the active one" \
+  test "$(lk "$S1" 'last_known pcre2 8.1')" = 10.46
+check "last_known: never another series' php version" \
+  test "$(lk "$S1" 'printf "[%s]" "$(last_known php 8.4)"')" = "[]"
+check "last_known: openssl from a series on the same side of 8.2" \
+  test "$(lk "$S1" 'last_known openssl 8.4')" = 4.0.1
+S2="$LK_SETUP; mk 8.1 php=8.1.33 openssl=3.5.4 pcre2=10.44 zlib-ng=2.2.4; mk 8.5 php=8.5.3 openssl=4.0.1 pcre2=10.46 zlib-ng=2.2.5; echo 8.5 > \$ACTIVE_FILE"
+check "last_known: 8.5 with an 8.1 rollback build reads 8.5's own pcre2 (scenario 2)" \
+  test "$(lk "$S2" 'last_known pcre2 8.5')" = 10.46
+check "last_known: ... and 8.5's own openssl" test "$(lk "$S2" 'last_known openssl 8.5')" = 4.0.1
+check "last_known: the 8.1 rollback build keeps its own OpenSSL 3" test "$(lk "$S2" 'last_known openssl 8.1')" = 3.5.4
+check "resolve offline: 8.5's check compares against 8.5's record (no false stale)" \
+  test "$(lk "$S2" 'resolve zlib-ng 8.5')" = 2.2.5
+S3="$LK_SETUP; mk 8.1 openssl=3.5.4; mk 8.3 openssl=3.6.0; echo 8.3 > \$ACTIVE_FILE"
+check "last_known: a new 8.2 takes OpenSSL from 8.3 (same side of 8.2), never 8.1's" \
+  test "$(lk "$S3" 'printf "[%s]" "$(last_known openssl 8.2)"')" = "[3.6.0]"
+check "last_known: without a series argument the build-common scan is kept" \
+  test "$(lk "$S2" 'last_known pcre2')" = 10.44
+
+# ---------------------------------------------------------------------------
+# 1.22.5: mimalloc is the only allocator (C28b; glibc and jemalloc removed,
+# see t-build-alloc.sh).
+# The build options gd-avif (C26)
+# and redis-zstd (C27) were removed before release.
+# ---------------------------------------------------------------------------
+out=$(tool_run 'ext_flags 8.5 "gd redis igbinary zip" /deps | tr "\n" " "')
+check "ext_flags: redis gets igbinary and no zstd" bash -c '[[ $1 == *"--enable-redis --enable-redis-igbinary "* && $1 != *zstd* ]]' _ "$out"
+check "ext_flags: the extensions after redis still get their flags" bash -c '[[ $1 == *"--with-zip"* ]]' _ "$out"
+out=$(tool_run 'ext_flags 8.5 "gd zip" /deps | tr "\n" " "')
+check "ext_flags: the default gd line is unchanged" bash -c '[[ $1 == *"--enable-gd --with-jpeg --with-webp --with-zip"* ]]' _ "$out"
+out=$(tool_run 'libs_for "ctype gd redis igbinary" | tr "\n" " "')
+check "libs_for: no zstd library" bash -c '[[ $1 != *zstd* ]]' _ "$out"
+check "verify: the allocator check is in verify_candidates" \
+  bash -c 'b=$(sed -n "/^verify_candidates() {/,/^}/p" "$1"); grep -qF "malloc_linked \"\$MALLOC_IMPL\"" <<<"$b"' _ "$ROOT/tools/php-build.sh"
+check "the removed build options are gone from the build tool (no AVIF, libaom, zstd or BOLT skip list)" \
+  bash -c '! grep -iE "avif|libaom|aom-releases|skip-funcs|zstd" "$1" "$2" "$3" | grep -v -- "--without-zstd\|ENABLE_ZSTD=OFF"' _ "$ROOT/tools/php-build.sh" "$ROOT/tools/build-common.sh" "$ROOT/php-build.conf"
+out=$(PHP_BUILD_MALLOC=glibc tool_run 'libs_for "ctype" | tr "\n" " "')
+check "libs_for: mimalloc is always built, even with a leftover PHP_BUILD_MALLOC=glibc (warned)" bash -c '[[ $1 == *"PHP_BUILD_MALLOC=glibc was removed in 1.22.5"* && $1 == *" mimalloc "* ]]' _ "$out"
+check "PHP_BUILD_MALLOC defaults to mimalloc" test "$(tool_run 'printf %s "$MALLOC_IMPL"')" = mimalloc
+chkm() ( # MALLOC_IMPL recorded-malloc -> cmd_check output
+  export CHK_ROOT=$TMP/chkm-$RANDOM CHK_M=$1 CHK_R=$2
+  mkdir -p "$CHK_ROOT/8.4/sbin"
+  printf 'ctype\n' > "$CHK_ROOT/8.4/exts.want"
+  tool_run 'ROOT=$CHK_ROOT; MALLOC_IMPL=$CHK_M
+    printf "recipe=%s\ncpu=%s\nexts=ctype\n%s" "$BUILD_RECIPE" "$(cpu_fingerprint)" "${CHK_R:+malloc=$CHK_R
+}" > "$ROOT/8.4/build.info"
+    rc=0; cmd_check 8.4 || rc=$?; echo "rc=$rc"'
+)
+check "check: a pre-1.22.5 build (no malloc=: glibc) is stale on mimalloc" has "$(chkm mimalloc "")" "malloc glibc -> mimalloc"
+check "check: a glibc build (option removed in 1.22.5) is stale on mimalloc" has "$(chkm mimalloc glibc)" "malloc glibc -> mimalloc"
+check "check: a mimalloc build is current" has "$(chkm mimalloc mimalloc)" "rc=0"
+check "check: a jemalloc build (option removed in 1.22.5) is stale on mimalloc" has "$(chkm mimalloc jemalloc)" "malloc jemalloc -> mimalloc"
+check "build: mimalloc goes into the program links only (EXTRA_LDFLAGS_PROGRAM, never opcache.so)" \
+  bash -c 'grep -q "EXTRA_LDFLAGS_PROGRAM" "$1" && ! grep -q "LDFLAGS=.*mimalloc" "$1"' _ "$ROOT/tools/php-build.sh"
+check "build: a CPU rebuild builds mimalloc too (resolve_set looks up a missing mimalloc= version)" \
+  bash -c '! grep -qF "if (( exact )); then MALLOC_IMPL=" "$1" && sed -n "/^resolve_set() {/,/^}/p" "$1" | grep -qF "v=\$(resolve mimalloc \"\$ver\")"' _ "$ROOT/tools/php-build.sh"
+
+# lib/php-build.sh: the removed build options are refused on the command
+# line and dropped with a warning when a host still names them
+check "ext option: gd-avif is refused by --php ext= (removed)" not php_build_ext_buildable gd-avif
+check "ext option: redis-zstd is refused by --php ext= (removed)" not php_build_ext_buildable redis-zstd
+out=$( (PHP_EXT_EXTRA=""; rc=0; php_build_ext_option redis-zstd || rc=$?; echo "rc=$rc") 2>&1 )
+check "--php ext=redis-zstd is refused before anything changes" bash -c '[[ $1 == *"--php ext=redis-zstd is not buildable from source"* && $1 == *rc=1* ]]' _ "$out"
+check "ext option: names with a dash are refused" not php_build_ext_buildable gd-webp
+eff() ( # PHP_EXT_EXTRA -> effective set (no app, a previous build of gd)
+  export PHP_EXT_EXTRA=$1 PHP_BUILD_EXT_RESET=0
+  _pb_prev_union() { printf 'ctype,gd'; }
+  php_build_detect_apps() { :; }
+  php_build_effective_exts 8.5 2>&1
+)
+out=$(eff "gd-avif,intl")
+check "a persisted PHP_EXT_EXTRA naming gd-avif: dropped with a warning, the rest kept" \
+  bash -c 'l=$(tail -n 1 <<<"$1"); [[ $1 == *"gd-avif is no longer a build option"* && ,$l, != *,gd-avif,* && ,$l, == *,intl,* && ,$l, == *,gd,* ]]' _ "$out"
+out=$(export PHP_EXT_EXTRA="" PHP_BUILD_EXT_RESET=0; _pb_prev_union() { printf 'ctype,gd,gd-avif'; }; php_build_detect_apps() { :; }; php_build_effective_exts 8.5 2>&1) || true
+check "a current build that has gd-avif: dropped with a warning, not a failure" \
+  bash -c 'l=$(tail -n 1 <<<"$1"); [[ $1 == *"gd-avif is no longer a build option"* && $1 != *"no source build path"* && ,$l, != *,gd-avif,* && ,$l, == *,gd,* ]]' _ "$out"
+out=$(eff "redis,redis-zstd")
+check "a persisted PHP_EXT_EXTRA naming redis-zstd: dropped with a warning, redis kept" \
+  bash -c 'l=$(tail -n 1 <<<"$1"); [[ $1 == *"redis-zstd is no longer a build option"* && $1 != *"no source build path"* && ,$l, != *,redis-zstd,* && ,$l, == *,redis,* ]]' _ "$out"
+# The daily refresh's BOLT retry (1.22.4) skips hosts without branch records
+# (1.22.5: bolt=nolbr / noperf until the next build).
+check "refresh: a current build that is due a BOLT pass gets one (bolt_retry_due)" \
+  bash -c 'sed -n "/^cmd_refresh()/,/^}/p" "$1" | grep -qF "elif (( rc == 0 )) && bolt_retry_due \"\$(info_get \"\$ver\" bolt)\" && unit_runs_build \"\$ver\"; then" && sed -n "/^cmd_refresh()/,/^}/p" "$1" | grep -qF "bash \"\$SELF\" bolt \"\$ver\" 60"' _ "$ROOT/tools/php-build.sh"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

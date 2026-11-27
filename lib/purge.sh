@@ -104,9 +104,10 @@ ufw_status_protects_port() {
 # --optimize reset keep-list, and setup.sh sources the file at the start of
 # every run, so leaving CPU_MITIGATIONS=off behind made the next --optimize or
 # --basic (configure_cpu_mitigations) write the drop-in again that --purge
-# basic had just removed while promising the kernel default.  Without the pin
-# the choice is "never touched" again.  Only that line goes; host facts and
-# feature choices in the same file stay.
+# basic had just removed while promising the kernel default.  Since 1.22.5
+# mitigations=off is the default, so the pin is only cleanup: a later
+# --basic or --optimize applies mitigations=off again.  Only that line goes;
+# host facts and feature choices in the same file stay.
 purge_cpu_mitigations_pin() {
   local f=${1:-/etc/default/setup-tuning}
   [[ -f $f ]] || return 0
@@ -115,9 +116,9 @@ purge_cpu_mitigations_pin() {
     # This process sourced the pin at startup; forget it here too.
     # shellcheck disable=SC2034  # read by configure_cpu_mitigations (lib/os.sh)
     CPU_MITIGATIONS=""
-    info "CPU_MITIGATIONS pin removed from ${f}; later runs leave the boot loader alone"
+    info "CPU_MITIGATIONS pin removed from ${f}"
   else
-    warn "Could not remove CPU_MITIGATIONS from ${f}; the next --optimize would re-apply it"
+    warn "Could not remove CPU_MITIGATIONS from ${f}"
   fi
 }
 
@@ -242,7 +243,7 @@ purge_basic() {
   if [[ -e $CPU_MITIGATIONS_DROPIN || -e $CPU_MITIGATIONS_LEGACY_DROPIN ]]; then
     rm -f "$CPU_MITIGATIONS_DROPIN" "$CPU_MITIGATIONS_LEGACY_DROPIN"
     if command -v update-grub >/dev/null 2>&1 && update-grub >/dev/null 2>&1; then
-      info "CPU mitigations drop-in removed; the kernel default applies after the next reboot"
+      info "CPU mitigations drop-in removed; the kernel default applies after the next reboot (a later --basic or --optimize applies mitigations=off again)"
     else
       warn "CPU mitigations drop-in removed, but update-grub failed; run it before rebooting"
     fi
@@ -469,6 +470,9 @@ purge_valkey() {
   step "Purge Valkey"
   # Our unit, the compiled build, its links and build units; the shared
   # refresh/CPU units and LLVM only with the last build (lib/valkey-build.sh).
+  # The build's version is read first: build.info goes with the build.
+  local vk_built=""
+  declare -F valkey_build_info_get >/dev/null 2>&1 && vk_built=$(valkey_build_info_get valkey)
   if declare -F valkey_build_purge >/dev/null 2>&1; then
     valkey_build_purge
   fi
@@ -491,6 +495,13 @@ purge_valkey() {
       break
     fi
   done
+  # With the units stopped: the TCP port a socket-only run closed comes back,
+  # the clean-stop guard goes, and a snapshot a packaged Valkey may not read
+  # is named (1.22.5 F15/F30; the data and the rest of the config stay).
+  if declare -F valkey_purge_cache_conf >/dev/null 2>&1; then
+    valkey_purge_cache_conf /etc/valkey/valkey.conf valkey "$vk_built"
+    valkey_purge_cache_conf /etc/redis/redis.conf redis
+  fi
   # Keep the valkey group and www-data's membership.  Removing the account
   # would break a reinstall and is an account change, not an uninstall.
   info "Leaving Valkey data, configuration and logs in place"
@@ -581,6 +592,9 @@ run_purge() {
       others)  purge_others ;;
     esac
   done
+  # The service watchdog (lib/watchdog.sh): drop-ins of the purged services;
+  # all of it with basic or the last enabled managed service.
+  watchdog_purge_targets "${PURGE_ORDER[@]}"
 
   apt_clean
   info "Purge stopped services and removed only the compiled nginx/PHP/Valkey builds; configuration, data, log and backup files were preserved"

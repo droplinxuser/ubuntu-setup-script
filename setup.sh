@@ -44,7 +44,7 @@ umask 022
 export LC_ALL=C.UTF-8
 
 readonly SCRIPT_NAME="${0##*/}"
-readonly SCRIPT_VERSION="1.22.4"
+readonly SCRIPT_VERSION="1.22.5"
 # Congestion control and qdisc for the OS profile.  BBR is a good default on
 # lossy long-haul links, but it can regress a busy reverse proxy badly (a
 # 40% throughput drop was measured on one host).  Operators can pin a host
@@ -88,6 +88,42 @@ if [[ -n ${SETUP_PRECOMPRESS_ASSETS+x} ]]; then
   unset SETUP_PRECOMPRESS_ASSETS
 fi
 unset PRECOMPRESS_ASSETS
+# The opt-in PHP session/cgi hardening (SETUP_PHP_SESSION_HARDENING=1, 1.6.10)
+# was removed in 1.22.5 (operator decision).  An exported value is reported
+# by validate_all and ignored; a PHP_SESSION_HARDENING line in the host file
+# is dropped from memory here and from the file by persist_php_jit, and the
+# next PHP tune rewrites zz-setup-optimize.ini without the block.
+RETIRED_SESSION_HARDENING_ENV=""
+if [[ -n ${SETUP_PHP_SESSION_HARDENING+x} ]]; then
+  RETIRED_SESSION_HARDENING_ENV="SETUP_PHP_SESSION_HARDENING=${SETUP_PHP_SESSION_HARDENING}"
+  unset SETUP_PHP_SESSION_HARDENING
+fi
+unset PHP_SESSION_HARDENING
+# Performance knobs removed in 1.22.5 because no value measured faster than
+# the hardware-derived default: the tracing-JIT hotness overrides
+# SETUP_PHP_JIT_HOT_{LOOP,FUNC,RETURN,SIDE_EXIT} and the SETUP_GZIP_LEVEL
+# pin.  An exported value is remembered for the warning validate_all prints
+# and dropped from the environment, never fatal.
+RETIRED_PERF_ENV=()
+for _retired in SETUP_PHP_JIT_HOT_LOOP SETUP_PHP_JIT_HOT_FUNC SETUP_PHP_JIT_HOT_RETURN \
+                SETUP_PHP_JIT_HOT_SIDE_EXIT SETUP_GZIP_LEVEL; do
+  if [[ -n ${!_retired+x} ]]; then
+    RETIRED_PERF_ENV+=("${_retired}=${!_retired}")
+    unset "$_retired"
+  fi
+done
+unset _retired
+# The opt-in monthly OPTIMIZE rebuild (SETUP_MARIADB_MONTHLY_OPTIMIZE=1,
+# persisted as MARIADB_MONTHLY_OPTIMIZE) was removed in 1.22.5: the monthly
+# mariadb-check always runs ANALYZE.  An exported value is reported by
+# validate_all and ignored; a persisted line is dropped from memory here and
+# from the host file by write_cron (mariadb_monthly_optimize_retire).
+RETIRED_MONTHLY_OPTIMIZE_ENV=""
+if [[ -n ${SETUP_MARIADB_MONTHLY_OPTIMIZE+x} ]]; then
+  RETIRED_MONTHLY_OPTIMIZE_ENV="SETUP_MARIADB_MONTHLY_OPTIMIZE=${SETUP_MARIADB_MONTHLY_OPTIMIZE}"
+  unset SETUP_MARIADB_MONTHLY_OPTIMIZE
+fi
+unset MARIADB_MONTHLY_OPTIMIZE
 # OPcache JIT: the tracing JIT is always on for the pool (buffer OPcache/8,
 # 32..128 MB, with tuned hotness thresholds (64/127/16/64) on 3+ CPU hosts and a
 # conservative set on 1-2 CPU hosts; measured +5% on the CPU-bound XenForo
@@ -187,7 +223,7 @@ SSL_REJECT_UNKNOWN_SNI="${SETUP_SSL_REJECT_UNKNOWN_SNI:-${SSL_REJECT_UNKNOWN_SNI
 # (default) a managed block at the end of each XenForo src/config.php keeps
 # XenForo's gzip for guests -- the FastCGI guest cache stores that compressed
 # body, so a hit costs no compression -- and turns it off for visitors with a
-# session cookie, whose pages nginx compresses (Brotli/gzip level 4).
+# session cookie, whose pages nginx compresses (Brotli level 1, gzip level 4).
 # SETUP_XF_MEMBER_GZIP=xenforo removes the block; the choice is persisted in
 # /etc/default/setup-tuning.  Since server-configs-nginx 1.6.56 the uncached
 # nginx handler withholds Accept-Encoding from PHP, so uncached pages are
@@ -202,12 +238,12 @@ if [[ -n ${SETUP_XF_MEMBER_GZIP+x} ]]; then
   XF_MEMBER_GZIP_PERSIST=1
 fi
 [[ $XF_MEMBER_GZIP == xenforo ]] || XF_MEMBER_GZIP=nginx
-# CPU vulnerability mitigations (Spectre/Meltdown/MDS/Retbleed...).  Empty =
-# never touched (the kernel default, on).  `--basic mitigations=off`,
-# `--optimize mitigations=off` or SETUP_CPU_MITIGATIONS=off add
-# `mitigations=off` to the kernel command line through a managed GRUB
-# drop-in (effective after the next reboot) and persist CPU_MITIGATIONS=off
-# here, so every later --optimize keeps it; `=on` removes the drop-in again.
+# CPU vulnerability mitigations (Spectre/Meltdown/MDS/Retbleed...).  Since
+# 1.22.5 every --basic and --optimize adds `mitigations=off` to the kernel
+# command line through a managed GRUB drop-in (effective after the next
+# reboot; lib/os.sh configure_cpu_mitigations).  mitigations=on and
+# SETUP_CPU_MITIGATIONS=on were removed (validate_all refuses them); a
+# persisted CPU_MITIGATIONS=on moves to off.  --purge basic removes it.
 # Measured on the Xeon E-2236 (PTI + IBRS): see tests/stress-site/RESULTS.md.
 CPU_MITIGATIONS="${CPU_MITIGATIONS:-}"
 CPU_MITIGATIONS_SETTING=""
@@ -355,6 +391,8 @@ source "${SCRIPT_DIR}/lib/php-build.sh"
 source "${SCRIPT_DIR}/lib/nginx-build.sh"
 # shellcheck source=lib/valkey-build.sh
 source "${SCRIPT_DIR}/lib/valkey-build.sh"
+# shellcheck source=lib/watchdog.sh
+source "${SCRIPT_DIR}/lib/watchdog.sh"
 
 # Last: its top-level defaults read what the build libs export
 # (NGINX_BUILD_DROPPABLE_RE / NGINX_BUILD_UNBUILT_RE, the build lock path).

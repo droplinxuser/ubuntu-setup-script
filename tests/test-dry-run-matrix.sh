@@ -136,7 +136,16 @@ run ok   --dry-run --basic --mariadb user=demo pass=temp size=4gb
 run ok   --dry-run --basic --mariadb user=demo pass=temp
 run ok   --dry-run --basic --mariadb user=demo pass=temp size=auto bind=127.0.0.1,IPV4
 run ok   --dry-run --basic --valkey
-run ok   --dry-run --basic --valkey ram=2g policy=noeviction io_threads=2
+run ok   --dry-run --basic --valkey ram=2g policy=allkeys-lfu
+# 1.22.5: io_threads= was removed (io-threads is always 1); a passed value,
+# even one the old validator refused, is ignored with a warning, never fatal.
+run_warn 'Ignored (removed in 1.22.5; io-threads above 1' --dry-run --basic --valkey ram=2g policy=allkeys-lfu io_threads=2
+run_warn 'Ignored (removed in 1.22.5; io-threads above 1' --dry-run --basic --valkey io_threads=0
+# 1.22.5: noeviction was removed; tcp= takes auto or on (never off).
+run fail --dry-run --basic --valkey policy=noeviction
+run ok   --dry-run --basic --valkey tcp=on
+run ok   --dry-run --basic --valkey tcp=auto
+run fail --dry-run --basic --valkey tcp=off
 run ok   --dry-run --basic --valkey ram=auto
 run ok   --dry-run --basic --elastic ram=4g host=localhost
 run fail --dry-run --basic --elastic host=localhost:9200
@@ -249,7 +258,6 @@ run fail --dry-run --domain example.com db=appdb user=Mysql pass=x
 run ok   --dry-run --domain example.com db=mysql_app user=sysop pass=x
 run fail --dry-run --basic --php children=0
 run fail --dry-run --basic --valkey policy=bogus
-run fail --dry-run --basic --valkey io_threads=0
 run fail --dry-run --basic --valkey ram=0
 run fail --dry-run --basic --elastic ram=x
 run fail --dry-run --basic --elastic ram=0
@@ -457,21 +465,27 @@ run fail --dry-run --basic --nginx anubis=yes
 run fail --dry-run --basic --nginx anubis=no
 run fail --dry-run --optimize anubis=yes
 run fail --dry-run --optimize anubis=no
-# CPU mitigations switch (--basic and --optimize, or SETUP_CPU_MITIGATIONS).
+# CPU mitigations: off is the default since 1.22.5 and mitigations=on was
+# removed (refused with an explanation; off stays accepted as a no-op).
 run ok   --dry-run --basic mitigations=off
-run ok   --dry-run --basic mitigations=on
+run_msg "mitigations=on was removed" --dry-run --basic mitigations=on
+run_msg "mitigations=on was removed" --dry-run --optimize mitigations=on
+run_msg "mitigations=on was removed" --dry-run --optimize mitigations=ON
+run_warn "CPU mitigations:" --dry-run --basic
 run ok   --dry-run --optimize mitigations=off
 run fail --dry-run --optimize anubis=yes mitigations=off
 run fail --dry-run --basic mitigations=maybe
 run fail --dry-run --optimize mitigations=
 # Any order: mitigations= after --dry-run used to be an unknown argument.
 run ok   --optimize --dry-run mitigations=off
-run ok   --basic --dry-run mitigations=on
+run_msg "mitigations=on was removed" --basic --dry-run mitigations=on
 run fail --optimize --dry-run mitigations=sometimes
 run fail --dry-run --php mitigations=off
 run fail --dry-run mitigations=off
 run_env ok   SETUP_CPU_MITIGATIONS=off --dry-run --optimize
 run_env fail SETUP_CPU_MITIGATIONS=sometimes --dry-run --optimize
+run_env_msg fail SETUP_CPU_MITIGATIONS=on "mitigations=on (SETUP_CPU_MITIGATIONS=on) was removed" --dry-run --optimize
+run_env_msg fail SETUP_CPU_MITIGATIONS=1 "was removed in 1.22.5" --dry-run --basic
 run fail --dry-run --optimize anubis=1
 run fail --dry-run --basic anubis=yes
 run fail --dry-run --basic --nginx anubis=maybe

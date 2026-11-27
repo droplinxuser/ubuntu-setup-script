@@ -2894,7 +2894,11 @@ migrate_valkey_cmd() {
   port=$(awk '$1 == "port" { v = $2 } END { print v }' "$c" 2>/dev/null)
   pass=$(awk '$1 == "requirepass" { $1 = ""; sub(/^ +/, ""); gsub(/^"|"$/, ""); v = $0 } END { print v }' "$c" 2>/dev/null)
   local -a target=()
-  if [[ -n $sock && -S $sock ]]; then target=(-s "$sock"); else target=(-h 127.0.0.1 -p "${port:-6379}"); fi
+  # A socket-only server (port 0, the 1.22.5 default) is asked on the
+  # default socket when the file names none that exists.
+  if [[ -n $sock && -S $sock ]]; then target=(-s "$sock")
+  elif [[ $port == 0 ]]; then target=(-s "${sock:-/run/valkey/valkey.sock}")
+  else target=(-h 127.0.0.1 -p "${port:-6379}"); fi
   REDISCLI_AUTH=$pass VALKEYCLI_AUTH=$pass timeout 10 "$vcli" "${target[@]}" "$@" 2>/dev/null
 }
 

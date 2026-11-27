@@ -1530,6 +1530,175 @@ tune_vhost_route_anchors() {
   return 0
 }
 
+# The QUIC catch-all (conf.d/1.https.default.conf, server-configs-nginx
+# 1.7.4) sets reuseport rcvbuf=4m sndbuf=4m on UDP 443.  nginx accepts socket
+# options on only one listen per address, so a vhost made from an older
+# template or the pre-1.7.4 h5bp/tls/http3.conf (`listen 443 quic
+# reuseport;`) fails nginx -t with "duplicate listen options" after the
+# sync.  Strip the socket options from such operator lines (every *.conf
+# under conf.d/, templates included, never the managed catch-all) and keep
+# the original line as a '# setup.sh: ' comment above it.  Not the
+# '# setup-nginx-build-off: ' marker: `nginx-build.sh restore` uncomments
+# that one, which would bring the duplicate back.  MODE scan prints
+# FILE:LINE for each line that still carries options and changes nothing.
+NGINX_QUIC_OPTS_MARK='# setup.sh: QUIC socket options are set by conf.d/1.https.default.conf: '
+_nginx_quic_listen_awk() { # mode file
+  awk -v mode="$1" -v mark="$NGINX_QUIC_OPTS_MARK" '
+    function keep() { if (mode != "scan") print }
+    {
+      semi = index($0, ";")
+      if ($0 !~ /^[[:space:]]*listen[[:space:]]/ || !semi) { keep(); next }
+      match($0, /^[[:space:]]*/); ind = substr($0, 1, RLENGTH)
+      body = substr($0, RLENGTH + 1, semi - RLENGTH - 1); rest = substr($0, semi)
+      n = split(body, t, /[[:space:]]+/)
+      if (n < 3 || t[2] !~ /(^|:)443$/) { keep(); next }
+      q = 0
+      for (i = 3; i <= n; i++) if (t[i] == "quic") q = 1
+      if (!q) { keep(); next }
+      out = t[1] " " t[2]; dropped = 0
+      for (i = 3; i <= n; i++) {
+        if (t[i] == "") continue
+        if (t[i] ~ /^(reuseport|deferred|bind)$/ \
+            || t[i] ~ /^(rcvbuf|sndbuf|backlog|fastopen|so_keepalive|ipv6only)=/) { dropped = 1; continue }
+        out = out " " t[i]
+      }
+      if (!dropped) { keep(); next }
+      if (mode == "scan") { print FILENAME ":" FNR; next }
+      print ind mark substr($0, length(ind) + 1)
+      print ind out rest
+    }
+  ' "$2"
+}
+
+tune_vhost_quic_listen_options() {
+  local target=${1:-/etc/nginx} file tmp
+  [[ -d $target/conf.d ]] || return 0
+  while IFS= read -r file; do
+    [[ $file == "$target/conf.d/1.https.default.conf" ]] && continue
+    grep -qE '^[[:space:]]*listen[[:space:]][^#]*quic' "$file" 2>/dev/null || continue
+    tmp=$(tmp_file) || return 1
+    _nginx_quic_listen_awk fix "$file" > "$tmp" || continue
+    if commit_if_changed "$file" "$tmp"; then
+      info "nginx: ${file#"$target"/}: QUIC listen socket options removed (set by the catch-all in conf.d/1.https.default.conf; original kept as a comment)"
+      tune_note "${file#"$target"/}: HTTP/3 listen socket options removed (owned by the QUIC catch-all)"
+    fi
+  done < <(find "$target/conf.d" -type f -name '*.conf' 2>/dev/null | sort)
+  return 0
+}
+
+# HTTP/3 on by default (1.22.5, server-configs-nginx 1.7.4): the templates
+# include h5bp/tls/http3.conf in every TLS server; existing vhosts get the
+# same line from --optimize.  A server block qualifies when it listens on
+# plain 443 (or [::]:443) with ssl, has no QUIC listen of its own and no
+# http3.conf include, active or commented out.  Commenting the include out
+# (`#include h5bp/tls/http3.conf;`) keeps HTTP/3 off for that vhost; a deleted
+# line comes back on the next run.  Only top-level conf.d/*.conf files are
+# edited (not the catch-alls, not templates/, which the sync owns).
+NGINX_HTTP3_MARK='# setup.sh: HTTP/3 on by default; comment this line out to turn it off'
+_nginx_http3_include_awk() { # file
+  awk -v mark="$NGINX_HTTP3_MARK" '
+    function code(s) { sub(/#.*/, "", s); return s }
+    function opens(s,   t) { t = code(s); return gsub(/\{/, "{", t) }
+    function closes(s,   t) { t = code(s); return gsub(/\}/, "}", t) }
+    function flush(   i, last, tls, quic, inc, n, tok, j, ssl, port) {
+      tls = 0; quic = 0; inc = 0; last = 0
+      for (i = 1; i <= nb; i++) {
+        if (buf[i] ~ /^[[:space:]]*#?[[:space:]]*include[[:space:]]+h5bp\/tls\/http3\.conf;/) inc = 1
+        if (bdepth[i] != 1 || code(buf[i]) !~ /^[[:space:]]*listen([[:space:]]|$)/) continue
+        # A listen directive continued on the next line: inserting after
+        # this line would split it, so leave the whole server block alone.
+        if (index(code(buf[i]), ";") == 0) { quic = 1; continue }
+        n = split(code(buf[i]), tok, /[[:space:];]+/)
+        ssl = 0; port = ""
+        for (j = 1; j <= n; j++) {
+          if (tok[j] == "listen" && port == "") { port = tok[j + 1] }
+          if (tok[j] == "quic") quic = 1
+          if (tok[j] == "ssl") ssl = 1
+        }
+        if (ssl && (port == "443" || port == "[::]:443")) { tls = 1; last = i }
+      }
+      for (i = 1; i <= nb; i++) {
+        print buf[i]
+        if (i == last && tls && !quic && !inc) {
+          match(buf[i], /^[[:space:]]*/)
+          print substr(buf[i], 1, RLENGTH) mark
+          print substr(buf[i], 1, RLENGTH) "include h5bp/tls/http3.conf;"
+        }
+      }
+      nb = 0
+    }
+    {
+      if (!inserver && depth == 0 && code($0) ~ /^[[:space:]]*server[[:space:]]*\{/) { inserver = 1 }
+      if (inserver) { nb++; buf[nb] = $0; bdepth[nb] = depth }
+      else print
+      depth += opens($0) - closes($0)
+      if (inserver && depth <= 0) { depth = 0; inserver = 0; flush() }
+    }
+    END { if (nb) for (i = 1; i <= nb; i++) print buf[i] }
+  ' "$1"
+}
+
+# FILE... -> the files under TARGET/conf.d (top level) the HTTP/3 default
+# would change.  Read-only.
+nginx_http3_candidates() {
+  local target=${1:-/etc/nginx} file tmp
+  [[ -f $target/h5bp/tls/http3.conf ]] || return 0
+  for file in "$target"/conf.d/*.conf; do
+    [[ -f $file ]] || continue
+    case ${file##*/} in 1.http.default.conf|1.https.default.conf) continue ;; esac
+    grep -qE '^[[:space:]]*listen[[:space:]][^#;]*[[:space:]]ssl' "$file" 2>/dev/null || continue
+    tmp=$(tmp_file) || return 1
+    _nginx_http3_include_awk "$file" > "$tmp" || continue
+    cmp -s "$file" "$tmp" || printf '%s\n' "$file"
+  done
+  return 0
+}
+
+# Add the include to every qualifying vhost, but only on a tree that passes
+# nginx -t before and after: the edit is undone (inode kept) when the test
+# fails afterwards, so an unusual vhost (an indirect QUIC listen, an
+# address-specific 443 elsewhere) can never block --optimize.
+tune_vhost_http3_default() {
+  local target=${1:-/etc/nginx} file tmp bak
+  local -a files=() baks=()
+  mapfile -t files < <(nginx_http3_candidates "$target")
+  (( ${#files[@]} )) || return 0
+  if ! nginx_test_tree "$target/nginx.conf" >/dev/null 2>&1; then
+    tune_note "nginx: HTTP/3 not added to ${#files[@]} vhost(s): the tree fails nginx -t without it"
+    return 0
+  fi
+  for file in "${files[@]}"; do
+    tmp=$(tmp_file) || return 1
+    bak=$(tmp_file) || return 1
+    cat "$file" > "$bak"
+    _nginx_http3_include_awk "$file" > "$tmp" && cat "$tmp" > "$file"
+    baks+=("$bak")
+  done
+  if nginx_test_tree "$target/nginx.conf" >/dev/null 2>&1; then
+    for file in "${files[@]}"; do
+      tune_note "${file#"$target"/}: HTTP/3 enabled (include h5bp/tls/http3.conf; comment it out to turn it off)"
+    done
+    return 0
+  fi
+  local i
+  for i in "${!files[@]}"; do cat "${baks[$i]}" > "${files[$i]}"; done
+  warn "nginx: adding HTTP/3 (h5bp/tls/http3.conf) made nginx -t fail; ${#files[@]} vhost(s) left unchanged: ${files[*]#"$target"/}"
+  return 0
+}
+
+# After a failed nginx -t: name every listen line under TARGET (outside the
+# catch-all) that still sets socket options on QUIC 443, so the failure says
+# what to edit instead of only "configuration test failed".
+nginx_quic_listen_conflicts() {
+  local target=${1:-/etc/nginx} file
+  while IFS= read -r file; do
+    [[ $file == "$target/conf.d/1.https.default.conf" ]] && continue
+    grep -qE '^[[:space:]]*listen[[:space:]][^#]*quic' "$file" 2>/dev/null || continue
+    _nginx_quic_listen_awk scan "$file"
+  done < <(find "$target" -type f -name '*.conf' 2>/dev/null | sort)
+  return 0
+}
+
 # server-configs-nginx 1.6.48 moved every deny rule of the four application
 # includes into one regex location per application
 # (h5bp/location/security_{xf,wp,chev,flarum}.conf, included by
@@ -1878,6 +2047,61 @@ nginx_local_php_follow_pool() {
   return 0
 }
 
+# Number of CPUs in a sysfs CPU list such as "0-3,8-11" (empty when not a list).
+cpu_list_count() {
+  local list=$1 part n=0 a b
+  [[ $list =~ ^[0-9,-]+$ ]] || return 0
+  local IFS=,
+  for part in $list; do
+    if [[ $part =~ ^([0-9]+)-([0-9]+)$ ]]; then
+      a=${BASH_REMATCH[1]}; b=${BASH_REMATCH[2]}
+      (( b >= a )) && n=$(( n + b - a + 1 ))
+    elif [[ $part =~ ^[0-9]+$ ]]; then
+      n=$(( n + 1 ))
+    fi
+  done
+  (( n > 0 )) && printf '%s' "$n"
+  return 0
+}
+
+# Why `worker_cpu_affinity auto` must not pin on this host (empty: pin).
+# auto binds worker N to CPU N counting from 0, which is wrong when
+#   - a cgroup CPU quota leaves fewer CPUs than the affinity mask allows
+#     (the other services float while nginx sits on CPUs 0..N-1),
+#   - a cpuset restricts the process to part of the online CPUs (nproc
+#     honours the mask, so it cannot see this; the targets may lie outside
+#     the set: sched_setaffinity EINVAL and floating workers),
+#   - the host has more than one NUMA node (the numbering follows neither
+#     node nor NIC locality).
+# $1: effective CPUs (effective_cpus).  SETUP_SYS_CPU_ONLINE and
+# SETUP_SYS_NODE_DIR point at fixtures in tests.  A normal host prints
+# nothing, so nginx.conf keeps the template's line.
+nginx_cpu_pin_block_reason() {
+  local eff=$1 mask online="" nodes=0 f
+  mask=$(unset OMP_NUM_THREADS OMP_THREAD_LIMIT; nproc 2>/dev/null || true)
+  f=${SETUP_SYS_CPU_ONLINE:-/sys/devices/system/cpu/online}
+  [[ -r $f ]] && online=$(cpu_list_count "$(tr -d '[:space:]' < "$f")")
+  [[ -n $online ]] || online=$(nproc --all 2>/dev/null || true)
+  if [[ $mask =~ ^[0-9]+$ && $eff =~ ^[0-9]+$ ]] && (( eff < mask )); then
+    printf 'cgroup CPU quota'
+    return 0
+  fi
+  if [[ $mask =~ ^[0-9]+$ && $online =~ ^[0-9]+$ ]] && (( mask < online )); then
+    printf 'cpuset of %s of %s CPUs' "$mask" "$online"
+    return 0
+  fi
+  # Only nodes with CPUs count: a memory-only node (CXL, some VMs) has an
+  # empty cpulist and says nothing about worker locality.
+  for f in "${SETUP_SYS_NODE_DIR:-/sys/devices/system/node}"/node[0-9]*; do
+    [[ -d $f && -r $f/cpulist ]] || continue
+    [[ -n $(tr -d '[:space:]' < "$f/cpulist") ]] && nodes=$(( nodes + 1 ))
+  done
+  if (( nodes > 1 )); then
+    printf '%s NUMA nodes' "$nodes"
+  fi
+  return 0
+}
+
 tune_nginx_configs() {
   local target=${1:-/etc/nginx}
   local nginx_conf="${target}/nginx.conf"
@@ -1917,6 +2141,9 @@ tune_nginx_configs() {
   # exceed what worker_rlimit_nofile leaves after the connections themselves
   # (a 4-core/32 GB host used to get 200000 entries against a 65536 limit).
   open_files=$(nginx_open_file_cache_max "$mem_mb" "$worker_rlimit" "$worker_connections")
+  # The connections also hold an upstream socket each (FastCGI/proxy):
+  # raise the limit so that worst case fits too (1.22.5 fd plan).
+  worker_rlimit=$(nginx_worker_rlimit_fit "$worker_rlimit" "$worker_connections" "$open_files")
 
   if (( mem_mb < 2048 )); then
     fastcgi_buffers='32 16k'; fastcgi_busy='256k'; body_buffer='64k'
@@ -2031,13 +2258,15 @@ tune_nginx_configs() {
   tune_replace "$nginx_conf" '^([[:space:]]*worker_processes[[:space:]]+)[^;]+;' "\\1${NGINX_WORKER_PROCESSES};" "nginx.conf: worker_processes=${NGINX_WORKER_PROCESSES}"
   # With a cgroup CPU quota below the host's core count, `auto` affinity
   # would pin the N workers to CPUs 0..N-1 while every other service floats;
-  # let the scheduler place them instead.
-  local host_cpus
-  host_cpus=$(nproc 2>/dev/null || echo "$nproc")
-  if [[ $host_cpus =~ ^[0-9]+$ ]] && (( nproc < host_cpus )); then
+  # let the scheduler place them instead.  The same for a cpuset (the online
+  # count, not nproc, which already honours the affinity mask) and for a
+  # host with several NUMA nodes (auto walks CPU numbers, not nodes).
+  local pin_why
+  pin_why=$(nginx_cpu_pin_block_reason "$nproc")
+  if [[ -n $pin_why ]]; then
     tune_replace "$nginx_conf" '^([[:space:]]*)worker_cpu_affinity[[:space:]]+auto;' \
-      '\1# worker_cpu_affinity auto; # setup.sh: cgroup CPU quota, no pinning' \
-      "nginx.conf: worker_cpu_affinity disabled (quota ${nproc} of ${host_cpus} CPUs)"
+      "\\1# worker_cpu_affinity auto; # setup.sh: ${pin_why}, no pinning" \
+      "nginx.conf: worker_cpu_affinity disabled (${pin_why})"
   fi
   # Storage-class dependent file I/O: on flash the page cache serves hot
   # files cheaply, so only very large files bypass it (directio 16m); a
@@ -2447,10 +2676,8 @@ sync_php_ini_template() {
   # Never leave a global cgi.fix_pathinfo override in the default template.
   # With fix_pathinfo=0 PHP-FPM prefers PATH_TRANSLATED; the deployed PHP
   # includes used to map that to the document root, so every pretty URL was
-  # denied.  The opt-in hardening block writes the value deliberately after
-  # PATH_TRANSLATED is repaired.
-  if [[ ${SETUP_PHP_SESSION_HARDENING:-0} != 1 ]] \
-     && grep -qE '^[[:space:]]*cgi\.fix_pathinfo[[:space:]]*=' "$tmp"; then
+  # denied.
+  if grep -qE '^[[:space:]]*cgi\.fix_pathinfo[[:space:]]*=' "$tmp"; then
     local cleaned
     cleaned=$(tmp_file) || return 1
     grep -vE '^[[:space:]]*cgi\.fix_pathinfo[[:space:]]*=' "$tmp" > "$cleaned" || true
@@ -2518,10 +2745,11 @@ php_pool_set_listener() {
 # buffer of an eighth of the OPcache (32..128 MB).  Shared by the ini writer
 # and the dry run.  Argument: opcache.memory_consumption in MB.
 #
-# The buffer is reserved per PHP-FPM worker, so it is a real memory decision,
-# not just a tuning knob: 512 MB OPcache / 8 = 64 MB, which on the 32-worker
-# application pool is 2 GiB of reservation instead of the 4 GiB the old
-# quarter-size (128 MB) buffer asked for.  Measured on the dev host (PHP 8.5.12,
+# The buffer lives inside OPcache's one shared segment (memory_consumption
+# plus jit_buffer_size), which the master maps once and every worker shares:
+# it is reserved once per PHP-FPM pool, not per worker (vm.nr_hugepages and
+# the memory plan count it once, lib/os.sh).  512 MB OPcache / 8 = 64 MB of
+# JIT buffer; the old quarter-size buffer asked for 128 MB.  Measured on the dev host (PHP 8.5.12,
 # tracing JIT, 32 workers, 20 s runs): 64 MB and 128 MB were within 0.5% of
 # each other on every tier (XenForo member 909 vs 906 req/s, WordPress
 # member 234 vs 229); 256 MB was slower (899 / 225).  Function JIT lost 6-8%
@@ -2566,17 +2794,14 @@ php_hugepages_ok() {
 # while the conservative set (128/255/32/128) lost 3-4% on the member tiers.
 # A 1-2 CPU host pays proportionally more for compilation, so it gets the
 # conservative set, which keeps the single PHP worker serving requests.
-# SETUP_PHP_JIT_HOT_{LOOP,FUNC,RETURN,SIDE_EXIT} override each value.
+# No override: no other value measured faster (the SETUP_PHP_JIT_HOT_*
+# variables were removed in 1.22.5 and are ignored with a warning).
 php_jit_threshold_lines() {
   local cpu=${1:-0} loop=64 func=127 ret=16 side=64
   [[ $cpu =~ ^[0-9]+$ ]] && (( cpu > 0 )) || cpu=$(effective_cpus)
   if (( cpu <= 2 )); then
     loop=128; func=255; ret=32; side=128
   fi
-  [[ ${SETUP_PHP_JIT_HOT_LOOP:-} =~ ^[0-9]+$ ]] && loop=$SETUP_PHP_JIT_HOT_LOOP
-  [[ ${SETUP_PHP_JIT_HOT_FUNC:-} =~ ^[0-9]+$ ]] && func=$SETUP_PHP_JIT_HOT_FUNC
-  [[ ${SETUP_PHP_JIT_HOT_RETURN:-} =~ ^[0-9]+$ ]] && ret=$SETUP_PHP_JIT_HOT_RETURN
-  [[ ${SETUP_PHP_JIT_HOT_SIDE_EXIT:-} =~ ^[0-9]+$ ]] && side=$SETUP_PHP_JIT_HOT_SIDE_EXIT
   printf 'opcache.jit_hot_loop = %s\nopcache.jit_hot_func = %s\nopcache.jit_hot_return = %s\nopcache.jit_hot_side_exit = %s\n' \
     "$loop" "$func" "$ret" "$side"
 }
@@ -2791,32 +3016,51 @@ php_jit_path_sections() {
 # them.  Written once per run.
 PHP_JIT_PERSISTED=0
 
-# The opt-in session/cgi hardening (SETUP_PHP_SESSION_HARDENING=1) is a
-# feature choice, not a hardware value.  It used to be read only from the
-# environment, so the next plain --optimize rewrote zz-setup-optimize.ini
-# without the block and sync_php_ini_template stripped cgi.fix_pathinfo: the
-# hardening silently disappeared.  The choice is recorded as
-# PHP_SESSION_HARDENING in /etc/default/setup-tuning (setup.sh sources it
-# before this file) and folded back into SETUP_PHP_SESSION_HARDENING, the one
-# flag every gate reads.  The environment still wins for a one-off run.
-PHP_SESSION_HARDENING_PERSIST=0
-php_session_hardening_load() {
-  if [[ -n ${SETUP_PHP_SESSION_HARDENING+x} ]]; then
-    PHP_SESSION_HARDENING_PERSIST=1
-    [[ $SETUP_PHP_SESSION_HARDENING == 1 ]] || SETUP_PHP_SESSION_HARDENING=0
-  elif [[ ${PHP_SESSION_HARDENING:-0} == 1 ]]; then
-    SETUP_PHP_SESSION_HARDENING=1
+# OPcache knob (1.22.5), persisted like the choices above and read back from
+# /etc/default/setup-tuning on a later --optimize.  validate_timestamps is
+# always 1 (revalidate_freq 60): the =0 option was removed before release
+# (operator decision: stale code after deploys costs more than it gains).
+#   SETUP_PHP_OPCACHE_FILE_OVERRIDE=0|1 (default 1 since 1.22.5: XenForo
+#     member pages +2-4 % on the Intel host, no tier slower;
+#     PHP_OPCACHE_FILE_OVERRIDE): 1 writes opcache.enable_file_override = 1,
+#     0 leaves it out.
+# The environment wins over the host file; any value other than the
+# non-default one means the default.
+PHP_OPCACHE_FILE_OVERRIDE_PERSIST=0
+php_opcache_opts_load() {
+  if [[ -n ${SETUP_PHP_OPCACHE_FILE_OVERRIDE+x} ]]; then
+    PHP_OPCACHE_FILE_OVERRIDE=$SETUP_PHP_OPCACHE_FILE_OVERRIDE
+    PHP_OPCACHE_FILE_OVERRIDE_PERSIST=1
+  fi
+  if [[ ${PHP_OPCACHE_FILE_OVERRIDE:-1} == 0 ]]; then PHP_OPCACHE_FILE_OVERRIDE=0; else PHP_OPCACHE_FILE_OVERRIDE=1; fi
+  return 0
+}
+php_opcache_opts_load
+
+# Persist one OPcache choice: always when the environment set it this run;
+# otherwise re-write a non-default value read from the host file when the
+# file no longer carries it (the --optimize profile reset moves pins that
+# are not on its keep-list out of the way), so the choice survives.
+php_opcache_persist_one() {
+  local key=$1 value=$2 explicit=$3 default=$4 f=${SETUP_TUNING_FILE:-/etc/default/setup-tuning}
+  if (( explicit )); then
+    persist_tuning_var "$key" "$value"
+    tune_summary "PHP: ${key}=${value} persisted in /etc/default/setup-tuning"
+  elif [[ $value != "$default" ]] && ! grep -qx "${key}=${value}" "$f" 2>/dev/null; then
+    persist_tuning_var "$key" "$value"
   fi
   return 0
 }
-php_session_hardening_load
 
 persist_php_jit() {
   # PHP_BUILD / PHP_FPM_MODULES are no longer persisted: 1.22 always builds
   # PHP from source with a static extension set (lib/php-build.sh).
-  if (( PHP_SESSION_HARDENING_PERSIST )); then
-    persist_tuning_var PHP_SESSION_HARDENING "$SETUP_PHP_SESSION_HARDENING"
-    tune_note "PHP: PHP_SESSION_HARDENING=${SETUP_PHP_SESSION_HARDENING} persisted in /etc/default/setup-tuning"
+  # The session/cgi hardening option was removed in 1.22.5: drop its pin.
+  local tf=${SETUP_TUNING_FILE:-/etc/default/setup-tuning}
+  if [[ -f $tf ]] && grep -qE '^PHP_SESSION_HARDENING=' "$tf" 2>/dev/null \
+     && { [[ ${EUID} -eq 0 || -n ${SETUP_TUNING_FILE:-} ]]; }; then
+    sed_in_place -E '/^PHP_SESSION_HARDENING=/d' "$tf"
+    tune_note "PHP: PHP_SESSION_HARDENING removed from /etc/default/setup-tuning (the session/cgi hardening option was removed in 1.22.5; zz-setup-optimize.ini no longer carries the block)"
   fi
   if (( PHP_JIT_WORDPRESS_PERSIST )); then
     persist_tuning_var PHP_JIT_WORDPRESS "$PHP_JIT_WORDPRESS"
@@ -2826,6 +3070,7 @@ persist_php_jit() {
     persist_tuning_var PHP_PAGE_GZIP "$PHP_PAGE_GZIP"
     tune_note "PHP: PHP_PAGE_GZIP=${PHP_PAGE_GZIP} persisted in /etc/default/setup-tuning"
   fi
+  php_opcache_persist_one PHP_OPCACHE_FILE_OVERRIDE "${PHP_OPCACHE_FILE_OVERRIDE:-1}" "${PHP_OPCACHE_FILE_OVERRIDE_PERSIST:-0}" 1
 }
 
 # RAM-derived php.ini values shared by the tuner and the dry-run preview so
@@ -3010,11 +3255,6 @@ tune_php_fpm_version() {
       opcache_hugepages=1
     fi
   fi
-  # Scripts restored from the OPcache file cache are never JIT-compiled
-  # (measured: with the file cache in place the JIT buffer stayed at 2.5 KB
-  # through a full load test on 8.4; with it cleared the same warm-up
-  # compiled 850 KB).  The file cache only warms restarts, so it stays off.
-  local opcache_file_cache=""
   memory_mb=$PHP_PROFILE_MEMORY_MB
   realpath_kb=$PHP_PROFILE_REALPATH_KB
 
@@ -3054,7 +3294,14 @@ tune_php_fpm_version() {
   tune_pool_set "$pool" request_slowlog_timeout 10s "PHP ${ver}: request_slowlog_timeout=10s"
   tune_pool_set "$pool" catch_workers_output yes "PHP ${ver}: catch_workers_output=yes"
   tune_pool_set "$pool" security.limit_extensions .php "PHP ${ver}: security.limit_extensions=.php"
-  tune_pool_set "$pool" rlimit_files 524288 "PHP ${ver}: rlimit_files=524288"
+  # The service watchdog's liveness probe (lib/watchdog.sh) sends one
+  # FastCGI request for this path over the pool socket; FPM answers it
+  # itself ("pong"), no script runs.  nginx cannot pass it: every
+  # fastcgi_pass location matches *.php only.  An existing ping.path stays.
+  if ! grep -qE '^[[:space:]]*ping\.path[[:space:]]*=' "$pool"; then
+    tune_pool_set "$pool" ping.path /setup-fpm-ping "PHP ${ver}: ping.path=/setup-fpm-ping (service watchdog liveness probe)"
+  fi
+  tune_pool_set "$pool" rlimit_files "${NOFILE_PHP_RLIMIT_FILES:-524288}" "PHP ${ver}: rlimit_files=${NOFILE_PHP_RLIMIT_FILES:-524288}"
   tune_pool_set "$pool" rlimit_core 0 "PHP ${ver}: rlimit_core=0"
   # Bound master/worker shutdown; see ensure_fpm_global_timeout().
   ensure_fpm_global_timeout "$ver"
@@ -3084,9 +3331,7 @@ tune_php_fpm_version() {
   local accel_files
   accel_files=$(php_accelerated_files_target)
 
-  mkdir -p "$ini_dir" /var/cache/php/opcache
-  chown -R www-data:www-data /var/cache/php 2>/dev/null || true
-  chmod 750 /var/cache/php /var/cache/php/opcache 2>/dev/null || true
+  mkdir -p "$ini_dir"
   # The pool template names its own version (pid path); rewrite any phpN.N,
   # not only php8.x, so a 9.x pool is handled the same way.  The listener is
   # excluded: php_pool_set_listener already wrote the path nginx points at,
@@ -3094,6 +3339,9 @@ tune_php_fpm_version() {
   sed_in_place -E "/^[[:space:]]*listen[[:space:]]*=/! s|php[0-9]+\.[0-9]+|php${ver}|g" "$pool"
   local ini_before=""
   [[ -f $ini ]] && ini_before=$(file_md5 "$ini")
+  # opcache.file_cache is written explicitly empty so a stray ini sorting
+  # earlier cannot turn it on: scripts restored from the file cache are
+  # never JIT-compiled (measured 3-5% slower on 8.4).
   cat > "$ini" <<EOF
 ; Managed by setup.sh --optimize (hardware-aware PHP tuning).
 ; This file sorts last in conf.d so it wins over earlier defaults.
@@ -3113,45 +3361,16 @@ $(php_jit_threshold_lines "$nproc")
 opcache.max_accelerated_files = ${accel_files}
 opcache.validate_timestamps = 1
 opcache.revalidate_freq = 60
-opcache.file_cache = ${opcache_file_cache}
+opcache.file_cache =
 opcache.file_cache_only = 0
 mysqlnd.net_cmd_buffer_size = 524288
 mysqli.default_socket = /run/mysqld/mysqld.sock
 pdo_mysql.default_socket = /run/mysqld/mysqld.sock
 EOF
-  if [[ ${SETUP_PHP_SESSION_HARDENING:-0} == 1 ]]; then
-    local php_error_log=/var/www/logs/php/php-error.log
-    ensure_fpm_log_path "$php_error_log" "${fpm_user:-www-data}" "${fpm_group:-www-data}"
-    cat >> "$ini" <<EOF
-
-; Optional session/cgi hardening, enabled with SETUP_PHP_SESSION_HARDENING=1.
-; Not written by default: strict session IDs and Secure cookies can break
-; Joomla/Polr sites and applications that validate PHP session identifiers.
-cgi.fix_pathinfo = 0
-expose_php = Off
-display_errors = Off
-log_errors = On
-error_log = ${php_error_log}
-session.use_strict_mode = 1
-session.use_only_cookies = 1
-session.cookie_httponly = 1
-session.cookie_secure = 1
-session.cookie_samesite = Lax
-session.gc_maxlifetime = 14400
-EOF
-    # session.sid_length and session.sid_bits_per_character are deprecated as
-    # of PHP 8.4 (each FPM start logs the deprecation, and a later release
-    # drops them); 8.4 uses its defaults instead (32 chars x 4 bits = 128 bits
-    # of session-ID entropy, still far beyond guessing).
-    local php_major=${ver%%.*} php_minor=${ver#*.}
-    php_minor=${php_minor%%.*}
-    if [[ $php_major =~ ^[0-9]+$ && $php_minor =~ ^[0-9]+$ ]] \
-       && (( php_major < 8 || (php_major == 8 && php_minor < 4) )); then
-      cat >> "$ini" <<EOF
-session.sid_length = 48
-session.sid_bits_per_character = 6
-EOF
-    fi
+  # OPcache knobs (php_opcache_opts_load).  enable_file_override is on by
+  # default (1.22.5); SETUP_PHP_OPCACHE_FILE_OVERRIDE=0 leaves it out.
+  if [[ ${PHP_OPCACHE_FILE_OVERRIDE:-1} == 1 ]]; then
+    printf '; file_exists/is_file/is_readable on cached scripts answered from OPcache (SETUP_PHP_OPCACHE_FILE_OVERRIDE=0 turns it off)\nopcache.enable_file_override = 1\n' >> "$ini"
   fi
   # Per-directory sections must come last: everything after a section header
   # belongs to that section.
@@ -3167,9 +3386,6 @@ EOF
   ini_after=$(file_md5 "$ini")
   if [[ $ini_before != "$ini_after" ]]; then
     tune_note "PHP ${ver}: memory_limit=${memory_mb}M opcache=${opcache_mb}M jit=${jit_desc}"
-    if [[ ${SETUP_PHP_SESSION_HARDENING:-0} == 1 ]]; then
-      tune_note "PHP ${ver}: optional session/cgi hardening"
-    fi
   fi
 
   # Test exactly what the unit starts.  The compiled php-fpm has no Debian
@@ -3345,19 +3561,18 @@ nginx_retire_module_loads() {
   return 0
 }
 
-# Dynamic Brotli level: SETUP_BROTLI_LEVEL when valid, otherwise 4, or 3 on a
-# 1-2 CPU host where per-response compression competes with PHP for cores.
+# Dynamic Brotli level: SETUP_BROTLI_LEVEL when valid, otherwise 1 (1.22.5).
 # One owner for the install, --optimize and dry-run values.
 nginx_brotli_level() {
   local level=${SETUP_BROTLI_LEVEL:-}
   if ! [[ $level =~ ^([1-9]|1[01])$ ]]; then
     # Every compressible response, static assets included (no siblings).
-    # Measured on an 8 vCPU XenForo origin (130 KB HTML thread page, nginx
-    # CPU per request): level 5 = 5.3 ms, level 4 = 2.7 ms, level 3 = 1.5 ms
-    # for 21 / 23 / 24 KB on the wire.  Level 4 halves the compression CPU of
-    # every member page for 10% more bytes; 1-2 CPU hosts take level 3.
-    level=4
-    (( $(effective_cpus) <= 2 )) && level=3
+    # 1.22.5, XenForo behind Cloudflare, pinned clock, two interleaved
+    # rounds: level 1 served 4.2-4.7 % more uncached req/s than level 4 on
+    # every tier (p99 equal or lower) for about 16 % more bytes to the
+    # proxy (11.1 vs 9.5 KB per home page); levels 2 and 3 sat between.
+    # Compression competes with PHP for the same cores on every host size.
+    level=1
   fi
   printf '%s' "$level"
 }
@@ -3734,6 +3949,9 @@ deploy_nginx_tree() {
         "$target/http.d/limit_req_conf" \
         "$target/http.d/proxy_cache_conf" \
         "$target/http.d/referer_map.conf" \
+        "$target/http.d/ppa_eilander_conf" \
+        "$target/http.d/http_trim_filter_conf" \
+        "$target/http.d/reverse_proxy_conf" \
         "$target/h5bp/limit_req/_high_conf" \
         "$target/h5bp/limit_req/_medium_conf" \
         "$target/h5bp/tls/private.key" \
@@ -3755,6 +3973,9 @@ deploy_nginx_tree() {
   if declare -F nginx_migrate_guest_cache_includes >/dev/null 2>&1; then
     nginx_migrate_guest_cache_includes "$target" || warn "Nested guest-cache include migration reported a problem"
   fi
+  # The QUIC catch-all now owns the UDP 443 socket options; an operator
+  # vhost that still sets them would fail the test below.
+  tune_vhost_quic_listen_options "$target" || true
 
   # Normalise ownership/modes for everything except operator certificates and
   # stream configs.  scripts/*.sh stay executable for the Cloudflare cron job.
@@ -3844,11 +4065,20 @@ deploy_nginx_tree() {
     fi
   fi
 
+  # HTTP/3 on by default in existing vhosts too (self-testing: it only
+  # changes a tree that passes nginx -t before and after).
+  tune_vhost_http3_default "$target" || true
+
   # Validate before anything reloads.  A stopped service is valid (the tree is
   # applied at the next start); reload only when the unit is active.  The
   # migration tests with its candidate binary (NGINX_TEST_BIN).
   if ! nginx_test_tree "$target/nginx.conf"; then
     warn "nginx configuration test failed; live service left untouched"
+    local quic_hit
+    while IFS= read -r quic_hit; do
+      [[ -n $quic_hit ]] || continue
+      warn "nginx: ${quic_hit#"$target"/} sets socket options on a QUIC 443 listen; conf.d/1.https.default.conf owns reuseport/rcvbuf/sndbuf for UDP 443 (\"duplicate listen options\"): remove them from that line"
+    done < <(nginx_quic_listen_conflicts "$target")
     return 1
   fi
   # The install and --optimize paths tune the synced tree before they reload

@@ -249,15 +249,85 @@ diag_mariadb_log_files() {
   } | sort -u
 }
 
+# MariaDB collations (report only, read-only SELECTs).  From 11.2 (Ubuntu
+# 26.04 ships 11.8) @@character_set_collations maps utf8mb4 to a uca1400
+# collation, so a statement that names only CHARSET utf8mb4 (an ALTER ...
+# CONVERT TO CHARACTER SET utf8mb4, an add-on installer, SET NAMES utf8mb4)
+# gets uca1400 while the app tables keep the general_ci/unicode_ci they were
+# created with; comparing the two raises error 1267 "Illegal mix of
+# collations".  WARN when an app schema mixes utf8mb4 collations, or when
+# that default is uca1400 and app columns use another utf8mb4 collation.
+# Binary (_bin) columns are a deliberate per-column choice and not counted.
+# Nothing is changed.  diag_mariadb_query is the test seam.
+diag_mariadb_query() {
+  timeout 10 mariadb -N -B -e "$1" 2>/dev/null
+}
+# $1=full (diagnostics section) or short (one --optimize Verify line).
+diag_mariadb_collations() {
+  local mode=${1:-full} ver map srv conn defc="" cols warns="" schema n tot
+  if ! diag_mariadb_installed || ! command -v mariadb >/dev/null 2>&1; then
+    [[ $mode == short ]] || printf 'MariaDB is not installed; collation check skipped\n'
+    return 0
+  fi
+  if ! ver=$(diag_mariadb_query 'SELECT @@version') || [[ -z $ver ]]; then
+    printf 'MariaDB: server not reachable; collation check skipped\n'
+    return 0
+  fi
+  # character_set_collations exists from 11.2 only; empty before.
+  map=$(diag_mariadb_query 'SELECT @@character_set_collations' || true)
+  srv=$(diag_mariadb_query 'SELECT @@collation_server' || true)
+  conn=$(diag_mariadb_query 'SELECT @@collation_connection' || true)
+  defc=$(printf '%s\n' "$map" | tr ',' '\n' | sed -n 's/^[[:space:]]*utf8mb4[[:space:]]*=[[:space:]]*//p' | head -n 1)
+  # schema <TAB> collation <TAB> columns, app schemas only.
+  cols=$(diag_mariadb_query "SELECT table_schema, collation_name, COUNT(*) FROM information_schema.columns WHERE collation_name IS NOT NULL AND table_schema NOT IN ('mysql','information_schema','performance_schema','sys') GROUP BY table_schema, collation_name ORDER BY table_schema, COUNT(*) DESC" || true)
+  while IFS=$'\t' read -r schema n; do
+    [[ -n $schema ]] || continue
+    warns+="${warns:+; }schema ${schema} mixes utf8mb4 collations (${n})"
+  done < <(printf '%s\n' "$cols" | awk -F'\t' '
+    $2 ~ /^utf8mb4_/ && $2 !~ /_bin$/ { c[$1]++; l[$1] = l[$1] (l[$1] == "" ? "" : ", ") $2 " " $3 }
+    END { for (s in c) if (c[s] > 1) printf "%s\t%s\n", s, l[s] }' | sort)
+  if [[ $defc == utf8mb4_uca1400* ]]; then
+    n=$(printf '%s\n' "$cols" | awk -F'\t' -v d="$defc" '
+      $2 ~ /^utf8mb4_/ && $2 !~ /_bin$/ && $2 != d { if (!seen[$2]++) o = o (o == "" ? "" : ", ") $2 }
+      END { print o }')
+    if [[ -n $n ]]; then
+      warns+="${warns:+; }character_set_collations maps utf8mb4 to ${defc} but app columns use ${n}: statements naming only CHARSET utf8mb4 or SET NAMES utf8mb4 risk 'Illegal mix of collations' (error 1267)"
+    fi
+  fi
+  if [[ $mode == short ]]; then
+    tot=$(printf '%s\n' "$cols" | awk -F'\t' 'NF == 3 { t[$2] += $3 } END { for (k in t) print k " " t[k] }' | sort | paste -sd, - | sed 's/,/, /g')
+    printf '%sMariaDB %s: utf8mb4 default %s, collation_server %s, app column collations %s%s\n' \
+      "${warns:+WARN }" "$ver" "${defc:-n/a (before 11.2)}" "${srv:-?}" "${tot:-none}" "${warns:+; ${warns}}"
+    return 0
+  fi
+  printf '@@version: %s\n' "$ver"
+  printf '@@character_set_collations: %s\n' "${map:-(empty or not supported before 11.2)}"
+  printf '@@collation_server: %s\n' "${srv:-?}"
+  printf '@@collation_connection: %s\n' "${conn:-?}"
+  printf -- '--- columns per collation (schema, collation, columns)\n'
+  if [[ -n $cols ]]; then printf '%s\n' "$cols"; else printf '(no app schema columns with a collation)\n'; fi
+  if [[ -n $warns ]]; then
+    printf 'WARN %s\n' "${warns//; /$'\n'WARN }"
+  else
+    printf 'collations: ok\n'
+  fi
+  return 0
+}
+
 diag_redis_log_files() {
-  local cli value
+  local cli value sock
+  local -a socks=()
+  mapfile -t socks < <(diag_valkey_sockets)
   {
     while IFS= read -r cli; do
       [[ -n $cli ]] || continue
-      value=$("$cli" CONFIG GET logfile 2>/dev/null | tail -n1 || true)
-      if [[ -n $value ]]; then
-        printf '%s\n' "$value"
-      fi
+      # TCP and every local socket (Valkey is socket-only by default).
+      for sock in "" "${socks[@]}"; do
+        value=$(timeout 5 "$cli" ${sock:+-s "$sock"} CONFIG GET logfile 2>/dev/null | tail -n1 || true)
+        if [[ -n $value ]]; then
+          printf '%s\n' "$value"
+        fi
+      done
     done < <(diag_redis_clis)
     printf '%s\n' /var/www/logs/valkey/valkey.log /var/log/redis/redis-server.log
   } | sort -u
@@ -268,16 +338,17 @@ diag_es_log_files() {
     -maxdepth 1 -type f \( -name '*.log' -o -name '*.json' \) 2>/dev/null | sort -u || true
 }
 
+# Arguments: the client command (CLI [-s SOCKET]) from diag_redis_cli.
 diag_redis_config() {
-  local cli=$1 key
-  command -v "$cli" >/dev/null 2>&1 || return 0
-  if ! "$cli" ping >/dev/null 2>&1; then
-    printf '%s is not responding\n' "$cli"
+  local key
+  command -v "$1" >/dev/null 2>&1 || return 0
+  if ! "$@" ping >/dev/null 2>&1; then
+    printf '%s is not responding\n' "$*"
     return 0
   fi
   for key in save appendonly unixsocket unixsocketperm bind protected-mode maxmemory maxmemory-policy logfile dir; do
     printf -- '--- %s\n' "$key"
-    "$cli" CONFIG GET "$key" 2>/dev/null || true
+    "$@" CONFIG GET "$key" 2>/dev/null || true
   done
 }
 
@@ -307,12 +378,22 @@ diag_redis_server_bin() {
 
 # Return a client that can actually reach the running cache.  This avoids
 # printing a connection-refused error for every Valkey/Redis section when the
-# service is installed but stopped or protected by authentication.
+# service is installed but stopped or protected by authentication.  Prints the
+# command one word per line: the client, then "-s" and the socket when the
+# server answers on a local unix socket (diag_valkey_sockets; Valkey is
+# socket-only by default, port 0), else the bare client (TCP default).
 diag_redis_cli() {
-  local cli
+  local cli sock
   while IFS= read -r cli; do
     [[ -n $cli ]] || continue
-    "$cli" ping >/dev/null 2>&1 && { printf '%s' "$cli"; return 0; }
+    while IFS= read -r sock; do
+      [[ -n $sock ]] || continue
+      if timeout 5 "$cli" -s "$sock" ping >/dev/null 2>&1; then
+        printf '%s\n-s\n%s\n' "$cli" "$sock"
+        return 0
+      fi
+    done < <(diag_valkey_sockets)
+    timeout 5 "$cli" ping >/dev/null 2>&1 && { printf '%s\n' "$cli"; return 0; }
   done < <(diag_redis_clis)
   return 1
 }
@@ -361,6 +442,470 @@ diag_nginx_include_status() {
       printf 'INACTIVE %s\n' "$f"
     fi
   done || true
+}
+
+# ---------------------------------------------------------------------------
+# Read-only verification (1.22.5): what the tuned host actually runs.  Used by
+# --diagnostics (full detail) and by the --optimize "Verify" and
+# "Certificates" report blocks (one line each).  Nothing here changes state:
+# files are read, binaries print versions, Valkey answers INFO/CONFIG GET.
+# DIAG_PROC / DIAG_SYS are test hooks for /proc and /sys.
+# ---------------------------------------------------------------------------
+
+# The CLI that matches the php-fpm of series X.Y (our build first).
+diag_php_cli_for() {
+  local ver=$1 cli
+  if declare -F php_cli_bin >/dev/null 2>&1; then
+    cli=$(php_cli_bin "$ver")
+  else
+    cli="${PHP_BUILD_ROOT:-/usr/local/lib/setup-php}/${ver}/bin/php"
+  fi
+  [[ -x $cli ]] || cli=/usr/bin/php${ver}
+  [[ -x $cli ]] || return 1
+  printf '%s' "$cli"
+}
+
+# The OPcache/JIT configuration php-fpm X.Y runs with: that series' CLI
+# reads the FPM php.ini and conf.d scan directory (the [PATH=] sections are
+# FPM-only and do not apply).  Two read-only runs:
+#   1. the JIT probe: opcache.enable_cli=1 with the FPM's JIT mode, so the
+#      CLI starts OPcache and the JIT the way FPM does.  It uses a small
+#      odd-sized segment (9 MB + 8 MB JIT, no huge code pages) so it never
+#      takes huge pages from the pool vm.nr_hugepages reserved for php-fpm.
+#      The interned-strings buffer (16-64 MB in the managed ini) and the
+#      script table are shrunk too, or OPcache cannot fit them in 9 MB, the
+#      CLI dies with "Insufficient shared memory" and the JIT reads unknown;
+#      whether the JIT switches on does not depend on these sizes;
+#   2. the settings: opcache.enable_cli=0 (no segment at all), ini_get of
+#      the values the FPM ini files set.
+# $2=short prints one line.  The CLI only runs while phpX.Y-fpm is active:
+# the unit's CPU gate keeps it stopped when the build does not match this
+# CPU, and a stale binary must not be started here.
+DIAG_PHP_OPCACHE_CODE='
+$mode = $argc > 1 ? $argv[1] : "full";
+$loaded = extension_loaded("Zend OPcache");
+if ($mode === "jit") {
+  $s = function_exists("opcache_get_status") ? opcache_get_status(false) : false;
+  echo (is_array($s) && !empty($s["jit"]["on"])) ? "on" : "off";
+  exit(0);
+}
+$jit = $argc > 2 ? $argv[2] : "unknown";
+if ($mode === "short") {
+  printf("PHP %s, OPcache %s, JIT %s (%s, buffer %s), validate_timestamps=%s\n", PHP_VERSION,
+    $loaded ? "loaded" : "not loaded", $jit, ini_get("opcache.jit"),
+    ini_get("opcache.jit_buffer_size"), ini_get("opcache.validate_timestamps"));
+  exit(0);
+}
+printf("PHP %s\n", PHP_VERSION);
+if (!$loaded) { echo "OPcache is not loaded\n"; exit(0); }
+foreach (["opcache.enable", "opcache.memory_consumption", "opcache.interned_strings_buffer",
+  "opcache.max_accelerated_files", "opcache.validate_timestamps", "opcache.revalidate_freq",
+  "opcache.enable_file_override", "opcache.huge_code_pages",
+  "opcache.jit", "opcache.jit_buffer_size", "opcache.jit_hot_loop", "opcache.jit_hot_func",
+  "opcache.jit_hot_return", "opcache.jit_hot_side_exit"] as $k) {
+  $v = ini_get($k);
+  printf("%s = %s\n", $k, $v === false ? "(unknown)" : $v);
+}
+printf("JIT: %s\n", $jit);
+'
+diag_php_effective_opcache() {
+  local ver=$1 mode=${2:-full} cli jit etc="${DIAG_PHP_ETC:-/etc/php}/${1}/fpm"
+  if ! systemctl is-active --quiet "php${ver}-fpm" 2>/dev/null; then
+    printf 'PHP %s: php%s-fpm is not running; effective OPcache/JIT not read\n' "$ver" "$ver"
+    return 0
+  fi
+  if ! cli=$(diag_php_cli_for "$ver"); then
+    printf 'PHP %s: no CLI binary for this series; effective OPcache/JIT not read\n' "$ver"
+    return 0
+  fi
+  [[ $mode == short ]] || printf 'CLI %s with %s/php.ini and %s/conf.d\n' "$cli" "$etc" "$etc"
+  jit=$(PHP_INI_SCAN_DIR="${etc}/conf.d" timeout 20 "$cli" -c "${etc}/php.ini" \
+        -d opcache.enable_cli=1 -d opcache.memory_consumption=9 -d opcache.interned_strings_buffer=1 \
+        -d opcache.max_accelerated_files=1000 -d opcache.jit_buffer_size=8M \
+        -d opcache.huge_code_pages=0 -d display_errors=0 \
+        -r "$DIAG_PHP_OPCACHE_CODE" -- jit 2>/dev/null) || jit=""
+  [[ $jit == on || $jit == off ]] || jit=unknown
+  PHP_INI_SCAN_DIR="${etc}/conf.d" timeout 20 "$cli" -c "${etc}/php.ini" -d opcache.enable_cli=0 \
+    -d display_errors=stderr -r "$DIAG_PHP_OPCACHE_CODE" -- "$mode" "$jit" 2>&1 \
+    || printf 'PHP %s: the CLI could not report its OPcache configuration\n' "$ver"
+  return 0
+}
+
+# Local Valkey/Redis unix sockets, configured one first: the unixsocket of
+# /etc/valkey/valkey.conf (an operator's custom path is kept by
+# valkey_apply_config) and /etc/redis/redis.conf, then any socket under
+# /run/valkey or /run/redis.  Valkey listens on the socket only by default
+# (port 0), so nothing here assumes TCP 6379.
+diag_valkey_sockets() {
+  local s conf etc=${DIAG_ETC:-/etc} run=${DIAG_RUN:-/run}
+  {
+    for conf in "$etc"/valkey/valkey.conf "$etc"/redis/redis.conf; do
+      [[ -r $conf ]] || continue
+      s=$(awk '$1 == "unixsocket" { print $2; exit }' "$conf" 2>/dev/null || true)
+      if [[ -n $s && -S $s ]]; then printf '%s\n' "$s"; fi
+    done
+    for s in "$run"/valkey/*.sock "$run"/redis/*.sock; do
+      if [[ -S $s ]]; then printf '%s\n' "$s"; fi
+    done
+  } | awk '!seen[$0]++'
+  return 0
+}
+
+# INFO sections of every local instance (read-only commands only).
+diag_valkey_instances() {
+  local cli sock section any=0
+  cli=$(diag_redis_clis | head -n 1 || true)
+  if [[ -z $cli ]]; then
+    printf 'no valkey-cli/redis-cli on this host\n'
+    return 0
+  fi
+  while IFS= read -r sock; do
+    [[ -n $sock ]] || continue
+    any=1
+    printf -- '--- %s\n' "$sock"
+    for section in server memory persistence clients threads keyspace; do
+      printf -- '-- INFO %s\n' "$section"
+      timeout 5 "$cli" -s "$sock" INFO "$section" 2>&1 | tr -d '\r' || true
+    done
+  done < <(diag_valkey_sockets)
+  (( any )) || printf 'no local Valkey/Redis unix socket (configured unixsocket, /run/valkey, /run/redis)\n'
+  return 0
+}
+
+# One line per instance: version, io-threads, maxmemory and its policy, the
+# RDB save schedule ("off" when save is empty) and the TCP port (0 =
+# socket-only).
+verify_valkey_lines() {
+  local cli sock ver thr mem pol port label save
+  cli=$(diag_redis_clis | head -n 1 || true)
+  [[ -n $cli ]] || return 0
+  while IFS= read -r sock; do
+    [[ -n $sock ]] || continue
+    label=Valkey
+    [[ $sock == */redis/* ]] && label=Redis
+    ver=$(timeout 5 "$cli" -s "$sock" INFO server 2>/dev/null | tr -d '\r' \
+          | awk -F: '$1 == "valkey_version" { v = $2 } $1 == "redis_version" && v == "" { v = $2 } END { print v }' || true)
+    if [[ -z $ver ]]; then
+      printf '%s (%s): not answering\n' "$label" "$sock"
+      continue
+    fi
+    thr=$(timeout 5 "$cli" -s "$sock" CONFIG GET io-threads 2>/dev/null | tr -d '\r' | sed -n 2p || true)
+    mem=$(timeout 5 "$cli" -s "$sock" CONFIG GET maxmemory 2>/dev/null | tr -d '\r' | sed -n 2p || true)
+    pol=$(timeout 5 "$cli" -s "$sock" CONFIG GET maxmemory-policy 2>/dev/null | tr -d '\r' | sed -n 2p || true)
+    port=$(timeout 5 "$cli" -s "$sock" CONFIG GET port 2>/dev/null | tr -d '\r' | sed -n 2p || true)
+    save=$(timeout 5 "$cli" -s "$sock" CONFIG GET save 2>/dev/null | tr -d '\r' | sed -n 2p || true)
+    if [[ $mem =~ ^[0-9]+$ ]] && (( mem > 0 )); then mem="$(( mem / 1048576 ))MB"; fi
+    if [[ $port == 0 ]]; then port="0 (socket-only)"; fi
+    # CONFIG GET save answers an empty value when RDB snapshots are off.
+    if [[ -z ${save// /} ]]; then save=off; fi
+    printf '%s %s (%s): io-threads %s, maxmemory %s, policy %s, RDB save %s, TCP port %s\n' \
+      "$label" "$ver" "$sock" "${thr:-?}" "${mem:-?}" "${pol:-?}" "$save" "${port:-?}"
+  done < <(diag_valkey_sockets)
+  return 0
+}
+
+# CPU frequency driver, governor, EPP and boost switches.
+diag_cpufreq() {
+  local sys=${DIAG_SYS:-/sys}/devices/system/cpu f
+  for f in cpu0/cpufreq/scaling_driver cpu0/cpufreq/scaling_governor \
+           cpu0/cpufreq/energy_performance_preference cpu0/cpufreq/scaling_min_freq \
+           cpu0/cpufreq/scaling_max_freq cpu0/cpufreq/cpuinfo_max_freq \
+           amd_pstate/status cpufreq/boost intel_pstate/status intel_pstate/no_turbo; do
+    if [[ -r $sys/$f ]]; then
+      printf '%s: %s\n' "$f" "$(head -n 1 -- "$sys/$f" 2>/dev/null)"
+    else
+      printf '%s: (absent)\n' "$f"
+    fi
+  done
+  return 0
+}
+
+# Queue counts of every NIC and its per-queue IRQ lines (total interrupts
+# and the CPUs each IRQ may run on), plus irqbalance.
+diag_nic_queues() {
+  local net=${DIAG_SYS:-/sys}/class/net proc=${DIAG_PROC:-/proc} dev path rx tx msi f
+  for path in "$net"/*; do
+    dev=${path##*/}
+    [[ $dev == lo || ! -d $path/queues ]] && continue
+    rx=$(find "$path/queues" -maxdepth 1 -name 'rx-*' 2>/dev/null | wc -l | tr -d ' ')
+    tx=$(find "$path/queues" -maxdepth 1 -name 'tx-*' 2>/dev/null | wc -l | tr -d ' ')
+    printf -- '--- %s: %s rx / %s tx queues\n' "$dev" "$rx" "$tx"
+    [[ -r $proc/interrupts ]] || continue
+    # IRQ lines named after the device (eth0-TxRx-0), or the MSI vectors of
+    # its PCI function (virtio names its vectors virtioN-input.M instead).
+    msi=""
+    for f in "$path"/device/msi_irqs/* "$path"/device/../msi_irqs/*; do
+      [[ -e $f ]] && msi+="${f##*/} "
+    done
+    awk -v dev="$dev" -v proc="$proc" -v msi=" $msi" '
+      NR > 1 { irq = $1; sub(/:$/, "", irq) }
+      NR > 1 && ($NF == dev || index($NF, dev "-") == 1 || index(msi, " " irq " ")) {
+        irq = $1; sub(/:$/, "", irq); total = 0
+        for (i = 2; i <= NF && $i ~ /^[0-9]+$/; i++) total += $i
+        name = $NF
+        aff = ""
+        f = proc "/irq/" irq "/smp_affinity_list"
+        if ((getline aff < f) <= 0) aff = "?"
+        close(f)
+        printf "IRQ %s %s: %s interrupts, CPUs %s\n", irq, name, total, aff
+      }' "$proc/interrupts" 2>/dev/null || true
+  done
+  printf 'irqbalance: %s\n' "$(systemctl is-active irqbalance 2>/dev/null || true)"
+  return 0
+}
+
+# Each managed service's effective file-descriptor limit (systemd
+# LimitNOFILE, what the unit actually starts with) next to the limit the
+# service itself is configured to use inside it: nginx worker_rlimit_nofile,
+# PHP-FPM rlimit_files, Valkey maxclients (each client is one descriptor),
+# MariaDB open_files_limit and Elasticsearch max_file_descriptors.  An
+# internal limit above the unit's LimitNOFILE is clamped by the kernel, so
+# the line says so.  Read-only: systemctl show, config files, CONFIG GET,
+# SELECT @@ and a loopback _nodes/stats (skipped when not reachable).
+# DIAG_ETC is the test hook for /etc.
+diag_nofile_line() { # UNIT INTERNAL_LABEL INTERNAL_VALUE
+  local unit=$1 label=$2 internal=$3 lim note=""
+  lim=$(systemctl show -p LimitNOFILE --value "$unit" 2>/dev/null || true)
+  [[ -n $lim ]] || lim="?"
+  if [[ $lim =~ ^[0-9]+$ && $internal =~ ^[0-9]+$ ]] && (( internal > lim )); then
+    note="; WARN ${label} is above LimitNOFILE, the kernel caps it at ${lim}"
+  fi
+  printf '%s: LimitNOFILE=%s, %s=%s%s\n' "$unit" "$lim" "$label" "${internal:-?}" "$note"
+  return 0
+}
+diag_nofile_limits() {
+  local etc=${DIAG_ETC:-/etc} web_etc ver pool v cli es_url conf
+  local -a rc=()
+  web_etc=$(diag_web_etc)
+  [[ -n ${DIAG_ETC:-} ]] && web_etc="${DIAG_ETC}/nginx"
+  if [[ -r $web_etc/nginx.conf ]]; then
+    v=$(awk '{ sub(/#.*/, "") } $1 == "worker_rlimit_nofile" { sub(/;.*/, "", $2); print $2; exit }' "$web_etc/nginx.conf" 2>/dev/null || true)
+    diag_nofile_line nginx.service worker_rlimit_nofile "${v:-unset}"
+  fi
+  for pool in "$etc"/php/*/fpm/pool.d; do
+    [[ -d $pool ]] || continue
+    ver=${pool%/fpm/pool.d}; ver=${ver##*/}
+    [[ $ver =~ ^[0-9]+\.[0-9]+$ ]] || continue
+    v=$(cat "$pool"/*.conf 2>/dev/null | awk -F= '{ k = $1; gsub(/[[:space:]]/, "", k) }
+          k == "rlimit_files" { x = $2; gsub(/[[:space:];]/, "", x); m = (x + 0 > m + 0) ? x : m }
+          END { print m }' || true)
+    diag_nofile_line "php${ver}-fpm.service" rlimit_files "${v:-unset}"
+  done
+  if systemctl cat valkey-server.service >/dev/null 2>&1 || systemctl cat redis-server.service >/dev/null 2>&1; then
+    mapfile -t rc < <(diag_redis_cli || true)
+    v=""
+    if (( ${#rc[@]} > 0 )); then
+      v=$(timeout 5 "${rc[@]}" CONFIG GET maxclients 2>/dev/null | tr -d '\r' | sed -n 2p || true)
+    fi
+    if [[ -z $v ]]; then
+      # One file per awk: mawk aborts on a missing operand (a Redis-only
+      # host has no valkey.conf) before it reads the next one.
+      for conf in "$etc/valkey/valkey.conf" "$etc/redis/redis.conf"; do
+        [[ -r $conf ]] || continue
+        v=$(awk '$1 == "maxclients" { print $2; exit }' "$conf" 2>/dev/null || true)
+        [[ -n $v ]] && break
+      done
+    fi
+    if systemctl cat valkey-server.service >/dev/null 2>&1; then
+      diag_nofile_line valkey-server.service maxclients "${v:-unset}"
+    else
+      diag_nofile_line redis-server.service maxclients "${v:-unset}"
+    fi
+  fi
+  if diag_mariadb_installed; then
+    v=$(timeout 5 mariadb -N -B -e 'SELECT @@open_files_limit' 2>/dev/null || true)
+    diag_nofile_line mariadb.service open_files_limit "${v:-unknown (server not reachable)}"
+  fi
+  if diag_elasticsearch_installed; then
+    v=""
+    if declare -F elasticsearch_http_url >/dev/null 2>&1; then
+      es_url=$(elasticsearch_http_url 2>/dev/null || true)
+      # Loopback only: never query a remote node from here.
+      if [[ $es_url =~ ^https?://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]+)?$ ]]; then
+        v=$(curl -fsS --max-time 5 "${es_url}/_nodes/_local/stats/process?filter_path=**.max_file_descriptors" 2>/dev/null \
+            | sed -n 's/.*"max_file_descriptors"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p' | head -n 1 || true)
+      fi
+    fi
+    if [[ -n $v ]]; then
+      diag_nofile_line elasticsearch.service max_file_descriptors "$v"
+    else
+      printf 'elasticsearch.service: LimitNOFILE=%s, max_file_descriptors not read (no loopback HTTP answer); skipped\n' \
+        "$(systemctl show -p LimitNOFILE --value elasticsearch.service 2>/dev/null || printf '?')"
+    fi
+  fi
+  return 0
+}
+
+# nginx version and the TLS library line from `nginx -V`.
+verify_nginx_line() {
+  local bin out ver tls
+  bin=$(diag_web_bin || true)
+  [[ -n $bin ]] || return 0
+  out=$("$bin" -V 2>&1 || true)
+  ver=$(printf '%s\n' "$out" | sed -n 's/^nginx version: //p' | head -n 1)
+  tls=$(printf '%s\n' "$out" | grep -m1 -E '^(built with|running with) ' || true)
+  printf 'nginx: %s; %s\n' "${ver:-unknown}" "${tls:-no TLS library line}"
+  return 0
+}
+
+# The short "Verify" block of the --optimize report, one line per item.
+verify_summary_lines() {
+  local ver="" cpus irq
+  verify_nginx_line
+  if declare -F php_active_version >/dev/null 2>&1; then
+    ver=$(php_active_version 2>/dev/null || true)
+  fi
+  if [[ -z $ver ]] && declare -F php_fpm_versions >/dev/null 2>&1; then
+    ver=$(php_fpm_versions 2>/dev/null | tail -n 1 || true)
+  fi
+  if [[ -n $ver ]]; then
+    diag_php_effective_opcache "$ver" short
+  fi
+  verify_valkey_lines
+  diag_mariadb_installed 2>/dev/null && diag_mariadb_collations short
+  if declare -F host_is_vps >/dev/null 2>&1 && ! host_is_vps 2>/dev/null; then
+    cpus=$(effective_cpus 2>/dev/null || nproc 2>/dev/null || echo 1)
+    irq=$(systemctl is-active irqbalance 2>/dev/null || true)
+    if [[ $cpus =~ ^[0-9]+$ ]] && (( cpus >= 4 )) && [[ $irq != active ]]; then
+      printf 'irqbalance is not active (%s) on this %s-CPU dedicated host: NIC interrupts may sit on few CPUs (see --diagnostics "NIC queues and IRQs"); report only, nothing was changed\n' \
+        "${irq:-unknown}" "$cpus"
+    fi
+  fi
+  return 0
+}
+
+# Certificate expiry of every enabled vhost (report only).  For each
+# ssl_certificate in ETC/conf.d/*.conf: notAfter and days left.  WARN when
+# it ends within 21 days, or is self-signed, on a vhost not proven behind
+# Cloudflare (Cloudflare "Full" accepts both at the origin).  Proven means
+# cloudflare_tls_migrate left its probe location in the file (Cloudflare
+# reached the origin through it), or every server_name resolves into the
+# Cloudflare ranges of ETC/http.d/cloudflare.conf (cf_tls_name_behind_cloudflare,
+# DNS only).  The Cloudflare check runs only for a certificate that would
+# otherwise warn.
+CERT_EXPIRY_WARN_DAYS=21
+cert_vhost_names() { # FILE -> server_name tokens, one per line
+  awk '{ sub(/#.*/, "") } { for (i = 1; i <= NF; i++) {
+          if ($i == "server_name") { on = 1; continue }
+          if (on) { t = $i; e = sub(/;.*$/, "", t); if (t != "") print t; if (e) on = 0 } } }' "$1" | sort -u
+}
+cert_vhost_cf_proof() { # FILE ETC -> "probe" | "dns" | nothing
+  local file=$1 etc=$2 name any=0
+  if grep -qF '# setup-cf-tls probe' "$file" 2>/dev/null; then printf 'probe'; return 0; fi
+  declare -F cf_tls_name_behind_cloudflare >/dev/null 2>&1 || return 0
+  while IFS= read -r name; do
+    case $name in _|localhost|'""'|'') continue ;; esac
+    [[ ${name,,} =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$ && ! $name =~ ^[0-9.]+$ ]] || return 0
+    cf_tls_name_behind_cloudflare "$name" "$etc/http.d/cloudflare.conf" || return 0
+    any=1
+  done < <(cert_vhost_names "$file")
+  (( any )) && printf 'dns'
+  return 0
+}
+cert_expiry_lines() {
+  local etc=${1:-$(diag_web_etc)} f crt end days subj iss selfsigned now endts proof names warn
+  if ! command -v openssl >/dev/null 2>&1; then
+    printf 'openssl is not installed; certificate expiry not checked\n'
+    return 0
+  fi
+  now=$(date +%s)
+  local any=0
+  for f in "$etc"/conf.d/*.conf; do
+    [[ -f $f ]] || continue
+    names=$(cert_vhost_names "$f" | grep -vxE '_|localhost|""' | tr '\n' ' ' | sed 's/ $//' || true)
+    while IFS= read -r crt; do
+      [[ -n $crt ]] || continue
+      any=1
+      if [[ $crt == *'$'* ]]; then
+        printf '%s: %s is a variable path; not checked\n' "${f##*/}" "$crt"
+        continue
+      fi
+      [[ $crt == /* ]] || crt="$etc/$crt"
+      if [[ ! -r $crt ]]; then
+        printf 'WARN %s: certificate %s is missing or unreadable\n' "${f##*/}" "$crt"
+        continue
+      fi
+      end=$(openssl x509 -in "$crt" -noout -enddate 2>/dev/null | sed -n 's/^notAfter=//p')
+      subj=$(openssl x509 -in "$crt" -noout -subject -nameopt RFC2253 2>/dev/null | sed 's/^subject=//')
+      iss=$(openssl x509 -in "$crt" -noout -issuer -nameopt RFC2253 2>/dev/null | sed 's/^issuer=//')
+      if [[ -z $end ]]; then
+        printf 'WARN %s: %s is not a readable X.509 certificate\n' "${f##*/}" "$crt"
+        continue
+      fi
+      selfsigned=0
+      [[ -n $subj && $subj == "$iss" ]] && selfsigned=1
+      # openssl decides expiry (-checkend); date only computes the day count
+      # shown.  OpenSSL 3 prints an ISO 8601 date every date(1) parses (the
+      # default "Nov 26 12:00:00 2026 GMT" form is the fallback).
+      days="?"
+      endts=$(openssl x509 -in "$crt" -noout -enddate -dateopt iso_8601 2>/dev/null | sed -n 's/^notAfter=//p')
+      endts=$(date -d "${endts:-$end}" +%s 2>/dev/null || true)
+      [[ $endts =~ ^[0-9]+$ ]] || endts=$(date -d "$end" +%s 2>/dev/null || true)
+      [[ $endts =~ ^[0-9]+$ ]] && days=$(( (endts - now) / 86400 ))
+      warn=""
+      if ! openssl x509 -in "$crt" -noout -checkend 0 >/dev/null 2>&1; then
+        warn="expired"
+      elif ! openssl x509 -in "$crt" -noout -checkend $(( CERT_EXPIRY_WARN_DAYS * 86400 )) >/dev/null 2>&1; then
+        warn="ends in ${days} days"
+      fi
+      (( selfsigned )) && warn+="${warn:+, }self-signed"
+      if [[ $days == "?" ]] && (( ! selfsigned )); then
+        warn+="${warn:+, }expiry date not parsed"
+      fi
+      proof=""
+      [[ -n $warn ]] && proof=$(cert_vhost_cf_proof "$f" "$etc")
+      if [[ -n $warn && -z $proof && -n $names ]]; then
+        printf 'WARN %s (%s): %s, notAfter %s; not proven behind Cloudflare, so visitors see this certificate\n' \
+          "${f##*/}" "$names" "$warn" "$end"
+      else
+        printf '%s (%s): notAfter %s (%s days)%s%s\n' "${f##*/}" "${names:-no server_name}" "$end" "$days" \
+          "$( (( selfsigned )) && printf ', self-signed')" \
+          "${proof:+, behind Cloudflare (${proof})}"
+      fi
+    done < <(awk '{ sub(/#.*/, "") } { for (i = 1; i < NF; i++) if ($i == "ssl_certificate") { p = $(i + 1); sub(/;.*$/, "", p); print p } }' "$f" | sort -u)
+  done
+  (( any )) || printf 'no ssl_certificate in %s/conf.d\n' "$etc"
+  return 0
+}
+
+# The --optimize report blocks "Verify" and "Certificates" (report only).
+# The web lines are left out while Angie still serves (legacy mode).
+opt_report_verify() {
+  local line
+  declare -F opt_report >/dev/null 2>&1 || return 0
+  opt_report "## Verify"
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    if [[ $line == WARN\ * ]]; then
+      opt_report "- **WARNING** ${line#WARN }"
+    else
+      opt_report "- ${line}"
+    fi
+  done < <(verify_summary_lines 2>/dev/null || true)
+  # File-descriptor plan (nofile_plan, lib/optimize.sh): unit / internal.
+  if declare -F nofile_plan_report_lines >/dev/null 2>&1; then
+    while IFS= read -r line; do
+      [[ -n $line ]] || continue
+      if [[ $line == WARN\ * ]]; then
+        opt_report "- **WARNING** ${line#WARN }"
+      else
+        opt_report "- ${line}"
+      fi
+    done < <(nofile_plan_report_lines 2>/dev/null || true)
+  fi
+  if (( ${OPT_WEB_LEGACY:-0} )) || [[ ! -d $(diag_web_etc)/conf.d ]]; then
+    return 0
+  fi
+  opt_report "## Certificates"
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    if [[ $line == WARN\ * ]]; then
+      opt_report "- **WARNING** ${line#WARN }"
+    else
+      opt_report "- ${line}"
+    fi
+  done < <(cert_expiry_lines "$(diag_web_etc)" 2>/dev/null || true)
+  return 0
 }
 
 # Diagnostics read journald, sudo records and service logs.  Redact common
@@ -452,6 +997,8 @@ run_diagnostics() {
   diag "qdisc" tc qdisc show
   diag_sh "CPU vulnerability mitigations" 'cat /proc/cmdline; grep -H . /sys/devices/system/cpu/vulnerabilities/* 2>/dev/null | sed "s|.*/vulnerabilities/||"'
   diag_sh "ethtool statistics" 'for i in $(ls /sys/class/net); do [ "$i" = lo ] && continue; echo "--- $i"; ethtool -S "$i" 2>/dev/null | head -40; done'
+  diag "NIC queues and IRQs" diag_nic_queues
+  diag "CPU frequency driver" diag_cpufreq
   diag "sysctl all" sysctl -a
   diag "sysctl.conf" cat /etc/sysctl.conf
   diag_sh "sysctl drop-ins" 'find /etc/sysctl.d -maxdepth 1 -type f -print -exec sh -c "echo --- \$1; sed -n \"1,300p\" \"\$1\"" _ {} \;'
@@ -470,6 +1017,7 @@ run_diagnostics() {
   diag "all units" systemctl list-units --all --no-pager
   diag "unit files" systemctl list-unit-files --no-pager
   diag "timers" systemctl list-timers --all --no-pager
+  diag "service watchdog" watchdog_status
   diag "systemd blame" bash -c 'systemd-analyze blame | head -40'
   diag "systemd critical chain" systemd-analyze critical-chain
 
@@ -490,6 +1038,7 @@ run_diagnostics() {
   # Compiled builds (read-only)
   # ---------------------------------------------------------------------------
   diag "builds" diag_builds
+  diag "service file-descriptor limits (LimitNOFILE vs internal)" diag_nofile_limits
 
   if [[ -n $web_bin ]]; then
     diag_section "web server: ${web_bin} (${web_etc})"
@@ -501,6 +1050,7 @@ run_diagnostics() {
   fi
   diag_sh "nginx vhosts" "find '${web_etc}/conf.d' -maxdepth 1 -type f -name '*.conf' -printf '%f\n' 2>/dev/null | sort"
   diag "nginx certificates" diag_nginx_certificates
+  diag "vhost certificate expiry" cert_expiry_lines "$web_etc"
   diag "nginx http.d include status" diag_nginx_include_status
   diag_sh "nginx error/access log sizes" 'du -sh /var/www/logs/nginx /var/www/logs/angie 2>/dev/null || true'
 
@@ -525,6 +1075,7 @@ run_diagnostics() {
     diag_sh "PHP ${ver} processes" "ps -eo pid,ppid,user,%cpu,%mem,rss,etime,cmd | grep -E '[p]hp-fpm' | head -60"
     diag_sh "PHP ${ver} listeners" "ss -lxp | grep -E 'php${ver}|php-fpm' || true"
     diag "PHP ${ver} status" diag_php_fpm_status "$ver"
+    diag "PHP ${ver} effective FPM OPcache/JIT" diag_php_effective_opcache "$ver"
   done < <(php_fpm_versions)
 
   if diag_mariadb_installed; then
@@ -536,6 +1087,7 @@ run_diagnostics() {
     diag "MariaDB processlist" mariadb -e 'SHOW FULL PROCESSLIST'
     diag "MariaDB InnoDB status" mariadb -e 'SHOW ENGINE INNODB STATUS\G'
     diag_sh "MariaDB database sizes" "mariadb -N -B -e \"SELECT table_schema, ROUND(SUM(data_length+index_length)/1024/1024,1) AS mb, COUNT(*) AS tables FROM information_schema.tables WHERE table_schema NOT IN ('mysql','information_schema','performance_schema','sys') GROUP BY table_schema ORDER BY mb DESC;\""
+    diag "MariaDB collations" diag_mariadb_collations full
     local db_mb pool_mb
     db_mb=$(mariadb -N -B -e "SELECT COALESCE(ROUND(SUM(data_length+index_length)/1024/1024),0) FROM information_schema.tables WHERE table_schema NOT IN ('mysql','information_schema','performance_schema','sys')" 2>/dev/null || true)
     pool_mb=$(mariadb -N -B -e 'SELECT ROUND(@@innodb_buffer_pool_size/1024/1024)' 2>/dev/null || true)
@@ -573,7 +1125,11 @@ run_diagnostics() {
 
   redis_unit=$(diag_redis_unit || true)
   redis_bin=$(diag_redis_server_bin || true)
-  redis_cli=$(diag_redis_cli || true)
+  # The client command, with -s SOCKET when the server answers on its unix
+  # socket (diag_redis_cli; Valkey is socket-only by default).
+  local -a redis_cmd=()
+  mapfile -t redis_cmd < <(diag_redis_cli || true)
+  redis_cli=${redis_cmd[0]:-}
   if [[ -z $redis_unit && -z $redis_bin ]]; then
     diag_sh "Valkey/Redis" 'printf "%s\n" "Valkey/Redis is not installed (no valkey-server or redis-server service unit)."'
   elif [[ -z $redis_unit ]]; then
@@ -587,15 +1143,16 @@ run_diagnostics() {
   else
     redis_label=Valkey
     [[ ${redis_cli##*/} == redis-cli ]] && redis_label=Redis
-    diag "${redis_label} info" "$redis_cli" INFO all
-    diag "${redis_label} config" "$redis_cli" CONFIG GET maxmemory
-    diag "${redis_label} selected config" diag_redis_config "$redis_cli"
-    diag "${redis_label} clients" "$redis_cli" CLIENT LIST
-    diag "${redis_label} slowlog" "$redis_cli" SLOWLOG GET 100
-    diag "${redis_label} memory stats" "$redis_cli" MEMORY STATS
-    diag "${redis_label} latency" "$redis_cli" LATENCY LATEST
+    diag "${redis_label} info" "${redis_cmd[@]}" INFO all
+    diag "${redis_label} config" "${redis_cmd[@]}" CONFIG GET maxmemory
+    diag "${redis_label} selected config" diag_redis_config "${redis_cmd[@]}"
+    diag "${redis_label} clients" "${redis_cmd[@]}" CLIENT LIST
+    diag "${redis_label} slowlog" "${redis_cmd[@]}" SLOWLOG GET 100
+    diag "${redis_label} memory stats" "${redis_cmd[@]}" MEMORY STATS
+    diag "${redis_label} latency" "${redis_cmd[@]}" LATENCY LATEST
   fi
   diag "Valkey/Redis resolved log files" diag_redis_log_files
+  diag "Valkey/Redis instances (INFO per local socket)" diag_valkey_instances
 
   if ! diag_elasticsearch_installed; then
     diag_sh "Elasticsearch" 'printf "%s\n" "Elasticsearch is not installed."'
@@ -663,7 +1220,7 @@ run_diagnostics() {
   mapfile -t log_files < <(find /var/www/logs -type f \( -name '*.log' -o -name '*.json' \) 2>/dev/null | sort)
   diag_tail_files 200 "${log_files[@]:0:120}"
 
-  diag_sh "log sizes" 'du -sh /var/www/logs/* /var/log/php* /var/log/mysql /var/log/redis* /var/www/*/error.log /var/www/*/access.log 2>/dev/null | sort -h || true'
+  diag_sh "log sizes" 'du -sh /var/www/logs/* /var/log/php* /var/log/mysql /var/log/redis* /var/www/*/error.log /var/www/*/access.log 2>/dev/null | 2>/dev/null | sort -h || true'
   diag_sh "web root ownership" 'ls -ld /var/www /var/www/logs /var/www/logs/* /var/www/mysql_database 2>/dev/null || true'
   diag_sh "log tree ownership" 'find /var/www/logs -maxdepth 2 -printf "%M %u:%g %p\n" 2>/dev/null | sort || true'
   diag_sh "logrotate debug" 'if command -v logrotate >/dev/null 2>&1 && [ -f /etc/logrotate.d/setup-logs ]; then logrotate -d /etc/logrotate.d/setup-logs; else echo "logrotate or /etc/logrotate.d/setup-logs is not installed"; fi'

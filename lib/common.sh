@@ -122,8 +122,8 @@ log_selection() {
       "${OPT[php.ver]:-auto}" "${OPT[php.ext]:-unchanged}" "${OPT[php.children]:-auto}" "${OPT[php.max_requests]:-auto}"
   fi
   if [[ ${ENABLED[valkey]:-0} -eq 1 ]]; then
-    printf 'Valkey       : ram=%s policy=%s io_threads=%s\n' \
-      "${OPT[valkey.ram]:-auto}" "${OPT[valkey.policy]:-allkeys-lru}" "${OPT[valkey.io_threads]:-1}"
+    printf 'Valkey       : ram=%s policy=%s\n' \
+      "${OPT[valkey.ram]:-auto}" "${OPT[valkey.policy]:-allkeys-lru}"
   fi
   if [[ ${ENABLED[elastic]:-0} -eq 1 ]]; then
     printf 'Elasticsearch: host=%s ram=%s\n' \

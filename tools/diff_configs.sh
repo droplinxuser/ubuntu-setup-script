@@ -50,9 +50,7 @@ config_files=(
     "${SETUP_REPO}/configs/mariadb/limit_nofile.conf /etc/systemd/system/mariadb.service.d/limits.conf"
     "${SETUP_REPO}/configs/mariadb/mariadb_server.cnf /etc/mysql/mariadb.conf.d/50-server.cnf"
     "${CONFIG_REPO}/nginx.conf /etc/nginx/nginx.conf"
-    "${CONFIG_REPO}/http.d/ppa_eilander_conf /etc/nginx/http.d/ppa_eilander.conf"
     "${CONFIG_REPO}/http.d/brotli_conf /etc/nginx/http.d/brotli.conf"
-    "${CONFIG_REPO}/http.d/http_trim_filter_conf /etc/nginx/http.d/http_trim_filter.conf"
     "${CONFIG_REPO}/h5bp/wordpress_cache.conf /etc/nginx/h5bp/wordpress_cache.conf"
 )
 

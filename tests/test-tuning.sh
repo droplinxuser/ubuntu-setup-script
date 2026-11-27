@@ -1336,8 +1336,10 @@ check "1-2 CPU hosts use conservative tracing thresholds" \
 opcache.jit_hot_func = 255
 opcache.jit_hot_return = 32
 opcache.jit_hot_side_exit = 128"
-check "SETUP_PHP_JIT_HOT_* overrides one threshold" \
-  test "$(SETUP_PHP_JIT_HOT_LOOP=8 php_jit_threshold_lines 16 | head -n1)" = "opcache.jit_hot_loop = 8"
+check "SETUP_PHP_JIT_HOT_* no longer overrides a threshold (removed in 1.22.5)" \
+  test "$(SETUP_PHP_JIT_HOT_LOOP=8 php_jit_threshold_lines 16 | head -n1)" = "opcache.jit_hot_loop = 64"
+check "php_jit_threshold_lines reads no SETUP_PHP_JIT_HOT_* variable" \
+  bash -c '! sed -n "/^php_jit_threshold_lines()/,/^}/p" "$1" | grep -q SETUP_PHP_JIT_HOT' _ "$ALL_SRC"
 check "the managed ini writes the thresholds" \
   test "$(grep -c '^\$(php_jit_threshold_lines "\$nproc")$' "$ALL_SRC")" -eq 1
 check "the pool is always static" \
@@ -1345,7 +1347,9 @@ check "the pool is always static" \
 check "no ondemand pool mode remains" \
   test "$(grep -c 'pm_mode=ondemand' "$ALL_SRC")" -eq 0
 check "the OPcache file cache stays empty (restored scripts are never JIT-compiled)" \
-  test "$(grep -c 'local opcache_file_cache=""' "$ALL_SRC")" -eq 1
+  test "$(grep -cx 'opcache.file_cache =' "$ALL_SRC")" -eq 1
+check "no opcache_file_cache variable or /var/cache/php/opcache directory code remains" \
+  test "$(grep -cE 'opcache_file_cache|mkdir -p /var/cache/php/opcache' "$ALL_SRC")" -eq 0
 # [PATH=] sections: only for WordPress roots and only when
 # SETUP_PHP_JIT_WORDPRESS=0 exempts WordPress from the always-on JIT.
 mkdir -p "$TMP/jit-nginx/conf.d" "$TMP/jit-wp/public" "$TMP/jit-xf/public/src"
@@ -1799,51 +1803,79 @@ check "tune_pool_dedupe keeps one pm.max_children" \
 check "tune_pool_dedupe keeps the value set by tune_pool_set" \
   grep -qx 'pm.max_children = 64' "$TMP/www.conf"
 
-# --optimize must keep the managed ini performance-only by default.  The
-# 1.8.39 global session hardening broke Joomla/Polr logins, so session and
-# cgi hardening is behind an explicit opt-in flag.
+# --optimize keeps the managed ini performance-only.  The 1.8.39 global
+# session hardening broke Joomla/Polr logins; the opt-in that replaced it
+# (SETUP_PHP_SESSION_HARDENING=1) was removed in 1.22.5.
 php_tune_body=$(sed -n '/^tune_php_fpm_version()/,/^}/p' "$ALL_SRC")
-php_tune_default=$(awk '/SETUP_PHP_SESSION_HARDENING:-0} == 1/{exit} {print}' <<<"$php_tune_body")
-php_tune_hardening=$(awk '/SETUP_PHP_SESSION_HARDENING:-0} == 1/{f=1} f' <<<"$php_tune_body")
 
 check "PHP optimize keeps the performance block" \
   grep -q '^memory_limit = ${memory_mb}M$' <<<"$php_tune_body"
-check "default PHP tuning writes no session overrides" \
-  test -z "$(grep '^session\.' <<<"$php_tune_default")"
-check "default PHP tuning writes no cgi/expose hardening" \
-  test -z "$(grep -E '^(cgi\.fix_pathinfo|expose_php|display_errors|log_errors) ' <<<"$php_tune_default")"
-check "session hardening is gated behind the opt-in flag" \
-  grep -qF 'SETUP_PHP_SESSION_HARDENING:-0} == 1' <<<"$php_tune_body"
+check "PHP tuning writes no session overrides" \
+  test -z "$(grep '^session\.' <<<"$php_tune_body")"
+check "PHP tuning writes no cgi/expose hardening" \
+  test -z "$(grep -E '^(cgi\.fix_pathinfo|expose_php|display_errors|log_errors) ' <<<"$php_tune_body")"
+check "the session hardening option is gone from the PHP tuner" \
+  bash -c '! grep -q "SESSION_HARDENING" <<<"$1"' _ "$php_tune_body"
 check "the shipped PHP template has no global session overrides" \
   test -z "$(grep '^session\.' "$ROOT/configs/php/custom_dan.ini")"
+check "the shipped PHP template no longer advertises the removed option" \
+  bash -c '! grep -q "SETUP_PHP_SESSION_HARDENING" "$1"' _ "$ROOT/configs/php/custom_dan.ini"
 # --- audit 1.21.58: web-robustness
 
-# SETUP_PHP_SESSION_HARDENING=1 used to vanish on the next plain --optimize
-# (never persisted).  It is now persisted as PHP_SESSION_HARDENING, read back
-# into the single gate flag, and kept by the --optimize profile reset.
-hard_load() (
-  unset SETUP_PHP_SESSION_HARDENING PHP_SESSION_HARDENING
-  PHP_SESSION_HARDENING_PERSIST=0
-  if [[ -n $1 ]]; then PHP_SESSION_HARDENING=$1; fi
-  if [[ -n $2 ]]; then SETUP_PHP_SESSION_HARDENING=$2; fi
-  php_session_hardening_load
-  printf '%s %s' "${SETUP_PHP_SESSION_HARDENING:-unset}" "$PHP_SESSION_HARDENING_PERSIST"
-)
-check "persisted session hardening is read back without the env" test "$(hard_load 1 '')" = '1 0'
-check "env session hardening is honoured and marked for persistence" test "$(hard_load '' 1)" = '1 1'
-check "env SETUP_PHP_SESSION_HARDENING=0 overrides a persisted 1" test "$(hard_load 1 0)" = '0 1'
-check "a non-1 env value is normalised to 0" test "$(hard_load '' yes)" = '0 1'
-check "no pin and no env leaves session hardening off" test "$(hard_load '' '')" = 'unset 0'
+# 1.22.5: a PHP_SESSION_HARDENING pin left by an older release is dropped
+# from the host file, and the profile reset no longer keeps it.
+hard_tf=$TMP/hard-tuning
+printf 'PHP_SESSION_HARDENING=1\nXF_JOB_CRON=1\n' > "$hard_tf"
 hard_persist_out=$(
-  persist_tuning_var() { printf '%s=%s\n' "$1" "$2"; }
-  PHP_SESSION_HARDENING_PERSIST=1 SETUP_PHP_SESSION_HARDENING=1
+  SETUP_TUNING_FILE=$hard_tf
+  tune_note() { printf '%s\n' "$*"; }
+  persist_tuning_var() { :; }
   PHP_JIT_WORDPRESS_PERSIST=0 PHP_PAGE_GZIP_PERSIST=0
   persist_php_jit
 )
-check "env session hardening is written to the host file" \
-  grep -qx 'PHP_SESSION_HARDENING=1' <<<"$hard_persist_out"
-check "the --optimize profile reset keeps PHP_SESSION_HARDENING" \
-  bash -c 'printf "%s\n" "$@" | grep -qx PHP_SESSION_HARDENING' _ "${RESET_KEEP_PINS[@]}"
+check "a retired PHP_SESSION_HARDENING pin is removed from the host file" \
+  bash -c '! grep -q "^PHP_SESSION_HARDENING=" "$1" && grep -qx "XF_JOB_CRON=1" "$1"' _ "$hard_tf"
+check "removing the retired pin is reported" \
+  grep -q 'PHP_SESSION_HARDENING removed' <<<"$hard_persist_out"
+check "the --optimize profile reset no longer keeps PHP_SESSION_HARDENING" \
+  bash -c '! printf "%s\n" "$@" | grep -qx PHP_SESSION_HARDENING' _ "${RESET_KEEP_PINS[@]}"
+check "an exported SETUP_PHP_SESSION_HARDENING is reported as ignored" \
+  grep -q 'RETIRED_SESSION_HARDENING_ENV' "$ROOT/lib/validate.sh"
+
+# 1.22.5: SETUP_PHP_JIT_HOT_*, SETUP_GZIP_LEVEL and
+# SETUP_MARIADB_MONTHLY_OPTIMIZE were removed.  setup.sh remembers an
+# exported value for the validate_all warning and drops it from the
+# environment (never fatal); a persisted MARIADB_MONTHLY_OPTIMIZE is dropped
+# from memory.
+retired_perf_out=$(
+  env SETUP_PHP_JIT_HOT_LOOP=8 SETUP_PHP_JIT_HOT_SIDE_EXIT=4 SETUP_GZIP_LEVEL=7 \
+    SETUP_MARIADB_MONTHLY_OPTIMIZE=1 MARIADB_MONTHLY_OPTIMIZE=1 \
+    SETUP_TEST_SOURCE_ONLY=1 SETUP_STATE_DIR="$TMP/retired-perf-state" \
+    bash -c 'source "$1" >/dev/null 2>&1
+             printf "perf=%s\n" "${RETIRED_PERF_ENV[*]}"
+             printf "monthly=%s\n" "$RETIRED_MONTHLY_OPTIMIZE_ENV"
+             printf "env=%s%s%s\n" "${SETUP_PHP_JIT_HOT_LOOP+loop}" "${SETUP_GZIP_LEVEL+gzip}" "${SETUP_MARIADB_MONTHLY_OPTIMIZE+monthly}"
+             printf "mem=%s\n" "${MARIADB_MONTHLY_OPTIMIZE+set}"' _ "$ROOT/setup.sh" 2>&1
+) || true
+check "an exported SETUP_PHP_JIT_HOT_* is recorded as removed" \
+  grep -q '^perf=.*SETUP_PHP_JIT_HOT_LOOP=8.*SETUP_PHP_JIT_HOT_SIDE_EXIT=4' <<<"$retired_perf_out"
+check "an exported SETUP_GZIP_LEVEL is recorded as removed" \
+  grep -q '^perf=.*SETUP_GZIP_LEVEL=7' <<<"$retired_perf_out"
+check "an exported SETUP_MARIADB_MONTHLY_OPTIMIZE is recorded as removed" \
+  grep -qx 'monthly=SETUP_MARIADB_MONTHLY_OPTIMIZE=1' <<<"$retired_perf_out"
+check "the removed knobs are dropped from the environment" \
+  grep -qx 'env=' <<<"$retired_perf_out"
+check "a persisted MARIADB_MONTHLY_OPTIMIZE is dropped from memory" \
+  grep -qx 'mem=' <<<"$retired_perf_out"
+check "validate_all warns that the JIT/gzip overrides are ignored (removed in 1.22.5)" \
+  grep -q 'Ignored (removed in 1.22.5; no other value measured faster.*RETIRED_PERF_ENV' "$ROOT/lib/validate.sh"
+check "validate_all warns that SETUP_MARIADB_MONTHLY_OPTIMIZE is ignored (removed in 1.22.5)" \
+  grep -q 'Ignored (removed in 1.22.5; the monthly mariadb-check always runs ANALYZE): ${RETIRED_MONTHLY_OPTIMIZE_ENV}' "$ROOT/lib/validate.sh"
+check "--optimize no longer lists the removed knobs as tuning overrides" \
+  bash -c '! sed -n "/^optimize_ignore_tuning_env()/,/^}/p" "$1" | grep -qE "SETUP_PHP_JIT_HOT|SETUP_GZIP_LEVEL"' _ "$ALL_SRC"
+check "--optimize still ignores SETUP_BROTLI_LEVEL (kept)" \
+  bash -c 'sed -n "/^optimize_ignore_tuning_env()/,/^}/p" "$1" | grep -q SETUP_BROTLI_LEVEL' _ "$ALL_SRC"
+unset retired_perf_out
 
 # --optimize refreshes a stale managed php.ini from the repo template while
 # keeping the host's existing timezone.
@@ -1943,35 +1975,6 @@ check "PATH_TRANSLATED repair covers all PHP includes" \
 tune_reset_changes
 tune_fastcgi_path_translated_all "$TMP/path-translated-all"
 check "all-include PATH_TRANSLATED repair is idempotent" test "$TUNE_DIRTY" -eq 0
-
-check "opt-in hardening disables cgi.fix_pathinfo" \
-  grep -q '^cgi.fix_pathinfo = 0$' <<<"$php_tune_hardening"
-check "opt-in hardening disables expose_php" \
-  grep -q '^expose_php = Off$' <<<"$php_tune_hardening"
-check "opt-in hardening disables display_errors" \
-  grep -q '^display_errors = Off$' <<<"$php_tune_hardening"
-check "opt-in hardening enables error logging" \
-  grep -q '^log_errors = On$' <<<"$php_tune_hardening"
-check "opt-in hardening points error_log at the central tree" \
-  grep -qF 'error_log = ${php_error_log}' <<<"$php_tune_hardening"
-check "opt-in hardening enables strict sessions" \
-  grep -q '^session.use_strict_mode = 1$' <<<"$php_tune_hardening"
-check "opt-in hardening restricts sessions to cookies" \
-  grep -q '^session.use_only_cookies = 1$' <<<"$php_tune_hardening"
-check "opt-in hardening marks cookies HttpOnly" \
-  grep -q '^session.cookie_httponly = 1$' <<<"$php_tune_hardening"
-check "opt-in hardening marks cookies Secure" \
-  grep -q '^session.cookie_secure = 1$' <<<"$php_tune_hardening"
-check "opt-in hardening sets SameSite=Lax" \
-  grep -q '^session.cookie_samesite = Lax$' <<<"$php_tune_hardening"
-check "opt-in hardening sets a bounded session lifetime" \
-  grep -q '^session.gc_maxlifetime = 14400$' <<<"$php_tune_hardening"
-check "opt-in hardening lengthens session IDs" \
-  grep -q '^session.sid_length = 48$' <<<"$php_tune_hardening"
-check "opt-in hardening uses six bits per session character" \
-  grep -q '^session.sid_bits_per_character = 6$' <<<"$php_tune_hardening"
-check "opt-in hardening creates the central PHP error log" \
-  grep -qF 'ensure_fpm_log_path "$php_error_log"' <<<"$php_tune_hardening"
 
 # ---------------------------------------------------------------------------
 # Memory booked outside the service settings: ES direct memory, huge pages
@@ -3371,11 +3374,12 @@ unset -f mariadb
 app_persistent_db_configs() { printf '0'; }  # keep the stub: unset -f would drop the real function too
 php_pool_max_children() { printf '128'; }
 
-valkey_lines=$(valkey_tuning_lines 512 allkeys-lru 2)
+valkey_lines=$(valkey_tuning_lines 512 allkeys-lru)
 check "Valkey shared lines keep maxmemory and policy" \
   grep -qx 'maxmemory 512mb' <<<"$valkey_lines"
-check "Valkey shared lines keep the io-threads override" \
-  grep -qx 'io-threads 2' <<<"$valkey_lines"
+# 1.22.5: the io_threads opt-in was removed; io-threads is pinned to 1.
+check "Valkey shared lines pin io-threads 1" \
+  grep -qx 'io-threads 1' <<<"$valkey_lines"
 
 printf '# BEGIN setup.sh optimize\nbootstrap.memory_lock: true\n# END setup.sh optimize\ncluster.name: keep\n' \
   > "$TMP/es-strip.yml"
@@ -3391,7 +3395,9 @@ check "optimize leaves swap untouched" \
   bash -c '! grep -q "configure_swap_auto" <<< "$1"' _ "$tuning_body"
 detect_body=$(sed -n '/^detect_installed_services()/,/^}/p' "$ALL_SRC")
 check "Valkey takes precedence over Redis in service detection" \
-  grep -q '! -f /etc/valkey/valkey.conf' <<<"$detect_body"
+  grep -qF '(( ! valkey_present )) && [[ -f /etc/redis/redis.conf ]]' <<<"$detect_body"
+check "a valkey.conf left without a Valkey server does not hide Redis" \
+  grep -qF 'systemctl cat valkey-server.service' <<<"$detect_body"
 
 # Diagnostics must not present absent services as connection failures.
 diag_body=$(sed -n '/^run_diagnostics()/,/^}/p' "$ALL_SRC")
@@ -3762,8 +3768,8 @@ php_pool_max_children() { printf '30000'; }
 check "valkey_maxclients is capped at 100000" \
   test "$(valkey_maxclients)" -eq 100000
 php_pool_max_children() { printf '0'; }
-check "valkey_clamp_io_threads caps at 8 on both paths" \
-  test "$(valkey_clamp_io_threads 16)" -eq 8 -a "$(valkey_clamp_io_threads x)" -eq 1
+check "the removed valkey_clamp_io_threads is gone (1.22.5)" \
+  not declare -F valkey_clamp_io_threads
 
 # service_mem_mb: the planned value wins; a stand-alone call uses the same
 # floors as the planner so an install and a later --optimize agree.
@@ -3859,18 +3865,20 @@ ENABLED=()
 OPT=()
 
 # valkey_apply_config writes the same file from any starting point.
-printf 'save 3600 1\nsave 300 100\nprotected-mode no\nmaxmemory 1gb\ndaemonize no\n' > "$TMP/valkey.conf"
-valkey_apply_config "$TMP/valkey.conf" valkey 512 allkeys-lru 16 /run/valkey/valkey.sock
-check "valkey_apply_config removes RDB saves and protected-mode no" \
-  bash -c "! grep -qE '^(save 3600|protected-mode no)' '$TMP/valkey.conf' && grep -qx 'save \"\"' '$TMP/valkey.conf'"
+printf 'save 3600 1\nsave 300 100\nprotected-mode no\nmaxmemory 1gb\ndaemonize no\nio-threads 4\n' > "$TMP/valkey.conf"
+valkey_apply_config "$TMP/valkey.conf" valkey 512 allkeys-lru /run/valkey/valkey.sock
+check "valkey_apply_config replaces old RDB saves with the 5-minute snapshot and drops protected-mode no" \
+  bash -c "! grep -qE '^(save 3600|save 300 100|protected-mode no)' '$TMP/valkey.conf' && grep -qx 'save 300 1' '$TMP/valkey.conf'"
 check "valkey_apply_config keeps operator directives" grep -qx 'daemonize no' "$TMP/valkey.conf"
-check "valkey_apply_config clamps io-threads to 8" grep -qx 'io-threads 8' "$TMP/valkey.conf"
+# 1.22.5: a file an earlier run wrote with io-threads 4 moves back to 1.
+check "valkey_apply_config resets io-threads 4 to 1 (1.22.5)" \
+  bash -c "grep -qx 'io-threads 1' '$TMP/valkey.conf' && [ \"\$(grep -c '^io-threads ' '$TMP/valkey.conf')\" -eq 1 ]"
 valkey_hash=$(md5sum "$TMP/valkey.conf" | awk '{print $1}')
-valkey_apply_config "$TMP/valkey.conf" valkey 512 allkeys-lru 16 /run/valkey/valkey.sock
+valkey_apply_config "$TMP/valkey.conf" valkey 512 allkeys-lru /run/valkey/valkey.sock
 check "valkey_apply_config is idempotent" test "$valkey_hash" = "$(md5sum "$TMP/valkey.conf" | awk '{print $1}')"
-no_startup_keys() { ! valkey_runtime_settings 512 allkeys-lru 1 | grep -qE '^(tcp-backlog|io-threads) '; }
+no_startup_keys() { ! valkey_runtime_settings 512 allkeys-lru | grep -qE '^(tcp-backlog|io-threads) '; }
 check "valkey_runtime_settings drops the startup-only keys" no_startup_keys
-keeps_maxmemory() { valkey_runtime_settings 512 allkeys-lru 1 | grep -qx 'maxmemory 512mb'; }
+keeps_maxmemory() { valkey_runtime_settings 512 allkeys-lru | grep -qx 'maxmemory 512mb'; }
 # The assertion used to sit outside check() (`check ... bash -c "true" && ...`),
 # so the check always passed and a failure only tripped set -e.
 check "valkey_runtime_settings keeps maxmemory" keeps_maxmemory
@@ -3950,15 +3958,15 @@ check "php_plan_max_children gives a 64-thread host 128 workers" \
 check "php_plan_max_children gives a 2-core box 4 workers" \
   test "$(php_plan_max_children 2 2048 "" "" 0)" = 4
 
-# Brotli level: explicit, else 4, or 3 on a 1-2 CPU host.
+# Brotli level: explicit, else 1 (1.22.5) on every host size.
 effective_cpus() { printf 16; }
 check "nginx_brotli_level honours SETUP_BROTLI_LEVEL" \
   test "$(SETUP_BROTLI_LEVEL=7 nginx_brotli_level)" = 7
 check "nginx_brotli_level ignores an invalid SETUP_BROTLI_LEVEL" \
-  test "$(SETUP_BROTLI_LEVEL=99 nginx_brotli_level)" = 4
+  test "$(SETUP_BROTLI_LEVEL=99 nginx_brotli_level)" = 1
 effective_cpus() { printf 2; }
-check "nginx_brotli_level drops to 3 on a 2 CPU host" \
-  test "$(nginx_brotli_level)" = 3
+check "nginx_brotli_level is 1 on a 2 CPU host too" \
+  test "$(nginx_brotli_level)" = 1
 effective_cpus() { printf 16; }
 # zstd (1.21.58) is retired in 1.21.59: Cloudflare asks origins for
 # "br, gzip" only.  The managed stanzas go, an operator's own stay, and the
@@ -4021,7 +4029,7 @@ printf '# Managed by setup.sh: dynamic Brotli from http.d/brotli_conf.\n# brotli
 ( NGINX_TEST_BIN=nb_filter ensure_nginx_compression "$bt" ) >/dev/null 2>&1 || true
 check "brotli.conf from the template has no brotli_static" not grep -q 'brotli_static' "$bt/http.d/brotli.conf"
 check "brotli.conf from the template keeps dynamic Brotli at the profile level" \
-  bash -c 'grep -qx "brotli on;" "$1" && grep -qx "brotli_comp_level 4;" "$1"' _ "$bt/http.d/brotli.conf"
+  bash -c 'grep -qx "brotli on;" "$1" && grep -qx "brotli_comp_level 1;" "$1"' _ "$bt/http.d/brotli.conf"
 rm -f "$bt/http.d/brotli_conf"
 ( NGINX_TEST_BIN=nb_filter ensure_nginx_compression "$bt" ) >/dev/null 2>&1 || true
 check "brotli.conf without a template has no brotli_static" not grep -q 'brotli_static' "$bt/http.d/brotli.conf"
@@ -4338,13 +4346,16 @@ php_ini_profile garbage
 check "php_ini_profile falls back to the 1 GB profile on garbage" \
   test "$PHP_PROFILE_OPCACHE_MB" -eq 128 -a "$PHP_PROFILE_MEMORY_MB" -eq 128 -a "$PHP_PROFILE_REALPATH_KB" -eq 4096
 
-# gzip level: explicit, else 4, or 3 on a 1-2 CPU host.
-check "nginx_gzip_level honours SETUP_GZIP_LEVEL" \
-  test "$(SETUP_GZIP_LEVEL=7 nginx_gzip_level)" = 7
-check "nginx_gzip_level ignores an invalid SETUP_GZIP_LEVEL and drops to 3 on 2 CPUs" \
-  test "$(effective_cpus() { printf 2; }; SETUP_GZIP_LEVEL=bogus nginx_gzip_level)" = 3
+# gzip level: 4, or 3 on a 1-2 CPU host.  SETUP_GZIP_LEVEL was removed in
+# 1.22.5 (no level measured faster) and no longer pins it.
+check "nginx_gzip_level ignores a SETUP_GZIP_LEVEL pin (removed in 1.22.5)" \
+  test "$(effective_cpus() { printf 8; }; SETUP_GZIP_LEVEL=7 nginx_gzip_level)" = 4
+check "nginx_gzip_level drops to 3 on 2 CPUs" \
+  test "$(effective_cpus() { printf 2; }; nginx_gzip_level)" = 3
 check "nginx_gzip_level defaults to 4 on 8 CPUs" \
-  test "$(effective_cpus() { printf 8; }; SETUP_GZIP_LEVEL='' nginx_gzip_level)" = 4
+  test "$(effective_cpus() { printf 8; }; nginx_gzip_level)" = 4
+check "nginx_gzip_level reads no SETUP_GZIP_LEVEL variable" \
+  bash -c '! sed -n "/^nginx_gzip_level()/,/^}/p" "$1" | grep -q SETUP_GZIP_LEVEL' _ "$ALL_SRC"
 
 es_json='{"cluster":{"number_of_nodes": 3,"status" : "green","x":{"size_in_bytes":123456}}}'
 check "es_json_num reads a spaced numeric field" test "$(es_json_num "$es_json" number_of_nodes)" = 3
@@ -5061,35 +5072,48 @@ check "backup user is written quoted" grep -qxF 'user="admin"' "$TMP/mysqlbkup.c
 # ---------------------------------------------------------------------------
 # 1.21.3: an adopted cache keeps AOF persistence and a non-loopback bind
 # ---------------------------------------------------------------------------
+# The writer reads redis-server --version (1.22.5, Redis 6.0 directives):
+# a test host's own redis-server must not change these expectations.
+VALKEY_REDIS_VERSION_CACHE=none
 vk_adopt="$TMP/redis-adopt.conf"
 printf 'bind 10.0.0.5 127.0.0.1\nappendonly yes\nsave 900 1\nmaxmemory 1gb\n' > "$vk_adopt"
-valkey_apply_config "$vk_adopt" redis 512 allkeys-lru 1 /run/redis/redis.sock adopt
+valkey_apply_config "$vk_adopt" redis 512 allkeys-lru /run/redis/redis.sock adopt
 check "adopted cache: appendonly yes is kept" grep -qx 'appendonly yes' "$vk_adopt"
 check "adopted cache: the save schedule is kept" grep -qx 'save 900 1' "$vk_adopt"
 check "adopted cache: persistence is not switched off" not grep -qx 'appendonly no' "$vk_adopt"
 check "adopted cache: the private bind address is kept" grep -qx 'bind 10.0.0.5 127.0.0.1' "$vk_adopt"
 cp "$vk_adopt" "$vk_adopt.first"
-valkey_apply_config "$vk_adopt" redis 512 allkeys-lru 1 /run/redis/redis.sock adopt
+valkey_apply_config "$vk_adopt" redis 512 allkeys-lru /run/redis/redis.sock adopt
 check "adopted cache: the second run writes the same file" cmp -s "$vk_adopt" "$vk_adopt.first"
 vk_plain="$TMP/redis-plain.conf"
 printf 'bind 127.0.0.1 -::1\nappendonly no\n' > "$vk_plain"
-valkey_apply_config "$vk_plain" redis 512 allkeys-lru 1 /run/redis/redis.sock adopt
-check "a default cache still gets persistence off" grep -qx 'save ""' "$vk_plain"
+valkey_apply_config "$vk_plain" redis 512 allkeys-lru /run/redis/redis.sock adopt
+check "a default cache gets the 5-minute RDB snapshot (1.22.5)" grep -qx 'save 300 1' "$vk_plain"
 check "a default cache keeps the loopback bind" grep -qx 'bind 127.0.0.1 -::1' "$vk_plain"
 vk_inst="$TMP/valkey-install.conf"
 printf 'bind 10.0.0.5\nappendonly yes\n' > "$vk_inst"
-valkey_apply_config "$vk_inst" valkey 512 allkeys-lru 1 /run/valkey/valkey.sock
+valkey_apply_config "$vk_inst" valkey 512 allkeys-lru /run/valkey/valkey.sock
 check "a fresh --valkey install writes the cache profile" \
   bash -c 'grep -qx "appendonly no" "$1" && grep -qx "bind 127.0.0.1 -::1" "$1"' _ "$vk_inst"
 
 # ---------------------------------------------------------------------------
-# 1.21.3: --valkey without policy=/io_threads= keeps the previous values
+# 1.21.3: --valkey without policy= keeps the previous value
 # ---------------------------------------------------------------------------
 validate_body=$(sed -n '/^validate_all()/,/^}/p' "$ALL_SRC")
 check "validation does not write a default policy back" \
   bash -c '! grep -q "valkey.policy\]:-allkeys-lru" <<<"$1"' _ "$validate_body"
-check "validation does not write a default io_threads back" \
-  bash -c '! grep -q "valkey.io_threads\]:-1" <<<"$1"' _ "$validate_body"
+# 1.22.5: --valkey io_threads=N was removed; a passed value is ignored with
+# a warning (never fatal) and never reaches OPT.
+vk_io_ignored() (
+  RETIRED_VALKEY_IO_THREADS=""
+  kv_set valkey io_threads 4 || exit 1
+  [[ $RETIRED_VALKEY_IO_THREADS == "--valkey io_threads=4" && -z ${OPT[valkey.io_threads]:-} ]]
+)
+check "--valkey io_threads=4 is recorded as retired, not stored (1.22.5)" vk_io_ignored
+check "validate_all warns 'Ignored (removed in 1.22.5' for --valkey io_threads=" \
+  bash -c 'grep -q "RETIRED_VALKEY_IO_THREADS" <<<"$1" && grep -q "Ignored (removed in 1.22.5; io-threads above 1" <<<"$1"' _ "$validate_body"
+check "validation no longer refuses or clamps io_threads" \
+  bash -c '! grep -qE "io_threads=.*(is invalid|exceeds)" <<<"$1"' _ "$validate_body"
 
 # ---------------------------------------------------------------------------
 # 1.21.3: generated vhosts get anchored route locations
@@ -6067,7 +6091,9 @@ mit_run() { # want -> "<file present 0/1> <update-grub calls>"
   (
     CPU_MITIGATIONS_DROPIN=$TMP/mit/grub.d/zz-setup-mitigations.cfg
     CPU_MITIGATIONS_LEGACY_DROPIN=$TMP/mit/grub.d/99-setup-mitigations.cfg
-    CPU_MITIGATIONS=$1 CPU_MITIGATIONS_SETTING=""
+    CPU_MITIGATIONS=$1 CPU_MITIGATIONS_SETTING="" CPU_MITIGATIONS_RETIRED_ON=0
+    # A persisted on is rewritten through persist_tuning_var: never the host file.
+    SETUP_TUNING_FILE=$TMP/mit/setup-tuning
     host_is_container() { return 1; }
     harden_note() { printf 'NOTE %s\n' "$*" >> "$TMP/mit/report"; }
     info() { printf 'INFO %s\n' "$*" >> "$TMP/mit/report"; }
@@ -6092,10 +6118,16 @@ mit_run() { # want -> "<file present 0/1> <update-grub calls>"
 }
 if [[ -f /etc/default/grub ]]; then
   mkdir -p "$TMP/mit"; : > "$TMP/mit/calls"
-  check "mitigations=off writes the drop-in and runs update-grub once" test "$(mit_run off)" = "1 1"
-  check "a second mitigations=off changes nothing (no update-grub)" test "$(mit_run off)" = "1 1"
-  check "mitigations=on removes the drop-in and runs update-grub" test "$(mit_run on)" = "0 2"
-  check "an unset choice never touches the boot loader" test "$(mit_run '')" = "0 2"
+  # 1.22.5: mitigations=off is the default; an unset choice applies it and a
+  # persisted CPU_MITIGATIONS=on moves to off (mitigations=on was removed).
+  check "an unset choice writes the default mitigations=off drop-in and runs update-grub once" test "$(mit_run '')" = "1 1"
+  check "mitigations=off then changes nothing (no update-grub)" test "$(mit_run off)" = "1 1"
+  : > "$TMP/mit/report"
+  check "a persisted CPU_MITIGATIONS=on keeps the drop-in (no update-grub)" test "$(mit_run on)" = "1 1"
+  check "a persisted CPU_MITIGATIONS=on is reported as moved to off" \
+    grep -q "^NOTE .*CPU_MITIGATIONS=on was removed in 1.22.5" "$TMP/mit/report"
+  check "a persisted CPU_MITIGATIONS=on is rewritten to off" \
+    grep -qx "CPU_MITIGATIONS=off" "$TMP/mit/setup-tuning"
   # The drop-in is present but the boot menu lacks mitigations=off (an earlier
   # update-grub failed): the next run regenerates it.
   mit_run off >/dev/null; echo "	linux /vmlinuz root=x ro" > "$TMP/mit/grub.cfg"
@@ -7089,6 +7121,8 @@ check_tree "the Chevereto redirect carries no regex in the non-cached include" \
   bash -c '! grep -q "request_uri ~" "$1/h5bp/php_chev.conf"' _ "$NGINX_TREE"
 check_tree "the dead referer map is gone" \
   test ! -e "$NGINX_TREE/http.d/referer_map.conf"
+check "the deploy retires the removed http.d perf files (1.22.5)" \
+  bash -c 'for f in ppa_eilander_conf http_trim_filter_conf reverse_proxy_conf; do grep -qF "\"\$target/http.d/$f\"" "$1" || exit 1; done' _ "$ROOT/lib/web.sh"
 check_tree "the cookie allowlist no longer names the removed filter" \
   bash -c '! grep -qi "anubis" "$1/http.d/fastcgi_cache.conf"' _ "$NGINX_TREE"
 check_tree "no unix: peer is trusted for forwarded headers" \
@@ -7350,31 +7384,11 @@ check "JIT threshold comment no longer calls the tuned set PHP's defaults" not \
   grep -q "PHP's defaults are used" <<<"$php_jit_comment"
 check "JIT threshold comment names PHP's 8/8 defaults" \
   grep -q "8/8" <<<"$php_jit_comment"
-php_jit_lines_4cpu=$(SETUP_PHP_JIT_HOT_RETURN='' SETUP_PHP_JIT_HOT_SIDE_EXIT='' php_jit_threshold_lines 4)
+php_jit_lines_4cpu=$(php_jit_threshold_lines 4)
 check "JIT keeps jit_hot_return=16 on a 4-CPU host" \
   grep -qx 'opcache.jit_hot_return = 16' <<<"$php_jit_lines_4cpu"
 check "JIT keeps jit_hot_side_exit=64 on a 4-CPU host" \
   grep -qx 'opcache.jit_hot_side_exit = 64' <<<"$php_jit_lines_4cpu"
-
-# session.sid_length / sid_bits_per_character are deprecated in PHP 8.4:
-# written only inside the pre-8.4 version gate.
-php_sid_gate=$(awk '/php_major < 8 \|\| \(php_major == 8 && php_minor < 4\)/{f=1} f' <<<"$php_tune_hardening")
-check "opt-in hardening gates sid_length on PHP < 8.4" \
-  grep -q '^session.sid_length = 48$' <<<"$php_sid_gate"
-check "opt-in hardening gates sid_bits_per_character on PHP < 8.4" \
-  grep -q '^session.sid_bits_per_character = 6$' <<<"$php_sid_gate"
-check "opt-in hardening derives the gate from the pool version" \
-  grep -qF 'php_major=${ver%%.*}' <<<"$php_tune_hardening"
-php_sid_gate_eval() {
-  local ver=$1 php_major php_minor
-  php_major=${ver%%.*} php_minor=${ver#*.}
-  php_minor=${php_minor%%.*}
-  [[ $php_major =~ ^[0-9]+$ && $php_minor =~ ^[0-9]+$ ]] \
-    && (( php_major < 8 || (php_major == 8 && php_minor < 4) ))
-}
-check "PHP 8.3 still gets the session-ID length lines" php_sid_gate_eval 8.3
-check "PHP 8.4 skips the deprecated session-ID lines" not php_sid_gate_eval 8.4
-check "PHP 8.5 skips the deprecated session-ID lines" not php_sid_gate_eval 8.5
 
 # ---- 1.21.67: interrupted --diagnostics leaves no unredacted temp report
 # An interrupted --diagnostics (Ctrl-C, set -e, die) left its unredacted
@@ -7505,7 +7519,7 @@ check "php-build.conf: pins, quotes and comments parse; unset keys mean latest; 
 check "php-build.conf: a value that is neither latest nor a version is refused" \
   test "$(pb_tool_case confbad)" = "refused"
 check "php-build.conf ships beside setup.sh with every component the tool builds" \
-  bash -c 'for k in PHP LLVM REDIS IGBINARY OPENSSL PCRE2 ZLIB_NG LIBXML2 LIBSODIUM GMP CURL LIBJPEG_TURBO LIBPNG LIBWEBP LIBZIP LIBICONV SQLITE ICU; do grep -qx "${k}_VERSION=latest" "$1/php-build.conf" || { echo "no $k"; exit 1; }; done' _ "$ROOT"
+  bash -c 'for k in PHP LLVM REDIS IGBINARY OPENSSL PCRE2 ZLIB_NG LIBXML2 LIBSODIUM GMP CURL LIBJPEG_TURBO LIBPNG LIBWEBP LIBZIP LIBICONV SQLITE ICU MIMALLOC; do grep -qx "${k}_VERSION=latest" "$1/php-build.conf" || { echo "no $k"; exit 1; }; done; grep -qx "PHP_BUILD_MALLOC=mimalloc" "$1/php-build.conf"' _ "$ROOT"
 lean_set_ok() {
   local f
   f=$(sed -n '/^cmd_build()/,/^}/p' "$ROOT/tools/php-build.sh")
@@ -7544,9 +7558,10 @@ check "phpinfo is not in the shipped disable_functions (XenForo/WordPress admin 
 unset -f pb_tool_case pb_tool_body lean_set_ok pb_traps_ok gpg_home_ok
 
 # ---- hardening and shared build code (1.21.70, carried into 1.22)
-PFB_SRC=$(cat "$ROOT/tools/php-build.sh" "$ROOT/tools/build-common.sh")
+# (The two files, not their text as one argument: together they passed
+# Linux's 128 KB limit for a single argument in 1.22.5.)
 check "php-build: Ubuntu's hardening flags (stack protector, clash probes, FORTIFY=3, CET/BTI, full RELRO)" \
-  bash -c 'for f in -fstack-protector-strong -fstack-clash-protection -D_FORTIFY_SOURCE=3 -fcf-protection=full -mbranch-protection=standard "-Wl,-z,relro,-z,now"; do grep -qF -- "$f" <<<"$1" || { echo "no $f"; exit 1; }; done' _ "$PFB_SRC"
+  bash -c 'for f in -fstack-protector-strong -fstack-clash-protection -D_FORTIFY_SOURCE=3 -fcf-protection=full -mbranch-protection=standard "-Wl,-z,relro,-z,now"; do cat "$1" "$2" | grep -qF -- "$f" || { echo "no $f"; exit 1; }; done' _ "$ROOT/tools/php-build.sh" "$ROOT/tools/build-common.sh"
 check "nginx-build: the same hardening flags" \
   bash -c 'for f in -fstack-protector-strong -fstack-clash-protection -D_FORTIFY_SOURCE=3 -fcf-protection=full "-Wl,-z,relro,-z,now"; do grep -qF -- "$f" "$1" || exit 1; done' _ "$ROOT/tools/nginx-build.sh"
 check "build downloads: a stalled transfer (under 1 KB/s for 30 s) fails over to the next source" \
@@ -7600,7 +7615,7 @@ check "install_nginx and optimize_nginx run nginx_build_ensure; --purge nginx ru
 check "every caller runs NGINX_BIN (the compiled binary), never /usr/sbin/nginx" \
   bash -c 'grep -qF "NGINX_BIN=\${NGINX_BIN:-\${NGINX_ROOT}/sbin/nginx}" "$1/lib/nginx-build.sh" && ! grep -nE "^[^#]*/usr/sbin/nginx[[:space:]]+-" "$1"/lib/web.sh "$1"/lib/service-optimizers.sh "$1"/lib/optimize.sh' _ "$ROOT"
 check "nginx-build.conf ships beside setup.sh with every component the tool builds" \
-  bash -c 'for k in NGINX LLVM OPENSSL PCRE2 ZLIB_NG BROTLI NGX_BROTLI; do grep -qx "${k}_VERSION=latest" "$1/nginx-build.conf" || exit 1; done' _ "$ROOT"
+  bash -c 'for k in NGINX LLVM AWS_LC PCRE2 ZLIB_NG BROTLI NGX_BROTLI; do grep -qx "${k}_VERSION=latest" "$1/nginx-build.conf" || exit 1; done; grep -qx "TLS_LIB=aws-lc" "$1/nginx-build.conf"' _ "$ROOT"
 nginx_modules=$(sed -n '/^CONFIGURE_MODULES=(/,/^)/p' "$ROOT/tools/nginx-build.sh")
 check "nginx-build: only the modules server-configs-nginx uses (no mail/stream/ssi/grpc ...)" \
   bash -c 'for w in http_v3_module http_realip_module http_stub_status_module with-threads without-http_ssi_module without-http_grpc_module; do grep -q -- "$w" <<<"$1" || exit 1; done; ! grep -qE -- "--with-(mail|stream|http_dav|http_mp4|http_sub|http_acme|http_gzip_static)" <<<"$1"' _ "$nginx_modules"
@@ -7872,12 +7887,12 @@ vk_tool_case() { # case -> result
       cache)   printf 'valkey=9.2.0\n' > "$T/root/build.info"; printf 'save ""\nappendonly no\n' > "$T/etc/valkey.conf"; printf '[%s]' "$(series)" ;;
       rdb)     printf 'valkey=9.0.6\n' > "$T/root/build.info"; printf 'save 900 1\nappendonly no\n' > "$T/etc/valkey.conf"; printf '[%s]' "$(series)" ;;
       aof)     printf 'valkey=9.0.6\n' > "$T/root/build.info"; printf 'save ""\nappendonly yes\n' > "$T/etc/valkey.conf"; printf '[%s]' "$(series)" ;;
-      pkg)     printf 'save 900 1\n' > "$T/etc/valkey.conf"; printf '[%s]' "$(VK_PKG=8.1.4; series)" ;;
+      pkg)     printf 'appendonly yes\n' > "$T/etc/valkey.conf"; printf '[%s]' "$(VK_PKG=8.1.4; series)" ;;
       legacy)
         mkdir -p "$T/root/build"; printf 'valkey=9.0.6\n' > "$T/root/build/build.info"
-        printf 'save 900 1\n' > "$T/etc/valkey.conf"; printf '[%s]' "$(VK_PKG=8.1.4; series)" ;;
+        printf 'appendonly yes\n' > "$T/etc/valkey.conf"; printf '[%s]' "$(VK_PKG=8.1.4; series)" ;;
       resolve)
-        printf 'valkey=9.0.6\n' > "$T/root/build.info"; printf 'save 900 1\n' > "$T/etc/valkey.conf"
+        printf 'valkey=9.0.6\n' > "$T/root/build.info"; printf 'appendonly yes\n' > "$T/etc/valkey.conf"
         latest_of() { case $1 in valkey) [[ -n ${2:-} ]] && printf '%s.8' "$2" || printf '9.2.0' ;; llvm) printf 23 ;; esac; }
         hashes_lookup() { return 0; }
         printf '%s' "$(resolve_all | tr '\n' ' ')" ;;
@@ -7896,13 +7911,13 @@ vk_tool_case() { # case -> result
 }
 check "valkey-build: a cache-only valkey.conf may run the newest release (no series pin)" \
   test "$(vk_tool_case cache)" = "[]"
-check "valkey-build: RDB snapshots or AOF pin the build to the series of the server that wrote the data" \
-  test "$(vk_tool_case rdb),$(vk_tool_case aof)" = "[9.0],[9.0]"
-check "valkey-build: before the first build, the valkey-server package's series is the data writer" \
+check "valkey-build: AOF pins the build to the series of the server that wrote the data; RDB snapshots do not (1.22.5: a newer Valkey loads an older RDB)" \
+  test "$(vk_tool_case rdb),$(vk_tool_case aof)" = "[],[9.0]"
+check "valkey-build: before the first build, the valkey-server package's series is the data writer (AOF)" \
   test "$(vk_tool_case pkg)" = "[8.1]"
 check "valkey-build: a 1.21 build newer than the package is the data writer" \
   test "$(vk_tool_case legacy)" = "[9.0]"
-check "valkey-build: with persistence, 'latest' resolves within that series" \
+check "valkey-build: with AOF, 'latest' resolves within that series" \
   test "$(vk_tool_case resolve)" = "valkey=9.0.8 llvm=23 "
 check "valkey-build pre: a build made on this CPU passes" \
   test "$(vk_tool_case cpusame)" = "rc=0 0"

@@ -389,7 +389,7 @@ xf_gzip_block() {
 // BEGIN setup.sh enableGzip (XF_MEMBER_GZIP=nginx in /etc/default/setup-tuning)
 // Guests: XenForo compresses (level 9) and the guest cache stores that body.
 // Logged-in visitors: XenForo sends plain HTML and nginx compresses it
-// (Brotli/gzip level 4), which costs far less PHP CPU per page.
+// (Brotli level 1, gzip level 4), which costs far less PHP CPU per page.
 $config['enableGzip'] = !isset($_COOKIE[($config['cookie']['prefix'] ?? 'xf_') . 'session']);
 // END setup.sh enableGzip
 EOF
@@ -703,7 +703,7 @@ audit_app_persistent_connections() {
         issues=$((issues + 1))
       fi
     else
-      opt_report "  - Valkey/Redis endpoint \`${redis_value}\` is not the local socket; set \`define('WP_REDIS_PATH', '${socket_hint}');\` and \`define('WP_REDIS_PERSISTENT', true);\`"
+      opt_report "  - Valkey/Redis endpoint \`${redis_value}\` is not the local socket; set \`define('WP_REDIS_SCHEME', 'unix');\` with \`define('WP_REDIS_PATH', '${socket_hint}');\` and \`define('WP_REDIS_PERSISTENT', true);\`"
       issues=$((issues + 1))
     fi
   done < <(app_find_wordpress_configs)

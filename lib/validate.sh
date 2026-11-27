@@ -547,7 +547,7 @@ php_ext_validate() {
   fi
   for name in ${list//,/ }; do
     [[ $name == none ]] && die "--php ext=none clears the list and cannot be combined with other names"
-    [[ ${name#-} =~ ^[a-z0-9_]+$ ]] \
+    [[ ${name#-} =~ ^[a-z0-9_]+(-[a-z0-9_]+)?$ ]] \
       || die "--php ext: '${name}' is not an extension name (use e.g. ext=intl,gmp, -NAME to drop one, or none)"
     [[ $name == -* ]] && continue
     if declare -F php_build_ext_buildable >/dev/null \
@@ -670,6 +670,19 @@ validate_all() {
   # Static-asset precompression removed in 1.22.1 (setup.sh drops the knob).
   [[ -n ${RETIRED_PRECOMPRESS_ENV:-} ]] \
     && warn "Ignored (removed in 1.22.1; gzip_static and brotli_static are not compiled in, nginx compresses with dynamic gzip and Brotli): ${RETIRED_PRECOMPRESS_ENV}"
+  # PHP session/cgi hardening removed in 1.22.5 (setup.sh drops the knob).
+  [[ -n ${RETIRED_SESSION_HARDENING_ENV:-} ]] \
+    && warn "Ignored (removed in 1.22.5; the optional PHP session/cgi hardening block is no longer written): ${RETIRED_SESSION_HARDENING_ENV}"
+  # JIT hotness overrides and the gzip level pin removed in 1.22.5.
+  if declare -p RETIRED_PERF_ENV >/dev/null 2>&1 && (( ${#RETIRED_PERF_ENV[@]} > 0 )); then
+    warn "Ignored (removed in 1.22.5; no other value measured faster, the hardware-derived JIT thresholds and gzip level apply): ${RETIRED_PERF_ENV[*]}"
+  fi
+  # Monthly OPTIMIZE rebuild removed in 1.22.5 (setup.sh drops the knob).
+  [[ -n ${RETIRED_MONTHLY_OPTIMIZE_ENV:-} ]] \
+    && warn "Ignored (removed in 1.22.5; the monthly mariadb-check always runs ANALYZE): ${RETIRED_MONTHLY_OPTIMIZE_ENV}"
+  # Valkey io_threads removed in 1.22.5 (kv_set records it; never fatal).
+  [[ -n ${RETIRED_VALKEY_IO_THREADS:-} ]] \
+    && warn "Ignored (removed in 1.22.5; io-threads above 1 measured no gain, Valkey always runs io-threads 1): ${RETIRED_VALKEY_IO_THREADS}"
   # SETUP_MEM_TOTAL_MB is a dry-run/test stand-in for the host's RAM only.
   if [[ -n ${SETUP_MEM_TOTAL_MB+x} ]] && ! mem_override_allowed; then
     warn "SETUP_MEM_TOTAL_MB is ignored outside --dry-run; the memory class comes from the host (${MEM_GATE_MIN_MB} MB = 4 GB class)"
@@ -680,22 +693,28 @@ validate_all() {
   (( ${LIMIT_REQ_EXEMPT_IGNORED:-0} )) \
     && warn "SETUP_LIMIT_REQ_EXEMPT is ignored: the only request limit left is the login limiter, which never exempts a remote address"
 
-  # mitigations=on|off (--basic, --optimize or SETUP_CPU_MITIGATIONS).
+  # mitigations=off is the default since 1.22.5 (--basic and --optimize
+  # apply it on every run); mitigations=on was removed (operator decision:
+  # single-tenant hosts, key-only SSH).  mitigations=off and
+  # SETUP_CPU_MITIGATIONS=off stay accepted and change nothing.
   if (( ${CPU_MITIGATIONS_LOOSE:-0} )) && (( ! OPTIMIZE )) && (( ${ENABLED[basic]:-0} != 1 )); then
     die "mitigations= is only valid with --basic or --optimize"
   fi
   if [[ -n ${CPU_MITIGATIONS_SETTING:-} ]]; then
     case ${CPU_MITIGATIONS_SETTING,,} in
       off|no|0|false) CPU_MITIGATIONS_SETTING=off ;;
-      on|yes|1|true|auto) CPU_MITIGATIONS_SETTING=on ;;
-      *) die "mitigations= expects on or off (got '${CPU_MITIGATIONS_SETTING}')" ;;
+      on|yes|1|true|auto)
+        die "mitigations=on (SETUP_CPU_MITIGATIONS=on) was removed in 1.22.5: every host setup.sh manages boots with mitigations=off; --purge basic removes it" ;;
+      *) die "mitigations= accepts only off, the default (got '${CPU_MITIGATIONS_SETTING}')" ;;
     esac
-    CPU_MITIGATIONS=$CPU_MITIGATIONS_SETTING
   fi
-  case ${CPU_MITIGATIONS:-} in
-    ''|on|off) ;;
-    *) CPU_MITIGATIONS="" ;;
-  esac
+  # A CPU_MITIGATIONS=on persisted by an older release moves to off: the
+  # tuner rewrites the pin and reports it (configure_cpu_mitigations).
+  # shellcheck disable=SC2034  # read by cpu_mitigations_retired_on (lib/os.sh)
+  if [[ ${CPU_MITIGATIONS:-} == on ]]; then
+    CPU_MITIGATIONS_RETIRED_ON=1
+  fi
+  CPU_MITIGATIONS=off
 
   # Anubis support was removed in 1.21.62.  A leftover SETUP_ANUBIS in the
   # environment (a stale export, a runbook) must stop the run instead of
@@ -1009,28 +1028,16 @@ validate_all() {
       fi
     fi
     # Only a value that was given is validated and stored.  An absent
-    # policy=/io_threads= stays unset so install_valkey can keep what a
-    # previous run wrote (allkeys-lru / 1 on a first install); writing the
-    # default back here silently reset `policy=noeviction io_threads=4` on
-    # the next `--valkey` run.
+    # policy= stays unset so install_valkey can keep what a previous run
+    # wrote (allkeys-lru on a first install); writing the default back here
+    # silently reset `policy=allkeys-lfu` on the next `--valkey` run
+    # (noeviction is refused earlier, by kv_set; io_threads= was removed in
+    # 1.22.5 and is ignored by kv_set, io-threads is always 1).
     if [[ -n ${OPT[valkey.policy]:-} ]]; then
       case "${OPT[valkey.policy]}" in
-        allkeys-lru|allkeys-lfu|volatile-lru|volatile-lfu|volatile-ttl|allkeys-random|volatile-random|noeviction) ;;
+        allkeys-lru|allkeys-lfu|volatile-lru|volatile-lfu|volatile-ttl|allkeys-random|volatile-random) ;;
         *) die "--valkey policy='${OPT[valkey.policy]}' is invalid" ;;
       esac
-    fi
-    if [[ -n ${OPT[valkey.io_threads]:-} ]]; then
-      local vio=${OPT[valkey.io_threads]}
-      [[ $vio =~ ^[1-9][0-9]*$ ]] && (( vio <= 64 )) \
-        || die "--valkey io_threads='${vio}' is invalid (use 1..64)"
-      if (( vio > 8 )); then
-        # valkey_clamp_io_threads writes at most 8 (more threads than that
-        # only add contention on the single command thread); say so instead
-        # of silently writing a different value than the one requested.
-        warn "--valkey io_threads=${vio} exceeds the 8-thread ceiling; using 8"
-        vio=8
-      fi
-      OPT[valkey.io_threads]=$vio
     fi
   fi
 

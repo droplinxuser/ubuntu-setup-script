@@ -55,7 +55,6 @@ GMP_MIRRORS="https://ftp.gnu.org/gnu/gmp https://ftpmirror.gnu.org/gmp https://g
 GNU_MIRRORS="https://ftp.gnu.org/gnu https://ftpmirror.gnu.org"
 # Algorithms and protocols none of the three applications (or curl for
 # them) uses: legacy ciphers, national ciphers, binary curves, SRP, DTLS.
-# Nothing here may disable kTLS (nginx-build.sh KTLS=1 adds enable-ktls).
 # shellcheck disable=SC2034 # used by the sourcing tools
 OPENSSL_TRIM="no-idea no-camellia no-seed no-aria no-sm2 no-sm3 no-sm4 no-whirlpool no-md4 no-rc2 no-rc4 no-mdc2 no-cast no-bf no-gost no-srp no-dtls no-ssl3 no-ec2m no-comp"
 
@@ -102,20 +101,40 @@ install_stripped() { # src dst
 # CPUID at run time), so a build stays valid when the flag comes or goes.
 # Hashing them meant a kernel or microcode update on a Zen 5 host kept every
 # compiled service down until the native rebuild finished.
-CPU_ISA_FLAGS="sse3 ssse3 sse4_1 sse4_2 popcnt avx avx2 fma f16c bmi1 bmi2 lzcnt movbe adx aes pclmulqdq vaes vpclmulqdq sha_ni xsave xsavec xsaveopt xsaves avx512f avx512dq avx512cd avx512bw avx512vl avx512_vnni avx512_bf16 avx512vbmi avx512_vbmi2 avx512ifma avx512_bitalg avx512_vpopcntdq gfni avx_vnni amx_tile amx_bf16 amx_int8 clflushopt clwb"
-# The flags 1.22.0-1.22.3 hashed on top of CPU_ISA_FLAGS (see
+#
+# 1.22.5: the list 1.22.0-1.22.4 hashed is frozen as CPU_ISA_FLAGS_V1, and
+# CPU_ISA_FLAGS adds the extensions clang can emit without an intrinsic
+# (cmpxchg16b for 16-byte atomics, prefetchw for __builtin_prefetch(p, 1),
+# AVX512-FP16 for _Float16, ...), in their /proc/cpuinfo spelling (Linux
+# calls PREFETCHW 3dnowprefetch; it is hashed as clang's prfchw).  One of
+# them hidden or masked on the same CPU model (cloud CPU-model masking,
+# clearcpuid=, live migration) is now a CPU change.  cpu_fingerprint_matches
+# still accepts the V1 hash (and its rdrnd/rdseed combinations): a host
+# built by 1.22.0-1.22.4 sees no CPU change after the update (a false one
+# would keep every compiled service down until the native rebuild), and its
+# next build records the new hash.  Flags only intrinsics use, or that
+# kernels and hypervisors hide by policy (fsgsbase, rdpid, pku, serialize,
+# wbnoinvd, movdir*, cmpccxadd, sha512/sm3/sm4, amx_fp16, ...), are not
+# listed: hashing them made a boot option or a VM CPU model a "CPU change".
+# A flag that only APPEARS (a newer kernel names it) is no change either:
+# cpu_fingerprint_matches compares the recorded cpu_info= text as a set.
+CPU_ISA_FLAGS_V1="sse3 ssse3 sse4_1 sse4_2 popcnt avx avx2 fma f16c bmi1 bmi2 lzcnt movbe adx aes pclmulqdq vaes vpclmulqdq sha_ni xsave xsavec xsaveopt xsaves avx512f avx512dq avx512cd avx512bw avx512vl avx512_vnni avx512_bf16 avx512vbmi avx512_vbmi2 avx512ifma avx512_bitalg avx512_vpopcntdq gfni avx_vnni amx_tile amx_bf16 amx_int8 clflushopt clwb"
+CPU_ISA_FLAGS="$CPU_ISA_FLAGS_V1 cx16 prfchw lahf_lm avx_ifma avx_vnni_int8 avx_ne_convert avx512_fp16 avx512_vp2intersect sse4a xop fma4 tbm"
+# The flags 1.22.0-1.22.3 hashed on top of CPU_ISA_FLAGS_V1 (see
 # cpu_fingerprint_matches).
 CPU_ISA_FLAGS_LEGACY="rdrnd rdseed"
 
 # The plain text the fingerprint hashes (diagnostics and build.info cpu_info=).
 # FORCE (x86 only): ISA names added to the list as if /proc/cpuinfo had them,
-# for the 1.22.0-1.22.3 fingerprints.
-cpu_fingerprint_text() {
-  local info=${SETUP_CPUINFO:-/proc/cpuinfo} force=${1:-}
+# for the 1.22.0-1.22.3 fingerprints.  ALLOW: the x86 allow-list (default
+# CPU_ISA_FLAGS; CPU_ISA_FLAGS_V1 gives the 1.22.0-1.22.4 text).
+cpu_fingerprint_text() { # [force] [allow]
+  local info=${SETUP_CPUINFO:-/proc/cpuinfo} force=${1:-} allow=${2:-$CPU_ISA_FLAGS}
   [[ -r $info ]] || return 0
-  awk -F'[[:space:]]*:[[:space:]]*' -v allow="$CPU_ISA_FLAGS" -v force="$force" '
+  awk -F'[[:space:]]*:[[:space:]]*' -v allow="$allow" -v force="$force" '
     BEGIN { n = split(allow, a, " "); for (i = 1; i <= n; i++) ok[a[i]] = 1
-            alias["pni"] = "sse3"; alias["abm"] = "lzcnt"; alias["rdrand"] = "rdrnd" }
+            alias["pni"] = "sse3"; alias["abm"] = "lzcnt"; alias["rdrand"] = "rdrnd"
+            alias["3dnowprefetch"] = "prfchw" }
     # The first processor block only: every core of one host is the same CPU.
     /^[[:space:]]*$/ { if (seen) exit; next }
     { seen = 1 }
@@ -142,32 +161,65 @@ cpu_fingerprint_text() {
 # Prints the hash stored as cpu= in every build.info.  Empty /proc/cpuinfo
 # gives an empty string, which every gate treats as a mismatch (rebuild),
 # never as "skip the check".
-cpu_fingerprint() {
+cpu_fingerprint() { # [force] [allow]
   local t
-  t=$(cpu_fingerprint_text "${1:-}")
+  t=$(cpu_fingerprint_text "${1:-}" "${2:-}")
   [[ -n $t ]] || return 0
   printf '%s' "$t" | sha256sum | cut -c1-16
 }
 
+# 0 when BUILT_TEXT (a recorded cpu_info= text whose hash is BUILT) names
+# this CPU's identity and no allow-listed ISA flag this CPU no longer lists
+# (see cpu_fingerprint_matches).  Any doubt is a mismatch.
+cpu_fingerprint_superset() { # BUILT BUILT_TEXT
+  local built=${1:-} btext=${2:-} now rid nid f
+  [[ -n $built && $btext == *isa=* ]] || return 1
+  [[ $(printf '%s' "$btext" | sha256sum | cut -c1-16) == "$built" ]] || return 1
+  now=$(cpu_fingerprint_text)
+  rid=${btext%%isa=*}; nid=${now%%isa=*}
+  [[ -n $nid && $rid == "$nid" ]] || return 1
+  local -a rec
+  IFS=, read -r -a rec <<<"${btext##*isa=}"
+  for f in "${rec[@]}"; do
+    # x86: a recorded flag outside today's allow-list (rdrnd, a dropped
+    # name) is not compared; aarch64 Features are all ISA.
+    [[ $nid == *"CPU implementer="* || " $CPU_ISA_FLAGS " == *" $f "* ]] || continue
+    [[ ",${now##*isa=}," == *",$f,"* ]] || return 1
+  done
+  return 0
+}
+
 # 0 when BUILT (a build.info cpu= value) was made for this CPU.  Every gate
 # and staleness check uses this, never a plain string compare: a build from
-# 1.22.0-1.22.3 recorded a hash that included rdrnd/rdseed when the kernel
+# 1.22.0-1.22.4 recorded the hash of CPU_ISA_FLAGS_V1 (accepted as well), and
+# one from 1.22.0-1.22.3 a V1 hash that included rdrnd/rdseed when the kernel
 # showed them, so each of their four combinations is accepted too.  An
 # update to this version therefore rebuilds nothing, and a Zen 5 host whose
 # kernel hid RDSEED after such a build keeps serving.  Empty BUILT or an
 # unreadable /proc/cpuinfo is a mismatch.
+#
+# BUILT_TEXT (optional, 1.22.5): the build.info cpu_info= text.  When it is
+# the text BUILT hashes, the build also matches if the CPU identity fields
+# are the same and every recorded ISA flag still in the allow-list is still
+# listed: a flag a newer kernel starts to name never invalidates a
+# -march=native build; one that disappears, or another CPU, still does.
+#   cpu_fingerprint_matches BUILT [BUILT_TEXT]
 cpu_fingerprint_matches() {
-  local built=${1:-} now extra
+  local built=${1:-} btext=${2:-} now extra
   now=$(cpu_fingerprint)
   [[ -n $built && -n $now ]] || return 1
   [[ $built == "$now" ]] && return 0
+  cpu_fingerprint_superset "$built" "$btext" && return 0
   [[ -n $(awk '$1 == "flags" { print; exit }' "${SETUP_CPUINFO:-/proc/cpuinfo}" 2>/dev/null) ]] || return 1
   # Each legacy flag alone, then all of them (rdrnd, rdseed, "rdrnd rdseed").
   local -a combos
   read -r -a combos <<<"$CPU_ISA_FLAGS_LEGACY"
   combos+=("$CPU_ISA_FLAGS_LEGACY")
+  # The 1.22.4 hash (V1 alone), then V1 with each legacy flag alone and with
+  # all of them (rdrnd, rdseed, "rdrnd rdseed").
+  combos=("" "${combos[@]}")
   for extra in "${combos[@]}"; do
-    [[ $built == "$(cpu_fingerprint "$extra")" ]] && return 0
+    [[ $built == "$(cpu_fingerprint "$extra" "$CPU_ISA_FLAGS_V1")" ]] && return 0
   done
   return 1
 }
@@ -183,6 +235,134 @@ perf_record_die() {
   [[ -r ${1:-} ]] && why=$(grep -v '^[[:space:]]*$' "$1" | tail -n 1 | cut -c1-200)
   die "perf could not record branch samples${why:+: $why} (BOLT needs Intel LBR or AMD LbrExtV2 (Zen 4+) on bare metal; most VMs expose neither)"
 }
+
+# 1.22.5: a host that cannot record branch samples at all (a VM, Zen 3 and
+# earlier, Zen 4 on a kernel before 6.1) is told apart from a transient
+# failure (too few samples, the lock held, a perf that is busy).  perf's own
+# words for an unsupported branch stack or an unsupported sampling event,
+# confirmed by a one-shot probe (`perf record -j any,u -- true`, a few ms):
+# 0 means "branch sampling is not possible on this host".  The tools then
+# record bolt=nolbr and the daily refresh and the --optimize retry skip BOLT
+# until the next build (which writes bolt=0).  A wrong match only delays
+# BOLT until that build.
+PERF_NOLBR_RE="branch stack|branch sampl|doesn't support sampling|does not support sampling|not supported|Operation not supported|returned with 95|returned with 2 \\(No such file or directory\\) for event"
+perf_unsupported() { # perf-log perf [probe perf-record options...]
+  local log=${1:-} perf=${2:-perf} probe rc=0
+  shift 2 || true
+  [[ -r $log ]] && grep -qiE "$PERF_NOLBR_RE" "$log" || return 1
+  probe=$(mktemp 2>/dev/null) || return 0
+  "$perf" record -q "$@" -o "$probe" -- true >/dev/null 2>&1 || rc=$?
+  rm -f "$probe"
+  (( rc != 0 ))
+}
+perf_branch_unsupported() { perf_unsupported "${1:-}" "${2:-perf}" -e cycles:u -j any,u; } # perf-log [perf]
+
+# The BOLT profile of nginx and PHP: `perf record -j any,u` (branch
+# records, the only mode).  Returns:
+#   0  samples in DATA
+#   4  branch sampling is not possible on this host (perf's words and a
+#      probe agree): the caller records bolt=nolbr (no retry until the
+#      next build)
+#   5  not even plain cycle samples (a second probe): the caller records
+#      bolt=noperf
+#   1  any other failure (transient: the caller dies with perf's reason and
+#      the next refresh retries)
+# The plain-cycles profile (BOLT_NOLBR=1, perf2bolt -nl) was removed in
+# 1.22.5: it measured 1-3 % slower than no BOLT at all on every uncached
+# XenForo tier, so a host without branch records keeps its ThinLTO build.
+bolt_record() { # perf data log secs
+  local perf=$1 data=$2 log=$3 secs=$4
+  "$perf" record -q -e cycles:u -j any,u -o "$data" -a -- sleep "$secs" > "$log" 2>&1 && return 0
+  perf_branch_unsupported "$log" "$perf" || return 1
+  perf_unsupported "$log" "$perf" -e cycles:u && return 5
+  return 4
+}
+
+# 0 when a BOLT pass is worth trying for a build whose build.info says
+# bolt=VALUE: not yet applied, and not marked impossible on this host
+# (nolbr: no branch samples; noperf: no perf sampling at all).  Both wait
+# for the next build, which writes bolt=0.
+bolt_retry_due() { # bolt-value
+  case ${1:-0} in
+    1|nolbr|noperf) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# A build option value removed in 1.22.5 (operator rule: an opt-in that is
+# not the default and measured no faster is deleted, code and keys).  A
+# conf or environment that still names one gets one warning and the
+# default, never a failure; a build made with it is reported stale by
+# `check`, so the next --optimize or refresh rebuilds it on the default.
+#   opt_removed WHAT WHY DEFAULT
+opt_removed() {
+  say "WARNING: $1 was removed in 1.22.5 ($2); using the default ($3)"
+}
+
+# A KEY=VALUE of a tool's .conf that is not a component version (the last
+# assignment wins; quotes, comments and CR stripped).
+conf_opt() { # key default [file]
+  local f=${3:-${CONF:-}} v=""
+  [[ -n $f && -f $f ]] && v=$(awk -F= -v k="$1" '{ sub(/\r$/, "") } $1 == k { v = substr($0, length(k) + 2); sub(/[[:space:]]*#.*$/, "", v); gsub(/^[[:space:]"'\'']+|[[:space:]"'\'']+$/, "", v); last = v } END { print last }' "$f")
+  printf '%s' "${v:-$2}"
+}
+
+# Set KEY=VALUE in a build.info (replaced in place, or appended).
+info_put() { # file key value
+  local f=$1 k=$2 v=$3 t
+  [[ -f $f ]] || return 1
+  t=$(mktemp "$f.XXXXXX") || return 1
+  awk -v k="$k" -v v="$v" -F= '$1 == k { if (!d) print k "=" v; d = 1; next } { print } END { if (!d) print k "=" v }' "$f" > "$t" \
+    || { rm -f "$t"; return 1; }
+  chmod --reference="$f" "$t" 2>/dev/null || chmod 644 "$t"
+  mv -f "$t" "$f"
+}
+
+# The PHP build's allocator: mimalloc, the only one since 1.22.5
+# (microsoft/mimalloc built statically with the same flags and linked so it
+# replaces malloc in php-fpm and php; also a component name, so its version
+# is resolved, fetched, recorded and checked like any other).  glibc's
+# malloc (3-4 % slower on uncached XenForo pages, twice the PHP-FPM
+# memory), jemalloc (PHP and nginx) and nginx's MALLOC option were
+# removed in 1.22.5: measured below mimalloc, or within noise of glibc.
+# tools/php-build.sh reads PHP_BUILD_MALLOC only to warn about it.
+
+# microsoft/mimalloc as one relocatable object, DEST (the static override:
+# an object file, unlike an archive member, is always linked whole, so its
+# malloc/free/calloc/realloc/posix_memalign definitions replace glibc's for
+# the whole process; glibc's own calls go through the PLT to them).  Built
+# with cmake, MI_OVERRIDE=ON, no shared library, the caller's compiler
+# flags; plain C with no hand-written assembly, so BOLT (--emit-relocs) can
+# move it like the rest of the binary.  Needs CC, AR, RANLIB.
+mimalloc_build() { # src-dir dest-object cflags jobs log
+  local src=$1 dest=$2 f=$3 j=$4 log=$5 obj
+  (
+    cd "$src"
+    cmake -S . -B _b -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_C_COMPILER="$CC" -DCMAKE_AR="$AR" -DCMAKE_RANLIB="$RANLIB" -DCMAKE_C_FLAGS="$f" \
+      -DMI_OVERRIDE=ON -DMI_BUILD_SHARED=OFF -DMI_BUILD_STATIC=ON -DMI_BUILD_OBJECT=ON \
+      -DMI_BUILD_TESTS=OFF -DMI_INSTALL_TOPLEVEL=ON -DMI_SECURE=OFF -DMI_DEBUG_FULL=OFF
+    cmake --build _b -j "$j"
+  ) >> "$log" 2>&1 || return 1
+  obj=$(find "$src/_b" -path '*mimalloc-obj.dir*' -name 'static.c.o' -print -quit 2>/dev/null)
+  [[ -n $obj ]] || obj=$(find "$src/_b" -maxdepth 1 -name 'mimalloc.o' -print -quit 2>/dev/null)
+  [[ -n $obj && -s $obj ]] || { say "mimalloc: the build produced no object file"; return 1; }
+  install -d "$(dirname "$dest")" && install -m 644 "$obj" "$dest"
+}
+
+# 0 when BIN runs on allocator IMPL.  mimalloc: MIMALLOC_VERBOSE makes it
+# report its options on stderr; glibc's malloc ignores the variable.  ARGS:
+# what makes BIN start and exit normally (php -n -v).
+malloc_linked() { # impl bin args...
+  local m=$1 b=$2 out; shift 2
+  case $m in
+    mimalloc)
+      out=$(MIMALLOC_VERBOSE=1 "$b" "$@" 2>&1 >/dev/null || true)
+      [[ $out == *mimalloc:* ]] ;;
+    *) return 1 ;;
+  esac
+}
+mimalloc_linked() { malloc_linked mimalloc "$@"; } # bin args...
 
 # --------------------------------------------------------------- build limits
 # CPUs this host may use: the cgroup v2/v1 quota when set, else nproc (which
@@ -318,8 +498,12 @@ conf_get() {
       END { print last }' "$CONF")
   fi
   v=${v:-latest}
-  # OPENSSL_VERSION=lts: the newest release of OpenSSL's LTS series (3.5).
-  [[ $v == lts && $1 == openssl ]] && { printf '%s' "$v"; return 0; }
+  # OPENSSL_VERSION=lts (the newest 3.5.x) was removed in 1.22.5: OpenSSL
+  # 4.1 measured faster on handshakes and tied on bulk transfers.
+  if [[ $v == lts && $1 == openssl ]]; then
+    opt_removed "$key=lts in $CONF" "the newest OpenSSL measured faster on handshakes" latest
+    v=latest
+  fi
   [[ $v == latest || $v =~ ^[0-9][0-9A-Za-z._+-]*$ || $v =~ ^[0-9a-f]{7,40}$ ]] || die "$key='$v' in $CONF is neither latest nor a version"
   printf '%s' "$v"
 }
@@ -392,14 +576,9 @@ latest_of() {
           igbinary) v=$(git_latest igbinary/igbinary '^([0-9]+\.[0-9]+\.[0-9]+)$') ;;
         esac
       fi ;;
-    # x=lts (OPENSSL_VERSION=lts): the newest 3.5.x, OpenSSL's LTS series.
-    openssl)
-      if [[ $x == lts ]]; then v=$(git_latest openssl/openssl '^openssl-(3\.5\.[0-9]+)$')
-      else v=$(git_latest openssl/openssl '^openssl-([0-9]+\.[0-9]+\.[0-9]+)$')
-      fi ;;
-    # Opt-in TLS libraries of the nginx build (TLS_LIB in nginx-build.conf).
-    aws-lc)    v=$(git_latest aws/aws-lc '^v([0-9]+\.[0-9]+\.[0-9]+)$') ;;
-    boringssl) v=$(git_latest google/boringssl '^(0\.[0-9]{8}\.[0-9]+)$') ;;
+    openssl)  v=$(git_latest openssl/openssl '^openssl-([0-9]+\.[0-9]+\.[0-9]+)$') ;;
+    # The TLS library of the nginx build (the only one since 1.22.5).
+    aws-lc)   v=$(git_latest aws/aws-lc '^v([0-9]+\.[0-9]+\.[0-9]+)$') ;;
     pcre2)    v=$(git_latest PCRE2Project/pcre2 '^pcre2-([0-9]+\.[0-9]+)$') ;;
     zlib)     v=$(git_latest madler/zlib '^v([0-9]+\.[0-9]+(\.[0-9]+)*)$') ;;
     curl)     v=$(git_latest curl/curl '^curl-([0-9]+_[0-9]+_[0-9]+)$'); v=${v//_/.} ;;
@@ -431,6 +610,8 @@ latest_of() {
       v=$(printf '%s' "$listing" | grep -oE "libiconv-[0-9]+\.[0-9]+(\.[0-9]+)?\.tar\.gz" \
         | sed -E "s/^libiconv-|\.tar\.gz\$//g" | sort -V | tail -n 1) ;;
     zlib-ng)  v=$(git_latest zlib-ng/zlib-ng '^([0-9]+\.[0-9]+\.[0-9]+)$') ;;
+    # The PHP build's allocator (the only one since 1.22.5).
+    mimalloc) v=$(git_latest microsoft/mimalloc '^v([0-9]+\.[0-9]+\.[0-9]+)$') ;;
     # nginx: the highest version nginx.org publishes, which is the mainline
     # branch (odd minor; the stable branch is always numbered lower).  Then
     # the release-X.Y.Z tags of nginx/nginx on GitHub.
@@ -457,7 +638,9 @@ latest_of() {
 # ROOT/X.Y/build.info (any PHP version).  Never a staged or previous build
 # (staging/, prev/): neither serves, and keeping its version when a lookup
 # fails would downgrade the next build and flip back on the next failure.
-last_known() {
+# The second argument (the series resolve() was asked about) is ignored
+# here; tools/php-build.sh overrides this to read that series only (1.22.5).
+last_known() { # name [series]
   local f v=""
   for f in "$ROOT/build.info" "$ROOT"/*/build.info; do
     [[ -f $f ]] || continue
@@ -473,8 +656,7 @@ last_known() {
 resolve() { # name [php X.Y]
   local name=$1 x=${2:-} want cache v
   want=$(conf_get "$name")
-  if [[ $want == lts ]]; then x=lts
-  elif [[ $want != latest ]]; then
+  if [[ $want != latest ]]; then
     printf '%s' "$want"; return 0
   fi
   cache=$SRC_CACHE/resolve/$name${x:+-$x}
@@ -483,8 +665,8 @@ resolve() { # name [php X.Y]
   fi
   v=$(latest_of "$name" "$x") || v=""
   if [[ -z $v ]]; then
-    v=$(last_known "$name")
-    [[ $x != lts || $v == 3.5.* ]] || v=""   # a recorded 4.x is not "lts"
+    # The series too (PHP's last_known reads only that series' record).
+    v=$(last_known "$name" "$x")
     [[ -n $v ]] || return 1
     say "$name: no source answered; keeping $v"
     printf '%s' "$v"; return 0
@@ -761,6 +943,9 @@ fetch_component() { # name version -> path of the source archive
     nginx)
       # PGP-verified only (R36/R95): never a tag snapshot, never first use.
       fetch_nginx_signed "$v" ;;
+    mimalloc)
+      fetch_first "https://github.com/microsoft/mimalloc/archive/refs/tags/v$v.tar.gz|$c/mimalloc-$v.tar.gz|" \
+        "https://codeload.github.com/microsoft/mimalloc/tar.gz/refs/tags/v$v|$c/mimalloc-src-$v.tar.gz|" ;;
     brotli)
       # GitHub is Brotli's only home: release archive, then codeload.
       fetch_first "https://github.com/google/brotli/archive/refs/tags/v$v.tar.gz|$c/brotli-$v.tar.gz|" \
@@ -772,10 +957,6 @@ fetch_component() { # name version -> path of the source archive
       # GitHub is AWS-LC's only home: tag archive, then codeload (pinned).
       fetch_first "https://github.com/aws/aws-lc/archive/refs/tags/v$v.tar.gz|$c/aws-lc-$v.tar.gz|" \
         "https://codeload.github.com/aws/aws-lc/tar.gz/refs/tags/v$v|$c/aws-lc-src-$v.tar.gz|" ;;
-    boringssl)
-      # google/boringssl's GitHub tags (0.YYYYMMDD.N): archive, then codeload.
-      fetch_first "https://github.com/google/boringssl/archive/refs/tags/$v.tar.gz|$c/boringssl-$v.tar.gz|" \
-        "https://codeload.github.com/google/boringssl/tar.gz/refs/tags/$v|$c/boringssl-src-$v.tar.gz|" ;;
     valkey)
       # GitHub is Valkey's source home: the tag archive, then codeload.
       fetch_first "https://github.com/valkey-io/valkey/archive/refs/tags/$v.tar.gz|$c/valkey-$v.tar.gz|" \

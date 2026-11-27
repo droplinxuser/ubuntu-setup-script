@@ -53,7 +53,10 @@ Elasticsearch, Node.js and helper tools, plus per-domain vhosts.
   EPYC 4245P (Zen 5), on Ubuntu 24.04 and 26.04.  BOLT needs hardware branch
   records (Intel LBR, or AMD LbrExtV2 on Zen 4 and later) on bare metal;
   without them (most VMs, Zen 3 and older) the builds keep their ThinLTO
-  binaries and the report quotes perf's reason.
+  binaries and the report quotes perf's reason.  Since 1.22.5 such a host records
+  `bolt=nolbr` in `build.info` and BOLT is not retried until the next build
+  (a plain-cycles profile, `perf2bolt -nl`, measured 1-3 % slower than no
+  BOLT on every uncached XenForo tier, so there is no such option).
 - **RAM: the 4 GB class for anything but nginx.**  A host whose `MemTotal`
   is below 3500 MB runs nginx only (see [Small hosts](#small-hosts-the-4-gb-rule)).
 - **Disk for the builds:** a build refuses to start with less than 6 GB free
@@ -113,7 +116,7 @@ took 10 min 15 s, including building nginx 1.31.10, PHP 8.5.13 and Valkey
 | `--nginx` | nginx built from source and its configuration tree (`--angie` is a deprecated alias that warns and installs nginx) | [nginx](#nginx---nginx) |
 | `--php [ver=] [ext=] [children=] [max_requests=]` | PHP-FPM and the PHP CLI, built from source | [PHP](#php---php) |
 | `--mariadb user= pass= [size=] [bind=]` | MariaDB | [MariaDB](#mariadb---mariadb) |
-| `--valkey [ram=] [policy=] [io_threads=]` | Valkey cache, built from source | [Valkey](#valkey---valkey) |
+| `--valkey [ram=] [policy=] [tcp=]` | Valkey cache, built from source | [Valkey](#valkey---valkey) |
 | `--elastic [host=] [ram=]` | Elasticsearch | [Elasticsearch](#elasticsearch---elastic) |
 | `--others ITEM... \| all` | helper packages | [Other packages](#other-packages---others) |
 | `--domain DOMAIN [app=] [db=] [user=] [pass=] [sql=]` | vhost, certificate and optional database | [Domains](#domains---domain) |
@@ -148,7 +151,7 @@ reported, instead of failing `nginx -t`.
 | `host=FQDN` | `<threads>c-<RAM_GB>g-<storage>` (e.g. `8c-32g-1T`) | hostname via `hostnamectl`; a repeat `--basic` without `host=` keeps the current name.  Where cloud-init is installed, `/etc/cloud/cloud.cfg.d/99-setup-hostname.cfg` records the name, so a provider's `manage_etc_hosts` rewrite of `/etc/hosts` at boot keeps it (`--optimize` adds it to hosts renamed before 1.22.4; `--purge basic` removes it) |
 | `swap=SIZE` | add swap only when total swap is 0 or below 50% of RAM, up to 50% of RAM (1-8 GiB, 4 GiB on a VPS) | `/swapfile` of exactly that size (`8G`, `8Gi`, `512M`) |
 | `time=REGION/CITY` | `Asia/Manila` | timezone; a repeat `--basic` without `time=` keeps the current zone |
-| `mitigations=off\|on` | not touched | `off` adds `mitigations=off` to the kernel command line (managed `/etc/default/grub.d/zz-setup-mitigations.cfg`, sourced after provider drop-ins such as Hetzner's `hetzner.cfg`, the provider's options kept, `update-grub`), effective at the next reboot; the run checks that the generated boot menu really carries it and names any drop-in that overrides it; `on` removes it.  Persisted as `CPU_MITIGATIONS`, so every `--optimize` keeps it (also `--optimize mitigations=off`, or `SETUP_CPU_MITIGATIONS`).  Measured on a Xeon E-2236: guest-cache hits +14-25 %, PHP tiers +5-7 % (1.21.36); +8-50 % cached and +15 % XenForo member/Chevereto uncached (1.21.38).  Further kernel hardening switches (`init_on_alloc=0`, `randomize_kstack_offset=off`) measured inside run-to-run noise on top of it, so they are not offered; `preempt=none` does not exist on the 7.0 kernel (it runs `lazy`).  It removes the kernel's protection between local processes (Spectre/Meltdown/MDS class), so use it on hosts where only you run code: one key-only administrator, no shared hosting, no untrusted local users |
+| `mitigations=off` | `off` (default since 1.22.5) | every `--basic` and `--optimize` adds `mitigations=off` to the kernel command line (managed `/etc/default/grub.d/zz-setup-mitigations.cfg`, sourced after provider drop-ins such as Hetzner's `hetzner.cfg`, the provider's options kept, `update-grub`), effective at the next reboot (the `--optimize` report says when the running kernel still lacks it); the run checks that the generated boot menu really carries it and names any drop-in that overrides it.  Skipped in containers and without GRUB (reported).  `mitigations=off` is accepted and changes nothing; `mitigations=on` and `SETUP_CPU_MITIGATIONS=on` were removed (refused), and a host with a persisted `CPU_MITIGATIONS=on` moves to off on its next `--optimize` (reported).  `--purge basic` removes the drop-in and restores the distribution default.  Trade-off: no kernel protection between local processes (Spectre/Meltdown/MDS class), which suits single-tenant hosts administered with SSH keys only.  Measured on a Xeon E-2236: guest-cache hits +14-25 %, PHP tiers +5-7 % (1.21.36); +8-50 % cached and +15 % XenForo member/Chevereto uncached (1.21.38).  Further kernel hardening switches (`init_on_alloc=0`, `randomize_kstack_offset=off`) measured inside run-to-run noise on top of it, so they are not offered; `preempt=none` does not exist on the 7.0 kernel (it runs `lazy`) |
 
 What `--basic` does:
 
@@ -157,7 +160,7 @@ What `--basic` does:
 | DNS | drop-in with `8.8.8.8`, `1.1.1.1` and `Domains=~.`, so they are the default route rather than only a fallback |
 | Packages | upgrades packages; installs the basic tools, `cron`, `logrotate` and `unattended-upgrades` |
 | OS profile | sysctl, PAM limits, governor, THP `madvise`, udev I/O rules (see [Hardware profile](#hardware-profile)) |
-| Root crontab | ownership repair of `/var/www` that skips logs and `wp-config.php`; Cloudflare IP refresh; MariaDB backup at 03:03 and monthly `mariadb-check`; `wp-cron.php` every 5 minutes |
+| Root crontab | ownership repair of `/var/www` that skips logs and `wp-config.php`; Cloudflare IP refresh; MariaDB backup at 03:03 and a monthly `mariadb-check -a` (ANALYZE, online; logged to `/var/www/logs/mariadb/check.log`); `wp-cron.php` every 5 minutes |
 | Firewall (UFW) | deny in, allow out, `ufw limit` on every effective SSH port, 80/443 open |
 | State | originals are recorded under `/var/lib/setup.sh` for `--purge basic` |
 
@@ -200,8 +203,9 @@ Every build:
   clang from apt.llvm.org at `-O3 -march=native` and Ubuntu's hardening flags
   (stack protector, stack-clash probes, `_FORTIFY_SOURCE=3`, CET, full
   RELRO), link-time optimisation and LLVM BOLT;
-* links only glibc (libc, libm) from Ubuntu: every library it needs is
-  compiled in statically, and the units' `sd_notify()` is a small static
+* links only glibc (libc, libm) from Ubuntu, and nginx also libstdc++
+  (AWS-LC's libssl is C++): every library it needs is compiled in
+  statically, and the units' `sd_notify()` is a small static
   implementation (no libsystemd);
 * contains only what the host's applications use (nginx: the modules
   server-configs-nginx uses; PHP: the [per-application extension
@@ -212,7 +216,7 @@ Every build:
 
 | Component | Built | Root | Unit |
 |---|---|---|---|
-| nginx | nginx.org mainline (the highest version nginx.org publishes), OpenSSL, PCRE2 (JIT), zlib-ng, Brotli | `/usr/local/lib/setup-nginx` | `nginx.service` |
+| nginx | nginx.org mainline (the highest version nginx.org publishes), AWS-LC, PCRE2 (JIT), zlib-ng, Brotli | `/usr/local/lib/setup-nginx` | `nginx.service` |
 | PHP X.Y | php.net release (any series from 8.1 on), FPM and CLI from one tree, static extensions | `/usr/local/lib/setup-php/X.Y` | `phpX.Y-fpm.service` |
 | Valkey | newest GitHub release, bundled jemalloc and Lua, no TLS | `/usr/local/lib/setup-valkey` | `valkey-server.service` (alias `valkey.service`) |
 
@@ -341,17 +345,19 @@ as a deprecated alias: it prints a warning and installs nginx.
 | Finish | activates and starts the service; `/usr/local/sbin/nginx` links to the binary for the shell |
 
 **What it is.**  nginx from nginx.org (the highest published version, which
-is the mainline branch), OpenSSL, PCRE2 (JIT), zlib-ng (zlib's API; 21 %
-less gzip CPU than Ubuntu's zlib) and Brotli (google/brotli with
-the filter module of google/ngx_brotli, compiled in statically, so there is
-no `load_module`),
+is the mainline branch), AWS-LC (the TLS library), PCRE2 (JIT), zlib-ng
+(zlib's API; 21 % less gzip CPU than Ubuntu's zlib) and Brotli
+(google/brotli with the filter module of google/ngx_brotli, compiled in
+statically, so there is no `load_module`),
 each at the version in [`nginx-build.conf`](nginx-build.conf), compiled with
-clang at `-O3 -march=native` with the hardening flags, ThinLTO, then
-rewritten by LLVM BOLT from a 60 s perf sample of live traffic (at least
+clang at `-O3 -march=native` with the hardening flags (ThinLTO for AWS-LC,
+zlib-ng, Brotli and nginx; PCRE2 is built by nginx's configure at the
+same flags without LTO), then rewritten by LLVM BOLT from a 60 s perf sample of live traffic (at least
 150 profiled functions; an idle server is skipped).  Only the modules
 `server-configs-nginx` uses are built: the http core with SSL, HTTP/2,
 HTTP/3 (QUIC), realip, stub_status (the metrics script polls it on
-127.0.0.1), threads, dynamic Brotli, `limit_req` (the login limiter) and
+127.0.0.1), threads, dynamic Brotli, `limit_req` (the login limiter, which
+since 1.22.5 also covers XenForo search and contact-form POSTs) and
 `auth_basic` (password-protected areas).  Mail, stream, ACME, DAV, mp4/flv,
 sub, SSI, uwsgi, scgi, grpc, memcached, userid, autoindex, split_clients,
 empty_gif, browser, mirror, `limit_conn`, referer, `gzip_static` and
@@ -402,7 +408,7 @@ Environment options:
 
 | Variable | Default | Effect |
 |---|---|---|
-| `SETUP_BROTLI_LEVEL=1..11` | 4 (3 on 1-2 CPU hosts) | dynamic Brotli level; gzip is the fallback.  Measured on a XenForo member thread page (1.21.63, pinned clock): level 1 = 0.8 ms nginx CPU / 23.9 KB, 2 = 1.3 ms / 18.4 KB, 3 = 1.4 ms / 17.9 KB, 4 = 2.1 ms / 17.1 KB; level 1 gave +4-6 % member req/s for 40 % more bytes, levels 2-3 were inside the noise.  A CPU-bound origin whose only client is Cloudflare can take 1.  There is no zstd: Cloudflare asks origins for `br, gzip` only, and `--optimize` removes old zstd stanzas |
+| `SETUP_BROTLI_LEVEL=1..11` | 1 (1.22.5) | dynamic Brotli level; gzip is the fallback.  1.22.5 (XenForo, pinned clock, two interleaved arms of 5 rounds each): level 1 served 4.2-4.7 % more uncached req/s than level 4 on every tier, p99 equal or lower, for about 16 % more bytes to Cloudflare (11.1 vs 9.5 KB per home page).  Measured on a XenForo member thread page (1.21.63, pinned clock): level 1 = 0.8 ms nginx CPU / 23.9 KB, 2 = 1.3 ms / 18.4 KB, 3 = 1.4 ms / 17.9 KB, 4 = 2.1 ms / 17.1 KB; level 1 gave +4-6 % member req/s for 40 % more bytes, levels 2-3 were inside the noise.  There is no zstd: Cloudflare asks origins for `br, gzip` only, and `--optimize` removes old zstd stanzas |
 | `SETUP_NGINX_COMPRESSION=0` | on | turns the managed compression profile off (`SETUP_ANGIE_COMPRESSION` is still read as the old name) |
 | `SETUP_XF_JOB_CRON=0` | on | removes the managed crontab entry that runs `cmd.php xf:run-jobs` once a minute as www-data for every XenForo root; persisted as `XF_JOB_CRON` |
 | `SETUP_NGINX_BUILD_BOLT=0` | 1 | skip the BOLT pass of `--optimize` |
@@ -445,7 +451,7 @@ Notes:
 | Option | Default | Effect |
 |---|---|---|
 | `ver=X.Y` | the newest series php.net has released | PHP series to build; any series from 8.1 on.  The newest X.Y.Z release of that series is built, never an RC |
-| `ext=LIST` | none | optional extensions added to the per-application set, comma-separated (`ext=intl,gmp`); `-NAME` drops one you added earlier, `none` clears the list.  Persisted as `PHP_EXT_EXTRA`.  A name the source build cannot compile is refused before anything changes |
+| `ext=LIST` | none | optional extensions added to the per-application set, comma-separated (`ext=intl,gmp`); `-NAME` drops one you added earlier, `none` clears the list.  Persisted as `PHP_EXT_EXTRA`.  A name the source build cannot compile is refused before anything changes. |
 | `children=auto\|N` | `auto` (shared memory plan and CPU count) | `pm.max_children`; an explicit value wins over every rule below |
 | `max_requests=N` | threads x 1024 | recycle a worker after N requests |
 
@@ -454,17 +460,16 @@ Environment options:
 | Variable | Default | Effect |
 |---|---|---|
 | `SETUP_PHP_WORKERS_PER_CPU` | by host class (see the pool table) | pins the workers-per-CPU factor for an install/one run; `--optimize` ignores it |
-| `SETUP_PHP_JIT_HOT_LOOP`, `_FUNC`, `_RETURN`, `_SIDE_EXIT` | tuned set 64/127/16/64 on 3+ CPU hosts (loop/func are PHP's defaults, return/side_exit raised from PHP's 8/8); a conservative set on 1-2 CPUs | JIT hotness thresholds |
 | `SETUP_PHP_JIT_WORDPRESS=0` | 1 (WordPress uses the JIT) | keeps `opcache.jit = off` for every WordPress document root through a `[PATH=<root>]` section of the managed ini, for a site that misbehaves with the JIT.  Tuning override: ignored by `--optimize` |
 | `SETUP_PHP_PAGE_GZIP=0` | 1 | by default the managed ini turns `zlib.output_compression` (level 4) on in a `[PATH=<root>]` section for every WordPress and Chevereto document root whose guest cache key carries the encoding token, so the FastCGI cache stores the gzip page (0.12 ms of nginx CPU per hit instead of about 1 ms to compress each hit); tuning override: ignored by `--optimize` (profile default 1) |
-| `SETUP_PHP_SESSION_HARDENING=1` | off | opt-in `session.*` strict settings, `cgi.fix_pathinfo=0`, `display_errors=Off` and a central `error_log`; it broke Joomla/Polr logins on a mixed host.  Persisted as `PHP_SESSION_HARDENING` (kept by `--optimize`; `=0` turns it off) |
+| `SETUP_PHP_OPCACHE_FILE_OVERRIDE=0` | on | `opcache.enable_file_override = 1` is written by default since 1.22.5 (`file_exists`/`is_file`/`is_readable` on cached scripts answered from OPcache; XenForo member pages measured 2-4 % faster, no tier slower).  A deleted PHP file can still read as present until OPcache revalidates it (60 s).  `=0` leaves the line out; persisted as `PHP_OPCACHE_FILE_OVERRIDE` |
 | `SETUP_PHP_ALLOW_MISSING_EXT=1` | off | accept that a detected application loses an extension the source build cannot provide (install, `--upgrade-php`, migration); the affected sites may fail |
 | `SETUP_PHP_BUILD_BOLT=0` | 1 | skip the BOLT pass of `--optimize` |
 
 **What it is.**  PHP from php.net, redis and igbinary from PECL, and every
 library PHP links (OpenSSL, PCRE2, zlib-ng, libxml2, libsodium, GMP, GNU
-libiconv, curl, libjpeg-turbo, libpng, libwebp, libzip, SQLite, and ICU only
-for `intl`), each from its own project at the version in
+libiconv, curl, libjpeg-turbo, libpng, libwebp, libzip, SQLite, ICU only
+for `intl`, and mimalloc as the allocator), each from its own project at the version in
 [`php-build.conf`](php-build.conf), compiled with clang at `-O3
 -march=native -fPIE` with the hardening flags and linked statically with
 ThinLTO.  php-fpm and the `php` CLI are built from one configured tree, so
@@ -477,7 +482,33 @@ path from `conf.d/00-setup-opcache.ini`.  No other shared module exists, so
 no `extension=` line is ever needed.  A library is built only when the
 host's extension set needs it.  BOLT needs `perf` for the running kernel
 (`linux-tools-$(uname -r)`) and CPU branch records (LBR); a VM without them
-keeps the ThinLTO build.
+keeps the ThinLTO build.  The allocator is mimalloc (`PHP_BUILD_MALLOC` in
+`php-build.conf`, default and only value `mimalloc`): a static mimalloc
+replaces malloc in php-fpm and php (`build.info` `malloc=`; the verify
+refuses a binary that does not run on it); any other value draws a warning
+and builds on mimalloc, never a failed build.  nginx's TLS library is
+AWS-LC (`TLS_LIB` in `nginx-build.conf`, default and only value `aws-lc`).
+Measured on XenForo (pinned clock, interleaved runs): mimalloc made
+uncached guest and member pages 3.3-3.8 % faster than glibc's malloc and
+halved PHP-FPM RSS under load (about 640 MB to 320 MB); AWS-LC made cached
+pages 2-5 % faster than OpenSSL 4.1 and cut nginx RSS by a fifth to a quarter
+(300-320 MB to 234-237 MB), with uncached pages within noise.  p99 was equal or
+lower everywhere.  With session tickets off, AWS-LC resumes TLS 1.2
+sessions from the shared cache but not TLS 1.3 ones: a TLS 1.3 client that
+reconnects straight to the origin (not through Cloudflare) does a full
+handshake.  Removed in 1.22.5 because they measured no faster on
+the Intel Xeon test host: `TLS_LIB=openssl` (2-5 % slower on cached
+XenForo pages and more nginx memory than aws-lc; nginx no longer builds
+OpenSSL, so `OPENSSL_VERSION` only applies to PHP),
+`PHP_BUILD_MALLOC=glibc` (uncached pages 3-4 % slower and twice the
+PHP-FPM memory), `PHP_BUILD_MALLOC=jemalloc` (below
+mimalloc on every tier), nginx's `MALLOC=mimalloc|jemalloc` (within noise of
+glibc; nginx always links glibc's malloc), `TLS_LIB=boringssl` (below aws-lc
+on the cached tier, no OCSP stapling), `OPENSSL_VERSION=lts` (the newest
+OpenSSL is faster on handshakes) and `BOLT_NOLBR=1` (1-3 % slower than no
+BOLT).  A conf or environment that still names one draws a warning and the
+default; a build made with one (an OpenSSL nginx, a glibc PHP) is reported
+stale and rebuilt on the default.
 
 **Checks before it serves.**  The candidate must start without warnings,
 list exactly the expected modules per SAPI (FPM: the set, PHP's fixed core
@@ -570,7 +601,9 @@ connections): 16 workers 834 req/s at 14.38 ms PHP CPU/request, 32 workers
 | MariaDB | socket defaults (`/run/mysqld/mysqld.sock` is compiled in) |
 | `opcache.jit` | always `tracing`; there is no mode switch (an old `SETUP_PHP_JIT` or persisted `PHP_JIT` value is ignored with a notice) |
 | `opcache.jit_buffer_size` | OPcache/8, 32-128 MB; carved out of the OPcache shared-memory segment once per pool, not per worker |
-| `opcache.file_cache` | empty, because scripts restored from the file cache are never JIT-compiled |
+| `opcache.validate_timestamps` | 1 with `revalidate_freq = 60` (always: a changed PHP file is picked up within a minute, no reload after a deploy) |
+| `opcache.file_cache` | written explicitly empty, because scripts restored from the file cache are never JIT-compiled (measured 3-5 % slower) |
+| Uploads | `upload_max_filesize = 100M`, `post_max_size = 102M`: above the Chevereto vhost's `client_max_body_size 101m`, so nginx's 413 is the one effective limit instead of PHP silently emptying `$_POST`/`$_FILES`.  Behind Cloudflare Free or Pro the edge caps a request body at 100 MB (413 from Cloudflare), so the largest Chevereto upload through a proxied hostname is a little under 100 MB |
 | `custom_dan.ini` | refreshed from `configs/php/` while the host timezone is kept |
 
 Measured on the test host (XenForo 2.3.13 + WordPress 7.1.4, PHP 8.5.12, 32
@@ -595,7 +628,7 @@ Uncached XenForo pages (members, guest bypass, `admin.php`, `job.php`) are
 compressed by nginx, not by XenForo: the uncached handler
 (`h5bp/php_xf_handler.conf`) gives PHP an empty `Accept-Encoding`, so
 XenForo's level-9 gzip never runs in a PHP worker and nginx applies
-Brotli/gzip level 4 instead.  That rule is in the nginx tree, so it works
+Brotli level 1 (gzip level 4 for clients without Brotli) instead.  That rule is in the nginx tree, so it works
 from the first request of a new install and reaches existing hosts with the
 next `--optimize`.  Measured on the Xeon E-2236 test host at a pinned clock:
 XenForo's gzip was 12 % of php-fpm CPU on a member thread page; moving it
@@ -699,25 +732,26 @@ Hardware profile (`99-setup-optimize.cnf`):
 | `max_connections` | PHP workers x 1.25 + 50 (threads x 32 without PHP), 200..2000, never below a live larger value |
 | Table caches | `clamp(max_connections x 16, 4000, 32768)` |
 | Temp tables | `clamp(RAM/256, 32, 256) MB`, capped at pool/8 |
-| `flush_log_at_trx_commit` | 2 |
+| `flush_log_at_trx_commit` | 2: the redo log is written at each commit but flushed to disk about once a second, so an OS crash or power loss can lose up to about 1 s of committed transactions (a MariaDB crash alone loses none).  For full durability put `[mysqld]` `innodb_flush_log_at_trx_commit = 1` in a file that sorts after the managed one, e.g. `/etc/mysql/mariadb.conf.d/99-zz-local.cnf` (setup.sh never edits it), and restart MariaDB; it costs one fsync per commit |
 | Logs | slow log (1 s, 100 rows, plan+explain) and `log_error` under `/var/www/logs/mariadb/` |
 
 ### Valkey (`--valkey`)
 
 | Option | Default | Effect |
 |---|---|---|
-| `ram=SIZE` | data +20% (128 MB minimum), data = the larger of `used_memory` and its peak since start. A maxmemory more than 10% above that shrinks to it online. An `allkeys-*` cache that fills 83-102% of its maxmemory keeps it (an LRU cache fills any size; `ram=` grows it); `noeviction`/`volatile-*` caches follow their data both ways, except a `volatile-*` cache that has already evicted keys (`evicted_keys` > 0), which is kept like an `allkeys-*` one. A stopped cache, or one started less than a day ago, never shrinks; the floor RAM/64 clamped to 128 MB..1 GB only when no maxmemory is in force and the cache is not measured or started less than a day ago | `maxmemory`; an explicit value is used verbatim |
-| `policy=NAME` | `allkeys-lru` | `maxmemory-policy`; use `noeviction` or `volatile-lru` when Valkey stores sessions or jobs that must survive |
-| `io_threads=N` | 1 | extra socket I/O threads; 8 threads cost 430% CPU and lowered full-page throughput, so raise it only after `valkey-benchmark` shows the main thread is saturated |
+| `ram=SIZE` | data +20% (128 MB minimum), data = the larger of `used_memory` and its peak since start. A maxmemory more than 10% above that shrinks to it online. An `allkeys-*` cache that fills 83-102% of its maxmemory keeps it (an LRU cache fills any size; `ram=` grows it); a `volatile-*` cache follows its data both ways, except one that has already evicted keys (`evicted_keys` > 0), which is kept like an `allkeys-*` one. A stopped cache, or one started less than a day ago, never shrinks; the floor RAM/64 clamped to 128 MB..1 GB only when no maxmemory is in force and the cache is not measured or started less than a day ago | `maxmemory`; an explicit value is used verbatim |
+| `policy=NAME` | `allkeys-lru` | `maxmemory-policy`.  `noeviction` was removed in 1.22.5 (a full cache failed every write; a host that had it moves to `allkeys-lru` on the next `--optimize`).  An adopted Redis/Valkey that keeps its operator AOF persistence (`appendonly yes`) keeps `noeviction` (a data store).  Sessions in Valkey survive clean restarts and reboots through the RDB snapshot (after a crash or power loss the cache starts empty); under memory pressure `allkeys-lru` may evict them, so size `ram=` to hold sessions plus cache.  Never `volatile-*` for sessions: session keys carry a TTL, so `volatile-*` evicts them first |
+| `tcp=auto\|on` | `auto` | `auto`: Unix socket only (`port 0`) unless a WordPress (incl. W3 Total Cache, LiteSpeed Cache or an unknown object-cache drop-in), XenForo, Chevereto or PHP session-handler config connects over loopback TCP, a connected client or a recent TCP connection (sampled 3 times, TIME-WAIT included) uses the port, the running server's clients cannot be listed, or an operator bind serves other hosts (the report names them).  `on`: keep TCP 6379 open (persisted in `valkey.conf`, or in `redis.conf` for an adopted redis-server; `tcp=auto` undoes it); `--purge valkey` restores the TCP port |
 
 **What it is.**  Valkey from its newest GitHub release (pin another in
 [`valkey-build.conf`](valkey-build.conf)), compiled with clang at `-O3
 -march=native` with the hardening flags and full LTO, with Valkey's bundled
 jemalloc and Lua (the XenForo Redis add-ons run Lua scripts) and without TLS
 (the applications use the Unix socket), then rewritten by LLVM BOLT from a
-perf profile of a `valkey-benchmark` run against the build itself
-(GET/SET/HSET/LPUSH/MSET/INCR in database 9, flushed afterwards), so it
-needs no live traffic.  It links only glibc.  A new build serves only after
+perf profile of a `valkey-benchmark` run (GET/SET/HSET/LPUSH/MSET/INCR)
+against a private, throwaway server started from the LTO binary on a socket
+in the work directory (no port, no persistence, 512 MB), so it needs no live
+traffic and never writes to the live cache.  It links only glibc.  A new build serves only after
 it answered PING, a Lua `EVAL` and `SAVE` on a private socket.
 
 | Install | Detail |
@@ -727,20 +761,20 @@ it answered PING, a Lua `EVAL` and `SAVE` on a private socket.
 | Unit | `/etc/systemd/system/valkey-server.service` (alias `valkey.service`), `Type=notify`, `User=valkey`, `ProtectSystem=strict`, `NoNewPrivileges`, `MemoryDenyWriteExecute`, `NoExecPaths=/` with `ExecPaths` limited to the build and the system libraries, `LimitNOFILE=524288` |
 | Configuration | `/etc/valkey/valkey.conf`, seeded on a host without one; the managed keys below are written by setup.sh |
 
-**Versions.**  The managed `valkey.conf` is a cache (`save ""`,
-`appendonly no`), so the newest release is safe to run.  When the
-configuration persists data (`save` or `appendonly yes`), `latest` means the
-newest release of the X.Y series of the server that wrote the data, and the
-build never goes below that version: an older server cannot read a newer
-RDB/AOF.
+**Versions.**  The managed `valkey.conf` keeps RDB snapshots (`save 300 1`,
+`appendonly no`).  A newer Valkey loads an older RDB, so the newest release
+is safe to run; the build never goes below the version of the server that
+wrote the data (an older server cannot read a newer RDB/AOF).  With AOF
+(`appendonly yes`, kept on an adopted server) `latest` also stays inside the
+X.Y series of that server.
 
 Managed `valkey.conf`:
 
 | Setting | Value |
 |---|---|
-| Network | loopback bind, `protected-mode` |
+| Network | Unix socket only (`port 0`) by default; TCP stays open, and the report says why, when an application config or a connected client uses TCP, an operator bind serves other hosts, or `tcp=on`.  Loopback bind (`127.0.0.1 ::1` on Redis below 6.2), `protected-mode` |
 | Socket | `unixsocket /run/valkey/valkey.sock`, mode 770, with `www-data` in the `valkey` group |
-| Persistence | `save ""`, `appendonly no` (cache only).  `--optimize` keeps `appendonly yes` and a non-loopback `bind` of a Redis/Valkey it did not install |
+| Persistence | RDB snapshot every 5 minutes when a key changed (`save 300 1`) and on every clean shutdown, `dump.rdb` in `/var/lib/valkey` (or the adopted server's `dir`/`dbfilename`), `rdbcompression yes`, `rdb-save-incremental-fsync yes`, `stop-writes-on-bgsave-error no`, `appendonly no`: the cache and sessions survive clean restarts, reboots, rebuilds and BOLT.  The snapshot loads only after a clean stop: after a crash, an OOM kill, kill -9 or a power loss the cache starts empty (the snapshot is moved aside to `dump.rdb.unclean-<UTC>`, 2 kept), so stale entries never contradict the database.  `TimeoutStopSec=300` and `shutdown-on-sigterm default force` (Valkey, Redis 7+): a final save that cannot finish never hangs a stop or a reboot (an adopted redis-server gets the same through a drop-in).  `--purge valkey` warns when the kept `dump.rdb` was written by a newer build than a packaged Valkey can read.  The `--optimize` report shows the snapshot fork's worst-case copy-on-write against the RAM outside the memory plan.  `--optimize` keeps `appendonly yes` and a non-loopback `bind` of a Redis/Valkey it did not install; `--purge` keeps the data |
 | `maxclients` | PHP workers x 4 + 2000, minimum 10000 |
 | Other | `tcp-backlog`, `hz 10`, lazy-free |
 
@@ -755,8 +789,9 @@ Notes:
 - Skipped with a warning when `redis-server` is installed; `--optimize` then
   tunes Redis with the same profile. Valkey wins when both exist.  A Redis
   server is never replaced.
-- Runtime values are applied with `CONFIG SET`; a restart (which empties the
-  cache) happens only for startup-only keys or a new binary.
+- Runtime values (the snapshot schedule and the port included) are applied
+  with `CONFIG SET`; a restart happens only for startup-only keys or a new
+  binary, and it saves and reloads the snapshot.
 - With php-redis and this Unix socket, XenForo's data cache measured +7–9 %
   authenticated throughput; without php-redis (the add-on's pure-PHP Credis
   client) it measured slower than local MariaDB. See the XenForo section.
@@ -851,14 +886,14 @@ a non-zero exit and the optimize report, exactly like `--optimize`.
 | Option | Effect |
 |---|---|
 | `--optimize` | tune the OS and every installed service in place (Ubuntu 22.04, 24.04, 26.04) |
-| `--optimize mitigations=off\|on` | the same, and set the kernel `mitigations=` choice (see `--basic`) |
+| `--optimize mitigations=off` | the same (`mitigations=off` is the default and changes nothing; `mitigations=on` was removed, see `--basic`) |
 | `--optimize --dry-run` | print the planned OS and service values, the build plan and, on a 1.21.x host, the migration plan; runs as a normal user |
 
 Tunes the OS and every installed service in place. It never installs a new
 service, never starts or purges a managed service outside the one-time
 migration, and never touches swap, the resolver (DNS) or the firewall (UFW),
 which stay as `--basic` or the operator left them.  The only packages it may
-add are the build prerequisites (compilers and autotools, cmake, nasm, git,
+add are the build prerequisites (compilers and autotools, cmake, ninja, nasm, git,
 gpgv, perf from `linux-tools` for the running kernel, the apt.llvm.org
 toolchain); the only packages
 it may remove are certbot, once nothing uses it (see Cloudflare-proxied
@@ -883,7 +918,8 @@ number instead of being skipped.  Steps:
    A WordPress vhost without `include h5bp/wordpress_cache.conf;` gets the
    include added before its `php_wp.conf` include (the guest cache is on by
    default); set `SETUP_WP_GUEST_CACHE=0` to keep such vhosts uncached, in
-   which case they are reported instead. Every application's guest cache
+   which case they are reported instead and an include an earlier run added
+   (the line marked `# added by setup.sh`) is removed again. Every application's guest cache
    reports its result in the same `X-Cache-Status` header (`HIT`, `MISS`,
    `BYPASS`, `EXPIRED`).
    **Cloudflare-proxied sites** (SSL mode "Full") move off certbot to the
@@ -1158,7 +1194,7 @@ What the reset does on every `--optimize`:
 |---|---|
 | `/etc/default/setup-tuning` | rewritten with only host facts/feature choices: `XF_JOB_CRON`, `NODE_MAJOR`, `NODE_ALLOW_MAJOR_UPGRADE`, `PHP_EXT_EXTRA`, ... Old `TCP_CC`, `QDISC`, `STORAGE_CLASS`, compression/JIT/page-cache and rate-limit pins no longer survive |
 | `/var/lib/setup.sh/explicit-options.conf` | moved to `/tmp`; recorded `php_children`/`max_requests`, MariaDB/Valkey/ES sizes and the dedi/vps pin are dropped and the shared memory plan recomputes them |
-| tuning environment | `SETUP_TCP_CC`, `SETUP_QDISC`, `SETUP_STORAGE_CLASS`, `SETUP_PHP_WORKERS_PER_CPU`, `SETUP_PHP_JIT_HOT_*`, `SETUP_GZIP_LEVEL`, `SETUP_BROTLI_LEVEL`, `SETUP_NGINX_COMPRESSION`, `SETUP_MARIADB_IO_CAPACITY`, `SETUP_LIMIT_REQ_EXEMPT`, `SETUP_PHP_PAGE_GZIP`, `SETUP_PHP_JIT_WORDPRESS` are unset for the run and listed in the report/warning |
+| tuning environment | `SETUP_TCP_CC`, `SETUP_QDISC`, `SETUP_STORAGE_CLASS`, `SETUP_PHP_WORKERS_PER_CPU`, `SETUP_BROTLI_LEVEL`, `SETUP_NGINX_COMPRESSION`, `SETUP_MARIADB_IO_CAPACITY`, `SETUP_LIMIT_REQ_EXEMPT`, `SETUP_PHP_PAGE_GZIP`, `SETUP_PHP_JIT_WORDPRESS` are unset for the run and listed in the report/warning |
 
 Feature choices are not performance overrides and still apply: `NODE_MAJOR`,
 `PHP_EXT_EXTRA`, the WordPress/Chevereto cache and security toggles, and the
@@ -1297,12 +1333,13 @@ data directory (NVMe / SSD / HDD) and the host class (`dedi`/`vps`).
 | Area | Rule |
 |---|---|
 | PHP-FPM | `pm = static`, `pm.max_children` = logical CPUs x the host's blocking factor (1.0 for a local database on flash, 1.5 for a shared/virtual CPU or a remote database, 2.0 for spinning disks), bounded by the RAM plan; a pool sized by hand is normalised to the same count, so a fresh install and `--optimize` write the same value (a 64-thread board left on 512 static workers is set to 64). `SETUP_PHP_WORKERS_PER_CPU` pins the factor for an install/one run; an explicit `--php children=` wins during that run and is clamped to floor..max(512, 2 x CPUs); `--optimize` ignores both and uses the hardware count. `pm.max_requests = threads x 1024`, `request_terminate_timeout 300s`, slow log at 10 s, `rlimit_files 524288`, systemd `LimitNOFILE=524288`/`UMask=0027`/`KillSignal=SIGQUIT`. `opcache.max_accelerated_files` = PHP files under the vhost roots x 1.5 (16384..128256), written as the OPcache hash-table prime PHP rounds it up to (32531, 65407 or 130987), so the ini only changes when the file count crosses a step; 130987 when no root is found; `memory_limit`, OPcache, JIT buffer and realpath sizes from one RAM profile shared with the dry run |
-| MariaDB | see the service section: pool = live data +5% (128 MB minimum, shrunk online when larger), floor `clamp(RAM/16, 256 MB, 4 GB)` only for a fresh install with nothing to measure, io_capacity by disk x host, thread pool, connections from the PHP pool, table caches from connections, Aria page cache `clamp(RAM/128, 16, 256) MB` |
-| Elasticsearch | heap = store/4 (512 MB..25% RAM..31 GB); `node.processors` = effective CPUs; search threads cpus/2 (max 16), write threads cpus/4 (max 8) |
-| Valkey / Redis | maxmemory = live +20% (128 MB minimum, shrunk online when more than 10% larger), floor `clamp(RAM/64, 128 MB, 1 GB)` only on a fresh install with nothing to measure; maxclients from the PHP pool; io_threads 1..8 (a larger `io_threads=` is clamped with a warning) |
-| nginx | `worker_processes` = **2/3 of CPUs** (`worker_cpu_affinity auto` commented out under a cgroup CPU quota; measured on the 12-thread EPYC: 8 workers 389-390k cached req/s vs 348-352k at `auto`/12), `worker_connections = clamp(cpus x 2048, 8192, 65535)` and `worker_rlimit_nofile = clamp(cpus x 8192, 65536, 524288)` (VPS: 1024 and 4096 per core), **no PHP upstream keepalive cache** (an idle FastCGI connection pins one PHP-FPM worker; see the live-origin.example audit in `tests/stress-site/RESULTS.md`), `open_file_cache max = clamp(RAM_MB x 8, 10000, 200000)` bounded by `rlimit - connections`, FastCGI buffers and cache zones by RAM, cache disk budget by RAM/cache filesystem size (capped at half its free space)/installed services (50% RAM nginx-only, 30% nginx+PHP, 25% full stack; a populated FastCGI, proxy or CDN cache is never shrunk below its live size), `directio 16m` on NVMe/SSD (4m on HDD), Brotli and gzip 4 (3 on 1-2 CPUs; `SETUP_BROTLI_LEVEL`, `SETUP_GZIP_LEVEL`) |
+| MariaDB | see the service section: pool = live data +5% (128 MB minimum, shrunk online when larger), floor `clamp(RAM/16, 256 MB, 4 GB)` only for a fresh install with nothing to measure, io_capacity by disk x host, thread pool, connections from the PHP pool, table caches from connections, Aria page cache `clamp(RAM/128, 16, 256) MB`; the memory plan books the non-pool memory (log buffer + Aria page cache + 32 MB key buffer, plus `thread_pool_size` active queries x (2.5 MB session buffers + `tmp_table_size`/2)) from the room PHP leaves, never by cutting PHP workers; when it does not fit, `tmp_table_size`/`max_heap_table_size` are capped (16 MB steps, 16 MB minimum) and the rest is named in the report and stays in the 20% OS margin |
+| Elasticsearch | heap = store/4 (512 MB..25% RAM..31 GB); `node.processors` = effective CPUs; search threads cpus/2 (max 16), write threads cpus/4 (max 8); `xpack.ml.enabled: false` (no machine-learning controller on a search-only node; static, applied by the restart the changed block already causes) |
+| Valkey / Redis | maxmemory = live +20% (128 MB minimum, shrunk online when more than 10% larger), floor `clamp(RAM/64, 128 MB, 1 GB)` only on a fresh install with nothing to measure; maxclients from the PHP pool; io-threads 1 (fixed; `io_threads=` was removed in 1.22.5) |
+| nginx | `worker_processes` = **2/3 of CPUs** (`worker_cpu_affinity auto` commented out under a cgroup CPU quota, a cpuset smaller than the online CPUs or more than one NUMA node, with the reason in the comment; measured on the 12-thread EPYC: 8 workers 389-390k cached req/s vs 348-352k at `auto`/12), `worker_connections = clamp(cpus x 2048, 8192, 65535)` and `worker_rlimit_nofile = clamp(cpus x 8192, 65536, 524288)` (VPS: 1024 and 4096 per core), **no PHP upstream keepalive cache** (an idle FastCGI connection pins one PHP-FPM worker; see the live-origin.example audit in `tests/stress-site/RESULTS.md`), `open_file_cache max = clamp(RAM_MB x 8, 10000, 200000)` bounded by `rlimit - connections`, FastCGI buffers and cache zones by RAM, cache disk budget by RAM/cache filesystem size (capped at half its free space)/installed services (50% RAM nginx-only, 30% nginx+PHP, 25% full stack; a populated FastCGI, proxy or CDN cache is never shrunk below its live size), `directio 16m` on NVMe/SSD (4m on HDD), Brotli 1 (`SETUP_BROTLI_LEVEL` overrides it) and gzip 4 (3 on 1-2 CPUs) |
 | Kernel / PHP | `vm.nr_hugepages = (OPcache MB + JIT MB + 1)/2 + 8` (8..512; 296 pages = 592 MB on 8 GB+) on hosts with 4 GB+ and PHP, and `opcache.huge_code_pages=1` when the pages exist (measured +3.5 % on the XenForo member/thread tiers); the reservation is booked in the memory plan |
-| Kernel | `somaxconn`/SYN backlog `cpus x 4096` (VPS x 2048, max 65536), conntrack `RAM_MB x 16` (VPS x 8), `tcp_rmem`/`tcp_wmem` default 85 KB under 4 GB, 128 KB under 16 GB, 256 KB above, `netdev_budget 600/8000 us` on dedicated hosts with 8+ CPUs, `vm.dirty_background_bytes = clamp(RAM/100, 64 MB, 512 MB)` and `vm.dirty_bytes = 4x` (tighter on HDD), `vm.min_free_kbytes` 1% of RAM (16 MB floor under 4 GB, 256 MB cap), `vm.swappiness` 1 on NVMe/SSD (10 on HDD), `kernel.shmmax = min(1 GiB, RAM/4)`, `ip_local_reserved_ports` = 3306, 6379, 9200, 9300 and the sshd ports (the ephemeral range is 1024-65535), BBR + fq (`SETUP_TCP_CC`, `SETUP_QDISC`), 1M-nofile PAM limits. The base profile's `ip_forward`/`forwarding = 0` lines are dropped on a host that already forwards (bridge, Docker/LXD, WireGuard/Tailscale interfaces) and its IPv6 `autoconf`/`accept_ra = 0` lines on a host whose address or default route comes from router advertisements |
+| Kernel | `somaxconn`/SYN backlog `cpus x 4096` (VPS x 2048, max 65536), conntrack `RAM_MB x 16` (VPS x 8), `tcp_rmem`/`tcp_wmem` default 85 KB under 4 GB, 128 KB under 16 GB, 256 KB above, `netdev_budget 600/8000 us` on dedicated hosts with 8+ CPUs, `vm.dirty_background_bytes = clamp(RAM/100, 64 MB, 512 MB)` and `vm.dirty_bytes = 4x` (tighter on HDD), `vm.min_free_kbytes` 1% of RAM (16 MB floor under 4 GB, 256 MB cap), `vm.swappiness` 1 on NVMe/SSD (10 on HDD), `kernel.shmmax = min(1 GiB, RAM/4)`, `ip_local_reserved_ports` = 3306, 6379, 9000, 9200, 9300 and the sshd ports (the ephemeral range is 1024-65535), BBR + fq (`SETUP_TCP_CC`, `SETUP_QDISC`; `--optimize` reports a NIC whose live root qdisc is not fq yet, which changes at the next reboot, nothing live is replaced), `tcp_notsent_lowat` 16384, 1M-nofile PAM limits. The base profile's `ip_forward`/`forwarding = 0` lines are dropped on a host that already forwards (bridge, Docker/LXD, WireGuard/Tailscale interfaces) and its IPv6 `autoconf`/`accept_ra = 0` lines on a host whose address or default route comes from router advertisements |
+| File descriptors | one plan (1.22.5) sizes every unit's `LimitNOFILE` together with the service's own limit: nginx `worker_connections x 2 + open_file_cache + 64` (at least `worker_rlimit_nofile`), PHP `rlimit_files 524288`, Valkey `maxclients + 32`, MariaDB `open_files_limit` as `mariadbd` computes it from `max_connections` and `table_open_cache` (524288 minimum), Elasticsearch 65535 (its bootstrap check).  Each unit gets its need rounded up to a power of two, never below the 1.22.4 value (nginx, PHP, Valkey 524288; MariaDB, Elasticsearch 1048576) and capped at the live `fs.nr_open` where that is above the floor, so today's sizes write exactly those values.  `fs.file-max` = RAM_MB x 1024 within 1M..10M, raised to the sum of the units present when that is larger (a small all-in-one host or two PHP series); `fs.nr_open` = the same, and at least twice the largest unit limit.  Neither is ever written below the system's own value: when that is already at least the target (stock Ubuntu, where systemd raises `nr_open` to about 1073741816 and `file-max` to LONG_MAX at boot) the key is not written at all; the `--optimize` Verify block lists each unit against its internal limit |
 | Host | swap RAM/2 clamped 1..8 GiB (VPS 4); governor on dedicated hardware only (the previous governor is recorded for `--purge`); THP `madvise`; `fstrim.timer` on SSD/NVMe; I/O scheduler and readahead per device class for every whole disk by its rotational flag (NVMe `none`, flash `mq-deadline`/128k, rotational `mq-deadline`/1024k; md/dm arrays on flash get readahead 128k only, since the kernel sizes an array's readahead from its stripe and the filesystem reads through the array, not its members; HDD arrays and loop/zram are left alone; the rules are re-triggered only for non-empty whole disks, so BMC virtual floppies and CD-ROMs are not replayed through other packages' udev rules) |
 
 ### Environment variables
@@ -1314,10 +1351,10 @@ hardware (with a warning), see
 [Profile pins and tuning overrides](#profile-pins-and-tuning-overrides).
 
 The `SETUP_*` names below are environment inputs for the run that applies
-them.  `SETUP_XF_JOB_CRON`, `SETUP_CF_SELF_SIGNED`,
-`SETUP_PHP_SESSION_HARDENING`, `SETUP_PHP_JIT_WORDPRESS`,
-`SETUP_PHP_PAGE_GZIP`, `SETUP_CPU_MITIGATIONS`,
-`--php ext=` (`PHP_EXT_EXTRA`) and the XenForo gzip choice are written to
+them.  `SETUP_XF_JOB_CRON`, `SETUP_CF_SELF_SIGNED`, `SETUP_PHP_JIT_WORDPRESS`,
+`SETUP_PHP_PAGE_GZIP`, `SETUP_PHP_OPCACHE_FILE_OVERRIDE`,
+`--php ext=` (`PHP_EXT_EXTRA`) and the
+XenForo gzip choice are written to
 `/etc/default/setup-tuning` and therefore survive a later `--optimize`.  The
 remaining ones are one-run inputs: they are not persisted, and a later
 install/optimize re-applies the host's recorded state unless the same
@@ -1331,18 +1368,19 @@ Feature choices (honoured by `--optimize`):
 | `SETUP_XF_MEMBER_GZIP` | `nginx\|xenforo` | who compresses XenForo pages for visitors with a session (default `nginx`) |
 | `SETUP_CF_SELF_SIGNED` | `0\|1` | Cloudflare-proxied vhosts on the self-signed origin certificate and certbot retirement (`--optimize`); persisted as `CF_SELF_SIGNED` |
 | `SETUP_SSL_REJECT_UNKNOWN_SNI` | `auto\|0\|1` | catch-all HTTPS server refuses handshakes with an unknown or missing SNI (`ssl_reject_handshake on`, hides the origin host name from IP scanners). `auto` (default) leaves it off while a loaded vhost trusts a reverse proxy outside the Cloudflare ranges (`set_real_ip_from`), since such a proxy may connect without the site name as SNI and every request would answer 502; `1` once every proxy in front sends it (`proxy_ssl_server_name on; proxy_ssl_name $host;`); read from `SSL_REJECT_UNKNOWN_SNI` in `/etc/default/setup-tuning` |
-| `SETUP_CPU_MITIGATIONS` | `on\|off` | the `mitigations=` choice of `--basic`/`--optimize`; persisted as `CPU_MITIGATIONS` |
+| `SETUP_CPU_MITIGATIONS` | `off` | accepted and changes nothing (`mitigations=off` is the default since 1.22.5); `on` was removed and is refused; a persisted `CPU_MITIGATIONS=on` moves to `off` |
 | `SETUP_NODE_MAJOR` | major number | Node.js major installed by `--others nodejs` |
 | `SETUP_NODE_ALLOW_MAJOR_UPGRADE` | `1` | allows a one-off Node.js major switch |
 | `SETUP_UFW_SSH_LIMIT` | `0\|1` | 1 (default) rate-limits the SSH port with `ufw limit` (6 new connections per 30 s per address); 0 writes a plain `ufw allow` rule for automation hosts (see troubleshooting) |
-| `SETUP_PHP_SESSION_HARDENING` | `1` | opt-in session/cgi hardening |
+| `SETUP_PHP_OPCACHE_FILE_OVERRIDE` | `0\|1` | default `1` writes `opcache.enable_file_override = 1`, `0` leaves it out; persisted as `PHP_OPCACHE_FILE_OVERRIDE` |
 | `SETUP_WP_DB_SPLIT` | `0` | keeps a WordPress `DB_USER` with global privileges as it is |
 | `SETUP_WP_ALLOW_FILE_MODS` | `1` | keeps WordPress plugin installs enabled |
 | `SETUP_WP_GUEST_CACHE` | `0` | keeps the WordPress guest-cache include off |
 | `SETUP_CHEV_GUEST_CACHE` | `1\|0` | forces the Chevereto guest cache on/off |
 | `SETUP_PURGE_MALWARE` | `1` | deletes known webshells instead of quarantining them |
 | `SETUP_DOMAIN_OPTIMIZE` | `0` | skips the tuning pass at the end of `--domain` |
-| `CONFIG_REPO_URL`, `CONFIG_REPO_REF`, `CONFIG_SOURCE_DIR` | URL, git ref (default `nginx`), local directory | source of the nginx configuration tree |
+| `SETUP_SERVICE_WATCHDOG` | `0\|1` | service watchdog (default on, installed by `--basic`/`--optimize` for the units present): a `zz-setup-watchdog.conf` drop-in gives `nginx.service`, every `phpX.Y-fpm.service`, `mariadb.service` and `elasticsearch.service` `Restart=on-abnormal` when the unit has no `Restart=` of its own (MariaDB's packaged `Restart=on-abort` is kept; crash, OOM kill; not the CPU gate's or `nginx -t`'s clean exit 1), and `setup-service-watchdog.timer` (every 30 s) restarts an enabled nginx/PHP-FPM/Valkey/Redis/MariaDB/Elasticsearch unit that has been `failed` (or never started this boot) for 60 s (`activating`, such as a slow Elasticsearch start, is never down).  The same pass restarts a unit that is `active` but hung: one cheap liveness probe per unit, in parallel, 10 s each (Valkey `PING` on its socket, `mariadb-admin --protocol=socket ping`, curl to Elasticsearch's `/` and nginx's `https://127.0.0.1/`, a FastCGI request for the pool's `ping.path = /setup-fpm-ping`, which `--optimize` adds and nginx cannot reach); any answer counts as alive (LOADING, BUSY, Too many connections, HTTP 401/503, the catch-all's empty reply), only a refused connection or no answer fails, and a failure is not counted while the unit's cgroup is busy (2% of a core or 1 MB/s disk I/O).  3 failed probes in a row (~90 s) restart nginx/PHP-FPM/Valkey, 5 (~150 s) MariaDB/Elasticsearch, never within 600 s of their start.  At most 3 restarts per unit per hour for both, logged as `journalctl -t setup-watchdog` (a probe failure and its recovery once each).  A unit stopped with `systemctl stop` stays down; nothing runs while setup.sh, a build, the migration or a CPU-change rebuild is in progress.  `0` (persisted as `SERVICE_WATCHDOG`) removes it for hosts with their own monitoring; `SETUP_SERVICE_WATCHDOG_HANG=0` (persisted as `SERVICE_WATCHDOG_HANG`) keeps the down restarts but turns the hang restarts off; `--purge` removes it with the last service |
+| `CONFIG_REPO_URL`, `CONFIG_REPO_REF`, `CONFIG_SOURCE_DIR` | URL, git ref (default `main`), local directory | source of the nginx configuration tree |
 | `SETUP_STATE_DIR` | directory | private state directory for tests and image builds |
 
 Builds and migration (one-run inputs):
@@ -1365,8 +1403,7 @@ Tuning overrides (ignored by `--optimize`, which uses the hardware profile):
 | `SETUP_TCP_CC`, `SETUP_QDISC` | congestion control and qdisc (profile default BBR + fq) |
 | `SETUP_STORAGE_CLASS` | `nvme\|ssd\|hdd` pin when the kernel cannot see the medium |
 | `SETUP_PHP_WORKERS_PER_CPU` | PHP-FPM workers-per-CPU factor |
-| `SETUP_PHP_JIT_HOT_LOOP`, `_FUNC`, `_RETURN`, `_SIDE_EXIT` | JIT hotness thresholds |
-| `SETUP_GZIP_LEVEL`, `SETUP_BROTLI_LEVEL` | dynamic compression levels |
+| `SETUP_BROTLI_LEVEL` | dynamic Brotli compression level |
 | `SETUP_NGINX_COMPRESSION` | 0 turns the managed compression profile off |
 | `SETUP_MARIADB_IO_CAPACITY` | `innodb_io_capacity`/`_max` |
 | `SETUP_LIMIT_REQ_EXEMPT` | ignored since 1.21.71 (the generic per-IP limits it exempted from are gone; the login limiter never used it).  A value an older release persisted only tells the TLS catch-all guard that a proxy sits in front |
@@ -1382,7 +1419,7 @@ Removed (ignored with a warning): `--source`, `SETUP_PHP_BUILD`,
 
 | Command | What it does | Notes |
 |---|---|---|
-| `--diagnostics` | writes one mode-600 `diagnostics.log` beside `setup.sh`: hardware, network, sysctls, units, nginx/PHP/MariaDB/Valkey/Elasticsearch configuration and runtime statistics, a `builds` section (each `build.info`, versions, CPU match, build timers, the last build logs), the migration state, slow and error logs, ownership, UFW, SSH, cron, package state | read-only; credentials are redacted |
+| `--diagnostics` | writes one mode-600 `diagnostics.log` beside `setup.sh`: hardware, network, sysctls, units, nginx/PHP/MariaDB/Valkey/Elasticsearch configuration and runtime statistics, a `builds` section (each `build.info`, versions, CPU match, build timers, the last build logs), the migration state, slow and error logs, ownership, UFW, SSH, cron, package state.  Verification sections: the effective FPM OPcache/JIT per PHP series (that series' CLI run with the FPM `php.ini` and `conf.d`), Valkey `INFO` over each local unix socket, the CPU frequency driver/EPP/boost, NIC queues with their IRQ lines and irqbalance, each service's `LimitNOFILE` next to its own limit (nginx `worker_rlimit_nofile`, PHP `rlimit_files`, Valkey `maxclients`, MariaDB `open_files_limit`, Elasticsearch `max_file_descriptors` from loopback only), and every vhost certificate's `notAfter` | read-only; credentials are redacted.  The `--optimize` report ends with a short **Verify** block (nginx and its TLS library, PHP version and JIT, Valkey version/io-threads/maxmemory policy/RDB save/TCP port, the file-descriptor plan: each service's unit `LimitNOFILE` next to its internal limit and `fs.file-max` against their sum, an irqbalance note on dedicated hosts with 4+ CPUs) and a **Certificates** block that warns about a certificate ending within 21 days, or a self-signed one, on a vhost not proven behind Cloudflare |
 | `--restart-all [--dry-run]` | repairs `/var/www` log ownership, stops nginx (Angie in the legacy-Angie state) and every active PHP-FPM, restarts Valkey/Redis, Elasticsearch (waits for HTTP) and MariaDB (waits for `SELECT 1`), then starts PHP-FPM and nginx | only units that were active are touched; uses the same pause/resume and readiness helpers as the `--optimize` tuners; `--dry-run` prints the plan |
 | `--purge [TARGET...]` | stops and disables the selected services and removes their managed cron entries; for nginx, PHP and Valkey it also removes the source build | no package, database, certificate, configuration or log is deleted; it keeps going past a file it cannot restore and reports it; there is no domain purge |
 
@@ -1472,18 +1509,34 @@ downloaded.
 
 - Certificates: the self-signed pairs suit Cloudflare "Full" mode.  For
   direct TLS, use an external ACME client (the nginx build has no ACME
-  module).  Behind Cloudflare, enable the real-IP config first or the login
-  limiter throttles everyone; consider HTTP/3 (`listen 443 quic`,
-  `ufw allow 443/udp`).
+  module).  Behind Cloudflare the real-IP list (`http.d/cloudflare.conf`,
+  refreshed daily by `scripts/cloudflare.sh`) is generated automatically, so
+  the login limiter keys on the visitor.  HTTP/3 is on by default for every
+  vhost created from a template since 1.22.5 (each TLS server includes
+  `h5bp/tls/http3.conf`; delete that line to turn it off for one vhost).
+  Behind Cloudflare it is idle today (Cloudflare reaches the origin over
+  TCP).  `--optimize` adds the same include to existing vhosts (each server
+  block that listens on plain 443 with ssl and has no QUIC listen of its
+  own), only when the tree passes `nginx -t` before and after; comment the
+  line out (`#include h5bp/tls/http3.conf;`) to keep a vhost off: a deleted
+  line comes back on the next run.  443/udp is already open, because `ufw
+  allow 443` admits TCP and UDP; the catch-all refuses every QUIC handshake
+  for an unknown name.
 - PHP: one pool and user per tenant with `open_basedir` in a dedicated pool
   (never via `fastcgi_param`); extend `disable_functions` where no app needs
-  process execution; `opcache.validate_timestamps=0` with a reload on deploy.
+  process execution.
 - MariaDB: per-application users without `GRANT OPTION`; `flush_log_at_trx_commit=1`
-  for critical data; TLS, UFW source rules and per-client accounts for remote
-  access; off-site encrypted backups and tested restores; binary logs for
-  point-in-time recovery; read replicas at scale.
-- Valkey: `save ""` makes it a cache; use AOF and `noeviction`/`volatile-lru`
-  (or a separate instance) for sessions, queues and locks; ACLs per app.
+  for critical data (a later-sorting drop-in, see the MariaDB section; the
+  default 2 can lose about 1 s of commits on an OS crash); TLS, UFW source
+  rules and per-client accounts for remote access; off-site encrypted
+  backups and tested restores; binary logs for point-in-time recovery; read
+  replicas at scale.
+- Valkey: socket only (`port 0`) by default; RDB snapshots every 5 minutes
+  keep sessions across clean restarts (a crash or power loss starts empty).  Size
+  `--valkey ram=` to hold sessions plus cache (`allkeys-lru` may evict them
+  under pressure; never `volatile-*`, which evicts the TTL-carrying session
+  keys first).  Use a separate instance with AOF for queues and locks; ACLs
+  per app.
 - Elasticsearch: never expose 9200/9300 without X-Pack security and TLS;
   snapshots to an external repository; a dedicated node once traffic grows.
 - Host: keys-only SSH, fail2ban or provider protection, central monitoring and
@@ -1516,6 +1569,8 @@ downloaded.
 | "Installation of system tables failed" (MariaDB) | Ubuntu 26.04 AppArmor profile; the script adds the override, re-run after `--purge --mariadb` if a previous install was interrupted |
 | `smartd could not be enabled` | no SMART-capable disk (VMs); a warning only |
 | `429` on logins behind Cloudflare/a proxy | the login limiter keys on the direct client address: enable real-IP (`/etc/nginx/scripts/cloudflare.sh`, `cloudflare.conf`); tune `http.d/limit_req.conf` and `h5bp/limit_req/*.conf` |
+| `429` on XenForo search or the contact form | since 1.22.5 `POST /search/search` and `POST /misc/contact` share the login limiter (20 a minute per address after a burst of 10); result pages and every GET stay unlimited.  Behind Cloudflare the key is the visitor only when real-IP is on (see above) |
+| `524` behind Cloudflare on a long admin job (XenForo rebuild, Chevereto import, WordPress update) | Cloudflare's proxy waits 100 s for the origin's response (every plan below Enterprise), while PHP may run up to `request_terminate_timeout` 300 s, so the job usually finished.  Run long jobs from the CLI or cron (XenForo's `php cmd.php` rebuild and import commands, WP-CLI) or through a DNS-only (grey-cloud) admin host name; the origin timeouts are not changed |
 | PHP-FPM slow log full of queued requests | `request_slowlog_timeout` counts from accept; check `listen queue` in `/fpm-status.php`, add workers or cache the endpoint |
 | "upstream prematurely closed connection" during a load test | worker recycling at `pm.max_requests` or an FPM reload; set `pm.max_requests = 0` for a benchmark |
 | `--domain` says nginx or MariaDB is missing | it only creates the vhost/database; install the stack first or combine the flags |

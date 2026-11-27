@@ -787,7 +787,7 @@ optimize_mariadb() {
   if mariadb_write_systemd_limits; then
     systemctl daemon-reload || true
     unit_changed=1
-    opt_report "- systemd LimitNOFILE=1048576"
+    opt_report "- systemd LimitNOFILE=$(nofile_unit mariadb 2>/dev/null || printf 1048576)"
   fi
   cnf="${cnf_dir}/99-setup-optimize.cnf"
 
@@ -807,6 +807,9 @@ optimize_mariadb() {
   fi
   opt_report "- Slow/error logging: /var/www/logs/mariadb/slow.log and error.log"
   opt_report "- innodb_io_capacity=${io_read}/${io_write}, thread_pool_size=${threads}"
+  local nonpool_line
+  nonpool_line=$(mariadb_nonpool_summary)
+  if [[ -n $nonpool_line ]]; then opt_report "- Memory plan: ${nonpool_line}"; fi
   # One owner for the performance values: remove the installer-managed block
   # from 50-server.cnf now that the 99- drop-in is authoritative.
   mariadb_strip_install_block "$size_mb" "$max_conn" \
@@ -1187,18 +1190,580 @@ optimize_valkey() {
 
 # --optimize report: Chevereto sites still on file sessions are shown the
 # two env.php lines that move them to this Valkey/Redis socket.  Advice only;
-# application files are never edited.
+# application files are never edited.  Sessions in Valkey survive restarts
+# through the RDB snapshot (a crash or power loss starts the cache empty,
+# F4) and allkeys-lru may evict them under memory pressure, so
+# maxmemory must hold sessions plus cache (1.22.5; never volatile-*: session
+# keys carry a TTL, so volatile-* evicts them first).
+VALKEY_SESSIONS_NOTE="sessions in Valkey survive clean restarts and reboots through the RDB snapshot (written at shutdown and by the 5-minute RDB snapshot; after a crash or power loss the cache starts empty, sessions included); under memory pressure allkeys-lru may evict them, so size maxmemory (\`--valkey ram=\`) to hold sessions plus cache"
 chevereto_session_hint() {
-  local socket=$1 root n=0
+  local socket=$1
+  opt_report "  Chevereto: \`'CHEVERETO_SESSION_SAVE_HANDLER' => 'redis', 'CHEVERETO_SESSION_SAVE_PATH' => 'unix://${socket}',\` in app/env.php keeps sessions here (each site's state is in the Chevereto sessions check)"
+  opt_report "  Chevereto sessions: ${VALKEY_SESSIONS_NOTE}"
+}
+
+# Where one Chevereto site keeps its PHP sessions: "HANDLER PATH SOURCE".
+# Chevereto reads CHEVERETO_SESSION_SAVE_HANDLER/_PATH from app/env.php and
+# from the process environment (nginx fastcgi_param in the site's vhost, an
+# FPM pool env[]).  Every place that sets the handler is read; any `files`
+# (or nothing set: Chevereto's default is files in /tmp) counts as files,
+# so a site is only reported as on Valkey/Redis when every setting agrees.
+chevereto_session_backend() { # root nginx-target php-etc
+  local root=$1 target=${2:-/etc/nginx} etc=${3:-/etc/php} live f vroot h p
+  local -a handlers=() paths=() srcs=()
+  live=$(sed -E '/^[[:space:]]*(\/\/|#|\/\*|\*)/d' "$root/app/env.php" 2>/dev/null || true)
+  h=$(valkey_chev_env "$live" CHEVERETO_SESSION_SAVE_HANDLER)
+  p=$(valkey_chev_env "$live" CHEVERETO_SESSION_SAVE_PATH)
+  [[ -n $h ]] && { handlers+=("$h"); srcs+=("app/env.php"); }
+  [[ -n $p ]] && paths+=("$p")
+  for f in "$target"/conf.d/*.conf; do
+    [[ -f $f ]] || continue
+    vroot=$(nginx_vhost_root "$f" 2>/dev/null || true)
+    [[ ${vroot%/} == "${root%/}" ]] || continue
+    h=$(sed -nE "s/^[[:space:]]*fastcgi_param[[:space:]]+CHEVERETO_SESSION_SAVE_HANDLER[[:space:]]+[\"']?([^\"';[:space:]]+).*/\1/p" "$f" | tail -n1)
+    p=$(sed -nE "s/^[[:space:]]*fastcgi_param[[:space:]]+CHEVERETO_SESSION_SAVE_PATH[[:space:]]+[\"']?([^\"';[:space:]]+).*/\1/p" "$f" | tail -n1)
+    [[ -n $h ]] && { handlers+=("$h"); srcs+=("${f#"$target"/} fastcgi_param"); }
+    [[ -n $p ]] && paths+=("$p")
+  done
+  # A pool's env[] belongs to the sites that pool serves: count it only when
+  # it is the host's only pool, or when the pool names this root (chdir,
+  # open_basedir, a path in the file).  Otherwise one site's pool would
+  # speak for every Chevereto site on the host.
+  local -a pools=()
+  for f in "$etc"/*/fpm/pool.d/*.conf; do [[ -f $f ]] && pools+=("$f"); done
+  for f in "${pools[@]}"; do
+    (( ${#pools[@]} == 1 )) || grep -qF -- "${root%/}" "$f" 2>/dev/null || continue
+    h=$(sed -nE "s/^[[:space:]]*env\[CHEVERETO_SESSION_SAVE_HANDLER\][[:space:]]*=[[:space:]]*[\"']?([^\"'[:space:]]+).*/\1/p" "$f" | tail -n1)
+    p=$(sed -nE "s/^[[:space:]]*env\[CHEVERETO_SESSION_SAVE_PATH\][[:space:]]*=[[:space:]]*[\"']?([^\"'[:space:]]+).*/\1/p" "$f" | tail -n1)
+    [[ -n $h ]] && { handlers+=("$h"); srcs+=("${f#"$etc"/} env[]"); }
+    [[ -n $p ]] && paths+=("$p")
+  done
+  h=files
+  if (( ${#handlers[@]} )); then
+    h=${handlers[0],,}
+    for f in "${handlers[@]}"; do [[ ${f,,} == "$h" ]] || h=mixed; done
+  fi
+  # No path anywhere: Chevereto's default is /tmp, which only makes sense
+  # for files; for redis it is a misconfiguration ("-").
+  p=/tmp
+  [[ $h == files ]] || p=-
+  (( ${#paths[@]} )) && p=${paths[${#paths[@]}-1]}
+  printf '%s %s %s\n' "$h" "$p" "$(IFS=,; printf '%s' "${srcs[*]:-default}")"
+}
+
+# --optimize (1.22.5, operator request): warn for every Chevereto site whose
+# sessions are not in this host's Valkey/Redis.  File sessions are one file
+# per guest visit (on a tmpfs /tmp a sustained flood exhausts its inodes
+# before setup-php-sessionclean.timer's 24-minute expiry) and serialise a
+# member's parallel requests; in Valkey the member explore tier measured
+# 9,466 vs ~2,200 req/s (1.22.4, EPYC 4245P).  Read-only: app files are
+# never edited.  Runs whether or not a cache service is installed.
+chevereto_session_check() { # nginx-target php-etc
+  local target=${1:-/etc/nginx} etc=${2:-/etc/php} root line h p src socket="" conf n=0
+  for conf in ${CHEV_SESSION_CACHE_CONFS:-/etc/valkey/valkey.conf /etc/redis/redis.conf}; do
+    [[ -f $conf ]] || continue
+    socket=$(valkey_conf_get "$conf" unixsocket 2>/dev/null || true)
+    [[ -n $socket ]] && break
+  done
   while IFS= read -r root; do
     [[ -n $root ]] || continue
-    n=$(( n + 1 ))
-  done < <(chevereto_session_dirs /etc/nginx 2>/dev/null)
-  if (( n )); then
-    opt_report "  Chevereto (${n} site(s) on file sessions): add \`'CHEVERETO_SESSION_SAVE_HANDLER' => 'redis', 'CHEVERETO_SESSION_SAVE_PATH' => 'unix://${socket}',\` to app/env.php.  File sessions are one file per guest visit and lock a member's parallel requests; in Valkey the member explore tier measured 9,466 vs ~2,200 req/s and uncached guests 4,418 vs 4,324 (1.22.4, EPYC 4245P).  setup-php-sessionclean.timer removes expired files meanwhile."
+    (( n++ == 0 )) && opt_report "## Chevereto sessions"
+    line=$(chevereto_session_backend "$root" "$target" "$etc")
+    read -r h p src <<<"$line"
+    if [[ $h == redis && $p == - ]]; then
+      warn "Chevereto ${root}: CHEVERETO_SESSION_SAVE_HANDLER is redis but CHEVERETO_SESSION_SAVE_PATH is not set (${src}); sessions may not reach Valkey"
+      opt_report "- **WARNING** \`${root}\`: CHEVERETO_SESSION_SAVE_HANDLER is redis but no CHEVERETO_SESSION_SAVE_PATH is set (${src}): add \`'CHEVERETO_SESSION_SAVE_PATH' => 'unix://${socket:-/run/valkey/valkey.sock}',\` to app/env.php"
+      continue
+    fi
+    if [[ $h == redis ]]; then
+      if [[ -n $socket && ( $p == *"$socket"* ) ]]; then
+        opt_report "- \`${root}\`: sessions in Valkey over the local socket (${src})"
+      elif valkey_socket_endpoint "${p//\\/}" || [[ $p == *.sock* ]]; then
+        opt_report "- \`${root}\`: sessions in Valkey/Redis over the socket \`${p}\` (${src})"
+      else
+        opt_report "- \`${root}\`: sessions in Valkey/Redis at \`${p}\` (${src}); the local socket${socket:+ \`unix://${socket}\`} avoids TCP"
+      fi
+      continue
+    fi
+    local fix
+    if [[ -n $socket ]]; then
+      fix="add \`'CHEVERETO_SESSION_SAVE_HANDLER' => 'redis', 'CHEVERETO_SESSION_SAVE_PATH' => 'unix://${socket}',\` to app/env.php"
+    else
+      fix="install Valkey (\`setup.sh --valkey\`), then set CHEVERETO_SESSION_SAVE_HANDLER 'redis' and CHEVERETO_SESSION_SAVE_PATH 'unix:///run/valkey/valkey.sock' in app/env.php"
+    fi
+    if [[ $h == mixed ]]; then
+      warn "Chevereto ${root}: CHEVERETO_SESSION_SAVE_HANDLER is set differently in ${src}; sessions may be files, not Valkey"
+      opt_report "- **WARNING** \`${root}\`: CHEVERETO_SESSION_SAVE_HANDLER disagrees between ${src}: make every place say redis (${fix#add })"
+    else
+      warn "Chevereto ${root}: PHP sessions are files in ${p}, not Valkey (${src}); ${fix//\`/}"
+      opt_report "- **WARNING** \`${root}\`: sessions are files in \`${p}\`, not Valkey (${src}): ${fix}.  One file per guest visit; a flood can exhaust a tmpfs /tmp, and file locks serialise a member's parallel requests."
+    fi
+  done < <(nginx_chevereto_roots "$target" 2>/dev/null)
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Application cache wiring (1.22.5): which WordPress, XenForo and Chevereto
+# configs use this cache, over the socket or TCP, and whether they share it
+# safely.  Read-only; application files are never edited.
+# ---------------------------------------------------------------------------
+# 0 when VALUE (host, host:port, [::1]:port, tcp://..., redis://...) names
+# this host's cache over TCP loopback: 127.0.0.1, localhost or ::1 on port
+# 6379 or OUR_PORT (PORT is a separately configured port; empty = default).
+valkey_loopback_endpoint() { # value port our_port
+  local v=${1,,} p=${2:-} our=${3:-6379} host
+  v=${v#tcp://}; v=${v#redis://}; v=${v#rediss://}
+  v=${v##*@}; v=${v%%/*}; v=${v%%\?*}
+  if [[ $v == \[*\]* ]]; then
+    host=${v%%]*}; host=${host#[}
+    [[ $v == *\]:* && -z $p ]] && p=${v##*]:}
+  elif [[ $v == *:*:* ]]; then
+    host=$v
+  elif [[ $v == *:* ]]; then
+    host=${v%%:*}
+    [[ -z $p ]] && p=${v#*:}
   else
-    opt_report "  Chevereto: \`'CHEVERETO_SESSION_SAVE_HANDLER' => 'redis', 'CHEVERETO_SESSION_SAVE_PATH' => 'unix://${socket}',\` in app/env.php keeps sessions here"
+    host=$v
   fi
+  case $host in 127.0.0.1|localhost|::1) ;; *) return 1 ;; esac
+  p=${p//[[:space:]\'\"]/}
+  [[ -z $p || $p == 6379 || $p == "$our" ]]
+}
+
+# 0 when VALUE is a Unix socket endpoint (an absolute path or unix://).
+valkey_socket_endpoint() {
+  [[ $1 == /* || $1 == unix://* || $1 == unix:/* ]]
+}
+
+# First define('NAME', value) of a wp-config.php, quotes stripped.
+valkey_wp_define() { # file name
+  sed -nE "s/^[[:space:]]*define[[:space:]]*\([[:space:]]*['\"]$2['\"][[:space:]]*,[[:space:]]*['\"]?([^'\")]*)['\"]?[[:space:]]*\).*/\1/p" "$1" 2>/dev/null \
+    | head -n1 | sed -E 's/[[:space:]]+$//' || true
+}
+
+# Last 'KEY' => 'value' of a Chevereto app/env.php (comments ignored).
+valkey_chev_env() { # live-text key
+  sed -nE "s/.*['\"]$2['\"][[:space:]]*=>[[:space:]]*['\"]?([^'\",]*)['\"]?.*/\1/p" <<<"$1" | tail -n1 || true
+}
+
+# Transport of one endpoint value for the conservative scans below: socket
+# for a path or unix://, remote for a non-loopback host, else tcp.
+valkey_endpoint_transport() { # value our_port
+  local v=${1//\\/}
+  if [[ $v == *.sock* ]] || valkey_socket_endpoint "$v"; then printf 'socket'
+  elif [[ -z $v ]] || valkey_loopback_endpoint "$v" "" "${2:-6379}"; then printf 'tcp'
+  elif [[ $v =~ ^(tcp://|redis://)?(127\.0\.0\.1|localhost|\[?::1\]?)(:|$) ]]; then printf 'other'
+  else printf 'remote'
+  fi
+}
+
+# W3 Total Cache (1.22.5 F3/F11): wp-content/w3tc-config/*.php with an
+# object/page/database/fragment cache engine set to redis.  tcp unless every
+# *.redis.servers entry is a socket; "none" when W3TC is configured without
+# Redis; empty when there is no W3TC config.  Both storage forms count: the
+# PHP array ('key' => value) and the `<?php exit; ?>` + JSON that W3TC
+# 0.9.5+ writes ("key": value; split at commas so a one-line JSON works).
+valkey_w3tc_transport() { # wp-root our_port
+  local f seen=0 hasr=0 t="" v vt
+  for f in "$1"/wp-content/w3tc-config/*.php; do
+    [[ -f $f ]] || continue
+    seen=1
+    grep -qiE "\.engine['\"][[:space:]]*(=>|:)[[:space:]]*['\"]redis['\"]" "$f" 2>/dev/null || continue
+    hasr=1
+    while IFS= read -r v; do
+      [[ -n $v ]] || continue
+      vt=$(valkey_endpoint_transport "$v" "${2:-6379}")
+      if [[ $vt == tcp ]]; then t=tcp
+      elif [[ $vt == socket && -z $t ]]; then t=socket
+      fi
+    done < <(tr ',' '\n' < "$f" 2>/dev/null | awk '/redis\.servers/ { on = 1 } on { print } on && /[]);]/ { on = 0 }' \
+               | sed -E "s/^.*redis\.servers['\"][[:space:]]*(=>|:)//" | sed -nE "s/.*['\"]([^'\"]+)['\"].*/\1/p" || true)
+  done
+  (( seen )) || return 0
+  if (( ! hasr )); then printf 'none'; return 0; fi
+  printf '%s' "${t:-tcp}"
+}
+
+# LiteSpeed Cache: wp-content/.litespeed_conf.dat (JSON) with its object
+# cache on Redis ("object-kind": true, or a redis mention).  socket when
+# "object-host" is a path, else tcp; "none" for Memcached or object cache
+# off; empty when there is no such file.
+valkey_litespeed_transport() { # wp-root
+  local f=$1/wp-content/.litespeed_conf.dat txt host
+  [[ -f $f ]] || return 0
+  txt=$(tr -d '\\\n' < "$f" 2>/dev/null || true)
+  if [[ $txt =~ \"object\"[[:space:]]*:[[:space:]]*(false|0|\"0\") ]] \
+     || ! [[ ${txt,,} =~ \"object-kind\"[[:space:]]*:[[:space:]]*(true|1|\"1\")|redis ]]; then
+    printf 'none'; return 0
+  fi
+  host=$(sed -nE 's/.*"object-host"[[:space:]]*:[[:space:]]*"([^"]*)".*/\1/p' <<<"$txt" | head -n1 || true)
+  if [[ -n $host ]] && [[ $host == /* || $host == *.sock* || $host == unix:* ]]; then printf 'socket'; else printf 'tcp'; fi
+}
+
+# The live $config['cache'] statements of a XenForo src/config.php (comment
+# lines dropped; multi-line array literals followed to their ';').
+valkey_xf_cache_text() { # config.php
+  sed -E '/^[[:space:]]*(\/\/|#|\/\*|\*)/d' "$1" 2>/dev/null | awk '
+    /\$config\[[\047"]cache[\047"]\]/ { on = 1 }
+    on { print; if ($0 ~ /;[[:space:]]*((\/\/|#).*)?$/) on = 0 }' || true
+}
+
+# PHP session handlers on this cache (F13/F19): session.save_handler =
+# redis in php.ini, conf.d/*.ini or an FPM pool (php_value[...] and
+# php_admin_value[...] forms), for every PHP under /etc/php.  One
+# "FILE<TAB>TRANSPORT" per file: socket for unix:// or a path, tcp for
+# tcp:// or a schemeless loopback save_path (or none in that file),
+# remote otherwise.
+valkey_php_session_scan() { # our_port
+  local our=${1:-6379} etc=${VALKEY_SCAN_PHP_ETC:-${PHP_BUILD_ETC:-/etc/php}} f path e t tt
+  for f in "$etc"/*/fpm/php.ini "$etc"/*/cli/php.ini "$etc"/*/fpm/conf.d/*.ini "$etc"/*/cli/conf.d/*.ini "$etc"/*/fpm/pool.d/*.conf; do
+    [[ -f $f ]] || continue
+    grep -qiE '^[[:space:]]*(php_(admin_)?value\[)?session\.save_handler\]?[[:space:]]*=[[:space:]]*"?redis' "$f" 2>/dev/null || continue
+    path=$(sed -nE 's/^[[:space:]]*(php_(admin_)?value\[)?session\.save_path\]?[[:space:]]*=[[:space:]]*"?([^";]*)"?.*/\3/p' "$f" 2>/dev/null | tail -n1 || true)
+    t=""
+    if [[ -z $path ]]; then
+      t=tcp
+    else
+      while IFS= read -r e; do
+        e=${e%%\?*}; e=${e//[[:space:]]/}
+        [[ -n $e ]] || continue
+        tt=$(valkey_endpoint_transport "$e" "$our")
+        case $tt in
+          tcp) t=tcp ;;
+          socket) [[ $t == tcp ]] || t=socket ;;
+          *) [[ -n $t ]] || t=remote ;;
+        esac
+      done < <(tr ',' '\n' <<<"$path")
+    fi
+    printf '%s\t%s\n' "$f" "${t:-tcp}"
+  done
+  return 0
+}
+
+# One record per application cache user, tab-separated:
+#   APP  FILE  TRANSPORT  FLAGS
+# APP wordpress|xenforo|chevereto-cache|chevereto-sessions; TRANSPORT
+# socket|tcp|remote; FLAGS a space list: noprefix (WordPress without
+# WP_REDIS_PREFIX/WP_CACHE_KEY_SALT), noscheme (WP_REDIS_PATH without
+# WP_REDIS_SCHEME 'unix': the Redis Object Cache drop-in then still
+# connects over TCP), nonamespace (XenForo without
+# $config['cache']['namespace']), sessions (XenForo sessions in the cache).
+# A WordPress with a Redis drop-in and no endpoint uses the plugin default
+# 127.0.0.1:6379 (tcp).  OUR_PORT is this cache's TCP port.
+valkey_app_cache_scan() { # our_port
+  local our=${1:-6379} conf root dropin path host port scheme t flags live v w3 lsc xtext
+  if declare -F app_find_wordpress_configs >/dev/null 2>&1; then
+    while IFS= read -r conf; do
+      [[ -n $conf && -f $conf ]] || continue
+      case $conf in */backup/*|*/mysql_database/*|*/logs/*) continue ;; esac
+      root=${conf%/wp-config.php}; dropin=$root/wp-content/object-cache.php
+      path=$(valkey_wp_define "$conf" WP_REDIS_PATH)
+      host=$(valkey_wp_define "$conf" WP_REDIS_HOST)
+      port=$(valkey_wp_define "$conf" WP_REDIS_PORT)
+      scheme=$(valkey_wp_define "$conf" WP_REDIS_SCHEME)
+      # W3 Total Cache and LiteSpeed Cache keep their Redis endpoint outside
+      # wp-config.php; any other object-cache.php drop-in that is not
+      # recognisably on the socket counts as a TCP user (1.22.5 F3/F11).
+      w3=$(valkey_w3tc_transport "$root" "$our")
+      lsc=$(valkey_litespeed_transport "$root")
+      if ! { [[ -f $dropin ]] && grep -qi redis "$dropin" 2>/dev/null; } \
+         && ! grep -qE "^[[:space:]]*define[[:space:]]*\([[:space:]]*['\"]WP_REDIS_" "$conf" 2>/dev/null; then
+        if [[ $w3 == tcp || $lsc == tcp ]]; then t=tcp
+        elif [[ $w3 == socket || $lsc == socket ]]; then t=socket
+        elif [[ -f $dropin && $w3 != none && $lsc != none ]]; then t=tcp
+        else continue
+        fi
+        printf 'wordpress\t%s\t%s\t\n' "$conf" "$t"
+        continue
+      fi
+      flags=""
+      grep -qE "WP_REDIS_PREFIX|WP_CACHE_KEY_SALT|['\"]prefix['\"][[:space:]]*=>" "$conf" 2>/dev/null || flags+=" noprefix"
+      if grep -qE "^[[:space:]]*define[[:space:]]*\([[:space:]]*['\"]WP_REDIS_(CONFIG|SERVERS|SHARDS|CLUSTER)['\"]" "$conf" 2>/dev/null; then
+        # A bare 'host:port' server entry is TCP too; anything not
+        # recognisably a socket or another host counts as TCP (F19).
+        if grep -qiE "(['\"]host['\"][[:space:]]*=>[[:space:]]*['\"](127\.0\.0\.1|localhost|::1)['\"])|(tcp://(127\.0\.0\.1|localhost|\[::1\]))|(['\"](tcp://)?(127\.0\.0\.1|localhost|\[::1\]):[0-9]+['\"])" "$conf" 2>/dev/null; then t=tcp
+        elif grep -qE "\.sock['\"]|unix://" "$conf" 2>/dev/null; then t=socket
+        elif grep -qiE "(['\"]host['\"][[:space:]]*=>[[:space:]]*['\"][^'\"/]+['\"])|(tcp://[a-z0-9])|(['\"][a-z0-9.-]+:[0-9]+['\"])" "$conf" 2>/dev/null; then t=remote
+        else t=tcp
+        fi
+      elif [[ -n $path && ${scheme,,} == unix ]]; then
+        t=socket
+      elif [[ -n $path ]]; then
+        if [[ -f $dropin ]] && grep -q 'Redis Object Cache' "$dropin" 2>/dev/null; then
+          t=tcp; flags+=" noscheme"
+        else
+          t=socket
+        fi
+      elif [[ ${scheme,,} == unix ]] || valkey_socket_endpoint "$host"; then
+        t=socket
+      elif [[ -z $host ]] || valkey_loopback_endpoint "$host" "$port" "$our"; then
+        t=tcp
+      else
+        t=remote
+      fi
+      [[ $w3 == tcp || $lsc == tcp ]] && t=tcp
+      printf 'wordpress\t%s\t%s\t%s\n' "$conf" "$t" "${flags# }"
+    done < <(app_find_wordpress_configs 2>/dev/null || true)
+  fi
+  if declare -F app_find_xenforo_configs >/dev/null 2>&1; then
+    while IFS= read -r conf; do
+      [[ -n $conf && -f $conf ]] || continue
+      case $conf in */backup/*|*/mysql_database/*|*/logs/*) continue ;; esac
+      # Any live $config['cache'] form that mentions Redis counts: the
+      # scalar provider line, the array form and per-context providers
+      # ($config['cache']['context'][...]['provider']); only an explicit
+      # enabled = false skips the board (1.22.5 F19).
+      xtext=$(valkey_xf_cache_text "$conf")
+      grep -qi redis <<<"$xtext" || continue
+      v=$(grep -oiE "\[['\"]enabled['\"]\][[:space:]]*=[[:space:]]*[a-z0-9]+|['\"]enabled['\"][[:space:]]*=>[[:space:]]*[a-z0-9]+" <<<"$xtext" \
+            | tail -n1 | sed -E 's/.*[=>][[:space:]]*//' || true)
+      [[ ${v,,} == false || $v == 0 ]] && continue
+      host=$(xf_cache_host_from_config "$conf")
+      port=$(xf_cache_port_from_config "$conf")
+      flags=""
+      grep -qE "^[[:space:]]*\\\$config\[['\"]cache['\"]\]\[['\"]namespace['\"]\][[:space:]]*=" "$conf" 2>/dev/null || flags+=" nonamespace"
+      v=$(sed -nE "s/^[[:space:]]*\\\$config\[['\"]cache['\"]\]\[['\"]sessions['\"]\][[:space:]]*=[[:space:]]*([a-zA-Z0-9]+).*/\1/p" "$conf" 2>/dev/null | tail -n1 || true)
+      [[ ${v,,} == true || $v == 1 ]] && flags+=" sessions"
+      # Socket only when the cache config names a .sock/unix endpoint and no
+      # loopback host; a non-loopback host alone is another server; else tcp.
+      if grep -qiE "['\"](tcp://)?(127\.0\.0\.1|localhost|::1|\[::1\])(:[0-9]+)?['\"]" <<<"$xtext"; then t=tcp
+      elif grep -qiE "\.sock|unix:" <<<"$xtext"; then t=socket
+      elif [[ -n $host ]] && ! valkey_loopback_endpoint "$host" "$port" "$our"; then t=remote
+      else t=tcp
+      fi
+      printf 'xenforo\t%s\t%s\t%s\n' "$conf" "$t" "${flags# }"
+    done < <(app_find_xenforo_configs 2>/dev/null || true)
+  fi
+  if declare -F nginx_chevereto_roots >/dev/null 2>&1; then
+    while IFS= read -r root; do
+      [[ -n $root && -f $root/app/env.php ]] || continue
+      conf=$root/app/env.php
+      live=$(sed -E '/^[[:space:]]*(\/\/|#|\/\*|\*)/d' "$conf" 2>/dev/null || true)
+      if [[ $(valkey_chev_env "$live" CHEVERETO_CACHE_DRIVER) == redis ]]; then
+        host=$(valkey_chev_env "$live" CHEVERETO_CACHE_HOST)
+        port=$(valkey_chev_env "$live" CHEVERETO_CACHE_PORT)
+        if valkey_socket_endpoint "$host"; then t=socket
+        elif [[ -z $host ]] || valkey_loopback_endpoint "$host" "$port" "$our"; then t=tcp
+        else t=remote
+        fi
+        printf 'chevereto-cache\t%s\t%s\t\n' "$conf" "$t"
+      fi
+      if [[ $(valkey_chev_env "$live" CHEVERETO_SESSION_SAVE_HANDLER) == redis ]]; then
+        path=$(valkey_chev_env "$live" CHEVERETO_SESSION_SAVE_PATH)
+        if valkey_socket_endpoint "$path"; then t=socket
+        elif [[ -z $path ]] || valkey_loopback_endpoint "$path" "" "$our"; then t=tcp
+        else t=remote
+        fi
+        printf 'chevereto-sessions\t%s\t%s\t\n' "$conf" "$t"
+      fi
+    done < <(nginx_chevereto_roots /etc/nginx 2>/dev/null || true)
+  fi
+  while IFS=$'\t' read -r conf t; do
+    [[ -n $conf ]] && printf 'php-sessions\t%s\t%s\t\n' "$conf" "$t"
+  done < <(valkey_php_session_scan "$our")
+  return 0
+}
+
+# Connected clients of the live server that use TCP (not the Unix socket),
+# one "addr=... name=... cmd=..." summary per line, plus recent TCP flows on
+# PORT in any state but LISTEN (ESTAB, TIME-WAIT: a short-lived PHP or cron
+# client leaves one for ~60 s after it closed), as "tcp STATE LOCAL -> PEER"
+# (1.22.5 F3/F13).  The client list and ss are sampled up to
+# VALKEY_TCP_SAMPLES (3) times VALKEY_TCP_SAMPLE_SLEEP (2) s apart; the
+# first hit ends the sampling, and so does a port nothing listens on (no
+# TCP client can appear).  The server is asked on its socket; a server whose
+# socket is not live yet (an adopted Redis that had none: every client it
+# has is a TCP client) is asked on loopback PORT, and that CLIENT LIST
+# connection itself is left out of the list (its flow may still show in ss:
+# such a server keeps TCP, and the next --optimize asks over the socket).
+# Prints "NOAUTH" when the server requires AUTH, "UNKNOWN" when ACTIVE (1)
+# and the list cannot be read (LOADING, a renamed CLIENT, no client
+# binary, no endpoint), nothing for a server that is not active.
+valkey_ss_flows() { # port
+  command -v ss >/dev/null 2>&1 || return 0
+  ss -Htan state all "( sport = :$1 or dport = :$1 )" 2>/dev/null \
+    | awk '$1 != "LISTEN" && NF >= 5 { print "tcp " $1 " " $4 " -> " $5 }' || true
+}
+valkey_ss_listening() { # port
+  command -v ss >/dev/null 2>&1 || return 0
+  [[ -n $(ss -Htln "( sport = :$1 )" 2>/dev/null || true) ]]
+}
+valkey_live_tcp_clients() { # cli socket [port] [active]
+  local cli=$1 sock=$2 port=${3:-} active=${4:-0} out hits round=0 rounds=${VALKEY_TCP_SAMPLES:-3}
+  local -a ep=()
+  [[ $port =~ ^[1-9][0-9]*$ ]] || port=""
+  if [[ -n $sock && -S $sock ]]; then
+    ep=(-s "$sock")
+  elif [[ -n $port ]]; then
+    ep=(-h 127.0.0.1 -p "$port")
+  fi
+  [[ -x $cli ]] || cli=$(command -v "$cli" 2>/dev/null || true)
+  if [[ -z $cli || ${#ep[@]} -eq 0 ]]; then
+    [[ $active == 1 ]] && printf 'UNKNOWN\n'
+    return 0
+  fi
+  while (( round < rounds )); do
+    (( round )) && sleep "${VALKEY_TCP_SAMPLE_SLEEP:-2}"
+    round=$(( round + 1 ))
+    hits=""
+    [[ -n $port ]] && hits=$(valkey_ss_flows "$port")
+    if [[ $cli == /* ]]; then
+      out=$(timeout 5 "$cli" "${ep[@]}" CLIENT LIST 2>/dev/null || true)
+    else
+      out=$("$cli" "${ep[@]}" CLIENT LIST 2>/dev/null || true)
+    fi
+    if [[ $out == *NOAUTH* ]]; then printf 'NOAUTH\n'; return 0; fi
+    if [[ $active == 1 && $out != *addr=* ]]; then printf 'UNKNOWN\n'; return 0; fi
+    out=$(awk '
+      {
+        a = ""; n = ""; c = ""; f = ""
+        for (i = 1; i <= NF; i++) {
+          if ($i ~ /^addr=/) a = substr($i, 6)
+          else if ($i ~ /^name=/) n = substr($i, 6)
+          else if ($i ~ /^cmd=/) c = substr($i, 5)
+          else if ($i ~ /^flags=/) f = substr($i, 7)
+        }
+        # A unix-socket client never has a "/" in a TCP address: Valkey
+        # 7.2-9 print it as "/run/valkey/valkey.sock:0" or as
+        # "[/run/valkey/valkey.sock:0]:0", and its flags carry U.
+        if (a == "" || a ~ /\// || a ~ /^unix/ || f ~ /U/) next
+        if (c == "client|list" || c == "client") next
+        printf "addr=%s name=%s cmd=%s\n", a, n, c
+      }' <<<"$out")
+    if [[ -n $out$hits ]]; then
+      [[ -n $out ]] && printf '%s\n' "$out"
+      [[ -n $hits ]] && printf '%s\n' "$hits"
+      return 0
+    fi
+    [[ -n $port ]] && valkey_ss_listening "$port" || break
+  done
+  return 0
+}
+
+# The socket-only decision (C23, 1.22.5).  Sets VALKEY_TCP_MODE (socket,
+# tcp or tcp-on, the 8th argument of valkey_apply_config) and
+# VALKEY_TCP_NOTES (report lines).  TCP stays open when the operator asked
+# for it (`--valkey tcp=on`, persisted in the file; on an adopted Redis
+# install_valkey records it), when an operator bind serves other hosts,
+# when an application config connects over loopback TCP (WordPress incl.
+# W3 Total Cache, LiteSpeed Cache and unknown object-cache drop-ins,
+# XenForo, Chevereto, PHP session handlers), when a connected client or a
+# recent TCP flow uses the port, or when ACTIVE (6th argument, 1 = the
+# unit runs) and its clients cannot be listed.  Otherwise port 0; a server
+# that is not active (a fresh install) defaults to it.
+VALKEY_TCP_MODE=socket
+VALKEY_TCP_NOTES=()
+VALKEY_APP_SCAN=""
+valkey_tcp_decide() { # conf kind cli socket [tcp-option] [active]
+  local conf=$1 kind=$2 cli=$3 socket=$4 opt=${5:-} active=${6:-0} port bind app file t line users=0 samples
+  VALKEY_TCP_MODE=socket
+  VALKEY_TCP_NOTES=()
+  port=$(valkey_conf_tcp_port "$conf")
+  VALKEY_APP_SCAN=$(valkey_app_cache_scan "$port")
+  if [[ -z $opt ]] && grep -qx '# setup.sh valkey tcp=on' "$conf" 2>/dev/null; then opt=on; fi
+  if [[ ${opt,,} == on ]]; then
+    VALKEY_TCP_MODE="tcp-on"
+    VALKEY_TCP_NOTES+=("TCP port ${port} kept: \`--valkey tcp=on\` (persisted in ${conf}; \`setup.sh --valkey tcp=auto\` returns to socket-only)")
+    return 0
+  fi
+  bind=$(valkey_conf_operator_bind "$conf")
+  if [[ -n $bind ]]; then
+    VALKEY_TCP_MODE=tcp
+    VALKEY_TCP_NOTES+=("TCP port ${port} kept: the operator bind \`${bind}\` serves other hosts")
+  fi
+  while IFS=$'\t' read -r app file t _; do
+    [[ $t == tcp ]] || continue
+    VALKEY_TCP_MODE=tcp; users=$(( users + 1 ))
+    VALKEY_TCP_NOTES+=("TCP port ${port} kept: ${app} \`${file}\` connects over TCP")
+  done <<<"$VALKEY_APP_SCAN"
+  # TCP already stays: one live sample is enough for the report.
+  samples=${VALKEY_TCP_SAMPLES:-3}
+  [[ $VALKEY_TCP_MODE == socket ]] || samples=1
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    VALKEY_TCP_MODE=tcp; users=$(( users + 1 ))
+    if [[ $line == NOAUTH ]]; then
+      VALKEY_TCP_NOTES+=("TCP port ${port} kept: the ${kind} server requires AUTH, so its connected clients cannot be checked for TCP use")
+    elif [[ $line == UNKNOWN ]]; then
+      VALKEY_TCP_NOTES+=("TCP port ${port} kept: the ${kind} server's connected clients could not be listed (CLIENT LIST failed: loading, renamed or not answering); the next --optimize re-checks")
+    elif [[ $line == tcp\ * ]]; then
+      VALKEY_TCP_NOTES+=("TCP port ${port} kept: a recent TCP connection on the port (${line#tcp }); the next --optimize re-checks")
+    else
+      VALKEY_TCP_NOTES+=("TCP port ${port} kept: a connected TCP client (${line})")
+    fi
+  done < <(VALKEY_TCP_SAMPLES=$samples valkey_live_tcp_clients "$cli" "$socket" "$port" "$active" | head -n 10)
+  if [[ $VALKEY_TCP_MODE == socket ]]; then
+    VALKEY_TCP_NOTES+=("Socket only (port 0): no application config, connected client or recent TCP connection uses TCP; \`setup.sh --valkey tcp=on\` keeps TCP port ${port} open$([[ $kind == redis ]] && printf ' (recorded in %s for this adopted Redis)' "$conf" || true)")
+  elif (( users )); then
+    VALKEY_TCP_NOTES+=("Switch the configs/clients above to the socket \`${socket}\` (WordPress: WP_REDIS_SCHEME 'unix' + WP_REDIS_PATH, or the socket in W3 Total Cache/LiteSpeed Cache; XenForo: host '${socket}', port 0; Chevereto: CHEVERETO_CACHE_HOST '${socket}', CHEVERETO_CACHE_PORT 0, unix:// session path; PHP sessions: session.save_path = \"unix://${socket}\"); the next --optimize then closes TCP (port 0)")
+  fi
+  return 0
+}
+
+# Bring the live TCP listener in line with the file (`port 0` = socket
+# only) without a restart (1.22.5).  Valkey 7.2+ and Redis 7 accept CONFIG
+# SET port (port 0 closes the listener; connected clients stay); Redis 6
+# refuses it, and then the restart applies it (non-zero).
+valkey_online_port() { # cli conf [endpoint args...]
+  local cli=$1 conf=$2 want live
+  shift 2
+  want=$(awk '$1 == "port" { v = $2 } END { print v }' "$conf" 2>/dev/null || true)
+  [[ $want =~ ^[0-9]+$ ]] || return 0
+  live=$("$cli" "$@" CONFIG GET port 2>/dev/null | tail -n1 || true)
+  [[ $live =~ ^[0-9]+$ ]] || return 0
+  [[ $live == "$want" ]] && return 0
+  if [[ $("$cli" "$@" CONFIG SET port "$want" 2>/dev/null) == OK ]]; then
+    if [[ $want == 0 ]]; then
+      opt_report "- TCP port ${live} closed online (socket only; connected TCP clients keep their connection)"
+    else
+      opt_report "- TCP port ${want} opened online"
+    fi
+    return 0
+  fi
+  opt_report "- port ${want} (live ${live}) applies on restart"
+  return 1
+}
+
+# Copy-on-write headroom of the RDB snapshot fork (1.22.5), report only:
+# the worst case copies every page of the dataset (maxmemory) while the
+# child writes, on top of what the plan books.  OPT_VALKEY_COW_ROOM_MB is
+# the RAM outside every booked service and the 10% OS floor.  Nothing is
+# resized: vm.overcommit_memory=1 lets the fork start, and a cache that is
+# mostly read during the few seconds of a save copies little.
+valkey_cow_report() { # maxmemory_mb
+  local max_mb=${1:-0} room=${OPT_VALKEY_COW_ROOM_MB:-}
+  [[ $room =~ ^[0-9]+$ && $max_mb =~ ^[0-9]+$ ]] || return 0
+  (( ${OPT_MEM_TOTAL_MB:-0} > 0 )) || return 0
+  if (( max_mb <= room )); then
+    opt_report "- Snapshot fork: worst-case copy-on-write ${max_mb} MB fits the ${room} MB outside the memory plan (OS floor kept)"
+  else
+    opt_report "- Snapshot fork: worst-case copy-on-write ${max_mb} MB exceeds the ${room} MB outside the memory plan; maxmemory is not cut for it (a save rarely rewrites every page), but watch swap during saves, or lower \`--valkey ram=\` / add RAM"
+  fi
+}
+
+# B19 (1.22.5) report-only notes on how the applications share the cache.
+valkey_app_cache_report() { # socket
+  local socket=$1 app file t flags local_users=0
+  while IFS=$'\t' read -r app file t flags; do
+    [[ $app == wordpress || $app == xenforo ]] || continue
+    [[ $t == socket || $t == tcp ]] && local_users=$(( local_users + 1 ))
+  done <<<"$VALKEY_APP_SCAN"
+  while IFS=$'\t' read -r app file t flags; do
+    [[ -n $app ]] || continue
+    if (( local_users > 1 )) && [[ " $flags " == *" noprefix "* ]]; then
+      opt_report "  WordPress \`${file}\`: ${local_users} sites share this cache and this one sets neither WP_REDIS_PREFIX nor WP_CACHE_KEY_SALT; give each site a unique prefix (\`define('WP_REDIS_PREFIX', 'site1:');\`) so keys cannot collide"
+    fi
+    if (( local_users > 1 )) && [[ " $flags " == *" nonamespace "* ]]; then
+      opt_report "  XenForo \`${file}\`: ${local_users} sites share this cache and this one has no \`\$config['cache']['namespace']\`; set a unique one per site so keys cannot collide"
+    fi
+    if [[ " $flags " == *" noscheme "* ]]; then
+      opt_report "  WordPress \`${file}\`: WP_REDIS_PATH is set without \`define('WP_REDIS_SCHEME', 'unix');\`, so the Redis Object Cache drop-in still connects over TCP; add it"
+    fi
+    if [[ " $flags " == *" sessions "* ]]; then
+      opt_report "  XenForo \`${file}\`: \`\$config['cache']['sessions'] = true\` puts member sessions in this cache: ${VALKEY_SESSIONS_NOTE}"
+    fi
+  done <<<"$VALKEY_APP_SCAN"
+  return 0
 }
 
 optimize_valkey_tune() {
@@ -1212,7 +1777,7 @@ optimize_valkey_tune() {
     label=Redis conf=/etc/redis/redis.conf conf_dir=/etc/redis
     unit=redis-server cli=redis-cli
   fi
-  local active=0 max_mb policy backlog io_threads i
+  local active=0 max_mb policy backlog file_io i
   local conf_before conf_after dropin unit_changed=0
   local online_ok=0 live_io="" live_backlog="" k v
   local socket_path group socket_before perm_before perm_after socket_changed=0 group_changed=0
@@ -1268,10 +1833,28 @@ optimize_valkey_tune() {
   esac
   policy=$(valkey_conf_get "$conf" maxmemory-policy)
   [[ -n $policy ]] || policy=allkeys-lru
-  # Preserve an explicit install-time io-threads value (the installer defaults
-  # to 1); forcing 1 here would silently undo `--valkey io_threads=N`.
-  io_threads=$(valkey_conf_get "$conf" io-threads)
-  io_threads=$(valkey_clamp_io_threads "$io_threads")
+  # 1.22.5: noeviction is no longer offered (a full cache failed every
+  # write instead of evicting).  A host that still has it moves to the
+  # default; sessions are protected by sizing maxmemory, not by the policy.
+  # An adopted store whose operator persistence (appendonly yes) is kept
+  # holds data, not a cache: it keeps noeviction, so writes fail at
+  # maxmemory instead of silently evicting queue or job keys (F2/F17).
+  if [[ $policy == noeviction ]]; then
+    policy=$(valkey_policy_migrate "$conf" "$policy")
+    if [[ $policy == noeviction ]]; then
+      opt_report "- maxmemory-policy noeviction kept: this ${kind} keeps operator persistence (appendonly yes) and holds data; allkeys-lru would evict it"
+    else
+      opt_report "- maxmemory-policy noeviction is no longer supported: migrated to allkeys-lru (${VALKEY_SESSIONS_NOTE})"
+    fi
+  fi
+  # io-threads is always 1 (valkey_tuning_lines).  1.22.5 removed the
+  # `--valkey io_threads=N` opt-in (io-threads 1 -> 4 measured no gain, 8
+  # threads cost 430% CPU for lower throughput); a file an earlier run wrote
+  # with more threads moves back here, reported once (the next run reads 1).
+  file_io=$(valkey_conf_get "$conf" io-threads)
+  if [[ -n $file_io && $file_io != 1 ]]; then
+    opt_report "- io-threads ${file_io} reset to 1: the \`--valkey io_threads=\` option was removed in 1.22.5 (more I/O threads measured no gain)"
+  fi
   conf_before=$(file_md5 "$conf")
 
   # Local PHP should use the Unix socket: it avoids ephemeral-port/TIME_WAIT
@@ -1286,12 +1869,23 @@ optimize_valkey_tune() {
   if [[ -n $socket_before && $socket_before == /* ]]; then
     socket_path=$socket_before
   fi
-  # Same writer as the installer: base directives (persistence off, local
-  # bind, log path, socket) plus the tuning block.
-  valkey_apply_config "$conf" "$kind" "$max_mb" "$policy" "$io_threads" "$socket_path" adopt
+  # Socket only (port 0) unless something needs TCP (valkey_tcp_decide).
+  local tcp_note
+  valkey_tcp_decide "$conf" "$kind" "$cli" "$socket_path" "" "$active"
+  for tcp_note in "${VALKEY_TCP_NOTES[@]}"; do opt_report "- ${tcp_note}"; done
+  # Same writer as the installer: base directives (RDB snapshots, local
+  # bind, port, log path, socket) plus the tuning block.
+  valkey_apply_config "$conf" "$kind" "$max_mb" "$policy" "$socket_path" adopt "$VALKEY_TCP_MODE"
   if grep -qx '# setup.sh kept operator persistence' "$conf"; then
     opt_report "- Kept the existing persistence settings (\`appendonly yes\`): this ${kind} holds data that must survive a restart"
   fi
+  local keep_persist=0
+  grep -qx "# setup.sh kept operator persistence" "$conf" && keep_persist=1
+  if (( ! keep_persist )); then
+    opt_report "- Persistence: RDB snapshot every 5 minutes when a key changed (\`save ${VALKEY_SAVE_SCHEDULE}\`, \`$(valkey_conf_get "$conf" dir)/$(valkey_conf_get "$conf" dbfilename)\`) and on every clean restart, so the cache and sessions survive restarts, reboots and rebuilds; a failed snapshot never stops writes"
+    opt_report "- Snapshot loaded only after a clean stop: after a crash, an OOM kill, kill -9 or a power loss the ${kind} starts empty (the older snapshot is moved aside to \`$(valkey_conf_get "$conf" dbfilename).unclean-<UTC time>\`, the 2 newest kept), so stale entries never contradict the database; a stop waits at most 300 s for the final save"
+  fi
+  valkey_cow_report "$max_mb"
   if grep -qx '# setup.sh kept operator bind' "$conf"; then
     opt_report "- Kept the existing \`bind\` line: this ${kind} serves clients on a non-loopback address"
   fi
@@ -1312,7 +1906,7 @@ optimize_valkey_tune() {
   opt_report "  XenForo: \`\$config['cache']['config']['host'] = '${socket_path}'; \$config['cache']['config']['port'] = 0;\`"
   opt_report "  XenForo note: with php-redis and this local socket the XF registry/session cache measured +7-9% authenticated throughput (1.21.23 audit); without php-redis the add-on's pure-PHP Credis client measured slower than local MariaDB (1.20.x audit). Keep it when \`redis\` is in \`php -m\`, disable it for Credis, and use it on multi-node or remote-DB setups."
   opt_report "  XenForo widgets: disabling Members online, Trending content and Featured content on the forum list measured +39% authenticated throughput and 13% smaller HTML; disable them in ACP > Widgets if they are not required."
-  opt_report "  WordPress: \`define('WP_REDIS_PATH', '${socket_path}');\`"
+  opt_report "  WordPress: \`define('WP_REDIS_SCHEME', 'unix'); define('WP_REDIS_PATH', '${socket_path}');\`"
   # Chevereto's default is file sessions in /tmp: PHP's session GC never
   # removes them (measured: a 2-hour-old file survived gc_divisor=1), so
   # /tmp grows by one file per guest visit, and the per-session flock
@@ -1321,6 +1915,7 @@ optimize_valkey_tune() {
   # 9,466 req/s (p99 300-700 -> 11.7 ms) and uncached guests from ~3,600
   # to 4,418 req/s, and /tmp stopped growing.
   chevereto_session_hint "$socket_path"
+  valkey_app_cache_report "$socket_path"
   opt_report "  Laravel/phpredis: \`'host' => '${socket_path}', 'port' => 0\`"
   opt_report "  Test: \`${cli} -s ${socket_path} ping\`"
 
@@ -1339,7 +1934,14 @@ optimize_valkey_tune() {
   if { [[ $kind == redis ]] || ! valkey_is_ours; } && valkey_write_systemd_limits "$unit" "$kind"; then
     unit_changed=1
     systemctl daemon-reload || true
-    opt_report "- systemd limits: LimitNOFILE=524288, ReadWritePaths=${LOG_ROOT}/${kind}"
+    opt_report "- systemd limits: LimitNOFILE=$(nofile_unit valkey 2>/dev/null || printf 524288), ReadWritePaths=${LOG_ROOT}/${kind}"
+  fi
+  # The adopted redis-server gets the clean-stop guard and the finite stop
+  # timeout our valkey-server.service carries (F4/F5).
+  if [[ $kind == redis ]] && valkey_write_rdb_guard "$unit" "$conf" redis; then
+    unit_changed=1
+    systemctl daemon-reload || true
+    opt_report "- systemd: \`$(dirname "$dropin")/${VALKEY_RDB_GUARD_DROPIN}\` (snapshot loaded only after a clean stop; TimeoutStopSec=300)"
   fi
 
   if (( active )) && (( TUNE_DIRTY == 0 )) \
@@ -1353,10 +1955,11 @@ optimize_valkey_tune() {
     return 0
   fi
 
-  # Apply the runtime-settable values to the live process.  A restart throws
-  # away the whole cache when persistence is disabled (the installer writes
-  # `save ""` and `appendonly no`), so a tuning run must not restart a busy
-  # cache just to add timeout/hz/lazyfree defaults.
+  # Apply the runtime-settable values to the live process.  A restart
+  # empties a cache without persistence and reloads a large snapshot slowly
+  # with it, so a tuning run must not restart a busy cache just to add
+  # timeout/hz/lazyfree defaults; the snapshot schedule and the port are
+  # applied online too (1.22.5).
   # The running server listens where its current config says.  An adopted
   # config may keep an operator bind/port, so the CLI default (127.0.0.1:6379)
   # is not always this server; the installer pings the socket for the same
@@ -1372,13 +1975,25 @@ optimize_valkey_tune() {
         opt_report "- Online \`CONFIG SET ${k} ${v}\` failed; a restart is required"
         break
       fi
-    done < <(valkey_runtime_settings "$max_mb" "$policy" "$io_threads")
+    done < <(valkey_runtime_settings "$max_mb" "$policy" "$kind"; (( keep_persist )) || valkey_persist_runtime_settings "$kind")
+    # The running server gets the snapshot schedule before any port change,
+    # so a restart that follows still saves on shutdown (F22).
+    if (( ! keep_persist )) && ! valkey_live_persist_on "$cli" --kind="$kind" "${live_ep[@]}"; then
+      opt_report "- **WARNING**: the running ${kind} refused the snapshot settings (CONFIG SET save); a restart may not save the cache first"
+    fi
+    # The port changes online only when no restart is forced (a socket or
+    # unit change applies port 0 together with the new socket) and this
+    # session talks to a live Unix socket: closing TCP from a TCP session
+    # leaves the server with no listener until the restart (F22/F32).
+    if (( ${#live_ep[@]} )) && (( ! socket_changed && ! unit_changed )); then
+      valkey_online_port "$cli" "$conf" "${live_ep[@]}" || online_ok=0
+    fi
     # io-threads is fixed at startup.  A systemd fd drop-in also needs a new
     # process before maxclients can exceed the old limit.
     live_io=$("$cli" "${live_ep[@]}" CONFIG GET io-threads 2>/dev/null | tail -n1 || true)
-    if [[ $live_io =~ ^[0-9]+$ ]] && [[ $live_io != "$io_threads" ]]; then
+    if [[ $live_io =~ ^[0-9]+$ ]] && [[ $live_io != 1 ]]; then
       online_ok=0
-      opt_report "- io-threads=${io_threads} differs from live ${live_io}; a restart is required"
+      opt_report "- io-threads=1 differs from live ${live_io}; a restart is required"
     fi
     if (( unit_changed )); then
       online_ok=0
@@ -1402,6 +2017,11 @@ optimize_valkey_tune() {
   fi
 
   if (( active )); then
+    # The running server gets the snapshot schedule first, so its shutdown
+    # writes dump.rdb and the restarted one reloads the cache and sessions.
+    if (( ! keep_persist )) && ! valkey_live_persist_on "$cli" --kind="$kind" "${live_ep[@]}"; then
+      opt_report "- **WARNING**: the running ${kind} did not take the snapshot settings before the restart; its shutdown may not save the cache (it then restarts empty)"
+    fi
     opt_restart_service "$unit" "$conf_dir" "$kind" "${kind}-systemd" valkey_restart_probe "$cli" "$socket_path" \
       || return 1
     # A socket path change does not alter the supplementary groups the PHP
@@ -2085,6 +2705,9 @@ optimize_plan() {
     fi
     printf '  MariaDB: buffer_pool=%sMB max_connections=%s back_log=%s%s\n' \
       "$size_mb" "$max_conn" "$backlog" "$db_fit"
+    local nonpool_line
+    nonpool_line=$(mariadb_nonpool_summary)
+    if [[ -n $nonpool_line ]]; then printf "  MariaDB: %s\n" "$nonpool_line"; fi
   fi
   if [[ " ${OPT_DETECTED[*]} " == *" valkey "* || " ${OPT_DETECTED[*]} " == *" redis "* ]]; then
     # The plan's value is final (live-data guard included), so this is the

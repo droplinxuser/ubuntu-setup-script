@@ -8,6 +8,387 @@ Reports of the 1.21.33-1.21.61 cycles that measured the removed Anubis
 filter were deleted from the tree on 2026-11-23 for the same reason;
 `git show <commit>:<path>` recovers them.
 
+## 1.22.5 (2026-11-27)
+
+Operator requests (XenForo search and contact limits, a file-descriptor
+plan, Valkey snapshots instead of `noeviction`, a kTLS decision, a MariaDB
+and Elasticsearch audit, `mitigations=off` by default, a service watchdog,
+alternative allocators and TLS libraries) and the fixes of a read-only gap
+audit and a 35-point review of the 1.22.4 tree.  Needs server-configs-nginx
+1.7.4 (`main`).  kTLS removed (the `KTLS` build option and every kTLS
+path): it measured 12-36 % slower on cached pages on both CPUs (Intel Xeon,
+AMD EPYC) and no faster on PHP pages.  nginx now builds on AWS-LC and PHP
+on mimalloc (see "New build defaults" below).
+
+Release before/after on the Intel Xeon test host (1.22.4 three times, 1.22.5
+twice, interleaved, each applied by `--optimize` and a reboot; XenForo,
+req/s as the mean of each arm's 5-round median, AUDIT-20261127-1.22.5.md):
+
+| Tier | 1.22.4 | 1.22.5 | Δ | p99 |
+|---|---:|---:|---:|---|
+| Guest home (cached) | 121,862 | 160,848 | +32.0 % | 0.90 -> 0.77 ms |
+| Guest home (uncached) | 545 | 657 | +20.6 % | 207 -> 172 ms |
+| Guest thread (uncached) | 379 | 442 | +16.7 % | 338 -> 282 ms |
+| Member home | 487 | 593 | +21.7 % | 242 -> 194 ms |
+| Member thread | 290 | 339 | +16.9 % | 467 -> 402 ms |
+
+Under load PHP-FPM uses 322 MB instead of 641 MB and nginx 187 MB instead of
+224 MB.  The kernel's `mitigations=off` brings most of it (about +26-29 %
+cached and +8-13 % uncached); PHP's mimalloc +3.3-3.8 % on every uncached
+tier and the halved PHP memory; dynamic Brotli level 1 +4-5 % uncached;
+AWS-LC the cached tier's remaining few percent and a smaller nginx.
+
+- **Valkey's BOLT pass no longer touches the live cache.**  It ran
+  `valkey-benchmark` against the production server: about 170 MB of
+  LPUSH/SET/HSET into database 9, which `allkeys-lru` paid for by evicting
+  live object-cache and session keys, then `FLUSHDB 9`.  The pass now
+  profiles a private server started from the LTO binary on a socket in the
+  work directory (no port, no persistence, 512 MB, killed on exit); the
+  live server is only restarted once, onto the BOLT binary.
+- **Redis 6.0 (Ubuntu 22.04) is tuned without a rollback.**  The managed
+  block wrote `bind 127.0.0.1 -::1` and `lazyfree-lazy-user-flush`, which
+  Redis below 6.2 rejects; it now writes `bind 127.0.0.1 ::1` and leaves the
+  key out there.
+- **Each PHP series resolves its libraries from its own `build.info`.**  An
+  8.1 rollback build on an 8.5 host could take 8.5's OpenSSL record (8.1
+  needs OpenSSL 3.x) and its other library versions; OpenSSL now only comes
+  from a series on the same side of 8.2, and the other components fall
+  back to the active series only when the series has no record.
+- **No daily BOLT retries where perf cannot sample branches.**  A VM or a
+  CPU without LBR/LbrExtV2 retried BOLT every day and on every
+  `--optimize`.  When perf's own error and a one-shot probe both say branch
+  sampling (or sampling at all) is unsupported, `build.info` records
+  `bolt=nolbr` (or `bolt=noperf`) and nothing retries until the next build;
+  a transient perf failure is still retried.
+- **More ISA extensions in the CPU fingerprint**, without a rebuild on
+  update: the list adds cx16, prfchw, AVX-512 FP16, the AMX/AVX-VNNI
+  additions, the AMD-only extensions and others the compiler can emit, so a
+  host moved to a CPU that differs only in those is rebuilt.  Flags that
+  only intrinsics use, or that kernels and hypervisors hide by policy
+  (fsgsbase, rdpid, movdiri, movdir64b, serialize, cmpccxadd, clzero,
+  wbnoinvd, pku, sha512, sm3, sm4, amx_fp16), are not hashed, so a boot
+  option or a VM CPU model is no longer a "CPU change" that keeps nginx/PHP
+  down until a rebuild.  The nginx, PHP and (new) Valkey gates compare the
+  recorded `cpu_info=` text as a set, so a flag a newer kernel starts to
+  name is tolerated.  Builds recorded by 1.22.0-1.22.4 still match, and
+  PHP's static library cache is renamed to the new key once instead of
+  being recompiled.
+- **The QUIC catch-all scales across workers.**  Both `listen 443 quic`
+  lines of `conf.d/1.https.default.conf` gained `reuseport rcvbuf=4m
+  sndbuf=4m` (one UDP socket per worker, instead of one shared 256 KB
+  socket), and `h5bp/tls/http3.conf` sets `quic_gso on`.  UDP 443 is open
+  by default (`ufw allow 443` admits TCP and UDP); the comments and README
+  now say so, and the catch-all still refuses every handshake.
+- **XenForo private trees match on the directory.**  `/src/` and
+  `/internal_data/` (plus the bare names) replace the prefixes that also
+  swallowed `/srcset-guide/` and the like.
+- **Chevereto uploads near 100 MB get nginx's 413.**  `post_max_size` is
+  102M (was 100M), above the vhost's `client_max_body_size 101m`, so PHP no
+  longer empties `$_POST`/`$_FILES` for a body between the two.  Behind
+  Cloudflare Free or Pro the edge's 100 MB cap applies first (README).
+- **`--purge` restores the IP fragment thresholds in a valid order** (the
+  low mark first when the recorded high mark is below the live low mark),
+  so large-RAM hosts no longer warn "Could not restore
+  net.ipv4.ipfrag_high_thresh".
+- **`SETUP_WP_GUEST_CACHE=0` removes the include an earlier run added**
+  (only the line marked `# added by setup.sh`; an operator's include is
+  never touched).
+- **nginx CPU pinning is skipped on a cpuset or a multi-node NUMA host**, as
+  it already was under a cgroup quota; the reason is in the commented
+  `worker_cpu_affinity` line.  Single-node hosts keep `auto`.
+- **`scripts/cloudflare.sh` cannot install a truncated range list**: it
+  requires a minimum count per family, validates each line, runs `nginx -t`
+  before the reload and puts the previous file back on failure.
+- **A `redis-server` installed after `--purge valkey` is tuned.**  The
+  purge keeps `/etc/valkey/valkey.conf`, and that file alone made
+  `--optimize` treat the host as a Valkey host and skip Redis.  A Valkey
+  host now also needs a Valkey server (binary or unit).
+- **`--purge valkey` restores the TCP port** socket-only mode closed,
+  removes the `tcp=on` marker and the Redis guard drop-in, and warns when a
+  kept `dump.rdb` was written by the source build (an older packaged
+  `valkey-server` cannot load it) with the command that moves it aside.
+- **Operator HTTP/3 vhosts keep working with the QUIC catch-all.**  The
+  deploy removes `reuseport`, `rcvbuf=`, `sndbuf=` and the other socket
+  options from operator `listen ...:443 quic` lines under `conf.d/` (they
+  would fail `nginx -t` as duplicate listen options), keeping the original
+  line as a comment.
+- **A typo in `nginx-build.conf` no longer stops nginx.**  An invalid
+  `TLS_LIB` makes `ExecStartPre` and `status` warn and use aws-lc; `build`
+  and `check` refuse it, and `--optimize` reports a FAILED line.  `MALLOC`
+  and `BOLT_NOLBR` were removed: any value only draws a warning.  A CPU
+  rebuild uses the versions `build.info` recorded, except that a build on
+  a removed TLS library (openssl, boringssl or none recorded) moves to
+  AWS-LC with a looked-up version.
+- **The BOLT profiling server for Valkey** no longer inherits the build
+  lock and dies with the tool (`setpriv --pdeathsig`).
+- **Reports:** the PHP JIT probe reads on/off instead of "unknown" with the
+  managed interned-strings buffer; certificate expiry is decided by
+  `openssl x509 -checkend`; a Redis-only host shows `maxclients` from
+  `redis.conf`; a memory-only NUMA node no longer turns CPU pinning off;
+  `SETUP_WP_GUEST_CACHE=0` reports "disabled" instead of "already enabled
+  for 0 vhost(s)".
+- Smaller: the Valkey socket hint for applications reads the configured
+  `unixsocket`; a `valkey.conf` without a `save` line counts as persisting
+  (as the migration already did); `/var/cache/php/opcache` is no longer
+  created and chowned on every tune (the file cache is off); comment and
+  doc fixes (ThinLTO scope in `tools/nginx-build.sh`, the `/attachments`
+  limiter comment, early data, the JIT buffer being per pool, the
+  challenge-ACK CVE, `CONFIG_REPO_REF` default `main`, port 9000 reserved).
+
+New defaults:
+
+- **XenForo search and contact-form POSTs are rate-limited** (operator
+  request).  `POST /search/search` (the search form and the navbar quick
+  search, the only requests that run a query) and `POST /misc/contact`
+  share the login limiter's zone: 20 a minute per address after a burst of
+  10, IPv6 per /64, loopback exempt, the visitor's IP behind Cloudflare.
+  Result pages (`/search/N/...`) and every GET stay unlimited.  To undo,
+  remove the two alternatives from `http.d/limit_req.conf`.
+- **Valkey keeps RDB snapshots** (operator request): `save 300 1` (every 5
+  minutes when a key changed, and on every clean shutdown), `appendonly
+  no`, `rdbcompression yes`, `rdb-save-incremental-fsync yes`,
+  `stop-writes-on-bgsave-error no`, `dump.rdb` in `/var/lib/valkey` (an
+  adopted server keeps its `dir`/`dbfilename`).  Existing hosts switch
+  online through `CONFIG SET`, and a restart saves and reloads the snapshot,
+  so the cache and sessions survive clean restarts, reboots, rebuilds and
+  BOLT.  The snapshot is only loaded after a clean stop: after a crash, OOM
+  kill, `kill -9`, stop timeout or power loss the cache starts empty and
+  the old dump is moved aside to `dump.rdb.unclean-<UTC>` (the 2 newest
+  kept), so stale entries never contradict MariaDB.  `TimeoutStopSec=300`
+  replaces 0 and Valkey/Redis 7+ get `shutdown-on-sigterm default force`,
+  so a final save that cannot finish (disk full) no longer hangs a restart
+  or a reboot.  An adopted `redis-server` gets the same guard through
+  `redis-server.service.d/zz-setup-rdb.conf`.  An operator AOF setup is
+  kept, and an adopted store that keeps `appendonly yes` holds data, so it
+  keeps `noeviction`.  The report shows
+  the snapshot fork's worst-case copy-on-write against the RAM outside the
+  memory plan.  A data-holding host is no longer pinned to its X.Y series
+  for RDB (a newer Valkey reads an older RDB); AOF hosts still are, and no
+  build ever goes below the version that wrote the data.  There is no
+  opt-out flag: `--optimize` writes this schedule over `save ""` (an AOF
+  setup is kept as it is).
+- **`--valkey policy=noeviction` is removed** (operator request): a full
+  cache failed every write.  The flag is refused, and a persisted
+  `noeviction` becomes `allkeys-lru` on the next `--optimize` (reported).
+  Sessions guidance everywhere: they survive restarts through the RDB
+  snapshot, `allkeys-lru` may evict them under memory pressure, so size
+  `--valkey ram=` for sessions plus cache, and never use `volatile-*`
+  (session keys carry a TTL and are evicted first).
+- **Valkey listens on its Unix socket only (`port 0`).**  TCP stays open,
+  and the report says why, when a WordPress, XenForo or Chevereto config
+  connects over loopback TCP (a Redis Object Cache drop-in with no endpoint
+  counts as 127.0.0.1:6379; XenForo in array or context-provider form, W3
+  Total Cache in its PHP or JSON config, LiteSpeed Cache, an unknown
+  `object-cache.php` drop-in and bare `host:port` entries count too), a PHP
+  session handler uses Redis over TCP (php.ini, conf.d or an FPM pool), a
+  recent TCP flow is on the port (`ss` and `CLIENT LIST` are sampled 3
+  times, 2 s apart, TIME-WAIT included; Unix-socket clients are ignored),
+  a running server cannot list its clients, an operator bind serves other
+  hosts, or `--valkey tcp=on` is set (an adopted `redis-server` records it
+  in `redis.conf`).  The port
+  is closed online with `CONFIG SET port 0` (Redis 6 applies it at the next
+  restart), and the previous port is remembered for a later TCP mode.
+  Opt-out: `--valkey tcp=on` (persisted in `valkey.conf`; `--valkey
+  tcp=auto` returns to the default).
+- **One `LimitNOFILE` plan** (operator request) sizes each unit together
+  with the service's own limit: nginx (`worker_connections x 2 +
+  open_file_cache + 1024`, at least `worker_rlimit_nofile`, which is raised
+  to the same worst case, rounded to a power of two, when it is below it),
+  PHP
+  (`rlimit_files`), Valkey (`maxclients + 32`), MariaDB (`open_files_limit`
+  as `mariadbd` computes it) and Elasticsearch (65535).  Units are rounded
+  up to a power of two, never below the 1.22.4 values and capped at
+  `fs.nr_open`: with today's sizing every unit, `rlimit_files` and
+  `open_files_limit` is byte-identical to 1.22.4.  `fs.file-max` (and
+  `fs.nr_open`) rise, never fall, to the sum of the units present when that
+  is above RAM_MB x 1024 (a small all-in-one host or two PHP series).  The
+  Valkey build tool keeps a higher limit already in its unit, so a timer
+  rebuild never lowers it.  `fs.nr_open` and `fs.file-max` are never
+  written below the system's own value (stock Ubuntu already boots far
+  above the target, so nothing is written there), and a live value an
+  older release lowered is raised back.
+- **`mitigations=off` on every managed host** (operator request: hosts are
+  administered with SSH keys only and run one tenant).  `--basic` and
+  `--optimize` write the managed GRUB drop-in and say when a reboot is
+  needed; `mitigations=on` / `SETUP_CPU_MITIGATIONS=on` are refused, and a
+  persisted `CPU_MITIGATIONS=on` becomes `off` (reported).  Containers and
+  hosts without GRUB are skipped; `--purge basic` restores the
+  distribution default.  Trade-off: no kernel protection against
+  Spectre/Meltdown-class leaks between local processes.
+- **Service watchdog** (operator request) for nginx, PHP-FPM, Valkey/Redis,
+  MariaDB and Elasticsearch.  A crash is restarted by systemd
+  (`Restart=on-abnormal`, added in a drop-in only where the unit has no
+  `Restart=` of its own).  `setup-service-watchdog.timer` (every 30 s,
+  Nice 10) restarts a unit that has been down 60 s, at most 3 times per
+  unit per hour, and never one an operator stopped, one being built or
+  upgraded, or one the CPU-change gate holds down.  Hung services are
+  restarted too: after 3 failed liveness probes in a row (Valkey `PING`,
+  the PHP-FPM ping path over FastCGI, an nginx request), 5 for MariaDB
+  (`mariadb-admin ping`) and Elasticsearch (cluster health), never while a
+  unit is busy, within 600 s of a MariaDB/Elasticsearch start, or before a
+  probe has once succeeded.  Journal tag `setup-watchdog`; the state is in
+  `--diagnostics`.  `SETUP_SERVICE_WATCHDOG=0` removes it,
+  `SETUP_SERVICE_WATCHDOG_HANG=0` keeps only the down check (both
+  persisted).
+- **MariaDB's memory outside the buffer pool is booked** in the memory
+  plan: log buffer, Aria page cache, key buffer and `thread_pool_size`
+  active queries x (2.5 MB session buffers + `tmp_table_size`/2).  It comes
+  from the room PHP leaves (PHP workers are never cut); where that room is
+  too small, `tmp_table_size`/`max_heap_table_size` are capped in 16 MB
+  steps (16 MB minimum) and the remainder is reported.  The plans on the
+  4, 8, 32 and 62 GB test hosts are unchanged.
+- **The monthly MariaDB job runs `ANALYZE`, not `OPTIMIZE`**:
+  `mariadb-check -Aas` (online) instead of `-Aos` (a rebuild of every
+  InnoDB table), logged to `/var/www/logs/mariadb/check.log`.
+  `SETUP_MARIADB_MONTHLY_OPTIMIZE=1` restores the rebuild (persisted).
+- **HTTP/3 on by default for every vhost** (operator request;
+  server-configs-nginx 1.7.4): every TLS server in the vhost templates
+  includes `h5bp/tls/http3.conf`, so a site created by `--domain` answers
+  HTTP/3 and advertises it with `Alt-Svc`.  Delete the include line to turn
+  it off for one vhost.  `--optimize` adds the include to existing vhosts
+  too (each server block on plain 443 with ssl and no QUIC listen of its
+  own), only on a tree that passes `nginx -t` before and after, and undoes
+  it otherwise; a commented-out include (`#include h5bp/tls/http3.conf;`)
+  keeps a vhost off.  Behind Cloudflare it is idle today (Cloudflare
+  reaches the origin over TCP).
+- **`opcache.enable_file_override = 1` by default** (operator rule: a
+  measured gain of 2 % or more with no tier slower becomes the default).
+  `file_exists`/`is_file`/`is_readable` on cached scripts are answered from
+  OPcache: on the Intel host XenForo member home +3.9 % and thread +1.6 %
+  against the two neighbouring baselines, every other tier within noise.
+  A deleted PHP file can still read as present until OPcache revalidates
+  it.  `SETUP_PHP_OPCACHE_FILE_OVERRIDE=0` leaves it out (persisted as
+  `PHP_OPCACHE_FILE_OVERRIDE`).
+- **Elasticsearch: `xpack.ml.enabled: false`** in the managed block (no ML
+  roles, no `controller` process); it applies with the one restart
+  `--optimize` already does when the block changes.
+
+Reports (read-only, only in `--optimize` and `--diagnostics`):
+
+- **Chevereto sessions check** (operator request): `--optimize` names
+  every Chevereto site and warns (console and report **WARNING**) when its
+  sessions are not in Valkey: Chevereto's default is one file per guest
+  visit in `/tmp`.  It reads `CHEVERETO_SESSION_SAVE_HANDLER`/`_PATH` from
+  `app/env.php`, the site's nginx `fastcgi_param` and PHP-FPM pool `env[]`
+  (any `files` counts; conflicting settings warn), gives the two env.php
+  lines with the local socket, or says to install Valkey when there is
+  none.  A site already on Valkey gets one line (socket or TCP).  Nothing
+  is edited.
+- `--optimize` ends with a **Verify** block (nginx and its TLS library,
+  PHP version, JIT and `validate_timestamps`, Valkey version,
+  io-threads, maxmemory, policy, RDB schedule and TCP port, each unit's
+  `LimitNOFILE` against its internal limit and `fs.file-max` against their
+  sum, an irqbalance note on dedicated hosts) and a **Certificates** block:
+  a certificate ending within 21 days, expired, missing or self-signed on a
+  vhost not proven behind Cloudflare is a warning.
+- `--diagnostics` adds the effective FPM OPcache/JIT per PHP
+  series, Valkey `INFO` per local socket, the CPU frequency driver/EPP/boost,
+  NIC queues with their IRQs and irqbalance, the `LimitNOFILE` table and
+  certificate expiry.
+- The Valkey section names WordPress configs without `WP_REDIS_PREFIX` /
+  `WP_CACHE_KEY_SALT` and XenForo configs without a cache namespace when
+  several share the cache, XenForo cache sessions, and `WP_REDIS_PATH`
+  without `WP_REDIS_SCHEME 'unix'`.
+- The kernel section reports a NIC whose live qdisc is not fq yet (it
+  changes at the next reboot; nothing is replaced live).
+- **MariaDB collation check** (MariaDB 11.8 on 26.04 maps utf8mb4 to
+  `utf8mb4_uca1400_ai_ci`): `--diagnostics` lists the server collations and
+  the column count per collation for each app schema, and the Verify block
+  warns when an app schema mixes utf8mb4 collations or uses one other than
+  the server's utf8mb4 default (risk of error 1267 "Illegal mix of
+  collations").  Read-only `SELECT`s with a 10 s timeout; nothing changes.
+- The README now states the `innodb_flush_log_at_trx_commit = 2`
+  trade-off (about 1 s of commits on an OS crash or power loss, none on a
+  `mariadbd` crash) and how to set 1 in a later-sorting drop-in.
+
+Removed (operator decisions):
+
+- **PHP session/cgi hardening** (`SETUP_PHP_SESSION_HARDENING=1`, opt-in
+  since 1.6.10).  An exported value is ignored with a warning, a persisted
+  `PHP_SESSION_HARDENING` is removed from `/etc/default/setup-tuning`
+  (reported), and the next `--optimize` rewrites `zz-setup-optimize.ini`
+  without the block (strict session IDs, Secure cookies,
+  `cgi.fix_pathinfo=0`, `display_errors=Off`, the central `error_log`).
+  Session and error settings return to the PHP and application defaults.
+- `opcache.validate_timestamps = 0` is no longer offered (it never shipped):
+  `validate_timestamps = 1` with `revalidate_freq = 60` is always written.
+  It measured within noise, and stale code after a deploy costs more.
+- The opt-in PHP build options planned for 1.22.5, `--php ext=gd-avif`
+  (AVIF in GD through static libavif + libaom) and `--php ext=redis-zstd`
+  (phpredis zstd compression), were dropped before release: neither
+  XenForo's core Redis cache nor the usual add-on uses phpredis's zstd.
+  A persisted `PHP_EXT_EXTRA` that names one is left out with a warning;
+  `--php ext=` refuses them.
+
+Removed: performance opt-ins with no measured gain (operator rule: an
+option that is off by default and not measured faster is deleted, not kept
+switched off).  Each removed variable or flag is ignored with an "Ignored
+(removed in 1.22.5; ...)" warning, never fatal, and a host that persisted
+one returns to the default once, with one report line:
+
+- **`--valkey io_threads=N`**: io-threads 1 -> 4 measured no gain and 8
+  threads cost 430 % CPU and lowered full-page throughput.  io-threads is
+  always 1; `--optimize` resets a `valkey.conf` that has more (one restart,
+  which saves the RDB snapshot first).
+- **`SETUP_PHP_JIT_HOT_LOOP` / `_FUNC` / `_RETURN` / `_SIDE_EXIT`**: no
+  override value measured faster than the hardware-derived sets
+  (64/127/16/64 on 3+ CPUs, 128/255/32/128 on 1-2 CPUs).
+- **`SETUP_GZIP_LEVEL`**: gzip is level 4 (3 on 1-2 CPUs); it serves only
+  clients without Brotli.
+- **`SETUP_MARIADB_MONTHLY_OPTIMIZE=1`**: the monthly `mariadb-check`
+  always runs ANALYZE (`-Aas`, online); a persisted
+  `MARIADB_MONTHLY_OPTIMIZE` is deleted and a 1.22.4 OPTIMIZE job
+  (`-Aos`) is rewritten on the next run that writes the crontab.
+- The never-enabled `opcache.file_cache` code (scripts restored from the
+  file cache are never JIT-compiled, 3-5 % slower).  The ini still writes
+  an explicit empty `opcache.file_cache =`.
+- server-configs-nginx 1.7.4: the TLS 1.3 0-RTT early-data opt-in and its
+  `Early-Data` / `HTTP_EARLY_DATA` plumbing (Cloudflare never sends 0-RTT
+  to the origin), the commented `proxy_request_buffering off`, the FreeBSD
+  `accept_filter` listen lines, `h5bp/tls/ocsp_stapling.conf` (now a
+  comment-only stub so old includes load) and three `http.d` files that
+  need modules the source build does not compile
+  (`ppa_eilander_conf`, `http_trim_filter_conf`) or were broken
+  (`reverse_proxy_conf`); the deploy retires those three from hosts.
+
+New build defaults (measured on XenForo, Intel Xeon, pinned clock, two
+interleaved arms of 5 rounds each, one arm each in the sweep; the next
+build after the update rebuilds nginx and PHP once onto them):
+
+- **nginx is built with AWS-LC** (`TLS_LIB=aws-lc`, the only value).
+  Against OpenSSL 4.1.0 it served 2-5 % more cached req/s (+1.8 % in the
+  interleaved confirmation, +5 % in the sweep), uncached tiers were within
+  noise, p99 was equal or lower, and nginx RSS under load fell by a
+  fifth to a quarter (300-320 -> 234-237 MB in the confirmation; the
+  release run's 224 -> 187 MB also includes Brotli 1 and the kernel).
+  `TLS_LIB=openssl` is removed: a file or environment that still sets it gets a warning and AWS-LC.
+  OpenSSL stays the TLS library of PHP.
+  Trade-off: with `ssl_session_tickets off`, AWS-LC resumes TLS 1.2
+  sessions from the shared cache but not TLS 1.3 ones (OpenSSL did), so a
+  TLS 1.3 client reconnecting straight to the origin pays a full
+  handshake; behind Cloudflare the edge keeps its origin connections open.
+- **PHP links mimalloc** (`PHP_BUILD_MALLOC=mimalloc`, the only value).
+  Against glibc's malloc, with everything else 1.22.5, uncached XenForo
+  pages were 3.3-3.8 % faster on every tier and PHP-FPM RSS under load
+  halved (641 -> 322 MB); the cached tier does not reach PHP.
+  `glibc` (and the earlier `jemalloc`) is removed with a warning.
+  An unknown value warns and builds with mimalloc, and never fails the daily rebuild.
+- **Dynamic Brotli is level 1** (was 4, or 3 on 1-2 CPU hosts), on new
+  installs and on existing hosts at the next `--optimize`.  Measured with
+  the two defaults above:
+  - level 1 served 4.2-4.7 % more uncached XenForo req/s than level 4 on
+    every tier, two interleaved arms of 5 rounds each;
+  - p99 was equal or lower, and the cached tier was +0.8 %;
+  - responses are about 16 % larger (11.1 vs 9.5 KB per home page), on
+    the origin-to-Cloudflare link;
+  - levels 2 and 3 fell between 1 and 4.
+
+  `SETUP_BROTLI_LEVEL` still overrides it.  gzip stays at 4 (3 on 1-2
+  CPUs).  server-configs-nginx 1.7.4 ships `http.d/brotli_conf` at
+  level 1.
+- Removed after measuring no faster: `BOLT_NOLBR=1` (a plain-cycles BOLT profile, 1-3 % below no BOLT) and nginx `MALLOC=mimalloc|jemalloc` (within noise of glibc).
+  `build.info` records `malloc=` for PHP.
+
 ## 1.22.4 (2026-11-26)
 
 First test on AMD: an EPYC 4245P (Zen 5, 6C/12T, 32 GB, bare metal) on

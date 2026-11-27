@@ -104,9 +104,12 @@ cpu_performance_governor_available() {
 # CPU vulnerability mitigations through a managed GRUB drop-in.  Ubuntu's
 # grub-mkconfig sources /etc/default/grub.d/*.cfg after /etc/default/grub, so
 # appending to GRUB_CMDLINE_LINUX_DEFAULT keeps the provider's own options
-# (console, iommu, nomodeset).  CPU_MITIGATIONS: off = add mitigations=off,
-# on = remove the drop-in, empty = never touched.  The kernel applies the
-# change at the next boot; the run says so instead of rebooting.
+# (console, iommu, nomodeset).  Since 1.22.5 mitigations=off is the default
+# on every host setup.sh manages (operator decision: single-tenant hosts,
+# key-only SSH); mitigations=on was removed, and a persisted
+# CPU_MITIGATIONS=on moves to off.  --purge basic still removes the drop-in.
+# The kernel applies the change at the next boot; the run says so instead
+# of rebooting.
 #
 # The drop-in must be sourced last.  The *.cfg glob sorts letters after
 # digits, so the old 99-setup-mitigations.cfg ran BEFORE a provider file such
@@ -118,10 +121,10 @@ CPU_MITIGATIONS_DROPIN=/etc/default/grub.d/zz-setup-mitigations.cfg
 CPU_MITIGATIONS_LEGACY_DROPIN=/etc/default/grub.d/99-setup-mitigations.cfg
 cpu_mitigations_dropin_text() {
   cat <<'EOF'
-# Managed by setup.sh (CPU_MITIGATIONS=off in /etc/default/setup-tuning).
+# Managed by setup.sh (mitigations=off is its default since 1.22.5).
 # Turns off the kernel's CPU vulnerability mitigations (PTI, IBRS, MDS buffer
-# clearing, ...) for throughput.  Remove with `setup.sh --optimize
-# mitigations=on` (or --purge basic), then reboot.
+# clearing, ...) for throughput.  Removed by `setup.sh --purge basic`, then
+# reboot.
 GRUB_CMDLINE_LINUX_DEFAULT="${GRUB_CMDLINE_LINUX_DEFAULT:+$GRUB_CMDLINE_LINUX_DEFAULT }mitigations=off"
 EOF
 }
@@ -130,16 +133,31 @@ cpu_mitigations_live_off() {
   grep -qw 'mitigations=off' /proc/cmdline 2>/dev/null
 }
 
+# 1 when the run must move a persisted CPU_MITIGATIONS=on to off (the value
+# sourced from /etc/default/setup-tuning; validate_all records it in
+# CPU_MITIGATIONS_RETIRED_ON before it normalises CPU_MITIGATIONS to off).
+cpu_mitigations_retired_on() {
+  (( ${CPU_MITIGATIONS_RETIRED_ON:-0} )) || [[ ${CPU_MITIGATIONS:-} == on ]]
+}
+
 # One dry-run line for the planned boot-loader change.
 cpu_mitigations_plan_text() {
+  local moved="" grub_default=${CPU_MITIGATIONS_GRUB_DEFAULT:-/etc/default/grub}
+  if cpu_mitigations_retired_on; then
+    moved='; the persisted CPU_MITIGATIONS=on moves to off (on was removed in 1.22.5)'
+  fi
   if host_is_container; then
-    printf 'CPU_MITIGATIONS=%s ignored (container)' "$CPU_MITIGATIONS"
-  elif [[ ! -f /etc/default/grub ]] || ! command -v update-grub >/dev/null 2>&1; then
-    printf 'CPU_MITIGATIONS=%s not applied (no GRUB)' "$CPU_MITIGATIONS"
-  elif [[ $CPU_MITIGATIONS == off ]]; then
-    printf 'would add mitigations=off (%s + update-grub; reboot to apply)' "$CPU_MITIGATIONS_DROPIN"
+    printf 'mitigations=off ignored (container)%s' "$moved"
+  elif [[ ! -f $grub_default ]] || ! command -v update-grub >/dev/null 2>&1; then
+    printf 'mitigations=off not applied (no GRUB)%s' "$moved"
+  elif cpu_mitigations_grubcfg_off && [[ -f $CPU_MITIGATIONS_DROPIN ]]; then
+    if cpu_mitigations_live_off; then
+      printf 'mitigations=off (default; already in %s and active)%s' "$CPU_MITIGATIONS_DROPIN" "$moved"
+    else
+      printf 'mitigations=off (default; already in %s, reboot needed to apply)%s' "$CPU_MITIGATIONS_DROPIN" "$moved"
+    fi
   else
-    printf 'would remove %s if present (update-grub; reboot to apply)' "$CPU_MITIGATIONS_DROPIN"
+    printf 'would add mitigations=off (default; %s + update-grub; reboot to apply)%s' "$CPU_MITIGATIONS_DROPIN" "$moved"
   fi
 }
 
@@ -169,74 +187,68 @@ cpu_mitigations_overriders() {
 
 # Never fails the run: a boot loader problem is a warning in the report, and
 # the next run retries update-grub (it compares the boot menu, not only the
-# drop-in).
+# drop-in).  mitigations=off is applied on every --basic and --optimize
+# (1.22.5 default); there is no "on" any more.
 configure_cpu_mitigations() {
-  local want=${CPU_MITIGATIONS:-} tmp changed=0 state regen=0
-  [[ -n $want ]] || return 0
+  local tmp changed=0 state regen=0 grub_default=${CPU_MITIGATIONS_GRUB_DEFAULT:-/etc/default/grub}
+  # A host pinned to CPU_MITIGATIONS=on by an older release moves to off:
+  # the pin is rewritten first, so it moves even where the boot loader is
+  # not managed (container, no GRUB).
+  if cpu_mitigations_retired_on; then
+    harden_note "- CPU mitigations: the persisted CPU_MITIGATIONS=on was removed in 1.22.5; this host moves to mitigations=off (the default)"
+    persist_tuning_var CPU_MITIGATIONS off
+    CPU_MITIGATIONS_RETIRED_ON=0
+  fi
+  CPU_MITIGATIONS=off
   if host_is_container; then
-    harden_note "- CPU mitigations: CPU_MITIGATIONS=${want} ignored in a container (the host kernel decides)"
+    harden_note "- CPU mitigations: mitigations=off ignored in a container (the host kernel decides)"
     return 0
   fi
-  if [[ ! -f /etc/default/grub ]] || ! command -v update-grub >/dev/null 2>&1; then
-    harden_warn "- CPU mitigations: CPU_MITIGATIONS=${want} needs GRUB (/etc/default/grub and update-grub); this boot loader is not managed"
+  if [[ ! -f $grub_default ]] || ! command -v update-grub >/dev/null 2>&1; then
+    harden_warn "- CPU mitigations: mitigations=off needs GRUB (/etc/default/grub and update-grub); this boot loader is not managed"
     return 0
   fi
   # Releases 1.21.36-1.21.43 wrote the drop-in under a name a provider file
-  # can override (see CPU_MITIGATIONS_DROPIN); either choice retires it.
+  # can override (see CPU_MITIGATIONS_DROPIN); it is retired.
   if [[ -e $CPU_MITIGATIONS_LEGACY_DROPIN && $CPU_MITIGATIONS_LEGACY_DROPIN != "$CPU_MITIGATIONS_DROPIN" ]]; then
     rm -f "$CPU_MITIGATIONS_LEGACY_DROPIN"
     changed=1
   fi
-  if [[ $want == off ]]; then
-    tmp=$(tmp_file) || return 0
-    cpu_mitigations_dropin_text > "$tmp"
-    if ! cmp -s "$tmp" "$CPU_MITIGATIONS_DROPIN" 2>/dev/null; then
-      mkdir -p "${CPU_MITIGATIONS_DROPIN%/*}"
-      if ! install -m 644 "$tmp" "$CPU_MITIGATIONS_DROPIN"; then
-        harden_warn "- CPU mitigations: could not write ${CPU_MITIGATIONS_DROPIN}"
-        return 0
-      fi
-      changed=1
+  tmp=$(tmp_file) || return 0
+  cpu_mitigations_dropin_text > "$tmp"
+  if ! cmp -s "$tmp" "$CPU_MITIGATIONS_DROPIN" 2>/dev/null; then
+    mkdir -p "${CPU_MITIGATIONS_DROPIN%/*}"
+    if ! install -m 644 "$tmp" "$CPU_MITIGATIONS_DROPIN"; then
+      harden_warn "- CPU mitigations: could not write ${CPU_MITIGATIONS_DROPIN}"
+      return 0
     fi
-    cpu_mitigations_grubcfg_off || regen=1
-  elif [[ -e $CPU_MITIGATIONS_DROPIN ]]; then
-    rm -f "$CPU_MITIGATIONS_DROPIN"
     changed=1
   fi
+  cpu_mitigations_grubcfg_off || regen=1
   if (( changed || regen )); then
     if ! update-grub >/dev/null 2>&1; then
-      harden_warn "- CPU mitigations: update-grub failed; the boot menu does not have CPU_MITIGATIONS=${want} yet (the next run retries)"
-      [[ -n ${CPU_MITIGATIONS_SETTING:-} ]] && persist_tuning_var CPU_MITIGATIONS "$want"
+      harden_warn "- CPU mitigations: update-grub failed; the boot menu does not have mitigations=off yet (the next run retries)"
       return 0
     fi
   fi
-  if [[ $want == off ]] && ! cpu_mitigations_grubcfg_off; then
+  if ! cpu_mitigations_grubcfg_off; then
     # update-grub succeeded but the generated menu still lacks the option:
     # another drop-in or a custom grub.cfg wins.  Say so instead of
     # reporting a reboot that would not apply it.
     local over
     over=$(cpu_mitigations_overriders | paste -sd' ' -)
-    harden_warn "- CPU mitigations: CPU_MITIGATIONS=off is set but the generated boot menu has no mitigations=off${over:+; ${over} assigns GRUB_CMDLINE_LINUX_DEFAULT after ${CPU_MITIGATIONS_DROPIN} (extend it with \"\${GRUB_CMDLINE_LINUX_DEFAULT} ...\" instead)}"
-    [[ -n ${CPU_MITIGATIONS_SETTING:-} ]] && persist_tuning_var CPU_MITIGATIONS "$want"
+    harden_warn "- CPU mitigations: mitigations=off is the default but the generated boot menu has no mitigations=off${over:+; ${over} assigns GRUB_CMDLINE_LINUX_DEFAULT after ${CPU_MITIGATIONS_DROPIN} (extend it with \"\${GRUB_CMDLINE_LINUX_DEFAULT} ...\" instead)}"
     return 0
   fi
-  if [[ $want == off ]]; then
-    if cpu_mitigations_live_off; then state="off (active)"; else state="off at the next reboot"; fi
-  elif (( changed )); then
-    state="on at the next reboot"
-  elif cpu_mitigations_live_off; then
-    # The running kernel has mitigations=off from a boot setting setup.sh
-    # does not manage (the operator's /etc/default/grub or another drop-in).
-    state="on requested, but mitigations=off comes from a boot setting setup.sh does not manage"
+  if cpu_mitigations_live_off; then
+    state="off (active)"
   else
-    state="on (kernel default)"
+    # The boot menu has it; the running kernel booted without it.
+    state="off at the next reboot (reboot needed: the running kernel booted without mitigations=off)"
   fi
-  harden_note "- CPU mitigations: ${state} (CPU_MITIGATIONS=${want})"
+  harden_note "- CPU mitigations: ${state}"
   if [[ $state == *"at the next reboot"* ]]; then
-    info "CPU mitigations: reboot to apply CPU_MITIGATIONS=${want}"
-  fi
-  if [[ -n ${CPU_MITIGATIONS_SETTING:-} ]]; then
-    persist_tuning_var CPU_MITIGATIONS "$want"
+    info "CPU mitigations: reboot to apply mitigations=off"
   fi
   return 0
 }
@@ -682,6 +694,7 @@ SYSCTL_MANAGED_KEYS=(
   vm.swappiness vm.overcommit_memory vm.overcommit_ratio
   net.ipv4.ip_local_reserved_ports net.core.netdev_budget net.core.netdev_budget_usecs
   net.core.default_qdisc net.ipv4.tcp_congestion_control
+  net.ipv4.tcp_notsent_lowat
 )
 
 # Record the live value of every managed key (plus any extra keys given) once,
@@ -743,6 +756,31 @@ restore_sysctl_pair() {
   fi
 }
 
+# Restore a fragment-reassembly pair (HIGH_KEY LOW_KEY) in an order the
+# kernel accepts: it rejects a high mark below the live low mark and a low
+# mark above the live high mark.  When the recorded high is below the live
+# low (lowering from a tune above ~87 GB of RAM, where the tuned low exceeds
+# the 4 MB default high), the low mark goes first; otherwise (the usual
+# case) the high mark goes first.  The same rule as the make-room step in
+# configure_sysctl.
+restore_frag_pair() {
+  local high_key=$1 low_key=$2 rh="" rl="" live_low f
+  f="${STATE_DIR}/sysctl-orig-${high_key}"; [[ -s $f ]] && rh=$(<"$f")
+  f="${STATE_DIR}/sysctl-orig-${low_key}"; [[ -s $f ]] && rl=$(<"$f")
+  live_low=$(sysctl -n "$low_key" 2>/dev/null || true)
+  local -a order=("$high_key" "$low_key")
+  if [[ $rh =~ ^[0-9]+$ && $live_low =~ ^[0-9]+$ ]] && (( rh < live_low )); then
+    order=("$low_key" "$high_key")
+  fi
+  local key value
+  for key in "${order[@]}"; do
+    if [[ $key == "$high_key" ]]; then value=$rh; else value=$rl; fi
+    [[ -n $value ]] || continue
+    sysctl -w "${key}=${value}" >/dev/null 2>&1 \
+      || warn "Could not restore ${key}=${value}"
+  done
+}
+
 restore_sysctl_values() {
   local key file value
   # Paired keys need care.  The dirty thresholds come as ratio/bytes pairs
@@ -750,8 +788,8 @@ restore_sysctl_values() {
   # (the tune wrote bytes, which zeroed the live ratio; restoring bytes=0 then
   # left no threshold and --purge logged "Could not restore vm.dirty_bytes=0").
   # Each pair restores whichever recorded value is non-zero, foreground pair
-  # first.  ipfrag_low_thresh is written after ipfrag_high_thresh, for IPv4
-  # and IPv6 (the kernel rejects a low mark above the live high mark).
+  # first.  The ipfrag pairs (IPv4 and IPv6) go last, each in the order the
+  # kernel accepts (restore_frag_pair).
   restore_sysctl_pair vm.dirty_ratio vm.dirty_bytes
   restore_sysctl_pair vm.dirty_background_ratio vm.dirty_background_bytes
   local -a all=("${SYSCTL_MANAGED_KEYS[@]}") ordered=()
@@ -763,11 +801,12 @@ restore_sysctl_values() {
     [[ -n $key && $seen != *" ${key} "* ]] || continue
     seen+="${key} "
     case $key in
-      vm.dirty_bytes|vm.dirty_ratio|vm.dirty_background_bytes|vm.dirty_background_ratio|net.ipv4.ipfrag_low_thresh|net.ipv6.ip6frag_low_thresh) continue ;;
+      vm.dirty_bytes|vm.dirty_ratio|vm.dirty_background_bytes|vm.dirty_background_ratio) continue ;;
+      net.ipv4.ipfrag_low_thresh|net.ipv6.ip6frag_low_thresh) continue ;;
+      net.ipv4.ipfrag_high_thresh|net.ipv6.ip6frag_high_thresh) continue ;;
     esac
     ordered+=("$key")
   done
-  ordered+=(net.ipv4.ipfrag_low_thresh net.ipv6.ip6frag_low_thresh)
   for key in "${ordered[@]}"; do
     file="${STATE_DIR}/sysctl-orig-${key//\//_}"
     [[ -f $file ]] || continue
@@ -780,6 +819,8 @@ restore_sysctl_values() {
     sysctl -w "${key}=${value}" >/dev/null 2>&1 \
       || warn "Could not restore ${key}=${value}"
   done
+  restore_frag_pair net.ipv4.ipfrag_high_thresh net.ipv4.ipfrag_low_thresh
+  restore_frag_pair net.ipv6.ip6frag_high_thresh net.ipv6.ip6frag_low_thresh
 }
 
 # Keep only the last definition of each sysctl key so an overlapping base
@@ -829,6 +870,31 @@ ipfrag_sysctl_lines() {
   local high=$1 low=$2
   printf 'net.ipv4.ipfrag_high_thresh = %s\n' "$high"
   printf 'net.ipv4.ipfrag_low_thresh = %s\n' "$low"
+}
+
+# Report-only: net.core.default_qdisc applies to qdiscs created after the
+# write, so a NIC that came up before it keeps its mq/fq_codel root until the
+# next reboot (systemd-sysctl applies 90-setup-network.conf before the links
+# come up).  BBR paces by itself without fq, so this is efficiency, not
+# correctness; nothing live is changed.  Physical NICs only (a device/ link
+# under /sys/class/net).  $1: the wanted qdisc; SETUP_SYS_CLASS_NET for tests.
+net_qdisc_report() {
+  local want=${1:-fq} dir=${SETUP_SYS_CLASS_NET:-/sys/class/net} d ifc live
+  [[ $want == fq ]] || return 0
+  command -v tc >/dev/null 2>&1 || return 0
+  for d in "$dir"/*; do
+    ifc=${d##*/}
+    [[ $ifc != lo && -e $d/device ]] || continue
+    live=$(tc qdisc show dev "$ifc" 2>/dev/null || true)
+    [[ -n $live ]] || continue
+    grep -qE '^qdisc fq ' <<<"$live" && continue
+    live=$(awk '$1 == "qdisc" && $2 != "mq" { print $2; exit }' <<<"$live")
+    info "qdisc on ${ifc}: fq applies after the next reboot (live: ${live:-unknown})"
+    if declare -F opt_report >/dev/null 2>&1; then
+      opt_report "- qdisc: ${ifc}: fq applies after the next reboot (live: ${live:-unknown}; BBR paces without it meanwhile)"
+    fi
+  done
+  return 0
 }
 
 # ufw loads its own /etc/ufw/sysctl.conf (IPT_SYSCTL in /etc/default/ufw)
@@ -1016,11 +1082,113 @@ sysctl_hugepages_sync() {
   info "OPcache huge pages: vm.nr_hugepages ${cur:-unset} -> ${want}"
 }
 
+# fs.file-max / fs.nr_open target: 1024 per MB of RAM within 1M..10M, raised
+# (within the same 10M ceiling) to the sum of the managed services' LimitNOFILE
+# values when that is larger (nofile_plan_sum, lib/optimize.sh).  The sum
+# counts only units present on the host, so a host without MariaDB or
+# Elasticsearch keeps the RAM-based value.
+sysctl_file_max_target() {
+  local ram_mb=${1:-1024} file_max sum=""
+  file_max=$(( ram_mb * 1024 ))
+  if (( file_max < 1048576 )); then file_max=1048576; fi
+  if (( file_max > 10485760 )); then file_max=10485760; fi
+  if declare -F nofile_plan_sum >/dev/null 2>&1; then
+    sum=$(nofile_plan_sum 2>/dev/null || true)
+  fi
+  if [[ $sum =~ ^[0-9]+$ ]] && (( sum > file_max )); then
+    file_max=$sum
+    if (( file_max > 10485760 )); then file_max=10485760; fi
+    info "fs.file-max/fs.nr_open raised to ${file_max}: the services' LimitNOFILE values add up to ${sum}" >&2
+  fi
+  printf '%s' "$file_max"
+}
+
+# fs.nr_open target (1.22.5): the file-max target, and at least twice the
+# largest managed LimitNOFILE (nofile_plan; the PAM nofile 1048576 counts
+# too), so one later raise of a unit limit still fits under the kernel
+# ceiling (systemd refuses to start a unit whose LimitNOFILE is above it).
+sysctl_nr_open_target() {
+  local file_max=${1:-1048576} biggest=1048576 v
+  if declare -F nofile_plan >/dev/null 2>&1; then
+    nofile_plan >/dev/null 2>&1 || true
+    for v in "${NOFILE_PLAN_NGINX_UNIT:-}" "${NOFILE_PLAN_PHP_UNIT:-}" "${NOFILE_PLAN_VALKEY_UNIT:-}" \
+             "${NOFILE_PLAN_MARIADB_UNIT:-}" "${NOFILE_PLAN_ELASTIC_UNIT:-}"; do
+      if [[ $v =~ ^[0-9]+$ ]] && (( v > biggest )); then biggest=$v; fi
+    done
+  fi
+  v=$(( biggest * 2 ))
+  if (( v < file_max )); then v=$file_max; fi
+  printf '%s' "$v"
+}
+
+# The system's own value of fs.nr_open / fs.file-max (1.22.5): the live
+# value, unless it is the one our managed /etc/sysctl.conf set (OURS, read
+# before the file is rewritten); then the value recorded before the first
+# run (STATE_DIR/sysctl-orig-KEY), or nothing when none was recorded.  On
+# stock Ubuntu systemd raises nr_open (~1073741816) and file-max (LONG_MAX)
+# at boot.  SYSCTL_LIVE_NR_OPEN / SYSCTL_LIVE_FILE_MAX are test hooks.
+sysctl_fd_system_value() {
+  local key=$1 ours=${2:-} live="" proc
+  case $key in
+    fs.nr_open)  live=${SYSCTL_LIVE_NR_OPEN:-};  proc=/proc/sys/fs/nr_open ;;
+    fs.file-max) live=${SYSCTL_LIVE_FILE_MAX:-}; proc=/proc/sys/fs/file-max ;;
+    *) return 0 ;;
+  esac
+  if [[ -z $live && -r $proc ]]; then live=$(< "$proc"); fi
+  live=${live//[[:space:]]/}
+  if [[ $live =~ ^[0-9]+$ && -n $ours && $live == "$ours" ]]; then
+    live=$(cat "${STATE_DIR}/sysctl-orig-${key}" 2>/dev/null || true)
+    live=${live//[[:space:]]/}
+  fi
+  if [[ $live =~ ^[0-9]+$ ]]; then printf '%s' "$live"; fi
+  return 0
+}
+
+# Value configure_sysctl writes for KEY (fs.nr_open / fs.file-max), or
+# nothing when the system's own value is already at least TARGET: the key is
+# then left to the kernel (never written below it).  1.22.4 wrote the 1M-10M
+# targets unconditionally, which lowered systemd's boot values.
+sysctl_fd_ceiling_value() {
+  local key=$1 target=$2 ours=${3:-} sys
+  sys=$(sysctl_fd_system_value "$key" "$ours")
+  if [[ $sys =~ ^[0-9]+$ ]] && (( ${#sys} > ${#target} || (${#sys} == ${#target} && sys >= target) )); then
+    return 0
+  fi
+  printf '%s' "$target"
+}
+
+# Finish the fd ceilings in FILE after the dedupe: a key left to the kernel
+# (empty value) loses the base template's line too, and a live value our old
+# line had lowered goes back up to the system's own value now instead of at
+# the next boot (only ever raised).
+sysctl_fd_ceiling_apply() {
+  local file=$1 file_max=$2 nr_open=$3 ours_file_max=${4:-} ours_nr_open=${5:-}
+  local key val ours sys live
+  for key in fs.file-max fs.nr_open; do
+    if [[ $key == fs.file-max ]]; then val=$file_max ours=$ours_file_max; else val=$nr_open ours=$ours_nr_open; fi
+    [[ -z $val ]] || continue
+    sed_in_place -E "/^[[:space:]]*${key//./\\.}[[:space:]]*=/d" "$file"
+    sys=$(sysctl_fd_system_value "$key" "$ours")
+    live=$(sysctl -n "$key" 2>/dev/null || true)
+    if [[ $sys =~ ^[0-9]+$ && $live =~ ^[0-9]+$ ]] \
+       && (( ${#sys} > ${#live} || (${#sys} == ${#live} && sys > live) )); then
+      sysctl -q -w "${key}=${sys}" >/dev/null 2>&1 || true
+    fi
+    info "${key}: left at the system value ${sys:-unknown} (not lowered)"
+  done
+  return 0
+}
+
 configure_sysctl() {
   step "sysctl tweaks"
   record_sysctl_values
   record_original /etc/sysctl.conf sysctl.conf
   record_original /etc/sysctl.d/99-sysctl.conf sysctl.d-99-sysctl.conf
+  # Our previous fd ceilings, read before the file is replaced: a live value
+  # equal to them is ours, not the system's (sysctl_fd_system_value).
+  local ours_file_max ours_nr_open
+  ours_file_max=$(sysctl_file_value /etc/sysctl.conf fs.file-max 2>/dev/null || true)
+  ours_nr_open=$(sysctl_file_value /etc/sysctl.conf fs.nr_open 2>/dev/null || true)
 
   local sysctl_src="${SCRIPT_DIR}/configs/system/sysctl.conf"
   if [[ -f $sysctl_src ]]; then
@@ -1036,6 +1204,7 @@ configure_sysctl() {
   local cpu ram_mb min_free shmall
   local somaxconn syn_backlog netdev_backlog tw_buckets max_orphans
   local file_max inotify_watches conntrack_max ipfrag_high ipfrag_low
+  local file_max_target nr_open nr_open_target fd_lines
   local arp_thresh3 arp_thresh2
   cpu=$(effective_cpus)
   (( cpu > 0 )) || cpu=1
@@ -1068,7 +1237,15 @@ configure_sysctl() {
   netdev_backlog=$(( cpu * 2048 ));     (( netdev_backlog < 4096 )) && netdev_backlog=4096;    (( netdev_backlog > 65536 )) && netdev_backlog=65536
   tw_buckets=$(( ram_mb * 16 ));        (( tw_buckets < 65536 )) && tw_buckets=65536;          (( tw_buckets > 2621440 )) && tw_buckets=2621440
   max_orphans=$(( ram_mb * 2 ));        (( max_orphans < 16384 )) && max_orphans=16384;        (( max_orphans > 262144 )) && max_orphans=262144
-  file_max=$(( ram_mb * 1024 ));        (( file_max < 1048576 )) && file_max=1048576;          (( file_max > 10485760 )) && file_max=10485760
+  file_max_target=$(sysctl_file_max_target "$ram_mb")
+  nr_open_target=$(sysctl_nr_open_target "$file_max_target")
+  # Never below the system's own value: a key whose system value is already
+  # at least the target is not written at all (1.22.5).
+  file_max=$(sysctl_fd_ceiling_value fs.file-max "$file_max_target" "$ours_file_max")
+  nr_open=$(sysctl_fd_ceiling_value fs.nr_open "$nr_open_target" "$ours_nr_open")
+  fd_lines=""
+  [[ -n $file_max ]] && fd_lines+="fs.file-max = ${file_max}"$'\n'
+  [[ -n $nr_open ]] && fd_lines+="fs.nr_open = ${nr_open}"$'\n'
   inotify_watches=$(( ram_mb * 4096 )); (( inotify_watches < 524288 )) && inotify_watches=524288; (( inotify_watches > 2097152 )) && inotify_watches=2097152
   conntrack_max=$(( ram_mb * 16 ));     (( conntrack_max < 65536 )) && conntrack_max=65536;    (( conntrack_max > 4194304 )) && conntrack_max=4194304
   if host_is_vps; then
@@ -1158,16 +1335,14 @@ net.ipv4.tcp_keepalive_time = 120
 net.ipv4.neigh.default.gc_thresh1 = 32
 net.ipv4.neigh.default.gc_thresh2 = ${arp_thresh2}
 net.ipv4.neigh.default.gc_thresh3 = ${arp_thresh3}
-# Keep low <= high.  A lower high mark is rejected while the old low mark is
-# still above it, so write the low mark first and the high mark second.
+# High mark first: at boot the change is upward from the kernel default (see
+# ipfrag_sysctl_lines in lib/os.sh).
 $(ipfrag_sysctl_lines "$ipfrag_high" "$ipfrag_low")
 net.netfilter.nf_conntrack_max = ${conntrack_max}
 # Byte thresholds override the percentage knobs from the base profile.
 vm.dirty_background_bytes = $(( dirty_bg_mb * 1048576 ))
 vm.dirty_bytes = $(( dirty_mb * 1048576 ))
-fs.file-max = ${file_max}
-fs.nr_open = ${file_max}
-fs.inotify.max_user_watches = ${inotify_watches}
+${fd_lines}fs.inotify.max_user_watches = ${inotify_watches}
 vm.min_free_kbytes = ${min_free}
 vm.swappiness = ${swappiness}
 # OPcache huge pages (2 MB each); 0 on a host below 4 GB of RAM.
@@ -1186,8 +1361,10 @@ net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.default.accept_redirects = 0
 net.ipv6.conf.all.accept_redirects = 0
 net.ipv6.conf.default.accept_redirects = 0
-# CVE-2019-11479: cap the TCP challenge-ACK rate.  The upstream profile left
-# the legacy maximum (1073741823), which is the vulnerable setting.
+# Challenge-ACK rate (RFC 5961).  CVE-2016-5696 was an off-path side channel
+# through the old global, fixed challenge-ACK counter; since Linux 4.7 the
+# limit is randomized, and since 6.0 the counter is per network namespace and
+# off by default (limit INT_MAX).  1000 keeps a bounded, randomized limit.
 net.ipv4.tcp_challenge_ack_limit = 1000
 # END setup.sh tuning
 EOF
@@ -1199,6 +1376,7 @@ EOF
   # one edit can silently undo the other.  Keep only the final definition of
   # each key; order and comments for distinct keys are preserved.
   sysctl_dedupe_keys /etc/sysctl.conf
+  sysctl_fd_ceiling_apply /etc/sysctl.conf "$file_max" "$nr_open" "$ours_file_max" "$ours_nr_open"
   if [[ -d /etc/sysctl.d ]] && [[ ! -e /etc/sysctl.d/99-sysctl.conf && ! -L /etc/sysctl.d/99-sysctl.conf ]]; then
     ln -s ../sysctl.conf /etc/sysctl.d/99-sysctl.conf
   fi
@@ -1288,6 +1466,8 @@ EOF
   # start would not re-apply a changed qdisc/congestion-control value.
   systemctl restart setup-network-tuning.service \
     || warn "Could not apply ${TCP_CC}/${QDISC} tuning"
+  # Report-only: which NICs keep their old root qdisc until the next reboot.
+  net_qdisc_report "$QDISC"
 
   # Late enforcement pass.  Foreign units (an old hand-written tcp-bbr
   # service, rc.local, a provider agent) can write a managed key after

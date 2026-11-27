@@ -7,7 +7,34 @@ manifests, sweep tables and run logs these sections cite (`AUDIT-*.md`,
 removed from the tree on 2026-11-19 to keep the repository lean; every one
 is still in git history, for example
 `git show 84b0db5:tests/stress-site/AUDIT-20261117-1.21.30.md`.  The current
-cycle report is `AUDIT-20261126-1.22.4.md`.
+cycle report is `AUDIT-20261127-1.22.5.md`.
+
+## 1.22.5 — Xeon E-2236 (2026-11-27)
+
+Full report: `AUDIT-20261127-1.22.5.md`.  XenForo only; an option at least
+2 % faster on a tier with none slower became the default, an opt-in that
+was not faster was deleted.
+
+- **New defaults:** nginx on AWS-LC (cached +2-5 %, nginx RSS -22-27 %), PHP on
+  mimalloc (uncached +3.3-3.8 %, PHP-FPM RSS halved), dynamic Brotli level
+  1 (uncached +4.2-4.7 %, responses about 16 % larger), kernel
+  `mitigations=off`.  Deleted: `TLS_LIB=openssl|boringssl`,
+  `PHP_BUILD_MALLOC=glibc|jemalloc`, nginx `MALLOC`, `BOLT_NOLBR`, kTLS.
+- **Before/after** (1.22.4 x3 vs 1.22.5 x2, interleaved, each applied by
+  `--optimize` and a reboot; req/s: the mean of each arm's 5-round median):
+
+  | Tier | 1.22.4 | 1.22.5 | Δ | p99 |
+  |---|---:|---:|---:|---|
+  | XF guest home (cached) | 121,862 | 160,848 | +32.0 % | 0.90 -> 0.77 ms |
+  | XF guest home (uncached) | 545 | 657 | +20.6 % | 207 -> 172 ms |
+  | XF guest thread (uncached) | 379 | 442 | +16.7 % | 338 -> 282 ms |
+  | XF member home | 487 | 593 | +21.7 % | 242 -> 194 ms |
+  | XF member thread | 290 | 339 | +16.9 % | 467 -> 402 ms |
+
+  PHP-FPM RSS under load 641 -> 322 MB, nginx 224 -> 187 MB.
+- **Found by the before/after:** the renamed 1.22.4 PHP library cache
+  kept its old path in `.pc`/`.la` files and every 1.22.5 PHP build failed
+  on an updated host; fixed before release.
 
 ## 1.22.4 — AMD EPYC 4245P, Ubuntu 24.04 and 26.04 (2026-11-26)
 

@@ -691,10 +691,38 @@ cron_mariadb_configured() {
     && { [[ -f /etc/mysqlbkup.cnf ]] || [[ -f /etc/mysqlbkup.config ]]; }
 }
 
+# Monthly MariaDB maintenance (1.22.5).  The default is ANALYZE (-a): online
+# and cheap, it refreshes the optimizer statistics.  OPTIMIZE (-o) rebuilds
+# every InnoDB table (hours of I/O on a large forum, free disk equal to the
+# largest table, writes blocked on FULLTEXT tables such as xf_search_index),
+# so the managed job is always ANALYZE (-Aas).  Output goes to
+# ${LOG_ROOT}/mariadb/check.log, which the managed logrotate rule rotates.
+# The opt-in OPTIMIZE rebuild (SETUP_MARIADB_MONTHLY_OPTIMIZE=1, persisted as
+# MARIADB_MONTHLY_OPTIMIZE) was removed in 1.22.5: setup.sh ignores the
+# environment knob with a warning, and a persisted line is dropped from the
+# host file here (once, with one note) while write_cron rewrites the -Aos
+# job to ANALYZE.
+mariadb_monthly_optimize_retire() {
+  local tf=${SETUP_TUNING_FILE:-/etc/default/setup-tuning}
+  [[ ${EUID} -eq 0 || -n ${SETUP_TUNING_FILE:-} ]] || return 0
+  [[ -f $tf ]] && grep -qE '^MARIADB_MONTHLY_OPTIMIZE=' "$tf" 2>/dev/null || return 0
+  sed_in_place -E '/^MARIADB_MONTHLY_OPTIMIZE=/d' "$tf"
+  tune_note "cron: MARIADB_MONTHLY_OPTIMIZE removed from /etc/default/setup-tuning (the monthly OPTIMIZE option was removed in 1.22.5; mariadb-check runs ANALYZE)"
+}
+
+# The managed monthly mariadb-check line (see above).
+mariadb_check_cron_line() {
+  printf '4 4 4 * * /usr/bin/mariadb-check -Aas >> %s/mariadb/check.log 2>&1' "$LOG_ROOT"
+}
+
 write_cron() {
   local cur tmp line group seen=" "
   local nginx_cron=0 mariadb_cron=0 wp_cron=0 xf_cron=0
   local -a lines=() existing=() preserved=()
+
+  # Drop a persisted MARIADB_MONTHLY_OPTIMIZE (removed in 1.22.5) whether or
+  # not MariaDB is still installed; the -Aos job is regenerated below.
+  mariadb_monthly_optimize_retire
 
   # Regenerate entries for installed services even when this run only selected
   # --basic.  This is what restores the managed block after --purge basic (or
@@ -715,7 +743,7 @@ write_cron() {
   if cron_mariadb_configured; then
     mariadb_cron=1
     lines+=("3 3 * * * /usr/local/bin/mysqlbkup.sh 1>> ${LOG_ROOT}/mariadb/backup.log 2>> ${LOG_ROOT}/mariadb/backup-err.log")
-    lines+=('4 4 4 * * /usr/bin/mariadb-check -Aos --auto-repair > /dev/null 2>&1')
+    lines+=("$(mariadb_check_cron_line)")
   fi
   # WordPress cron: only when the hardening step disabled WP-Cron in at least
   # one wp-config.php.  Running wp-cron.php from the system scheduler is what

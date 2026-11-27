@@ -44,18 +44,19 @@ Usage:
 
 Basic (always required for an install; all values are optional):
   --basic [server=dedi|vps] [host=custom.host] [swap=8G] [time=Asia/Manila]
-          [mitigations=on|off]
+          [mitigations=off]
     server   auto-detected when omitted (systemd-detect-virt/DMI/cgroup)
     host     auto-generated when omitted: <threads>c-<RAM>g-<storage>
              e.g. 8c-32g-1T (8 threads, 32 GB RAM, 1 TB storage)
     swap     auto when omitted: only adds swap if current swap is 0 or
              below 50% of RAM; target total is 50% of RAM
     time     defaults to Asia/Manila
-    mitigations  off = boot with mitigations=off (no PTI/IBRS/MDS clearing:
-             faster syscalls and context switches, weaker isolation
-             between local processes); on = remove it again.  GRUB only,
-             applied at the next reboot, persisted as CPU_MITIGATIONS so
-             every --optimize keeps it.  Omitted = never touched.
+    mitigations  always off (the default since 1.22.5): every --basic and
+             --optimize boots the host with mitigations=off (no PTI/IBRS/
+             MDS clearing: faster syscalls and context switches, no
+             protection between local processes; for single-tenant,
+             key-only hosts).  GRUB only, applied at the next reboot.
+             mitigations=on was removed; --purge basic removes it.
 
 Services (optional; only the ones listed are installed):
   --nginx
@@ -84,13 +85,22 @@ Services (optional; only the ones listed are installed):
                IPV4 auto-detects the server's public IPv4; on NAT it falls
                back to the local outbound IPv4
                e.g. bind=127.0.0.1,2.3.4.5  or  bind=127.0.0.1,IPV4
-  --valkey    [ram=2g] [policy=allkeys-lru] [io_threads=1]
+  --valkey    [ram=2g] [policy=allkeys-lru] [tcp=auto]
       ram        maxmemory (default: live working set +20%, 128 MB minimum,
-                 from the shared memory plan)
-      policy     maxmemory-policy (default allkeys-lru; use noeviction or
-                 volatile-lru when Valkey stores sessions/jobs that must survive)
-      io_threads extra socket I/O threads (default 1; raise only after
-                 valkey-benchmark shows the main thread is saturated)
+                 from the shared memory plan); with sessions in Valkey, size
+                 it to hold sessions plus cache
+      policy     maxmemory-policy (default allkeys-lru; noeviction was
+                 removed; an adopted AOF store keeps it).  Sessions survive
+                 clean restarts through the RDB snapshot (a crash or power
+                 loss starts the cache empty) and may be evicted under
+                 memory pressure; never volatile-*, which
+                 evicts the TTL-carrying session keys first
+      tcp        auto (default): Unix socket only (port 0) unless an app
+                 config (WordPress incl. W3TC/LiteSpeed, XenForo, Chevereto,
+                 PHP sessions), a client or a recent TCP connection uses TCP,
+                 or the clients cannot be listed; on: keep TCP 6379 open
+                 (persisted, also for an adopted redis-server; tcp=auto
+                 undoes it)
   --elastic   [ram=4g|auto] [host=localhost]
       ram        JVM heap (default: auto = index store / 4, clamped to
                  512 MB..25% of RAM (31 GB ceiling); the page cache serves
@@ -102,7 +112,8 @@ Services (optional; only the ones listed are installed):
 
 Source builds (always; there are no package modes):
       nginx, PHP (FPM and CLI) and Valkey are compiled from their upstream
-      releases with clang -O3 -march=native, hardening, ThinLTO and BOLT,
+      releases with clang -O3 -march=native, hardening, LTO (ThinLTO for
+      nginx and PHP, full LTO for Valkey) and BOLT,
       with only the modules the host's applications need.  Downloads are
       verified (nginx PGP signatures, php.net and valkey-hashes SHA-256).
       A build failure stops the install and names the build log; nothing
@@ -155,7 +166,7 @@ Domain setup (standalone; nginx + MariaDB must already be installed/running):
       no --purge for domains; remove the files/database manually.
 
 Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
-  --optimize [mitigations=on|off] [--dry-run]
+  --optimize [mitigations=off] [--dry-run]
       One command for the whole host.  It synchronizes nginx's /etc/nginx
       tree from server-configs-nginx (or CONFIG_SOURCE_DIR), applies the
       hardware-aware OS profile (CPU governor, PAM security limits, and
@@ -202,6 +213,11 @@ Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
       and /var/www/logs ownership repaired before any service is restarted.
       Configuration files are backed up under /tmp/setup-optimize-*
       and a Markdown report is written to /var/log/setup-optimize-*.md.
+      The report ends with a read-only Verify block (nginx/TLS library,
+      PHP JIT, Valkey policy/RDB schedule/TCP port, each unit's
+      LimitNOFILE against its internal limit and fs.file-max) and a
+      Certificates block (expiring or self-signed certificates on vhosts
+      not proven behind Cloudflare).
       Existing application vhosts and credentials are preserved.
       --dry-run only prints the planned OS and service values.
 
@@ -220,10 +236,9 @@ Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
           and the dedi/vps pin so the shared memory plan recomputes them;
         - tuning environment variables (SETUP_TCP_CC, SETUP_QDISC,
           SETUP_STORAGE_CLASS, SETUP_PHP_WORKERS_PER_CPU,
-          SETUP_PHP_JIT_HOT_*, SETUP_GZIP_LEVEL, SETUP_BROTLI_LEVEL,
-          SETUP_NGINX_COMPRESSION, SETUP_MARIADB_IO_CAPACITY,
-          SETUP_LIMIT_REQ_EXEMPT, SETUP_PHP_PAGE_GZIP,
-          SETUP_PHP_JIT_WORDPRESS) are ignored with a
+          SETUP_BROTLI_LEVEL, SETUP_NGINX_COMPRESSION,
+          SETUP_MARIADB_IO_CAPACITY, SETUP_LIMIT_REQ_EXEMPT,
+          SETUP_PHP_PAGE_GZIP, SETUP_PHP_JIT_WORDPRESS) are ignored with a
           warning, so two servers with the same hardware get the same
           profile.  Feature choices (Node major, application cache
           and security toggles) and the CONFIG_* source knobs still apply.
@@ -315,7 +330,11 @@ Diagnostics:
       Collects host/hardware details, running services and their status,
       nginx/PHP/MariaDB/Valkey/Redis/Elasticsearch runtime statistics,
       slow-query and slow-request logs, service error logs and kernel/OOM
-      reports into diagnostics.log beside setup.sh.  Run as root; this mode
+      reports, plus read-only verification (effective FPM OPcache/JIT per
+      PHP series, Valkey INFO per socket, CPU frequency
+      driver, NIC queues/IRQs, irqbalance, each service's LimitNOFILE
+      next to its own limit, vhost certificate expiry)
+      into diagnostics.log beside setup.sh.  Run as root; this mode
       only reads state and writes that one file.
 
 Restart all:
@@ -367,7 +386,9 @@ kv_set() {
     basic:server|basic:host|basic:time|basic:swap|basic:mitigations) ;;
     php:ver|php:ext|php:children|php:max_requests) ;;
     mariadb:user|mariadb:pass|mariadb:size|mariadb:bind) ;;
-    valkey:ram|valkey:policy|valkey:io_threads) ;;
+    valkey:ram|valkey:policy|valkey:tcp) ;;
+    # Removed in 1.22.5; recognised only so it is ignored with a warning.
+    valkey:io_threads) ;;
     elastic:host|elastic:ram) ;;
     *) die "--${ctx}: unknown option '${key}'" ;;
   esac
@@ -382,6 +403,27 @@ kv_set() {
   if [[ $ctx:$key == php:ext && -z $val ]]; then
     die "--php ext= requires a list (e.g. ext=intl,gmp) or none (the value is empty)"
   fi
+  # 1.22.5: noeviction was removed (a full cache failed every write).
+  # Sessions survive restarts through the RDB snapshot; size ram= for them.
+  if [[ $ctx:$key == valkey:policy && $val == noeviction ]]; then
+    die "--valkey policy=noeviction was removed in 1.22.5: a full cache failed every write. Keep the default allkeys-lru and size --valkey ram= to hold sessions plus cache (sessions survive clean restarts and reboots through the RDB snapshot); do not use volatile-*, which evicts the TTL-carrying session keys first"
+  fi
+  # 1.22.5: io_threads was removed (io-threads 1 -> 4 measured no gain and
+  # 8 threads burned 430% CPU for less throughput); io-threads is pinned to
+  # 1.  A script or runbook that still passes it is ignored, never refused;
+  # validate_all reports it once.
+  if [[ $ctx:$key == valkey:io_threads ]]; then
+    RETIRED_VALKEY_IO_THREADS="--valkey io_threads=${val}"
+    return 0
+  fi
+  # tcp=on keeps the TCP port open (persisted); auto (default) is socket
+  # only unless an application or a connected client needs TCP.
+  if [[ $ctx:$key == valkey:tcp ]]; then
+    case ${val,,} in
+      on|auto) val=${val,,} ;;
+      *) die "--valkey tcp='${val}' is invalid (use auto or on)" ;;
+    esac
+  fi
   OPT["${ctx}.${key}"]=$val
 }
 
@@ -391,6 +433,8 @@ kv_set() {
 # with `shift "$KV_CONSUMED"`.  One implementation replaced five near-identical
 # loops (--basic, --php, --mariadb, --valkey, --elastic).
 KV_CONSUMED=0
+# Set by kv_set when the removed --valkey io_threads= is passed (1.22.5).
+RETIRED_VALKEY_IO_THREADS=""
 kv_consume() {
   local ctx=$1 allow_cont=$2 last_key=""
   shift 2
@@ -422,10 +466,15 @@ anubis_gone() {
   die "Anubis support was removed in 1.21.62; put Cloudflare (or another CDN/WAF) in front of the origin instead. On a host that still runs Anubis, run tools/remove-anubis.sh first."
 }
 
-# mitigations=on|off belongs to --basic and --optimize (CPU_MITIGATIONS).
-# Normalised to on/off; validate_all rejects anything else.
+# mitigations= belongs to --basic and --optimize.  Only off (the default
+# since 1.22.5) is accepted, and it changes nothing; mitigations=on was
+# removed and is refused here, the rest by validate_all.
 mitigations_set() {
-  [[ -n $1 ]] || die "mitigations= requires on or off (the value is empty)"
+  [[ -n $1 ]] || die "mitigations= accepts only off, the default (the value is empty)"
+  case ${1,,} in
+    on|yes|1|true|auto)
+      die "mitigations=on was removed in 1.22.5: every host setup.sh manages boots with mitigations=off; --purge basic removes it" ;;
+  esac
   CPU_MITIGATIONS_SETTING=$1
 }
 

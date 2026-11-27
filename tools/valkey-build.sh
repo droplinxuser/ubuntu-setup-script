@@ -26,14 +26,17 @@
 #   /etc/valkey/valkey.conf        seeded on a host without one; setup.sh's
 #                                  valkey_apply_config owns the managed keys
 #
-# Version policy.  Valkey here is a cache (save "", appendonly no): the
-# newest release is safe to run.  A host whose valkey.conf persists data
-# (save or appendonly) stays on the X.Y series of the server that wrote the
-# data: the active build (build.info valkey=), else the newer of the
-# valkey-server package (recorded as pkg_version= in build.info during the
-# 1.22 migration) and the 1.21 build its drop-in ran.  An older
-# server cannot load a newer RDB/AOF, so such a host never goes below that
-# version either.
+# Version policy.  Valkey keeps RDB snapshots by default (1.22.5: save 300 1,
+# appendonly no).  An RDB written by an older Valkey loads in every newer
+# one, so RDB never pins the series: the newest release is safe to run.
+# Only a downgrade is unsafe (an older server cannot load a newer RDB/AOF),
+# so a host whose valkey.conf persists data (save or appendonly) never goes
+# below the version of the server that wrote it: the active build
+# (build.info valkey=), else the newer of the valkey-server package
+# (recorded as pkg_version= in build.info during the 1.22 migration) and the
+# 1.21 build its drop-in ran.  A host with AOF (appendonly yes, an
+# operator's choice setup.sh keeps) also stays on that server's X.Y
+# series, as before 1.22.5.
 #
 # Downloads: the release archive is checked against the SHA-256 in
 # valkey-io/valkey-hashes, a second repository the Valkey project keeps for
@@ -53,7 +56,8 @@
 #   valkey-build.sh refresh       daily timer: rebuild when stale, BOLT when due
 #   valkey-build.sh check         0 current, 10 rebuild due, 11 cache missing
 #   valkey-build.sh layout        user, dirs, valkey.conf seed, unit, links
-#   valkey-build.sh pre           ExecStartPre (CPU gate)
+#   valkey-build.sh pre           ExecStartPre (CPU gate, clean-stop RDB guard)
+#   valkey-build.sh post          ExecStopPost (records a clean stop)
 #   valkey-build.sh fetch | versions | status | unit-text | apt-hook
 set -Eeuo pipefail
 export LC_ALL=C DEBIAN_FRONTEND=noninteractive
@@ -131,11 +135,15 @@ unit_is_ours() { [[ -f $UNIT_FILE ]] && grep -qxF "$UNIT_MARKER" "$UNIT_FILE"; }
 unit_state() { systemctl is-enabled "$UNIT.service" 2>/dev/null || true; }
 
 # The socket (or loopback port) the live server answers on, from valkey.conf.
+# Since 1.22.5 the managed block writes `port 0` (socket only) by default:
+# a conf without a socket and with port 0 is asked on the default socket,
+# never on a TCP port that is closed.
 live_target() {
   local s p
   s=$(awk '$1 == "unixsocket" { v = $2 } END { print v }' "$VALKEY_CONF" 2>/dev/null || true)
   if [[ -n $s ]]; then printf -- '-s\n%s\n' "$s"; return 0; fi
   p=$(awk '$1 == "port" { v = $2 } END { print v }' "$VALKEY_CONF" 2>/dev/null || true)
+  if [[ $p == 0 ]]; then printf -- '-s\n%s\n' "$DEFAULT_SOCK"; return 0; fi
   printf -- '-h\n127.0.0.1\n-p\n%s\n' "${p:-6379}"
 }
 
@@ -163,10 +171,13 @@ restart_checked() {
 }
 
 # True when valkey.conf keeps data across restarts (RDB snapshots or AOF).
+# A conf with no `save` line runs Valkey's default RDB schedule, so it
+# persists, exactly as lib/migrate.sh's migrate_valkey_persists reads it;
+# only an explicit `save ""` turns RDB off (1.22.5).
 persists() {
   local save aof
   [[ -f $VALKEY_CONF ]] || return 1
-  save=$(awk '$1 == "save" { $1 = ""; v = $0 } END { gsub(/^ +|"/, "", v); print v }' "$VALKEY_CONF")
+  save=$(awk '$1 == "save" { n++; $1 = ""; v = $0 } END { if (n == 0) print "default"; else { gsub(/^ +|"/, "", v); print v } }' "$VALKEY_CONF")
   aof=$(awk '$1 == "appendonly" { v = $2 } END { print v }' "$VALKEY_CONF")
   [[ -n $save || ${aof,,} == yes ]]
 }
@@ -188,10 +199,18 @@ data_writer() {
   return 0
 }
 
-# The series a persisting host must stay on ("" = any).
+# 0 when valkey.conf runs AOF (appendonly yes).
+aof_on() {
+  [[ -f $VALKEY_CONF ]] || return 1
+  [[ $(awk '$1 == "appendonly" { v = $2 } END { print tolower(v) }' "$VALKEY_CONF") == yes ]]
+}
+
+# The series an AOF host must stay on ("" = any).  RDB-only persistence
+# (the 1.22.5 default) does not pin it: newer releases load older RDB
+# files; data_floor still forbids a downgrade.
 series() {
   local w
-  persists || return 0
+  aof_on || return 0
   w=$(data_writer)
   [[ -n $w ]] || return 0
   w=${w#*:}
@@ -384,10 +403,15 @@ cmd_build() { # [--cpu-only]
       VERS[$line]=$n
     done < <(resolve_all || true)
     x=$(series)
+    w=""
+    persists && w=$(data_writer)
     if [[ -n $x ]]; then
-      w=$(data_writer)
       [[ ${VERS[valkey]%.*} == "$x" ]] \
-        || die "valkey.conf persists data (save/appendonly): Valkey must stay on the $x series of ${w%%:*} ${w#*:}, not ${VERS[valkey]}"
+        || die "valkey.conf persists data with AOF (appendonly yes): Valkey must stay on the $x series of ${w%%:*} ${w#*:}, not ${VERS[valkey]}"
+    fi
+    # RDB or AOF: never older than the server that wrote the data (an older
+    # server cannot load it); newer is fine for RDB.
+    if [[ -n $w ]]; then
       ver_ge "${VERS[valkey]}" "${w#*:}" \
         || die "valkey.conf persists data: Valkey ${VERS[valkey]} is older than ${w%%:*} ${w#*:}, which wrote it"
     fi
@@ -463,6 +487,7 @@ cmd_build() { # [--cpu-only]
     for line in "${COMPONENTS[@]}"; do printf '%s=%s\n' "$line" "${VERS[$line]}"; done
     printf 'compiler=%s\n' "$("$CC" --version | sed -n 1p)"
     printf 'cpu=%s\ncpu_desc=%s\n' "$(cpu_fingerprint)" "$(cpu_desc)"
+    printf 'cpu_info=%s\n' "$(cpu_fingerprint_text)"
     printf 'src=%s\nsrc_sha256=%s\nsrc_check=%s\n' "${arc##*/}" "$sum" "$SRC_CHECK"
     printf 'persists=%s\nseries=%s\n' "$(persists && echo 1 || echo 0)" "$(series)"
     printf 'data_writer=%s\npkg_version=%s\n' "$(data_writer)" "$(pkg_version)"
@@ -504,6 +529,21 @@ verify_binary() { # server cli
 }
 
 # ----------------------------------------------------------------- layout
+# LimitNOFILE: VALKEY_LIMIT_NOFILE from setup.sh (nofile_plan in lib/optimize.sh)
+# when given, else the value the current unit already carries when that is
+# higher (a timer-driven refresh or rebuild-cpu must not lower what the last
+# --optimize planned), else 524288.  Never below 524288.
+unit_nofile() {
+  local v=${VALKEY_LIMIT_NOFILE:-} cur=""
+  if ! [[ $v =~ ^[0-9]+$ ]]; then
+    [[ -f $UNIT_FILE ]] && cur=$(awk -F= '$1 == "LimitNOFILE" { print $2; exit }' "$UNIT_FILE" 2>/dev/null || true)
+    v=524288
+    if [[ $cur =~ ^[0-9]+$ ]] && (( cur > v )); then v=$cur; fi
+  fi
+  if (( v < 524288 )); then v=524288; fi
+  printf '%s' "$v"
+}
+
 # The whole unit is ours (no package unit to copy from).  Hardening as the
 # Debian/Ubuntu valkey-server unit, plus the options that cost nothing for a
 # network daemon.  NoExecPaths=/ with ExecPaths limited to our binaries AND
@@ -513,8 +553,11 @@ verify_binary() { # server cli
 # so a missing directory cannot fail the start with 226/NAMESPACE (layout
 # and pre create them).  Restart=on-abnormal: a crash or an OOM kill
 # restarts, but the CPU gate's exit 1 does not loop (it queued the rebuild,
-# which starts the unit).  TimeoutStopSec=0 as the package: a persisting
-# server finishes its final save however long it takes.
+# which starts the unit).  TimeoutStopSec=300 (1.22.5 F5; the package has 0):
+# a cache-sized final save finishes well within it, and a save that cannot
+# finish (disk full) no longer hangs a restart or a reboot forever.  The
+# post hook (root) records a clean stop; pre loads the RDB snapshot only
+# after one (F4, rdb_guard_pre).
 unit_text() {
   local execpaths="$BIN $TOOL /usr/lib /lib" d
   for d in /usr/lib64 /lib64; do [[ -d $d ]] && execpaths+=" $d"; done
@@ -536,11 +579,12 @@ ExecStart=$BIN/valkey-server $VALKEY_CONF --supervised systemd --daemonize no
 Restart=on-abnormal
 RestartSec=2
 TimeoutStartSec=300
-TimeoutStopSec=0
+TimeoutStopSec=300
+ExecStopPost=+$TOOL post
 RuntimeDirectory=valkey
 RuntimeDirectoryMode=2755
 UMask=007
-LimitNOFILE=524288
+LimitNOFILE=$(unit_nofile)
 LimitCORE=0
 PrivateTmp=true
 PrivateDevices=true
@@ -586,8 +630,9 @@ databases 16
 loglevel notice
 supervised systemd
 logfile $VK_LOG_DIR/valkey.log
-save ""
+save 300 1
 appendonly no
+stop-writes-on-bgsave-error no
 bind 127.0.0.1 -::1
 protected-mode yes
 unixsocket $DEFAULT_SOCK
@@ -688,7 +733,7 @@ cmd_activate() {
     die "the valkey-server package still serves: the 1.22 migration activates this build"
   fi
   if (( staged )); then
-    cpu_fingerprint_matches "$(info_get "$STAGE/build.info" cpu)" || die "the staged build was made for another CPU"
+    cpu_fingerprint_matches "$(info_get "$STAGE/build.info" cpu)" "$(info_get "$STAGE/build.info" cpu_info)" || die "the staged build was made for another CPU"
     rm -rf "${PREV:?}"
     if [[ -x $BIN/valkey-server ]]; then
       install -d -m 755 "$PREV/bin" "$PREV/lto"
@@ -711,8 +756,9 @@ cmd_activate() {
     say "Valkey $(info_get "$INFO" valkey) installed; valkey-server.service ($state) is left to the caller to start"
     return 0
   fi
-  # A restart empties a cache-only Valkey: only for a new binary, a changed
-  # unit, or a unit that is down.
+  # A restart only for a new binary, a changed unit, or a unit that is
+  # down: it saves and reloads the RDB snapshot (1.22.5 default), which
+  # takes time on a large dataset, and empties a cache without one.
   if systemctl is-active --quiet "$UNIT.service" && (( ! staged )) && [[ $LAYOUT_UNIT_CHANGED != 1 ]]; then
     answers || die "valkey-server runs but does not answer"
     say "Valkey $(info_get "$INFO" valkey) already active"
@@ -746,20 +792,92 @@ cmd_pre() {
   [[ -d $DATA_DIR && -d $VK_LOG_DIR ]] || { ensure_user; ensure_dirs; }
   [[ -x $BIN/valkey-server ]] || { say "no Valkey build in $BIN"; exit 1; }
   built=$(info_get "$INFO" cpu); now=$(cpu_fingerprint)
-  cpu_fingerprint_matches "$built" && exit 0
+  if cpu_fingerprint_matches "$built" "$(info_get "$INFO" cpu_info)"; then rdb_guard_pre || true; exit 0; fi
   say "Valkey: build made for another CPU ($(info_get "$INFO" cpu_desc), now $(cpu_desc)): staying down until $CPU_UNIT rebuilds it"
   systemctl start --no-block "$CPU_UNIT" >/dev/null 2>&1 \
     || say "Valkey: $CPU_UNIT could not be started; rebuild by hand: $TOOL rebuild-cpu"
   exit 1
 }
 
+# ----------------------------------------------------- clean-stop guard
+# The RDB snapshot is loaded only after a clean stop (1.22.5 F4).  After a
+# crash, an OOM kill, kill -9, a stop timeout or a power loss dump.rdb is up
+# to 5 minutes old, and the database writes of those minutes were mirrored
+# into the cache: reloading it would serve values that contradict MariaDB.
+# post (ExecStopPost, root) writes DIR/.setup-clean-stop when systemd saw a
+# clean exit (SERVICE_RESULT=success, EXIT_CODE=exited) and the snapshot was
+# written in the last 120 s (the shutdown save: with shutdown-on-sigterm
+# force a failed save still exits 0).  pre (after the CPU gate, so a start
+# refused for a CPU change consumes nothing) moves the snapshot aside to
+# DBFILE.unclean-<UTC stamp> (the 2 newest kept) when the previous run
+# started under the guard (.setup-started) and has no clean-stop marker;
+# the server then starts empty.  The first start under the guard (the
+# migration cutover, an upgrade) keeps the snapshot.  An AOF store
+# (appendonly yes) is never touched.  lib/services.sh valkey_rdb_guard_sh is
+# the same logic for an adopted redis-server.
+rdb_paths() { # -> "dir dbfile"
+  local d f
+  d=$(awk '$1 == "dir" { print $2; exit }' "$VALKEY_CONF" 2>/dev/null || true)
+  f=$(awk '$1 == "dbfilename" { print $2; exit }' "$VALKEY_CONF" 2>/dev/null || true)
+  printf '%s %s\n' "${d:-$DATA_DIR}" "${f:-dump.rdb}"
+}
+rdb_guard_pre() {
+  local d f n o
+  read -r d f < <(rdb_paths)
+  [[ -d $d ]] || return 0
+  grep -qiE '^[[:space:]]*appendonly[[:space:]]+yes' "$VALKEY_CONF" 2>/dev/null && return 0
+  f=$d/$f
+  if [[ -e $d/.setup-started && ! -e $d/.setup-clean-stop && -e $f ]]; then
+    n="$f.unclean-$(date -u +%Y%m%dT%H%M%SZ)"
+    mv -f "$f" "$n" && say "Valkey: $f was not written by a clean stop: moved aside to $n (the cache starts empty)"
+    while IFS= read -r o; do rm -f "$o"; done < <(ls -1d "$f".unclean-* 2>/dev/null | sort -r | tail -n +3)
+  fi
+  rm -f "$d/.setup-clean-stop"
+  : > "$d/.setup-started"
+}
+cmd_post() {
+  local d f t
+  unit_is_ours || exit 0
+  [[ ${SERVICE_RESULT:-} == success && ${EXIT_CODE:-} == exited ]] || exit 0
+  read -r d f < <(rdb_paths)
+  [[ -d $d ]] || exit 0
+  f=$d/$f
+  if [[ -e $f ]]; then
+    t=$(stat -c %Y "$f" 2>/dev/null) || exit 0
+    (( $(date +%s) - t <= 120 )) || { say "Valkey: the shutdown did not write $f (save failed): the next start begins empty"; exit 0; }
+  fi
+  : > "$d/.setup-clean-stop"
+  exit 0
+}
+
 # ------------------------------------------------------------------- BOLT
-# BOLT from a valkey-benchmark run against the running build (database 9,
-# flushed afterwards): the GET/SET/HSET/MGET mix of the applications' cache
-# calls, without depending on live traffic (1.21.71).
+# BOLT from a valkey-benchmark run: the GET/SET/HSET/MGET mix of the
+# applications' cache calls, without depending on live traffic (1.21.71).
+# Since 1.22.5 the benchmark never touches the live server: it drives a
+# private, throwaway server started from the LTO binary itself (the same
+# build ID perf2bolt maps) on a socket in the work directory, with no TCP
+# port, no persistence and its own 512 MB allkeys-lru ceiling.  Before, the
+# ~180 MB of benchmark writes went into db 9 of the production instance,
+# evicted live cache and session keys (allkeys-lru works across every
+# database) and db 9 was flushed afterwards.  The EXIT trap kills the
+# private server.  The live server is restarted once, onto the BOLT binary.
+BOLT_PID=""
+bolt_cleanup() {
+  if [[ -n ${BOLT_PID:-} ]]; then
+    kill "$BOLT_PID" 2>/dev/null || true
+    wait "$BOLT_PID" 2>/dev/null || true
+    BOLT_PID=""
+  fi
+  [[ ${VALKEY_BUILD_KEEP_WORK:-0} == 1 ]] || rm -rf "${WORK_DIR:-}"
+}
+# The private server's arguments, one per line (tests read them).
+bolt_private_args() { # work-dir
+  printf '%s\n' --port 0 --unixsocket "$1/bolt.sock" --unixsocketperm 700 --save "" --appendonly no \
+    --dir "$1" --maxmemory 512mb --maxmemory-policy allkeys-lru --daemonize no --logfile "$1/server.log"
+}
 cmd_bolt() {
-  local n perf work p2b bolt samples base=$LTO_DIR/valkey-server.lto pid bench r
-  local -a t=()
+  local n perf work p2b bolt samples base=$LTO_DIR/valkey-server.lto bench sock ok=0 _
+  local -a args=()
   need_root
   [[ -f $base && -f $INFO ]] || die "no build to BOLT"
   unit_is_ours && systemctl is-active --quiet "$UNIT.service" || die "valkey-server is not running on the compiled unit"
@@ -774,26 +892,33 @@ cmd_bolt() {
   [[ -x $p2b && -x $bolt ]] || die "llvm-bolt/perf2bolt $n not found in $LLVM_BIN"
   bench=$BIN/valkey-benchmark
   [[ -x $bench ]] || die "no $bench to drive the profile"
-  mapfile -t t < <(live_target)
-  if [[ $(info_get "$INFO" bolt) == 1 ]]; then
-    install_stripped "$base" "$BIN/valkey-server.new"; mv -f "$BIN/valkey-server.new" "$BIN/valkey-server"
-    info_set "$INFO" bolt 0
-    restart_checked || die "Valkey did not restart on the LTO build"
-  fi
-  answers || die "Valkey is not answering (${t[*]})"
-  r=$("$BIN/valkey-cli" "${t[@]}" ping 2>/dev/null || true)
-  if [[ $r != PONG ]]; then say "Valkey: '$r' from the server (requirepass?): BOLT skipped"; return 3; fi
-  pid=$(systemctl show -p MainPID --value "$UNIT.service")
-  [[ $pid =~ ^[1-9][0-9]*$ ]] || die "no Valkey process to sample"
+  # The live server keeps serving whatever it runs (an earlier BOLT binary
+  # included): the profile comes from the LTO binary in a private server.
   work=$(mktemp -d "$SRC_CACHE/bolt.XXXXXX")
   WORK_DIR=$work
-  [[ ${VALKEY_BUILD_KEEP_WORK:-0} == 1 ]] || trap 'rm -rf "${WORK_DIR:-}"' EXIT
-  say "Valkey: profiling a valkey-benchmark run for BOLT"
-  "$perf" record -q -e cycles:u -j any,u -o "$work/perf.data" -p "$pid" -- \
-    "$bench" "${t[@]}" --dbnum 9 -c 50 -n 400000 -r 100000 -d 256 -q \
+  trap bolt_cleanup EXIT
+  sock=$work/bolt.sock
+  mapfile -t args < <(bolt_private_args "$work")
+  # fd 9 (the build lock) is closed for the server, and it dies with this
+  # tool (pdeathsig): a SIGKILLed tool leaves neither a held lock nor an
+  # orphaned server on bolt.sock (F23).
+  if [[ $(setpriv --help 2>&1 || true) == *--pdeathsig* ]]; then
+    setpriv --pdeathsig KILL -- "$base" "${args[@]}" 9>&- > /dev/null 2>&1 &
+  else
+    "$base" "${args[@]}" 9>&- > /dev/null 2>&1 &
+  fi
+  BOLT_PID=$!
+  for _ in $(seq 1 100); do
+    [[ $("$BIN/valkey-cli" -s "$sock" ping 2>/dev/null) == PONG ]] && { ok=1; break; }
+    sleep 0.1
+  done
+  (( ok )) || die "the private profiling server ($base) did not answer on $sock"
+  say "Valkey: profiling a valkey-benchmark run for BOLT (private server, pid $BOLT_PID; the live server is not touched)"
+  "$perf" record -q -e cycles:u -j any,u -o "$work/perf.data" -p "$BOLT_PID" -- \
+    "$bench" -s "$sock" --dbnum 9 -c 50 -n 400000 -r 100000 -d 256 -q \
       -t get,set,hset,lpush,mset,incr > "$work/bench.log" 2>&1 \
-    || { "$BIN/valkey-cli" "${t[@]}" -n 9 flushdb >/dev/null 2>&1 || true; perf_record_die "$work/bench.log"; }
-  "$BIN/valkey-cli" "${t[@]}" -n 9 flushdb >/dev/null 2>&1 || true
+    || perf_record_die "$work/bench.log"
+  kill "$BOLT_PID" 2>/dev/null || true; wait "$BOLT_PID" 2>/dev/null || true; BOLT_PID=""
   "$p2b" -p "$work/perf.data" -o "$work/valkey.fdata" "$base" > "$work/p2b.log" 2>&1 \
     || { tail -n 5 "$work/p2b.log" >&2; die "perf2bolt failed"; }
   samples=$(awk '/BOLT-INFO: [0-9]+ out of [0-9]+ functions in the binary/ { print $2 }' "$work/p2b.log" | sed -n 1p)
@@ -846,15 +971,15 @@ cmd_rebuild_cpu() {
 # CHECK_LOOKUP_FAILED=1 when a version lookup failed (that component is not
 # judged).  Globals, not output: a command substitution would lose them.
 check_record() { # record bindir
-  local rec=$1 bdir=$2 name want have stale="" bcpu f
+  local recf=$1 bdir=$2 name want have stale="" bcpu f
   CHECK_LOOKUP_FAILED=0
-  [[ $(info_get "$rec" recipe) == "$BUILD_RECIPE" ]] || stale+="recipe $(info_get "$rec" recipe) -> $BUILD_RECIPE, "
-  bcpu=$(info_get "$rec" cpu)
-  cpu_fingerprint_matches "$bcpu" || stale+="cpu $(info_get "$rec" cpu_desc) -> $(cpu_desc), "
+  [[ $(info_get "$recf" recipe) == "$BUILD_RECIPE" ]] || stale+="recipe $(info_get "$recf" recipe) -> $BUILD_RECIPE, "
+  bcpu=$(info_get "$recf" cpu)
+  cpu_fingerprint_matches "$bcpu" "$(info_get "$recf" cpu_info)" || stale+="cpu $(info_get "$recf" cpu_desc) -> $(cpu_desc), "
   for f in "${BINS[@]}"; do [[ -e $bdir/$f ]] || stale+="$f missing, "; done
   while IFS='=' read -r name want; do
     if [[ $want == "?" ]]; then CHECK_LOOKUP_FAILED=1; continue; fi
-    have=$(info_get "$rec" "$name")
+    have=$(info_get "$recf" "$name")
     [[ $have == "$want" ]] || stale+="$name ${have:-none} -> $want, "
   done < <(resolve_all || true)
   CHECK_STALE=$stale
@@ -920,7 +1045,7 @@ cmd_status() {
   local bcpu cpu=no unit=no act
   if [[ -f $INFO ]]; then
     bcpu=$(info_get "$INFO" cpu)
-    cpu_fingerprint_matches "$bcpu" 2>/dev/null && cpu=yes
+    cpu_fingerprint_matches "$bcpu" "$(info_get "$INFO" cpu_info)" 2>/dev/null && cpu=yes
     unit_is_ours && unit=yes
     act=$(systemctl is-active "$UNIT.service" 2>/dev/null || true)
     printf 'Valkey: build %s (clang %s, recipe %s, built %s), bolt=%s, cpu match=%s, unit ours=%s (%s, %s), source=%s, log %s%s\n' \
@@ -964,10 +1089,11 @@ main() {
     versions)   resolve_all ;;
     layout)     cmd_layout ;;
     pre)        cmd_pre ;;
+    post)       cmd_post ;;
     status)     cmd_status ;;
     unit-text)  unit_text ;;
     apt-hook)   cmd_apt_hook ;;
-    *) die "usage: $0 build [--cpu-only]|activate|bolt|rebuild|rebuild-cpu|refresh|check|fetch|layout|pre|versions|status|unit-text" ;;
+    *) die "usage: $0 build [--cpu-only]|activate|bolt|rebuild|rebuild-cpu|refresh|check|fetch|layout|pre|post|versions|status|unit-text" ;;
   esac
 }
 

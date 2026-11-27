@@ -128,10 +128,9 @@ print_plan() {
           "${OPT[mariadb.user]:-}" "${OPT[mariadb.size]:-}" "$bind_display"
         ;;
       valkey)
-        printf '  %-10s ram=%s policy=%s io_threads=%s\n' "$s" \
+        printf '  %-10s ram=%s policy=%s\n' "$s" \
           "${OPT[valkey.ram]:-auto (memory plan)}" \
-          "${OPT[valkey.policy]:-allkeys-lru}" \
-          "${OPT[valkey.io_threads]:-1}"
+          "${OPT[valkey.policy]:-allkeys-lru}"
         if declare -F valkey_build_plan >/dev/null 2>&1; then
           printf '  %-10s %s\n' "" "$(valkey_build_plan 2>/dev/null || true)"
         fi

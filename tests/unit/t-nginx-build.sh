@@ -146,7 +146,7 @@ check "choose_fallback: the refused version itself is never the fallback (nothin
 
 # cmd_build up to the first library download: the patch, the fallback
 # decision and the skip record, with every host step stubbed.  The stubbed
-# fetch of openssl records the nginx version being built and stops.
+# fetch of aws-lc (the first library) records the nginx version being built and stops.
 tnb_build_case() ( # ci context how version bad-versions [patched_ok] [master] -> "rc=N reached=V skip=S needroot=N"
   local NB=$TMP/tnb-build ci=$1 ctx=$2 how=$3 ver=$4 bad=$5 pok=${6:-} master=${7:-} rc=0 c
   tnb_env "$NB"
@@ -164,7 +164,7 @@ tnb_build_case() ( # ci context how version bad-versions [patched_ok] [master] -
   master_pid() { [[ -n $master ]] && printf 4242; }
   resolve_all() {
     printf 'nginx=%s\n' "$ver"
-    printf '%s\n' llvm=23 openssl=3.6.0 pcre2=10.47 zlib-ng=2.3.1 brotli=1.2.0 ngx-brotli=a71f931
+    printf '%s\n' llvm=23 aws-lc=1.66.2 pcre2=10.47 zlib-ng=2.3.1 brotli=1.2.0 ngx-brotli=a71f931
   }
   fetch_unpack() { # name version dir
     if [[ $1 == nginx ]]; then
@@ -348,12 +348,12 @@ tnb_fp_legacy() ( # cpuinfo-file -> the 1.22.3 hash (rdrnd/rdseed hashed when sh
   . "$TNB_REPO/tools/build-common.sh"
   set +eE; trap - ERR
   extra=$(awk '/^flags/ { for (i = 1; i <= NF; i++) if ($i == "rdrand") r = "rdrnd"; else if ($i == "rdseed") s = "rdseed"; print r, s; exit }' "$1")
-  SETUP_CPUINFO=$1 cpu_fingerprint "$extra"
+  SETUP_CPUINFO=$1 cpu_fingerprint "$extra" "$CPU_ISA_FLAGS_V1"
 )
-tnb_fp_matches() ( # cpuinfo-file built-hash
+tnb_fp_matches() ( # cpuinfo-file built-hash [built cpu_info= text]
   . "$TNB_REPO/tools/build-common.sh"
   set +eE; trap - ERR
-  SETUP_CPUINFO=$1 cpu_fingerprint_matches "$2"
+  SETUP_CPUINFO=$1 cpu_fingerprint_matches "$2" "${3:-}"
 )
 check "cpu_fingerprint: rdrnd/rdseed are not in the hashed text" \
   bash -c '[[ $1 != *rdrnd* && $1 != *rdseed* ]]' _ "$TNB_FPT"
@@ -372,6 +372,105 @@ check "cpu_fingerprint_matches: another CPU's new hash does not match" \
   not tnb_fp_matches "$TNB_CPU/x86-a" "$(tnb_fp "$TNB_CPU/x86-d")"
 check "cpu_fingerprint_matches: another CPU's 1.22.3 hash does not match" \
   not tnb_fp_matches "$TNB_CPU/x86-a" "$(tnb_fp_legacy "$TNB_CPU/x86-d")"
+# 1.22.5: CPU_ISA_FLAGS gained the extensions clang can emit without an
+# intrinsic; the 1.22.0-1.22.4 list is frozen as CPU_ISA_FLAGS_V1 and its
+# hashes keep matching (a false CPU change keeps every service down).
+# tnb_fp_1224 is a frozen copy of 1.22.4's cpu_fingerprint (list and awk),
+# so the test does not depend on the code it checks.
+tnb_fp_1224() { # cpuinfo-file [force] -> the cpu= hash 1.22.4 recorded
+  local t allow="sse3 ssse3 sse4_1 sse4_2 popcnt avx avx2 fma f16c bmi1 bmi2 lzcnt movbe adx aes pclmulqdq vaes vpclmulqdq sha_ni xsave xsavec xsaveopt xsaves avx512f avx512dq avx512cd avx512bw avx512vl avx512_vnni avx512_bf16 avx512vbmi avx512_vbmi2 avx512ifma avx512_bitalg avx512_vpopcntdq gfni avx_vnni amx_tile amx_bf16 amx_int8 clflushopt clwb"
+  t=$(awk -F'[[:space:]]*:[[:space:]]*' -v allow="$allow" -v force="${2:-}" '
+    BEGIN { n = split(allow, a, " "); for (i = 1; i <= n; i++) ok[a[i]] = 1
+            alias["pni"] = "sse3"; alias["abm"] = "lzcnt"; alias["rdrand"] = "rdrnd" }
+    /^[[:space:]]*$/ { if (seen) exit; next }
+    { seen = 1 }
+    $1 == "vendor_id" || $1 == "cpu family" || $1 == "model" || $1 == "stepping" || $1 == "model name" \
+      || $1 == "CPU implementer" || $1 == "CPU architecture" || $1 == "CPU variant" || $1 == "CPU part" || $1 == "CPU revision" {
+      id = id $1 "=" $2 ";" }
+    $1 == "flags" || $1 == "Features" {
+      m = split($2, f, " ")
+      for (i = 1; i <= m; i++) {
+        x = (f[i] in alias) ? alias[f[i]] : f[i]
+        if ($1 == "Features" || (x in ok)) isa[x] = 1
+      }
+      if ($1 == "flags") { k = split(force, g, " "); for (i = 1; i <= k; i++) isa[g[i]] = 1 } }
+    END {
+      s = ""; c = 0
+      for (x in isa) list[++c] = x
+      for (i = 2; i <= c; i++) { v = list[i]; j = i - 1; while (j > 0 && list[j] > v) { list[j + 1] = list[j]; j-- } list[j + 1] = v }
+      for (i = 1; i <= c; i++) s = s (i > 1 ? "," : "") list[i]
+      printf "%sisa=%s\n", id, s }' "$1")
+  printf '%s' "$t" | sha256sum | cut -c1-16
+}
+tnb_fp_v1() ( # cpuinfo-file -> cpu_fingerprint with CPU_ISA_FLAGS_V1
+  . "$TNB_REPO/tools/build-common.sh"
+  set +eE; trap - ERR
+  SETUP_CPUINFO=$1 cpu_fingerprint "" "$CPU_ISA_FLAGS_V1"
+)
+sed -E '/^flags/ s/$/ avx512_fp16 movdiri/' "$TNB_CPU/x86-a" > "$TMP/tnb-x86-a-new"
+sed -E '/^flags/ s/ avx512_fp16//' "$TMP/tnb-x86-a-new" > "$TMP/tnb-x86-a-masked"
+TNB_FPN=$(tnb_fp "$TMP/tnb-x86-a-new")
+TNB_1224=$(tnb_fp_1224 "$TMP/tnb-x86-a-new")
+check "ISA list v2: the new hash differs from the 1.22.4 one on a CPU with the added extensions" \
+  bash -c '[[ -n $1 && -n $2 && $1 != "$2" ]]' _ "$TNB_FPN" "$TNB_1224"
+check "ISA list v2: the hashed text has cx16, prfchw (3dnowprefetch) and avx512_fp16, not the intrinsic-only movdiri" \
+  bash -c '[[ $1 == *cx16* && $1 == *prfchw* && $1 == *avx512_fp16* && $1 != *movdiri* && $1 != *3dnowprefetch* ]]' _ "$(tnb_fp_text "$TMP/tnb-x86-a-new")"
+check "ISA list v2: cpu_fingerprint with CPU_ISA_FLAGS_V1 gives exactly the 1.22.4 hash" \
+  test "$(tnb_fp_v1 "$TMP/tnb-x86-a-new")" = "$TNB_1224"
+for tnb_x in "" rdrnd rdseed "rdrnd rdseed"; do
+  check "ISA list v2: a 1.22.0-1.22.4 build (legacy flags: ${tnb_x:-none}) sees no CPU change after the update" \
+    tnb_fp_matches "$TMP/tnb-x86-a-new" "$(tnb_fp_1224 "$TMP/tnb-x86-a-new" "$tnb_x")"
+done
+unset tnb_x
+check "ISA list v2: a 1.22.4 build of the original fixture still matches it" \
+  tnb_fp_matches "$TNB_CPU/x86-a" "$(tnb_fp_1224 "$TNB_CPU/x86-a")"
+check "ISA list v2: a 1.22.4 build of another CPU model does not match" \
+  not tnb_fp_matches "$TMP/tnb-x86-a-new" "$(tnb_fp_1224 "$TNB_CPU/x86-d")"
+check "ISA list v2: a 1.22.4 build of a CPU with AVX-512 does not match one without" \
+  not tnb_fp_matches "$TNB_CPU/x86-a" "$(tnb_fp_1224 "$TNB_CPU/x86-c")"
+check "ISA list v2: nginx and PHP builds record cpu_fingerprint (the new list)" \
+  bash -c 'grep -qF "printf '"'"'cpu=%s\\n'"'"' \"\$(cpu_fingerprint)\"" "$1/tools/nginx-build.sh" && grep -qF "printf '"'"'cpu=%s\\n'"'"' \"\$(cpu_fingerprint)\"" "$1/tools/php-build.sh"' _ "$TNB_REPO"
+check "ISA list v2: the new hash of the same CPU matches" tnb_fp_matches "$TMP/tnb-x86-a-new" "$TNB_FPN"
+check "ISA list v2: an added extension masked on the same model is a CPU change for a v2 build" \
+  not tnb_fp_matches "$TMP/tnb-x86-a-masked" "$TNB_FPN"
+# F6: intrinsic-only flags, and flags kernels or hypervisors hide by policy
+# (nopku, nofsgsbase, VM CPU models), are not hashed.
+check "ISA list v2: no intrinsic-only or policy-hidden flag in CPU_ISA_FLAGS" \
+  bash -c '. "$1/tools/build-common.sh"; for w in fsgsbase rdpid movdiri movdir64b serialize cmpccxadd clzero wbnoinvd pku sha512 sm3 sm4 amx_fp16; do [[ " $CPU_ISA_FLAGS " == *" $w "* ]] && exit 1; done; [[ " $CPU_ISA_FLAGS " == *" cx16 "* && " $CPU_ISA_FLAGS " == *" avx_ifma "* ]]' _ "$TNB_REPO"
+sed -E '/^flags/ s/$/ pku fsgsbase rdpid wbnoinvd serialize/' "$TMP/tnb-x86-a-new" > "$TMP/tnb-x86-a-pku"
+check "ISA list v2: the kernel or hypervisor showing pku/fsgsbase/rdpid/wbnoinvd/serialize is no CPU change" \
+  test "$(tnb_fp "$TMP/tnb-x86-a-pku")" = "$TNB_FPN"
+# F9: a flag that APPEARS (a newer kernel names avx_ifma, ...) is no CPU
+# change when the recorded cpu_info= text shows the same CPU; a flag that
+# disappears, another model, or a text that is not the recorded hash's is.
+TNB_TXN=$(tnb_fp_text "$TMP/tnb-x86-a-new")
+sed -E '/^flags/ s/$/ avx_ifma avx_vnni_int8/' "$TMP/tnb-x86-a-new" > "$TMP/tnb-x86-a-newkernel"
+check "cpu_fingerprint_matches: a kernel upgrade that names new flags changes the hash" \
+  bash -c '[[ -n $1 && $1 != "$2" ]]' _ "$(tnb_fp "$TMP/tnb-x86-a-newkernel")" "$TNB_FPN"
+check "cpu_fingerprint_matches: ... but the build still matches through its cpu_info= text" \
+  tnb_fp_matches "$TMP/tnb-x86-a-newkernel" "$TNB_FPN" "$TNB_TXN"
+check "cpu_fingerprint_matches: without the text an appeared flag is still a mismatch (valkey, old callers)" \
+  not tnb_fp_matches "$TMP/tnb-x86-a-newkernel" "$TNB_FPN"
+check "cpu_fingerprint_matches: a flag that disappears is a mismatch even with the text" \
+  not tnb_fp_matches "$TMP/tnb-x86-a-masked" "$TNB_FPN" "$TNB_TXN"
+sed -E 's/^(model[[:space:]]+): 106$/\1: 143/' "$TMP/tnb-x86-a-newkernel" > "$TMP/tnb-x86-a-othermodel"
+check "cpu_fingerprint_matches: another CPU model with more flags is a mismatch (identity fields)" \
+  bash -c 'grep -q "^model[[:space:]]*: 143" "$1"' _ "$TMP/tnb-x86-a-othermodel"
+check "cpu_fingerprint_matches: ... and its build does not match" \
+  not tnb_fp_matches "$TMP/tnb-x86-a-othermodel" "$TNB_FPN" "$TNB_TXN"
+check "cpu_fingerprint_matches: a text that is not the recorded hash's is ignored" \
+  not tnb_fp_matches "$TMP/tnb-x86-a-newkernel" "$TNB_FPN" "${TNB_TXN/isa=/isa=aes,}x"
+check "cpu_fingerprint_matches: another CPU's text and hash do not match" \
+  not tnb_fp_matches "$TNB_CPU/x86-a" "$(tnb_fp "$TNB_CPU/x86-d")" "$(tnb_fp_text "$TNB_CPU/x86-d")"
+check "cpu_fingerprint_matches: a 1.22.4 build (V1 hash and text) stays valid after a kernel upgrade names new flags" \
+  tnb_fp_matches "$TMP/tnb-x86-a-newkernel" "$(tnb_fp_1224 "$TMP/tnb-x86-a-new")"
+sed -E '/^Features/ s/$/ sve2p9/' "$TNB_CPU/arm64" > "$TMP/tnb-arm64-new"
+check "cpu_fingerprint_matches: arm64 Features gaining a name keeps the build through its text" \
+  tnb_fp_matches "$TMP/tnb-arm64-new" "$(tnb_fp "$TNB_CPU/arm64")" "$(tnb_fp_text "$TNB_CPU/arm64")"
+check "the nginx and PHP CPU gates pass the recorded cpu_info= text" \
+  bash -c '(( $(grep -c "cpu_fingerprint_matches .*cpu_info" "$1/tools/nginx-build.sh") == 4 && $(grep -c "cpu_fingerprint_matches .*cpu_info" "$1/tools/php-build.sh") == 3 ))' _ "$TNB_REPO"
+unset TNB_FPN TNB_1224 TNB_TXN
+unset -f tnb_fp_1224 tnb_fp_v1
 check "cpu_fingerprint_matches: an empty build value is a mismatch" \
   not tnb_fp_matches "$TNB_CPU/x86-a" ""
 check "cpu_fingerprint_matches: unreadable cpuinfo is a mismatch" \
@@ -535,9 +634,9 @@ tnb_ci_case() ( # ci -> "stdout|calls|components"
   printf '%s|%s|%s' "$out" "$(tr '\n' ',' < "$NB/calls")" "${COMPONENTS[*]}"
 )
 check "CI mode: 'build' prints only ROOT/staging/sbin/nginx on stdout, without the build lock" \
-  test "$(tnb_ci_case 1)" = "$TMP/tnb-ci/root/staging/sbin/nginx||nginx openssl pcre2 zlib-ng brotli ngx-brotli"
+  test "$(tnb_ci_case 1)" = "$TMP/tnb-ci/root/staging/sbin/nginx||nginx aws-lc pcre2 zlib-ng brotli ngx-brotli"
 check "host mode: 'build' takes the build lock and also ends stdout with the staging path" \
-  test "$(tnb_ci_case 0)" = "$TMP/tnb-ci/root/staging/sbin/nginx|lock,|nginx llvm openssl pcre2 zlib-ng brotli ngx-brotli"
+  test "$(tnb_ci_case 0)" = "$TMP/tnb-ci/root/staging/sbin/nginx|lock,|nginx llvm aws-lc pcre2 zlib-ng brotli ngx-brotli"
 check "CI mode: activate and BOLT are refused" \
   bash -c 'grep -qF "host_mode || die \"activate is not available in CI mode\"" "$1" && grep -qF "host_mode || die \"no BOLT in CI mode\"" "$1"' _ "$TNB_REPO/tools/nginx-build.sh"
 
@@ -765,36 +864,154 @@ check "shared units: nginx, PHP and Valkey purges all apply the one last-consume
   bash -c 'sed -n "/^nginx_build_purge()/,/^}/p" "$1/lib/nginx-build.sh" | grep -q "setup_build_remove_shared_units_if_last nginx" && grep -q "setup_build_remove_shared_units_if_last php" "$1/lib/php-build.sh" && grep -q "setup_build_remove_shared_units_if_last valkey" "$1/lib/valkey-build.sh"' _ "$TNB_REPO"
 
 # ---------------------------------------------------------------------------
-# TLS library and kTLS arms (1.22.2, benchmark-only; the default is unchanged)
+# TLS library (1.22.5: AWS-LC is the only one; openssl and boringssl removed).
+# kTLS (KTLS=, enable-ktls, build.info ktls=) was removed in 1.22.5.
 # ---------------------------------------------------------------------------
-tnb_tls_case() ( # TLS_LIB KTLS -> "lib=.. ktls=.. ignored=.. comps=.. opt=.. key=.."
+# sha256("aws-lc") cut to 16: the key every aws-lc build recorded since 1.22.2.
+TNB_AWSLC_KEY=24760def2037b6f3
+tnb_tls_case() ( # [TLS_LIB] -> "lib=.. comps=.. key=.."
   tnb_env "$TMP/tnb-tls"
-  export NGINX_BUILD_TLS_LIB=$1 NGINX_BUILD_KTLS=$2
+  if [[ -n ${1:-} ]]; then export NGINX_BUILD_TLS_LIB=$1; else unset NGINX_BUILD_TLS_LIB; fi
+  export NGINX_BUILD_KTLS=1
   . "$TNB_REPO/tools/nginx-build.sh" 2>/dev/null
   tnb_quiet
-  printf 'lib=%s ktls=%s ignored=%s comps=%s opt=%s key=%s\n' "$TLS_LIB" "$KTLS" "$KTLS_IGNORED" \
-    "${COMPONENTS[*]}" "$(openssl_opt | tr ' ' ,)" "$(tls_key "$TLS_LIB" "$KTLS")"
+  printf 'lib=%s comps=%s key=%s\n' "$TLS_LIB" "${COMPONENTS[*]}" "$(tls_key "$TLS_LIB")"
 )
-TNB_TLS0=$(tnb_tls_case openssl 0)
-TNB_TLS1=$(tnb_tls_case openssl 1)
-TNB_TLSA=$(tnb_tls_case aws-lc 1)
-check "TLS arms: the default openssl build has no enable-ktls" tnb_lacks "$TNB_TLS0" 'enable-ktls'
-check "TLS arms: KTLS=1 adds enable-ktls to the OpenSSL options" tnb_has "$TNB_TLS1" 'enable-ktls'
-check "TLS arms: KTLS changes the build key (a rebuild is reported)" \
-  test "${TNB_TLS0##*key=}" != "${TNB_TLS1##*key=}"
-check "TLS arms: the build key is stable across runs" test "$(tnb_tls_case openssl 0)" = "$TNB_TLS0"
-check "TLS arms: aws-lc replaces openssl in the component list" \
-  bash -c 'c=${1#*comps=}; c=${c%% opt=*}; [[ " $c " == *" aws-lc "* && " $c " != *" openssl "* ]]' _ "$TNB_TLSA"
-check "TLS arms: KTLS=1 is ignored (with a warning) for aws-lc, which lacks kTLS" \
-  tnb_has "$TNB_TLSA" 'ktls=0 ignored=1'
-check "TLS arms: an invalid KTLS value is refused" not tnb_tls_case openssl yes
-check "TLS arms: an unknown TLS library is refused" not tnb_tls_case wolfssl 0
-check "TLS arms: the default configure-args carry no TLS-arm or kTLS option" \
-  bash -c '[[ -n $1 && $1 != *ktls* && $1 != *aws-lc* && $1 != *boringssl* ]]' _ "$TNB_ARGS"
+TNB_TLS0=$(tnb_tls_case)
+TNB_TLSA=$(tnb_tls_case aws-lc)
+check "TLS: aws-lc is the default (no conf, no env) and takes the TLS slot of the component list" \
+  bash -c '[[ $1 == "lib=aws-lc comps="* && " ${1#*comps=} " == *" aws-lc "* && $1 != *openssl* ]]' _ "$TNB_TLS0"
+check "TLS: TLS_LIB=aws-lc gives the same library, components and key as the default" \
+  test "$TNB_TLSA" = "$TNB_TLS0"
+check "TLS: the aws-lc build key is unchanged since 1.22.2 (an aws-lc host is not rebuilt)" \
+  bash -c '[[ $1 == *" key=$2" ]]' _ "$TNB_TLS0" "$TNB_AWSLC_KEY"
+check "TLS: the build key is stable across runs" test "$(tnb_tls_case)" = "$TNB_TLS0"
+check "TLS: no OpenSSL build path is left in nginx-build.sh (--with-openssl, openssl_opt, OPENSSL_TRIM, VERS[openssl], ktls=0 key)" \
+  bash -c '! grep -nE -e "--with-openssl|openssl_opt|OPENSSL_TRIM|VERS\[openssl\]|fetch_unpack openssl|resolve openssl" "$1/tools/nginx-build.sh" && ! grep -n "ktls=0" "$1/tools/nginx-build.sh" | grep -v "^ *[0-9]*: *#"' _ "$TNB_REPO"
+check "TLS: ninja-build is an unconditional package of the nginx build" \
+  bash -c 'grep -qE "^  ensure_packages .* ninja-build " "$1/tools/nginx-build.sh" && ! grep -q "|| ensure_packages ninja-build" "$1/tools/nginx-build.sh"' _ "$TNB_REPO"
+check "TLS: the candidate check requires AWS-LC unconditionally" \
+  bash -c 'sed -n "/^verify_binary()/,/^}/p" "$1/tools/nginx-build.sh" | grep -qF "[[ \$v == *AWS-LC* ]] || die \"candidate is not built with AWS-LC\""' _ "$TNB_REPO"
+check "build.info no longer records ktls= and nothing reads it" \
+  bash -c '! grep -nE "ktls=%s|info_get ktls|KTLS_IGNORED|enable-ktls" "$1/tools/nginx-build.sh"' _ "$TNB_REPO"
+# 1.22.5 (F10): an invalid value is recorded and the default used, so `pre`
+# (ExecStartPre) never dies on it; build and check refuse it.
+tnb_tls_bad() ( # TLS_LIB -> "<lib> | CONF_INVALID | check rc"
+  tnb_env "$TMP/tnb-tls"
+  export NGINX_BUILD_TLS_LIB=$1
+  . "$TNB_REPO/tools/nginx-build.sh" 2>/dev/null
+  tnb_quiet
+  : > "$STATE/build.info"
+  printf '%s | %s | check=%s\n' "$TLS_LIB" "$CONF_INVALID" "$( (cmd_check >/dev/null 2>&1); echo $? )"
+)
+check "TLS: an unknown TLS library falls back to aws-lc, is recorded and refused by check" \
+  bash -c '[[ $1 == "aws-lc | TLS_LIB=wolfssl: expected aws-lc;"*" | check=1" ]]' _ "$(tnb_tls_bad wolfssl)"
+# 1.22.5: TLS_LIB=openssl (2-5 % slower on cached XenForo pages, more
+# memory) and TLS_LIB=boringssl (below aws-lc on the cached tier, no OCSP
+# stapling) were removed.  A conf or env that still names one warns once and
+# builds aws-lc with its unchanged key; such a build is stale; a CPU rebuild
+# of one builds aws-lc.
+tnb_tls_removed() ( # lib env|conf -> "lib=.. comps=.. invalid=[..] warn=N key=.."
+  tnb_env "$TMP/tnb-tls"
+  if [[ $2 == env ]]; then export NGINX_BUILD_TLS_LIB=$1
+  else unset NGINX_BUILD_TLS_LIB; printf 'TLS_LIB=%s\nOPENSSL_VERSION=3.6.1\nBORINGSSL_VERSION=0.20250101.0\n' "$1" > "$NGINX_BUILD_CONF"
+  fi
+  logger() { :; }
+  . "$TNB_REPO/tools/nginx-build.sh" 2> "$TMP/tnb-tls.err"
+  tnb_quiet
+  printf 'lib=%s comps=%s invalid=[%s] warn=%s key=%s\n' "$TLS_LIB" "${COMPONENTS[*]}" "$CONF_INVALID" \
+    "$(grep -c "WARNING: nginx: TLS_LIB=$1 was removed in 1.22.5 .*; using the default (aws-lc)" "$TMP/tnb-tls.err")" "$(tls_key "$TLS_LIB")"
+)
+for TNB_LIB in openssl boringssl; do
+  for TNB_HOW in conf env; do
+    TNB_OUT=$(tnb_tls_removed "$TNB_LIB" "$TNB_HOW")
+    check "TLS removed ($TNB_LIB, $TNB_HOW): warns once and builds aws-lc, nothing invalid" \
+      bash -c '[[ $1 == "lib=aws-lc comps="*" aws-lc "*" invalid=[] warn=1 "* && $1 != *openssl* && $1 != *boringssl* ]]' _ "$TNB_OUT"
+    check "TLS removed ($TNB_LIB, $TNB_HOW): the build key is the unchanged aws-lc key" \
+      bash -c '[[ $1 == *" key=$2" ]]' _ "$TNB_OUT" "$TNB_AWSLC_KEY"
+  done
+done
+TNB_OUT=$(tnb_tls_removed openssl conf)
+check "TLS removed: the openssl warning gives the measured reason" \
+  grep -q "TLS_LIB=openssl was removed in 1.22.5 (measured 2-5 % slower on cached XenForo pages and more nginx memory than aws-lc); using the default (aws-lc)" "$TMP/tnb-tls.err"
+tnb_tls_stale() ( # build.info-text conf-text -> cmd_check output
+  tnb_env "$TMP/tnb-tls"
+  unset NGINX_BUILD_TLS_LIB
+  printf '%s\n' "$2" > "$NGINX_BUILD_CONF"
+  logger() { :; }
+  . "$TNB_REPO/tools/nginx-build.sh" 2>/dev/null
+  tnb_quiet
+  resolve_all() { :; }; cpu_fingerprint_matches() { return 0; }
+  { printf 'recipe=%s\n' "$BUILD_RECIPE"; printf '%b' "$1"; } > "$STATE/build.info"
+  ( cmd_check ) 2>&1; echo "rc=$?"
+)
+check "TLS removed: a BoringSSL build is stale (rebuilt on aws-lc)" \
+  bash -c '[[ $1 == *"TLS options boringssl -> aws-lc"* && $1 == *rc=10* ]]' _ \
+  "$(tnb_tls_stale 'boringssl=0.20250101.0\ntls_lib=boringssl\ntls_opts=765f9cec0a7ae2b5\n' '')"
+check "TLS removed: an openssl build (1.22.2-1.22.4 key) is stale (rebuilt on aws-lc)" \
+  bash -c '[[ $1 == *"TLS options openssl -> aws-lc"* && $1 == *rc=10* ]]' _ \
+  "$(tnb_tls_stale 'openssl=3.6.1\ntls_lib=openssl\ntls_opts=396cac09f8d67cc9\n' '')"
+check "TLS removed: ... also while the conf still says TLS_LIB=openssl (no refusal)" \
+  bash -c '[[ $1 == *"TLS options openssl -> aws-lc"* && $1 == *rc=10* && $1 != *ERROR* ]]' _ \
+  "$(tnb_tls_stale 'openssl=3.6.1\ntls_lib=openssl\ntls_opts=396cac09f8d67cc9\n' 'TLS_LIB=openssl')"
+check "TLS removed: a build.info without tls_opts= (before the TLS arms: openssl) is stale" \
+  bash -c '[[ $1 == *"TLS options openssl -> aws-lc"* && $1 == *rc=10* ]]' _ \
+  "$(tnb_tls_stale 'openssl=3.6.1\n' '')"
+check "TLS: a current aws-lc build is not stale for its TLS library" \
+  bash -c '[[ $1 != *"TLS options"* && $1 == *rc=0* ]]' _ \
+  "$(tnb_tls_stale "aws-lc=1.66.2\ntls_lib=aws-lc\ntls_opts=$TNB_AWSLC_KEY\n" '')"
+tnb_tls_cpu() ( # recorded-lib -> CPU-change rebuild of a recorded openssl/BoringSSL build
+  tnb_env "$TMP/tnb-tls"
+  unset NGINX_BUILD_TLS_LIB
+  logger() { :; }
+  . "$TNB_REPO/tools/nginx-build.sh" 2>/dev/null
+  tnb_quiet
+  case $1 in
+    boringssl) printf 'nginx=1.29.0\nllvm=20\nboringssl=0.20250101.0\npcre2=10.46\nzlib-ng=2.2.5\nbrotli=1.1.0\nngx-brotli=abcdef123456\ntls_lib=boringssl\n' > "$STATE/build.info" ;;
+    openssl)   printf 'nginx=1.29.0\nllvm=20\nopenssl=3.6.1\npcre2=10.46\nzlib-ng=2.2.5\nbrotli=1.1.0\nngx-brotli=abcdef123456\ntls_lib=openssl\ntls_opts=396cac09f8d67cc9\n' > "$STATE/build.info" ;;
+    none)      printf 'nginx=1.29.0\nllvm=20\nopenssl=3.6.1\npcre2=10.46\nzlib-ng=2.2.5\nbrotli=1.1.0\nngx-brotli=abcdef123456\n' > "$STATE/build.info" ;;
+  esac
+  ensure_packages() { echo "packages $*"; }; build_deprioritize() { :; }; build_space_check() { :; }
+  resolve() { [[ $1 == aws-lc ]] && echo 1.66.2; }
+  host_mode() { [[ -n ${VERS[nginx]:-} ]] && { printf 'VERS aws-lc=%s openssl=%s tls=%s\n' "${VERS[aws-lc]:-none}" "${VERS[openssl]:-none}" "$TLS_LIB"; exit 0; }; return 1; }
+  ( cmd_build cpu ) 2>&1; echo "rc=$?"
+)
+for TNB_LIB in boringssl openssl none; do
+  TNB_OUT=$(tnb_tls_cpu "$TNB_LIB")
+  TNB_REC=$TNB_LIB; [[ $TNB_REC == none ]] && TNB_REC=openssl
+  check "TLS removed: a CPU rebuild of a recorded $TNB_LIB build builds aws-lc at a resolved version (ninja-build installed)" \
+    bash -c '[[ $1 == *"VERS aws-lc=1.66.2 openssl=none tls=aws-lc"* && $1 == *"recorded TLS library $2 was removed in 1.22.5; rebuilding with aws-lc 1.66.2"* && $1 == *rc=0* && $1 == *"packages "*ninja-build* ]]' _ "$TNB_OUT" "$TNB_REC"
+done
+check "TLS removed: BoringSSL has no lookup, download or verify left" \
+  bash -c '! grep -niE "boringssl" "$1/tools/build-common.sh" && ! grep -n "BoringSSL" "$1/tools/nginx-build.sh" | grep -v "^ *[0-9]*: *#"' _ "$TNB_REPO"
+check "TLS removed: nginx-build.conf sets TLS_LIB=aws-lc and has no OPENSSL_VERSION or BORINGSSL_VERSION" \
+  bash -c 'grep -qx "TLS_LIB=aws-lc" "$1/nginx-build.conf" && grep -qx "AWS_LC_VERSION=latest" "$1/nginx-build.conf" && ! grep -q "^BORINGSSL_VERSION=" "$1/nginx-build.conf" && ! grep -q "^OPENSSL_VERSION=" "$1/nginx-build.conf"' _ "$TNB_REPO"
+# 1.22.5: OPENSSL_VERSION=lts (the newest 3.5.x) was removed: measured not
+# faster than the newest OpenSSL.  build-common keeps it for the PHP build's
+# OpenSSL: it warns and resolves like "latest".
+tnb_lts() ( # -> resolve openssl output
+  tnb_env "$TMP/tnb-tls"
+  unset NGINX_BUILD_TLS_LIB
+  printf 'OPENSSL_VERSION=lts\n' > "$NGINX_BUILD_CONF"
+  logger() { :; }
+  . "$TNB_REPO/tools/nginx-build.sh" 2>/dev/null
+  tnb_quiet
+  latest_of() { printf 'latest_of[%s|%s]' "$1" "${2:-}"; }
+  printf 'get=%s\n' "$(conf_get openssl 2>/dev/null)"
+  resolve openssl 2>&1; echo
+)
+TNB_OUT=$(tnb_lts)
+check "OPENSSL_VERSION=lts: warns that it was removed and resolves the newest release (no 3.5 series)" \
+  bash -c '[[ $1 == *"get=latest"* && $1 == *"OPENSSL_VERSION=lts in "*" was removed in 1.22.5"* && $1 == *"latest_of[openssl|]"* && $1 != *3.5* ]]' _ "$TNB_OUT"
+check "OPENSSL_VERSION=lts: no lts code path is left in build-common" \
+  bash -c '! grep -nF -e "want == lts" -e "x=lts" -e "x == lts" -e "3\\.5\\." -e "3.5.*" "$1/tools/build-common.sh"' _ "$TNB_REPO"
+check "TLS: the default configure-args carry no TLS library or kTLS option" \
+  bash -c '[[ -n $1 && $1 != *ktls* && $1 != *aws-lc* && $1 != *boringssl* && $1 != *--with-openssl* ]]' _ "$TNB_ARGS"
 
 unset -f tnb_has tnb_lacks tnb_line tnb_noline tnb_env tnb_quiet tnb_break_count tnb_brand_case tnb_fallback \
   tnb_build_case tnb_build_err tnb_args_have tnb_args_lack tnb_res_ok tnb_tmpfiles_ok tnb_fp tnb_fp_text \
   tnb_pre_case tnb_fake_nginx tnb_fit_case tnb_ci_case tnb_gpgv tnb_armor tnb_pgp_case tnb_fetch_case \
-  tnb_master_case tnb_upgrade_case tnb_swap_case tnb_last_case tnb_tls_case
-unset TNB_TLS0 TNB_TLS1 TNB_TLSA
+  tnb_master_case tnb_upgrade_case tnb_swap_case tnb_last_case tnb_tls_case tnb_tls_bad \
+  tnb_tls_removed tnb_tls_stale tnb_tls_cpu tnb_lts
+unset TNB_TLS0 TNB_TLSA TNB_OUT TNB_HOW TNB_LIB TNB_REC TNB_AWSLC_KEY
 unset TNB_REPO TNB_SRC TNB_CPU TNB_FB TNB_FB1 TNB_FB2 TNB_FB3 TNB_ARGS TNB_ARGS_CI TNB_UNIT TNB_TMPF TNB_FPA TNB_FPT

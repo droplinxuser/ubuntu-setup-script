@@ -3,11 +3,12 @@
 # Valkey compiled from source (1.22.0): the only Valkey setup.sh installs.
 # ---------------------------------------------------------------------------
 # tools/valkey-build.sh builds the newest Valkey release (versions in
-# valkey-build.conf; a host whose valkey.conf persists data stays on the
-# series of the server that wrote it) with clang from apt.llvm.org, -O3
-# -march=native, Ubuntu's hardening flags, LTO and BOLT, bundled jemalloc
-# and Lua, no TLS; it links only glibc.  It installs valkey-server,
-# valkey-cli, valkey-benchmark, valkey-check-aof and valkey-check-rdb into
+# valkey-build.conf; a host whose valkey.conf runs AOF stays on the series
+# of the server that wrote it, and no host goes below that version) with
+# clang from apt.llvm.org, -O3 -march=native, Ubuntu's hardening flags,
+# LTO and BOLT, bundled jemalloc and Lua, no TLS; it links only glibc.  It
+# installs valkey-server, valkey-cli, valkey-benchmark, valkey-check-aof
+# and valkey-check-rdb into
 # /usr/local/lib/setup-valkey/bin (links in /usr/local/bin), writes our own
 # valkey-server.service (Alias valkey.service), creates the valkey user and
 # group and seeds /etc/valkey/valkey.conf on a host without one.  The
@@ -189,7 +190,7 @@ valkey_build_retire_legacy_layout() {
 # /usr/local/bin links.  Needs an installed tool; never starts the service.
 valkey_build_layout() {
   valkey_build_install_support || return 1
-  "$VALKEY_BUILD_TOOL" layout >/dev/null
+  VALKEY_LIMIT_NOFILE=$(nofile_unit valkey 2>/dev/null || printf 524288) "$VALKEY_BUILD_TOOL" layout >/dev/null
 }
 
 # Run one tool command; its output goes to ROOT/logs/ensure-<cmd>.log (the
@@ -199,7 +200,8 @@ valkey_build_run() { # out command [args]
   shift 2
   install -d -m 750 "$VALKEY_BUILD_LOG_DIR"
   f="${VALKEY_BUILD_LOG_DIR}/ensure-${cmd}.log"
-  env VALKEY_BUILD_CUTOVER="${VALKEY_BUILD_CUTOVER_FLAG:-0}" VALKEY_BUILD_NO_START="${VALKEY_BUILD_CUTOVER_FLAG:-0}" \
+  env VALKEY_LIMIT_NOFILE="$(nofile_unit valkey 2>/dev/null || printf 524288)" \
+    VALKEY_BUILD_CUTOVER="${VALKEY_BUILD_CUTOVER_FLAG:-0}" VALKEY_BUILD_NO_START="${VALKEY_BUILD_CUTOVER_FLAG:-0}" \
     "$VALKEY_BUILD_TOOL" "$cmd" "$@" > "$f" 2>&1 || rc=$?
   if (( rc != 0 )); then
     tail -n 8 "$f" >&2 2>/dev/null || true
@@ -310,9 +312,9 @@ valkey_build_plan() {
   v=$(valkey_build_info_get valkey)
   if [[ -n $v ]]; then
     printf 'Valkey %s compiled from source (/usr/local/lib/setup-valkey); rebuilt when Valkey (or LLVM) releases a newer version%s' \
-      "$v" "$( [[ $(valkey_build_info_get persists) == 1 ]] && printf ', staying on the %s series (valkey.conf persists data)' "${v%.*}")"
+      "$v" "$( s=$(valkey_build_info_get series); [[ -n $s ]] && printf ', staying on the %s series (valkey.conf persists data with AOF)' "$s")"
   elif valkey_pkg_installed valkey-server; then
-    printf 'Valkey: the valkey-server package is replaced by a source build (newest release, or the package series when valkey.conf persists data) by the 1.22 migration'
+    printf 'Valkey: the valkey-server package is replaced by a source build (newest release, or the package series when valkey.conf persists data with AOF) by the 1.22 migration'
   else
     printf 'Valkey compiled from source (newest release; clang, LTO, BOLT) into /usr/local/lib/setup-valkey, own valkey-server.service'
   fi

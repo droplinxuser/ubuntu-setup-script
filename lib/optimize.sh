@@ -311,7 +311,17 @@ detect_installed_services() {
   if command -v mariadbd >/dev/null 2>&1; then
     [[ -d /etc/mysql ]] && OPT_DETECTED+=(mariadb)
   fi
+  # A valkey.conf with no Valkey server left (`--purge valkey` keeps the
+  # configuration) is not a Valkey host: a redis-server installed afterwards
+  # was never tuned because the stale file took precedence.
+  local valkey_present=0
   if [[ -f /etc/valkey/valkey.conf ]]; then
+    if command -v valkey-server >/dev/null 2>&1 || [[ -x $(opt_valkey_server_bin) ]] \
+      || systemctl cat valkey-server.service >/dev/null 2>&1; then
+      valkey_present=1
+    fi
+  fi
+  if (( valkey_present )); then
     if ! mem_gate_allows valkey; then
       OPT_DETECT_NOTES+=("Valkey: not tuned or migrated (under the 4 GB class this host runs nginx only)")
     elif valkey_is_ours; then
@@ -327,7 +337,7 @@ detect_installed_services() {
   # Valkey takes precedence.  Tuning both would apply the same shared cache
   # budget twice and could overcommit RAM; Redis-only hosts still get the
   # complete Valkey tuning profile.
-  if [[ ! -f /etc/valkey/valkey.conf && -f /etc/redis/redis.conf ]]; then
+  if (( ! valkey_present )) && [[ -f /etc/redis/redis.conf ]]; then
     OPT_DETECTED+=(redis)
   fi
   [[ -f /etc/elasticsearch/elasticsearch.yml ]] && OPT_DETECTED+=(elastic)
@@ -415,10 +425,23 @@ OPT_MARIADB_BUDGET_MB=0
 OPT_MARIADB_KEPT_MB=0
 # The pool live before this run (0 = unknown); the report names a shrink.
 OPT_MARIADB_LIVE_MB=0
+# MariaDB memory outside the buffer pool booked by the plan (1.22.5):
+# fixed buffers + active queries x (session buffers + tmp_table_size/2);
+# the part that did not fit the room PHP leaves; the tmp_table_size cap the
+# plan set to make it fit (0 = none, read by mariadb_compute_profile); the
+# resulting tmp_table_size; the active-query estimate (thread_pool_size).
+OPT_MARIADB_NONPOOL_MB=0
+OPT_MARIADB_NONPOOL_SHORT_MB=0
+OPT_MARIADB_TMP_CAP_MB=0
+OPT_MARIADB_TMP_MB=0
+OPT_MARIADB_ACTIVE_THREADS=0
 OPT_VALKEY_BUDGET_MB=0
 OPT_VALKEY_LIVE_MB=0
 # maxmemory in force before this run when the plan lowers it (else 0).
 OPT_VALKEY_PREV_MB=0
+# RAM outside every booked service and the 10% OS floor, for the RDB
+# snapshot fork's worst-case copy-on-write (report only, 1.22.5).
+OPT_VALKEY_COW_ROOM_MB=0
 # Why the plan chose the cache size (valkey_guard_maxmemory_mb): plan, live,
 # full, raised, capped or explicit.  Read by the report and the dry run.
 OPT_VALKEY_GUARD=""
@@ -809,6 +832,7 @@ plan_memory_budget() {
   OPT_VALKEY_BUDGET_MB=0
   OPT_VALKEY_LIVE_MB=0
   OPT_VALKEY_PREV_MB=0
+  OPT_VALKEY_COW_ROOM_MB=0
   OPT_VALKEY_GUARD=""
   OPT_ES_BUDGET_MB=0
   OPT_ES_KEPT_MB=0
@@ -1266,6 +1290,49 @@ plan_memory_budget() {
     fi
   fi
 
+  # MariaDB memory outside the buffer pool (1.22.5): the fixed buffers (log
+  # buffer, Aria page cache, key_buffer) plus, per active query
+  # (thread_pool_size), the session buffers and half of tmp_table_size.  It
+  # is booked from the room PHP leaves inside the budget, never by cutting
+  # workers: the pool is already at its hardware target (php_children_floor)
+  # and the writer never goes below it.  When that room is too small,
+  # tmp_table_size/max_heap_table_size are capped to fit (16 MB steps, never
+  # below MariaDB's 16 MB default); what still does not fit is reported
+  # (OPT_MARIADB_NONPOOL_SHORT_MB) and stays in the 20% OS margin, where it
+  # lived before 1.22.5: the overcommit check, the snapshot room and the
+  # Elasticsearch preload estimate keep their figures (transient per-query
+  # buffers; no new "host too small" warning, no pool or worker change).
+  local maria_nonpool=0 maria_short=0
+  OPT_MARIADB_NONPOOL_MB=0
+  OPT_MARIADB_NONPOOL_SHORT_MB=0
+  OPT_MARIADB_TMP_CAP_MB=0
+  OPT_MARIADB_TMP_MB=0
+  OPT_MARIADB_ACTIVE_THREADS=0
+  if (( has_maria )); then
+    local m_threads=$cpu m_tmp m_room m_avail m_fit
+    (( m_threads > 64 )) && m_threads=64
+    m_tmp=$(mariadb_tmp_table_mb "$total" "$maria_alloc")
+    maria_nonpool=$(mariadb_nonpool_mb "$total" "$m_threads" "$m_tmp")
+    m_room=$(( remaining - php_budget ))
+    (( m_room < 0 )) && m_room=0
+    if (( maria_nonpool > m_room )); then
+      m_avail=$(( m_room - $(mariadb_fixed_nonpool_mb "$total") - (m_threads * 5 + 1) / 2 ))
+      m_fit=0
+      (( m_avail > 0 )) && m_fit=$(( m_avail * 2 / m_threads / 16 * 16 ))
+      (( m_fit < 16 )) && m_fit=16
+      if (( m_fit < m_tmp )); then
+        OPT_MARIADB_TMP_CAP_MB=$m_fit
+        m_tmp=$(mariadb_tmp_table_mb "$total" "$maria_alloc" "$m_fit")
+        maria_nonpool=$(mariadb_nonpool_mb "$total" "$m_threads" "$m_tmp")
+      fi
+      (( maria_nonpool > m_room )) && maria_short=$(( maria_nonpool - m_room ))
+    fi
+    OPT_MARIADB_NONPOOL_MB=$maria_nonpool
+    OPT_MARIADB_NONPOOL_SHORT_MB=$maria_short
+    OPT_MARIADB_TMP_MB=$m_tmp
+    OPT_MARIADB_ACTIVE_THREADS=$m_threads
+  fi
+
   # Normalise the search heap to a 512 MB boundary unless it is a preserved
   # live value.
   if (( has_es && es_alloc > 0 && es_kept == 0 )); then
@@ -1292,6 +1359,10 @@ plan_memory_budget() {
   # includes the booked Elasticsearch direct memory and OPcache huge pages.
   OPT_MEM_OVERCOMMIT_MB=0
   booked=$(( maria_alloc + valkey_alloc + es_alloc + es_book + php_budget + hp_mb ))
+  # The snapshot fork of the cache may copy up to its maxmemory (1.22.5):
+  # report the room left for it; the plan does not shrink the cache for it.
+  OPT_VALKEY_COW_ROOM_MB=$(( total - booked - total / 10 ))
+  (( OPT_VALKEY_COW_ROOM_MB < 0 )) && OPT_VALKEY_COW_ROOM_MB=0
   # Preload only when the index (plus 5% growth) fits the RAM left after
   # every booked service and the 10% kernel/OS floor; preloading an index
   # that cannot stay resident would only evict MariaDB's and PHP's pages.
@@ -1514,17 +1585,15 @@ nginx_worker_limits() {
 }
 PHP_WRITTEN_CHILDREN=0
 
-# gzip level from the same CPU rule as Brotli (5, 4 on 1-2 CPUs);
-# SETUP_GZIP_LEVEL=1..9 pins it.
+# gzip level 4, 3 on 1-2 CPUs (Brotli is 1 since 1.22.5).  There is
+# no pin: no other level measured faster (SETUP_GZIP_LEVEL was removed in
+# 1.22.5 and is ignored with a warning).
 nginx_gzip_level() {
-  local level=${SETUP_GZIP_LEVEL:-}
-  if ! [[ $level =~ ^[1-9]$ ]]; then
-    # gzip is the fallback for the few clients without Brotli; measured on
-    # the same 8 vCPU origin: level 5 = 3.1 ms, level 3 = 1.9 ms per 130 KB
-    # page (25 vs 29 KB).  Level 4 matches the Brotli choice.
-    level=4
-    (( $(effective_cpus) <= 2 )) && level=3
-  fi
+  # gzip is the fallback for the few clients without Brotli; measured on
+  # the same 8 vCPU origin: level 5 = 3.1 ms, level 3 = 1.9 ms per 130 KB
+  # page (25 vs 29 KB).  Level 4 matches the Brotli choice.
+  local level=4
+  (( $(effective_cpus) <= 2 )) && level=3
   printf '%s' "$level"
 }
 
@@ -1540,10 +1609,259 @@ nginx_open_file_cache_max() {
   (( open_files > fd_room )) && open_files=$fd_room
   printf '%s' "$open_files"
 }
+# worker_rlimit_nofile that covers a worker's worst case: a client and an
+# upstream socket per connection, the open-file cache and 1024 spare (logs,
+# temp files).  RLIMIT CONNS OFC -> RLIMIT raised to a power of two when the
+# worst case does not fit (never lowered, at most 524288, the unit floor).
+# Only a limit: nothing is allocated, so a higher value costs nothing.
+nginx_worker_rlimit_fit() {
+  local rlimit=$1 conns=$2 ofc=$3 need p=65536
+  need=$(( conns * 2 + ofc + 1024 ))
+  (( need <= rlimit )) && { printf '%s' "$rlimit"; return 0; }
+  while (( p < need && p < 524288 )); do p=$(( p * 2 )); done
+  (( p < rlimit )) && p=$rlimit
+  printf '%s' "$p"
+}
 NGINX_WORKER_PROCESSES=""
 NGINX_WORKER_RLIMIT=""
 NGINX_WORKER_CONNECTIONS=""
 NGINX_PHP_KEEPALIVE=""
+
+# ---------------------------------------------------------------------------
+# File-descriptor plan: every managed service's systemd LimitNOFILE, sized
+# together in one place (1.22.5).
+# ---------------------------------------------------------------------------
+# A unit's limit is that service's own need with headroom, rounded up to a
+# power of two, never below the value 1.22.4 wrote (no service may lose
+# capacity) and never above fs.nr_open (systemd refuses to start a unit whose
+# LimitNOFILE is above it).  The limit each service applies inside its unit
+# (nginx worker_rlimit_nofile, PHP-FPM rlimit_files, Valkey maxclients + 32,
+# MariaDB open_files_limit, Elasticsearch's 65535 bootstrap minimum) is always
+# <= its unit's value.  RLIMIT_NOFILE is per process: the sum of the unit
+# limits is checked against fs.file-max (configure_sysctl raises file-max
+# within its clamp when the sum is larger; --optimize reports both).
+# With today's clamps every need is below its floor, so the units keep the
+# 1.22.4 values; the plan guards the invariants when a sizing rule changes.
+NOFILE_FLOOR_NGINX=524288
+NOFILE_FLOOR_PHP=524288
+NOFILE_FLOOR_VALKEY=524288
+NOFILE_FLOOR_MARIADB=1048576
+NOFILE_FLOOR_ELASTIC=1048576
+# Internal limits that are constants today (php-fpm.conf, the [www] pool,
+# 50-server.cnf); the writers read these so the plan and the files agree.
+NOFILE_PHP_RLIMIT_FILES=524288
+NOFILE_MARIADB_OPEN_FILES_FLOOR=524288
+NOFILE_ELASTIC_MIN=65535
+NOFILE_FILE_MAX_CEIL=10485760
+
+NOFILE_PLAN_NGINX_UNIT=""
+NOFILE_PLAN_NGINX_INTERNAL=""
+NOFILE_PLAN_NGINX_NEED=""
+NOFILE_PLAN_NGINX_WORKERS=""
+NOFILE_PLAN_PHP_UNIT=""
+NOFILE_PLAN_PHP_INTERNAL=""
+NOFILE_PLAN_VALKEY_UNIT=""
+NOFILE_PLAN_VALKEY_INTERNAL=""
+NOFILE_PLAN_MARIADB_UNIT=""
+NOFILE_PLAN_MARIADB_INTERNAL=""
+NOFILE_PLAN_MARIADB_NEED=""
+NOFILE_PLAN_ELASTIC_UNIT=""
+NOFILE_PLAN_ELASTIC_INTERNAL=""
+NOFILE_PLAN_CAP=""
+
+# Smallest power of two >= N (at least 1024).
+nofile_pow2() {
+  local n=${1:-0} p=1024
+  [[ $n =~ ^[0-9]+$ ]] || n=0
+  while (( p < n )); do p=$(( p * 2 )); done
+  printf '%s' "$p"
+}
+
+# Live fs.nr_open, empty when unreadable.  NOFILE_NR_OPEN is the test hook.
+nofile_nr_open() {
+  local v=${NOFILE_NR_OPEN:-}
+  if [[ -z $v && -r /proc/sys/fs/nr_open ]]; then v=$(< /proc/sys/fs/nr_open); fi
+  if [[ $v =~ ^[0-9]+$ ]]; then printf '%s' "$v"; fi
+  return 0
+}
+
+# Unit limit from FLOOR, NEED and the nr_open CAP (optional).  A cap below
+# the floor (a kernel ceiling lower than what 1.22.4 already wrote) keeps the
+# floor: the service keeps its capacity, and configure_sysctl raises nr_open.
+nofile_unit_value() {
+  local floor=$1 need=$2 cap=${3:-} v
+  v=$(nofile_pow2 "$need")
+  if (( v < floor )); then v=$floor; fi
+  if [[ $cap =~ ^[0-9]+$ ]] && (( v > cap && cap >= floor )); then v=$cap; fi
+  printf '%s' "$v"
+}
+
+# Compute the plan into NOFILE_PLAN_*.  Inputs: the effective CPU count and
+# RAM (NOFILE_CPUS / NOFILE_RAM_MB override), Valkey maxclients
+# (valkey_maxclients; NOFILE_VALKEY_MAXCLIENTS overrides), MariaDB
+# max_connections / table_open_cache (MARIADB_PROFILE_*, else their caps).
+nofile_plan() {
+  local cpus=${NOFILE_CPUS:-} ram=${NOFILE_RAM_MB:-} cap conns ofc rlimit need maxc max_conn open_cache internal
+  local saved_wp=$NGINX_WORKER_PROCESSES saved_wr=$NGINX_WORKER_RLIMIT saved_wc=$NGINX_WORKER_CONNECTIONS saved_ka=$NGINX_PHP_KEEPALIVE
+  [[ $cpus =~ ^[1-9][0-9]*$ ]] || cpus=$(effective_cpus 2>/dev/null || printf 1)
+  [[ $cpus =~ ^[1-9][0-9]*$ ]] || cpus=1
+  [[ $ram =~ ^[1-9][0-9]*$ ]] || ram=$(mem_total_mb 2>/dev/null || printf 1024)
+  [[ $ram =~ ^[1-9][0-9]*$ ]] || ram=1024
+  cap=$(nofile_nr_open)
+  NOFILE_PLAN_CAP=$cap
+
+  # nginx, per worker: a client and an upstream socket per connection, the
+  # open_file_cache entries and the log files.
+  nginx_worker_limits "$cpus"
+  rlimit=$NGINX_WORKER_RLIMIT conns=$NGINX_WORKER_CONNECTIONS
+  NOFILE_PLAN_NGINX_WORKERS=$NGINX_WORKER_PROCESSES
+  NGINX_WORKER_PROCESSES=$saved_wp NGINX_WORKER_RLIMIT=$saved_wr NGINX_WORKER_CONNECTIONS=$saved_wc NGINX_PHP_KEEPALIVE=$saved_ka
+  ofc=$(nginx_open_file_cache_max "$ram" "$rlimit" "$conns")
+  NOFILE_PLAN_NGINX_NEED=$(( conns * 2 + ofc + 1024 ))
+  # tune_nginx_configs raises worker_rlimit_nofile the same way.
+  rlimit=$(nginx_worker_rlimit_fit "$rlimit" "$conns" "$ofc")
+  need=$NOFILE_PLAN_NGINX_NEED
+  if (( need < rlimit )); then need=$rlimit; fi
+  NOFILE_PLAN_NGINX_INTERNAL=$rlimit
+  NOFILE_PLAN_NGINX_UNIT=$(nofile_unit_value "$NOFILE_FLOOR_NGINX" "$need" "$cap")
+
+  # PHP-FPM: the master applies rlimit_files to every worker.
+  NOFILE_PLAN_PHP_INTERNAL=$NOFILE_PHP_RLIMIT_FILES
+  NOFILE_PLAN_PHP_UNIT=$(nofile_unit_value "$NOFILE_FLOOR_PHP" "$NOFILE_PHP_RLIMIT_FILES" "$cap")
+
+  # Valkey: one descriptor per client plus the 32 it reserves for itself.
+  maxc=${NOFILE_VALKEY_MAXCLIENTS:-}
+  if ! [[ $maxc =~ ^[0-9]+$ ]] && declare -F valkey_maxclients >/dev/null 2>&1; then
+    maxc=$(valkey_maxclients 2>/dev/null || true)
+  fi
+  [[ $maxc =~ ^[0-9]+$ ]] || maxc=100000
+  NOFILE_PLAN_VALKEY_INTERNAL=$maxc
+  NOFILE_PLAN_VALKEY_UNIT=$(nofile_unit_value "$NOFILE_FLOOR_VALKEY" $(( maxc + 32 )) "$cap")
+
+  # MariaDB raises open_files_limit itself to at least
+  # max(10 + max_connections + 2 x table_open_cache, 5 x max_connections);
+  # unknown inputs take their caps (100000 connections, 32768 tables).
+  max_conn=${MARIADB_PROFILE_MAX_CONN:-}
+  open_cache=${MARIADB_PROFILE_OPEN_CACHE:-}
+  [[ $max_conn =~ ^[0-9]+$ ]] || max_conn=100000
+  [[ $open_cache =~ ^[0-9]+$ ]] || open_cache=32768
+  need=$(( 10 + max_conn + 2 * open_cache ))
+  if (( max_conn * 5 > need )); then need=$(( max_conn * 5 )); fi
+  NOFILE_PLAN_MARIADB_NEED=$need
+  internal=$(nofile_pow2 "$need")
+  if (( internal < NOFILE_MARIADB_OPEN_FILES_FLOOR )); then internal=$NOFILE_MARIADB_OPEN_FILES_FLOOR; fi
+  NOFILE_PLAN_MARIADB_UNIT=$(nofile_unit_value "$NOFILE_FLOOR_MARIADB" "$internal" "$cap")
+  if (( internal > NOFILE_PLAN_MARIADB_UNIT )); then internal=$NOFILE_PLAN_MARIADB_UNIT; fi
+  NOFILE_PLAN_MARIADB_INTERNAL=$internal
+
+  # Elasticsearch's bootstrap check wants at least 65535.
+  NOFILE_PLAN_ELASTIC_INTERNAL=$NOFILE_ELASTIC_MIN
+  NOFILE_PLAN_ELASTIC_UNIT=$(nofile_unit_value "$NOFILE_FLOOR_ELASTIC" "$NOFILE_ELASTIC_MIN" "$cap")
+  return 0
+}
+
+# One value of the plan: nofile_unit SERVICE / nofile_internal SERVICE
+# (nginx|php|valkey|mariadb|elastic).  Falls back to the 1.22.4 value, so a
+# unit writer never gets an empty LimitNOFILE.
+nofile_unit() {
+  local v="" floor
+  nofile_plan >/dev/null 2>&1 || true
+  case $1 in
+    nginx)   v=$NOFILE_PLAN_NGINX_UNIT;   floor=$NOFILE_FLOOR_NGINX ;;
+    php)     v=$NOFILE_PLAN_PHP_UNIT;     floor=$NOFILE_FLOOR_PHP ;;
+    valkey)  v=$NOFILE_PLAN_VALKEY_UNIT;  floor=$NOFILE_FLOOR_VALKEY ;;
+    mariadb) v=$NOFILE_PLAN_MARIADB_UNIT; floor=$NOFILE_FLOOR_MARIADB ;;
+    elastic) v=$NOFILE_PLAN_ELASTIC_UNIT; floor=$NOFILE_FLOOR_ELASTIC ;;
+    *) return 1 ;;
+  esac
+  [[ $v =~ ^[0-9]+$ ]] || v=$floor
+  printf '%s' "$v"
+}
+
+nofile_internal() {
+  local v="" floor
+  nofile_plan >/dev/null 2>&1 || true
+  case $1 in
+    nginx)   v=$NOFILE_PLAN_NGINX_INTERNAL;   floor=65536 ;;
+    php)     v=$NOFILE_PLAN_PHP_INTERNAL;     floor=$NOFILE_PHP_RLIMIT_FILES ;;
+    valkey)  v=$NOFILE_PLAN_VALKEY_INTERNAL;  floor=10000 ;;
+    mariadb) v=$NOFILE_PLAN_MARIADB_INTERNAL; floor=$NOFILE_MARIADB_OPEN_FILES_FLOOR ;;
+    elastic) v=$NOFILE_PLAN_ELASTIC_INTERNAL; floor=$NOFILE_ELASTIC_MIN ;;
+    *) return 1 ;;
+  esac
+  [[ $v =~ ^[0-9]+$ ]] || v=$floor
+  printf '%s' "$v"
+}
+
+# Managed services present on this host, one word per unit (php once per
+# installed phpX.Y-fpm unit).  NOFILE_PRESENT (space-separated) and
+# NOFILE_UNIT_DIRS are test hooks.
+nofile_present_services() {
+  local d f
+  local -a dirs
+  if [[ -n ${NOFILE_PRESENT+x} ]]; then
+    for f in $NOFILE_PRESENT; do printf '%s\n' "$f"; done
+    return 0
+  fi
+  read -r -a dirs <<< "${NOFILE_UNIT_DIRS:-/etc/systemd/system /lib/systemd/system /usr/lib/systemd/system}"
+  for d in "${dirs[@]}"; do
+    [[ -d $d ]] || continue
+    for f in "$d"/nginx.service "$d"/php*-fpm.service "$d"/valkey-server.service "$d"/redis-server.service \
+             "$d"/mariadb.service "$d"/elasticsearch.service; do
+      [[ -f $f && ! -L $f ]] && printf '%s\n' "${f##*/}"
+    done
+  done | sort -u | while IFS= read -r f; do
+    case $f in
+      nginx.service) printf 'nginx\n' ;;
+      php*-fpm.service) printf 'php\n' ;;
+      valkey-server.service|redis-server.service) printf 'valkey\n' ;;
+      mariadb.service) printf 'mariadb\n' ;;
+      elasticsearch.service) printf 'elastic\n' ;;
+    esac
+  done | awk '$0 != "valkey" || !v++'
+}
+
+# Sum of the unit limits of the present services (for fs.file-max).
+nofile_plan_sum() {
+  local s sum=0
+  nofile_plan >/dev/null 2>&1 || true
+  while IFS= read -r s; do
+    [[ -n $s ]] || continue
+    sum=$(( sum + $(nofile_unit "$s") ))
+  done < <(nofile_present_services)
+  printf '%s' "$sum"
+}
+
+# --optimize report lines: one per present service (unit limit / internal
+# limit), then fs.file-max against the sum.  NOFILE_FILE_MAX is the test hook.
+nofile_plan_report_lines() {
+  local s seen=" " sum fmax=${NOFILE_FILE_MAX:-} php_n=0
+  nofile_plan >/dev/null 2>&1 || true
+  while IFS= read -r s; do
+    [[ $s == php ]] && php_n=$(( php_n + 1 ))
+    [[ -n $s && $seen != *" $s "* ]] || continue
+    seen+="$s "
+  done < <(nofile_present_services)
+  [[ $seen == " " ]] && return 0
+  [[ $seen == *" nginx "* ]] && printf 'LimitNOFILE nginx: unit %s / worker_rlimit_nofile %s (per-worker need %s, %s workers)\n' \
+    "$NOFILE_PLAN_NGINX_UNIT" "$NOFILE_PLAN_NGINX_INTERNAL" "$NOFILE_PLAN_NGINX_NEED" "$NOFILE_PLAN_NGINX_WORKERS"
+  [[ $seen == *" php "* ]] && printf 'LimitNOFILE php-fpm (%s unit%s): unit %s / rlimit_files %s\n' \
+    "$php_n" "$( (( php_n > 1 )) && printf s)" "$NOFILE_PLAN_PHP_UNIT" "$NOFILE_PLAN_PHP_INTERNAL"
+  [[ $seen == *" valkey "* ]] && printf 'LimitNOFILE valkey: unit %s / maxclients %s (+32 reserved)\n' \
+    "$NOFILE_PLAN_VALKEY_UNIT" "$NOFILE_PLAN_VALKEY_INTERNAL"
+  [[ $seen == *" mariadb "* ]] && printf 'LimitNOFILE mariadb: unit %s / open_files_limit %s (need %s)\n' \
+    "$NOFILE_PLAN_MARIADB_UNIT" "$NOFILE_PLAN_MARIADB_INTERNAL" "$NOFILE_PLAN_MARIADB_NEED"
+  [[ $seen == *" elastic "* ]] && printf 'LimitNOFILE elasticsearch: unit %s / bootstrap minimum %s\n' \
+    "$NOFILE_PLAN_ELASTIC_UNIT" "$NOFILE_PLAN_ELASTIC_INTERNAL"
+  sum=$(nofile_plan_sum)
+  if [[ -z $fmax && -r /proc/sys/fs/file-max ]]; then fmax=$(< /proc/sys/fs/file-max); fi
+  if [[ $fmax =~ ^[0-9]+$ ]] && (( fmax < sum )); then
+    printf 'WARN fs.file-max %s is below the sum of the unit limits %s\n' "$fmax" "$sum"
+  else
+    printf 'fs.file-max %s covers the sum of the unit limits %s\n' "${fmax:-unknown}" "$sum"
+  fi
+  return 0
+}
 
 # Disk basis of the cache budget in MB: the size of the cache filesystem,
 # capped at 10x its free space (so a 5% share never exceeds half of what is
@@ -1695,6 +2013,23 @@ plan_install_budget() {
       warn "PHP-FPM keeps ${pool_now} workers (sized without a local database) until the next --optimize or --php run, which sets ${pool_plan} for this host"
     fi
   fi
+}
+
+# MariaDB non-pool memory booked by plan_memory_budget (1.22.5), one line for
+# the --optimize report and the dry run.  Nothing when MariaDB is not planned.
+mariadb_nonpool_summary() {
+  (( ${OPT_MARIADB_NONPOOL_MB:-0} > 0 )) || return 0
+  local fixed
+  fixed=$(mariadb_fixed_nonpool_mb "${OPT_MEM_TOTAL_MB:-0}")
+  printf 'non-pool memory booked %sMB (fixed %sMB + %s active queries x (2.5MB session buffers + tmp_table_size %sMB/2)); PHP workers changed: 0' \
+    "$OPT_MARIADB_NONPOOL_MB" "$fixed" "${OPT_MARIADB_ACTIVE_THREADS:-0}" "${OPT_MARIADB_TMP_MB:-0}"
+  if (( ${OPT_MARIADB_TMP_CAP_MB:-0} > 0 )); then
+    printf '; tmp_table_size/max_heap_table_size capped at %sMB to fit the room PHP leaves' "$OPT_MARIADB_TMP_MB"
+  fi
+  if (( ${OPT_MARIADB_NONPOOL_SHORT_MB:-0} > 0 )); then
+    printf '; %sMB does not fit the room PHP leaves and stays in the 20%% OS margin' "$OPT_MARIADB_NONPOOL_SHORT_MB"
+  fi
+  return 0
 }
 
 # The one-line memory-plan summary used by the installer, --optimize and the
@@ -2089,11 +2424,39 @@ ensure_fastcgi_cache_zone() {
   return 0
 }
 
+# The include line optimize_wordpress_cache inserts by default (the marker
+# is what SETUP_WP_GUEST_CACHE=0 removes again).
+WP_GUEST_CACHE_MARKED_INCLUDE='include h5bp/wordpress_cache.conf; # added by setup.sh (SETUP_WP_GUEST_CACHE=0 disables)'
+wp_guest_cache_remove_marked() { # target vhost...
+  local target=$1 vhost tmp
+  shift
+  for vhost in "$@"; do
+    [[ -f $vhost ]] || continue
+    grep -qF -- "$WP_GUEST_CACHE_MARKED_INCLUDE" "$vhost" || continue
+    tmp=$(tmp_file) || return 0
+    awk -v m="$WP_GUEST_CACHE_MARKED_INCLUDE" '
+      { line = $0; sub(/^[[:space:]]+/, "", line); sub(/[[:space:]]+$/, "", line) }
+      line == m { next }
+      { print }
+    ' "$vhost" > "$tmp" || continue
+    if commit_if_changed "$vhost" "$tmp"; then
+      tune_note "${vhost#"${target}"/}: wordpress_cache include added by setup.sh removed (SETUP_WP_GUEST_CACHE=0)"
+    fi
+  done
+  return 0
+}
+
 optimize_wordpress_cache() {
   local target=${1:-/etc/nginx}
   local -a wp_vhosts=()
   mapfile -t wp_vhosts < <(nginx_wordpress_vhosts "$target")
   (( ${#wp_vhosts[@]} > 0 )) || return 0
+  # SETUP_WP_GUEST_CACHE=0 undoes what an earlier default run added: only
+  # the exact marked line setup.sh inserts goes, never an operator's own
+  # include (or the template's unmarked one).
+  if [[ ${SETUP_WP_GUEST_CACHE:-1} == 0 ]]; then
+    wp_guest_cache_remove_marked "$target" "${wp_vhosts[@]}"
+  fi
 
   local -a wp_active=()
   mapfile -t wp_active < <(nginx_active_http_files "$target")
@@ -2140,6 +2503,16 @@ optimize_wordpress_cache() {
   done
   local include_ready=0
   (( ${#wp_enabled[@]} > 0 )) && include_ready=1
+  # Opted out and no vhost still includes the cache: report it and stop
+  # before the zone, map and snippet installs (the opt-out never creates
+  # them on a host that lacks them; existing ones stay, inert).
+  if [[ ${SETUP_WP_GUEST_CACHE:-1} == 0 ]] && (( include_ready == 0 )); then
+    opt_report "- WordPress: FastCGI guest cache disabled (SETUP_WP_GUEST_CACHE=0)"
+    for vhost in "${wp_optout[@]}"; do
+      opt_report "- WordPress: \`${vhost#"${target}"/}\` has no wordpress_cache include (guest cache disabled by SETUP_WP_GUEST_CACHE=0)"
+    done
+    return 0
+  fi
 
   if (( active_zone && active_map && include_ready )) \
      && [[ -f "${target}/h5bp/wordpress_cache.conf" ]] \
@@ -2192,7 +2565,7 @@ optimize_wordpress_cache() {
   if [[ ${SETUP_WP_GUEST_CACHE:-1} == 1 ]]; then
     for vhost in "${wp_optout[@]}"; do
       if tune_insert_before "$vhost" '^[[:space:]]*include[[:space:]]+h5bp/php_wp\.conf;' \
-           '    include h5bp/wordpress_cache.conf; # added by setup.sh (SETUP_WP_GUEST_CACHE=0 disables)' \
+           "    ${WP_GUEST_CACHE_MARKED_INCLUDE}" \
            "${vhost#"${target}"/}: wordpress_cache include added"; then
         wp_enabled+=("$vhost")
         changed=1
@@ -2526,7 +2899,17 @@ ensure_xf_guest_cache() {
 # wp-config.php and XenForo's src/config.php, so the report gives the exact
 # settings needed for persistent MariaDB connections and the local Valkey
 # socket.
+# The configured unixsocket of valkey.conf (else redis.conf) comes first
+# (1.22.5): an operator socket such as /run/valkey/cache.sock was flagged as
+# "not the local socket" and the report pointed at a path that did not
+# exist.  APP_CACHE_CONFS is a test hook.
+APP_CACHE_CONFS=${APP_CACHE_CONFS:-/etc/valkey/valkey.conf /etc/redis/redis.conf}
 app_cache_socket_hint() {
+  local conf s
+  for conf in $APP_CACHE_CONFS; do
+    s=$(valkey_conf_get "$conf" unixsocket 2>/dev/null || true)
+    if [[ $s == /* ]]; then printf '%s' "$s"; return 0; fi
+  done
   if [[ -f /etc/valkey/valkey.conf || -S /run/valkey/valkey.sock ]]; then
     printf '/run/valkey/valkey.sock'
   elif [[ -f /etc/redis/redis.conf || -S /run/redis/redis.sock ]]; then
@@ -2536,11 +2919,15 @@ app_cache_socket_hint() {
   fi
 }
 
+# The default socket names, the configured socket (app_cache_socket_hint)
+# or any path that is a live Unix socket.
 app_is_socket_path() {
+  local p=${1#unix://}
   case "$1" in
     */valkey.sock|*/redis.sock|unix://*) return 0 ;;
-    *) return 1 ;;
   esac
+  [[ $p == /* ]] || return 1
+  [[ $p == "$(app_cache_socket_hint)" || -S $p ]]
 }
 
 wp_db_host_from_config() {

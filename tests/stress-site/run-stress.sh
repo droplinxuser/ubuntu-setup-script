@@ -65,7 +65,7 @@ echo "Collecting pre-test state..." >&2
 FREE_BEFORE=$(free -m | awk '/^Mem:/{printf "%s/%s MB used", $3, $2}')
 LOAD_BEFORE=$(awk '{print $1}' /proc/loadavg)
 FPM_BEFORE=$(curl_nginx /fpm-status.php | tr '\n' ';')
-VK_BEFORE=$(valkey-cli INFO stats | grep -E 'instantaneous_ops_per_sec|total_commands_processed|evicted_keys|rejected_connections' | tr '\n' ';')
+VK_BEFORE=$(valkey-cli -s "${STRESS_VALKEY_SOCKET:-/run/valkey/valkey.sock}" INFO stats | grep -E 'instantaneous_ops_per_sec|total_commands_processed|evicted_keys|rejected_connections' | tr '\n' ';')
 DB_BEFORE=$(sql "SHOW GLOBAL STATUS WHERE Variable_name IN ('Questions','Threads_connected','Threads_running','Max_used_connections','Slow_queries','Aborted_connects')" | tr '\n' ';')
 ES_BEFORE=$(curl -fsS 'http://127.0.0.1:9200/_nodes/stats/jvm,indices?filter_path=nodes.*.jvm.mem.heap_used_in_bytes,nodes.*.jvm.gc.collectors.young.collection_count,nodes.*.indices.search.query_total' | jq -c .)
 
@@ -107,7 +107,7 @@ cat "$TMP/table.md" >>"$REPORT"
 FREE_AFTER=$(free -m | awk '/^Mem:/{printf "%s/%s MB used", $3, $2}')
 LOAD_AFTER=$(awk '{print $1}' /proc/loadavg)
 FPM_AFTER=$(curl_nginx /fpm-status.php | tr '\n' ';')
-VK_AFTER=$(valkey-cli INFO stats | grep -E 'instantaneous_ops_per_sec|total_commands_processed|evicted_keys|rejected_connections' | tr '\n' ';')
+VK_AFTER=$(valkey-cli -s "${STRESS_VALKEY_SOCKET:-/run/valkey/valkey.sock}" INFO stats | grep -E 'instantaneous_ops_per_sec|total_commands_processed|evicted_keys|rejected_connections' | tr '\n' ';')
 DB_AFTER=$(sql "SHOW GLOBAL STATUS WHERE Variable_name IN ('Questions','Threads_connected','Threads_running','Max_used_connections','Slow_queries','Aborted_connects')" | tr '\n' ';')
 ES_AFTER=$(curl -fsS 'http://127.0.0.1:9200/_nodes/stats/jvm,indices?filter_path=nodes.*.jvm.mem.heap_used_in_bytes,nodes.*.jvm.gc.collectors.young.collection_count,nodes.*.indices.search.query_total' | jq -c .)
 

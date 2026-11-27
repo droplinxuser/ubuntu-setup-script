@@ -3,14 +3,16 @@
 #
 # A lean nginx built from upstream sources only: nginx from nginx.org (PGP
 # signature checked against the nginx.org keys pinned in build-common.sh),
-# OpenSSL, PCRE2 (JIT), zlib-ng, Brotli (google/brotli + google/ngx_brotli's filter
+# AWS-LC, PCRE2 (JIT), zlib-ng, Brotli (google/brotli + google/ngx_brotli's filter
 # module, compiled in statically) from their own releases at the versions in
 # nginx-build.conf ("latest" by default; nginx's latest is the mainline),
 # compiled with clang from apt.llvm.org at -O3 -march=native with Ubuntu's
-# hardening flags, OpenSSL, PCRE2 and zlib-ng linked statically, ThinLTO,
-# then rewritten by LLVM BOLT from a perf sample of live traffic.  Measured
-# on the test host (1.21.70, same recipe): cached guest pages +2.2 to +12.4 %
-# with BOLT (+3.6 to +6.1 % before it); gzip CPU per page -21 % (zlib-ng).
+# hardening flags, AWS-LC, PCRE2 and zlib-ng linked statically (ThinLTO for
+# AWS-LC, zlib-ng, Brotli and nginx; PCRE2 is built by nginx's configure
+# at the same -O3 -march=native flags without LTO), then rewritten by LLVM
+# BOLT from a perf sample of live traffic.  Measured on the test host
+# (1.21.70, same recipe): cached guest pages +2.2 to +12.4 % with BOLT
+# (+3.6 to +6.1 % before it); gzip CPU per page -21 % (zlib-ng).
 #
 # Lean: only what server-configs-nginx uses: the http core with SSL, HTTP/2,
 # HTTP/3 (QUIC), realip, stub_status (the metrics script polls it on
@@ -69,7 +71,7 @@
 # Usage (root):
 #   nginx-build.sh build | build-only   build + verify into ROOT/staging (prints its path)
 #   nginx-build.sh build-arm DIR        benchmark build into DIR/sbin/nginx, never activated
-#                                       (TLS_LIB / KTLS arms: see nginx-build.conf)
+#                                       (version arms: see nginx-build.conf)
 #   nginx-build.sh activate             swap staging in (in-place upgrade, or start)
 #   nginx-build.sh bolt [S]             sample S seconds (default 60) of traffic, BOLT
 #   nginx-build.sh rebuild              build, activate, wait for traffic, bolt
@@ -111,9 +113,9 @@ BUILD_COMMON=${NGINX_BUILD_COMMON:-$(dirname "$SELF")/build-common.sh}
 BUILD_RECIPE=5
 NGINX_FALLBACK_DEFAULT=1.31.10
 if [[ $CI == 1 ]]; then
-  COMPONENTS=(nginx openssl pcre2 zlib-ng brotli ngx-brotli)
+  COMPONENTS=(nginx aws-lc pcre2 zlib-ng brotli ngx-brotli)
 else
-  COMPONENTS=(nginx llvm openssl pcre2 zlib-ng brotli ngx-brotli)
+  COMPONENTS=(nginx llvm aws-lc pcre2 zlib-ng brotli ngx-brotli)
 fi
 declare -A VERS=()
 # Ubuntu libraries the build must not link (they are compiled in).
@@ -158,37 +160,67 @@ conf_value() { # key default
   printf '%s' "${v:-$2}"
 }
 
-# The TLS library (TLS_LIB / NGINX_BUILD_TLS_LIB, KTLS / NGINX_BUILD_KTLS in
-# nginx-build.conf).  openssl without kTLS is the fleet build; aws-lc and
-# boringssl (benchmark arms) take openssl's place in COMPONENTS, so their
-# version is resolved, recorded and checked like any other component.
-# AWS-LC and BoringSSL lack BIO_get_ktls_send: KTLS=1 is ignored for them.
-tls_setup() { # lib ktls
-  local i
-  TLS_LIB=${1:-openssl}; KTLS=${2:-0}; KTLS_IGNORED=0
-  case $TLS_LIB in openssl|aws-lc|boringssl) ;; *) die "TLS_LIB=$TLS_LIB: expected openssl, aws-lc or boringssl" ;; esac
-  case $KTLS in 0|1) ;; *) die "KTLS=$KTLS: expected 0 or 1" ;; esac
-  if [[ $KTLS == 1 && $TLS_LIB != openssl ]]; then KTLS=0; KTLS_IGNORED=1; fi
-  for i in "${!COMPONENTS[@]}"; do
-    case ${COMPONENTS[i]} in openssl|aws-lc|boringssl) COMPONENTS[i]=$TLS_LIB ;; esac
+# The TLS library (TLS_LIB / NGINX_BUILD_TLS_LIB in nginx-build.conf):
+# AWS-LC is the only one since 1.22.5 (built first with cmake + ninja and
+# linked like a system library; its version is resolved, recorded and
+# checked like any other component).
+# An invalid value never dies here (1.22.5): this runs for every command,
+# `pre` (nginx.service ExecStartPre) included, so it is recorded in
+# CONF_INVALID and the default is used; build and check refuse it
+# (conf_invalid_die), pre and status only warn.
+# A value or option removed in 1.22.5 (TLS_LIB=openssl|boringssl, MALLOC,
+# BOLT_NOLBR) is not invalid: it is noted in CONF_REMOVED, warned about once
+# (below) and the default is used; build and check go on, and `check`
+# reports a build made with it stale.
+CONF_INVALID=""
+CONF_REMOVED=""
+conf_invalid_die() { [[ -z $CONF_INVALID ]] || die "nginx-build.conf: ${CONF_INVALID%; }"; }
+tls_setup() { # lib
+  TLS_LIB=${1:-aws-lc}
+  case $TLS_LIB in
+    aws-lc) ;;
+    # XenForo on the test host (1.22.5): cached pages 2-5 % slower than
+    # aws-lc (uncached within noise), and more nginx memory under load.
+    openssl) CONF_REMOVED+="TLS_LIB=openssl|measured 2-5 % slower on cached XenForo pages and more nginx memory than aws-lc|aws-lc;"; TLS_LIB=aws-lc ;;
+    # Measured below aws-lc on the cached tier, no OCSP stapling, one
+    # certificate per server block.
+    boringssl) CONF_REMOVED+="TLS_LIB=boringssl|measured slower than aws-lc, no OCSP stapling|aws-lc;"; TLS_LIB=aws-lc ;;
+    *) CONF_INVALID+="TLS_LIB=$TLS_LIB: expected aws-lc; "; TLS_LIB=aws-lc ;;
+  esac
+}
+tls_setup "${NGINX_BUILD_TLS_LIB:-$(conf_value TLS_LIB aws-lc)}"
+
+# nginx always links glibc's malloc: MALLOC=mimalloc|jemalloc measured
+# within noise of it on every tier and was removed in 1.22.5 (a build that
+# recorded another malloc= is stale).  BOLT_NOLBR=1 (a plain-cycles BOLT
+# profile where perf has no branch samples) measured 3-4 % slower than no
+# BOLT and was removed too.  A conf or environment that still sets either
+# only draws the warning.
+CONF_MALLOC=${NGINX_BUILD_MALLOC:-$(conf_value MALLOC glibc)}
+[[ $CONF_MALLOC == glibc ]] || CONF_REMOVED+="MALLOC=$CONF_MALLOC|measured within noise of glibc|glibc;"
+CONF_NOLBR=${NGINX_BUILD_BOLT_NOLBR:-$(conf_value BOLT_NOLBR 0)}
+[[ $CONF_NOLBR == 0 ]] || CONF_REMOVED+="BOLT_NOLBR=$CONF_NOLBR|plain-cycles BOLT measured slower than no BOLT|no BOLT without branch samples;"
+unset CONF_MALLOC CONF_NOLBR
+# One warning per option per run (say: stderr and the journal).
+conf_removed_warn() {
+  local e what why def
+  local -a items=()
+  IFS=';' read -r -a items <<<"$CONF_REMOVED"
+  for e in ${items[@]+"${items[@]}"}; do
+    IFS='|' read -r what why def <<<"$e"
+    opt_removed "nginx: $what" "$why" "$def"
   done
 }
-tls_setup "${NGINX_BUILD_TLS_LIB:-$(conf_value TLS_LIB openssl)}" "${NGINX_BUILD_KTLS:-$(conf_value KTLS 0)}"
+conf_removed_warn
 
-# --with-openssl-opt without the compiler flags.  The default (no kTLS) is
-# exactly the string of recipe 5.
-openssl_opt() {
-  local k=""
-  [[ $KTLS == 1 ]] && k="enable-ktls "
-  printf '%s' "no-shared no-tests no-docs no-apps no-legacy no-module enable-ec_nistp_64_gcc_128 --openssldir=/usr/lib/ssl ${k}$OPENSSL_TRIM"
-}
-
-# build.info tls_opts=: changes with the library, kTLS and the OpenSSL options
-# (OPENSSL_TRIM), so switching any of them makes `check` report the build stale.
-tls_key() { # lib ktls
-  local o=$1
-  [[ $1 == openssl ]] && o+=" ktls=$2 $(KTLS=$2 openssl_opt)"
-  printf '%s' "$o" | sha256sum | cut -c1-16
+# build.info tls_opts=: the hash of the library name.  An aws-lc build keeps
+# the key it recorded before 1.22.5 (sha256 of "aws-lc"), so it is not
+# rebuilt; an openssl build (its key also hashed ktls=0 and the
+# OpenSSL configure options), a BoringSSL build or one with no tls_opts=
+# (before the TLS arms, always openssl) keys differently and is reported
+# stale by `check`, then rebuilt on AWS-LC.
+tls_key() { # lib
+  printf '%s' "$1" | sha256sum | cut -c1-16
 }
 
 resolve_all() {
@@ -501,14 +533,13 @@ build_deps() { # work jobs cflags: Brotli's static libraries for the static ngx_
   ln -sfn ../deps "$nb/filter/deps"
 }
 
-# TLS_LIB=aws-lc|boringssl: static libssl.a/libcrypto.a and the headers in
+# AWS-LC: static libssl.a/libcrypto.a and the headers in
 # WORK/tls-prefix, same compiler and flags as nginx (ThinLTO on hosts).  Only
 # the two libraries are built (no tests, tools, Go or Perl); -Wno-error in the
 # Release flags, which come after the projects' own -Werror.
 tls_lib_build() { # work jobs cflags
   local work=$1 j=$2 f=$3 src=$1/$TLS_LIB pre=$1/tls-prefix bld l
-  local -a opts=()
-  [[ $TLS_LIB == aws-lc ]] && opts=(-DDISABLE_GO=ON -DDISABLE_PERL=ON -DBUILD_TOOL=OFF)
+  local -a opts=(-DDISABLE_GO=ON -DDISABLE_PERL=ON -DBUILD_TOOL=OFF)
   fetch_unpack "$TLS_LIB" "${VERS[$TLS_LIB]}" "$src"
   bld=$src/out
   cmake -S "$src" -B "$bld" -G Ninja -DCMAKE_BUILD_TYPE=Release \
@@ -574,15 +605,15 @@ nginx_source() { # version src
 # build: resolve (or, for "cpu", read build.info), fetch, patch, compile,
 # verify, stage in ROOT/staging.  Nothing that serves changes.
 cmd_build() { # [normal|cpu]
-  local how=${1:-normal} work src n j line flags ld lto="" fb fail="" stamp
+  local how=${1:-normal} work src n j line flags ld lto="" fb fail="" stamp rec
   # CI runners build as an ordinary user (ensure_packages uses sudo there).
   host_mode && need_root
-  ensure_packages ca-certificates curl git xz-utils bzip2 make cmake perl gpgv binutils autoconf automake libtool build-essential
-  # CPU-change rebuild: the TLS library and kTLS build.info recorded.
-  [[ $how == cpu ]] && tls_setup "$(info_get tls_lib)" "$(info_get ktls)"
-  # AWS-LC / BoringSSL: cmake + ninja (g++'s libstdc++ comes with build-essential).
-  [[ $TLS_LIB == openssl ]] || ensure_packages ninja-build
-  (( KTLS_IGNORED == 0 )) || say "nginx build: KTLS=1 ignored: $TLS_LIB has no kTLS support (BIO_get_ktls_send)"
+  ensure_packages ca-certificates curl git xz-utils bzip2 make cmake ninja-build perl gpgv binutils autoconf automake libtool build-essential
+  # CPU-change rebuild: the conf's values, valid or not, do not apply to it.
+  # The TLS library is always AWS-LC (1.22.5); a build that recorded another
+  # one (openssl, boringssl, or none before the TLS arms) is rebuilt on it.
+  if [[ $how == cpu ]]; then CONF_INVALID=""; fi
+  conf_invalid_die
   mkdir -p "$SRC_CACHE/src" "$LOGS"; chmod 700 "$SRC_CACHE"
   host_mode && build_space_check "$SRC_CACHE"
   build_deprioritize
@@ -595,6 +626,14 @@ cmd_build() { # [normal|cpu]
     # lookup; the same version patches with the same counts.
     for line in "${COMPONENTS[@]}"; do
       n=$(info_get "$line")
+      # A build on a TLS library removed in 1.22.5 (openssl, boringssl;
+      # openssl when none is recorded) recorded no aws-lc=: its version is
+      # resolved (the cached lookup, else upstream).
+      rec=$(info_get tls_lib); rec=${rec:-openssl}
+      if [[ -z $n && $line == aws-lc && $rec != aws-lc ]]; then
+        n=$(resolve aws-lc) || n=""
+        if [[ -n $n ]]; then say "nginx: the recorded TLS library $rec was removed in 1.22.5; rebuilding with aws-lc $n"; fi
+      fi
       [[ -n $n ]] || die "build.info records no $line version; run setup.sh --optimize"
       VERS[$line]=$n
     done
@@ -656,19 +695,10 @@ cmd_build() { # [normal|cpu]
   else
     rm -f "$SKIP_FILE"
   fi
-  # The TLS library: OpenSSL compiled in by nginx's configure (--with-openssl),
-  # or AWS-LC / BoringSSL built first and linked like a system library
-  # (-I/-L, static archives only; their libssl is C++, hence -lstdc++).
-  local tls_cc="" tls_ld=""
-  local -a tls_cfg=()
-  if [[ $TLS_LIB == openssl ]]; then
-    fetch_unpack openssl "${VERS[openssl]}" "$work/openssl"
-    tls_cfg=(--with-openssl="$work/openssl" --with-openssl-opt="$(openssl_opt) $flags")
-  else
-    tls_lib_build "$work" "$j" "$flags $lto" || { log_excerpt "$LOG_FILE" 30; die "$TLS_LIB failed to build (log: $LOG_FILE)"; }
-    tls_cc=" -I$work/tls-prefix/include"
-    tls_ld=" -L$work/tls-prefix/lib -lssl -lcrypto -lstdc++"
-  fi
+  # The TLS library: AWS-LC built first and linked like a system library
+  # (-I/-L, static archives only; its libssl is C++, hence -lstdc++).
+  tls_lib_build "$work" "$j" "$flags $lto" || { log_excerpt "$LOG_FILE" 30; die "$TLS_LIB failed to build (log: $LOG_FILE)"; }
+  local tls_cc=" -I$work/tls-prefix/include" tls_ld=" -L$work/tls-prefix/lib -lssl -lcrypto -lstdc++"
   fetch_unpack pcre2 "${VERS[pcre2]}" "$work/pcre2"
   # zlib-ng with zlib's API (1.21.70: gzip CPU per XenForo page -21 % against
   # Ubuntu's zlib, -19 % against zlib 1.4), built first and linked in through
@@ -689,15 +719,10 @@ cmd_build() { # [normal|cpu]
     ./configure "${cfg[@]}" \
       --with-cc="$CC" --with-cc-opt="$flags $lto -I$work/zlib-ng$tls_cc" --with-ld-opt="$ld -L$work/zlib-ng$tls_ld" \
       "${CONFIGURE_MODULES[@]}" \
-      ${tls_cfg[@]+"${tls_cfg[@]}"} \
       --with-pcre="$work/pcre2" --with-pcre-jit --with-pcre-opt="$flags" \
       --add-module="$work/ngx_brotli/filter"
     nice -n 10 make -j"$j"
   ) >> "$LOG_FILE" 2>&1 || { log_excerpt "$LOG_FILE" 40; die "nginx ${VERS[nginx]} failed to build (log: $LOG_FILE)"; }
-  # OpenSSL's Configure drops kTLS silently when its linux/tls.h probe fails.
-  if [[ $KTLS == 1 ]] && grep -q 'define OPENSSL_NO_KTLS' "$work/openssl/.openssl/include/openssl/configuration.h"; then
-    die "OpenSSL ${VERS[openssl]} was configured without kTLS (KTLS=1; log: $LOG_FILE)"
-  fi
   verify_binary "$src/objs/nginx"
   rm -rf "$STAGING"
   install -d -m 755 "$STAGING/sbin"
@@ -715,7 +740,7 @@ cmd_build() { # [normal|cpu]
   {
     printf 'recipe=%s\n' "$BUILD_RECIPE"
     for line in "${COMPONENTS[@]}"; do printf '%s=%s\n' "$line" "${VERS[$line]}"; done
-    printf 'tls_lib=%s\nktls=%s\ntls_opts=%s\n' "$TLS_LIB" "$KTLS" "$(tls_key "$TLS_LIB" "$KTLS")"
+    printf 'tls_lib=%s\ntls_opts=%s\n' "$TLS_LIB" "$(tls_key "$TLS_LIB")"
     printf 'patched_ok=%s\n' "${VERS[nginx]}"
     [[ -n $fail ]] && printf 'fallback_from=%s\n' "$fail"
     printf 'compiler=%s\n' "$("$CC" --version | sed -n 1p)"
@@ -755,11 +780,9 @@ verify_binary() { # binary
   v=$("$cand" -V 2>&1 || true)
   [[ $v == *--add-module=*ngx_brotli* ]] || die "candidate has no static ngx_brotli (nginx -V lacks --add-module=...ngx_brotli)"
   [[ $v == *--with-http_stub_status_module* ]] || die "candidate has no stub_status"
-  # "built with OpenSSL 1.1.1 (compatible; AWS-LC x.y.z | BoringSSL)"
-  case $TLS_LIB in
-    aws-lc)    [[ $v == *AWS-LC* ]] || die "candidate is not built with AWS-LC" ;;
-    boringssl) [[ $v == *BoringSSL* ]] || die "candidate is not built with BoringSSL" ;;
-  esac
+  # "built with OpenSSL 1.1.1 (compatible; AWS-LC x.y.z)": AWS-LC is the only
+  # TLS library (1.22.5), never an OpenSSL picked up by mistake.
+  [[ $v == *AWS-LC* ]] || die "candidate is not built with AWS-LC"
   branding_check "$cand" || die "candidate failed the branding check (log: $LOG_FILE)"
   if live_test_enabled; then
     apply_tmpfiles
@@ -921,11 +944,12 @@ cmd_pre() {
   local built now
   [[ -x $SBIN/nginx ]] || die "no nginx build in $SBIN (run setup.sh --optimize)"
   built=$(info_get cpu); now=$(cpu_fingerprint)
-  if ! cpu_fingerprint_matches "$built"; then
+  if ! cpu_fingerprint_matches "$built" "$(info_get cpu_info)"; then
     say "nginx: built for CPU ${built:-unknown}, this CPU is ${now:-unknown}: staying down until setup-build-cpu.service has rebuilt it"
     systemctl start --no-block setup-build-cpu.service >/dev/null 2>&1 || true
     exit 1
   fi
+  [[ -z $CONF_INVALID ]] || say "nginx: nginx-build.conf: ${CONF_INVALID%; } (ignored here; the next build refuses it)"
   apply_tmpfiles
   conf_test "$SBIN/nginx" >/dev/null && return 0
   fit_config "$SBIN/nginx" && return 0
@@ -947,7 +971,7 @@ php_upstreams_up() {
 }
 
 cmd_bolt() {
-  local secs=${1:-60} n perf work p2b bolt samples base=$SBIN/nginx.lto info stamp
+  local secs=${1:-60} n perf work p2b bolt samples base=$SBIN/nginx.lto info stamp rc
   need_root
   host_mode || die "no BOLT in CI mode"
   [[ -f $base ]] || die "no build to BOLT"
@@ -978,8 +1002,21 @@ cmd_bolt() {
     swap_in "$work/nginx.lto-run" "" "$work/build.info"
   fi
   say "nginx: sampling for ${secs}s for BOLT (log: $LOG_FILE)"
-  "$perf" record -q -e cycles:u -j any,u -o "$work/perf.data" -a -- sleep "$secs" > "$work/perf.log" 2>&1 \
-    || { cat "$work/perf.log" >> "$LOG_FILE" 2>/dev/null; perf_record_die "$work/perf.log"; }
+  # Branch records (LBR) unless this host has none (bolt_record, 1.22.5):
+  # bolt=nolbr / noperf then stop the refresh and the --optimize retry until
+  # the next build.
+  rc=0; bolt_record "$perf" "$work/perf.data" "$work/perf.log" "$secs" || rc=$?
+  cat "$work/perf.log" >> "$LOG_FILE" 2>/dev/null || true
+  case $rc in
+    0) ;;
+    4) info_put "$STATE/build.info" bolt nolbr
+       say "nginx: no branch samples on this host (a VM or a CPU without LBR); BOLT skipped until the next build (bolt=nolbr)"
+       return 3 ;;
+    5) info_put "$STATE/build.info" bolt noperf
+       say "nginx: perf cannot sample on this host; BOLT skipped until the next build (bolt=noperf)"
+       return 3 ;;
+    *) perf_record_die "$work/perf.log" ;;
+  esac
   # No nginx samples at all (an idle server, e.g. a fresh install with no
   # site yet): perf2bolt fails with "Please rename the input binary".  That
   # is too little traffic, not an error (1.22.0 fresh-install test).
@@ -1009,7 +1046,9 @@ cmd_bolt() {
   install -m 600 "$work/nginx.fdata" "$STATE/nginx.fdata"
   install_stripped "$work/nginx.bolt" "$work/nginx.run"
   info=$work/build.info.bolt
-  sed 's/^bolt=.*/bolt=1/' "$STATE/build.info" > "$info"
+  # A bolt_mode= left by the removed plain-cycles profile goes: this one is
+  # a branch-record profile.
+  sed -e 's/^bolt=.*/bolt=1/' -e '/^bolt_mode=/d' "$STATE/build.info" > "$info"
   swap_in "$work/nginx.run" "" "$info"
   rm -f "$STATE/build.info.prev"
   say "nginx: BOLT applied from ${samples} profiled functions"
@@ -1034,7 +1073,7 @@ cmd_rebuild() { # build, activate, let traffic warm up, then BOLT
 cmd_rebuild_cpu() {
   need_root
   [[ -f $STATE/build.info ]] || die "no build.info in $STATE: nothing to rebuild (run setup.sh --optimize)"
-  if [[ -x $SBIN/nginx ]] && cpu_fingerprint_matches "$(info_get cpu)"; then
+  if [[ -x $SBIN/nginx ]] && cpu_fingerprint_matches "$(info_get cpu)" "$(info_get cpu_info)"; then
     say "nginx: the build already matches this CPU"; return 0
   fi
   BUILD_OFFLINE=1
@@ -1062,17 +1101,27 @@ cache_ensure() {
 cmd_check() { # [info]
   local info=${1:-$STATE/build.info} name want have stale="" rc=0 bcpu skip n
   [[ -f $info ]] || { echo "no build"; return 10; }
+  conf_invalid_die
   [[ $(info_get recipe "$info") == "$BUILD_RECIPE" ]] || stale+="recipe $(info_get recipe "$info") -> $BUILD_RECIPE, "
   [[ $(info_get ci "$info") != 1 ]] || stale+="CI build, "
-  # A build.info without tls_opts= (before the TLS arms) is the default openssl build.
-  have=$(info_get tls_opts "$info"); [[ -n $have ]] || have=$(tls_key openssl 0)
-  want=$(tls_key "$TLS_LIB" "$KTLS")
+  # The TLS library: a build.info without tls_opts= (before the TLS arms,
+  # always openssl) or with an openssl/BoringSSL key is stale (1.22.5: AWS-LC
+  # only) and is rebuilt on AWS-LC.
+  have=$(info_get tls_opts "$info")
+  want=$(tls_key "$TLS_LIB")
   if [[ $have != "$want" ]]; then
-    have=$(info_get tls_lib "$info"); n=$(info_get ktls "$info")
-    stale+="TLS options ${have:-openssl}/ktls=${n:-0} -> $TLS_LIB/ktls=$KTLS, "
+    have=$(info_get tls_lib "$info")
+    stale+="TLS options ${have:-openssl} -> $TLS_LIB, "
   fi
+  # Options removed in 1.22.5: a build made with another allocator than
+  # glibc's (MALLOC=, none recorded before 1.22.5) or BOLTed from the
+  # plain-cycles profile (bolt_mode=nolbr) is rebuilt on the default.  An
+  # OpenSSL or BoringSSL build is stale through tls_opts= above.
+  n=$(info_get malloc "$info")
+  [[ ${n:-glibc} == glibc ]] || stale+="malloc $n -> glibc (removed in 1.22.5), "
+  [[ $(info_get bolt_mode "$info") != nolbr ]] || stale+="BOLT profile without branch samples (removed in 1.22.5), "
   bcpu=$(info_get cpu "$info")
-  cpu_fingerprint_matches "$bcpu" || stale+="cpu ${bcpu:-unknown} -> $(cpu_fingerprint), "
+  cpu_fingerprint_matches "$bcpu" "$(info_get cpu_info "$info")" || stale+="cpu ${bcpu:-unknown} -> $(cpu_fingerprint), "
   n=$(info_get llvm "$info")
   if [[ -n $n && ! -x /usr/lib/llvm-$n/bin/clang && ! -x $LLVM_OPT/$n/bin/clang ]]; then stale+="LLVM $n missing, "; fi
   skip=$(cat "$SKIP_FILE" 2>/dev/null || true)
@@ -1114,7 +1163,9 @@ cmd_refresh() {
     fi
     sleep "${NGINX_BUILD_BOLT_DELAY:-300}"
     self bolt 60 || true
-  elif [[ $(info_get bolt) != 1 ]] && master_pid >/dev/null; then
+  elif bolt_retry_due "$(info_get bolt)" && master_pid >/dev/null; then
+    # (bolt=nolbr / noperf: this host cannot record the profile; not
+    # retried until the next build.)
     self bolt 60 || true
   fi
   return 0
@@ -1123,7 +1174,7 @@ cmd_refresh() {
 # build-arm DIR: a benchmark build into its own prefix, never activated.
 # A child `build` with NGINX_BUILD_ROOT=DIR (so --prefix/--sbin-path are DIR,
 # the staging is DIR/staging), this nginx-build.conf (or NGINX_BUILD_CONF,
-# e.g. one per arm with its own OPENSSL_VERSION / TLS_LIB / KTLS), no live
+# e.g. one per arm with its own AWS_LC_VERSION / NGINX_VERSION), no live
 # configuration test (`build` never touches the link); then DIR/sbin/nginx.
 # Nothing under ROOT changes and nothing is started.  An arm whose non-TLS
 # components differ from the live build (or that fell back) gets a warning:
@@ -1153,7 +1204,7 @@ cmd_build_arm() { # dir
 cmd_status() {
   local cpu="match" pid
   if [[ -f $STATE/build.info ]]; then
-    cpu_fingerprint_matches "$(info_get cpu)" || cpu="MISMATCH (rebuild pending)"
+    cpu_fingerprint_matches "$(info_get cpu)" "$(info_get cpu_info)" || cpu="MISMATCH (rebuild pending)"
     pid=$(master_pid || true)
     printf 'nginx: build %s (clang %s, recipe %s), bolt=%s, cpu %s, %s\n' \
       "$(info_get nginx)" "$(info_get llvm)" "$(info_get recipe)" "$(info_get bolt)" "$cpu" \
@@ -1162,6 +1213,7 @@ cmd_status() {
     printf 'nginx: no build in %s\n' "$ROOT"
   fi
   [[ -f $STAGING/build.info ]] && printf 'nginx: staged %s (not active yet)\n' "$(info_get nginx "$STAGING/build.info")"
+  [[ -z $CONF_INVALID ]] || printf "nginx: nginx-build.conf: %s (ignored: build and check refuse it)\n" "${CONF_INVALID%; }"
   return 0
 }
 

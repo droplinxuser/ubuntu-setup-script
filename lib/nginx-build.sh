@@ -102,7 +102,7 @@ ExecReload=${NGINX_ROOT}/sbin/nginx -t -q
 ExecReload=/bin/kill -s HUP \$MAINPID
 ExecStop=/bin/kill -s QUIT \$MAINPID
 TimeoutStopSec=30
-LimitNOFILE=524288
+LimitNOFILE=$(nofile_unit nginx 2>/dev/null || printf 524288)
 UMask=0027
 
 [Install]
@@ -508,7 +508,12 @@ nginx_build_ensure() {
         need=1
       else
         chk=$("$NGINX_BUILD_TOOL" check 2>/dev/null) || rc=$?
-        if (( rc == 10 )); then need=1; "$out" "- nginx: build ${chk}"; fi
+        if (( rc == 10 )); then need=1; "$out" "- nginx: build ${chk}"
+        elif (( rc != 0 )); then
+          # 1.22.5: e.g. an invalid TLS_LIB in nginx-build.conf;
+          # the installed build keeps serving.
+          "$out" "- **FAILED: nginx: the build check failed (exit $rc: $("$NGINX_BUILD_TOOL" check 2>&1 >/dev/null | grep -m1 'ERROR:' | sed 's/^ERROR: //')); the installed build keeps serving**"
+        fi
         rc=0
       fi
       nginx_build_install_units "$context"
@@ -561,16 +566,29 @@ _nginx_build_ensure_running() { # context out
   return 1
 }
 
+# build.info bolt= of the active build (0, 1, nolbr, noperf).
+_nginx_build_bolt_state() { awk -F= '$1 == "bolt" { print $2; exit }' "${NGINX_ROOT}/build/build.info" 2>/dev/null || true; }
+
 # BOLT under live traffic (--optimize only): failures never fail the run.
 _nginx_build_bolt() { # out
   local out=$1 rc=0
   nginx_build_bolted && return 0
   [[ ${SETUP_NGINX_BUILD_BOLT:-1} == 1 ]] || return 0
+  # 1.22.5: a host the tool found without branch samples (bolt=nolbr) or
+  # without perf sampling (noperf) is not retried until the next build.
+  case $(_nginx_build_bolt_state) in
+    noperf) "$out" "- nginx: BOLT not possible on this host (perf cannot sample: bolt=noperf); the ThinLTO build serves"; return 0 ;;
+    nolbr)  "$out" "- nginx: BOLT not possible on this host (no branch samples: bolt=nolbr); the ThinLTO build serves"; return 0 ;;
+  esac
   systemctl is-active -q nginx.service || return 0
   nginx_build_run_tool optimize bolt "${SETUP_NGINX_BUILD_BOLT_SECONDS:-60}" || rc=$?
   case $rc in
     0) "$out" "- nginx: BOLT applied from live traffic (in-place upgrade)" ;;
-    3) "$out" "- nginx: BOLT skipped ($(grep -m1 -E 'skipped|too little' <<<"$NGINX_BUILD_LAST_OUT" | sed 's/^nginx: //')); the refresh timer retries under load" ;;
+    3) if grep -q 'BOLT skipped until the next build' <<<"$NGINX_BUILD_LAST_OUT"; then
+         "$out" "- nginx: BOLT not possible on this host ($(grep -m1 -E 'no branch samples|cannot sample' <<<"$NGINX_BUILD_LAST_OUT" | sed 's/^nginx: //')); not retried until the next build"
+       else
+         "$out" "- nginx: BOLT skipped ($(grep -m1 -E 'skipped|too little' <<<"$NGINX_BUILD_LAST_OUT" | sed 's/^nginx: //')); the refresh timer retries under load"
+       fi ;;
     *) "$out" "- nginx: BOLT not applied ($(grep -m1 'ERROR:' <<<"$NGINX_BUILD_LAST_OUT" | sed 's/^ERROR: //')); the ThinLTO build keeps serving" ;;
   esac
   return 0
@@ -642,7 +660,7 @@ nginx_build_status() {
   local info=${NGINX_ROOT}/build/build.info log
   if [[ ! -f $info ]]; then printf 'nginx build: none in %s\n' "$NGINX_ROOT"; return 0; fi
   [[ -x $NGINX_BUILD_TOOL ]] && "$NGINX_BUILD_TOOL" status 2>/dev/null
-  printf 'nginx build.info: %s\n' "$(grep -E '^(nginx|openssl|pcre2|zlib-ng|brotli|ngx-brotli|llvm|recipe|bolt|built|patched_ok|fallback_from)=' "$info" | tr '\n' ' ')"
+  printf 'nginx build.info: %s\n' "$(grep -E '^(nginx|aws-lc|tls_lib|pcre2|zlib-ng|brotli|ngx-brotli|llvm|recipe|bolt|built|patched_ok|fallback_from)=' "$info" | tr '\n' ' ')"
   printf 'setup-build-cpu.service: %s; setup-build-refresh.timer: %s\n' \
     "$(systemctl is-active setup-build-cpu.service 2>/dev/null || true)" "$(systemctl is-active setup-build-refresh.timer 2>/dev/null || true)"
   log=$(find "${NGINX_ROOT}/logs" -maxdepth 1 -name 'nginx-*.log' -printf '%T@ %p\n' 2>/dev/null | sort -rn | sed -n '1s/^[^ ]* //p')

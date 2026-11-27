@@ -44,7 +44,8 @@ function appsim_cache(): Redis
     static $redis = null;
     if ($redis === null) {
         $redis = new Redis();
-        $redis->pconnect('127.0.0.1', 6379, 1.0);
+        // The Unix socket: setup.sh runs Valkey socket-only (port 0) since 1.22.5.
+        $redis->pconnect('/run/valkey/valkey.sock', 0, 1.0);
     }
     return $redis;
 }

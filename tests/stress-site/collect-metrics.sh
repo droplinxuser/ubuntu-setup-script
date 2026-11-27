@@ -34,7 +34,8 @@ db_status() {
 }
 vk_status() {
   local cli; cli=$(command -v valkey-cli || command -v redis-cli); [[ -n $cli ]] || return 0
-  "$cli" INFO 2>/dev/null | grep -E '^(connected_clients|instantaneous_ops_per_sec|used_memory_human|evicted_keys|rejected_connections|keyspace_hits|keyspace_misses|total_commands_processed):' | tr '\r\n' ' '
+  # Socket first: setup.sh runs Valkey socket-only (port 0) since 1.22.5.
+  "$cli" -s "${STRESS_VALKEY_SOCKET:-/run/valkey/valkey.sock}" INFO 2>/dev/null | grep -E '^(connected_clients|instantaneous_ops_per_sec|used_memory_human|evicted_keys|rejected_connections|keyspace_hits|keyspace_misses|total_commands_processed):' | tr '\r\n' ' '
 }
 es_status() { curl -fsS 'http://127.0.0.1:9200/_nodes/stats/jvm,thread_pool,indices?filter_path=nodes.*.jvm.mem.heap_used_percent,nodes.*.thread_pool.search.rejected,nodes.*.thread_pool.search.queue,nodes.*.indices.search.query_total' 2>/dev/null | tr -d ' \n' | cut -c1-240; }
 log_sizes() {

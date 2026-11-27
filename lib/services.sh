@@ -761,6 +761,59 @@ app_persistent_db_configs() {
   printf '%s' "$n"
 }
 MARIADB_PROFILE_PERSISTENT_APPS=0
+# MariaDB memory outside the buffer pool (1.22.5).  One formula each for the
+# profile writer and the memory plan, so the plan books what is written.
+# innodb_log_buffer_size: RAM/256, 16..64 MB (read-only key: it follows RAM,
+# not the pool, so an online pool resize never forces a restart).
+mariadb_log_buffer_mb() {
+  local ram=${1:-0} mb
+  mb=$(( ram / 256 ))
+  (( mb < 16 )) && mb=16
+  (( mb > 64 )) && mb=64
+  printf '%s' "$mb"
+}
+# aria_pagecache_buffer_size: RAM/128, 16..256 MB.
+mariadb_aria_mb() {
+  local ram=${1:-0} mb
+  mb=$(( ram / 128 ))
+  (( mb < 16 )) && mb=16
+  (( mb > 256 )) && mb=256
+  printf '%s' "$mb"
+}
+# tmp_table_size = max_heap_table_size: RAM/256, 32..256 MB, never above
+# pool/8 (32 MB floor).  A plan cap (OPT_MARIADB_TMP_CAP_MB, set only when
+# the non-pool memory would not fit the room PHP leaves) lowers it further,
+# never below MariaDB's own 16 MB default.
+mariadb_tmp_table_mb() {
+  local ram=${1:-0} pool=${2:-0} cap=${3:-0} mb pool_cap
+  mb=$(( ram / 256 ))
+  (( mb < 32 )) && mb=32
+  (( mb > 256 )) && mb=256
+  pool_cap=$(( pool / 8 ))
+  (( pool_cap < 32 )) && pool_cap=32
+  (( mb > pool_cap )) && mb=$pool_cap
+  [[ $cap =~ ^[0-9]+$ ]] || cap=0
+  if (( cap > 0 && mb > cap )); then
+    mb=$cap
+    (( mb < 16 )) && mb=16
+  fi
+  printf '%s' "$mb"
+}
+# Fixed non-pool memory: log buffer + Aria page cache + key_buffer (32 MB).
+mariadb_fixed_nonpool_mb() {
+  local ram=${1:-0}
+  printf '%s' $(( $(mariadb_log_buffer_mb "$ram") + $(mariadb_aria_mb "$ram") + 32 ))
+}
+# Non-pool memory of a busy server: the fixed buffers plus, per active
+# query (thread_pool_size of them run at once under pool-of-threads), the
+# session buffers (sort 1M + join/read/read_rnd 512K = 2.5 MB) and half of
+# tmp_table_size (an in-memory temp table rarely reaches the ceiling, and
+# not every active query builds one).
+mariadb_nonpool_mb() {
+  local ram=${1:-0} threads=${2:-1} tmp=${3:-0}
+  (( threads > 0 )) || threads=1
+  printf '%s' $(( $(mariadb_fixed_nonpool_mb "$ram") + (threads * 5 + 1) / 2 + threads * tmp / 2 ))
+}
 
 mariadb_compute_profile() {
   local size_mb=$1 logsize open_cache aria_mb threads max_conn current_max="" kept_max=0
@@ -782,16 +835,13 @@ mariadb_compute_profile() {
   # it: capping made the buffer follow the pool again, and since 1.21.49
   # shrinks pools to data+5%, a 4 GB -> 128 MB shrink would have forced a
   # full restart instead of an online resize.
-  local log_buffer=$(( ram_mb / 256 ))
-  (( log_buffer < 16 )) && log_buffer=16
-  (( log_buffer > 64 )) && log_buffer=64
+  local log_buffer
+  log_buffer=$(mariadb_log_buffer_mb "$ram_mb")
   (( logsize < log_buffer )) && logsize=$log_buffer
   # Aria serves internal temporary tables, not the InnoDB data: size its
   # page cache from RAM (RAM/128, 16..256 MB) so it stops changing, and
   # forcing a restart, every time the buffer pool is re-planned.
-  aria_mb=$(( ram_mb / 128 ))
-  (( aria_mb < 16 )) && aria_mb=16
-  (( aria_mb > 256 )) && aria_mb=256
+  aria_mb=$(mariadb_aria_mb "$ram_mb")
   threads=$(effective_cpus)
   (( threads > 64 )) && threads=64
   # PHP-FPM opens one MariaDB connection per active request.  A 500-connection
@@ -841,12 +891,8 @@ mariadb_compute_profile() {
   # fixed 64M on large sites; scale with RAM but never above pool/8 (32M is
   # the floor, so even a 128 MB pool gets a legal, bounded value instead of
   # the RAM/256 figure that could exceed the whole pool on a tiny host).
-  tmp_mb=$(( ram_mb / 256 ))
-  (( tmp_mb < 32 )) && tmp_mb=32
-  (( tmp_mb > 256 )) && tmp_mb=256
-  local tmp_cap=$(( size_mb / 8 ))
-  (( tmp_cap < 32 )) && tmp_cap=32
-  (( tmp_mb > tmp_cap )) && tmp_mb=$tmp_cap
+  # The memory plan may cap it further (OPT_MARIADB_TMP_CAP_MB).
+  tmp_mb=$(mariadb_tmp_table_mb "$ram_mb" "$size_mb" "${OPT_MARIADB_TMP_CAP_MB:-0}")
   # Never lower an existing, larger ceiling: a busy application may already
   # allow more than threads*32 connections, and a tune must not turn into
   # "Too many connections" during a traffic peak.
@@ -1062,7 +1108,7 @@ innodb_snapshot_isolation = 0
 skip_name_resolve = 1
 query_cache_size = 0
 query_cache_type = 0
-open_files_limit = 524288
+open_files_limit = $(nofile_internal mariadb 2>/dev/null || printf 524288)
 secure_file_priv = /var/lib/mysql-files
 local_infile = 0
 innodb_read_only_compressed = OFF
@@ -1306,9 +1352,17 @@ install_mariadb() {
 # Valkey
 # ---------------------------------------------------------------------------
 # The live-tuning keys are shared so a fresh install and --optimize cannot
-# disagree about maxmemory, backlog, lazy-free or I/O settings.
+# disagree about maxmemory, backlog, lazy-free or I/O settings.  KIND
+# (valkey|redis, optional) drops the directives an adopted Redis older
+# than 6.2 does not know (1.22.5): Ubuntu 22.04's redis-server 6.0 refused
+# lazyfree-lazy-user-flush with "Bad directive", so every --optimize tune
+# failed, restarted twice and rolled back.
+#
+# io-threads is pinned to 1 (1.22.5): the io_threads opt-in was removed after
+# io-threads 1 -> 4 measured no gain and 8 threads cost 430% CPU for lower
+# full-page throughput.
 valkey_tuning_lines() {
-  local max_mb=$1 policy=$2 io_threads=$3
+  local max_mb=$1 policy=$2 kind=${3:-valkey}
   cat <<EOF
 maxmemory ${max_mb}mb
 maxmemory-policy ${policy}
@@ -1318,14 +1372,91 @@ tcp-backlog $(effective_backlog)
 timeout 0
 tcp-keepalive 300
 hz 10
-io-threads ${io_threads}
+io-threads 1
 io-threads-do-reads yes
 lazyfree-lazy-eviction yes
 lazyfree-lazy-expire yes
 lazyfree-lazy-server-del yes
 lazyfree-lazy-user-del yes
-lazyfree-lazy-user-flush yes
 EOF
+  valkey_redis_pre62 "$kind" || printf '%s\n' 'lazyfree-lazy-user-flush yes'
+}
+
+# Version of the adopted redis-server ("6.0.16"), read once per run; empty
+# when it cannot be read.  REDIS_SERVER_BIN is a test hook.
+VALKEY_REDIS_VERSION_CACHE=""
+valkey_redis_version() {
+  if [[ -z $VALKEY_REDIS_VERSION_CACHE ]]; then
+    VALKEY_REDIS_VERSION_CACHE=$("${REDIS_SERVER_BIN:-redis-server}" --version 2>/dev/null \
+      | sed -nE 's/.* v=([0-9]+\.[0-9]+\.[0-9]+).*/\1/p' | sed -n 1p || true)
+    [[ -n $VALKEY_REDIS_VERSION_CACHE ]] || VALKEY_REDIS_VERSION_CACHE=none
+  fi
+  [[ $VALKEY_REDIS_VERSION_CACHE == none ]] || printf '%s' "$VALKEY_REDIS_VERSION_CACHE"
+}
+
+# 0 when KIND is an adopted Redis older than 6.2: no '-' prefix for an
+# optional bind address and no lazyfree-lazy-user-flush.  Every other line
+# the writer emits (port, save, appendonly, dir, dbfilename, rdbcompression,
+# rdb-save-incremental-fsync, stop-writes-on-bgsave-error, unixsocket,
+# unixsocketperm, io-threads, io-threads-do-reads, lazyfree-lazy-user-del,
+# maxmemory-*, tcp-*, timeout, hz, supervised, logfile, protected-mode)
+# exists in Redis 6.0.  An unreadable version counts as current.
+valkey_redis_pre62() {
+  local kind=${1:-valkey} v major minor
+  [[ $kind == redis ]] || return 1
+  v=$(valkey_redis_version)
+  [[ $v =~ ^([0-9]+)\.([0-9]+)\. ]] || return 1
+  major=${BASH_REMATCH[1]} minor=${BASH_REMATCH[2]}
+  (( major < 6 || (major == 6 && minor < 2) ))
+}
+
+# RDB snapshots (1.22.5, the new default): a snapshot every 5 minutes when
+# at least one key changed, plus the one a clean shutdown or restart writes,
+# so sessions and the warm cache survive restarts, the daily rebuilds and
+# BOLT.  After a crash or power loss the cache starts empty (the snapshot
+# loads only after a clean stop, see valkey_rdb_guard_sh).  No AOF.  A failed
+# snapshot (disk full, a fork refused) must never stop cache writes, hence
+# stop-writes-on-bgsave-error no.  Every key exists in Valkey 7.2+ and in
+# Redis 6.0+ and is CONFIG SET-able (appendonly is left to the file).
+VALKEY_SAVE_SCHEDULE="300 1"
+# KIND (valkey|redis, optional; 1.22.5 F5): on Valkey and on Redis 7+ the
+# shutdown save may fail (disk full) without blocking the exit
+# (`shutdown-on-sigterm default force`): a stop or reboot then never hangs on
+# a cache; the clean-stop guard (valkey_rdb_guard_sh, tools/valkey-build.sh
+# post) sees the stale snapshot and the next start begins empty.  Redis 6.x
+# does not know the key (and an unreadable Redis version does not get it).
+valkey_persist_lines() {
+  printf '%s\n' "save ${VALKEY_SAVE_SCHEDULE}" 'appendonly no' 'rdbcompression yes' \
+    'rdb-save-incremental-fsync yes' 'stop-writes-on-bgsave-error no'
+  valkey_shutdown_force_ok "${1:-valkey}" && printf '%s\n' 'shutdown-on-sigterm default force'
+  return 0
+}
+# 0 when KIND accepts shutdown-on-sigterm: every Valkey (7.2+), Redis 7+.
+valkey_shutdown_force_ok() {
+  local v
+  [[ ${1:-valkey} == redis ]] || return 0
+  v=$(valkey_redis_version)
+  [[ $v =~ ^([0-9]+)\. ]] && (( BASH_REMATCH[1] >= 7 ))
+}
+# The runtime-settable part, for CONFIG SET before a restart or instead of one.
+valkey_persist_runtime_settings() { # [kind]
+  valkey_persist_lines "${1:-valkey}" | grep -v '^appendonly '
+}
+
+# 0 when the operator's persistence of an adopted cache is kept (1.22.5
+# F2/F17): the marker a previous run wrote, or an unmanaged file with
+# `appendonly yes` (a job/queue store).  One predicate for the writer,
+# --optimize and the installer.  Such a store also keeps noeviction.
+valkey_conf_keeps_persist() {
+  local conf=$1
+  [[ -f $conf ]] || return 1
+  grep -qx '# setup.sh kept operator persistence' "$conf" \
+    || { ! valkey_conf_managed "$conf" && [[ $(valkey_conf_get "$conf" appendonly) == yes ]]; }
+}
+# The policy to write for POLICY: noeviction moves to allkeys-lru (1.22.5)
+# unless the store keeps its operator persistence.
+valkey_policy_migrate() { # conf policy
+  if [[ $2 == noeviction ]] && ! valkey_conf_keeps_persist "$1"; then printf 'allkeys-lru'; else printf '%s' "$2"; fi
 }
 
 # Client ceiling for the cache: every PHP worker can hold a few connections
@@ -1353,6 +1484,10 @@ install_valkey() {
   if pkg_ok redis-server; then
     warn "redis-server is installed; leaving it untouched because setup.sh never removes packages."
     warn "Valkey was not installed. Run --optimize to tune the existing Redis server with the same cache profile."
+    # `--valkey tcp=on|auto` reaches the adopted Redis too (1.22.5 F18): the
+    # choice is recorded in its config, where --optimize's socket-only
+    # decision (valkey_tcp_decide) reads it.
+    valkey_redis_record_tcp "${OPT[valkey.tcp]:-}" /etc/redis/redis.conf
     # A pre-existing Redis is not a failed install: the requested service was
     # already covered by a compatible cache and --optimize handles it.
     return 0
@@ -1381,44 +1516,68 @@ install_valkey() {
   [[ -f $conf ]] || die "Valkey config ${conf} not found after the build's layout step"
   before=$(file_md5 "$conf")
 
-  local valkey_mb policy io_threads
+  local valkey_mb policy
   if [[ -n ${OPT[valkey.ram]:-} && ${OPT[valkey.ram],,} != auto ]]; then
     valkey_mb=$(size_to_mb "${OPT[valkey.ram]}")
   else
     valkey_mb=$(service_mem_mb valkey)
   fi
-  # Preserve a policy/io-threads value a previous setup.sh tune wrote, exactly
-  # like --optimize does; only a fresh (unmanaged) config falls back to the
-  # documented defaults.  Without this a re-install silently reset
-  # `--valkey policy=volatile-lru io_threads=4` to allkeys-lru/1.
+  # Preserve a policy value a previous setup.sh tune wrote, exactly like
+  # --optimize does; only a fresh (unmanaged) config falls back to the
+  # documented default.  Without this a re-install silently reset
+  # `--valkey policy=volatile-lru` to allkeys-lru.
   policy=${OPT[valkey.policy]:-}
   if [[ -z $policy ]] && valkey_conf_managed "$conf"; then
     policy=$(valkey_conf_get "$conf" maxmemory-policy)
   fi
-  [[ -n $policy ]] || policy=allkeys-lru
-  # For typical web-cache command sizes, extra I/O threads add more CPU
-  # contention than throughput.  Benchmarks on a 16-core host showed
-  # io-threads=1 at 6.5k full-page req/s vs 5.1k at io-threads=8.
-  io_threads=${OPT[valkey.io_threads]:-}
-  if [[ -z $io_threads ]] && valkey_conf_managed "$conf"; then
-    io_threads=$(valkey_conf_get "$conf" io-threads)
+  # An adopted store whose operator persistence is kept also keeps its
+  # noeviction (F2/F17: a queue store must fail writes, not lose keys).
+  if [[ -z $policy ]] && valkey_conf_keeps_persist "$conf" \
+     && [[ $(valkey_conf_get "$conf" maxmemory-policy) == noeviction ]]; then
+    policy=noeviction
   fi
-  [[ -n $io_threads ]] || io_threads=1
+  [[ -n $policy ]] || policy=allkeys-lru
+  # 1.22.5: noeviction is no longer offered (a full cache failed every
+  # write); a host that still has it moves to the default.
+  if [[ $policy == noeviction ]]; then
+    policy=$(valkey_policy_migrate "$conf" "$policy")
+    if [[ $policy == noeviction ]]; then
+      info "Valkey: maxmemory-policy noeviction kept: this valkey keeps operator persistence (appendonly yes) and holds data; allkeys-lru would evict it"
+    else
+      info "Valkey: maxmemory-policy noeviction is no longer supported; using allkeys-lru (size --valkey ram= to hold sessions plus cache)"
+    fi
+  fi
+  # io-threads is always 1 (valkey_tuning_lines; the opt-in was removed in
+  # 1.22.5).  A managed file a previous run wrote with more moves back.
+  local vk_io
+  vk_io=$(valkey_conf_get "$conf" io-threads)
+  if valkey_conf_managed "$conf" && [[ -n $vk_io && $vk_io != 1 ]]; then
+    info "Valkey: io-threads ${vk_io} reset to 1 (the io_threads option was removed in 1.22.5: more I/O threads measured no gain)"
+  fi
 
   # Keep a socket path an operator already uses: application configs and
   # remote clients point at it, and the writer below would otherwise rewrite
-  # `unixsocket` to the default on every re-install.  The seeded file has
-  # the key commented out, so a fresh install still gets the default.
+  # `unixsocket` to the default on every re-install.  The seeded file
+  # (tools/valkey-build.sh conf_template) already names the default
+  # socket, so a fresh install keeps /run/valkey/valkey.sock either way.
   local socket
   socket=$(valkey_conf_get "$conf" unixsocket)
   [[ -n $socket ]] || socket=/run/valkey/valkey.sock
+
+  # Socket only (port 0) unless an application, a live TCP client, an
+  # operator bind or --valkey tcp=on needs TCP (valkey_tcp_decide).
+  local tcp_mode tcp_note vk_active=0
+  systemctl is-active --quiet valkey-server 2>/dev/null && vk_active=1
+  valkey_tcp_decide "$conf" valkey "$VALKEY_CLI_BIN" "$socket" "${OPT[valkey.tcp]:-}" "$vk_active"
+  tcp_mode=$VALKEY_TCP_MODE
+  for tcp_note in "${VALKEY_TCP_NOTES[@]}"; do info "Valkey: ${tcp_note}"; done
 
   # One writer for the base and tuning directives, shared with --optimize.
   # "adopt" is passed on install too: a re-install of an existing host must
   # not wipe AOF persistence or rebind a cache that serves other app servers.
   # The keep logic only fires for an unmanaged file with non-default values or
   # for a marker a previous tune wrote, so a fresh install is unaffected.
-  valkey_apply_config "$conf" valkey "$valkey_mb" "$policy" "$io_threads" "$socket" adopt
+  valkey_apply_config "$conf" valkey "$valkey_mb" "$policy" "$socket" adopt "$tcp_mode"
   info "Valkey maxmemory: ${valkey_mb} MB (${policy}; shared memory plan)"
   tail -24 "$conf"
 
@@ -1427,9 +1586,15 @@ install_valkey() {
   # adopted redis-server still gets one from --optimize).
   "$VALKEY_SERVER_BIN" -v
   # One restart loads the written file.  A re-run that changed nothing does
-  # not restart: a restart empties a cache-only Valkey.
+  # not restart.  Since 1.22.5 the running server gets the snapshot
+  # schedule first, so its shutdown writes dump.rdb and the restart reloads
+  # the cache and sessions instead of emptying them.
   systemctl enable valkey-server >/dev/null 2>&1 || true
   if [[ $(file_md5 "$conf") != "$before" ]] || ! systemctl is-active --quiet valkey-server; then
+    if systemctl is-active --quiet valkey-server && [[ -S $socket ]] \
+       && ! grep -qx '# setup.sh kept operator persistence' "$conf"; then
+      valkey_live_persist_on "$VALKEY_CLI_BIN" -s "$socket" || true
+    fi
     systemctl restart valkey-server
   fi
   systemctl status valkey-server -l --no-pager || true
@@ -1454,8 +1619,13 @@ install_valkey() {
 # Base and tuning directives for Valkey/Redis.  Active copies of every
 # managed key are removed and the canonical block appended once, so a fresh
 # install and --optimize write byte-identical files and an old profile with
-# "protected-mode no" or RDB saves is upgraded without contradictory
-# duplicates.  Operator directives outside the managed set survive.
+# "protected-mode no" is upgraded without contradictory duplicates.
+# Operator directives outside the managed set survive.
+#
+# Persistence (1.22.5): RDB snapshots every 5 minutes (valkey_persist_lines)
+# into dbfilename (dump.rdb unless the file names another) under dir (the
+# file's own, else /var/lib/KIND), no AOF.  An adopted server's RDB data is
+# therefore kept, not switched off as before.
 #
 # ADOPT (7th argument "adopt", passed by --optimize) protects a cache that
 # setup.sh did not install: when its configuration has AOF persistence on
@@ -1463,25 +1633,32 @@ install_valkey() {
 # servers), those lines are kept and marked, and stay kept on later runs.
 # Turning persistence off or rebinding such a service loses data or cuts
 # clients off on the restart that follows.
+#
+# TCP (8th argument, 1.22.5, decided by valkey_tcp_decide): "socket" writes
+# `port 0` (socket only) and remembers the TCP port in a marker, "tcp"
+# writes that TCP port, "tcp-on" does the same and records the operator's
+# `--valkey tcp=on`.  Empty leaves any port line as it is.  A kept operator
+# bind always keeps TCP.
 valkey_apply_config() {
-  local conf=$1 kind=$2 max_mb=$3 policy=$4 io_threads=$5 socket=${6:-} adopt=${7:-}
-  local keep_persist="" keep_bind="" bind_line
+  local conf=$1 kind=$2 max_mb=$3 policy=$4 socket=${5:-} adopt=${6:-} tcp=${7:-}
+  local keep_persist="" keep_bind="" dir dbfile port port_re="" bind_default='bind 127.0.0.1 -::1'
   [[ -n $socket ]] || socket="/run/${kind}/${kind}.sock"
-  io_threads=$(valkey_clamp_io_threads "$io_threads")
   if [[ $adopt == adopt ]]; then
-    if grep -qx '# setup.sh kept operator persistence' "$conf" \
-       || { ! valkey_conf_managed "$conf" && [[ $(valkey_conf_get "$conf" appendonly) == yes ]]; }; then
-      keep_persist=$(grep -E '^[[:space:]]*(save|appendonly)[[:space:]]' "$conf" || true)
+    if valkey_conf_keeps_persist "$conf"; then
+      keep_persist=$(grep -E '^[[:space:]]*(save|appendonly|rdbcompression|rdb-save-incremental-fsync|stop-writes-on-bgsave-error|shutdown-on-sigterm)[[:space:]]' "$conf" || true)
     fi
-    bind_line=$(grep -E '^[[:space:]]*bind[[:space:]]' "$conf" | tail -n1 || true)
-    if [[ -n $bind_line ]] && { grep -qx '# setup.sh kept operator bind' "$conf" \
-       || { ! valkey_conf_managed "$conf" \
-            && [[ -n $(printf '%s\n' "$bind_line" | tr -s '[:space:]' '\n' | grep -vxE 'bind|-?127\.0\.0\.1|-?::1|localhost' || true) ]]; }; }; then
-      keep_bind=$bind_line
-    fi
+    keep_bind=$(valkey_conf_operator_bind "$conf")
   fi
-  sed_in_place -E '/^# setup\.sh kept operator (persistence|bind)$/d' "$conf"
-  sed_in_place -E '/^[[:space:]]*(bind|protected-mode|save|maxmemory|maxmemory-policy|maxmemory-samples|supervised|io-threads|io-threads-do-reads|tcp-backlog|tcp-keepalive|timeout|maxclients|hz|appendonly|lazyfree-[a-z-]+|unixsocket|unixsocketperm|logfile)[[:space:]]/d' "$conf"
+  [[ -n $keep_bind && $tcp == socket ]] && tcp=tcp
+  dir=$(valkey_conf_get "$conf" dir)
+  [[ -n $dir ]] || dir=/var/lib/${kind}
+  dbfile=$(valkey_conf_get "$conf" dbfilename)
+  [[ -n $dbfile ]] || dbfile=dump.rdb
+  port=$(valkey_conf_tcp_port "$conf")
+  [[ -n $tcp ]] && port_re='|port'
+  valkey_redis_pre62 "$kind" && bind_default='bind 127.0.0.1 ::1'
+  sed_in_place -E '/^# setup\.sh (kept operator (persistence|bind)|valkey tcp=on|socket-only: tcp port [0-9]+)$/d' "$conf"
+  sed_in_place -E "/^[[:space:]]*(bind|protected-mode|save|maxmemory|maxmemory-policy|maxmemory-samples|supervised|io-threads|io-threads-do-reads|tcp-backlog|tcp-keepalive|timeout|maxclients|hz|appendonly|lazyfree-[a-z-]+|unixsocket|unixsocketperm|logfile|dir|dbfilename|rdbcompression|rdb-save-incremental-fsync|stop-writes-on-bgsave-error|shutdown-on-sigterm${port_re})[[:space:]]/d" "$conf"
   sed_in_place -E '/^# setup\.sh managed valkey$/d' "$conf"
   {
     printf '%s\n' '# setup.sh managed valkey' \
@@ -1490,18 +1667,57 @@ valkey_apply_config() {
     if [[ -n $keep_persist ]]; then
       printf '%s\n' '# setup.sh kept operator persistence' "$keep_persist"
     else
-      printf '%s\n' 'save ""' 'appendonly no'
+      valkey_persist_lines "$kind"
     fi
+    printf '%s\n' "dir ${dir}" "dbfilename ${dbfile}"
+    case $tcp in
+      socket) printf '%s\n' "# setup.sh socket-only: tcp port ${port}" 'port 0' ;;
+      tcp)    printf '%s\n' "port ${port}" ;;
+      tcp-on) printf '%s\n' '# setup.sh valkey tcp=on' "port ${port}" ;;
+    esac
     if [[ -n $keep_bind ]]; then
       printf '%s\n' '# setup.sh kept operator bind' "$keep_bind"
     else
-      printf '%s\n' 'bind 127.0.0.1 -::1'
+      printf '%s\n' "$bind_default"
     fi
     printf '%s\n' 'protected-mode yes' \
       "unixsocket ${socket}" \
       'unixsocketperm 770'
-    valkey_tuning_lines "$max_mb" "$policy" "$io_threads"
+    valkey_tuning_lines "$max_mb" "$policy" "$kind"
   } >> "$conf"
+}
+
+# The operator's non-loopback `bind` line an adopted cache keeps (other app
+# servers reach it over TCP); empty when there is none.  Kept once means
+# kept on later runs (the marker).
+valkey_conf_operator_bind() {
+  local conf=$1 bind_line
+  [[ -f $conf ]] || return 0
+  bind_line=$(grep -E '^[[:space:]]*bind[[:space:]]' "$conf" | tail -n1 || true)
+  if [[ -n $bind_line ]] && { grep -qx '# setup.sh kept operator bind' "$conf" \
+     || { ! valkey_conf_managed "$conf" \
+          && [[ -n $(printf '%s\n' "$bind_line" | tr -s '[:space:]' '\n' | grep -vxE 'bind|-?127\.0\.0\.1|-?::1|localhost' || true) ]]; }; }; then
+    printf '%s' "$bind_line"
+  fi
+  return 0
+}
+
+# The TCP port this cache serves (or served before it went socket-only):
+# the file's non-zero `port`, else the port the socket-only marker
+# remembers, else 6379.
+valkey_conf_tcp_port() {
+  local conf=$1 p=""
+  [[ -f $conf ]] && p=$(awk '$1 == "port" { v = $2 } END { print v }' "$conf" 2>/dev/null || true)
+  if [[ ! $p =~ ^[1-9][0-9]*$ ]]; then
+    p=$(sed -nE 's/^# setup\.sh socket-only: tcp port ([1-9][0-9]*)$/\1/p' "$conf" 2>/dev/null | tail -n1 || true)
+  fi
+  [[ $p =~ ^[1-9][0-9]*$ ]] || p=6379
+  printf '%s' "$p"
+}
+
+# 0 when the file runs the cache socket-only (`port 0`).
+valkey_conf_socket_only() {
+  [[ -f ${1:-} ]] && [[ $(awk '$1 == "port" { v = $2 } END { print v }' "$1" 2>/dev/null) == 0 ]]
 }
 
 # True when FILE already carries the block setup.sh wrote, i.e. the values in
@@ -1519,17 +1735,6 @@ valkey_conf_get() {
   awk -v k="$key" '$1 == k { print $2; exit }' "$file"
 }
 
-# Valkey's own guidance caps useful I/O threads well below the core count.
-# The installer and --optimize clamp identically so an install-time value is
-# never silently rewritten by the next tune.
-valkey_clamp_io_threads() {
-  local n=$1
-  [[ $n =~ ^[0-9]+$ ]] || n=1
-  (( n < 1 )) && n=1
-  (( n > 8 )) && n=8
-  printf '%s' "$n"
-}
-
 # Runtime-settable subset of valkey_tuning_lines (everything except the
 # startup-only keys), derived from the same helper so the live process and
 # the file cannot drift apart.
@@ -1544,7 +1749,7 @@ valkey_write_systemd_limits() {
   local unit=$1 kind=$2
   write_service_limits_dropin "/etc/systemd/system/${unit}.service.d/limits.conf" \
 "[Service]
-LimitNOFILE=524288
+LimitNOFILE=$(nofile_unit valkey 2>/dev/null || printf 524288)
 LimitCORE=0
 # The packaged unit uses ProtectSystem=strict; allow the central log tree.
 ReadWritePaths=${LOG_ROOT}/${kind}"
@@ -1567,7 +1772,117 @@ valkey_ensure_www_group() {
 }
 
 # valkey_pong CLI [ARGS...]: e.g. valkey_pong valkey-cli -s /run/valkey/valkey.sock
-valkey_pong() { local cli=$1; shift; "$cli" "$@" ping 2>/dev/null | grep -q PONG; }
+# LOADING counts as up (1.22.5): a restarted server reads its RDB snapshot
+# before it answers PING, and a large one takes longer than the probe waits.
+valkey_pong() { local cli=$1; shift; "$cli" "$@" ping 2>/dev/null | grep -qE "^(PONG|\(error\) LOADING|LOADING)"; }
+
+# CONFIG SET the snapshot schedule on the running server (CLI [ARGS...]),
+# so the shutdown of the restart that follows writes dump.rdb and the new
+# process reloads it.  Non-zero when one setting was refused.
+valkey_live_persist_on() { # cli [--kind=valkey|redis] [endpoint args...]
+  local cli=$1 k v kind=valkey; shift
+  if [[ ${1:-} == --kind=* ]]; then kind=${1#--kind=}; shift; fi
+  while read -r k v; do
+    [[ -n $k ]] || continue
+    "$cli" "$@" CONFIG SET "$k" "$v" 2>/dev/null | grep -qx OK || return 1
+  done < <(valkey_persist_runtime_settings "$kind")
+  return 0
+}
+
+# --valkey tcp=on|auto on a host whose cache is an adopted redis-server
+# (install_valkey leaves the package alone): tcp=on writes the marker
+# valkey_tcp_decide honours, tcp=auto removes it (1.22.5 F18).
+valkey_redis_record_tcp() { # tcp-option conf
+  local opt=${1,,} conf=$2 port
+  [[ -n $opt && -f $conf ]] || return 0
+  port=$(valkey_conf_tcp_port "$conf")
+  if [[ $opt == on ]]; then
+    grep -qx '# setup.sh valkey tcp=on' "$conf" || printf '%s\n' '# setup.sh valkey tcp=on' >> "$conf"
+    info "Redis: \`--valkey tcp=on\` recorded in ${conf}; the next --optimize keeps TCP port ${port} open"
+  else
+    sed_in_place -E '/^# setup\.sh valkey tcp=on$/d' "$conf"
+    info "Redis: \`--valkey tcp=auto\` recorded in ${conf}; the next --optimize closes TCP port ${port} (socket only) unless an application or a client still uses it"
+  fi
+}
+
+# Load the RDB snapshot only after a clean stop (1.22.5 F4).  A snapshot
+# left by a crash, an OOM or SIGKILL, a stop timeout or a power loss is up
+# to 5 minutes old: the database writes of those minutes were mirrored into
+# the cache, and reloading it would serve values that contradict MariaDB
+# (WordPress alloptions, the XenForo registry) until each key is rewritten.
+# MODE pre (ExecStartPre, root): when the previous run started under this
+# guard (.setup-started) and did not stop cleanly (no .setup-clean-stop),
+# DIR/DBFILE is moved aside to DBFILE.unclean-<UTC stamp> (the 2 newest
+# kept) and the server starts empty.  MODE post (ExecStopPost, root): a stop
+# with SERVICE_RESULT=success, EXIT_CODE=exited and a snapshot written in the
+# last 120 s (the shutdown save; with `shutdown-on-sigterm force` a failed
+# save still exits 0) writes .setup-clean-stop.  A first start under the
+# guard keeps the snapshot (a migration or an upgrade from a release without
+# it); an AOF store (appendonly yes, operator persistence) is never touched.
+# Prints one POSIX sh line without single quotes or backslashes (tools/
+# valkey-build.sh pre/post is the same logic for our own unit).
+valkey_rdb_guard_sh() { # pre|post dir dbfile conf
+  local d=$2 f=$3 c=$4
+  if [[ $1 == pre ]]; then
+    printf '%s' "d=\"${d}\"; f=\"\$d/${f}\"; grep -qiE \"^[[:space:]]*appendonly[[:space:]]+yes\" \"${c}\" && exit 0; " \
+      "if [ -e \"\$d/.setup-started\" ] && [ ! -e \"\$d/.setup-clean-stop\" ] && [ -e \"\$f\" ]; then " \
+      "n=\"\$f.unclean-\$(date -u +%Y%m%dT%H%M%SZ)\"; mv -f \"\$f\" \"\$n\" && echo \"setup.sh: \$f was not written by a clean stop: moved aside to \$n (the cache starts empty)\" >&2; " \
+      "ls -1d \"\$f\".unclean-* 2>/dev/null | sort -r | tail -n +3 | while read -r o; do rm -f \"\$o\"; done; fi; " \
+      "rm -f \"\$d/.setup-clean-stop\"; : > \"\$d/.setup-started\""
+  else
+    printf '%s' "d=\"${d}\"; f=\"\$d/${f}\"; [ \"\$SERVICE_RESULT\" = success ] && [ \"\$EXIT_CODE\" = exited ] || exit 0; " \
+      "if [ -e \"\$f\" ]; then t=\$(stat -c %Y \"\$f\") || exit 0; [ \$(( \$(date +%s) - t )) -le 120 ] || exit 0; fi; " \
+      ": > \"\$d/.setup-clean-stop\""
+  fi
+}
+# systemd Exec* lines expand \$VAR and %x: double both.
+valkey_systemd_escape() { sed -e 's/\$/$$/g' -e 's/%/%%/g'; }
+
+# The adopted redis-server's guard drop-in (F4) with a finite stop timeout
+# (F5: a shutdown save that cannot finish never hangs a restart or a
+# reboot; 300 s covers a cache-sized final save).  0 when written/changed.
+VALKEY_RDB_GUARD_DROPIN=zz-setup-rdb.conf
+valkey_write_rdb_guard() { # unit conf kind
+  local unit=$1 conf=$2 kind=${3:-redis} dir dbfile sd=${VALKEY_SYSTEMD_DIR:-/etc/systemd/system}
+  dir=$(valkey_conf_get "$conf" dir); [[ -n $dir ]] || dir=/var/lib/${kind}
+  dbfile=$(valkey_conf_get "$conf" dbfilename); [[ -n $dbfile ]] || dbfile=dump.rdb
+  [[ $dir$dbfile$conf =~ ^[A-Za-z0-9._/@+-]+$ ]] || return 1
+  write_service_limits_dropin "${sd}/${unit}.service.d/${VALKEY_RDB_GUARD_DROPIN}" \
+"# setup.sh (1.22.5): the RDB snapshot loads only after a clean stop; a stop
+# never waits longer than 300 s for the final save.  --purge valkey removes it.
+[Service]
+TimeoutStopSec=300
+ExecStartPre=-+/bin/sh -c '$(valkey_rdb_guard_sh pre "$dir" "$dbfile" "$conf" | valkey_systemd_escape)'
+ExecStopPost=-+/bin/sh -c '$(valkey_rdb_guard_sh post "$dir" "$dbfile" "$conf" | valkey_systemd_escape)'"
+}
+
+# --purge valkey, once the units are stopped (F15/F30): put back the TCP port
+# the socket-only marker remembers, drop the tcp=on marker, the clean-stop
+# guard's state files and the redis-server guard drop-in.  When a snapshot
+# written by the source build (VERSION, from build.info) is left, say that a
+# packaged valkey-server older than it cannot load it.  Data stays.
+valkey_purge_cache_conf() { # conf kind [source-build version]
+  local conf=$1 kind=$2 ver=${3:-} p dir dbf dump sd=${VALKEY_SYSTEMD_DIR:-/etc/systemd/system}
+  if [[ $kind == redis && -f $sd/redis-server.service.d/${VALKEY_RDB_GUARD_DROPIN} ]]; then
+    rm -f "$sd/redis-server.service.d/${VALKEY_RDB_GUARD_DROPIN}"
+    info "Redis: clean-stop guard drop-in removed"
+  fi
+  [[ -f $conf ]] || return 0
+  p=$(sed -nE 's/^# setup\.sh socket-only: tcp port ([1-9][0-9]*)$/\1/p' "$conf" | tail -n1 || true)
+  if [[ -n $p ]]; then
+    sed_in_place -E "s/^port 0\$/port ${p}/; /^# setup\\.sh socket-only: tcp port [0-9]+\$/d" "$conf"
+    info "${kind^}: TCP port ${p} restored in ${conf} (was socket-only)"
+  fi
+  grep -qx '# setup.sh valkey tcp=on' "$conf" && sed_in_place -E '/^# setup\.sh valkey tcp=on$/d' "$conf"
+  dir=$(valkey_conf_get "$conf" dir); [[ -n $dir ]] || dir=/var/lib/${kind}
+  dbf=$(valkey_conf_get "$conf" dbfilename); [[ -n $dbf ]] || dbf=dump.rdb
+  rm -f "$dir/.setup-started" "$dir/.setup-clean-stop"
+  dump=$dir/$dbf
+  if [[ $kind == valkey && -n $ver && -f $dump ]]; then
+    warn "Valkey: ${dump} was written by the source-built Valkey ${ver} (kept). A packaged valkey-server older than ${ver} cannot load it and will not start: before installing the package, move it aside (mv ${dump} ${dump}.${ver})"
+  fi
+  return 0
+}
 
 # Run a probe once per second until it succeeds or N attempts are used up.
 wait_for_cmd() {
@@ -1610,6 +1925,9 @@ LimitCORE=0
 Environment=MYSQLD_OPTS=
 Environment=_WSREP_NEW_CLUSTER='
   fi
+  # LimitNOFILE from the shared plan (nofile_plan in lib/optimize.sh); the
+  # file in configs/ carries the 1.22.4 value, which is the plan's floor.
+  content=$(printf '%s\n' "$content" | sed -E "s/^LimitNOFILE=[0-9]+$/LimitNOFILE=$(nofile_unit mariadb 2>/dev/null || printf 1048576)/")
   write_service_limits_dropin /etc/systemd/system/mariadb.service.d/limits.conf "$content"
 }
 
@@ -1672,6 +1990,11 @@ elasticsearch_write_performance_block() {
   # older files so no stale line remains.  node.processors tells every other
   # thread pool (get, management, refresh, flush, merge) about the cgroup
   # quota the two sized pools already follow.
+  # xpack.ml.enabled: false (1.22.5): a search-only node for forum/blog search
+  # never uses machine learning, and on x86_64 the ml role starts a native
+  # controller process whose memory the plan does not book.  Static: it
+  # takes effect with the restart --optimize already does when this block
+  # changes.
   # Every index file is loaded into the page cache when the index opens, so
   # search never reads the store from disk after a restart or boot.  Only
   # written when the memory plan found room for the whole index
@@ -1691,7 +2014,8 @@ elasticsearch_write_performance_block() {
     indices.memory.index_buffer_size indices.fielddata.cache.size
     search.max_buckets action.destructive_requires_name
     http.compression http.max_content_length
-    thread_pool.search.size thread_pool.write.size node.processors)
+    thread_pool.search.size thread_pool.write.size node.processors
+    xpack.ml.enabled)
   if (( has_net )); then keys+=(http.host transport.host); fi
   if (( ${OPT_ES_PRELOAD:-0} )); then
     preload=$'index.store.preload: ["*"]\n'
@@ -1709,6 +2033,7 @@ http.compression: true
 http.max_content_length: 200mb
 thread_pool.search.size: ${search_threads}
 thread_pool.write.size: ${write_threads}
+xpack.ml.enabled: false
 ${preload}# END setup.sh optimize
 EOF
   chmod 644 "$file"
@@ -1763,8 +2088,11 @@ ES_MANAGED_HOST=""
 # /var/www/logs; without it a fresh install left them 0644 until the next
 # --optimize tightened them, and every rotation reopened them 0644.
 elasticsearch_write_systemd_limits() {
+  # LimitNOFILE from the shared plan (nofile_plan in lib/optimize.sh).
+  local nofile
+  nofile=$(nofile_unit elastic 2>/dev/null || printf 1048576)
   write_service_limits_dropin /etc/systemd/system/elasticsearch.service.d/limits.conf \
-    $'[Service]\nLimitMEMLOCK=infinity\nLimitNOFILE=1048576\nLimitNPROC=4096\nUMask=0027'
+    $'[Service]\nLimitMEMLOCK=infinity\nLimitNOFILE='"${nofile}"$'\nLimitNPROC=4096\nUMask=0027'
 }
 
 # Base (non-performance) YAML: cluster name, bind, paths, single-node discovery

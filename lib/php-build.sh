@@ -82,6 +82,12 @@ PHP_BUILDABLE_EXTS=(bcmath calendar ctype curl dom exif fileinfo filter ftp gd g
   igbinary intl libxml mbstring mysqli mysqlnd opcache openssl pcntl pdo pdo_mysql pdo_sqlite phar
   posix redis session shmop simplexml soap sockets sodium sqlite3 sysvmsg sysvsem sysvshm tokenizer
   xml xmlreader xmlwriter zip zlib)
+# Build options that no longer exist (gd-avif: AVIF in GD; redis-zstd:
+# phpredis zstd compression; both dropped before 1.22.5 shipped).  --php
+# ext= refuses them like any unbuildable name; one still named by a
+# persisted PHP_EXT_EXTRA or by the current build is left out with a
+# warning instead of failing every build.
+PHP_RETIRED_EXTS=(gd-avif redis-zstd)
 # Modules every build carries (and SAPI modules): never part of a set.
 PHP_CORE_EXTS=(core date hash json pcre random reflection spl standard lexbor uri cgi-fcgi)
 
@@ -128,6 +134,7 @@ php_build_app_exts() { # app
 
 php_build_ext_buildable() { [[ " ${PHP_BUILDABLE_EXTS[*]} " == *" ${1,,} "* ]]; }
 php_build_buildable_exts() { printf '%s\n' "${PHP_BUILDABLE_EXTS[@]}"; }
+_pb_retired() { [[ " ${PHP_RETIRED_EXTS[*]} " == *" ${1,,} "* ]]; }
 
 # PECL extensions whose newest release does not compile against a newer PHP
 # series yet: EXT=newest series it builds for.  redis 6.3.0 (the newest
@@ -357,9 +364,21 @@ php_build_effective_exts() { # [X.Y]
     any=1
     for name in $(php_build_app_exts "$app"); do set[${name,,}]=1; req[${name,,}]=1; done
   done
-  for name in $(_pb_norm "${PHP_EXT_EXTRA:-}"); do set[$name]=1; done
+  for name in $(_pb_norm "${PHP_EXT_EXTRA:-}"); do
+    if _pb_retired "$name"; then
+      _pb_warn "PHP: ${name} is no longer a build option; left out (PHP_EXT_EXTRA still names it: --php ext=-${name} removes it)"
+      continue
+    fi
+    set[$name]=1
+  done
   if [[ ${PHP_BUILD_EXT_RESET:-0} != 1 ]]; then
-    for name in "${!prevset[@]}"; do set[$name]=1; done
+    for name in "${!prevset[@]}"; do
+      if _pb_retired "$name"; then
+        _pb_warn "PHP${ver:+ ${ver}}: ${name} is no longer a build option; the next build leaves it out"
+        continue
+      fi
+      set[$name]=1
+    done
   fi
   if (( ! any )) && [[ -z $prev && -z ${PHP_EXT_EXTRA:-} ]]; then
     for app in wordpress xenforo chevereto; do
@@ -628,7 +647,7 @@ ExecStart=${PHP_BUILD_ROOT}/${ver}/sbin/php-fpm --nodaemonize --fpm-config ${e}/
 ExecReload=/bin/kill -USR2 \$MAINPID
 RuntimeDirectory=php
 RuntimeDirectoryPreserve=yes
-LimitNOFILE=524288
+LimitNOFILE=$(nofile_unit php 2>/dev/null || printf 524288)
 LimitCORE=0
 # Stop gracefully: on SIGQUIT the workers finish their request and close
 # their persistent MariaDB connections.  SIGTERM killed them mid-connection
@@ -858,7 +877,7 @@ emergency_restart_threshold = 100
 emergency_restart_interval = 1m
 process_control_timeout = 10s
 
-rlimit_files = 524288
+rlimit_files = ${NOFILE_PHP_RLIMIT_FILES:-524288}
 rlimit_core = 0
 
 include = ${etc}/${ver}/fpm/pool.d/*.conf
@@ -1173,6 +1192,16 @@ php_build_current() { # X.Y
 }
 
 php_build_bolted() { grep -qx 'bolt=1' "$PHP_BUILD_ROOT/$1/build.info" 2>/dev/null; }
+# build.info bolt= (0, 1, nolbr, noperf) and whether a BOLT pass may run:
+# not when the tool found no branch samples (nolbr) or no perf sampling at
+# all (noperf) on this host; the next build resets it (1.22.5).
+php_build_bolt_state() { awk -F= '$1 == "bolt" { print $2; exit }' "$PHP_BUILD_ROOT/$1/build.info" 2>/dev/null || true; }
+php_build_bolt_due() { # X.Y
+  case $(php_build_bolt_state "$1") in
+    nolbr|noperf) return 1 ;;
+    *) return 0 ;;
+  esac
+}
 
 # Run the tool's build with its log in ROOT/logs (kept on failure, the last
 # 5 per version).  The tool lowers its own priority (nice 10, idle IO, OOM
@@ -1313,12 +1342,21 @@ php_build_ensure() { # X.Y MODE CONTEXT OUT
   # next --optimize or the refresh rebuild BOLTs the new version.
   if [[ $context == optimize && $mode == full && ${PHP_UPGRADE_IN_FLIGHT:-0} == 1 ]] && ! php_build_bolted "$ver"; then
     _pb_report "$out" "- PHP ${ver}: BOLT deferred to the next --optimize (not during the --upgrade-php switch)"
+  elif [[ $context == optimize && $mode == full && $(php_active_version) == "$ver" ]] && ! php_build_bolt_due "$ver" \
+     && [[ ${SETUP_PHP_BUILD_BOLT:-1} == 1 ]]; then
+    # 1.22.5: bolt=nolbr / noperf (no branch samples / no perf sampling on
+    # this host) waits for the next build.
+    _pb_report "$out" "- PHP ${ver}: BOLT not possible on this host (bolt=$(php_build_bolt_state "$ver")); the ThinLTO build serves"
   elif [[ $context == optimize && $mode == full && $(php_active_version) == "$ver" ]] && ! php_build_bolted "$ver" \
      && [[ ${SETUP_PHP_BUILD_BOLT:-1} == 1 ]]; then
     "$PHP_BUILD_TOOL" bolt "$ver" "${SETUP_PHP_BUILD_BOLT_SECONDS:-60}" > "${PHP_BUILD_LOG_DIR}/bolt-${ver}.log" 2>&1 || rc=$?
     case $rc in
       0) _pb_report "$out" "- PHP ${ver}: BOLT applied to php-fpm from live traffic" ;;
-      3) _pb_report "$out" "- PHP ${ver}: BOLT skipped (too little traffic in the sample, or another build held the lock); the next --optimize under load retries" ;;
+      3) if grep -q 'BOLT skipped until the next build' "${PHP_BUILD_LOG_DIR}/bolt-${ver}.log" 2>/dev/null; then
+           _pb_report "$out" "- PHP ${ver}: BOLT not possible on this host ($(grep -m1 -oE 'no branch samples[^;]*|perf cannot sample[^;]*' "${PHP_BUILD_LOG_DIR}/bolt-${ver}.log" 2>/dev/null)); not retried until the next build"
+         else
+           _pb_report "$out" "- PHP ${ver}: BOLT skipped (too little traffic in the sample, or another build held the lock); the next --optimize under load retries"
+         fi ;;
       *) _pb_report "$out" "- PHP ${ver}: BOLT not applied ($(tail -n 1 "${PHP_BUILD_LOG_DIR}/bolt-${ver}.log" 2>/dev/null)); the ThinLTO build keeps serving" ;;
     esac
     rc=0

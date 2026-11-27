@@ -1,20 +1,24 @@
 #!/usr/bin/env bash
-# TLS-library and kTLS benchmark: nginx arms built with
-# `tools/nginx-build.sh build-arm DIR` (TLS_LIB=openssl|aws-lc|boringssl,
-# KTLS=0|1), each run standalone from one arm-neutral config on its own
-# ports, never touching the live /etc/nginx or nginx.service.
+# TLS benchmark: nginx arms built with `tools/nginx-build.sh build-arm DIR`
+# (AWS-LC, the only TLS library since 1.22.5: arms differ by AWS_LC_VERSION
+# or NGINX_VERSION in their own nginx-build.conf),
+# each run standalone from one arm-neutral config on its own ports, never
+# touching the live /etc/nginx or nginx.service.
 #
 # Usage (root):
-#   ARMS="openssl-3.5 openssl-4.1 aws-lc boringssl openssl-3.5-ktls" ROUNDS=5 tls-arms-bench.sh
+#   ARMS="aws-lc-a aws-lc-b" ROUNDS=5 tls-arms-bench.sh
 #   tls-arms-bench.sh --summary /root/audit/tls-arms/raw-STAMP.tsv
 #
-# Arms are /opt/nginx-arms/<arm>/sbin/nginx (ARMDIR).  A name ending in
-# "-ktls" gets `ssl_conf_command Options KTLS;` (OpenSSL only; the build
-# must have enable-ktls) and the tls kernel module is loaded for the run.
+# Arms are /opt/nginx-arms/<arm>/sbin/nginx (ARMDIR).  (The 1.22.2 "-ktls"
+# arm was removed with kTLS in 1.22.5, the "boringssl" and "openssl-3.5"
+# arms with TLS_LIB=boringssl and OPENSSL_VERSION=lts, and the "openssl-4.1"
+# arm with TLS_LIB=openssl: build-arm can no longer build them.  An arm binary
+# already in ARMDIR still runs, and --summary still reads their raw files;
+# columns are found by their header names.)
 #
 # Only features every library supports are configured: TLS 1.3, no
 # stapling, no session cache and no tickets (every handshake tier is a full
-# handshake), one certificate per server block (BoringSSL).
+# handshake), one certificate per server block.
 #   :9443 ECDSA P-256, groups X25519MLKEM768:X25519 (the OpenSSL 3.5+ default)
 #   :9444 ECDSA P-256, X25519 only
 #   :9445 RSA-2048,    X25519 only
@@ -25,7 +29,7 @@
 #   K-1k    keep-alive, 1 KB          K-page  keep-alive, XenForo guest page snapshot
 #   B-1m    keep-alive, 1 MB          B-16m   keep-alive, 16 MB (incompressible)
 # Per row: req/s, p50, p99, MB/s, nginx CPU ms per request (utime+stime of
-# the master and workers), TlsTxSw delta (kTLS proof), non-2xx/socket errors.
+# the master and workers), non-2xx/socket errors.
 # Each round visits the arms forward, then reverse.  Pin the clock first
 # (set-clock.sh 3600) or the turbo budget favours whichever arm runs first.
 set -Eeuo pipefail
@@ -45,17 +49,19 @@ summary() { # raw.tsv -> markdown: median and spread per arm and tier
   awk -F'\t' '
     function med(a, n,   i, j, t) { for (i = 2; i <= n; i++) { t = a[i]; for (j = i - 1; j >= 1 && a[j] > t; j--) a[j+1] = a[j]; a[j+1] = t }
                                     return (n % 2) ? a[(n+1)/2] : (a[n/2] + a[n/2+1]) / 2 }
-    NR == 1 || $11 != "ok" { next }
-    { k = $1 SUBSEP $3; n[k]++; R[k, n[k]] = $4; P50[k, n[k]] = $5; P99[k, n[k]] = $6; MB[k, n[k]] = $7; C[k, n[k]] = $8; T[k] += $9
-      if (!(k in mn) || $4 < mn[k]) mn[k] = $4; if (!(k in mx) || $4 > mx[k]) mx[k] = $4
-      if (!($3 in seen)) { seen[$3] = 1; tiers[++nt] = $3 }; if (!($1 in sa)) { sa[$1] = 1; arms[++na] = $1 } }
+    NR == 1 { for (i = 1; i <= NF; i++) col[$i] = i; next }
+    $col["gate"] != "ok" { next }
+    { k = $col["arm"] SUBSEP $col["tier"]; n[k]++; v = $col["rps"]; R[k, n[k]] = v
+      P50[k, n[k]] = $col["p50_ms"]; P99[k, n[k]] = $col["p99_ms"]; MB[k, n[k]] = $col["MBps"]; C[k, n[k]] = $col["nginx_cpu_ms_req"]
+      if (!(k in mn) || v < mn[k]) mn[k] = v; if (!(k in mx) || v > mx[k]) mx[k] = v
+      if (!($col["tier"] in seen)) { seen[$col["tier"]] = 1; tiers[++nt] = $col["tier"] }; if (!($col["arm"] in sa)) { sa[$col["arm"]] = 1; arms[++na] = $col["arm"] } }
     END {
-      print "| tier | arm | rounds | req/s (median) | spread | p50 ms | p99 ms | MB/s | nginx CPU ms/req | TlsTxSw/round |"
-      print "|---|---|---|---|---|---|---|---|---|---|"
+      print "| tier | arm | rounds | req/s (median) | spread | p50 ms | p99 ms | MB/s | nginx CPU ms/req |"
+      print "|---|---|---|---|---|---|---|---|---|"
       for (t = 1; t <= nt; t++) for (a = 1; a <= na; a++) { k = arms[a] SUBSEP tiers[t]; m = n[k]; if (!m) continue
         for (i = 1; i <= m; i++) { r[i] = R[k, i]; p[i] = P50[k, i]; q[i] = P99[k, i]; b[i] = MB[k, i]; c[i] = C[k, i] }
-        mr = med(r, m); printf "| %s | %s | %d | %.0f | %.1f%% | %.2f | %.2f | %.1f | %.4f | %.0f |\n", tiers[t], arms[a], m, mr,
-          (mr ? 100 * (mx[k] - mn[k]) / mr : 0), med(p, m), med(q, m), med(b, m), med(c, m), T[k] / m } }' "$1"
+        mr = med(r, m); printf "| %s | %s | %d | %.0f | %.1f%% | %.2f | %.2f | %.1f | %.4f |\n", tiers[t], arms[a], m, mr,
+          (mr ? 100 * (mx[k] - mn[k]) / mr : 0), med(p, m), med(q, m), med(b, m), med(c, m) } }' "$1"
 }
 [[ ${1:-} == --summary ]] && { summary "${2:?raw tsv}"; exit 0; }
 (( EUID == 0 )) || { echo "run as root" >&2; exit 1; }
@@ -77,7 +83,6 @@ cpu_ticks() { # pid file -> utime+stime of the master and its workers
   done
   echo "$t"
 }
-tls_tx() { awk '$1 == "TlsTxSw" { print $2; f = 1 } END { if (!f) print 0 }' /proc/net/tls_stat 2>/dev/null || echo 0; }
 
 prepare() {
   mkdir -p "$W"/{www,ssl,run,logs,tmp} "$OUT"
@@ -99,8 +104,7 @@ prepare() {
 }
 
 write_conf() { # arm -> conf path
-  local arm=$1 c="$W/$1.conf" kt=""
-  [[ $arm == *-ktls ]] && kt="ssl_conf_command Options KTLS;"
+  local arm=$1 c="$W/$1.conf"
   cat > "$c" <<EOF
 worker_processes $WORKERS;
 pid $W/run/$arm.pid;
@@ -114,7 +118,6 @@ http {
   types { text/html html; application/octet-stream bin; }
   ssl_protocols TLSv1.3;
   ssl_session_cache off; ssl_session_tickets off;
-  $kt
   root $W/www;
   server { listen 127.0.0.1:9443 ssl reuseport; ssl_certificate $W/ssl/ec.crt;  ssl_certificate_key $W/ssl/ec.key;  ssl_ecdh_curve X25519MLKEM768:X25519; }
   server { listen 127.0.0.1:9444 ssl reuseport; ssl_certificate $W/ssl/ec.crt;  ssl_certificate_key $W/ssl/ec.key;  ssl_ecdh_curve X25519; }
@@ -160,13 +163,13 @@ tier_args() { # tier -> "port path conns closeflag"
 }
 
 run_tier() { # arm round tier -> one TSV row
-  local arm=$1 rd=$2 t=$3 port path conns mode out c0 c1 x0 x1 reqs rps p50 p99 mbs cpu err gate=ok hz
+  local arm=$1 rd=$2 t=$3 port path conns mode out c0 c1 reqs rps p50 p99 mbs cpu err gate=ok hz
   read -r port path conns mode < <(tier_args "$t")
   local -a h=(); [[ $mode == close ]] && h=(-H 'Connection: close')
   taskset -c "$WRK_CPUS" wrk -t4 -c"$conns" -d2s "${h[@]}" "https://127.0.0.1:$port$path" >/dev/null 2>&1 || true
-  c0=$(cpu_ticks "$W/run/$arm.pid"); x0=$(tls_tx)
+  c0=$(cpu_ticks "$W/run/$arm.pid")
   out=$(taskset -c "$WRK_CPUS" wrk -t4 -c"$conns" -d"${DUR}s" --latency "${h[@]}" "https://127.0.0.1:$port$path" 2>&1) || gate="fail: wrk"
-  c1=$(cpu_ticks "$W/run/$arm.pid"); x1=$(tls_tx)
+  c1=$(cpu_ticks "$W/run/$arm.pid")
   reqs=$(awk '/requests in/ { print $1 }' <<<"$out"); rps=$(awk '/^Requests\/sec/ { print $2 }' <<<"$out")
   p50=$(ms "$(awk '$1 == "50%" { print $2 }' <<<"$out")"); p99=$(ms "$(awk '$1 == "99%" { print $2 }' <<<"$out")")
   mbs=$(mb "$(awk '/^Transfer\/sec/ { print $2 }' <<<"$out")")
@@ -175,30 +178,20 @@ run_tier() { # arm round tier -> one TSV row
   cpu=$(awk -v d=$(( c1 - c0 )) -v r="${reqs:-0}" -v hz="$hz" 'BEGIN { printf "%.4f", r ? d * 1000 / hz / r : 0 }')
   [[ -n $err ]] && gate="fail: $err"
   [[ ${reqs:-0} -gt 0 ]] || gate="fail: no requests"
-  [[ $arm == *-ktls && $t == B-* && $(( x1 - x0 )) -le 0 ]] && gate="fail: kTLS not engaged"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$arm" "$rd" "$t" "${rps:-0}" "$p50" "$p99" "$mbs" "$cpu" $(( x1 - x0 )) "$conns" "$gate"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$arm" "$rd" "$t" "${rps:-0}" "$p50" "$p99" "$mbs" "$cpu" "$conns" "$gate"
 }
 
 read -r -a ARM_LIST <<<"${ARMS:?set ARMS (arm names under $ARMDIR)}"
 read -r -a TIER_LIST <<<"$TIERS"
 prepare
-for a in "${ARM_LIST[@]}"; do [[ $a == *-ktls ]] && { modprobe tls || { echo "modprobe tls failed" >&2; exit 1; }; break; }; done
-# kTLS sendfile stalls (one record per ~200 ms timer) while the unsent-bytes
-# low-water mark is under a few records: refuse rather than measure a stall.
-for a in "${ARM_LIST[@]}"; do
-  [[ $a == *-ktls ]] || continue
-  (( $(sysctl -n net.ipv4.tcp_notsent_lowat) >= 131072 )) \
-    || { echo "kTLS arm $a: set net.ipv4.tcp_notsent_lowat >= 131072 for this run (16384 stalls kTLS sendfile)" >&2; exit 1; }
-  break
-done
 STAMP=$(date +%Y%m%d-%H%M%S); RAW="$OUT/raw-$STAMP.tsv"
-printf 'arm\tround\ttier\trps\tp50_ms\tp99_ms\tMBps\tnginx_cpu_ms_req\ttls_tx_sw\tconns\tgate\n' > "$RAW"
+printf 'arm\tround\ttier\trps\tp50_ms\tp99_ms\tMBps\tnginx_cpu_ms_req\tconns\tgate\n' > "$RAW"
 for a in "${ARM_LIST[@]}"; do stop_arm "$a"; done
 for (( rd = 1; rd <= ROUNDS; rd++ )); do
   order=("${ARM_LIST[@]}")
   if (( rd % 2 == 0 )); then order=(); for (( i = ${#ARM_LIST[@]} - 1; i >= 0; i-- )); do order+=("${ARM_LIST[i]}"); done; fi
   for a in "${order[@]}"; do
-    if ! start_arm "$a"; then printf '%s\t%s\tstart\t0\t0\t0\t0\t0\t0\t0\tfail: start\n' "$a" "$rd" >> "$RAW"; continue; fi
+    if ! start_arm "$a"; then printf '%s\t%s\tstart\t0\t0\t0\t0\t0\t0\tfail: start\n' "$a" "$rd" >> "$RAW"; continue; fi
     for t in "${TIER_LIST[@]}"; do run_tier "$a" "$rd" "$t" | tee -a "$RAW" >&2; done
     stop_arm "$a"
   done

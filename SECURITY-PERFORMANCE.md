@@ -17,14 +17,14 @@ Existing hosts move to the compiled services once, through `--optimize`
 
 | Layer | In place |
 |---|---|
-| nginx | compiled from nginx.org mainline (1.31.10 at release) with OpenSSL, PCRE2 and zlib-ng linked statically and the Brotli filter built in; lean module set (no mail, stream, DAV, SSI, sub, uwsgi/scgi/grpc, memcached, `limit_conn`, and since 1.22.1 no `gzip_static`/`brotli_static`: every response is compressed dynamically, ...); branding stripped in the source (section 2); `worker_processes`/connections/rlimit from the hardware, HTTP/2, HTTP/3, TLS 1.2/1.3 with HSTS, dynamic Brotli 4 (3 on 1-2 CPU hosts) + gzip, FastCGI/proxy cache zones sized to RAM and disk with `min_free` headroom, a login brute-force limiter (below), guest full-page caches for WordPress/XenForo/Chevereto/Flarum whose cookie rule is default-deny (an unknown cookie is never a guest page; analytics, consent and CDN cookies are the allowlist), immutable asset locations, dotfile/`wp-config.php`/`xmlrpc.php` denies, no PHP from upload directories, `auth_basic` compiled in, access log off, error log under `/var/www/logs/nginx` |
-| Login limiter | the only request limit: login, registration and password-reset POSTs, 20 a minute per address after a burst of 10, IPv6 per /64, loopback exempt, `429` on reject, logged at `info` so a flood cannot fill the disk; the generic per-IP limits were removed in 1.21.71 and `limit_conn` is not built |
-| PHP-FPM / CLI | compiled from php.net (any released version, never RC/alpha/beta), FPM and CLI from one tree, extensions linked statically: a base set plus what each detected application needs (WordPress, XenForo, Chevereto, generic PHP), `--php ext=` for more; detection only adds, never removes; static pool, 1.0 worker per logical CPU with a local database on flash (1.5 on a VPS or with a remote database, 2.0 on HDD), Unix socket `www-data` 0660, OPcache, tracing JIT always on (`SETUP_PHP_JIT_WORDPRESS=0` exempts WordPress roots), slow log 10 s, worker recycling, `expose_php=Off`, `PATH_TRANSLATED` and `open_basedir` leak repairs; opt-in session/cgi hardening (`SETUP_PHP_SESSION_HARDENING=1`) |
+| nginx | compiled from nginx.org mainline (1.31.10 at release) with AWS-LC, PCRE2 and zlib-ng linked statically and the Brotli filter built in; lean module set (no mail, stream, DAV, SSI, sub, uwsgi/scgi/grpc, memcached, `limit_conn`, and since 1.22.1 no `gzip_static`/`brotli_static`: every response is compressed dynamically, ...); branding stripped in the source (section 2); `worker_processes`/connections/rlimit from the hardware, HTTP/2, HTTP/3 (on by default since 1.22.5: every TLS vhost includes `h5bp/tls/http3.conf`; comment the include out to turn it off for one vhost), TLS 1.2/1.3 with HSTS, dynamic Brotli 1 + gzip 4 (3 on 1-2 CPU hosts), FastCGI/proxy cache zones sized to RAM and disk with `min_free` headroom, a login brute-force limiter (below), guest full-page caches for WordPress/XenForo/Chevereto/Flarum whose cookie rule is default-deny (an unknown cookie is never a guest page; analytics, consent and CDN cookies are the allowlist), immutable asset locations, dotfile/`wp-config.php`/`xmlrpc.php` denies, no PHP from upload directories, `auth_basic` compiled in, access log off, error log under `/var/www/logs/nginx` |
+| Login limiter | the only request limit: login, registration and password-reset POSTs, and since 1.22.5 XenForo search (`POST /search/search`) and contact-form (`POST /misc/contact`) submissions in the same zone (result pages and every GET stay unlimited), 20 a minute per address after a burst of 10, IPv6 per /64, loopback exempt, `429` on reject, logged at `info` so a flood cannot fill the disk; the generic per-IP limits were removed in 1.21.71 and `limit_conn` is not built |
+| PHP-FPM / CLI | compiled from php.net (any released version, never RC/alpha/beta), FPM and CLI from one tree, extensions linked statically: a base set plus what each detected application needs (WordPress, XenForo, Chevereto, generic PHP), `--php ext=` for more; detection only adds, never removes; static pool, 1.0 worker per logical CPU with a local database on flash (1.5 on a VPS or with a remote database, 2.0 on HDD), Unix socket `www-data` 0660, OPcache, tracing JIT always on (`SETUP_PHP_JIT_WORDPRESS=0` exempts WordPress roots), slow log 10 s, worker recycling, `expose_php=Off`, `PATH_TRANSLATED` and `open_basedir` leak repairs |
 | PHP sessions | `/var/lib/php/sessions`, owned by the pool user (`www-data`) with mode 0700; PHP collects expired sessions itself (`gc_probability=1`, `gc_divisor=1000`), so Debian's `phpsessionclean` timer is gone; a pool that runs as another user gets its own `/var/lib/php/sessions-<user>` (0700) |
 | MariaDB | buffer pool (data+5%) and redo log from live data, thread pool, NVMe/SSD/HDD I/O capacity, connections from the PHP pool, `skip_name_resolve`, `secure_file_priv`, `local_infile=0`, loopback bind, slow/error logs, AppArmor fix, systemd fd limit, embedded backup job (30 dumps) and `mysqltuner.pl`, config validated before every restart |
-| Valkey | compiled from source; loopback + `protected-mode`, Unix socket 770 with `www-data` in the group, cache-only persistence, `maxmemory` = working set +20% (128 MB minimum; RAM floor only on a fresh install), `allkeys-lru`, `io-threads 1`, lazy-free, online `CONFIG SET` tuning; a host whose data is persisted stays on the series that wrote it |
+| Valkey | compiled from source; Unix socket only (`port 0`; TCP kept only when an app config or a connected client needs it, an operator bind serves other hosts, or `--valkey tcp=on`), loopback + `protected-mode`, Unix socket 770 with `www-data` in the group, RDB snapshot every 5 minutes (`save 300 1`, no AOF; a failed snapshot never stops writes), `maxmemory` = working set +20% (128 MB minimum; RAM floor only on a fresh install), `allkeys-lru`, `io-threads 1`, lazy-free, online `CONFIG SET` tuning; never older than the server that wrote the data (AOF hosts also stay on its series) |
 | Elasticsearch | loopback bind, locked heap = store/4 (512 MB..25% RAM..31 GB), bounded search/write thread pools, single-node replica fix, `vm.max_map_count`, memlock/fd limits |
-| Host | DNS drop-in, performance governor on dedicated hardware, BBR + fq, hardware-scaled backlogs/conntrack/dirty bytes/`min_free_kbytes`, 1M-nofile limits, THP `madvise`, per-device I/O scheduler, swap policy, UFW (deny in, `ufw limit` SSH, 80/443), `unattended-upgrades`, managed cron (ownership repair that skips logs, backups, Cloudflare IPs, wp-cron), logrotate for `/var/www/logs`; hosts under 4 GB RAM get nginx only |
+| Host | DNS drop-in, performance governor on dedicated hardware, kernel `mitigations=off` by default since 1.22.5 (managed GRUB drop-in, next reboot; `mitigations=on` removed, `--purge basic` restores the distribution default), which drops the kernel's protection between local processes and so suits only single-tenant hosts administered with SSH keys only, BBR + fq, hardware-scaled backlogs/conntrack/dirty bytes/`min_free_kbytes`, 1M-nofile limits and one `LimitNOFILE` plan for nginx, PHP, Valkey, MariaDB and Elasticsearch, THP `madvise`, per-device I/O scheduler, swap policy, UFW (deny in, `ufw limit` SSH, 80 and 443 TCP+UDP), `unattended-upgrades`, managed cron (ownership repair that skips logs, backups, Cloudflare IPs, wp-cron), logrotate for `/var/www/logs`; hosts under 4 GB RAM get nginx only |
 | WordPress | `wp-config.php` 640, file-edit/mods constants, WP-Cron moved to cron, salts, per-database user split, webshell quarantine, world-writable and archive reports |
 | Operations | `--diagnostics` bundle with redaction and a read-only builds section (versions, CPU match, timers, last build logs), `--restart-all` in dependency order, `--optimize` report with rollback per service, `--purge` (removes our units, builds and links; never the backups) |
 
@@ -172,7 +172,9 @@ site 200. A second `--optimize` found nothing to migrate.
    ACME client of your choice) and automate renewal.
 2. **SSH and brute force.** Keys only, no root/password login, fail2ban or
    provider protection; the script only rate-limits SSH in UFW and reports
-   password authentication.
+   password authentication.  Key-only access matters more since 1.22.5:
+   every managed host boots with `mitigations=off`, so no untrusted user may
+   run code on it.
 3. **Secrets and database users.** Rotate the setup admin password; give
    every application its own database user without `GRANT OPTION` (the
    WordPress split is automatic, XenForo and custom apps are manual).
@@ -192,18 +194,27 @@ site 200. A second `--optimize` found nothing to migrate.
    and PHP units with a drop-in if your applications allow it.
 7. **Edge protection.** A CDN/WAF in front (Cloudflare with the real-IP
    config enabled first, or every visitor behind it shares one limiter key),
-   rate limits on search and API endpoints, bot management if needed.
+   rate limits on API endpoints (XenForo search and contact POSTs share the
+   login limiter since 1.22.5), bot management if needed.  Cloudflare waits
+   100 s for an origin response below the Enterprise plan: run long admin
+   jobs from the CLI or cron, or through a DNS-only admin host name.
 8. **Exposure.** Keep MariaDB, Valkey and Elasticsearch on loopback. For
    remote access use explicit addresses, TLS (`require_secure_transport`,
    X-Pack security, Valkey ACLs/TLS) and UFW source rules. Remove any
    pre-existing mDNS/WS-Discovery rules you do not need.
-9. **Data durability.** `innodb_flush_log_at_trx_commit=1` for financial
-   data; AOF plus `noeviction`/`volatile-lru` (or a separate instance) when
-   Valkey holds sessions, queues or locks.
+9. **Data durability.** The default `innodb_flush_log_at_trx_commit=2`
+   can lose about 1 s of commits on an OS crash or power loss; set 1 for
+   financial data in a drop-in that sorts after `99-setup-optimize.cnf`.
+   Valkey keeps sessions across clean restarts and reboots through its RDB
+   snapshot (after a crash or power loss the cache starts empty); size
+   `--valkey ram=` to hold sessions plus cache, because `allkeys-lru` may
+   evict them under pressure (never `volatile-*`: session keys carry a TTL
+   and are evicted first).  Use a separate instance with AOF for queues or
+   locks.
 10. **Hygiene.** Remove the `stress.invalid` site, test databases and test
     certificates from production; review held-back packages and
-    reboot-required; `opcache.validate_timestamps=0` with a reload on deploy;
-    once the host is stable, prune `/var/backups/setup-1.22` yourself.
+    reboot-required; once the host is stable, prune
+    `/var/backups/setup-1.22` yourself.
 
 ## 5. Large-site architecture
 

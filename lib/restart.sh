@@ -514,6 +514,9 @@ run_optimize() {
   fi
   opt_report "## Operating system"
   opt_report "- CPU governor, PAM limits and kernel/network/memory sysctls tuned for ${OPT_MEM_TOTAL_MB}MB RAM / $(effective_cpus) CPUs"
+  # Crash-restart drop-ins + the 30 s down-check timer (lib/watchdog.sh);
+  # it skips while this run holds the run lock.  One report line.
+  watchdog_ensure opt_report "- " || true
   step "Optimizing installed services"
   if (( ${#OPT_DETECTED[@]} == 0 )); then
     info "No supported installed services detected (nginx, PHP-FPM, MariaDB, Valkey/Redis, Elasticsearch)"
@@ -573,6 +576,10 @@ run_optimize() {
   if [[ " ${OPT_DETECTED[*]} " == *" nginx "* ]] && (( ! OPT_WEB_LEGACY )); then
     php_refresh_after_nginx opt_report "- " || rc=1
   fi
+  # Chevereto sites whose sessions are not in Valkey (read-only warning).
+  if [[ " ${OPT_DETECTED[*]} " == *" nginx "* ]]; then
+    chevereto_session_check /etc/nginx /etc/php || true
+  fi
 
   verify_optimized_services || rc=1
   # Detect WordPress/XenForo configs under /var/www and report the exact
@@ -592,6 +599,13 @@ run_optimize() {
     fi
   else
     opt_report "- Cache: left intact (no service was reloaded or restarted)"
+  fi
+
+  # Read-only "Verify" and "Certificates" blocks (lib/diagnostics.sh): what
+  # the host runs now (nginx/TLS library, PHP JIT, Valkey) and the
+  # vhost certificate expiry.  Nothing is changed.
+  if declare -F opt_report_verify >/dev/null 2>&1; then
+    opt_report_verify || true
   fi
 
   local report
@@ -962,6 +976,8 @@ main() {
   done
   if (( svc_any )); then
     write_cron || warn "Could not refresh the managed crontab"
+    # The units this run installed get the service watchdog (lib/watchdog.sh).
+    watchdog_ensure info || warn "Could not install the service watchdog"
   fi
 
   local summary_ok=1

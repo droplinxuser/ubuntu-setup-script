@@ -10,7 +10,8 @@
 # amalgamation), ICU from unicode-org (only when intl is asked for), and
 # every library the binaries link (OpenSSL, PCRE2, zlib-ng, libxml2,
 # libsodium, GMP, GNU libiconv, curl, libjpeg-turbo, libpng, libwebp,
-# libzip) from the project's own releases, at the versions in php-build.conf
+# libzip; mimalloc, which replaces glibc's malloc in php-fpm and php) from
+# the project's own releases, at the versions in php-build.conf
 # ("latest" by default).  Everything is compiled -O3 -march=native -fPIE with
 # Ubuntu's hardening flags, linked statically with ThinLTO, and php-fpm is
 # rewritten by LLVM BOLT from a perf sample of live traffic (the CLI is LTO
@@ -93,6 +94,45 @@ BOLT_MIN_FUNCS=${PHP_BUILD_BOLT_MIN_FUNCS:-300}
 # zlib-ng with zlib's API: +7 % on uncached Chevereto pages, where PHP gzips
 # the page itself (1.21.70).  PHP_BUILD_ZLIB=zlib builds zlib instead.
 ZLIB_IMPL=${PHP_BUILD_ZLIB:-zlib-ng}
+# The allocator: always mimalloc (1.22.5; microsoft/mimalloc linked into
+# php-fpm and php as a static object that replaces malloc; Zend MM still
+# serves request memory, so libxml2, GD, curl, OpenSSL and the like move to
+# it).  Recorded as build.info malloc=; a build without it, or on another
+# allocator, is reported stale by `check` and rebuilt on mimalloc (a CPU
+# rebuild too).
+# php-build.conf PHP_BUILD_MALLOC (env PHP_BUILD_MALLOC overrides) is only
+# read to warn.  Removed in 1.22.5 (operator rule: options that measured no
+# faster): PHP_BUILD_MALLOC=glibc (3-4 % slower on uncached XenForo pages
+# and twice the PHP-FPM memory under load),
+# PHP_BUILD_MALLOC=jemalloc (below mimalloc on every XenForo tier) and
+# BOLT_NOLBR=1 (a plain-cycles BOLT profile, 1-3 % slower than no BOLT).
+# Either still set draws one warning and the default; a build made with
+# one is stale (cmd_check).  Any other value (a typo) warns too and builds
+# on mimalloc: it never fails a build, so the daily refresh cannot loop on
+# it.
+MALLOC_IMPL=${PHP_BUILD_MALLOC:-$(conf_opt PHP_BUILD_MALLOC mimalloc)}
+case $MALLOC_IMPL in
+  mimalloc) ;;
+  glibc)
+    opt_removed "PHP: PHP_BUILD_MALLOC=glibc" "measured 3-4 % slower on uncached XenForo pages and twice the PHP-FPM memory of mimalloc" mimalloc ;;
+  jemalloc)
+    opt_removed "PHP: PHP_BUILD_MALLOC=jemalloc" "measured slower than mimalloc on every tier" mimalloc ;;
+  *)
+    say "WARNING: PHP: PHP_BUILD_MALLOC=$MALLOC_IMPL is not an allocator this build knows (expected mimalloc); using the default (mimalloc)" ;;
+esac
+MALLOC_IMPL=mimalloc
+PHP_NOLBR=${PHP_BUILD_BOLT_NOLBR:-$(conf_opt BOLT_NOLBR 0)}
+[[ $PHP_NOLBR == 0 ]] \
+  || opt_removed "PHP: BOLT_NOLBR=$PHP_NOLBR" "plain-cycles BOLT measured slower than no BOLT" "no BOLT without branch samples"
+unset PHP_NOLBR
+# The allocator a build recorded (none: glibc, before 1.22.5).  Only the
+# verify of a BOLT pass reads it: an older glibc or jemalloc build that is
+# BOLTed before its rebuild is not checked for mimalloc.
+recorded_malloc() { # X.Y
+  local m
+  m=$(info_get "$1" malloc)
+  printf '%s' "${m:-glibc}"
+}
 
 # Bump LIB_RECIPE when a library's configure options change: it is part of
 # the library cache key.  6: 1.22 (SQLite, ICU; the CPU fingerprint joined
@@ -104,7 +144,7 @@ LIB_RECIPE=6
 # the Sury package).  5: 1.22.0 (FPM + CLI, own layout, per-host set).
 BUILD_RECIPE=5
 # Libraries php-fpm/php must NOT take from Ubuntu (they are linked statically).
-STATIC_LIBS_RE='^(libssl|libcrypto|libxml2|libpcre2-8|libz|libicu[a-z0-9]*|libcurl|libsodium|libgmp|libjpeg|libpng16|libwebp|libsharpyuv|libzip|libonig|libsystemd|libiconv|libsqlite3)\.so'
+STATIC_LIBS_RE='^(libssl|libcrypto|libxml2|libpcre2-8|libz|libicu[a-z0-9]*|libcurl|libsodium|libgmp|libjpeg|libpng16|libwebp|libsharpyuv|libzip|libonig|libsystemd|libiconv|libsqlite3|libmimalloc)\.so'
 # Extensions only the CLI SAPI builds (pcntl's config.m4 names cli/cgi).
 CLI_ONLY_EXTS="pcntl"
 
@@ -193,6 +233,42 @@ unit_is_ours() { # X.Y
 # other component.
 eval "bc_$(declare -f latest_of)"
 eval "bc_$(declare -f fetch_component)"
+eval "bc_$(declare -f last_known)"
+
+# The version the build of SERIES recorded for NAME, when no source answers
+# (resolve's offline fallback).  Only ROOT/SERIES/build.info, never another
+# series' record first (1.22.5): build-common's scan took the first
+# ROOT/*/build.info, so a host on 8.5 with an 8.1 rollback build checked 8.5
+# against 8.1's libraries (a false "stale" and a downgrade rebuild), and an
+# --upgrade-php=8.1 from 8.5 got 8.5's OpenSSL 4 (8.1 does not compile
+# against it).  A component SERIES has no record of yet (a new series, a
+# library the set just gained) falls back to the active series, then the
+# others; never for php itself, and openssl only from a series on the same
+# side of 8.2 (8.1 stays on OpenSSL 3).
+last_known() { # name [series]
+  local name=$1 x=${2:-} f s v="" act
+  local -a order=()
+  valid_ver "$x" || { bc_last_known "$name"; return 0; }
+  v=$(info_get "$x" "$name")
+  if [[ -z $v && $name != php ]]; then
+    act=$(active_version)
+    [[ -n $act ]] && order+=("$act")
+    for f in "$ROOT"/*/build.info; do
+      [[ -f $f ]] || continue
+      s=${f%/build.info}; s=${s##*/}
+      valid_ver "$s" && [[ $s != "$act" ]] && order+=("$s")
+    done
+    for s in ${order[@]+"${order[@]}"}; do
+      [[ $s != "$x" ]] || continue
+      if [[ $name == openssl ]]; then
+        if ver_ge "$x" 8.2; then ver_ge "$s" 8.2 || continue; else ver_ge "$s" 8.2 && continue; fi
+      fi
+      v=$(info_get "$s" "$name")
+      [[ -n $v ]] && break
+    done
+  fi
+  printf '%s' "$v"
+}
 
 # The newest released PHP version on php.net (the per-major JSON), then the
 # highest php-X.Y.Z tag of php-src (never a pre-release: the tag regex has
@@ -316,6 +392,8 @@ libs_for() { # set
   set_has "$s" zip && l+=(libzip)
   { set_has "$s" sqlite3 || set_has "$s" pdo_sqlite; } && l+=(sqlite)
   set_has "$s" intl && l+=(icu)
+  # The allocator (mimalloc, the only one since 1.22.5).
+  l+=("$MALLOC_IMPL")
   printf '%s\n' "${l[@]}"
 }
 
@@ -337,6 +415,13 @@ resolve_set() { # X.Y set exact
   if (( exact )); then
     for c in "${COMPONENTS[@]}"; do
       v=$(info_get "$ver" "$c")
+      # A build on an allocator removed in 1.22.5 (glibc, jemalloc) recorded
+      # no mimalloc=: a CPU rebuild resolves it (the cached lookup, else
+      # upstream) and moves the build to mimalloc.
+      if [[ -z $v && $c == mimalloc ]]; then
+        v=$(resolve mimalloc "$ver") || v=""
+        if [[ -n $v ]]; then say "PHP $ver: the recorded allocator $(recorded_malloc "$ver") was removed in 1.22.5; rebuilding with mimalloc $v"; fi
+      fi
       if [[ -n $v ]]; then printf '%s=%s\n' "$c" "$v"; else printf '%s=?\n' "$c"; rc=1; fi
     done
     return "$rc"
@@ -519,6 +604,11 @@ build_libs() { # deps work jobs log libs...
             --disable-shared --enable-static --with-data-packaging=static \
             --disable-tests --disable-samples --disable-extras --disable-layoutex
           make -j"$j" && make install ;;
+        mimalloc)
+          # The allocator: one object linked into php-fpm and
+          # php (cmd_build), cold flags (no LTO: the definitions must stay
+          # global and whole).
+          mimalloc_build "$src" "$deps/lib/mimalloc.o" "$cold" "$j" "$log" ;;
       esac
     ) >> "$log" 2>&1 || { log_excerpt "$log" 40; die "$name $v failed to build (log: $log)"; }
     rm -rf "$src"
@@ -573,6 +663,56 @@ php86_pecl_compat() { # X.Y SRC
   return 0
 }
 
+# The library cache key for CPU fingerprint FP (reads cmd_build's n, LIBS
+# and VERS); LIB... hashes those names instead of LIBS.
+lib_cache_key() { # FP [LIB...]
+  local fp=$1 line; shift
+  local -a libs=("$@")
+  (( ${#libs[@]} )) || libs=("${LIBS[@]}")
+  { printf 'recipe=%s\nllvm=%s\nflags=%s\ncpu=%s\n' "$LIB_RECIPE" "$n" "$BASE_FLAGS" "$fp"
+    for line in "${libs[@]}"; do printf '%s=%s\n' "$line" "${VERS[$line]}"; done; } | sha256sum | cut -c1-16
+}
+
+# 1.22.5 changed the fingerprint the key hashes: a cache built under this
+# host's own 1.22.0-1.22.4 fingerprint (V1, and V1 with rdrnd/rdseed) holds
+# the same objects for the same CPU, recipe, LLVM, flags and versions, so it
+# is renamed to DEPS once instead of recompiling every library.  Those
+# caches never held the allocator (mimalloc arrived in 1.22.5 too), so the
+# old key is hashed without it and only the allocator is built after the
+# rename (reads cmd_build's work, j and log); if that fails the reused
+# cache is dropped and cmd_build builds every library.
+lib_cache_migrate() { # DEPS
+  local extra old l
+  local -a old_libs=()
+  for l in "${LIBS[@]}"; do [[ $l == "$MALLOC_IMPL" ]] || old_libs+=("$l"); done
+  (( ${#old_libs[@]} )) || return 0
+  for extra in "" rdrnd rdseed "rdrnd rdseed"; do
+    old=$SRC_CACHE/deps-$(lib_cache_key "$(cpu_fingerprint "$extra" "$CPU_ISA_FLAGS_V1")" "${old_libs[@]}")
+    [[ $old != "$1" && -f $old/.done ]] || continue
+    # The marker goes first and comes back last: a run killed in between
+    # leaves an unmarked directory, which the next run rebuilds.
+    rm -rf "$1"; mv "$old" "$1"; rm -f "$1/.done"
+    # The libraries' .pc, .la and *-config files (and a few binaries) hold
+    # the old directory as their prefix: rewrite it, or every pkg-config
+    # include path points at a directory that no longer exists.  Both
+    # names are deps-<16 hex>, so binaries keep their length.
+    if ! { { grep -rlF -- "/${old##*/}" "$1" || true; } | xargs -r sed -i "s|/${old##*/}|/${1##*/}|g"; } 2>/dev/null \
+      || grep -rqF -- "/${old##*/}" "$1" 2>/dev/null; then
+      say "library cache: ${old##*/} could not be moved to ${1##*/}; building every library"
+      rm -rf "$1"; return 0
+    fi
+    say "library cache ${old##*/} reused as ${1##*/} (same CPU, 1.22.5 fingerprint)"
+    if [[ " ${LIBS[*]} " == *" $MALLOC_IMPL "* && ! -s $1/lib/$MALLOC_IMPL.o ]] \
+      && ! ( build_libs "$1" "$work" "$j" "$log" "$MALLOC_IMPL" ); then
+      say "library cache: $MALLOC_IMPL did not build into the reused cache; building every library"
+      rm -rf "$1"; return 0
+    fi
+    touch "$1/.done"
+    return 0
+  done
+  return 0
+}
+
 cmd_build() { # X.Y [exact]
   local ver=$1 exact=${2:-0} set work src stage dir key deps n j line log libs_csv
   local -A VERS=()
@@ -580,6 +720,10 @@ cmd_build() { # X.Y [exact]
   need_root
   ver_supported "$ver" || die "PHP $ver is not supported (8.1 or newer)"
   [[ $(uname -m) == x86_64 || $(uname -m) == aarch64 ]] || die "unsupported architecture $(uname -m)"
+  # Always mimalloc (1.22.5), a CPU rebuild of an older glibc build too
+  # (resolve_set looks its version up).  Never a die here: a bad
+  # PHP_BUILD_MALLOC only warned at load time.
+  MALLOC_IMPL=mimalloc
   set=$(want_exts "$ver")
   # Unknown names stop the build before anything is downloaded.
   ext_flags "$ver" "$set" /nonexistent >/dev/null
@@ -640,8 +784,9 @@ cmd_build() { # X.Y [exact]
   # Libraries: cached per (toolchain, flags, CPU, versions); a PHP-only
   # update reuses them.  The CPU is part of the key: -march=native objects
   # of another CPU must never be linked after a hardware change.
-  key=$( { printf 'recipe=%s\nllvm=%s\nflags=%s\ncpu=%s\n' "$LIB_RECIPE" "$n" "$BASE_FLAGS" "$(cpu_fingerprint)"; for line in "${LIBS[@]}"; do printf '%s=%s\n' "$line" "${VERS[$line]}"; done; } | sha256sum | cut -c1-16)
+  key=$(lib_cache_key "$(cpu_fingerprint)")
   deps=$SRC_CACHE/deps-$key
+  [[ -f $deps/.done ]] || lib_cache_migrate "$deps"
   if [[ ! -f $deps/.done ]]; then
     rm -rf "$deps"; mkdir -p "$deps"
     say "building ${LIBS[*]} with clang $n"
@@ -697,6 +842,13 @@ cmd_build() { # X.Y [exact]
   sed -i -E "s|^#define[[:space:]]+PHP_INCLUDE_PATH[[:space:]].*|#define PHP_INCLUDE_PATH \"${INCLUDE_PATH}\"|" main/build-defs.h
   grep -qF "#define PHP_INCLUDE_PATH \"$INCLUDE_PATH\"" main/build-defs.h \
     || die "could not set PHP_INCLUDE_PATH in main/build-defs.h"
+  # mimalloc: the object goes into the two program links only
+  # (EXTRA_LDFLAGS_PROGRAM: php and php-fpm; never opcache.so), where its
+  # malloc family replaces glibc's for the whole process.  verify requires
+  # both binaries to run on it.
+  [[ -s $deps/lib/$MALLOC_IMPL.o ]] || die "$MALLOC_IMPL: $deps/lib/$MALLOC_IMPL.o was not built"
+  grep -q '^EXTRA_LDFLAGS_PROGRAM *=' Makefile || die "$MALLOC_IMPL: no EXTRA_LDFLAGS_PROGRAM in PHP's Makefile"
+  sed -i -E "s|^(EXTRA_LDFLAGS_PROGRAM *=.*)\$|\\1 -Wl,$deps/lib/$MALLOC_IMPL.o|" Makefile
   # session.save_path defaults to the managed sessions directory even
   # without php.ini (the managed php.ini sets it too).
   # A release that renamed the entry only loses this default; the managed
@@ -735,6 +887,7 @@ cmd_build() { # X.Y [exact]
     printf 'libs=%s\n' "$libs_csv"
     printf 'opcache=%s\n' "$(opcache_shared "$ver" && echo shared || echo builtin)"
     printf 'jit=%s\n' "$jit"
+    printf 'malloc=%s\n' "$MALLOC_IMPL"
     printf 'compiler=%s\n' "$("$CC" --version | sed -n 1p)"
     printf 'cpu=%s\n' "$(cpu_fingerprint)"
     printf 'cpu_info=%s\n' "$(cpu_fingerprint_text | tr '\n' ' ' | sed 's/ $//')"
@@ -823,6 +976,13 @@ verify_candidates() { # X.Y fpm cli opcache.so set work
       && "$cli" -n "$work/setup-check.phar" 2>&1) || true
     [[ $out == *phar-ok* ]] || die "the CLI candidate cannot run a phar archive: $(printf '%s' "$out" | sed -n 1p)"
   fi
+  # A BOLT pass over an older glibc build (recorded_malloc) has nothing to
+  # check; every new build must run on mimalloc.
+  if [[ $MALLOC_IMPL == mimalloc ]]; then
+    for f in "$fpm" "$cli"; do
+      malloc_linked "$MALLOC_IMPL" "$f" -n -v || die "${f##*/} does not run on $MALLOC_IMPL"
+    done
+  fi
   # FPM accepts a minimal configuration of its own (the live /etc/php tree
   # is tested by setup.sh's php_fpm_test once the layout is written).
   cat > "$work/fpm-test.conf" <<EOF
@@ -900,13 +1060,15 @@ cmd_activate() {
 }
 
 cmd_bolt() {
-  local ver=$1 secs=${2:-60} dir base work perf p2b bolt samples n oc=""
+  local ver=$1 secs=${2:-60} dir base work perf p2b bolt samples n oc="" rc
   need_root
   dir=$(vdir "$ver"); base=$dir/sbin/php-fpm.lto
   [[ -x $base ]] || die "no build for PHP $ver: run build"
   unit_runs_build "$ver" || die "php$ver-fpm is not running the build"
   n=$(info_get "$ver" llvm)
   [[ $n =~ ^[0-9]+$ ]] || die "build.info names no LLVM version: rebuild"
+  # The verify below checks the allocator the build recorded.
+  MALLOC_IMPL=$(recorded_malloc "$ver")
   # A working perf (e.g. a provider kernel's own) is used as it is, like the
   # nginx and Valkey passes; only a missing one is installed.
   perf=$(command -v perf || true)
@@ -934,9 +1096,20 @@ cmd_bolt() {
   # binary's addresses, and sampling with it off profiled the same functions
   # (2,549 vs 2,541) for the same speed (1.21.69).
   say "PHP $ver: sampling php-fpm for ${secs}s for BOLT"
-  if ! "$perf" record -q -e cycles:u -j any,u -o "$work/perf.data" -a -- sleep "$secs" > "$work/perf.log" 2>&1; then
-    perf_record_die "$work/perf.log"
-  fi
+  # Branch records (LBR) unless this host has none (bolt_record, 1.22.5):
+  # bolt=nolbr / noperf then stop the refresh and the --optimize retry until
+  # the next build.
+  rc=0; bolt_record "$perf" "$work/perf.data" "$work/perf.log" "$secs" || rc=$?
+  case $rc in
+    0) ;;
+    4) sed -i 's/^bolt=.*/bolt=nolbr/' "$dir/build.info"
+       say "PHP $ver: no branch samples on this host (a VM or a CPU without LBR); BOLT skipped until the next build (bolt=nolbr)"
+       return 3 ;;
+    5) sed -i 's/^bolt=.*/bolt=noperf/' "$dir/build.info"
+       say "PHP $ver: perf cannot sample on this host; BOLT skipped until the next build (bolt=noperf)"
+       return 3 ;;
+    *) perf_record_die "$work/perf.log" ;;
+  esac
   # perf2bolt fails ("Please rename the input binary", after listing the
   # binaries it did see) when php-fpm took no samples at all: an idle pool,
   # e.g. the post-domain optimize of a fresh install before any application
@@ -971,7 +1144,9 @@ cmd_bolt() {
     restart_checked "$ver" || say "PHP $ver: the LTO build did not start either (systemctl status php$ver-fpm)"
     die "PHP $ver did not start on the BOLT binary; back on the LTO build"
   fi
-  sed -i 's/^bolt=.*/bolt=1/' "$dir/build.info"
+  # A bolt_mode= left by the removed plain-cycles profile goes: this one is
+  # a branch-record profile.
+  sed -i -e 's/^bolt=.*/bolt=1/' -e '/^bolt_mode=/d' "$dir/build.info"
   say "PHP $ver: BOLT applied ($samples php-fpm functions profiled)"
 }
 
@@ -1070,7 +1245,7 @@ cmd_pre() {
     done
   done
   built=$(info_get "$ver" cpu); now=$(cpu_fingerprint)
-  if ! cpu_fingerprint_matches "$built"; then
+  if ! cpu_fingerprint_matches "$built" "$(info_get "$ver" cpu_info)"; then
     logger -t "$LOG_TAG" "PHP $ver: built for CPU ${built:-unknown}, this CPU is ${now:-unknown}: php$ver-fpm stays down until setup-build-cpu.service rebuilt it" 2>/dev/null || true
     say "PHP $ver: the CPU changed since the build; php$ver-fpm stays down until setup-build-cpu.service has rebuilt it"
     systemctl start --no-block setup-build-cpu.service >/dev/null 2>&1 \
@@ -1103,10 +1278,17 @@ cmd_check() {
   recipe=$(info_get "$ver" recipe)
   [[ ${recipe:-1} == "$BUILD_RECIPE" ]] || stale+="recipe ${recipe:-1} -> $BUILD_RECIPE, "
   bcpu=$(info_get "$ver" cpu)
-  cpu_fingerprint_matches "$bcpu" || stale+="cpu ${bcpu:-none} -> $(cpu_fingerprint), "
+  cpu_fingerprint_matches "$bcpu" "$(info_get "$ver" cpu_info)" || stale+="cpu ${bcpu:-none} -> $(cpu_fingerprint), "
   set=$(want_exts "$ver" 2>/dev/null) || { echo "stale: no extension set recorded"; return 10; }
   hset=$(set_norm "$(info_get "$ver" exts)")
   [[ $set == "$hset" ]] || stale+="extensions ${hset// /,} -> ${set// /,}, "
+  # The allocator (1.22.5: mimalloc only; a build without malloc= is
+  # glibc's).  A build on a removed one (glibc, jemalloc) never matches: it
+  # is rebuilt on mimalloc.
+  have=$(info_get "$ver" malloc)
+  [[ ${have:-glibc} == "$MALLOC_IMPL" ]] || stale+="malloc ${have:-glibc} -> $MALLOC_IMPL, "
+  # A BOLT pass from the removed plain-cycles profile (BOLT_NOLBR=1).
+  [[ $(info_get "$ver" bolt_mode) != nolbr ]] || stale+="BOLT profile without branch samples (removed in 1.22.5), "
   while IFS='=' read -r name want; do
     have=$(info_get "$ver" "$name")
     if [[ $want == "?" ]]; then rc=2; continue; fi
@@ -1155,7 +1337,9 @@ cmd_refresh() {
   if (( rc == 10 )); then
     say "PHP $ver: $out; rebuilding in the background (setup-php-build@$ver.service); the running build keeps serving"
     systemctl start --no-block "setup-php-build@$ver.service" 2>/dev/null || true
-  elif (( rc == 0 )) && [[ $(info_get "$ver" bolt) != 1 ]] && unit_runs_build "$ver"; then
+  elif (( rc == 0 )) && bolt_retry_due "$(info_get "$ver" bolt)" && unit_runs_build "$ver"; then
+    # (bolt=nolbr / noperf: this host cannot record the profile; not
+    # retried until the next build.)
     # A current build that never got its BOLT pass (the pass found the build
     # lock held, or too little traffic) is retried here, as nginx's refresh
     # does.  Before 1.22.4 only a manual --optimize retried it: on the EPYC
@@ -1175,7 +1359,7 @@ cmd_status() {
     valid_ver "$ver" || continue
     [[ -n ${1:-} && $1 != "$ver" ]] && continue
     if [[ $(info_get "$ver" mode) == clang ]]; then printf 'PHP %s: 1.21 build (php-fpm only), replaced by the next build\n' "$ver"; continue; fi
-    cpu=match; cpu_fingerprint_matches "$(info_get "$ver" cpu)" || cpu=CHANGED
+    cpu=match; cpu_fingerprint_matches "$(info_get "$ver" cpu)" "$(info_get "$ver" cpu_info)" || cpu=CHANGED
     printf 'PHP %s: build %s (clang %s, recipe %s), bolt=%s, jit=%s, cpu=%s, running=%s, active=%s, exts=%s\n' "$ver" \
       "$(info_get "$ver" version)" "$(info_get "$ver" llvm)" "$(info_get "$ver" recipe)" "$(info_get "$ver" bolt)" \
       "$(info_get "$ver" jit)" "$cpu" "$(unit_runs_build "$ver" && echo yes || echo no)" \
