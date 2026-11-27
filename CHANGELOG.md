@@ -8,6 +8,19 @@ Reports of the 1.21.33-1.21.61 cycles that measured the removed Anubis
 filter were deleted from the tree on 2026-11-23 for the same reason;
 `git show <commit>:<path>` recovers them.
 
+## 1.22.8 (2026-11-28)
+
+- **A site that `/etc/hosts` maps to loopback is still recognised as
+  behind Cloudflare.**  The Cloudflare check resolved names through
+  `getent`, so a host whose `/etc/hosts` maps its own site names to
+  `127.0.1.1` (cloud-init's `manage_etc_hosts`) saw only loopback: the
+  migration warned that a Cloudflare-proxied ACME vhost was "not behind
+  Cloudflare", certbot was kept, and the unknown-SNI guard stayed off.
+  When every local answer is loopback, the public DNS answer
+  (systemd-resolved without `/etc/hosts`) is used instead; a name DNS does
+  not answer still never counts as Cloudflare.  Found on a live front
+  proxy.
+
 ## 1.22.7 (2026-11-28)
 
 Needs server-configs-nginx 1.7.5.

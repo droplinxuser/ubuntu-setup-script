@@ -867,8 +867,25 @@ ipv6_in_cidr() {
 }
 
 # Addresses a name resolves to, one per line (tests replace this function).
+# /etc/hosts often maps a host's own site names to 127.0.1.1 (cloud-init's
+# manage_etc_hosts with the site as FQDN): getent then answers loopback
+# only, and a Cloudflare-proxied site looked "not behind Cloudflare" (a
+# false migration warning, certbot kept, SNI guard off; 1.22.8).  When
+# every local answer is loopback, the public DNS answer is used instead
+# (systemd-resolved without /etc/hosts or other synthesized records); with
+# no such answer the loopback result stands, which never counts as
+# Cloudflare.
 cf_tls_resolve() {
-  getent ahosts "$1" 2>/dev/null | awk '{print $1}' | sort -u || true
+  local out dns
+  out=$(getent ahosts "$1" 2>/dev/null | awk '{print $1}' | sort -u || true)
+  if [[ -n $out ]] && ! grep -qvE '^(127\.|::1$|::ffff:127\.)' <<<"$out" && command -v resolvectl >/dev/null 2>&1; then
+    dns=$(timeout 10 resolvectl query --synthesize=no --legend=no "$1" 2>/dev/null \
+      | awk -v n="$1:" '{ for (i = 1; i <= NF; i++) { if ($i == "--") break; if ($i == n) continue
+          if ($i ~ /^[0-9a-fA-F:.]+$/ && $i ~ /[.:]/) print $i } }' \
+      | sort -u || true)
+    [[ -n $dns ]] && out=$dns
+  fi
+  [[ -z $out ]] || printf '%s\n' "$out"
 }
 
 # 0 when NAME resolves and every address is inside a Cloudflare range.
