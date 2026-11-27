@@ -1958,5 +1958,25 @@ check "report: the part states are listed" has "$out" "state nginx: done"
 check "report: every PHP version's state is listed" has "$out" "state php-8.3: done"
 check "report: the valkey rc state is explained" has "$out" "stay in dpkg's config-files (rc) state on purpose"
 
+# ---------------------------------------------------------------------------
+# 1.22.7 (live host with `listen 443 quic reuseport;` in an Angie vhost): the
+# render strips QUIC socket options from the operator vhosts it copies, and
+# a failed fit reports the fit's own error.
+# ---------------------------------------------------------------------------
+check "render: QUIC listen options are stripped after the operator files are copied" \
+  bash -c 'b=$(sed -n "/^migrate_nginx_prepare() {/,/^}/p" "$1")
+    c=$(grep -n "migrate_copy_operator_files ||" <<<"$b" | head -1 | cut -d: -f1); q=$(grep -n "tune_vhost_quic_listen_options \"\$MIGRATE_NGINX_ETC\"" <<<"$b" | head -1 | cut -d: -f1)
+    t=$(grep -n "nginx -t of the rendered tree failed" <<<"$b" | head -1 | cut -d: -f1)
+    [[ -n $c && -n $q && -n $t ]] && (( c < q && q < t ))' _ "$ROOT/lib/migrate.sh"
+check "render: a failed fit reports the fit's stderr, not the first nginx -t" \
+  bash -c 'grep -qF "fit=\$(migrate_nginx_fit \"\$MIGRATE_NGINX_ETC/nginx.conf\" \"\$cand\" 2>\"\$fit_errf\")" "$1" && grep -qF "fit_err=\$(grep -m3 -E '"'"'emerg|error'"'"' \"\$fit_errf\"" "$1" && ! grep -qF "\"\$cand\" 2>/dev/null) \\" "$1"' _ "$ROOT/lib/migrate.sh"
+qd=$(mktemp -d "${TMPDIR:-/tmp}/t-migrate-quic.XXXXXX"); mkdir -p "$qd/conf.d"
+printf 'server {\n    listen 443 ssl;\n    listen 443 quic reuseport;\n}\n' > "$qd/conf.d/site.conf"
+printf 'server {\n  listen 443 quic default_server reuseport rcvbuf=4m sndbuf=4m;\n}\n' > "$qd/conf.d/1.https.default.conf"
+SETUP_TEST_SOURCE_ONLY=1 bash -c 'source "$1/setup.sh"; set +eE; trap - ERR; tune_vhost_quic_listen_options "$2"' _ "$ROOT" "$qd" >/dev/null 2>&1
+check "render fixer: an Angie vhost's 'listen 443 quic reuseport;' loses reuseport (catch-all untouched)" \
+  bash -c 'grep -qE "^    listen 443 quic;$" "$1/conf.d/site.conf" && grep -qF "# setup.sh: QUIC socket options are set by" "$1/conf.d/site.conf" && grep -qF "reuseport rcvbuf=4m sndbuf=4m" "$1/conf.d/1.https.default.conf"' _ "$qd"
+rm -rf "$qd"
+
 printf '\n%s passed, %s failed, %s skipped\n' "$PASS" "$FAIL" "$SKIP"
 (( FAIL == 0 ))

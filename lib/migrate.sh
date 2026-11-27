@@ -2218,6 +2218,10 @@ migrate_nginx_prepare() {
   install -m 755 -d "$MIGRATE_NGINX_ETC/scripts"
   [[ -f $MIGRATE_NGINX_ETC/scripts/cloudflare.sh ]] && chmod 755 "$MIGRATE_NGINX_ETC/scripts/cloudflare.sh"
   migrate_copy_operator_files || { migrate_nginx_abort "copying the operator files from /etc/angie failed"; return 1; }
+  # The vhosts arrive after deploy_nginx_tree ran this: an Angie vhost with
+  # `listen 443 quic reuseport;` would otherwise fail nginx -t ("duplicate
+  # listen options") against the QUIC catch-all's socket options (1.22.7).
+  tune_vhost_quic_listen_options "$MIGRATE_NGINX_ETC" || true
   nginx_restore_upstreams "$MIGRATE_NGINX_ETC" "$upsnap"
   tune_nginx_dedupe_http "$MIGRATE_NGINX_ETC" || true
   nginx_secure_auth_files "$MIGRATE_NGINX_ETC"
@@ -2236,11 +2240,19 @@ migrate_nginx_prepare() {
   # candidate: droppable directives are commented with the nginx marker (each
   # reported), anything else aborts (R26, R88).
   if ! err=$("$cand" -e stderr -t -q -c "$MIGRATE_NGINX_ETC/nginx.conf" 2>&1); then
-    if fit=$(migrate_nginx_fit "$MIGRATE_NGINX_ETC/nginx.conf" "$cand" 2>/dev/null) \
+    local fit_errf fit_err
+    fit_errf="$(migrate_run_dir)/nginx-fit.err"
+    if fit=$(migrate_nginx_fit "$MIGRATE_NGINX_ETC/nginx.conf" "$cand" 2>"$fit_errf") \
        && err=$("$cand" -e stderr -t -q -c "$MIGRATE_NGINX_ETC/nginx.conf" 2>&1); then
       migrate_nginx_fit_report "$fit"
     else
-      migrate_nginx_abort "nginx -t of the rendered tree failed: $(printf '%s' "$err" | grep -m3 -E 'emerg|error' | paste -sd' ' -)"
+      # Report what still fails: the fit's own error (the directive it could
+      # not comment out), not the first test's, which the fit may have fixed
+      # (1.22.7: "brotli_static" was reported while a duplicate QUIC listen
+      # option blocked).
+      fit_err=$(grep -m3 -E 'emerg|error' "$fit_errf" 2>/dev/null | paste -sd' ' -)
+      [[ -n $fit_err ]] || fit_err=$(printf '%s' "$err" | grep -m3 -E 'emerg|error' | paste -sd' ' -)
+      migrate_nginx_abort "nginx -t of the rendered tree failed: ${fit_err}"
       return 1
     fi
   fi

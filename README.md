@@ -367,8 +367,9 @@ empty_gif, browser, mirror, `limit_conn`, referer, `gzip_static` and
 names the server: no default `Server` header on HTTP/1.1, HTTP/2 or HTTP/3,
 and error pages that end with `</body></html>` (no `<hr><center>nginx` line).
 The configuration also keeps `server_tokens off`, and `fastcgi.conf` passes
-`SERVER_SOFTWARE nginx` without a version (internal to PHP, never sent to
-clients; WordPress uses it to detect nginx).  Every patch is counted.  When
+`SERVER_SOFTWARE nginx` without a version, except `nginx/<version>` on
+`admin.php` for XenForo's Server environment report (internal to PHP, never
+sent to clients; WordPress uses it to detect nginx).  Every patch is counted.  When
 a new mainline moved one of the patched lines, an install or migration
 builds the newest known-good version instead (`NGINX_FALLBACK` in
 `nginx-build.conf`, currently 1.31.10, or this host's last patched build)

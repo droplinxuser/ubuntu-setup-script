@@ -165,6 +165,9 @@ pid $BASE/bench-web.pid;
 error_log $BASE/bench-web-error.log warn;
 events { worker_connections 65535; multi_accept on; use epoll; }
 http {
+  # fastcgi_params passes \$fastcgi_server_software (server-configs-nginx 1.7.5
+  # defines it in http.d/server_software.conf, which this http block does not load).
+  map \$uri \$fastcgi_server_software { default nginx; }
   access_log off;
   server_tokens off;
   sendfile on;
@@ -532,6 +535,9 @@ pid $BASE/bench-web.pid;
 error_log $BASE/bench-web-error.log warn;
 events { worker_connections 65535; multi_accept on; use epoll; }
 http {
+  # fastcgi_params passes \$fastcgi_server_software (server-configs-nginx 1.7.5
+  # defines it in http.d/server_software.conf, which this http block does not load).
+  map \$uri \$fastcgi_server_software { default nginx; }
   access_log off;
   server_tokens off;
   sendfile on;

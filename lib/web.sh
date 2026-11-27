@@ -3884,8 +3884,8 @@ deploy_nginx_tree() {
   local src=${CONFIG_SOURCE_DIR:-}
   [[ -n $src && -d $src ]] || { warn "No nginx config source directory available"; return 1; }
   # The nginx tree of server-configs-nginx (CONFIG_REPO_REF=main) ships
-  # its own fastcgi.conf / fastcgi_params (SERVER_SOFTWARE "nginx" with no
-  # version, R38) and mime.types; no package provides them any more, so a
+  # its own fastcgi.conf / fastcgi_params (SERVER_SOFTWARE "nginx", with the
+  # version on admin.php only, R38) and mime.types; no package provides them any more, so a
   # tree without them (the 1.21 Angie tree, tag angie-final) is refused before
   # anything in /etc/nginx changes.
   local req

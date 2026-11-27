@@ -69,7 +69,8 @@ daily refresh keeps the running binary. The verify step starts the candidate
 on 127.0.0.1 with `server_tokens on` and checks that neither the headers nor
 the body of a 404 or 502 contain "nginx", so the patch is tested, not the
 config. PHP is built with `expose_php=Off`, so there is no `X-Powered-By`
-either. `SERVER_SOFTWARE` stays `nginx` (no version) in `fastcgi.conf`:
+either. `SERVER_SOFTWARE` stays `nginx` (no version) in `fastcgi.conf`, except
+`nginx/<version>` on `admin.php` (XenForo's Server environment report):
 WordPress uses it to detect nginx, and it is never sent to clients.
 
 Checked on a fresh install on the Xeon E-2236 test host: no `Server` or

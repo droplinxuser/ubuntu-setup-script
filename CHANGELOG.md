@@ -8,6 +8,26 @@ Reports of the 1.21.33-1.21.61 cycles that measured the removed Anubis
 filter were deleted from the tree on 2026-11-23 for the same reason;
 `git show <commit>:<path>` recovers them.
 
+## 1.22.7 (2026-11-28)
+
+Needs server-configs-nginx 1.7.5.
+
+- **The migration renders Angie vhosts with HTTP/3 that set QUIC socket
+  options.**  A 1.21 vhost with `listen 443 quic reuseport;` failed
+  `nginx -t` ("duplicate listen options for 0.0.0.0:443") against the QUIC
+  catch-all's `reuseport rcvbuf=4m sndbuf=4m` (1.22.5), so the nginx part
+  was blocked and Angie kept serving.  The fixer ran inside the tree sync,
+  before the migration copied the operator's vhosts in; it now runs again
+  after the copy.  Found on a live XenForo origin; PHP and Valkey had
+  migrated in the same run (sessions kept).
+- **A blocked render names what blocks it.**  The report showed the first
+  `nginx -t` error (`unknown directive "brotli_static"`), which the fit had
+  already commented out, and dropped the fit's own error; it now reports
+  the fit's.
+- **XenForo's admin Server environment report shows the nginx version**
+  (operator request, server-configs-nginx 1.7.5): `SERVER_SOFTWARE` is
+  `nginx/<version>` on `admin.php` only and `nginx` everywhere else.
+
 ## 1.22.6 (2026-11-27)
 
 Fixes found by the first live `--optimize` of 1.22.5: a 1.21 host (Angie,
