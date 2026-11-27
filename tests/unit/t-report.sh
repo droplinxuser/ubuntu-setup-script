@@ -114,6 +114,7 @@ nofile_probe() (
   diag_mariadb_installed() { return 0; }
   diag_elasticsearch_installed() { return 0; }
   mariadb() { echo 524288; }
+  timeout() { shift; "$@"; }  # the report wraps mariadb in timeout(1), which would exec the real client
   elasticsearch_http_url() { printf 'http://127.0.0.1:9200'; }
   curl() { printf '{"nodes":{"x":{"process":{"max_file_descriptors":65535}}}}'; }
   DIAG_ETC=$E diag_nofile_limits
