@@ -6616,15 +6616,15 @@ check "server blocks: directives on the server { line, or an existing probe, mak
 # timeout(1), which would bypass a shell function).
 cfbin=$TMP/cf-res-bin; mkdir -p "$cfbin"
 printf '#!/bin/sh\ncase "$2" in loop.test) printf "127.0.1.1 STREAM loop.test\\n127.0.1.1 DGRAM\\n" ;; mixed.test) printf "127.0.1.1 STREAM\\n104.21.5.1 STREAM\\n" ;; nodns.test) printf "127.0.1.1 STREAM\\n" ;; esac\n' > "$cfbin/getent"
-printf '#!/bin/sh\nfor a; do n=$a; done\ncase "$n" in loop.test) printf "loop.test: 2a06:98c1:3121::7 -- link: eth0\\n           188.114.96.7 -- link: eth0\\n" ;; mixed.test) printf "mixed.test: 203.0.113.9 -- link: eth0\\n" ;; *) exit 1 ;; esac\n' > "$cfbin/resolvectl"
+printf '#!/bin/sh\nfor a; do n=$a; done\ncase "$n" in loop.test) printf "loop.test: 2606:4700:3031::7 -- link: eth0\\n           104.21.9.7 -- link: eth0\\n" ;; mixed.test) printf "mixed.test: 203.0.113.9 -- link: eth0\\n" ;; *) exit 1 ;; esac\n' > "$cfbin/resolvectl"
 chmod +x "$cfbin/getent" "$cfbin/resolvectl"
 check "cf resolve: a site that /etc/hosts maps to loopback uses the public DNS answer" \
-  test "$(PATH="$cfbin:$PATH" cf_tls_resolve loop.test | tr '\n' ' ')" = "188.114.96.7 2a06:98c1:3121::7 "
+  test "$(PATH="$cfbin:$PATH" cf_tls_resolve loop.test | tr '\n' ' ')" = "104.21.9.7 2606:4700:3031::7 "
 check "cf resolve: a non-loopback local answer is kept (DNS not asked)" \
   test "$(PATH="$cfbin:$PATH" cf_tls_resolve mixed.test | tr '\n' ' ')" = "104.21.5.1 127.0.1.1 "
 check "cf resolve: loopback stays when DNS has no answer (never counts as Cloudflare)" \
   test "$(PATH="$cfbin:$PATH" cf_tls_resolve nodns.test)" = "127.0.1.1"
-printf 'set_real_ip_from 188.114.96.0/20;\nset_real_ip_from 2a06:98c0::/29;\n' > "$TMP/cf-ranges.conf"
+printf 'set_real_ip_from 104.16.0.0/13;\nset_real_ip_from 2606:4700::/32;\n' > "$TMP/cf-ranges.conf"
 cf_behind_with_fakes() ( PATH="$cfbin:$PATH"; cf_tls_name_behind_cloudflare loop.test "$TMP/cf-ranges.conf" )
 check "cf resolve: the loopback-mapped Cloudflare site counts as behind Cloudflare" cf_behind_with_fakes
 rm -rf "$cfbin"
