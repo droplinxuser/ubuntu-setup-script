@@ -1244,5 +1244,29 @@ check "a persisted PHP_EXT_EXTRA naming redis-zstd: dropped with a warning, redi
 check "refresh: a current build that is due a BOLT pass gets one (bolt_retry_due)" \
   bash -c 'sed -n "/^cmd_refresh()/,/^}/p" "$1" | grep -qF "elif (( rc == 0 )) && bolt_retry_due \"\$(info_get \"\$ver\" bolt)\" && unit_runs_build \"\$ver\"; then" && sed -n "/^cmd_refresh()/,/^}/p" "$1" | grep -qF "bash \"\$SELF\" bolt \"\$ver\" 60"' _ "$ROOT/tools/php-build.sh"
 
+# ---------------------------------------------------------------------------
+# 1.22.6 live host (QEMU generic CPU, PHP 8.3): RTLD_DEEPBIND made
+# opcache.so free mimalloc memory through glibc; no AVX2 made mbstring an
+# ifunc that crashes LLVM 23's ThinLTO link.
+# ---------------------------------------------------------------------------
+db=$TMP/deepbind; mkdir -p "$db/Zend"
+cat > "$db/Zend/zend_portability.h" <<'EOF'
+# if defined(RTLD_GROUP) && defined(RTLD_WORLD) && defined(RTLD_PARENT)
+#  define DL_LOAD(libname)			dlopen(libname, PHP_RTLD_MODE | RTLD_GLOBAL | RTLD_GROUP | RTLD_WORLD | RTLD_PARENT)
+# elif defined(RTLD_DEEPBIND) && !defined(__SANITIZE_ADDRESS__) && !__has_feature(memory_sanitizer)
+#  define DL_LOAD(libname)			dlopen(libname, PHP_RTLD_MODE | RTLD_GLOBAL | RTLD_DEEPBIND)
+# else
+EOF
+out=$(tool_run "php_no_deepbind '$db'; php_no_deepbind '$db'; echo rc=\$?")
+check "php_no_deepbind: modules dlopen without RTLD_DEEPBIND (they share the binary's mimalloc)" \
+  bash -c '[[ $1 == *"rc=0"* ]] && ! grep -q "| RTLD_DEEPBIND" "$2" && grep -qF "dlopen(libname, PHP_RTLD_MODE | RTLD_GLOBAL)" "$2" && grep -qF "# elif defined(RTLD_DEEPBIND)" "$2"' _ "$out" "$db/Zend/zend_portability.h"
+check "php cmd_build: php_no_deepbind runs on the source before configure" \
+  bash -c 'b=$(sed -n "/^cmd_build() {/,/^}/p" "$1"); (( $(grep -n "php_no_deepbind \"\$src\"" <<<"$b" | cut -d: -f1) < $(grep -n "./configure" <<<"$b" | head -1 | cut -d: -f1) ))' _ "$ROOT/tools/php-build.sh"
+check "php cmd_build: a CPU without AVX2 answers configure's ifunc probe no (x86 only)" \
+  bash -c 'b=$(sed -n "/^cmd_build() {/,/^}/p" "$1"); grep -qF "! cpu_has_flag avx2; then" <<<"$b" && grep -qF "cfg_env=(ax_cv_have_func_attribute_ifunc=no)" <<<"$b" && grep -qF "env \"\${cfg_env[@]}\" ./configure" <<<"$b"' _ "$ROOT/tools/php-build.sh"
+printf 'flags\t\t: fpu sse sse2 sse4_2 avx avx2\n' > "$TMP/cpu-avx2"; printf 'flags\t\t: fpu sse sse2\n' > "$TMP/cpu-noavx2"
+check "cpu_has_flag: avx2 present / absent / unreadable" \
+  bash -c 'SETUP_CPUINFO=$2 bash -c ". \"\$1\"; cpu_has_flag avx2" _ "$1" && ! SETUP_CPUINFO=$3 bash -c ". \"\$1\"; cpu_has_flag avx2" _ "$1" && ! SETUP_CPUINFO=/nonexistent bash -c ". \"\$1\"; cpu_has_flag avx2" _ "$1"' _ "$ROOT/tools/build-common.sh" "$TMP/cpu-avx2" "$TMP/cpu-noavx2"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

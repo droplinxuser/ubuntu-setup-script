@@ -518,7 +518,7 @@ build_libs() { # deps work jobs log libs...
         zlib-ng)
           # zlib's API and names (libz.a, zlib.h), so PHP, curl, libpng and
           # libzip link it unchanged.
-          CFLAGS=$hot LDFLAGS=$ld_hot ./configure --prefix="$deps" --static --zlib-compat
+          CFLAGS=$(zlibng_cflags "$hot") LDFLAGS=$ld_hot ./configure --prefix="$deps" --static --zlib-compat
           make -j"$j" && make install ;;
         libiconv)
           # PHP's iconv: GNU libiconv from source, not glibc's iconv and its
@@ -640,6 +640,22 @@ PHP86_ALIASES=(
   'WRONG_PARAM_COUNT||ZEND_WRONG_PARAM_COUNT()'
   'php_hash_bin2hex|(out, in, len)|zend_bin2hex((out), (in), (len))'
 )
+# 1.22.6: PHP loads a shared module with RTLD_DEEPBIND, so the module's
+# malloc/free bind to libc before the binary.  The binary carries mimalloc,
+# so before PHP 8.5 (OPcache is a shared opcache.so there) OPcache freed
+# mimalloc memory through glibc: "free(): invalid pointer" on every start.
+# Without DEEPBIND a module binds to the binary's allocator; every other
+# library here is linked statically, so there is nothing left to isolate.
+# A DL_LOAD line in another form is left alone; the candidate check, which
+# starts each SAPI with opcache.so loaded, still refuses a binary that
+# frees across allocators.
+php_no_deepbind() { # SRC
+  local h=$1/Zend/zend_portability.h
+  grep -q 'RTLD_GLOBAL | RTLD_DEEPBIND)' "$h" || return 0
+  sed -i 's/ | RTLD_GLOBAL | RTLD_DEEPBIND)/ | RTLD_GLOBAL)/' "$h"
+  ! grep -q '| RTLD_DEEPBIND' "$h" || die "PHP: could not remove RTLD_DEEPBIND from $h"
+}
+
 php86_pecl_compat() { # X.Y SRC
   local ver=$1 src=$2 f a name args body block=""
   ver_ge "$ver" 8.6 || return 0
@@ -811,6 +827,7 @@ cmd_build() { # X.Y [exact]
       > "$src/ext/standard/$h.h"
   done
   php86_pecl_compat "$ver" "$src"
+  php_no_deepbind "$src"
   cd "$src"
   say "building PHP ${VERS[php]} (FPM + CLI) with clang $n: ${set// /,}"
   ./buildconf --force >> "$log" 2>&1 || { log_excerpt "$log" 20; die "buildconf failed (log: $log)"; }
@@ -822,13 +839,25 @@ cmd_build() { # X.Y [exact]
   # read /etc/php/X.Y/fpm/php-fpm.conf; the compiled php.ini path and scan
   # dir are the CLI's (the FPM unit passes -c and PHP_INI_SCAN_DIR).
   lld_driver "$work/lld-cc" "$CC" "$CXX"
+  # 1.22.6: on an x86 CPU without AVX2 (QEMU's generic virtual CPU, for
+  # one) PHP 8.3+ selects mbstring's UTF-8 check through a GNU ifunc
+  # (mb_fast_check_utf8, ZEND_INTRIN_AVX2_RESOLVER), and LLVM 23's ThinLTO
+  # link crashes on it (ld.lld segfault in computeDeadSymbols /
+  # propagateAttributes).  There PHP's function-pointer dispatch is used
+  # instead (configure's ifunc probe answered "no"); an AVX2 CPU compiles
+  # the AVX2 code in directly and never emits that ifunc.
+  local -a cfg_env=()
+  if [[ $(uname -m) == x86_64 ]] && ! cpu_has_flag avx2; then
+    cfg_env=(ax_cv_have_func_attribute_ifunc=no)
+    say "PHP: this CPU has no AVX2; SIMD paths dispatch through function pointers, not ifunc"
+  fi
   CC="$work/lld-cc/clang" CXX="$work/lld-cc/clang++" \
   CFLAGS="$BASE_FLAGS -flto=thin ${PHP_BUILD_EXTRA_CFLAGS:-}" CXXFLAGS="$BASE_FLAGS -flto=thin ${PHP_BUILD_EXTRA_CFLAGS:-}" \
   LDFLAGS="-flto=thin -fuse-ld=lld $THINLTO -Wl,--emit-relocs $HARD_LD $GC_LD ${PHP_BUILD_EXTRA_LDFLAGS:-} -L$deps/lib" \
   CPPFLAGS="-I$deps/include" \
   PKG_CONFIG="pkg-config --static" PKG_CONFIG_LIBDIR="$deps/lib/pkgconfig" \
   PKG_CONFIG_PATH="" PROG_SENDMAIL=/usr/sbin/sendmail \
-  ./configure \
+  env "${cfg_env[@]}" ./configure \
     --prefix="$ROOT/$ver" --sysconfdir="$PHP_ETC/$ver/fpm" --localstatedir=/var \
     --with-config-file-path="$PHP_ETC/$ver/cli" \
     --with-config-file-scan-dir="$PHP_ETC/$ver/cli/conf.d" \

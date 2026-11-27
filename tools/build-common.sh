@@ -158,6 +158,29 @@ cpu_fingerprint_text() { # [force] [allow]
       printf "%sisa=%s\n", id, s }' "$info"
 }
 
+# zlib-ng's CFLAGS (1.22.6).  On an x86 CPU without SSE4.2 (QEMU's generic
+# "QEMU Virtual CPU", for one), -march=native turns CRC32 off explicitly, so
+# zlib-ng's SSE4.2 probe (_mm_crc32_u32 with -msse4.2) fails while its AVX2
+# file still calls adler32_fold_copy_sse42 (2.3.3): libz.a does not link and
+# neither nginx nor PHP builds.  There the library is compiled for the
+# x86-64 baseline instead; zlib-ng's runtime CPU dispatch then picks the
+# SSE2 code, which is all such a CPU can run anyway.  Any other CPU keeps
+# FLAGS unchanged.
+zlibng_cflags() { # FLAGS
+  local f=$1
+  if [[ $(uname -m) == x86_64 && $f == *-march=native* ]] && ! cpu_has_flag sse4_2; then
+    f=${f//-march=native/-march=x86-64}
+  fi
+  printf '%s' "$f"
+}
+
+# True when the first CPU's /proc/cpuinfo "flags" line names FLAG (x86).
+# Unreadable or missing: false, so callers take their conservative path.
+cpu_has_flag() { # FLAG
+  awk -v want="$1" '$1 == "flags" { for (i = 2; i <= NF; i++) if ($i == want) { ok = 1; exit } } END { exit !ok }' \
+    "${SETUP_CPUINFO:-/proc/cpuinfo}" 2>/dev/null
+}
+
 # Prints the hash stored as cpu= in every build.info.  Empty /proc/cpuinfo
 # gives an empty string, which every gate treats as a mismatch (rebuild),
 # never as "skip the check".

@@ -1589,7 +1589,9 @@ migrate_preflight() {
       (( ${#unb_req[@]} )) && printf '    required by an application and unbuildable: %s%s\n' "${unb_req[*]}" \
         "$([[ ${SETUP_PHP_ALLOW_MISSING_EXT:-0} == 1 ]] && echo ' (dropped: SETUP_PHP_ALLOW_MISSING_EXT=1)' || echo ' -> this version is REFUSED')"
       if declare -F php_build_effective_exts >/dev/null 2>&1; then
-        printf '    effective set after the union: %s\n' "$(PHP_EXT_DETECT_TREE=$(migrate_php_detect_tree) php_build_effective_exts 2>/dev/null || true)"
+        # The real run persists keep[] in PHP_EXT_EXTRA before it builds
+        # (migrate_php_persist_exts); show the set that build will get.
+        printf '    effective set after the union: %s\n' "$(PHP_EXT_EXTRA="${PHP_EXT_EXTRA:-} ${keep[*]}" PHP_EXT_DETECT_TREE=$(migrate_php_detect_tree) php_build_effective_exts 2>/dev/null || true)"
       fi
       continue
     fi

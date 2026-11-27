@@ -8,6 +8,37 @@ Reports of the 1.21.33-1.21.61 cycles that measured the removed Anubis
 filter were deleted from the tree on 2026-11-23 for the same reason;
 `git show <commit>:<path>` recovers them.
 
+## 1.22.6 (2026-11-27)
+
+Fixes found by the first live `--optimize` of 1.22.5: a 1.21 host (Angie,
+Sury PHP 8.3, the valkey-server package) on Ubuntu 24.04, an 8-vCPU KVM
+whose CPU is QEMU's generic "QEMU Virtual CPU version 2.5+" (SSE2 only:
+no SSSE3, SSE4 or AVX).  1.22.5 migrated its Valkey, then left nginx and
+PHP on Angie and Sury; with these fixes the third run migrated both and
+exited 0 (every vhost probed, guest cache HIT, no new PHP or XenForo
+errors).
+
+- **PHP 8.1-8.4 start on mimalloc.**  PHP loads `opcache.so` (a shared
+  module before 8.5) with `RTLD_DEEPBIND`, so its `malloc`/`free` bound to
+  glibc while the binary allocates with mimalloc: every candidate aborted
+  with `free(): invalid pointer` and the verify kept Sury serving.  The
+  build drops `RTLD_DEEPBIND` from `DL_LOAD`, so a module binds to the
+  binary's allocator (every other library is linked statically).  PHP 8.5
+  and newer, where OPcache is built in, were not affected.
+- **zlib-ng builds on a CPU without SSE4.2.**  `-march=native` there turns
+  CRC32 off, so zlib-ng 2.3.3's SSE4.2 probe failed while its AVX2 code
+  still calls the SSE4.2 Adler-32 routine: `libz.a` did not link and
+  neither nginx (`zlib library not found`) nor PHP built.  On such a CPU
+  zlib-ng alone is compiled for the x86-64 baseline; its runtime dispatch
+  picks the SSE2 code, all that CPU runs.  Other CPUs are unchanged.
+- **PHP links on a CPU without AVX2.**  PHP 8.3+ then selects mbstring's
+  UTF-8 check through a GNU ifunc, and LLVM 23's ThinLTO link crashed on
+  it (`ld.lld` segfault in `computeDeadSymbols`).  On such a CPU configure
+  is told there is no ifunc support, so PHP uses its function-pointer
+  dispatch; an AVX2 CPU builds as before.
+- `--optimize --dry-run` lists the extensions the migration keeps in the
+  "effective set" line too (the real run always built them).
+
 ## 1.22.5 (2026-11-27)
 
 Operator requests (XenForo search and contact limits, a file-descriptor

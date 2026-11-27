@@ -704,7 +704,7 @@ cmd_build() { # [normal|cpu]
   # Ubuntu's zlib, -19 % against zlib 1.4), built first and linked in through
   # -I/-L like a system zlib (only libz.a exists in that directory).
   fetch_unpack zlib-ng "${VERS[zlib-ng]}" "$work/zlib-ng"
-  ( cd "$work/zlib-ng" && CC=$CC CFLAGS="$flags $lto" ./configure --static --zlib-compat \
+  ( cd "$work/zlib-ng" && CC=$CC CFLAGS="$(zlibng_cflags "$flags $lto")" ./configure --static --zlib-compat \
       && make -j"$j" libz.a ) >> "$LOG_FILE" 2>&1 || { log_excerpt "$LOG_FILE" 30; die "zlib-ng failed to build (log: $LOG_FILE)"; }
   build_deps "$work" "$j" "$flags $lto" || { log_excerpt "$LOG_FILE" 30; die "Brotli failed to build (log: $LOG_FILE)"; }
   if [[ ! -x $src/configure ]]; then   # a Git snapshot keeps it in auto/

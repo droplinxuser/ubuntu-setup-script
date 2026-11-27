@@ -257,5 +257,26 @@ out=$(pt "" 'git_latest() { printf "[%s %s]" "$1" "$2"; }; resolve openssl 8.1')
 check "php: PHP 8.1's newest-3.x resolution is unchanged without the key (no warning)" \
   bash -c '[[ $1 == "[openssl/openssl ^openssl-(3\.[0-9]+\.[0-9]+)\$]" ]]' _ "$out"
 
+# ---------------------------------------------------------------------------
+# zlibng_cflags: an x86 CPU without SSE4.2 (QEMU's generic virtual CPU)
+# builds zlib-ng for the x86-64 baseline; zlib-ng 2.3.3 does not link with
+# -march=native there.  Every other CPU keeps the flags.
+# ---------------------------------------------------------------------------
+printf 'processor\t: 0\nmodel name\t: QEMU Virtual CPU version 2.5+\nflags\t\t: fpu de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 syscall nx lm nopl pni cx16 hypervisor lahf_lm\n\n' > "$TMP/cpu-qemu"
+printf 'processor\t: 0\nflags\t\t: fpu sse sse2 ssse3 sse4_1 sse4_2 popcnt avx avx2\n\n' > "$TMP/cpu-modern"
+zc() { SETUP_CPUINFO=$1 bc "uname() { echo ${3:-x86_64}; }; zlibng_cflags '$2'"; }
+if [[ $(uname -m) == x86_64 || $(uname -m) == aarch64 ]]; then
+  check "zlibng_cflags: a CPU without SSE4.2 builds zlib-ng for x86-64" \
+    test "$(zc "$TMP/cpu-qemu" '-O3 -march=native -mtune=native -flto=thin')" = "-O3 -march=x86-64 -mtune=native -flto=thin"
+  check "zlibng_cflags: a CPU with SSE4.2 keeps -march=native" \
+    test "$(zc "$TMP/cpu-modern" '-O3 -march=native -mtune=native')" = "-O3 -march=native -mtune=native"
+  check "zlibng_cflags: flags without -march=native (CI) are unchanged" \
+    test "$(zc "$TMP/cpu-qemu" '-O2 -pipe')" = "-O2 -pipe"
+  check "zlibng_cflags: aarch64 is never touched" \
+    test "$(zc "$ROOT/tests/fixtures/cpuinfo/arm64" '-O3 -march=native' aarch64)" = "-O3 -march=native"
+  check "nginx and PHP build zlib-ng through zlibng_cflags" \
+    bash -c 'grep -q "CFLAGS=\"\$(zlibng_cflags \"\$flags \$lto\")\"" "$1/tools/nginx-build.sh" && grep -q "CFLAGS=\$(zlibng_cflags \"\$hot\")" "$1/tools/php-build.sh"' _ "$ROOT"
+fi
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
