@@ -1123,11 +1123,36 @@ EOF
   fi
 }
 
-# Restart (a new binary needs one) and require the master to stay up.
+# Bring a running master onto the binary at its path and require it to stay
+# up.  A graceful reload first (1.22.18): on SIGUSR2 the FPM master re-execs
+# itself from the path the unit started (keeping its PID, which systemd
+# tracks) and inherits its listening sockets, so a binary renamed over that
+# path takes over while /run/php/php-fpm.sock stays bound; a restart removed
+# the socket for up to a second and nginx answered 502 meanwhile.  Checked
+# with a real php-fpm: same PID, the new inode, "using inherited socket".
+# The reload counts once the master runs the file on disk (its exe no longer
+# a deleted inode) and is still up a second later; anything else (a stopped
+# unit, a changed unit file, a master that died) falls back to the restart.
 restart_checked() {
-  systemctl restart "php$1-fpm" || return 1
+  local u="php$1-fpm" want pid i
+  want=$(readlink -f "$(vdir "$1")/sbin/php-fpm" 2>/dev/null || true)
+  if [[ -n $want ]] && systemctl is-active --quiet "$u" 2>/dev/null \
+     && [[ $(systemctl show -p NeedDaemonReload --value "$u" 2>/dev/null) != yes ]] \
+     && systemctl reload "$u" 2>/dev/null; then
+    for i in $(seq 1 20); do
+      sleep 0.5
+      systemctl is-active --quiet "$u" 2>/dev/null || break
+      pid=$(systemctl show -p MainPID --value "$u" 2>/dev/null || true)
+      if [[ $(readlink "/proc/${pid}/exe" 2>/dev/null) == "$want" ]]; then
+        sleep 1
+        systemctl is-active --quiet "$u" 2>/dev/null && return 0
+        break
+      fi
+    done
+  fi
+  systemctl restart "$u" || return 1
   sleep 2
-  systemctl is-active --quiet "php$1-fpm"
+  systemctl is-active --quiet "$u"
 }
 
 # Swap SRC over DST atomically (rename in one directory tree), keeping the

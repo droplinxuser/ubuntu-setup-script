@@ -1440,14 +1440,14 @@ migrate_php_scan_digest() {
   # that application is gone or no longer needs it.
   { migrate_php_ext_union "$1"; migrate_php_listeners "$1"
     migrate_php_series_ok "$1" && echo series=ok || echo series=no
-    printf 'app-req=%s\n' "$(migrate_php_app_required_exts 2>/dev/null | paste -sd, -)"; } 2>/dev/null | md5sum | awk '{ print $1 }'
+    printf 'app-req=%s\n' "$(migrate_php_app_required_exts "$1" 2>/dev/null | paste -sd, -)"; } 2>/dev/null | md5sum | awk '{ print $1 }'
 }
 
 # Lower-case module names some detected application requires (C's lists,
 # over the live vhost roots and the /var/www roots), one per line.  Status 1
 # when C's functions are not loaded: the caller cannot rule anything out.
-migrate_php_app_required_exts() {
-  local tree app root
+migrate_php_app_required_exts() { # [X.Y]
+  local tree app root ver=${1:-}
   declare -F php_upgrade_app_required_extensions >/dev/null 2>&1 || return 1
   tree=$(migrate_web_tree)
   {
@@ -1455,7 +1455,7 @@ migrate_php_app_required_exts() {
     declare -F php_upgrade_app_roots >/dev/null 2>&1 && php_upgrade_app_roots
   } 2>/dev/null | sort -u | while IFS=$'\t' read -r app root; do
     [[ -n $app && -n $root ]] || continue
-    php_upgrade_app_required_extensions "$app" "$root" preflight 2>/dev/null || true
+    php_upgrade_app_required_extensions "$app" "$root" preflight "$ver" 2>/dev/null || true
   done | tr ' ,\t' '\n\n\n' | tr '[:upper:]' '[:lower:]' | sed -e '/^$/d' -e 's/^zend_opcache$/opcache/' | sort -u
   return 0
 }
@@ -1481,7 +1481,7 @@ migrate_php_minimal_split() {
   if [[ ${MIGRATE_PHP_MINIMAL:-1} != 1 ]] \
      || ! declare -F php_build_effective_exts >/dev/null 2>&1 \
      || ! declare -F php_build_detect_apps >/dev/null 2>&1 \
-     || ! need=$(migrate_php_app_required_exts) \
+     || ! need=$(migrate_php_app_required_exts "$v") \
      || [[ -z $(PHP_EXT_DETECT_TREE=$tree php_build_detect_apps 2>/dev/null | head -n 1) ]] \
      || ! eff=$(PHP_EXT_EXTRA='' PHP_BUILD_EXT_RESET=1 PHP_EXT_DETECT_TREE=$tree php_build_effective_exts "$v" 2>/dev/null); then
     for e; do printf 'keep %s\n' "$e"; done
@@ -1703,7 +1703,7 @@ migrate_preflight() {
     # Without C's requirement lists nothing can be ruled out: all count.
     if (( ${#unb_fpm[@]} )); then
       local req=""
-      if req=$(migrate_php_app_required_exts); then
+      if req=$(migrate_php_app_required_exts "$v"); then
         for e in "${unb_fpm[@]}"; do grep -qxF -- "$e" <<<"$req" && unb_req+=("$e"); done
       else
         unb_req=("${unb_fpm[@]}")
@@ -4059,6 +4059,21 @@ migrate_pa_fail() { warn "migrate: $*"; MIGRATE_PA_ERRORS+=("$*"); }
 # The single post-removal pass (R2, R16, R24, R34, R52, R55, R89): re-lay our
 # /etc/php, links, tmpfiles, daemon-reload, enable + assert every unit,
 # restart PHP, re-verify everything.  Idempotent (also the repair attempt).
+# Reload a running phpX.Y-fpm (FPM re-reads every configuration file on
+# SIGUSR2 and keeps its listening socket) and require it to stay up; a
+# stopped unit, a changed unit file or a master that does not survive the
+# reload gets the full restart.
+migrate_php_reload_checked() { # X.Y
+  local u="php$1-fpm"
+  if systemctl is-active --quiet "$u" 2>/dev/null \
+     && [[ $(systemctl show -p NeedDaemonReload --value "$u" 2>/dev/null) != yes ]] \
+     && systemctl reload "$u" 2>/dev/null; then
+    sleep 1.5
+    systemctl is-active --quiet "$u" 2>/dev/null && return 0
+  fi
+  systemctl restart "$u"
+}
+
 migrate_post_assert() {
   local -a vers=("$@")
   local v conv sess u why bad=0 primary msg rc
@@ -4156,13 +4171,16 @@ migrate_post_assert() {
     systemctl reset-failed "${u}.service" >/dev/null 2>&1 || true
     systemctl start "${u}.service" >/dev/null 2>&1 || warn "migrate: ${u} did not start after the removals"
   done
-  # Restart PHP (full restart: conffiles were rewritten), then verify.
+  # PHP re-reads the re-laid conffiles (php.ini, conf.d, the pools), then
+  # verify.  A graceful reload does that (1.22.18): the master re-execs and
+  # keeps the socket, while a restart removed it and dropped the requests of
+  # that moment (7 on a live board).  A restart remains the fallback.
   for v in "${vers[@]}"; do
     [[ -n $v ]] || continue
     if ! msg=$(php_fpm_test "$v" 2>&1) || grep -qiE 'Unable to load|already loaded' <<<"$msg"; then
       migrate_pa_fail "PHP ${v}: php-fpm -t after the removals: $(printf '%s' "$msg" | grep -m2 -iE 'error|unable|already' | paste -sd' ' -)"; bad=1; continue
     fi
-    systemctl restart "php${v}-fpm" || { migrate_pa_fail "php${v}-fpm did not restart after the removals"; bad=1; continue; }
+    migrate_php_reload_checked "$v" || { migrate_pa_fail "php${v}-fpm did not restart after the removals"; bad=1; continue; }
     "$(migrate_php_cli_bin "$v")" -r 'exit(function_exists("opcache_get_status") ? 0 : 1);' >/dev/null 2>&1 \
       || { migrate_pa_fail "PHP ${v}: OPcache missing in the CLI after the removals"; bad=1; }
     [[ -n $(find "$MIGRATE_PHP_ETC/$v/fpm/conf.d" "$MIGRATE_PHP_ETC/$v/cli/conf.d" -maxdepth 1 -type l 2>/dev/null) ]] \

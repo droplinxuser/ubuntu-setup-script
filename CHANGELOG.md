@@ -8,6 +8,35 @@ Reports of the 1.21.33-1.21.61 cycles that measured the removed Anubis
 filter were deleted from the tree on 2026-11-23 for the same reason;
 `git show <commit>:<path>` recovers them.
 
+## 1.22.18 (2026-11-29)
+
+- **PHP binary swaps and the post-removal check no longer drop requests.**
+  A new build, a BOLT binary and the return to the LTO build were each a
+  `systemctl restart`, and so was the migration's check after the package
+  removals; each removed `/run/php/php-fpm.sock` for up to a second, and
+  nginx answered 502 meanwhile (7 requests on a live board during the
+  1.22.17 run, 94 over four restarts in the 1.22.16 one).  They are now a
+  graceful reload: on SIGUSR2 the FPM master re-execs itself from the path
+  the unit started, keeping its PID and inheriting its listening socket,
+  so a binary renamed over that path takes over without the socket ever
+  going away (checked with a real php-fpm: same PID, the new inode, FPM's
+  "using inherited socket").  A swap counts once the master runs the file
+  on disk (its exe is no longer a deleted inode) and is still up a second
+  later; a stopped unit, a changed unit file or a master that dies gets the
+  restart as before.
+- **XenForo no longer gets ext/xml** (operator request: only what XenForo
+  needs).  The expat-style `xml_parser_*` API had no caller on a live 2.2
+  board, in its core, its add-ons or their vendor libraries; XenForo's XML
+  work is DOM and SimpleXML, which stay.  A board whose code does call
+  `xml_parser_create` (2.3's importers, an add-on, a library) keeps it,
+  and so does one calling `utf8_encode`/`utf8_decode` on a PHP below 8.2
+  (they live in ext/xml there; 8.2 moved them to ext/standard, and
+  XenForo's vendor libraries call them): the requirement scan reads
+  `src/` (symlinked add-on directories included) like the Redis and FTP
+  scans, for the series being built.  A host
+  migrated earlier carries xml in `PHP_EXT_EXTRA`; `--optimize ext=-xml`
+  drops it there.
+
 ## 1.22.17 (2026-11-29)
 
 - **Ubuntu's Redis package is replaced by the compiled Valkey** (operator

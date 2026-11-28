@@ -103,6 +103,7 @@ case $cmd in
   stop|kill) if [ "$cmd" = stop ] && grep -qxF -- "$unit" "$STUB_DIR/fail-stop" 2>/dev/null; then exit 1; fi
              del_active "$unit"; hook "$cmd" "$unit" ;;
   enable|reenable) if [ "$now" = 1 ]; then do_start "$unit"; fi ;;
+  reload) hook reload "$unit" ;;
   list-units) cat "$STUB_DIR/list-units" 2>/dev/null ;;
   *) : ;;
 esac
@@ -1922,6 +1923,23 @@ check "post-assert: the active version is asserted" called "php_active_set 8.3"
 check "post-assert: B's links are refreshed" called "php_build_links 8.3"
 check "post-assert: the PHP probe runs after the restart" in_order "systemctl restart php8.3-fpm" "probe 8.3"
 check "post-assert: Valkey answers PING" called "valkey-cli[$(migrate_valkey_cli)] -h 127.0.0.1 -p 6379 PING"
+# 1.22.18: a running PHP re-reads the re-laid files through a reload (the
+# socket stays bound); only a stopped or dead one is restarted.
+rout=$( ( : > "$TCALLS"; active php8.3-fpm; migrate_php_reload_checked 8.3; echo "rc=$?" ) 2>&1 )
+check "reload: a running PHP is reloaded, not restarted" \
+  bash -c '[[ $1 == *rc=0* ]] && grep -qxF "systemctl reload php8.3-fpm" "$2" && ! grep -qF "systemctl restart php8.3-fpm" "$2"' _ "$rout" "$TCALLS"
+rout=$( (
+  : > "$TCALLS"; active php8.3-fpm
+  printf '#!/bin/sh\ngrep -vxF php8.3-fpm "$STUB_DIR/active" > "$STUB_DIR/a.new"; mv -f "$STUB_DIR/a.new" "$STUB_DIR/active"\n' > "$STUBD/hook.reload.php8.3-fpm"
+  chmod 755 "$STUBD/hook.reload.php8.3-fpm"
+  migrate_php_reload_checked 8.3; echo "rc=$?"
+) 2>&1 )
+rm -f "$STUBD/hook.reload.php8.3-fpm"
+check "reload: a master that dies on the reload is restarted" in_order "systemctl reload php8.3-fpm" "systemctl restart php8.3-fpm"
+rout=$( ( : > "$TCALLS"; printf 'yes\n' > "$STUBD/show.NeedDaemonReload.php8.3-fpm"; active php8.3-fpm; migrate_php_reload_checked 8.3 ) 2>&1 )
+rm -f "$STUBD/show.NeedDaemonReload.php8.3-fpm"
+check "reload: a changed unit file gets the restart" \
+  bash -c '! grep -qF "systemctl reload php8.3-fpm" "$1" && grep -qF "systemctl restart php8.3-fpm" "$1"' _ "$TCALLS"
 check "post-assert: no assertion fails on a sound host" lacks "$out" "PA unit assertion"
 if (( sess_ok )); then
   check "post-assert: the pass verifies" has "$out" "rc=0"

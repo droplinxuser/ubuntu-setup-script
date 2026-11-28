@@ -300,7 +300,8 @@ check "wordpress: no pdo_mysql, redis, sqlite or intl without a reason" \
 check "wordpress: the core modules are never listed" csv_lacks_all "$out" core date standard spl random cgi-fcgi
 check "the set is a sorted comma list without duplicates" csv_sorted "$out"
 out=$(effp PHP_BUILD_ROOT="$NOROOT" PHP_BUILD_NGINX="$TMP/t-xf") || true
-check "xenforo: mysqli, xml, zip and exif" csv_has_all "$out" mysqli xml zip exif gd curl mbstring
+check "xenforo: mysqli, zip and exif" csv_has_all "$out" mysqli zip exif gd curl mbstring
+check "xenforo: no ext/xml without an xml_parser_* caller (1.22.18)" csv_lacks_all "$out" xml
 check "xenforo: gmp (push) and sodium (passkeys) are in the set (1.22.15)" csv_has_all "$out" gmp sodium
 check "xenforo: no redis or pdo_mysql without a reason" csv_lacks_all "$out" redis igbinary pdo_mysql xmlwriter
 out=$(effp PHP_BUILD_ROOT="$NOROOT" PHP_BUILD_NGINX="$TMP/t-xf-redis") || true
@@ -319,7 +320,7 @@ out=$(effp PHP_BUILD_ROOT="$NOROOT" PHP_BUILD_NGINX="$TMP/t-none" PHP_EXT_EXTRA=
 check "PHP_EXT_EXTRA alone: intl in the set" csv_has "$out" intl
 check "PHP_EXT_EXTRA alone: no application union" csv_lacks_all "$out" sodium redis pdo_mysql
 out=$(effp PHP_BUILD_ROOT="$NOROOT" PHP_BUILD_NGINX="$TMP/t-none" PHP_BUILD_APPS=xf) || true
-check "--domain app=xf adds the xenforo set" csv_has_all "$out" mysqli xml zip exif
+check "--domain app=xf adds the xenforo set" csv_has_all "$out" mysqli zip exif
 check "--domain app=xf adds nothing of the other applications" csv_lacks_all "$out" redis pdo_mysql xmlwriter
 out=$(effp PHP_BUILD_ROOT="$NOROOT" PHP_BUILD_NGINX="$TMP/t-none" PHP_BUILD_APPS=shlink) || true
 check "--domain app=shlink adds gmp to the generic set" csv_has_all "$out" gmp sqlite3 bcmath
@@ -592,6 +593,41 @@ check "PHP_EXT_DROP: ftp is still built while an FTP adapter is configured" bash
 printf '<?php\n$config = [];\n// $config["fsAdapters"]["data"] = new \\League\\Flysystem\\Adapter\\Ftp([]);\n' > "$X/src/config.php"
 check "a commented FTP adapter is not a requirement" \
   bash -c '[[ " $(tr "\n" " " <<<"$1") " != *" ftp "* ]]' _ "$(php_upgrade_app_required_extensions xenforo "$X" install)"
+# ext/xml (1.22.18): not in the XenForo set; a board whose code calls the
+# xml_parser_* API (an add-on, a vendor library) keeps it.
+check "xml: the XenForo set no longer lists ext/xml" \
+  bash -c '[[ " $(tr "\n" " " <<<"$1") " != *" xml "* ]]' _ "$(php_upgrade_app_requirements xenforo)"
+check "xml: a board without xml_parser_* calls does not need it" \
+  bash -c '[[ " $(tr "\n" " " <<<"$1") " != *" xml "* ]]' _ "$(php_upgrade_app_required_extensions xenforo "$X" install)"
+mkdir -p "$X/src/addons/Some/Feed/vendor/lib"
+printf '<?php\nfunction p($s) { $x = xml_parser_create("UTF-8"); xml_parse($x, $s); }\n' > "$X/src/addons/Some/Feed/vendor/lib/Parser.php"
+check "xml: an add-on library calling xml_parser_create keeps it" \
+  bash -c '[[ " $(tr "\n" " " <<<"$1") " == *" xml "* ]]' _ "$(php_upgrade_app_required_extensions xenforo "$X" install)"
+printf '<?php\n// see xml_parser_create_ns in the PHP manual\n$s = "xml_parser_create";\n' > "$X/src/addons/Some/Feed/vendor/lib/Parser.php"
+check "xml: a mention without a call does not count" \
+  bash -c '[[ " $(tr "\n" " " <<<"$1") " != *" xml "* ]]' _ "$(php_upgrade_app_required_extensions xenforo "$X" install)"
+printf '<?php\n$p = \\xml_parser_create_ns ( "UTF-8" );\n' > "$X/src/addons/Some/Feed/vendor/lib/Parser.php"
+check "xml: a namespaced, spaced call counts" \
+  bash -c '[[ " $(tr "\n" " " <<<"$1") " == *" xml "* ]]' _ "$(php_upgrade_app_required_extensions xenforo "$X" install)"
+# Before PHP 8.2 utf8_encode/utf8_decode live in ext/xml (review, 1.22.18).
+printf '<?php\nfunction n($s) { return utf8_decode($s); }\n' > "$X/src/addons/Some/Feed/vendor/lib/Parser.php"
+check "xml: a utf8_decode caller keeps it for PHP 8.1" \
+  bash -c '[[ " $(tr "\n" " " <<<"$1") " == *" xml "* ]]' _ "$(php_upgrade_app_required_extensions xenforo "$X" install 8.1)"
+check "xml: a utf8_decode caller keeps it when the target is unknown" \
+  bash -c '[[ " $(tr "\n" " " <<<"$1") " == *" xml "* ]]' _ "$(php_upgrade_app_required_extensions xenforo "$X" install)"
+check "xml: on PHP 8.2+ utf8_decode is ext/standard's (no xml)" \
+  bash -c '[[ " $(tr "\n" " " <<<"$1") " != *" xml "* ]]' _ "$(php_upgrade_app_required_extensions xenforo "$X" install 8.3)"
+check "xml: PHP 10.0 counts as 8.2+" \
+  bash -c '[[ " $(tr "\n" " " <<<"$1") " != *" xml "* ]]' _ "$(php_upgrade_app_required_extensions xenforo "$X" install 10.0)"
+# A symlinked add-on directory is scanned (grep -R).
+mkdir -p "$TMP/xf-linked-addon/Lib"
+printf '<?php\n$p = xml_parser_create();\n' > "$TMP/xf-linked-addon/Lib/P.php"
+printf '<?php\n' > "$X/src/addons/Some/Feed/vendor/lib/Parser.php"
+ln -s "$TMP/xf-linked-addon" "$X/src/addons/Linked"
+check "xml: an xml_parser_create caller in a symlinked add-on directory counts" \
+  bash -c '[[ " $(tr "\n" " " <<<"$1") " == *" xml "* ]]' _ "$(php_upgrade_app_required_extensions xenforo "$X" install 8.3)"
+rm "$X/src/addons/Linked"
+rm -r "$X/src/addons/Some"
 check "leftovers: PHP_EXT_PRUNED and PHP_EXT_DROP survive a profile reset" \
   bash -c '[[ " ${*} " == *" PHP_EXT_PRUNED "* && " ${*} " == *" PHP_EXT_DROP "* ]]' _ "${RESET_KEEP_PINS[@]}"
 check "ext=-NAME passes the validator" q php_ext_validate -intl
@@ -763,6 +799,48 @@ check "verify: a candidate of another series is refused" has "$out" "not a PHP 8
 out=$(VC_WARN='PHP Warning:  Module "curl" is already loaded in Unknown on line 0' \
   vc 8.4 "$C84 cgi-fcgi curl phar" "$C84 curl phar pcntl" "$SET") || true
 check "verify: a start-up warning is refused" has "$out" "fpm candidate starts with warnings"
+
+# restart_checked (1.22.18): a binary swap on a running master is a reload
+# (FPM re-execs from its path and keeps the socket), verified by the
+# master's exe; anything else is the restart it was before.
+rc_case() { # ACTIVE(0|1) EXE-AFTER-RELOAD NEEDRELOAD -> the systemctl calls and the status
+  # Fresh names per case (it runs in $(...): a counter would not persist).
+  local mark calls
+  mark=$(mktemp -u "$TMP/rc-reloaded.XXXXXX"); calls=$(mktemp -u "$TMP/rc-calls.XXXXXX")
+  tool_run "
+    vdir() { printf /opt/php/%s \"\$1\"; }
+    sleep() { :; }
+    readlink() {
+      if [[ \$1 == -f ]]; then printf '%s' \"\$2\"; return 0; fi
+      if [[ \$1 == /proc/* ]]; then if [[ -f '$mark' ]]; then printf '%s' '$2'; else printf '%s' '/opt/php/8.3/sbin/php-fpm (deleted)'; fi; return 0; fi
+      command readlink \"\$@\"
+    }
+    systemctl() {
+      echo \"systemctl \$*\" >> '$calls'
+      case \$1 in
+        is-active) [[ $1 == 1 ]] ;;
+        show) if [[ \$3 == NeedDaemonReload ]]; then echo '$3'; elif [[ \$3 == MainPID ]]; then echo 4242; fi; return 0 ;;
+        reload) : > '$mark' ;;
+        *) return 0 ;;
+      esac
+    }
+    if restart_checked 8.3; then echo rc=0; else echo rc=1; fi
+  "
+  cat "$calls" 2>/dev/null
+}
+out=$(rc_case 1 /opt/php/8.3/sbin/php-fpm no) || true
+check "restart_checked: a running master takes the new binary by reload" \
+  bash -c '[[ $1 == *"systemctl reload php8.3-fpm"* && $1 != *"systemctl restart"* && $1 == *rc=0* ]]' _ "$out"
+out=$(rc_case 1 "/opt/php/8.3/sbin/php-fpm (deleted)" no) || true
+check "restart_checked: a master still on the old inode after the reload is restarted" \
+  bash -c '[[ $1 == *"systemctl reload php8.3-fpm"*"systemctl restart php8.3-fpm"* ]]' _ "$out"
+out=$(rc_case 0 /opt/php/8.3/sbin/php-fpm no) || true
+check "restart_checked: a stopped unit is not reloaded" \
+  bash -c '[[ $1 != *"systemctl reload"* && $1 == *"systemctl restart php8.3-fpm"* ]]' _ "$out"
+out=$(rc_case 1 /opt/php/8.3/sbin/php-fpm yes) || true
+check "restart_checked: a changed unit file gets the restart" \
+  bash -c '[[ $1 != *"systemctl reload"* && $1 == *"systemctl restart php8.3-fpm"* ]]' _ "$out"
+
 out=$(tool_run 'printf "%s" "$CLI_ONLY_EXTS"') || true
 check "the tool's CLI-only list is pcntl" test "$out" = pcntl
 out=$(tool_run 'core_required 8.1 | paste -sd, -; core_required 8.2 | paste -sd, -; core_allowed 8.5 fpm | paste -sd, -') || true

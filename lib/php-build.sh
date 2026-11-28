@@ -129,7 +129,7 @@ php_build_app_exts() { # app
   case $1 in
     chevereto) printf '%s\n' pdo_mysql pdo mysqli redis igbinary gd curl mbstring exif fileinfo xmlwriter zip ;;
     wordpress|wp) printf '%s\n' mysqli gd curl mbstring exif zip xml sodium ;;
-    xenforo|xf) printf '%s\n' mysqli gd curl mbstring xml zip exif gmp sodium ;;
+    xenforo|xf) printf '%s\n' mysqli gd curl mbstring zip exif gmp sodium ;;
     # shlink's ID generator needs gmp (R62).
     shlink) printf '%s\n' "${PHP_GENERIC_EXTS[@]}" gmp ;;
     *) printf '%s\n' "${PHP_GENERIC_EXTS[@]}" ;;
@@ -359,7 +359,7 @@ php_build_effective_exts() { # [X.Y]
     any=1
     for name in $(php_build_app_exts "$app"); do set[${name,,}]=1; req[${name,,}]=1; done
     if [[ $app != php ]] && declare -F php_upgrade_app_required_extensions >/dev/null; then
-      for name in $(php_upgrade_app_required_extensions "$app" "$root" install 2>/dev/null); do set[${name,,}]=1; req[${name,,}]=1; done
+      for name in $(php_upgrade_app_required_extensions "$app" "$root" install "$ver" 2>/dev/null); do set[${name,,}]=1; req[${name,,}]=1; done
     fi
     if _pb_redis_needed "$app" "$root"; then set[redis]=1; set[igbinary]=1; req[redis]=1; fi
     if [[ $app != php ]]; then
@@ -437,13 +437,13 @@ php_build_effective_exts() { # [X.Y]
 
 # Build guard (R8): every requirement of every detected (app, root) must be
 # in SET.  Prints the missing "app|root|ext" lines; status 1 when any.
-php_build_requirements_missing() { # set-csv
-  local s=",$1," app root name rc=0
+php_build_requirements_missing() { # set-csv [X.Y]
+  local s=",$1," ver=${2:-} app root name rc=0
   declare -F php_upgrade_app_required_extensions >/dev/null || return 0
   [[ ${SETUP_PHP_ALLOW_MISSING_EXT:-0} == 1 ]] && return 0
   while IFS=$'\t' read -r app root; do
     [[ -n $app && $app != php ]] || continue
-    for name in $(php_upgrade_app_required_extensions "$app" "$root" install 2>/dev/null); do
+    for name in $(php_upgrade_app_required_extensions "$app" "$root" install "$ver" 2>/dev/null); do
       name=${name,,}
       [[ $s == *",$name,"* ]] && continue
       printf '%s|%s|%s\n' "$app" "$root" "$name"; rc=1
@@ -1413,7 +1413,7 @@ php_build_ensure() { # X.Y MODE CONTEXT OUT
       [[ -n $wline ]] && _pb_report "$out" "- PHP ${ver}: ${wline}"
     done < <(sed -E 's/\x1b\[[0-9;]*m//g; s/^.*\[WARN\][[:space:]]*//; s/^WARN: //' "${PHP_BUILD_LOG_DIR}/exts-${ver}.err" 2>/dev/null || true)
     rm -f "${PHP_BUILD_LOG_DIR}/exts-${ver}.err"
-    if missing=$(php_build_requirements_missing "$exts"); then :; else
+    if missing=$(php_build_requirements_missing "$exts" "$ver"); then :; else
       _pb_report "$out" "- **FAILED** PHP ${ver}: the extension set lacks application requirements: $(tr '\n' ' ' <<<"$missing")"
       return 1
     fi

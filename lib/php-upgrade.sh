@@ -347,12 +347,12 @@ php_upgrade_app_requirements() {
     # metadata, zip for updates, xml for feeds/XML-RPC, sodium for core's
     # signature checks); redis only with an object-cache drop-in, below.
     wordpress) printf '%s\n' mysqli gd curl mbstring exif zip xml sodium ;;
-    # XenForo 2.3: xml_parser_* in the importers and add-on XML, zip for
-    # add-on archives, exif for attachment rotation; gmp for push
+    # XenForo: no ext/xml (added by the scan below where code needs it), zip
+    # for add-on archives, exif for attachment rotation; gmp for push
     # notifications (minishlink/web-push calls gmp_strval unguarded; push is
     # on by default) and sodium for passkeys and the JWT keys (web-token,
     # lbuchs/webauthn) (1.22.15).  Add-ons' own php-ext requirements: below.
-    xenforo)   printf '%s\n' mysqli gd curl mbstring xml zip exif gmp sodium ;;
+    xenforo)   printf '%s\n' mysqli gd curl mbstring zip exif gmp sodium ;;
   esac
 }
 
@@ -383,8 +383,19 @@ php_upgrade_xf_addon_exts() {
 #              use it.  The preflight still waives an extension the current
 #              PHP-FPM does not load, so a broad rule only blocks where redis
 #              is actually in use.
-php_upgrade_app_required_extensions() {
-  local app=$1 root=$2 mode=${3:-preflight} redis=0
+# 0 when series X.Y is at least A.B (integers compared per part; anything
+# unparsable counts as older).
+php_upgrade_ver_at_least() { # X.Y A.B
+  local a=${1%%.*} b=${1#*.} c=${2%%.*} d=${2#*.}
+  b=${b%%.*}; d=${d%%.*}
+  [[ $a =~ ^[0-9]+$ && $b =~ ^[0-9]+$ && $c =~ ^[0-9]+$ && $d =~ ^[0-9]+$ ]] || return 1
+  (( a > c || (a == c && b >= d) ))
+}
+
+# VER (optional): the PHP series the set is for; ext/xml's utf8_* rule below
+# depends on it (unknown counts as below 8.2).
+php_upgrade_app_required_extensions() { # app root [mode] [X.Y]
+  local app=$1 root=$2 mode=${3:-preflight} ver=${4:-} redis=0
   php_upgrade_app_requirements "$app"
   case $app in
     wordpress)
@@ -430,6 +441,21 @@ php_upgrade_app_required_extensions() {
         printf 'ftp\n'
       fi
       php_upgrade_xf_addon_exts "$root"
+      # ext/xml is not in the XenForo set (1.22.18): XenForo's own XML work
+      # is DOM and SimpleXML, and a live 2.2 board's core, add-ons and
+      # vendor libraries call no xml_parser_* function.  A board whose code
+      # does (2.3's importers, an add-on, a library) keeps it.  Before PHP
+      # 8.2, utf8_encode/utf8_decode also live in ext/xml (8.2 moved them
+      # to ext/standard), and XenForo's vendor libraries call them: they
+      # count for a target below 8.2, or when the target is unknown (VER).
+      # grep -R follows symlinked add-on directories.  Captured, not piped
+      # into an early-exiting reader (pipefail, see above).
+      local xmlp="" xmlre='\bxml_parser_create(_ns)?[[:space:]]*\('
+      if [[ -z $ver ]] || ! php_upgrade_ver_at_least "$ver" 8.2; then
+        xmlre+='|\butf8_(en|de)code[[:space:]]*\('
+      fi
+      [[ -d $root/src ]] && xmlp=$(grep -RlE --include='*.php' "$xmlre" "$root/src" 2>/dev/null || true)
+      if [[ -n $xmlp ]]; then printf 'xml\n'; fi
       ;;
   esac
   if (( redis )); then printf '%s\n' redis igbinary; fi
@@ -574,7 +600,7 @@ php_ensure_app_extensions() {
     ext=$(printf '%s' "$ext" | tr '[:upper:]' '[:lower:]')
     grep -qxF "$ext" <<<"$loaded" && continue
     [[ " ${want[*]} " == *" ${ext} "* ]] || want+=("$ext")
-  done < <(php_upgrade_app_required_extensions "$app" "$root" install)
+  done < <(php_upgrade_app_required_extensions "$app" "$root" install "$ver")
   (( ${#want[@]} > 0 )) || return 0
   if ! declare -F php_build_ensure >/dev/null; then
     warn "${app} at ${root} needs ${want[*]}, which PHP ${ver} does not load; run --optimize to rebuild PHP"
@@ -630,7 +656,7 @@ php_upgrade_preflight_apps() {
         continue
       fi
       PHP_UPGRADE_BLOCKERS+=("${app}|${root}|${ext}")
-    done < <(php_upgrade_app_required_extensions "$app" "$root")
+    done < <(php_upgrade_app_required_extensions "$app" "$root" preflight "$target")
     floor=$(php_upgrade_app_php_floor "$root")
     if [[ -n $floor && $(printf '%s\n%s\n' "$floor" "$target" | sort -V | head -n 1) != "$floor" ]]; then
       PHP_UPGRADE_BLOCKERS+=("${app}|${root}|php>=${floor}")
