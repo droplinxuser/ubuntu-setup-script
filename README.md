@@ -545,7 +545,7 @@ plus the set of every application found on the host, plus `PHP_EXT_EXTRA`.
 | Chevereto | pdo_mysql pdo mysqli redis igbinary gd curl mbstring exif fileinfo xmlwriter zip |
 | Other PHP apps (`--domain app=` flarum, polr, lychee, sfs, php, or a PHP root that is none of the three) | mysqli pdo_mysql pdo tokenizer bcmath sqlite3 pdo_sqlite xml xmlwriter zip exif; shlink adds gmp |
 | Any application root that uses SQLite | sqlite3 pdo_sqlite (a scan of the root, 4 levels deep, skipping `vendor`, `node_modules`, `cache` and `.git`, for `new SQLite3`, a `sqlite:` PDO DSN or a database file with the "SQLite format 3" magic) |
-| `--php ext=` only | anything else the build can compile: bcmath calendar ftp gettext gmp intl (builds ICU) shmop soap sockets sysvmsg sysvsem sysvshm xmlreader, and the names above |
+| `--php ext=` only | anything else the build can compile: bcmath calendar ftp gettext gmp imagick (builds ImageMagick 7 from source: JPEG, PNG, WebP, GIF) intl (builds ICU) shmop soap sockets sysvmsg sysvsem sysvshm xmlreader, and the names above |
 
 * Applications are detected from the vhost roots in `/etc/nginx/conf.d`,
   the `/var/www` tree and the `--domain app=` entries of the run.
@@ -1159,7 +1159,7 @@ touches `/etc/angie`), `--restart-all` restarts Angie as it is,
 their own.  Fix the blocker and run `--optimize` again.  A part blocked on
 an unchanged configuration is not retried on every run; a new setup.sh
 release or `SETUP_MIGRATE_RETRY=1` retries it.  A PHP version whose sites
-need an extension the build cannot provide (for example imagick for an
+need an extension the build cannot provide (for example xsl or ffi for an
 application that requires it) stays on Sury the same way
 (`SETUP_PHP_ALLOW_MISSING_EXT=1` drops it).  This includes redis on PHP
 8.6: phpredis 6.3.0 does not compile against 8.6.0, so an 8.6 host with
@@ -1559,7 +1559,7 @@ downloaded.
 | nginx, PHP-FPM or Valkey is down after a hardware change or a VM migration | the CPU changed and the service waits for its native rebuild, by design.  `journalctl -u setup-build-cpu -f` shows progress; each service starts when its own rebuild passes.  The `status` command of each build tool and the `builds` section of `--diagnostics` show whether the build matches the CPU |
 | "too little traffic, BOLT skipped" | not an error: the server was idle during the 60 s sample.  The next `--optimize` under real traffic applies BOLT |
 | A directive is commented out with `# setup-nginx-build-off: ` | its module is not built (for example `sub_filter`, `limit_conn`).  The report lists it; `nginx-build.sh restore` puts the lines back |
-| `--php ext=NAME`: "cannot compile this extension" | the name is not in the buildable list (shown in the message).  Extensions that need a library outside the build recipe, such as imagick, are not offered |
+| `--php ext=NAME`: "cannot compile this extension" | the name is not in the buildable list (shown in the message).  Extensions that need a library outside the build recipe, such as xsl, are not offered (imagick is offered: it builds ImageMagick from source) |
 | `--php`, `--valkey`, `--mariadb`, `--elastic` or a PHP `--domain` refused for RAM | the host is below the 4 GB class (`MemTotal` under 3500 MB): only nginx runs there |
 | `--nginx`, `--domain`, `--php` or `--valkey` refused: "run --optimize first" | the host still serves through Angie, Sury PHP or the valkey-server package; `--optimize` runs the one-time migration |
 | `--optimize` says "Web server: Angie (legacy mode ...)" | the nginx part of the migration is blocked or rolled back; read the reason in the report and `/var/log/setup-migrate-1.22.log`, fix it and run `--optimize` again (`SETUP_MIGRATE_RETRY=1` forces a retry on an unchanged configuration) |

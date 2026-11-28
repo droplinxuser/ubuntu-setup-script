@@ -1994,5 +1994,10 @@ out=$(sury_plan 8.0 8.3)
 check "dry-run: every running version moving still shows the Sury purge" \
   bash -c '[[ $1 == *"purge Sury PHP after cutover: 2 package(s)"* && $1 != *"Sury PHP kept"* ]]' _ "$out"
 
+# 1.22.11: imagick is buildable, so a Sury PHP that loads it keeps it (a live
+# XenForo origin whose image library is Imagick); xsl and ffi are still dropped.
+check "keep: imagick loaded by Sury is kept for the source build" migrate_php_buildable imagick 8.3
+check "keep: xsl is still not buildable" not migrate_php_buildable xsl 8.3
+
 printf '\n%s passed, %s failed, %s skipped\n' "$PASS" "$FAIL" "$SKIP"
 (( FAIL == 0 ))

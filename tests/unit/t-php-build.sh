@@ -1268,5 +1268,64 @@ printf 'flags\t\t: fpu sse sse2 sse4_2 avx avx2\n' > "$TMP/cpu-avx2"; printf 'fl
 check "cpu_has_flag: avx2 present / absent / unreadable" \
   bash -c 'SETUP_CPUINFO=$2 bash -c ". \"\$1\"; cpu_has_flag avx2" _ "$1" && ! SETUP_CPUINFO=$3 bash -c ". \"\$1\"; cpu_has_flag avx2" _ "$1" && ! SETUP_CPUINFO=/nonexistent bash -c ". \"\$1\"; cpu_has_flag avx2" _ "$1"' _ "$ROOT/tools/build-common.sh" "$TMP/cpu-avx2" "$TMP/cpu-noavx2"
 
+# ---------------------------------------------------------------------------
+# 1.22.11: imagick, opt-in only (ImageMagick 7 compiled from source).
+# ---------------------------------------------------------------------------
+out=$(tool_run 'libs_for "ctype gd imagick redis" | tr "\n" " "')
+check "imagick: ImageMagick follows its image libraries, each library once" \
+  bash -c 'l=" $1"; [[ $l == *" libjpeg-turbo libpng libwebp imagemagick "* ]] && (( $(grep -o " libpng " <<<"$l" | wc -l) == 1 ))' _ "$out"
+out=$(tool_run 'libs_for "ctype imagick" | tr "\n" " "')
+check "imagick: a set without gd still builds the image libraries before ImageMagick" \
+  bash -c '[[ " $1" == *" libjpeg-turbo libpng libwebp imagemagick "* ]]' _ "$out"
+a=$(tool_run 'libs_for "ctype curl gd zip redis igbinary" | tr "\n" " "')
+check "imagick: a set without it has no ImageMagick and the same order as before (cache key unchanged)" \
+  test "$a" = "zlib-ng openssl pcre2 libxml2 curl libjpeg-turbo libpng libwebp libzip mimalloc "
+c1=$(tool_run 'components_for "ctype imagick" | tr "\n" " "'); c2=$(tool_run 'components_for "ctype gd" | tr "\n" " "')
+check "imagick: the PECL extension and ImageMagick are components only when asked for" \
+  bash -c '[[ " $1" == *" imagick "* && " $1" == *" imagemagick "* && " $2" != *" imagick "* && " $2" != *" imagemagick "* ]]' _ "$c1" "$c2"
+check "imagick: configure gets --with-imagick on the library prefix" \
+  test "$(tool_run 'ext_flags 8.5 "imagick" /deps')" = "--with-imagick=/deps"
+out=$(FAKE_JSON='<a href="https://github.com/ImageMagick/ImageMagick/releases/download/7.1.2-36/ImageMagick-7.1.2-36-portable-Q16-x64.7z">x</a> ImageMagick-7.1.2-9 ImageMagick-6.9.13-30' tool_run 'latest_of imagemagick')
+check "imagick: the ImageMagick version comes from imagemagick.org's download page (newest 7.x)" test "$out" = "7.1.2-36"
+out=$(FAKE_JSON="" FAKE_TAGS="7.1.2-9 7.1.2-35 6.9.13-30 7.1.2-36-beta" tool_run 'latest_of imagemagick')
+check "imagick: without the page, the newest 7.x release tag (no beta, no 6.x)" test "$out" = "7.1.2-35"
+out=$(FAKE_JSON='<r><v>3.8.1</v><s>stable</s></r><r><v>3.8.0</v><s>stable</s></r><r><v>3.9.0RC1</v><s>beta</s></r>' tool_run 'latest_of imagick')
+check "imagick: the extension is PECL's newest stable release" test "$out" = "3.8.1"
+check "imagick: ImageMagick downloads from the GitHub release (checked SHA-256), then the tag snapshot" \
+  bash -c 'b=$(sed -n "/^fetch_component() {/,/^}/p" "$1"); grep -qF "releases/download/\$v/ImageMagick-\$v.tar.xz|\$c/ImageMagick-\$v.tar.xz|\$(gh_digest ImageMagick/ImageMagick" <<<"$b" && grep -qF "codeload.github.com/ImageMagick/ImageMagick/tar.gz/refs/tags/\$v" <<<"$b" && grep -qF "https://pecl.php.net/get/imagick-\$v.tgz" <<<"$b"' _ "$ROOT/tools/php-build.sh"
+check "imagick: ImageMagick is configured static, no OpenMP, no modules, only JPEG/PNG/WebP/zlib delegates" \
+  bash -c 'b=$(sed -n "/^        imagemagick)/,/make -j/p" "$1"); for w in --disable-shared --enable-static --disable-openmp --without-modules --enable-zero-configuration --with-jpeg --with-png --with-webp --with-zlib --without-xml --without-freetype --without-tiff --without-heic --without-x; do grep -q -- "$w" <<<"$b" || { echo "missing $w"; exit 1; }; done' _ "$ROOT/tools/php-build.sh"
+imh=$TMP/im/MagickCore/policy-private.h; mkdir -p "${imh%/*}"
+cat > "$imh" <<'EOF'
+#if defined(MAGICKCORE_ZERO_CONFIGURATION_SUPPORT)
+static const char
+  *ZeroConfigurationPolicy = \
+"<policymap> \
+</policymap>";
+#endif
+EOF
+out=$(tool_run "imagemagick_policy '$TMP/im' && echo rc=0 || echo rc=1")
+im_policy_ok() {
+  [[ $out == *rc=0* ]] || return 1
+  grep -qF '<policy domain=\"coder\" rights=\"none\" pattern=\"*\"/>' "$imh" \
+    && grep -qF 'rights=\"read|write\" pattern=\"{GIF,JPEG,' "$imh" \
+    && grep -qF '<policy domain=\"delegate\" rights=\"none\" pattern=\"*\"/>' "$imh" \
+    && grep -qF '<policy domain=\"path\" rights=\"none\" pattern=\"@*\"/>' "$imh" \
+    && ! grep -qF '"<policymap> \' "$imh"
+}
+check "imagick: the allowlist policy is compiled into ImageMagick (web raster coders only; delegates, @file refused)" im_policy_ok
+printf 'static const char *ZeroConfigurationPolicy = "<policymap version=2></policymap>";\n' > "$imh"
+out=$(tool_run "imagemagick_policy '$TMP/im' && echo rc=0 || echo rc=1")
+check "imagick: a source whose built-in policy changed form stops the build (never ships without it)" \
+  bash -c '[[ $1 == *rc=1* && $1 == *"not building without the compiled-in policy"* ]]' _ "$out"
+check "imagick: the policy is written before ImageMagick's configure runs" \
+  bash -c 'b=$(sed -n "/^        imagemagick)/,/make -j/p" "$1"); (( $(grep -n "imagemagick_policy" <<<"$b" | cut -d: -f1) < $(grep -n "\./configure" <<<"$b" | cut -d: -f1) ))' _ "$ROOT/tools/php-build.sh"
+check "imagick: Ubuntu's libMagickCore/Wand count as libraries that must be static" \
+  bash -c 'source <(grep "^STATIC_LIBS_RE=" "$1"); grep -qE "$STATIC_LIBS_RE" <<<"libMagickCore-7.Q16.so.10" && grep -qE "$STATIC_LIBS_RE" <<<"libMagickWand-6.Q16.so.7"' _ "$ROOT/tools/php-build.sh"
+check "imagick: buildable (--php ext=imagick) but in no default or per-application set" \
+  bash -c 'source "$1"; php_build_ext_buildable imagick && [[ " ${PHP_BASE_EXTS[*]} ${PHP_GENERIC_EXTS[*]} " != *" imagick "* ]] && ! grep -nE "imagick" <(sed -n "/^php_build_app_exts()/,/^}/p" "$1")' _ "$ROOT/lib/php-build.sh"
+check "imagick: both versions default to latest in php-build.conf" \
+  bash -c 'grep -qx "IMAGICK_VERSION=latest" "$1" && grep -qx "IMAGEMAGICK_VERSION=latest" "$1"' _ "$ROOT/php-build.conf"
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))

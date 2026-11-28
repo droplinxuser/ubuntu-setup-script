@@ -1583,7 +1583,7 @@ migrate_preflight() {
     done < <(migrate_php_ext_union "$v")
     # Rev3 step 3 (R41, R58): a module the build cannot provide refuses the
     # version only when a detected application requires it; otherwise it is
-    # dropped with a warning (imagick under the GD rule, ffi from php-common).
+    # dropped with a warning (ffi from php-common, xsl; imagick is buildable since 1.22.11 and kept).
     # Without C's requirement lists nothing can be ruled out: all count.
     if (( ${#unb_fpm[@]} )); then
       local req=""

@@ -8,6 +8,29 @@ Reports of the 1.21.33-1.21.61 cycles that measured the removed Anubis
 filter were deleted from the tree on 2026-11-23 for the same reason;
 `git show <commit>:<path>` recovers them.
 
+## 1.22.11 (2026-11-28)
+
+- **imagick is an optional PHP extension** (operator request; never
+  installed by default).  `--php ext=imagick` adds PECL imagick (newest
+  stable from pecl.php.net) compiled into PHP with a static ImageMagick 7
+  (the release imagemagick.org links, SHA-256 checked) built from source
+  on the recipe's own libjpeg-turbo, libpng, libwebp and zlib-ng: Q16, no
+  HDRI, no OpenMP, no modules, only the JPEG, PNG, WebP and built-in GIF,
+  BMP and ICO coders, nothing linked from Ubuntu.  Its security policy is
+  compiled in (zero configuration, so no policy.xml can go missing): an
+  allowlist of those raster formats; PDF and PostScript (Ghostscript),
+  SVG, MVG, MSL, TEXT and every other coder, every delegate and filter,
+  `@file` indirection and `/proc`, `/sys`, `/dev` paths are refused (a
+  test build without it read PostScript through the host's Ghostscript
+  and `text:/etc/hostname`).  Built and checked with PHP 8.1, 8.5 and 8.6.  `IMAGICK_VERSION` and
+  `IMAGEMAGICK_VERSION` (php-build.conf, `latest`) follow new releases
+  with the daily refresh like every other component.  A migrated host
+  whose Sury PHP loaded imagick keeps it (XenForo's image library set to
+  Imagick); a fresh install or a set without it builds exactly as before.
+  Tested on a live XenForo 2.2.3 host (Sury PHP 8.0 with Imagick): PHP
+  8.1 with imagick rendered every page and made XenForo thumbnails with
+  its Imagick driver.
+
 ## 1.22.10 (2026-11-28)
 
 - **The warning for a PHP series older than 8.1 gives a usable hint.**  It

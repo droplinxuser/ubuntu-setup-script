@@ -78,8 +78,12 @@ PHP_BASE_EXTS=(ctype curl dom fileinfo filter gd iconv libxml mbstring mysqlnd o
 PHP_GENERIC_EXTS=(mysqli pdo_mysql pdo tokenizer bcmath sqlite3 pdo_sqlite xml xmlwriter zip exif)
 # Everything tools/php-build.sh can build statically (no library outside
 # the build recipe).  --php ext= and the migration's union accept these.
+# imagick (1.22.11) is opt-in only like intl: it builds ImageMagick from
+# source (JPEG, PNG, WebP, GIF) and is never part of a default or
+# per-application set; --php ext=imagick, or a migrated host whose Sury PHP
+# loaded it.
 PHP_BUILDABLE_EXTS=(bcmath calendar ctype curl dom exif fileinfo filter ftp gd gettext gmp iconv
-  igbinary intl libxml mbstring mysqli mysqlnd opcache openssl pcntl pdo pdo_mysql pdo_sqlite phar
+  igbinary imagick intl libxml mbstring mysqli mysqlnd opcache openssl pcntl pdo pdo_mysql pdo_sqlite phar
   posix redis session shmop simplexml soap sockets sodium sqlite3 sysvmsg sysvsem sysvshm tokenizer
   xml xmlreader xmlwriter zip zlib)
 # Build options that no longer exist (gd-avif: AVIF in GD; redis-zstd:

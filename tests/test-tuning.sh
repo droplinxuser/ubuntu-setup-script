@@ -7537,16 +7537,16 @@ check "php-build.conf: pins, quotes and comments parse; unset keys mean latest; 
 check "php-build.conf: a value that is neither latest nor a version is refused" \
   test "$(pb_tool_case confbad)" = "refused"
 check "php-build.conf ships beside setup.sh with every component the tool builds" \
-  bash -c 'for k in PHP LLVM REDIS IGBINARY OPENSSL PCRE2 ZLIB_NG LIBXML2 LIBSODIUM GMP CURL LIBJPEG_TURBO LIBPNG LIBWEBP LIBZIP LIBICONV SQLITE ICU MIMALLOC; do grep -qx "${k}_VERSION=latest" "$1/php-build.conf" || { echo "no $k"; exit 1; }; done; grep -qx "PHP_BUILD_MALLOC=mimalloc" "$1/php-build.conf"' _ "$ROOT"
+  bash -c 'for k in PHP LLVM REDIS IGBINARY IMAGICK OPENSSL PCRE2 ZLIB_NG LIBXML2 LIBSODIUM GMP CURL LIBJPEG_TURBO LIBPNG LIBWEBP LIBZIP LIBICONV SQLITE ICU IMAGEMAGICK MIMALLOC; do grep -qx "${k}_VERSION=latest" "$1/php-build.conf" || { echo "no $k"; exit 1; }; done; grep -qx "PHP_BUILD_MALLOC=mimalloc" "$1/php-build.conf"' _ "$ROOT"
 lean_set_ok() {
   local f
   f=$(sed -n '/^cmd_build()/,/^}/p' "$ROOT/tools/php-build.sh")
   grep -q -- "--disable-all" <<<"$f" && grep -q -- "--disable-cgi" <<<"$f" \
     && grep -q -- "--disable-phpdbg" <<<"$f" && grep -q -- "--without-pear" <<<"$f" \
-    && ! grep -qi -- "imagick" <<<"$f" \
+    && ! grep -i -- "imagick" <<<"$f" | grep -qvF 'set_has "$set" imagick && fetch_unpack imagick' \
     && grep -q -- 'BASE_FLAGS="[^"]*-fPIE' <<<"$f" && ! grep -q -- 'BASE_FLAGS="[^"]*-fPIC' <<<"$f"
 }
-check "the build starts from --disable-all (only the host's set; no CGI, phpdbg, PEAR or imagick; -fPIE)" lean_set_ok
+check "the build starts from --disable-all (only the host's set; no CGI, phpdbg or PEAR; imagick only when the set names it; -fPIE)" lean_set_ok
 check "php-build: an extension outside the recipe stops the build (never a silent omission)" \
   bash -c 'sed -n "/^ext_flags()/,/^}/p" "$1" | grep -qF "is not part of the build recipe"' _ "$ROOT/tools/php-build.sh"
 # An EXIT trap fires after the function returned: every variable it names

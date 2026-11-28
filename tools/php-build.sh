@@ -27,6 +27,8 @@
 # module exists, so no extension= line is ever needed.
 # No intl/ICU unless asked for: measured 1.21.69, ICU made php-fpm 102 MB
 # instead of 60 MB and cost 4.5x the data-TLB misses on XenForo pages.
+# No imagick/ImageMagick unless asked for (--php ext=imagick, 1.22.11): it
+# compiles ImageMagick 7 from source on the recipe's image libraries.
 #
 # Layout (ROOT = /usr/local/lib/setup-php):
 #   ROOT/X.Y/sbin/php-fpm(.lto)  ROOT/X.Y/bin/php  ROOT/X.Y/lib/opcache.so
@@ -144,7 +146,7 @@ LIB_RECIPE=6
 # the Sury package).  5: 1.22.0 (FPM + CLI, own layout, per-host set).
 BUILD_RECIPE=5
 # Libraries php-fpm/php must NOT take from Ubuntu (they are linked statically).
-STATIC_LIBS_RE='^(libssl|libcrypto|libxml2|libpcre2-8|libz|libicu[a-z0-9]*|libcurl|libsodium|libgmp|libjpeg|libpng16|libwebp|libsharpyuv|libzip|libonig|libsystemd|libiconv|libsqlite3|libmimalloc)\.so'
+STATIC_LIBS_RE='^(libssl|libcrypto|libxml2|libpcre2-8|libz|libicu[a-z0-9]*|libcurl|libsodium|libgmp|libjpeg|libpng16|libwebp|libsharpyuv|libzip|libonig|libsystemd|libiconv|libsqlite3|libmimalloc|libMagick(Core|Wand)-[0-9][0-9A-Za-z.]*)\.so'
 # Extensions only the CLI SAPI builds (pcntl's config.m4 names cli/cgi).
 CLI_ONLY_EXTS="pcntl"
 
@@ -317,6 +319,19 @@ latest_of() {
       v=$(git ls-remote --tags --refs https://github.com/unicode-org/icu.git 2>/dev/null \
         | awk '{ sub("refs/tags/", "", $2); print $2 }' \
         | sed -nE 's/^release-([0-9]+)[-.]([0-9]+)$/\1.\2/p' | sort -V | tail -n 1 || true) ;;
+    imagemagick)
+      # imagemagick.org's download page names the current release (it links
+      # the GitHub release); the newest 7.x tag is the fallback.
+      v=$(http_get https://imagemagick.org/download/ 2>/dev/null \
+        | grep -oE 'ImageMagick-7\.[0-9]+\.[0-9]+-[0-9]+' | sed 's/^ImageMagick-//' | sort -uV | tail -n 1 || true)
+      [[ -n $v ]] || v=$(git ls-remote --tags --refs https://github.com/ImageMagick/ImageMagick.git 2>/dev/null \
+        | awk '{ sub("refs/tags/", "", $2); print $2 }' | grep -E '^7\.[0-9]+\.[0-9]+-[0-9]+$' | sort -V | tail -n 1 || true) ;;
+    imagick)
+      # PECL's newest stable release, then the newest GitHub tag.
+      v=$(http_get https://pecl.php.net/rest/r/imagick/allreleases.xml 2>/dev/null \
+        | grep -oE '<r><v>[0-9]+\.[0-9]+\.[0-9]+</v><s>stable</s>' \
+        | sed -E 's#<r><v>([^<]+)</v>.*#\1#' | sort -V | tail -n 1 || true)
+      [[ -n $v ]] || v=$(git_latest Imagick/imagick '^([0-9]+\.[0-9]+\.[0-9]+)$') ;;
     openssl)
       # PHP 8.1 does not compile against OpenSSL 4 (ERR_NUM_ERRORS and other
       # removed API; 1.22.0 downgrade test): it gets the newest 3.x release.
@@ -375,6 +390,14 @@ fetch_component() { # name version -> path of the source archive
         done
       done
       fetch_first "${srcs[@]}" ;;
+    imagemagick)
+      # The GitHub release imagemagick.org links, with its SHA-256 from the
+      # release API; then the tag snapshot (pinned on first use).
+      fetch_first "https://github.com/ImageMagick/ImageMagick/releases/download/$v/ImageMagick-$v.tar.xz|$c/ImageMagick-$v.tar.xz|$(gh_digest ImageMagick/ImageMagick "$v" "ImageMagick-$v.tar.xz")" \
+        "https://codeload.github.com/ImageMagick/ImageMagick/tar.gz/refs/tags/$v|$c/ImageMagick-src-$v.tar.gz|" ;;
+    imagick)
+      fetch_first "https://pecl.php.net/get/imagick-$v.tgz|$c/imagick-$v.tgz|" \
+        "https://github.com/Imagick/imagick/archive/refs/tags/$v.tar.gz|$c/imagick-gh-$v.tar.gz|" ;;
     *) bc_fetch_component "$@" ;;
   esac
 }
@@ -389,12 +412,17 @@ libs_for() { # set
   set_has "$s" iconv && l+=(libiconv)
   set_has "$s" curl && l+=(curl)
   set_has "$s" gd && l+=(libjpeg-turbo libpng libwebp)
+  # Opt-in (--php ext=imagick): ImageMagick from source on the same image
+  # libraries (listed again for a set without gd; the list is de-duplicated).
+  set_has "$s" imagick && l+=(libjpeg-turbo libpng libwebp imagemagick)
   set_has "$s" zip && l+=(libzip)
   { set_has "$s" sqlite3 || set_has "$s" pdo_sqlite; } && l+=(sqlite)
   set_has "$s" intl && l+=(icu)
   # The allocator (mimalloc, the only one since 1.22.5).
   l+=("$MALLOC_IMPL")
-  printf '%s\n' "${l[@]}"
+  # First occurrence wins, so a set without imagick keeps its old list (and
+  # its library cache key).
+  printf '%s\n' "${l[@]}" | awk '!seen[$0]++'
 }
 
 components_for() { # set
@@ -402,6 +430,7 @@ components_for() { # set
   printf '%s\n' php llvm
   set_has "$s" redis && printf 'redis\n'
   set_has "$s" igbinary && printf 'igbinary\n'
+  set_has "$s" imagick && printf 'imagick\n'
   libs_for "$s"
 }
 
@@ -450,6 +479,7 @@ ext_flags() { # X.Y set deps
       gmp)       printf '%s\n' "--with-gmp=$deps" ;;
       iconv)     printf '%s\n' "--with-iconv=$deps" ;;
       igbinary)  printf '%s\n' --enable-igbinary ;;
+      imagick)   printf '%s\n' "--with-imagick=$deps" ;;
       intl)      printf '%s\n' --enable-intl ;;
       libxml)    printf '%s\n' --with-libxml ;;
       mbstring)  printf '%s\n' --enable-mbstring --disable-mbregex ;;
@@ -486,6 +516,34 @@ ext_flags() { # X.Y set deps
     esac
   done
   return 0
+}
+
+# The ImageMagick security policy compiled into an ext=imagick build
+# (1.22.11).  Zero-configuration ImageMagick reads no policy.xml; it loads
+# only ZeroConfigurationPolicy from MagickCore/policy-private.h, an empty
+# <policymap> upstream (--with-security-policy only installs a file it
+# never reads; a 1.22.11 test read PostScript through Ghostscript and
+# text:/etc/hostname with it).  An allowlist: the web raster formats read
+# and written; every other coder, every delegate and filter, @file
+# indirection and the virtual filesystems refused.
+IMAGEMAGICK_POLICY='<policymap>
+<policy domain="delegate" rights="none" pattern="*"/>
+<policy domain="filter" rights="none" pattern="*"/>
+<policy domain="coder" rights="none" pattern="*"/>
+<policy domain="coder" rights="read|write" pattern="{GIF,JPEG,JPG,JPE,PJPEG,PNG,PNG8,PNG24,PNG32,PNG48,PNG64,PNG00,WEBP,BMP,BMP2,BMP3,ICO,CUR}"/>
+<policy domain="path" rights="none" pattern="@*"/>
+<policy domain="path" rights="none" pattern="/proc/*"/>
+<policy domain="path" rights="none" pattern="/sys/*"/>
+<policy domain="path" rights="none" pattern="/dev/*"/>
+</policymap>'
+imagemagick_policy() { # SRC
+  local h=$1/MagickCore/policy-private.h c
+  c=$(printf '%s' "$IMAGEMAGICK_POLICY" | tr -d '\n' | sed 's/"/\\"/g')
+  POLICY=$c perl -0pi -e 's/\*ZeroConfigurationPolicy\s*=\s*\\\s*\n\s*"<policymap>\s*\\\s*\n\s*<\/policymap>";/*ZeroConfigurationPolicy = "$ENV{POLICY}";/' "$h" 2>/dev/null || true
+  if ! grep -qF '<policy domain=\"coder\" rights=\"none\" pattern=\"*\"/>' "$h" 2>/dev/null; then
+    echo "ImageMagick: the built-in policy in ${h##*/} has another form; not building without the compiled-in policy" >&2
+    return 1
+  fi
 }
 
 # Static libraries in DEPS, compiled from upstream with the toolchain in the
@@ -566,6 +624,35 @@ build_libs() { # deps work jobs log libs...
             --disable-smtp --disable-gopher --disable-mqtt --disable-smb --disable-ftp --disable-file \
             --disable-manual --disable-docs \
             --with-ca-bundle=/etc/ssl/certs/ca-certificates.crt --with-ca-path=/etc/ssl/certs
+          make -j"$j" && make install ;;
+        imagemagick)
+          # Opt-in for ext=imagick (1.22.11).  Static ImageMagick 7: Q16 without
+          # HDRI (like Debian's Q16 build), no OpenMP (threads inside PHP-FPM
+          # workers), no modules, and only the coders XenForo, WordPress and
+          # Chevereto use: JPEG, PNG and WebP on this recipe's static libraries
+          # (GIF, BMP and ICO are built in).  Every other delegate is off, so
+          # nothing from Ubuntu is linked.  Cold flags: thumbnailing is not a
+          # page-view path.
+          # The security policy is compiled in (zero configuration reads no
+          # policy.xml, so there is none to lose with the build cache): an
+          # allowlist of the web raster formats; every other coder (PDF and
+          # PostScript via Ghostscript, SVG, MVG, MSL, TEXT: the ImageTragick
+          # class), every delegate and filter, @file indirection and /proc,
+          # /sys, /dev paths are refused.  A source whose built-in policy moved
+          # stops the build rather than ship without one.
+          imagemagick_policy "$src" || exit 1
+          PKG_CONFIG="pkg-config --static" PKG_CONFIG_LIBDIR="$deps/lib/pkgconfig" PKG_CONFIG_PATH="" \
+          CFLAGS=$cold CXXFLAGS=$cold CPPFLAGS="-I$deps/include" LDFLAGS="$ld_cold -L$deps/lib" \
+          ./configure --prefix="$deps" --disable-shared --enable-static --disable-openmp --disable-opencl \
+            --enable-zero-configuration \
+            --without-modules --with-quantum-depth=16 --disable-hdri --disable-docs --without-utilities \
+            --with-jpeg --with-png --with-webp --with-zlib \
+            --without-bzlib --without-lzma --without-zstd --without-xml --without-freetype --without-fontconfig \
+            --without-lcms --without-tiff --without-heic --without-jxl --without-openjp2 --without-raw \
+            --without-djvu --without-fftw --without-gvc --without-rsvg --without-wmf --without-openexr \
+            --without-jbig --without-lqr --without-pango --without-raqm --without-gslib --without-dps \
+            --without-flif --without-fpx --without-x --without-perl --without-magick-plus-plus \
+            --without-zip --without-uhdr --without-jemalloc --without-tcmalloc --without-umem
           make -j"$j" && make install ;;
         libjpeg-turbo)
           cmake_lib -DENABLE_SHARED=OFF -DENABLE_STATIC=ON -DWITH_TURBOJPEG=OFF ;;
@@ -817,6 +904,7 @@ cmd_build() { # X.Y [exact]
   fetch_unpack php "${VERS[php]}" "$src"
   set_has "$set" igbinary && fetch_unpack igbinary "${VERS[igbinary]}" "$src/ext/igbinary"
   set_has "$set" redis && fetch_unpack redis "${VERS[redis]}" "$src/ext/redis"
+  set_has "$set" imagick && fetch_unpack imagick "${VERS[imagick]}" "$src/ext/imagick"
   # PHP 8.5 dropped ext/standard/php_smart_string.h, which only ever
   # included Zend's header; igbinary 3.2.16 still includes it (Sury patches
   # the same way).  Recreate the wrapper when the release lacks it.
