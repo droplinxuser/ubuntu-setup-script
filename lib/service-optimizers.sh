@@ -721,6 +721,96 @@ opt_resume_web_frontends() {
   return "$rc"
 }
 
+# Application tables on MyISAM, Aria or MEMORY move to InnoDB (1.22.14).
+# Those engines lock the whole table for every write, and a reader waits
+# behind it: XenForo's MEMORY xf_session_activity (written on every page,
+# read by the online-members join, purged by a cron DELETE) queued guest
+# pages for 3-8 s on a live origin ("Waiting for table level lock"); InnoDB
+# locks rows.  Every database except MariaDB's own is covered (XenForo,
+# WordPress, Chevereto, Polr, Lychee, imports).  Skipped and reported, with
+# the statement to run by hand:
+#   - a table with a FULLTEXT index (InnoDB's full-text search uses another
+#     minimum word length and stopword list, so search results can change);
+#   - a table larger than SETUP_MARIADB_INNODB_MAX_MB (256): changing the
+#     engine copies the table and blocks its writes for the whole copy;
+#   - every MyISAM table of a schema that holds a MERGE (MRG_MyISAM) table:
+#     a MERGE table only opens MyISAM children.
+# ROW_FORMAT=DEFAULT drops an inherited FIXED/PAGE row format, which InnoDB's
+# strict mode refuses.  Each ALTER waits at most 2 s for its table lock
+# (lock_wait_timeout): while it waits, new queries on that table queue
+# behind it, so a busy table is skipped (retried by the next run) rather
+# than stalling the site.  Any other refusal (an AUTO_INCREMENT column that
+# is not first in its key, a row too large for InnoDB) is reported with
+# MariaDB's message; it fails before any row is copied.
+# SETUP_MARIADB_INNODB=0 turns it off.
+mariadb_innodb_candidates() { # -> schema TAB table TAB engine TAB MB TAB fulltext(0|1) TAB merge-schema(0|1)
+  mariadb -N -B -e "SELECT t.table_schema, t.table_name, t.engine,
+      CAST(CEIL((COALESCE(t.data_length,0) + COALESCE(t.index_length,0)) / 1048576) AS UNSIGNED),
+      EXISTS(SELECT 1 FROM information_schema.statistics s
+             WHERE s.table_schema = t.table_schema AND s.table_name = t.table_name
+               AND s.index_type = 'FULLTEXT'),
+      EXISTS(SELECT 1 FROM information_schema.tables m
+             WHERE m.table_schema = t.table_schema AND m.engine = 'MRG_MyISAM')
+    FROM information_schema.tables t
+    WHERE t.table_type = 'BASE TABLE' AND t.engine IN ('MyISAM', 'Aria', 'MEMORY')
+      AND t.table_schema NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys')
+    ORDER BY t.table_schema, t.table_name" 2>/dev/null
+}
+
+mariadb_innodb_convert() { # [dry]  dry=1 prints the plan
+  local dry=${1:-0} rows s t e mb ft mrg err max=${SETUP_MARIADB_INNODB_MAX_MB:-256}
+  local -a conv=() ftx=() big=() mrgd=() busy=() bad=() odd=()
+  if [[ ${SETUP_MARIADB_INNODB:-1} != 1 ]]; then
+    if (( dry )); then printf '  MariaDB: non-InnoDB application tables left as they are (SETUP_MARIADB_INNODB=0)\n'
+    else opt_report "- Non-InnoDB application tables: conversion off (SETUP_MARIADB_INNODB=0)"; fi
+    return 0
+  fi
+  [[ $max =~ ^[0-9]+$ ]] || max=256
+  if ! rows=$(mariadb_innodb_candidates); then
+    if (( dry )); then printf '  MariaDB: non-InnoDB application tables move to InnoDB (the list needs root and a running server)\n'
+    else opt_report "- Non-InnoDB application tables: not checked (the server did not answer)"; fi
+    return 0
+  fi
+  while IFS=$'\t' read -r s t e mb ft mrg; do
+    [[ -n $s && -n $t ]] || continue
+    # Names are quoted with backticks below; anything unusual is reported,
+    # never interpolated.
+    if [[ ! $s =~ ^[A-Za-z0-9_-]+$ || ! $t =~ ^[A-Za-z0-9_-]+$ ]]; then odd+=("${s}.${t}"); continue; fi
+    [[ $mb =~ ^[0-9]+$ ]] || mb=0
+    if [[ $mrg == 1 && $e == MyISAM ]]; then mrgd+=("${s}.${t}"); continue; fi
+    if [[ $ft == 1 ]]; then ftx+=("${s}.${t}"); continue; fi
+    if (( mb > max )); then big+=("${s}.${t} (${mb}MB)"); continue; fi
+    if (( dry )); then conv+=("${s}.${t} (${e})"); continue; fi
+    if err=$(mariadb -e "SET SESSION lock_wait_timeout = 2; ALTER TABLE \`${s}\`.\`${t}\` ENGINE=InnoDB ROW_FORMAT=DEFAULT" 2>&1 >/dev/null); then
+      conv+=("${s}.${t} (${e})")
+    elif [[ $err == *"ERROR 1205"* || $err == *"Lock wait timeout"* ]]; then
+      busy+=("${s}.${t}")
+    else
+      # The client frames the failing statement in dashes first; keep the
+      # ERROR line (or the first other non-empty line).
+      err=$(grep -m1 '^ERROR' <<<"$err" || grep -m1 -vE '^(-+|[[:space:]]*)$' <<<"$err" || true)
+      bad+=("${s}.${t} (${err:0:160})")
+    fi
+  done <<<"$rows"
+  local hint="ALTER TABLE <db>.<table> ENGINE=InnoDB"
+  if (( dry )); then
+    (( ${#conv[@]} )) && printf '  MariaDB: would move to InnoDB (row locks instead of table locks): %s\n' "${conv[*]}"
+    (( ${#ftx[@]} )) && printf '  MariaDB: left as they are (FULLTEXT index; InnoDB search may return other results; by hand: %s): %s\n' "$hint" "${ftx[*]}"
+    (( ${#big[@]} )) && printf '  MariaDB: left as they are (over %sMB, the copy would block writes; by hand off-peak: %s): %s\n' "$max" "$hint" "${big[*]}"
+    (( ${#mrgd[@]} )) && printf '  MariaDB: left as they are (MyISAM in a schema with a MERGE table): %s\n' "${mrgd[*]}"
+    (( ${#odd[@]} )) && printf '  MariaDB: left as they are (unusual names): %s\n' "${odd[*]}"
+    return 0
+  fi
+  (( ${#conv[@]} )) && opt_report "- Moved to InnoDB (row locks instead of table locks): ${conv[*]}"
+  (( ${#ftx[@]} )) && opt_report "- Left on their engine (FULLTEXT index; InnoDB full-text search may return other results; by hand: \`${hint}\`): ${ftx[*]}"
+  (( ${#big[@]} )) && opt_report "- Left on their engine (over ${max}MB, the copy would block writes; by hand off-peak: \`${hint}\`): ${big[*]}"
+  (( ${#mrgd[@]} )) && opt_report "- Left on their engine (MyISAM in a schema with a MERGE table, which only opens MyISAM tables): ${mrgd[*]}"
+  (( ${#busy[@]} )) && opt_report "- Not moved this run (table busy for 2 s; the next --optimize retries): ${busy[*]}"
+  (( ${#bad[@]} )) && opt_report "- **WARNING** MariaDB refused the move to InnoDB (fix the table by hand; nothing was copied): ${bad[*]}"
+  (( ${#odd[@]} )) && opt_report "- Left on their engine (unusual names): ${odd[*]}"
+  return 0
+}
+
 optimize_mariadb() {
   local active=0 ver size_mb buffer open_cache aria_mb
   local threads max_conn io_read io_write cnf_dir cnf backlog cnf_before cnf_after
@@ -764,6 +854,8 @@ optimize_mariadb() {
       opt_report "- Database data+index=${OPT_DB_SIZE_MB}MB; buffer pool=${size_mb}MB; ${target}"
     fi
   fi
+  # Table-locking engines move to InnoDB first (1.22.14; online, per table).
+  if (( active )); then mariadb_innodb_convert; fi
   mariadb_compute_profile "$size_mb"
   buffer=$MARIADB_PROFILE_BUFFER
   open_cache=$MARIADB_PROFILE_OPEN_CACHE
@@ -2712,6 +2804,7 @@ optimize_plan() {
     local nonpool_line
     nonpool_line=$(mariadb_nonpool_summary)
     if [[ -n $nonpool_line ]]; then printf "  MariaDB: %s\n" "$nonpool_line"; fi
+    mariadb_innodb_convert 1
   fi
   if [[ " ${OPT_DETECTED[*]} " == *" valkey "* || " ${OPT_DETECTED[*]} " == *" redis "* ]]; then
     # The plan's value is final (live-data guard included), so this is the

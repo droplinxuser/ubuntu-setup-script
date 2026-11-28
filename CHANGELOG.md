@@ -8,6 +8,46 @@ Reports of the 1.21.33-1.21.61 cycles that measured the removed Anubis
 filter were deleted from the tree on 2026-11-23 for the same reason;
 `git show <commit>:<path>` recovers them.
 
+## 1.22.14 (2026-11-28)
+
+- **Application tables on MyISAM, Aria and MEMORY move to InnoDB.**  Those
+  engines lock the whole table for every write, and readers wait behind
+  it.  On a live XenForo origin, the MEMORY `xf_session_activity` table
+  (written on each page, read by the online-members join, purged by a cron
+  `DELETE`) held guest pages in "Waiting for table level lock" for 3-8 s
+  at a time.  Interleaved A/B there (MEMORY, InnoDB, InnoDB, MEMORY,
+  MEMORY, InnoDB; 4 minutes each under live traffic, a sequential guest
+  probe):
+
+  | Engine | requests | p50 ms | p99 ms | slowest | over 1 s | lock waits/s |
+  |---|---|---|---|---|---|---|
+  | MEMORY | 2,757 | 229-235 | 426-496 | 3.5-7.8 s | 10 | 1.44-4.08 |
+  | InnoDB | 2,901 | 229-236 | 400-425 | 0.48-0.55 s | 0 | 0.00 |
+
+  Every `--optimize` (and the MariaDB re-optimization after a `--domain
+  ... sql=` import) now moves such tables in every application database
+  (XenForo, WordPress, Chevereto, Polr, Lychee, imports; never MariaDB's
+  own schemas) to InnoDB, online and one table at a time.  Tables with a
+  FULLTEXT index (InnoDB's full-text search may return other results) and
+  tables over `SETUP_MARIADB_INNODB_MAX_MB` (256; the engine change copies
+  the table and blocks its writes) are left alone and listed with the
+  statement to run by hand, and so are the MyISAM tables of a schema with
+  a MERGE table (it only opens MyISAM tables).  `ROW_FORMAT=DEFAULT` lets
+  an inherited FIXED or PAGE row format through.  Each `ALTER` waits at
+  most 2 s for its table lock (new queries queue behind a waiting
+  `ALTER`), so a busy table is retried by the next run instead of stalling
+  the site; any other refusal (AUTO_INCREMENT not first in its key, a row
+  too large) is a warning with MariaDB's message, raised before any row is
+  copied.  The dry run lists the plan; `SETUP_MARIADB_INNODB=0` turns it
+  off.  Checked against MariaDB 11.8 (strict mode on) with MEMORY (hash
+  index), MyISAM, MyISAM `ROW_FORMAT=FIXED`, Aria `PAGE TRANSACTIONAL=1`,
+  FULLTEXT, MERGE, view and AUTO_INCREMENT-second-in-key fixtures: rows
+  kept, the MERGE table still reads its children, a table held by `LOCK
+  TABLES` skipped after 2 s and converted by the next run, the refusal
+  reported with error 1075.  A multi-lens review (bash, MariaDB, the
+  applications) with adversarial verification found the MERGE, row-format
+  and refusal-reporting cases before release.
+
 ## 1.22.13 (2026-11-28)
 
 - **`--optimize ext=LIST` changes the PHP extension set on any supported

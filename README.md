@@ -697,6 +697,34 @@ Environment option:
 | Variable | Default | Effect |
 |---|---|---|
 | `SETUP_MARIADB_IO_CAPACITY="r m"` | by disk and host class | pins `innodb_io_capacity` and `innodb_io_capacity_max` for an install/one run; `--optimize` ignores it |
+| `SETUP_MARIADB_INNODB=0` | 1 | keeps application tables on MyISAM, Aria and MEMORY (see below) |
+| `SETUP_MARIADB_INNODB_MAX_MB` | 256 | the largest table (data + index) `--optimize` moves to InnoDB by itself |
+
+**Table-locking engines move to InnoDB (1.22.14).**  Every `--optimize`
+(and the re-optimization after a `--domain ... sql=` import) moves the
+MyISAM, Aria and MEMORY tables of every application database to InnoDB,
+online, one table at a time; MariaDB's own schemas are left alone.  Those
+engines lock the whole table for each write and every reader waits: on a
+live XenForo origin the MEMORY `xf_session_activity` table (written on each
+page, read by the online-members join, purged by a cron `DELETE`) held
+guest pages for 3-8 s at a time.  Interleaved A/B on that origin, three
+4-minute rounds per engine under live traffic: table-lock waits 1.4-4.1/s
+-> 0, requests over 1 s 10 -> 0, slowest request 3.5-7.8 s -> under
+0.55 s, p99 -6 %, p50 unchanged, +5 % requests served by the sequential
+probe.  Left alone and listed in the report, with the statement to run by
+hand: a table with a FULLTEXT index (InnoDB's full-text search has another
+minimum word length and stopword list, so search results can change; on a
+XenForo host searching through Elasticsearch `xf_search_index` is unused),
+a table over `SETUP_MARIADB_INNODB_MAX_MB` (the engine change copies it
+and blocks its writes meanwhile), and the MyISAM tables of a schema that
+holds a MERGE (`MRG_MyISAM`) table, which only opens MyISAM tables.  The
+`ALTER` adds `ROW_FORMAT=DEFAULT`, so an inherited FIXED or PAGE row format
+does not block it.  Each `ALTER` waits at most 2 s for its table lock,
+because new queries on that table queue behind a waiting `ALTER`: a busy
+table is retried by the next run instead of stalling the site.  A table
+MariaDB refuses for another reason (an AUTO_INCREMENT column that is not
+first in its key, a row too large for InnoDB) is reported with MariaDB's
+message; the refusal comes before any row is copied.  The dry run lists what would move.
 
 After a large `--domain ... sql=` import or an application-level bulk seed, run
 `--optimize` again (or pass `--mariadb size=...`) so the buffer pool is

@@ -332,5 +332,87 @@ check "ES: a re-run writes the same bytes (no extra restart)" eq "$(md5sum < "$y
 check "ES: the restart is the existing changed-block path" \
   has "$(declare -f optimize_elastic)" 'opt_restart_service elasticsearch'
 
+
+# ---------------------------------------------------------------------------
+# DB9 (1.22.14): table-locking application tables move to InnoDB
+# ---------------------------------------------------------------------------
+# The stub answers the candidate query from $TMP/innodb.rows and records
+# every ALTER; $TMP/innodb.fail lists "table busy|refused" ALTERs that fail.
+ic_run() { # dry -> report/plan lines ; ALTERs in $TMP/innodb.alters
+  (
+    : > "$TMP/innodb.alters"
+    mariadb() {
+      local sql=${*: -1}
+      case $sql in
+        *information_schema.tables*) [[ -f $TMP/innodb.down ]] && return 1; cat "$TMP/innodb.rows" ;;
+        *"ALTER TABLE"*)
+          printf '%s\n' "$sql" >> "$TMP/innodb.alters"
+          local f k; while read -r f k; do
+            [[ -n $f && $sql == *"\`${f}\`"* ]] || continue
+            case $k in
+              busy) echo 'ERROR 1205 (HY000) at line 1: Lock wait timeout exceeded; try restarting transaction' >&2 ;;
+              *)    printf -- '--------------\nSET SESSION lock_wait_timeout = 2; ALTER TABLE x\n--------------\n\nERROR 1075 (42000) at line 1: Incorrect table definition; there can be only one auto column and it must be defined as a key\nsecond line\n' >&2 ;;
+            esac
+            return 1
+          done < <(cat "$TMP/innodb.fail" 2>/dev/null)
+          return 0 ;;
+      esac
+    }
+    OPT_REPORT=()
+    opt_report() { printf 'R %s\n' "$*"; }
+    mariadb_innodb_convert "$1"
+  )
+}
+printf 'xf\txf_session_activity\tMEMORY\t33\t0\nxf\txf_search_index\tMyISAM\t900\t1\nwp\twp_big\tMyISAM\t5000\t0\nwp\twp_opts\tAria\t2\t0\nchev\tchv_x\tMyISAM\t1\t0\n' > "$TMP/innodb.rows"
+out=$(ic_run 0)
+alters=$(cat "$TMP/innodb.alters")
+check "innodb: MEMORY, Aria and MyISAM tables are altered to InnoDB" \
+  bash -c '[[ $1 == *"\`xf\`.\`xf_session_activity\` ENGINE=InnoDB"* && $1 == *"\`wp\`.\`wp_opts\` ENGINE=InnoDB"* && $1 == *"\`chev\`.\`chv_x\` ENGINE=InnoDB"* ]]' _ "$alters"
+check "innodb: each ALTER waits at most 2 s for its table lock" \
+  bash -c '[[ $(grep -c "ALTER" <<<"$1") == $(grep -c "lock_wait_timeout = 2;" <<<"$1") ]]' _ "$alters"
+check "innodb: a FULLTEXT table is not altered" lacks "$alters" "xf_search_index"
+check "innodb: a table over the size cap is not altered" lacks "$alters" "wp_big"
+check "innodb: the report names the moved tables" has "$out" "Moved to InnoDB (row locks instead of table locks): xf.xf_session_activity (MEMORY) wp.wp_opts (Aria) chev.chv_x (MyISAM)"
+check "innodb: the report names the FULLTEXT table with the by-hand statement" \
+  bash -c '[[ $1 == *"FULLTEXT index"*"ALTER TABLE <db>.<table> ENGINE=InnoDB"*"xf.xf_search_index"* ]]' _ "$out"
+check "innodb: the report names the big table with its size" has "$out" "wp.wp_big (5000MB)"
+out=$(SETUP_MARIADB_INNODB_MAX_MB=10000 ic_run 0)
+check "innodb: SETUP_MARIADB_INNODB_MAX_MB raises the cap" has "$(cat "$TMP/innodb.alters")" "\`wp\`.\`wp_big\` ENGINE=InnoDB"
+check "innodb: the ALTER drops an inherited row format (ROW_FORMAT=DEFAULT)" \
+  bash -c '[[ $(grep -c "ALTER" <<<"$1") == $(grep -c "ENGINE=InnoDB ROW_FORMAT=DEFAULT" <<<"$1") ]]' _ "$alters"
+printf 'wp_opts busy\nchv_x refused\n' > "$TMP/innodb.fail"
+out=$(ic_run 0); rm -f "$TMP/innodb.fail"
+check "innodb: a lock timeout is reported as busy, retried next run" \
+  bash -c '[[ $1 == *"Not moved this run (table busy for 2 s; the next --optimize retries): wp.wp_opts"* && $1 != *"WARNING"*"wp.wp_opts"* ]]' _ "$out"
+check "innodb: another refusal is a warning with MariaDB's first message line" \
+  bash -c '[[ $1 == *"WARNING** MariaDB refused the move to InnoDB"*"chev.chv_x (ERROR 1075 (42000) at line 1: Incorrect table definition"* && $1 != *"second line"* ]]' _ "$out"
+check "innodb: the other tables still move" has "$out" "Moved to InnoDB (row locks instead of table locks): xf.xf_session_activity (MEMORY)"
+printf 'logs\tl2025\tMyISAM\t1\t0\t1\nlogs\tcache\tMEMORY\t1\t0\t1\n' > "$TMP/innodb.rows"
+out=$(ic_run 0)
+check "innodb: MyISAM tables of a schema with a MERGE table stay MyISAM" \
+  bash -c '[[ $1 == *"MERGE table"*"logs.l2025"* && $(cat "$2") != *l2025* ]]' _ "$out" "$TMP/innodb.alters"
+check "innodb: a MEMORY table next to a MERGE table still moves" has "$(cat "$TMP/innodb.alters")" "\`logs\`.\`cache\`"
+printf 'xf\txf_session_activity\tMEMORY\t33\t0\t0\nxf\txf_search_index\tMyISAM\t900\t1\t0\nwp\twp_big\tMyISAM\t5000\t0\t0\nwp\twp_opts\tAria\t2\t0\t0\nchev\tchv_x\tMyISAM\t1\t0\t0\n' > "$TMP/innodb.rows"
+out=$(ic_run 1)
+check "innodb: the dry run lists the plan and alters nothing" \
+  bash -c '[[ $1 == *"would move to InnoDB"*"xf.xf_session_activity (MEMORY)"* && ! -s $2 ]]' _ "$out" "$TMP/innodb.alters"
+out=$(SETUP_MARIADB_INNODB=0 ic_run 0)
+check "innodb: SETUP_MARIADB_INNODB=0 turns it off" \
+  bash -c '[[ $1 == *"conversion off"* && ! -s $2 ]]' _ "$out" "$TMP/innodb.alters"
+printf 'x`y\tt\tMyISAM\t1\t0\nok\tt;drop\tMyISAM\t1\t0\n' > "$TMP/innodb.rows"
+out=$(ic_run 0)
+check "innodb: unusual schema or table names are reported, never interpolated" \
+  bash -c '[[ ! -s $2 && $1 == *"unusual names"* ]]' _ "$out" "$TMP/innodb.alters"
+touch "$TMP/innodb.down"; out=$(ic_run 0); rm -f "$TMP/innodb.down"
+check "innodb: a server that does not answer is reported, nothing altered" \
+  bash -c '[[ $1 == *"not checked"* && ! -s $2 ]]' _ "$out" "$TMP/innodb.alters"
+: > "$TMP/innodb.rows"; out=$(ic_run 0)
+check "innodb: nothing to convert prints nothing" eq "$out" ""
+ic_def=$(declare -f mariadb_innodb_candidates)
+check "innodb: the candidate query skips MariaDB's own schemas" has "$ic_def" "NOT IN ('mysql', 'information_schema', 'performance_schema', 'sys')"
+check "innodb: the candidate query skips views" has "$ic_def" "t.table_type = 'BASE TABLE'"
+om_def=$(declare -f optimize_mariadb)
+check "innodb: optimize_mariadb converts only on a running server, before the profile" \
+  bash -c '[[ $1 == *"if (( active )); then"*"mariadb_innodb_convert"*"mariadb_compute_profile"* ]]' _ "$om_def"
 printf '\nTOTAL: %d passed, %d failed\n' "$PASS" "$FAIL"
 (( FAIL == 0 ))
