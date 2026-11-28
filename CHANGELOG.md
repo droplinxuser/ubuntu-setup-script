@@ -8,6 +8,16 @@ Reports of the 1.21.33-1.21.61 cycles that measured the removed Anubis
 filter were deleted from the tree on 2026-11-23 for the same reason;
 `git show <commit>:<path>` recovers them.
 
+## 1.22.9 (2026-11-28)
+
+- **The dry-run no longer promises a Sury purge that will not happen.**  On
+  a host whose running PHP stays on Sury (PHP 8.0 here: the source build
+  makes 8.1 and newer), the plan said both "Sury keeps serving 8.0" and
+  "purge Sury PHP after cutover: 15 package(s)".  The real run was always
+  safe (Sury is removed only when every running version is on the source
+  build); the plan now says "Sury PHP kept: PHP 8.0 stays on Sury".  Found
+  on a live XenForo 2.2 host before its migration.
+
 ## 1.22.8 (2026-11-28)
 
 - **A site that `/etc/hosts` maps to loopback is still recognised as

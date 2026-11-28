@@ -1978,5 +1978,21 @@ check "render fixer: an Angie vhost's 'listen 443 quic reuseport;' loses reusepo
   bash -c 'grep -qE "^    listen 443 quic;$" "$1/conf.d/site.conf" && grep -qF "# setup.sh: QUIC socket options are set by" "$1/conf.d/site.conf" && grep -qF "reuseport rcvbuf=4m sndbuf=4m" "$1/conf.d/1.https.default.conf"' _ "$qd"
 rm -rf "$qd"
 
+# 1.22.9: the dry-run promised "purge Sury PHP" on a host whose PHP 8.0 stays
+# on Sury (migrate_removals keeps Sury then); the plan now says so.
+sury_plan() ( # MOVES... -> the collateral plan lines
+  migrate_pkg_list() { case $1 in sury) printf "php8.0-fpm\nphp8.0-cli\n" ;; esac; }
+  migrate_sury_active_versions() { printf "8.0\n8.3\n"; }
+  migrate_sury_purge_preflight() { return 0; }
+  MIGRATE_DRY_PHP_MOVES=("$@"); MIGRATE_SIM_COLLATERAL=()
+  migrate_preflight_collateral 1 2>&1
+)
+out=$(sury_plan 8.3)
+check "dry-run: a running version left on Sury keeps Sury (no purge promised)" \
+  bash -c '[[ $1 == *"Sury PHP kept: PHP 8.0 stays on Sury"* && $1 != *"purge Sury PHP after cutover"* ]]' _ "$out"
+out=$(sury_plan 8.0 8.3)
+check "dry-run: every running version moving still shows the Sury purge" \
+  bash -c '[[ $1 == *"purge Sury PHP after cutover: 2 package(s)"* && $1 != *"Sury PHP kept"* ]]' _ "$out"
+
 printf '\n%s passed, %s failed, %s skipped\n' "$PASS" "$FAIL" "$SKIP"
 (( FAIL == 0 ))

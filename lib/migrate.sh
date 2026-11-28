@@ -1515,9 +1515,13 @@ migrate_preflight() {
   # deferred) until the operator consolidates them.
   local primary
   primary=$(migrate_primary_version)
+  # Dry run: the versions this run would leave on the source build, so the
+  # Sury purge line follows migrate_removals' rule (every running version
+  # on our build) instead of promising a purge that will not happen (1.22.9).
+  MIGRATE_DRY_PHP_MOVES=()
   for v in "${php_active[@]}"; do
     st=$(migrate_state_get "php-${v}")
-    [[ $st == "done" ]] && { (( dry )) && printf '  PHP %s: migrated\n' "$v"; continue; }
+    [[ $st == "done" ]] && { (( dry )) && { printf '  PHP %s: migrated\n' "$v"; MIGRATE_DRY_PHP_MOVES+=("$v"); }; continue; }
     if ! migrate_part_retry_ok "php-${v}" "$(migrate_php_scan_digest "$v")"; then
       if (( dry )); then printf '  PHP %s: %s (unchanged since; SETUP_MIGRATE_RETRY=1 retries)\n' "$v" "$st"
       else migrate_note "PHP ${v} stays on Sury: ${st} (nothing changed since; SETUP_MIGRATE_RETRY=1 retries)"; fi
@@ -1593,6 +1597,7 @@ migrate_preflight() {
         # (migrate_php_persist_exts); show the set that build will get.
         printf '    effective set after the union: %s\n' "$(PHP_EXT_EXTRA="${PHP_EXT_EXTRA:-} ${keep[*]}" PHP_EXT_DETECT_TREE=$(migrate_php_detect_tree) php_build_effective_exts 2>/dev/null || true)"
       fi
+      if (( ${#unb_req[@]} == 0 )) || [[ ${SETUP_PHP_ALLOW_MISSING_EXT:-0} == 1 ]]; then MIGRATE_DRY_PHP_MOVES+=("$v"); fi
       continue
     fi
     if (( ${#unb_req[@]} > 0 )) && [[ ${SETUP_PHP_ALLOW_MISSING_EXT:-0} != 1 ]]; then
@@ -1666,7 +1671,7 @@ migrate_distro_nginx_blocks() {
 }
 
 migrate_preflight_collateral() {
-  local dry=$1 kind
+  local dry=$1 kind v
   local -a pkgs=()
   for kind in angie valkey; do
     mapfile -t pkgs < <(migrate_pkg_list "$kind")
@@ -1684,7 +1689,15 @@ migrate_preflight_collateral() {
     fi
   done
   mapfile -t pkgs < <(migrate_pkg_list sury)
-  if (( ${#pkgs[@]} > 0 )); then
+  local -a sury_stays=()
+  if (( dry && ${#pkgs[@]} > 0 )); then
+    while IFS= read -r v; do
+      [[ -n $v && " ${MIGRATE_DRY_PHP_MOVES[*]:-} " != *" $v "* ]] && sury_stays+=("$v")
+    done < <(migrate_sury_active_versions)
+  fi
+  if (( ${#sury_stays[@]} > 0 )); then
+    printf '  Sury PHP kept: PHP %s stays on Sury (purged only once every running version is on the source build)\n' "${sury_stays[*]}"
+  elif (( ${#pkgs[@]} > 0 )); then
     if migrate_sury_purge_preflight >/dev/null; then
       (( dry )) && printf '  purge Sury PHP after cutover: %s package(s)%s\n' "${#pkgs[@]}" \
         "$([[ ${SETUP_PHP_ALLOW_COLLATERAL:-0} == 1 && ${#MIGRATE_SIM_COLLATERAL[@]} -gt 0 ]] && echo " (also removes ${MIGRATE_SIM_COLLATERAL[*]}: SETUP_PHP_ALLOW_COLLATERAL=1)")"
