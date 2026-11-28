@@ -8,6 +8,14 @@ Reports of the 1.21.33-1.21.61 cycles that measured the removed Anubis
 filter were deleted from the tree on 2026-11-23 for the same reason;
 `git show <commit>:<path>` recovers them.
 
+## 1.22.10 (2026-11-28)
+
+- **The warning for a PHP series older than 8.1 gives a usable hint.**  It
+  said "re-run --optimize once 8.0.0 is released", advice meant for a
+  series not released yet (a Sury RC).  An older series now gets "Move its
+  sites to PHP 8.1 or newer (check the applications support it)".  Found on
+  a live XenForo 2.2 host whose PHP 8.0 stays on Sury.
+
 ## 1.22.9 (2026-11-28)
 
 - **The dry-run no longer promises a Sury purge that will not happen.**  On

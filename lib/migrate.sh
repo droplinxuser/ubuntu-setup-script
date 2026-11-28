@@ -1539,7 +1539,13 @@ migrate_preflight() {
     if ! migrate_php_series_ok "$v"; then
       if (( dry )); then printf '  PHP %s: refused, the source build supports released series from 8.1 on; Sury keeps serving %s\n' "$v" "$v"
       else migrate_state_set "php-${v}" "refused:series not buildable"; migrate_state_set "php-${v}.scan" "$(migrate_php_scan_digest "$v")"
-           migrate_warn "PHP ${v}: the source build supports released PHP series from 8.1 on (no RC); Sury keeps serving ${v} and is not purged.  Move its sites to a supported series, or re-run --optimize once ${v}.0 is released"; fi
+           # The release hint only fits a series not out yet (a Sury RC);
+           # an old series (8.0 and before) never gets a new .0 release.
+           if [[ $(printf '%s\n%s\n' "$v" 8.1 | sort -V | head -n1) == 8.1 ]]; then
+             migrate_warn "PHP ${v}: the source build supports released PHP series from 8.1 on (no RC); Sury keeps serving ${v} and is not purged.  Move its sites to a supported series, or re-run --optimize once ${v}.0 is released"
+           else
+             migrate_warn "PHP ${v}: the source build supports PHP 8.1 and newer; Sury keeps serving ${v} and is not purged.  Move its sites to PHP 8.1 or newer (check the applications support it) to migrate it"
+           fi; fi
       continue
     fi
     conflict=""
