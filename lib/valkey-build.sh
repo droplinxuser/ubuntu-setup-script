@@ -226,10 +226,13 @@ valkey_build_run() { # out command [args]
 valkey_build_ensure() {
   local mode=${1:-full} context=${2:-install} out=${3:-info} chk="" rc=0
   case $mode in build-only|activate|full|bolt) ;; *) valkey_build_report "$out" "- Valkey: unknown build mode ${mode}"; return 1 ;; esac
-  # An adopted Redis is never replaced (it is tuned as Redis instead).
-  if valkey_pkg_installed redis-server && ! valkey_pkg_installed valkey-server \
-     && ! valkey_unit_is_ours && [[ ! -f $VALKEY_BUILD_INFO ]]; then
-    valkey_build_report "$out" "- Valkey: skipped (redis-server is installed; a Redis server is never replaced)"
+  # Ubuntu's redis-server is replaced only by the 1.22 migration (1.22.17),
+  # which stops it and carries its dataset first.  Everywhere else a Redis
+  # host keeps Redis (tuned as Redis): also after a rolled-back replacement,
+  # whose build stays on disk but must never start beside it.
+  if [[ $context != migrate ]] && valkey_pkg_installed redis-server && ! valkey_pkg_installed valkey-server \
+     && ! valkey_unit_is_ours; then
+    valkey_build_report "$out" "- Valkey: skipped (redis-server serves; the 1.22 migration of --optimize replaces it when it can)"
     return 0
   fi
   valkey_build_retire_legacy

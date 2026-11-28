@@ -1290,10 +1290,16 @@ valkey_data_size_mb() {
   return 0
 }
 
+# A graceful reload is enough (1.22.17): FPM re-spawns every worker on
+# SIGUSR2 and each new worker calls initgroups() for its pool user, so it
+# reads the new membership, while the master keeps the listening socket.  A
+# restart removed /run/php/php-fpm.sock for up to a second (nginx 502s on a
+# busy site).  The restart stays the fallback.
 restart_php_workers_for_group() {
   local group=$1 unit
   while IFS= read -r unit; do
     [[ -n $unit ]] || continue
+    systemctl reload "$unit" 2>/dev/null && continue
     if ! systemctl restart "$unit" 2>/dev/null; then
       warn "Could not restart ${unit} to inherit the ${group} group"
     fi

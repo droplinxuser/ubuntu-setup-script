@@ -51,6 +51,13 @@ MIGRATE_NGINX_ETC=/etc/nginx
 MIGRATE_PHP_ETC=${SETUP_MIGRATE_PHP_ETC:-/etc/php}
 MIGRATE_VALKEY_ETC=${SETUP_MIGRATE_VALKEY_ETC:-/etc/valkey}
 MIGRATE_VALKEY_DATA=${SETUP_MIGRATE_VALKEY_DATA:-/var/lib/valkey}
+# Ubuntu's redis-server package, replaced by the compiled Valkey (1.22.17).
+MIGRATE_REDIS_ETC=${SETUP_MIGRATE_REDIS_ETC:-/etc/redis}
+MIGRATE_REDIS_DATA=${SETUP_MIGRATE_REDIS_DATA:-/var/lib/redis}
+MIGRATE_REDIS_TMPFILES=${SETUP_MIGRATE_REDIS_TMPFILES:-/etc/tmpfiles.d/setup-redis-socket.conf}
+MIGRATE_REDIS_CLI_LINK=${SETUP_MIGRATE_REDIS_CLI_LINK:-/usr/local/bin/redis-cli}
+MIGRATE_VALKEY_SOCK=${SETUP_MIGRATE_VALKEY_SOCK:-/run/valkey/valkey.sock}
+MIGRATE_VALKEY_LOGFILE=${SETUP_MIGRATE_VALKEY_LOGFILE:-/var/www/logs/valkey/valkey.log}
 MIGRATE_LEGACY_TOOLS=${SETUP_MIGRATE_LEGACY_TOOLS:-/usr/local/lib/setup-1.21-legacy}
 MIGRATE_BUILD_LOCK=${SETUP_BUILD_LOCK:-/run/setup-build.lock}
 MIGRATE_APT_PIN=/etc/apt/preferences.d/setup-source-builds
@@ -106,6 +113,7 @@ MIGRATE_FAILED=0
 # Filled by the pre-flight.
 MIGRATE_DO_NGINX=0
 MIGRATE_DO_VALKEY=0
+MIGRATE_VALKEY_FROM=valkey   # valkey|redis: the package the Valkey part replaces
 MIGRATE_PHP_TODO=()
 MIGRATE_SIM_COLLATERAL=()
 MIGRATE_SIM_REMOVED=()
@@ -377,6 +385,7 @@ migrate_pkg_installed() { dpkg-query -W -f='${db:Status-Abbrev}' "$1" 2>/dev/nul
 #           libapache2-mod-php* is NOT part of it, so the guard reports it
 #           as collateral (Apache may serve through it, R17)
 #   valkey  valkey-server valkey-tools
+#   redis   redis, redis-server, redis-tools (Ubuntu's Redis, 1.22.17)
 #   distro-nginx  nginx, nginx-common/core/full/light/extras, libnginx-mod-*,
 #           python3-certbot-nginx (R30, R71)
 migrate_pkg_list() {
@@ -384,6 +393,7 @@ migrate_pkg_list() {
     angie)  migrate_dpkg_names | grep -E '^angie(-module-[a-z0-9.+-]+)?$' || true ;;
     sury)   migrate_dpkg_names | grep -E '^(php([0-9]+\.[0-9]+)?(-[a-z0-9.+-]+)?|debsuryorg-archive-keyring)$' || true ;;
     valkey) migrate_dpkg_names | grep -xE 'valkey-server|valkey-tools' || true ;;
+    redis)  migrate_dpkg_names | grep -xE 'redis|redis-server|redis-tools' || true ;;
     distro-nginx)
             migrate_dpkg_names | grep -xE 'nginx|nginx-(common|core|full|light|extras)|libnginx-mod-[a-z0-9.+-]+|python3-certbot-nginx' || true ;;
   esac
@@ -448,11 +458,11 @@ migrate_sury_purge_preflight() {
   return 0
 }
 
-# 0 when a deferred removal of KIND (angie|valkey) could run now.
+# 0 when a deferred removal of KIND (angie|valkey|redis) could run now.
 migrate_removal_possible() {
   local kind=$1 action=purge
   local -a pkgs=()
-  [[ $kind == valkey ]] && action=remove
+  [[ $kind == valkey || $kind == redis ]] && action=remove
   mapfile -t pkgs < <(migrate_pkg_list "$kind")
   (( ${#pkgs[@]} > 0 )) || return 1
   migrate_purge_sim "$action" "${pkgs[@]}" && (( ${#MIGRATE_SIM_COLLATERAL[@]} == 0 ))
@@ -799,6 +809,12 @@ migrate_sury_active_versions() {
   return 0
 }
 migrate_valkey_pkg_present() { migrate_pkg_installed valkey-server; }
+# Ubuntu's redis-server serving on a host without the valkey-server package
+# (a host with both keeps Valkey's own migration and leaves Redis alone).
+migrate_redis_pkg_present() { migrate_pkg_installed redis-server && ! migrate_pkg_installed valkey-server; }
+# The state key of the Valkey part this run does: valkey (the valkey-server
+# package) or redis (Ubuntu's redis-server, 1.22.17).
+migrate_valkey_part() { if [[ $MIGRATE_VALKEY_FROM == redis ]]; then printf redis; else printf valkey; fi; }
 
 # Where live vhosts are read from (R58): /etc/angie while Angie serves.
 migrate_web_tree() {
@@ -901,6 +917,28 @@ migrate_needed() {
       *) return 0 ;;
     esac
   fi
+  # Ubuntu's redis-server: replaced by the compiled Valkey (1.22.17).
+  # Its own state keys (redis, redis-remove): a host whose Valkey part came
+  # from the valkey-server package and that keeps a redis-server beside it
+  # is judged on the Redis part alone (refused while valkey.conf exists).
+  # Not for PART valkey: that is the install-mode gate (--valkey), which
+  # keeps skipping a Redis host as before; only --optimize replaces Redis.
+  if [[ $part == all || $part == redis ]] && migrate_redis_pkg_present; then
+    st=$(migrate_state_get redis)
+    case $st in
+      done)
+        if [[ $part == all ]]; then
+          case $(migrate_state_get redis-remove) in
+            done) ;;
+            deferred:*) migrate_removal_possible redis && return 0 ;;
+            *) return 0 ;;
+          esac
+        fi ;;
+      refused-mem) migrate_mem_allows valkey && return 0 ;;
+      failed:*|refused:*) migrate_part_retry_ok redis "$(migrate_redis_scan_digest)" && return 0 ;;
+      *) return 0 ;;
+    esac
+  fi
   # Distro nginx on a host already migrated (or a leftover after a deferred
   # purge) is finished by the next run.
   if [[ $part == all ]] && [[ $(migrate_state_get nginx) == "done" ]] && [[ -n $(migrate_pkg_list distro-nginx) ]]; then
@@ -959,8 +997,9 @@ migrate_resume_safe() {
   migrate_run_dir_init || true
   warn "migrate: an earlier run stopped during '${phase}'; restoring a serving state first"
   case $phase in
-    nginx|php-*|valkey)
-      # A switch that was never verified is rolled back whole (the old
+    nginx|php-*|valkey|redis)
+      # A switch that was never verified is rolled back whole (a Redis
+      # replacement whose Valkey already serves is finished forward instead) (the old
       # service, its configuration and data come back from the snapshot);
       # the part is retried by this or the next run.
       MIGRATE_IN_FLIGHT=$phase
@@ -1014,6 +1053,10 @@ migrate_inflight_rollback() {
     nginx)  migrate_nginx_rollback "interrupted" || true; migrate_state_set nginx "postponed:interrupted" ;;
     php-*)  migrate_php_rollback "${phase#php-}" "interrupted" || true; migrate_state_set "$phase" "postponed:interrupted" ;;
     valkey) migrate_valkey_rollback "interrupted" || true; migrate_state_set valkey "postponed:interrupted" ;;
+    # A Valkey that already serves the dataset is finished forward: rolling
+    # it back would lose what it took since (1.22.17 review).
+    redis)  if migrate_redis_resume_forward; then :
+            else migrate_redis_rollback "interrupted" || true; migrate_state_set redis "postponed:interrupted"; fi ;;
     purge)  : ;;  # forward on the next run (migrate_resume_safe)
   esac
   MIGRATE_IN_FLIGHT=""
@@ -1492,7 +1535,7 @@ migrate_php_persist_exts() {
 migrate_preflight() {
   local dry=${1:-0} scan st v line blockers e digest
   local -a php_active=()
-  MIGRATE_DO_NGINX=0; MIGRATE_DO_VALKEY=0; MIGRATE_PHP_TODO=()
+  MIGRATE_DO_NGINX=0; MIGRATE_DO_VALKEY=0; MIGRATE_VALKEY_FROM=valkey; MIGRATE_PHP_TODO=()
   scan=$(tmp_file) || return 1
 
   # --- nginx part
@@ -1720,6 +1763,37 @@ migrate_preflight() {
       MIGRATE_DO_VALKEY=1
       (( dry )) && printf '  Valkey: package -> source build (%s)\n' "$(migrate_valkey_persists && echo 'persistence on: dataset snapshot after a clean stop' || echo 'cache only')"
     fi
+  elif migrate_redis_pkg_present; then
+    # Ubuntu's redis-server -> the compiled Valkey (1.22.17): the dataset
+    # (sessions included) moves with it, and the old socket path keeps
+    # answering for applications configured with it.
+    local rwhy=""
+    st=$(migrate_state_get redis)
+    if [[ $st == "done" ]]; then
+      (( dry )) && printf '  Redis: replaced by the Valkey build (package removal pending)\n'
+    elif ! migrate_part_retry_ok redis "$(migrate_redis_scan_digest)"; then
+      if (( dry )); then printf '  Redis: %s (unchanged since; SETUP_MIGRATE_RETRY=1 retries)\n' "$st"
+      else migrate_note "Redis stays on the redis-server package: ${st} (SETUP_MIGRATE_RETRY=1 retries)"; fi
+    elif ! migrate_mem_allows valkey; then
+      if (( dry )); then printf '  Redis: refused (host below the 4 GB class)\n'
+      else migrate_state_set redis refused-mem; migrate_warn "Redis: host below the 4 GB class; left on the package"; fi
+    elif rwhy=$(migrate_redis_refusal) && [[ -n $rwhy ]]; then
+      if (( dry )); then printf '  Redis: stays on the redis-server package (%s)\n' "$rwhy"
+      else
+        migrate_state_set redis "refused:${rwhy}"
+        migrate_state_set redis.scan "$(migrate_redis_scan_digest)"
+        migrate_note "Redis stays on the redis-server package: ${rwhy}"
+      fi
+    else
+      MIGRATE_DO_VALKEY=1; MIGRATE_VALKEY_FROM=redis
+      if (( dry )); then
+        local rsock rkeys
+        rsock=$(migrate_conf_get "$MIGRATE_REDIS_ETC/redis.conf" unixsocket)
+        rkeys=$(migrate_cache_keys migrate_redis_cmd "$(command -v redis-cli || true)")
+        printf '  Redis: redis-server %s package -> Valkey source build (%s keys carried by a snapshot at the stop%s; packages removed after the verified cutover)\n' \
+          "$(migrate_redis_version)" "${rkeys:-?}" "${rsock:+; ${rsock} links to ${MIGRATE_VALKEY_SOCK}, application config unchanged}"
+      fi
+    fi
   fi
 
   # --- Collateral of every removal list, rc packages included (R9)
@@ -1754,11 +1828,14 @@ migrate_distro_nginx_blocks() {
 migrate_preflight_collateral() {
   local dry=$1 kind v
   local -a pkgs=()
-  for kind in angie valkey; do
+  for kind in angie valkey redis; do
+    # Redis only when this run replaces it (an adopted Redis that stays is
+    # not removed).
+    [[ $kind == redis && $MIGRATE_VALKEY_FROM != redis ]] && continue
     mapfile -t pkgs < <(migrate_pkg_list "$kind")
     (( ${#pkgs[@]} > 0 )) || continue
     local action=purge
-    [[ $kind == valkey ]] && action=remove
+    [[ $kind == valkey || $kind == redis ]] && action=remove
     if ! migrate_purge_sim "$action" "${pkgs[@]}"; then
       if (( dry )); then printf '  %s %s: apt refuses the simulation (held or broken package); kept installed\n' "$action" "$kind"
       else migrate_warn "${action} ${kind}: apt refuses the simulation; the packages will stay installed"; fi
@@ -1798,7 +1875,15 @@ migrate_preflight_disk() {
     cache_need=$(( cache_need + MIGRATE_DISK_PHP_MB ))
   done
   (( ${#MIGRATE_PHP_TODO[@]} )) && backup_need=$(( backup_need + $(migrate_size_mb "$MIGRATE_PHP_ETC" /var/lib/php/sessions) ))
-  (( MIGRATE_DO_VALKEY )) && { cache_need=$(( cache_need + MIGRATE_DISK_VALKEY_MB )); backup_need=$(( backup_need + $(migrate_size_mb "$MIGRATE_VALKEY_ETC" "$MIGRATE_VALKEY_DATA") )); }
+  if (( MIGRATE_DO_VALKEY )); then
+    cache_need=$(( cache_need + MIGRATE_DISK_VALKEY_MB ))
+    if [[ $MIGRATE_VALKEY_FROM == redis ]]; then
+      # The Redis tree is snapshotted, and its dataset copied into /var/lib/valkey.
+      backup_need=$(( backup_need + 2 * $(migrate_size_mb "$MIGRATE_REDIS_ETC" "$MIGRATE_REDIS_DATA") ))
+    else
+      backup_need=$(( backup_need + $(migrate_size_mb "$MIGRATE_VALKEY_ETC" "$MIGRATE_VALKEY_DATA") ))
+    fi
+  fi
   (( cache_need + backup_need > 0 )) || return 0
   # Builds: the cache filesystem never below 6 GB free, / never below 2 GB.
   (( cache_need < 6144 )) && (( cache_need > 0 )) && cache_need=6144
@@ -1824,13 +1909,13 @@ migrate_preflight_disk() {
     migrate_fail "not enough disk for the builds (${msg}; / ${rmsg}); every part postponed, the current services keep serving"
     (( MIGRATE_DO_NGINX )) && migrate_state_set nginx "postponed:disk"
     for v in "${MIGRATE_PHP_TODO[@]}"; do migrate_state_set "php-${v}" "postponed:disk"; done
-    (( MIGRATE_DO_VALKEY )) && migrate_state_set valkey "postponed:disk"
+    (( MIGRATE_DO_VALKEY )) && migrate_state_set "$(migrate_valkey_part)" "postponed:disk"
     MIGRATE_DO_NGINX=0; MIGRATE_PHP_TODO=(); MIGRATE_DO_VALKEY=0
   elif (( ! ok_backup )); then
     # The dataset snapshot is the biggest one: Valkey goes first.
     if (( MIGRATE_DO_VALKEY )); then
       migrate_fail "not enough disk for the Valkey dataset snapshot (${msg}); Valkey postponed"
-      migrate_state_set valkey "postponed:disk"; MIGRATE_DO_VALKEY=0
+      migrate_state_set "$(migrate_valkey_part)" "postponed:disk"; MIGRATE_DO_VALKEY=0
     else
       migrate_fail "not enough disk for the configuration snapshots (${msg}); every part postponed"
       MIGRATE_DO_NGINX=0; MIGRATE_PHP_TODO=()
@@ -1889,9 +1974,9 @@ migrate_build_all() {
   MIGRATE_PHP_TODO=("${todo[@]}")
   if (( MIGRATE_DO_VALKEY )); then
     if valkey_build_ensure build-only migrate migrate_out; then
-      migrate_state_set valkey built
+      migrate_state_set "$(migrate_valkey_part)" built
     else
-      migrate_state_set valkey "postponed:build failed"
+      migrate_state_set "$(migrate_valkey_part)" "postponed:build failed"
       migrate_fail "Valkey build failed; the package keeps serving (retried by the next --optimize)"
       MIGRATE_DO_VALKEY=0
     fi
@@ -2995,9 +3080,22 @@ migrate_valkey_persists() {
 # valkey-cli CLI ARGS... against the configured socket/port; the password
 # goes through the environment, never the command line.
 migrate_valkey_cmd() {
-  local vcli=$1 c=$MIGRATE_VALKEY_ETC/valkey.conf sock port pass
+  local vcli=$1
   shift
-  [[ -x $vcli ]] || return 1
+  migrate_cache_cmd "$MIGRATE_VALKEY_ETC/valkey.conf" /run/valkey/valkey.sock "$vcli" "$@"
+}
+
+# The same against Ubuntu's redis-server (redis.conf, /run/redis/redis.sock).
+migrate_redis_cmd() {
+  local rcli=$1
+  shift
+  migrate_cache_cmd "$MIGRATE_REDIS_ETC/redis.conf" /run/redis/redis.sock "$rcli" "$@"
+}
+
+migrate_cache_cmd() { # conf default-socket cli args...
+  local c=$1 defsock=$2 vcli=$3 sock port pass
+  shift 3
+  [[ -n $vcli && -x $vcli ]] || return 1
   sock=$(awk '$1 == "unixsocket" { v = $2 } END { print v }' "$c" 2>/dev/null)
   port=$(awk '$1 == "port" { v = $2 } END { print v }' "$c" 2>/dev/null)
   pass=$(awk '$1 == "requirepass" { $1 = ""; sub(/^ +/, ""); gsub(/^"|"$/, ""); v = $0 } END { print v }' "$c" 2>/dev/null)
@@ -3005,7 +3103,7 @@ migrate_valkey_cmd() {
   # A socket-only server (port 0, the 1.22.5 default) is asked on the
   # default socket when the file names none that exists.
   if [[ -n $sock && -S $sock ]]; then target=(-s "$sock")
-  elif [[ $port == 0 ]]; then target=(-s "${sock:-/run/valkey/valkey.sock}")
+  elif [[ $port == 0 ]]; then target=(-s "${sock:-$defsock}")
   else target=(-h 127.0.0.1 -p "${port:-6379}"); fi
   REDISCLI_AUTH=$pass VALKEYCLI_AUTH=$pass timeout 10 "$vcli" "${target[@]}" "$@" 2>/dev/null
 }
@@ -3134,7 +3232,7 @@ migrate_valkey_rollback() {
 # Step 11: removals, then one re-lay / enable / assert / verify pass
 # ---------------------------------------------------------------------------
 migrate_removals() {
-  local debs angie_ok=0 sury_ok=0 valkey_ok=0 v st resume=0
+  local debs angie_ok=0 sury_ok=0 valkey_ok=0 redis_ok=0 v st resume=0
   local -a done_php=()
   # Versions on our build: the running ones and any migrated earlier.
   sury_ok=1
@@ -3160,9 +3258,14 @@ migrate_removals() {
     done|removed) valkey_ok=0 ;;
     deferred:*) migrate_removal_possible valkey || valkey_ok=0 ;;
   esac
+  [[ $(migrate_state_get redis) == "done" ]] && migrate_redis_pkg_present && redis_ok=1
+  case $(migrate_state_get redis-remove) in
+    done|removed) redis_ok=0 ;;
+    deferred:*) migrate_removal_possible redis || redis_ok=0 ;;
+  esac
   case $(migrate_state_get removals) in started|pending|post-purge-failed) resume=1 ;; esac
 
-  if (( ! angie_ok && ! sury_ok && ! valkey_ok )); then
+  if (( ! angie_ok && ! sury_ok && ! valkey_ok && ! redis_ok )); then
     # Nothing to remove this run.  An interrupted or failed removal phase is
     # finished forward: re-lay, links, enable, verify, then the clean-up.
     (( resume )) || return 0
@@ -3176,7 +3279,7 @@ migrate_removals() {
   debs=$(migrate_snapshot_dir debs) || return 1
   migrate_state_set debs "$debs"
   # Package lists and their .debs while the repositories still exist (R18).
-  local -a angie_pkgs=() sury_pkgs=() valkey_pkgs=()
+  local -a angie_pkgs=() sury_pkgs=() valkey_pkgs=() redis_pkgs=()
   (( angie_ok )) && mapfile -t angie_pkgs < <(migrate_pkg_list angie)
   if (( sury_ok )); then
     if migrate_sury_purge_preflight && (( ${#MIGRATE_SURY_PKGS[@]} > 0 )); then
@@ -3191,13 +3294,14 @@ migrate_removals() {
     fi
   fi
   (( valkey_ok )) && mapfile -t valkey_pkgs < <(migrate_pkg_list valkey)
-  migrate_save_debs "$debs" "${angie_pkgs[@]}" "${sury_pkgs[@]}" "${valkey_pkgs[@]}"
+  (( redis_ok )) && mapfile -t redis_pkgs < <(migrate_pkg_list redis)
+  migrate_save_debs "$debs" "${angie_pkgs[@]}" "${sury_pkgs[@]}" "${valkey_pkgs[@]}" "${redis_pkgs[@]}"
   local f
   for f in /etc/apt/sources.list.d/*; do
     [[ -f $f ]] && grep -qsE 'download\.angie\.software|packages\.sury\.org|ondrej/php|ondrej/nginx|nginx\.org/packages' "$f" \
       && cp -a -- "$f" "$debs/"
   done
-  (( angie_ok || sury_ok || valkey_ok )) || { migrate_removals_verify "${done_php[@]}"; return $?; }
+  (( angie_ok || sury_ok || valkey_ok || redis_ok )) || { migrate_removals_verify "${done_php[@]}"; return $?; }
 
   # The post-removal pass compares against the vhost answers of NOW, not the
   # cutover baseline: a deferred removal may run weeks after the cutover,
@@ -3276,6 +3380,22 @@ migrate_removals() {
       migrate_warn "removing valkey-server would also remove ${MIGRATE_SIM_COLLATERAL[*]:-?}; the package stays installed"
     fi
   fi
+  # Redis (1.22.17): remove, never purge, like valkey-server: its postrm
+  # purge deletes /var/lib/redis (the cutover's copy is in the snapshot,
+  # but the operator's own files may sit there too) and the redis user.
+  if (( redis_ok )); then
+    if migrate_purge_sim remove "${redis_pkgs[@]}" && (( ${#MIGRATE_SIM_COLLATERAL[@]} == 0 )); then
+      if migrate_apt_remove remove "${redis_pkgs[@]}"; then
+        migrate_state_set redis-remove removed
+        migrate_redis_after_remove
+      else
+        migrate_state_set redis-remove "deferred:apt failed"
+      fi
+    else
+      migrate_state_set redis-remove "deferred:collateral ${MIGRATE_SIM_COLLATERAL[*]}"
+      migrate_warn "removing redis-server would also remove ${MIGRATE_SIM_COLLATERAL[*]:-?}; the package stays installed (stopped and disabled; Valkey serves)"
+    fi
+  fi
   migrate_policy_remove
   migrate_removals_verify "${done_php[@]}" || return 1
   migrate_removals_finalize "$debs"
@@ -3310,17 +3430,19 @@ migrate_removals_verify() {
 # After a verified removal phase: sources and keyrings (only now, R18),
 # Angie leftovers, the apt pin.
 migrate_removals_finalize() {
-  local debs=${1:-} angie=0 sury=0 valkey=0
+  local debs=${1:-} angie=0 sury=0 valkey=0 redis=0
   [[ -n $debs && -d $debs ]] || debs=$(migrate_snapshot_dir debs) || return 0
   [[ $(migrate_state_get angie-purge) == purged ]] && angie=1
   [[ $(migrate_state_get sury-purge) == purged || $(migrate_state_get sury-purge) == post-purge-failed ]] && sury=1
   [[ $(migrate_state_get valkey-remove) == removed ]] && valkey=1
+  [[ $(migrate_state_get redis-remove) == removed ]] && redis=1
   migrate_retire_sources "$debs" "$angie" "$sury"
   (( angie )) && migrate_angie_after_purge
   (( sury )) && migrate_state_set sury-purge "done"
   (( valkey )) && migrate_state_set valkey-remove "done"
-  migrate_write_apt_pin "$angie" "$sury" "$valkey"
-  (( angie || sury || valkey )) && migrate_note "package removals verified; .debs and repository files for a manual rollback in ${debs}"
+  (( redis )) && migrate_state_set redis-remove "done"
+  migrate_write_apt_pin "$angie" "$sury" "$valkey" "$redis"
+  (( angie || sury || valkey || redis )) && migrate_note "package removals verified; .debs and repository files for a manual rollback in ${debs}"
   return 0
 }
 
@@ -3365,6 +3487,398 @@ migrate_sury_unhold() {
     return 1
   fi
   migrate_state_del sury-held
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Step 10b: Ubuntu's redis-server -> the compiled Valkey (1.22.17)
+# ---------------------------------------------------------------------------
+# Valkey forked from Redis 7.2.4: it reads Redis's configuration directives
+# and loads RDB files written by Redis up to 7.2.  The replacement keeps the
+# operator's redis.conf settings (only the paths move to Valkey's layout),
+# carries the dataset through a snapshot written at the Redis stop (sessions
+# survive), and keeps the old socket path answering through a tmpfiles.d
+# link, so wp-config.php / src/config.php / env.php are never edited.  The
+# packages are removed (never purged) after the verified cutover.
+
+# Last value of DIRECTIVE in CONF ("" when absent; quotes stripped).
+migrate_conf_get() { # conf directive
+  awk -v k="$2" 'tolower($1) == k { $1 = ""; sub(/^[ \t]+/, ""); gsub(/^"|"$/, ""); v = $0 } END { print v }' "$1" 2>/dev/null || true
+}
+
+# The redis-server package's upstream version ("7.0.15"), "" when unknown.
+migrate_redis_version() {
+  local v
+  v=$(dpkg-query -W -f='${Version}' redis-server 2>/dev/null || true)
+  v=${v#*:}; v=${v%%-*}; v=${v%%+*}
+  [[ $v =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] && printf '%s' "$v"
+  return 0
+}
+
+migrate_redis_scan_digest() {
+  { cat "$MIGRATE_REDIS_ETC/redis.conf" 2>/dev/null; dpkg-query -W -f='${Version}' redis-server 2>/dev/null
+    migrate_pkg_installed redis-sentinel && echo sentinel; [[ -e $MIGRATE_VALKEY_ETC/valkey.conf ]] && echo valkey-conf
+    # Runtime facts a refusal may rest on: a started server or AOF turned
+    # off retries the part.
+    systemctl is-active redis-server 2>/dev/null; getent group redis 2>/dev/null; } \
+    | md5sum | awk '{ print $1 }'
+}
+
+# Total keys over every database (INFO keyspace), "" when the server does
+# not answer.  CMD is migrate_redis_cmd or migrate_valkey_cmd.
+migrate_cache_keys() { # cmd cli
+  local out
+  out=$("$1" "$2" INFO keyspace) || return 0
+  [[ $out == *"# Keyspace"* || $out == *db[0-9]*:keys=* ]] || return 0
+  printf '%s\n' "$out" | tr -d '\r' | awk -F'[:=,]' '/^db[0-9]+:keys=/ { n += $3 } END { print n + 0 }'
+}
+
+# Why this redis-server cannot be replaced unattended ("" = it can).  Each
+# reason leaves Redis serving untouched; a changed redis.conf, package or
+# code retries the part (migrate_redis_scan_digest).
+migrate_redis_refusal() {
+  local c=$MIGRATE_REDIS_ETC/redis.conf v major minor sock aof
+  [[ -f $c ]] || { printf 'no %s' "$c"; return 0; }
+  v=$(migrate_redis_version)
+  if [[ -n $v ]]; then
+    major=${v%%.*}; minor=${v#*.}; minor=${minor%%.*}
+    if (( major > 7 || (major == 7 && minor >= 4) )); then
+      printf 'Redis %s writes RDB files Valkey cannot load (Valkey reads Redis up to 7.2)' "$v"; return 0
+    fi
+  fi
+  if migrate_pkg_installed redis-sentinel; then printf 'redis-sentinel is installed (it depends on the Redis packages)'; return 0; fi
+  if grep -qiE '^[[:space:]]*(loadmodule)[[:space:]]' "$c"; then printf 'redis.conf loads modules (loadmodule)'; return 0; fi
+  if grep -qiE '^[[:space:]]*include[[:space:]]' "$c"; then printf 'redis.conf includes other files (include)'; return 0; fi
+  if grep -qiE '^[[:space:]]*rename-command[[:space:]]' "$c"; then printf 'redis.conf renames commands (rename-command)'; return 0; fi
+  if grep -qiE '^[[:space:]]*aclfile[[:space:]]' "$c"; then printf 'redis.conf uses an ACL file (aclfile)'; return 0; fi
+  if grep -qiE '^[[:space:]]*user[[:space:]]' "$c"; then printf 'redis.conf defines ACL users (user)'; return 0; fi
+  aof=$(migrate_redis_cmd "$(command -v redis-cli || true)" CONFIG GET appendonly | sed -n 2p || true)
+  [[ -n $aof ]] || aof=$(migrate_conf_get "$c" appendonly)
+  if [[ ${aof,,} == yes ]]; then printf 'AOF persistence (appendonly yes) is on'; return 0; fi
+  if systemctl list-units --no-legend --plain 'redis-server@*' 2>/dev/null | grep -q .; then
+    printf 'extra Redis instances (redis-server@) run'; return 0
+  fi
+  if ! systemctl is-active --quiet redis-server 2>/dev/null; then printf 'redis-server is not running'; return 0; fi
+  if [[ -e $MIGRATE_VALKEY_ETC/valkey.conf ]]; then printf '%s already exists' "$MIGRATE_VALKEY_ETC/valkey.conf"; return 0; fi
+  sock=$(migrate_conf_get "$c" unixsocket)
+  if [[ -n $sock && $sock != /run/* && $sock != /var/run/* ]]; then
+    printf 'its socket %s is outside /run (no link can stand in for it)' "$sock"; return 0
+  fi
+  return 0
+}
+
+# redis.conf -> valkey.conf.  Every directive is carried as written except
+# the paths (Valkey's unit may only write its own directories) and the
+# supervision lines our unit passes on its command line.
+migrate_redis_conf_convert() { # src dst
+  local tmp
+  tmp=$(tmp_file) || return 1
+  awk -v data="$MIGRATE_VALKEY_DATA" -v sock="$MIGRATE_VALKEY_SOCK" -v logf="$MIGRATE_VALKEY_LOGFILE" '
+    /^[ \t]*(#|$)/ { print; next }
+    { k = tolower($1) }
+    k == "dir"        { print "dir " data; next }
+    k == "pidfile"    { print "pidfile /run/valkey/valkey-server.pid"; next }
+    k == "logfile"    { if ($2 == "" || $2 == "\"\"") print; else print "logfile " logf; next }
+    k == "unixsocket" { print "unixsocket " sock; next }
+    k == "daemonize"  { print "daemonize no"; next }
+    k == "supervised" { print "supervised systemd"; next }
+    { print }
+  ' "$1" > "$tmp" || { rm -f -- "$tmp"; return 1; }
+  # 0600 from the first byte: a requirepass line must never be readable by
+  # local users (root:valkey 0640 once the valkey group exists).
+  ( umask 077
+    {
+      printf '# Converted from %s by setup.sh %s when the compiled Valkey replaced\n' "$1" "${SCRIPT_VERSION:-1.22}"
+      printf '# the redis-server package (paths moved to Valkey'"'"'s layout).\n'
+      cat "$tmp"
+    } > "$2" ) && rm -f -- "$tmp"
+}
+
+# The old socket path as a link to Valkey's socket, re-created at boot.
+migrate_redis_socket_link() { # old new
+  local old=$1 new=$2
+  mkdir -p "$(dirname "$MIGRATE_REDIS_TMPFILES")" || return 1
+  {
+    printf '# Managed by setup.sh 1.22.17: the compiled Valkey replaced the redis-server\n'
+    printf '# package.  Applications configured for %s reach\n# %s through this link.\n' "$old" "$new"
+    printf 'd %s 0755 root root -\n' "$(dirname "$old")"
+    printf 'L+ %s - - - - %s\n' "$old" "$new"
+  } > "$MIGRATE_REDIS_TMPFILES" || return 1
+  chmod 644 "$MIGRATE_REDIS_TMPFILES"
+  systemd-tmpfiles --create "$MIGRATE_REDIS_TMPFILES" >/dev/null 2>&1 || true
+  [[ -L $old ]]
+}
+
+# Members of the redis group other than redis itself and www-data (which
+# valkey_build_ensure's activate adds) join the valkey group, so whatever
+# reached Redis's 770 socket reaches Valkey's.  0 when one was added (its
+# processes need a restart or a PHP reload to see the group).
+migrate_redis_carry_group() {
+  local m members added=1
+  members=$(getent group redis 2>/dev/null | cut -d: -f4 || true)
+  for m in ${members//,/ }; do
+    [[ $m == redis || $m == www-data ]] && continue
+    id -nG "$m" 2>/dev/null | tr ' ' '\n' | grep -qx valkey && continue
+    if usermod -aG valkey "$m" 2>/dev/null; then
+      added=0
+      migrate_note "${m} (a member of the redis group) joins the valkey group to keep reaching the cache socket"
+    else
+      migrate_warn "${m} is in the redis group but could not join the valkey group: it loses the cache socket"
+    fi
+  done
+  return "$added"
+}
+
+# After an interruption during the Redis cutover: 0 when Valkey already
+# serves the carried dataset (our running binary, PING, the old socket path
+# answering as www-data, Redis down), so the part is finished forward
+# instead of rolled back.  A rollback then would throw away everything
+# Valkey took since and bring Redis back on an older snapshot.
+migrate_redis_resume_forward() {
+  local snap pid exe oldsock
+  snap=$(migrate_state_get redis.snap)
+  [[ -n $snap && -d $snap ]] || return 1
+  systemctl is-active --quiet valkey-server 2>/dev/null || return 1
+  systemctl is-active --quiet redis-server 2>/dev/null && return 1
+  pid=$(systemctl show -p MainPID --value valkey-server 2>/dev/null || true)
+  exe=$(readlink -f "/proc/${pid}/exe" 2>/dev/null || true)
+  [[ $exe == "$(migrate_valkey_root)/"* ]] || return 1
+  [[ $(migrate_valkey_cmd "$(migrate_valkey_cli)" PING || true) == PONG ]] || return 1
+  oldsock=$(cat "$snap/socket" 2>/dev/null || true)
+  if [[ -n $oldsock && $oldsock != "$MIGRATE_VALKEY_SOCK" ]]; then
+    [[ -L $oldsock && -f $MIGRATE_REDIS_TMPFILES ]] || return 1
+    [[ $(migrate_redis_www_ping "$oldsock" || true) == PONG ]] || return 1
+  fi
+  systemctl disable redis-server >/dev/null 2>&1 || true
+  systemctl mask redis-server >/dev/null 2>&1 || true
+  migrate_state_set redis "done"
+  migrate_note "Redis replacement finished after an interruption: Valkey already served the dataset; snapshot ${snap}"
+  return 0
+}
+
+# 0 when the next migration run would replace this host's Redis (the same
+# tests as the pre-flight, read-only): the planner then shows the host as it
+# will be, a Valkey host.
+migrate_redis_will_replace() {
+  migrate_redis_pkg_present || return 1
+  [[ $(migrate_state_get redis) != "done" ]] || return 1
+  migrate_part_retry_ok redis "$(migrate_redis_scan_digest)" || return 1
+  migrate_mem_allows valkey || return 1
+  [[ -z $(migrate_redis_refusal) ]]
+}
+
+# PING on SOCKET as the web user (the applications' own access path).
+migrate_redis_www_ping() { # socket
+  local cli
+  cli=$(migrate_valkey_cli)
+  id -u www-data >/dev/null 2>&1 || { migrate_valkey_cmd "$cli" PING; return; }
+  local pass
+  pass=$(migrate_conf_get "$MIGRATE_VALKEY_ETC/valkey.conf" requirepass)
+  REDISCLI_AUTH=$pass VALKEYCLI_AUTH=$pass timeout 10 runuser -u www-data -- "$cli" -s "$1" PING 2>/dev/null
+}
+
+migrate_redis_cutover() {
+  local snap before="" after pid exe rcli en oldsock rdir dbf need msg try pong="" t
+  migrate_assert_no_old_triggers || { migrate_state_set redis "failed:1.21 triggers present"; return 1; }
+  rdir=$(migrate_conf_get "$MIGRATE_REDIS_ETC/redis.conf" dir); rdir=${rdir:-$MIGRATE_REDIS_DATA}
+  dbf=$(migrate_conf_get "$MIGRATE_REDIS_ETC/redis.conf" dbfilename); dbf=${dbf:-dump.rdb}
+  oldsock=$(migrate_conf_get "$MIGRATE_REDIS_ETC/redis.conf" unixsocket)
+  # Disk first, while nothing has changed: the Redis tree into the snapshot
+  # plus the dataset copy in /var/lib/valkey.
+  need=$(( $(migrate_size_mb "$MIGRATE_REDIS_ETC" "$rdir") * 2 + 64 ))
+  if ! msg=$(migrate_disk_fits "$MIGRATE_BACKUP_ROOT" "$need"); then
+    migrate_state_set redis "postponed:disk"
+    migrate_fail "Redis replacement postponed: no room for the dataset snapshot (${msg}); redis-server keeps serving"
+    return 1
+  fi
+  snap=$(migrate_snapshot_dir redis) || return 1
+  migrate_state_set redis.snap "$snap"
+  rcli=$(command -v redis-cli || true)
+  systemctl is-enabled redis-server > "$snap/enabled" 2>/dev/null || true
+  en=$(cat "$snap/enabled")
+  printf '%s' "$oldsock" > "$snap/socket"
+  migrate_copy_tree "$MIGRATE_REDIS_ETC" "$snap/etc"
+  migrate_copy_tree "$MIGRATE_UNIT_DIR/redis-server.service.d" "$snap/dropins"
+
+  migrate_inflight_set redis
+  # (1) While Redis still serves: Valkey's configuration (before the
+  # layout, which seeds a template only where none exists) and our build,
+  # installed and enabled but not started.  Nothing listens twice: the
+  # unit starts only after the Redis stop.
+  install -d -m 750 "$MIGRATE_VALKEY_ETC"
+  if ! migrate_redis_conf_convert "$MIGRATE_REDIS_ETC/redis.conf" "$MIGRATE_VALKEY_ETC/valkey.conf"; then
+    migrate_redis_rollback "converting redis.conf failed"; return 1
+  fi
+  if ! valkey_build_ensure activate migrate migrate_out; then
+    migrate_redis_rollback "activating the Valkey build failed"; return 1
+  fi
+  # The layout enables our unit; until Redis has stopped it must stay off,
+  # or a reboot in the meantime would start both (it is re-enabled after
+  # the stop).
+  systemctl disable valkey-server >/dev/null 2>&1 || true
+  chown root:valkey "$MIGRATE_VALKEY_ETC" "$MIGRATE_VALKEY_ETC/valkey.conf" 2>/dev/null || true
+  chmod 750 "$MIGRATE_VALKEY_ETC" 2>/dev/null || true
+  chmod 640 "$MIGRATE_VALKEY_ETC/valkey.conf" 2>/dev/null || true
+  mkdir -p "$MIGRATE_VALKEY_DATA"
+  # Every other member of the redis group (an extra pool user, a worker)
+  # keeps reaching the socket: it joins the valkey group too.
+  if migrate_redis_carry_group; then
+    declare -F restart_php_workers_for_group >/dev/null && restart_php_workers_for_group valkey
+  fi
+
+  # (2) Before anything stops: the keys must be countable (the check after
+  # the start compares against them) and Redis must be able to write its
+  # snapshot (a save that fails at the stop would leave nothing to carry).
+  before=$(migrate_cache_keys migrate_redis_cmd "$rcli")
+  printf '%s' "$before" > "$snap/keys"
+  if [[ ! $before =~ ^[0-9]+$ ]]; then
+    migrate_redis_rollback "the key count could not be read before the stop (redis-cli: ${rcli:-missing})"
+    migrate_state_set redis "postponed:no key count"; return 1
+  fi
+  if (( before > 0 )); then
+    local p="" i
+    migrate_redis_cmd "$rcli" BGSAVE >/dev/null 2>&1 || true
+    for i in $(seq 1 "${MIGRATE_REDIS_BGSAVE_WAIT:-300}"); do
+      p=$(migrate_redis_cmd "$rcli" INFO persistence | tr -d '\r' || true)
+      [[ $p == *rdb_bgsave_in_progress:0* ]] && break
+      sleep 1
+    done
+    if [[ $p != *rdb_bgsave_in_progress:0* || $p != *rdb_last_bgsave_status:ok* ]]; then
+      migrate_redis_rollback "Redis could not write its snapshot (BGSAVE did not finish with rdb_last_bgsave_status:ok)"
+      migrate_state_set redis "postponed:snapshot failed"; return 1
+    fi
+  fi
+  # (3) The cache-down window: the Redis stop writes the dataset again (a
+  # Redis without persistence, save "", gets a snapshot point for this one
+  # stop, so the sessions move too), the copy, the Valkey start.
+  if [[ -n $rcli ]]; then
+    [[ -n $(migrate_redis_cmd "$rcli" CONFIG GET save | sed -n 2p | tr -d '[:space:]"') ]] \
+      || migrate_redis_cmd "$rcli" CONFIG SET save "3600 1" >/dev/null || true
+  fi
+  # The stop must write the snapshot itself: the BGSAVE above is older than
+  # the writes made since (sessions).  Redis saves to a temporary file and
+  # renames it, so a save at the stop gives dump.rdb a new inode; the same
+  # inode means the shutdown save failed (a stop that systemd ended with
+  # SIGKILL still returns 0).
+  local ino_before
+  ino_before=$(stat -c %i "$rdir/$dbf" 2>/dev/null || echo none)
+  if ! systemctl stop redis-server; then
+    migrate_redis_rollback "redis-server did not stop cleanly"; return 1
+  fi
+  if (( before > 0 )); then
+    t=$(stat -c %i "$rdir/$dbf" 2>/dev/null || echo none)
+    if [[ $t == none || $t == "$ino_before" ]]; then
+      migrate_redis_rollback "the Redis stop did not write ${rdir}/${dbf} (the writes since the last snapshot would be lost)"; return 1
+    fi
+  fi
+  # Only the dataset is copied in the window; the snapshot of Redis's data
+  # directory follows the verified start.
+  if [[ -f $rdir/$dbf ]]; then
+    cp --preserve=timestamps -- "$rdir/$dbf" "$MIGRATE_VALKEY_DATA/$dbf" \
+      || { migrate_redis_rollback "copying ${rdir}/${dbf} failed"; return 1; }
+  fi
+  # A fresh guard: the first start under it loads the snapshot (F4).
+  rm -f "$MIGRATE_VALKEY_DATA/.setup-started" "$MIGRATE_VALKEY_DATA/.setup-clean-stop"
+  chown -R valkey:valkey "$MIGRATE_VALKEY_DATA" 2>/dev/null || true
+  # redis-server stays installed until the removal, disabled and masked:
+  # nothing (an operator, a maintainer script) may start it on the socket
+  # path and port Valkey now owns.
+  systemctl disable redis-server >/dev/null 2>&1 || true
+  systemctl mask redis-server >/dev/null 2>&1 || true
+  systemctl daemon-reload || true
+  systemctl reenable valkey-server >/dev/null 2>&1 || true
+  [[ $en == enabled || -z $en ]] || systemctl disable valkey-server >/dev/null 2>&1 || true
+  if [[ -n $oldsock && $oldsock != "$MIGRATE_VALKEY_SOCK" ]] && ! migrate_redis_socket_link "$oldsock" "$MIGRATE_VALKEY_SOCK"; then
+    migrate_redis_rollback "the link ${oldsock} -> ${MIGRATE_VALKEY_SOCK} could not be made"; return 1
+  fi
+  if ! systemctl start valkey-server; then
+    migrate_redis_rollback "valkey-server did not start on the source build"; return 1
+  fi
+
+  # (3) Verify: our executable, PING, the dataset, the applications' path.
+  pid=$(systemctl show -p MainPID --value valkey-server 2>/dev/null || true)
+  exe=$(readlink -f "/proc/${pid}/exe" 2>/dev/null || true)
+  if [[ $exe != "$(migrate_valkey_root)/"* ]]; then
+    migrate_redis_rollback "the running server is ${exe:-unknown}, not the source build"; return 1
+  fi
+  for try in 1 2 3 4 5 6 7 8 9 10; do
+    pong=$(migrate_valkey_cmd "$(migrate_valkey_cli)" PING || true)
+    [[ $pong == PONG ]] && break
+    sleep 1
+  done
+  [[ $pong == PONG ]] || { migrate_redis_rollback "PING through $(migrate_valkey_cli) failed"; return 1; }
+  if [[ $before =~ ^[0-9]+$ ]] && (( before > 0 )); then
+    after=$(migrate_cache_keys migrate_valkey_cmd "$(migrate_valkey_cli)")
+    if [[ ! $after =~ ^[0-9]+$ ]] || (( after * 100 < before * 95 )); then
+      migrate_redis_rollback "the dataset did not load (${before} keys before, ${after:-?} after)"; return 1
+    fi
+  fi
+  if [[ -n $oldsock ]]; then
+    pong=$(migrate_redis_www_ping "$oldsock" || true)
+    [[ $pong == PONG ]] || { migrate_redis_rollback "PING on ${oldsock} as www-data failed (${pong:-no answer})"; return 1; }
+  fi
+  # Redis's data directory into the snapshot, outside the cache-down window.
+  migrate_copy_tree "$rdir" "$snap/data"
+  migrate_state_set redis "done"
+  migrate_inflight_clear
+  migrate_note "Redis replaced: the compiled Valkey serves (${after:-${before:-0}} keys carried$( [[ -n $oldsock && $oldsock != "$MIGRATE_VALKEY_SOCK" ]] && printf '; %s links to %s, application settings unchanged' "$oldsock" "$MIGRATE_VALKEY_SOCK")); snapshot ${snap}"
+  return 0
+}
+
+# Back to redis-server.  Valkey stops WITHOUT saving (Redis 7.0 cannot load
+# an RDB written by Valkey 9); Redis's own dataset was only copied, never
+# moved, so it starts from the snapshot its stop wrote.  /etc/valkey and
+# /var/lib/valkey move into the snapshot: a leftover valkey.conf would make
+# the next --optimize tune a Valkey that does not run.
+migrate_redis_rollback() {
+  local why=$1 snap oldsock en
+  warn "migrate: Redis replacement failed (${why}); back to redis-server"
+  snap=$(migrate_state_get redis.snap)
+  # SIGKILL to the unit's cgroup, never `SHUTDOWN NOSAVE` through the CLI:
+  # the converted valkey.conf keeps Redis's port, so on a TCP host whose
+  # Valkey is not up yet the command would reach Redis itself and stop it
+  # without saving.  A killed Valkey writes nothing either.
+  systemctl kill -s KILL valkey-server >/dev/null 2>&1 || true
+  systemctl stop valkey-server >/dev/null 2>&1 || true
+  systemctl disable valkey-server >/dev/null 2>&1 || true
+  if [[ -n $snap && -d $snap ]]; then
+    oldsock=$(cat "$snap/socket" 2>/dev/null || true)
+    en=$(cat "$snap/enabled" 2>/dev/null || true)
+    mkdir -p "$snap/ours"
+    [[ -e $(migrate_unit_file valkey-server) ]] && migrate_stash "$(migrate_unit_file valkey-server)" "$snap/ours" || true
+    [[ -L $MIGRATE_UNIT_DIR/valkey.service ]] && migrate_stash "$MIGRATE_UNIT_DIR/valkey.service" "$snap/ours/alias" || true
+    [[ -e $MIGRATE_VALKEY_ETC ]] && migrate_stash "$MIGRATE_VALKEY_ETC" "$snap/ours" || true
+    [[ -e $MIGRATE_VALKEY_DATA ]] && migrate_stash "$MIGRATE_VALKEY_DATA" "$snap/ours" || true
+  fi
+  rm -f -- "$MIGRATE_REDIS_TMPFILES"
+  [[ -n ${oldsock:-} && -L $oldsock ]] && { rm -f -- "$oldsock" || true; }
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl unmask redis-server >/dev/null 2>&1 || true
+  systemctl reset-failed redis-server >/dev/null 2>&1 || true
+  [[ ${en:-enabled} == enabled ]] && { systemctl enable redis-server >/dev/null 2>&1 || true; }
+  systemctl start redis-server >/dev/null 2>&1 || warn "migrate: redis-server did not start again either"
+  migrate_state_set redis "failed:${why}"
+  migrate_state_set redis.scan "$(migrate_redis_scan_digest)"
+  MIGRATE_IN_FLIGHT=""
+  migrate_state_del inflight
+  migrate_fail "Redis replacement rolled back, redis-server serves again: ${why}"
+  return 0
+}
+
+# After the package removal: the redis-server guard drop-in (a unit that no
+# longer exists) into the snapshot, and redis-cli for scripts and monitoring
+# agents that call it, as a link to valkey-cli (same protocol and options).
+migrate_redis_after_remove() {
+  local snap
+  snap=$(migrate_state_get redis.snap)
+  if [[ -d $MIGRATE_UNIT_DIR/redis-server.service.d && -n $snap && -d $snap ]]; then
+    { mkdir -p "$snap/ours" && migrate_stash "$MIGRATE_UNIT_DIR/redis-server.service.d" "$snap/ours"; } || true
+  fi
+  if [[ ! -e $MIGRATE_USR_BIN/redis-cli && ! -e $MIGRATE_REDIS_CLI_LINK && -x $(migrate_valkey_cli) ]]; then
+    mkdir -p "$(dirname "$MIGRATE_REDIS_CLI_LINK")" && ln -s "$(migrate_valkey_cli)" "$MIGRATE_REDIS_CLI_LINK" \
+      && migrate_note "redis-cli now runs valkey-cli (${MIGRATE_REDIS_CLI_LINK})" || true
+  fi
+  systemctl daemon-reload >/dev/null 2>&1 || true
   return 0
 }
 
@@ -3473,7 +3987,7 @@ migrate_retire_sources() {
 
 # Keep apt from bringing the packages back (R71): only for parts removed.
 migrate_write_apt_pin() {
-  local angie=$1 sury=$2 valkey=$3 tmp
+  local angie=$1 sury=$2 valkey=$3 redis=${4:-0} tmp
   local -a pats=()
   [[ $(migrate_state_get nginx) == "done" ]] && pats+=("nginx nginx-* libnginx-mod-*")
   (( angie )) && pats+=("angie angie-*")
@@ -3482,6 +3996,9 @@ migrate_write_apt_pin() {
   # which would also refuse unrelated packages such as phpmyadmin.
   (( sury )) && pats+=("php[0-9]* php-* libapache2-mod-php*")
   (( valkey )) && pats+=("valkey-server valkey-tools")
+  # A reinstalled redis-server would start a second cache on the paths and
+  # port the Valkey build now owns.
+  (( redis )) && pats+=("redis redis-server redis-tools")
   if [[ -f $MIGRATE_APT_PIN ]]; then
     local old
     old=$(sed -nE 's/^Package: //p' "$MIGRATE_APT_PIN" | head -n1)
@@ -3557,7 +4074,7 @@ migrate_post_assert() {
     php_build_layout "$v" adopt || { warn "migrate: php_build_layout ${v} failed"; bad=1; }
   done
   local t
-  for t in /etc/tmpfiles.d/setup-php.conf /etc/tmpfiles.d/setup-php-pools.conf /etc/tmpfiles.d/setup-nginx.conf; do
+  for t in /etc/tmpfiles.d/setup-php.conf /etc/tmpfiles.d/setup-php-pools.conf /etc/tmpfiles.d/setup-nginx.conf "$MIGRATE_REDIS_TMPFILES"; do
     [[ -f $t ]] && systemd-tmpfiles --create "$t" >/dev/null 2>&1
   done
   # B's own tmpfiles pass also asserts the session directory (www-data 0700).
@@ -3607,7 +4124,7 @@ migrate_post_assert() {
   local -a units=()
   [[ $(migrate_state_get nginx) == "done" ]] && units+=(nginx)
   for v in "${vers[@]}"; do [[ -n $v ]] && units+=("php${v}-fpm"); done
-  [[ $(migrate_state_get valkey) == "done" ]] && units+=(valkey-server)
+  [[ $(migrate_state_get valkey) == "done" || $(migrate_state_get redis) == "done" ]] && units+=(valkey-server)
   for u in "${units[@]}"; do
     systemctl unmask "${u}.service" >/dev/null 2>&1 || true
     migrate_clear_dsh_state "$u"
@@ -3748,7 +4265,7 @@ migrate_final_report() {
   fi
   migrate_wp_permalink_check
   local s
-  for s in nginx angie-purge sury-purge valkey valkey-remove; do
+  for s in nginx angie-purge sury-purge valkey valkey-remove redis redis-remove; do
     [[ -n $(migrate_state_get "$s") ]] && migrate_report "    - state ${s}: $(migrate_state_get "$s")"
   done
   while IFS= read -r s; do
@@ -3779,7 +4296,7 @@ migrate_start_bolt() {
     [[ -x $r/php-build.sh ]] && cmd+="'$r/php-build.sh' bolt $v || true; "
   done
   r=$(migrate_valkey_root)
-  [[ $(migrate_state_get valkey) == "done" && -x $r/valkey-build.sh ]] && cmd+="'$r/valkey-build.sh' bolt || true; "
+  [[ ( $(migrate_state_get valkey) == "done" || $(migrate_state_get redis) == "done" ) && -x $r/valkey-build.sh ]] && cmd+="'$r/valkey-build.sh' bolt || true; "
   [[ -n $cmd ]] || return 0
   command -v systemd-run >/dev/null 2>&1 || return 0
   systemd-run --no-block --collect --quiet --unit=setup-migrate-bolt-1.22 -p Nice=10 -p IOSchedulingClass=idle \
@@ -3848,7 +4365,7 @@ migrate_main_body() {
       migrate_php_cutover "$v" && php_done_now+=("$v")
     done
     if (( MIGRATE_DO_VALKEY )); then
-      migrate_valkey_cutover
+      if [[ $MIGRATE_VALKEY_FROM == redis ]]; then migrate_redis_cutover; else migrate_valkey_cutover; fi
     fi
   else
     # Removals and their verification still serialise with the builds.

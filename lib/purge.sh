@@ -40,6 +40,34 @@ purge_service_stop() {
 # Package: line, so an operator who removed the source build can install the
 # packaged one again; the file goes when no pattern is left.
 PURGE_APT_PIN=${MIGRATE_APT_PIN:-/etc/apt/preferences.d/setup-source-builds}
+# After `--purge valkey` on a host whose Valkey replaced Ubuntu's Redis
+# (1.22.17): the redis pin, the mask the cutover set, the old socket path's
+# tmpfiles link and the redis-cli link into the build.  Each only when it is
+# ours; /etc/redis and /var/lib/redis (kept by the package removal) stay.
+PURGE_REDIS_TMPFILES=${SETUP_MIGRATE_REDIS_TMPFILES:-/etc/tmpfiles.d/setup-redis-socket.conf}
+PURGE_REDIS_CLI_LINK=${SETUP_MIGRATE_REDIS_CLI_LINK:-/usr/local/bin/redis-cli}
+purge_redis_replacement_leftovers() {
+  local old unit=${SETUP_MIGRATE_UNIT_DIR:-/etc/systemd/system}/redis-server.service
+  if [[ -f $PURGE_APT_PIN ]] && grep -qE '^Package:.*(^|[[:space:]])redis-server([[:space:]]|$)' "$PURGE_APT_PIN"; then
+    purge_apt_pin_remove "redis redis-server redis-tools"
+  fi
+  if [[ -L $unit && $(readlink "$unit") == /dev/null ]]; then
+    systemctl unmask redis-server >/dev/null 2>&1 || rm -f -- "$unit"
+    info "redis-server unmasked (the Valkey that replaced it is purged)"
+  fi
+  if [[ -f $PURGE_REDIS_TMPFILES ]]; then
+    old=$(awk '$1 == "L+" { print $2; exit }' "$PURGE_REDIS_TMPFILES")
+    rm -f -- "$PURGE_REDIS_TMPFILES"
+    [[ -n $old && -L $old ]] && rm -f -- "$old"
+    info "removed the Redis socket link ${old:-?} -> Valkey (${PURGE_REDIS_TMPFILES})"
+  fi
+  if [[ -L $PURGE_REDIS_CLI_LINK && $(readlink "$PURGE_REDIS_CLI_LINK") == */setup-valkey/* ]]; then
+    rm -f -- "$PURGE_REDIS_CLI_LINK"
+    info "removed ${PURGE_REDIS_CLI_LINK} (it ran valkey-cli)"
+  fi
+  return 0
+}
+
 purge_apt_pin_remove() { # "pattern ..."
   local drop=" $1 " pkgs="" p tmp
   local -a cur=()
@@ -478,6 +506,10 @@ purge_valkey() {
   fi
   # The packaged Valkey may be installed again.
   purge_apt_pin_remove "valkey-server valkey-tools"
+  # A Valkey that replaced Ubuntu's Redis (1.22.17): the Redis package may be
+  # installed again too, unmasked, without the old socket path linking to a
+  # Valkey that is gone, and redis-cli is no longer valkey-cli.
+  purge_redis_replacement_leftovers
   # A package valkey-server the migration has not replaced yet.
   purge_service_stop valkey-server
   # --optimize and --restart-all treat an adopted Redis as a managed cache

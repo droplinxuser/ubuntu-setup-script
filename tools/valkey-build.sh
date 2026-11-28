@@ -961,6 +961,9 @@ cmd_rebuild() { cmd_build; cmd_activate; bolt_tolerant; }
 # setup-build-cpu.service: build.info versions, cached sources, recorded
 # LLVM; no BOLT (the refresh timer applies it once traffic runs).
 cmd_rebuild_cpu() {
+  # A host whose valkey-server is not our unit (a package server, or a
+  # redis-server after a rolled-back replacement) keeps this build idle.
+  unit_is_ours || { say "rebuild-cpu skipped: valkey-server is not on the compiled unit"; return 0; }
   cmd_build --cpu-only
   cmd_activate
 }

@@ -338,7 +338,14 @@ detect_installed_services() {
   # budget twice and could overcommit RAM; Redis-only hosts still get the
   # complete Valkey tuning profile.
   if (( ! valkey_present )) && [[ -f /etc/redis/redis.conf ]]; then
-    OPT_DETECTED+=(redis)
+    # As the migration leaves the host (1.22.17): a Redis package it will
+    # replace is planned as the Valkey build.
+    if (( OPT_DETECT_LEGACY )) && declare -F migrate_redis_will_replace >/dev/null 2>&1 \
+       && migrate_redis_will_replace; then
+      OPT_DETECTED+=(valkey)
+    else
+      OPT_DETECTED+=(redis)
+    fi
   fi
   [[ -f /etc/elasticsearch/elasticsearch.yml ]] && OPT_DETECTED+=(elastic)
   return 0

@@ -8,6 +8,65 @@ Reports of the 1.21.33-1.21.61 cycles that measured the removed Anubis
 filter were deleted from the tree on 2026-11-23 for the same reason;
 `git show <commit>:<path>` recovers them.
 
+## 1.22.17 (2026-11-29)
+
+- **Ubuntu's Redis package is replaced by the compiled Valkey** (operator
+  decision; it was never replaced before).  `--optimize` now runs the
+  migration step on a host whose cache is the `redis-server` package and
+  moves it to the source-built Valkey once, sessions included:
+  `redis.conf` becomes `/etc/valkey/valkey.conf` with every directive kept
+  (only `dir`, `unixsocket`, `pidfile` and `logfile` move to Valkey's
+  paths) and the build is installed while Redis still serves; then Redis
+  stops (a Redis without persistence gets a snapshot point for that one
+  stop), its `dump.rdb` is copied, `redis-server` is disabled and masked
+  and Valkey starts.  The cutover requires our binary, PING, at least 95 %
+  of the keys of every database (INFO keyspace, not db0's DBSIZE: XenForo
+  keeps its cache and sessions in db 1) and a PING as `www-data` on the old
+  socket path, which stays a link to `/run/valkey/valkey.sock`
+  (`/etc/tmpfiles.d/setup-redis-socket.conf`), so application config is
+  never edited.  Any failure stops Valkey without saving and starts Redis
+  again from its own, untouched data.  The packages are removed (never
+  purged) with the other removals and pinned out; `redis-cli` becomes a
+  link to `valkey-cli`.  Redis 7.4+ (RDB Valkey cannot load), AOF,
+  modules, `include`, `rename-command`, ACL files, extra instances,
+  `redis-sentinel`, a stopped server or a socket outside `/run` keep Redis,
+  with the reason in the report.  Checked with real binaries: a live
+  XenForo host's `redis.conf` and a Redis 7.0.15 RDB (805 keys in db 0 and
+  1 with TTLs, hash, list, set, zset) load in Valkey 9.2.1 with every key,
+  value and TTL.
+- Before Redis stops, the replacement requires a key count and a finished
+  `BGSAVE` with `rdb_last_bgsave_status:ok` (else it is postponed with
+  Redis untouched), and the stop itself must write a new `dump.rdb` (Redis
+  renames a temporary file over it, so the inode changes; a fresh BGSAVE
+  file cannot hide a failed save at the stop); our unit stays disabled until
+  Redis has stopped, and Redis's data directory is snapshotted after the
+  verified start, outside the cache-down window; an interrupted Redis part
+  is handled by the resume step like the other parts; `--valkey` (install
+  mode) keeps skipping a Redis host, only `--optimize` replaces it; other members of the `redis` group join the `valkey`
+  group; a run interrupted after Valkey already serves the dataset is
+  finished forward instead of rolled back; the converted `valkey.conf` is
+  0600 from its first byte; a rollback kills Valkey through its cgroup
+  (a `SHUTDOWN NOSAVE` through the CLI would reach Redis itself on a TCP
+  host whose Valkey is not up yet).  The part has its own state keys
+  (`redis`, `redis-remove`), so a host that keeps a redis-server beside a
+  Valkey from the valkey-server package settles after one refusal.
+  `--purge valkey` on such a host removes the Redis pin, the mask, the
+  socket link and the `redis-cli` link.  These came from an adversarial
+  review of the change before release.
+- A rolled-back replacement leaves the build on disk but never starts it
+  beside Redis: outside the migration `valkey_build_ensure` skips a host
+  whose `redis-server` serves on a unit that is not ours (it used to look
+  only for a missing build record), and the CPU-change rebuild skips a
+  Valkey that is not on our unit.
+- **PHP workers pick up a new group with a graceful reload.**  Moving the
+  cache socket to a group PHP must join (Valkey's install, the Redis
+  replacement) restarted PHP-FPM, which removes `/run/php/php-fpm.sock`
+  for up to a second: nginx answered 502 to the requests of that moment on
+  a busy board.  FPM re-spawns every worker on SIGUSR2 and each worker
+  calls `initgroups()`; checked with a real php-fpm 8.5: after the reload
+  the worker has the new group and the socket keeps its inode.  A restart
+  stays the fallback.
+
 ## 1.22.16 (2026-11-28)
 
 - **XenForo's `xf_search_index` moves to InnoDB too** (operator decision:

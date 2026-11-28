@@ -848,9 +848,10 @@ Managed `valkey.conf`:
 
 Notes:
 
-- Skipped with a warning when `redis-server` is installed; `--optimize` then
-  tunes Redis with the same profile. Valkey wins when both exist.  A Redis
-  server is never replaced.
+- Skipped with a warning when `redis-server` is installed: `--optimize`
+  replaces Ubuntu's Redis package with this build (1.22.17, see "Upgrading
+  from 1.21.x", step 8b) and tunes a Redis it cannot replace with the same
+  profile.  Valkey wins when both exist.
 - Runtime values (the snapshot schedule and the port included) are applied
   with `CONFIG SET`; a restart happens only for startup-only keys or a new
   binary, and it saves and reloads the snapshot.
@@ -1150,10 +1151,38 @@ sudo bash setup.sh --optimize          # migrates, then tunes as usual
 8. Valkey: the package server stops first (so a persisting configuration
    writes its RDB), then `/etc/valkey` and `/var/lib/valkey` are
    snapshotted, our unit starts and must answer PING.
+   8b. Redis (1.22.17): Ubuntu's `redis-server` package is replaced by the
+   same build, on any host (1.21 or not).  While Redis still serves,
+   `redis.conf` becomes `/etc/valkey/valkey.conf` (every directive kept;
+   `dir`, `unixsocket`, `pidfile`, `logfile` move to Valkey's paths) and the
+   build is installed (other members of the `redis` group join the `valkey`
+   group).  Redis must give a key count and finish a `BGSAVE` with
+   `rdb_last_bgsave_status:ok`, else the part waits for the next run with
+   Redis untouched.  Then Redis stops (a Redis without persistence,
+   `save ""`, gets a snapshot point for that one stop, so sessions move
+   too), its `dump.rdb` is copied to `/var/lib/valkey`, `redis-server` is
+   disabled and masked, and Valkey starts.  It must run our binary, answer
+   PING and load at least 95 % of the keys of every database.  A run
+   interrupted after Valkey already serves the dataset is finished
+   forward on the next run.  The old
+   socket (`/run/redis/redis.sock`) becomes a link to
+   `/run/valkey/valkey.sock` (`/etc/tmpfiles.d/setup-redis-socket.conf`,
+   re-created at boot), checked with a PING as `www-data`, so `wp-config.php`,
+   `src/config.php` and `env.php` are never edited.  Any failure stops
+   Valkey without saving and starts Redis again from its own data.  The
+   packages are removed (never purged) with the other removals and pinned
+   out; `redis-cli` becomes a link to `valkey-cli`.  Redis stays (and is
+   tuned as Redis) when it cannot be replaced unattended: Redis 7.4 or
+   newer (Valkey loads RDB files up to Redis 7.2), AOF persistence,
+   modules, `include`, `rename-command`, an ACL file or `user` lines, extra
+   `redis-server@` instances, `redis-sentinel`, a stopped server, a socket
+   outside `/run`, or an existing `valkey.conf`; the reason is in the
+   report and a change to `redis.conf` retries it.
 9. Removals, only for parts that passed: Angie (packages, repository, key,
    `angie` user when it owns nothing else; `/etc/angie` moves to the backups
    first), the Sury PHP packages (repository and keyring included), and
-   `apt-get remove` (never purge) of valkey-server and valkey-tools.  Then
+   `apt-get remove` (never purge) of valkey-server and valkey-tools (and of
+   redis, redis-server and redis-tools after step 8b).  Then
    our `/etc/php` files are re-laid, every unit is enabled and checked, and
    everything is verified again.  `angie.service` becomes an alias of
    `nginx.service`, so a legacy `systemctl reload angie` reaches nginx.
@@ -1165,7 +1194,10 @@ sudo bash setup.sh --optimize          # migrates, then tunes as usual
 
 Expected cutover windows: about 1-3 s for nginx between the Angie stop and
 the nginx start, about 1 s per PHP version, and one Valkey restart (the
-dataset reloads).
+dataset reloads); replacing Redis takes the stop, a copy of `dump.rdb` and
+the Valkey start (about 1-2 s for a small cache).  PHP workers that need a
+new group to reach the socket get it through a graceful reload (1.22.17;
+it was a restart, which dropped requests on a busy site).
 
 **Safety rules.**
 
