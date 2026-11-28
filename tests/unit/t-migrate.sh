@@ -544,6 +544,9 @@ nginx_build_tmpfiles_apply() { rec "nginx_build_tmpfiles_apply"; }
 migrate_sury_loaded_exts() { printf 'redis\nmysqli\nopcache\n'; }
 php_active_set() { rec "php_active_set $1"; printf '%s\n' "$1" > "$MIGRATE_PHP_ETC/setup-active"; }
 persist_tuning_var() { rec "persist $1=$2"; }
+# Application detection never reads the host running the tests (1.22.13:
+# the minimal PHP keep depends on it); tests that need an application stub it.
+php_build_detect_apps() { :; }
 php_build_layout() { rec "php_build_layout $*"; }
 php_build_tmpfiles_apply() { rec "php_build_tmpfiles_apply"; }
 php_build_links() { rec "php_build_links $*"; }
@@ -1998,6 +2001,118 @@ check "dry-run: every running version moving still shows the Sury purge" \
 # XenForo origin whose image library is Imagick); xsl and ffi are still dropped.
 check "keep: imagick loaded by Sury is kept for the source build" migrate_php_buildable imagick 8.3
 check "keep: xsl is still not buildable" not migrate_php_buildable xsl 8.3
+
+# 1.22.13: the migrated build is minimal.  Of the modules Sury loaded, only
+# those an application needs, imagick and the operator's extras are kept.
+ms() { # EXTRA OPT-EXT NAMES... -> "keep a b | drop c d"
+  (
+    PHP_EXT_EXTRA=$1; OPT["php.ext"]=$2; shift 2
+    php_build_detect_apps() { printf 'xenforo\t/srv/xf\n'; }
+    php_build_effective_exts() {
+      [[ -z ${PHP_EXT_EXTRA:-} && ${PHP_BUILD_EXT_RESET:-0} == 1 ]] || { echo LEAKED; return 0; }
+      echo 'curl,gd,mbstring,mysqli,redis,igbinary,xml,zip'
+    }
+    migrate_php_app_required_exts() { printf 'exif\n'; }
+    out=$(migrate_php_minimal_split 8.1 "$@")
+    printf 'keep %s | drop %s' "$(awk '$1=="keep"{print $2}' <<<"$out" | paste -sd' ' -)" \
+      "$(awk '$1=="drop"{print $2}' <<<"$out" | paste -sd' ' -)"
+  )
+}
+check "minimal: modules no application needs are dropped; app set, requirements and imagick kept" \
+  eqv "$(ms '' '' calendar exif ftp gettext igbinary imagick pdo pdo_mysql redis shmop xmlreader)" \
+      "keep exif igbinary imagick redis | drop calendar ftp gettext pdo pdo_mysql shmop xmlreader"
+check "minimal: the build's set is computed without operator extras or the previous build" \
+  eqv "$(ms 'soap' '' redis)" "keep redis | drop "
+check "minimal: an extra already in PHP_EXT_EXTRA is kept" \
+  eqv "$(ms 'intl,soap' '' intl soap calendar)" "keep intl soap | drop calendar"
+check "minimal: --optimize ext=NAME keeps one, ext=-NAME drops an extra and imagick" \
+  eqv "$(ms 'intl' 'calendar,-intl,-imagick' calendar intl imagick ftp)" "keep calendar | drop intl imagick ftp"
+check "minimal: ext=-NAME never drops what an application needs" \
+  eqv "$(ms '' '-redis' redis)" "keep redis | drop "
+check "minimal: ext=none drops every extra" \
+  eqv "$(ms 'intl' 'none' intl imagick redis)" "keep redis | drop intl imagick"
+out=$( (
+  php_build_detect_apps() { :; }
+  migrate_php_app_required_exts() { printf 'exif\n'; }
+  migrate_php_minimal_split 8.1 calendar ftp | paste -sd' ' -
+) )
+check "minimal: no detected application -> nothing can be ruled out, all kept" eqv "$out" "keep calendar keep ftp"
+out=$( (
+  php_build_detect_apps() { printf 'xenforo\t/srv/xf\n'; }
+  migrate_php_app_required_exts() { return 1; }
+  migrate_php_minimal_split 8.1 calendar | paste -sd' ' -
+) )
+check "minimal: requirement lists unavailable -> all kept" eqv "$out" "keep calendar"
+out=$( (
+  php_build_detect_apps() { printf 'xenforo\t/srv/xf\n'; }
+  migrate_php_app_required_exts() { printf 'exif\n'; }
+  MIGRATE_PHP_MINIMAL=0 migrate_php_minimal_split 8.1 calendar | paste -sd' ' -
+) )
+check "minimal: MIGRATE_PHP_MINIMAL=0 keeps every module" eqv "$out" "keep calendar"
+fresh
+pkgs "ii php8.3-fpm"
+active php8.3-fpm
+mkdir -p "$T_PHPETC/8.3/fpm/pool.d"
+printf '[www]\nlisten = /run/php/php8.3-fpm.sock\n' > "$T_PHPETC/8.3/fpm/pool.d/www.conf"
+out=$( (
+  migrate_preflight_disk() { :; }
+  migrate_php_app_required_exts() { return 0; }
+  migrate_sury_modules() { printf '%s\n' core calendar redis igbinary mysqli; }
+  php_build_detect_apps() { printf 'xenforo\t/srv/xf\n'; }
+  php_build_effective_exts() { echo 'mysqli,redis,igbinary'; }
+  migrate_preflight 0
+  echo "todo=${MIGRATE_PHP_TODO[*]}"
+) 2>&1 )
+check "pre-flight: the dropped module is reported with the ext= remedy" \
+  has "$out" "not built (minimal): calendar (--optimize ext=NAME adds one back)"
+check "pre-flight: only the kept modules reach PHP_EXT_EXTRA" called "persist PHP_EXT_EXTRA=igbinary,mysqli,redis"
+check "pre-flight: the version still moves" has "$out" "todo=8.3"
+out=$( (
+  migrate_php_app_required_exts() { return 0; }
+  migrate_sury_modules() { printf '%s\n' core calendar redis; }
+  php_build_detect_apps() { printf 'xenforo\t/srv/xf\n'; }
+  php_build_effective_exts() { echo 'redis,igbinary'; }
+  migrate_preflight_disk() { :; }
+  fresh; pkgs "ii php8.3-fpm"; active php8.3-fpm
+  migrate_preflight 1
+) 2>&1 )
+check "dry-run: the dropped modules are listed" has "$out" "not built (minimal; --optimize ext=NAME keeps one): calendar"
+fresh
+pkgs "ii php8.3-fpm"
+active php8.3-fpm
+out=$( (
+  migrate_preflight_disk() { :; }
+  migrate_php_app_required_exts() { return 0; }
+  migrate_sury_modules() { printf '%s\n' core calendar redis; }
+  migrate_php_minimal_split() { printf 'keep redis\n'; return 0; }
+  migrate_preflight 0
+) 2>&1 )
+check "pre-flight: a split that loses a name keeps every module (fail-safe)" called "persist PHP_EXT_EXTRA=calendar,redis"
+check "pre-flight: nothing is reported dropped then" lacks "$out" "not built (minimal)"
+# Review fixes (1.22.13): the detached unit sees the opt-out and this run's
+# ext=, and the parent reloads what the unit persisted.
+check "unit env: MIGRATE_PHP_MINIMAL and SETUP_OPTIMIZE_PHP_EXT reach the detached unit" \
+  bash -c '[[ " $1 " == *" MIGRATE_PHP_MINIMAL "* && " $1 " == *" SETUP_OPTIMIZE_PHP_EXT "* ]]' _ "${MIGRATE_PASS_ENV[*]}"
+out=$( (
+  unset 'OPT[php.ext]'
+  SETUP_OPTIMIZE_PHP_EXT='-imagick'
+  php_build_detect_apps() { printf 'xenforo\t/srv/xf\n'; }
+  php_build_effective_exts() { echo 'redis'; }
+  migrate_php_app_required_exts() { :; }
+  migrate_php_minimal_split 8.1 imagick redis | paste -sd' ' -
+) )
+check "minimal: the unit honours ext= from SETUP_OPTIMIZE_PHP_EXT" eqv "$out" "drop imagick keep redis"
+check "the parent exports this run's ext= for the unit" \
+  bash -c 'sed -n "/^run_optimize()/,/^}/p" "$1" | grep -qF "export SETUP_OPTIMIZE_PHP_EXT=\${OPT[php.ext]}"' _ "$ROOT/lib/restart.sh"
+tf=$TMP/reload-tuning
+printf 'NODE_MAJOR=22\nPHP_EXT_EXTRA=imagick,intl\n' > "$tf"
+out=$( PHP_EXT_EXTRA=stale; SETUP_TUNING_FILE=$tf; optimize_reload_php_ext_extra; printf '%s' "$PHP_EXT_EXTRA" )
+check "after the migration the parent reloads PHP_EXT_EXTRA from the tuning file" eqv "$out" "imagick,intl"
+printf 'NODE_MAJOR=22\n' > "$tf"
+out=$( PHP_EXT_EXTRA=kept; SETUP_TUNING_FILE=$tf; optimize_reload_php_ext_extra; printf '%s' "$PHP_EXT_EXTRA" )
+check "a tuning file without PHP_EXT_EXTRA leaves the value alone" eqv "$out" "kept"
+check "optimize_migration_step reloads PHP_EXT_EXTRA after migrate_run" \
+  bash -c 'sed -n "/^optimize_migration_step()/,/^}/p" "$1" | awk "/migrate_run opt_report/{a=NR} /optimize_reload_php_ext_extra/{b=NR} END{exit !(a && b > a)}"' _ "$ROOT/lib/optimize.sh"
 
 printf '\n%s passed, %s failed, %s skipped\n' "$PASS" "$FAIL" "$SKIP"
 (( FAIL == 0 ))

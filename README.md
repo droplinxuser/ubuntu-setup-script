@@ -120,7 +120,7 @@ took 10 min 15 s, including building nginx 1.31.10, PHP 8.5.13 and Valkey
 | `--elastic [host=] [ram=]` | Elasticsearch | [Elasticsearch](#elasticsearch---elastic) |
 | `--others ITEM... \| all` | helper packages | [Other packages](#other-packages---others) |
 | `--domain DOMAIN [app=] [db=] [user=] [pass=] [sql=]` | vhost, certificate and optional database | [Domains](#domains---domain) |
-| `--optimize [mitigations=]` | tune the OS and every installed service in place, rebuild stale source builds; on a 1.21.x host, the one-time migration. Recorded tuning overrides are always ignored | [`--optimize`](#--optimize), [Upgrading from 1.21.x](#upgrading-from-121x) |
+| `--optimize [mitigations=] [ext=]` | tune the OS and every installed service in place, rebuild stale source builds; on a 1.21.x host, the one-time migration. Recorded tuning overrides are always ignored | [`--optimize`](#--optimize), [Upgrading from 1.21.x](#upgrading-from-121x) |
 | `--upgrade-php=X.Y` | switch PHP to another series in place | [`--upgrade-php`](#--upgrade-phpxy) |
 | `--diagnostics` | write a redacted `diagnostics.log`; read-only | [Maintenance](#--diagnostics---restart-all---purge) |
 | `--restart-all` | ordered restart of every active service | [Maintenance](#--diagnostics---restart-all---purge) |
@@ -541,7 +541,7 @@ plus the set of every application found on the host, plus `PHP_EXT_EXTRA`.
 |---|---|
 | Base (always) | ctype curl dom fileinfo filter gd iconv libxml mbstring mysqlnd openssl opcache phar posix session simplexml tokenizer zlib, and pcntl in the CLI only (phar, posix, tokenizer and pcntl are for wp-cli and composer), plus PHP's always-on core |
 | WordPress | mysqli gd curl mbstring exif zip xml sodium; + redis igbinary when a Redis object-cache drop-in needs `\Redis` (no Predis fallback) or Object Cache Pro is installed |
-| XenForo | mysqli gd curl mbstring xml zip exif; + redis igbinary when `src/config.php` selects the `Redis` cache provider |
+| XenForo | mysqli gd curl mbstring xml zip exif; + redis igbinary when `src/config.php` selects the `Redis` cache provider or the SV RedisCache add-on (`SV\RedisCache\Redis`, since 1.22.13) |
 | Chevereto | pdo_mysql pdo mysqli redis igbinary gd curl mbstring exif fileinfo xmlwriter zip |
 | Other PHP apps (`--domain app=` flarum, polr, lychee, sfs, php, or a PHP root that is none of the three) | mysqli pdo_mysql pdo tokenizer bcmath sqlite3 pdo_sqlite xml xmlwriter zip exif; shlink adds gmp |
 | Any application root that uses SQLite | sqlite3 pdo_sqlite (a scan of the root, 4 levels deep, skipping `vendor`, `node_modules`, `cache` and `.git`, for `new SQLite3`, a `sqlite:` PDO DSN or a database file with the "SQLite format 3" magic) |
@@ -552,7 +552,9 @@ plus the set of every application found on the host, plus `PHP_EXT_EXTRA`.
 * Detection only **adds**: the set of the current build is always part of
   the new one, so an unmounted volume, an unreadable config or a scan
   timeout never shrinks a live build.  A set shrinks only through
-  `--php ext=-NAME`, `--php ext=none` or a removed `--domain`.
+  `--php ext=-NAME`, `--php ext=none` (or the same `ext=` on `--optimize`,
+  which works on every supported release while `--php` needs 26.04) or a
+  removed `--domain`.
 * A bare `--php` on a host with no application and no previous build gets
   the union of the WordPress, XenForo and Chevereto sets, so a site dropped
   in later does not answer 500.
@@ -671,10 +673,12 @@ Valkey on the local Unix socket it measured **+7–9 %** authenticated
 throughput on the 1.21.23 audit (PHP 8.5, Ubuntu 26.04); with the add-on's
 pure-PHP Credis fallback (php-redis absent) it measured ~27 % slower than
 MariaDB on the same host class.  The PHP build adds `redis` and `igbinary`
-by itself when `src/config.php` selects XenForo's own `Redis` provider; an
-add-on that uses Credis does not trigger it, so add `--php ext=redis` to
-give it php-redis.  Keep the cache when `redis` is in `php -m`, disable it
-for Credis, and re-measure on the actual stack.
+by itself when `src/config.php` selects XenForo's own `Redis` provider or,
+since 1.22.13, the SV RedisCache add-on (`SV\RedisCache\Redis`): its Credis
+client uses php-redis and igbinary whenever they are loaded and stores
+igbinary-encoded sessions, so removing them would log every member out.
+Keep the cache when `redis` is in `php -m`, and re-measure on the actual
+stack.
 
 ### MariaDB (`--mariadb`)
 
@@ -888,6 +892,7 @@ a non-zero exit and the optimize report, exactly like `--optimize`.
 |---|---|
 | `--optimize` | tune the OS and every installed service in place (Ubuntu 22.04, 24.04, 26.04) |
 | `--optimize mitigations=off` | the same (`mitigations=off` is the default and changes nothing; `mitigations=on` was removed, see `--basic`) |
+| `--optimize ext=LIST` | the same, after changing the PHP extension set exactly like `--php ext=` (`NAME` adds, `-NAME` drops one added earlier, `none` clears the list; persisted as `PHP_EXT_EXTRA`); the source build is rebuilt when the set changed.  Works on 22.04 and 24.04, where `--php` is refused.  An extension a detected application needs stays (1.22.13) |
 | `--optimize --dry-run` | print the planned OS and service values, the build plan and, on a 1.21.x host, the migration plan; runs as a normal user |
 
 Tunes the OS and every installed service in place. It never installs a new
@@ -1071,10 +1076,15 @@ sudo bash setup.sh --optimize          # migrates, then tunes as usual
    operator `.ini` files are commented with `; setup-1.22-off: `), our layout
    and unit are written, and the version starts on the same socket.  It must
    pass `php-fpm -t` without load warnings, show OPcache active and answer a
-   PHP page of every detected root with a status below 500.  The build keeps
-   every extension the Sury PHP loaded that the source build can compile, in
-   addition to the applications' sets (recorded in `PHP_EXT_EXTRA`; trim it
-   later with `--php ext=-NAME`).  From the cutover on, Sury's
+   PHP page of every detected root with a status below 500.  The build is
+   minimal (1.22.13): of the extensions the Sury PHP loaded, it keeps only
+   those a detected application needs (its set, the requirement lists, the
+   Redis and SQLite scans), imagick, and what the operator named
+   (`PHP_EXT_EXTRA`, `--optimize ext=NAME`); the kept ones are recorded in
+   `PHP_EXT_EXTRA`.  Every other module is dropped and listed in the report
+   and the dry run (`--optimize ext=NAME` on the same run, or later, adds
+   one back).  With no detected application or no requirement lists nothing
+   can be ruled out and every buildable module is kept, as before.  From the cutover on, Sury's
    `/usr/bin/phpX.Y` is diverted to `/usr/bin/phpX.Y.sury` (`dpkg-divert
    --local`) and the source CLI linked in its place, so cron and
    `/usr/bin/php` run the source build even while the Sury purge waits; the

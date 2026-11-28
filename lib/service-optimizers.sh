@@ -2604,6 +2604,10 @@ optimize_plan() {
     "$governor_desc" "$nproc" "$ram_mb"
   printf '  Legacy repair: nightly cron chown and /var/www/logs ownership\n'
   printf '  Security: wp-config 640, scoped DB users, malware quarantine, OS/SSH/firewall audit\n'
+  if [[ -n ${OPT[php.ext]:-} ]]; then
+    printf '  PHP extensions: ext=%s would be recorded (PHP_EXT_EXTRA now: %s); the PHP build below then follows the new set\n' \
+      "${OPT[php.ext]}" "${PHP_EXT_EXTRA:-none}"
+  fi
   if declare -F migrate_plan >/dev/null 2>&1; then
     migrate_plan || true
   fi

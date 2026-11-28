@@ -434,6 +434,16 @@ run_optimize() {
   if (( ${#OPTIMIZE_IGNORED_ENV[@]} > 0 )); then
     opt_report "- Ignored tuning environment: \`${OPTIMIZE_IGNORED_ENV[*]}\`"
   fi
+  # --optimize ext=LIST (1.22.13): recorded before the migration plans and
+  # before the PHP build computes the set (PHP_EXT_EXTRA persisted; a
+  # removal exports PHP_BUILD_EXT_RESET so this run's build may shrink).
+  if [[ -n ${OPT[php.ext]:-} ]]; then
+    # The detached migration unit reads it from here (lib/migrate.sh
+    # MIGRATE_PASS_ENV, migrate_php_minimal_split).
+    export SETUP_OPTIMIZE_PHP_EXT=${OPT[php.ext]}
+    php_ext_request_apply
+    opt_report "- PHP extensions: \`ext=${OPT[php.ext]}\` recorded (PHP_EXT_EXTRA=${PHP_EXT_EXTRA:-none})"
+  fi
   detect_installed_services
   # One /var/www walk for every WordPress/XenForo finder in this run.
   app_config_scan_prime

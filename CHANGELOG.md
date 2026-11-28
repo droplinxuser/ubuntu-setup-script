@@ -8,6 +8,36 @@ Reports of the 1.21.33-1.21.61 cycles that measured the removed Anubis
 filter were deleted from the tree on 2026-11-23 for the same reason;
 `git show <commit>:<path>` recovers them.
 
+## 1.22.13 (2026-11-28)
+
+- **`--optimize ext=LIST` changes the PHP extension set on any supported
+  release.**  `--php ext=` needs `--basic`, and installs need Ubuntu 26.04,
+  so an operator on 22.04 or 24.04 had no way to trim a migrated build.
+  `--optimize ext=` takes the same `NAME`, `-NAME` and `none`, is checked
+  before anything changes (an unbuildable or malformed name, an empty list
+  and `none` mixed with names are refused), records `PHP_EXT_EXTRA`, and
+  the build step rebuilds PHP when the set changed.  The dry run says what
+  it would record.
+- **The 1.21 -> 1.22 migration builds a minimal PHP** (operator request).
+  It used to keep every module the Sury PHP loaded that the source build
+  can compile, so a XenForo host carried calendar, ftp, gettext, pdo,
+  pdo_mysql, shmop and xmlreader that nothing used.  Now only the modules a
+  detected application needs (its extension set, the requirement lists, the
+  Redis and SQLite scans), imagick, and the operator's own extras
+  (`PHP_EXT_EXTRA`, `--optimize ext=NAME`) are kept; the rest are dropped,
+  listed in the dry run and the report with the `ext=NAME` remedy.  With no
+  detected application or no requirement lists nothing can be ruled out,
+  and every buildable module is kept as before (`MIGRATE_PHP_MINIMAL=0`
+  keeps them all too).
+- **The SV RedisCache XenForo add-on counts as needing redis and
+  igbinary.**  Its Credis client runs without php-redis, but uses it and
+  igbinary whenever they are loaded (on a live XenForo origin, PHP 8.1:
+  9.3 vs 11.1 us per command; igbinary sessions 333 vs 649 bytes and 1.3
+  vs 2.4 us per round trip), and the sessions it stored are
+  igbinary-encoded, so a build without them would log every member out.
+  `src/config.php` selecting `SV\RedisCache\Redis` now adds both, like
+  XenForo's own Redis provider, in the build and in the requirement table.
+
 ## 1.22.12 (2026-11-28)
 
 - **nginx CPU pinning is commented out, not deleted, and no stray file is

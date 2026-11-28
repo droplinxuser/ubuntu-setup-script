@@ -244,9 +244,15 @@ _pb_redis_needed() { # app root
       [[ -f $oc ]] || return 1
       { grep -qE 'new[[:space:]]+\\?Redis([^A-Za-z0-9_]|$)' "$oc" 2>/dev/null && ! grep -qi 'predis' "$oc" 2>/dev/null; } \
         || grep -qE 'RedisCachePro|Object Cache Pro' "$oc" 2>/dev/null ;;
+    # XenForo's own Redis cache needs phpredis.  The SV RedisCache add-on
+    # (provider SV\RedisCache\Redis, 1.22.13) runs without it on its bundled
+    # Credis client, but uses phpredis and igbinary whenever they are loaded
+    # (measured 1.8 us less per command, sessions half the size), and its
+    # stored sessions are igbinary-encoded: dropping them logs every member
+    # out once.  So it counts as needing both.
     xenforo)
       [[ -f $root/src/config.php ]] && awk '!/^[[:space:]]*(#|\/\/|\*)/' "$root/src/config.php" 2>/dev/null \
-        | grep -qiE "provider[^;]*(['\"]Redis['\"]|Doctrine[\\\\]+Common[\\\\]+Cache[\\\\]+RedisCache)" ;;
+        | grep -qiE "provider[^;]*(['\"]Redis['\"]|Doctrine[\\\\]+Common[\\\\]+Cache[\\\\]+RedisCache|SV[\\\\]+RedisCache[\\\\]+Redis)" ;;
     *) return 1 ;;
   esac
 }

@@ -363,6 +363,18 @@ detect_installed_services() {
 # --dry-run (optimize_plan prints migrate_plan instead).  OPT_SKIP_MIGRATION=1
 # (the closing pass after --domain) only detects and reports: the migration
 # belongs to an explicit --optimize, not to a domain install.
+# Reload PHP_EXT_EXTRA from the tuning file (sourced in a subshell: the file
+# is the one every run sources at startup).  Unchanged when the file is
+# missing or does not set it.
+optimize_reload_php_ext_extra() {
+  local f=${SETUP_TUNING_FILE:-/etc/default/setup-tuning} v
+  [[ -r $f ]] && grep -q '^PHP_EXT_EXTRA=' "$f" 2>/dev/null || return 0
+  # shellcheck disable=SC1090
+  v=$( set +u; unset PHP_EXT_EXTRA; . "$f" >/dev/null 2>&1; printf '%s' "${PHP_EXT_EXTRA-}" ) || return 0
+  PHP_EXT_EXTRA=$v
+  export PHP_EXT_EXTRA
+}
+
 optimize_migration_step() {
   local need=0 note
   OPT_MIGRATE_RC=0
@@ -390,6 +402,11 @@ optimize_migration_step() {
       2) opt_report "- Migration: the nginx part is not done; Angie keeps serving (legacy mode)" ;;
       *) opt_report "- **FAILED** Migration: a part failed or was rolled back (see the lines above and ${MIGRATE_LOG:-/var/log/setup-migrate-1.22.log})" ;;
     esac
+    # The migration (often a detached unit) persisted the modules it kept
+    # in PHP_EXT_EXTRA; this shell still holds the value from before it.
+    # Without the reload a same-run ext=-NAME (PHP_BUILD_EXT_RESET=1) would
+    # rebuild PHP below without them (1.22.13).
+    optimize_reload_php_ext_extra
     detect_installed_services
     (( OPT_MIGRATE_RC == 2 )) && OPT_WEB_LEGACY=1
     # The new services own memory the first plan did not see (or the old

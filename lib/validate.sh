@@ -781,6 +781,9 @@ validate_all() {
     (( PURGE )) && die "--optimize cannot be combined with --purge"
     [[ ${#DOMAINS[@]} -eq 0 ]] || die "--optimize cannot be combined with --domain"
     [[ ${#ENABLED[@]} -eq 0 ]] || die "--optimize scans installed services and cannot be combined with install flags"
+    # --optimize ext=LIST (1.22.13): checked like --php ext= before anything
+    # changes; recorded by run_optimize, then the PHP build follows it.
+    [[ -z ${OPT[php.ext]+set} ]] || php_ext_validate "${OPT[php.ext]}"
     return 0
   fi
 
@@ -948,7 +951,7 @@ validate_all() {
       php_series_supported "${OPT[php.ver]}" \
         || die "--php ver=${OPT[php.ver]}: the source build supports PHP ${PHP_UPGRADE_MIN_SERIES:-8.1} and newer"
     fi
-    [[ -z ${OPT[php.ext]:-} ]] || php_ext_validate "${OPT[php.ext]}"
+    [[ -z ${OPT[php.ext]+set} ]] || php_ext_validate "${OPT[php.ext]}"
     # --php is a first installation.  On a host that already runs PHP-FPM it
     # only re-applies the managed configuration of that version; changing the
     # version is --upgrade-php's job (it carries the extensions and custom

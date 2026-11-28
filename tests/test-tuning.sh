@@ -5396,11 +5396,13 @@ check "the blocker names the site, the extension and the ext= remedy" \
   bash -c 'grep -qF "chevereto at /var/www/chev requires the redis extension" <<<"$1" && grep -qF -- "--php ext=redis" <<<"$1"' _ "$blocker_desc"
 
 # 1.21.56: php-redis is a hard requirement only where something needs it.
-# XenForo's own Redis provider uses the \Redis class; SV RedisCache's Credis
-# client falls back to a pure-PHP connection without the extension.
+# XenForo's own Redis provider uses the \Redis class.  SV RedisCache's Credis
+# client runs without the extension, but uses phpredis and igbinary when
+# loaded and stores igbinary sessions, so since 1.22.13 it counts as needing
+# them (removing them would log every member out).
 printf "\$config['cache']['enabled'] = true;\n\$config['cache']['provider'] = 'SV\\\\RedisCache\\\\Redis';\n\$config['cache']['config'] = ['server' => '/run/valkey/valkey.sock', 'port' => 0];\n" > "$TMP/apps/xf/public/src/config.php"
-check "XenForo with SV RedisCache (Credis, Valkey socket) does not require php-redis" \
-  lacks_ext php_upgrade_app_required_extensions xenforo "$TMP/apps/xf/public"
+check "XenForo with SV RedisCache (Credis, Valkey socket) requires php-redis (1.22.13)" \
+  has_ext php_upgrade_app_required_extensions xenforo "$TMP/apps/xf/public"
 printf "\$config['cache'] = ['enabled' => true, 'provider' => 'Redis', 'config' => ['host' => '127.0.0.1']];\n" > "$TMP/apps/xf/public/src/config.php"
 check "XenForo's core Redis provider in array form requires php-redis" \
   has_ext php_upgrade_app_required_extensions xenforo "$TMP/apps/xf/public"
@@ -5477,7 +5479,12 @@ check "a rebuild that still lacks the module warns with the ext= remedy" \
 check "a Chevereto site whose FPM already loads redis gets nothing" \
   test "$(pe_run chevereto "$TMP/apps/chev/public" "$pe_chev redis imagick" "")" = ""
 printf "\$config['cache']['provider'] = 'SV\\\\RedisCache\\\\Redis';\n" > "$TMP/apps/xf/public/src/config.php"
-check "a XenForo site (SV RedisCache or no cache) gets no rebuild" \
+check "a XenForo site with SV RedisCache whose FPM loads redis gets no rebuild" \
+  test "$(pe_run xenforo "$TMP/apps/xf/public" "mysqli gd curl mbstring xml zip exif redis igbinary" "")" = ""
+check "a XenForo site with SV RedisCache whose build lacks redis gets a refresh rebuild (1.22.13)" \
+  test "$(pe_run xenforo "$TMP/apps/xf/public" "mysqli gd curl mbstring xml zip exif" "mysqli gd curl mbstring xml zip exif redis igbinary")" = "build 8.5 full refresh info"
+printf "\$config['db']['host'] = 'localhost';\n" > "$TMP/apps/xf/public/src/config.php"
+check "a XenForo site with no cache gets no rebuild" \
   test "$(pe_run xenforo "$TMP/apps/xf/public" "mysqli gd curl mbstring xml zip exif" "")" = ""
 check "an unknown module list rebuilds nothing (no guessing)" \
   test "$(pe_run chevereto "$TMP/apps/chev/public" "" "")" = ""

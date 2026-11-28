@@ -552,6 +552,7 @@ R=$TMP/redis
 mk_xf "$R/xf-on" "\$config['cache']['provider'] = 'Redis';"
 mk_xf "$R/xf-lower" "\$config['cache']['provider'] = \"redis\";"
 mk_xf "$R/xf-doctrine" "\$config['cache']['provider'] = 'Doctrine\\Common\\Cache\\RedisCache';"
+mk_xf "$R/xf-sv" "\$config['cache']['provider'] = 'SV\\RedisCache\\Redis';"
 mk_xf "$R/xf-slash" "// \$config['cache']['provider'] = 'Redis';"
 mk_xf "$R/xf-hash" "# \$config['cache']['provider'] = 'Redis';"
 mk_xf "$R/xf-memcached" "\$config['cache']['provider'] = 'Memcached';"
@@ -559,6 +560,7 @@ mk_xf "$R/xf-plain"
 check "xenforo: provider 'Redis' needs redis" test "$(rn xenforo "$R/xf-on")" = 0
 check "xenforo: the provider name is matched case-insensitively" test "$(rn xenforo "$R/xf-lower")" = 0
 check "xenforo: Doctrine's RedisCache class needs redis" test "$(rn xenforo "$R/xf-doctrine")" = 0
+check "xenforo: the SV RedisCache add-on counts as needing redis (1.22.13)" test "$(rn xenforo "$R/xf-sv")" = 0
 check "xenforo: a // commented example does not count" test "$(rn xenforo "$R/xf-slash")" = 1
 check "xenforo: a # commented example does not count" test "$(rn xenforo "$R/xf-hash")" = 1
 check "xenforo: the Memcached provider needs no redis" test "$(rn xenforo "$R/xf-memcached")" = 1
@@ -569,7 +571,7 @@ agree() { # ROOT: _pb_redis_needed and the single table (install mode) agree
   php_upgrade_app_required_extensions xenforo "$1" install | grep -qx redis && b=0
   [[ $a == "$b" ]]
 }
-for x in xf-on xf-lower xf-doctrine xf-slash xf-hash xf-memcached xf-plain; do
+for x in xf-on xf-lower xf-doctrine xf-sv xf-slash xf-hash xf-memcached xf-plain; do
   check "xenforo ${x}: the build and the requirement table agree on redis" agree "$R/$x"
 done
 mk_wp "$R/wp-phpredis"

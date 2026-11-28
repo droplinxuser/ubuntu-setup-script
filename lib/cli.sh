@@ -166,7 +166,10 @@ Domain setup (standalone; nginx + MariaDB must already be installed/running):
       no --purge for domains; remove the files/database manually.
 
 Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
-  --optimize [mitigations=off] [--dry-run]
+  --optimize [mitigations=off] [ext=LIST] [--dry-run]
+      ext=LIST changes the PHP extension set like --php ext= (NAME adds,
+      -NAME drops one, none clears the list) on 22.04, 24.04 and 26.04;
+      the stale build is rebuilt and swapped in by the same run.
       One command for the whole host.  It synchronizes nginx's /etc/nginx
       tree from server-configs-nginx (or CONFIG_SOURCE_DIR), applies the
       hardware-aware OS profile (CPU governor, PAM security limits, and
@@ -191,7 +194,11 @@ Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
       configuration it replaces is kept in /var/backups/setup-1.22.  A
       blocked part (an Angie-only directive, an extension the build cannot
       provide) is reported and left serving as before; below the 4 GB class
-      only nginx is migrated.  --dry-run prints the migration plan.
+      only nginx is migrated.  PHP is built minimal: only the extensions a
+      detected application requires (plus imagick when Sury loaded it, and
+      the operator's ext=); every other module Sury loaded is dropped and
+      listed (--optimize ext=NAME adds one back).  --dry-run prints the
+      migration plan.
       It also never
       touches the resolver (DNS), the firewall (UFW) or swap: those are
       --basic decisions and stay as the operator left them.  Allocations
@@ -620,9 +627,12 @@ parse_args() {
         ;;
       --optimize)
         OPTIMIZE=1; shift
-        while (( $# )) && [[ $1 == anubis=* || $1 == mitigations=* ]]; do
+        while (( $# )) && [[ $1 == anubis=* || $1 == mitigations=* || $1 == ext=* ]]; do
           case $1 in
             anubis=*) anubis_gone ;;
+            # 1.22.13: the PHP extension set on any supported release
+            # (--php needs 26.04): same NAME, -NAME and none as --php ext=.
+            ext=*)    OPT[php.ext]=${1#*=} ;;
             *)        mitigations_set "${1#*=}" ;;
           esac
           shift

@@ -385,18 +385,19 @@ php_upgrade_app_required_extensions() {
       fi
       ;;
     xenforo)
-      # Only XenForo's own Redis cache provider (`'provider' => 'Redis'`,
+      # XenForo's own Redis cache provider (`'provider' => 'Redis'`,
       # Doctrine's RedisCache on the \Redis class) needs the extension.  The
-      # stock config.php ships commented examples, which do not count, and
-      # the SV RedisCache add-on talks to Redis or Valkey through its bundled
-      # Credis client, which falls back to a pure-PHP connection when the
-      # extension is absent (`standalone = !extension_loaded('redis')`).
+      # stock config.php ships commented examples, which do not count.  The
+      # SV RedisCache add-on (provider SV\RedisCache\Redis) falls back to a
+      # pure-PHP Credis connection without phpredis, but uses phpredis and
+      # igbinary when loaded (faster, sessions half the size) and stores
+      # igbinary-encoded sessions, so it counts too (1.22.13).
       # grep reads all of awk's output (no -q): under pipefail an early
       # grep -q exit can SIGPIPE awk on a busy host and turn a match into a
       # miss (seen on a loaded test host).
       if [[ -f $root/src/config.php ]] \
          && awk '!/^[[:space:]]*(#|\/\/|\*)/' "$root/src/config.php" \
-            | grep -iE "provider[^;]*(['\"]Redis['\"]|Doctrine[\\\\]+Common[\\\\]+Cache[\\\\]+RedisCache)" >/dev/null; then
+            | grep -iE "provider[^;]*(['\"]Redis['\"]|Doctrine[\\\\]+Common[\\\\]+Cache[\\\\]+RedisCache|SV[\\\\]+RedisCache[\\\\]+Redis)" >/dev/null; then
         redis=1
       fi
       ;;

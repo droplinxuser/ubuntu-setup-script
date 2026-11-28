@@ -487,6 +487,15 @@ run_env fail SETUP_CPU_MITIGATIONS=sometimes --dry-run --optimize
 run_env_msg fail SETUP_CPU_MITIGATIONS=on "mitigations=on (SETUP_CPU_MITIGATIONS=on) was removed" --dry-run --optimize
 run_env_msg fail SETUP_CPU_MITIGATIONS=1 "was removed in 1.22.5" --dry-run --basic
 run fail --dry-run --optimize anubis=1
+# 1.22.13: --optimize ext=LIST changes the PHP extension set on any release.
+run ok   --dry-run --optimize ext=-calendar,-gettext,-shmop,-ftp,-pdo,-pdo_mysql,-xmlreader
+run ok   --dry-run --optimize mitigations=off ext=imagick
+run ok   --dry-run --optimize ext=none
+run_msg "cannot compile this extension" --dry-run --optimize ext=xsl
+run_msg "is not an extension name" --dry-run --optimize 'ext=bad;name'
+run_msg "requires a list" --dry-run --optimize ext=
+run_msg "cannot be combined with other names" --dry-run --optimize ext=none,intl
+run fail --dry-run --optimize anubis=yes ext=imagick
 run fail --dry-run --basic anubis=yes
 run fail --dry-run --basic --nginx anubis=maybe
 run fail --dry-run --basic --php anubis=yes

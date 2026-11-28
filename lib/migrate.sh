@@ -1417,6 +1417,54 @@ migrate_php_app_required_exts() {
   return 0
 }
 
+# The source build is minimal (1.22.13).  Of the buildable modules Sury
+# loads for version V (the NAMES), only those still wanted are kept:
+#   - in the build's own set for the detected applications (their ext sets,
+#     C's requirement lists, the Redis and SQLite scans), computed with no
+#     operator extras and no previous build;
+#   - on C's preflight requirement lists (broader than the build's);
+#   - imagick (only ever there because the operator installed it);
+#   - named by the operator: PHP_EXT_EXTRA before the migration, or a NAME
+#     in --optimize ext= (a -NAME there drops it unless an application needs
+#     it; none drops every extra).
+# Prints "keep NAME" / "drop NAME".  When the requirement lists, the build's
+# set or any detected application are missing nothing can be ruled out, so
+# every module is kept (as before 1.22.13).  MIGRATE_PHP_MINIMAL=0 keeps all.
+migrate_php_minimal_split() {
+  local v=$1 e t need eff tree
+  shift
+  local -A appset=() want=()
+  tree=$(migrate_php_detect_tree)
+  if [[ ${MIGRATE_PHP_MINIMAL:-1} != 1 ]] \
+     || ! declare -F php_build_effective_exts >/dev/null 2>&1 \
+     || ! declare -F php_build_detect_apps >/dev/null 2>&1 \
+     || ! need=$(migrate_php_app_required_exts) \
+     || [[ -z $(PHP_EXT_DETECT_TREE=$tree php_build_detect_apps 2>/dev/null | head -n 1) ]] \
+     || ! eff=$(PHP_EXT_EXTRA='' PHP_BUILD_EXT_RESET=1 PHP_EXT_DETECT_TREE=$tree php_build_effective_exts "$v" 2>/dev/null); then
+    for e; do printf 'keep %s\n' "$e"; done
+    return 0
+  fi
+  for e in $(printf '%s\n%s\n' "$eff" "$need" | tr ', ' '\n\n' | tr '[:upper:]' '[:lower:]'); do appset[$e]=1; done
+  want[imagick]=1
+  t=${PHP_EXT_EXTRA:-}
+  for e in ${t//,/ }; do want[${e,,}]=1; done
+  # This run's --optimize ext= (the detached unit gets it from the
+  # environment: its own command line has none).
+  t=${OPT[php.ext]:-${SETUP_OPTIMIZE_PHP_EXT:-}}; t=${t,,}
+  if [[ $t == none ]]; then
+    want=()
+  else
+    for e in ${t//,/ }; do
+      if [[ $e == -* ]]; then unset "want[${e#-}]"; else want[$e]=1; fi
+    done
+  fi
+  for e; do
+    if [[ -n ${appset[$e]:-} || -n ${want[$e]:-} ]]; then printf 'keep %s\n' "$e"
+    else printf 'drop %s\n' "$e"; fi
+  done
+  return 0
+}
+
 # Merge NAMES into PHP_EXT_EXTRA (persisted, comma list) so the effective
 # set keeps them; the operator trims later with --php ext= (R2.9).
 migrate_php_persist_exts() {
@@ -1581,6 +1629,27 @@ migrate_preflight() {
         unbuildable) unb_fpm+=("$line") ;;
       esac
     done < <(migrate_php_ext_union "$v")
+    # 1.22.13: minimal build; modules no application needs are dropped.
+    local -a dropped=()
+    # A split that fails or loses a name keeps every module (never drop
+    # extensions because of a bug here).
+    if (( ${#keep[@]} )); then
+      local -a kept=()
+      local split=""
+      if split=$(migrate_php_minimal_split "$v" "${keep[@]}" 2>/dev/null); then
+        while read -r e line; do
+          case $e in
+            keep) kept+=("$line") ;;
+            drop) dropped+=("$line") ;;
+          esac
+        done <<<"$split"
+      fi
+      if (( ${#kept[@]} + ${#dropped[@]} == ${#keep[@]} )); then
+        keep=("${kept[@]}")
+      else
+        dropped=()
+      fi
+    fi
     # Rev3 step 3 (R41, R58): a module the build cannot provide refuses the
     # version only when a detected application requires it; otherwise it is
     # dropped with a warning (ffi from php-common, xsl; imagick is buildable since 1.22.11 and kept).
@@ -1595,6 +1664,7 @@ migrate_preflight() {
     fi
     if (( dry )); then
       printf '  PHP %s: Sury -> source build; modules kept (FPM and CLI): %s\n' "$v" "${keep[*]:-none}"
+      (( ${#dropped[@]} )) && printf '    not required by a detected application, not built (minimal; --optimize ext=NAME keeps one): %s\n' "${dropped[*]}"
       (( ${#unb_fpm[@]} )) && printf '    modules that cannot be built: %s\n' "${unb_fpm[*]}"
       (( ${#unb_req[@]} )) && printf '    required by an application and unbuildable: %s%s\n' "${unb_req[*]}" \
         "$([[ ${SETUP_PHP_ALLOW_MISSING_EXT:-0} == 1 ]] && echo ' (dropped: SETUP_PHP_ALLOW_MISSING_EXT=1)' || echo ' -> this version is REFUSED')"
@@ -1617,6 +1687,7 @@ migrate_preflight() {
       continue
     fi
     (( ${#unb_fpm[@]} )) && migrate_warn "PHP ${v}: modules the source build cannot provide are dropped (no detected application requires them): ${unb_fpm[*]}"
+    (( ${#dropped[@]} )) && migrate_warn "PHP ${v}: modules Sury loaded that no detected application requires are not built (minimal): ${dropped[*]} (--optimize ext=NAME adds one back)"
     migrate_php_persist_exts "${keep[@]}"
     migrate_note "PHP ${v}: extensions loaded today kept in PHP_EXT_EXTRA: ${keep[*]:-none}"
     MIGRATE_PHP_TODO+=("$v")
@@ -3818,7 +3889,11 @@ migrate_unit_main() {
 # Environment the unit needs from this run.
 MIGRATE_PASS_ENV=(CONFIG_SOURCE_DIR CONFIG_REPO_REF CONFIG_REPO_URL SETUP_PHP_ALLOW_COLLATERAL
                   SETUP_PHP_ALLOW_MISSING_EXT SETUP_STATE_DIR SETUP_CF_SELF_SIGNED SETUP_TUNING_FILE
-                  SETUP_MIGRATE_LOCK_WAIT SETUP_MIGRATE_RETRY)
+                  SETUP_MIGRATE_LOCK_WAIT SETUP_MIGRATE_RETRY
+                  MIGRATE_PHP_MINIMAL SETUP_OPTIMIZE_PHP_EXT)
+# (1.22.13: the minimal PHP keep runs in the unit and must see the opt-out
+# and this run's --optimize ext=, which the parent exports as
+# SETUP_OPTIMIZE_PHP_EXT.)
 
 migrate_can_detach() {
   [[ ${SETUP_MIGRATE_DETACH:-1} == 1 ]] || return 1
