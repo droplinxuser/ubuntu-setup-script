@@ -531,7 +531,7 @@ bs() ( # SANDBOX VER -> rc=
   php_build_unit_text 9.8 > "$PHP_BUILD_UNIT_DIR/php9.8-fpm.service"
   STUB_ENABLED="php9.7-fpm php9.8-fpm"
   STUB_ACTIVE="php9.8-fpm"
-  PHP_BUILD_CHANGED=0
+  PHP_BUILD_CHANGED=${BS_CHANGED:-0}; PHP_BUILD_UNIT_CHANGED=${BS_UNIT:-0}
   php_build_start "$2" bs_report >/dev/null 2>&1 || rc=$?
   printf 'rc=%s\n' "$rc"
 )
@@ -542,6 +542,15 @@ check "php_build_start: every other version of ours is disabled --now" file_has 
 check "php_build_start: the kept version is reported for --upgrade-php" file_has "$BS/stub.log" "kept for --upgrade-php=9.7"
 check "php_build_start: the active version is enabled" file_has "$BS/stub.log" "systemctl enable php9.8-fpm"
 check "php_build_start: an unchanged running build is not restarted" file_lacks "$BS/stub.log" "restart php9.8-fpm"
+# 1.22.18: a changed build (binary, ini, pools) is applied by a reload;
+# only a changed unit file or drop-in restarts.
+BS3=$TMP/start-changed
+out=$(BS_CHANGED=1 bs "$BS3" 9.8) || true
+check "php_build_start: a changed build is reloaded, not restarted" \
+  bash -c 'grep -qF "reload php9.8-fpm" "$1" && ! grep -qF "restart php9.8-fpm" "$1"' _ "$BS3/stub.log"
+BS4=$TMP/start-unit-changed
+out=$(BS_CHANGED=1 BS_UNIT=1 bs "$BS4" 9.8) || true
+check "php_build_start: a changed unit file restarts" file_has "$BS4/stub.log" "restart php9.8-fpm"
 BS2=$TMP/start-inactive
 out=$(bs "$BS2" 9.7) || true
 check "php_build_start: an inactive version is never enabled" file_lacks "$BS2/stub.log" "systemctl enable php9.7-fpm"

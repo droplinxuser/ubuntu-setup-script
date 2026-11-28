@@ -8,6 +8,17 @@ Reports of the 1.21.33-1.21.61 cycles that measured the removed Anubis
 filter were deleted from the tree on 2026-11-23 for the same reason;
 `git show <commit>:<path>` recovers them.
 
+## 1.22.19 (2026-11-29)
+
+- **The restart right after a new PHP build is gone too.**  The 1.22.18
+  run on a live board swapped the new build in by a clean reload, and two
+  seconds later the build step's start-up check restarted PHP-FPM anyway
+  because "something changed" (7 requests answered 502).  The build step
+  now tells a changed unit file or drop-in (which systemd applies only to
+  a new process: restart) from everything else, a new binary, `php.ini`,
+  `conf.d` and pool files, which a verified graceful reload applies with
+  the socket kept.
+
 ## 1.22.18 (2026-11-29)
 
 - **PHP binary swaps and the post-removal check no longer drop requests.**

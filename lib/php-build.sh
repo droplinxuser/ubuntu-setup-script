@@ -58,6 +58,10 @@ PHP_BUILD_OFF_MARK="; setup-1.22-off: "
 # apt.llvm.org source the tools add (removed with the last build).
 PHP_BUILD_LLVM_FILES=(/etc/apt/sources.list.d/setup-llvm.sources /etc/apt/preferences.d/setup-llvm.pref /etc/apt/keyrings/setup-llvm.asc)
 PHP_BUILD_CHANGED=0
+# Set with PHP_BUILD_CHANGED when the unit file or its drop-ins changed:
+# only those need a restart (systemd applies them only to a new process);
+# everything else (a binary, ini, pools) is applied by a reload (1.22.18).
+PHP_BUILD_UNIT_CHANGED=0
 
 # ---------------------------------------------------------------------------
 # Extension sets (REVISION 3)
@@ -818,9 +822,10 @@ php_build_unit_write() { # X.Y
     [[ -f $d/$b ]] || continue
     mv -f "$d/$b" "$(_pb_backup_dir "php-${ver}-dropins-$(date -u +%Y%m%d-%H%M%S)")/$b"
     PHP_BUILD_CHANGED=1
+    PHP_BUILD_UNIT_CHANGED=1
   done
   rmdir "$d" 2>/dev/null || true
-  _pb_write "$f" 644 "$(php_build_unit_text "$ver")" || true
+  if _pb_write "$f" 644 "$(php_build_unit_text "$ver")"; then PHP_BUILD_UNIT_CHANGED=1; fi
   systemctl daemon-reload 2>/dev/null || true
 }
 
@@ -1354,7 +1359,17 @@ php_build_start() { # X.Y OUT
   systemctl enable "php${ver}-fpm" >/dev/null 2>&1 || true
   if systemctl is-active --quiet "php${ver}-fpm" 2>/dev/null; then
     (( PHP_BUILD_CHANGED )) || return 0
-    systemctl restart "php${ver}-fpm" || { _pb_report "$out" "- **FAILED** PHP ${ver}: php${ver}-fpm did not restart (systemctl status php${ver}-fpm)"; return 1; }
+    # A new binary was already swapped in by the tool's activate (a reload
+    # since 1.22.18); ini and pool changes are applied by a reload too, which
+    # keeps the socket bound.  Only a changed unit file or drop-in needs the
+    # restart (it removed the socket for a moment: nginx 502s, 7 requests on
+    # a live board right after the activate's clean reload).
+    if (( ! PHP_BUILD_UNIT_CHANGED )) && declare -F php_fpm_reload_verified >/dev/null 2>&1 \
+       && php_fpm_reload_verified "$ver"; then
+      :
+    else
+      systemctl restart "php${ver}-fpm" || { _pb_report "$out" "- **FAILED** PHP ${ver}: php${ver}-fpm did not restart (systemctl status php${ver}-fpm)"; return 1; }
+    fi
   else
     systemctl reset-failed "php${ver}-fpm" >/dev/null 2>&1 || true
     systemctl start "php${ver}-fpm" || { _pb_report "$out" "- **FAILED** PHP ${ver}: php${ver}-fpm did not start (systemctl status php${ver}-fpm)"; return 1; }
@@ -1390,7 +1405,7 @@ php_build_ensure() { # X.Y MODE CONTEXT OUT
     return 1
   fi
   php_build_install_support || { _pb_report "$out" "- **FAILED** PHP ${ver}: build support files missing from this checkout"; return 1; }
-  PHP_BUILD_CHANGED=0
+  PHP_BUILD_CHANGED=0; PHP_BUILD_UNIT_CHANGED=0
   if [[ $mode != activate ]]; then
     # --php ext=LIST of this run (lib/validate.sh php_ext_request_apply:
     # records PHP_EXT_EXTRA and PHP_BUILD_EXT_RESET; idempotent, a no-op in
