@@ -336,8 +336,12 @@ tune_replace() {
   fi
   tmp=$(tmp_file) || return 1
   # Use a delimiter that does not collide with regex alternation (`|`) or
-  # common path characters in these directives.
-  sed -E "s#${pattern}#${replacement}#" "$file" > "$tmp" || return 1
+  # common path characters in these directives.  A '#' in either part is
+  # escaped (1.22.12): the CPU-pinning comment "\1# worker_cpu_affinity
+  # auto; # setup.sh: ..." ended the s command early, its " w..." tail ran
+  # as sed's w flag (a junk file named "orker_cpu_affinity ..." in the
+  # working directory) and the directive was deleted instead of commented.
+  sed -E "s#${pattern//#/\\#}#${replacement//#/\\#}#" "$file" > "$tmp" || return 1
   commit_if_changed "$file" "$tmp" && tune_note "$desc"
   return 0
 }

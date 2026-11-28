@@ -8,6 +8,19 @@ Reports of the 1.21.33-1.21.61 cycles that measured the removed Anubis
 filter were deleted from the tree on 2026-11-23 for the same reason;
 `git show <commit>:<path>` recovers them.
 
+## 1.22.12 (2026-11-28)
+
+- **nginx CPU pinning is commented out, not deleted, and no stray file is
+  written.**  On a host with several NUMA nodes or a CPU quota,
+  `--optimize` comments `worker_cpu_affinity auto;` out with a note.  The
+  note contains `#`, the delimiter of `tune_replace`'s sed command: sed
+  ended the substitution early, deleted the directive, and ran the rest of
+  the note as its `w` flag, writing a file named `orker_cpu_affinity auto;
+  # setup.sh: 2 NUMA nodes, no pinning#` into the working directory (found
+  in `/root` on a live 2-node EPYC host).  `tune_replace` now escapes `#`
+  in the pattern and the replacement.  nginx ran unpinned either way, as
+  intended.
+
 ## 1.22.11 (2026-11-28)
 
 - **imagick is an optional PHP extension** (operator request; never

@@ -1060,6 +1060,21 @@ check "tune_replace rewrites a matching directive" \
 check "tune_replace marks configuration dirty" test "$TUNE_DIRTY" -eq 1
 check "tune_replace records the change" test "${#TUNE_CHANGES[@]}" -eq 1
 
+# 1.22.12: a '#' in the replacement (the CPU-pinning comment) ended the sed
+# command early; its " w..." tail ran as sed's w flag (a junk file in the
+# working directory) and the directive was deleted instead of commented.
+pin_cwd=$(mktemp -d "$TMP/pin-cwd.XXXXXX")
+printf 'worker_processes 4;\n    worker_cpu_affinity auto;\nevents {}\n' > "$TMP/pin-nginx.conf"
+( cd "$pin_cwd" && tune_replace "$TMP/pin-nginx.conf" '^([[:space:]]*)worker_cpu_affinity[[:space:]]+auto;' \
+    "\\1# worker_cpu_affinity auto; # setup.sh: 2 NUMA nodes, no pinning" "nginx.conf: worker_cpu_affinity disabled (test)" )
+check "tune_replace: a '#' in the replacement comments the directive out (not deleted)" \
+  grep -qxF '    # worker_cpu_affinity auto; # setup.sh: 2 NUMA nodes, no pinning' "$TMP/pin-nginx.conf"
+check "tune_replace: a '#' in the replacement writes no stray file (sed w flag)" \
+  test -z "$(ls -A "$pin_cwd")"
+printf 'a = 1 # old\n' > "$TMP/pin-hash.conf"
+tune_replace "$TMP/pin-hash.conf" '^a = 1 # old$' 'a = 2 # new' "hash in pattern"
+check "tune_replace: a '#' in the pattern matches literally" grep -qxF 'a = 2 # new' "$TMP/pin-hash.conf"
+
 tune_reset_changes
 tune_replace "$TMP/pool.conf" 'absent_directive = [0-9]+' 'absent_directive = 1' "missing test"
 check "tune_replace records a miss instead of failing silently" \
