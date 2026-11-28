@@ -348,9 +348,31 @@ php_upgrade_app_requirements() {
     # signature checks); redis only with an object-cache drop-in, below.
     wordpress) printf '%s\n' mysqli gd curl mbstring exif zip xml sodium ;;
     # XenForo 2.3: xml_parser_* in the importers and add-on XML, zip for
-    # add-on archives, exif for attachment rotation.
-    xenforo)   printf '%s\n' mysqli gd curl mbstring xml zip exif ;;
+    # add-on archives, exif for attachment rotation; gmp for push
+    # notifications (minishlink/web-push calls gmp_strval unguarded; push is
+    # on by default) and sodium for passkeys and the JWT keys (web-token,
+    # lbuchs/webauthn) (1.22.15).  Add-ons' own php-ext requirements: below.
+    xenforo)   printf '%s\n' mysqli gd curl mbstring xml zip exif gmp sodium ;;
   esac
+}
+
+# PHP extensions the installed XenForo add-ons declare ("php-ext/NAME" in
+# the "require" block of addon.json: XenForo refuses to install or upgrade
+# such an add-on without it, e.g. ThemeHouse Holidays needs calendar),
+# lower-case, one per line (1.22.15).  Only names the source build can
+# compile are printed: a core module is always there, and an unbuildable
+# name would fail every build instead of being reported.
+php_upgrade_xf_addon_exts() {
+  local root=$1 f n
+  for f in "$root"/src/addons/*/addon.json "$root"/src/addons/*/*/addon.json; do
+    [[ -f $f ]] || continue
+    grep -oE '"php-ext/[A-Za-z0-9_]+"' "$f" 2>/dev/null || true
+  done | sed -E 's#"php-ext/([A-Za-z0-9_]+)"#\1#' | tr '[:upper:]' '[:lower:]' | sort -u \
+    | while read -r n; do
+        if declare -F php_build_ext_buildable >/dev/null 2>&1; then php_build_ext_buildable "$n" || continue; fi
+        printf '%s\n' "$n"
+      done
+  return 0
 }
 
 # Print the required extension list for one app/root pair, adding redis (and
@@ -400,6 +422,14 @@ php_upgrade_app_required_extensions() {
             | grep -iE "provider[^;]*(['\"]Redis['\"]|Doctrine[\\\\]+Common[\\\\]+Cache[\\\\]+RedisCache|SV[\\\\]+RedisCache[\\\\]+Redis)" >/dev/null; then
         redis=1
       fi
+      # A data/internal_data filesystem on Flysystem's FTP adapter needs ftp
+      # (1.22.15; same no -q pattern as above).
+      if [[ -f $root/src/config.php ]] \
+         && awk '!/^[[:space:]]*(#|\/\/|\*)/' "$root/src/config.php" \
+            | grep -iE 'Adapter[\\]+Ftp|ftp://' >/dev/null; then
+        printf 'ftp\n'
+      fi
+      php_upgrade_xf_addon_exts "$root"
       ;;
   esac
   if (( redis )); then printf '%s\n' redis igbinary; fi

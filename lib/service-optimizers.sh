@@ -2696,9 +2696,22 @@ optimize_plan() {
     "$governor_desc" "$nproc" "$ram_mb"
   printf '  Legacy repair: nightly cron chown and /var/www/logs ownership\n'
   printf '  Security: wp-config 640, scoped DB users, malware quarantine, OS/SSH/firewall audit\n'
-  if [[ -n ${OPT[php.ext]:-} ]]; then
-    printf '  PHP extensions: ext=%s would be recorded (PHP_EXT_EXTRA now: %s); the PHP build below then follows the new set\n' \
-      "${OPT[php.ext]}" "${PHP_EXT_EXTRA:-none}"
+  # What the run would record and build (ext=, then the one-time leftover
+  # removal), computed in a subshell without persisting (1.22.15: the plan
+  # used to show only the old list).
+  if [[ -n ${OPT[php.ext]:-} || ${PHP_EXT_PRUNED:-0} != 1 ]] && declare -F php_ext_prune_leftovers >/dev/null 2>&1; then
+    local ext_plan ext_new ext_prune ext_set
+    ext_plan=$( persist_tuning_var() { :; }; _pb_note() { :; }
+      if [[ -n ${OPT[php.ext]:-} ]]; then php_build_ext_option "${OPT[php.ext]}" >/dev/null 2>&1 || exit 1; fi
+      php_ext_prune_leftovers >/dev/null 2>&1
+      printf '%s\n%s\n%s\n' "${PHP_EXT_EXTRA:-none}" "$PHP_EXT_PRUNE_LIST" \
+        "$( [[ -n $(php_active_version 2>/dev/null) ]] && php_build_effective_exts 2>/dev/null)" ) || ext_plan=""
+    { read -r ext_new; read -r ext_prune; read -r ext_set; } <<<"$ext_plan" || true
+    [[ -n ${OPT[php.ext]:-} ]] && printf '  PHP extensions: ext=%s would be recorded (PHP_EXT_EXTRA now: %s -> %s)\n' \
+      "${OPT[php.ext]}" "${PHP_EXT_EXTRA:-none}" "${ext_new:-?}"
+    [[ -n $ext_prune ]] && printf '  PHP extensions: 1.21 migration leftovers would leave PHP_EXT_EXTRA (once): %s\n' "$ext_prune"
+    [[ -n $ext_set && ( -n ${OPT[php.ext]:-} || -n $ext_prune ) ]] \
+      && printf '  PHP extensions: the next build of the active version would carry: %s\n' "$ext_set"
   fi
   if declare -F migrate_plan >/dev/null 2>&1; then
     migrate_plan || true

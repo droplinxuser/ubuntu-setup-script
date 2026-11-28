@@ -1455,7 +1455,11 @@ migrate_php_minimal_split() {
     want=()
   else
     for e in ${t//,/ }; do
-      if [[ $e == -* ]]; then unset "want[${e#-}]"; else want[$e]=1; fi
+      case $e in
+        minimal) want=(); want[imagick]=1 ;;
+        -*)      unset "want[${e#-}]" ;;
+        *)       want[$e]=1 ;;
+      esac
     done
   fi
   for e; do

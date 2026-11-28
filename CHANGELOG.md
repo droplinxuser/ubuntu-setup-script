@@ -8,6 +8,48 @@ Reports of the 1.21.33-1.21.61 cycles that measured the removed Anubis
 filter were deleted from the tree on 2026-11-23 for the same reason;
 `git show <commit>:<path>` recovers them.
 
+## 1.22.15 (2026-11-28)
+
+- **XenForo builds are minimal and complete.**  A code scan of three live
+  XenForo 2.2/2.3 installs with their add-ons found the script's XenForo
+  set short: push notifications (on by default; 216-239 subscribers on
+  the scanned forums) call `gmp_strval` without a check in
+  minishlink/web-push, and passkeys and the JWT keys call sodium.  The set
+  is now mysqli gd curl mbstring xml zip exif gmp sodium (redis and
+  igbinary with a Redis cache, as before), and every `php-ext/NAME` an
+  installed add-on declares in its `addon.json` (XenForo refuses to
+  install or upgrade such an add-on without it; ThemeHouse Holidays
+  needs calendar) is built too.  Only names the build can compile are
+  taken, so an add-on naming an unbuildable module never fails a build.
+- **Migration leftovers leave the build once, on XenForo hosts.**  Hosts
+  migrated before 1.22.13 still carried every module Sury loaded in
+  `PHP_EXT_EXTRA`.  On a host that serves only XenForo (every vhost root
+  present), the next `--optimize` removes, of the names its migration log
+  shows the migration wrote, calendar, ftp, gettext, pdo,
+  pdo_mysql, shmop, sockets, sysvmsg, sysvsem, sysvshm and xmlreader from
+  it (unused by XenForo and its add-ons in the scan; only library code
+  XenForo does not load references them) and adds them to `PHP_EXT_DROP`,
+  which only stops the current build from carrying them over, so PHP is
+  rebuilt without them while the rest of the build is still carried over
+  and a name XenForo, an add-on or a later `ext=NAME` needs is still
+  built.  ftp counts as a XenForo requirement while `config.php` names an
+  FTP adapter.  `PHP_EXT_DROP` clears itself once the active build has
+  none of its names.  `PHP_EXT_PRUNED=1` records the run.  Hosts with
+  WordPress or another application, and names the operator added, are
+  left alone; xmlwriter stays (XenForo's Braintree
+  payment provider).  A multi-lens review with adversarial verification
+  (two rounds) replaced a first design that used a full build reset (it
+  could drop an application's modules after a transient detection miss),
+  pruned mixed hosts and operator-added names, and kept the drop list for
+  good.
+- **`--optimize ext=minimal`** (also `--php ext=minimal`) drops every
+  extra except imagick, so the build carries only what the detected
+  applications need; names after it are added on top
+  (`ext=minimal,intl`).
+- The `--optimize --dry-run` plan shows what `ext=` and the leftover
+  removal would record and the extension set the next build would carry
+  (it used to show only the old list).
+
 ## 1.22.14 (2026-11-28)
 
 - **Application tables on MyISAM, Aria and MEMORY move to InnoDB.**  Those

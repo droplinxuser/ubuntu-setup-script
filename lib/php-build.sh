@@ -129,7 +129,7 @@ php_build_app_exts() { # app
   case $1 in
     chevereto) printf '%s\n' pdo_mysql pdo mysqli redis igbinary gd curl mbstring exif fileinfo xmlwriter zip ;;
     wordpress|wp) printf '%s\n' mysqli gd curl mbstring exif zip xml sodium ;;
-    xenforo|xf) printf '%s\n' mysqli gd curl mbstring xml zip exif ;;
+    xenforo|xf) printf '%s\n' mysqli gd curl mbstring xml zip exif gmp sodium ;;
     # shlink's ID generator needs gmp (R62).
     shlink) printf '%s\n' "${PHP_GENERIC_EXTS[@]}" gmp ;;
     *) printf '%s\n' "${PHP_GENERIC_EXTS[@]}" ;;
@@ -338,7 +338,8 @@ _pb_prev_union() { # X.Y
 #   version's when X.Y is another one: _pb_prev_union): detection only
 #   ADDS (R11), so a transient miss (unmounted volume, unreadable config,
 #   scan timeout) never shrinks a live build.  PHP_BUILD_EXT_RESET=1 (an explicit --php ext=none
-#   / ext=-NAME, or a removed --domain) drops that last input.
+#   / ext=-NAME, or a removed --domain) drops that last input; PHP_EXT_DROP
+#   removes only the names it lists from it.
 # A host with no application and no previous build (a bare --php) gets the
 # union of the three applications' sets, today's lean APP_MODULES list, so a
 # site dropped in later does not 500.
@@ -382,7 +383,13 @@ php_build_effective_exts() { # [X.Y]
     set[$name]=1
   done
   if [[ ${PHP_BUILD_EXT_RESET:-0} != 1 ]]; then
+    # PHP_EXT_DROP (1.22.15, php_ext_prune_leftovers) names modules the
+    # current build may not carry over by itself; an application's set and
+    # PHP_EXT_EXTRA above still add them.
+    local -A dropset=()
+    for name in $(_pb_norm "${PHP_EXT_DROP:-}"); do dropset[$name]=1; done
     for name in "${!prevset[@]}"; do
+      [[ -n ${dropset[$name]:-} ]] && continue
       if _pb_retired "$name"; then
         _pb_warn "PHP${ver:+ ${ver}}: ${name} is no longer a build option; the next build leaves it out"
         continue
@@ -445,9 +452,103 @@ php_build_requirements_missing() { # set-csv
   return "$rc"
 }
 
+# Leftovers of the 1.21 -> 1.22 migration (1.22.15).  Before 1.22.13 the
+# migration kept every module Sury loaded in PHP_EXT_EXTRA, so a migrated
+# host still builds Sury's defaults.  On XenForo (a code scan of three live
+# XenForo 2.2/2.3 installs with their add-ons) these are never called, or
+# only by library code XenForo does not load:
+PHP_EXT_LEFTOVERS=(calendar ftp gettext pdo pdo_mysql shmop sockets sysvmsg sysvsem sysvshm xmlreader)
+# Removed once, by the next --optimize, and only where that is known safe:
+#   - only a name the migration itself wrote: its log line "extensions
+#     loaded today kept in PHP_EXT_EXTRA: ..." (MIGRATE_LOG) must list it,
+#     so a name the operator added (and Sury never loaded) stays;
+#   - every detected application is XenForo, and every vhost root exists
+#     (a missing root could hide a WordPress site, which may need ftp or
+#     sockets for FS_METHOD or XMLReader for a plugin): a mixed host keeps
+#     them and the operator trims with --optimize ext=minimal or ext=-NAME;
+#   - a name this run's ext= asks for stays.
+# The names leave PHP_EXT_EXTRA and go to PHP_EXT_DROP, which only stops
+# the current build from carrying them over (php_build_effective_exts): an
+# application's set (its add-ons' php-ext requirements, ftp for an FTP
+# adapter) and a later ext=NAME still add them.  No PHP_BUILD_EXT_RESET:
+# the rest of the current build is still carried over.  PHP_EXT_DROP
+# clears itself once the active build no longer has any of its names
+# (php_ext_drop_settle), so a later --domain app= keeps its usual
+# carry-over.  PHP_EXT_PRUNED=1 records the run.  Sets PHP_EXT_PRUNE_LIST
+# to the removed names (call it directly, not in $( ): the exports must
+# reach this shell); DRY=1 changes nothing.
+PHP_EXT_PRUNE_LIST=""
+php_ext_prune_leftovers() { # [dry]
+  local dry=${1:-0} name app root any=0 only_xf=1 t file line
+  local log=${MIGRATE_LOG:-${SETUP_MIGRATE_LOG:-/var/log/setup-migrate-1.22.log}}
+  local -A extra=() asked=() drop=() sury=()
+  local -a gone=()
+  PHP_EXT_PRUNE_LIST=""
+  [[ ${PHP_EXT_PRUNED:-0} == 1 ]] && return 0
+  line=$(grep -h 'extensions loaded today kept in PHP_EXT_EXTRA:' "$log" 2>/dev/null | tail -n 1 || true)
+  [[ -n $line ]] || return 0
+  for name in $(_pb_norm "${line##*PHP_EXT_EXTRA:}"); do sury[$name]=1; done
+  for t in "${PHP_BUILD_NGINX:-/etc/nginx}" ${PHP_EXT_DETECT_TREE:-}; do
+    [[ -d $t/conf.d ]] || continue
+    for file in "$t"/conf.d/*.conf; do
+      [[ -f $file ]] || continue
+      root=$(_pb_vhost_root "$file")
+      [[ -z $root || -d $root ]] || return 0
+    done
+  done
+  while IFS=$'\t' read -r app root; do
+    [[ -n $app ]] || continue
+    any=1
+    [[ $app == xenforo ]] || only_xf=0
+  done < <(php_build_detect_apps 2>/dev/null)
+  (( any && only_xf )) || return 0
+  for name in $(_pb_norm "${PHP_EXT_EXTRA:-}"); do extra[$name]=1; done
+  for name in $(_pb_norm "${OPT[php.ext]:-}"); do
+    case $name in -*|minimal|none) ;; *) asked[$name]=1 ;; esac
+  done
+  for name in "${PHP_EXT_LEFTOVERS[@]}"; do
+    if [[ -n ${extra[$name]:-} && -n ${sury[$name]:-} && -z ${asked[$name]:-} ]]; then gone+=("$name"); fi
+  done
+  # shellcheck disable=SC2034  # read by run_optimize and the dry-run plan
+  PHP_EXT_PRUNE_LIST="${gone[*]}"
+  (( dry )) && return 0
+  if (( ${#gone[@]} )); then
+    for name in $(_pb_norm "${PHP_EXT_DROP:-}") "${gone[@]}"; do drop[$name]=1; done
+    for name in "${gone[@]}"; do unset "extra[$name]"; done
+    PHP_EXT_EXTRA=$( (( ${#extra[@]} )) && printf '%s\n' "${!extra[@]}" | sort | paste -sd, - || true)
+    PHP_EXT_DROP=$(printf '%s\n' "${!drop[@]}" | sort | paste -sd, -)
+    export PHP_EXT_EXTRA PHP_EXT_DROP
+    if declare -F persist_tuning_var >/dev/null; then
+      persist_tuning_var PHP_EXT_EXTRA "$PHP_EXT_EXTRA"
+      persist_tuning_var PHP_EXT_DROP "$PHP_EXT_DROP"
+    fi
+  fi
+  PHP_EXT_PRUNED=1
+  declare -F persist_tuning_var >/dev/null && persist_tuning_var PHP_EXT_PRUNED 1
+  return 0
+}
+
+# PHP_EXT_DROP has done its job once the active build carries none of its
+# names: clear it (persisted) so it never filters a later carry-over.
+php_ext_drop_settle() {
+  local name ver prev
+  [[ -n ${PHP_EXT_DROP:-} ]] || return 0
+  ver=$(php_active_version 2>/dev/null || true)
+  [[ -n $ver ]] || return 0
+  prev=",$(_pb_prev_union "$ver" 2>/dev/null | tr -d ' '),"
+  for name in $(_pb_norm "$PHP_EXT_DROP"); do
+    if [[ $prev == *",${name},"* ]]; then return 0; fi
+  done
+  PHP_EXT_DROP=""
+  export PHP_EXT_DROP
+  declare -F persist_tuning_var >/dev/null && persist_tuning_var PHP_EXT_DROP ""
+  return 0
+}
+
 # --php ext=LIST: names add to PHP_EXT_EXTRA (persisted), -NAME removes one,
-# none clears it.  Removals set PHP_BUILD_EXT_RESET=1 so the next build may
-# shrink.  Unknown names are refused before anything changes.
+# none clears it, minimal keeps only imagick.  Removals set
+# PHP_BUILD_EXT_RESET=1 so the next build may shrink.  Unknown names are
+# refused before anything changes.
 php_build_ext_option() { # list
   local list=${1,,} name cur
   local -A extra=()
@@ -457,6 +558,16 @@ php_build_ext_option() { # list
   else
     for name in ${list//,/ }; do
       [[ -n $name ]] || continue
+      # minimal (1.22.15): back to what the detected applications need.
+      # Every extra goes except imagick (only ever there by operator
+      # choice); names after it in the list are added on top.
+      if [[ $name == minimal ]]; then
+        local keep_imagick=${extra[imagick]:-}
+        extra=()
+        [[ -n $keep_imagick ]] && extra[imagick]=1
+        PHP_BUILD_EXT_RESET=1
+        continue
+      fi
       if [[ $name == -* ]]; then
         unset "extra[${name#-}]"; PHP_BUILD_EXT_RESET=1
         continue

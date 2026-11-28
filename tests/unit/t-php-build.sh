@@ -301,7 +301,8 @@ check "wordpress: the core modules are never listed" csv_lacks_all "$out" core d
 check "the set is a sorted comma list without duplicates" csv_sorted "$out"
 out=$(effp PHP_BUILD_ROOT="$NOROOT" PHP_BUILD_NGINX="$TMP/t-xf") || true
 check "xenforo: mysqli, xml, zip and exif" csv_has_all "$out" mysqli xml zip exif gd curl mbstring
-check "xenforo: no sodium, redis or pdo_mysql without a reason" csv_lacks_all "$out" sodium redis igbinary pdo_mysql
+check "xenforo: gmp (push) and sodium (passkeys) are in the set (1.22.15)" csv_has_all "$out" gmp sodium
+check "xenforo: no redis or pdo_mysql without a reason" csv_lacks_all "$out" redis igbinary pdo_mysql xmlwriter
 out=$(effp PHP_BUILD_ROOT="$NOROOT" PHP_BUILD_NGINX="$TMP/t-xf-redis") || true
 check "xenforo with the Redis cache provider: redis and igbinary" csv_has_all "$out" redis igbinary mysqli
 out=$(effp PHP_BUILD_ROOT="$NOROOT" PHP_BUILD_NGINX="$TMP/t-chev") || true
@@ -319,7 +320,7 @@ check "PHP_EXT_EXTRA alone: intl in the set" csv_has "$out" intl
 check "PHP_EXT_EXTRA alone: no application union" csv_lacks_all "$out" sodium redis pdo_mysql
 out=$(effp PHP_BUILD_ROOT="$NOROOT" PHP_BUILD_NGINX="$TMP/t-none" PHP_BUILD_APPS=xf) || true
 check "--domain app=xf adds the xenforo set" csv_has_all "$out" mysqli xml zip exif
-check "--domain app=xf adds nothing of the other applications" csv_lacks_all "$out" sodium redis
+check "--domain app=xf adds nothing of the other applications" csv_lacks_all "$out" redis pdo_mysql xmlwriter
 out=$(effp PHP_BUILD_ROOT="$NOROOT" PHP_BUILD_NGINX="$TMP/t-none" PHP_BUILD_APPS=shlink) || true
 check "--domain app=shlink adds gmp to the generic set" csv_has_all "$out" gmp sqlite3 bcmath
 out=$(effp PHP_BUILD_ROOT="$NOROOT" PHP_BUILD_NGINX="$TMP/t-none" PHP_BUILD_APPS=flarum) || true
@@ -462,7 +463,7 @@ check "PHP_EXT_EXTRA is exported to the build tool" has "$out" "exported=gmp,int
 # The file is written shell-quoted (%q; bash escapes the comma) and sourced
 # by the host: compare the value it yields.
 # shellcheck disable=SC1090
-tuning_value() ( unset "$2"; source "$1"; printf "%s" "${!2-unset}" ) # FILE KEY
+tuning_value() ( unset "$2"; [[ -f $1 ]] && source "$1"; printf "%s" "${!2-unset}" ) # FILE KEY
 check "PHP_EXT_EXTRA is persisted in the tuning file" test "$(tuning_value "$tf" PHP_EXT_EXTRA)" = "gmp,intl"
 out=$(extopt "$tf" "gmp,intl" "-intl") || true
 check "ext=-intl drops one name" has "$out" "rc=0 extra=gmp "
@@ -484,6 +485,115 @@ plus_rc=0; q php_ext_validate +intl || plus_rc=1
 out=$(extopt "$TMP/tuning-plus" "" "+intl") || true
 opt_plus=1; has "$out" "rc=0" && opt_plus=0
 check "ext=+NAME: the validator and php_build_ext_option agree" test "$plus_rc" = "$opt_plus"
+
+# 1.22.15: ext=minimal, XenForo's own set, add-on requirements, leftovers
+out=$(extopt "$TMP/tuning-min" "calendar,ftp,imagick,intl,redis" "minimal") || true
+check "ext=minimal keeps only imagick of the extras" has "$out" "rc=0 extra=imagick reset=1"
+out=$(extopt "$TMP/tuning-min" "calendar,intl" "minimal,gmp") || true
+check "ext=minimal,NAME adds names after the reset (no imagick when it was not there)" has "$out" "rc=0 extra=gmp reset=1"
+check "ext=minimal passes the validator" q php_ext_validate minimal,intl
+check "the XenForo set carries gmp (push) and sodium (passkeys)" \
+  bash -c 'x=" $(tr "\n" " " <<<"$1") "; [[ $x == *" gmp "* && $x == *" sodium "* ]]' _ "$(php_upgrade_app_requirements xenforo)"
+check "the fallback XenForo set matches the single table" \
+  test "$(php_upgrade_app_requirements xenforo | tr '[:upper:]' '[:lower:]' | sort | paste -sd,)" = "$( (unset -f php_upgrade_app_requirements; php_build_app_exts xenforo) | sort | paste -sd,)"
+X=$TMP/xf-addons
+mk_xf "$X"
+mkdir -p "$X/src/addons/ThemeHouse/Holidays" "$X/src/addons/Single" "$X/src/addons/Vendor/NoReq"
+printf '{"require": {"php-ext/calendar": ["*", "Calendar PHP extension"], "php": ["7.2"]}}\n' > "$X/src/addons/ThemeHouse/Holidays/addon.json"
+printf '{"require": {"php-ext/Intl": ["*"], "php-ext/memcached": ["*"], "php-ext/json": ["*"]}}\n' > "$X/src/addons/Single/addon.json"
+printf '{"title": "no requirements"}\n' > "$X/src/addons/Vendor/NoReq/addon.json"
+out=$(php_upgrade_xf_addon_exts "$X" | paste -sd, -)
+check "add-on php-ext requirements are read (one and two directory levels, lower-cased)" test "$out" = "calendar,intl"
+check "an unbuildable or core add-on requirement is not printed (memcached, json)" bash -c '[[ $1 != *memcached* && $1 != *json* ]]' _ "$out"
+check "the XenForo requirement list includes its add-ons' php-ext names" \
+  bash -c '[[ " $(tr "\n" " " <<<"$1") " == *" calendar "* ]]' _ "$(php_upgrade_app_required_extensions xenforo "$X" install)"
+mk_xf "$TMP/xf-noaddons"
+check "a XenForo root without add-ons prints nothing extra" test -z "$(php_upgrade_xf_addon_exts "$TMP/xf-noaddons")"
+mig=$TMP/migrate-log; printf '2026-11-27 15:56:36 UTC [INFO] migrate: PHP 8.3: extensions loaded today kept in PHP_EXT_EXTRA: calendar exif ftp gettext gmp igbinary imagick mysqli pdo pdo_mysql redis shmop sockets sodium sysvmsg sysvsem sysvshm xml xmlreader xmlwriter zip zlib\n' > "$mig"
+noweb=$TMP/no-nginx; mkdir -p "$noweb"
+prune() ( # TUNING-FILE EXTRA PRUNED OPT-EXT APPS [dry] [MIGRATE-LOG] [NGINX-TREE] -> "list=… extra=… drop=… reset=… pruned=…"
+  SETUP_TUNING_FILE=$1; PHP_EXT_EXTRA=$2; PHP_EXT_PRUNED=$3; OPT["php.ext"]=$4
+  MIGRATE_LOG=${7:-$mig}; PHP_BUILD_NGINX=${8:-$noweb}; PHP_EXT_DETECT_TREE=""
+  local apps=$5
+  unset PHP_BUILD_EXT_RESET PHP_EXT_DROP
+  php_build_detect_apps() { local a; for a in $apps; do printf '%s\t%s\n' "$a" "$X"; done; }
+  php_ext_prune_leftovers "${6:-0}"
+  printf 'list=%s extra=%s drop=%s reset=%s pruned=%s' "$PHP_EXT_PRUNE_LIST" "$PHP_EXT_EXTRA" "${PHP_EXT_DROP:-}" \
+    "${PHP_BUILD_EXT_RESET:-unset}" "$(tuning_value "$1" PHP_EXT_PRUNED)"
+)
+pf=$TMP/tuning-prune
+out=$(prune "$pf" "calendar,exif,ftp,gettext,gmp,igbinary,imagick,pdo,pdo_mysql,redis,shmop,sockets,sysvmsg,sysvsem,sysvshm,xmlreader,xmlwriter" 0 "" "xenforo")
+check "leftovers: the eleven known-unused modules leave PHP_EXT_EXTRA on a migrated XenForo host" \
+  has "$out" "list=calendar ftp gettext pdo pdo_mysql shmop sockets sysvmsg sysvsem sysvshm xmlreader "
+check "leftovers: everything else stays (gmp, imagick, redis, xmlwriter...)" has "$out" "extra=exif,gmp,igbinary,imagick,redis,xmlwriter "
+check "leftovers: the names go to PHP_EXT_DROP, not a full reset of the carried-over build" \
+  has "$out" "drop=calendar,ftp,gettext,pdo,pdo_mysql,shmop,sockets,sysvmsg,sysvsem,sysvshm,xmlreader reset=unset pruned=1"
+check "leftovers: PHP_EXT_EXTRA and PHP_EXT_DROP are persisted" \
+  bash -c '[[ $1 == "exif,gmp,igbinary,imagick,redis,xmlwriter" && $2 == calendar,* ]]' _ "$(tuning_value "$pf" PHP_EXT_EXTRA)" "$(tuning_value "$pf" PHP_EXT_DROP)"
+out=$(prune "$TMP/tuning-prune2" "calendar,shmop" 1 "" "xenforo")
+check "leftovers: never a second time (PHP_EXT_PRUNED=1 keeps a name added back)" has "$out" "list= extra=calendar,shmop drop= reset=unset"
+out=$(prune "$TMP/tuning-prune3" "calendar,shmop" 0 "calendar,-intl" "xenforo")
+check "leftovers: a name this run's ext= asks for stays" has "$out" "list=shmop extra=calendar "
+out=$(prune "$TMP/tuning-prune4" "calendar,shmop" 0 "" "xenforo" 1)
+check "leftovers: the dry mode names them and changes nothing" \
+  bash -c '[[ $1 == "list=calendar shmop extra=calendar,shmop drop= reset=unset pruned=unset" && ! -e $2 ]]' _ "$out" "$TMP/tuning-prune4"
+out=$(prune "$TMP/tuning-prune5" "calendar,shmop" 0 "" "xenforo wordpress")
+check "leftovers: a host with a non-XenForo application keeps them (and is not marked)" \
+  bash -c '[[ $1 == "list= extra=calendar,shmop drop= reset=unset pruned=unset" ]]' _ "$out"
+printf 'nothing about PHP here\n' > "$TMP/migrate-log-none"
+out=$(prune "$TMP/tuning-prune6" "calendar,shmop" 0 "" "xenforo" 0 "$TMP/migrate-log-none")
+check "leftovers: a host whose migration log names no kept modules keeps them (operator names)" \
+  bash -c '[[ $1 == "list= extra=calendar,shmop drop= reset=unset pruned=unset" ]]' _ "$out"
+out=$(prune "$TMP/tuning-prune7" "calendar" 0 "" "")
+check "leftovers: no detected application: nothing removed" has "$out" "list= extra=calendar "
+printf '2026-11-27 UTC [INFO] migrate: PHP 8.3: extensions loaded today kept in PHP_EXT_EXTRA: gettext shmop\n' > "$TMP/migrate-log-some"
+out=$(prune "$TMP/tuning-prune8" "calendar,gettext,shmop,sockets" 0 "" "xenforo" 0 "$TMP/migrate-log-some")
+check "leftovers: only names the migration itself wrote leave (calendar, sockets added later stay)" \
+  has "$out" "list=gettext shmop extra=calendar,sockets "
+web=$TMP/nginx-missing-root; mkdir -p "$web/conf.d"
+printf 'server {\n  root /nonexistent/wp-site;\n}\n' > "$web/conf.d/wp.conf"
+out=$(prune "$TMP/tuning-prune9" "calendar,shmop" 0 "" "xenforo" 0 "$mig" "$web")
+check "leftovers: a vhost root that does not exist (could hide another app) blocks the removal" \
+  bash -c '[[ $1 == "list= extra=calendar,shmop drop= reset=unset pruned=unset" ]]' _ "$out"
+settle() ( # DROP PREV-UNION TUNING-FILE -> PHP_EXT_DROP after the settle ; persisted value
+  PHP_EXT_DROP=$1; SETUP_TUNING_FILE=$3; local prev_union=$2
+  php_active_version() { echo 8.3; }
+  _pb_prev_union() { echo "$prev_union"; }
+  php_ext_drop_settle
+  printf '%s|%s' "$PHP_EXT_DROP" "$(tuning_value "$3" PHP_EXT_DROP)"
+)
+check "PHP_EXT_DROP: cleared once the active build carries none of its names" \
+  test "$(settle "calendar,shmop" "curl,gd,mysqli" "$TMP/tuning-settle1")" = "|"
+check "PHP_EXT_DROP: kept while the active build still has one of them" \
+  test "$(settle "calendar,shmop" "curl,shmop" "$TMP/tuning-settle2")" = "calendar,shmop|unset"
+check "run_optimize settles PHP_EXT_DROP before the one-time removal" \
+  bash -c 'sed -n "/^run_optimize()/,/^}/p" "$1" | awk "/php_ext_drop_settle/{a=NR} /^    php_ext_prune_leftovers/{b=NR} END{exit !(a && b > a)}"' _ "$ROOT/lib/restart.sh"
+# PHP_EXT_DROP only stops the carry-over: an application's set and the
+# extras still add a name.
+eff_drop() ( # DROP EXTRA APPS -> effective set
+  PHP_EXT_DROP=$1; PHP_EXT_EXTRA=$2; local apps=$3
+  unset PHP_BUILD_EXT_RESET
+  _pb_prev_union() { echo "calendar,gmp,mysqli,shmop,sqlite3"; }
+  php_build_detect_apps() { local a; for a in $apps; do printf '%s\t%s\n' "$a" "$X"; done; }
+  _pb_sqlite_scan() { return 1; }
+  php_build_effective_exts 8.3 2>/dev/null
+)
+out=$(eff_drop "calendar,shmop,ftp" "" "xenforo")
+check "PHP_EXT_DROP: a dropped name is not carried over from the current build" bash -c '[[ ,$1, != *,shmop,* ]]' _ "$out"
+check "PHP_EXT_DROP: the rest of the current build is still carried over (sqlite3)" bash -c '[[ ,$1, == *,sqlite3,* ]]' _ "$out"
+check "PHP_EXT_DROP: an add-on requirement still adds a dropped name (calendar)" bash -c '[[ ,$1, == *,calendar,* ]]' _ "$out"
+out=$(eff_drop "shmop" "shmop" "xenforo")
+check "PHP_EXT_DROP: a later ext=NAME (PHP_EXT_EXTRA) adds it back" bash -c '[[ ,$1, == *,shmop,* ]]' _ "$out"
+printf '<?php\n$config = [];\n$config["fsAdapters"]["data"] = function() { return new \\League\\Flysystem\\Adapter\\Ftp([]); };\n' > "$X/src/config.php"
+check "an FTP adapter in config.php makes ftp a XenForo requirement" \
+  bash -c '[[ " $(tr "\n" " " <<<"$1") " == *" ftp "* ]]' _ "$(php_upgrade_app_required_extensions xenforo "$X" install)"
+out=$(eff_drop "ftp" "" "xenforo")
+check "PHP_EXT_DROP: ftp is still built while an FTP adapter is configured" bash -c '[[ ,$1, == *,ftp,* ]]' _ "$out"
+printf '<?php\n$config = [];\n// $config["fsAdapters"]["data"] = new \\League\\Flysystem\\Adapter\\Ftp([]);\n' > "$X/src/config.php"
+check "a commented FTP adapter is not a requirement" \
+  bash -c '[[ " $(tr "\n" " " <<<"$1") " != *" ftp "* ]]' _ "$(php_upgrade_app_required_extensions xenforo "$X" install)"
+check "leftovers: PHP_EXT_PRUNED and PHP_EXT_DROP survive a profile reset" \
+  bash -c '[[ " ${*} " == *" PHP_EXT_PRUNED "* && " ${*} " == *" PHP_EXT_DROP "* ]]' _ "${RESET_KEEP_PINS[@]}"
 check "ext=-NAME passes the validator" q php_ext_validate -intl
 persisted() ( # the tuning file as the host sources it, then the set
   # shellcheck disable=SC1090

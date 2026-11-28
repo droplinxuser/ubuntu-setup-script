@@ -547,6 +547,7 @@ php_ext_validate() {
   fi
   for name in ${list//,/ }; do
     [[ $name == none ]] && die "--php ext=none clears the list and cannot be combined with other names"
+    [[ $name == minimal ]] && continue
     [[ ${name#-} =~ ^[a-z0-9_]+(-[a-z0-9_]+)?$ ]] \
       || die "--php ext: '${name}' is not an extension name (use e.g. ext=intl,gmp, -NAME to drop one, or none)"
     [[ $name == -* ]] && continue

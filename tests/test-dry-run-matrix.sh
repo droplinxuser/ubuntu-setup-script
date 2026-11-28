@@ -491,6 +491,8 @@ run fail --dry-run --optimize anubis=1
 run ok   --dry-run --optimize ext=-calendar,-gettext,-shmop,-ftp,-pdo,-pdo_mysql,-xmlreader
 run ok   --dry-run --optimize mitigations=off ext=imagick
 run ok   --dry-run --optimize ext=none
+run ok   --dry-run --optimize ext=minimal
+run ok   --dry-run --optimize ext=minimal,intl
 run_msg "cannot compile this extension" --dry-run --optimize ext=xsl
 run_msg "is not an extension name" --dry-run --optimize 'ext=bad;name'
 run_msg "requires a list" --dry-run --optimize ext=

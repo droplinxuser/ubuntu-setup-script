@@ -322,7 +322,7 @@ gate() ( # EXTS LOADED -> blockers|not-loaded
   printf 'B:%s\n' "${PHP_UPGRADE_BLOCKERS[@]:-}"
   printf 'N:%s\n' "${PHP_UPGRADE_NOT_LOADED[@]:-}"
 )
-base_exts=$'mysqli\ngd\ncurl\nmbstring\nxml\nzip\nexif'
+base_exts=$'mysqli\ngd\ncurl\nmbstring\nxml\nzip\nexif\ngmp\nsodium'
 out=$(gate "$base_exts" $'mysqli\nredis\nigbinary\ngd\ncurl\nmbstring\nxml\nzip\nexif') || true
 check "gate: a site's loaded redis missing from the target blocks" line_in "$out" "B:xenforo|$PF/forum|redis"
 check "gate: igbinary goes with it" line_in "$out" "B:xenforo|$PF/forum|igbinary"

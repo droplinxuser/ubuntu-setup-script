@@ -541,7 +541,7 @@ plus the set of every application found on the host, plus `PHP_EXT_EXTRA`.
 |---|---|
 | Base (always) | ctype curl dom fileinfo filter gd iconv libxml mbstring mysqlnd openssl opcache phar posix session simplexml tokenizer zlib, and pcntl in the CLI only (phar, posix, tokenizer and pcntl are for wp-cli and composer), plus PHP's always-on core |
 | WordPress | mysqli gd curl mbstring exif zip xml sodium; + redis igbinary when a Redis object-cache drop-in needs `\Redis` (no Predis fallback) or Object Cache Pro is installed |
-| XenForo | mysqli gd curl mbstring xml zip exif; + redis igbinary when `src/config.php` selects the `Redis` cache provider or the SV RedisCache add-on (`SV\RedisCache\Redis`, since 1.22.13) |
+| XenForo | mysqli gd curl mbstring xml zip exif gmp sodium (gmp: push notifications, which XenForo enables by default, call `gmp_strval` unguarded; sodium: passkeys and the JWT keys); + every `php-ext/NAME` an installed add-on's `addon.json` requires (XenForo refuses to install or upgrade the add-on without it); + redis igbinary when `src/config.php` selects the `Redis` cache provider or the SV RedisCache add-on (`SV\RedisCache\Redis`, since 1.22.13) |
 | Chevereto | pdo_mysql pdo mysqli redis igbinary gd curl mbstring exif fileinfo xmlwriter zip |
 | Other PHP apps (`--domain app=` flarum, polr, lychee, sfs, php, or a PHP root that is none of the three) | mysqli pdo_mysql pdo tokenizer bcmath sqlite3 pdo_sqlite xml xmlwriter zip exif; shlink adds gmp |
 | Any application root that uses SQLite | sqlite3 pdo_sqlite (a scan of the root, 4 levels deep, skipping `vendor`, `node_modules`, `cache` and `.git`, for `new SQLite3`, a `sqlite:` PDO DSN or a database file with the "SQLite format 3" magic) |
@@ -558,6 +558,28 @@ plus the set of every application found on the host, plus `PHP_EXT_EXTRA`.
 * A bare `--php` on a host with no application and no previous build gets
   the union of the WordPress, XenForo and Chevereto sets, so a site dropped
   in later does not answer 500.
+
+**Migration leftovers (1.22.15).**  Hosts migrated before 1.22.13 still
+list in `PHP_EXT_EXTRA` every module Sury loaded.  On a host that serves
+only XenForo (and whose vhost roots all exist), the next `--optimize`
+removes, once, the ones XenForo never uses, as far as the migration log
+shows the migration itself wrote them (a name the operator added stays): calendar, ftp, gettext, pdo,
+pdo_mysql, shmop, sockets, sysvmsg, sysvsem, sysvshm and xmlreader (a code
+scan of three live XenForo 2.2/2.3 installs with their add-ons found them
+unused or only in library code XenForo does not load).  They leave
+`PHP_EXT_EXTRA` and join `PHP_EXT_DROP`, which only stops the current
+build from carrying them over: a name XenForo or an add-on requires (ftp
+with an FTP adapter in `config.php`, calendar for an add-on that declares
+it) or a later `ext=NAME` is still built, and the rest of the current
+build is still carried over; `PHP_EXT_DROP` clears itself once the active
+build no longer has any of its names.  `PHP_EXT_PRUNED=1` records the run.  A host
+with WordPress or another application next to XenForo keeps them
+(WordPress may use ftp or sockets for `FS_METHOD`, a plugin XMLReader):
+review and trim with `--optimize ext=minimal` or `ext=-NAME`.  xmlwriter
+is not on the list (XenForo's Braintree payment provider).  The dry run
+shows the list and the resulting build set.
+
+
 * The daily refresh reruns the detection.  When the set grew (for example a
   XenForo `config.php` switched its cache to Redis), the active version is
   rebuilt in the background; until then the `--optimize` report says so.
@@ -920,7 +942,7 @@ a non-zero exit and the optimize report, exactly like `--optimize`.
 |---|---|
 | `--optimize` | tune the OS and every installed service in place (Ubuntu 22.04, 24.04, 26.04) |
 | `--optimize mitigations=off` | the same (`mitigations=off` is the default and changes nothing; `mitigations=on` was removed, see `--basic`) |
-| `--optimize ext=LIST` | the same, after changing the PHP extension set exactly like `--php ext=` (`NAME` adds, `-NAME` drops one added earlier, `none` clears the list; persisted as `PHP_EXT_EXTRA`); the source build is rebuilt when the set changed.  Works on 22.04 and 24.04, where `--php` is refused.  An extension a detected application needs stays (1.22.13) |
+| `--optimize ext=LIST` | the same, after changing the PHP extension set exactly like `--php ext=` (`NAME` adds, `-NAME` drops one added earlier, `none` clears the list, `minimal` (1.22.15) keeps only imagick of the extras so the build carries just what the detected applications need; persisted as `PHP_EXT_EXTRA`); the source build is rebuilt when the set changed.  Works on 22.04 and 24.04, where `--php` is refused.  An extension a detected application needs stays (1.22.13) |
 | `--optimize --dry-run` | print the planned OS and service values, the build plan and, on a 1.21.x host, the migration plan; runs as a normal user |
 
 Tunes the OS and every installed service in place. It never installs a new

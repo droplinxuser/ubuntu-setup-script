@@ -444,6 +444,14 @@ run_optimize() {
     php_ext_request_apply
     opt_report "- PHP extensions: \`ext=${OPT[php.ext]}\` recorded (PHP_EXT_EXTRA=${PHP_EXT_EXTRA:-none})"
   fi
+  # 1.22.15: the 1.21 migration's leftover modules leave PHP_EXT_EXTRA once
+  # (lib/php-build.sh php_ext_prune_leftovers); the PHP build below follows.
+  if (( ! ${DRY_RUN:-0} )); then
+    php_ext_drop_settle
+    php_ext_prune_leftovers
+    [[ -z $PHP_EXT_PRUNE_LIST ]] \
+      || opt_report "- PHP extensions: 1.21 migration leftovers no detected application needs removed from PHP_EXT_EXTRA (once; \`--optimize ext=NAME\` adds one back): ${PHP_EXT_PRUNE_LIST}"
+  fi
   detect_installed_services
   # One /var/www walk for every WordPress/XenForo finder in this run.
   app_config_scan_prime

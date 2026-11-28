@@ -5480,12 +5480,12 @@ check "a Chevereto site whose FPM already loads redis gets nothing" \
   test "$(pe_run chevereto "$TMP/apps/chev/public" "$pe_chev redis imagick" "")" = ""
 printf "\$config['cache']['provider'] = 'SV\\\\RedisCache\\\\Redis';\n" > "$TMP/apps/xf/public/src/config.php"
 check "a XenForo site with SV RedisCache whose FPM loads redis gets no rebuild" \
-  test "$(pe_run xenforo "$TMP/apps/xf/public" "mysqli gd curl mbstring xml zip exif redis igbinary" "")" = ""
+  test "$(pe_run xenforo "$TMP/apps/xf/public" "mysqli gd curl mbstring xml zip exif gmp sodium redis igbinary" "")" = ""
 check "a XenForo site with SV RedisCache whose build lacks redis gets a refresh rebuild (1.22.13)" \
-  test "$(pe_run xenforo "$TMP/apps/xf/public" "mysqli gd curl mbstring xml zip exif" "mysqli gd curl mbstring xml zip exif redis igbinary")" = "build 8.5 full refresh info"
+  test "$(pe_run xenforo "$TMP/apps/xf/public" "mysqli gd curl mbstring xml zip exif gmp sodium" "mysqli gd curl mbstring xml zip exif gmp sodium redis igbinary")" = "build 8.5 full refresh info"
 printf "\$config['db']['host'] = 'localhost';\n" > "$TMP/apps/xf/public/src/config.php"
 check "a XenForo site with no cache gets no rebuild" \
-  test "$(pe_run xenforo "$TMP/apps/xf/public" "mysqli gd curl mbstring xml zip exif" "")" = ""
+  test "$(pe_run xenforo "$TMP/apps/xf/public" "mysqli gd curl mbstring xml zip exif gmp sodium" "")" = ""
 check "an unknown module list rebuilds nothing (no guessing)" \
   test "$(pe_run chevereto "$TMP/apps/chev/public" "" "")" = ""
 # 1.22: create_domains hands the new sites' app types to one rebuild

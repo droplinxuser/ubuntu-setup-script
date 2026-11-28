@@ -168,7 +168,8 @@ Domain setup (standalone; nginx + MariaDB must already be installed/running):
 Optimize-only mode (Ubuntu 22.04, 24.04 or 26.04):
   --optimize [mitigations=off] [ext=LIST] [--dry-run]
       ext=LIST changes the PHP extension set like --php ext= (NAME adds,
-      -NAME drops one, none clears the list) on 22.04, 24.04 and 26.04;
+      -NAME drops one, none clears the list, minimal keeps only imagick of
+      the extras) on 22.04, 24.04 and 26.04;
       the stale build is rebuilt and swapped in by the same run.
       One command for the whole host.  It synchronizes nginx's /etc/nginx
       tree from server-configs-nginx (or CONFIG_SOURCE_DIR), applies the
