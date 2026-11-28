@@ -730,19 +730,30 @@ opt_resume_web_frontends() {
 # WordPress, Chevereto, Polr, Lychee, imports).  Skipped and reported, with
 # the statement to run by hand:
 #   - a table with a FULLTEXT index (InnoDB's full-text search uses another
-#     minimum word length and stopword list, so search results can change);
+#     minimum word length and stopword list, so search results can change),
+#     except XenForo's xf_search_index (1.22.16: XenForo runs on InnoDB
+#     FULLTEXT; on a live board the same queries returned the same counts
+#     after the move) up to SETUP_MARIADB_INNODB_SEARCH_MAX_MB (512).  The
+#     FULLTEXT rebuild ran at about 3.6 MB/s (781 MB in 217 s), and a post
+#     saved meanwhile waits for it at the end of its request, which PHP-FPM
+#     kills at 300 s (request_terminate_timeout): 512 MB is about 140 s at
+#     that rate, twice as fast as the limit for a slower host;
 #   - a table larger than SETUP_MARIADB_INNODB_MAX_MB (256): changing the
 #     engine copies the table and blocks its writes for the whole copy;
 #   - every MyISAM table of a schema that holds a MERGE (MRG_MyISAM) table:
 #     a MERGE table only opens MyISAM children.
 # ROW_FORMAT=DEFAULT drops an inherited FIXED/PAGE row format, which InnoDB's
-# strict mode refuses.  Each ALTER waits at most 2 s for its table lock
-# (lock_wait_timeout): while it waits, new queries on that table queue
-# behind it, so a busy table is skipped (retried by the next run) rather
-# than stalling the site.  Any other refusal (an AUTO_INCREMENT column that
-# is not first in its key, a row too large for InnoDB) is reported with
-# MariaDB's message; it fails before any row is copied.
-# SETUP_MARIADB_INNODB=0 turns it off.
+# strict mode refuses; LOCK=SHARED keeps reads going during the copy.
+# lock_wait_timeout bounds both the wait for the table at the start and the
+# exclusive lock for the final swap after the copy; new queries on the table
+# queue behind either wait.  2 s for a small table; a table over 64 MB gets
+# 10 s, so a slow reader at the swap does not throw a long copy away, and is
+# skipped up front while a query on it has run for 2 s or more.  A lock
+# timeout before the copy is "busy" (the next run retries); one after a copy
+# of more than 5 s is reported apart (a long query held the swap: run it
+# off-peak).  Any other refusal (an AUTO_INCREMENT column that is not first
+# in its key, a row too large for InnoDB) is reported with MariaDB's message;
+# it fails before any row is copied.  SETUP_MARIADB_INNODB=0 turns it off.
 mariadb_innodb_candidates() { # -> schema TAB table TAB engine TAB MB TAB fulltext(0|1) TAB merge-schema(0|1)
   mariadb -N -B -e "SELECT t.table_schema, t.table_name, t.engine,
       CAST(CEIL((COALESCE(t.data_length,0) + COALESCE(t.index_length,0)) / 1048576) AS UNSIGNED),
@@ -757,15 +768,29 @@ mariadb_innodb_candidates() { # -> schema TAB table TAB engine TAB MB TAB fullte
     ORDER BY t.table_schema, t.table_name" 2>/dev/null
 }
 
+# Queries that have run for 2 s or more and name TABLE (a large copy is not
+# started under them).  Prints a count; 0 when the server does not answer.
+mariadb_innodb_long_queries() { # schema table
+  local n
+  n=$(mariadb -N -B -e "SELECT COUNT(*) FROM information_schema.processlist
+      WHERE command NOT IN ('Sleep', 'Daemon', 'Binlog Dump') AND time >= 2
+        AND id <> CONNECTION_ID() AND INSTR(COALESCE(info, ''), '$2') > 0" 2>/dev/null || true)
+  [[ $n =~ ^[0-9]+$ ]] || n=0
+  printf '%s\n' "$n"
+}
+
 mariadb_innodb_convert() { # [dry]  dry=1 prints the plan
   local dry=${1:-0} rows s t e mb ft mrg err max=${SETUP_MARIADB_INNODB_MAX_MB:-256}
-  local -a conv=() ftx=() big=() mrgd=() busy=() bad=() odd=()
+  local smax=${SETUP_MARIADB_INNODB_SEARCH_MAX_MB:-512} cap lwt t0 late=${MARIADB_INNODB_LATE_S:-5}
+  local -a conv=() ftx=() big=() mrgd=() busy=() swap=() bad=() odd=()
   if [[ ${SETUP_MARIADB_INNODB:-1} != 1 ]]; then
     if (( dry )); then printf '  MariaDB: non-InnoDB application tables left as they are (SETUP_MARIADB_INNODB=0)\n'
     else opt_report "- Non-InnoDB application tables: conversion off (SETUP_MARIADB_INNODB=0)"; fi
     return 0
   fi
   [[ $max =~ ^[0-9]+$ ]] || max=256
+  [[ $smax =~ ^[0-9]+$ ]] || smax=512
+  [[ $late =~ ^[0-9]+$ ]] || late=5
   if ! rows=$(mariadb_innodb_candidates); then
     if (( dry )); then printf '  MariaDB: non-InnoDB application tables move to InnoDB (the list needs root and a running server)\n'
     else opt_report "- Non-InnoDB application tables: not checked (the server did not answer)"; fi
@@ -778,13 +803,23 @@ mariadb_innodb_convert() { # [dry]  dry=1 prints the plan
     if [[ ! $s =~ ^[A-Za-z0-9_-]+$ || ! $t =~ ^[A-Za-z0-9_-]+$ ]]; then odd+=("${s}.${t}"); continue; fi
     [[ $mb =~ ^[0-9]+$ ]] || mb=0
     if [[ $mrg == 1 && $e == MyISAM ]]; then mrgd+=("${s}.${t}"); continue; fi
-    if [[ $ft == 1 ]]; then ftx+=("${s}.${t}"); continue; fi
-    if (( mb > max )); then big+=("${s}.${t} (${mb}MB)"); continue; fi
+    cap=$max
+    if [[ $ft == 1 ]]; then
+      [[ $t == xf_search_index ]] || { ftx+=("${s}.${t}"); continue; }
+      cap=$smax
+    fi
+    if (( mb > cap )); then big+=("${s}.${t} (${mb}MB > ${cap}MB)"); continue; fi
     if (( dry )); then conv+=("${s}.${t} (${e})"); continue; fi
-    if err=$(mariadb -e "SET SESSION lock_wait_timeout = 2; ALTER TABLE \`${s}\`.\`${t}\` ENGINE=InnoDB ROW_FORMAT=DEFAULT" 2>&1 >/dev/null); then
+    lwt=2
+    if (( mb > 64 )); then
+      lwt=10
+      if (( $(mariadb_innodb_long_queries "$s" "$t") > 0 )); then busy+=("${s}.${t}"); continue; fi
+    fi
+    t0=$SECONDS
+    if err=$(mariadb -e "SET SESSION lock_wait_timeout = ${lwt}; ALTER TABLE \`${s}\`.\`${t}\` ENGINE=InnoDB ROW_FORMAT=DEFAULT, LOCK=SHARED" 2>&1 >/dev/null); then
       conv+=("${s}.${t} (${e})")
     elif [[ $err == *"ERROR 1205"* || $err == *"Lock wait timeout"* ]]; then
-      busy+=("${s}.${t}")
+      if (( SECONDS - t0 > late )); then swap+=("${s}.${t} ($((SECONDS - t0)) s)"); else busy+=("${s}.${t}"); fi
     else
       # The client frames the failing statement in dashes first; keep the
       # ERROR line (or the first other non-empty line).
@@ -796,16 +831,17 @@ mariadb_innodb_convert() { # [dry]  dry=1 prints the plan
   if (( dry )); then
     (( ${#conv[@]} )) && printf '  MariaDB: would move to InnoDB (row locks instead of table locks): %s\n' "${conv[*]}"
     (( ${#ftx[@]} )) && printf '  MariaDB: left as they are (FULLTEXT index; InnoDB search may return other results; by hand: %s): %s\n' "$hint" "${ftx[*]}"
-    (( ${#big[@]} )) && printf '  MariaDB: left as they are (over %sMB, the copy would block writes; by hand off-peak: %s): %s\n' "$max" "$hint" "${big[*]}"
+    (( ${#big[@]} )) && printf '  MariaDB: left as they are (over the size cap, the copy would block writes; by hand off-peak: %s): %s\n' "$hint" "${big[*]}"
     (( ${#mrgd[@]} )) && printf '  MariaDB: left as they are (MyISAM in a schema with a MERGE table): %s\n' "${mrgd[*]}"
     (( ${#odd[@]} )) && printf '  MariaDB: left as they are (unusual names): %s\n' "${odd[*]}"
     return 0
   fi
   (( ${#conv[@]} )) && opt_report "- Moved to InnoDB (row locks instead of table locks): ${conv[*]}"
   (( ${#ftx[@]} )) && opt_report "- Left on their engine (FULLTEXT index; InnoDB full-text search may return other results; by hand: \`${hint}\`): ${ftx[*]}"
-  (( ${#big[@]} )) && opt_report "- Left on their engine (over ${max}MB, the copy would block writes; by hand off-peak: \`${hint}\`): ${big[*]}"
+  (( ${#big[@]} )) && opt_report "- Left on their engine (over the size cap, the copy would block writes; by hand off-peak: \`${hint}\`): ${big[*]}"
   (( ${#mrgd[@]} )) && opt_report "- Left on their engine (MyISAM in a schema with a MERGE table, which only opens MyISAM tables): ${mrgd[*]}"
-  (( ${#busy[@]} )) && opt_report "- Not moved this run (table busy for 2 s; the next --optimize retries): ${busy[*]}"
+  (( ${#busy[@]} )) && opt_report "- Not moved this run (table busy; the next --optimize retries): ${busy[*]}"
+  (( ${#swap[@]} )) && opt_report "- **WARNING** Copied but not moved: a long query held the table at the final swap, so the copy was discarded (run it off-peak: \`${hint}\`): ${swap[*]}"
   (( ${#bad[@]} )) && opt_report "- **WARNING** MariaDB refused the move to InnoDB (fix the table by hand; nothing was copied): ${bad[*]}"
   (( ${#odd[@]} )) && opt_report "- Left on their engine (unusual names): ${odd[*]}"
   return 0

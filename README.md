@@ -721,6 +721,7 @@ Environment option:
 | `SETUP_MARIADB_IO_CAPACITY="r m"` | by disk and host class | pins `innodb_io_capacity` and `innodb_io_capacity_max` for an install/one run; `--optimize` ignores it |
 | `SETUP_MARIADB_INNODB=0` | 1 | keeps application tables on MyISAM, Aria and MEMORY (see below) |
 | `SETUP_MARIADB_INNODB_MAX_MB` | 256 | the largest table (data + index) `--optimize` moves to InnoDB by itself |
+| `SETUP_MARIADB_INNODB_SEARCH_MAX_MB` | 512 | the same for XenForo's `xf_search_index` (1.22.16) |
 
 **Table-locking engines move to InnoDB (1.22.14).**  Every `--optimize`
 (and the re-optimization after a `--domain ... sql=` import) moves the
@@ -735,12 +736,18 @@ guest pages for 3-8 s at a time.  Interleaved A/B on that origin, three
 0.55 s, p99 -6 %, p50 unchanged, +5 % requests served by the sequential
 probe.  Left alone and listed in the report, with the statement to run by
 hand: a table with a FULLTEXT index (InnoDB's full-text search has another
-minimum word length and stopword list, so search results can change; on a
-XenForo host searching through Elasticsearch `xf_search_index` is unused),
+minimum word length and stopword list, so search results can change),
+except XenForo's `xf_search_index` (1.22.16: XenForo runs on InnoDB
+FULLTEXT; on a live board 781 MB moved in 217 s and the same searches
+returned the same counts), which moves up to
+`SETUP_MARIADB_INNODB_SEARCH_MAX_MB` (512: a post saved during the copy
+waits for it, and PHP-FPM kills a request at 300 s; 512 MB is about 140 s
+at that rate, twice as fast as the limit for a slower host),
 a table over `SETUP_MARIADB_INNODB_MAX_MB` (the engine change copies it
 and blocks its writes meanwhile), and the MyISAM tables of a schema that
 holds a MERGE (`MRG_MyISAM`) table, which only opens MyISAM tables.  The
-`ALTER` adds `ROW_FORMAT=DEFAULT`, so an inherited FIXED or PAGE row format
+`ALTER` adds `ROW_FORMAT=DEFAULT` and `LOCK=SHARED` (reads go on during the
+copy), so an inherited FIXED or PAGE row format
 does not block it.  Each `ALTER` waits at most 2 s for its table lock,
 because new queries on that table queue behind a waiting `ALTER`: a busy
 table is retried by the next run instead of stalling the site.  A table

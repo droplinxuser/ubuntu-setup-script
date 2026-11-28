@@ -8,6 +8,35 @@ Reports of the 1.21.33-1.21.61 cycles that measured the removed Anubis
 filter were deleted from the tree on 2026-11-23 for the same reason;
 `git show <commit>:<path>` recovers them.
 
+## 1.22.16 (2026-11-28)
+
+- **XenForo's `xf_search_index` moves to InnoDB too** (operator decision:
+  XenForo runs on InnoDB FULLTEXT).  1.22.14 left every FULLTEXT table on
+  its engine; XenForo's search index is now the exception, up to
+  `SETUP_MARIADB_INNODB_SEARCH_MAX_MB` (512).  On a live board (MySQL
+  search, MariaDB 10.11) the 781 MB MyISAM table moved in 217 s (the
+  FULLTEXT rebuild runs at about 3.6 MB/s) and six frequent terms
+  returned the same counts before and after; a two-term query took 52 ms.
+  XenForo writes the index at the end of the request that saved a post,
+  so a post made during the copy waits for it, and PHP-FPM kills a request
+  at 300 s (`request_terminate_timeout`): 512 MB is about 140 s at that
+  rate, twice as fast as the limit for a slower host.  A larger index is
+  listed with the statement to run off-peak.  Other FULLTEXT tables are
+  still left alone.
+- Every engine change now says `LOCK=SHARED`: reads go on during the copy
+  (the copy algorithm already allowed them; the statement now fails
+  rather than silently taking a stronger lock).  Checked on MariaDB 11.8
+  with MEMORY, Aria (PAGE, TRANSACTIONAL=1), MyISAM and a XenForo-shaped
+  `xf_search_index` with both FULLTEXT keys (MATCH results unchanged).
+- **A long copy is no longer thrown away by a 2 s lock wait.**
+  `lock_wait_timeout` also bounds the exclusive lock for the final swap
+  after the copy, so a reader holding the table at that moment discarded
+  the whole copy and the report called it "busy".  A table over 64 MB now
+  gets 10 s, is skipped up front while a query on it has run for 2 s or
+  more, and a timeout after a copy is reported apart ("copied but not
+  moved", run it off-peak).  The review that found this also corrected the
+  search cap, first sized for nginx's 360 s instead of PHP-FPM's 300 s.
+
 ## 1.22.15 (2026-11-28)
 
 - **XenForo builds are minimal and complete.**  A code scan of three live
